@@ -142,7 +142,8 @@ fn interactive_shell(args: &[String]) -> ! {
     let mut line = String::new();
 
     loop {
-        if show_prompt {
+        // Python prints its own trailing `>>> ` prompt as part of each foreground action.
+        if show_prompt && !env.in_python_repl() {
             let _ = write!(stdout, "shellsim:{}$ ", env.cwd);
             let _ = stdout.flush();
         }

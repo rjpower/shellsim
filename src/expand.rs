@@ -16,8 +16,12 @@ struct Part {
 }
 
 pub fn expand_word(interp: &mut Interp, word: &str, do_split_glob: bool) -> Vec<String> {
-    let parts = expand_to_parts(interp, word);
-    assemble(interp, parts, do_split_glob)
+    let mut out = Vec::new();
+    for expanded in brace_expand(word, 0) {
+        let parts = expand_to_parts(interp, &expanded);
+        out.extend(assemble(interp, parts, do_split_glob));
+    }
+    out
 }
 
 /// Expand a list of words (a command's argv) into the final field list.
@@ -27,6 +31,154 @@ pub fn expand_words(interp: &mut Interp, words: &[String]) -> Vec<String> {
         out.extend(expand_word(interp, w, true));
     }
     out
+}
+
+/// Bash-style pre-expansion for the common `{a,b}` and `{1..5[..step]}` forms. Braces inside
+/// quotes and parameter expansions are left alone. The recursion and result count are bounded so
+/// an adversarial expansion cannot consume unmetered host memory.
+fn brace_expand(word: &str, depth: usize) -> Vec<String> {
+    if depth >= 8 {
+        return vec![word.to_string()];
+    }
+    let chars: Vec<char> = word.chars().collect();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut open = None;
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = if quote == Some(ch) {
+                None
+            } else if quote.is_none() {
+                Some(ch)
+            } else {
+                quote
+            };
+            continue;
+        }
+        if ch == '{' && quote.is_none() && (index == 0 || chars[index - 1] != '$') {
+            open = Some(index);
+            break;
+        }
+    }
+    let Some(open) = open else {
+        return vec![word.to_string()];
+    };
+    let mut nested = 0usize;
+    let mut close = None;
+    for (index, ch) in chars.iter().copied().enumerate().skip(open + 1) {
+        match ch {
+            '{' => nested += 1,
+            '}' if nested > 0 => nested -= 1,
+            '}' => {
+                close = Some(index);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return vec![word.to_string()];
+    };
+    let inner: String = chars[open + 1..close].iter().collect();
+    let alternatives = brace_alternatives(&inner);
+    if alternatives.is_empty() {
+        return vec![word.to_string()];
+    }
+    let prefix: String = chars[..open].iter().collect();
+    let suffix: String = chars[close + 1..].iter().collect();
+    let mut out = Vec::new();
+    for alternative in alternatives.into_iter().take(1_024) {
+        let combined = format!("{prefix}{alternative}{suffix}");
+        out.extend(brace_expand(&combined, depth + 1));
+        if out.len() >= 1_024 {
+            out.truncate(1_024);
+            break;
+        }
+    }
+    out
+}
+
+fn brace_alternatives(inner: &str) -> Vec<String> {
+    let comma_parts = split_brace_commas(inner);
+    if comma_parts.len() > 1 {
+        return comma_parts;
+    }
+    let range: Vec<&str> = inner.split("..").collect();
+    if !(2..=3).contains(&range.len()) {
+        return Vec::new();
+    }
+    let step = range
+        .get(2)
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|step| *step != 0);
+    if let (Ok(start), Ok(end)) = (range[0].parse::<i64>(), range[1].parse::<i64>()) {
+        let width = range[0]
+            .trim_start_matches('-')
+            .len()
+            .max(range[1].trim_start_matches('-').len());
+        let step = step.unwrap_or(if start <= end { 1 } else { -1 });
+        if (end - start).signum() != step.signum() && start != end {
+            return Vec::new();
+        }
+        let mut result = Vec::new();
+        let mut value = start;
+        while result.len() < 1_024 && if step > 0 { value <= end } else { value >= end } {
+            let sign = if value < 0 { "-" } else { "" };
+            result.push(format!(
+                "{sign}{:0width$}",
+                value.unsigned_abs(),
+                width = width
+            ));
+            value = value.saturating_add(step);
+        }
+        return result;
+    }
+    let start = range[0].chars().collect::<Vec<_>>();
+    let end = range[1].chars().collect::<Vec<_>>();
+    if start.len() == 1 && end.len() == 1 {
+        let start = start[0] as i64;
+        let end = end[0] as i64;
+        let step = step.unwrap_or(if start <= end { 1 } else { -1 });
+        let mut result = Vec::new();
+        let mut value = start;
+        while result.len() < 1_024 && if step > 0 { value <= end } else { value >= end } {
+            if let Some(ch) = char::from_u32(value as u32) {
+                result.push(ch.to_string());
+            }
+            value = value.saturating_add(step);
+        }
+        return result;
+    }
+    Vec::new()
+}
+
+fn split_brace_commas(inner: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, ch) in inner.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(inner[start..index].to_string());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if !parts.is_empty() {
+        parts.push(inner[start..].to_string());
+    }
+    parts
 }
 
 fn assemble(interp: &mut Interp, parts: Vec<Part>, do_split_glob: bool) -> Vec<String> {
@@ -779,12 +931,97 @@ fn run_capture(interp: &mut Interp, src: &str) -> String {
 }
 
 pub fn eval_arith(interp: &mut Interp, expr: &str) -> i64 {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return 0;
+    }
+    // Bash arithmetic commands commonly mutate a loop variable. Handle the useful assignment
+    // and increment forms before handing pure expressions to the precedence parser below.
+    if let Some(name) = expr.strip_suffix("++").map(str::trim) {
+        if is_name(name) {
+            let old = interp
+                .get_var(name)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0i64);
+            interp.set_var(name, old.saturating_add(1).to_string());
+            return old;
+        }
+    }
+    if let Some(name) = expr.strip_suffix("--").map(str::trim) {
+        if is_name(name) {
+            let old = interp
+                .get_var(name)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0i64);
+            interp.set_var(name, old.saturating_sub(1).to_string());
+            return old;
+        }
+    }
+    for (prefix, delta) in [("++", 1i64), ("--", -1i64)] {
+        if let Some(name) = expr.strip_prefix(prefix).map(str::trim) {
+            if is_name(name) {
+                let old = interp
+                    .get_var(name)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0i64);
+                let value = old.saturating_add(delta);
+                interp.set_var(name, value.to_string());
+                return value;
+            }
+        }
+    }
+    if let Some((name, op, rhs)) = arithmetic_assignment(expr) {
+        let rhs = eval_arith(interp, rhs);
+        let old = interp
+            .get_var(name)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0i64);
+        let value = match op {
+            "=" => rhs,
+            "+=" => old.saturating_add(rhs),
+            "-=" => old.saturating_sub(rhs),
+            "*=" => old.saturating_mul(rhs),
+            "/=" if rhs != 0 => old / rhs,
+            "%=" if rhs != 0 => old % rhs,
+            _ => old,
+        };
+        interp.set_var(name, value.to_string());
+        return value;
+    }
     let mut p = ArithParser {
         interp,
         chars: expr.chars().collect(),
         i: 0,
     };
     p.expr()
+}
+
+fn arithmetic_assignment(expr: &str) -> Option<(&str, &str, &str)> {
+    let bytes = expr.as_bytes();
+    let mut depth = 0usize;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            _ if depth != 0 => continue,
+            _ => {}
+        }
+        for op in ["+=", "-=", "*=", "/=", "%=", "="] {
+            if expr[i..].starts_with(op) {
+                if op == "="
+                    && (i > 0 && matches!(bytes[i - 1], b'!' | b'<' | b'>' | b'=')
+                        || bytes.get(i + 1) == Some(&b'='))
+                {
+                    continue;
+                }
+                let name = expr[..i].trim();
+                if is_name(name) {
+                    return Some((name, op, expr[i + op.len()..].trim()));
+                }
+            }
+        }
+    }
+    None
 }
 
 struct ArithParser<'a> {
@@ -807,15 +1044,15 @@ impl ArithParser<'_> {
         self.ternary()
     }
     fn ternary(&mut self) -> i64 {
-        let c = self.add_sub();
+        let c = self.logical_or();
         if self.peek() == Some('?') {
             self.i += 1;
-            let a = self.add_sub();
+            let a = self.logical_or();
             self.skip_ws();
             if self.peek() == Some(':') {
                 self.i += 1;
             }
-            let b = self.add_sub();
+            let b = self.logical_or();
             if c != 0 {
                 a
             } else {
@@ -823,6 +1060,61 @@ impl ArithParser<'_> {
             }
         } else {
             c
+        }
+    }
+
+    fn logical_or(&mut self) -> i64 {
+        let mut value = self.logical_and();
+        while self.consume("||") {
+            let right = self.logical_and();
+            value = i64::from(value != 0 || right != 0);
+        }
+        value
+    }
+
+    fn logical_and(&mut self) -> i64 {
+        let mut value = self.comparison();
+        while self.consume("&&") {
+            let right = self.comparison();
+            value = i64::from(value != 0 && right != 0);
+        }
+        value
+    }
+
+    fn comparison(&mut self) -> i64 {
+        let mut value = self.add_sub();
+        loop {
+            let op = ["==", "!=", "<=", ">=", "<", ">"]
+                .into_iter()
+                .find(|op| self.starts_with(op));
+            let Some(op) = op else { break };
+            self.i += op.len();
+            let right = self.add_sub();
+            value = i64::from(match op {
+                "==" => value == right,
+                "!=" => value != right,
+                "<=" => value <= right,
+                ">=" => value >= right,
+                "<" => value < right,
+                ">" => value > right,
+                _ => false,
+            });
+        }
+        value
+    }
+
+    fn starts_with(&mut self, value: &str) -> bool {
+        self.skip_ws();
+        let wanted: Vec<char> = value.chars().collect();
+        self.chars.get(self.i..self.i + wanted.len()) == Some(wanted.as_slice())
+    }
+
+    fn consume(&mut self, value: &str) -> bool {
+        if self.starts_with(value) {
+            self.i += value.chars().count();
+            true
+        } else {
+            false
         }
     }
     fn add_sub(&mut self) -> i64 {

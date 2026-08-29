@@ -207,6 +207,35 @@ pub fn exec(
             }
             s
         }
+        Node::CFor {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            let _ = crate::expand::eval_arith(interp, init);
+            let mut status = 0;
+            let mut guard = 0usize;
+            while cond.is_empty() || crate::expand::eval_arith(interp, cond) != 0 {
+                if interp.resources.is_stopped() || guard >= 5_000 {
+                    break;
+                }
+                guard += 1;
+                status = exec(interp, body, Vec::new(), out, err);
+                if interp.loop_break > 0 {
+                    interp.loop_break -= 1;
+                    break;
+                }
+                if interp.loop_continue > 0 {
+                    interp.loop_continue -= 1;
+                }
+                if interp.exiting.is_some() || interp.returning.is_some() {
+                    break;
+                }
+                let _ = crate::expand::eval_arith(interp, update);
+            }
+            status
+        }
         Node::Case { word, arms } => {
             let subject = expand_word(interp, word, false).join(" ");
             for (pats, body) in arms {
@@ -222,6 +251,13 @@ pub fn exec(
         Node::FuncDef { name, body } => {
             interp.funcs.insert(name.clone(), (**body).clone());
             0
+        }
+        Node::Arithmetic(expression) => {
+            if crate::expand::eval_arith(interp, expression) == 0 {
+                1
+            } else {
+                0
+            }
         }
     };
     interp.last_status = status;
@@ -279,6 +315,10 @@ fn plan_redirects(interp: &mut Interp, redirs: &[Redirect]) -> RedirPlan {
             }
             RedirOp::HeredocRaw => {
                 stdin = r.target.clone().into_bytes();
+            }
+            RedirOp::HereString => {
+                stdin = expand_word(interp, &r.target, false).join(" ").into_bytes();
+                stdin.push(b'\n');
             }
             RedirOp::Write | RedirOp::Append => {
                 let path = expand_word(interp, &r.target, true).join(" ");

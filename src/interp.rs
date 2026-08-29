@@ -84,6 +84,10 @@ pub struct ProcessState {
     pub trust_partial: std::collections::BTreeSet<String>,
     /// Package names recorded by the lightweight `pip`/`uv`/`conda` compatibility commands.
     pub packages: std::collections::BTreeSet<String>,
+    /// A foreground Python REPL, when `python` was invoked without a program. Keeping this in
+    /// process state lets an agent enter Python in one shell action and continue it in later
+    /// actions without giving the shim access to host stdin.
+    pub python_repl: Option<crate::python::ReplState>,
 }
 
 impl Deref for Environment {
@@ -157,6 +161,7 @@ impl Environment {
                 trust_noop: std::collections::BTreeSet::new(),
                 trust_partial: std::collections::BTreeSet::new(),
                 packages: std::collections::BTreeSet::new(),
+                python_repl: None,
             },
         }
     }
@@ -384,6 +389,11 @@ impl Environment {
     /// Whether this persistent shell can accept another action.
     pub fn is_terminated(&self) -> bool {
         self.resources.is_stopped() || self.exiting.is_some()
+    }
+
+    /// Whether subsequent session actions are currently interpreted by the minimal Python REPL.
+    pub fn in_python_repl(&self) -> bool {
+        self.python_repl.is_some()
     }
 
     /// Sticky terminal status after `exit`, `set -e`, or resource exhaustion.

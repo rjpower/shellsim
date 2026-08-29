@@ -43,7 +43,8 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
         cmd_noop,
     );
     reg(m, &["kill", "killall", "pkill"], Trust::Real, cmd_noop);
-    reg(m, &["type", "command", "which"], Trust::Real, cmd_which);
+    reg(m, &["type", "which"], Trust::Real, cmd_which);
+    reg(m, &["command"], Trust::Real, cmd_command);
     reg(m, &["alias", "unalias"], Trust::Real, cmd_noop);
     reg(m, &["getopts"], Trust::Real, cmd_getopts);
     reg(m, &["let"], Trust::Real, cmd_let);
@@ -159,11 +160,23 @@ fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i3
                     i += 1;
                 }
             }
-            s if s.starts_with("-euo") || s.starts_with("-eu") => {
-                interp.opt_errexit = true;
-                interp.opt_nounset = true;
-                if s.contains('x') {
-                    interp.opt_xtrace = true;
+            "--" => {
+                interp.positional = args[i + 1..].to_vec();
+                break;
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                for option in s[1..].chars() {
+                    match option {
+                        'e' => interp.opt_errexit = true,
+                        'u' => interp.opt_nounset = true,
+                        'x' => interp.opt_xtrace = true,
+                        'o' if args.get(i + 1).map(String::as_str) == Some("pipefail") => {
+                            interp.opt_pipefail = true;
+                            i += 1;
+                        }
+                        'o' => {}
+                        _ => {}
+                    }
                 }
             }
             s if !s.starts_with('-') && !s.starts_with('+') => {
@@ -379,6 +392,7 @@ fn eval_test(interp: &Interp, a: &[&str]) -> bool {
                     .unwrap_or(false),
                 "-r" | "-w" | "-x" => interp.vfs.lexists(&interp.cwd, x),
                 "-L" | "-h" => interp.vfs.is_symlink(&interp.cwd, x),
+                "-v" => interp.get_var(x).is_some() || interp.arrays.contains_key(x),
                 "!" => !eval_test(interp, &a[1..]),
                 _ => !op.is_empty(),
             }
@@ -396,6 +410,9 @@ fn eval_test(interp: &Interp, a: &[&str]) -> bool {
                 "-ge" => num(x) >= num(y),
                 "<" => x < y,
                 ">" => x > y,
+                "=~" => regex::Regex::new(y)
+                    .map(|regex| regex.is_match(x))
+                    .unwrap_or(false),
                 "-nt" => true,
                 "-ot" => false,
                 _ => false,
@@ -499,7 +516,7 @@ fn read_one_line(interp: &mut Interp, io: &Io) -> Option<String> {
 fn cmd_which(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let known = KNOWN_COMMANDS;
     let mut ok = true;
-    for a in args {
+    for a in args.iter().filter(|arg| !arg.starts_with('-')) {
         if interp.funcs.contains_key(a) {
             wln(io.out, &format!("{a} is a function"));
         } else if known.contains(&a.as_str()) {
@@ -513,6 +530,24 @@ fn cmd_which(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
     } else {
         1
     }
+}
+
+fn cmd_command(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.is_empty() {
+        return 0;
+    }
+    if matches!(args.first().map(String::as_str), Some("-v" | "-V")) {
+        return cmd_which(interp, &args[1..], io);
+    }
+    let argv = if args.first().map(String::as_str) == Some("--") {
+        &args[1..]
+    } else {
+        args
+    };
+    if argv.is_empty() {
+        return 0;
+    }
+    crate::commands::run(interp, argv, io.stdin.clone(), io.out, io.err)
 }
 
 fn cmd_let(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {

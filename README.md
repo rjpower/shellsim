@@ -62,6 +62,22 @@ The `shell` subcommand drives one such environment line by line. It shows a prom
 preserves state between lines, exits normally on EOF or `exit`, and prints a reason before exiting
 with status 137 when a resource is exhausted.
 
+Invoking `python` without arguments transfers the foreground session to a deliberately-minimal
+Python REPL. Simple assignments and expressions persist across actions; `exit()` or `quit()`
+returns to the shell. This is a modeled process mode, not access to host CPython.
+
+## Bash-ish compatibility
+
+The shell intentionally targets common agent-written Bash rather than the full Bash grammar. It
+supports functions, indexed and associative arrays, `if`/`case`/`for`/`while`/`until`, C-style
+`for ((...))` loops, `((...))`, pipelines, `&&`/`||`, background jobs, groups and subshells,
+heredocs and here-strings, command/arithmetic substitution, brace expansion, parameter expansion,
+globbing, `[[...]]`, and frequently used `set` options including `pipefail`.
+
+Standard paths such as `/bin/sh` and `/usr/bin/env` resolve to their simulated commands. More
+specialized Bash behavior—process substitution, traps/signals, coprocesses, job timing, and exact
+subshell isolation—remains outside the faithful subset.
+
 ## Command implementations
 
 Commands receive a uniform environment context:
@@ -86,15 +102,21 @@ New commands should live in their own module. Multiple names can share one behav
 `echo`, `printf`, and `sort` demonstrate the layout. Older implementations still grouped by family
 already use the same metered context and can be split mechanically when revised.
 
+The current command set includes filesystem and text coreutils, `grep`, `sed`, a useful partial
+`awk`, hashes and encoders, virtual `curl`/`wget`, shell builtins, minimal package/Python launchers,
+and simulated system queries such as `env`, `printenv`, `uname`, `id`, `nproc`, `df`, `free`, and
+`ps`. Partial commands are surfaced in evaluation reports instead of being presented as fully
+faithful implementations.
+
 Disk enforcement lives inside `Vfs`, so direct command mutations cannot bypass capacity checks.
 Commands should still surface `VfsError::NoSpace` with a non-zero status.
 
 ## Minimal Python compatibility
 
 `python` is a bootstrap shim, not an embedded interpreter. It supports `--version`, a small
-`python -c` subset for literal output, exit status, arguments and environment lookups, plus light
-`pip`/`venv` compatibility. Unknown syntax fails loudly and is recorded as unsupported. Host
-CPython is never invoked.
+`python -c` subset for output, simple scalar assignments and expressions, exit status, arguments
+and environment lookups, a persistent foreground REPL, plus light `pip`/`venv` compatibility.
+Unknown syntax fails loudly and is recorded as unsupported. Host CPython is never invoked.
 
 ## Library API
 
@@ -123,6 +145,8 @@ src/shell.rs           lexer, parser, capture API
 src/expand.rs          shell expansion
 src/exec.rs            metered executor, pipelines, redirects, control flow
 src/commands/          registry, command context, implementations
+src/commands/awk.rs    partial record-oriented awk
+src/commands/system.rs simulated environment/system queries
 src/python/mod.rs      minimal python -c shim
 src/clock.rs           virtual clock
 src/net.rs             virtual route-table network

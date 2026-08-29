@@ -34,6 +34,12 @@ pub enum Node {
         words: Vec<String>,
         body: Box<Node>,
     },
+    CFor {
+        init: String,
+        cond: String,
+        update: String,
+        body: Box<Node>,
+    },
     While {
         cond: Box<Node>,
         body: Box<Node>,
@@ -47,6 +53,7 @@ pub enum Node {
         name: String,
         body: Box<Node>,
     },
+    Arithmetic(String),
     Not(Box<Node>),
     Redirected(Box<Node>, Vec<Redirect>),
     Empty,
@@ -67,6 +74,7 @@ pub enum RedirOp {
     DupOut,     // >&N  / N>&M
     Heredoc,    // << (target carries the already-captured body; quoted flag in op variant below)
     HeredocRaw, // << with quoted delimiter (no expansion of body)
+    HereString, // <<< word
 }
 
 // ===================== Lexer =====================
@@ -79,6 +87,8 @@ enum Tok {
     Great,                 // >
     DGreat,                // >>
     Heredoc(String, bool), // body, quoted-delim
+    Arithmetic(String),    // (( expression ))
+    HereString(String),    // <<< word
     GreatAmp(i32),         // >&N captured fd source default 1; store dest in word? we encode as op
     RedirFd(i32, String),  // e.g. 2> with op ; we keep simple
     Eof,
@@ -169,15 +179,27 @@ impl Lexer {
                     }
                 }
                 '(' => {
-                    self.toks.push(Tok::Op("(".into()));
-                    self.i += 1;
+                    if self.at(1) == Some('(') {
+                        let expression = self.read_arithmetic_command();
+                        self.toks.push(Tok::Arithmetic(expression));
+                    } else {
+                        self.toks.push(Tok::Op("(".into()));
+                        self.i += 1;
+                    }
                 }
                 ')' => {
                     self.toks.push(Tok::Op(")".into()));
                     self.i += 1;
                 }
                 '<' => {
-                    if self.at(1) == Some('<') {
+                    if self.at(1) == Some('<') && self.at(2) == Some('<') {
+                        self.i += 3;
+                        while matches!(self.peek(), Some(' ' | '\t')) {
+                            self.i += 1;
+                        }
+                        let word = self.read_word();
+                        self.toks.push(Tok::HereString(word));
+                    } else if self.at(1) == Some('<') {
                         // heredoc << or <<-
                         let dashed = self.at(2) == Some('-');
                         self.i += if dashed { 3 } else { 2 };
@@ -280,6 +302,30 @@ impl Lexer {
             self.chars.get(self.i - 1),
             Some(' ') | Some('\t') | Some('\n') | Some(';') | Some('&') | Some('|') | Some('(')
         )
+    }
+
+    /// Consume a top-level bash arithmetic command, preserving its expression as source.
+    fn read_arithmetic_command(&mut self) -> String {
+        self.i += 2; // opening ((
+        let start = self.i;
+        let mut depth = 1usize;
+        while self.i < self.chars.len() {
+            if self.peek() == Some('(') && self.at(1) == Some('(') {
+                depth += 1;
+                self.i += 2;
+            } else if self.peek() == Some(')') && self.at(1) == Some(')') {
+                depth -= 1;
+                if depth == 0 {
+                    let expression: String = self.chars[start..self.i].iter().collect();
+                    self.i += 2;
+                    return expression;
+                }
+                self.i += 2;
+            } else {
+                self.i += 1;
+            }
+        }
+        self.chars[start..].iter().collect()
     }
 
     fn read_heredoc_delim(&mut self) -> (String, bool) {
@@ -707,6 +753,10 @@ impl Parser {
             self.i += 1;
             return self.parse_funcdef_named();
         }
+        if let Tok::Arithmetic(expression) = self.peek().clone() {
+            self.i += 1;
+            return self.attach_redirects(Node::Arithmetic(expression));
+        }
         if matches!(self.peek(), Tok::Op(o) if o == "(") {
             self.i += 1;
             let body = self.parse_program();
@@ -873,6 +923,14 @@ impl Parser {
                         target: body,
                     });
                 }
+                Tok::HereString(target) => {
+                    self.i += 1;
+                    redirects.push(Redirect {
+                        fd: 0,
+                        op: RedirOp::HereString,
+                        target,
+                    });
+                }
                 _ => break,
             }
         }
@@ -976,6 +1034,23 @@ impl Parser {
 
     fn parse_for(&mut self) -> Node {
         self.i += 1; // for
+        if let Tok::Arithmetic(expression) = self.peek().clone() {
+            self.i += 1;
+            let mut parts = expression.splitn(3, ';');
+            let init = parts.next().unwrap_or_default().trim().to_string();
+            let cond = parts.next().unwrap_or_default().trim().to_string();
+            let update = parts.next().unwrap_or_default().trim().to_string();
+            self.skip_terminators();
+            self.expect_word("do");
+            let body = self.parse_program();
+            self.expect_word("done");
+            return Node::CFor {
+                init,
+                cond,
+                update,
+                body: Box::new(body),
+            };
+        }
         let var = self.take_word();
         self.skip_newlines();
         let mut words = Vec::new();
@@ -1109,6 +1184,35 @@ impl Interp {
         let mut err = Vec::new();
         if let Some(status) = self.termination_status() {
             return (self.outcome(status), out, err);
+        }
+        // A no-argument `python` command transfers the foreground session to the minimal REPL.
+        // Keep feeding later actions to it until `exit()`/`quit()` returns control to the shell.
+        if let Some(mut repl) = self.python_repl.take() {
+            let cpu_before = self.resources.cpu_used();
+            let disk_before = self.vfs.disk_used();
+            let output_remaining = self.resources.output_remaining();
+            let (code, stay) =
+                crate::python::run_repl_line(self, &mut repl, src, &mut out, &mut err);
+            if stay && !self.resources.is_stopped() {
+                self.python_repl = Some(repl);
+            }
+            let produced = out.len().saturating_add(err.len()) as u64;
+            if produced > output_remaining {
+                let allowed_out = out.len().min(output_remaining as usize);
+                out.truncate(allowed_out);
+                let remaining = output_remaining.saturating_sub(allowed_out as u64) as usize;
+                err.truncate(err.len().min(remaining));
+            }
+            let _ = self.resources.charge_output(produced);
+            self.cmd_trace.push("python:repl".to_string());
+            self.resources.record_command(
+                "python:repl",
+                cpu_before,
+                disk_before,
+                self.vfs.disk_used(),
+            );
+            self.last_status = code;
+            return (self.outcome(code), out, err);
         }
         let memory_mark = self.resources.memory_mark();
         let parser_memory = 8 * 1024 + (src.len() as u64).saturating_mul(2);

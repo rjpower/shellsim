@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use crate::interp::Interp;
 
+mod awk;
 mod builtins;
 mod echo;
 mod fs;
@@ -24,6 +25,7 @@ pub(crate) mod pkg;
 mod printf;
 mod proc;
 mod sort;
+mod system;
 mod text;
 pub mod util;
 
@@ -124,9 +126,11 @@ fn reg_costed(
 fn build_registry() -> HashMap<&'static str, CommandSpec> {
     let mut m = HashMap::new();
     builtins::register(&mut m);
+    awk::register(&mut m);
     echo::register(&mut m);
     printf::register(&mut m);
     sort::register(&mut m);
+    system::register(&mut m);
     text::register(&mut m);
     fs::register(&mut m);
     hashing::register(&mut m);
@@ -147,7 +151,10 @@ pub fn run(
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> i32 {
-    let cmd = argv[0].as_str();
+    let requested = argv[0].as_str();
+    // Agents frequently use explicit paths or `/usr/bin/env` shebangs. Standard utility paths
+    // resolve to the same in-process command without pretending arbitrary host paths exist.
+    let cmd = standard_utility_name(requested).unwrap_or(requested);
     let args = &argv[1..];
     if let Some(spec) = registry().get(cmd) {
         match spec.trust {
@@ -223,15 +230,27 @@ pub fn run(
     }
 
     // ---- fallback: maybe it's an executable script in the VFS ----
-    if let Some(code) = util::try_exec_script(interp, cmd, args, &stdin, out, err) {
+    if let Some(code) = util::try_exec_script(interp, requested, args, &stdin, out, err) {
         return code;
     }
     // An unknown command the task actually invoked (a missing tool, a compiled binary we can't
     // run, …) is a genuine simulation gap — record it so the trust verdict reflects it.
-    interp.note_unsupported(cmd);
-    interp.trust_noop.insert(cmd.to_string());
-    util::ewln(err, &format!("{cmd}: command not found"));
+    interp.note_unsupported(requested);
+    interp.trust_noop.insert(requested.to_string());
+    util::ewln(err, &format!("{requested}: command not found"));
     127
+}
+
+fn standard_utility_name(path: &str) -> Option<&str> {
+    [
+        "/bin/",
+        "/sbin/",
+        "/usr/bin/",
+        "/usr/sbin/",
+        "/usr/local/bin/",
+    ]
+    .into_iter()
+    .find_map(|prefix| path.strip_prefix(prefix).filter(|name| !name.contains('/')))
 }
 
 /// Provide `run_script_into` for nested execution (source, eval, scripts).
