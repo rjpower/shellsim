@@ -17,10 +17,18 @@ pub struct HttpResponse {
 
 impl HttpResponse {
     pub fn ok(body: impl Into<Vec<u8>>) -> Self {
-        HttpResponse { status: 200, headers: vec![], body: body.into() }
+        HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: body.into(),
+        }
     }
     pub fn not_found() -> Self {
-        HttpResponse { status: 404, headers: vec![], body: b"Not Found".to_vec() }
+        HttpResponse {
+            status: 404,
+            headers: vec![],
+            body: b"Not Found".to_vec(),
+        }
     }
 }
 

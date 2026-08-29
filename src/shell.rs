@@ -1,7 +1,6 @@
 //! A pragmatic bash-subset parser and executor.
 //!
-//! Scope is deliberately the constructs that appear in Terminal-Bench `solve.sh` oracle
-//! scripts: pipelines, `&& || ; &` lists, redirects + heredocs, `if/for/while/until/case`,
+//! Scope includes pipelines, `&& || ; &` lists, redirects + heredocs, `if/for/while/until/case`,
 //! function definitions, subshells/groups, and word expansion (quoting, `$VAR`/`${...}`
 //! parameter expansion, `$(...)`/backtick command substitution, `$((...))` arithmetic,
 //! tilde and globbing). It is not a complete bash, but it is faithful where it matters.
@@ -12,7 +11,11 @@ use crate::interp::Interp;
 
 #[derive(Clone, Debug)]
 pub enum Node {
-    Command { assigns: Vec<(String, String)>, words: Vec<String>, redirects: Vec<Redirect> },
+    Command {
+        assigns: Vec<(String, String)>,
+        words: Vec<String>,
+        redirects: Vec<Redirect>,
+    },
     Pipeline(Vec<Node>),
     And(Box<Node>, Box<Node>),
     Or(Box<Node>, Box<Node>),
@@ -20,11 +23,30 @@ pub enum Node {
     Background(Box<Node>),
     Subshell(Box<Node>),
     Group(Box<Node>),
-    If { cond: Box<Node>, then: Box<Node>, elifs: Vec<(Node, Node)>, els: Option<Box<Node>> },
-    For { var: String, words: Vec<String>, body: Box<Node> },
-    While { cond: Box<Node>, body: Box<Node>, until: bool },
-    Case { word: String, arms: Vec<(Vec<String>, Node)> },
-    FuncDef { name: String, body: Box<Node> },
+    If {
+        cond: Box<Node>,
+        then: Box<Node>,
+        elifs: Vec<(Node, Node)>,
+        els: Option<Box<Node>>,
+    },
+    For {
+        var: String,
+        words: Vec<String>,
+        body: Box<Node>,
+    },
+    While {
+        cond: Box<Node>,
+        body: Box<Node>,
+        until: bool,
+    },
+    Case {
+        word: String,
+        arms: Vec<(Vec<String>, Node)>,
+    },
+    FuncDef {
+        name: String,
+        body: Box<Node>,
+    },
     Not(Box<Node>),
     Redirected(Box<Node>, Vec<Redirect>),
     Empty,
@@ -32,19 +54,19 @@ pub enum Node {
 
 #[derive(Clone, Debug)]
 pub struct Redirect {
-    pub fd: i32,         // 0 stdin, 1 stdout, 2 stderr
+    pub fd: i32, // 0 stdin, 1 stdout, 2 stderr
     pub op: RedirOp,
-    pub target: String,  // filename word (unexpanded), or heredoc body, or "&N"
+    pub target: String, // filename word (unexpanded), or heredoc body, or "&N"
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RedirOp {
-    Read,      // <
-    Write,     // >
-    Append,    // >>
-    DupOut,    // >&N  / N>&M
-    Heredoc,   // << (target carries the already-captured body; quoted flag in op variant below)
-    HeredocRaw,// << with quoted delimiter (no expansion of body)
+    Read,       // <
+    Write,      // >
+    Append,     // >>
+    DupOut,     // >&N  / N>&M
+    Heredoc,    // << (target carries the already-captured body; quoted flag in op variant below)
+    HeredocRaw, // << with quoted delimiter (no expansion of body)
 }
 
 // ===================== Lexer =====================
@@ -52,13 +74,13 @@ pub enum RedirOp {
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
     Word(String),
-    Op(String),       // ; ;; & && | || ( ) newline
-    Less,             // <
-    Great,            // >
-    DGreat,           // >>
+    Op(String),            // ; ;; & && | || ( ) newline
+    Less,                  // <
+    Great,                 // >
+    DGreat,                // >>
     Heredoc(String, bool), // body, quoted-delim
-    GreatAmp(i32),    // >&N captured fd source default 1; store dest in word? we encode as op
-    RedirFd(i32, String), // e.g. 2> with op ; we keep simple
+    GreatAmp(i32),         // >&N captured fd source default 1; store dest in word? we encode as op
+    RedirFd(i32, String),  // e.g. 2> with op ; we keep simple
     Eof,
 }
 
@@ -70,7 +92,11 @@ struct Lexer {
 
 impl Lexer {
     fn new(src: &str) -> Self {
-        Lexer { chars: src.chars().collect(), i: 0, toks: Vec::new() }
+        Lexer {
+            chars: src.chars().collect(),
+            i: 0,
+            toks: Vec::new(),
+        }
     }
 
     fn peek(&self) -> Option<char> {
@@ -197,9 +223,7 @@ impl Lexer {
                         self.i += 1;
                     }
                 }
-                c if c.is_ascii_digit()
-                    && (self.at(1) == Some('>') || self.at(1) == Some('<')) =>
-                {
+                c if c.is_ascii_digit() && (self.at(1) == Some('>') || self.at(1) == Some('<')) => {
                     // fd-prefixed redirect like 2> 2>> 1> 2>&1
                     let fd = c.to_digit(10).unwrap() as i32;
                     self.i += 1;
@@ -252,7 +276,10 @@ impl Lexer {
         if self.i == 0 {
             return true;
         }
-        matches!(self.chars.get(self.i - 1), Some(' ') | Some('\t') | Some('\n') | Some(';') | Some('&') | Some('|') | Some('('))
+        matches!(
+            self.chars.get(self.i - 1),
+            Some(' ') | Some('\t') | Some('\n') | Some(';') | Some('&') | Some('|') | Some('(')
+        )
     }
 
     fn read_heredoc_delim(&mut self) -> (String, bool) {
@@ -305,11 +332,19 @@ impl Lexer {
             if had_nl {
                 self.i += 1;
             }
-            let check = if dashed { line.trim_start_matches('\t') } else { line.as_str() };
+            let check = if dashed {
+                line.trim_start_matches('\t')
+            } else {
+                line.as_str()
+            };
             if check == delim {
                 break;
             }
-            let line = if dashed { line.trim_start_matches('\t').to_string() } else { line };
+            let line = if dashed {
+                line.trim_start_matches('\t').to_string()
+            } else {
+                line
+            };
             body.push_str(&line);
             body.push('\n');
             if !had_nl && self.i >= self.chars.len() {
@@ -695,14 +730,21 @@ impl Parser {
                 self.i += 3;
                 self.skip_blank_newlines();
                 let body = self.parse_command();
-                return Node::FuncDef { name, body: Box::new(body) };
+                return Node::FuncDef {
+                    name,
+                    body: Box::new(body),
+                };
             }
         }
         self.parse_simple()
     }
 
     fn parse_funcdef_named(&mut self) -> Node {
-        let name = if let Tok::Word(n) = self.next() { n } else { String::new() };
+        let name = if let Tok::Word(n) = self.next() {
+            n
+        } else {
+            String::new()
+        };
         // optional ()
         if matches!(self.peek(), Tok::Op(o) if o == "(") {
             self.i += 1;
@@ -710,7 +752,10 @@ impl Parser {
         }
         self.skip_blank_newlines();
         let body = self.parse_command();
-        Node::FuncDef { name, body: Box::new(body) }
+        Node::FuncDef {
+            name,
+            body: Box::new(body),
+        }
     }
 
     fn parse_simple(&mut self) -> Node {
@@ -741,53 +786,101 @@ impl Parser {
                 Tok::Less => {
                     self.i += 1;
                     let t = self.take_word();
-                    redirects.push(Redirect { fd: 0, op: RedirOp::Read, target: t });
+                    redirects.push(Redirect {
+                        fd: 0,
+                        op: RedirOp::Read,
+                        target: t,
+                    });
                 }
                 Tok::Great => {
                     self.i += 1;
                     let t = self.take_word();
-                    redirects.push(Redirect { fd: 1, op: RedirOp::Write, target: t });
+                    redirects.push(Redirect {
+                        fd: 1,
+                        op: RedirOp::Write,
+                        target: t,
+                    });
                 }
                 Tok::DGreat => {
                     self.i += 1;
                     let t = self.take_word();
-                    redirects.push(Redirect { fd: 1, op: RedirOp::Append, target: t });
+                    redirects.push(Redirect {
+                        fd: 1,
+                        op: RedirOp::Append,
+                        target: t,
+                    });
                 }
                 Tok::GreatAmp(n) => {
                     self.i += 1;
-                    redirects.push(Redirect { fd: 1, op: RedirOp::DupOut, target: format!("&{n}") });
+                    redirects.push(Redirect {
+                        fd: 1,
+                        op: RedirOp::DupOut,
+                        target: format!("&{n}"),
+                    });
                 }
                 Tok::RedirFd(fd, op) => {
                     self.i += 1;
                     if op == "&>" {
                         let t = self.take_word();
-                        redirects.push(Redirect { fd: 1, op: RedirOp::Write, target: t.clone() });
-                        redirects.push(Redirect { fd: 2, op: RedirOp::DupOut, target: "&1".into() });
+                        redirects.push(Redirect {
+                            fd: 1,
+                            op: RedirOp::Write,
+                            target: t.clone(),
+                        });
+                        redirects.push(Redirect {
+                            fd: 2,
+                            op: RedirOp::DupOut,
+                            target: "&1".into(),
+                        });
                     } else if let Some(rest) = op.strip_prefix(">&") {
-                        redirects.push(Redirect { fd, op: RedirOp::DupOut, target: format!("&{rest}") });
+                        redirects.push(Redirect {
+                            fd,
+                            op: RedirOp::DupOut,
+                            target: format!("&{rest}"),
+                        });
                     } else if op == ">" {
                         let t = self.take_word();
-                        redirects.push(Redirect { fd, op: RedirOp::Write, target: t });
+                        redirects.push(Redirect {
+                            fd,
+                            op: RedirOp::Write,
+                            target: t,
+                        });
                     } else if op == ">>" {
                         let t = self.take_word();
-                        redirects.push(Redirect { fd, op: RedirOp::Append, target: t });
+                        redirects.push(Redirect {
+                            fd,
+                            op: RedirOp::Append,
+                            target: t,
+                        });
                     } else if op == "<" {
                         let t = self.take_word();
-                        redirects.push(Redirect { fd, op: RedirOp::Read, target: t });
+                        redirects.push(Redirect {
+                            fd,
+                            op: RedirOp::Read,
+                            target: t,
+                        });
                     }
                 }
                 Tok::Heredoc(body, quoted) => {
                     self.i += 1;
                     redirects.push(Redirect {
                         fd: 0,
-                        op: if quoted { RedirOp::HeredocRaw } else { RedirOp::Heredoc },
+                        op: if quoted {
+                            RedirOp::HeredocRaw
+                        } else {
+                            RedirOp::Heredoc
+                        },
                         target: body,
                     });
                 }
                 _ => break,
             }
         }
-        Node::Command { assigns, words, redirects }
+        Node::Command {
+            assigns,
+            words,
+            redirects,
+        }
     }
 
     fn take_word(&mut self) -> String {
@@ -805,15 +898,27 @@ impl Parser {
             match self.peek().clone() {
                 Tok::Great => {
                     self.i += 1;
-                    redirs.push(Redirect { fd: 1, op: RedirOp::Write, target: self.take_word() });
+                    redirs.push(Redirect {
+                        fd: 1,
+                        op: RedirOp::Write,
+                        target: self.take_word(),
+                    });
                 }
                 Tok::DGreat => {
                     self.i += 1;
-                    redirs.push(Redirect { fd: 1, op: RedirOp::Append, target: self.take_word() });
+                    redirs.push(Redirect {
+                        fd: 1,
+                        op: RedirOp::Append,
+                        target: self.take_word(),
+                    });
                 }
                 Tok::Less => {
                     self.i += 1;
-                    redirs.push(Redirect { fd: 0, op: RedirOp::Read, target: self.take_word() });
+                    redirs.push(Redirect {
+                        fd: 0,
+                        op: RedirOp::Read,
+                        target: self.take_word(),
+                    });
                 }
                 _ => break,
             }
@@ -861,7 +966,12 @@ impl Parser {
             }
         }
         self.expect_word("fi");
-        Node::If { cond: Box::new(cond), then: Box::new(then), elifs, els }
+        Node::If {
+            cond: Box::new(cond),
+            then: Box::new(then),
+            elifs,
+            els,
+        }
     }
 
     fn parse_for(&mut self) -> Node {
@@ -885,7 +995,11 @@ impl Parser {
         self.expect_word("do");
         let body = self.parse_program();
         self.expect_word("done");
-        Node::For { var, words, body: Box::new(body) }
+        Node::For {
+            var,
+            words,
+            body: Box::new(body),
+        }
     }
 
     fn parse_while(&mut self, until: bool) -> Node {
@@ -894,7 +1008,11 @@ impl Parser {
         self.expect_word("do");
         let body = self.parse_program();
         self.expect_word("done");
-        Node::While { cond: Box::new(cond), body: Box::new(body), until }
+        Node::While {
+            cond: Box::new(cond),
+            body: Box::new(body),
+            until,
+        }
     }
 
     fn parse_case(&mut self) -> Node {
@@ -982,18 +1100,39 @@ pub fn parse(src: &str) -> Node {
 // ===================== entry on Interp =====================
 
 impl Interp {
-    /// Parse and run a whole script, returning the final exit status.
-    pub fn run_script(&mut self, src: &str) -> i32 {
-        let ast = parse(src);
+    /// Parse and execute without writing to the host console.
+    pub fn run_script_capture(
+        &mut self,
+        src: &str,
+    ) -> (crate::resources::RunOutcome, Vec<u8>, Vec<u8>) {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = crate::exec::exec(self, &ast, Vec::new(), &mut out, &mut err);
+        if let Some(status) = self.termination_status() {
+            return (self.outcome(status), out, err);
+        }
+        let memory_mark = self.resources.memory_mark();
+        let parser_memory = 8 * 1024 + (src.len() as u64).saturating_mul(2);
+        let code = if self.resources.reserve_memory(parser_memory)
+            && self.resources.charge_cpu(src.len() as u64)
+        {
+            let ast = parse(src);
+            crate::exec::exec(self, &ast, Vec::new(), &mut out, &mut err)
+        } else {
+            self.resources
+                .stop_reason()
+                .map_or(137, |reason| reason.exit_status())
+        };
+        self.resources.restore_memory(memory_mark);
+        let status = self.exiting.unwrap_or(code);
+        (self.outcome(status), out, err)
+    }
+
+    /// Parse and run a whole script, returning the final exit status.
+    pub fn run_script(&mut self, src: &str) -> i32 {
+        let (outcome, out, err) = self.run_script_capture(src);
         // anything left on stdout/stderr goes to the real console of the simulator
         self.flush_console(&out, &err);
-        if let Some(c) = self.exiting {
-            return c;
-        }
-        code
+        outcome.exit_status
     }
 
     fn flush_console(&mut self, out: &[u8], err: &[u8]) {

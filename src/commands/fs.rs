@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use crate::commands::util::{ewln, glob_eq, split_flags, wln};
-use crate::commands::{CommandSpec, Io, Trust};
+use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
@@ -31,7 +31,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["file"], Trust::Real, cmd_file);
 }
 
-fn cmd_ls(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, _l) = split_flags(args);
     let long = flags.contains(&'l');
     let all = flags.contains(&'a');
@@ -79,20 +79,31 @@ fn cmd_ls(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
         } else if interp.vfs.lexists(&interp.cwd, p) {
             wln(io.out, p);
         } else {
-            ewln(io.err, &format!("ls: cannot access '{p}': No such file or directory"));
+            ewln(
+                io.err,
+                &format!("ls: cannot access '{p}': No such file or directory"),
+            );
             status = 2;
         }
     }
     status
 }
 
-fn emit_listing(interp: &Interp, dir: &str, entries: &[String], long: bool, one: bool, out: &mut Vec<u8>) {
+fn emit_listing(
+    interp: &Interp,
+    dir: &str,
+    entries: &[String],
+    long: bool,
+    one: bool,
+    out: &mut Vec<u8>,
+) {
     if long {
         for e in entries {
             let full = if e == "." {
                 dir.to_string()
             } else if e == ".." {
-                crate::vfs::parent_of(&crate::vfs::resolve_against(&interp.cwd, dir)).unwrap_or_else(|| "/".into())
+                crate::vfs::parent_of(&crate::vfs::resolve_against(&interp.cwd, dir))
+                    .unwrap_or_else(|| "/".into())
             } else {
                 format!("{}/{}", dir.trim_end_matches('/'), e)
             };
@@ -111,7 +122,16 @@ fn emit_listing(interp: &Interp, dir: &str, entries: &[String], long: bool, one:
                 }
                 Err(_) => ('-', 0o644, 0),
             };
-            wln(out, &format!("{}{} 1 root root {:>6} Jan  1 00:00 {}", typ, mode_str(mode), size, e));
+            wln(
+                out,
+                &format!(
+                    "{}{} 1 root root {:>6} Jan  1 00:00 {}",
+                    typ,
+                    mode_str(mode),
+                    size,
+                    e
+                ),
+            );
         }
     } else if one {
         for e in entries {
@@ -138,7 +158,7 @@ fn mode_str(mode: u32) -> String {
     s
 }
 
-fn cmd_mkdir(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_mkdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, _l) = split_flags(args);
     let parents = flags.contains(&'p');
     let cwd = interp.cwd.clone();
@@ -151,7 +171,10 @@ fn cmd_mkdir(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
         };
         if let Err(e) = r {
             if !parents {
-                ewln(io.err, &format!("mkdir: cannot create directory '{d}': {e}"));
+                ewln(
+                    io.err,
+                    &format!("mkdir: cannot create directory '{d}': {e}"),
+                );
                 status = 1;
             }
         }
@@ -159,7 +182,7 @@ fn cmd_mkdir(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     status
 }
 
-fn cmd_rmdir(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_rmdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (_f, ops, _l) = split_flags(args);
     let cwd = interp.cwd.clone();
     let mut status = 0;
@@ -172,7 +195,7 @@ fn cmd_rmdir(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     status
 }
 
-fn cmd_rm(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_rm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, _l) = split_flags(args);
     let recursive = flags.contains(&'r') || flags.contains(&'R');
     let force = flags.contains(&'f');
@@ -194,7 +217,7 @@ fn cmd_rm(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     status
 }
 
-fn cmd_cp(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, _l) = split_flags(args);
     let recursive = flags.contains(&'r') || flags.contains(&'R') || flags.contains(&'a');
     if ops.len() < 2 {
@@ -219,7 +242,7 @@ fn cmd_cp(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     status
 }
 
-fn cmd_mv(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_mv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (_f, ops, _l) = split_flags(args);
     if ops.len() < 2 {
         ewln(io.err, "mv: missing destination operand");
@@ -237,7 +260,7 @@ fn cmd_mv(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     status
 }
 
-fn cmd_touch(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_touch(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (_f, ops, _l) = split_flags(args);
     let cwd = interp.cwd.clone();
     let now = interp.clock.unix_ms();
@@ -251,7 +274,7 @@ fn cmd_touch(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     status
 }
 
-fn cmd_ln(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_ln(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, _l) = split_flags(args);
     let symbolic = flags.contains(&'s');
     if ops.len() < 2 {
@@ -323,14 +346,17 @@ fn parse_mode(s: &str, cur: u32) -> u32 {
     mode
 }
 
-fn cmd_chmod(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_chmod(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut recursive = false;
     let mut mode_arg = None;
     let mut targets = Vec::new();
     for a in args {
         if a == "-R" || a == "--recursive" {
             recursive = true;
-        } else if mode_arg.is_none() && (a.chars().all(|c| c.is_digit(8)) || a.contains(['+', '-', '='])) && !a.starts_with('/') {
+        } else if mode_arg.is_none()
+            && (a.chars().all(|c| c.is_digit(8)) || a.contains(['+', '-', '=']))
+            && !a.starts_with('/')
+        {
             mode_arg = Some(a.clone());
         } else {
             targets.push(a.clone());
@@ -350,7 +376,11 @@ fn cmd_chmod(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
             vec![crate::vfs::resolve_against(&cwd, t)]
         };
         for p in paths {
-            let cur = interp.vfs.metadata("/", &p, true).map(|n| n.mode).unwrap_or(0o644);
+            let cur = interp
+                .vfs
+                .metadata("/", &p, true)
+                .map(|n| n.mode)
+                .unwrap_or(0o644);
             let m = parse_mode(&mode_arg, cur);
             if let Err(e) = interp.vfs.chmod("/", &p, m) {
                 ewln(io.err, &format!("chmod: {e}"));
@@ -361,7 +391,7 @@ fn cmd_chmod(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     status
 }
 
-fn cmd_chown(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_chown(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, _l) = split_flags(args);
     let recursive = flags.contains(&'R');
     if ops.is_empty() {
@@ -402,7 +432,7 @@ fn parse_owner(spec: &str) -> (Option<u32>, Option<u32>) {
     }
 }
 
-fn cmd_basename(_interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_basename(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let Some(p) = args.first() else { return 1 };
     let mut base = crate::vfs::basename(p.trim_end_matches('/')).to_string();
     if let Some(suffix) = args.get(1) {
@@ -414,7 +444,7 @@ fn cmd_basename(_interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_dirname(_interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_dirname(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let Some(p) = args.first() else { return 1 };
     let p = p.trim_end_matches('/');
     let d = match p.rfind('/') {
@@ -426,11 +456,11 @@ fn cmd_dirname(_interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_realpath(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_realpath(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     realpath_impl(interp, "realpath", args, io)
 }
 
-fn cmd_readlink(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_readlink(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     realpath_impl(interp, "readlink", args, io)
 }
 
@@ -464,9 +494,12 @@ fn realpath_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -
     0
 }
 
-fn cmd_stat(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_stat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (_f, ops, long) = split_flags(args);
-    let fmt = long.iter().find(|(k, _)| *k == "format" || *k == "printf").map(|(_, v)| v.clone());
+    let fmt = long
+        .iter()
+        .find(|(k, _)| *k == "format" || *k == "printf")
+        .map(|(_, v)| v.clone());
     // also handle -c FORMAT
     let mut format = fmt;
     let mut files = Vec::new();
@@ -509,7 +542,7 @@ fn cmd_stat(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_find(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_find(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     // supports: find [paths...] [-type f|d] [-name PAT] [-maxdepth N] [-path PAT]
     let mut paths = Vec::new();
     let mut typ: Option<char> = None;
@@ -562,7 +595,10 @@ fn cmd_find(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
                     continue;
                 }
             }
-            let is_dir = matches!(interp.vfs.metadata("/", &p, false).map(|n| n.kind), Ok(crate::vfs::NodeKind::Dir));
+            let is_dir = matches!(
+                interp.vfs.metadata("/", &p, false).map(|n| n.kind),
+                Ok(crate::vfs::NodeKind::Dir)
+            );
             if let Some(t) = typ {
                 let ok = match t {
                     'd' => is_dir,
@@ -594,7 +630,9 @@ fn cmd_find(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
             } else {
                 let prefix = format!("{}/", interp.cwd.trim_end_matches('/'));
                 if !start.starts_with('/') {
-                    p.strip_prefix(&prefix).map(|s| s.to_string()).unwrap_or(p.clone())
+                    p.strip_prefix(&prefix)
+                        .map(|s| s.to_string())
+                        .unwrap_or(p.clone())
                 } else {
                     p.clone()
                 }
@@ -605,12 +643,15 @@ fn cmd_find(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_du(_interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
-    wln(io.out, &format!("0\t{}", args.last().cloned().unwrap_or_else(|| ".".into())));
+fn cmd_du(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    wln(
+        io.out,
+        &format!("0\t{}", args.last().cloned().unwrap_or_else(|| ".".into())),
+    );
     0
 }
 
-fn cmd_mktemp(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_mktemp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, _l) = split_flags(args);
     let dir = flags.contains(&'d');
     let tmpl = ops.first().map(|s| s.as_str()).unwrap_or("tmp.XXXXXX");
@@ -618,7 +659,11 @@ fn cmd_mktemp(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     let n = interp.clock.now_ms();
     let suffix = format!("{:06}", n % 1_000_000);
     let name = tmpl.replace("XXXXXX", &suffix);
-    let path = if name.starts_with('/') { name } else { format!("/tmp/{name}") };
+    let path = if name.starts_with('/') {
+        name
+    } else {
+        format!("/tmp/{name}")
+    };
     let _ = interp.vfs.mkdir_all("/", "/tmp");
     if dir {
         let _ = interp.vfs.mkdir_all("/", &path);
@@ -630,12 +675,17 @@ fn cmd_mktemp(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_file(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_file(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (_f, ops, _l) = split_flags(args);
     for p in &ops {
         let desc = match interp.vfs.read(&interp.cwd, p) {
             Ok(d) if d.is_empty() => "empty".to_string(),
-            Ok(d) if d.iter().all(|b| b.is_ascii() || *b >= 0x80) && std::str::from_utf8(&d).is_ok() => "ASCII text".to_string(),
+            Ok(d)
+                if d.iter().all(|b| b.is_ascii() || *b >= 0x80)
+                    && std::str::from_utf8(&d).is_ok() =>
+            {
+                "ASCII text".to_string()
+            }
             Ok(_) => "data".to_string(),
             Err(_) if interp.vfs.is_dir(&interp.cwd, p) => "directory".to_string(),
             Err(_) => "cannot open".to_string(),

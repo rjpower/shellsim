@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use crate::commands::util::{ewln, split_flags, wln, KNOWN_COMMANDS};
-use crate::commands::{CommandSpec, Io, Trust};
+use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
@@ -15,7 +15,12 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["export"], Trust::Real, cmd_export);
     reg(m, &["unset"], Trust::Real, cmd_unset);
     reg(m, &["set"], Trust::Real, cmd_set);
-    reg(m, &["declare", "typeset", "local", "readonly"], Trust::Real, cmd_declare);
+    reg(
+        m,
+        &["declare", "typeset", "local", "readonly"],
+        Trust::Real,
+        cmd_declare,
+    );
     reg(m, &["source", "."], Trust::Real, cmd_source);
     reg(m, &["eval"], Trust::Real, cmd_eval);
     reg(m, &["exit"], Trust::Real, cmd_exit);
@@ -46,31 +51,33 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["pushd", "popd", "dirs"], Trust::Real, cmd_noop);
 }
 
-fn cmd_noop(_interp: &mut Interp, _args: &[String], _io: &mut Io) -> i32 {
+fn cmd_noop(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_true(_interp: &mut Interp, _args: &[String], _io: &mut Io) -> i32 {
+fn cmd_true(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_false(_interp: &mut Interp, _args: &[String], _io: &mut Io) -> i32 {
+fn cmd_false(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {
     1
 }
 
-fn cmd_getopts(_interp: &mut Interp, _args: &[String], _io: &mut Io) -> i32 {
+fn cmd_getopts(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {
     1 // signal "no more options" — scripts usually guard on this
 }
 
-fn cmd_pwd(interp: &mut Interp, _args: &[String], io: &mut Io) -> i32 {
+fn cmd_pwd(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
     wln(io.out, &interp.cwd);
     0
 }
 
-fn cmd_cd(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_cd(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let target = match args.first().map(|s| s.as_str()) {
         None | Some("~") => interp.get_var("HOME").unwrap_or_else(|| "/".into()),
-        Some("-") => interp.get_var("OLDPWD").unwrap_or_else(|| interp.cwd.clone()),
+        Some("-") => interp
+            .get_var("OLDPWD")
+            .unwrap_or_else(|| interp.cwd.clone()),
         Some(p) => p.to_string(),
     };
     let abs = crate::vfs::resolve_against(&interp.cwd, &target);
@@ -78,7 +85,8 @@ fn cmd_cd(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
         let old = interp.cwd.clone();
         interp.set_var("OLDPWD", old);
         interp.cwd = interp.vfs.realpath(&abs, true).unwrap_or(abs);
-        interp.set_var("PWD", interp.cwd.clone());
+        let cwd = interp.cwd.clone();
+        interp.set_var("PWD", cwd);
         0
     } else {
         ewln(io.err, &format!("cd: {target}: No such file or directory"));
@@ -86,7 +94,7 @@ fn cmd_cd(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     }
 }
 
-fn cmd_export(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_export(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
     for a in args {
         if let Some((k, v)) = a.split_once('=') {
             interp.set_var(k, v);
@@ -98,7 +106,7 @@ fn cmd_export(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_unset(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_unset(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
     for a in args {
         if a == "-v" || a == "-f" {
             continue;
@@ -121,7 +129,7 @@ fn cmd_unset(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_set(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -170,7 +178,7 @@ fn cmd_set(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_declare(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_declare(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut assoc = false;
     let mut indexed = false;
     let mut print = false;
@@ -270,45 +278,54 @@ fn print_declared(interp: &Interp, name: &str, io: &mut Io) {
     }
 }
 
-fn cmd_source(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_source(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let Some(path) = args.first() else { return 0 };
     match interp.vfs.read_string(&interp.cwd, path) {
         Ok(src) => interp.run_script_into(&src, io.out, io.err),
         Err(_) => {
-            ewln(io.err, &format!("source: {path}: No such file or directory"));
+            ewln(
+                io.err,
+                &format!("source: {path}: No such file or directory"),
+            );
             1
         }
     }
 }
 
-fn cmd_eval(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_eval(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let src = args.join(" ");
     interp.run_script_into(&src, io.out, io.err)
 }
 
-fn cmd_exit(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
-    let code = args.first().and_then(|s| s.parse().ok()).unwrap_or(interp.last_status);
+fn cmd_exit(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
+    let code = args
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(interp.last_status);
     interp.exiting = Some(code);
     code
 }
 
-fn cmd_return(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
-    let code = args.first().and_then(|s| s.parse().ok()).unwrap_or(interp.last_status);
+fn cmd_return(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
+    let code = args
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(interp.last_status);
     interp.returning = Some(code);
     code
 }
 
-fn cmd_break(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_break(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
     interp.loop_break = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
     0
 }
 
-fn cmd_continue(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_continue(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
     interp.loop_continue = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
     0
 }
 
-fn cmd_shift(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_shift(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
     let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
     for _ in 0..n {
         if interp.positional.is_empty() {
@@ -319,11 +336,11 @@ fn cmd_shift(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
     0
 }
 
-fn cmd_test(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_test(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
     eval_test_cmd(interp, "[", args)
 }
 
-fn cmd_dbracket(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_dbracket(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
     eval_test_cmd(interp, "[[", args)
 }
 
@@ -355,7 +372,11 @@ fn eval_test(interp: &Interp, a: &[&str]) -> bool {
                 "-e" | "-a" => interp.vfs.lexists(&interp.cwd, x),
                 "-f" => interp.vfs.is_file(&interp.cwd, x),
                 "-d" => interp.vfs.is_dir(&interp.cwd, x),
-                "-s" => interp.vfs.read(&interp.cwd, x).map(|d| !d.is_empty()).unwrap_or(false),
+                "-s" => interp
+                    .vfs
+                    .read(&interp.cwd, x)
+                    .map(|d| !d.is_empty())
+                    .unwrap_or(false),
                 "-r" | "-w" | "-x" => interp.vfs.lexists(&interp.cwd, x),
                 "-L" | "-h" => interp.vfs.is_symlink(&interp.cwd, x),
                 "!" => !eval_test(interp, &a[1..]),
@@ -400,7 +421,7 @@ fn num(s: &str) -> i64 {
     s.trim().parse().unwrap_or(0)
 }
 
-fn cmd_read(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_read(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, _long) = split_flags(args);
     // `read -a arr`: split the line into an indexed array (the name follows `-a`).
     if flags.contains(&'a') {
@@ -411,14 +432,19 @@ fn cmd_read(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
         let elems: Vec<String> = if ifs.is_empty() {
             vec![line]
         } else {
-            line.split(|c| ifs.contains(c)).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+            line.split(|c| ifs.contains(c))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
         };
         interp.set_array(arr, elems);
         return 0;
     }
     // Obtain a line: from explicit stdin (pipe) if present, else from the persistent input
     // cursor (set up by a `< file` redirect on an enclosing loop).
-    let Some(line) = read_one_line(interp, io) else { return 1 };
+    let Some(line) = read_one_line(interp, io) else {
+        return 1;
+    };
 
     let ifs = interp.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
     if ops.is_empty() {
@@ -429,7 +455,10 @@ fn cmd_read(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
             interp.set_var(v, "");
         }
     } else {
-        let parts: Vec<&str> = line.split(|c| ifs.contains(c)).filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = line
+            .split(|c| ifs.contains(c))
+            .filter(|s| !s.is_empty())
+            .collect();
         for (i, var) in ops.iter().enumerate() {
             if i == ops.len() - 1 {
                 interp.set_var(var, parts[i..].join(" "));
@@ -445,7 +474,13 @@ fn cmd_read(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
 /// cursor (a `< file` redirect on an enclosing loop). Returns None at EOF.
 fn read_one_line(interp: &mut Interp, io: &Io) -> Option<String> {
     if !io.stdin.is_empty() {
-        return Some(String::from_utf8_lossy(&io.stdin).lines().next().unwrap_or("").to_string());
+        return Some(
+            String::from_utf8_lossy(&io.stdin)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        );
     }
     if interp.input_pos < interp.input_stream.len() {
         let rest = &interp.input_stream[interp.input_pos..];
@@ -461,7 +496,7 @@ fn read_one_line(interp: &mut Interp, io: &Io) -> Option<String> {
     None
 }
 
-fn cmd_which(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_which(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let known = KNOWN_COMMANDS;
     let mut ok = true;
     for a in args {
@@ -480,7 +515,7 @@ fn cmd_which(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     }
 }
 
-fn cmd_let(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_let(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
     let mut last = 0i64;
     for a in args {
         if let Some((name, expr)) = a.split_once('=') {

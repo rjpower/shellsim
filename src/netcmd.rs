@@ -58,7 +58,11 @@ pub fn curl(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
                 return 22;
             }
             if let Some(of) = output_file {
-                let name = if of.is_empty() { url.rsplit('/').next().unwrap_or("index.html").to_string() } else { of };
+                let name = if of.is_empty() {
+                    url.rsplit('/').next().unwrap_or("index.html").to_string()
+                } else {
+                    of
+                };
                 let cwd = interp.cwd.clone();
                 let _ = interp.vfs.write(&cwd, &name, &body, 0o644);
             } else {
@@ -68,7 +72,10 @@ pub fn curl(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
         }
         None => {
             if !silent {
-                ewln(err, &format!("curl: (7) Failed to connect: no virtual route for {url}"));
+                ewln(
+                    err,
+                    &format!("curl: (7) Failed to connect: no virtual route for {url}"),
+                );
             }
             7
         }
@@ -101,7 +108,8 @@ pub fn wget(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
                 RouteBody::Static(b) => b.clone(),
                 RouteBody::VfsFile(p) => interp.vfs.read("/", p).unwrap_or_default(),
             };
-            let name = output_file.unwrap_or_else(|| url.rsplit('/').next().unwrap_or("index.html").to_string());
+            let name = output_file
+                .unwrap_or_else(|| url.rsplit('/').next().unwrap_or("index.html").to_string());
             if name == "-" {
                 out.extend_from_slice(&body);
             } else {
@@ -112,7 +120,10 @@ pub fn wget(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
             0
         }
         None => {
-            ewln(err, &format!("wget: unable to resolve host (no virtual route): {url}"));
+            ewln(
+                err,
+                &format!("wget: unable to resolve host (no virtual route): {url}"),
+            );
             4
         }
     }

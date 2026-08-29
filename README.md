@@ -1,169 +1,131 @@
 # shellsim
 
-A **bring-your-own-sandbox** shell + Python simulator for agentic RL training, in a single
-static Rust binary. Instead of running each rollout in a gVisor/VM/container, `shellsim`
-*simulates* a bash session against an in-memory filesystem — deterministically, with no
-real processes, network, or blocking — and runs the task's verifier to produce the same
-reward a real machine would.
+`shellsim` is a deterministic, resource-constrained BusyBox-like environment for evaluating
+agents. Shell programs and Unix-style commands run in-process against an in-memory filesystem;
+they never execute host programs or use the host filesystem as their working environment.
 
-It is a **filter, not a replacement**: it covers the subset of tasks that stay inside a
-faithfully-simulated envelope (bash + coreutils + Python stdlib), and it tells you, per
-rollout, whether it stayed inside that envelope so you can route the rest to a real sandbox.
+The resource model is deliberately approximate. Commands use ordinary Rust data structures while
+reserving modeled memory and charging stable abstract CPU units. This keeps the model predictable,
+cheap, and easy to tune.
 
-## What it simulates
+## Resource model
 
-- **Shell:** a real lexer + recursive-descent parser (pipes, heredocs, `if`/`for`/`while`/
-  `case`, functions, `set -e`/`-u`/`-o pipefail`), word expansion (`$VAR`, `${..}`, `$(..)`,
-  `` `..` ``, `$((..))`, globbing, splitting), and **bash arrays** (indexed + associative:
-  `arr=(…)`, `${arr[@]}`, `${!m[@]}`, `${#a[@]}`, slices, `declare -A`).
-- **~110 builtins / coreutils** dispatched in-process against an in-memory VFS (files, dirs,
-  symlinks, modes): the usual `ls/cat/cp/mv/grep/sed/sort/cut/tr/find/jq/sha*/base64/…`.
-- **Embedded Python** (RustPython, full stdlib) operating on the *same* in-memory VFS via a
-  pure-Python bridge — including an `importlib`/meta-path loader that imports packages from the
-  VFS, a `subprocess` shim that re-enters the VM in-process, and a minimal `pytest` (fixtures
-  `tmp_path`/`monkeypatch`/`capsys`/…, `scope="module"` fixtures, definition-order collection)
-  so task verifiers run unmodified.
-- **Deliberately-simple scientific stack** — pure-Python reimplementations of `numpy`, `pandas`,
-  `scipy.stats`/`scipy.linalg`, and a micro-`sklearn`, plus `yaml`. Not fast and not complete:
-  enough of the array/DataFrame/indexing/linalg surface that pure-compute tasks use. Any op
-  outside the modelled surface calls `_shellsim_ood(...)` (→ `low` trust) instead of silently
-  returning a wrong answer. See [`SIMLIBS.md`](SIMLIBS.md).
-- **Package state** — `pip`/`uv add`/`uv pip install`/`uv sync`/`python -m pip` record installed
-  packages (and write a plausible `.venv`/`pyproject.toml`/`uv.lock`). A sim-lib is importable
-  **only if it was installed**, mirroring a real venv; an uninstalled `import numpy` fails exactly
-  as it would on a real machine.
-- **Virtual clock:** `sleep`/`timeout`/background jobs advance logical time and return
-  instantly — no real blocking anywhere in a rollout.
-- **Virtual network:** `curl`/`wget` resolve a route table (`net route <url> <status> <body>`)
-  — no real egress.
+- **CPU** is monotonic fuel. Parsing, executor nodes, dispatch, input, output, and algorithms
+  consume units. Exhaustion stops the evaluation.
+- **Memory** is modeled concurrent working set. Command reservations are released on return;
+  nested invocations contribute to the same peak.
+- **Disk** is logical in-memory filesystem size. Content and a fixed 256-byte non-root node overhead count.
+  Mutations that exceed quota roll back atomically, and deletion releases capacity.
+- **Output** caps materialized stdout and stderr as a safety guardrail.
 
-## Status
+Defaults are 10,000,000 CPU units, 64 MiB memory, 64 MiB disk, and 4 MiB output. Costs are
+deterministic rather than cycle-accurate. Results include a cost-model version.
 
-Validated by comparing the sandbox's reward against **real CPython 3.14** running each task's
-*real* oracle + verifier (see [`eval/`](eval/)). On the OpenThoughts-TBLite corpus (the 72
-tasks of 100 that ship a reference solution):
-
-| metric | value |
-|---|---|
-| tasks both harnesses can score | 57 |
-| **exact reward match (faithful)** | **38 (66%)** — incl. byte-exact partial credit (0.922, 0.8825) |
-| full passes (reward = 1.0) | 9 |
-| true coverage gaps (sandbox < real) | 16 |
-
-Every rollout emits a **trust signal** (`high`/`medium`/`low`) plus the offending
-`trust_gaps`, so a training pipeline knows whether to use the simulated reward or fall back:
-
-- `high` — nothing consequential was stubbed; the reward should match a real machine.
-- `medium` — a dependency installer (`pip`/…) was stubbed, **or** a deliberately-simple sim-lib
-  (`numpy`/`pandas`/…) was used (faithful within its modelled surface, but a reimplementation).
-- `low` — a real-execution command ran as a no-op (compiler / runtime / server), a known
-  third-party module failed to import, **or** a sim-lib hit an unmodelled code path and raised
-  `_shellsim_ood(...)`.
-
-Distribution over the corpus: **high 28 / medium 18 / low 21** (5 error). All 9 tasks where
-the sandbox produces a correct non-zero reward read `high`. The signal reliably flags
-*resource* gaps; it does **not** catch subtle *logic* divergence (a task that runs
-end-to-end but returns a wrong reward), which is why the `eval/` ground-truth harness stays
-the backstop.
-
-## Sandbox boundary
-
-The premise of "bring-your-own-sandbox" is that a rollout cannot reach the host. We pursue that on
-two layers, because RustPython is memory-safe but **not** a deny-by-default sandbox — its stdlib
-ships a real `os`/`io`/`socket` against the real OS:
-
-1. **Cooperative VFS hardening (the common path).** The Python prelude overrides `os.open`/`io`/
-   `os.scandir`/`os.system`/`os.popen`/`subprocess`/`socket` to route through the in-memory VFS and
-   the in-process VM, so ordinary task code transparently sees the simulated machine, not the host.
-2. **A seccomp backstop (the guarantee).** At startup (`src/sandbox.rs`, Linux) we install a
-   `seccompiler` filter that denies the syscalls a Python-level escape would need —
-   `socket`/`connect`/`socketpair` (no egress), `execve`/`execveat` (no native subprocess),
-   `fork`/`vfork`, `ptrace` — returning `EPERM`. So even a deliberate `ctypes`/raw-`os` attempt to
-   step outside the cooperative layer is stopped at the kernel, not by our Python shims. It is a
-   no-op on non-Linux and can be disabled for debugging with `SHELLSIM_NO_SANDBOX=1`.
-
-This is why the engine is RustPython rather than a deny-by-default mini-VM: we keep RustPython's
-broad language/stdlib coverage (the corpus is class- and dunder-heavy) and add the syscall fence
-underneath it. Compilation is intentionally excluded for the same reason — see
-[`COMPILERS.md`](COMPILERS.md).
-
-## What it does *not* cover
-
-These are the boundaries — a task that needs any of them is a poor fit and should run in a
-real sandbox:
-
-- **Scientific stack is a *subset*** — the embedded `numpy`/`pandas`/`scipy`/`sklearn` cover the
-  common surface, not the whole API. Unmodelled ops fail loudly (`low` trust), never silently
-  wrong. Large numerical workloads run, but in pure Python: expect seconds-to-minutes, not the
-  C-speed of the real libraries.
-- **No native compilation** — `gcc`/`clang`/`cargo`/`make` are no-ops; tasks that build and
-  then run a compiled artifact won't work. This is deliberate, not a TODO — see
-  [`COMPILERS.md`](COMPILERS.md) for why embedding a compiler would defeat the sandbox.
-- **No real services or concurrency** — listening sockets, `uvicorn`/`gunicorn`, databases,
-  containers (`docker`), `vim`, and `flock`-style real concurrency are out of scope.
-- **Package installs are stubbed** — `pip`/`apt`/`npm` pretend to succeed; a task that
-  actually executes installed package *contents* won't have them.
-- **Python is the stdlib subset RustPython supports.** Most stdlib works; exotic C-extension
-  modules don't.
-
-A task is a **good fit** when its oracle and verifier stay within: bash + coreutils + text
-tools, the Python standard library, file/JSON/CSV I/O, hashing, and subprocess-ing its own
-CLI. On this corpus that's roughly a quarter of tasks.
-
-## Build
+## Build and use
 
 ```sh
-cargo build --release --features python
+cargo build --release
+
+# Ordinary output
+./target/release/shellsim -c 'printf "b\na\n" | sort'
+
+# Host file used only as script source; execution occurs in a fresh simulated environment
+./target/release/shellsim run script.sh arg1 arg2
+
+# Persistent interactive session; state and resource usage accumulate until exit/exhaustion
+./target/release/shellsim shell --cpu 100k --memory 8m --disk 2m --output 64k
+
+# Structured evaluation report
+./target/release/shellsim eval \
+  --cpu 100k --memory 8m --disk 2m --output 64k \
+  -c 'printf "b\na\n" | sort > result.txt; cat result.txt'
 ```
 
-(Without `--features python` you get the shell-only binary; both write the same
-`target/release/shellsim`, so always build with the feature for task runs.)
+Limit values accept `k`, `m`, and `g` binary suffixes. Arguments after `--` in `eval` mode become
+shell positional parameters.
 
-## Use
+The JSON report contains the exit status, typed stop reason, limits, aggregate usage, per-command
+CPU/disk deltas, stdout, stderr, command trace, and unsupported capabilities.
 
-```sh
-# run a shell snippet
-./target/release/shellsim -c 'echo hello | tr a-z A-Z'
+## Persistent shell sessions
 
-# run one TBLite task end-to-end (Dockerfile → oracle → verifier → reward + trust JSON)
-./target/release/shellsim task <tblite-task-dir>
+An `Environment` is a session, not a single command. Reusing it across `run_script_capture` calls
+preserves the VFS, working directory, variables, arrays, functions, package state, clock/network
+state, command history, and cumulative resource usage. CPU and output are cumulative fuel, disk
+tracks current persistent usage, and temporary command memory is released while its peak remains.
 
-# run a whole corpus
-./target/release/shellsim bench --json <corpus-dir>
+`exit N`, `set -e` termination, CPU exhaustion, memory exhaustion, and output exhaustion make the
+session terminal. Later calls return the same terminal outcome without executing or charging more
+work. Disk-full errors are recoverable: a command can remove files and retry.
+
+The `shell` subcommand drives one such environment line by line. It shows a prompt on a terminal,
+preserves state between lines, exits normally on EOF or `exit`, and prints a reason before exiting
+with status 137 when a resource is exhausted.
+
+## Command implementations
+
+Commands receive a uniform environment context:
+
+```rust
+fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
 ```
 
-Fake URLs and no-op sleep:
+The dispatcher applies each command's coarse base CPU and memory cost. Commands add dynamic costs
+when useful:
 
-```sh
-./target/release/shellsim -c '
-  net route https://api.example.com/health 200 "{\"status\":\"ok\"}"
-  curl -s https://api.example.com/health
-  sleep 3600          # advances virtual time, returns instantly
-'
+```rust
+if !env.reserve_memory(input.len() as u64 * 2) {
+    return 137;
+}
+if !env.charge_cpu(input.len() as u64) {
+    return 137;
+}
 ```
+
+New commands should live in their own module. Multiple names can share one behavioral module.
+`echo`, `printf`, and `sort` demonstrate the layout. Older implementations still grouped by family
+already use the same metered context and can be split mechanically when revised.
+
+Disk enforcement lives inside `Vfs`, so direct command mutations cannot bypass capacity checks.
+Commands should still surface `VfsError::NoSpace` with a non-zero status.
+
+## Minimal Python compatibility
+
+`python` is a bootstrap shim, not an embedded interpreter. It supports `--version`, a small
+`python -c` subset for literal output, exit status, arguments and environment lookups, plus light
+`pip`/`venv` compatibility. Unknown syntax fails loudly and is recorded as unsupported. Host
+CPython is never invoked.
+
+## Library API
+
+```rust
+use shellsim::{Environment, Limits};
+
+let mut env = Environment::with_limits(Limits {
+    cpu: 100_000,
+    memory: 8 * 1024 * 1024,
+    disk: 2 * 1024 * 1024,
+    output: 64 * 1024,
+});
+
+let (outcome, stdout, stderr) = env.run_script_capture("echo hello");
+```
+
+`Interp` remains as an alias for `Environment` for source compatibility.
 
 ## Layout
 
+```text
+src/resources.rs       limits, accounting, outcomes, command usage
+src/interp.rs          machine Environment and shell-local ProcessState
+src/vfs.rs             quota-enforced in-memory filesystem
+src/shell.rs           lexer, parser, capture API
+src/expand.rs          shell expansion
+src/exec.rs            metered executor, pipelines, redirects, control flow
+src/commands/          registry, command context, implementations
+src/python/mod.rs      minimal python -c shim
+src/clock.rs           virtual clock
+src/net.rs             virtual route-table network
 ```
-src/shell.rs     lexer + recursive-descent parser
-src/expand.rs    word expansion + arrays + globbing
-src/exec.rs      executor: pipelines, redirects, control flow, errexit/pipefail
-src/commands/    ~110 builtins behind a registry (CommandSpec{run, trust}); see mod.rs
-src/python/      embedded RustPython + the pure-Python VFS bridge (*.py via include_str!)
-src/vfs.rs       in-memory filesystem
-src/clock.rs     virtual clock
-src/net.rs       virtual network (route table)
-src/harness.rs   TBLite task runner (Dockerfile → oracle → verifier → reward + trust)
-eval/            faithfulness harness (real-CPython ground truth; see eval/README.md)
-```
 
-`cargo test --features python` runs 29 unit tests (arrays, VFS, expansion, net routing, a
-CPython `py_compile` check on the embedded Python, and the `sim_integration_tests` that drive
-package-gating + numpy/pandas semantics end-to-end). Broader faithfulness lives in `eval/`,
-which needs the external corpus and a CPython venv.
-
-## Validation
-
-The [`eval/`](eval/) directory contains the ground-truth comparison harness used throughout
-development — it runs each task's *real* oracle and verifier under real CPython and compares
-the reward to the sandbox's. See [eval/README.md](eval/README.md).
+Run the unit and resource-invariant tests with `cargo test`.

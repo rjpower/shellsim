@@ -6,8 +6,24 @@ use crate::shell::{Node, RedirOp, Redirect};
 
 /// Execute a node. `stdin` is the input byte stream (from a pipe or empty). Command output
 /// is appended to `out`/`err` unless redirected. Returns the exit status.
-pub fn exec(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
-    if interp.exiting.is_some() || interp.returning.is_some() || interp.loop_break > 0 || interp.loop_continue > 0 {
+pub fn exec(
+    interp: &mut Interp,
+    node: &Node,
+    stdin: Vec<u8>,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+) -> i32 {
+    if !interp.resources.charge_cpu(10) {
+        return interp
+            .resources
+            .stop_reason()
+            .map_or(137, |r| r.exit_status());
+    }
+    if interp.exiting.is_some()
+        || interp.returning.is_some()
+        || interp.loop_break > 0
+        || interp.loop_continue > 0
+    {
         return interp.last_status;
     }
     let status = match node {
@@ -41,6 +57,9 @@ pub fn exec(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<u8>,
         Node::Seq(nodes) => {
             let mut s = 0;
             for n in nodes {
+                if interp.resources.is_stopped() {
+                    break;
+                }
                 s = exec(interp, n, stdin.clone(), out, err);
                 if interp.exiting.is_some() || interp.returning.is_some() {
                     break;
@@ -95,15 +114,28 @@ pub fn exec(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<u8>,
             } else {
                 None
             };
-            let s = exec(interp, inner, plan.stdin.clone(), &mut local_out, &mut local_err);
+            let mut s = exec(
+                interp,
+                inner,
+                plan.stdin.clone(),
+                &mut local_out,
+                &mut local_err,
+            );
             if let Some((stream, pos)) = saved {
                 interp.input_stream = stream;
                 interp.input_pos = pos;
             }
-            apply_outputs(interp, &plan, &local_out, &local_err, out, err);
+            if !apply_outputs(interp, &plan, &local_out, &local_err, out, err) {
+                s = 1;
+            }
             s
         }
-        Node::If { cond, then, elifs, els } => {
+        Node::If {
+            cond,
+            then,
+            elifs,
+            els,
+        } => {
             if exec_cond(interp, cond, stdin.clone(), out, err) == 0 {
                 exec(interp, then, stdin, out, err)
             } else {
@@ -123,6 +155,9 @@ pub fn exec(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<u8>,
             let mut s = 0;
             let mut guard = 0;
             loop {
+                if interp.resources.is_stopped() {
+                    break;
+                }
                 guard += 1;
                 // bound runaway poll loops (e.g. `until curl ...; do sleep; done` against a
                 // service we don't simulate). Real task loops never need this many iterations.
@@ -153,6 +188,9 @@ pub fn exec(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<u8>,
             let items = expand_words(interp, words);
             let mut s = 0;
             for item in items {
+                if interp.resources.is_stopped() {
+                    break;
+                }
                 interp.set_var(var, item);
                 s = exec(interp, body, Vec::new(), out, err);
                 if interp.loop_break > 0 {
@@ -191,7 +229,13 @@ pub fn exec(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<u8>,
 }
 
 /// Execute as a condition: errexit is suppressed inside.
-fn exec_cond(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
+fn exec_cond(
+    interp: &mut Interp,
+    node: &Node,
+    stdin: Vec<u8>,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+) -> i32 {
     interp.cond_depth += 1;
     let s = exec(interp, node, stdin, out, err);
     interp.cond_depth -= 1;
@@ -249,7 +293,11 @@ fn plan_redirects(interp: &mut Interp, redirs: &[Redirect]) -> RedirPlan {
                 // &N : duplicate target fd's destination
                 let tgt = r.target.trim_start_matches('&');
                 let src = tgt.parse::<i32>().unwrap_or(1);
-                let dup = if src == 1 { out_dest.clone() } else { err_dest.clone() };
+                let dup = if src == 1 {
+                    out_dest.clone()
+                } else {
+                    err_dest.clone()
+                };
                 if r.fd == 2 {
                     err_dest = dup;
                 } else {
@@ -258,7 +306,11 @@ fn plan_redirects(interp: &mut Interp, redirs: &[Redirect]) -> RedirPlan {
             }
         }
     }
-    RedirPlan { stdin, out_dest, err_dest }
+    RedirPlan {
+        stdin,
+        out_dest,
+        err_dest,
+    }
 }
 
 fn apply_outputs(
@@ -268,38 +320,57 @@ fn apply_outputs(
     local_err: &[u8],
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
-) {
+) -> bool {
+    let mut ok = true;
     match &plan.out_dest {
         OutDest::Parent => out.extend_from_slice(local_out),
-        OutDest::File(p, append) => write_to(interp, p, local_out, *append),
+        OutDest::File(p, append) => {
+            if let Err(error) = write_to(interp, p, local_out, *append) {
+                err.extend_from_slice(format!("shellsim: {p}: {error}\n").as_bytes());
+                ok = false;
+            }
+        }
     }
     match &plan.err_dest {
         OutDest::Parent => err.extend_from_slice(local_err),
-        OutDest::File(p, append) => write_to(interp, p, local_err, *append),
+        OutDest::File(p, append) => {
+            if let Err(error) = write_to(interp, p, local_err, *append) {
+                err.extend_from_slice(format!("shellsim: {p}: {error}\n").as_bytes());
+                ok = false;
+            }
+        }
     }
+    ok
 }
 
-fn write_to(interp: &mut Interp, path: &str, data: &[u8], append: bool) {
+fn write_to(interp: &mut Interp, path: &str, data: &[u8], append: bool) -> crate::vfs::Result<()> {
     if path == "/dev/null" {
-        return;
+        return Ok(());
     }
     if path == "/dev/stdout" {
-        return;
+        return Ok(());
     }
     let cwd = interp.cwd.clone();
-    let r = if append {
+    if append {
         interp.vfs.append(&cwd, path, data, 0o644)
     } else {
         interp.vfs.write(&cwd, path, data, 0o644)
-    };
-    if r.is_err() {
-        // surface nothing; the command's status already reflects success
     }
 }
 
-fn exec_command(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
+fn exec_command(
+    interp: &mut Interp,
+    node: &Node,
+    stdin: Vec<u8>,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+) -> i32 {
     let (assigns, words, redirects) = match node {
-        Node::Command { assigns, words, redirects } => (assigns, words, redirects),
+        Node::Command {
+            assigns,
+            words,
+            redirects,
+        } => (assigns, words, redirects),
         _ => unreachable!(),
     };
 
@@ -314,7 +385,9 @@ fn exec_command(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<
         // a bare redirection like `> file` still truncates
         if !redirects.is_empty() {
             let plan = plan_redirects(interp, redirects);
-            apply_outputs(interp, &plan, &[], &[], out, err);
+            if !apply_outputs(interp, &plan, &[], &[], out, err) {
+                return 1;
+            }
         }
         return 0;
     }
@@ -328,7 +401,11 @@ fn exec_command(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<
 
     // Set up redirects.
     let plan = plan_redirects(interp, redirects);
-    let cmd_stdin = if redirects.iter().any(|r| r.fd == 0) { plan.stdin.clone() } else { stdin };
+    let cmd_stdin = if redirects.iter().any(|r| r.fd == 0) {
+        plan.stdin.clone()
+    } else {
+        stdin
+    };
 
     // Temporary assignments apply only for the duration of this command (we set then restore).
     let saved: Vec<(String, Option<String>)> = expanded_assigns
@@ -345,7 +422,7 @@ fn exec_command(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<
 
     interp.cmd_trace.push(argv[0].clone());
 
-    let status = if let Some(body) = interp.funcs.get(&argv[0]).cloned() {
+    let mut status = if let Some(body) = interp.funcs.get(&argv[0]).cloned() {
         // function call: set positional params
         let saved_pos = std::mem::replace(&mut interp.positional, argv[1..].to_vec());
         let s = exec(interp, &body, cmd_stdin, &mut local_out, &mut local_err);
@@ -367,7 +444,9 @@ fn exec_command(interp: &mut Interp, node: &Node, stdin: Vec<u8>, out: &mut Vec<
         }
     }
 
-    apply_outputs(interp, &plan, &local_out, &local_err, out, err);
+    if !apply_outputs(interp, &plan, &local_out, &local_err, out, err) {
+        status = 1;
+    }
     status
 }
 
@@ -430,7 +509,10 @@ pub fn apply_assignment(interp: &mut Interp, raw_key: &str, raw_val: &str) {
     if trimmed.starts_with('(') && trimmed.ends_with(')') {
         let inner = &trimmed[1..trimmed.len() - 1];
         // Associative literal? Detect `[key]=val` pairs.
-        let assoc_existing = matches!(interp.arrays.get(name), Some(crate::interp::ArrayVal::Assoc(_)));
+        let assoc_existing = matches!(
+            interp.arrays.get(name),
+            Some(crate::interp::ArrayVal::Assoc(_))
+        );
         if !append {
             // fresh array
             if assoc_existing {
@@ -493,7 +575,11 @@ pub fn apply_assignment(interp: &mut Interp, raw_key: &str, raw_val: &str) {
 /// Split an array-literal body into (optional explicit key, expanded value) pairs.
 /// Each top-level word undergoes expansion + word-splitting (so `$(cmd)` splits on IFS and
 /// `"$x"` stays one element). `[key]=val` forms yield an explicit key.
-fn parse_array_elems(interp: &mut Interp, inner: &str, _assoc: bool) -> Vec<(Option<String>, String)> {
+fn parse_array_elems(
+    interp: &mut Interp,
+    inner: &str,
+    _assoc: bool,
+) -> Vec<(Option<String>, String)> {
     let mut out = Vec::new();
     for tok in split_top_level_words(inner) {
         // explicit subscript form: [key]=value
@@ -617,15 +703,30 @@ fn split_top_level_words(s: &str) -> Vec<String> {
     words
 }
 
-fn exec_pipeline(interp: &mut Interp, stages: &[Node], stdin: Vec<u8>, out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
+fn exec_pipeline(
+    interp: &mut Interp,
+    stages: &[Node],
+    stdin: Vec<u8>,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+) -> i32 {
     let mut input = stdin;
     let mut last_status = 0;
     let mut statuses = Vec::new();
     for (idx, stage) in stages.iter().enumerate() {
+        if interp.resources.is_stopped() {
+            break;
+        }
         let is_last = idx == stages.len() - 1;
         let mut stage_out = Vec::new();
         // stderr of all stages flows to the shared err
-        last_status = exec(interp, stage, std::mem::take(&mut input), &mut stage_out, err);
+        last_status = exec(
+            interp,
+            stage,
+            std::mem::take(&mut input),
+            &mut stage_out,
+            err,
+        );
         statuses.push(last_status);
         if is_last {
             out.extend_from_slice(&stage_out);
@@ -634,7 +735,11 @@ fn exec_pipeline(interp: &mut Interp, stages: &[Node], stdin: Vec<u8>, out: &mut
         }
     }
     if interp.opt_pipefail {
-        statuses.into_iter().rev().find(|s| *s != 0).unwrap_or(last_status)
+        statuses
+            .into_iter()
+            .rev()
+            .find(|s| *s != 0)
+            .unwrap_or(last_status)
     } else {
         last_status
     }
@@ -666,7 +771,9 @@ fn case_match(pattern: &str, text: &str) -> bool {
         return true;
     }
     let re = format!("^{}$", glob_to_regex_body(pattern));
-    regex::Regex::new(&re).map(|r| r.is_match(text)).unwrap_or(pattern == text)
+    regex::Regex::new(&re)
+        .map(|r| r.is_match(text))
+        .unwrap_or(pattern == text)
 }
 
 fn glob_to_regex_body(pat: &str) -> String {
@@ -712,22 +819,34 @@ mod array_tests {
 
     #[test]
     fn indexed_basics() {
-        assert_eq!(run(r#"a=(x y z); echo "${a[1]} ${#a[@]} ${a[@]}""#), "y 3 x y z\n");
+        assert_eq!(
+            run(r#"a=(x y z); echo "${a[1]} ${#a[@]} ${a[@]}""#),
+            "y 3 x y z\n"
+        );
     }
 
     #[test]
     fn append_and_count() {
-        assert_eq!(run(r#"a=(x y z); a+=(w v); echo "${#a[@]} ${a[@]}""#), "5 x y z w v\n");
+        assert_eq!(
+            run(r#"a=(x y z); a+=(w v); echo "${#a[@]} ${a[@]}""#),
+            "5 x y z w v\n"
+        );
     }
 
     #[test]
     fn sparse_indices_and_values() {
-        assert_eq!(run(r#"a=(1 2 3); a[5]=six; echo "${!a[@]}"; echo "${a[@]}""#), "0 1 2 5\n1 2 3 six\n");
+        assert_eq!(
+            run(r#"a=(1 2 3); a[5]=six; echo "${!a[@]}"; echo "${a[@]}""#),
+            "0 1 2 5\n1 2 3 six\n"
+        );
     }
 
     #[test]
     fn scalar_promotes_to_array() {
-        assert_eq!(run(r#"x=1; x[2]=3; echo "${x[0]} ${x[2]} ${#x[@]}""#), "1 3 2\n");
+        assert_eq!(
+            run(r#"x=1; x[2]=3; echo "${x[0]} ${x[2]} ${#x[@]}""#),
+            "1 3 2\n"
+        );
     }
 
     #[test]
@@ -744,33 +863,49 @@ mod array_tests {
 
     #[test]
     fn empty_array_iterates_zero_times() {
-        assert_eq!(run(r#"a=(); for x in "${a[@]}"; do echo "X$x"; done; echo done"#), "done\n");
+        assert_eq!(
+            run(r#"a=(); for x in "${a[@]}"; do echo "X$x"; done; echo done"#),
+            "done\n"
+        );
     }
 
     #[test]
     fn command_substitution_splits() {
-        assert_eq!(run(r#"a=($(printf "f1\nf2\nf3\n")); echo "${#a[@]} ${a[1]}""#), "3 f2\n");
+        assert_eq!(
+            run(r#"a=($(printf "f1\nf2\nf3\n")); echo "${#a[@]} ${a[1]}""#),
+            "3 f2\n"
+        );
     }
 
     #[test]
     fn associative_get_keys_count() {
         // sorted key order is deterministic in our impl
-        assert_eq!(run(r#"declare -A m; m[foo]=1; m[bar]=2; echo "${m[foo]} ${!m[@]} ${#m[@]}""#), "1 bar foo 2\n");
+        assert_eq!(
+            run(r#"declare -A m; m[foo]=1; m[bar]=2; echo "${m[foo]} ${!m[@]} ${#m[@]}""#),
+            "1 bar foo 2\n"
+        );
     }
 
     #[test]
     fn associative_literal_and_arith() {
-        let out = run(r#"declare -A m=([a]=0 [b]=5); m[a]=$((${m[a]} + 1)); echo "${m[a]} ${m[b]}""#);
+        let out =
+            run(r#"declare -A m=([a]=0 [b]=5); m[a]=$((${m[a]} + 1)); echo "${m[a]} ${m[b]}""#);
         assert_eq!(out, "1 5\n");
     }
 
     #[test]
     fn slice_and_last() {
-        assert_eq!(run(r#"a=(a b c d e); echo "${a[@]:1:2}"; echo "${a[@]: -1}""#), "b c\ne\n");
+        assert_eq!(
+            run(r#"a=(a b c d e); echo "${a[@]:1:2}"; echo "${a[@]: -1}""#),
+            "b c\ne\n"
+        );
     }
 
     #[test]
     fn unset_element() {
-        assert_eq!(run(r#"a=(1 2 3 4); unset "a[1]"; echo "${a[@]} ${!a[@]}""#), "1 3 4 0 2 3\n");
+        assert_eq!(
+            run(r#"a=(1 2 3 4); unset "a[1]"; echo "${a[@]} ${!a[@]}""#),
+            "1 3 4 0 2 3\n"
+        );
     }
 }

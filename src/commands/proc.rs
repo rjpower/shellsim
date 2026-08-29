@@ -1,10 +1,10 @@
 //! "Process-ish" commands: virtual-clock time/scheduling (sleep/usleep/timeout/date/sync),
-//! nested shells (sh/bash/dash/zsh), uv launchers, the Python engine, jq, and pytest.
+//! nested shells (sh/bash/dash/zsh), uv launchers, the Python shim, and jq.
 
 use std::collections::HashMap;
 
 use crate::commands::util::{parse_duration, wln};
-use crate::commands::{CommandSpec, Io, Trust};
+use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
@@ -21,28 +21,27 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["uv", "uvx", "uvenv"], Trust::Partial, cmd_uv);
 
     // interpreters
-    reg(m, &["python3"], Trust::Real, cmd_python3);
-    reg(m, &["python"], Trust::Real, cmd_python);
-    reg(m, &["python3.11"], Trust::Real, cmd_python311);
-    reg(m, &["python3.12"], Trust::Real, cmd_python312);
-    reg(m, &["python3.13"], Trust::Real, cmd_python313);
+    reg(m, &["python3"], Trust::Partial, cmd_python3);
+    reg(m, &["python"], Trust::Partial, cmd_python);
+    reg(m, &["python3.11"], Trust::Partial, cmd_python311);
+    reg(m, &["python3.12"], Trust::Partial, cmd_python312);
+    reg(m, &["python3.13"], Trust::Partial, cmd_python313);
     reg(m, &["jq"], Trust::Partial, cmd_jq);
-    reg(m, &["pytest", "py.test"], Trust::Real, cmd_pytest);
 }
 
-fn cmd_sleep(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_sleep(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
     let secs = args.first().map(|s| parse_duration(s)).unwrap_or(0);
     interp.clock.sleep_ms(secs);
     0
 }
 
-fn cmd_usleep(interp: &mut Interp, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_usleep(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
     let us: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
     interp.clock.sleep_ms(us / 1000);
     0
 }
 
-fn cmd_timeout(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     // timeout DURATION CMD ... : we never actually time out (virtual clock), just run cmd
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
     if rest.is_empty() {
@@ -52,7 +51,7 @@ fn cmd_timeout(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     crate::commands::run(interp, &rest, stdin, io.out, io.err)
 }
 
-fn cmd_date(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_date(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let secs = interp.clock.unix_secs();
     // handle +FORMAT and %s
     if let Some(fmt) = args.iter().find(|a| a.starts_with('+')) {
@@ -100,7 +99,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 /// `sh`/`bash -c "…"` or a script file — run it through our own interpreter.
-fn cmd_sh(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -129,7 +128,10 @@ fn cmd_sh(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
                     interp.exiting = None;
                     return code;
                 }
-                crate::commands::util::ewln(io.err, &format!("{}: {}: No such file or directory", args[0], s));
+                crate::commands::util::ewln(
+                    io.err,
+                    &format!("{}: {}: No such file or directory", args[0], s),
+                );
                 return 127;
             }
         }
@@ -142,9 +144,9 @@ fn cmd_sh(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
 }
 
 /// `uv` / `uvx` / `uv run` / `uv tool run`: package-management subcommands update the simulated
-/// venv / installed-package state; `run`/`tool run`/`uvx` route an embedded `pytest`/`python`
+/// venv / installed-package state; `run`/`tool run`/`uvx` route the minimal Python shim
 /// to our engines so verifiers launched via uv still run.
-fn cmd_uv(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let has = |s: &str| args.iter().any(|a| a == s);
     // ---- package management (takes priority so `uv pip install pytest` installs, not runs) ----
     if has("add") {
@@ -171,7 +173,10 @@ fn cmd_uv(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
         return 0;
     }
     // ---- run / tool run / uvx: route the embedded interpreter ----
-    if let Some(pos) = args.iter().position(|a| a == "pytest" || a.ends_with("/pytest")) {
+    if let Some(pos) = args
+        .iter()
+        .position(|a| a == "pytest" || a.ends_with("/pytest"))
+    {
         return crate::python::run_pytest(interp, &args[pos + 1..], io.out, io.err);
     }
     if let Some(pos) = args.iter().position(|a| a == "python" || a == "python3") {
@@ -224,11 +229,15 @@ fn ensure_venv(interp: &mut Interp) {
     }
     let py = crate::vfs::resolve_against(&cwd, ".venv/bin/python");
     if !interp.vfs.is_file("/", &py) {
-        interp.vfs.put_file(&py, b"#!shellsim-venv\n".to_vec(), 0o755);
+        let _ = interp
+            .vfs
+            .put_file(&py, b"#!shellsim-venv\n".to_vec(), 0o755);
     }
     let lock = crate::vfs::resolve_against(&cwd, "uv.lock");
     if !interp.vfs.is_file("/", &lock) {
-        interp.vfs.put_file(&lock, b"# shellsim uv.lock\n".to_vec(), 0o644);
+        let _ = interp
+            .vfs
+            .put_file(&lock, b"# shellsim uv.lock\n".to_vec(), 0o644);
     }
 }
 
@@ -274,7 +283,7 @@ fn update_pyproject(interp: &mut Interp, specs: &[String]) {
             content.insert_str(at, &format!("\n    \"{spec}\","));
         }
     }
-    interp.vfs.put_file(&path, content.into_bytes(), 0o644);
+    let _ = interp.vfs.put_file(&path, content.into_bytes(), 0o644);
 }
 
 /// Extract `name[op ver]` dependency strings from a pyproject's dependencies arrays.
@@ -287,12 +296,15 @@ fn extract_dep_specs(toml_src: &str) -> Vec<String> {
             in_deps = true;
         }
         if in_deps {
-            for part in t.split(|c| c == '"' || c == '\'') {
+            for part in t.split(['"', '\'']) {
                 let p = part.trim().trim_end_matches(',');
                 // a dependency spec starts with a letter (name); package_name_of strips any
                 // version operator. Skips the `dependencies = [` token and bare punctuation.
                 if !p.is_empty()
-                    && p.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+                    && p.chars()
+                        .next()
+                        .map(|c| c.is_ascii_alphabetic())
+                        .unwrap_or(false)
                     && p != "dependencies"
                 {
                     out.push(p.to_string());
@@ -306,19 +318,19 @@ fn extract_dep_specs(toml_src: &str) -> Vec<String> {
     out
 }
 
-fn cmd_python3(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_python3(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python3", args, io)
 }
-fn cmd_python(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_python(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python", args, io)
 }
-fn cmd_python311(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_python311(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python3.11", args, io)
 }
-fn cmd_python312(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_python312(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python3.12", args, io)
 }
-fn cmd_python313(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_python313(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python3.13", args, io)
 }
 
@@ -330,11 +342,7 @@ fn python_impl(interp: &mut Interp, name: &str, args: &[String], io: &mut Io) ->
     crate::python::run_python(interp, &argv, stdin, io.out, io.err)
 }
 
-fn cmd_jq(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_jq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let stdin = std::mem::take(&mut io.stdin);
     crate::jqcmd::jq(interp, args, stdin, io.out, io.err)
-}
-
-fn cmd_pytest(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
-    crate::python::run_pytest(interp, args, io.out, io.err)
 }

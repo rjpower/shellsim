@@ -282,7 +282,7 @@ fn eval(f: &Filter, input: &Value, out: &mut Vec<Value>) -> Result<(), String> {
                 keys.sort();
                 out.push(Value::Array(keys.into_iter().map(Value::String).collect()));
             } else if let Value::Array(a) = input {
-                out.push(Value::Array((0..a.len()).map(|i| Value::from(i)).collect()));
+                out.push(Value::Array((0..a.len()).map(Value::from).collect()));
             } else {
                 return Err("keys on non-object".into());
             }
@@ -322,9 +322,7 @@ fn eval(f: &Filter, input: &Value, out: &mut Vec<Value>) -> Result<(), String> {
             if let Value::Object(m) = input {
                 let arr: Vec<Value> = m
                     .iter()
-                    .map(|(k, v)| {
-                        serde_json::json!({"key": k, "value": v})
-                    })
+                    .map(|(k, v)| serde_json::json!({"key": k, "value": v}))
                     .collect();
                 out.push(Value::Array(arr));
             }

@@ -47,8 +47,8 @@ fn assemble(interp: &mut Interp, parts: Vec<Part>, do_split_glob: bool) -> Vec<S
             cur_glob |= p.has_glob && !p.quoted;
         } else {
             // split unquoted text on IFS
-            let mut chars = p.text.chars().peekable();
-            while let Some(c) = chars.next() {
+            let chars = p.text.chars();
+            for c in chars {
                 if ifs.contains(c) {
                     if started {
                         fields.push((std::mem::take(&mut cur), cur_glob));
@@ -92,14 +92,21 @@ fn expand_to_parts(interp: &mut Interp, word: &str) -> Vec<Part> {
     macro_rules! flush_unquoted {
         () => {
             if !buf.is_empty() {
-                parts.push(Part { text: std::mem::take(&mut buf), quoted: false, has_glob: buf_glob, field_break: false });
+                parts.push(Part {
+                    text: std::mem::take(&mut buf),
+                    quoted: false,
+                    has_glob: buf_glob,
+                    field_break: false,
+                });
                 buf_glob = false;
             }
         };
     }
     // tilde at start
     if chars.first() == Some(&'~') {
-        let home = interp.get_var("HOME").unwrap_or_else(|| "/root".to_string());
+        let home = interp
+            .get_var("HOME")
+            .unwrap_or_else(|| "/root".to_string());
         // ~ or ~/...
         if chars.get(1).map(|c| *c == '/').unwrap_or(true) {
             buf.push_str(&home);
@@ -126,7 +133,12 @@ fn expand_to_parts(interp: &mut Interp, word: &str) -> Vec<Part> {
                 let s: String = chars[start..i].iter().collect();
                 i += 1; // closing
                 flush_unquoted!();
-                parts.push(Part { text: s, quoted: true, has_glob: false, field_break: false });
+                parts.push(Part {
+                    text: s,
+                    quoted: true,
+                    has_glob: false,
+                    field_break: false,
+                });
             }
             '"' => {
                 i += 1;
@@ -178,7 +190,12 @@ fn expand_to_parts(interp: &mut Interp, word: &str) -> Vec<Part> {
         }
     }
     if !buf.is_empty() {
-        parts.push(Part { text: buf, quoted: false, has_glob: buf_glob, field_break: false });
+        parts.push(Part {
+            text: buf,
+            quoted: false,
+            has_glob: buf_glob,
+            field_break: false,
+        });
     }
     parts
 }
@@ -269,14 +286,23 @@ fn expand_double(interp: &mut Interp, chars: &[char]) -> (Vec<Part>, usize) {
         // sole empty array expansion → zero fields
         return (Vec::new(), i);
     }
-    parts.push(Part { text: out, quoted: true, has_glob: false, field_break: cur_break });
+    parts.push(Part {
+        text: out,
+        quoted: true,
+        has_glob: false,
+        field_break: cur_break,
+    });
     (parts, i)
 }
 
 /// If the `$...` at `chars` is a multi-valued array expansion (`${arr[@]}`, `${arr[*]}`,
 /// `${!arr[@]}`, `${!arr[*]}`, or an `@`/`*` slice), return the element/key list and the number
 /// of chars consumed. Returns `None` for everything else (handled by `expand_dollar`).
-fn try_array_words(interp: &mut Interp, chars: &[char], quoted: bool) -> Option<(Vec<String>, usize)> {
+fn try_array_words(
+    interp: &mut Interp,
+    chars: &[char],
+    quoted: bool,
+) -> Option<(Vec<String>, usize)> {
     if chars.first() != Some(&'$') || chars.get(1) != Some(&'{') {
         return None;
     }
@@ -318,10 +344,18 @@ fn try_array_words(interp: &mut Interp, chars: &[char], quoted: bool) -> Option<
     if let Some(spec) = tail.strip_prefix(':') {
         let (off, len) = parse_slice(interp, spec);
         let n = items.len() as i64;
-        let start = if off < 0 { (n + off).max(0) } else { off.min(n) } as usize;
+        let start = if off < 0 {
+            (n + off).max(0)
+        } else {
+            off.min(n)
+        } as usize;
         items = items.into_iter().skip(start).collect();
         if let Some(l) = len {
-            let l = if l < 0 { (items.len() as i64 + l).max(0) } else { l } as usize;
+            let l = if l < 0 {
+                (items.len() as i64 + l).max(0)
+            } else {
+                l
+            } as usize;
             items.truncate(l);
         }
     }
@@ -347,7 +381,10 @@ fn is_name(s: &str) -> bool {
 /// negative offset (`${arr[@]: -1}`) is allowed.
 fn parse_slice(interp: &mut Interp, spec: &str) -> (i64, Option<i64>) {
     match spec.split_once(':') {
-        Some((a, b)) => (eval_arith(interp, a.trim()), Some(eval_arith(interp, b.trim()))),
+        Some((a, b)) => (
+            eval_arith(interp, a.trim()),
+            Some(eval_arith(interp, b.trim())),
+        ),
         None => (eval_arith(interp, spec.trim()), None),
     }
 }
@@ -477,7 +514,9 @@ fn expand_param(interp: &mut Interp, inner: &str) -> String {
 /// Apply the operator portion `rest` (e.g. `:-default`, `%.gz`, `:1:2`) of a `${name<rest>}`.
 fn apply_op_from_rest(interp: &mut Interp, name: &str, rest: &str, cur: Option<String>) -> String {
     // substring slice `${var:offset:len}` (offset not one of the named ops)
-    let ops = [":-", ":=", ":+", ":?", "##", "#", "%%", "%", "//", "/", "^^", "^", ",,", ","];
+    let ops = [
+        ":-", ":=", ":+", ":?", "##", "#", "%%", "%", "//", "/", "^^", "^", ",,", ",",
+    ];
     for op in ops {
         if let Some(arg) = rest.strip_prefix(op) {
             let arg_expanded = expand_word(interp, arg, false).join(" ");
@@ -490,7 +529,11 @@ fn apply_op_from_rest(interp: &mut Interp, name: &str, rest: &str, cur: Option<S
         let (off, len) = parse_slice(interp, spec);
         let chars: Vec<char> = v.chars().collect();
         let n = chars.len() as i64;
-        let start = if off < 0 { (n + off).max(0) } else { off.min(n) } as usize;
+        let start = if off < 0 {
+            (n + off).max(0)
+        } else {
+            off.min(n)
+        } as usize;
         let end = match len {
             Some(l) if l < 0 => (n + l).max(start as i64) as usize,
             Some(l) => (start + l as usize).min(chars.len()),
@@ -736,9 +779,12 @@ fn run_capture(interp: &mut Interp, src: &str) -> String {
 }
 
 pub fn eval_arith(interp: &mut Interp, expr: &str) -> i64 {
-    let mut p = ArithParser { interp, chars: expr.chars().collect(), i: 0 };
-    let v = p.expr();
-    v
+    let mut p = ArithParser {
+        interp,
+        chars: expr.chars().collect(),
+        i: 0,
+    };
+    p.expr()
 }
 
 struct ArithParser<'a> {
@@ -909,7 +955,11 @@ fn glob_vfs(interp: &Interp, pattern: &str) -> Vec<String> {
     // Only glob the basename components that contain metacharacters, against the VFS.
     // Split pattern into directory part and a per-component glob walk.
     let absolute = pattern.starts_with('/');
-    let base = if absolute { "/".to_string() } else { interp.cwd.clone() };
+    let base = if absolute {
+        "/".to_string()
+    } else {
+        interp.cwd.clone()
+    };
     let comps: Vec<&str> = pattern.split('/').filter(|c| !c.is_empty()).collect();
     let mut current = vec![base];
     for comp in &comps {

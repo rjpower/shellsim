@@ -23,7 +23,11 @@ impl Default for Clock {
 impl Clock {
     pub fn new() -> Self {
         // default virtual epoch: 2025-01-01T00:00:00Z, deterministic across runs
-        Clock { now_ms: 0, slept_ms: 0, epoch_base_ms: 1_735_689_600_000 }
+        Clock {
+            now_ms: 0,
+            slept_ms: 0,
+            epoch_base_ms: 1_735_689_600_000,
+        }
     }
 
     pub fn now_ms(&self) -> u64 {

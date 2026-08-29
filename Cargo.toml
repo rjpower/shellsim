@@ -2,7 +2,7 @@
 name = "shellsim"
 version = "0.1.0"
 edition = "2021"
-description = "Deterministic, in-memory bash-like shell simulator for agentic RL — bring-your-own-sandbox"
+description = "Deterministic, resource-constrained BusyBox-like environment for evaluating agents"
 license = "Apache-2.0"
 
 [[bin]]
@@ -25,10 +25,6 @@ md-5 = "0.10"
 base64 = "0.22"
 crc32fast = "1"
 
-# Python engine (heavy build) is feature-gated so the core iterates fast.
-rustpython-vm = { version = "0.4", features = ["freeze-stdlib"], optional = true }
-rustpython = { version = "0.4", features = ["stdlib", "freeze-stdlib"], optional = true }
-
 # Process-level syscall sandbox (Linux only): a startup seccomp filter that denies
 # network/exec/fork so no Python-level trick can reach the real OS for those. shellsim
 # itself never opens sockets, execs, or forks, so this is safe for its own file I/O.
@@ -38,7 +34,8 @@ libc = "0.2"
 
 [features]
 default = []
-python = ["dep:rustpython-vm", "dep:rustpython"]
+# Retained as an empty compatibility feature. Python is now always the minimal `-c` shim.
+python = []
 
 [profile.dev]
 opt-level = 1

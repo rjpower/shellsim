@@ -1,5 +1,5 @@
 //! Hashing and encoding helpers (thin wrappers over well-tested crates) so that
-//! `sha256sum`, `md5sum`, `base64`, etc. are byte-exact — the TBLite verifiers hash inputs
+//! `sha256sum`, `md5sum`, `base64`, etc. are byte-exact — evaluators often hash inputs
 //! and compare digests, so approximate is not good enough.
 
 use base64::Engine;
@@ -41,7 +41,9 @@ pub fn base64_encode(data: &[u8]) -> String {
 }
 
 pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    base64::engine::general_purpose::STANDARD.decode(s.trim()).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .ok()
 }
 
 fn hex(bytes: &[u8]) -> String {

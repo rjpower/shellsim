@@ -5,6 +5,7 @@
 //! directory listing, rename, copy and snapshotting trivial at the scale of an RL task
 //! (thousands of files), while still supporting unix permissions, ownership and symlinks.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 pub type Mode = u32;
@@ -28,10 +29,22 @@ pub struct Node {
 
 impl Node {
     fn dir(mode: Mode) -> Self {
-        Node { kind: NodeKind::Dir, mode, uid: 0, gid: 0, mtime: 0 }
+        Node {
+            kind: NodeKind::Dir,
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        }
     }
     fn file(data: Vec<u8>, mode: Mode) -> Self {
-        Node { kind: NodeKind::File(data), mode, uid: 0, gid: 0, mtime: 0 }
+        Node {
+            kind: NodeKind::File(data),
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        }
     }
 }
 
@@ -44,6 +57,7 @@ pub enum VfsError {
     Exists(String),
     Loop(String),
     Invalid(String),
+    NoSpace,
 }
 
 impl std::fmt::Display for VfsError {
@@ -56,6 +70,7 @@ impl std::fmt::Display for VfsError {
             VfsError::Exists(p) => write!(f, "File exists: {p}"),
             VfsError::Loop(p) => write!(f, "Too many levels of symbolic links: {p}"),
             VfsError::Invalid(p) => write!(f, "Invalid argument: {p}"),
+            VfsError::NoSpace => write!(f, "No space left on device"),
         }
     }
 }
@@ -65,6 +80,10 @@ pub type Result<T> = std::result::Result<T, VfsError>;
 #[derive(Clone)]
 pub struct Vfs {
     nodes: BTreeMap<String, Node>,
+    disk_limit: u64,
+    disk_used: u64,
+    disk_peak: u64,
+    read_bytes: Cell<u64>,
 }
 
 impl Default for Vfs {
@@ -126,9 +145,49 @@ pub fn basename(path: &str) -> &str {
 
 impl Vfs {
     pub fn new() -> Self {
+        Self::with_disk_limit(u64::MAX)
+    }
+
+    pub fn with_disk_limit(disk_limit: u64) -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert("/".to_string(), Node::dir(0o755));
-        Vfs { nodes }
+        let disk_used = logical_usage(&nodes);
+        Vfs {
+            nodes,
+            disk_limit,
+            disk_used,
+            disk_peak: disk_used,
+            read_bytes: Cell::new(0),
+        }
+    }
+
+    pub fn disk_used(&self) -> u64 {
+        self.disk_used
+    }
+
+    pub fn disk_peak(&self) -> u64 {
+        self.disk_peak
+    }
+
+    pub fn read_bytes(&self) -> u64 {
+        self.read_bytes.get()
+    }
+
+    fn finish_mutation(&mut self, before: BTreeMap<String, Node>) -> Result<()> {
+        let used = logical_usage(&self.nodes);
+        if used > self.disk_limit {
+            self.nodes = before;
+            self.disk_used = logical_usage(&self.nodes);
+            Err(VfsError::NoSpace)
+        } else {
+            self.disk_used = used;
+            self.disk_peak = self.disk_peak.max(used);
+            Ok(())
+        }
+    }
+
+    fn refresh_usage(&mut self) {
+        self.disk_used = logical_usage(&self.nodes);
     }
 
     // ---- low level ----
@@ -159,7 +218,10 @@ impl Vfs {
             format!("{real_parent}/{name}")
         };
         match self.nodes.get(&candidate) {
-            Some(Node { kind: NodeKind::Symlink(target), .. }) if follow_final => {
+            Some(Node {
+                kind: NodeKind::Symlink(target),
+                ..
+            }) if follow_final => {
                 let next = resolve_against(&real_parent, target);
                 self.realpath_inner(&next, true, depth + 1)
             }
@@ -169,18 +231,28 @@ impl Vfs {
 
     pub fn exists(&self, cwd: &str, path: &str) -> bool {
         let abs = resolve_against(cwd, path);
-        self.realpath(&abs, true).map(|p| self.nodes.contains_key(&p)).unwrap_or(false)
+        self.realpath(&abs, true)
+            .map(|p| self.nodes.contains_key(&p))
+            .unwrap_or(false)
     }
 
     pub fn lexists(&self, cwd: &str, path: &str) -> bool {
         let abs = resolve_against(cwd, path);
-        self.realpath(&abs, false).map(|p| self.nodes.contains_key(&p)).unwrap_or(false)
+        self.realpath(&abs, false)
+            .map(|p| self.nodes.contains_key(&p))
+            .unwrap_or(false)
     }
 
     pub fn is_dir(&self, cwd: &str, path: &str) -> bool {
         let abs = resolve_against(cwd, path);
         match self.realpath(&abs, true) {
-            Ok(p) => matches!(self.nodes.get(&p), Some(Node { kind: NodeKind::Dir, .. })),
+            Ok(p) => matches!(
+                self.nodes.get(&p),
+                Some(Node {
+                    kind: NodeKind::Dir,
+                    ..
+                })
+            ),
             Err(_) => false,
         }
     }
@@ -188,7 +260,13 @@ impl Vfs {
     pub fn is_file(&self, cwd: &str, path: &str) -> bool {
         let abs = resolve_against(cwd, path);
         match self.realpath(&abs, true) {
-            Ok(p) => matches!(self.nodes.get(&p), Some(Node { kind: NodeKind::File(_), .. })),
+            Ok(p) => matches!(
+                self.nodes.get(&p),
+                Some(Node {
+                    kind: NodeKind::File(_),
+                    ..
+                })
+            ),
             Err(_) => false,
         }
     }
@@ -196,7 +274,13 @@ impl Vfs {
     pub fn is_symlink(&self, cwd: &str, path: &str) -> bool {
         let abs = resolve_against(cwd, path);
         match self.realpath(&abs, false) {
-            Ok(p) => matches!(self.nodes.get(&p), Some(Node { kind: NodeKind::Symlink(_), .. })),
+            Ok(p) => matches!(
+                self.nodes.get(&p),
+                Some(Node {
+                    kind: NodeKind::Symlink(_),
+                    ..
+                })
+            ),
             Err(_) => false,
         }
     }
@@ -207,8 +291,18 @@ impl Vfs {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
         match self.nodes.get(&real) {
-            Some(Node { kind: NodeKind::File(d), .. }) => Ok(d.clone()),
-            Some(Node { kind: NodeKind::Dir, .. }) => Err(VfsError::IsADir(path.to_string())),
+            Some(Node {
+                kind: NodeKind::File(d),
+                ..
+            }) => {
+                self.read_bytes
+                    .set(self.read_bytes.get().saturating_add(d.len() as u64));
+                Ok(d.clone())
+            }
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => Err(VfsError::IsADir(path.to_string())),
             _ => Err(VfsError::NotFound(path.to_string())),
         }
     }
@@ -220,7 +314,10 @@ impl Vfs {
     pub fn metadata(&self, cwd: &str, path: &str, follow: bool) -> Result<Node> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, follow)?;
-        self.nodes.get(&real).cloned().ok_or_else(|| VfsError::NotFound(path.to_string()))
+        self.nodes
+            .get(&real)
+            .cloned()
+            .ok_or_else(|| VfsError::NotFound(path.to_string()))
     }
 
     /// List directory entry names (not including "." / "..").
@@ -228,11 +325,18 @@ impl Vfs {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
         match self.nodes.get(&real) {
-            Some(Node { kind: NodeKind::Dir, .. }) => {}
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => {}
             Some(_) => return Err(VfsError::NotADir(path.to_string())),
             None => return Err(VfsError::NotFound(path.to_string())),
         }
-        let prefix = if real == "/" { "/".to_string() } else { format!("{real}/") };
+        let prefix = if real == "/" {
+            "/".to_string()
+        } else {
+            format!("{real}/")
+        };
         let mut out = Vec::new();
         for key in self.nodes.keys() {
             if let Some(rest) = key.strip_prefix(&prefix) {
@@ -247,7 +351,11 @@ impl Vfs {
 
     /// All paths under `dir` (recursive), including the dir itself, sorted.
     pub fn walk(&self, abs_dir: &str) -> Vec<String> {
-        let prefix = if abs_dir == "/" { "/".to_string() } else { format!("{abs_dir}/") };
+        let prefix = if abs_dir == "/" {
+            "/".to_string()
+        } else {
+            format!("{abs_dir}/")
+        };
         let mut out = Vec::new();
         for key in self.nodes.keys() {
             if key == abs_dir || key.starts_with(&prefix) {
@@ -261,7 +369,10 @@ impl Vfs {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, false)?;
         match self.nodes.get(&real) {
-            Some(Node { kind: NodeKind::Symlink(t), .. }) => Ok(t.clone()),
+            Some(Node {
+                kind: NodeKind::Symlink(t),
+                ..
+            }) => Ok(t.clone()),
             _ => Err(VfsError::Invalid(path.to_string())),
         }
     }
@@ -272,7 +383,10 @@ impl Vfs {
         let parent = parent_of(abs).unwrap_or_else(|| "/".to_string());
         let real_parent = self.realpath(&parent, true)?;
         match self.nodes.get(&real_parent) {
-            Some(Node { kind: NodeKind::Dir, .. }) => Ok(()),
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => Ok(()),
             Some(_) => Err(VfsError::NotADir(parent)),
             None => Err(VfsError::NotFound(parent)),
         }
@@ -284,78 +398,109 @@ impl Vfs {
         let parent = parent_of(&abs).unwrap_or_else(|| "/".to_string());
         let real_parent = self.realpath(&parent, true)?;
         let name = basename(&abs);
-        Ok(if real_parent == "/" { format!("/{name}") } else { format!("{real_parent}/{name}") })
+        Ok(if real_parent == "/" {
+            format!("/{name}")
+        } else {
+            format!("{real_parent}/{name}")
+        })
     }
 
     pub fn write(&mut self, cwd: &str, path: &str, data: &[u8], mode: Mode) -> Result<()> {
+        let before = self.nodes.clone();
         let target = self.write_target(cwd, path)?;
         self.require_parent_dir(&target)?;
         match self.nodes.get_mut(&target) {
-            Some(Node { kind: NodeKind::File(d), .. }) => {
+            Some(Node {
+                kind: NodeKind::File(d),
+                ..
+            }) => {
                 *d = data.to_vec();
             }
-            Some(Node { kind: NodeKind::Dir, .. }) => {
-                return Err(VfsError::IsADir(path.to_string()))
-            }
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => return Err(VfsError::IsADir(path.to_string())),
             _ => {
                 self.nodes.insert(target, Node::file(data.to_vec(), mode));
             }
         }
-        Ok(())
+        self.finish_mutation(before)
     }
 
     pub fn append(&mut self, cwd: &str, path: &str, data: &[u8], mode: Mode) -> Result<()> {
+        let before = self.nodes.clone();
         let target = self.write_target(cwd, path)?;
         self.require_parent_dir(&target)?;
         match self.nodes.get_mut(&target) {
-            Some(Node { kind: NodeKind::File(d), .. }) => d.extend_from_slice(data),
-            Some(Node { kind: NodeKind::Dir, .. }) => {
-                return Err(VfsError::IsADir(path.to_string()))
-            }
+            Some(Node {
+                kind: NodeKind::File(d),
+                ..
+            }) => d.extend_from_slice(data),
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => return Err(VfsError::IsADir(path.to_string())),
             _ => {
                 self.nodes.insert(target, Node::file(data.to_vec(), mode));
             }
         }
-        Ok(())
+        self.finish_mutation(before)
     }
 
     pub fn mkdir(&mut self, cwd: &str, path: &str) -> Result<()> {
+        let before = self.nodes.clone();
         let target = self.write_target(cwd, path)?;
         if self.nodes.contains_key(&target) {
             return Err(VfsError::Exists(path.to_string()));
         }
         self.require_parent_dir(&target)?;
         self.nodes.insert(target, Node::dir(0o755));
-        Ok(())
+        self.finish_mutation(before)
     }
 
     pub fn mkdir_all(&mut self, cwd: &str, path: &str) -> Result<()> {
+        let before = self.nodes.clone();
         let abs = resolve_against(cwd, path);
         let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
         // resolve symlinks progressively
         let mut cur = "/".to_string();
         for c in comps {
-            let next = if cur == "/" { format!("/{c}") } else { format!("{cur}/{c}") };
+            let next = if cur == "/" {
+                format!("/{c}")
+            } else {
+                format!("{cur}/{c}")
+            };
             let real = self.realpath(&next, true).unwrap_or(next.clone());
             match self.nodes.get(&real) {
-                Some(Node { kind: NodeKind::Dir, .. }) => {}
-                Some(_) => return Err(VfsError::NotADir(real)),
+                Some(Node {
+                    kind: NodeKind::Dir,
+                    ..
+                }) => {}
+                Some(_) => {
+                    self.nodes = before;
+                    self.refresh_usage();
+                    return Err(VfsError::NotADir(real));
+                }
                 None => {
                     self.nodes.insert(real.clone(), Node::dir(0o755));
                 }
             }
             cur = real;
         }
-        Ok(())
+        self.finish_mutation(before)
     }
 
     pub fn remove_file(&mut self, cwd: &str, path: &str) -> Result<()> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, false)?;
         match self.nodes.get(&real) {
-            Some(Node { kind: NodeKind::Dir, .. }) => Err(VfsError::IsADir(path.to_string())),
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => Err(VfsError::IsADir(path.to_string())),
             Some(_) => {
                 self.nodes.remove(&real);
+                self.refresh_usage();
                 Ok(())
             }
             None => Err(VfsError::NotFound(path.to_string())),
@@ -371,6 +516,7 @@ impl Vfs {
         for k in self.walk(&real) {
             self.nodes.remove(&k);
         }
+        self.refresh_usage();
         Ok(())
     }
 
@@ -378,11 +524,15 @@ impl Vfs {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
         match self.nodes.get(&real) {
-            Some(Node { kind: NodeKind::Dir, .. }) => {
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => {
                 if !self.list_dir(cwd, path)?.is_empty() {
                     return Err(VfsError::NotEmpty(path.to_string()));
                 }
                 self.nodes.remove(&real);
+                self.refresh_usage();
                 Ok(())
             }
             Some(_) => Err(VfsError::NotADir(path.to_string())),
@@ -391,6 +541,7 @@ impl Vfs {
     }
 
     pub fn rename(&mut self, cwd: &str, from: &str, to: &str) -> Result<()> {
+        let before = self.nodes.clone();
         let from_abs = resolve_against(cwd, from);
         let from_real = self.realpath(&from_abs, false)?;
         if !self.nodes.contains_key(&from_real) {
@@ -398,9 +549,19 @@ impl Vfs {
         }
         let mut to_target = self.write_target(cwd, to)?;
         // moving into an existing directory
-        if matches!(self.nodes.get(&to_target), Some(Node { kind: NodeKind::Dir, .. })) {
+        if matches!(
+            self.nodes.get(&to_target),
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            })
+        ) {
             let name = basename(&from_real);
-            to_target = if to_target == "/" { format!("/{name}") } else { format!("{to_target}/{name}") };
+            to_target = if to_target == "/" {
+                format!("/{name}")
+            } else {
+                format!("{to_target}/{name}")
+            };
         }
         let subtree = self.walk(&from_real);
         for k in subtree {
@@ -409,7 +570,7 @@ impl Vfs {
             let newk = format!("{to_target}{suffix}");
             self.nodes.insert(newk, node);
         }
-        Ok(())
+        self.finish_mutation(before)
     }
 
     pub fn copy_file(&mut self, cwd: &str, from: &str, to: &str) -> Result<()> {
@@ -419,15 +580,26 @@ impl Vfs {
     }
 
     pub fn copy_recursive(&mut self, cwd: &str, from: &str, to: &str) -> Result<()> {
+        let before = self.nodes.clone();
         let from_abs = resolve_against(cwd, from);
         let from_real = self.realpath(&from_abs, true)?;
         if !self.is_dir(cwd, from) {
             return self.copy_file(cwd, from, to);
         }
         let mut to_target = self.write_target(cwd, to)?;
-        if matches!(self.nodes.get(&to_target), Some(Node { kind: NodeKind::Dir, .. })) {
+        if matches!(
+            self.nodes.get(&to_target),
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            })
+        ) {
             let name = basename(&from_real);
-            to_target = if to_target == "/" { format!("/{name}") } else { format!("{to_target}/{name}") };
+            to_target = if to_target == "/" {
+                format!("/{name}")
+            } else {
+                format!("{to_target}/{name}")
+            };
         }
         for k in self.walk(&from_real) {
             let node = self.nodes.get(&k).unwrap().clone();
@@ -435,10 +607,11 @@ impl Vfs {
             let newk = format!("{to_target}{suffix}");
             self.nodes.insert(newk, node);
         }
-        Ok(())
+        self.finish_mutation(before)
     }
 
     pub fn symlink(&mut self, cwd: &str, target: &str, linkpath: &str) -> Result<()> {
+        let before = self.nodes.clone();
         let link_target = self.write_target(cwd, linkpath)?;
         if self.nodes.contains_key(&link_target) {
             return Err(VfsError::Exists(linkpath.to_string()));
@@ -446,12 +619,19 @@ impl Vfs {
         self.require_parent_dir(&link_target)?;
         self.nodes.insert(
             link_target,
-            Node { kind: NodeKind::Symlink(target.to_string()), mode: 0o777, uid: 0, gid: 0, mtime: 0 },
+            Node {
+                kind: NodeKind::Symlink(target.to_string()),
+                mode: 0o777,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
         );
-        Ok(())
+        self.finish_mutation(before)
     }
 
     pub fn touch(&mut self, cwd: &str, path: &str, mtime: u64) -> Result<()> {
+        let before = self.nodes.clone();
         let target = self.write_target(cwd, path)?;
         match self.nodes.get_mut(&target) {
             Some(n) => n.mtime = mtime,
@@ -462,7 +642,7 @@ impl Vfs {
                 self.nodes.insert(target, n);
             }
         }
-        Ok(())
+        self.finish_mutation(before)
     }
 
     pub fn chmod(&mut self, cwd: &str, path: &str, mode: Mode) -> Result<()> {
@@ -474,10 +654,19 @@ impl Vfs {
             .ok_or_else(|| VfsError::NotFound(path.to_string()))
     }
 
-    pub fn chown(&mut self, cwd: &str, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+    pub fn chown(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<()> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
-        let n = self.nodes.get_mut(&real).ok_or_else(|| VfsError::NotFound(path.to_string()))?;
+        let n = self
+            .nodes
+            .get_mut(&real)
+            .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
         if let Some(u) = uid {
             n.uid = u;
         }
@@ -496,20 +685,24 @@ impl Vfs {
     // ---- bulk load / dump (bridge to real dirs for task loading & snapshots) ----
 
     /// Insert a file directly at an absolute path, creating parent dirs.
-    pub fn put_file(&mut self, abs: &str, data: Vec<u8>, mode: Mode) {
+    pub fn put_file(&mut self, abs: &str, data: Vec<u8>, mode: Mode) -> Result<()> {
+        let before = self.nodes.clone();
         let norm = normalize(abs);
         if let Some(parent) = parent_of(&norm) {
-            let _ = self.mkdir_all("/", &parent);
+            self.mkdir_all("/", &parent)?;
         }
         self.nodes.insert(norm, Node::file(data, mode));
+        self.finish_mutation(before)
     }
 
-    pub fn put_dir(&mut self, abs: &str, mode: Mode) {
+    pub fn put_dir(&mut self, abs: &str, mode: Mode) -> Result<()> {
+        let before = self.nodes.clone();
         let norm = normalize(abs);
-        let _ = self.mkdir_all("/", &norm);
+        self.mkdir_all("/", &norm)?;
         if let Some(n) = self.nodes.get_mut(&norm) {
             n.mode = mode;
         }
+        self.finish_mutation(before)
     }
 
     pub fn all_paths(&self) -> impl Iterator<Item = (&String, &Node)> {
@@ -523,6 +716,22 @@ impl Vfs {
     pub fn is_empty(&self) -> bool {
         self.nodes.len() <= 1
     }
+}
+
+const NODE_OVERHEAD: u64 = 256;
+
+fn logical_usage(nodes: &BTreeMap<String, Node>) -> u64 {
+    nodes
+        .iter()
+        .filter(|(path, _)| path.as_str() != "/")
+        .fold(0u64, |total, (_, node)| {
+            let payload = match &node.kind {
+                NodeKind::File(data) => data.len() as u64,
+                NodeKind::Symlink(target) => target.len() as u64,
+                NodeKind::Dir => 0,
+            };
+            total.saturating_add(NODE_OVERHEAD).saturating_add(payload)
+        })
 }
 
 #[cfg(test)]
@@ -574,5 +783,24 @@ mod tests {
         v.symlink("/", "/real", "/link").unwrap();
         assert!(v.is_symlink("/", "/link"));
         assert_eq!(v.read_string("/", "/link/f").unwrap(), "data");
+    }
+
+    #[test]
+    fn disk_quota_is_atomic_and_delete_releases_space() {
+        // The implicit root is free; the file node and three payload bytes are charged.
+        let mut v = Vfs::with_disk_limit(NODE_OVERHEAD + 3);
+        v.write("/", "/a", b"123", 0o644).unwrap();
+        assert_eq!(v.disk_used(), NODE_OVERHEAD + 3);
+
+        assert!(matches!(
+            v.append("/", "/a", b"4", 0o644),
+            Err(VfsError::NoSpace)
+        ));
+        assert_eq!(v.read_string("/", "/a").unwrap(), "123");
+        assert_eq!(v.disk_used(), NODE_OVERHEAD + 3);
+
+        v.remove_file("/", "/a").unwrap();
+        assert_eq!(v.disk_used(), 0);
+        v.write("/", "/b", b"123", 0o644).unwrap();
     }
 }

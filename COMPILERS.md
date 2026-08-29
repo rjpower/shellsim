@@ -19,8 +19,7 @@ to prevent:
   crate), we would then have to **run** the emitted machine code in our address space. That is a
   direct, deliberate sandbox escape: JIT'd code is not subject to seccomp's syscall *table*
   rewriting in any cooperative way, and it bypasses every Python/shell-level guard we built. It
-  would undo the entire "no native trick can escape" guarantee that drove the RustPython+seccomp
-  decision.
+  would undo the environment's in-process, capability-limited execution model.
 
 So a compiler buys us nothing we can safely use: compile-without-run is pointless for grading, and
 compile-and-run is the one capability we are explicitly hardening against.
@@ -31,10 +30,8 @@ compile-and-run is the one capability we are explicitly hardening against.
 registered as `Trust::NoOp` — they "succeed" (exit 0, no error spew) so a Dockerfile/solve script
 that merely *mentions* them doesn't abort, **but they produce no artifact.** The moment the task
 tries to run the artifact (`./a.out`, `./target/release/foo`, …) it hits the
-command-not-found / unsupported path, which records the gap and forces the trust verdict to
-`low`. The signal is therefore truthful: a compiled-language task is detected as out-of-distribution
-and flagged, never silently scored as if we'd run native code. This is precisely the
-"maximal coverage so long as we can detect when we're OOD and fail out" contract.
+command-not-found / unsupported path, which records the capability gap. A compiled-language
+workload is therefore flagged rather than silently treated as native execution.
 
 ## `make` specifically
 
@@ -55,5 +52,5 @@ to the scientific-Python coverage that the target dataset actually needs. Tracke
 |---|---|---|
 | Embed tinycc / cranelift / LLVM and **run** output | ✗ rejected | Direct sandbox escape; defeats seccomp |
 | Embed a compiler, compile only (no run) | ✗ rejected | No grading value; cost without benefit |
-| Treat compilers/build tools as `NoOp`, flag run attempts as `low` trust | ✓ **shipped** | Honest OOD detection; zero new attack surface |
+| Treat compilers/build tools as `NoOp`, record capability gaps | ✓ **shipped** | Honest detection; zero new attack surface |
 | Minimal shell-recipe `make` (no compilation) | ↪ future | Safe, useful for non-C Makefiles; out of scope this round |

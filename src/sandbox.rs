@@ -1,21 +1,14 @@
 //! Process-level syscall sandbox.
 //!
-//! RustPython is memory-safe but **not** a deny-by-default capability sandbox: it ships
-//! `os`/`io`/`socket` implemented against the real OS, so Python-level tricks
-//! (`os.system`, `socket.connect`, `os.open`, …) can reach the host. The pure-Python prelude
-//! neutralizes the high- and low-level *file* surface cooperatively, but a cooperative patch
-//! is not a hard boundary. This module installs the hard one: a `seccomp` filter applied at
-//! process start that makes the kernel itself refuse the two worst escape classes —
-//! **network egress** (`socket`/`connect`) and **process exec/fork** (`execve`/`fork`). No
-//! Python-level trick can bypass a kernel seccomp filter.
+//! The command layer never intentionally executes host programs or opens host network sockets.
+//! This module adds a seccomp backstop so a future bug or dependency cannot silently broaden
+//! that capability boundary. It denies network egress, native process execution/fork, and
+//! `ptrace` before any simulated program runs.
 //!
 //! This is safe for shellsim because the simulator never opens sockets, execs programs, or
 //! forks — it is entirely in-process with a virtual clock and virtual network. The filter is
-//! **default-allow**: only the explicit denylist is blocked (returning `EPERM`), so the
-//! harness's own file reads/writes are untouched. It is NOT a replacement for an OS sandbox
-//! around the whole process for adversarial workloads (FS-read confinement still wants
-//! landlock / a subprocess jail — see [[shellsim-sandbox-boundary]]); it is defense-in-depth
-//! that closes the network/exec holes for real.
+//! **default-allow**: only the explicit denylist is blocked. It remains defense-in-depth, not a
+//! complete host-filesystem confinement mechanism.
 //!
 //! Set `SHELLSIM_NO_SANDBOX=1` to skip it (debugging / unusual hosts).
 
@@ -28,8 +21,8 @@ pub fn apply() {
     {
         if let Err(e) = imp::install() {
             // Don't hard-fail: a host that forbids seccomp (some CI/containers) should still
-            // run, just without the kernel backstop. The cooperative prelude hardening remains.
-            eprintln!("shellsim: warning: seccomp sandbox not installed ({e}); relying on cooperative hardening");
+            // run, just without the kernel backstop.
+            eprintln!("shellsim: warning: seccomp sandbox not installed ({e}); continuing without the kernel backstop");
         }
     }
 }
@@ -70,8 +63,8 @@ mod imp {
         let arch = std::env::consts::ARCH.try_into()?;
         let filter = SeccompFilter::new(
             rules,
-            SeccompAction::Allow,                      // default for everything not listed
-            SeccompAction::Errno(libc::EPERM as u32),  // listed syscalls fail with EPERM
+            SeccompAction::Allow, // default for everything not listed
+            SeccompAction::Errno(libc::EPERM as u32), // listed syscalls fail with EPERM
             arch,
         )?;
         let prog: BpfProgram = filter.try_into()?;

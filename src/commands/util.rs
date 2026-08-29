@@ -21,7 +21,7 @@ pub fn ewln(err: &mut Vec<u8>, s: &str) {
 }
 
 /// Split argv into (single-char flags, positional operands, long/value flags).
-pub fn split_flags<'a>(args: &'a [String]) -> (Vec<char>, Vec<&'a String>, Vec<(&'a str, String)>) {
+pub fn split_flags(args: &[String]) -> (Vec<char>, Vec<&String>, Vec<(&str, String)>) {
     let mut flags = Vec::new();
     let mut ops = Vec::new();
     let mut long = Vec::new();
@@ -37,7 +37,10 @@ pub fn split_flags<'a>(args: &'a [String]) -> (Vec<char>, Vec<&'a String>, Vec<(
             } else {
                 long.push((rest, String::new()));
             }
-        } else if a.len() > 1 && a.starts_with('-') && !a[1..].chars().next().unwrap().is_ascii_digit() {
+        } else if a.len() > 1
+            && a.starts_with('-')
+            && !a[1..].chars().next().unwrap().is_ascii_digit()
+        {
             for c in a[1..].chars() {
                 flags.push(c);
             }
@@ -69,7 +72,10 @@ pub fn parse_duration(s: &str) -> u64 {
 
 /// Split bytes into owned lines (lossy UTF-8).
 pub fn lines_of(s: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(s).lines().map(|l| l.to_string()).collect()
+    String::from_utf8_lossy(s)
+        .lines()
+        .map(|l| l.to_string())
+        .collect()
 }
 
 /// Read each operand file (or stdin when "-") and return concatenated bytes plus any error.
@@ -138,7 +144,9 @@ pub fn glob_eq(pattern: &str, text: &str) -> bool {
         }
     }
     re.push('$');
-    regex::Regex::new(&re).map(|r| r.is_match(text)).unwrap_or(false)
+    regex::Regex::new(&re)
+        .map(|r| r.is_match(text))
+        .unwrap_or(false)
 }
 
 /// Run a script file in the VFS if it exists and looks like a shell/python script.
@@ -173,9 +181,56 @@ pub fn try_exec_script(
 
 /// Names recognized by `which`/`type`/`command`.
 pub const KNOWN_COMMANDS: &[&str] = &[
-    "cat", "echo", "printf", "ls", "mkdir", "rmdir", "rm", "cp", "mv", "touch", "ln", "chmod",
-    "chown", "head", "tail", "sort", "uniq", "cut", "tr", "grep", "sed", "awk", "find", "seq",
-    "wc", "cd", "pwd", "test", "true", "false", "basename", "dirname", "realpath", "readlink",
-    "date", "sleep", "env", "export", "python3", "python", "jq", "base64", "sha256sum", "curl",
-    "tee", "xargs", "diff", "comm", "sort", "stat", "file", "mktemp",
+    "cat",
+    "echo",
+    "printf",
+    "ls",
+    "mkdir",
+    "rmdir",
+    "rm",
+    "cp",
+    "mv",
+    "touch",
+    "ln",
+    "chmod",
+    "chown",
+    "head",
+    "tail",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "grep",
+    "sed",
+    "awk",
+    "find",
+    "seq",
+    "wc",
+    "cd",
+    "pwd",
+    "test",
+    "true",
+    "false",
+    "basename",
+    "dirname",
+    "realpath",
+    "readlink",
+    "date",
+    "sleep",
+    "env",
+    "export",
+    "python3",
+    "python",
+    "jq",
+    "base64",
+    "sha256sum",
+    "curl",
+    "tee",
+    "xargs",
+    "diff",
+    "comm",
+    "sort",
+    "stat",
+    "file",
+    "mktemp",
 ];

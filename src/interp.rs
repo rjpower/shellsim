@@ -1,9 +1,11 @@
 //! Interpreter state shared across the shell executor and all commands.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::{Deref, DerefMut};
 
 use crate::clock::Clock;
 use crate::net::VirtualNet;
+use crate::resources::{Limits, Resources, RunOutcome};
 use crate::vfs::Vfs;
 
 /// A bash array value. Indexed arrays are sparse (`arr[5]=x` on an empty array is legal),
@@ -26,10 +28,19 @@ pub struct Job {
     pub status: i32,
 }
 
-pub struct Interp {
+/// Machine-wide state and limits. A future scheduler can attach multiple process states to the
+/// same machine; the initial implementation intentionally runs one process synchronously.
+pub struct Environment {
     pub vfs: Vfs,
     pub clock: Clock,
     pub net: VirtualNet,
+    /// Deterministic CPU, transient-memory, and output accounting for this environment.
+    pub resources: Resources,
+    pub process: ProcessState,
+}
+
+/// Shell-local state for the single process currently executing in an [`Environment`].
+pub struct ProcessState {
     /// shell + environment variables (we don't distinguish exported vs not for simplicity,
     /// except that `env`/child python only sees exported ones, tracked in `exported`)
     pub vars: HashMap<String, String>,
@@ -71,25 +82,36 @@ pub struct Interp {
     pub trust_noop: std::collections::BTreeSet<String>,
     /// command names that ran as `Trust::Partial` (subset impl — e.g. jq/sed) during this run
     pub trust_partial: std::collections::BTreeSet<String>,
-    /// Installed Python packages (by *import* name, e.g. `numpy`, `sklearn`). Populated by the
-    /// `pip`/`uv`/`conda` shims as the Dockerfile/solve script "installs" them. Gates whether the
-    /// embedded mini-libraries are importable, mirroring a real venv (see [[shell-sim-design]]).
+    /// Package names recorded by the lightweight `pip`/`uv`/`conda` compatibility commands.
     pub packages: std::collections::BTreeSet<String>,
-    /// Out-of-distribution events raised by the embedded mini-libraries: a code path that our
-    /// numpy/pandas/scipy/sklearn shim does not faithfully implement was hit. Accumulated across
-    /// every Python invocation in a run; any entry forces the trust verdict to `low`.
-    pub py_ood: Vec<String>,
-    /// Embedded mini-libraries that were actually imported during a run (e.g. `numpy`/`pandas`).
-    /// Using a reimplemented scientific library caps trust at `medium` (reward is plausible but
-    /// not guaranteed byte-identical to the real library — the eval harness is the backstop).
-    pub py_simlib: std::collections::BTreeSet<String>,
 }
 
-impl Interp {
+impl Deref for Environment {
+    type Target = ProcessState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.process
+    }
+}
+
+impl DerefMut for Environment {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.process
+    }
+}
+
+impl Environment {
     pub fn new() -> Self {
+        Self::with_limits(Limits::default())
+    }
+
+    pub fn with_limits(limits: Limits) -> Self {
         let mut vars = HashMap::new();
         vars.insert("HOME".into(), "/root".into());
-        vars.insert("PATH".into(), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+        vars.insert(
+            "PATH".into(),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+        );
         vars.insert("PWD".into(), "/".into());
         vars.insert("SHELL".into(), "/bin/bash".into());
         vars.insert("TERM".into(), "xterm-256color".into());
@@ -98,48 +120,48 @@ impl Interp {
         vars.insert("LANG".into(), "C.UTF-8".into());
         vars.insert("IFS".into(), " \t\n".into());
         let mut exported = std::collections::BTreeSet::new();
-        for k in ["HOME", "PATH", "PWD", "SHELL", "TERM", "USER", "HOSTNAME", "LANG"] {
+        for k in [
+            "HOME", "PATH", "PWD", "SHELL", "TERM", "USER", "HOSTNAME", "LANG",
+        ] {
             exported.insert(k.to_string());
         }
-        Interp {
-            vfs: Vfs::new(),
+        Environment {
+            vfs: Vfs::with_disk_limit(limits.disk),
             clock: Clock::new(),
             net: VirtualNet::new(),
-            vars,
-            arrays: HashMap::new(),
-            exported,
-            cwd: "/".to_string(),
-            funcs: HashMap::new(),
-            last_status: 0,
-            positional: Vec::new(),
-            opt_errexit: false,
-            opt_nounset: false,
-            opt_xtrace: false,
-            opt_pipefail: false,
-            jobs: Vec::new(),
-            next_job_id: 1,
-            loop_break: 0,
-            loop_continue: 0,
-            returning: None,
-            exiting: None,
-            cond_depth: 0,
-            uid: 0,
-            input_stream: Vec::new(),
-            input_pos: 0,
-            cmd_trace: Vec::new(),
-            unsupported: Vec::new(),
-            trust_noop: std::collections::BTreeSet::new(),
-            trust_partial: std::collections::BTreeSet::new(),
-            packages: std::collections::BTreeSet::new(),
-            py_ood: Vec::new(),
-            py_simlib: std::collections::BTreeSet::new(),
+            resources: Resources::new(limits),
+            process: ProcessState {
+                vars,
+                arrays: HashMap::new(),
+                exported,
+                cwd: "/".to_string(),
+                funcs: HashMap::new(),
+                last_status: 0,
+                positional: Vec::new(),
+                opt_errexit: false,
+                opt_nounset: false,
+                opt_xtrace: false,
+                opt_pipefail: false,
+                jobs: Vec::new(),
+                next_job_id: 1,
+                loop_break: 0,
+                loop_continue: 0,
+                returning: None,
+                exiting: None,
+                cond_depth: 0,
+                uid: 0,
+                input_stream: Vec::new(),
+                input_pos: 0,
+                cmd_trace: Vec::new(),
+                unsupported: Vec::new(),
+                trust_noop: std::collections::BTreeSet::new(),
+                trust_partial: std::collections::BTreeSet::new(),
+                packages: std::collections::BTreeSet::new(),
+            },
         }
     }
 
-    /// Mark a Python package (by *import* name) as installed, pulling in the dependency closure
-    /// our mini-libraries assume (pandas/scipy/sklearn all need numpy; sklearn also needs scipy).
-    /// This mirrors `pip` resolving transitive deps so a task that only `pip install pandas` can
-    /// still `import numpy` indirectly.
+    /// Record a package name installed by a compatibility command.
     pub fn install_package(&mut self, import_name: &str) {
         let name = import_name.trim();
         if name.is_empty() {
@@ -216,7 +238,8 @@ impl Interp {
     /// Ensure `name` exists as an *associative* array (created empty if absent).
     pub fn declare_assoc(&mut self, name: &str) {
         if !matches!(self.arrays.get(name), Some(ArrayVal::Assoc(_))) {
-            self.arrays.insert(name.to_string(), ArrayVal::Assoc(BTreeMap::new()));
+            self.arrays
+                .insert(name.to_string(), ArrayVal::Assoc(BTreeMap::new()));
         }
     }
 
@@ -228,8 +251,10 @@ impl Interp {
     /// Replace the whole array at `name` with the given element list (indexed).
     pub fn set_array(&mut self, name: &str, elems: Vec<String>) {
         self.vars.remove(name);
-        self.arrays
-            .insert(name.to_string(), ArrayVal::Indexed(elems.into_iter().map(Some).collect()));
+        self.arrays.insert(
+            name.to_string(),
+            ArrayVal::Indexed(elems.into_iter().map(Some).collect()),
+        );
     }
 
     /// Append elements to the end of an indexed array (creating/promoting as needed). For an
@@ -338,17 +363,43 @@ impl Interp {
     pub fn new_job(&mut self, cmd: String) -> u32 {
         let id = self.next_job_id;
         self.next_job_id += 1;
-        self.jobs.push(Job { id, cmd, done: false, status: 0 });
+        self.jobs.push(Job {
+            id,
+            cmd,
+            done: false,
+            status: 0,
+        });
         id
     }
 
     pub fn note_unsupported(&mut self, what: &str) {
         self.unsupported.push(what.to_string());
     }
+
+    pub fn outcome(&self, exit_status: i32) -> RunOutcome {
+        self.resources
+            .outcome(exit_status, self.vfs.disk_used(), self.vfs.disk_peak())
+    }
+
+    /// Whether this persistent shell can accept another action.
+    pub fn is_terminated(&self) -> bool {
+        self.resources.is_stopped() || self.exiting.is_some()
+    }
+
+    /// Sticky terminal status after `exit`, `set -e`, or resource exhaustion.
+    pub fn termination_status(&self) -> Option<i32> {
+        self.resources
+            .stop_reason()
+            .map(crate::resources::StopReason::exit_status)
+            .or(self.exiting)
+    }
 }
 
-impl Default for Interp {
+impl Default for Environment {
     fn default() -> Self {
         Self::new()
     }
 }
+
+/// Compatibility name for callers written against the original shell simulator API.
+pub type Interp = Environment;

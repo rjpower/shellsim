@@ -1,17 +1,15 @@
 //! Package managers and build tools.
 //!
 //! Installers (`pip`/`pip3`/`conda`/`pipx`) don't fetch anything, but they DO record the
-//! installed package names into [`Interp::packages`] so the embedded mini-libraries
-//! (numpy/pandas/scipy/sklearn/yaml) become importable — mirroring a real venv. The actual
-//! package *contents* are absent, so they remain [`Trust::NoOp`] for the trust verdict
-//! (a task that executes installed third-party *code* we don't ship is still flagged).
+//! installed package names into [`Interp::packages`] so bootstrap probes such as `pip list`
+//! remain deterministic. Package contents are absent, so installers remain [`Trust::NoOp`].
 //!
 //! Build tools / compilers (`gcc`/`make`/`cargo`/…) stay pure no-ops: see the
 //! `COMPILERS.md` survey for why we deliberately don't simulate native compilation.
 
 use std::collections::HashMap;
 
-use crate::commands::{CommandSpec, Io, Trust};
+use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
@@ -22,9 +20,31 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(
         m,
         &[
-            "apt", "apt-get", "npm", "node", "cargo", "make", "cmake", "gcc", "g++", "cc",
-            "clang", "mvn", "gradle", "javac", "java", "docker", "systemctl", "service",
-            "uvicorn", "gunicorn", "flask", "ld", "ar", "rustc", "go",
+            "apt",
+            "apt-get",
+            "npm",
+            "node",
+            "cargo",
+            "make",
+            "cmake",
+            "gcc",
+            "g++",
+            "cc",
+            "clang",
+            "mvn",
+            "gradle",
+            "javac",
+            "java",
+            "docker",
+            "systemctl",
+            "service",
+            "uvicorn",
+            "gunicorn",
+            "flask",
+            "ld",
+            "ar",
+            "rustc",
+            "go",
         ],
         Trust::NoOp,
         cmd_noop,
@@ -32,16 +52,20 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
 }
 
 /// Pretend success; the dispatcher already recorded the command as unsupported.
-fn cmd_noop(_interp: &mut Interp, _args: &[String], _io: &mut Io) -> i32 {
+fn cmd_noop(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {
     0
 }
 
 /// `pip install [flags] pkg[==ver] ...` / `pip install -r req.txt` / `conda install ...`.
 /// Records package names so the embedded libraries become importable. Other subcommands
 /// (`list`, `show`, `freeze`, `uninstall`, …) are handled enough to be plausible.
-fn cmd_pip(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+fn cmd_pip(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     // find the subcommand (first non-flag token)
-    let sub = args.iter().find(|a| !a.starts_with('-')).map(|s| s.as_str()).unwrap_or("");
+    let sub = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(|s| s.as_str())
+        .unwrap_or("");
     match sub {
         "install" => {
             register_install_args(interp, args);
@@ -61,7 +85,11 @@ fn cmd_pip(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
         }
         "show" => {
             // `pip show NAME` → minimal metadata if "installed"
-            if let Some(name) = args.iter().rfind(|a| !a.starts_with('-')).filter(|a| a.as_str() != "show") {
+            if let Some(name) = args
+                .iter()
+                .rfind(|a| !a.starts_with('-'))
+                .filter(|a| a.as_str() != "show")
+            {
                 let key = normalize_pkg(name);
                 if interp.packages.contains(&key) || interp.packages.contains(name.as_str()) {
                     crate::commands::util::wln(io.out, &format!("Name: {name}"));
@@ -80,9 +108,25 @@ fn cmd_pip(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
 pub fn register_install_args(interp: &mut Interp, args: &[String]) {
     // flags that consume the following token as a value (and aren't packages)
     const VALUE_FLAGS: &[&str] = &[
-        "-i", "--index-url", "--extra-index-url", "-f", "--find-links", "-c", "--constraint",
-        "-t", "--target", "-p", "--python", "--prefix", "--root", "--platform",
-        "--abi", "--implementation", "--cache-dir", "--no-binary", "--only-binary",
+        "-i",
+        "--index-url",
+        "--extra-index-url",
+        "-f",
+        "--find-links",
+        "-c",
+        "--constraint",
+        "-t",
+        "--target",
+        "-p",
+        "--python",
+        "--prefix",
+        "--root",
+        "--platform",
+        "--abi",
+        "--implementation",
+        "--cache-dir",
+        "--no-binary",
+        "--only-binary",
     ];
     let mut i = 0;
     let mut seen_sub = false;
@@ -114,7 +158,10 @@ pub fn register_install_args(interp: &mut Interp, args: &[String]) {
             continue;
         }
         // a package spec (or a local path / VCS URL we can't model — skip those)
-        if a.starts_with("git+") || a.contains("://") || a.starts_with('.') || a.ends_with(".whl")
+        if a.starts_with("git+")
+            || a.contains("://")
+            || a.starts_with('.')
+            || a.ends_with(".whl")
             || a.ends_with(".tar.gz")
         {
             i += 1;
@@ -151,7 +198,7 @@ pub fn package_name_of(spec: &str) -> Option<String> {
     }
     // cut at the first version operator / extras bracket / whitespace / semicolon (markers)
     let end = s
-        .find(|c: char| matches!(c, '=' | '<' | '>' | '!' | '~' | '[' | ' ' | ';' | '@'))
+        .find(['=', '<', '>', '!', '~', '[', ' ', ';', '@'])
         .unwrap_or(s.len());
     let dist = &s[..end];
     if dist.is_empty() {
