@@ -51,23 +51,84 @@ pub fn split_flags(args: &[String]) -> (Vec<char>, Vec<&String>, Vec<(&str, Stri
     (flags, ops, long)
 }
 
-/// Parse a duration string into milliseconds; supports s/m/h/d suffix and fractional seconds.
-pub fn parse_duration(s: &str) -> u64 {
-    let s = s.trim();
-    let (num, mult) = if let Some(n) = s.strip_suffix("ms") {
-        (n, 1.0)
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, 1000.0)
-    } else if let Some(n) = s.strip_suffix('m') {
-        (n, 60_000.0)
-    } else if let Some(n) = s.strip_suffix('h') {
-        (n, 3_600_000.0)
-    } else if let Some(n) = s.strip_suffix('d') {
-        (n, 86_400_000.0)
+/// Parse a non-negative decimal duration exactly into nanoseconds.
+///
+/// A missing suffix means seconds.  `ns`, `us`, `ms`, `s`, `m`, `h`, and `d` are accepted.
+/// Fractional values are truncated below nanosecond precision, matching the simulator's clock
+/// resolution.  Invalid, negative, non-finite, and overflowing values are errors rather than
+/// silently becoming zero.
+pub fn parse_duration_ns(input: &str) -> Result<u64, String> {
+    use crate::clock::{NANOS_PER_MICROSECOND, NANOS_PER_MILLISECOND, NANOS_PER_SECOND};
+
+    let input = input.trim();
+    let (number, multiplier): (&str, u64) = if let Some(number) = input.strip_suffix("ns") {
+        (number, 1)
+    } else if let Some(number) = input.strip_suffix("us") {
+        (number, NANOS_PER_MICROSECOND)
+    } else if let Some(number) = input.strip_suffix("µs") {
+        (number, NANOS_PER_MICROSECOND)
+    } else if let Some(number) = input.strip_suffix("ms") {
+        (number, NANOS_PER_MILLISECOND)
+    } else if let Some(number) = input.strip_suffix('s') {
+        (number, NANOS_PER_SECOND)
+    } else if let Some(number) = input.strip_suffix('m') {
+        (number, 60 * NANOS_PER_SECOND)
+    } else if let Some(number) = input.strip_suffix('h') {
+        (number, 60 * 60 * NANOS_PER_SECOND)
+    } else if let Some(number) = input.strip_suffix('d') {
+        (number, 24 * 60 * 60 * NANOS_PER_SECOND)
     } else {
-        (s, 1000.0)
+        (input, NANOS_PER_SECOND)
     };
-    (num.parse::<f64>().unwrap_or(0.0) * mult) as u64
+    let number = number.strip_prefix('+').unwrap_or(number);
+    if number.is_empty() || number.starts_with('-') {
+        return Err(format!("invalid duration {input:?}"));
+    }
+    let mut pieces = number.split('.');
+    let whole = pieces.next().unwrap_or_default();
+    let fraction = pieces.next();
+    if pieces.next().is_some()
+        || (!whole.is_empty() && !whole.bytes().all(|byte| byte.is_ascii_digit()))
+        || fraction.is_some_and(|digits| !digits.bytes().all(|byte| byte.is_ascii_digit()))
+        || (whole.is_empty() && fraction.is_none_or(str::is_empty))
+    {
+        return Err(format!("invalid duration {input:?}"));
+    }
+    let whole = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u128>()
+            .map_err(|_| format!("duration is too large: {input:?}"))?
+    };
+    let mut nanos = whole
+        .checked_mul(u128::from(multiplier))
+        .ok_or_else(|| format!("duration is too large: {input:?}"))?;
+    if let Some(digits) = fraction.filter(|digits| !digits.is_empty()) {
+        // u128 can exactly hold 10^38.  More digits cannot affect nanosecond output for any
+        // supported suffix, so discard them only after validating the full decimal above.
+        let significant = &digits[..digits.len().min(38)];
+        let numerator = significant
+            .parse::<u128>()
+            .map_err(|_| format!("invalid duration {input:?}"))?;
+        let denominator = 10_u128.pow(significant.len() as u32);
+        nanos = nanos
+            .checked_add(
+                numerator
+                    .checked_mul(u128::from(multiplier))
+                    .ok_or_else(|| format!("duration is too large: {input:?}"))?
+                    / denominator,
+            )
+            .ok_or_else(|| format!("duration is too large: {input:?}"))?;
+    }
+    u64::try_from(nanos).map_err(|_| format!("duration is too large: {input:?}"))
+}
+
+/// Compatibility helper for older command implementations.
+pub fn parse_duration(s: &str) -> u64 {
+    parse_duration_ns(s)
+        .map(|nanos| nanos / crate::clock::NANOS_PER_MILLISECOND)
+        .unwrap_or_default()
 }
 
 /// Split bytes into owned lines (lossy UTF-8).
@@ -169,7 +230,7 @@ pub fn try_exec_script(
     let first = text.lines().next().unwrap_or("");
     let code = if first.starts_with("#!") && (first.contains("python")) {
         // python script
-        let mut a = vec![name.to_string()];
+        let mut a = vec!["python3.14".to_string(), name.to_string()];
         a.extend(args.iter().cloned());
         crate::python::run_python(interp, &a, stdin.to_vec(), out, err)
     } else {
@@ -223,6 +284,7 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "envsubst",
     "export",
     "python3",
+    "python3.14",
     "python",
     "jq",
     "base64",
@@ -247,3 +309,23 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "free",
     "ps",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration_ns;
+
+    #[test]
+    fn durations_are_parsed_exactly_at_nanosecond_resolution() {
+        assert_eq!(parse_duration_ns(".0015").unwrap(), 1_500_000);
+        assert_eq!(parse_duration_ns("2us").unwrap(), 2_000);
+        assert_eq!(parse_duration_ns("1.5m").unwrap(), 90_000_000_000);
+        assert_eq!(parse_duration_ns("0.0000000009").unwrap(), 0);
+    }
+
+    #[test]
+    fn invalid_durations_do_not_silently_become_zero() {
+        for invalid in ["", "-1", "NaN", "inf", "1.2.3", "1fortnight"] {
+            assert!(parse_duration_ns(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+}

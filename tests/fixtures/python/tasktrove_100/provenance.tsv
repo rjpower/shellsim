@@ -1,0 +1,101 @@
+id	task_id	source_path	source_lines_or_symbol	derivation_note
+001	bloom-filter-cache-penetration-prevention	solution/solve.sh	BloomFilter.__init__ (84-87)	arithmetic precedence and multiplication observed in Bloom sizing
+002	bloom-filter-cache-penetration-prevention	solution/solve.sh	BloomFilter.__init__ (84)	parenthesized arithmetic expression observed in Bloom sizing
+003	db-migration-local-storage	environment/generate_csv.py	generate_csv (37-47)	floor division and remainder arithmetic observed in record generation
+004	service-deployment-wave-planner	environment/task_file/scripts/model.py	model helpers (28-30)	division and unary arithmetic observed in weight normalization
+005	bloom-filter-cache-penetration-prevention	solution/solve.sh	BloomFilter.__init__ (84-87)	modulo/exponent multiplication idioms observed in sizing formulas
+006	build-system-task-ordering	tests/test_outputs.py	parse/reference (46-54, 125)	comparison and equality branches observed in parser and DSU
+007	build-system-task-ordering	tests/test_outputs.py	parse (35-36)	and/or-style boolean filtering and truthiness observed in parser
+008	malicious-package-forensics	solution/solve.sh	main output (646)	string concatenation and repetition observed in report formatting
+009	monorepo-changelog-cli	solution/solve.sh	changelog generator (45-46)	strip/split string parsing idioms observed in path parsing
+010	neural-architecture-search-final	tests/test_outputs.py	validation tests (96, 102-115)	string prefix/suffix checks observed in architecture validation
+011	todos-api	solution/solve.sh	_check_rate_limit/get_todos (61-67, 265)	list append mutation observed in request and result accumulation
+012	build-system-task-ordering	tests/test_outputs.py	reference (287-290)	list extension observed while assembling the topological order
+013	distributed-test-execution-scheduler	solution/solve.sh	solve (217-230)	list removal observed when scheduling unscheduled tests
+014	build-system-task-ordering	tests/test_outputs.py	parse (45-64)	subscripted sequence/data access observed in parser records
+015	csv-json-jsonl-merger	solution/solve.sh	merge logic (33-47)	dictionary construction and keyed assignment observed in profile merge
+016	raft-log-repair-concurrent-access	solution/solve.sh	solve (40-42)	dict.setdefault with a list default observed in log grouping
+017	anomaly-detection-ranking	tests/grader.py	validation (79, 85, 95)	dict items/keys/values iteration observed in grading calculations
+018	api-endpoint-permission-canonicalizer	solution/solve.sh	canonicalize (192-225)	set.add and membership accumulation observed in endpoint filtering
+019	build-system-task-ordering	tests/test_outputs.py	parse (101-106)	tuple records and tuple equality observed in parsed target blocks
+020	cpp-daemon-sighup-segfault	tests/test_outputs.py	process checks (40, 93, 105)	identity comparisons against None observed in process lifecycle checks
+021	build-system-task-ordering	tests/test_outputs.py	parse/reference (39-45, 242-244)	for-loop iteration and accumulation observed in reference implementation
+022	api-endpoint-permission-canonicalizer	solution/solve.sh	parse_input (80-120)	while-loop scanning observed in section parsing
+023	todos-api	solution/solve.sh	get_todos (250-265)	continue in filtered iteration observed in todo filtering
+024	api-endpoint-permission-canonicalizer	solution/solve.sh	parse_input (80-84)	break from a scan loop observed at hard cutoff
+025	ekf-localization	environment/generate_data.py	generate_data (38-40)	for loop with pass body observed in optional data cleanup
+026	todos-api	solution/solve.sh	get_todos (269-273)	if/elif/else selection observed in sort-mode dispatch
+027	todos-api	solution/solve.sh	TeamData and endpoint functions (26-80, 179)	function definitions, calls, and returns observed throughout service code
+028	build-system-task-ordering	tests/test_outputs.py	DSU.find (115-120)	recursive function call observed in path-compression implementation
+029	build-system-task-ordering	tests/test_outputs.py	parse (35-36)	nested helper closure observed inside parser
+030	todos-api	solution/solve.sh	get_todos (269-273)	augmented assignment/state update idiom observed in service logic
+031	todos-api	solution/solve.sh	get_todos (269-273)	lambda key functions observed in sort dispatch
+032	neural-architecture-search-final	tests/test_outputs.py	validation tests (52, 69, 92)	sorted builtin observed over architecture data
+033	iot-device-registration-server	tests/grader.py	comparison helpers (43-44)	sorted with a lambda key observed in output verification
+034	todos-api	solution/solve.sh	get_todos (269-273)	in-place sort with reverse keyword observed in API filtering
+035	distributed-test-execution-scheduler	environment/task_file/scripts/model.py	objective helpers (241, 301)	min/max builtins observed in score clamping
+036	bandit-delayed-feedback	tests/test_outputs.py	calibration checks (163, 205)	sum and abs builtins observed in numeric validation
+037	neural-architecture-search-final	tests/test_outputs.py	validation tests (52, 69)	enumerate observed while checking indexed architecture entries
+038	pdf-table-parsing	solution/solve.sh	header normalization (38)	zip iteration observed when pairing header rows
+039	cpp-daemon-sighup-segfault	tests/test_outputs.py	stress tests (89, 141)	range iteration observed in repeated test actions
+040	api-endpoint-permission-canonicalizer	tests/test_outputs.py	endpoint checks (68-72)	any/all generator-style predicates observed in validation
+041	build-system-task-ordering	tests/test_outputs.py	parse_block_body (70-78)	list/tuple/set container construction observed in parser state
+042	raft-log-repair-concurrent-access	solution/solve.sh	solve (11-21)	function keyword-capable signature and call data observed in solver
+043	python-api-rate-limit	environment/src/limiter/window.py	SlidingWindowLimiter (9-15)	variable annotations observed on state fields
+044	build-system-task-ordering	tests/test_outputs.py	module header and parse (9, 33)	future annotations import observed in test module
+045	build-merkle-tree-cli-sha512	tests/test_outputs.py	JSON verification (34-39, 97-104)	json loading/dumps data-shape idioms observed in merkle checks
+046	submission_a63937a5_20251224_152124	tests/test_outputs.py	_compute_game_hash (52-54)	json dumps with sorted keys observed in deterministic hashing
+047	distributed-test-execution-scheduler	environment/task_file/scripts/model.py	output writer (450)	compact JSON serialization call observed in scheduler output
+048	service-deployment-wave-planner	environment/task_file/scripts/baseline.py	load_data/solve (11-28, 43-45)	defaultdict and list-valued aggregation observed in planner
+049	distributed-test-execution-scheduler	solution/solve.sh	WaveState.__init__ (86-93)	qualified collections.defaultdict construction observed in scheduler
+050	distributed-test-execution-scheduler	solution/solve.sh	CLI entry point (243-244)	sys.argv access observed in the command-line wrapper
+051	bloom-filter-cache-penetration-prevention	solution/solve.sh	get_redis_client (228-240)	os.getenv with deterministic fallback observed in service setup
+052	application-debug	solution/solve.sh	embedded report writer (132-143)	os.environ.get fallback access observed in report generation
+053	pdf-table-parsing	solution/solve.sh	row normalization (64)	negative and positive sequence indexing observed in table processing
+054	csv-json-jsonl-merger	solution/solve.sh	merge logic (33-47)	nested dictionary indexing observed while merging records
+055	api-endpoint-permission-canonicalizer	solution/solve.sh	canonicalize (192-225)	in/not-in membership tests observed in endpoint inclusion
+056	build-system-task-ordering	tests/test_outputs.py	parse_block_body (70-98)	set and dictionary equality/state comparisons observed in parser reference
+057	build-system-task-ordering	tests/test_outputs.py	parse (35-36, 43-44)	truthiness-driven conditional return observed in comment filtering
+058	db-migration-local-storage	environment/generate_csv.py	generate_csv (46-47)	range iteration with an accumulating counter observed in generation
+059	anomaly-detection-ranking	tests/grader.py	metric helpers (51-53)	zip over paired sequences observed in metric counting
+060	build-system-task-ordering	tests/test_outputs.py	parse/reference (122-127)	multiple function calls with positional arguments observed in DSU operations
+061	todos-api	solution/solve.sh	TeamData (26-80)	class method, instance attribute, and method call patterns observed
+062	todos-api	solution/solve.sh	TeamData (26-30)	class-level/state attribute initialization observed in data model
+063	build-system-task-ordering	tests/test_outputs.py	strong (217-240)	nonlocal closure mutation observed in Tarjan traversal
+064	build-system-task-ordering	tests/test_outputs.py	parse (45-54)	tuple unpacking observed for parsed directive fields
+065	bloom-filter-cache-penetration-prevention	tests/test_outputs.py	Redis shim (50)	starred argument binding observed in the test helper
+066	multi-labeller	solution/solve.sh	build_augmented_label_matrix (132-139)	list/set comprehensions observed when building label matrices
+067	etl_checkpoint_resume_bug	environment/app/loaders.py	mapping helpers (148-158)	dict comprehension observed for legacy-to-new ID maps
+068	multi-labeller	solution/solve.sh	build_augmented_label_matrix (132-139)	set-comprehension aggregation observed in label processing
+069	neural-architecture-search-final	tests/test_outputs.py	file checks (23-24)	with statement resource management observed in test code
+070	server-log-analysis	tests/grader.py	grade (69-79)	re.match call observed while parsing numbered answers
+071	california-housing-api	solution/solve.sh	load_model (154-164)	async def declaration observed in API wrapper
+072	etl_checkpoint_resume_bug	tests/test_outputs.py	legacy_session/new_session (21-42)	yield statement observed in fixture generators
+073	python-api-rate-limit	environment/src/limiter/window.py	_get_key (27-29)	f-string interpolation observed in key generation
+074	submission_a63937a5_20251224_152124	solution/solve.sh	UCB helper (74-77)	math.sqrt call observed in bandit scoring
+075	schedule-vacation	environment/find_overlap.py	main (116-120)	list comprehension observed for window dates
+076	multi-labeller	solution/solve.sh	build_augmented_label_matrix (132-139)	nested for-comprehension shape observed in label expansion
+077	todos-api	solution/solve.sh	get_todos (250-273)	conditional classification and comparison observed in filtering
+078	task-xxe-exploit	environment/data/parsers/parser_alpha.py	main/parse_xml (25-35)	conditional binding and subsequent use observed in parser error handling
+079	todos-api	solution/solve.sh	_check_rate_limit (54-67)	range/list accumulation observed in request tracking
+080	service-deployment-wave-planner	environment/task_file/scripts/model.py	wave accounting (501)	dictionary subscript augmented update observed in wave accounting
+081	todos-api	solution/solve.sh	get_todos (269-273)	in-place sort and equality validation observed in API result checks
+082	raft-log-repair-concurrent-access	solution/solve.sh	cutoff_parse (14-35)	str/repr/int conversion and parsing observed in log records
+083	bloom-filter-cache-penetration-prevention	tests/test_outputs.py	Redis shim (50)	variadic *args binding observed in the test helper
+084	build-merkle-tree-cli-sha512	tests/test_outputs.py	JSON verification (97-104)	sequence subscript and mapping get access observed in proof checks
+085	api-endpoint-permission-canonicalizer	solution/solve.sh	canonicalize (192-225)	dictionary/set membership observed in deduplication
+086	cpp-daemon-sighup-segfault	tests/test_outputs.py	stress tests (89-146)	for-range printing/iteration observed in repeated checks
+087	todos-api	solution/solve.sh	_check_rate_limit (54-67)	while-loop counter update observed in sliding-window cleanup
+088	build-system-task-ordering	tests/test_outputs.py	load_solve/reference (20-30, 130-143)	function returning a constructed value observed in test helpers
+089	pdf-table-parsing	solution/solve.sh	row normalization (64)	negative tuple/list indexing observed while carrying forward a row
+090	monorepo-changelog-cli	solution/solve.sh	changelog generator (45-46)	lstrip/rstrip/strip-style normalization observed in text parsing
+091	build-system-task-ordering	tests/test_outputs.py	parse_block_body/reference (97-99, 287-290)	list concatenation/extension observed in parser output assembly
+092	cpp-daemon-sighup-segfault	tests/test_outputs.py	process checks (40, 93, 105)	identity and equality comparisons with booleans/None observed
+093	submission_a63937a5_20251224_152124	tests/test_outputs.py	_compute_game_hash (52-54)	nested JSON object serialization with sort_keys observed
+094	distributed-test-execution-scheduler	solution/solve.sh	WaveState.__init__ (88-93)	defaultdict(int) observed for numeric resource totals
+095	schedule-vacation	environment/find_overlap.py	main (118-127)	function call inside loop and list accumulation observed
+096	csv-json-jsonl-merger	solution/solve.sh	merge logic (33-47)	shared mapping mutation/reference behavior observed
+097	todos-api	solution/solve.sh	get_todos (269-273)	sorted lambda with reverse ordering observed
+098	api-endpoint-permission-canonicalizer	solution/solve.sh	canonicalize (192-225)	boolean negation and empty-container truthiness observed
+099	bloom-filter-cache-penetration-prevention	tests/test_outputs.py	Redis shim (50)	starred positional/keyword argument binding observed in the test helper
+100	db-migration-local-storage	environment/generate_csv.py	generate_csv (46-47)	range construction and list conversion observed in generation

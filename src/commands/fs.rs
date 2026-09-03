@@ -655,9 +655,13 @@ fn cmd_mktemp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     let (flags, ops, _l) = split_flags(args);
     let dir = flags.contains(&'d');
     let tmpl = ops.first().map(|s| s.as_str()).unwrap_or("tmp.XXXXXX");
-    // deterministic: use the clock to make a unique-ish suffix
-    let n = interp.clock.now_ms();
-    let suffix = format!("{:06}", n % 1_000_000);
+    // Identity is deterministic but deliberately separate from time: creating a name is not a
+    // temporal effect and must not perturb deadlines.
+    let Some(n) = interp.next_temp_id() else {
+        ewln(io.err, "mktemp: exhausted deterministic name space");
+        return 1;
+    };
+    let suffix = format!("{n:06}");
     let name = tmpl.replace("XXXXXX", &suffix);
     let path = if name.starts_with('/') {
         name
@@ -670,7 +674,6 @@ fn cmd_mktemp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     } else {
         let _ = interp.vfs.write("/", &path, b"", 0o600);
     }
-    interp.clock.tick(1);
     wln(io.out, &path);
     0
 }

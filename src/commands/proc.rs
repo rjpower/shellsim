@@ -3,7 +3,10 @@
 
 use std::collections::HashMap;
 
-use crate::commands::util::{parse_duration, wln};
+use crate::clock::{
+    BlockOutcome, EventKind, MAIN_TASK_ID, NANOS_PER_MICROSECOND, NANOS_PER_SECOND,
+};
+use crate::commands::util::{ewln, parse_duration_ns, wln};
 use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
@@ -12,7 +15,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     // time / scheduling (virtual clock, never blocks)
     reg(m, &["sleep"], Trust::Real, cmd_sleep);
     reg(m, &["usleep"], Trust::Real, cmd_usleep);
-    reg(m, &["timeout"], Trust::Real, cmd_timeout);
+    reg(m, &["timeout"], Trust::Partial, cmd_timeout);
     reg(m, &["date"], Trust::Real, cmd_date);
     reg(m, &["sync"], Trust::Real, |_, _, _| 0);
 
@@ -26,63 +29,214 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["python3.11"], Trust::Partial, cmd_python311);
     reg(m, &["python3.12"], Trust::Partial, cmd_python312);
     reg(m, &["python3.13"], Trust::Partial, cmd_python313);
+    reg(m, &["python3.14"], Trust::Partial, cmd_python314);
+    reg(m, &["pytest"], Trust::Partial, cmd_pytest);
     reg(m, &["jq"], Trust::Partial, cmd_jq);
 }
 
 fn cmd_sleep(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
-    let secs = args.first().map(|s| parse_duration(s)).unwrap_or(0);
-    interp.clock.sleep_ms(secs);
-    0
+    if args.is_empty() {
+        return 1;
+    }
+    let duration = args.iter().try_fold(0_u64, |total, argument| {
+        parse_duration_ns(argument).and_then(|part| {
+            total
+                .checked_add(part)
+                .ok_or_else(|| "duration is too large".to_string())
+        })
+    });
+    let duration = match duration {
+        Ok(duration) => duration,
+        Err(error) => {
+            ewln(_io.err, &format!("sleep: {error}"));
+            return 1;
+        }
+    };
+    match interp.clock.block_task(MAIN_TASK_ID, duration) {
+        Ok(BlockOutcome::Completed) => 0,
+        Ok(BlockOutcome::Interrupted(event)) => {
+            interp.deadline_interrupt = Some(event.id);
+            124
+        }
+        Err(error) => {
+            ewln(_io.err, &format!("sleep: {error}"));
+            1
+        }
+    }
 }
 
-fn cmd_usleep(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
-    let us: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    interp.clock.sleep_ms(us / 1000);
-    0
+fn cmd_usleep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let Some(argument) = args.first() else {
+        ewln(io.err, "usleep: missing operand");
+        return 1;
+    };
+    let duration = match argument
+        .parse::<u64>()
+        .ok()
+        .and_then(|micros| micros.checked_mul(NANOS_PER_MICROSECOND))
+    {
+        Some(duration) => duration,
+        None => {
+            ewln(
+                io.err,
+                &format!("usleep: invalid time interval {argument:?}"),
+            );
+            return 1;
+        }
+    };
+    match interp.clock.block_task(MAIN_TASK_ID, duration) {
+        Ok(BlockOutcome::Completed) => 0,
+        Ok(BlockOutcome::Interrupted(event)) => {
+            interp.deadline_interrupt = Some(event.id);
+            124
+        }
+        Err(error) => {
+            ewln(io.err, &format!("usleep: {error}"));
+            1
+        }
+    }
 }
 
 fn cmd_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    // timeout DURATION CMD ... : we never actually time out (virtual clock), just run cmd
-    let rest: Vec<String> = args.iter().skip(1).cloned().collect();
-    if rest.is_empty() {
-        return 0;
+    // Capability-free subset: deadline semantics are real; signal selection is accepted but the
+    // synchronous executor reports GNU timeout's conventional 124 instead of modeling signals.
+    let mut index = 0;
+    let mut preserve_status = false;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--preserve-status" => {
+                preserve_status = true;
+                index += 1;
+            }
+            "--foreground" => index += 1,
+            "-s" | "--signal" | "-k" | "--kill-after" => index += 2,
+            option if option.starts_with("--signal=") || option.starts_with("--kill-after=") => {
+                index += 1
+            }
+            _ => break,
+        }
     }
+    let Some(duration_argument) = args.get(index) else {
+        ewln(io.err, "timeout: missing operand");
+        return 125;
+    };
+    let duration = match parse_duration_ns(duration_argument) {
+        Ok(duration) => duration,
+        Err(error) => {
+            ewln(io.err, &format!("timeout: {error}"));
+            return 125;
+        }
+    };
+    let rest: Vec<String> = args.iter().skip(index + 1).cloned().collect();
+    if rest.is_empty() {
+        ewln(io.err, "timeout: missing command");
+        return 125;
+    }
+    // GNU timeout treats zero as disabling the timeout.
+    let deadline = if duration == 0 {
+        None
+    } else {
+        match interp
+            .clock
+            .schedule_after(duration, EventKind::Deadline { task: MAIN_TASK_ID })
+        {
+            Ok(event) => Some(event),
+            Err(error) => {
+                ewln(io.err, &format!("timeout: {error}"));
+                return 125;
+            }
+        }
+    };
     let stdin = std::mem::take(&mut io.stdin);
-    crate::commands::run(interp, &rest, stdin, io.out, io.err)
+    let status = crate::commands::run(interp, &rest, stdin, io.out, io.err);
+    let interrupted = interp.deadline_interrupt;
+    if let Some(deadline) = deadline {
+        interp.clock.cancel(deadline);
+        if interrupted == Some(deadline) {
+            interp.deadline_interrupt = None;
+            return if preserve_status { status } else { 124 };
+        }
+    }
+    // An enclosing timeout fired.  Preserve its interrupt so that its own command frame unwinds.
+    if interrupted.is_some() {
+        124
+    } else {
+        status
+    }
 }
 
 fn cmd_date(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let secs = interp.clock.unix_secs();
-    // handle +FORMAT and %s
-    if let Some(fmt) = args.iter().find(|a| a.starts_with('+')) {
-        let f = &fmt[1..];
-        if f.contains("%s") {
-            wln(io.out, &f.replace("%s", &secs.to_string()));
-        } else {
-            wln(io.out, &format_date(secs, f));
+    let unix_ns = match interp.clock.wall_time_ns() {
+        Ok(value) => value,
+        Err(error) => {
+            ewln(io.err, &format!("date: {error}"));
+            return 1;
         }
+    };
+    let rendered = if let Some(fmt) = args.iter().find(|a| a.starts_with('+')) {
+        format_date(unix_ns, &fmt[1..])
     } else {
-        wln(io.out, &format_date(secs, "%a %b %e %H:%M:%S UTC %Y"));
+        format_date(unix_ns, "%a %b %e %H:%M:%S UTC %Y")
+    };
+    match rendered {
+        Ok(rendered) => {
+            wln(io.out, &rendered);
+            0
+        }
+        Err(error) => {
+            ewln(io.err, &format!("date: {error}"));
+            1
+        }
     }
-    0
 }
 
-fn format_date(secs: u64, fmt: &str) -> String {
+fn format_date(unix_ns: i128, fmt: &str) -> Result<String, String> {
     // convert unix secs to UTC fields (proleptic Gregorian)
-    let days = (secs / 86400) as i64;
-    let tod = secs % 86400;
+    let secs = unix_ns.div_euclid(i128::from(NANOS_PER_SECOND));
+    let subsecond_ns = unix_ns.rem_euclid(i128::from(NANOS_PER_SECOND));
+    let days = i64::try_from(secs.div_euclid(86_400))
+        .map_err(|_| "timestamp is outside the supported calendar range".to_string())?;
+    let tod = secs.rem_euclid(86_400) as u64;
     let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
     let (y, mo, d) = civil_from_days(days);
-    fmt.replace("%Y", &format!("{y:04}"))
-        .replace("%m", &format!("{mo:02}"))
-        .replace("%d", &format!("{d:02}"))
-        .replace("%H", &format!("{h:02}"))
-        .replace("%M", &format!("{mi:02}"))
-        .replace("%S", &format!("{s:02}"))
-        .replace("%e", &format!("{d:2}"))
-        .replace("%a", "Mon")
-        .replace("%b", "Jan")
-        .replace("%s", &secs.to_string())
+    let weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let weekday = weekdays[(days + 4).rem_euclid(7) as usize];
+    let month = months[(mo - 1) as usize];
+    let mut output = String::new();
+    let mut chars = fmt.chars();
+    while let Some(character) = chars.next() {
+        if character != '%' {
+            output.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => output.push('%'),
+            Some('Y') => output.push_str(&format!("{y:04}")),
+            Some('m') => output.push_str(&format!("{mo:02}")),
+            Some('d') => output.push_str(&format!("{d:02}")),
+            Some('e') => output.push_str(&format!("{d:2}")),
+            Some('H') => output.push_str(&format!("{h:02}")),
+            Some('M') => output.push_str(&format!("{mi:02}")),
+            Some('S') => output.push_str(&format!("{s:02}")),
+            Some('N') => output.push_str(&format!("{subsecond_ns:09}")),
+            Some('a') => output.push_str(weekday),
+            Some('b') => output.push_str(month),
+            Some('s') => output.push_str(&secs.to_string()),
+            Some('z') => output.push_str("+0000"),
+            Some('Z') => output.push_str("UTC"),
+            Some('F') => output.push_str(&format!("{y:04}-{mo:02}-{d:02}")),
+            Some('T') => output.push_str(&format!("{h:02}:{mi:02}:{s:02}")),
+            Some(other) => {
+                output.push('%');
+                output.push(other);
+            }
+            None => output.push('%'),
+        }
+    }
+    Ok(output)
 }
 
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
@@ -179,7 +333,10 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     {
         return crate::python::run_pytest(interp, &args[pos + 1..], io.out, io.err);
     }
-    if let Some(pos) = args.iter().position(|a| a == "python" || a == "python3") {
+    if let Some(pos) = args
+        .iter()
+        .position(|a| matches!(a.as_str(), "python" | "python3" | "python3.14"))
+    {
         let mut argv = vec![args[pos].clone()];
         argv.extend(args[pos + 1..].iter().cloned());
         let stdin = std::mem::take(&mut io.stdin);
@@ -333,6 +490,13 @@ fn cmd_python312(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) 
 fn cmd_python313(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python3.13", args, io)
 }
+fn cmd_python314(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    python_impl(interp, "python3.14", args, io)
+}
+
+fn cmd_pytest(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    crate::python::run_pytest(interp, args, io.out, io.err)
+}
 
 fn python_impl(interp: &mut Interp, name: &str, args: &[String], io: &mut Io) -> i32 {
     // run_python expects argv[0] to be the program name (it skips it).
@@ -345,4 +509,29 @@ fn python_impl(interp: &mut Interp, name: &str, args: &[String], io: &mut Io) ->
 fn cmd_jq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let stdin = std::mem::take(&mut io.stdin);
     crate::jqcmd::jq(interp, args, stdin, io.out, io.err)
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::format_date;
+    use crate::clock::NANOS_PER_SECOND;
+    use std::process::Command;
+
+    #[test]
+    fn utc_formatting_matches_coreutils_when_available() {
+        let format = "%a %b %F %T %z %Z %s";
+        for seconds in [0_i128, 951_827_696, 1_735_689_600, 1_772_368_496] {
+            let expected = Command::new("date")
+                .args(["-u", &format!("--date=@{seconds}"), &format!("+{format}")])
+                .output();
+            let Ok(expected) = expected else {
+                return;
+            };
+            assert!(expected.status.success());
+            assert_eq!(
+                format_date(seconds * i128::from(NANOS_PER_SECOND), format).unwrap(),
+                String::from_utf8_lossy(&expected.stdout).trim_end()
+            );
+        }
+    }
 }

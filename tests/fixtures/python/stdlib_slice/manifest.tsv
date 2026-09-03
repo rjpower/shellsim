@@ -1,0 +1,19 @@
+id	status	module	script	host_status	note
+sys	supported	sys	case_01_sys.py	0	deterministic executable path
+os	supported	os	case_02_os.py	0	deterministic missing environment variable
+collections	supported	collections	case_03_collections.py	0	defaultdict factory
+itertools	supported	itertools	case_04_itertools.py	0	finite islice over lazy count
+heapq	supported	heapq	case_05_heapq.py	0	heapify/pop
+bisect	supported	bisect	case_06_bisect.py	0	bisect_left
+math	supported	math	case_07_math.py	0	sqrt/ceil
+string	supported	string	case_08_string.py	0	digits constant
+json	supported	json	case_09_json.py	0	deterministic dumps
+re	supported	re	case_10_re.py	0	substitution
+functools	supported	functools	case_11_functools.py	0	reduce
+dataclasses	supported	dataclasses	case_12_dataclasses.py	0	dataclass decorator
+typing	supported	typing	case_13_typing.py	0	generic alias
+enum	supported	enum	case_14_enum.py	0	Enum value
+argparse	supported	argparse	case_15_argparse.py	0	deterministic parser program
+subprocess	supported	subprocess	case_16_subprocess.py	0	import-only capability-free entrypoint
+pytest	supported	pytest	case_17_pytest.py	any	import capability plus the explicit-file runner slice
+unittest	supported	unittest	case_18_unittest.py	0	TestCase entrypoint and VFS runner

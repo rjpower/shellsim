@@ -1,0 +1,101 @@
+id	status	task_id	source_path	script	expected_stdout
+001	supported	bloom-filter-cache-penetration-prevention	solution/solve.sh	case_001.py	14
+002	supported	bloom-filter-cache-penetration-prevention	solution/solve.sh	case_002.py	20
+003	supported	db-migration-local-storage	environment/generate_csv.py	case_003.py	3 2
+004	supported	service-deployment-wave-planner	environment/task_file/scripts/model.py	case_004.py	2.5 -3
+005	supported	bloom-filter-cache-penetration-prevention	solution/solve.sh	case_005.py	2 6
+006	supported	build-system-task-ordering	tests/test_outputs.py	case_006.py	True False
+007	supported	build-system-task-ordering	tests/test_outputs.py	case_007.py	8 9 True
+008	supported	malicious-package-forensics	solution/solve.sh	case_008.py	abcdef xxx
+009	supported	monorepo-changelog-cli	solution/solve.sh	case_009.py	hi ['a', 'b']
+010	supported	neural-architecture-search-final	tests/test_outputs.py	case_010.py	True True
+011	supported	todos-api	solution/solve.sh	case_011.py	[3, 1, 2]
+012	supported	build-system-task-ordering	tests/test_outputs.py	case_012.py	3 [1, 2]
+013	supported	distributed-test-execution-scheduler	solution/solve.sh	case_013.py	[2, 1]
+014	supported	build-system-task-ordering	tests/test_outputs.py	case_014.py	7 [7, 20]
+015	supported	csv-json-jsonl-merger	solution/solve.sh	case_015.py	{'a': 1, 'b': 2} 1
+016	supported	raft-log-repair-concurrent-access	solution/solve.sh	case_016.py	4 4 {'x': 4}
+017	supported	anomaly-detection-ranking	tests/grader.py	case_017.py	['a', 'b'] [1, 2] [('a', 1), ('b', 2)]
+018	supported	api-endpoint-permission-canonicalizer	solution/solve.sh	case_018.py	3 True
+019	supported	build-system-task-ordering	tests/test_outputs.py	case_019.py	b True
+020	supported	cpp-daemon-sighup-segfault	tests/test_outputs.py	case_020.py	True True
+021	supported	build-system-task-ordering	tests/test_outputs.py	case_021.py	6
+022	supported	api-endpoint-permission-canonicalizer	solution/solve.sh	case_022.py	6
+023	supported	todos-api	solution/solve.sh	case_023.py	[1, 3]
+024	supported	api-endpoint-permission-canonicalizer	solution/solve.sh	case_024.py	[1]
+025	supported	ekf-localization	environment/generate_data.py	case_025.py	done
+026	supported	todos-api	solution/solve.sh	case_026.py	two
+027	supported	todos-api	solution/solve.sh	case_027.py	7
+028	supported	build-system-task-ordering	tests/test_outputs.py	case_028.py	120
+029	supported	build-system-task-ordering	tests/test_outputs.py	case_029.py	7
+030	supported	todos-api	solution/solve.sh	case_030.py	10
+031	supported	todos-api	solution/solve.sh	case_031.py	12
+032	supported	neural-architecture-search-final	tests/test_outputs.py	case_032.py	[1, 2, 3]
+033	supported	iot-device-registration-server	tests/grader.py	case_033.py	[('a', 1), ('b', 2)]
+034	supported	todos-api	solution/solve.sh	case_034.py	[3, 2, 1]
+035	supported	distributed-test-execution-scheduler	environment/task_file/scripts/model.py	case_035.py	2 9
+036	supported	bandit-delayed-feedback	tests/test_outputs.py	case_036.py	6 8
+037	supported	neural-architecture-search-final	tests/test_outputs.py	case_037.py	[(1, 'a'), (2, 'b')]
+038	supported	pdf-table-parsing	solution/solve.sh	case_038.py	[(1, 'a'), (2, 'b')]
+039	supported	cpp-daemon-sighup-segfault	tests/test_outputs.py	case_039.py	[2, 4, 6]
+040	supported	api-endpoint-permission-canonicalizer	tests/test_outputs.py	case_040.py	True True
+041	supported	build-system-task-ordering	tests/test_outputs.py	case_041.py	[3, 4] (5, 6) {1, 2}
+042	supported	raft-log-repair-concurrent-access	solution/solve.sh	case_042.py	32
+043	supported	python-api-rate-limit	environment/src/limiter/window.py	case_043.py	5
+044	supported	build-system-task-ordering	tests/test_outputs.py	case_044.py	6
+045	supported	build-merkle-tree-cli-sha512	tests/test_outputs.py	case_045.py	{"a": [1, true, null]}
+046	supported	submission_a63937a5_20251224_152124	tests/test_outputs.py	case_046.py	{"a":2,"z":1}
+047	supported	distributed-test-execution-scheduler	environment/task_file/scripts/model.py	case_047.py	[1,{"x":"y"}]
+048	supported	service-deployment-wave-planner	environment/task_file/scripts/baseline.py	case_048.py	[1] ['x']
+049	supported	distributed-test-execution-scheduler	solution/solve.sh	case_049.py	[2]
+050	supported	distributed-test-execution-scheduler	solution/solve.sh	case_050.py	True
+051	supported	bloom-filter-cache-penetration-prevention	solution/solve.sh	case_051.py	fallback
+052	supported	application-debug	solution/solve.sh	case_052.py	fallback
+053	supported	pdf-table-parsing	solution/solve.sh	case_053.py	3 2
+054	supported	csv-json-jsonl-merger	solution/solve.sh	case_054.py	3
+055	supported	api-endpoint-permission-canonicalizer	solution/solve.sh	case_055.py	True True True
+056	supported	build-system-task-ordering	tests/test_outputs.py	case_056.py	True True
+057	supported	build-system-task-ordering	tests/test_outputs.py	case_057.py	9 4
+058	supported	db-migration-local-storage	environment/generate_csv.py	case_058.py	6
+059	supported	anomaly-detection-ranking	tests/grader.py	case_059.py	[3, 5, 7]
+060	supported	build-system-task-ordering	tests/test_outputs.py	case_060.py	7 11
+061	supported	todos-api	solution/solve.sh	case_061.py	7 7
+062	supported	todos-api	solution/solve.sh	case_062.py	2
+063	supported	build-system-task-ordering	tests/test_outputs.py	case_063.py	2 3
+064	supported	build-system-task-ordering	tests/test_outputs.py	case_064.py	9
+065	supported	bloom-filter-cache-penetration-prevention	tests/test_outputs.py	case_065.py	1 [2, 3]
+066	supported	multi-labeller	solution/solve.sh	case_066.py	[2, 4, 6]
+067	supported	etl_checkpoint_resume_bug	environment/app/loaders.py	case_067.py	{1: 1, 2: 4, 3: 9}
+068	supported	multi-labeller	solution/solve.sh	case_068.py	6
+069	supported	neural-architecture-search-final	tests/test_outputs.py	case_069.py	7
+070	supported	server-log-analysis	tests/grader.py	case_070.py	True
+071	frontier	california-housing-api	solution/solve.sh	case_071.py	async
+072	supported	etl_checkpoint_resume_bug	tests/test_outputs.py	case_072.py	generator
+073	supported	python-api-rate-limit	environment/src/limiter/window.py	case_073.py	value=3
+074	supported	submission_a63937a5_20251224_152124	solution/solve.sh	case_074.py	3.0
+075	supported	schedule-vacation	environment/find_overlap.py	case_075.py	[1, 22]
+076	supported	multi-labeller	solution/solve.sh	case_076.py	[1, 2, 3, 4]
+077	supported	todos-api	solution/solve.sh	case_077.py	negative nonnegative
+078	supported	task-xxe-exploit	environment/data/parsers/parser_alpha.py	case_078.py	3
+079	supported	todos-api	solution/solve.sh	case_079.py	[0, 1, 4, 9, 16]
+080	supported	service-deployment-wave-planner	environment/task_file/scripts/model.py	case_080.py	{'a': 5}
+081	supported	todos-api	solution/solve.sh	case_081.py	True
+082	supported	raft-log-repair-concurrent-access	solution/solve.sh	case_082.py	12 'x' 7
+083	supported	bloom-filter-cache-penetration-prevention	tests/test_outputs.py	case_083.py	6
+084	supported	build-merkle-tree-cli-sha512	tests/test_outputs.py	case_084.py	1 8
+085	supported	api-endpoint-permission-canonicalizer	solution/solve.sh	case_085.py	True False
+086	supported	cpp-daemon-sighup-segfault	tests/test_outputs.py	case_086.py	0\\n1\\n2
+087	supported	todos-api	solution/solve.sh	case_087.py	3
+088	supported	build-system-task-ordering	tests/test_outputs.py	case_088.py	[1, 2]
+089	supported	pdf-table-parsing	solution/solve.sh	case_089.py	3
+090	supported	monorepo-changelog-cli	solution/solve.sh	case_090.py	|
+091	supported	build-system-task-ordering	tests/test_outputs.py	case_091.py	[1, 2, 3]
+092	supported	cpp-daemon-sighup-segfault	tests/test_outputs.py	case_092.py	True False True
+093	supported	submission_a63937a5_20251224_152124	tests/test_outputs.py	case_093.py	{"nested": {"ok": false}}
+094	supported	distributed-test-execution-scheduler	solution/solve.sh	case_094.py	2 0
+095	supported	schedule-vacation	environment/find_overlap.py	case_095.py	[4, 9, 16]
+096	supported	csv-json-jsonl-merger	solution/solve.sh	case_096.py	{'x': 1, 'y': 2}
+097	supported	todos-api	solution/solve.sh	case_097.py	[('a', 3), ('b', 1)]
+098	supported	api-endpoint-permission-canonicalizer	solution/solve.sh	case_098.py	False True
+099	supported	bloom-filter-cache-penetration-prevention	tests/test_outputs.py	case_099.py	5
+100	supported	db-migration-local-storage	environment/generate_csv.py	case_100.py	[0, 1, 2]

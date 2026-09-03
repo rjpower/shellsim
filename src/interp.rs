@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 
-use crate::clock::Clock;
+use crate::clock::{Clock, EventId};
 use crate::net::VirtualNet;
 use crate::resources::{Limits, Resources, RunOutcome};
 use crate::vfs::Vfs;
@@ -62,6 +62,8 @@ pub struct ProcessState {
     pub opt_pipefail: bool,
     pub jobs: Vec<Job>,
     next_job_id: u32,
+    /// Deterministic identity source kept separate from virtual time.
+    next_temp_id: u64,
     /// recursion / loop-control signaling
     pub loop_break: u32,
     pub loop_continue: u32,
@@ -69,6 +71,9 @@ pub struct ProcessState {
     pub exiting: Option<i32>,
     /// depth of "condition" contexts (if/while/&&/||/!) where `set -e` is suppressed
     pub cond_depth: u32,
+    /// Deadline event currently unwinding the synchronous executor.  A future resumable
+    /// scheduler will keep this on each task frame; today there is one shell process.
+    pub(crate) deadline_interrupt: Option<EventId>,
     /// effective uid (for permission-ish checks / `id`)
     pub uid: u32,
     /// persistent input stream + cursor for `read` inside `while read…; done < file`
@@ -129,9 +134,12 @@ impl Environment {
         ] {
             exported.insert(k.to_string());
         }
+        let clock = Clock::new();
+        let mut vfs = Vfs::with_disk_limit(limits.disk);
+        vfs.set_mutation_time(clock.unix_ms());
         Environment {
-            vfs: Vfs::with_disk_limit(limits.disk),
-            clock: Clock::new(),
+            vfs,
+            clock,
             net: VirtualNet::new(),
             resources: Resources::new(limits),
             process: ProcessState {
@@ -148,11 +156,13 @@ impl Environment {
                 opt_pipefail: false,
                 jobs: Vec::new(),
                 next_job_id: 1,
+                next_temp_id: 0,
                 loop_break: 0,
                 loop_continue: 0,
                 returning: None,
                 exiting: None,
                 cond_depth: 0,
+                deadline_interrupt: None,
                 uid: 0,
                 input_stream: Vec::new(),
                 input_pos: 0,
@@ -182,6 +192,11 @@ impl Environment {
         for d in deps {
             self.packages.insert((*d).to_string());
         }
+    }
+
+    /// Make the wall-clock/VFS boundary explicit immediately before a filesystem effect.
+    pub fn sync_vfs_time(&mut self) {
+        self.vfs.set_mutation_time(self.clock.unix_ms());
     }
 
     pub fn get_var(&self, name: &str) -> Option<String> {
@@ -375,6 +390,12 @@ impl Environment {
             status: 0,
         });
         id
+    }
+
+    pub(crate) fn next_temp_id(&mut self) -> Option<u64> {
+        let id = self.next_temp_id;
+        self.next_temp_id = self.next_temp_id.checked_add(1)?;
+        Some(id)
     }
 
     pub fn note_unsupported(&mut self, what: &str) {

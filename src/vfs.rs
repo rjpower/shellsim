@@ -28,22 +28,22 @@ pub struct Node {
 }
 
 impl Node {
-    fn dir(mode: Mode) -> Self {
+    fn dir(mode: Mode, mtime: u64) -> Self {
         Node {
             kind: NodeKind::Dir,
             mode,
             uid: 0,
             gid: 0,
-            mtime: 0,
+            mtime,
         }
     }
-    fn file(data: Vec<u8>, mode: Mode) -> Self {
+    fn file(data: Vec<u8>, mode: Mode, mtime: u64) -> Self {
         Node {
             kind: NodeKind::File(data),
             mode,
             uid: 0,
             gid: 0,
-            mtime: 0,
+            mtime,
         }
     }
 }
@@ -58,6 +58,7 @@ pub enum VfsError {
     Loop(String),
     Invalid(String),
     NoSpace,
+    TooLarge { path: String, limit: usize },
 }
 
 impl std::fmt::Display for VfsError {
@@ -71,6 +72,9 @@ impl std::fmt::Display for VfsError {
             VfsError::Loop(p) => write!(f, "Too many levels of symbolic links: {p}"),
             VfsError::Invalid(p) => write!(f, "Invalid argument: {p}"),
             VfsError::NoSpace => write!(f, "No space left on device"),
+            VfsError::TooLarge { path, limit } => {
+                write!(f, "file too large: {path} (limit {limit} bytes)")
+            }
         }
     }
 }
@@ -80,6 +84,9 @@ pub type Result<T> = std::result::Result<T, VfsError>;
 #[derive(Clone)]
 pub struct Vfs {
     nodes: BTreeMap<String, Node>,
+    /// Wall-clock timestamp assigned to subsequent content mutations.  The environment updates
+    /// this immediately before an effect; the VFS never consults the host clock.
+    mutation_time_ms: u64,
     disk_limit: u64,
     disk_used: u64,
     disk_peak: u64,
@@ -150,10 +157,11 @@ impl Vfs {
 
     pub fn with_disk_limit(disk_limit: u64) -> Self {
         let mut nodes = BTreeMap::new();
-        nodes.insert("/".to_string(), Node::dir(0o755));
+        nodes.insert("/".to_string(), Node::dir(0o755, 0));
         let disk_used = logical_usage(&nodes);
         Vfs {
             nodes,
+            mutation_time_ms: 0,
             disk_limit,
             disk_used,
             disk_peak: disk_used,
@@ -171,6 +179,16 @@ impl Vfs {
 
     pub fn read_bytes(&self) -> u64 {
         self.read_bytes.get()
+    }
+
+    /// Set the timestamp source for future mutations.  This explicit handoff keeps VFS fixtures
+    /// independently constructible while making the owning environment authoritative for time.
+    pub fn set_mutation_time(&mut self, unix_ms: u64) {
+        self.mutation_time_ms = unix_ms;
+    }
+
+    pub fn mutation_time(&self) -> u64 {
+        self.mutation_time_ms
     }
 
     fn finish_mutation(&mut self, before: BTreeMap<String, Node>) -> Result<()> {
@@ -311,6 +329,37 @@ impl Vfs {
         Ok(String::from_utf8_lossy(&self.read(cwd, path)?).into_owned())
     }
 
+    /// Read a UTF-8-ish file only when it is within `limit` bytes.
+    ///
+    /// Unlike checking `metadata`, this avoids cloning a potentially enormous file merely to
+    /// discover that a caller cannot safely process it.  The read counter is updated only for a
+    /// read that is actually returned.
+    pub fn read_string_limited(&self, cwd: &str, path: &str, limit: usize) -> Result<String> {
+        let abs = resolve_against(cwd, path);
+        let real = self.realpath(&abs, true)?;
+        match self.nodes.get(&real) {
+            Some(Node {
+                kind: NodeKind::File(data),
+                ..
+            }) => {
+                if data.len() > limit {
+                    return Err(VfsError::TooLarge {
+                        path: path.to_string(),
+                        limit,
+                    });
+                }
+                self.read_bytes
+                    .set(self.read_bytes.get().saturating_add(data.len() as u64));
+                Ok(String::from_utf8_lossy(data).into_owned())
+            }
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => Err(VfsError::IsADir(path.to_string())),
+            _ => Err(VfsError::NotFound(path.to_string())),
+        }
+    }
+
     pub fn metadata(&self, cwd: &str, path: &str, follow: bool) -> Result<Node> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, follow)?;
@@ -412,16 +461,21 @@ impl Vfs {
         match self.nodes.get_mut(&target) {
             Some(Node {
                 kind: NodeKind::File(d),
+                mtime,
                 ..
             }) => {
                 *d = data.to_vec();
+                *mtime = self.mutation_time_ms;
             }
             Some(Node {
                 kind: NodeKind::Dir,
                 ..
             }) => return Err(VfsError::IsADir(path.to_string())),
             _ => {
-                self.nodes.insert(target, Node::file(data.to_vec(), mode));
+                self.nodes.insert(
+                    target,
+                    Node::file(data.to_vec(), mode, self.mutation_time_ms),
+                );
             }
         }
         self.finish_mutation(before)
@@ -434,14 +488,21 @@ impl Vfs {
         match self.nodes.get_mut(&target) {
             Some(Node {
                 kind: NodeKind::File(d),
+                mtime,
                 ..
-            }) => d.extend_from_slice(data),
+            }) => {
+                d.extend_from_slice(data);
+                *mtime = self.mutation_time_ms;
+            }
             Some(Node {
                 kind: NodeKind::Dir,
                 ..
             }) => return Err(VfsError::IsADir(path.to_string())),
             _ => {
-                self.nodes.insert(target, Node::file(data.to_vec(), mode));
+                self.nodes.insert(
+                    target,
+                    Node::file(data.to_vec(), mode, self.mutation_time_ms),
+                );
             }
         }
         self.finish_mutation(before)
@@ -454,7 +515,8 @@ impl Vfs {
             return Err(VfsError::Exists(path.to_string()));
         }
         self.require_parent_dir(&target)?;
-        self.nodes.insert(target, Node::dir(0o755));
+        self.nodes
+            .insert(target, Node::dir(0o755, self.mutation_time_ms));
         self.finish_mutation(before)
     }
 
@@ -482,7 +544,8 @@ impl Vfs {
                     return Err(VfsError::NotADir(real));
                 }
                 None => {
-                    self.nodes.insert(real.clone(), Node::dir(0o755));
+                    self.nodes
+                        .insert(real.clone(), Node::dir(0o755, self.mutation_time_ms));
                 }
             }
             cur = real;
@@ -602,7 +665,8 @@ impl Vfs {
             };
         }
         for k in self.walk(&from_real) {
-            let node = self.nodes.get(&k).unwrap().clone();
+            let mut node = self.nodes.get(&k).unwrap().clone();
+            node.mtime = self.mutation_time_ms;
             let suffix = &k[from_real.len()..];
             let newk = format!("{to_target}{suffix}");
             self.nodes.insert(newk, node);
@@ -624,7 +688,7 @@ impl Vfs {
                 mode: 0o777,
                 uid: 0,
                 gid: 0,
-                mtime: 0,
+                mtime: self.mutation_time_ms,
             },
         );
         self.finish_mutation(before)
@@ -637,7 +701,7 @@ impl Vfs {
             Some(n) => n.mtime = mtime,
             None => {
                 self.require_parent_dir(&target)?;
-                let mut n = Node::file(Vec::new(), 0o644);
+                let mut n = Node::file(Vec::new(), 0o644, mtime);
                 n.mtime = mtime;
                 self.nodes.insert(target, n);
             }
@@ -691,7 +755,8 @@ impl Vfs {
         if let Some(parent) = parent_of(&norm) {
             self.mkdir_all("/", &parent)?;
         }
-        self.nodes.insert(norm, Node::file(data, mode));
+        self.nodes
+            .insert(norm, Node::file(data, mode, self.mutation_time_ms));
         self.finish_mutation(before)
     }
 
@@ -802,5 +867,18 @@ mod tests {
         v.remove_file("/", "/a").unwrap();
         assert_eq!(v.disk_used(), 0);
         v.write("/", "/b", b"123", 0o644).unwrap();
+    }
+
+    #[test]
+    fn limited_read_rejects_before_returning_file_data() {
+        let mut v = Vfs::new();
+        v.write("/", "/large", b"12345", 0o644).unwrap();
+        assert!(matches!(
+            v.read_string_limited("/", "/large", 4),
+            Err(VfsError::TooLarge { .. })
+        ));
+        assert_eq!(v.read_bytes(), 0);
+        assert_eq!(v.read_string_limited("/", "/large", 5).unwrap(), "12345");
+        assert_eq!(v.read_bytes(), 5);
     }
 }
