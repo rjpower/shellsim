@@ -44,8 +44,44 @@ cargo build --release
 Limit values accept `k`, `m`, and `g` binary suffixes. Arguments after `--` in `eval` mode become
 shell positional parameters.
 
+For development, `make format`, `make lint`, and `make test` are the canonical local commands and
+the exact entrypoints used by CI. See [CONTRIBUTING.md](CONTRIBUTING.md) for code, testing, review,
+and optional pre-commit-hook guidelines.
+
 The JSON report contains the exit status, typed stop reason, limits, aggregate usage, per-command
 CPU/disk deltas, stdout, stderr, command trace, and unsupported capabilities.
+
+## Virtual time
+
+An environment owns one deterministic `Timeline`; neither shell commands nor the Python engine
+read the host clock or block a host thread. Its clock domains are intentionally separate:
+
+- **Monotonic time** starts at zero and orders sleeps, deadlines, and injected events.
+- **Wall time** is the fixed default epoch `2025-01-01T00:00:00Z` plus monotonic time and an
+  explicit adjustment. Adjusting wall time never changes a deadline.
+- **Process CPU time** derives from deterministic resource fuel (one CPU unit is one virtual
+  microsecond) and never advances monotonic or wall time.
+
+Scheduled events use `(deadline_ns, insertion_sequence)` ordering, so simultaneous events replay
+in a stable order. Pending-event count and scheduling horizon are bounded. Cloning a `Timeline`
+captures its clocks, ordering sequence, pending events, and ready events; no hidden host state is
+needed to replay it.
+
+`sleep` and Python `time.sleep()` schedule a wake event. When the current executor has no runnable
+work, it jumps directly to the next event. `timeout` schedules a deadline event and interrupts
+nested shell or Python execution at that instant. `date`, Python `time.time*`, filesystem mutation
+times, and those deadlines all observe the same environment timeline. Python `time.monotonic*`,
+`perf_counter*`, and `process_time*` expose their corresponding domains.
+
+Runnable commands and bytecode consume zero virtual duration unless an operation explicitly
+models latency. Thus a timeout is observed at a blocking/yield point, while CPU fuel bounds a
+zero-time busy loop; shellsim does not invent a host-dependent instructions-per-second rate.
+
+The executor still evaluates `&` jobs synchronously, so independent background sleeps do not yet
+overlap. The timeline/event contract is designed for the next scheduler step: background AST
+frames become resumable tasks, runnable tasks execute in stable task-id order, and time advances
+only when the runnable set is empty. This limitation is explicit rather than approximating
+concurrency by guessing durations.
 
 ## Persistent shell sessions
 
@@ -111,12 +147,35 @@ faithful implementations.
 Disk enforcement lives inside `Vfs`, so direct command mutations cannot bypass capacity checks.
 Commands should still surface `VfsError::NoSpace` with a non-zero status.
 
-## Minimal Python compatibility
+## Python 3.14 compatibility
 
-`python` is a bootstrap shim, not an embedded interpreter. It supports `--version`, a small
-`python -c` subset for output, simple scalar assignments and expressions, exit status, arguments
-and environment lookups, a persistent foreground REPL, plus light `pip`/`venv` compatibility.
-Unknown syntax fails loudly and is recorded as unsupported. Host CPython is never invoked.
+`python`, `python3`, and `python3.14` route to shellsim's safe in-process interpreter. Source goes
+through a UTF-8/indentation-aware lexer, owned AST, semantic bytecode compiler, and metered stack
+VM; host CPython is never invoked. The current language slice covers scalar and mutable containers,
+comparisons and control flow, functions/closures/defaults/`*args`, classes and bound methods,
+comprehensions, suspended generators, exceptions and context managers, `assert`, decorators,
+starred assignment/calls, f-strings, VFS-only imports, common iterator/container builtins, and the
+modeled REPL/script/stdin/shebang entrypoints. Unsupported syntax and APIs fail loudly with a
+diagnostic.
+
+The requested stdlib gate is 18/18 exact CPython 3.14 probes for these APIs: `sys.executable`,
+`os.getenv`, `collections.defaultdict`, `itertools.count`/`islice`, `heapq.heapify`/`heappop`,
+`bisect.bisect_left`, `math.sqrt`/`ceil`, `string.digits`, `json.dumps(sort_keys=...)`, `re.sub`,
+`functools.reduce`, `dataclasses.dataclass`, `typing.List[...]`, `enum.Enum`,
+`argparse.ArgumentParser.prog`, `import subprocess`, and the `pytest`/`unittest.TestCase` entry
+points. These are intentionally partial module slices, not claims of complete stdlib support.
+
+`pytest` and `unittest` are VFS-only first runner slices: explicit files, stable definition-order
+collection, plain zero-argument pytest tests, direct `unittest.TestCase` classes, tested assertions/
+skip/raises controls, and bounded wrappers. Fixtures, decorated tests, plugins, rich
+parametrization, async fixtures, directory/package discovery, and unlisted flags are rejected
+explicitly. The 100-row TaskTrove mini corpus is differential-tested with per-row provenance (99
+supported, one async frontier), and one complete `build-system-task-ordering` solution matches
+CPython 3.14. CPU fuel, modeled memory, output, source/wrapper size, and nesting limits keep this
+general-purpose slice safe and deliberately slow.
+
+See [`PYTHON_3_14_PROPOSAL.md`](PYTHON_3_14_PROPOSAL.md) for the architecture, target extensions,
+module matrix, and validation plan.
 
 ## Library API
 
@@ -147,7 +206,7 @@ src/exec.rs            metered executor, pipelines, redirects, control flow
 src/commands/          registry, command context, implementations
 src/commands/awk.rs    partial record-oriented awk
 src/commands/system.rs simulated environment/system queries
-src/python/mod.rs      minimal python -c shim
+src/python/            Python 3.14 lexer, parser, bytecode compiler, and metered VM
 src/clock.rs           virtual clock
 src/net.rs             virtual route-table network
 ```

@@ -192,6 +192,7 @@ pub fn run(
         let out_before = out.len();
         let err_before = err.len();
         let output_meter_before = interp.resources.output_bytes();
+        interp.sync_vfs_time();
         let mut io = Io { stdin, out, err };
         let mut context = CommandContext { env: interp };
         let mut status = (spec.run)(&mut context, args, &mut io);
@@ -230,6 +231,7 @@ pub fn run(
     }
 
     // ---- fallback: maybe it's an executable script in the VFS ----
+    interp.sync_vfs_time();
     if let Some(code) = util::try_exec_script(interp, requested, args, &stdin, out, err) {
         return code;
     }

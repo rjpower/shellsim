@@ -6,6 +6,9 @@
 use serde::{Deserialize, Serialize};
 
 pub const COST_MODEL_VERSION: u32 = 1;
+/// Stable conversion used by Python's process clocks.  CPU remains deterministic fuel; assigning
+/// one microsecond per unit merely gives that separate domain a conventional time representation.
+pub const CPU_UNIT_NANOS: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Limits {
@@ -197,6 +200,14 @@ impl Resources {
 
     pub fn cpu_used(&self) -> u64 {
         self.cpu_used
+    }
+
+    pub fn process_time_ns(&self) -> u64 {
+        self.cpu_used.saturating_mul(CPU_UNIT_NANOS)
+    }
+
+    pub fn process_time_seconds(&self) -> f64 {
+        self.process_time_ns() as f64 / 1_000_000_000_f64
     }
 
     pub fn record_command(

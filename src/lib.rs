@@ -8,7 +8,7 @@
 //!   * [`resources`] — CPU, memory, disk/output limits and structured outcomes
 //!   * [`shell`] / [`expand`] / [`exec`] — bash-subset parser, word expansion, executor
 //!   * [`commands`] — native coreutils + builtins
-//!   * [`python`] — deliberately-minimal `python -c` compatibility shim
+//!   * [`python`] — metered Python 3.14 source-to-bytecode compatibility engine
 
 pub mod clock;
 pub mod commands;
@@ -25,5 +25,8 @@ pub mod sandbox;
 pub mod shell;
 pub mod vfs;
 
+pub use clock::{
+    BlockOutcome, EventId, EventKind, ScheduledEvent, Timeline, TimelineError, TimelineLimits,
+};
 pub use interp::{Environment, Interp, ProcessState};
 pub use resources::{Limits, RunOutcome, StopReason, Usage};

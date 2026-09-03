@@ -23,8 +23,13 @@ pub fn exec(
         || interp.returning.is_some()
         || interp.loop_break > 0
         || interp.loop_continue > 0
+        || interp.deadline_interrupt.is_some()
     {
-        return interp.last_status;
+        return if interp.deadline_interrupt.is_some() {
+            124
+        } else {
+            interp.last_status
+        };
     }
     let status = match node {
         Node::Empty => 0,
@@ -62,6 +67,10 @@ pub fn exec(
                 }
                 s = exec(interp, n, stdin.clone(), out, err);
                 if interp.exiting.is_some() || interp.returning.is_some() {
+                    break;
+                }
+                if interp.deadline_interrupt.is_some() {
+                    s = 124;
                     break;
                 }
                 if interp.loop_break > 0 || interp.loop_continue > 0 {
@@ -390,6 +399,7 @@ fn write_to(interp: &mut Interp, path: &str, data: &[u8], append: bool) -> crate
     if path == "/dev/stdout" {
         return Ok(());
     }
+    interp.sync_vfs_time();
     let cwd = interp.cwd.clone();
     if append {
         interp.vfs.append(&cwd, path, data, 0o644)
