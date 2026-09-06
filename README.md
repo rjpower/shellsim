@@ -177,6 +177,37 @@ general-purpose slice safe and deliberately slow.
 See [`PYTHON_3_14_PROPOSAL.md`](PYTHON_3_14_PROPOSAL.md) for the architecture, target extensions,
 module matrix, and validation plan.
 
+## Optional Monty command
+
+Build with `cargo build --release --features monty` to add a separate `monty`
+command. The existing `python` commands keep their current interpreter.
+
+```sh
+./target/release/shellsim -c 'monty -c "print(sum([1, 2, 3]))"'
+```
+
+`monty -c CODE`, `monty SCRIPT`, and `monty -` (stdin) execute Python in-process.
+Script paths resolve only within the simulated filesystem. Each invocation has
+fresh Python globals; files persist across shell actions. The injected functions
+`read_file(path)` and `write_file(path, text)` exchange UTF-8 text with that same
+filesystem. Source is capped at 256 KiB and file-tool payloads at 1 MiB. Parent
+directories must already exist. OS calls, unresolved external names, and async
+suspensions are rejected; no host mounts or process/network bridges are installed.
+
+This feature pins Monty 0.0.16 because it exposes a custom resource tracker.
+Newer releases changed that interface to elapsed-time and allocator-based limits.
+Shellsim instead charges one CPU unit per Monty resource-check callback, reserves
+parser scratch, conservatively charges cumulative Python allocations within a
+command, caps recursion at 100 frames, and meters print output before buffering.
+Command completion releases temporary memory reservations. These are modeled
+costs, not CPython timings or exact host allocator measurements; fuel costs are
+specific to the pinned interpreter. VFS writes retain the existing disk quota.
+
+Monty's Python subset is not a scientific-package runtime: this command does not
+install dependencies, run native extensions, provide a persistent Python REPL, or
+delegate unsupported behavior to the existing interpreter. The opt-in integration
+is intended for experiments with bounded code and file-manipulation rollouts.
+
 ## Library API
 
 ```rust
