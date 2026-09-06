@@ -24,6 +24,8 @@ sha1 = "0.10"
 md-5 = "0.10"
 base64 = "0.22"
 crc32fast = "1"
+# 0.0.16 retains the custom ResourceTracker needed for deterministic CPU fuel.
+monty = { git = "https://github.com/pydantic/monty", rev = "142807bbba3636a7525f017cea15b8d4f2bd5ed8", optional = true }
 
 # Process-level syscall sandbox (Linux only): a startup seccomp filter that denies
 # network/exec/fork so no Python-level trick can reach the real OS for those. shellsim
@@ -34,6 +36,7 @@ libc = "0.2"
 
 [features]
 default = []
+monty = ["dep:monty"]
 # Retained as an empty compatibility feature. Python is now always the minimal `-c` shim.
 python = []
 

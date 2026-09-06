@@ -20,6 +20,8 @@ mod builtins;
 mod echo;
 mod fs;
 mod hashing;
+#[cfg(feature = "monty")]
+mod monty;
 mod net;
 pub(crate) mod pkg;
 mod printf;
@@ -137,6 +139,8 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     net::register(&mut m);
     proc::register(&mut m);
     pkg::register(&mut m);
+    #[cfg(feature = "monty")]
+    reg(&mut m, &["monty"], Trust::Partial, monty::run);
     m
 }
 
