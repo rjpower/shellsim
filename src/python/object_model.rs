@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::native::{BinarySlotFn, UnarySlotFn};
+use super::native::{BinarySlotFn, TernarySlotFn, UnarySlotFn};
 use super::Value;
 
 /// Stable identity of a Python type within a [`ReplState`](super::ReplState).
@@ -30,6 +30,8 @@ pub(super) enum BuiltinType {
     Int,
     Float,
     String,
+    Bytes,
+    ByteArray,
     List,
     Tuple,
     Dict,
@@ -50,7 +52,7 @@ pub(super) enum BuiltinType {
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 24] = [
+    pub(super) const ALL: [Self; 26] = [
         Self::Object,
         Self::Type,
         Self::None,
@@ -58,6 +60,8 @@ impl BuiltinType {
         Self::Int,
         Self::Float,
         Self::String,
+        Self::Bytes,
+        Self::ByteArray,
         Self::List,
         Self::Tuple,
         Self::Dict,
@@ -90,6 +94,8 @@ impl BuiltinType {
             Self::Int => "int",
             Self::Float => "float",
             Self::String => "str",
+            Self::Bytes => "bytes",
+            Self::ByteArray => "bytearray",
             Self::List => "list",
             Self::Tuple => "tuple",
             Self::Dict => "dict",
@@ -176,6 +182,7 @@ pub struct TypeSlots {
 pub enum SlotValue {
     Descriptor(Value),
     NativeBinary(BinarySlotFn),
+    NativeTernary(TernarySlotFn),
     NativeUnary(UnarySlotFn),
 }
 
@@ -511,6 +518,14 @@ impl Default for TypeRegistry {
             &super::stdlib::core::STRING_TYPE,
         );
         install_native_methods(
+            &mut types[BuiltinType::Bytes as usize],
+            &super::stdlib::core::BYTES_TYPE,
+        );
+        install_native_methods(
+            &mut types[BuiltinType::ByteArray as usize],
+            &super::stdlib::core::BYTEARRAY_TYPE,
+        );
+        install_native_methods(
             &mut types[BuiltinType::List as usize],
             &super::stdlib::core::LIST_TYPE,
         );
@@ -716,6 +731,23 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.add = Some(intrinsic(super::stdlib::core::slot_string_add));
     slots.multiply = Some(intrinsic(super::stdlib::core::slot_string_multiply));
     slots.reflected_multiply = Some(intrinsic(super::stdlib::core::slot_string_multiply));
+
+    let slots = &mut types[BuiltinType::Bytes as usize].slots;
+    slots.length = Some(unary(super::stdlib::core::slot_bytes_length));
+    slots.get_item = Some(intrinsic(super::stdlib::core::slot_bytes_get_item));
+    slots.add = Some(intrinsic(super::stdlib::core::slot_bytes_add));
+    slots.multiply = Some(intrinsic(super::stdlib::core::slot_bytes_multiply));
+    slots.reflected_multiply = Some(intrinsic(super::stdlib::core::slot_bytes_multiply));
+
+    let slots = &mut types[BuiltinType::ByteArray as usize].slots;
+    slots.length = Some(unary(super::stdlib::core::slot_bytearray_length));
+    slots.get_item = Some(intrinsic(super::stdlib::core::slot_bytearray_get_item));
+    slots.add = Some(intrinsic(super::stdlib::core::slot_bytearray_add));
+    slots.multiply = Some(intrinsic(super::stdlib::core::slot_bytearray_multiply));
+    slots.reflected_multiply = Some(intrinsic(super::stdlib::core::slot_bytearray_multiply));
+    slots.set_item = Some(SlotValue::NativeTernary(
+        super::stdlib::core::slot_bytearray_set_item,
+    ));
 
     let slots = &mut types[BuiltinType::List as usize].slots;
     slots.add = Some(intrinsic(super::stdlib::core::slot_list_add));

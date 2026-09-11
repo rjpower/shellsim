@@ -8,8 +8,9 @@ use std::cmp::Ordering;
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, MethodDef, NativeTypeDef, PyCallable, PyDict, PyError, PyKind, PyList,
-    PyProperty, PyResult, PyRuntime, PySequence, PySet, PyString, PyValue, PyValueCast,
+    CallArgs, FunctionDef, MethodDef, NativeTypeDef, PyByteArray, PyBytes, PyCallable, PyDict,
+    PyError, PyKind, PyList, PyProperty, PyResult, PyRuntime, PySequence, PySet, PyString, PyValue,
+    PyValueCast,
 };
 
 static BUILTINS: &[FunctionDef] = &[
@@ -49,6 +50,33 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "replace", string_replace),
         method("str", "format", string_format),
         method("str", "encode", string_encode),
+        method("str", "lower", string_lower),
+        method("str", "upper", string_upper),
+        method("str", "isalnum", string_isalnum),
+        method("str", "isalpha", string_isalpha),
+        method("str", "isdigit", string_isdigit),
+    ],
+};
+
+pub(crate) static BYTES_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "bytes",
+    methods: &[
+        method("bytes", "decode", bytes_decode),
+        method("bytes", "hex", bytes_hex),
+        method("bytes", "startswith", bytes_startswith),
+        method("bytes", "endswith", bytes_endswith),
+        method("bytes", "find", bytes_find),
+    ],
+};
+
+pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "bytearray",
+    methods: &[
+        method("bytearray", "append", bytearray_append),
+        method("bytearray", "extend", bytearray_extend),
+        method("bytearray", "decode", bytes_decode),
+        method("bytearray", "hex", bytes_hex),
+        method("bytearray", "find", bytes_find),
     ],
 };
 
@@ -60,6 +88,7 @@ pub(crate) static LIST_TYPE: NativeTypeDef = NativeTypeDef {
         method("list", "pop", list_pop),
         method("list", "remove", list_remove),
         method("list", "reverse", list_reverse),
+        method("list", "clear", list_clear),
         method("list", "count", list_count),
         method("list", "index", list_index),
         method("list", "sort", list_sort),
@@ -124,20 +153,298 @@ fn string_rstrip(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
     strip(runtime, receiver, args, StripKind::Right)
 }
 
-/// Bytes are not yet a distinct runtime layout. UTF-8 encode therefore returns the same immutable
-/// byte-preserving string value, which is accepted only by APIs that explicitly use this bridge.
 fn string_encode(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.encode", 0, 2)?;
     args.reject_keywords("str.encode")?;
-    for argument in args.positional() {
-        let PyString(value) = (*argument).cast(runtime)?;
-        if !matches!(value.as_str(), "utf-8" | "UTF-8" | "strict") {
-            return Err(PyError::value_error(
-                "only UTF-8 strict encoding is supported",
-            ));
-        }
+    let PyString(value) = receiver.cast(runtime)?;
+    let encoding = args
+        .positional()
+        .first()
+        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .transpose()?
+        .unwrap_or_else(|| "utf-8".into())
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    let errors = args
+        .positional()
+        .get(1)
+        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .transpose()?
+        .unwrap_or_else(|| "strict".into());
+    if errors != "strict" {
+        return Err(PyError::value_error(
+            "only strict encoding errors are supported",
+        ));
     }
-    Ok(receiver)
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    let encoded = match encoding.as_str() {
+        "utf-8" | "utf8" => value.into_bytes(),
+        "ascii" => {
+            if !value.is_ascii() {
+                return Err(PyError::exception(
+                    "UnicodeEncodeError",
+                    "character is outside the ASCII range",
+                ));
+            }
+            value.into_bytes()
+        }
+        "latin-1" | "latin1" | "iso-8859-1" => value
+            .chars()
+            .map(|character| {
+                u8::try_from(u32::from(character)).map_err(|_| {
+                    PyError::exception(
+                        "UnicodeEncodeError",
+                        "character is outside the Latin-1 range",
+                    )
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?,
+        _ => return Err(PyError::value_error("unknown text encoding")),
+    };
+    runtime.new_bytes(encoded)
+}
+
+fn string_lower(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_transform(
+        runtime,
+        receiver,
+        args,
+        |value| value.to_lowercase(),
+        "str.lower",
+    )
+}
+
+fn string_upper(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_transform(
+        runtime,
+        receiver,
+        args,
+        |value| value.to_uppercase(),
+        "str.upper",
+    )
+}
+
+fn string_transform(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    transform: fn(&str) -> String,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 0, 0)?;
+    args.reject_keywords(name)?;
+    let PyString(value) = receiver.cast(runtime)?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    runtime.new_string(transform(&value))
+}
+
+fn string_isalnum(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_predicate(
+        runtime,
+        receiver,
+        args,
+        char::is_alphanumeric,
+        "str.isalnum",
+    )
+}
+
+fn string_isalpha(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_predicate(runtime, receiver, args, char::is_alphabetic, "str.isalpha")
+}
+
+fn string_isdigit(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_predicate(runtime, receiver, args, char::is_numeric, "str.isdigit")
+}
+
+fn string_predicate(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    predicate: fn(char) -> bool,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 0, 0)?;
+    args.reject_keywords(name)?;
+    let PyString(value) = receiver.cast(runtime)?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    Ok(PyValue::Bool(
+        !value.is_empty() && value.chars().all(predicate),
+    ))
+}
+
+fn bytes_decode(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytes.decode", 0, 2)?;
+    args.reject_keywords("bytes.decode")?;
+    let encoding = args
+        .positional()
+        .first()
+        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .transpose()?
+        .unwrap_or_else(|| "utf-8".into());
+    let errors = args
+        .positional()
+        .get(1)
+        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .transpose()?
+        .unwrap_or_else(|| "strict".into());
+    if errors != "strict" {
+        return Err(PyError::value_error(
+            "only strict decoding errors are supported",
+        ));
+    }
+    let PyBytes(value) = receiver.cast(runtime)?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    let normalized = encoding.to_ascii_lowercase().replace('_', "-");
+    let decoded = match normalized.as_str() {
+        "utf-8" | "utf8" => String::from_utf8(value)
+            .map_err(|_| PyError::exception("UnicodeDecodeError", "invalid UTF-8 byte sequence"))?,
+        "ascii" => {
+            if !value.is_ascii() {
+                return Err(PyError::exception(
+                    "UnicodeDecodeError",
+                    "byte is outside the ASCII range",
+                ));
+            }
+            String::from_utf8(value).expect("ASCII is valid UTF-8")
+        }
+        "latin-1" | "latin1" | "iso-8859-1" => value.into_iter().map(char::from).collect(),
+        _ => return Err(PyError::value_error("unknown text encoding")),
+    };
+    runtime.new_string(decoded)
+}
+
+fn bytes_hex(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytes.hex", 0, 0)?;
+    args.reject_keywords("bytes.hex")?;
+    let PyBytes(value) = receiver.cast(runtime)?;
+    let length = value
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| PyError::resource_error("hex result is too large"))?;
+    runtime.reserve_memory(length)?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    let mut result = String::with_capacity(length);
+    for byte in value {
+        use std::fmt::Write;
+        write!(&mut result, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    runtime.new_string(result)
+}
+
+fn bytes_startswith(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    bytes_affix(runtime, receiver, args, true)
+}
+
+fn bytes_endswith(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    bytes_affix(runtime, receiver, args, false)
+}
+
+fn bytes_affix(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    prefix: bool,
+) -> PyResult {
+    args.expect_positional("bytes affix test", 1, 1)?;
+    args.reject_keywords("bytes affix test")?;
+    let PyBytes(value) = receiver.cast(runtime)?;
+    let PyBytes(needle) = args.positional()[0].cast(runtime)?;
+    Ok(PyValue::Bool(if prefix {
+        value.starts_with(&needle)
+    } else {
+        value.ends_with(&needle)
+    }))
+}
+
+fn bytes_find(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytes.find", 1, 3)?;
+    args.reject_keywords("bytes.find")?;
+    let PyBytes(value) = receiver.cast(runtime)?;
+    let PyBytes(needle) = args.positional()[0].cast(runtime)?;
+    let optional_index = |value: Option<&PyValue>, default| -> PyResult<i64> {
+        value
+            .map(|value| {
+                runtime
+                    .int_value(value)
+                    .ok_or_else(|| PyError::type_error("slice indices must be integers"))
+            })
+            .transpose()
+            .map(|value| value.unwrap_or(default))
+    };
+    let start = optional_index(args.positional().get(1), 0)?;
+    let end = optional_index(
+        args.positional().get(2),
+        i64::try_from(value.len()).unwrap_or(i64::MAX),
+    )?;
+    let length = i64::try_from(value.len()).unwrap_or(i64::MAX);
+    let normalize = |index: i64| {
+        usize::try_from(if index < 0 {
+            index.saturating_add(length).max(0)
+        } else {
+            index
+        })
+        .unwrap_or(value.len())
+        .min(value.len())
+    };
+    let start = normalize(start);
+    let end = normalize(end);
+    runtime.charge_cpu(u64::try_from(end.saturating_sub(start)).unwrap_or(u64::MAX))?;
+    let found = if start <= end && needle.len() <= end - start {
+        if needle.is_empty() {
+            Some(start)
+        } else {
+            value[start..end]
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .map(|position| start + position)
+        }
+    } else {
+        None
+    };
+    Ok(PyValue::Int(
+        found
+            .and_then(|value| i64::try_from(value).ok())
+            .unwrap_or(-1),
+    ))
+}
+
+fn bytearray_append(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytearray.append", 1, 1)?;
+    args.reject_keywords("bytearray.append")?;
+    let array = receiver.cast::<PyByteArray>(runtime)?;
+    let byte = runtime
+        .int_value(&args.positional()[0])
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or_else(|| PyError::value_error("byte must be in range(0, 256)"))?;
+    let mut items = runtime.bytearray_items(array)?;
+    items.push(byte);
+    runtime.replace_bytearray_items(array, items)?;
+    Ok(PyValue::None)
+}
+
+fn bytearray_extend(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytearray.extend", 1, 1)?;
+    args.reject_keywords("bytearray.extend")?;
+    let array = receiver.cast::<PyByteArray>(runtime)?;
+    let iterator = runtime.iterator(args.positional()[0])?;
+    let mut additions = Vec::new();
+    while let Some(value) = runtime.iterator_next(iterator)? {
+        additions.push(
+            runtime
+                .int_value(&value)
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| PyError::value_error("byte must be in range(0, 256)"))?,
+        );
+    }
+    let mut items = runtime.bytearray_items(array)?;
+    let length = items
+        .len()
+        .checked_add(additions.len())
+        .ok_or_else(|| PyError::resource_error("bytearray is too large"))?;
+    runtime.reserve_memory(length)?;
+    items.extend(additions);
+    runtime.replace_bytearray_items(array, items)?;
+    Ok(PyValue::None)
 }
 
 enum StripKind {
@@ -478,6 +785,14 @@ fn list_reverse(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     values.reverse();
     runtime.replace_list_items(list, values)?;
     Ok(Value::None)
+}
+
+fn list_clear(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("list.clear", 0, 0)?;
+    args.reject_keywords("list.clear")?;
+    let list = receiver.cast::<PyList>(runtime)?;
+    runtime.replace_list_items(list, Vec::new())?;
+    Ok(PyValue::None)
 }
 
 fn list_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -937,6 +1252,188 @@ pub(crate) fn slot_string_multiply(
     runtime.reserve_memory(bytes)?;
     runtime.charge_cpu(u64::try_from(bytes).unwrap_or(u64::MAX))?;
     runtime.new_string(value.repeat(count)).map(Some)
+}
+
+pub(crate) fn slot_bytes_length(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let Some(value) = runtime.bytes_value(&value)? else {
+        return Ok(None);
+    };
+    let length = i64::try_from(value.len())
+        .map_err(|_| PyError::overflow_error("bytes object is too large"))?;
+    Ok(Some(PyValue::Int(length)))
+}
+
+pub(crate) fn slot_bytes_get_item(
+    runtime: &mut dyn PyRuntime,
+    owner: PyValue,
+    index: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let Some(value) = runtime.bytes_value(&owner)? else {
+        return Ok(None);
+    };
+    let Some(index) = runtime.int_value(&index) else {
+        return Ok(None);
+    };
+    let length = i64::try_from(value.len()).unwrap_or(i64::MAX);
+    let index = if index < 0 {
+        index.checked_add(length)
+    } else {
+        Some(index)
+    }
+    .and_then(|index| usize::try_from(index).ok())
+    .filter(|index| *index < value.len())
+    .ok_or_else(|| PyError::exception("IndexError", "index out of range"))?;
+    Ok(Some(PyValue::Int(i64::from(value[index]))))
+}
+
+pub(crate) fn slot_bytes_add(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (Some(mut left), Some(right)) = (runtime.bytes_value(&left)?, runtime.bytes_value(&right)?)
+    else {
+        return Ok(None);
+    };
+    let length = left
+        .len()
+        .checked_add(right.len())
+        .ok_or_else(|| PyError::resource_error("bytes result is too large"))?;
+    runtime.reserve_memory(length)?;
+    runtime.charge_cpu(u64::try_from(right.len()).unwrap_or(u64::MAX))?;
+    left.extend(right);
+    runtime.new_bytes(left).map(Some)
+}
+
+pub(crate) fn slot_bytes_multiply(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (value, count) = if let Some(value) = runtime.bytes_value(&left)? {
+        (value, right)
+    } else if let Some(value) = runtime.bytes_value(&right)? {
+        (value, left)
+    } else {
+        return Ok(None);
+    };
+    let Some(count) = super::super::number::runtime_repeat_count(runtime, &count)? else {
+        return Ok(None);
+    };
+    let length = value
+        .len()
+        .checked_mul(count)
+        .ok_or_else(|| PyError::resource_error("bytes result is too large"))?;
+    runtime.reserve_memory(length)?;
+    runtime.charge_cpu(u64::try_from(length).unwrap_or(u64::MAX))?;
+    runtime.new_bytes(value.repeat(count)).map(Some)
+}
+
+pub(crate) fn slot_bytearray_length(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let array = value.cast::<PyByteArray>(runtime)?;
+    let length = i64::try_from(runtime.bytearray_items(array)?.len())
+        .map_err(|_| PyError::overflow_error("bytearray is too large"))?;
+    Ok(Some(PyValue::Int(length)))
+}
+
+pub(crate) fn slot_bytearray_add(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    if runtime.kind(&left)? != PyKind::ByteArray {
+        return Ok(None);
+    }
+    let (Some(mut left), Some(right)) = (runtime.bytes_value(&left)?, runtime.bytes_value(&right)?)
+    else {
+        return Ok(None);
+    };
+    let length = left
+        .len()
+        .checked_add(right.len())
+        .ok_or_else(|| PyError::resource_error("bytearray result is too large"))?;
+    runtime.reserve_memory(length)?;
+    runtime.charge_cpu(u64::try_from(right.len()).unwrap_or(u64::MAX))?;
+    left.extend(right);
+    runtime.new_bytearray(left).map(Some)
+}
+
+pub(crate) fn slot_bytearray_multiply(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (value, count) = if runtime.kind(&left)? == PyKind::ByteArray {
+        (runtime.bytes_value(&left)?.unwrap_or_default(), right)
+    } else if runtime.kind(&right)? == PyKind::ByteArray {
+        (runtime.bytes_value(&right)?.unwrap_or_default(), left)
+    } else {
+        return Ok(None);
+    };
+    let Some(count) = super::super::number::runtime_repeat_count(runtime, &count)? else {
+        return Ok(None);
+    };
+    let length = value
+        .len()
+        .checked_mul(count)
+        .ok_or_else(|| PyError::resource_error("bytearray result is too large"))?;
+    runtime.reserve_memory(length)?;
+    runtime.charge_cpu(u64::try_from(length).unwrap_or(u64::MAX))?;
+    runtime.new_bytearray(value.repeat(count)).map(Some)
+}
+
+pub(crate) fn slot_bytearray_get_item(
+    runtime: &mut dyn PyRuntime,
+    owner: PyValue,
+    index: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let array = owner.cast::<PyByteArray>(runtime)?;
+    let Some(index) = runtime.int_value(&index) else {
+        return Ok(None);
+    };
+    let items = runtime.bytearray_items(array)?;
+    let index = byte_index(index, items.len())?;
+    Ok(Some(PyValue::Int(i64::from(items[index]))))
+}
+
+pub(crate) fn slot_bytearray_set_item(
+    runtime: &mut dyn PyRuntime,
+    owner: PyValue,
+    index: PyValue,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let array = owner.cast::<PyByteArray>(runtime)?;
+    let Some(index) = runtime.int_value(&index) else {
+        return Ok(None);
+    };
+    let value = runtime
+        .int_value(&value)
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or_else(|| PyError::value_error("byte must be in range(0, 256)"))?;
+    let mut items = runtime.bytearray_items(array)?;
+    let index = byte_index(index, items.len())?;
+    items[index] = value;
+    runtime.replace_bytearray_items(array, items)?;
+    Ok(Some(PyValue::None))
+}
+
+fn byte_index(index: i64, length: usize) -> PyResult<usize> {
+    let length = i64::try_from(length).unwrap_or(i64::MAX);
+    let index = if index < 0 {
+        index.checked_add(length)
+    } else {
+        Some(index)
+    }
+    .and_then(|index| usize::try_from(index).ok())
+    .filter(|index| *index < usize::try_from(length).unwrap_or(usize::MAX))
+    .ok_or_else(|| PyError::exception("IndexError", "bytearray index out of range"))?;
+    Ok(index)
 }
 
 pub(crate) fn slot_list_add(

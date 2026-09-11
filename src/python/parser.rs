@@ -1285,6 +1285,7 @@ impl Parser {
             TokenKind::BigInteger(value) => ExpressionKind::Constant(Constant::BigInteger(value)),
             TokenKind::Float(value) => ExpressionKind::Constant(Constant::Float(value)),
             TokenKind::String(value) => ExpressionKind::Constant(Constant::String(value)),
+            TokenKind::Bytes(value) => ExpressionKind::Constant(Constant::Bytes(value)),
             TokenKind::FString { body, raw } => self.fstring_expression(body, raw, token.span)?,
             TokenKind::None => ExpressionKind::Constant(Constant::None),
             TokenKind::True => ExpressionKind::Constant(Constant::Bool(true)),

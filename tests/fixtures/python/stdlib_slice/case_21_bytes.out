@@ -1,0 +1,6 @@
+b'\x00\xffhello' [0, 255, 104, 101, 108, 108, 111] 00ff68656c6c6f
+b'AP9oZWxsbw==' b'\x00\xffhello'
+b'\x02\x01\xff\xff\xff\xf9' (513, -7)
+b'\x00\xffhello' 3421780262
+ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+Hello

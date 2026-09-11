@@ -104,6 +104,19 @@ class Path:
             return Path(self._path + suffix)
         return Path(self._path[:-len(self.suffix)] + suffix)
 
+    def replace(self, target):
+        target = str(target)
+        _shellsim_vfs.rename(self._path, target)
+        return Path(target)
+
+    def rename(self, target):
+        return self.replace(target)
+
+    def unlink(self, missing_ok=False):
+        if missing_ok and not self.exists():
+            return
+        _shellsim_vfs.remove_file(self._path)
+
     def open(self, mode="r", encoding=None, newline=None):
         return open(self._path, mode, encoding, newline)
 
@@ -111,14 +124,14 @@ class Path:
         return _shellsim_vfs.read_text(self._path)
 
     def read_bytes(self):
-        return _shellsim_vfs.read_text(self._path)
+        return _shellsim_vfs.read_bytes(self._path)
 
     def write_text(self, data, encoding=None):
         _shellsim_vfs.write_text(self._path, data)
         return len(data)
 
     def write_bytes(self, data):
-        _shellsim_vfs.write_text(self._path, data)
+        _shellsim_vfs.write_bytes(self._path, data)
         return len(data)
 
 

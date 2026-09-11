@@ -128,9 +128,9 @@ fn requested_stdlib_slice_matches_cpython_or_rejects_frontier() {
         }
     }
 
-    assert_eq!(supported, 20);
+    assert_eq!(supported, 21);
     assert_eq!(frontier, 0);
-    assert_eq!(supported + frontier, 20);
+    assert_eq!(supported + frontier, 21);
     eprintln!(
         "stdlib slice differential probes: {supported} supported, {frontier} frontier (CPython 3.14: {})",
         if reference_available { "verified CPython 3.14" } else { "not verified; oracle skipped" }

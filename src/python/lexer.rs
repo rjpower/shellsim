@@ -73,10 +73,12 @@ impl<'a> Lexer<'a> {
                 'f' | 'F' if self.followed_by_quote() => self.fstring(start, 1, false)?,
                 'f' | 'F' if self.followed_by_raw_quote() => self.fstring(start, 2, true)?,
                 'r' | 'R' if self.followed_by_format_quote() => self.fstring(start, 2, true)?,
+                'r' | 'R' if self.followed_by_byte_quote() => self.raw_byte_string(start)?,
                 'r' | 'R' if self.followed_by_quote() => self.raw_string(start)?,
+                'b' | 'B' if self.followed_by_raw_quote() => self.raw_byte_string(start)?,
                 'b' | 'B' if self.followed_by_quote() => {
                     self.bump();
-                    self.string(start)?
+                    self.byte_string(start)?
                 }
                 'a'..='z' | 'A'..='Z' | '_' => self.name(),
                 '0'..='9' => self.number(start, false)?,
@@ -444,6 +446,116 @@ impl<'a> Lexer<'a> {
         Ok(TokenKind::String(value))
     }
 
+    /// Decode a bytes literal without passing arbitrary octets through UTF-8 text storage.
+    fn byte_string(&mut self, start: Span) -> Result<TokenKind, LexError> {
+        let quote = self.bump().expect("the caller observed a quote");
+        let triple =
+            self.peek() == Some(quote) && self.source[self.offset..].chars().nth(1) == Some(quote);
+        if triple {
+            self.bump();
+            self.bump();
+        }
+        let mut value = Vec::new();
+        loop {
+            let Some(ch) = self.bump() else {
+                return Err(self.error(start, "unterminated bytes literal"));
+            };
+            match ch {
+                ch if ch == quote && self.consume_triple_end(quote, triple) => break,
+                '\n' if !triple => return Err(self.error(start, "unterminated bytes literal")),
+                '\\' => {
+                    let escaped = self
+                        .bump()
+                        .ok_or_else(|| self.error(start, "unterminated bytes escape"))?;
+                    if escaped == '\n' {
+                        continue;
+                    }
+                    let byte = match escaped {
+                        'n' => b'\n',
+                        'r' => b'\r',
+                        't' => b'\t',
+                        'b' => 8,
+                        'f' => 12,
+                        'v' => 11,
+                        '\\' => b'\\',
+                        '\'' => b'\'',
+                        '"' => b'"',
+                        'x' => {
+                            let high = self.bump().and_then(|ch| ch.to_digit(16));
+                            let low = self.bump().and_then(|ch| ch.to_digit(16));
+                            let (Some(high), Some(low)) = (high, low) else {
+                                return Err(self.error(start, "invalid hexadecimal bytes escape"));
+                            };
+                            u8::try_from(high * 16 + low).expect("two hex digits fit in a byte")
+                        }
+                        '0'..='7' => {
+                            let mut number = escaped.to_digit(8).expect("matched octal digit");
+                            for _ in 0..2 {
+                                let Some(digit) = self.peek().and_then(|ch| ch.to_digit(8)) else {
+                                    break;
+                                };
+                                self.bump();
+                                number = number * 8 + digit;
+                            }
+                            u8::try_from(number).map_err(|_| {
+                                self.error(start, "octal bytes escape is out of range")
+                            })?
+                        }
+                        other if other.is_ascii() => {
+                            value.push(b'\\');
+                            other as u8
+                        }
+                        _ => return Err(self.error(start, "bytes literals must contain ASCII")),
+                    };
+                    value.push(byte);
+                }
+                other if other.is_ascii() => value.push(other as u8),
+                _ => return Err(self.error(start, "bytes literals must contain ASCII")),
+            }
+        }
+        Ok(TokenKind::Bytes(value))
+    }
+
+    fn raw_byte_string(&mut self, start: Span) -> Result<TokenKind, LexError> {
+        self.bump();
+        self.bump();
+        let quote = self.bump().expect("prefix is followed by a quote");
+        let triple =
+            self.peek() == Some(quote) && self.source[self.offset..].chars().nth(1) == Some(quote);
+        if triple {
+            self.bump();
+            self.bump();
+        }
+        let mut value = Vec::new();
+        loop {
+            let Some(ch) = self.bump() else {
+                return Err(self.error(start, "unterminated raw bytes literal"));
+            };
+            if ch == '\\' {
+                let escaped = self
+                    .bump()
+                    .ok_or_else(|| self.error(start, "unterminated raw bytes literal"))?;
+                if !escaped.is_ascii() {
+                    return Err(self.error(start, "bytes literals must contain ASCII"));
+                }
+                value.push(b'\\');
+                value.push(escaped as u8);
+                continue;
+            }
+            if ch == quote && self.consume_triple_end(quote, triple) {
+                break;
+            }
+            if ch == '\n' && !triple {
+                return Err(self.error(start, "unterminated raw bytes literal"));
+            }
+            if !ch.is_ascii() {
+                return Err(self.error(start, "bytes literals must contain ASCII"));
+            }
+            value.push(ch as u8);
+        }
+        Ok(TokenKind::Bytes(value))
+    }
+
     /// Capture an f-string body without interpreting braces.  The parser owns
     /// brace matching and embedded-expression parsing; keeping the raw body in
     /// one token prevents the ordinary lexer from confusing expression tokens
@@ -505,6 +617,16 @@ impl<'a> Lexer<'a> {
                 self.source[self.offset..].chars().nth(2)
             ),
             (Some('f' | 'F'), Some('\'' | '"'))
+        )
+    }
+
+    fn followed_by_byte_quote(&self) -> bool {
+        matches!(
+            (
+                self.source[self.offset..].chars().nth(1),
+                self.source[self.offset..].chars().nth(2)
+            ),
+            (Some('b' | 'B'), Some('\'' | '"'))
         )
     }
 

@@ -13,10 +13,10 @@ use super::bytecode::{ClassField, Code, Operation};
 use super::filesystem::PyModuleLoader;
 use super::heap::{ClassLayout, InstancePayload, Object, ScopeId};
 use super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentSpec, PyCallable, PyClass,
-    PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyIdentity, PyInstance,
-    PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyNativeKind, PyProperty,
-    PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyTuple, PyValueCast,
+    CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentSpec, PyByteArray, PyCallable,
+    PyClass, PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyIdentity,
+    PyInstance, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyNativeKind,
+    PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyTuple, PyValueCast,
 };
 use super::object_model::{BuiltinType, PyLayout, Slot, SlotValue, TypeId};
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
@@ -358,8 +358,7 @@ impl<'a> Vm<'a> {
                 Operation::StoreNonlocal(name) => self.store_nonlocal(name),
                 Operation::StoreGlobal(name) => {
                     let value = self.pop().map_err(|error| (error, instruction.span))?;
-                    self.state.locals.insert(name.clone(), value);
-                    Ok(())
+                    self.store_global(name, value)
                 }
                 Operation::StoreAttribute(name) => {
                     let owner = self.pop().map_err(|error| (error, instruction.span))?;
@@ -375,10 +374,7 @@ impl<'a> Vm<'a> {
                         Ok(())
                     }
                 }
-                Operation::DeleteGlobal(name) => {
-                    self.state.locals.remove(name);
-                    Ok(())
-                }
+                Operation::DeleteGlobal(name) => self.delete_global(name),
                 Operation::DeleteSubscript => self.delete_subscript(),
                 Operation::Import(name) => self.import(name),
                 Operation::LoadAttribute(name) => self.load_attribute(name),
@@ -719,6 +715,8 @@ impl<'a> Vm<'a> {
                 "int" => Some(BuiltinType::Int),
                 "float" => Some(BuiltinType::Float),
                 "str" => Some(BuiltinType::String),
+                "bytes" => Some(BuiltinType::Bytes),
+                "bytearray" => Some(BuiltinType::ByteArray),
                 "list" => Some(BuiltinType::List),
                 "tuple" => Some(BuiltinType::Tuple),
                 "dict" => Some(BuiltinType::Dict),
@@ -847,6 +845,36 @@ impl<'a> Vm<'a> {
             .copied()
             .ok_or_else(|| format!("no binding for nonlocal {name:?} found"))?;
         self.state.heap.scope_store_nonlocal(scope, name, value)
+    }
+
+    fn store_global(&mut self, name: &str, value: Value) -> Result<(), String> {
+        let Some(scope) = self.local_scopes.last().copied() else {
+            self.state.locals.insert(name.to_string(), value);
+            return Ok(());
+        };
+        let root = self.state.heap.scope_root(scope)?;
+        if self.state.heap.scope_uses_repl_globals(root)? {
+            self.state.locals.insert(name.to_string(), value);
+            Ok(())
+        } else {
+            self.state
+                .heap
+                .scope_insert(root, name.to_string(), value, &mut self.interp.resources)
+        }
+    }
+
+    fn delete_global(&mut self, name: &str) -> Result<(), String> {
+        let Some(scope) = self.local_scopes.last().copied() else {
+            self.state.locals.remove(name);
+            return Ok(());
+        };
+        let root = self.state.heap.scope_root(scope)?;
+        if self.state.heap.scope_uses_repl_globals(root)? {
+            self.state.locals.remove(name);
+        } else {
+            self.state.heap.scope_remove(root, name)?;
+        }
+        Ok(())
     }
 
     fn import(&mut self, name: &str) -> Result<(), String> {
@@ -1237,6 +1265,8 @@ impl<'a> Vm<'a> {
                 }
                 Object::Set(_) => return Err("set object is not subscriptable".into()),
                 Object::String(_)
+                | Object::Bytes(_)
+                | Object::ByteArray(_)
                 | Object::Exception { .. }
                 | Object::BigInt(_)
                 | Object::Function { .. }
@@ -1304,6 +1334,15 @@ impl<'a> Vm<'a> {
             let indices = slice_indices(characters.len(), start, stop, step)?;
             self.charge_cpu(u64::try_from(indices.len()).unwrap_or(u64::MAX))?;
             self.allocate_string(indices.into_iter().map(|index| characters[index]).collect())?
+        } else if let Some(bytes) = protocol::bytes_value(&self.state.heap, &owner)? {
+            let indices = slice_indices(bytes.len(), start, stop, step)?;
+            self.charge_cpu(u64::try_from(indices.len()).unwrap_or(u64::MAX))?;
+            let selected = indices.into_iter().map(|index| bytes[index]).collect();
+            if self.type_id(&owner)? == BuiltinType::ByteArray.id() {
+                self.allocate_bytearray(selected)?
+            } else {
+                self.allocate_bytes(selected)?
+            }
         } else if let Some(id) = owner.object_id() {
             let (values, tuple) = match self.state.heap.get(id)?.clone() {
                 Object::List(values) => (values, false),
@@ -1383,6 +1422,8 @@ impl<'a> Vm<'a> {
             }
             Object::Tuple(_) => return Err("tuple object does not support item assignment".into()),
             Object::String(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
             | Object::Exception { .. }
             | Object::Set(_)
             | Object::BigInt(_)
@@ -2111,6 +2152,15 @@ impl<'a> Vm<'a> {
                 return call(self, *receiver, *argument)
                     .map_err(|error| self.record_native_error(error));
             }
+            SlotValue::NativeTernary(call) => {
+                let [first, second] = arguments.as_slice() else {
+                    return Err(
+                        "ternary protocol slot received the wrong number of arguments".into(),
+                    );
+                };
+                return call(self, *receiver, *first, *second)
+                    .map_err(|error| self.record_native_error(error));
+            }
             SlotValue::NativeUnary(call) => {
                 if !arguments.is_empty() {
                     return Err("unary protocol slot received arguments".into());
@@ -2366,6 +2416,50 @@ impl<'a> Vm<'a> {
                     None => String::new(),
                 };
                 self.allocate_string(value)?
+            }
+            BuiltinType::Bytes | BuiltinType::ByteArray => {
+                expect_arity(&arguments, 0, 2)?;
+                let value = match arguments.as_slice() {
+                    [] => Vec::new(),
+                    [value] if protocol::bytes_value(&self.state.heap, value)?.is_some() => {
+                        protocol::bytes_value(&self.state.heap, value)?.expect("guarded")
+                    }
+                    [value] if protocol::int_value(&self.state.heap, value).is_some() => {
+                        let length = usize::try_from(
+                            protocol::int_value(&self.state.heap, value).expect("guarded"),
+                        )
+                        .map_err(|_| "negative count")?;
+                        self.reserve_result(length)?;
+                        vec![0; length]
+                    }
+                    [value] => {
+                        let items = self.iterable_values(value)?;
+                        let mut bytes = Vec::with_capacity(items.len());
+                        for item in items {
+                            let byte = protocol::int_value(&self.state.heap, &item)
+                                .and_then(|value| u8::try_from(value).ok())
+                                .ok_or("bytes must be in range(0, 256)")?;
+                            bytes.push(byte);
+                        }
+                        bytes
+                    }
+                    [value, encoding] => {
+                        let text = protocol::string_value(&self.state.heap, value)?
+                            .ok_or("encoding without a string argument")?;
+                        let encoding = protocol::string_value(&self.state.heap, encoding)?
+                            .ok_or("bytes() encoding must be a string")?;
+                        if !matches!(encoding.to_ascii_lowercase().as_str(), "utf-8" | "utf8") {
+                            return Err("only UTF-8 encoding is supported".into());
+                        }
+                        text.into_bytes()
+                    }
+                    _ => unreachable!("arity checked"),
+                };
+                if builtin_type == BuiltinType::Bytes {
+                    self.allocate_bytes(value)?
+                } else {
+                    self.allocate_bytearray(value)?
+                }
             }
             BuiltinType::List | BuiltinType::Tuple | BuiltinType::Set => {
                 expect_arity(&arguments, 0, 1)?;
@@ -3465,6 +3559,8 @@ impl<'a> Vm<'a> {
                         }
                         Object::BigInt(_)
                         | Object::String(_)
+                        | Object::Bytes(_)
+                        | Object::ByteArray(_)
                         | Object::Exception { .. }
                         | Object::Function { .. }
                         | Object::Class { .. }
@@ -4040,6 +4136,14 @@ impl<'a> Vm<'a> {
         }
     }
 
+    fn allocate_bytes(&mut self, value: Vec<u8>) -> Result<Value, String> {
+        self.allocate_object(Object::Bytes(value))
+    }
+
+    fn allocate_bytearray(&mut self, value: Vec<u8>) -> Result<Value, String> {
+        self.allocate_object(Object::ByteArray(value))
+    }
+
     fn allocate_exception(&mut self, kind: String, message: String) -> Result<Value, String> {
         self.allocate_object(Object::Exception { kind, message })
     }
@@ -4059,6 +4163,7 @@ impl<'a> Vm<'a> {
             }
             Constant::Float(value) => Value::Float(*value),
             Constant::String(value) => self.allocate_string(value.clone())?,
+            Constant::Bytes(value) => self.allocate_bytes(value.clone())?,
         })
     }
 
@@ -4126,6 +4231,10 @@ impl<'a> Vm<'a> {
             for character in value.chars() {
                 let character = self.allocate_string(character.to_string())?;
                 self.push_materialized(&mut result, character)?;
+            }
+        } else if let Some(value) = protocol::bytes_value(&self.state.heap, value)? {
+            for byte in value {
+                self.push_materialized(&mut result, Value::Int(i64::from(byte)))?;
             }
         } else if let Some(id) = value.object_id() {
             match self.state.heap.get(id)?.clone() {
@@ -4304,6 +4413,8 @@ impl PyRuntime for Vm<'_> {
                 .map_err(PyError::runtime_error)?
             {
                 Object::String(_) => PyKind::String,
+                Object::Bytes(_) => PyKind::Bytes,
+                Object::ByteArray(_) => PyKind::ByteArray,
                 Object::Exception { .. } => PyKind::Native,
                 Object::List(_) => PyKind::List,
                 Object::BigInt(_) => PyKind::Int,
@@ -4334,8 +4445,21 @@ impl PyRuntime for Vm<'_> {
         protocol::string_value(&self.state.heap, value).map_err(PyError::runtime_error)
     }
 
+    fn bytes_value(&self, value: &Value) -> PyResult<Option<Vec<u8>>> {
+        protocol::bytes_value(&self.state.heap, value).map_err(PyError::runtime_error)
+    }
+
     fn new_string(&mut self, value: String) -> PyResult<Value> {
         self.allocate_string(value).map_err(PyError::resource_error)
+    }
+
+    fn new_bytes(&mut self, value: Vec<u8>) -> PyResult<Value> {
+        self.allocate_bytes(value).map_err(PyError::resource_error)
+    }
+
+    fn new_bytearray(&mut self, value: Vec<u8>) -> PyResult<Value> {
+        self.allocate_bytearray(value)
+            .map_err(PyError::resource_error)
     }
 
     fn native_kind(&self, value: &Value) -> PyResult<Option<PyNativeKind>> {
@@ -4424,6 +4548,60 @@ impl PyRuntime for Vm<'_> {
         match self.state.heap.get(id).map_err(PyError::runtime_error)? {
             Object::List(items) => Ok(items.clone()),
             _ => Err(PyError::runtime_error("list handle changed object kind")),
+        }
+    }
+
+    fn bytearray_items(&mut self, value: PyByteArray) -> PyResult<Vec<u8>> {
+        let id = value.object_id();
+        let length = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::ByteArray(items) => items.len(),
+            _ => {
+                return Err(PyError::runtime_error(
+                    "bytearray handle changed object kind",
+                ))
+            }
+        };
+        self.reserve_memory(length)?;
+        match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::ByteArray(items) => Ok(items.clone()),
+            _ => Err(PyError::runtime_error(
+                "bytearray handle changed object kind",
+            )),
+        }
+    }
+
+    fn replace_bytearray_items(&mut self, value: PyByteArray, items: Vec<u8>) -> PyResult<()> {
+        let id = value.object_id();
+        let current = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::ByteArray(items) => items.len(),
+            _ => {
+                return Err(PyError::runtime_error(
+                    "bytearray handle changed object kind",
+                ))
+            }
+        };
+        if items.len() > current {
+            self.state
+                .heap
+                .reserve_growth(
+                    u64::try_from(items.len() - current).unwrap_or(u64::MAX),
+                    &mut self.interp.resources,
+                )
+                .map_err(PyError::resource_error)?;
+        }
+        match self
+            .state
+            .heap
+            .get_mut(id)
+            .map_err(PyError::runtime_error)?
+        {
+            Object::ByteArray(current) => {
+                *current = items;
+                Ok(())
+            }
+            _ => Err(PyError::runtime_error(
+                "bytearray handle changed object kind",
+            )),
         }
     }
 

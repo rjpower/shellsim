@@ -67,7 +67,9 @@ fn add_argument(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) ->
     }
     args.reject_unknown_keywords(
         "add_argument",
-        &["dest", "required", "action", "type", "default", "help"],
+        &[
+            "dest", "required", "action", "type", "default", "help", "choices",
+        ],
     )?;
     let parser = receiver.cast::<PyArgumentParser>(runtime)?;
     let names = args
@@ -121,6 +123,13 @@ fn add_argument(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) ->
         } else {
             Value::None
         });
+    let mut choices = Vec::new();
+    if let Some(value) = args.keyword("add_argument", "choices")? {
+        let iterator = runtime.iterator(*value)?;
+        while let Some(value) = runtime.iterator_next(iterator)? {
+            choices.push(value);
+        }
+    }
     runtime.append_argument(
         parser,
         PyArgumentSpec {
@@ -130,6 +139,7 @@ fn add_argument(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) ->
             default,
             store_true,
             integer,
+            choices,
         },
     )?;
     Ok(Value::None)
@@ -212,6 +222,20 @@ fn parse_values(
         } else {
             runtime.new_string(raw)?
         };
+        if !spec.choices.is_empty() {
+            let mut accepted = false;
+            for choice in &spec.choices {
+                if runtime.equals(&value, choice)? {
+                    accepted = true;
+                    break;
+                }
+            }
+            if !accepted {
+                return Err(PyError::value_error(format!(
+                    "invalid choice for argument {name:?}"
+                )));
+            }
+        }
         set_value(&mut values, &spec.dest, value)?;
         index += 1;
     }

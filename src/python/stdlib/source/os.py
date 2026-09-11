@@ -92,3 +92,17 @@ path = _Path()
 
 def makedirs(name, mode=511, exist_ok=False):
     _shellsim_vfs.mkdir(name, True, exist_ok)
+
+
+def remove(path):
+    _shellsim_vfs.remove_file(path)
+
+
+unlink = remove
+
+
+def rename(source, destination):
+    _shellsim_vfs.rename(source, destination)
+
+
+replace = rename

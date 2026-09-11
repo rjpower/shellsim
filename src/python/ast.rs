@@ -262,6 +262,7 @@ pub enum Constant {
     BigInteger(String),
     Float(f64),
     String(String),
+    Bytes(Vec<u8>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

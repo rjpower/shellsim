@@ -47,6 +47,16 @@ pub fn string_value(heap: &Heap, value: &Value) -> Result<Option<String>, String
     })
 }
 
+pub fn bytes_value(heap: &Heap, value: &Value) -> Result<Option<Vec<u8>>, String> {
+    let Some(id) = value.object_id() else {
+        return Ok(None);
+    };
+    Ok(match heap.get(id)? {
+        Object::Bytes(value) | Object::ByteArray(value) => Some(value.clone()),
+        _ => None,
+    })
+}
+
 pub fn exception_parts(heap: &Heap, value: &Value) -> Result<Option<(String, String)>, String> {
     let Some(id) = value.object_id() else {
         return Ok(None);
@@ -111,6 +121,8 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
         if !active.insert(id) {
             return Ok(match heap.get(id)? {
                 Object::String(_) => "<str ...>",
+                Object::Bytes(_) => "<bytes ...>",
+                Object::ByteArray(_) => "<bytearray ...>",
                 Object::Exception { .. } => "<exception ...>",
                 Object::List(_) => "[...]",
                 Object::Tuple(_) => "(...)",
@@ -140,6 +152,8 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
         }
         let rendered = match heap.get(id)? {
             Object::String(value) => quote_string(value),
+            Object::Bytes(value) => quote_bytes(value),
+            Object::ByteArray(value) => format!("bytearray({})", quote_bytes(value)),
             Object::Exception { kind, message } => {
                 if message.is_empty() {
                     kind.clone()
@@ -255,6 +269,8 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
     };
     Ok(match heap.get(id)? {
         Object::String(value) => !value.is_empty(),
+        Object::Bytes(value) => !value.is_empty(),
+        Object::ByteArray(value) => !value.is_empty(),
         Object::Exception { .. } => true,
         Object::List(values) | Object::Tuple(values) | Object::Set(values) => !values.is_empty(),
         Object::Dict(entries) | Object::DefaultDict { entries, .. } => !entries.is_empty(),
@@ -364,6 +380,10 @@ fn equals_inner(
             }
             let result = match (heap.get(left)?, heap.get(right)?) {
                 (Object::String(left), Object::String(right)) => left == right,
+                (Object::Bytes(left), Object::Bytes(right)) => left == right,
+                (Object::Bytes(left), Object::ByteArray(right))
+                | (Object::ByteArray(left), Object::Bytes(right))
+                | (Object::ByteArray(left), Object::ByteArray(right)) => left == right,
                 (
                     Object::Exception {
                         kind: lk,
@@ -513,6 +533,9 @@ pub fn compare(heap: &Heap, left: &Value, right: &Value) -> Result<Ordering, Str
     if let (Some(left), Some(right)) = (string_value(heap, left)?, string_value(heap, right)?) {
         return Ok(left.cmp(&right));
     }
+    if let (Some(left), Some(right)) = (bytes_value(heap, left)?, bytes_value(heap, right)?) {
+        return Ok(left.cmp(&right));
+    }
     match (left.object_id(), right.object_id()) {
         (Some(left), Some(right)) => match (heap.get(left)?, heap.get(right)?) {
             (Object::List(left), Object::List(right))
@@ -565,6 +588,12 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
     match container.object_id() {
         Some(id) => match heap.get(id)? {
             Object::String(_) | Object::Exception { .. } => Err("object is not a container".into()),
+            Object::Bytes(value) | Object::ByteArray(value) => {
+                let needle = int_value(heap, needle)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or("bytes containment requires an integer in range(0, 256)")?;
+                Ok(value.contains(&needle))
+            }
             Object::List(values) | Object::Tuple(values) | Object::Set(values) => {
                 for value in values {
                     if identical(value, needle) || equals(heap, value, needle)? {
@@ -615,6 +644,23 @@ fn quote_string(value: &str) -> String {
             .replace('\r', "\\r")
             .replace('\t', "\\t")
     )
+}
+
+fn quote_bytes(value: &[u8]) -> String {
+    let mut rendered = String::from("b'");
+    for byte in value {
+        match byte {
+            b'\\' => rendered.push_str("\\\\"),
+            b'\'' => rendered.push_str("\\'"),
+            b'\n' => rendered.push_str("\\n"),
+            b'\r' => rendered.push_str("\\r"),
+            b'\t' => rendered.push_str("\\t"),
+            0x20..=0x7e => rendered.push(char::from(*byte)),
+            _ => rendered.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    rendered.push('\'');
+    rendered
 }
 
 #[cfg(test)]

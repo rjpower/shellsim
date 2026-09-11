@@ -25,6 +25,10 @@ pub(super) type PyResult<T = PyValue> = Result<T, PyError>;
 pub(super) type BinarySlotFn =
     fn(&mut dyn PyRuntime, PyValue, PyValue) -> PyResult<Option<PyValue>>;
 
+/// Native implementation stored directly in a three-operand protocol slot.
+pub(super) type TernarySlotFn =
+    fn(&mut dyn PyRuntime, PyValue, PyValue, PyValue) -> PyResult<Option<PyValue>>;
+
 /// Native implementation stored directly in a unary protocol slot.
 pub(super) type UnarySlotFn = fn(&mut dyn PyRuntime, PyValue) -> PyResult<Option<PyValue>>;
 
@@ -103,6 +107,8 @@ pub(super) enum PyKind {
     Int,
     Float,
     String,
+    Bytes,
+    ByteArray,
     List,
     Tuple,
     Dict,
@@ -161,6 +167,11 @@ pub(super) trait PyEnvironment {
 pub(super) trait PyFilesystem {
     fn read_text(&mut self, path: &str) -> PyResult<String>;
     fn write_text(&mut self, path: &str, contents: &str) -> PyResult<()>;
+    fn read_bytes(&mut self, path: &str) -> PyResult<Vec<u8>>;
+    fn write_bytes(&mut self, path: &str, contents: &[u8]) -> PyResult<()>;
+    fn remove_file(&mut self, path: &str) -> PyResult<()>;
+    fn remove_tree(&mut self, path: &str) -> PyResult<()>;
+    fn rename(&mut self, source: &str, destination: &str) -> PyResult<()>;
     fn exists(&self, path: &str) -> bool;
     fn is_file(&self, path: &str) -> bool;
     fn is_dir(&self, path: &str) -> bool;
@@ -177,6 +188,9 @@ pub(super) trait PyRuntime {
     fn identity(&self, value: &PyValue) -> Option<PyIdentity>;
     fn int_value(&self, value: &PyValue) -> Option<i64>;
     fn string_value(&self, value: &PyValue) -> PyResult<Option<String>>;
+    fn bytes_value(&self, value: &PyValue) -> PyResult<Option<Vec<u8>>>;
+    fn bytearray_items(&mut self, value: PyByteArray) -> PyResult<Vec<u8>>;
+    fn replace_bytearray_items(&mut self, value: PyByteArray, items: Vec<u8>) -> PyResult<()>;
     fn is_integer_type(&self, value: &PyValue) -> bool;
     /// Return an exact decimal rendering for any Python integer representation.
     fn integer_text(&self, value: &PyValue) -> PyResult<Option<String>>;
@@ -209,6 +223,8 @@ pub(super) trait PyRuntime {
     fn new_dict(&mut self, items: Vec<(PyValue, PyValue)>) -> PyResult<PyValue>;
     fn new_set(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
     fn new_string(&mut self, value: String) -> PyResult<PyValue>;
+    fn new_bytes(&mut self, value: Vec<u8>) -> PyResult<PyValue>;
+    fn new_bytearray(&mut self, value: Vec<u8>) -> PyResult<PyValue>;
     fn property_getter(&self, property: PyProperty) -> PyResult<PyValue>;
     fn new_property(&mut self, getter: PyValue, setter: Option<PyValue>) -> PyResult<PyValue>;
     /// Allocate a class through the runtime's single `type.__new__` implementation.
@@ -261,6 +277,8 @@ pub(super) trait PyRuntime {
             PyKind::Int => "int",
             PyKind::Float => "float",
             PyKind::String => "str",
+            PyKind::Bytes => "bytes",
+            PyKind::ByteArray => "bytearray",
             PyKind::List => "list",
             PyKind::Tuple => "tuple",
             PyKind::Dict => "dict",
@@ -305,6 +323,46 @@ impl FromPyValue for PyString {
                 "expected a string, got {actual}"
             )))
         }
+    }
+}
+
+/// Owned byte sequence extracted from an erased value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PyBytes(pub Vec<u8>);
+
+impl FromPyValue for PyBytes {
+    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
+        if let Some(value) = runtime.bytes_value(&value)? {
+            Ok(Self(value))
+        } else {
+            let actual = runtime.type_name(&value)?;
+            Err(PyError::type_error(format!(
+                "expected a bytes-like object, got {actual}"
+            )))
+        }
+    }
+}
+
+/// Checked handle to a mutable byte array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PyByteArray(ObjectId);
+
+impl FromPyValue for PyByteArray {
+    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
+        let Some(id) = value.object_id() else {
+            return Err(PyError::type_error("expected a bytearray"));
+        };
+        if runtime.kind(&value)? == PyKind::ByteArray {
+            Ok(Self(id))
+        } else {
+            Err(PyError::type_error("expected a bytearray"))
+        }
+    }
+}
+
+impl PyByteArray {
+    pub(super) fn object_id(self) -> ObjectId {
+        self.0
     }
 }
 
@@ -383,6 +441,7 @@ pub(super) struct PyArgumentSpec {
     pub default: PyValue,
     pub store_true: bool,
     pub integer: bool,
+    pub choices: Vec<PyValue>,
 }
 
 /// Checked handle to an interpreter-owned argument parser.

@@ -101,3 +101,22 @@ VFS state and shared resource accounting.
 The immediate lesson is that broad, ordinary parser coverage has more value than another deep
 object-model feature for this corpus. Once the parser items above land, rerun the same first-blocker
 probe rather than projecting a pass rate from these counts.
+
+## Follow-up after source stdlib and byte values
+
+The September 11, 2026 resample after source-backed stdlib modules and byte-preserving `bytes` and
+`bytearray` passes 7 of 69 unchanged solution payloads, representing 6 tasks whose solution Python
+all passes. The pre-bytes sample passed 4 payloads and 3 complete tasks. This remains a source
+loadability measure, not a task solve rate.
+
+`base64`, `codecs`, `struct`, `tempfile`, and binary-mode I/O no longer appear as first import or
+representation blockers. The two `struct`-using reverse-engineering payloads now reach their
+expected missing input files. The remaining solution failures are led by third-party ecosystems
+(`pandas` 10, async syntax 5, NumPy 4, and `socket` 3), followed by task files that are intentionally
+absent from an isolated payload invocation. Small actionable API gaps include argparse subparsers,
+the fail-closed subprocess facade, and richer parameter and subscription grammar.
+
+Verifier task passes remain 0 of 97. Forty verifier groups still stop first on the task-provided
+`grader` package, while others require pytest decorators, subprocess execution, importlib, async,
+or syntax outside the current slice. The bytes work removes a shared correctness obstacle, but it
+does not change those harness boundaries.

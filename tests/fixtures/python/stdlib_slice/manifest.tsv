@@ -19,3 +19,4 @@ pytest	supported	pytest	case_17_pytest.py	any	import capability plus the explici
 unittest	supported	unittest	case_18_unittest.py	0	TestCase entrypoint and VFS runner
 csv	supported	csv	case_19_csv.py	0	quoted reader and writer protocols from frozen Python source
 source_modules	supported	collections,json,os,datetime,zlib	case_20_source_modules.py	0	stdlib policy composed in frozen Python over narrow native cores
+bytes	supported	base64,codecs,hashlib,struct,zlib	case_21_bytes.py	0	byte-preserving values and bounded binary codec cores

@@ -286,13 +286,86 @@ print(date.today())
 }
 
 #[test]
-fn frozen_zlib_exposes_exact_crc_and_rejects_byte_decompression() {
+fn frozen_base64_and_zlib_preserve_arbitrary_bytes() {
+    let source = r#"
+import base64
+import zlib
+
+value = b'\x00\xffhello'
+encoded = base64.b64encode(value)
+print(encoded, base64.b64decode(encoded))
+compressed = zlib.compress(value)
+print(zlib.decompress(compressed), zlib.crc32(b'123456789'))
+"#;
     assert_eq!(
-        run("import zlib\nprint(zlib.crc32(b'123456789'))"),
-        (0, "3421780262\n".into(), String::new())
+        run(source),
+        (
+            0,
+            "b'AP9oZWxsbw==' b'\\x00\\xffhello'\nb'\\x00\\xffhello' 3421780262\n".into(),
+            String::new(),
+        )
     );
-    let (_, _, error) = run("import zlib\nzlib.decompress('data')");
-    assert!(error.contains("requires byte-preserving PyBytes support"));
+}
+
+#[test]
+fn frozen_struct_packs_standard_width_binary_records() {
+    let source = r#"
+import struct
+
+packed = struct.pack('>Hif4s', 513, -7, 1.5, b'xy')
+print(struct.calcsize('>Hif4s'), packed)
+print(struct.unpack('>Hif4s', packed))
+print(struct.unpack('<Q', struct.pack('<Q', 18446744073709551615)))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "14 b'\\x02\\x01\\xff\\xff\\xff\\xf9?\\xc0\\x00\\x00xy\\x00\\x00'\n(513, -7, 1.5, b'xy\\x00\\x00')\n(18446744073709551615,)\n".into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
+fn source_codecs_tempfiles_and_path_replacement_use_runtime_protocols() {
+    let source = r#"
+import codecs
+import io
+import logging
+import tempfile
+from pathlib import Path
+
+print(codecs.encode('Hello, World!', 'rot_13'))
+print(codecs.decode('Uryyb, Jbeyq!', 'rot_13'))
+text_buffer = io.StringIO()
+text_buffer.write('text')
+byte_buffer = io.BytesIO(b'ab')
+byte_buffer.seek(2)
+byte_buffer.write(b'\xff')
+print(text_buffer.getvalue(), byte_buffer.getvalue())
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(message)s'))
+logging.getLogger().addHandler(handler)
+with tempfile.TemporaryDirectory(prefix='case-', dir='/tmp') as directory:
+    source = Path(directory) / 'old.bin'
+    target = Path(directory) / 'new.bin'
+    source.write_bytes(b'\x00\xff')
+    print(source.replace(target), target.read_bytes())
+    print(source.exists(), target.exists())
+print(Path(directory).exists())
+with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.dat') as stream:
+    stream.write(b'ok')
+print(stream.name, Path(stream.name).read_bytes())
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "Uryyb, Jbeyq!\nHello, World!\ntext b'ab\\xff'\n/tmp/case-00000000000040008000000000000001/new.bin b'\\x00\\xff'\nFalse True\nFalse\n/tmp/tmp00000000000040008000000000000002.dat b'ok'\n".into(),
+            String::new(),
+        )
+    );
 }
 
 #[test]

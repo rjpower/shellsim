@@ -10,6 +10,7 @@ pub enum TokenKind {
     /// A decimal floating-point literal validated by the lexer and stored as an f64.
     Float(f64),
     String(String),
+    Bytes(Vec<u8>),
     FString {
         body: String,
         raw: bool,

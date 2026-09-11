@@ -378,6 +378,33 @@ impl Vfs {
         }
     }
 
+    /// Read a file as exact bytes only when it is within `limit`.
+    pub fn read_limited(&self, cwd: &str, path: &str, limit: usize) -> Result<Vec<u8>> {
+        let abs = resolve_against(cwd, path);
+        let real = self.realpath(&abs, true)?;
+        match self.nodes.get(&real) {
+            Some(Node {
+                kind: NodeKind::File(data),
+                ..
+            }) => {
+                if data.len() > limit {
+                    return Err(VfsError::TooLarge {
+                        path: path.to_string(),
+                        limit,
+                    });
+                }
+                self.read_bytes
+                    .set(self.read_bytes.get().saturating_add(data.len() as u64));
+                Ok(data.clone())
+            }
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => Err(VfsError::IsADir(path.to_string())),
+            _ => Err(VfsError::NotFound(path.to_string())),
+        }
+    }
+
     pub fn read_string(&self, cwd: &str, path: &str) -> Result<String> {
         Ok(String::from_utf8_lossy(&self.read(cwd, path)?).into_owned())
     }
@@ -933,5 +960,11 @@ mod tests {
         assert_eq!(v.read_bytes(), 0);
         assert_eq!(v.read_string_limited("/", "/large", 5).unwrap(), "12345");
         assert_eq!(v.read_bytes(), 5);
+        v.write("/", "/binary", b"\0\xff", 0o644).unwrap();
+        assert!(matches!(
+            v.read_limited("/", "/binary", 1),
+            Err(VfsError::TooLarge { .. })
+        ));
+        assert_eq!(v.read_limited("/", "/binary", 2).unwrap(), b"\0\xff");
     }
 }

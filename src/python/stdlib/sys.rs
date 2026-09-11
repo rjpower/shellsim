@@ -2,8 +2,8 @@
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, MethodDef, ModuleDef, NativeTypeDef, PyConstant, PyMarker, PyResult, PyRuntime,
-    ValueDef,
+    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyConstant, PyError, PyMarker,
+    PyResult, PyRuntime, ValueDef,
 };
 
 pub(crate) static STREAM_TYPE: NativeTypeDef = NativeTypeDef {
@@ -17,7 +17,11 @@ pub(crate) static STREAM_TYPE: NativeTypeDef = NativeTypeDef {
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "sys",
-    functions: &[],
+    functions: &[FunctionDef {
+        module: "sys",
+        name: "exit",
+        call: exit,
+    }],
     values: &[
         ValueDef::Constant {
             name: "version",
@@ -49,6 +53,20 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
     ],
 };
+
+fn exit(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("sys.exit", 0, 1)?;
+    args.reject_keywords("sys.exit")?;
+    let status = match args.positional().first() {
+        None => 0,
+        Some(value) if *value == Value::None => 0,
+        Some(value) => runtime
+            .int_value(value)
+            .and_then(|status| i32::try_from(status).ok())
+            .unwrap_or(1),
+    };
+    Err(PyError::exit(status))
+}
 
 fn argv(runtime: &mut dyn PyRuntime) -> PyResult {
     runtime.new_argv()

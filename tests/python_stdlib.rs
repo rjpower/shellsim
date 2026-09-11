@@ -17,6 +17,12 @@ fn run(source: &str) -> (i32, Vec<u8>, Vec<u8>) {
 }
 
 #[test]
+fn sys_exit_returns_the_requested_process_status() {
+    assert_eq!(run("import sys\nsys.exit(4)"), (4, Vec::new(), Vec::new()));
+    assert_eq!(run("import sys\nsys.exit()"), (0, Vec::new(), Vec::new()));
+}
+
+#[test]
 fn math_and_string_constants_match_cpython() {
     let source = r#"import math
 import string
@@ -117,17 +123,27 @@ fn argparse_parser_and_namespace_are_capability_free() {
 parser = argparse.ArgumentParser(prog="demo")
 parser.add_argument("--count", type=int, default=2)
 parser.add_argument("--verbose", action="store_true")
-args = parser.parse_args(["--count", "7", "--verbose"])
-print(parser.prog, args.count, args.verbose)
+parser.add_argument("--mode", choices=["fast", "safe"], default="safe")
+args = parser.parse_args(["--count", "7", "--verbose", "--mode", "fast"])
+print(parser.prog, args.count, args.verbose, args.mode)
 "#;
     let simulated = run(source);
-    assert_eq!(simulated, (0, b"demo 7 True\n".to_vec(), Vec::new()));
+    assert_eq!(simulated, (0, b"demo 7 True fast\n".to_vec(), Vec::new()));
     let reference = Command::new("python3.14").arg("-c").arg(source).output();
     if let Ok(reference) = reference {
         assert_eq!(simulated.0, reference.status.code().unwrap_or(1));
         assert_eq!(simulated.1, reference.stdout);
         assert_eq!(simulated.2, reference.stderr);
     }
+
+    let invalid = run(
+        "import argparse\np = argparse.ArgumentParser()\np.add_argument('--mode', choices=['a'])\np.parse_args(['--mode', 'b'])",
+    );
+    assert_ne!(invalid.0, 0);
+    assert!(invalid
+        .2
+        .windows(14)
+        .any(|window| window == b"invalid choice"));
 }
 
 #[test]

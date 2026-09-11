@@ -1,7 +1,7 @@
 //! Private VFS primitives for frozen pure-Python stdlib facades.
 
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyResult, PyRuntime, PyString, PyValueCast,
+    CallArgs, FunctionDef, ModuleDef, PyBytes, PyResult, PyRuntime, PyString, PyValueCast,
 };
 use super::super::Value;
 
@@ -17,6 +17,16 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             module: "_shellsim_vfs",
             name: "write_text",
             call: write_text,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "read_bytes",
+            call: read_bytes,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "write_bytes",
+            call: write_bytes,
         },
         FunctionDef {
             module: "_shellsim_vfs",
@@ -43,6 +53,21 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             name: "glob",
             call: glob_paths,
         },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "remove_file",
+            call: remove_file,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "remove_tree",
+            call: remove_tree,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "rename",
+            call: rename,
+        },
     ],
     values: &[],
 };
@@ -63,6 +88,25 @@ fn write_text(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let PyString(path) = args.positional()[0].cast(runtime)?;
     let PyString(contents) = args.positional()[1].cast(runtime)?;
     runtime.filesystem().write_text(&path, &contents)?;
+    Ok(Value::None)
+}
+
+fn read_bytes(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("_shellsim_vfs.read_bytes", 1, 1)?;
+    args.reject_keywords("_shellsim_vfs.read_bytes")?;
+    let PyString(path) = args.positional()[0].cast(runtime)?;
+    runtime
+        .filesystem()
+        .read_bytes(&path)
+        .and_then(|bytes| runtime.new_bytes(bytes))
+}
+
+fn write_bytes(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("_shellsim_vfs.write_bytes", 2, 2)?;
+    args.reject_keywords("_shellsim_vfs.write_bytes")?;
+    let PyString(path) = args.positional()[0].cast(runtime)?;
+    let PyBytes(contents) = args.positional()[1].cast(runtime)?;
+    runtime.filesystem().write_bytes(&path, &contents)?;
     Ok(Value::None)
 }
 
@@ -107,4 +151,29 @@ fn glob_paths(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         values.push(runtime.new_string(path)?);
     }
     runtime.new_list(values)
+}
+
+fn remove_file(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("_shellsim_vfs.remove_file", 1, 1)?;
+    args.reject_keywords("_shellsim_vfs.remove_file")?;
+    let PyString(path) = args.positional()[0].cast(runtime)?;
+    runtime.filesystem().remove_file(&path)?;
+    Ok(Value::None)
+}
+
+fn remove_tree(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("_shellsim_vfs.remove_tree", 1, 1)?;
+    args.reject_keywords("_shellsim_vfs.remove_tree")?;
+    let PyString(path) = args.positional()[0].cast(runtime)?;
+    runtime.filesystem().remove_tree(&path)?;
+    Ok(Value::None)
+}
+
+fn rename(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("_shellsim_vfs.rename", 2, 2)?;
+    args.reject_keywords("_shellsim_vfs.rename")?;
+    let PyString(source) = args.positional()[0].cast(runtime)?;
+    let PyString(destination) = args.positional()[1].cast(runtime)?;
+    runtime.filesystem().rename(&source, &destination)?;
+    Ok(Value::None)
 }

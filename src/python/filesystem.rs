@@ -70,6 +70,60 @@ impl PyFilesystem for Interp {
             })
     }
 
+    fn read_bytes(&mut self, path: &str) -> PyResult<Vec<u8>> {
+        let length = self
+            .vfs
+            .file_len(&self.cwd, path)
+            .map_err(|error| PyError::runtime_error(error.to_string()))?;
+        if length > MAX_TEXT_FILE {
+            return Err(PyError::resource_error(
+                "binary file exceeds the 4 MiB limit",
+            ));
+        }
+        reserve_memory(self, length)?;
+        charge_cpu(self, length)?;
+        self.vfs
+            .read_limited(&self.cwd, path, MAX_TEXT_FILE)
+            .map_err(|error| PyError::runtime_error(error.to_string()))
+    }
+
+    fn write_bytes(&mut self, path: &str, contents: &[u8]) -> PyResult<()> {
+        reserve_memory(self, contents.len())?;
+        charge_cpu(self, contents.len())?;
+        let path = resolve_against(&self.cwd, path);
+        self.sync_vfs_time();
+        self.vfs
+            .put_file(&path, contents.to_vec(), 0o644)
+            .map_err(|error| match error {
+                VfsError::NoSpace => PyError::resource_error(error.to_string()),
+                _ => PyError::runtime_error(error.to_string()),
+            })
+    }
+
+    fn remove_file(&mut self, path: &str) -> PyResult<()> {
+        self.sync_vfs_time();
+        let cwd = self.cwd.clone();
+        self.vfs
+            .remove_file(&cwd, path)
+            .map_err(|error| PyError::runtime_error(error.to_string()))
+    }
+
+    fn remove_tree(&mut self, path: &str) -> PyResult<()> {
+        self.sync_vfs_time();
+        let cwd = self.cwd.clone();
+        self.vfs
+            .remove_all(&cwd, path)
+            .map_err(|error| PyError::runtime_error(error.to_string()))
+    }
+
+    fn rename(&mut self, source: &str, destination: &str) -> PyResult<()> {
+        self.sync_vfs_time();
+        let cwd = self.cwd.clone();
+        self.vfs
+            .rename(&cwd, source, destination)
+            .map_err(|error| PyError::runtime_error(error.to_string()))
+    }
+
     fn exists(&self, path: &str) -> bool {
         self.vfs.exists(&self.cwd, path)
     }

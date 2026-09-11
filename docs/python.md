@@ -50,13 +50,15 @@ ValueTag
 ```
 
 `None`, booleans, bounded integers, floats, and UTF-8 strings up to fifteen bytes are immediate.
-Long strings, arbitrary-precision integers, mutable values, exceptions, classes, and other values
-requiring distinct identity live in the invocation arena. Each arena entry has a semantic
-`TypeId`, optional attributes, and a typed payload.
+Long strings, immutable bytes, mutable byte arrays, arbitrary-precision integers, mutable values,
+exceptions, classes, and other values requiring distinct identity live in the invocation arena.
+Each arena entry has a semantic `TypeId`, optional attributes, and a typed payload. Byte sequences
+are never routed through UTF-8 storage: `PyBytes` exposes an owned, checked octet snapshot and
+`PyByteArray` provides snapshot-and-commit mutation.
 
 Physical tags do not define Python types. `type_id(value)` maps immediate storage to canonical
 builtin types and arena values to the type in their object header. `PyKind` exists only to obtain a
-checked native view such as `PyNumber`, `PyString`, `PyList`, or `PyDict`.
+checked native view such as `PyNumber`, `PyString`, `PyBytes`, `PyList`, or `PyDict`.
 
 There is no separate identity field. Arena values use `ObjectId`; immediate values are canonical
 by representation, with floats compared by exact bits for identity. Container equality and
@@ -108,17 +110,18 @@ required: `time` receives the virtual clock and `os` receives the simulated envi
 must not inspect VM stacks, heap payload variants, or `Environment` directly.
 
 Filesystem access is split into two explicit boundaries in `python/filesystem.rs`. `PyFilesystem`
-provides bounded text I/O, predicates, directory creation, and globbing to the private frozen-module
-facade. `PyModuleLoader` performs VFS-only source discovery for imports. Both own path policy,
-resource charging, quota translation, and mutation-time synchronization; `vm.rs` contains no VFS
-operations and neither boundary can reach the host filesystem.
+provides separate bounded text and byte I/O, predicates, directory mutation, renaming, and globbing
+to the private frozen-module facade. `PyModuleLoader` performs VFS-only source discovery for
+imports. Both own path policy, resource charging, quota translation, and mutation-time
+synchronization; `vm.rs` contains no VFS operations and neither boundary can reach the host
+filesystem.
 
 The registry contains bounded native slices of modules such as `argparse`, `bisect`, `dataclasses`,
 `enum`, `functools`, `heapq`, `itertools`, `math`, `pytest`, `re`, `string`, `subprocess`, `sys`,
 `time`, `typing`, and `unittest`. A separate closed frozen-source registry bundles Python
 implementations with `include_str!` and executes them through the ordinary compiler and module
-namespace. `abc`, `collections`, `csv`, `datetime`, `glob`, `hashlib`, `io`, `json`, `logging`,
-`os`, `pathlib`, `uuid`, and `zlib` use this path. Source modules may import small private native
+namespace. `abc`, `base64`, `codecs`, `collections`, `csv`, `datetime`, `glob`, `hashlib`, `io`,
+`json`, `logging`, `os`, `pathlib`, `struct`, `tempfile`, `uuid`, and `zlib` use this path. Source modules may import small private native
 cores for algorithms or modeled capabilities that Python cannot implement directly. Filesystem
 modules share `_shellsim_vfs`; `collections` imports only native `defaultdict`; `json`, `hashlib`,
 and `zlib` delegate their bounded codec, digest, or checksum primitives. `subprocess` remains an
@@ -149,7 +152,7 @@ Other explicit frontiers include:
 - async functions, async iterators, async fixtures, and structural pattern matching;
 - generator `send`, `throw`, `close`, and `yield from`;
 - custom exception subclasses and complete attribute interception;
-- byte-preserving bytes/bytearray, multidimensional slicing, attribute deletion, hashing, and
+- the complete buffer protocol, multidimensional slicing, attribute deletion, hashing slots, and
   dict-view semantics;
 - `exec`, `eval`, `compile`, code objects, pickle, weak references, and garbage collection;
 - native extensions, arbitrary import hooks, host-backed modules, and full pytest/unittest.

@@ -47,6 +47,8 @@ pub struct ScopeId(usize);
 #[derive(Clone, Debug)]
 pub enum Object {
     String(String),
+    Bytes(Vec<u8>),
+    ByteArray(Vec<u8>),
     Exception {
         kind: String,
         message: String,
@@ -298,6 +300,17 @@ impl Heap {
         }
     }
 
+    pub fn scope_root(&self, mut scope: ScopeId) -> Result<ScopeId, String> {
+        loop {
+            let current = self.scopes.get(scope.0).ok_or("invalid scope reference")?;
+            if let Some(parent) = current.parent {
+                scope = parent;
+            } else {
+                return Ok(scope);
+            }
+        }
+    }
+
     pub fn scope_parent(&self, scope: ScopeId) -> Result<Option<ScopeId>, String> {
         Ok(self
             .scopes
@@ -398,6 +411,8 @@ impl Heap {
     fn infer_type_id(&self, object: &Object) -> Result<TypeId, String> {
         Ok(match object {
             Object::String(_) => BuiltinType::String.id(),
+            Object::Bytes(_) => BuiltinType::Bytes.id(),
+            Object::ByteArray(_) => BuiltinType::ByteArray.id(),
             Object::Exception { .. } => BuiltinType::Exception.id(),
             Object::List(_) => BuiltinType::List.id(),
             Object::Tuple(_) => BuiltinType::Tuple.id(),
@@ -453,6 +468,8 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
     const VALUE: u64 = 24;
     let slots = match object {
         Object::String(value) => value.len(),
+        Object::Bytes(value) => value.len(),
+        Object::ByteArray(value) => value.len(),
         Object::Exception { kind, message } => kind
             .len()
             .checked_add(message.len())

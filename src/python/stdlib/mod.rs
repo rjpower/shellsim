@@ -4,6 +4,7 @@
 //! Keeping this directory self-contained makes each shim straightforward to review and test.
 
 pub mod argparse;
+mod base64;
 pub mod bisect;
 pub mod collections;
 pub mod core;
@@ -20,6 +21,7 @@ pub mod os;
 pub mod pytest;
 pub mod re;
 pub mod string;
+mod r#struct;
 pub mod subprocess;
 pub mod sys;
 pub mod time;
@@ -47,6 +49,7 @@ pub(super) fn frozen_builtin(name: &str) -> Option<(&'static str, &'static str)>
 pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
     match name {
         "argparse" => Some(&argparse::MODULE),
+        "_base64" => Some(&base64::MODULE),
         "_json" => Some(&json::MODULE),
         "bisect" => Some(&bisect::MODULE),
         "_collections" => Some(&collections::MODULE),
@@ -63,6 +66,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "pytest" => Some(&pytest::MODULE),
         "re" => Some(&re::MODULE),
         "string" => Some(&string::MODULE),
+        "_struct" => Some(&r#struct::MODULE),
         "sys" => Some(&sys::MODULE),
         "subprocess" => Some(&subprocess::MODULE),
         "time" => Some(&time::MODULE),

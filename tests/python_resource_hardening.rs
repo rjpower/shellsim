@@ -1,4 +1,5 @@
 use shellsim::{python, Environment, Limits, StopReason};
+use std::io::Write;
 
 fn run_with_limits(
     source: &str,
@@ -154,6 +155,44 @@ fn string_join_reserves_its_result_before_host_growth() {
     );
     assert_eq!(status, 137);
     assert!(usage.memory_peak <= 40 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn bytes_repetition_reserves_before_allocating() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "b'x' * 1000000",
+        Limits {
+            memory: 32 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 32 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn zlib_rejects_expansion_before_materializing_the_result() {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&vec![0; 1024 * 1024]).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let literal = compressed
+        .iter()
+        .map(|byte| format!("\\x{byte:02x}"))
+        .collect::<String>();
+    let source = format!("import zlib\nzlib.decompress(b'{literal}')");
+    let (status, stdout, stderr, usage) = run_with_limits(
+        &source,
+        Limits {
+            memory: 512 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 512 * 1024);
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 }
