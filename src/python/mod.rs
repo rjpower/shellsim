@@ -7,6 +7,7 @@
 mod ast;
 mod bytecode;
 mod compiler;
+mod filesystem;
 mod heap;
 mod lexer;
 mod native;

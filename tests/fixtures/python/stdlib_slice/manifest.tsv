@@ -17,3 +17,4 @@ argparse	supported	argparse	case_15_argparse.py	0	deterministic parser program
 subprocess	supported	subprocess	case_16_subprocess.py	0	import-only capability-free entrypoint
 pytest	supported	pytest	case_17_pytest.py	any	import capability plus the explicit-file runner slice
 unittest	supported	unittest	case_18_unittest.py	0	TestCase entrypoint and VFS runner
+csv	supported	csv	case_19_csv.py	0	quoted reader and writer protocols from frozen Python source

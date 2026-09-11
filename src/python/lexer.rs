@@ -67,8 +67,14 @@ impl<'a> Lexer<'a> {
                     }
                     continue;
                 }
-                'f' | 'F' if self.followed_by_quote() => self.fstring(start)?,
+                'f' | 'F' if self.followed_by_quote() => self.fstring(start, 1, false)?,
+                'f' | 'F' if self.followed_by_raw_quote() => self.fstring(start, 2, true)?,
+                'r' | 'R' if self.followed_by_format_quote() => self.fstring(start, 2, true)?,
                 'r' | 'R' if self.followed_by_quote() => self.raw_string(start)?,
+                'b' | 'B' if self.followed_by_quote() => {
+                    self.bump();
+                    self.string(start)?
+                }
                 'a'..='z' | 'A'..='Z' | '_' => self.name(),
                 '0'..='9' => self.number(start, false)?,
                 '\'' | '"' => self.string(start)?,
@@ -87,7 +93,15 @@ impl<'a> Lexer<'a> {
                 }
                 '*' => self.single(TokenKind::Star),
                 '%' => self.single(TokenKind::Percent),
+                '&' => self.single(TokenKind::Ampersand),
+                '^' => self.single(TokenKind::Caret),
+                '~' => self.single(TokenKind::Tilde),
                 '|' => self.single(TokenKind::Pipe),
+                '\\' if self.source[self.offset..].starts_with("\\\n") => {
+                    self.bump();
+                    self.bump();
+                    continue;
+                }
                 '=' => self.either('=', TokenKind::EqualEqual, TokenKind::Equal),
                 '!' => {
                     self.bump();
@@ -280,14 +294,20 @@ impl<'a> Lexer<'a> {
 
     fn string(&mut self, start: Span) -> Result<TokenKind, LexError> {
         let quote = self.bump().expect("the caller observed a quote");
+        let triple =
+            self.peek() == Some(quote) && self.source[self.offset..].chars().nth(1) == Some(quote);
+        if triple {
+            self.bump();
+            self.bump();
+        }
         let mut value = String::new();
         loop {
             let Some(ch) = self.bump() else {
                 return Err(self.error(start, "unterminated string literal"));
             };
             match ch {
-                ch if ch == quote => break,
-                '\n' => return Err(self.error(start, "unterminated string literal")),
+                ch if ch == quote && self.consume_triple_end(quote, triple) => break,
+                '\n' if !triple => return Err(self.error(start, "unterminated string literal")),
                 '\\' => {
                     let Some(escaped) = self.bump() else {
                         return Err(self.error(start, "unterminated escape sequence"));
@@ -322,15 +342,29 @@ impl<'a> Lexer<'a> {
     fn raw_string(&mut self, start: Span) -> Result<TokenKind, LexError> {
         self.bump(); // r/R prefix
         let quote = self.bump().expect("followed_by_quote checked above");
+        let triple =
+            self.peek() == Some(quote) && self.source[self.offset..].chars().nth(1) == Some(quote);
+        if triple {
+            self.bump();
+            self.bump();
+        }
         let mut value = String::new();
         loop {
             let Some(ch) = self.bump() else {
                 return Err(self.error(start, "unterminated raw string literal"));
             };
-            if ch == quote {
+            if ch == '\\' {
+                value.push(ch);
+                let escaped = self
+                    .bump()
+                    .ok_or_else(|| self.error(start, "unterminated raw string literal"))?;
+                value.push(escaped);
+                continue;
+            }
+            if ch == quote && self.consume_triple_end(quote, triple) {
                 break;
             }
-            if ch == '\n' {
+            if ch == '\n' && !triple {
                 return Err(self.error(start, "unterminated raw string literal"));
             }
             value.push(ch);
@@ -342,20 +376,35 @@ impl<'a> Lexer<'a> {
     /// brace matching and embedded-expression parsing; keeping the raw body in
     /// one token prevents the ordinary lexer from confusing expression tokens
     /// with the surrounding literal text.
-    fn fstring(&mut self, start: Span) -> Result<TokenKind, LexError> {
-        self.bump(); // f/F prefix
+    fn fstring(
+        &mut self,
+        start: Span,
+        prefix_length: usize,
+        raw: bool,
+    ) -> Result<TokenKind, LexError> {
+        for _ in 0..prefix_length {
+            self.bump();
+        }
         let quote = self.bump().expect("followed_by_quote checked above");
+        let triple =
+            self.peek() == Some(quote) && self.source[self.offset..].chars().nth(1) == Some(quote);
+        if triple {
+            self.bump();
+            self.bump();
+        }
         let body_start = self.offset;
         while let Some(ch) = self.bump() {
-            if ch == quote {
-                return Ok(TokenKind::FString(
-                    self.source[body_start..self.offset - 1].into(),
-                ));
+            if ch == quote && self.consume_triple_end(quote, triple) {
+                let delimiter_length = if triple { 3 } else { 1 };
+                return Ok(TokenKind::FString {
+                    body: self.source[body_start..self.offset - delimiter_length].into(),
+                    raw,
+                });
             }
-            if ch == '\n' {
+            if ch == '\n' && !triple {
                 return Err(self.error(start, "unterminated f-string literal"));
             }
-            if ch == '\\' {
+            if ch == '\\' && !raw {
                 self.bump()
                     .ok_or_else(|| self.error(start, "unterminated escape sequence"))?;
             }
@@ -365,6 +414,39 @@ impl<'a> Lexer<'a> {
 
     fn followed_by_quote(&self) -> bool {
         matches!(self.source[self.offset..].chars().nth(1), Some('\'' | '"'))
+    }
+
+    fn followed_by_raw_quote(&self) -> bool {
+        matches!(
+            (
+                self.source[self.offset..].chars().nth(1),
+                self.source[self.offset..].chars().nth(2)
+            ),
+            (Some('r' | 'R'), Some('\'' | '"'))
+        )
+    }
+
+    fn followed_by_format_quote(&self) -> bool {
+        matches!(
+            (
+                self.source[self.offset..].chars().nth(1),
+                self.source[self.offset..].chars().nth(2)
+            ),
+            (Some('f' | 'F'), Some('\'' | '"'))
+        )
+    }
+
+    fn consume_triple_end(&mut self, quote: char, triple: bool) -> bool {
+        if !triple {
+            return true;
+        }
+        if self.peek() == Some(quote) && self.source[self.offset..].chars().nth(1) == Some(quote) {
+            self.bump();
+            self.bump();
+            true
+        } else {
+            false
+        }
     }
 
     fn single(&mut self, kind: TokenKind) -> TokenKind {

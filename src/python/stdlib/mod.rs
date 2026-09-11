@@ -9,7 +9,9 @@ pub mod collections;
 pub mod core;
 pub mod dataclasses;
 pub mod r#enum;
+mod frozen;
 pub mod functools;
+mod hashlib;
 pub mod heapq;
 pub mod itertools;
 pub mod json;
@@ -23,8 +25,22 @@ pub mod sys;
 pub mod time;
 pub mod typing;
 pub mod unittest;
+mod vfs;
 
 use super::native::ModuleDef;
+
+/// Resolve a capability-free stdlib module implemented in ordinary Python source.
+pub(super) fn frozen_module(name: &str) -> Option<&'static str> {
+    frozen::module_source(name)
+}
+
+/// Resolve a builtin implemented by a frozen module without preloading that module into the VFS.
+pub(super) fn frozen_builtin(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "open" => Some(("_io", "open")),
+        _ => None,
+    }
+}
 
 /// Resolve one capability-free module through the declarative native registry.
 pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
@@ -36,6 +52,8 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "dataclasses" => Some(&dataclasses::MODULE),
         "enum" => Some(&r#enum::MODULE),
         "heapq" => Some(&heapq::MODULE),
+        "_hashlib" => Some(&hashlib::MODULE),
+        "_shellsim_vfs" => Some(&vfs::MODULE),
         "functools" => Some(&functools::MODULE),
         "itertools" => Some(&itertools::MODULE),
         "math" => Some(&math::MODULE),

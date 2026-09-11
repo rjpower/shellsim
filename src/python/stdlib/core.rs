@@ -48,6 +48,7 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "join", string_join),
         method("str", "replace", string_replace),
         method("str", "format", string_format),
+        method("str", "encode", string_encode),
     ],
 };
 
@@ -121,6 +122,22 @@ fn string_lstrip(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
 
 fn string_rstrip(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     strip(runtime, receiver, args, StripKind::Right)
+}
+
+/// Bytes are not yet a distinct runtime layout. UTF-8 encode therefore returns the same immutable
+/// byte-preserving string value, which is accepted only by APIs that explicitly use this bridge.
+fn string_encode(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.encode", 0, 2)?;
+    args.reject_keywords("str.encode")?;
+    for argument in args.positional() {
+        let PyString(value) = (*argument).cast(runtime)?;
+        if !matches!(value.as_str(), "utf-8" | "UTF-8" | "strict") {
+            return Err(PyError::value_error(
+                "only UTF-8 strict encoding is supported",
+            ));
+        }
+    }
+    Ok(receiver)
 }
 
 enum StripKind {

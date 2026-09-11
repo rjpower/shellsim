@@ -325,6 +325,23 @@ impl Vfs {
         }
     }
 
+    /// Return a regular file's byte length without cloning its contents.
+    pub fn file_len(&self, cwd: &str, path: &str) -> Result<usize> {
+        let abs = resolve_against(cwd, path);
+        let real = self.realpath(&abs, true)?;
+        match self.nodes.get(&real) {
+            Some(Node {
+                kind: NodeKind::File(data),
+                ..
+            }) => Ok(data.len()),
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => Err(VfsError::IsADir(path.to_string())),
+            _ => Err(VfsError::NotFound(path.to_string())),
+        }
+    }
+
     pub fn is_symlink(&self, cwd: &str, path: &str) -> bool {
         let abs = resolve_against(cwd, path);
         match self.realpath(&abs, false) {

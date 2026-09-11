@@ -274,12 +274,23 @@ impl Parser {
                 body: self.suite()?,
             }
         } else if self.take(|kind| matches!(kind, TokenKind::From)).is_some() {
-            let module = self.module_name("expected a module name after 'from'")?;
+            let mut module = String::new();
+            while self.take(|kind| matches!(kind, TokenKind::Dot)).is_some() {
+                module.push('.');
+            }
+            if !self.at(|kind| matches!(kind, TokenKind::Import)) {
+                module.push_str(&self.module_name("expected a module name after 'from'")?);
+            } else if module.is_empty() {
+                return Err(self.error("expected a module name after 'from'"));
+            }
             self.expect(
                 |kind| matches!(kind, TokenKind::Import),
                 "expected 'import' after module name",
             )?;
             let mut names = Vec::new();
+            let parenthesized = self
+                .take(|kind| matches!(kind, TokenKind::LeftParen))
+                .is_some();
             loop {
                 let imported = self.name("expected a name to import")?;
                 let binding = if self.take(|kind| matches!(kind, TokenKind::As)).is_some() {
@@ -291,6 +302,15 @@ impl Parser {
                 if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
                     break;
                 }
+                if parenthesized && self.at(|kind| matches!(kind, TokenKind::RightParen)) {
+                    break;
+                }
+            }
+            if parenthesized {
+                self.expect(
+                    |kind| matches!(kind, TokenKind::RightParen),
+                    "expected ')' after imported names",
+                )?;
             }
             StatementKind::ImportFrom { module, names }
         } else if self
@@ -482,6 +502,7 @@ impl Parser {
             |kind| matches!(kind, TokenKind::Newline),
             "expected a newline before indented suite",
         )?;
+        self.separators();
         self.expect(
             |kind| matches!(kind, TokenKind::Indent),
             "expected an indented suite",
@@ -526,7 +547,7 @@ impl Parser {
         {
             self.lambda_expression()
         } else {
-            self.boolean_or()
+            self.conditional_expression()
         };
         self.expression_depth -= 1;
         result
@@ -545,7 +566,12 @@ impl Parser {
         }
     }
 
-    fn fstring_expression(&self, body: String, span: Span) -> Result<ExpressionKind, ParseError> {
+    fn fstring_expression(
+        &self,
+        body: String,
+        raw: bool,
+        span: Span,
+    ) -> Result<ExpressionKind, ParseError> {
         let mut parts = Vec::new();
         let mut text = String::new();
         let chars: Vec<char> = body.chars().collect();
@@ -592,15 +618,8 @@ impl Parser {
                             span,
                         });
                     }
-                    let source: String = chars[start..cursor].iter().collect();
-                    if has_top_level_format_marker(&source) {
-                        return Err(ParseError {
-                            message:
-                                "f-string conversions and format specifications are not implemented"
-                                    .into(),
-                            span,
-                        });
-                    }
+                    let field: String = chars[start..cursor].iter().collect();
+                    let (source, conversion, format_spec) = split_fstring_field(&field, span)?;
                     let embedded_tokens =
                         super::lexer::lex(&source).map_err(|error| ParseError {
                             message: format!("invalid f-string expression: {}", error.message),
@@ -621,7 +640,15 @@ impl Parser {
                             span,
                         });
                     };
-                    parts.push(FStringPart::Expression(expression));
+                    if conversion.is_some() || !format_spec.is_empty() {
+                        parts.push(FStringPart::Formatted {
+                            expression,
+                            conversion,
+                            format_spec,
+                        });
+                    } else {
+                        parts.push(FStringPart::Expression(expression));
+                    }
                     index = cursor + 1;
                 }
                 '}' => {
@@ -630,7 +657,7 @@ impl Parser {
                         span,
                     });
                 }
-                '\\' if index + 1 < chars.len() => {
+                '\\' if !raw && index + 1 < chars.len() => {
                     let escaped = match chars[index + 1] {
                         'n' => '\n',
                         'r' => '\r',
@@ -789,6 +816,27 @@ impl Parser {
         Ok(left)
     }
 
+    fn conditional_expression(&mut self) -> Result<Expression, ParseError> {
+        let body = self.boolean_or()?;
+        if self.take(|kind| matches!(kind, TokenKind::If)).is_none() {
+            return Ok(body);
+        }
+        let test = self.boolean_or()?;
+        self.expect(
+            |kind| matches!(kind, TokenKind::Else),
+            "expected 'else' in conditional expression",
+        )?;
+        let otherwise = self.expression()?;
+        Ok(Expression {
+            span: body.span.through(otherwise.span),
+            kind: ExpressionKind::Conditional {
+                test: Box::new(test),
+                body: Box::new(body),
+                otherwise: Box::new(otherwise),
+            },
+        })
+    }
+
     fn boolean_and(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.boolean_not()?;
         while self.take(|kind| matches!(kind, TokenKind::And)).is_some() {
@@ -824,7 +872,7 @@ impl Parser {
     }
 
     fn comparison(&mut self) -> Result<Expression, ParseError> {
-        let left = self.additive()?;
+        let left = self.bitwise_or()?;
         let mut comparisons = Vec::new();
         loop {
             let operator = if self
@@ -872,7 +920,7 @@ impl Parser {
                 None
             };
             let Some(operator) = operator else { break };
-            comparisons.push((operator, self.additive()?));
+            comparisons.push((operator, self.bitwise_or()?));
         }
         if comparisons.is_empty() {
             Ok(left)
@@ -888,6 +936,54 @@ impl Parser {
                 span,
             })
         }
+    }
+
+    fn bitwise_or(&mut self) -> Result<Expression, ParseError> {
+        self.binary_chain(
+            Self::bitwise_xor,
+            TokenKind::Pipe,
+            BinaryOperator::BitwiseOr,
+        )
+    }
+
+    fn bitwise_xor(&mut self) -> Result<Expression, ParseError> {
+        self.binary_chain(
+            Self::bitwise_and,
+            TokenKind::Caret,
+            BinaryOperator::BitwiseXor,
+        )
+    }
+
+    fn bitwise_and(&mut self) -> Result<Expression, ParseError> {
+        self.binary_chain(
+            Self::additive,
+            TokenKind::Ampersand,
+            BinaryOperator::BitwiseAnd,
+        )
+    }
+
+    fn binary_chain(
+        &mut self,
+        operand: fn(&mut Self) -> Result<Expression, ParseError>,
+        token: TokenKind,
+        operator: BinaryOperator,
+    ) -> Result<Expression, ParseError> {
+        let mut left = operand(self)?;
+        while self
+            .take(|kind| std::mem::discriminant(kind) == std::mem::discriminant(&token))
+            .is_some()
+        {
+            let right = operand(self)?;
+            left = Expression {
+                span: left.span.through(right.span),
+                kind: ExpressionKind::Binary {
+                    left: Box::new(left),
+                    operator,
+                    right: Box::new(right),
+                },
+            };
+        }
+        Ok(left)
     }
 
     fn additive(&mut self) -> Result<Expression, ParseError> {
@@ -956,6 +1052,8 @@ impl Parser {
             Some(UnaryOperator::Positive)
         } else if self.take(|kind| matches!(kind, TokenKind::Minus)).is_some() {
             Some(UnaryOperator::Negative)
+        } else if self.take(|kind| matches!(kind, TokenKind::Tilde)).is_some() {
+            Some(UnaryOperator::Invert)
         } else {
             None
         };
@@ -990,7 +1088,45 @@ impl Parser {
                 .take(|kind| matches!(kind, TokenKind::LeftBracket))
                 .is_some()
             {
-                let index = self.expression()?;
+                let start_or_index = if self.at(|kind| matches!(kind, TokenKind::Colon)) {
+                    None
+                } else {
+                    Some(self.expression()?)
+                };
+                if self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {
+                    let stop = if self
+                        .at(|kind| matches!(kind, TokenKind::Colon | TokenKind::RightBracket))
+                    {
+                        None
+                    } else {
+                        Some(self.expression()?)
+                    };
+                    let step = if self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {
+                        if self.at(|kind| matches!(kind, TokenKind::RightBracket)) {
+                            None
+                        } else {
+                            Some(self.expression()?)
+                        }
+                    } else {
+                        None
+                    };
+                    let end = self.expect(
+                        |kind| matches!(kind, TokenKind::RightBracket),
+                        "expected ']' after slice",
+                    )?;
+                    let span = value.span.through(end.span);
+                    value = Expression {
+                        kind: ExpressionKind::Slice {
+                            value: Box::new(value),
+                            start: start_or_index.map(Box::new),
+                            stop: stop.map(Box::new),
+                            step: step.map(Box::new),
+                        },
+                        span,
+                    };
+                    continue;
+                }
+                let index = start_or_index.ok_or_else(|| self.error("expected subscript index"))?;
                 let end = self.expect(
                     |kind| matches!(kind, TokenKind::RightBracket),
                     "expected ']' after subscript",
@@ -1088,7 +1224,7 @@ impl Parser {
             TokenKind::BigInteger(value) => ExpressionKind::Constant(Constant::BigInteger(value)),
             TokenKind::Float(value) => ExpressionKind::Constant(Constant::Float(value)),
             TokenKind::String(value) => ExpressionKind::Constant(Constant::String(value)),
-            TokenKind::FString(value) => self.fstring_expression(value, token.span)?,
+            TokenKind::FString { body, raw } => self.fstring_expression(body, raw, token.span)?,
             TokenKind::None => ExpressionKind::Constant(Constant::None),
             TokenKind::True => ExpressionKind::Constant(Constant::Bool(true)),
             TokenKind::False => ExpressionKind::Constant(Constant::Bool(false)),
@@ -1309,10 +1445,12 @@ impl Parser {
                 |kind| matches!(kind, TokenKind::In),
                 "expected 'in' after comprehension target",
             )?;
-            let iterable = self.expression()?;
+            // An unparenthesized comprehension iterable stops before the following `if`/`for`.
+            // Conditional expressions remain available when parenthesized inside this position.
+            let iterable = self.boolean_or()?;
             let mut conditions = Vec::new();
             while self.take(|kind| matches!(kind, TokenKind::If)).is_some() {
-                conditions.push(self.expression()?);
+                conditions.push(self.boolean_or()?);
             }
             clauses.push(ComprehensionClause {
                 target,
@@ -1431,11 +1569,16 @@ impl Parser {
     }
 }
 
-fn has_top_level_format_marker(source: &str) -> bool {
+fn split_fstring_field(
+    source: &str,
+    span: Span,
+) -> Result<(String, Option<char>, String), ParseError> {
     let mut nesting = 0usize;
     let mut quote = None;
     let mut escaped = false;
-    for ch in source.chars() {
+    let characters = source.chars().collect::<Vec<_>>();
+    let mut marker = None;
+    for (index, ch) in characters.iter().copied().enumerate() {
         if escaped {
             escaped = false;
             continue;
@@ -1457,10 +1600,47 @@ fn has_top_level_format_marker(source: &str) -> bool {
         } else if matches!(ch, ')' | ']' | '}') {
             nesting = nesting.saturating_sub(1);
         } else if nesting == 0 && matches!(ch, '!' | ':') {
-            return true;
+            marker = Some((index, ch));
+            break;
         }
     }
-    false
+    let Some((index, marker)) = marker else {
+        return Ok((source.to_string(), None, String::new()));
+    };
+    let expression = characters[..index].iter().collect::<String>();
+    if expression.trim().is_empty() {
+        return Err(ParseError {
+            message: "f-string field requires an expression".into(),
+            span,
+        });
+    }
+    if marker == ':' {
+        return Ok((expression, None, characters[index + 1..].iter().collect()));
+    }
+    let conversion = characters
+        .get(index + 1)
+        .copied()
+        .ok_or_else(|| ParseError {
+            message: "f-string conversion requires a conversion character".into(),
+            span,
+        })?;
+    if !matches!(conversion, 's' | 'r' | 'a') {
+        return Err(ParseError {
+            message: format!("unsupported f-string conversion !{conversion}"),
+            span,
+        });
+    }
+    let format_spec = match characters.get(index + 2) {
+        None => String::new(),
+        Some(':') => characters[index + 3..].iter().collect(),
+        Some(_) => {
+            return Err(ParseError {
+                message: "expected ':' or '}' after f-string conversion".into(),
+                span,
+            })
+        }
+    };
+    Ok((expression, Some(conversion), format_spec))
 }
 
 fn assignment_target(expression: Expression) -> Result<AssignmentTarget, ParseError> {

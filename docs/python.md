@@ -15,11 +15,17 @@ Python source and uses shellsim-owned data structures throughout.
 `-c`, stdin, VFS script files and shebangs, the persistent shell-owned REPL, and the bounded
 `pytest` and `unittest` runners.
 
+For host-side experiments, `shellsim-python PATH` creates a fresh environment, imports a file's
+containing project into `/work`, and runs the file. A directory discovers `test_*.py` files by
+default; `--entry`, `--pytest`, `--root`, resource-limit flags, and `--json` select other modes.
+Host ingestion rejects symlinks and is complete before the interpreter starts, so it does not give
+simulated code ambient filesystem access.
+
 ```text
 source -> lexer -> AST parser -> semantic bytecode compiler -> metered stack VM
                                                             |
                                                             +-> native modules
-                                                            +-> shellsim VFS, clock, and environment
+                                                            +-> modeled capability traits
 ```
 
 The lexer and parser are UTF-8 and indentation aware. The compiler emits a typed internal
@@ -79,7 +85,9 @@ Important dunder methods populate cached slots for calls, construction, attribut
 truth, iteration, arithmetic, comparison, and containment. Bytecode arithmetic asks the operand
 types for the appropriate slot. Numeric slots cast both erased operands to `PyNumber`, covering
 immediate integers, heap big integers, floats, booleans, and `int` subclass payloads without VM
-tag-specific arithmetic branches.
+tag-specific arithmetic branches. This includes reflected operations, floor division, remainder,
+bitwise operations, and unary positive, negative, and invert. `sum()` uses the same addition
+dispatch instead of a private numeric fast path.
 
 ## Native Python APIs
 
@@ -99,10 +107,20 @@ and type tables. Most modules receive only `PyRuntime`. Narrow traits expose mod
 required: `time` receives the virtual clock and `os` receives the simulated environment. A module
 must not inspect VM stacks, heap payload variants, or `Environment` directly.
 
+Filesystem access is split into two explicit boundaries in `python/filesystem.rs`. `PyFilesystem`
+provides bounded text I/O, predicates, directory creation, and globbing to the private frozen-module
+facade. `PyModuleLoader` performs VFS-only source discovery for imports. Both own path policy,
+resource charging, quota translation, and mutation-time synchronization; `vm.rs` contains no VFS
+operations and neither boundary can reach the host filesystem.
+
 The current registry contains bounded slices of `argparse`, `bisect`, `collections`, `dataclasses`,
 `enum`, `functools`, `heapq`, `itertools`, `json`, `math`, `os`, `pytest`, `re`, `string`,
-`subprocess`, `sys`, `time`, `typing`, and `unittest`. `subprocess` is an importable fail-closed
-frontier and has no host process capability.
+`subprocess`, `sys`, `time`, `typing`, and `unittest`. A separate closed frozen-source registry
+bundles Python implementations with `include_str!` and executes them through the ordinary compiler
+and module namespace. `abc`, `csv`, `glob`, `hashlib`, `io`, `logging`, `pathlib`, and `uuid` use
+this path. Filesystem-facing modules call a small private facade over `PyFilesystem`; `hashlib`
+delegates only its exact digest core to a private native primitive. `subprocess` is an importable
+fail-closed frontier and has no host process capability.
 
 ## Supported behavior and frontiers
 
@@ -123,11 +141,11 @@ Other explicit frontiers include:
 - async functions, async iterators, async fixtures, and structural pattern matching;
 - generator `send`, `throw`, `close`, and `yield from`;
 - custom exception subclasses and complete attribute interception;
-- complete bytes/bytearray, slicing, deletion, hashing, and dict-view semantics;
+- complete bytes/bytearray, multidimensional slicing, deletion, hashing, and dict-view semantics;
 - `exec`, `eval`, `compile`, code objects, pickle, weak references, and garbage collection;
 - native extensions, arbitrary import hooks, host-backed modules, and full pytest/unittest.
 
-The checked stdlib probe set covers 18 named APIs, not entire modules. The TaskTrove mini corpus
+The checked stdlib probe set covers 19 named APIs, not entire modules. The TaskTrove mini corpus
 currently supports 99 of 100 checked cases, with async behavior as the recorded frontier. A
 portable CPython-basic sample passes 61 of 64 isolated behaviors; the remaining probes cover the
 three deeper object/generator items named above. Raw CPython `Lib/test` files are not a useful
@@ -152,4 +170,3 @@ For language behavior, keep parsing, compilation, and execution separate. Add sy
 parser/compiler layer, semantic behavior through source fixtures, and an explicit rejection test
 for the unsupported edge. Any filesystem, process, clock, environment, or network requirement
 must be implemented against a narrow modeled capability before Python code can observe it.
-

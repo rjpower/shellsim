@@ -681,6 +681,20 @@ impl Compiler {
                                 span,
                             );
                         }
+                        FStringPart::Formatted {
+                            expression,
+                            conversion,
+                            format_spec,
+                        } => {
+                            self.expression(expression);
+                            self.emit(
+                                Operation::FormatValue {
+                                    conversion,
+                                    format_spec,
+                                },
+                                span,
+                            );
+                        }
                     }
                     self.emit(Operation::Binary(super::ast::BinaryOperator::Add), span);
                 }
@@ -773,6 +787,34 @@ impl Compiler {
                 self.expression(*index);
                 self.emit(Operation::LoadSubscript, span);
             }
+            ExpressionKind::Slice {
+                value,
+                start,
+                stop,
+                step,
+            } => {
+                self.expression(*value);
+                let has_start = start.is_some();
+                let has_stop = stop.is_some();
+                let has_step = step.is_some();
+                if let Some(start) = start {
+                    self.expression(*start);
+                }
+                if let Some(stop) = stop {
+                    self.expression(*stop);
+                }
+                if let Some(step) = step {
+                    self.expression(*step);
+                }
+                self.emit(
+                    Operation::LoadSlice {
+                        has_start,
+                        has_stop,
+                        has_step,
+                    },
+                    span,
+                );
+            }
             ExpressionKind::Call {
                 function,
                 arguments,
@@ -849,6 +891,19 @@ impl Compiler {
                 self.expression(*left);
                 self.expression(*right);
                 self.emit(Operation::Binary(operator), span);
+            }
+            ExpressionKind::Conditional {
+                test,
+                body,
+                otherwise,
+            } => {
+                self.expression(*test);
+                let otherwise_jump = self.emit(Operation::PopJumpIfFalse(usize::MAX), span);
+                self.expression(*body);
+                let finished_jump = self.emit(Operation::Jump(usize::MAX), span);
+                self.patch_jump(otherwise_jump, self.instructions.len());
+                self.expression(*otherwise);
+                self.patch_jump(finished_jump, self.instructions.len());
             }
             ExpressionKind::Boolean {
                 left,

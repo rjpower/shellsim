@@ -9,6 +9,10 @@ license = "Apache-2.0"
 name = "shellsim"
 path = "src/main.rs"
 
+[[bin]]
+name = "shellsim-python"
+path = "src/bin/shellsim-python.rs"
+
 [lib]
 name = "shellsim"
 path = "src/lib.rs"

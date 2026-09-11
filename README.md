@@ -39,6 +39,11 @@ cargo build --release
 ./target/release/shellsim eval \
   --cpu 100k --memory 8m --disk 2m --output 64k \
   -c 'printf "b\na\n" | sort > result.txt; cat result.txt'
+
+# Import a host Python project into a fresh VFS and run it in shellsim
+./target/release/shellsim-python project/main.py -- arg1
+./target/release/shellsim-python project/tests --pytest
+./target/release/shellsim-python --json --root project project/main.py
 ```
 
 Limit values accept `k`, `m`, and `g` binary suffixes. Arguments after `--` in `eval` mode become
@@ -50,6 +55,11 @@ and optional pre-commit-hook guidelines.
 
 The JSON report contains the exit status, typed stop reason, limits, aggregate usage, per-command
 CPU/disk deltas, stdout, stderr, command trace, and unsupported capabilities.
+
+`shellsim-python` treats its host path as trusted harness input, copies the containing project into
+`/work`, then closes that boundary before simulated Python starts. A directory automatically
+discovers `test_*.py` files; `--entry FILE` selects a script within a directory. Use `--root` to
+control which project tree is imported and the standard limit flags to constrain the run.
 
 ## Virtual time
 
@@ -141,12 +151,13 @@ Native Python modules use an erased value ABI, checked object views, declarative
 and narrow modeled capabilities. See [docs/python.md](docs/python.md) for the goals, value and
 object model, extension workflow, compatibility evidence, and explicit frontiers.
 
-The requested stdlib gate is 18/18 exact CPython 3.14 probes for these APIs: `sys.executable`,
+The requested stdlib gate is 19/19 exact CPython 3.14 probes for these APIs: `sys.executable`,
 `os.getenv`, `collections.defaultdict`, `itertools.count`/`islice`, `heapq.heapify`/`heappop`,
 `bisect.bisect_left`, `math.sqrt`/`ceil`, `string.digits`, `json.dumps(sort_keys=...)`, `re.sub`,
 `functools.reduce`, `dataclasses.dataclass`, `typing.List[...]`, `enum.Enum`,
-`argparse.ArgumentParser.prog`, `import subprocess`, and the `pytest`/`unittest.TestCase` entry
-points. These are intentionally partial module slices, not claims of complete stdlib support.
+`argparse.ArgumentParser.prog`, `csv.reader`/`writer`, `import subprocess`, and the
+`pytest`/`unittest.TestCase` entry points. These are intentionally partial module slices, not
+claims of complete stdlib support.
 
 `pytest` and `unittest` are VFS-only first runner slices: explicit files, stable definition-order
 collection, plain zero-argument pytest tests, direct `unittest.TestCase` classes, tested assertions/

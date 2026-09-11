@@ -6,16 +6,17 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use num_bigint::BigInt;
-use num_traits::{Signed, ToPrimitive, Zero};
+use num_traits::ToPrimitive;
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
 use super::bytecode::{ClassField, Code, Operation};
+use super::filesystem::PyModuleLoader;
 use super::heap::{ClassLayout, InstancePayload, Object, ScopeId};
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentSpec, PyCallable, PyClass,
-    PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyIdentity, PyInstance, PyIterator,
-    PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyNativeKind, PyProperty, PyRaisesContext,
-    PyRegex, PyResult, PyRuntime, PySet, PyTuple, PyValueCast,
+    PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyIdentity, PyInstance,
+    PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyNativeKind, PyProperty,
+    PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyTuple, PyValueCast,
 };
 use super::object_model::{BuiltinType, PyLayout, Slot, SlotValue, TypeId};
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
@@ -215,6 +216,10 @@ pub(super) fn execute(
     out: Out,
     err: Out,
 ) -> ExecResult {
+    state
+        .locals
+        .entry("__name__".into())
+        .or_insert_with(|| Value::inline_string("__main__").expect("short builtin string"));
     let tokens = match super::lexer::lex(source) {
         Ok(tokens) => tokens,
         Err(error) => {
@@ -367,6 +372,11 @@ impl<'a> Vm<'a> {
                 Operation::Import(name) => self.import(name),
                 Operation::LoadAttribute(name) => self.load_attribute(name),
                 Operation::LoadSubscript => self.load_subscript(),
+                Operation::LoadSlice {
+                    has_start,
+                    has_stop,
+                    has_step,
+                } => self.load_slice(*has_start, *has_stop, *has_step),
                 Operation::BuildList(count) => self.build_sequence(*count, SequenceKind::List),
                 Operation::BuildTuple(count) => self.build_sequence(*count, SequenceKind::Tuple),
                 Operation::BuildDict(count) => self.build_dict(*count),
@@ -397,6 +407,10 @@ impl<'a> Vm<'a> {
                 },
                 Operation::Unary(operator) => self.unary(*operator),
                 Operation::Binary(operator) => self.binary(*operator),
+                Operation::FormatValue {
+                    conversion,
+                    format_spec,
+                } => self.format_value(*conversion, format_spec),
                 Operation::Compare(operator) => self.compare(*operator),
                 Operation::Call {
                     positional,
@@ -668,108 +682,120 @@ impl<'a> Vm<'a> {
             .map(|scope| self.state.heap.scope_uses_repl_globals(scope))
             .transpose()?
             .unwrap_or(true);
-        let value = scoped
-            .or_else(|| {
-                can_use_globals
-                    .then(|| self.state.locals.get(name).cloned())
-                    .flatten()
-            })
-            .or_else(|| {
-                let builtin_type = match name {
-                    "type" => Some(BuiltinType::Type),
-                    "object" => Some(BuiltinType::Object),
-                    "bool" => Some(BuiltinType::Bool),
-                    "int" => Some(BuiltinType::Int),
-                    "float" => Some(BuiltinType::Float),
-                    "str" => Some(BuiltinType::String),
-                    "list" => Some(BuiltinType::List),
-                    "tuple" => Some(BuiltinType::Tuple),
-                    "dict" => Some(BuiltinType::Dict),
-                    "set" => Some(BuiltinType::Set),
-                    _ => None,
-                };
-                if let Some(builtin_type) = builtin_type {
-                    return Some(Value::Native(NativeValue::BuiltinType(builtin_type)));
+        let value = scoped.or_else(|| {
+            can_use_globals
+                .then(|| self.state.locals.get(name).cloned())
+                .flatten()
+        });
+        if let Some(value) = value {
+            self.stack.push(value);
+            return Ok(());
+        }
+        if let Some((module_name, attribute)) = super::stdlib::frozen_builtin(name) {
+            self.import(module_name)?;
+            let module = self.pop()?;
+            let callable = self.resolve_attribute(module, attribute)?.ok_or_else(|| {
+                format!("frozen module {module_name:?} does not define {attribute:?}")
+            })?;
+            self.stack.push(callable);
+            return Ok(());
+        }
+        let value = (|| {
+            let builtin_type = match name {
+                "type" => Some(BuiltinType::Type),
+                "object" => Some(BuiltinType::Object),
+                "bool" => Some(BuiltinType::Bool),
+                "int" => Some(BuiltinType::Int),
+                "float" => Some(BuiltinType::Float),
+                "str" => Some(BuiltinType::String),
+                "list" => Some(BuiltinType::List),
+                "tuple" => Some(BuiltinType::Tuple),
+                "dict" => Some(BuiltinType::Dict),
+                "set" => Some(BuiltinType::Set),
+                _ => None,
+            };
+            if let Some(builtin_type) = builtin_type {
+                return Some(Value::Native(NativeValue::BuiltinType(builtin_type)));
+            }
+            if let Some(function) = super::stdlib::core::builtin_function(name) {
+                return Some(Value::Native(NativeValue::NativeFunction(function)));
+            }
+            let builtin = match name {
+                "print" => Builtin::Print,
+                "exit" | "quit" => Builtin::Exit,
+                "repr" => Builtin::Repr,
+                "isinstance" => Builtin::IsInstance,
+                "issubclass" => Builtin::IsSubclass,
+                "len" => Builtin::Length,
+                "sorted" => Builtin::Sorted,
+                "min" => Builtin::Minimum,
+                "max" => Builtin::Maximum,
+                "sum" => Builtin::Sum,
+                "abs" => Builtin::Absolute,
+                "range" => Builtin::Range,
+                "enumerate" => Builtin::Enumerate,
+                "zip" => Builtin::Zip,
+                "any" => Builtin::Any,
+                "all" => Builtin::All,
+                "next" => Builtin::Next,
+                "property" => Builtin::Property,
+                "staticmethod" => Builtin::StaticMethod,
+                "classmethod" => Builtin::ClassMethod,
+                "super" => Builtin::Super,
+                "Exception" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "Exception",
+                    ))))
                 }
-                if let Some(function) = super::stdlib::core::builtin_function(name) {
-                    return Some(Value::Native(NativeValue::NativeFunction(function)));
+                "BaseException" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "BaseException",
+                    ))))
                 }
-                let builtin = match name {
-                    "print" => Builtin::Print,
-                    "exit" | "quit" => Builtin::Exit,
-                    "repr" => Builtin::Repr,
-                    "isinstance" => Builtin::IsInstance,
-                    "issubclass" => Builtin::IsSubclass,
-                    "len" => Builtin::Length,
-                    "sorted" => Builtin::Sorted,
-                    "min" => Builtin::Minimum,
-                    "max" => Builtin::Maximum,
-                    "sum" => Builtin::Sum,
-                    "abs" => Builtin::Absolute,
-                    "range" => Builtin::Range,
-                    "enumerate" => Builtin::Enumerate,
-                    "zip" => Builtin::Zip,
-                    "any" => Builtin::Any,
-                    "all" => Builtin::All,
-                    "next" => Builtin::Next,
-                    "property" => Builtin::Property,
-                    "staticmethod" => Builtin::StaticMethod,
-                    "classmethod" => Builtin::ClassMethod,
-                    "super" => Builtin::Super,
-                    "Exception" => {
-                        return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                            "Exception",
-                        ))))
-                    }
-                    "BaseException" => {
-                        return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                            "BaseException",
-                        ))))
-                    }
-                    "RuntimeError" => {
-                        return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                            "RuntimeError",
-                        ))))
-                    }
-                    "ValueError" => {
-                        return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                            "ValueError",
-                        ))))
-                    }
-                    "TypeError" => {
-                        return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                            "TypeError",
-                        ))))
-                    }
-                    "KeyError" => {
-                        return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                            "KeyError",
-                        ))))
-                    }
-                    "IndexError" => {
-                        return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                            "IndexError",
-                        ))))
-                    }
-                    "StopIteration" => {
-                        return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                            "StopIteration",
-                        ))))
-                    }
-                    "AssertionError" => {
-                        return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                            "AssertionError",
-                        ))))
-                    }
-                    "Skipped" => {
-                        return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                            "Skipped",
-                        ))))
-                    }
-                    _ => return None,
-                };
-                Some(Value::Native(NativeValue::Function(builtin)))
-            });
+                "RuntimeError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "RuntimeError",
+                    ))))
+                }
+                "ValueError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "ValueError",
+                    ))))
+                }
+                "TypeError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "TypeError",
+                    ))))
+                }
+                "KeyError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "KeyError",
+                    ))))
+                }
+                "IndexError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "IndexError",
+                    ))))
+                }
+                "StopIteration" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "StopIteration",
+                    ))))
+                }
+                "AssertionError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "AssertionError",
+                    ))))
+                }
+                "Skipped" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "Skipped",
+                    ))))
+                }
+                _ => return None,
+            };
+            Some(Value::Native(NativeValue::Function(builtin)))
+        })();
         self.stack
             .push(value.ok_or_else(|| format!("name {name:?} is not defined"))?);
         Ok(())
@@ -821,25 +847,19 @@ impl<'a> Vm<'a> {
             return Ok(());
         }
 
-        let relative = name.replace('.', "/");
-        let roots = if self.state.import_paths.is_empty() {
-            vec![self.interp.cwd.clone()]
+        let relative_name = name.trim_start_matches('.');
+        let source = if let Some(source) = super::stdlib::frozen_module(relative_name) {
+            Some((format!("<frozen {name}>"), source.to_string()))
         } else {
-            self.state.import_paths.clone()
+            let roots = if self.state.import_paths.is_empty() {
+                vec![self.interp.cwd.clone()]
+            } else {
+                self.state.import_paths.clone()
+            };
+            self.interp
+                .load_module_source(&roots, relative_name)
+                .map_err(|error| self.record_native_error(error))?
         };
-        let mut source = None;
-        for root in roots {
-            for suffix in [format!("{relative}.py"), format!("{relative}/__init__.py")] {
-                let candidate = crate::vfs::resolve_against(&root, &suffix);
-                if let Ok(contents) = self.interp.vfs.read_string("/", &candidate) {
-                    source = Some((candidate, contents));
-                    break;
-                }
-            }
-            if source.is_some() {
-                break;
-            }
-        }
         let Some((path, source)) = source else {
             return Err(format!(
                 "no module named {name:?} in the virtual filesystem"
@@ -867,10 +887,11 @@ impl<'a> Vm<'a> {
             )
         })?;
         let code = super::compiler::compile(program);
+        let module_name = self.allocate_string(relative_name.to_string())?;
         let scope = self.state.heap.allocate_scope(
             None,
             false,
-            HashMap::new(),
+            HashMap::from([("__name__".into(), module_name)]),
             &mut self.interp.resources,
         )?;
         let module = self.allocate_object(Object::Module {
@@ -880,9 +901,19 @@ impl<'a> Vm<'a> {
         self.state.modules.insert(name.to_string(), module);
 
         let outer_stack = std::mem::take(&mut self.stack);
+        let temporary_import_path = (!path.starts_with('<')).then(|| {
+            path.rsplit_once('/')
+                .map_or_else(|| "/".to_string(), |(parent, _)| parent.to_string())
+        });
+        if let Some(path) = &temporary_import_path {
+            self.state.import_paths.insert(0, path.clone());
+        }
         self.local_scopes.push(scope);
         let execution = self.execute_code(&code);
         self.local_scopes.pop();
+        if temporary_import_path.is_some() {
+            self.state.import_paths.remove(0);
+        }
         self.stack = outer_stack;
         match execution {
             Ok(Execution::Halt) => {
@@ -1213,6 +1244,66 @@ impl<'a> Vm<'a> {
             }
         } else {
             return Err("object is not subscriptable".into());
+        };
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn load_slice(
+        &mut self,
+        has_start: bool,
+        has_stop: bool,
+        has_step: bool,
+    ) -> Result<(), String> {
+        let step = if has_step {
+            Some(
+                self.pop()?
+                    .as_int()
+                    .ok_or("slice step must be an integer")?,
+            )
+        } else {
+            None
+        };
+        let stop = if has_stop {
+            Some(
+                self.pop()?
+                    .as_int()
+                    .ok_or("slice stop must be an integer")?,
+            )
+        } else {
+            None
+        };
+        let start = if has_start {
+            Some(
+                self.pop()?
+                    .as_int()
+                    .ok_or("slice start must be an integer")?,
+            )
+        } else {
+            None
+        };
+        let owner = self.pop()?;
+        let value = if let Some(text) = protocol::string_value(&self.state.heap, &owner)? {
+            let characters = text.chars().collect::<Vec<_>>();
+            let indices = slice_indices(characters.len(), start, stop, step)?;
+            self.charge_cpu(u64::try_from(indices.len()).unwrap_or(u64::MAX))?;
+            self.allocate_string(indices.into_iter().map(|index| characters[index]).collect())?
+        } else if let Some(id) = owner.object_id() {
+            let (values, tuple) = match self.state.heap.get(id)?.clone() {
+                Object::List(values) => (values, false),
+                Object::Tuple(values) => (values, true),
+                _ => return Err("object is not sliceable".into()),
+            };
+            let indices = slice_indices(values.len(), start, stop, step)?;
+            self.charge_cpu(u64::try_from(indices.len()).unwrap_or(u64::MAX))?;
+            let selected = indices.into_iter().map(|index| values[index]).collect();
+            self.allocate_object(if tuple {
+                Object::Tuple(selected)
+            } else {
+                Object::List(selected)
+            })?
+        } else {
+            return Err("object is not sliceable".into());
         };
         self.stack.push(value);
         Ok(())
@@ -1990,6 +2081,12 @@ impl<'a> Vm<'a> {
                 return call(self, *receiver, *argument)
                     .map_err(|error| self.record_native_error(error));
             }
+            SlotValue::NativeUnary(call) => {
+                if !arguments.is_empty() {
+                    return Err("unary protocol slot received arguments".into());
+                }
+                return call(self, *receiver).map_err(|error| self.record_native_error(error));
+            }
             SlotValue::Descriptor(descriptor) => descriptor,
         };
         let Some(id) = receiver.object_id() else {
@@ -2600,54 +2697,21 @@ impl<'a> Vm<'a> {
 
     fn unary(&mut self, operator: UnaryOperator) -> Result<(), String> {
         let value = self.pop()?;
-        if self.is_bigint(&value)? && operator != UnaryOperator::Not {
-            let integer = self.bigint_operand(&value)?;
-            let integer = match operator {
-                UnaryOperator::Positive => integer,
-                UnaryOperator::Negative => -integer,
-                UnaryOperator::Not => unreachable!(),
-            };
-            let result = if let Some(integer) = integer.to_i64() {
-                Value::Int(integer)
-            } else {
-                self.allocate_object(Object::BigInt(integer))?
-            };
-            self.stack.push(result);
+        if operator == UnaryOperator::Not {
+            let value = Value::Bool(!self.truth_value(&value)?);
+            self.stack.push(value);
             return Ok(());
-        }
-        let value = if operator == UnaryOperator::Not {
-            Value::Bool(!self.truth_value(&value)?)
-        } else if let Some(super::number::NumberRef::Int(value)) =
-            super::number::view(&self.state.heap, &value)
-        {
-            match operator {
-                UnaryOperator::Positive => Value::Int(value),
-                UnaryOperator::Negative => match value.checked_neg() {
-                    Some(value) => Value::Int(value),
-                    None => self.allocate_object(Object::BigInt(-BigInt::from(value)))?,
-                },
-                UnaryOperator::Not => unreachable!(),
-            }
-        } else if let Some(value) = value.float_value() {
-            Value::Float(if operator == UnaryOperator::Negative {
-                -value
-            } else {
-                value
-            })
-        } else {
-            let value = protocol::int_value(&self.state.heap, &value)
-                .ok_or("bad operand type for unary arithmetic")?;
-            match operator {
-                UnaryOperator::Positive => Value::Int(value),
-                UnaryOperator::Negative => Value::Int(
-                    value
-                        .checked_neg()
-                        .ok_or("integer arithmetic exceeds the current bounded integer range")?,
-                ),
-                UnaryOperator::Not => unreachable!(),
-            }
         };
-        self.stack.push(value);
+        let (slot, name) = match operator {
+            UnaryOperator::Positive => (Slot::Positive, "__pos__"),
+            UnaryOperator::Negative => (Slot::Negative, "__neg__"),
+            UnaryOperator::Invert => (Slot::Invert, "__invert__"),
+            UnaryOperator::Not => unreachable!("handled above"),
+        };
+        let result = self
+            .invoke_slot(&value, slot, name, Vec::new())?
+            .ok_or("bad operand type for unary arithmetic")?;
+        self.stack.push(result);
         Ok(())
     }
 
@@ -2767,86 +2831,118 @@ impl<'a> Vm<'a> {
     fn binary(&mut self, operator: BinaryOperator) -> Result<(), String> {
         let right = self.pop()?;
         let left = self.pop()?;
-        let slots = match operator {
-            BinaryOperator::Add => Some((Slot::Add, "__add__", Slot::ReflectedAdd, "__radd__")),
-            BinaryOperator::Subtract => Some((
-                Slot::Subtract,
-                "__sub__",
-                Slot::ReflectedSubtract,
-                "__rsub__",
-            )),
-            BinaryOperator::Multiply => Some((
-                Slot::Multiply,
-                "__mul__",
-                Slot::ReflectedMultiply,
-                "__rmul__",
-            )),
-            _ => None,
-        };
-        if let Some((slot, name, reflected_slot, reflected_name)) = slots {
-            if let Some(value) = self.invoke_slot(&left, slot, name, vec![right])? {
-                self.stack.push(value);
-                return Ok(());
-            }
-            if let Some(value) =
-                self.invoke_slot(&right, reflected_slot, reflected_name, vec![left])?
-            {
-                self.stack.push(value);
-                return Ok(());
-            }
-            return Err("unsupported arithmetic operands".into());
-        }
-        let value = self
-            .numeric_binary(operator, &left, &right)?
-            .ok_or("unsupported arithmetic operands")?;
+        let value = self.binary_value(operator, left, right)?;
         self.stack.push(value);
         Ok(())
     }
 
-    fn numeric_binary(
+    fn binary_value(
         &mut self,
         operator: BinaryOperator,
-        left: &Value,
-        right: &Value,
-    ) -> Result<Option<Value>, String> {
-        let (Some(left_number), Some(right_number)) = (
-            super::number::view(&self.state.heap, left),
-            super::number::view(&self.state.heap, right),
-        ) else {
-            return Ok(None);
+        left: Value,
+        right: Value,
+    ) -> Result<Value, String> {
+        let (slot, name, reflected_slot, reflected_name) = match operator {
+            BinaryOperator::Add => (Slot::Add, "__add__", Slot::ReflectedAdd, "__radd__"),
+            BinaryOperator::Subtract => (
+                Slot::Subtract,
+                "__sub__",
+                Slot::ReflectedSubtract,
+                "__rsub__",
+            ),
+            BinaryOperator::Multiply => (
+                Slot::Multiply,
+                "__mul__",
+                Slot::ReflectedMultiply,
+                "__rmul__",
+            ),
+            BinaryOperator::Divide => (
+                Slot::Divide,
+                "__truediv__",
+                Slot::ReflectedDivide,
+                "__rtruediv__",
+            ),
+            BinaryOperator::FloorDivide => (
+                Slot::FloorDivide,
+                "__floordiv__",
+                Slot::ReflectedFloorDivide,
+                "__rfloordiv__",
+            ),
+            BinaryOperator::Remainder => (
+                Slot::Remainder,
+                "__mod__",
+                Slot::ReflectedRemainder,
+                "__rmod__",
+            ),
+            BinaryOperator::BitwiseAnd => (
+                Slot::BitwiseAnd,
+                "__and__",
+                Slot::ReflectedBitwiseAnd,
+                "__rand__",
+            ),
+            BinaryOperator::BitwiseXor => (
+                Slot::BitwiseXor,
+                "__xor__",
+                Slot::ReflectedBitwiseXor,
+                "__rxor__",
+            ),
+            BinaryOperator::BitwiseOr => (
+                Slot::BitwiseOr,
+                "__or__",
+                Slot::ReflectedBitwiseOr,
+                "__ror__",
+            ),
         };
-        let value = if matches!(left_number, super::number::NumberRef::Float(_))
-            || matches!(right_number, super::number::NumberRef::Float(_))
-        {
-            float_binary(
-                operator,
-                super::number::as_f64(&self.state.heap, left)
-                    .ok_or("int too large to convert to float")?,
-                super::number::as_f64(&self.state.heap, right)
-                    .ok_or("int too large to convert to float")?,
-            )?
-        } else if matches!(left_number, super::number::NumberRef::BigInt(_))
-            || matches!(right_number, super::number::NumberRef::BigInt(_))
-        {
-            self.bigint_binary(operator, left, right)?
-        } else if let (
-            Some(super::number::NumberRef::Int(left)),
-            Some(super::number::NumberRef::Int(right)),
-        ) = (
-            super::number::view(&self.state.heap, left),
-            super::number::view(&self.state.heap, right),
-        ) {
-            match integer_binary(operator, left, right) {
-                Ok(value) => value,
-                Err(error) if error == INTEGER_OVERFLOW => {
-                    self.bigint_binary(operator, &Value::Int(left), &Value::Int(right))?
-                }
-                Err(error) => return Err(error),
-            }
+        if let Some(value) = self.invoke_slot(&left, slot, name, vec![right])? {
+            return Ok(value);
+        }
+        if let Some(value) = self.invoke_slot(&right, reflected_slot, reflected_name, vec![left])? {
+            return Ok(value);
+        }
+        Err("unsupported arithmetic operands".into())
+    }
+
+    fn format_value(&mut self, conversion: Option<char>, format_spec: &str) -> Result<(), String> {
+        let value = self.pop()?;
+        let converted = match conversion {
+            Some('r' | 'a') => Some(protocol::repr(&self.state.heap, &value)?),
+            Some('s') => Some(protocol::display(&self.state.heap, &value)?),
+            Some(other) => return Err(format!("unsupported f-string conversion !{other}")),
+            None => None,
+        };
+        let rendered = if format_spec.is_empty() {
+            converted.unwrap_or(protocol::display(&self.state.heap, &value)?)
+        } else if format_spec.contains(['{', '}']) {
+            return Err("nested f-string format specifications are not implemented".into());
+        } else if let Some(converted) = converted {
+            format_text(&converted, format_spec)?
         } else {
-            unreachable!("numeric pair was classified above")
+            self.format_unconverted_value(&value, format_spec)?
         };
-        Ok(Some(value))
+        self.charge_cpu(u64::try_from(rendered.len()).unwrap_or(u64::MAX))?;
+        let rendered = self.allocate_string(rendered)?;
+        self.stack.push(rendered);
+        Ok(())
+    }
+
+    fn format_unconverted_value(&self, value: &Value, spec: &str) -> Result<String, String> {
+        let presentation = spec.chars().last().unwrap_or(' ');
+        if matches!(presentation, 'f' | 'e' | 'E') {
+            let number = super::number::as_f64(&self.state.heap, value)
+                .ok_or("floating-point format requires a number")?;
+            return format_float(number, spec);
+        }
+        if presentation == 'd' {
+            let text = self
+                .bigint_operand(value)
+                .map_err(|_| "integer format requires an integer")?
+                .to_string();
+            return pad_number(text, &spec[..spec.len() - 1]);
+        }
+        if let Some(text) = protocol::string_value(&self.state.heap, value)? {
+            return format_text(&text, spec);
+        }
+        Err(format!("unsupported format specification {spec:?}"))
     }
 
     fn is_bigint(&self, value: &Value) -> Result<bool, String> {
@@ -2878,101 +2974,8 @@ impl<'a> Vm<'a> {
             .ok_or_else(|| "unsupported arithmetic operands".into())
     }
 
-    /// Perform arbitrary-precision work only after charging for an operand-sized operation and
-    /// reserving an upper bound for the result. Small results are folded back into immediates.
-    fn bigint_binary(
-        &mut self,
-        operator: BinaryOperator,
-        left: &Value,
-        right: &Value,
-    ) -> Result<Value, String> {
-        let left = self.bigint_operand(left)?;
-        let right = self.bigint_operand(right)?;
-        if right.is_zero()
-            && matches!(
-                operator,
-                BinaryOperator::Divide | BinaryOperator::FloorDivide | BinaryOperator::Remainder
-            )
-        {
-            return Err(if operator == BinaryOperator::Divide {
-                "division by zero"
-            } else {
-                "integer division or modulo by zero"
-            }
-            .into());
-        }
-        let left_bytes = usize::try_from(left.bits().saturating_add(7) / 8)
-            .map_err(|_| "integer result is too large")?;
-        let right_bytes = usize::try_from(right.bits().saturating_add(7) / 8)
-            .map_err(|_| "integer result is too large")?;
-        let result_bytes = match operator {
-            BinaryOperator::Multiply => left_bytes
-                .checked_add(right_bytes)
-                .ok_or("integer result is too large")?,
-            _ => left_bytes.max(right_bytes).saturating_add(1),
-        };
-        self.charge_cpu(u64::try_from(result_bytes.max(1)).unwrap_or(u64::MAX))?;
-        self.reserve_result(result_bytes)?;
-
-        if operator == BinaryOperator::Divide {
-            let left = left.to_f64().ok_or("int too large to convert to float")?;
-            let right = right.to_f64().ok_or("int too large to convert to float")?;
-            return Ok(Value::Float(left / right));
-        }
-        let result = match operator {
-            BinaryOperator::Add => left + right,
-            BinaryOperator::Subtract => left - right,
-            BinaryOperator::Multiply => left * right,
-            BinaryOperator::FloorDivide => bigint_floor_div(&left, &right),
-            BinaryOperator::Remainder => {
-                let quotient = bigint_floor_div(&left, &right);
-                left - quotient * right
-            }
-            BinaryOperator::Divide => unreachable!(),
-        };
-        if let Some(value) = result.to_i64() {
-            Ok(Value::Int(value))
-        } else {
-            self.allocate_object(Object::BigInt(result))
-        }
-    }
-
     fn add_numbers(&mut self, left: Value, right: Value) -> Result<Value, String> {
-        if self.is_bigint(&left)? || self.is_bigint(&right)? {
-            if matches!(
-                super::number::view(&self.state.heap, &left),
-                Some(super::number::NumberRef::Float(_))
-            ) || matches!(
-                super::number::view(&self.state.heap, &right),
-                Some(super::number::NumberRef::Float(_))
-            ) {
-                return Ok(Value::Float(
-                    self.numeric_float(&left)? + self.numeric_float(&right)?,
-                ));
-            }
-            return self.bigint_binary(BinaryOperator::Add, &left, &right);
-        }
-        if let (
-            Some(super::number::NumberRef::Int(left)),
-            Some(super::number::NumberRef::Int(right)),
-        ) = (
-            super::number::view(&self.state.heap, &left),
-            super::number::view(&self.state.heap, &right),
-        ) {
-            match left.checked_add(right) {
-                Some(value) => Ok(Value::Int(value)),
-                None => {
-                    self.bigint_binary(BinaryOperator::Add, &Value::Int(left), &Value::Int(right))
-                }
-            }
-        } else if let (Some(left), Some(right)) = (
-            super::number::as_f64(&self.state.heap, &left),
-            super::number::as_f64(&self.state.heap, &right),
-        ) {
-            Ok(Value::Float(left + right))
-        } else {
-            Err("unsupported operands for sum()".into())
-        }
+        self.binary_value(BinaryOperator::Add, left, right)
     }
 
     fn call(
@@ -3543,27 +3546,9 @@ impl<'a> Vm<'a> {
             }
             Builtin::Absolute => {
                 expect_arity(&arguments, 1, 1)?;
-                let value = if let Some(super::number::NumberRef::Int(value)) =
-                    super::number::view(&self.state.heap, &arguments[0])
-                {
-                    match value.checked_abs() {
-                        Some(value) => Value::Int(value),
-                        None => self.allocate_object(Object::BigInt(BigInt::from(value).abs()))?,
-                    }
-                } else if let Some(super::number::NumberRef::Float(value)) =
-                    super::number::view(&self.state.heap, &arguments[0])
-                {
-                    Value::Float(value.abs())
-                } else if self.is_bigint(&arguments[0])? {
-                    let value = self.bigint_operand(&arguments[0])?.abs();
-                    if let Some(value) = value.to_i64() {
-                        Value::Int(value)
-                    } else {
-                        self.allocate_object(Object::BigInt(value))?
-                    }
-                } else {
-                    return Err("bad operand type for abs()".into());
-                };
+                let value = self
+                    .invoke_slot(&arguments[0], Slot::Absolute, "__abs__", Vec::new())?
+                    .ok_or("bad operand type for abs()")?;
                 Ok(CallResult::Value(value))
             }
             Builtin::Next => {
@@ -3594,7 +3579,23 @@ impl<'a> Vm<'a> {
                         }
                         value
                     }
-                    _ => return Err("next() argument is not an iterator".into()),
+                    _ => {
+                        match self.invoke_slot(&arguments[0], Slot::Next, "__next__", Vec::new()) {
+                            Ok(Some(value)) => Some(value),
+                            Ok(None) => return Err("next() argument is not an iterator".into()),
+                            Err(_error)
+                                if self
+                                    .pending_exception
+                                    .as_ref()
+                                    .is_some_and(|exception| exception.kind == "StopIteration")
+                                    && arguments.len() == 2 =>
+                            {
+                                self.pending_exception = None;
+                                arguments.get(1).copied()
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
                 };
                 let value = match value {
                     Some(value) => value,
@@ -4049,7 +4050,24 @@ impl<'a> Vm<'a> {
     fn iterable_values(&mut self, value: &Value) -> Result<Vec<Value>, String> {
         if let Some(iterable) = self.invoke_slot(value, Slot::Iter, "__iter__", Vec::new())? {
             if protocol::identical(value, &iterable) {
-                return Err("__iter__ returned a non-iterator self value".into());
+                let mut result = Vec::new();
+                loop {
+                    match self.invoke_slot(&iterable, Slot::Next, "__next__", Vec::new()) {
+                        Ok(Some(item)) => self.push_materialized(&mut result, item)?,
+                        Ok(None) => return Err("iterator does not define __next__".into()),
+                        Err(_error)
+                            if self
+                                .pending_exception
+                                .as_ref()
+                                .is_some_and(|exception| exception.kind == "StopIteration") =>
+                        {
+                            self.pending_exception = None;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                return Ok(result);
             }
             return self.iterable_values(&iterable);
         }
@@ -4946,6 +4964,10 @@ impl PyRuntime for Vm<'_> {
     fn environment(&self) -> &dyn PyEnvironment {
         self
     }
+
+    fn filesystem(&mut self) -> &mut dyn PyFilesystem {
+        self.interp
+    }
 }
 
 impl PyClock for Vm<'_> {
@@ -5042,74 +5064,130 @@ struct ClassDefinition {
     enum_members: Vec<Value>,
 }
 
-const INTEGER_OVERFLOW: &str = "integer arithmetic exceeds the current bounded integer range";
+fn format_float(value: f64, spec: &str) -> Result<String, String> {
+    let presentation = spec.chars().last().ok_or("empty float format")?;
+    let options = &spec[..spec.len() - presentation.len_utf8()];
+    let (width, precision, zero_pad) = parse_numeric_format(options)?;
+    let precision = precision.unwrap_or(6);
+    let rendered = match presentation {
+        'f' => format!("{value:.precision$}"),
+        'e' => format!("{value:.precision$e}"),
+        'E' => format!("{value:.precision$e}").to_uppercase(),
+        _ => return Err(format!("unsupported floating-point format {spec:?}")),
+    };
+    Ok(pad_rendered_number(rendered, width, zero_pad))
+}
 
-fn integer_binary(operator: BinaryOperator, left: i64, right: i64) -> Result<Value, String> {
-    match operator {
-        BinaryOperator::Add => left
-            .checked_add(right)
-            .map(Value::Int)
-            .ok_or(INTEGER_OVERFLOW.into()),
-        BinaryOperator::Subtract => left
-            .checked_sub(right)
-            .map(Value::Int)
-            .ok_or(INTEGER_OVERFLOW.into()),
-        BinaryOperator::Multiply => left
-            .checked_mul(right)
-            .map(Value::Int)
-            .ok_or(INTEGER_OVERFLOW.into()),
-        BinaryOperator::Divide => {
-            if right == 0 {
-                Err("division by zero".into())
-            } else {
-                Ok(Value::Float(left as f64 / right as f64))
-            }
-        }
-        BinaryOperator::FloorDivide => floor_div(left, right).map(Value::Int),
-        BinaryOperator::Remainder => {
-            let quotient = floor_div(left, right)?;
-            left.checked_sub(quotient.checked_mul(right).ok_or(INTEGER_OVERFLOW)?)
-                .map(Value::Int)
-                .ok_or(INTEGER_OVERFLOW.into())
-        }
+fn pad_number(value: String, options: &str) -> Result<String, String> {
+    let (width, precision, zero_pad) = parse_numeric_format(options)?;
+    if precision.is_some() {
+        return Err("precision is not allowed in integer format".into());
+    }
+    Ok(pad_rendered_number(value, width, zero_pad))
+}
+
+fn parse_numeric_format(options: &str) -> Result<(usize, Option<usize>, bool), String> {
+    let zero_pad = options.starts_with('0') && options.len() > 1;
+    let (width, precision) = options
+        .split_once('.')
+        .map_or((options, None), |(width, precision)| {
+            (width, Some(precision))
+        });
+    let width = if width.is_empty() {
+        0
+    } else {
+        width
+            .parse::<usize>()
+            .map_err(|_| format!("unsupported numeric format {options:?}"))?
+    };
+    let precision = precision
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| format!("unsupported numeric format {options:?}"))
+        })
+        .transpose()?;
+    Ok((width, precision, zero_pad))
+}
+
+fn pad_rendered_number(value: String, width: usize, zero_pad: bool) -> String {
+    let padding = width.saturating_sub(value.len());
+    if padding == 0 {
+        return value;
+    }
+    let fill = if zero_pad { '0' } else { ' ' };
+    if zero_pad && value.starts_with('-') {
+        format!("-{}{}", fill.to_string().repeat(padding), &value[1..])
+    } else {
+        format!("{}{}", fill.to_string().repeat(padding), value)
     }
 }
 
-fn bigint_floor_div(left: &BigInt, right: &BigInt) -> BigInt {
-    let mut quotient = left / right;
-    let remainder = left % right;
-    if !remainder.is_zero() && remainder.is_negative() != right.is_negative() {
-        quotient -= 1;
-    }
-    quotient
+fn format_text(value: &str, spec: &str) -> Result<String, String> {
+    let (alignment, width_text) = match spec.chars().next() {
+        Some(alignment @ ('<' | '>' | '^')) => (alignment, &spec[alignment.len_utf8()..]),
+        _ => ('<', spec),
+    };
+    let width = width_text
+        .parse::<usize>()
+        .map_err(|_| format!("unsupported string format {spec:?}"))?;
+    let padding = width.saturating_sub(value.chars().count());
+    let left = match alignment {
+        '>' => padding,
+        '^' => padding / 2,
+        _ => 0,
+    };
+    let right = padding - left;
+    Ok(format!(
+        "{}{}{}",
+        " ".repeat(left),
+        value,
+        " ".repeat(right)
+    ))
 }
 
-fn floor_div(left: i64, right: i64) -> Result<i64, String> {
-    if right == 0 {
-        return Err("integer division or modulo by zero".into());
+fn slice_indices(
+    length: usize,
+    start: Option<i64>,
+    stop: Option<i64>,
+    step: Option<i64>,
+) -> Result<Vec<usize>, String> {
+    let length = i64::try_from(length).map_err(|_| "sequence is too large to slice")?;
+    let step = step.unwrap_or(1);
+    if step == 0 {
+        return Err("slice step cannot be zero".into());
     }
-    let mut quotient = left
-        .checked_div(right)
-        .ok_or("integer arithmetic exceeds the current bounded integer range")?;
-    let remainder = left % right;
-    if remainder != 0 && (remainder < 0) != (right < 0) {
-        quotient -= 1;
+    let normalize = |value: i64, minimum: i64, maximum: i64| {
+        let value = if value < 0 {
+            value.saturating_add(length)
+        } else {
+            value
+        };
+        value.clamp(minimum, maximum)
+    };
+    let (mut current, stop) = if step > 0 {
+        (
+            start.map_or(0, |value| normalize(value, 0, length)),
+            stop.map_or(length, |value| normalize(value, 0, length)),
+        )
+    } else {
+        (
+            start.map_or(length - 1, |value| normalize(value, -1, length - 1)),
+            stop.map_or(-1, |value| normalize(value, -1, length - 1)),
+        )
+    };
+    let mut indices = Vec::new();
+    while if step > 0 {
+        current < stop
+    } else {
+        current > stop
+    } {
+        indices.push(usize::try_from(current).map_err(|_| "slice index out of range")?);
+        current = current
+            .checked_add(step)
+            .ok_or("slice index arithmetic overflow")?;
     }
-    Ok(quotient)
-}
-
-fn float_binary(operator: BinaryOperator, left: f64, right: f64) -> Result<Value, String> {
-    match operator {
-        BinaryOperator::Add => Ok(Value::Float(left + right)),
-        BinaryOperator::Subtract => Ok(Value::Float(left - right)),
-        BinaryOperator::Multiply => Ok(Value::Float(left * right)),
-        BinaryOperator::Divide if right != 0.0 => Ok(Value::Float(left / right)),
-        BinaryOperator::FloorDivide if right != 0.0 => Ok(Value::Float((left / right).floor())),
-        BinaryOperator::Remainder if right != 0.0 => {
-            Ok(Value::Float(left - (left / right).floor() * right))
-        }
-        _ => Err("division by zero".into()),
-    }
+    Ok(indices)
 }
 
 fn expect_arity(arguments: &[Value], minimum: usize, maximum: usize) -> Result<(), String> {

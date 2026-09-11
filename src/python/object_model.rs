@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::native::BinarySlotFn;
+use super::native::{BinarySlotFn, UnarySlotFn};
 use super::Value;
 
 /// Stable identity of a Python type within a [`ReplState`](super::ReplState).
@@ -122,7 +122,7 @@ pub enum PyLayout {
 
 /// Cached protocol methods resolved from a type dictionary.
 ///
-/// A user slot holds its ordinary Python descriptor. Builtin binary slots hold a direct native
+/// A user slot holds its ordinary Python descriptor. Builtin operator slots hold a direct native
 /// function with the erased runtime ABI. Empty slots mean the type does not implement the
 /// protocol.
 #[derive(Clone, Debug, Default)]
@@ -138,12 +138,28 @@ pub struct TypeSlots {
     pub hash: Option<SlotValue>,
     pub iter: Option<SlotValue>,
     pub next: Option<SlotValue>,
+    pub positive: Option<SlotValue>,
+    pub negative: Option<SlotValue>,
+    pub invert: Option<SlotValue>,
+    pub absolute: Option<SlotValue>,
     pub add: Option<SlotValue>,
     pub reflected_add: Option<SlotValue>,
     pub subtract: Option<SlotValue>,
     pub reflected_subtract: Option<SlotValue>,
     pub multiply: Option<SlotValue>,
     pub reflected_multiply: Option<SlotValue>,
+    pub divide: Option<SlotValue>,
+    pub reflected_divide: Option<SlotValue>,
+    pub floor_divide: Option<SlotValue>,
+    pub reflected_floor_divide: Option<SlotValue>,
+    pub remainder: Option<SlotValue>,
+    pub reflected_remainder: Option<SlotValue>,
+    pub bitwise_and: Option<SlotValue>,
+    pub reflected_bitwise_and: Option<SlotValue>,
+    pub bitwise_xor: Option<SlotValue>,
+    pub reflected_bitwise_xor: Option<SlotValue>,
+    pub bitwise_or: Option<SlotValue>,
+    pub reflected_bitwise_or: Option<SlotValue>,
     pub equal: Option<SlotValue>,
     pub less_than: Option<SlotValue>,
     pub contains: Option<SlotValue>,
@@ -154,6 +170,7 @@ pub struct TypeSlots {
 pub enum SlotValue {
     Descriptor(Value),
     NativeBinary(BinarySlotFn),
+    NativeUnary(UnarySlotFn),
 }
 
 /// Protocol operations cached on each type after MRO resolution.
@@ -170,19 +187,35 @@ pub enum Slot {
     Hash,
     Iter,
     Next,
+    Positive,
+    Negative,
+    Invert,
+    Absolute,
     Add,
     ReflectedAdd,
     Subtract,
     ReflectedSubtract,
     Multiply,
     ReflectedMultiply,
+    Divide,
+    ReflectedDivide,
+    FloorDivide,
+    ReflectedFloorDivide,
+    Remainder,
+    ReflectedRemainder,
+    BitwiseAnd,
+    ReflectedBitwiseAnd,
+    BitwiseXor,
+    ReflectedBitwiseXor,
+    BitwiseOr,
+    ReflectedBitwiseOr,
     Equal,
     LessThan,
     Contains,
 }
 
 impl Slot {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 36] = [
         Self::Call,
         Self::New,
         Self::Init,
@@ -194,12 +227,28 @@ impl Slot {
         Self::Hash,
         Self::Iter,
         Self::Next,
+        Self::Positive,
+        Self::Negative,
+        Self::Invert,
+        Self::Absolute,
         Self::Add,
         Self::ReflectedAdd,
         Self::Subtract,
         Self::ReflectedSubtract,
         Self::Multiply,
         Self::ReflectedMultiply,
+        Self::Divide,
+        Self::ReflectedDivide,
+        Self::FloorDivide,
+        Self::ReflectedFloorDivide,
+        Self::Remainder,
+        Self::ReflectedRemainder,
+        Self::BitwiseAnd,
+        Self::ReflectedBitwiseAnd,
+        Self::BitwiseXor,
+        Self::ReflectedBitwiseXor,
+        Self::BitwiseOr,
+        Self::ReflectedBitwiseOr,
         Self::Equal,
         Self::LessThan,
         Self::Contains,
@@ -221,12 +270,28 @@ impl TypeSlots {
             hash: get("__hash__"),
             iter: get("__iter__"),
             next: get("__next__"),
+            positive: get("__pos__"),
+            negative: get("__neg__"),
+            invert: get("__invert__"),
+            absolute: get("__abs__"),
             add: get("__add__"),
             reflected_add: get("__radd__"),
             subtract: get("__sub__"),
             reflected_subtract: get("__rsub__"),
             multiply: get("__mul__"),
             reflected_multiply: get("__rmul__"),
+            divide: get("__truediv__"),
+            reflected_divide: get("__rtruediv__"),
+            floor_divide: get("__floordiv__"),
+            reflected_floor_divide: get("__rfloordiv__"),
+            remainder: get("__mod__"),
+            reflected_remainder: get("__rmod__"),
+            bitwise_and: get("__and__"),
+            reflected_bitwise_and: get("__rand__"),
+            bitwise_xor: get("__xor__"),
+            reflected_bitwise_xor: get("__rxor__"),
+            bitwise_or: get("__or__"),
+            reflected_bitwise_or: get("__ror__"),
             equal: get("__eq__"),
             less_than: get("__lt__"),
             contains: get("__contains__"),
@@ -246,12 +311,28 @@ impl TypeSlots {
             &self.hash,
             &self.iter,
             &self.next,
+            &self.positive,
+            &self.negative,
+            &self.invert,
+            &self.absolute,
             &self.add,
             &self.reflected_add,
             &self.subtract,
             &self.reflected_subtract,
             &self.multiply,
             &self.reflected_multiply,
+            &self.divide,
+            &self.reflected_divide,
+            &self.floor_divide,
+            &self.reflected_floor_divide,
+            &self.remainder,
+            &self.reflected_remainder,
+            &self.bitwise_and,
+            &self.reflected_bitwise_and,
+            &self.bitwise_xor,
+            &self.reflected_bitwise_xor,
+            &self.bitwise_or,
+            &self.reflected_bitwise_or,
             &self.equal,
             &self.less_than,
             &self.contains,
@@ -274,12 +355,28 @@ impl TypeSlots {
             Slot::Hash => self.hash.as_ref(),
             Slot::Iter => self.iter.as_ref(),
             Slot::Next => self.next.as_ref(),
+            Slot::Positive => self.positive.as_ref(),
+            Slot::Negative => self.negative.as_ref(),
+            Slot::Invert => self.invert.as_ref(),
+            Slot::Absolute => self.absolute.as_ref(),
             Slot::Add => self.add.as_ref(),
             Slot::ReflectedAdd => self.reflected_add.as_ref(),
             Slot::Subtract => self.subtract.as_ref(),
             Slot::ReflectedSubtract => self.reflected_subtract.as_ref(),
             Slot::Multiply => self.multiply.as_ref(),
             Slot::ReflectedMultiply => self.reflected_multiply.as_ref(),
+            Slot::Divide => self.divide.as_ref(),
+            Slot::ReflectedDivide => self.reflected_divide.as_ref(),
+            Slot::FloorDivide => self.floor_divide.as_ref(),
+            Slot::ReflectedFloorDivide => self.reflected_floor_divide.as_ref(),
+            Slot::Remainder => self.remainder.as_ref(),
+            Slot::ReflectedRemainder => self.reflected_remainder.as_ref(),
+            Slot::BitwiseAnd => self.bitwise_and.as_ref(),
+            Slot::ReflectedBitwiseAnd => self.reflected_bitwise_and.as_ref(),
+            Slot::BitwiseXor => self.bitwise_xor.as_ref(),
+            Slot::ReflectedBitwiseXor => self.reflected_bitwise_xor.as_ref(),
+            Slot::BitwiseOr => self.bitwise_or.as_ref(),
+            Slot::ReflectedBitwiseOr => self.reflected_bitwise_or.as_ref(),
             Slot::Equal => self.equal.as_ref(),
             Slot::LessThan => self.less_than.as_ref(),
             Slot::Contains => self.contains.as_ref(),
@@ -299,12 +396,28 @@ impl TypeSlots {
             Slot::Hash => &mut self.hash,
             Slot::Iter => &mut self.iter,
             Slot::Next => &mut self.next,
+            Slot::Positive => &mut self.positive,
+            Slot::Negative => &mut self.negative,
+            Slot::Invert => &mut self.invert,
+            Slot::Absolute => &mut self.absolute,
             Slot::Add => &mut self.add,
             Slot::ReflectedAdd => &mut self.reflected_add,
             Slot::Subtract => &mut self.subtract,
             Slot::ReflectedSubtract => &mut self.reflected_subtract,
             Slot::Multiply => &mut self.multiply,
             Slot::ReflectedMultiply => &mut self.reflected_multiply,
+            Slot::Divide => &mut self.divide,
+            Slot::ReflectedDivide => &mut self.reflected_divide,
+            Slot::FloorDivide => &mut self.floor_divide,
+            Slot::ReflectedFloorDivide => &mut self.reflected_floor_divide,
+            Slot::Remainder => &mut self.remainder,
+            Slot::ReflectedRemainder => &mut self.reflected_remainder,
+            Slot::BitwiseAnd => &mut self.bitwise_and,
+            Slot::ReflectedBitwiseAnd => &mut self.reflected_bitwise_and,
+            Slot::BitwiseXor => &mut self.bitwise_xor,
+            Slot::ReflectedBitwiseXor => &mut self.reflected_bitwise_xor,
+            Slot::BitwiseOr => &mut self.bitwise_or,
+            Slot::ReflectedBitwiseOr => &mut self.reflected_bitwise_or,
             Slot::Equal => &mut self.equal,
             Slot::LessThan => &mut self.less_than,
             Slot::Contains => &mut self.contains,
@@ -529,14 +642,31 @@ fn install_native_methods(ty: &mut PyType, definition: &'static super::native::N
 
 fn install_builtin_slots(types: &mut [PyType]) {
     let intrinsic = SlotValue::NativeBinary;
+    let unary = SlotValue::NativeUnary;
     for builtin in [BuiltinType::Bool, BuiltinType::Int, BuiltinType::Float] {
         let slots = &mut types[builtin as usize].slots;
+        slots.positive = Some(unary(super::number::slot_positive));
+        slots.negative = Some(unary(super::number::slot_negative));
+        slots.invert = Some(unary(super::number::slot_invert));
+        slots.absolute = Some(unary(super::number::slot_absolute));
         slots.add = Some(intrinsic(super::number::slot_add));
         slots.reflected_add = Some(intrinsic(super::number::slot_add));
         slots.subtract = Some(intrinsic(super::number::slot_subtract));
         slots.reflected_subtract = Some(intrinsic(super::number::slot_reflected_subtract));
         slots.multiply = Some(intrinsic(super::number::slot_multiply));
         slots.reflected_multiply = Some(intrinsic(super::number::slot_multiply));
+        slots.divide = Some(intrinsic(super::number::slot_divide));
+        slots.reflected_divide = Some(intrinsic(super::number::slot_reflected_divide));
+        slots.floor_divide = Some(intrinsic(super::number::slot_floor_divide));
+        slots.reflected_floor_divide = Some(intrinsic(super::number::slot_reflected_floor_divide));
+        slots.remainder = Some(intrinsic(super::number::slot_remainder));
+        slots.reflected_remainder = Some(intrinsic(super::number::slot_reflected_remainder));
+        slots.bitwise_and = Some(intrinsic(super::number::slot_bitwise_and));
+        slots.reflected_bitwise_and = Some(intrinsic(super::number::slot_bitwise_and));
+        slots.bitwise_xor = Some(intrinsic(super::number::slot_bitwise_xor));
+        slots.reflected_bitwise_xor = Some(intrinsic(super::number::slot_bitwise_xor));
+        slots.bitwise_or = Some(intrinsic(super::number::slot_bitwise_or));
+        slots.reflected_bitwise_or = Some(intrinsic(super::number::slot_bitwise_or));
     }
     let slots = &mut types[BuiltinType::String as usize].slots;
     slots.add = Some(intrinsic(super::stdlib::core::slot_string_add));

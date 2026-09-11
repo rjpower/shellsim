@@ -25,6 +25,9 @@ pub(super) type PyResult<T = PyValue> = Result<T, PyError>;
 pub(super) type BinarySlotFn =
     fn(&mut dyn PyRuntime, PyValue, PyValue) -> PyResult<Option<PyValue>>;
 
+/// Native implementation stored directly in a unary protocol slot.
+pub(super) type UnarySlotFn = fn(&mut dyn PyRuntime, PyValue) -> PyResult<Option<PyValue>>;
+
 /// Stable error categories produced by native Python operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PyErrorKind {
@@ -150,6 +153,21 @@ pub(super) trait PyEnvironment {
     fn get(&self, name: &str) -> Option<String>;
 }
 
+/// Metered access to shellsim's simulated filesystem.
+///
+/// Implementations must remain confined to the interpreter-owned VFS. Native modules receive
+/// this capability explicitly so neither the bytecode VM nor stdlib facades need to know VFS
+/// path, quota, or mutation-time policy.
+pub(super) trait PyFilesystem {
+    fn read_text(&mut self, path: &str) -> PyResult<String>;
+    fn write_text(&mut self, path: &str, contents: &str) -> PyResult<()>;
+    fn exists(&self, path: &str) -> bool;
+    fn is_file(&self, path: &str) -> bool;
+    fn is_dir(&self, path: &str) -> bool;
+    fn mkdir(&mut self, path: &str, parents: bool, exist_ok: bool) -> PyResult<()>;
+    fn glob(&mut self, pattern: &str) -> PyResult<Vec<String>>;
+}
+
 /// Runtime value protocols and explicitly modeled services available to native modules.
 pub(super) trait PyRuntime {
     fn reserve_memory(&mut self, bytes: usize) -> PyResult<()>;
@@ -234,6 +252,7 @@ pub(super) trait PyRuntime {
     fn exception_type_name(&self, value: &PyValue) -> Option<&'static str>;
     fn clock(&mut self) -> &mut dyn PyClock;
     fn environment(&self) -> &dyn PyEnvironment;
+    fn filesystem(&mut self) -> &mut dyn PyFilesystem;
 
     fn type_name(&self, value: &PyValue) -> PyResult<&'static str> {
         Ok(match self.kind(value)? {

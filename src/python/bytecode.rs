@@ -39,6 +39,11 @@ pub enum Operation {
     Import(String),
     LoadAttribute(String),
     LoadSubscript,
+    LoadSlice {
+        has_start: bool,
+        has_stop: bool,
+        has_step: bool,
+    },
     BuildList(usize),
     BuildTuple(usize),
     BuildDict(usize),
@@ -63,6 +68,10 @@ pub enum Operation {
     ForIterator(usize),
     Unary(UnaryOperator),
     Binary(BinaryOperator),
+    FormatValue {
+        conversion: Option<char>,
+        format_spec: String,
+    },
     Compare(ComparisonOperator),
     Call {
         positional: usize,

@@ -184,6 +184,12 @@ pub enum ExpressionKind {
         value: Box<Expression>,
         index: Box<Expression>,
     },
+    Slice {
+        value: Box<Expression>,
+        start: Option<Box<Expression>>,
+        stop: Option<Box<Expression>>,
+        step: Option<Box<Expression>>,
+    },
     Call {
         function: Box<Expression>,
         arguments: Vec<CallArgument>,
@@ -200,6 +206,11 @@ pub enum ExpressionKind {
         left: Box<Expression>,
         operator: BinaryOperator,
         right: Box<Expression>,
+    },
+    Conditional {
+        test: Box<Expression>,
+        body: Box<Expression>,
+        otherwise: Box<Expression>,
     },
     Boolean {
         left: Box<Expression>,
@@ -223,6 +234,11 @@ pub struct CallArgument {
 pub enum FStringPart {
     Text(String),
     Expression(Expression),
+    Formatted {
+        expression: Expression,
+        conversion: Option<char>,
+        format_spec: String,
+    },
 }
 
 /// A formal parameter and its optional definition-time default expression.
@@ -251,6 +267,7 @@ pub enum Constant {
 pub enum UnaryOperator {
     Positive,
     Negative,
+    Invert,
     Not,
 }
 
@@ -282,4 +299,7 @@ pub enum BinaryOperator {
     Divide,
     FloorDivide,
     Remainder,
+    BitwiseAnd,
+    BitwiseXor,
+    BitwiseOr,
 }
