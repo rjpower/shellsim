@@ -96,7 +96,9 @@ work. Disk-full errors are recoverable: a command can remove files and retry.
 
 The `shell` subcommand drives one such environment line by line. It shows a prompt on a terminal,
 preserves state between lines, exits normally on EOF or `exit`, and prints a reason before exiting
-with status 137 when a resource is exhausted.
+with status 137 when a resource is exhausted. It is an action console rather than a resumable
+terminal: each completed action has closed stdin. Use a pipe or heredoc for command input. The
+console collects a heredoc through its terminating delimiter before executing the action.
 
 Invoking `python` without arguments transfers the foreground session to a deliberately-minimal
 Python REPL. Simple assignments and expressions persist across actions; `exit()` or `quit()`
@@ -195,7 +197,15 @@ let mut env = Environment::with_limits(Limits {
 });
 
 let (outcome, stdout, stderr) = env.run_script_capture("echo hello");
+
+// Harness actions may attach stdin without giving the simulated command host-terminal access.
+let (outcome, stdout, stderr) =
+    env.run_script_capture_with_stdin("cat > input.txt", b"hello\n");
 ```
+
+An `Environment` preserves its VFS, working directory, variables, functions, options, and resource
+usage across actions. Each action receives its own explicit stdin byte stream; an input redirect in
+the action takes precedence. New environments include `/root`, `/tmp`, and `/work`.
 
 `Interp` remains as an alias for `Environment` for source compatibility.
 

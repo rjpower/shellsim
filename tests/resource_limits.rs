@@ -37,6 +37,19 @@ fn redirected_write_reports_disk_full_without_creating_a_file() {
 }
 
 #[test]
+fn removing_a_base_directory_does_not_create_free_disk_quota() {
+    let mut env = Environment::with_limits(Limits {
+        disk: 256 + 2,
+        ..Limits::unlimited()
+    });
+    let (outcome, _, stderr) = env.run_script_capture("rmdir /tmp; printf 123 > /result");
+
+    assert_eq!(outcome.exit_status, 1);
+    assert!(!env.vfs.lexists("/", "/result"));
+    assert!(String::from_utf8_lossy(&stderr).contains("No space left on device"));
+}
+
+#[test]
 fn output_limit_is_reported_separately() {
     let mut env = Environment::with_limits(Limits {
         output: 5,
@@ -85,6 +98,34 @@ fn reused_environment_preserves_shell_and_filesystem_state() {
     assert_eq!(stdout, b"agent:/demo:saved");
     assert!(second.usage.cpu_used > first.usage.cpu_used);
     assert_eq!(env.cwd, "/demo");
+}
+
+#[test]
+fn action_stdin_is_explicit_and_shell_state_still_persists() {
+    let mut env = Environment::new();
+    env.run_script_capture("name=agent; cd /work");
+    let (outcome, stdout, stderr) = env.run_script_capture_with_stdin(
+        "cat > input; printf '%s:%s:' \"$name\" \"$PWD\"; cat input",
+        b"payload\n",
+    );
+
+    assert_eq!(outcome.exit_status, 0);
+    assert_eq!(stdout, b"agent:/work:payload\n");
+    assert!(stderr.is_empty());
+    assert_eq!(env.cwd, "/work");
+}
+
+#[test]
+fn conventional_workspace_directories_exist_in_every_environment() {
+    let env = Environment::new();
+
+    for path in ["/root", "/tmp", "/work"] {
+        assert!(
+            env.vfs.is_dir("/", path),
+            "missing conventional directory {path}"
+        );
+    }
+    assert_eq!(env.vfs.disk_used(), 0);
 }
 
 #[test]

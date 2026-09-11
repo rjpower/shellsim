@@ -98,6 +98,7 @@ struct Lexer {
     chars: Vec<char>,
     i: usize,
     toks: Vec<Tok>,
+    heredocs_complete: bool,
 }
 
 impl Lexer {
@@ -106,6 +107,7 @@ impl Lexer {
             chars: src.chars().collect(),
             i: 0,
             toks: Vec::new(),
+            heredocs_complete: true,
         }
     }
 
@@ -116,7 +118,7 @@ impl Lexer {
         self.chars.get(self.i + o).copied()
     }
 
-    fn tokenize(mut self) -> Vec<Tok> {
+    fn tokenize(mut self) -> (Vec<Tok>, bool) {
         // pending heredocs: (delim, quoted, token-index placeholder)
         let mut pending: Vec<(String, bool, usize)> = Vec::new();
         while let Some(c) = self.peek() {
@@ -290,7 +292,7 @@ impl Lexer {
             }
         }
         self.toks.push(Tok::Eof);
-        self.toks
+        (self.toks, self.heredocs_complete)
     }
 
     fn prev_is_boundary(&self) -> bool {
@@ -394,6 +396,7 @@ impl Lexer {
             body.push_str(&line);
             body.push('\n');
             if !had_nl && self.i >= self.chars.len() {
+                self.heredocs_complete = false;
                 break;
             }
         }
@@ -1167,18 +1170,51 @@ impl Node {}
 // single definition, add them to the enum at top. (See additions.)
 
 pub fn parse(src: &str) -> Node {
-    let toks = Lexer::new(src).tokenize();
+    let (toks, _) = Lexer::new(src).tokenize();
     let mut p = Parser::new(toks);
     p.parse_program()
+}
+
+/// Return whether every heredoc opened in `src` has its terminating delimiter.
+///
+/// The action console uses this narrow completeness check to collect a standard pasted heredoc
+/// before executing it. Other multiline shell constructs remain complete-action inputs.
+pub fn heredocs_complete(src: &str) -> bool {
+    let (_, complete) = Lexer::new(src).tokenize();
+    complete
 }
 
 // ===================== entry on Interp =====================
 
 impl Interp {
-    /// Parse and execute without writing to the host console.
+    /// Parse and execute an action with an explicit input stream.
+    ///
+    /// The environment, including shell variables and the working directory, persists after the
+    /// action completes. `stdin` belongs only to this action and is overridden by an explicit
+    /// shell input redirect such as a pipe, `< file`, or heredoc.
+    pub fn run_script_capture_with_stdin(
+        &mut self,
+        src: &str,
+        stdin: &[u8],
+    ) -> (crate::resources::RunOutcome, Vec<u8>, Vec<u8>) {
+        self.run_script_capture_inner(src, stdin.to_vec())
+    }
+
+    /// Parse and execute an action with closed stdin, without writing to the host console.
+    ///
+    /// Use [`Interp::run_script_capture_with_stdin`] when a harness supplies input bytes for the
+    /// action.
     pub fn run_script_capture(
         &mut self,
         src: &str,
+    ) -> (crate::resources::RunOutcome, Vec<u8>, Vec<u8>) {
+        self.run_script_capture_inner(src, Vec::new())
+    }
+
+    fn run_script_capture_inner(
+        &mut self,
+        src: &str,
+        stdin: Vec<u8>,
     ) -> (crate::resources::RunOutcome, Vec<u8>, Vec<u8>) {
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1220,7 +1256,7 @@ impl Interp {
             && self.resources.charge_cpu(src.len() as u64)
         {
             let ast = parse(src);
-            crate::exec::exec(self, &ast, Vec::new(), &mut out, &mut err)
+            crate::exec::exec(self, &ast, stdin, &mut out, &mut err)
         } else {
             self.resources
                 .stop_reason()

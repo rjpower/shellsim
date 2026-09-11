@@ -137,6 +137,7 @@ impl Environment {
         let clock = Clock::new();
         let mut vfs = Vfs::with_disk_limit(limits.disk);
         vfs.set_mutation_time(clock.unix_ms());
+        vfs.seed_dirs(["/root", "/tmp", "/work"]);
         Environment {
             vfs,
             clock,
