@@ -56,6 +56,7 @@ pub enum Operation {
         name: String,
         code: Box<Code>,
         bases: usize,
+        has_metaclass: bool,
         fields: Vec<ClassField>,
     },
     GetIterator,

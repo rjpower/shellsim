@@ -222,13 +222,38 @@ impl Parser {
         } else if self.take(|kind| matches!(kind, TokenKind::Class)).is_some() {
             let name = self.name("expected a class name after 'class'")?;
             let mut bases = Vec::new();
+            let mut metaclass = None;
             if self
                 .take(|kind| matches!(kind, TokenKind::LeftParen))
                 .is_some()
             {
                 if !self.at(|kind| matches!(kind, TokenKind::RightParen)) {
                     loop {
-                        bases.push(self.expression()?);
+                        let keyword = match (
+                            &self.peek().kind,
+                            self.tokens.get(self.current + 1).map(|token| &token.kind),
+                        ) {
+                            (TokenKind::Name(name), Some(TokenKind::Equal)) => Some(name.clone()),
+                            _ => None,
+                        };
+                        if let Some(keyword) = keyword {
+                            self.advance();
+                            self.advance();
+                            if keyword != "metaclass" {
+                                return Err(self.error("unsupported class keyword argument"));
+                            }
+                            if metaclass.is_some() {
+                                return Err(self.error("metaclass passed more than once"));
+                            }
+                            metaclass = Some(self.expression()?);
+                        } else {
+                            if metaclass.is_some() {
+                                return Err(
+                                    self.error("positional class base follows metaclass keyword")
+                                );
+                            }
+                            bases.push(self.expression()?);
+                        }
                         if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
                             break;
                         }
@@ -245,6 +270,7 @@ impl Parser {
             StatementKind::Class {
                 name,
                 bases,
+                metaclass,
                 body: self.suite()?,
             }
         } else if self.take(|kind| matches!(kind, TokenKind::From)).is_some() {

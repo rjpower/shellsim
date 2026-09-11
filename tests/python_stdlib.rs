@@ -90,6 +90,9 @@ print(re.findall(r"\d+", text))
 print(re.sub(r"\d+", "#", text))
 print(re.escape("a+b? c"))
 print(re.search(r"b", text, flags=re.IGNORECASE).group())
+pattern = re.compile(r"([a-z])(\d)")
+matched = pattern.search("a1 b2")
+print(matched.group(1), pattern.findall("a1 b2"), pattern.sub("#", "a1 b2"))
 "##;
     let simulated = run(source);
     let reference = Command::new("python3.14").arg("-c").arg(source).output();
@@ -102,7 +105,7 @@ print(re.search(r"b", text, flags=re.IGNORECASE).group())
         simulated,
         (
             0,
-            b"A12 A 12 0 3\nA\n['12', '34']\nA# b#\na\\+b\\?\\ c\nb\n".to_vec(),
+            b"A12 A 12 0 3\nA\n['12', '34']\nA# b#\na\\+b\\?\\ c\nb\na [('a', '1'), ('b', '2')] # #\n".to_vec(),
             Vec::new()
         )
     );

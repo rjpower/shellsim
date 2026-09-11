@@ -4,23 +4,68 @@
 //! values.  The eventual adapter can implement Python's cross-type comparison rules and map its
 //! `TypeError` to a failed comparison before calling these simple index algorithms.
 
+use std::cmp::Ordering;
+
+use super::super::native::{
+    CallArgs, FunctionDef, ModuleDef, PyError, PyResult, PyRuntime, PySequence, PyValueCast,
+};
+use super::super::Value;
+
+pub(super) static MODULE: ModuleDef = ModuleDef {
+    name: "bisect",
+    functions: &[FunctionDef {
+        module: "bisect",
+        name: "bisect_left",
+        call: native_bisect_left,
+    }],
+    values: &[],
+};
+
+fn native_bisect_left(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("bisect_left", 2, 2)?;
+    args.reject_keywords("bisect_left")?;
+    let values = args.positional()[0]
+        .clone()
+        .cast::<PySequence>(runtime)?
+        .items(runtime)?;
+    let needle = &args.positional()[1];
+    let mut low = 0usize;
+    let mut high = values.len();
+    while low < high {
+        runtime.charge_cpu(1)?;
+        let middle = low + (high - low) / 2;
+        if runtime.compare(&values[middle], needle)? == Ordering::Less {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    i64::try_from(low)
+        .map(Value::Int)
+        .map_err(|_| PyError::overflow_error("bisect result exceeds bounded integer range"))
+}
+
 /// Errors for an explicitly bounded search.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BisectError {
     InvalidBounds { lo: usize, hi: usize, length: usize },
 }
 
 /// Return the first index at which `item` may be inserted while preserving sorted order.
+#[cfg(test)]
 pub fn bisect_left<T: Ord>(items: &[T], item: &T) -> usize {
     bisect_left_range(items, item, 0, items.len()).expect("full slice bounds are valid")
 }
 
 /// Return the insertion point after existing equal values.
+#[cfg(test)]
 pub fn bisect_right<T: Ord>(items: &[T], item: &T) -> usize {
     bisect_right_range(items, item, 0, items.len()).expect("full slice bounds are valid")
 }
 
 /// Bounded equivalent of Python's `bisect_left(..., lo, hi)` for non-negative bounds.
+#[cfg(test)]
 pub fn bisect_left_range<T: Ord>(
     items: &[T],
     item: &T,
@@ -41,6 +86,7 @@ pub fn bisect_left_range<T: Ord>(
 }
 
 /// Bounded equivalent of Python's `bisect_right(..., lo, hi)` for non-negative bounds.
+#[cfg(test)]
 pub fn bisect_right_range<T: Ord>(
     items: &[T],
     item: &T,
@@ -61,17 +107,20 @@ pub fn bisect_right_range<T: Ord>(
 }
 
 /// Insert before equal values.
+#[cfg(test)]
 pub fn insort_left<T: Ord>(items: &mut Vec<T>, item: T) {
     let index = bisect_left(items, &item);
     items.insert(index, item);
 }
 
 /// Insert after equal values.
+#[cfg(test)]
 pub fn insort_right<T: Ord>(items: &mut Vec<T>, item: T) {
     let index = bisect_right(items, &item);
     items.insert(index, item);
 }
 
+#[cfg(test)]
 fn validate_bounds(length: usize, lo: usize, hi: usize) -> Result<(), BisectError> {
     // CPython permits an empty interval when lo >= hi and simply returns lo. It does reject a
     // high bound that would cause an indexed read; negative bounds are represented and rejected

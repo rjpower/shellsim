@@ -5,17 +5,21 @@ use crate::interp::Interp;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use regex::{Regex, RegexBuilder};
-
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
 use super::bytecode::{ClassField, Code, Operation};
-use super::heap::{Method, Object, ScopeId};
+use super::heap::{ClassLayout, InstancePayload, Method, Object, ScopeId};
+use super::native::{
+    CallArgs, FunctionDef, ModuleDef, NativeTypeDef, PyCallable, PyClass, PyClock, PyDict,
+    PyEnvironment, PyError, PyErrorKind, PyInstance, PyIterator, PyKind, PyList, PyMarker, PyMatch,
+    PyMatchData, PyNativeKind, PyRegex, PyResult, PyRuntime, PyTuple, PyValueCast,
+};
 use super::{protocol, ExecResult, Out, ReplState, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NativeValue {
-    Module(Module),
+    Module(&'static ModuleDef),
     Function(Builtin),
+    NativeFunction(&'static FunctionDef),
     Stream(Stream),
     Environment,
     ExceptionType(ExceptionType),
@@ -37,29 +41,6 @@ struct RaisedException {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Module {
-    Sys,
-    Os,
-    Json,
-    Collections,
-    Math,
-    String,
-    Itertools,
-    Heapq,
-    Bisect,
-    Functools,
-    Typing,
-    Subprocess,
-    Re,
-    Argparse,
-    Dataclasses,
-    Enum,
-    Pytest,
-    Unittest,
-    Time,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Stream {
     Stdout,
     Stderr,
@@ -72,6 +53,10 @@ pub(super) enum Builtin {
     String,
     Repr,
     Integer,
+    Type,
+    IsInstance,
+    IsSubclass,
+    Object,
     Length,
     Sorted,
     Minimum,
@@ -88,64 +73,8 @@ pub(super) enum Builtin {
     Any,
     All,
     Next,
-    JsonDumps,
-    DefaultDict,
-    Math(MathBuiltin),
     Write(Stream),
-    GetEnv,
     EnvironmentGet,
-    ItertoolsCount,
-    ItertoolsIslice,
-    HeapqHeapify,
-    HeapqHeappop,
-    BisectLeft,
-    Reduce,
-    ReCompile,
-    ReSearch,
-    ReMatch,
-    ReFullMatch,
-    ReFindAll,
-    ReFindIter,
-    ReSub,
-    ReEscape,
-    ArgparseArgumentParser,
-    ArgparseNamespace,
-    Dataclass,
-    PytestFail,
-    PytestSkip,
-    PytestRaises,
-    Time,
-    TimeNs,
-    Monotonic,
-    MonotonicNs,
-    ProcessTime,
-    ProcessTimeNs,
-    Sleep,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MathBuiltin {
-    Ceil,
-    Exp,
-    IsInf,
-    IsNan,
-    Log,
-    Sin,
-    Sqrt,
-}
-
-impl MathBuiltin {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Ceil => "ceil",
-            Self::Exp => "exp",
-            Self::IsInf => "isinf",
-            Self::IsNan => "isnan",
-            Self::Log => "log",
-            Self::Sin => "sin",
-            Self::Sqrt => "sqrt",
-        }
-    }
 }
 
 pub(super) fn execute(
@@ -318,8 +247,9 @@ impl<'a> Vm<'a> {
                     name,
                     code,
                     bases,
+                    has_metaclass,
                     fields,
-                } => self.make_class(name.clone(), code, *bases, fields),
+                } => self.make_class(name.clone(), code, *bases, *has_metaclass, fields),
                 Operation::GetIterator => self.get_iterator(),
                 Operation::ForIterator(target) => match self.for_iterator() {
                     Ok(true) => Ok(()),
@@ -610,6 +540,10 @@ impl<'a> Vm<'a> {
                     "str" => Builtin::String,
                     "repr" => Builtin::Repr,
                     "int" => Builtin::Integer,
+                    "type" => Builtin::Type,
+                    "isinstance" => Builtin::IsInstance,
+                    "issubclass" => Builtin::IsSubclass,
+                    "object" => Builtin::Object,
                     "len" => Builtin::Length,
                     "sorted" => Builtin::Sorted,
                     "min" => Builtin::Minimum,
@@ -722,28 +656,7 @@ impl<'a> Vm<'a> {
     }
 
     fn import(&mut self, name: &str) -> Result<(), String> {
-        if let Some(module) = match name {
-            "sys" => Some(Module::Sys),
-            "os" => Some(Module::Os),
-            "json" => Some(Module::Json),
-            "collections" => Some(Module::Collections),
-            "math" => Some(Module::Math),
-            "string" => Some(Module::String),
-            "itertools" => Some(Module::Itertools),
-            "heapq" => Some(Module::Heapq),
-            "bisect" => Some(Module::Bisect),
-            "functools" => Some(Module::Functools),
-            "typing" => Some(Module::Typing),
-            "subprocess" => Some(Module::Subprocess),
-            "re" => Some(Module::Re),
-            "argparse" => Some(Module::Argparse),
-            "dataclasses" => Some(Module::Dataclasses),
-            "enum" => Some(Module::Enum),
-            "pytest" => Some(Module::Pytest),
-            "unittest" => Some(Module::Unittest),
-            "time" => Some(Module::Time),
-            _ => None,
-        } {
+        if let Some(module) = super::stdlib::native_module(name) {
             self.stack.push(Value::Native(NativeValue::Module(module)));
             return Ok(());
         }
@@ -844,6 +757,29 @@ impl<'a> Vm<'a> {
 
     fn load_attribute(&mut self, name: &str) -> Result<(), String> {
         let owner = self.pop()?;
+        if let Value::Native(NativeValue::Module(module)) = &owner {
+            if let Some(function) = module.function(name) {
+                self.stack
+                    .push(Value::Native(NativeValue::NativeFunction(function)));
+                return Ok(());
+            }
+            if let Some(value) = module.value(name) {
+                let value = value.get(self).map_err(|error| error.to_string())?;
+                self.stack.push(value);
+                return Ok(());
+            }
+        }
+        if let Some(method) = self
+            .native_type_def(&owner)?
+            .and_then(|native_type| native_type.method(name))
+        {
+            let method = self.allocate_object(Object::NativeBoundMethod {
+                receiver: owner,
+                method,
+            })?;
+            self.stack.push(method);
+            return Ok(());
+        }
         if let Some(method) = self.method_for(&owner, name)? {
             let method = self.state.heap.allocate(
                 Object::BoundMethod {
@@ -867,11 +803,18 @@ impl<'a> Vm<'a> {
                     self.stack.push(value);
                     return Ok(());
                 }
-                Object::Class { attributes, .. } => {
-                    let value = attributes
-                        .get(name)
-                        .cloned()
-                        .ok_or_else(|| format!("class has no attribute {name:?}"))?;
+                Object::Class { .. } => {
+                    let mut value = self.class_attribute(*id, name)?;
+                    if value.is_none() {
+                        let Object::Class { metaclass, .. } = self.state.heap.get(*id)? else {
+                            unreachable!()
+                        };
+                        let metaclass = metaclass.clone();
+                        if let Value::Object(metaclass) = metaclass {
+                            value = self.class_attribute(metaclass, name)?;
+                        }
+                    }
+                    let value = value.ok_or_else(|| format!("class has no attribute {name:?}"))?;
                     self.stack.push(value);
                     return Ok(());
                 }
@@ -887,15 +830,22 @@ impl<'a> Vm<'a> {
                     self.stack.push(value);
                     return Ok(());
                 }
-                Object::Instance { class, attributes } => {
-                    if let Some(value) = attributes.get(name).cloned() {
+                Object::Instance { class, .. } => {
+                    let instance = owner
+                        .clone()
+                        .cast::<PyInstance>(self)
+                        .map_err(|error| error.to_string())?;
+                    if let Some(value) = instance
+                        .attribute(self, name)
+                        .map_err(|error| error.to_string())?
+                    {
                         self.stack.push(value);
                         return Ok(());
                     }
-                    let Object::Class { attributes, .. } = self.state.heap.get(class)? else {
-                        return Err("instance has an invalid class".into());
-                    };
-                    if attributes.contains_key("__shellsim_unittest__") {
+                    if self
+                        .class_attribute(class, "__shellsim_unittest__")?
+                        .is_some()
+                    {
                         let method = match name {
                             "assertEqual" => Some(Method::UnitTestAssertEqual),
                             "assertTrue" => Some(Method::UnitTestAssertTrue),
@@ -916,9 +866,8 @@ impl<'a> Vm<'a> {
                             return Ok(());
                         }
                     }
-                    let value = attributes
-                        .get(name)
-                        .cloned()
+                    let value = self
+                        .class_attribute(class, name)?
                         .ok_or_else(|| format!("instance has no attribute {name:?}"))?;
                     if let Value::Object(function) = value {
                         if matches!(self.state.heap.get(function)?, Object::Function { .. }) {
@@ -953,153 +902,6 @@ impl<'a> Vm<'a> {
             }
         }
         let value = match (owner, name) {
-            (Value::Native(NativeValue::Module(Module::Sys)), "version") => {
-                Value::String("3.14.0 (shellsim)".into())
-            }
-            (Value::Native(NativeValue::Module(Module::Sys)), "version_info") => {
-                Value::String("(3, 14, 0, 'final', 0)".into())
-            }
-            (Value::Native(NativeValue::Module(Module::Sys)), "executable") => {
-                Value::String("/usr/bin/python3.14".into())
-            }
-            (Value::Native(NativeValue::Module(Module::Sys)), "prefix") => {
-                Value::String("/usr".into())
-            }
-            (Value::Native(NativeValue::Module(Module::Sys)), "argv") => self.state.heap.allocate(
-                Object::List(self.argv.iter().cloned().map(Value::String).collect()),
-                &mut self.interp.resources,
-            )?,
-            (Value::Native(NativeValue::Module(Module::Sys)), "stdout") => {
-                Value::Native(NativeValue::Stream(Stream::Stdout))
-            }
-            (Value::Native(NativeValue::Module(Module::Sys)), "stderr") => {
-                Value::Native(NativeValue::Stream(Stream::Stderr))
-            }
-            (Value::Native(NativeValue::Module(Module::Os)), "getenv") => {
-                Value::Native(NativeValue::Function(Builtin::GetEnv))
-            }
-            (Value::Native(NativeValue::Module(Module::Os)), "environ") => {
-                Value::Native(NativeValue::Environment)
-            }
-            (Value::Native(NativeValue::Module(Module::Json)), "dumps") => {
-                Value::Native(NativeValue::Function(Builtin::JsonDumps))
-            }
-            (Value::Native(NativeValue::Module(Module::Collections)), "defaultdict") => {
-                Value::Native(NativeValue::Function(Builtin::DefaultDict))
-            }
-            (Value::Native(NativeValue::Module(Module::Math)), name) => {
-                if let Some(value) = super::stdlib::math::constant(name) {
-                    match value {
-                        super::stdlib::math::MathValue::Float(value) => Value::Float(value),
-                        super::stdlib::math::MathValue::Int(value) => Value::Int(value),
-                        super::stdlib::math::MathValue::Bool(value) => Value::Bool(value),
-                    }
-                } else {
-                    let function = match name {
-                        "ceil" => MathBuiltin::Ceil,
-                        "exp" => MathBuiltin::Exp,
-                        "isinf" => MathBuiltin::IsInf,
-                        "isnan" => MathBuiltin::IsNan,
-                        "log" => MathBuiltin::Log,
-                        "sin" => MathBuiltin::Sin,
-                        "sqrt" => MathBuiltin::Sqrt,
-                        _ => return Err(format!("math has no attribute {name:?}")),
-                    };
-                    Value::Native(NativeValue::Function(Builtin::Math(function)))
-                }
-            }
-            (Value::Native(NativeValue::Module(Module::String)), name) => {
-                let value = super::stdlib::string::constant(name)
-                    .ok_or_else(|| format!("string has no attribute {name:?}"))?;
-                Value::String(value.into())
-            }
-            (Value::Native(NativeValue::Module(Module::Itertools)), "count") => {
-                Value::Native(NativeValue::Function(Builtin::ItertoolsCount))
-            }
-            (Value::Native(NativeValue::Module(Module::Itertools)), "islice") => {
-                Value::Native(NativeValue::Function(Builtin::ItertoolsIslice))
-            }
-            (Value::Native(NativeValue::Module(Module::Heapq)), "heapify") => {
-                Value::Native(NativeValue::Function(Builtin::HeapqHeapify))
-            }
-            (Value::Native(NativeValue::Module(Module::Heapq)), "heappop") => {
-                Value::Native(NativeValue::Function(Builtin::HeapqHeappop))
-            }
-            (Value::Native(NativeValue::Module(Module::Bisect)), "bisect_left") => {
-                Value::Native(NativeValue::Function(Builtin::BisectLeft))
-            }
-            (Value::Native(NativeValue::Module(Module::Functools)), "reduce") => {
-                Value::Native(NativeValue::Function(Builtin::Reduce))
-            }
-            (Value::Native(NativeValue::Module(Module::Typing)), "List") => {
-                Value::Native(NativeValue::TypingList)
-            }
-            (Value::Native(NativeValue::Module(Module::Re)), "IGNORECASE") => Value::Int(2),
-            (Value::Native(NativeValue::Module(Module::Re)), "MULTILINE") => Value::Int(8),
-            (Value::Native(NativeValue::Module(Module::Re)), "compile") => {
-                Value::Native(NativeValue::Function(Builtin::ReCompile))
-            }
-            (Value::Native(NativeValue::Module(Module::Re)), "search") => {
-                Value::Native(NativeValue::Function(Builtin::ReSearch))
-            }
-            (Value::Native(NativeValue::Module(Module::Re)), "match") => {
-                Value::Native(NativeValue::Function(Builtin::ReMatch))
-            }
-            (Value::Native(NativeValue::Module(Module::Re)), "fullmatch") => {
-                Value::Native(NativeValue::Function(Builtin::ReFullMatch))
-            }
-            (Value::Native(NativeValue::Module(Module::Re)), "findall") => {
-                Value::Native(NativeValue::Function(Builtin::ReFindAll))
-            }
-            (Value::Native(NativeValue::Module(Module::Re)), "finditer") => {
-                Value::Native(NativeValue::Function(Builtin::ReFindIter))
-            }
-            (Value::Native(NativeValue::Module(Module::Re)), "sub") => {
-                Value::Native(NativeValue::Function(Builtin::ReSub))
-            }
-            (Value::Native(NativeValue::Module(Module::Re)), "escape") => {
-                Value::Native(NativeValue::Function(Builtin::ReEscape))
-            }
-            (Value::Native(NativeValue::Module(Module::Argparse)), "ArgumentParser") => {
-                Value::Native(NativeValue::Function(Builtin::ArgparseArgumentParser))
-            }
-            (Value::Native(NativeValue::Module(Module::Argparse)), "Namespace") => {
-                Value::Native(NativeValue::Function(Builtin::ArgparseNamespace))
-            }
-            (Value::Native(NativeValue::Module(Module::Dataclasses)), "dataclass") => {
-                Value::Native(NativeValue::Function(Builtin::Dataclass))
-            }
-            (Value::Native(NativeValue::Module(Module::Dataclasses)), "fields") => {
-                return Err("dataclasses.fields is not implemented".into())
-            }
-            (Value::Native(NativeValue::Module(Module::Enum)), "Enum") => {
-                Value::Native(NativeValue::EnumBase)
-            }
-            (Value::Native(NativeValue::Module(Module::Pytest)), "fail") => {
-                Value::Native(NativeValue::Function(Builtin::PytestFail))
-            }
-            (Value::Native(NativeValue::Module(Module::Pytest)), "skip") => {
-                Value::Native(NativeValue::Function(Builtin::PytestSkip))
-            }
-            (Value::Native(NativeValue::Module(Module::Pytest)), "raises") => {
-                Value::Native(NativeValue::Function(Builtin::PytestRaises))
-            }
-            (Value::Native(NativeValue::Module(Module::Unittest)), "TestCase") => {
-                Value::Native(NativeValue::UnitTestBase)
-            }
-            (Value::Native(NativeValue::Module(Module::Time)), name) => {
-                let function = match name {
-                    "time" => Builtin::Time,
-                    "time_ns" => Builtin::TimeNs,
-                    "monotonic" | "perf_counter" => Builtin::Monotonic,
-                    "monotonic_ns" | "perf_counter_ns" => Builtin::MonotonicNs,
-                    "process_time" => Builtin::ProcessTime,
-                    "process_time_ns" => Builtin::ProcessTimeNs,
-                    "sleep" => Builtin::Sleep,
-                    _ => return Err(format!("time has no attribute {name:?}")),
-                };
-                Value::Native(NativeValue::Function(function))
-            }
             (Value::Native(NativeValue::UnitTestBase), "__name__") => {
                 Value::String("TestCase".into())
             }
@@ -1170,22 +972,6 @@ impl<'a> Vm<'a> {
                     "discard" => Some(Method::SetDiscard),
                     _ => None,
                 },
-                Object::Regex { .. } => match name {
-                    "search" => Some(Method::RegexSearch),
-                    "match" => Some(Method::RegexMatch),
-                    "fullmatch" => Some(Method::RegexFullMatch),
-                    "findall" => Some(Method::RegexFindAll),
-                    "finditer" => Some(Method::RegexFindIter),
-                    "sub" => Some(Method::RegexSub),
-                    _ => None,
-                },
-                Object::Match { .. } => match name {
-                    "group" => Some(Method::MatchGroup),
-                    "groups" => Some(Method::MatchGroups),
-                    "start" => Some(Method::MatchStart),
-                    "end" => Some(Method::MatchEnd),
-                    _ => None,
-                },
                 Object::ArgumentParser { .. } => match name {
                     "add_argument" => Some(Method::ArgumentParserAddArgument),
                     "parse_args" => Some(Method::ArgumentParserParseArgs),
@@ -1201,11 +987,14 @@ impl<'a> Vm<'a> {
                 | Object::Class { .. }
                 | Object::Instance { .. }
                 | Object::PythonBoundMethod { .. }
+                | Object::NativeBoundMethod { .. }
                 | Object::Iterator { .. }
                 | Object::CountIterator { .. }
                 | Object::Generator { .. }
                 | Object::BoundMethod { .. }
                 | Object::Module { .. }
+                | Object::Regex { .. }
+                | Object::Match { .. }
                 | Object::Namespace { .. } => None,
                 Object::EnumMember { .. } => None,
             },
@@ -1294,6 +1083,7 @@ impl<'a> Vm<'a> {
                 | Object::Class { .. }
                 | Object::Instance { .. }
                 | Object::PythonBoundMethod { .. }
+                | Object::NativeBoundMethod { .. }
                 | Object::Iterator { .. }
                 | Object::CountIterator { .. }
                 | Object::Generator { .. }
@@ -1366,6 +1156,7 @@ impl<'a> Vm<'a> {
             | Object::Class { .. }
             | Object::Instance { .. }
             | Object::PythonBoundMethod { .. }
+            | Object::NativeBoundMethod { .. }
             | Object::Iterator { .. }
             | Object::CountIterator { .. }
             | Object::Generator { .. }
@@ -1422,18 +1213,106 @@ impl<'a> Vm<'a> {
         name: String,
         code: &Code,
         base_count: usize,
+        has_metaclass: bool,
         fields: &[ClassField],
     ) -> Result<(), String> {
-        if self.stack.len() < base_count {
+        let stack_values = base_count
+            .checked_add(usize::from(has_metaclass))
+            .ok_or("too many class construction values")?;
+        if self.stack.len() < stack_values {
             return Err("invalid bytecode stack effect while creating class".into());
         }
+        let explicit_metaclass = has_metaclass.then(|| self.stack.pop().expect("checked above"));
         let bases = self.stack.split_off(self.stack.len() - base_count);
         let is_enum = bases.len() == 1 && matches!(bases[0], Value::Native(NativeValue::EnumBase));
         let is_unittest =
             bases.len() == 1 && matches!(bases[0], Value::Native(NativeValue::UnitTestBase));
-        if !bases.is_empty() && !is_enum && !is_unittest {
-            return Err("only enum.Enum and unittest.TestCase inheritance is supported".into());
+        let has_int_base = bases
+            .iter()
+            .any(|base| matches!(base, Value::Native(NativeValue::Function(Builtin::Integer))));
+        let has_object_base = bases
+            .iter()
+            .any(|base| matches!(base, Value::Native(NativeValue::Function(Builtin::Object))));
+        let has_type_base = bases
+            .iter()
+            .any(|base| matches!(base, Value::Native(NativeValue::Function(Builtin::Type))));
+        let user_bases = if is_enum || is_unittest {
+            Vec::new()
+        } else {
+            bases
+                .iter()
+                .filter_map(|base| match base {
+                    Value::Object(id)
+                        if matches!(self.state.heap.get(*id), Ok(Object::Class { .. })) =>
+                    {
+                        Some(Ok(*id))
+                    }
+                    Value::Native(NativeValue::Function(Builtin::Integer)) => None,
+                    Value::Native(NativeValue::Function(Builtin::Object)) => None,
+                    Value::Native(NativeValue::Function(Builtin::Type)) => None,
+                    _ => Some(Err("class bases must be classes".to_string())),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if has_int_base && (bases.len() != 1 || is_enum || is_unittest) {
+            return Err("int inheritance cannot yet be combined with another direct base".into());
         }
+        if has_object_base && bases.len() != 1 {
+            return Err("object cannot be combined with another direct base in this slice".into());
+        }
+        if has_type_base && bases.len() != 1 {
+            return Err("type cannot be combined with another direct base in this slice".into());
+        }
+        let inherited_int_layouts = user_bases
+            .iter()
+            .filter_map(|base| match self.state.heap.get(*base) {
+                Ok(Object::Class { layout, .. }) => Some(*layout == ClassLayout::Int),
+                _ => None,
+            })
+            .filter(|is_int| *is_int)
+            .count();
+        if inherited_int_layouts > 1 {
+            return Err("multiple bases have incompatible int instance layouts".into());
+        }
+        let inherited_type_layouts = user_bases
+            .iter()
+            .filter_map(|base| match self.state.heap.get(*base) {
+                Ok(Object::Class { layout, .. }) => Some(*layout == ClassLayout::Type),
+                _ => None,
+            })
+            .filter(|is_type| *is_type)
+            .count();
+        if inherited_type_layouts > 1 || (inherited_type_layouts == 1 && inherited_int_layouts == 1)
+        {
+            return Err("multiple bases have incompatible instance layouts".into());
+        }
+        let layout = if has_type_base || inherited_type_layouts == 1 {
+            ClassLayout::Type
+        } else if has_int_base || inherited_int_layouts == 1 {
+            ClassLayout::Int
+        } else {
+            ClassLayout::Object
+        };
+        let default_metaclass = user_bases
+            .first()
+            .and_then(|base| match self.state.heap.get(*base) {
+                Ok(Object::Class { metaclass, .. }) => Some(metaclass.clone()),
+                _ => None,
+            })
+            .unwrap_or(Value::Native(NativeValue::Function(Builtin::Type)));
+        let metaclass = explicit_metaclass.unwrap_or(default_metaclass);
+        let valid_metaclass = matches!(
+            metaclass,
+            Value::Native(NativeValue::Function(Builtin::Type))
+        ) || matches!(
+            metaclass,
+            Value::Object(id)
+                if matches!(self.state.heap.get(id), Ok(Object::Class { layout: ClassLayout::Type, .. }))
+        );
+        if !valid_metaclass {
+            return Err("metaclass must derive from type".into());
+        }
+        let mro = self.linearize_bases(&user_bases)?;
         let parent = self.local_scopes.last().copied();
         let uses_repl_globals = parent
             .map(|scope| self.state.heap.scope_uses_repl_globals(scope))
@@ -1472,6 +1351,13 @@ impl<'a> Vm<'a> {
             }
         }
         let mut attributes = self.state.heap.scope_values(scope)?;
+        if layout == ClassLayout::Type
+            && ["__new__", "__init__", "__call__"]
+                .iter()
+                .any(|name| attributes.contains_key(*name))
+        {
+            return Err("custom metaclass construction hooks are not implemented".into());
+        }
         if is_unittest {
             attributes.insert("__shellsim_unittest__".into(), Value::Bool(true));
         }
@@ -1503,6 +1389,10 @@ impl<'a> Vm<'a> {
         let class = self.state.heap.allocate(
             Object::Class {
                 name,
+                bases: user_bases,
+                mro,
+                metaclass,
+                layout,
                 attributes,
                 is_dataclass: false,
                 dataclass_fields,
@@ -1512,6 +1402,180 @@ impl<'a> Vm<'a> {
         )?;
         self.stack.push(class);
         Ok(())
+    }
+
+    fn linearize_bases(
+        &mut self,
+        bases: &[super::heap::ObjectId],
+    ) -> Result<Vec<super::heap::ObjectId>, String> {
+        for (index, base) in bases.iter().enumerate() {
+            if bases[..index].contains(base) {
+                return Err("duplicate base class".into());
+            }
+        }
+        let mut sequences = Vec::with_capacity(bases.len().saturating_add(1));
+        for base in bases {
+            let Object::Class { mro, .. } = self.state.heap.get(*base)? else {
+                return Err("class base changed object kind".into());
+            };
+            let mut sequence = Vec::with_capacity(mro.len().saturating_add(1));
+            sequence.push(*base);
+            sequence.extend(mro.iter().copied());
+            sequences.push(sequence);
+        }
+        sequences.push(bases.to_vec());
+
+        let mut result = Vec::new();
+        loop {
+            sequences.retain(|sequence| !sequence.is_empty());
+            if sequences.is_empty() {
+                return Ok(result);
+            }
+            let candidate = sequences.iter().find_map(|sequence| {
+                let head = sequence[0];
+                (!sequences
+                    .iter()
+                    .any(|other| other.iter().skip(1).any(|item| *item == head)))
+                .then_some(head)
+            });
+            let Some(candidate) = candidate else {
+                return Err("cannot create a consistent method resolution order".into());
+            };
+            self.charge_cpu(u64::try_from(sequences.len()).unwrap_or(u64::MAX))?;
+            result.push(candidate);
+            for sequence in &mut sequences {
+                if sequence.first() == Some(&candidate) {
+                    sequence.remove(0);
+                }
+            }
+        }
+    }
+
+    fn class_attribute(
+        &mut self,
+        class: super::heap::ObjectId,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let Object::Class {
+            attributes, mro, ..
+        } = self.state.heap.get(class)?
+        else {
+            return Err("instance has an invalid class".into());
+        };
+        if let Some(value) = attributes.get(name) {
+            return Ok(Some(value.clone()));
+        }
+        let ancestors = mro.clone();
+        for ancestor in ancestors {
+            self.charge_cpu(1)?;
+            let Object::Class { attributes, .. } = self.state.heap.get(ancestor)? else {
+                return Err("class MRO contains a non-class object".into());
+            };
+            if let Some(value) = attributes.get(name) {
+                return Ok(Some(value.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn type_of(&self, value: &Value) -> Result<Value, String> {
+        let builtin = match value {
+            Value::Int(_) => Some(Builtin::Integer),
+            Value::Bool(_) => Some(Builtin::Boolean),
+            Value::String(_) => Some(Builtin::String),
+            Value::Object(id) => match self.state.heap.get(*id)? {
+                Object::Instance { class, .. } => return Ok(Value::Object(*class)),
+                Object::Class { metaclass, .. } => return Ok(metaclass.clone()),
+                Object::List(_) => Some(Builtin::List),
+                Object::Tuple(_) => Some(Builtin::Tuple),
+                Object::Set(_) => Some(Builtin::Set),
+                _ => None,
+            },
+            Value::Native(NativeValue::Function(_)) if self.is_type_value(value) => {
+                Some(Builtin::Type)
+            }
+            _ => None,
+        };
+        builtin
+            .map(|builtin| Value::Native(NativeValue::Function(builtin)))
+            .ok_or_else(|| "type() is not implemented for this value kind".into())
+    }
+
+    fn is_instance(&self, value: &Value, class: &Value) -> Result<bool, String> {
+        if matches!(class, Value::Native(NativeValue::Function(Builtin::Object))) {
+            return Ok(true);
+        }
+        if matches!(
+            class,
+            Value::Native(NativeValue::Function(Builtin::Integer))
+        ) && protocol::int_value(&self.state.heap, value).is_some()
+        {
+            return Ok(true);
+        }
+        let actual = self.type_of(value)?;
+        self.is_subclass(&actual, class)
+    }
+
+    fn is_subclass(&self, class: &Value, base: &Value) -> Result<bool, String> {
+        if !self.is_type_value(class) || !self.is_type_value(base) {
+            return Err("isinstance() and issubclass() require a class argument".into());
+        }
+        if identity(class, base)
+            || matches!(base, Value::Native(NativeValue::Function(Builtin::Object)))
+        {
+            return Ok(true);
+        }
+        if matches!(
+            (class, base),
+            (
+                Value::Native(NativeValue::Function(Builtin::Boolean)),
+                Value::Native(NativeValue::Function(Builtin::Integer))
+            )
+        ) {
+            return Ok(true);
+        }
+        let Value::Object(class_id) = class else {
+            return Ok(false);
+        };
+        let Object::Class { mro, layout, .. } = self.state.heap.get(*class_id)? else {
+            return Ok(false);
+        };
+        match base {
+            Value::Object(base_id) => Ok(mro.contains(base_id)),
+            Value::Native(NativeValue::Function(Builtin::Integer)) => {
+                Ok(*layout == ClassLayout::Int)
+            }
+            Value::Native(NativeValue::Function(Builtin::Type)) => Ok(*layout == ClassLayout::Type),
+            _ => Ok(false),
+        }
+    }
+
+    fn is_type_value(&self, value: &Value) -> bool {
+        match value {
+            Value::Native(NativeValue::Function(
+                Builtin::Integer
+                | Builtin::String
+                | Builtin::Boolean
+                | Builtin::List
+                | Builtin::Tuple
+                | Builtin::Set
+                | Builtin::Object
+                | Builtin::Type,
+            )) => true,
+            Value::Object(id) => matches!(self.state.heap.get(*id), Ok(Object::Class { .. })),
+            _ => false,
+        }
+    }
+
+    fn native_type_def(&self, value: &Value) -> Result<Option<&'static NativeTypeDef>, String> {
+        let Value::Object(id) = value else {
+            return Ok(None);
+        };
+        Ok(match self.state.heap.get(*id)? {
+            Object::Regex { .. } => Some(&super::stdlib::re::PATTERN_TYPE),
+            Object::Match { .. } => Some(&super::stdlib::re::MATCH_TYPE),
+            _ => None,
+        })
     }
 
     fn get_iterator(&mut self) -> Result<(), String> {
@@ -1744,7 +1808,19 @@ impl<'a> Vm<'a> {
             ),
             (UnaryOperator::Positive, Value::Float(value)) => Value::Float(value),
             (UnaryOperator::Negative, Value::Float(value)) => Value::Float(-value),
-            _ => return Err("bad operand type for unary arithmetic".into()),
+            (operator, value) => {
+                let value = protocol::int_value(&self.state.heap, &value)
+                    .ok_or("bad operand type for unary arithmetic")?;
+                match operator {
+                    UnaryOperator::Positive => Value::Int(value),
+                    UnaryOperator::Negative => {
+                        Value::Int(value.checked_neg().ok_or(
+                            "integer arithmetic exceeds the current bounded integer range",
+                        )?)
+                    }
+                    UnaryOperator::Not => unreachable!(),
+                }
+            }
         };
         self.stack.push(value);
         Ok(())
@@ -1843,6 +1919,14 @@ impl<'a> Vm<'a> {
     fn binary(&mut self, operator: BinaryOperator) -> Result<(), String> {
         let right = self.pop()?;
         let left = self.pop()?;
+        let right = match (&right, protocol::int_value(&self.state.heap, &right)) {
+            (Value::Object(_), Some(value)) => Value::Int(value),
+            _ => right,
+        };
+        let left = match (&left, protocol::int_value(&self.state.heap, &left)) {
+            (Value::Object(_), Some(value)) => Value::Int(value),
+            _ => left,
+        };
         let value = match (operator, left, right) {
             (BinaryOperator::Add, Value::Object(left_id), Value::Object(right_id)) => {
                 let left_values = match self.state.heap.get(left_id)?.clone() {
@@ -2013,12 +2097,24 @@ impl<'a> Vm<'a> {
                         keyword_arguments,
                     )
                 }
+                Object::NativeBoundMethod { receiver, method } => {
+                    let call = CallArgs::new(arguments, keyword_arguments);
+                    match (method.call)(self, receiver, call) {
+                        Ok(value) => Ok(CallResult::Value(value)),
+                        Err(PyError {
+                            kind: PyErrorKind::Exit(status),
+                            ..
+                        }) => Ok(CallResult::Exit(status)),
+                        Err(error) => Err(self.record_native_error(error)),
+                    }
+                }
                 Object::Class {
                     name,
-                    attributes,
+                    layout,
                     is_dataclass,
                     dataclass_fields,
                     enum_members,
+                    ..
                 } => {
                     if !enum_members.is_empty() {
                         if !keyword_arguments.is_empty() || arguments.len() != 1 {
@@ -2039,8 +2135,35 @@ impl<'a> Vm<'a> {
                         }
                         return Err(format!("value is not a valid {name}"));
                     }
+                    let payload = match layout {
+                        ClassLayout::Object => InstancePayload::Object,
+                        ClassLayout::Int => {
+                            if !keyword_arguments.is_empty() {
+                                return Err(format!("{name}() does not accept keyword arguments"));
+                            }
+                            let value = arguments
+                                .first()
+                                .map(|value| {
+                                    protocol::int_value(&self.state.heap, value)
+                                        .or_else(|| value.as_int())
+                                        .ok_or_else(|| {
+                                            format!("{name}() argument is not supported")
+                                        })
+                                })
+                                .transpose()?
+                                .unwrap_or(0);
+                            if arguments.len() > 1 {
+                                return Err(format!("{name}() expects at most one value"));
+                            }
+                            InstancePayload::Int(value)
+                        }
+                        ClassLayout::Type => {
+                            return Err("direct custom metaclass calls are not implemented".into())
+                        }
+                    };
                     let instance = self.allocate_object(Object::Instance {
                         class: id,
+                        payload,
                         attributes: HashMap::new(),
                     })?;
                     if is_dataclass {
@@ -2097,7 +2220,7 @@ impl<'a> Vm<'a> {
                             unreachable!()
                         };
                         attributes.extend(values);
-                    } else if let Some(initializer) = attributes.get("__init__") {
+                    } else if let Some(initializer) = self.class_attribute(id, "__init__")? {
                         let Value::Object(function) = initializer else {
                             return Err(format!("{name}.__init__ is not callable"));
                         };
@@ -2106,7 +2229,7 @@ impl<'a> Vm<'a> {
                             code,
                             closure,
                             defaults,
-                        } = self.state.heap.get(*function)?.clone()
+                        } = self.state.heap.get(function)?.clone()
                         else {
                             return Err(format!("{name}.__init__ is not a function"));
                         };
@@ -2125,7 +2248,9 @@ impl<'a> Vm<'a> {
                             }
                             CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
                         }
-                    } else if !arguments.is_empty() || !keyword_arguments.is_empty() {
+                    } else if layout == ClassLayout::Object
+                        && (!arguments.is_empty() || !keyword_arguments.is_empty())
+                    {
                         return Err(format!("{name}() takes no arguments"));
                     }
                     Ok(CallResult::Value(instance))
@@ -2146,26 +2271,21 @@ impl<'a> Vm<'a> {
                 message,
             }));
         }
+        if let Value::Native(NativeValue::NativeFunction(function)) = function {
+            let call = CallArgs::new(arguments, keyword_arguments);
+            return match (function.call)(self, call) {
+                Ok(value) => Ok(CallResult::Value(value)),
+                Err(PyError {
+                    kind: PyErrorKind::Exit(status),
+                    ..
+                }) => Ok(CallResult::Exit(status)),
+                Err(error) => Err(self.record_native_error(error)),
+            };
+        }
         let Value::Native(NativeValue::Function(function)) = function else {
             return Err("object is not callable".into());
         };
-        if !keyword_arguments.is_empty()
-            && !matches!(
-                function,
-                Builtin::JsonDumps
-                    | Builtin::Sorted
-                    | Builtin::ReCompile
-                    | Builtin::ReSearch
-                    | Builtin::ReMatch
-                    | Builtin::ReFullMatch
-                    | Builtin::ReFindAll
-                    | Builtin::ReFindIter
-                    | Builtin::ReSub
-                    | Builtin::ArgparseArgumentParser
-                    | Builtin::ArgparseNamespace
-                    | Builtin::Dataclass
-            )
-        {
+        if !keyword_arguments.is_empty() && !matches!(function, Builtin::Sorted) {
             return Err("this builtin does not accept keyword arguments".into());
         }
         match function {
@@ -2205,10 +2325,37 @@ impl<'a> Vm<'a> {
                 expect_arity(&arguments, 0, 1)?;
                 let value = arguments
                     .first()
-                    .map(|value| value.as_int().ok_or("int() argument is not supported"))
+                    .map(|value| {
+                        protocol::int_value(&self.state.heap, value)
+                            .or_else(|| value.as_int())
+                            .ok_or("int() argument is not supported")
+                    })
                     .transpose()?
                     .unwrap_or(0);
                 Ok(CallResult::Value(Value::Int(value)))
+            }
+            Builtin::Type => {
+                expect_arity(&arguments, 1, 1)?;
+                Ok(CallResult::Value(self.type_of(&arguments[0])?))
+            }
+            Builtin::IsInstance => {
+                expect_arity(&arguments, 2, 2)?;
+                Ok(CallResult::Value(Value::Bool(
+                    self.is_instance(&arguments[0], &arguments[1])?,
+                )))
+            }
+            Builtin::IsSubclass => {
+                expect_arity(&arguments, 2, 2)?;
+                Ok(CallResult::Value(Value::Bool(
+                    self.is_subclass(&arguments[0], &arguments[1])?,
+                )))
+            }
+            Builtin::Object => {
+                expect_arity(&arguments, 0, 0)?;
+                if !keyword_arguments.is_empty() {
+                    return Err("object() does not accept keyword arguments".into());
+                }
+                Err("direct object() instances are not implemented".into())
             }
             Builtin::Length => {
                 expect_arity(&arguments, 1, 1)?;
@@ -2225,6 +2372,7 @@ impl<'a> Vm<'a> {
                         | Object::Class { .. }
                         | Object::Instance { .. }
                         | Object::PythonBoundMethod { .. }
+                        | Object::NativeBoundMethod { .. }
                         | Object::Iterator { .. }
                         | Object::CountIterator { .. }
                         | Object::Generator { .. }
@@ -2494,510 +2642,13 @@ impl<'a> Vm<'a> {
                 }
                 Ok(CallResult::Value(Value::Bool(result)))
             }
-            Builtin::ItertoolsCount => {
-                expect_arity(&arguments, 0, 2)?;
-                let current = arguments
-                    .first()
-                    .map(|value| value.as_int().ok_or("count start must be an integer"))
-                    .transpose()?
-                    .unwrap_or(0);
-                let step = arguments
-                    .get(1)
-                    .map(|value| value.as_int().ok_or("count step must be an integer"))
-                    .transpose()?
-                    .unwrap_or(1);
-                Ok(CallResult::Value(self.allocate_object(
-                    Object::CountIterator { current, step },
-                )?))
-            }
-            Builtin::ItertoolsIslice => {
-                if !keyword_arguments.is_empty() {
-                    return Err("itertools.islice does not accept keyword arguments".into());
-                }
-                if !(2..=4).contains(&arguments.len()) {
-                    return Err("itertools.islice expected 2 to 4 arguments".into());
-                }
-                let (iterable, start, stop, step) = match arguments.as_slice() {
-                    [iterable, stop] => (
-                        iterable,
-                        0_i64,
-                        stop.as_int().ok_or("islice stop must be an integer")?,
-                        1_i64,
-                    ),
-                    [iterable, start, stop] => (
-                        iterable,
-                        start.as_int().ok_or("islice start must be an integer")?,
-                        stop.as_int().ok_or("islice stop must be an integer")?,
-                        1_i64,
-                    ),
-                    [iterable, start, stop, step] => (
-                        iterable,
-                        start.as_int().ok_or("islice start must be an integer")?,
-                        stop.as_int().ok_or("islice stop must be an integer")?,
-                        step.as_int().ok_or("islice step must be an integer")?,
-                    ),
-                    _ => unreachable!(),
-                };
-                if step <= 0 {
-                    return Err("islice step must be greater than zero".into());
-                }
-                let values = if let Value::Object(id) = iterable {
-                    match self.state.heap.get(*id)?.clone() {
-                        Object::CountIterator {
-                            current,
-                            step: count_step,
-                        } => {
-                            if start < 0 || stop < 0 {
-                                return Err("islice indices must be non-negative".into());
-                            }
-                            let skip = start
-                                .checked_mul(count_step)
-                                .ok_or("islice arithmetic overflow")?;
-                            let first = current
-                                .checked_add(skip)
-                                .ok_or("islice arithmetic overflow")?;
-                            let length = if stop <= start {
-                                0
-                            } else {
-                                usize::try_from((stop - start + step - 1) / step)
-                                    .map_err(|_| "islice result is too large")?
-                            };
-                            let increment = count_step
-                                .checked_mul(step)
-                                .ok_or("islice arithmetic overflow")?;
-                            self.reserve_result(length.saturating_mul(64))?;
-                            let generated =
-                                super::stdlib::itertools::count_slice(first, increment, length)
-                                    .map_err(str::to_string)?;
-                            let mut values = Vec::new();
-                            for current in generated {
-                                self.charge_cpu(1)?;
-                                values.push(Value::Int(current));
-                            }
-                            let consumed = count_step
-                                .checked_mul(stop)
-                                .ok_or("islice arithmetic overflow")?;
-                            let next_current = current
-                                .checked_add(consumed)
-                                .ok_or("islice arithmetic overflow")?;
-                            let Object::CountIterator { current, .. } =
-                                self.state.heap.get_mut(*id)?
-                            else {
-                                unreachable!()
-                            };
-                            *current = next_current;
-                            values
-                        }
-                        _ => {
-                            let source = self.iterable_values(iterable)?;
-                            let begin = usize::try_from(start.max(0))
-                                .map_err(|_| "islice start is too large")?;
-                            let end = usize::try_from(stop.max(0))
-                                .map_err(|_| "islice stop is too large")?;
-                            let mut values = Vec::new();
-                            let step =
-                                usize::try_from(step).map_err(|_| "islice step is too large")?;
-                            for value in source
-                                .into_iter()
-                                .skip(begin)
-                                .take(end.saturating_sub(begin))
-                                .step_by(step)
-                            {
-                                self.push_materialized(&mut values, value)?;
-                            }
-                            values
-                        }
-                    }
-                } else {
-                    return Err("islice argument is not iterable".into());
-                };
-                Ok(CallResult::Value(self.allocate_object(
-                    Object::Iterator {
-                        values,
-                        position: 0,
-                    },
-                )?))
-            }
-            Builtin::HeapqHeapify => {
-                expect_arity(&arguments, 1, 1)?;
-                let Value::Object(id) = arguments[0] else {
-                    return Err("heapify argument must be a list".into());
-                };
-                let mut values = match self.state.heap.get(id)?.clone() {
-                    Object::List(values) => values,
-                    _ => return Err("heapify argument must be a list".into()),
-                };
-                dynamic_heapify(&self.state.heap, &mut values)?;
-                let Object::List(destination) = self.state.heap.get_mut(id)? else {
-                    unreachable!()
-                };
-                *destination = values;
-                Ok(CallResult::Value(Value::None))
-            }
-            Builtin::HeapqHeappop => {
-                expect_arity(&arguments, 1, 1)?;
-                let Value::Object(id) = arguments[0] else {
-                    return Err("heappop argument must be a list".into());
-                };
-                let mut values = match self.state.heap.get(id)?.clone() {
-                    Object::List(values) => values,
-                    _ => return Err("heappop argument must be a list".into()),
-                };
-                let last = values.pop().ok_or("index out of range")?;
-                if values.is_empty() {
-                    let Object::List(destination) = self.state.heap.get_mut(id)? else {
-                        unreachable!()
-                    };
-                    *destination = values;
-                    return Ok(CallResult::Value(last));
-                }
-                let smallest = std::mem::replace(&mut values[0], last);
-                dynamic_sift_down(&self.state.heap, &mut values, 0)?;
-                let Object::List(destination) = self.state.heap.get_mut(id)? else {
-                    unreachable!()
-                };
-                *destination = values;
-                Ok(CallResult::Value(smallest))
-            }
-            Builtin::BisectLeft => {
-                expect_arity(&arguments, 2, 2)?;
-                let Value::Object(id) = arguments[0] else {
-                    return Err("bisect argument must be a sequence".into());
-                };
-                let values = match self.state.heap.get(id)? {
-                    Object::List(values) | Object::Tuple(values) => values.clone(),
-                    _ => return Err("bisect argument must be a sequence".into()),
-                };
-                let mut low = 0;
-                let mut high = values.len();
-                while low < high {
-                    let middle = low + (high - low) / 2;
-                    if protocol::compare(&self.state.heap, &values[middle], &arguments[1])?
-                        == Ordering::Less
-                    {
-                        low = middle + 1;
-                    } else {
-                        high = middle;
-                    }
-                }
-                Ok(CallResult::Value(Value::Int(low as i64)))
-            }
-            Builtin::Reduce => {
-                if !(2..=3).contains(&arguments.len()) {
-                    return Err("reduce expected 2 or 3 arguments".into());
-                }
-                let function = arguments[0].clone();
-                let values = self.iterable_values(&arguments[1])?;
-                let mut iterator = values.into_iter();
-                let mut accumulator = match arguments.get(2) {
-                    Some(initial) => initial.clone(),
-                    None => iterator
-                        .next()
-                        .ok_or("reduce() of empty sequence with no initial value")?,
-                };
-                for value in iterator {
-                    self.stack.push(function.clone());
-                    self.stack.extend([accumulator, value]);
-                    accumulator = match self.call(2, &[], &[false, false])? {
-                        CallResult::Value(value) => value,
-                        CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                    };
-                }
-                Ok(CallResult::Value(accumulator))
-            }
-            Builtin::JsonDumps => {
-                expect_arity(&arguments, 1, 1)?;
-                let mut item_separator = ", ".to_string();
-                let mut key_separator = ": ".to_string();
-                let mut sort_keys = false;
-                let mut saw_separators = false;
-                let mut saw_sort_keys = false;
-                for (name, value) in keyword_arguments {
-                    match name.as_str() {
-                        "separators" if !saw_separators => {
-                            let values = self.iterable_values(&value)?;
-                            let [Value::String(item), Value::String(key)] = values.as_slice()
-                            else {
-                                return Err(
-                                    "json.dumps separators must be a pair of strings".into()
-                                );
-                            };
-                            item_separator = item.clone();
-                            key_separator = key.clone();
-                            saw_separators = true;
-                        }
-                        "sort_keys" if !saw_sort_keys => {
-                            sort_keys = protocol::truth(&self.state.heap, &value)?;
-                            saw_sort_keys = true;
-                        }
-                        "separators" | "sort_keys" => {
-                            return Err(format!(
-                                "json.dumps got multiple values for keyword {name:?}"
-                            ))
-                        }
-                        _ => {
-                            return Err(format!(
-                                "json.dumps keyword argument {name:?} is not implemented"
-                            ))
-                        }
-                    }
-                }
-                let bound = self.json_size_bound(&arguments[0], 0, &mut Vec::new())?;
-                let bound = bound
-                    .checked_add(bound / 2)
-                    .and_then(|bound| bound.checked_add(256))
-                    .ok_or("json.dumps result is too large")?;
-                self.reserve_result(bound)?;
-                let rendered = self.json_dump_value(
-                    &arguments[0],
-                    &item_separator,
-                    &key_separator,
-                    sort_keys,
-                    0,
-                    &mut Vec::new(),
-                )?;
-                Ok(CallResult::Value(Value::String(rendered)))
-            }
-            Builtin::ReCompile => {
-                let flags = keyword_int(&keyword_arguments, "flags")?
-                    .unwrap_or_else(|| arguments.get(1).and_then(Value::as_int).unwrap_or(0));
-                expect_arity(&arguments, 1, 2)?;
-                let pattern = string_argument(&arguments[0], "regex pattern")?;
-                Ok(CallResult::Value(self.allocate_regex(pattern, flags)?))
-            }
-            Builtin::ReSearch | Builtin::ReMatch | Builtin::ReFullMatch => {
-                let (pattern, flags) = regex_argument(&arguments, &keyword_arguments)?;
-                let text = string_argument(
-                    arguments.get(1).ok_or("regex input is required")?,
-                    "regex input",
-                )?;
-                expect_arity(&arguments, 2, 3)?;
-                let regex = build_regex(&pattern, flags)?;
-                let captures = match function {
-                    Builtin::ReSearch => regex.captures(&text),
-                    Builtin::ReMatch => regex.captures_at(&text, 0),
-                    Builtin::ReFullMatch => regex.captures(&text).filter(|captures| {
-                        captures.get(0).is_some_and(|matched| {
-                            matched.start() == 0 && matched.end() == text.len()
-                        })
-                    }),
-                    _ => unreachable!(),
-                };
-                match captures {
-                    Some(captures) => Ok(CallResult::Value(self.allocate_match(&text, &captures)?)),
-                    None => Ok(CallResult::Value(Value::None)),
-                }
-            }
-            Builtin::ReFindAll | Builtin::ReFindIter => {
-                let (pattern, flags) = regex_argument(&arguments, &keyword_arguments)?;
-                let text = string_argument(
-                    arguments.get(1).ok_or("regex input is required")?,
-                    "regex input",
-                )?;
-                expect_arity(&arguments, 2, 3)?;
-                let regex = build_regex(&pattern, flags)?;
-                if matches!(function, Builtin::ReFindIter) {
-                    let mut matches = Vec::new();
-                    for captures in regex.captures_iter(&text) {
-                        matches.push(self.allocate_match(&text, &captures)?);
-                        if matches.len() > 100_000 {
-                            return Err("regex result exceeds the bounded match limit".into());
-                        }
-                    }
-                    return Ok(CallResult::Value(
-                        self.allocate_object(Object::List(matches))?,
-                    ));
-                }
-                let capture_count = regex.captures_len().saturating_sub(1);
-                let mut values = Vec::new();
-                for captures in regex.captures_iter(&text) {
-                    let value = match capture_count {
-                        0 => Value::String(captures[0].to_string()),
-                        1 => Value::String(
-                            captures
-                                .get(1)
-                                .map_or_else(String::new, |m| m.as_str().into()),
-                        ),
-                        _ => {
-                            let fields = (1..=capture_count)
-                                .map(|index| {
-                                    Value::String(
-                                        captures
-                                            .get(index)
-                                            .map_or_else(String::new, |m| m.as_str().into()),
-                                    )
-                                })
-                                .collect();
-                            self.allocate_object(Object::Tuple(fields))?
-                        }
-                    };
-                    values.push(value);
-                    if values.len() > 100_000 {
-                        return Err("regex result exceeds the bounded match limit".into());
-                    }
-                }
-                Ok(CallResult::Value(
-                    self.allocate_object(Object::List(values))?,
-                ))
-            }
-            Builtin::ReSub => {
-                if arguments.len() < 3 || arguments.len() > 5 {
-                    return Err("re.sub() expected 3 to 5 arguments".into());
-                }
-                let pattern = string_argument(&arguments[0], "regex pattern")?;
-                let mut flags = arguments.get(4).and_then(Value::as_int).unwrap_or(0) as u32;
-                if let Some(value) = keyword_int(&keyword_arguments, "flags")? {
-                    if arguments.len() > 4 {
-                        return Err("regex flags passed more than once".into());
-                    }
-                    flags = value as u32;
-                }
-                if flags & !(RE_IGNORECASE | RE_MULTILINE) != 0 {
-                    return Err("regex flags are limited to IGNORECASE and MULTILINE".into());
-                }
-                let replacement = string_argument(&arguments[1], "replacement")?;
-                let text = string_argument(&arguments[2], "regex input")?;
-                let count = arguments.get(3).and_then(Value::as_int).unwrap_or(0);
-                if count < 0 {
-                    return Err("re.sub() count must be non-negative".into());
-                }
-                let regex = build_regex(&pattern, flags)?;
-                // Rust's regex crate uses `$1`; accept Python's common `\\1` spelling without
-                // attempting to emulate the full replacement mini-language.
-                let replacement = normalize_replacement(&replacement)?;
-                let rendered = if count == 0 {
-                    regex.replace_all(&text, replacement.as_str()).into_owned()
-                } else {
-                    regex
-                        .replacen(&text, count as usize, replacement.as_str())
-                        .into_owned()
-                };
-                Ok(CallResult::Value(Value::String(rendered)))
-            }
-            Builtin::ReEscape => {
-                expect_arity(&arguments, 1, 1)?;
-                let text = string_argument(&arguments[0], "escape input")?;
-                Ok(CallResult::Value(Value::String(python_re_escape(&text))))
-            }
-            Builtin::ArgparseArgumentParser => {
-                expect_arity(&arguments, 0, 0)?;
-                let prog = keyword_string(&keyword_arguments, "prog")?
-                    .unwrap_or_else(|| self.argv.first().cloned().unwrap_or_else(|| "-".into()));
-                reject_unknown_keywords(&keyword_arguments, &["prog", "description"])?;
-                Ok(CallResult::Value(self.allocate_object(
-                    Object::ArgumentParser {
-                        prog,
-                        arguments: Vec::new(),
-                    },
-                )?))
-            }
-            Builtin::ArgparseNamespace => {
-                if !arguments.is_empty() {
-                    return Err("argparse.Namespace accepts keyword arguments only".into());
-                }
-                let mut values = Vec::new();
-                for (name, value) in keyword_arguments {
-                    values.push((name, value));
-                }
-                Ok(CallResult::Value(
-                    self.allocate_object(Object::Namespace { values })?,
-                ))
-            }
-            Builtin::Dataclass => {
-                expect_arity(&arguments, 1, 1)?;
-                if !keyword_arguments.is_empty() {
-                    return Err("dataclass options are not implemented".into());
-                }
-                let Value::Object(id) = arguments[0] else {
-                    return Err("dataclass expects a class".into());
-                };
-                let Object::Class { is_dataclass, .. } = self.state.heap.get_mut(id)? else {
-                    return Err("dataclass expects a class".into());
-                };
-                *is_dataclass = true;
-                Ok(CallResult::Value(arguments[0].clone()))
-            }
-            Builtin::PytestFail | Builtin::PytestSkip => {
-                expect_arity(&arguments, 0, 1)?;
-                let message = arguments
-                    .first()
-                    .map(|value| protocol::display(&self.state.heap, value))
-                    .transpose()?
-                    .unwrap_or_default();
-                let kind = if matches!(function, Builtin::PytestSkip) {
-                    "Skipped"
-                } else {
-                    "Failed"
-                };
-                let value = Value::Exception {
-                    kind: kind.into(),
-                    message,
-                };
-                self.pending_exception = Some(RaisedException {
-                    kind: kind.into(),
-                    value,
-                });
-                Err(if kind == "Skipped" {
-                    "pytest.skip()".into()
-                } else {
-                    "pytest.fail()".into()
-                })
-            }
-            Builtin::PytestRaises => {
-                expect_arity(&arguments, 1, 1)?;
-                let Value::Native(NativeValue::ExceptionType(exception)) = arguments[0] else {
-                    return Err("pytest.raises() expects an exception type".into());
-                };
-                Ok(CallResult::Value(self.allocate_object(
-                    Object::RaisesContext {
-                        expected: exception.0.to_string(),
-                    },
-                )?))
-            }
-            Builtin::DefaultDict => {
-                expect_arity(&arguments, 1, 1)?;
-                let factory = arguments[0].clone();
-                let callable = matches!(factory, Value::Native(NativeValue::Function(_)))
-                    || matches!(
-                        &factory,
-                        Value::Object(id)
-                            if matches!(
-                                self.state.heap.get(*id)?,
-                                Object::Function { .. }
-                                    | Object::BoundMethod { .. }
-                                    | Object::PythonBoundMethod { .. }
-                            )
-                    );
-                if !callable {
-                    return Err("defaultdict first argument must be callable".into());
-                }
-                Ok(CallResult::Value(self.allocate_object(
-                    Object::DefaultDict {
-                        factory,
-                        entries: Vec::new(),
-                    },
-                )?))
-            }
-            Builtin::Math(function) => {
-                let arguments = arguments
-                    .iter()
-                    .map(|value| as_float(value).ok_or("math argument must be a real number"))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let value = super::stdlib::math::call(function.name(), &arguments)
-                    .map_err(|error| error.to_string())?;
-                Ok(CallResult::Value(match value {
-                    super::stdlib::math::MathValue::Float(value) => Value::Float(value),
-                    super::stdlib::math::MathValue::Int(value) => Value::Int(value),
-                    super::stdlib::math::MathValue::Bool(value) => Value::Bool(value),
-                }))
-            }
             Builtin::Write(stream) => {
                 expect_arity(&arguments, 1, 1)?;
                 let text = protocol::display(&self.state.heap, &arguments[0])?;
                 self.write_output(stream, text.as_bytes());
                 Ok(CallResult::Value(Value::Int(text.chars().count() as i64)))
             }
-            Builtin::GetEnv | Builtin::EnvironmentGet => {
+            Builtin::EnvironmentGet => {
                 expect_arity(&arguments, 1, 2)?;
                 let Value::String(key) = &arguments[0] else {
                     return Err("environment variable name must be a string".into());
@@ -3008,74 +2659,6 @@ impl<'a> Vm<'a> {
                     .map(Value::String)
                     .unwrap_or_else(|| arguments.get(1).cloned().unwrap_or(Value::None));
                 Ok(CallResult::Value(value))
-            }
-            Builtin::Time => {
-                expect_arity(&arguments, 0, 0)?;
-                let seconds = self
-                    .interp
-                    .clock
-                    .wall_time_seconds()
-                    .map_err(|error| error.to_string())?;
-                Ok(CallResult::Value(Value::Float(seconds)))
-            }
-            Builtin::TimeNs => {
-                expect_arity(&arguments, 0, 0)?;
-                let nanos = self
-                    .interp
-                    .clock
-                    .wall_time_ns()
-                    .map_err(|error| error.to_string())?;
-                let nanos =
-                    i64::try_from(nanos).map_err(|_| "wall clock is outside Python int range")?;
-                Ok(CallResult::Value(Value::Int(nanos)))
-            }
-            Builtin::Monotonic => {
-                expect_arity(&arguments, 0, 0)?;
-                Ok(CallResult::Value(Value::Float(
-                    self.interp.clock.monotonic_seconds(),
-                )))
-            }
-            Builtin::MonotonicNs => {
-                expect_arity(&arguments, 0, 0)?;
-                let nanos = i64::try_from(self.interp.clock.monotonic_ns())
-                    .map_err(|_| "monotonic clock is outside Python int range")?;
-                Ok(CallResult::Value(Value::Int(nanos)))
-            }
-            Builtin::ProcessTime => {
-                expect_arity(&arguments, 0, 0)?;
-                Ok(CallResult::Value(Value::Float(
-                    self.interp.resources.process_time_seconds(),
-                )))
-            }
-            Builtin::ProcessTimeNs => {
-                expect_arity(&arguments, 0, 0)?;
-                let nanos = i64::try_from(self.interp.resources.process_time_ns())
-                    .map_err(|_| "process clock is outside Python int range")?;
-                Ok(CallResult::Value(Value::Int(nanos)))
-            }
-            Builtin::Sleep => {
-                expect_arity(&arguments, 1, 1)?;
-                let seconds =
-                    as_float(&arguments[0]).ok_or("time.sleep() argument must be a real number")?;
-                if !seconds.is_finite() || seconds < 0.0 {
-                    return Err("time.sleep() length must be a finite non-negative number".into());
-                }
-                let nanos = seconds * crate::clock::NANOS_PER_SECOND as f64;
-                if nanos > u64::MAX as f64 {
-                    return Err("time.sleep() length is too large".into());
-                }
-                match self
-                    .interp
-                    .clock
-                    .block_task(crate::clock::MAIN_TASK_ID, nanos as u64)
-                    .map_err(|error| error.to_string())?
-                {
-                    crate::clock::BlockOutcome::Completed => {}
-                    crate::clock::BlockOutcome::Interrupted(event) => {
-                        self.interp.deadline_interrupt = Some(event.id);
-                    }
-                }
-                Ok(CallResult::Value(Value::None))
             }
         }
     }
@@ -3321,6 +2904,29 @@ impl<'a> Vm<'a> {
             value,
         });
         Err("unittest assertion failed".into())
+    }
+
+    fn record_native_error(&mut self, error: PyError) -> String {
+        let kind = match error.kind {
+            PyErrorKind::Type => Some("TypeError"),
+            PyErrorKind::Value => Some("ValueError"),
+            PyErrorKind::ZeroDivision => Some("ZeroDivisionError"),
+            PyErrorKind::Overflow => Some("OverflowError"),
+            PyErrorKind::Runtime => Some("RuntimeError"),
+            PyErrorKind::Exception(kind) => Some(kind),
+            PyErrorKind::Resource | PyErrorKind::Exit(_) => None,
+        };
+        if let Some(kind) = kind {
+            let value = Value::Exception {
+                kind: kind.to_string(),
+                message: error.message.clone(),
+            };
+            self.pending_exception = Some(RaisedException {
+                kind: kind.to_string(),
+                value,
+            });
+        }
+        error.message
     }
 
     fn call_method(
@@ -3614,175 +3220,6 @@ impl<'a> Vm<'a> {
                 }
                 Ok(CallResult::Value(Value::None))
             }
-            Method::RegexSearch
-            | Method::RegexMatch
-            | Method::RegexFullMatch
-            | Method::RegexFindAll
-            | Method::RegexFindIter
-            | Method::RegexSub => {
-                let Value::Object(id) = receiver else {
-                    return Err("invalid regex method receiver".into());
-                };
-                let Object::Regex { pattern, flags } = self.state.heap.get(id)?.clone() else {
-                    return Err("invalid regex method receiver".into());
-                };
-                let regex = build_regex(&pattern, flags)?;
-                match method {
-                    Method::RegexSub => {
-                        expect_arity(&arguments, 2, 3)?;
-                        let replacement = string_argument(&arguments[0], "replacement")?;
-                        let text = string_argument(&arguments[1], "regex input")?;
-                        let count = arguments.get(2).and_then(Value::as_int).unwrap_or(0);
-                        if count < 0 {
-                            return Err("regex count must be non-negative".into());
-                        }
-                        let replacement = normalize_replacement(&replacement)?;
-                        // Empty patterns can match at every UTF-8 boundary. Reserve a
-                        // conservative output bound before regex::replace allocates its String.
-                        let potential_matches = text.len().saturating_add(1);
-                        let matches = if count == 0 {
-                            potential_matches
-                        } else {
-                            potential_matches.min(count as usize)
-                        };
-                        let bound = text
-                            .len()
-                            .checked_add(
-                                matches
-                                    .checked_mul(replacement.len())
-                                    .ok_or("regex substitution result is too large")?,
-                            )
-                            .ok_or("regex substitution result is too large")?;
-                        self.reserve_result(bound.saturating_add(64))?;
-                        self.charge_cpu(
-                            u64::try_from(text.len().saturating_add(replacement.len()))
-                                .unwrap_or(u64::MAX),
-                        )?;
-                        let rendered = if count == 0 {
-                            regex.replace_all(&text, replacement.as_str()).into_owned()
-                        } else {
-                            regex
-                                .replacen(&text, count as usize, replacement.as_str())
-                                .into_owned()
-                        };
-                        Ok(CallResult::Value(Value::String(rendered)))
-                    }
-                    Method::RegexFindAll | Method::RegexFindIter => {
-                        let text = string_argument(
-                            arguments.first().ok_or("regex input is required")?,
-                            "regex input",
-                        )?;
-                        let capture_count = regex.captures_len().saturating_sub(1);
-                        let mut values = Vec::new();
-                        for captures in regex.captures_iter(&text) {
-                            self.charge_cpu(1)?;
-                            if matches!(method, Method::RegexFindIter) {
-                                let item = self.allocate_match(&text, &captures)?;
-                                self.push_materialized(&mut values, item)?;
-                            } else {
-                                let item = match capture_count {
-                                    0 => Value::String(captures[0].to_string()),
-                                    1 => Value::String(
-                                        captures
-                                            .get(1)
-                                            .map_or_else(String::new, |m| m.as_str().into()),
-                                    ),
-                                    _ => self.allocate_object(Object::Tuple(
-                                        (1..=capture_count)
-                                            .map(|index| {
-                                                Value::String(
-                                                    captures
-                                                        .get(index)
-                                                        .map_or_else(String::new, |m| {
-                                                            m.as_str().into()
-                                                        }),
-                                                )
-                                            })
-                                            .collect(),
-                                    ))?,
-                                };
-                                self.push_materialized(&mut values, item)?;
-                            }
-                            if values.len() > 100_000 {
-                                return Err("regex result exceeds the bounded match limit".into());
-                            }
-                        }
-                        Ok(CallResult::Value(
-                            self.allocate_object(Object::List(values))?,
-                        ))
-                    }
-                    _ => {
-                        let text = string_argument(
-                            arguments.first().ok_or("regex input is required")?,
-                            "regex input",
-                        )?;
-                        let captures = match method {
-                            Method::RegexSearch => regex.captures(&text),
-                            Method::RegexMatch => regex.captures_at(&text, 0),
-                            Method::RegexFullMatch => regex.captures(&text).filter(|captures| {
-                                captures.get(0).is_some_and(|matched| {
-                                    matched.start() == 0 && matched.end() == text.len()
-                                })
-                            }),
-                            _ => unreachable!(),
-                        };
-                        match captures {
-                            Some(captures) => {
-                                Ok(CallResult::Value(self.allocate_match(&text, &captures)?))
-                            }
-                            None => Ok(CallResult::Value(Value::None)),
-                        }
-                    }
-                }
-            }
-            Method::MatchGroup | Method::MatchGroups | Method::MatchStart | Method::MatchEnd => {
-                let Value::Object(id) = receiver else {
-                    return Err("invalid match method receiver".into());
-                };
-                let Object::Match {
-                    groups, start, end, ..
-                } = self.state.heap.get(id)?.clone()
-                else {
-                    return Err("invalid match method receiver".into());
-                };
-                match method {
-                    Method::MatchGroup => {
-                        expect_arity(&arguments, 0, 1)?;
-                        let index = arguments
-                            .first()
-                            .map_or(0, |value| value.as_int().unwrap_or(-1));
-                        let index = usize::try_from(index).map_err(|_| "no such group")?;
-                        Ok(CallResult::Value(
-                            groups
-                                .get(index)
-                                .cloned()
-                                .flatten()
-                                .map_or(Value::None, Value::String),
-                        ))
-                    }
-                    Method::MatchGroups => {
-                        expect_arity(&arguments, 0, 0)?;
-                        let values = groups
-                            .iter()
-                            .skip(1)
-                            .map(|value| value.clone().map_or(Value::None, Value::String))
-                            .collect();
-                        Ok(CallResult::Value(
-                            self.allocate_object(Object::Tuple(values))?,
-                        ))
-                    }
-                    Method::MatchStart | Method::MatchEnd => {
-                        expect_arity(&arguments, 0, 1)?;
-                        let position = if matches!(method, Method::MatchStart) {
-                            start
-                        } else {
-                            end
-                        };
-                        Ok(CallResult::Value(Value::Int(position as i64)))
-                    }
-                    _ => unreachable!(),
-                }
-            }
             Method::UnitTestAssertEqual => {
                 expect_arity(&arguments, 2, 3)?;
                 if protocol::equals(&self.state.heap, &arguments[0], &arguments[1])? {
@@ -3960,37 +3397,6 @@ impl<'a> Vm<'a> {
         self.state.heap.allocate(object, &mut self.interp.resources)
     }
 
-    fn allocate_regex(&mut self, pattern: String, flags: i64) -> Result<Value, String> {
-        if flags < 0 || flags as u64 > u32::MAX as u64 {
-            return Err("regex flags are out of range".into());
-        }
-        let flags = flags as u32;
-        build_regex(&pattern, flags)?;
-        self.allocate_object(Object::Regex { pattern, flags })
-    }
-
-    fn allocate_match(
-        &mut self,
-        text: &str,
-        captures: &regex::Captures<'_>,
-    ) -> Result<Value, String> {
-        let whole = captures
-            .get(0)
-            .ok_or("regex engine returned no whole match")?;
-        let groups = captures
-            .iter()
-            .map(|capture| capture.map(|matched| matched.as_str().to_string()))
-            .collect();
-        let start = text[..whole.start()].chars().count();
-        let end = text[..whole.end()].chars().count();
-        self.allocate_object(Object::Match {
-            text: whole.as_str().to_string(),
-            groups,
-            start,
-            end,
-        })
-    }
-
     fn range_values(&mut self, start: i64, stop: i64, step: i64) -> Result<Vec<Value>, String> {
         if step == 0 {
             return Err("range() arg 3 must not be zero".into());
@@ -4026,128 +3432,6 @@ impl<'a> Vm<'a> {
         Ok(values)
     }
 
-    fn json_dump_value(
-        &mut self,
-        value: &Value,
-        item_separator: &str,
-        key_separator: &str,
-        sort_keys: bool,
-        depth: usize,
-        active: &mut Vec<super::heap::ObjectId>,
-    ) -> Result<String, String> {
-        if depth == 256 {
-            return Err("maximum JSON nesting depth exceeded".into());
-        }
-        if !self.interp.resources.charge_cpu(1) {
-            return Err("resource limit exceeded while encoding JSON".into());
-        }
-        match value {
-            Value::None => Ok("null".into()),
-            Value::Bool(value) => Ok(value.to_string()),
-            Value::Int(value) => Ok(value.to_string()),
-            Value::Float(value) if value.is_finite() => {
-                serde_json::to_string(value).map_err(|error| error.to_string())
-            }
-            Value::String(value) => serde_json::to_string(value).map_err(|error| error.to_string()),
-            Value::Exception { .. } => Err("object is not JSON serializable".into()),
-            Value::Object(id) => {
-                if active.contains(id) {
-                    return Err("circular reference detected while encoding JSON".into());
-                }
-                let object = self.state.heap.get(*id)?.clone();
-                match object {
-                    Object::List(values) | Object::Tuple(values) => {
-                        active.push(*id);
-                        let rendered = values
-                            .iter()
-                            .map(|value| {
-                                self.json_dump_value(
-                                    value,
-                                    item_separator,
-                                    key_separator,
-                                    sort_keys,
-                                    depth + 1,
-                                    active,
-                                )
-                            })
-                            .collect::<Result<Vec<_>, _>>();
-                        active.pop();
-                        Ok(format!("[{}]", rendered?.join(item_separator)))
-                    }
-                    Object::Dict(mut entries) | Object::DefaultDict { mut entries, .. } => {
-                        if sort_keys {
-                            for (key, _) in &entries {
-                                if !matches!(key, Value::String(_)) {
-                                    return Err("json.dumps sort_keys requires string keys".into());
-                                }
-                            }
-                            // Keep comparison work inside the VM meter. This insertion sort is
-                            // intentionally slow but makes every native comparison auditable.
-                            for index in 1..entries.len() {
-                                let mut current = index;
-                                while current > 0 {
-                                    self.charge_cpu(1)?;
-                                    let should_swap =
-                                        match (&entries[current - 1].0, &entries[current].0) {
-                                            (Value::String(left), Value::String(right)) => {
-                                                left > right
-                                            }
-                                            _ => unreachable!(),
-                                        };
-                                    if !should_swap {
-                                        break;
-                                    }
-                                    entries.swap(current - 1, current);
-                                    current -= 1;
-                                }
-                            }
-                        }
-                        active.push(*id);
-                        let rendered = entries
-                            .iter()
-                            .map(|(key, value)| {
-                                let Value::String(key) = key else {
-                                    return Err("json.dumps currently requires string keys".into());
-                                };
-                                let key = serde_json::to_string(key)
-                                    .map_err(|error| error.to_string())?;
-                                let value = self.json_dump_value(
-                                    value,
-                                    item_separator,
-                                    key_separator,
-                                    sort_keys,
-                                    depth + 1,
-                                    active,
-                                )?;
-                                Ok(format!("{key}{key_separator}{value}"))
-                            })
-                            .collect::<Result<Vec<_>, String>>();
-                        active.pop();
-                        Ok(format!("{{{}}}", rendered?.join(item_separator)))
-                    }
-                    Object::Set(_)
-                    | Object::Function { .. }
-                    | Object::Class { .. }
-                    | Object::Instance { .. }
-                    | Object::PythonBoundMethod { .. }
-                    | Object::Iterator { .. }
-                    | Object::CountIterator { .. }
-                    | Object::Generator { .. }
-                    | Object::BoundMethod { .. }
-                    | Object::Module { .. }
-                    | Object::Regex { .. }
-                    | Object::Match { .. }
-                    | Object::ArgumentParser { .. }
-                    | Object::Namespace { .. } => Err("object is not JSON serializable".into()),
-                    Object::EnumMember { .. } => Err("object is not JSON serializable".into()),
-                    Object::RaisesContext { .. } => Err("object is not JSON serializable".into()),
-                }
-            }
-            Value::Float(_) => Err("non-finite float is not JSON serializable".into()),
-            Value::Native(_) => Err("object is not JSON serializable".into()),
-        }
-    }
-
     fn reserve_slots(&mut self, slots: usize) -> Result<(), String> {
         let bytes = u64::try_from(slots)
             .ok()
@@ -4156,92 +3440,6 @@ impl<'a> Vm<'a> {
         self.state
             .heap
             .reserve_growth(bytes, &mut self.interp.resources)
-    }
-
-    /// Compute a deliberately generous bound for every host String/Vec built by JSON encoding.
-    /// This runs before `json_dump_value`, whose convenient recursive implementation constructs
-    /// child strings eagerly. The bound includes per-node allocator slack, not just final JSON
-    /// bytes, so the convenience implementation remains within the modeled memory budget.
-    fn json_size_bound(
-        &mut self,
-        value: &Value,
-        depth: usize,
-        active: &mut Vec<super::heap::ObjectId>,
-    ) -> Result<usize, String> {
-        if depth == 256 {
-            return Err("maximum JSON nesting depth exceeded".into());
-        }
-        self.charge_cpu(1)?;
-        let scalar = |size: usize| {
-            size.checked_add(64)
-                .ok_or_else(|| "json result is too large".to_string())
-        };
-        match value {
-            Value::None => scalar(4),
-            Value::Bool(value) => scalar(if *value { 4 } else { 5 }),
-            Value::Int(_) => scalar(32),
-            Value::Float(value) if value.is_finite() => scalar(64),
-            // JSON escaping uses at most six ASCII bytes per input byte (`\\u00xx`), plus quotes.
-            Value::String(value) => scalar(
-                value
-                    .len()
-                    .checked_mul(6)
-                    .and_then(|size| size.checked_add(2))
-                    .ok_or("json result is too large")?,
-            ),
-            Value::Float(_) => Err("non-finite float is not JSON serializable".into()),
-            Value::Exception { .. } | Value::Native(_) => {
-                Err("object is not JSON serializable".into())
-            }
-            Value::Object(id) => {
-                if active.contains(id) {
-                    return Err("circular reference detected while encoding JSON".into());
-                }
-                active.push(*id);
-                let result = match self.state.heap.get(*id)?.clone() {
-                    Object::List(values) | Object::Tuple(values) => {
-                        let mut size = 2usize;
-                        for (index, child) in values.iter().enumerate() {
-                            if index != 0 {
-                                size = size.checked_add(1).ok_or("json result is too large")?;
-                            }
-                            size = size
-                                .checked_add(self.json_size_bound(child, depth + 1, active)?)
-                                .and_then(|size| size.checked_add(64))
-                                .ok_or("json result is too large")?;
-                        }
-                        Ok(size)
-                    }
-                    Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                        let mut size = 2usize;
-                        for (index, (key, child)) in entries.iter().enumerate() {
-                            let Value::String(key) = key else {
-                                return Err("json.dumps currently requires string keys".into());
-                            };
-                            if index != 0 {
-                                size = size.checked_add(1).ok_or("json result is too large")?;
-                            }
-                            let key_size = key
-                                .len()
-                                .checked_mul(6)
-                                .and_then(|size| size.checked_add(2))
-                                .ok_or("json result is too large")?;
-                            let child_size = self.json_size_bound(child, depth + 1, active)?;
-                            size = size
-                                .checked_add(key_size)
-                                .and_then(|size| size.checked_add(1))
-                                .and_then(|size| size.checked_add(child_size))
-                                .and_then(|size| size.checked_add(64))
-                                .ok_or("json result is too large")?;
-                        }
-                        Ok(size)
-                    }
-                    _ => Err("object is not JSON serializable".into()),
-                };
-                active.pop();
-                result
-            }
-        }
     }
 
     fn iterable_values(&mut self, value: &Value) -> Result<Vec<Value>, String> {
@@ -4427,6 +3625,484 @@ impl<'a> Vm<'a> {
     }
 }
 
+impl PyRuntime for Vm<'_> {
+    fn reserve_memory(&mut self, bytes: usize) -> PyResult<()> {
+        self.reserve_result(bytes).map_err(PyError::resource_error)
+    }
+
+    fn charge_cpu(&mut self, units: u64) -> PyResult<()> {
+        Vm::charge_cpu(self, units).map_err(PyError::resource_error)
+    }
+
+    fn kind(&self, value: &Value) -> PyResult<PyKind> {
+        Ok(match value {
+            Value::None => PyKind::None,
+            Value::Bool(_) => PyKind::Bool,
+            Value::Int(_) => PyKind::Int,
+            Value::Float(_) => PyKind::Float,
+            Value::String(_) => PyKind::String,
+            Value::Exception { .. } | Value::Native(_) => PyKind::Native,
+            Value::Object(id) => match self.state.heap.get(*id).map_err(PyError::runtime_error)? {
+                Object::List(_) => PyKind::List,
+                Object::Tuple(_) => PyKind::Tuple,
+                Object::Dict(_) | Object::DefaultDict { .. } => PyKind::Dict,
+                Object::Set(_) => PyKind::Set,
+                Object::Function { .. }
+                | Object::PythonBoundMethod { .. }
+                | Object::NativeBoundMethod { .. }
+                | Object::BoundMethod { .. } => PyKind::Function,
+                Object::Class { .. } => PyKind::Class,
+                Object::Instance { .. } | Object::EnumMember { .. } => PyKind::Instance,
+                Object::Iterator { .. } | Object::CountIterator { .. } => PyKind::Iterator,
+                Object::Generator { .. } => PyKind::Generator,
+                Object::Module { .. } => PyKind::Module,
+                Object::Regex { .. }
+                | Object::Match { .. }
+                | Object::ArgumentParser { .. }
+                | Object::Namespace { .. }
+                | Object::RaisesContext { .. } => PyKind::Native,
+            },
+        })
+    }
+
+    fn native_kind(&self, value: &Value) -> PyResult<Option<PyNativeKind>> {
+        let Value::Object(id) = value else {
+            return Ok(None);
+        };
+        Ok(
+            match self.state.heap.get(*id).map_err(PyError::runtime_error)? {
+                Object::Regex { .. } => Some(PyNativeKind::Regex),
+                Object::Match { .. } => Some(PyNativeKind::Match),
+                _ => None,
+            },
+        )
+    }
+
+    fn int_value(&self, value: &Value) -> Option<i64> {
+        protocol::int_value(&self.state.heap, value)
+    }
+
+    fn truth(&self, value: &Value) -> PyResult<bool> {
+        protocol::truth(&self.state.heap, value).map_err(PyError::runtime_error)
+    }
+
+    fn display(&self, value: &Value) -> PyResult<String> {
+        protocol::display(&self.state.heap, value).map_err(PyError::runtime_error)
+    }
+
+    fn compare(&self, left: &Value, right: &Value) -> PyResult<Ordering> {
+        protocol::compare(&self.state.heap, left, right).map_err(PyError::type_error)
+    }
+
+    fn list_items(&mut self, list: PyList) -> PyResult<Vec<Value>> {
+        let id = list.object_id();
+        let length = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::List(items) => items.len(),
+            _ => return Err(PyError::runtime_error("list handle changed object kind")),
+        };
+        let bytes = length
+            .checked_mul(std::mem::size_of::<Value>())
+            .ok_or_else(|| PyError::resource_error("list snapshot size overflow"))?;
+        self.reserve_memory(bytes)?;
+        match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::List(items) => Ok(items.clone()),
+            _ => Err(PyError::runtime_error("list handle changed object kind")),
+        }
+    }
+
+    fn tuple_items(&mut self, tuple: PyTuple) -> PyResult<Vec<Value>> {
+        let id = tuple.object_id();
+        let length = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::Tuple(items) => items.len(),
+            _ => return Err(PyError::runtime_error("tuple handle changed object kind")),
+        };
+        let bytes = length
+            .checked_mul(std::mem::size_of::<Value>())
+            .ok_or_else(|| PyError::resource_error("tuple snapshot size overflow"))?;
+        self.reserve_memory(bytes)?;
+        match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::Tuple(items) => Ok(items.clone()),
+            _ => Err(PyError::runtime_error("tuple handle changed object kind")),
+        }
+    }
+
+    fn dict_items(&mut self, dict: PyDict) -> PyResult<Vec<(Value, Value)>> {
+        let id = dict.object_id();
+        let length = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::Dict(items) | Object::DefaultDict { entries: items, .. } => items.len(),
+            _ => return Err(PyError::runtime_error("dict handle changed object kind")),
+        };
+        let bytes = length
+            .checked_mul(std::mem::size_of::<(Value, Value)>())
+            .ok_or_else(|| PyError::resource_error("dict snapshot size overflow"))?;
+        self.reserve_memory(bytes)?;
+        match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::Dict(items) | Object::DefaultDict { entries: items, .. } => Ok(items.clone()),
+            _ => Err(PyError::runtime_error("dict handle changed object kind")),
+        }
+    }
+
+    fn instance_attribute(&self, instance: PyInstance, name: &str) -> PyResult<Option<Value>> {
+        match self
+            .state
+            .heap
+            .get(instance.object_id())
+            .map_err(PyError::runtime_error)?
+        {
+            Object::Instance { attributes, .. } => Ok(attributes.get(name).cloned()),
+            _ => Err(PyError::runtime_error(
+                "instance handle changed object kind",
+            )),
+        }
+    }
+
+    fn replace_list_items(&mut self, list: PyList, items: Vec<Value>) -> PyResult<()> {
+        let Object::List(destination) = self
+            .state
+            .heap
+            .get_mut(list.object_id())
+            .map_err(PyError::runtime_error)?
+        else {
+            return Err(PyError::runtime_error("list handle changed object kind"));
+        };
+        *destination = items;
+        Ok(())
+    }
+
+    fn call_value(&mut self, callable: Value, args: CallArgs) -> PyResult<Value> {
+        let (positional, keywords) = args.into_parts();
+        let argument_count = positional.len();
+        let total = argument_count
+            .checked_add(keywords.len())
+            .ok_or_else(|| PyError::resource_error("too many call arguments"))?;
+        let unpacked = vec![false; total];
+        let keyword_names = keywords
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        self.stack.push(callable);
+        self.stack.extend(positional);
+        self.stack
+            .extend(keywords.into_iter().map(|(_, value)| value));
+        match self
+            .call(argument_count, &keyword_names, &unpacked)
+            .map_err(PyError::runtime_error)?
+        {
+            CallResult::Value(value) => Ok(value),
+            CallResult::Exit(status) => Err(PyError::exit(status)),
+        }
+    }
+
+    fn is_callable(&self, value: &Value) -> PyResult<bool> {
+        Ok(match value {
+            Value::Native(
+                NativeValue::Function(_)
+                | NativeValue::NativeFunction(_)
+                | NativeValue::ExceptionType(_),
+            ) => true,
+            Value::Object(id) => matches!(
+                self.state.heap.get(*id).map_err(PyError::runtime_error)?,
+                Object::Function { .. }
+                    | Object::Class { .. }
+                    | Object::BoundMethod { .. }
+                    | Object::PythonBoundMethod { .. }
+            ),
+            _ => false,
+        })
+    }
+
+    fn iterator(&mut self, value: Value) -> PyResult<PyIterator> {
+        if let Value::Object(id) = value {
+            if matches!(
+                self.state.heap.get(id).map_err(PyError::runtime_error)?,
+                Object::Iterator { .. } | Object::CountIterator { .. } | Object::Generator { .. }
+            ) {
+                return Value::Object(id).cast(self);
+            }
+        }
+        let values = self.iterable_values(&value).map_err(PyError::type_error)?;
+        self.new_iterator(values)?.cast(self)
+    }
+
+    fn iterator_next(&mut self, iterator: PyIterator) -> PyResult<Option<Value>> {
+        let id = iterator.object_id();
+        match self
+            .state
+            .heap
+            .get(id)
+            .map_err(PyError::runtime_error)?
+            .clone()
+        {
+            Object::Iterator { values, position } => {
+                let value = values.get(position).cloned();
+                if value.is_some() {
+                    let Object::Iterator { position, .. } = self
+                        .state
+                        .heap
+                        .get_mut(id)
+                        .map_err(PyError::runtime_error)?
+                    else {
+                        return Err(PyError::runtime_error("iterator changed object kind"));
+                    };
+                    *position += 1;
+                }
+                Ok(value)
+            }
+            Object::CountIterator { current, step } => {
+                let value = current;
+                let next = super::stdlib::itertools::count_next(current, step)
+                    .map_err(PyError::overflow_error)?;
+                let Object::CountIterator { current, .. } = self
+                    .state
+                    .heap
+                    .get_mut(id)
+                    .map_err(PyError::runtime_error)?
+                else {
+                    return Err(PyError::runtime_error("iterator changed object kind"));
+                };
+                *current = next;
+                Ok(Some(Value::Int(value)))
+            }
+            Object::Generator { .. } => self.resume_generator(id).map_err(PyError::runtime_error),
+            _ => Err(PyError::type_error("expected an iterator")),
+        }
+    }
+
+    fn new_iterator(&mut self, values: Vec<Value>) -> PyResult<Value> {
+        Vm::allocate_object(
+            self,
+            Object::Iterator {
+                values,
+                position: 0,
+            },
+        )
+        .map_err(PyError::resource_error)
+    }
+
+    fn new_count_iterator(&mut self, start: i64, step: i64) -> PyResult<Value> {
+        Vm::allocate_object(
+            self,
+            Object::CountIterator {
+                current: start,
+                step,
+            },
+        )
+        .map_err(PyError::resource_error)
+    }
+
+    fn new_default_dict(&mut self, factory: PyCallable) -> PyResult<Value> {
+        Vm::allocate_object(
+            self,
+            Object::DefaultDict {
+                factory: factory.into_value(),
+                entries: Vec::new(),
+            },
+        )
+        .map_err(PyError::resource_error)
+    }
+
+    fn new_list(&mut self, items: Vec<Value>) -> PyResult<Value> {
+        Vm::allocate_object(self, Object::List(items)).map_err(PyError::resource_error)
+    }
+
+    fn new_tuple(&mut self, items: Vec<Value>) -> PyResult<Value> {
+        Vm::allocate_object(self, Object::Tuple(items)).map_err(PyError::resource_error)
+    }
+
+    fn new_dict(&mut self, items: Vec<(Value, Value)>) -> PyResult<Value> {
+        Vm::allocate_object(self, Object::Dict(items)).map_err(PyError::resource_error)
+    }
+
+    fn new_regex(&mut self, pattern: String, flags: u32) -> PyResult<Value> {
+        Vm::allocate_object(self, Object::Regex { pattern, flags }).map_err(PyError::resource_error)
+    }
+
+    fn new_match(
+        &mut self,
+        text: String,
+        groups: Vec<Option<String>>,
+        start: usize,
+        end: usize,
+    ) -> PyResult<Value> {
+        Vm::allocate_object(
+            self,
+            Object::Match {
+                text,
+                groups,
+                start,
+                end,
+            },
+        )
+        .map_err(PyError::resource_error)
+    }
+
+    fn regex_parts(&mut self, regex: PyRegex) -> PyResult<(String, u32)> {
+        let Object::Regex { pattern, flags } = self
+            .state
+            .heap
+            .get(regex.object_id())
+            .map_err(PyError::runtime_error)?
+        else {
+            return Err(PyError::runtime_error("regex handle changed object kind"));
+        };
+        let pattern = pattern.clone();
+        let flags = *flags;
+        self.reserve_memory(pattern.len())?;
+        Ok((pattern, flags))
+    }
+
+    fn match_data(&mut self, matched: PyMatch) -> PyResult<PyMatchData> {
+        let Object::Match {
+            groups, start, end, ..
+        } = self
+            .state
+            .heap
+            .get(matched.object_id())
+            .map_err(PyError::runtime_error)?
+        else {
+            return Err(PyError::runtime_error("match handle changed object kind"));
+        };
+        let bytes = groups.iter().try_fold(0usize, |total, group| {
+            total.checked_add(group.as_ref().map_or(0, String::len))
+        });
+        let bytes = bytes.ok_or_else(|| PyError::resource_error("match snapshot is too large"))?;
+        let groups = groups.clone();
+        let start = *start;
+        let end = *end;
+        self.reserve_memory(bytes)?;
+        Ok(PyMatchData { groups, start, end })
+    }
+
+    fn marker(&self, marker: PyMarker) -> Value {
+        Value::Native(match marker {
+            PyMarker::TypingList => NativeValue::TypingList,
+            PyMarker::EnumBase => NativeValue::EnumBase,
+            PyMarker::UnitTestBase => NativeValue::UnitTestBase,
+            PyMarker::Environment => NativeValue::Environment,
+            PyMarker::Stdout => NativeValue::Stream(Stream::Stdout),
+            PyMarker::Stderr => NativeValue::Stream(Stream::Stderr),
+        })
+    }
+
+    fn mark_dataclass(&mut self, class: PyClass) -> PyResult<()> {
+        let Object::Class { is_dataclass, .. } = self
+            .state
+            .heap
+            .get_mut(class.object_id())
+            .map_err(PyError::runtime_error)?
+        else {
+            return Err(PyError::runtime_error("class handle changed object kind"));
+        };
+        *is_dataclass = true;
+        Ok(())
+    }
+
+    fn argv0(&self) -> String {
+        self.argv.first().cloned().unwrap_or_else(|| "-".into())
+    }
+
+    fn new_argv(&mut self) -> PyResult<Value> {
+        self.new_list(self.argv.iter().cloned().map(Value::String).collect())
+    }
+
+    fn new_argument_parser(&mut self, program: String) -> PyResult<Value> {
+        Vm::allocate_object(
+            self,
+            Object::ArgumentParser {
+                prog: program,
+                arguments: Vec::new(),
+            },
+        )
+        .map_err(PyError::resource_error)
+    }
+
+    fn new_namespace(&mut self, values: Vec<(String, Value)>) -> PyResult<Value> {
+        Vm::allocate_object(self, Object::Namespace { values }).map_err(PyError::resource_error)
+    }
+
+    fn new_raises_context(&mut self, expected: String) -> PyResult<Value> {
+        Vm::allocate_object(self, Object::RaisesContext { expected })
+            .map_err(PyError::resource_error)
+    }
+
+    fn exception_type_name(&self, value: &Value) -> Option<&'static str> {
+        match value {
+            Value::Native(NativeValue::ExceptionType(ExceptionType(name))) => Some(name),
+            _ => None,
+        }
+    }
+
+    fn clock(&mut self) -> &mut dyn PyClock {
+        self
+    }
+
+    fn environment(&self) -> &dyn PyEnvironment {
+        self
+    }
+}
+
+impl PyClock for Vm<'_> {
+    fn wall_time(&self) -> PyResult<f64> {
+        self.interp
+            .clock
+            .wall_time_seconds()
+            .map_err(|error| PyError::runtime_error(error.to_string()))
+    }
+
+    fn wall_time_ns(&self) -> PyResult<i64> {
+        let nanos = self
+            .interp
+            .clock
+            .wall_time_ns()
+            .map_err(|error| PyError::runtime_error(error.to_string()))?;
+        i64::try_from(nanos)
+            .map_err(|_| PyError::overflow_error("wall clock is outside Python int range"))
+    }
+
+    fn monotonic(&self) -> f64 {
+        self.interp.clock.monotonic_seconds()
+    }
+
+    fn monotonic_ns(&self) -> PyResult<i64> {
+        i64::try_from(self.interp.clock.monotonic_ns())
+            .map_err(|_| PyError::overflow_error("monotonic clock is outside Python int range"))
+    }
+
+    fn process_time(&self) -> f64 {
+        self.interp.resources.process_time_seconds()
+    }
+
+    fn process_time_ns(&self) -> PyResult<i64> {
+        i64::try_from(self.interp.resources.process_time_ns())
+            .map_err(|_| PyError::overflow_error("process clock is outside Python int range"))
+    }
+
+    fn sleep(&mut self, seconds: f64) -> PyResult<()> {
+        let nanos = seconds * crate::clock::NANOS_PER_SECOND as f64;
+        if nanos > u64::MAX as f64 {
+            return Err(PyError::overflow_error("time.sleep() length is too large"));
+        }
+        match self
+            .interp
+            .clock
+            .block_task(crate::clock::MAIN_TASK_ID, nanos as u64)
+            .map_err(|error| PyError::runtime_error(error.to_string()))?
+        {
+            crate::clock::BlockOutcome::Completed => {}
+            crate::clock::BlockOutcome::Interrupted(event) => {
+                self.interp.deadline_interrupt = Some(event.id);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PyEnvironment for Vm<'_> {
+    fn get(&self, name: &str) -> Option<String> {
+        self.interp.get_var(name)
+    }
+}
+
 enum CallResult {
     Value(Value),
     Exit(i32),
@@ -4464,42 +4140,6 @@ fn add_numbers(left: Value, right: Value) -> Result<Value, String> {
         (Value::Float(left), Value::Int(right)) => Ok(Value::Float(left + right as f64)),
         (Value::Float(left), Value::Float(right)) => Ok(Value::Float(left + right)),
         _ => Err("unsupported operands for sum()".into()),
-    }
-}
-
-fn dynamic_heapify(heap: &super::heap::Heap, values: &mut [Value]) -> Result<(), String> {
-    if values.len() < 2 {
-        return Ok(());
-    }
-    for index in (0..values.len() / 2).rev() {
-        dynamic_sift_down(heap, values, index)?;
-    }
-    Ok(())
-}
-
-fn dynamic_sift_down(
-    heap: &super::heap::Heap,
-    values: &mut [Value],
-    mut parent: usize,
-) -> Result<(), String> {
-    loop {
-        let left = parent * 2 + 1;
-        if left >= values.len() {
-            return Ok(());
-        }
-        let right = left + 1;
-        let child = if right < values.len()
-            && protocol::compare(heap, &values[right], &values[left])? == Ordering::Less
-        {
-            right
-        } else {
-            left
-        };
-        if protocol::compare(heap, &values[parent], &values[child])? != Ordering::Greater {
-            return Ok(());
-        }
-        values.swap(parent, child);
-        parent = child;
     }
 }
 
@@ -4640,9 +4280,6 @@ fn expect_arity(arguments: &[Value], minimum: usize, maximum: usize) -> Result<(
     }
 }
 
-const RE_IGNORECASE: u32 = 2;
-const RE_MULTILINE: u32 = 8;
-const MAX_REGEX_PATTERN: usize = 4096;
 const MAX_REGEX_INPUT: usize = 1_048_576;
 
 fn string_argument(value: &Value, label: &str) -> Result<String, String> {
@@ -4651,23 +4288,6 @@ fn string_argument(value: &Value, label: &str) -> Result<String, String> {
         Value::String(_) => Err(format!("{label} exceeds the bounded regex input limit")),
         _ => Err(format!("{label} must be a string")),
     }
-}
-
-fn keyword_int(keywords: &[(String, Value)], name: &str) -> Result<Option<i64>, String> {
-    let mut result = None;
-    for (key, value) in keywords {
-        if key == name {
-            if result.is_some() {
-                return Err(format!("got multiple values for keyword {name:?}"));
-            }
-            result = Some(
-                value
-                    .as_int()
-                    .ok_or(format!("keyword {name:?} must be an integer"))?,
-            );
-        }
-    }
-    Ok(result)
 }
 
 fn keyword_string(keywords: &[(String, Value)], name: &str) -> Result<Option<String>, String> {
@@ -4803,79 +4423,4 @@ fn parse_argument_values(
         }
     }
     Ok(values)
-}
-
-fn regex_argument(
-    arguments: &[Value],
-    keywords: &[(String, Value)],
-) -> Result<(String, u32), String> {
-    let pattern = arguments.first().ok_or("regex pattern is required")?;
-    let (pattern, mut flags) = match pattern {
-        Value::String(pattern) => (pattern.clone(), 0),
-        Value::Object(_) => {
-            return Err("compiled regex values are only supported by methods".into())
-        }
-        _ => return Err("regex pattern must be a string".into()),
-    };
-    if let Some(value) = arguments.get(2) {
-        flags = value.as_int().ok_or("regex flags must be an integer")? as u32;
-    }
-    if let Some(value) = keyword_int(keywords, "flags")? {
-        if arguments.len() > 2 {
-            return Err("regex flags passed more than once".into());
-        }
-        flags = value as u32;
-    }
-    if flags & !(RE_IGNORECASE | RE_MULTILINE) != 0 {
-        return Err("regex flags are limited to IGNORECASE and MULTILINE".into());
-    }
-    Ok((pattern, flags))
-}
-
-fn build_regex(pattern: &str, flags: u32) -> Result<Regex, String> {
-    if pattern.len() > MAX_REGEX_PATTERN {
-        return Err("regex pattern exceeds the bounded pattern limit".into());
-    }
-    RegexBuilder::new(pattern)
-        .case_insensitive(flags & RE_IGNORECASE != 0)
-        .multi_line(flags & RE_MULTILINE != 0)
-        .build()
-        .map_err(|error| format!("unsupported regex pattern: {error}"))
-}
-
-fn normalize_replacement(replacement: &str) -> Result<String, String> {
-    let mut output = String::with_capacity(replacement.len());
-    let mut chars = replacement.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            output.push(ch);
-            continue;
-        }
-        let Some(next) = chars.next() else {
-            return Err("bad escape in replacement".into());
-        };
-        if next.is_ascii_digit() {
-            output.push('$');
-            output.push(next);
-        } else if next == '\\' {
-            output.push('\\');
-            output.push('\\');
-        } else {
-            output.push('\\');
-            output.push(next);
-        }
-    }
-    Ok(output)
-}
-
-fn python_re_escape(text: &str) -> String {
-    text.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ",:;!/".contains(ch) {
-                ch.to_string()
-            } else {
-                format!("\\{ch}")
-            }
-        })
-        .collect()
 }

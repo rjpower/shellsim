@@ -153,10 +153,15 @@ Commands should still surface `VfsError::NoSpace` with a non-zero status.
 through a UTF-8/indentation-aware lexer, owned AST, semantic bytecode compiler, and metered stack
 VM; host CPython is never invoked. The current language slice covers scalar and mutable containers,
 comparisons and control flow, functions/closures/defaults/`*args`, classes and bound methods,
-comprehensions, suspended generators, exceptions and context managers, `assert`, decorators,
+user inheritance with C3 lookup, `int` subclasses, constrained metaclasses, comprehensions,
+suspended generators, exceptions and context managers, `assert`, decorators,
 starred assignment/calls, f-strings, VFS-only imports, common iterator/container builtins, and the
 modeled REPL/script/stdin/shebang entrypoints. Unsupported syntax and APIs fail loudly with a
 diagnostic.
+
+Native Python modules use the erased value ABI and checked object views described in
+[`PYTHON_RUNTIME_MODEL.md`](PYTHON_RUNTIME_MODEL.md). The layout keeps module definitions small
+while routing allocation, recursion, and work through the interpreter's resource meter.
 
 The requested stdlib gate is 18/18 exact CPython 3.14 probes for these APIs: `sys.executable`,
 `os.getenv`, `collections.defaultdict`, `itertools.count`/`islice`, `heapq.heapify`/`heappop`,

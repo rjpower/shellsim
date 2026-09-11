@@ -4,11 +4,106 @@
 //! introducing a host process or filesystem capability.  Python's dynamic mixed-type failures
 //! should be checked by that adapter before invoking these algorithms.
 
+use std::cmp::Ordering;
+
+use super::super::native::{
+    CallArgs, FunctionDef, ModuleDef, PyError, PyList, PyResult, PyRuntime, PyValue, PyValueCast,
+};
+use super::super::Value;
+
+pub(super) static MODULE: ModuleDef = ModuleDef {
+    name: "heapq",
+    functions: &[
+        FunctionDef {
+            module: "heapq",
+            name: "heapify",
+            call: native_heapify,
+        },
+        FunctionDef {
+            module: "heapq",
+            name: "heappop",
+            call: native_heappop,
+        },
+    ],
+    values: &[],
+};
+
+fn native_heapify(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("heapify", 1, 1)?;
+    args.reject_keywords("heapify")?;
+    let list = args.positional()[0].clone().cast::<PyList>(runtime)?;
+    let mut values = list.items(runtime)?;
+    dynamic_heapify(runtime, &mut values)?;
+    runtime.replace_list_items(list, values)?;
+    Ok(Value::None)
+}
+
+fn native_heappop(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("heappop", 1, 1)?;
+    args.reject_keywords("heappop")?;
+    let list = args.positional()[0].clone().cast::<PyList>(runtime)?;
+    let mut values = list.items(runtime)?;
+    let last = values
+        .pop()
+        .ok_or_else(|| PyError::value_error("index out of range"))?;
+    if values.is_empty() {
+        runtime.replace_list_items(list, values)?;
+        return Ok(last);
+    }
+    let smallest = std::mem::replace(&mut values[0], last);
+    dynamic_sift_down(runtime, &mut values, 0)?;
+    runtime.replace_list_items(list, values)?;
+    Ok(smallest)
+}
+
+fn dynamic_heapify(runtime: &mut dyn PyRuntime, values: &mut [PyValue]) -> PyResult<()> {
+    if values.len() < 2 {
+        return Ok(());
+    }
+    for index in (0..values.len() / 2).rev() {
+        dynamic_sift_down(runtime, values, index)?;
+    }
+    Ok(())
+}
+
+fn dynamic_sift_down(
+    runtime: &mut dyn PyRuntime,
+    values: &mut [PyValue],
+    mut parent: usize,
+) -> PyResult<()> {
+    loop {
+        let left = parent
+            .checked_mul(2)
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| PyError::resource_error("heap index overflow"))?;
+        if left >= values.len() {
+            return Ok(());
+        }
+        let right = left + 1;
+        runtime.charge_cpu(1)?;
+        let child = if right < values.len()
+            && runtime.compare(&values[right], &values[left])? == Ordering::Less
+        {
+            right
+        } else {
+            left
+        };
+        runtime.charge_cpu(1)?;
+        if runtime.compare(&values[parent], &values[child])? != Ordering::Greater {
+            return Ok(());
+        }
+        values.swap(parent, child);
+        parent = child;
+    }
+}
+
 /// Error raised by Python's `heapq.heappop`/`heapreplace` on an empty heap.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeapEmpty;
 
 /// Transform an arbitrary vector into a valid min-heap in place.
+#[cfg(test)]
 pub fn heapify<T: Ord>(heap: &mut [T]) {
     if heap.len() < 2 {
         return;
@@ -20,6 +115,7 @@ pub fn heapify<T: Ord>(heap: &mut [T]) {
 }
 
 /// Push an item and restore the min-heap invariant.
+#[cfg(test)]
 pub fn heappush<T: Ord>(heap: &mut Vec<T>, item: T) {
     heap.push(item);
     let last = heap.len() - 1;
@@ -27,6 +123,7 @@ pub fn heappush<T: Ord>(heap: &mut Vec<T>, item: T) {
 }
 
 /// Pop the smallest item, or `HeapEmpty` for an empty vector.
+#[cfg(test)]
 pub fn heappop<T: Ord>(heap: &mut Vec<T>) -> Result<T, HeapEmpty> {
     let last = heap.pop().ok_or(HeapEmpty)?;
     if heap.is_empty() {
@@ -38,6 +135,7 @@ pub fn heappop<T: Ord>(heap: &mut Vec<T>) -> Result<T, HeapEmpty> {
 }
 
 /// Replace the root and return the old smallest item.
+#[cfg(test)]
 pub fn heapreplace<T: Ord>(heap: &mut [T], item: T) -> Result<T, HeapEmpty> {
     if heap.is_empty() {
         return Err(HeapEmpty);
@@ -48,6 +146,7 @@ pub fn heapreplace<T: Ord>(heap: &mut [T], item: T) -> Result<T, HeapEmpty> {
 }
 
 /// Push an item then pop and return the smallest item, doing only one sift operation.
+#[cfg(test)]
 pub fn heappushpop<T: Ord>(heap: &mut [T], mut item: T) -> T {
     if let Some(root) = heap.first_mut() {
         if *root < item {
@@ -58,6 +157,7 @@ pub fn heappushpop<T: Ord>(heap: &mut [T], mut item: T) -> T {
     item
 }
 
+#[cfg(test)]
 fn sift_up<T: Ord>(heap: &mut [T], mut child: usize) {
     while child > 0 {
         let parent = (child - 1) / 2;
@@ -69,6 +169,7 @@ fn sift_up<T: Ord>(heap: &mut [T], mut child: usize) {
     }
 }
 
+#[cfg(test)]
 fn sift_down<T: Ord>(heap: &mut [T], mut parent: usize) {
     loop {
         let left = parent * 2 + 1;

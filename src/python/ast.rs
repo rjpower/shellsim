@@ -58,6 +58,7 @@ pub enum StatementKind {
     Class {
         name: String,
         bases: Vec<Expression>,
+        metaclass: Option<Expression>,
         body: Vec<Statement>,
     },
     Decorated {

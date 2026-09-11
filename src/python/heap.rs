@@ -8,7 +8,23 @@ use crate::resources::Resources;
 use std::collections::HashMap;
 
 use super::bytecode::Code;
+use super::native::MethodDef;
 use super::Value;
+
+/// Storage layout inherited by user-defined classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassLayout {
+    Object,
+    Int,
+    Type,
+}
+
+/// Type-erased payload carried by an instance while preserving its user-defined class identity.
+#[derive(Clone, Debug)]
+pub enum InstancePayload {
+    Object,
+    Int(i64),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(usize);
@@ -34,6 +50,13 @@ pub enum Object {
     },
     Class {
         name: String,
+        /// Direct user-defined bases in source order.
+        bases: Vec<ObjectId>,
+        /// C3-linearized user-defined ancestors, excluding this class.
+        mro: Vec<ObjectId>,
+        /// The callable type object responsible for this class.
+        metaclass: Value,
+        layout: ClassLayout,
         attributes: HashMap<String, Value>,
         is_dataclass: bool,
         dataclass_fields: Vec<(String, Option<Value>)>,
@@ -41,6 +64,7 @@ pub enum Object {
     },
     Instance {
         class: ObjectId,
+        payload: InstancePayload,
         attributes: HashMap<String, Value>,
     },
     EnumMember {
@@ -50,6 +74,10 @@ pub enum Object {
     PythonBoundMethod {
         receiver: Value,
         function: ObjectId,
+    },
+    NativeBoundMethod {
+        receiver: Value,
+        method: &'static MethodDef,
     },
     Iterator {
         values: Vec<Value>,
@@ -139,16 +167,6 @@ pub enum Method {
     SetUpdate,
     SetRemove,
     SetDiscard,
-    RegexSearch,
-    RegexMatch,
-    RegexFullMatch,
-    RegexFindAll,
-    RegexFindIter,
-    RegexSub,
-    MatchGroup,
-    MatchGroups,
-    MatchStart,
-    MatchEnd,
     ArgumentParserAddArgument,
     ArgumentParserParseArgs,
     RaisesEnter,
@@ -363,13 +381,20 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .ok_or("modeled object size overflow")?,
         Object::Class {
             name,
+            bases,
+            mro,
+            metaclass: _,
+            layout: _,
             attributes,
             is_dataclass,
             dataclass_fields,
             enum_members,
         } => name
             .len()
-            .checked_add(attributes.len())
+            .checked_add(bases.len())
+            .and_then(|size| size.checked_add(mro.len()))
+            .and_then(|size| size.checked_add(1))
+            .and_then(|size| size.checked_add(attributes.len()))
             .and_then(|size| size.checked_add(usize::from(*is_dataclass)))
             .and_then(|size| size.checked_add(dataclass_fields.len()))
             .and_then(|size| size.checked_add(enum_members.len()))
@@ -380,6 +405,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .checked_add(1)
             .ok_or("modeled object size overflow")?,
         Object::PythonBoundMethod { .. } => 2,
+        Object::NativeBoundMethod { .. } => 2,
         Object::Iterator { values, .. } => values.len(),
         Object::CountIterator { .. } => 2,
         Object::Generator {

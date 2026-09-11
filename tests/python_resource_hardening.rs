@@ -110,3 +110,18 @@ fn json_dumps_has_a_preallocation_bound() {
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn json_loads_reserves_parser_and_object_memory() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import json; json.loads('[0,0,0,0,0,0,0,0,0,0]' * 1000)",
+        Limits {
+            memory: 32 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 32 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}

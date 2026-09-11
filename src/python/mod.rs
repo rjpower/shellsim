@@ -9,6 +9,8 @@ mod bytecode;
 mod compiler;
 mod heap;
 mod lexer;
+mod native;
+mod number;
 mod parser;
 mod protocol;
 mod source;
@@ -584,7 +586,10 @@ fn collect_unittest_classes(source: &str) -> Result<Vec<UnitTestClass>, String> 
     })?;
     let mut classes = Vec::new();
     for statement in program.statements {
-        let StatementKind::Class { name, bases, body } = statement.kind else {
+        let StatementKind::Class {
+            name, bases, body, ..
+        } = statement.kind
+        else {
             if matches!(statement.kind, StatementKind::Decorated { .. }) {
                 return Err("decorators are unsupported by the minimal unittest runner".into());
             }

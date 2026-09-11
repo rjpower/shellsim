@@ -6,7 +6,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
-use super::heap::{Heap, Object, ObjectId};
+use super::heap::{Heap, InstancePayload, Object, ObjectId};
 use super::Value;
 
 pub fn display(heap: &Heap, value: &Value) -> Result<String, String> {
@@ -23,6 +23,22 @@ pub fn display(heap: &Heap, value: &Value) -> Result<String, String> {
 
 pub fn repr(heap: &Heap, value: &Value) -> Result<String, String> {
     render(heap, value, &mut BTreeSet::new())
+}
+
+/// Return the integer payload of an immediate integer or an `int` subclass instance.
+pub fn int_value(heap: &Heap, value: &Value) -> Option<i64> {
+    match value {
+        Value::Int(value) => Some(*value),
+        Value::Bool(value) => Some(i64::from(*value)),
+        Value::Object(id) => match heap.get(*id).ok()? {
+            Object::Instance {
+                payload: InstancePayload::Int(value),
+                ..
+            } => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result<String, String> {
@@ -69,6 +85,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                     Object::Class { .. } => "<class ...>",
                     Object::Instance { .. } => "<instance ...>",
                     Object::PythonBoundMethod { .. } => "<bound method ...>",
+                    Object::NativeBoundMethod { .. } => "<bound native method ...>",
                     Object::Iterator { .. } => "<iterator ...>",
                     Object::CountIterator { .. } => "<iterator ...>",
                     Object::Generator { .. } => "<generator ...>",
@@ -112,11 +129,15 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 }
                 Object::Function { name, .. } => format!("<function {name}>"),
                 Object::Class { name, .. } => format!("<class '{name}'>"),
-                Object::Instance { class, .. } => match heap.get(*class)? {
-                    Object::Class { name, .. } => format!("<{name} object>"),
-                    _ => return Err("instance has an invalid class".into()),
+                Object::Instance { class, payload, .. } => match payload {
+                    InstancePayload::Int(value) => value.to_string(),
+                    InstancePayload::Object => match heap.get(*class)? {
+                        Object::Class { name, .. } => format!("<{name} object>"),
+                        _ => return Err("instance has an invalid class".into()),
+                    },
                 },
                 Object::PythonBoundMethod { .. } => "<bound method>".into(),
+                Object::NativeBoundMethod { .. } => "<bound native method>".into(),
                 Object::Iterator { .. } => "<iterator>".into(),
                 Object::CountIterator { .. } => "<iterator>".into(),
                 Object::Generator { .. } => "<generator>".into(),
@@ -177,10 +198,18 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
                 !values.is_empty()
             }
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => !entries.is_empty(),
+            Object::Instance {
+                payload: InstancePayload::Int(value),
+                ..
+            } => *value != 0,
             Object::Function { .. }
             | Object::Class { .. }
-            | Object::Instance { .. }
+            | Object::Instance {
+                payload: InstancePayload::Object,
+                ..
+            }
             | Object::PythonBoundMethod { .. }
+            | Object::NativeBoundMethod { .. }
             | Object::Iterator { .. }
             | Object::CountIterator { .. }
             | Object::Generator { .. }
@@ -206,6 +235,17 @@ fn equals_inner(
     right: &Value,
     active: &mut BTreeSet<(ObjectId, ObjectId)>,
 ) -> Result<bool, String> {
+    if let Some(left) = int_value(heap, left) {
+        if let Some(right) = int_value(heap, right) {
+            return Ok(left == right);
+        }
+        if let Value::Float(right) = right {
+            return Ok(left as f64 == *right);
+        }
+    }
+    if let (Value::Float(left), Some(right)) = (left, int_value(heap, right)) {
+        return Ok(*left == right as f64);
+    }
     match (left, right) {
         (Value::None, Value::None) => Ok(true),
         (Value::Bool(left), Value::Bool(right)) => Ok(left == right),
@@ -327,6 +367,21 @@ fn sequence_equal(
 }
 
 pub fn compare(heap: &Heap, left: &Value, right: &Value) -> Result<Ordering, String> {
+    if let Some(left) = int_value(heap, left) {
+        if let Some(right) = int_value(heap, right) {
+            return Ok(left.cmp(&right));
+        }
+        if let Value::Float(right) = right {
+            return (left as f64)
+                .partial_cmp(right)
+                .ok_or_else(|| "comparison with NaN is unordered".into());
+        }
+    }
+    if let (Value::Float(left), Some(right)) = (left, int_value(heap, right)) {
+        return left
+            .partial_cmp(&(right as f64))
+            .ok_or_else(|| "comparison with NaN is unordered".into());
+    }
     match (left, right) {
         (Value::Int(left), Value::Int(right)) => Ok(left.cmp(right)),
         (Value::Float(left), Value::Float(right)) => left
@@ -391,6 +446,7 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::Class { .. }
             | Object::Instance { .. }
             | Object::PythonBoundMethod { .. }
+            | Object::NativeBoundMethod { .. }
             | Object::Iterator { .. }
             | Object::CountIterator { .. }
             | Object::Generator { .. }

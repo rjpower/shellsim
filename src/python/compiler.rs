@@ -229,7 +229,12 @@ impl Compiler {
                 );
                 self.emit(Operation::StoreName(name), span);
             }
-            StatementKind::Class { name, bases, body } => {
+            StatementKind::Class {
+                name,
+                bases,
+                metaclass,
+                body,
+            } => {
                 let base_count = bases.len();
                 let fields = body
                     .iter()
@@ -255,6 +260,10 @@ impl Compiler {
                 for base in bases {
                     self.expression(base);
                 }
+                let has_metaclass = metaclass.is_some();
+                if let Some(metaclass) = metaclass {
+                    self.expression(metaclass);
+                }
                 self.emit(
                     Operation::MakeClass {
                         name: name.clone(),
@@ -263,6 +272,7 @@ impl Compiler {
                             parameters: Vec::new(),
                         }),
                         bases: base_count,
+                        has_metaclass,
                         fields,
                     },
                     span,

@@ -7,6 +7,132 @@
 
 use std::fmt;
 
+use super::super::native::{
+    CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyResult, PyRuntime, PyValueCast,
+    ValueDef,
+};
+use super::super::number::PyNumber;
+use super::super::Value;
+
+pub(super) static MODULE: ModuleDef = ModuleDef {
+    name: "math",
+    functions: &[
+        FunctionDef {
+            module: "math",
+            name: "ceil",
+            call: native_ceil,
+        },
+        FunctionDef {
+            module: "math",
+            name: "exp",
+            call: native_exp,
+        },
+        FunctionDef {
+            module: "math",
+            name: "isinf",
+            call: native_isinf,
+        },
+        FunctionDef {
+            module: "math",
+            name: "isnan",
+            call: native_isnan,
+        },
+        FunctionDef {
+            module: "math",
+            name: "log",
+            call: native_log,
+        },
+        FunctionDef {
+            module: "math",
+            name: "sin",
+            call: native_sin,
+        },
+        FunctionDef {
+            module: "math",
+            name: "sqrt",
+            call: native_sqrt,
+        },
+    ],
+    values: &[
+        ValueDef::Constant {
+            name: "e",
+            value: PyConstant::Float(std::f64::consts::E),
+        },
+        ValueDef::Constant {
+            name: "pi",
+            value: PyConstant::Float(std::f64::consts::PI),
+        },
+        ValueDef::Constant {
+            name: "tau",
+            value: PyConstant::Float(std::f64::consts::TAU),
+        },
+        ValueDef::Constant {
+            name: "inf",
+            value: PyConstant::Float(f64::INFINITY),
+        },
+        ValueDef::Constant {
+            name: "nan",
+            value: PyConstant::Float(f64::NAN),
+        },
+    ],
+};
+
+fn native_ceil(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "ceil")
+}
+
+fn native_exp(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "exp")
+}
+
+fn native_isinf(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "isinf")
+}
+
+fn native_isnan(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "isnan")
+}
+
+fn native_log(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "log")
+}
+
+fn native_sin(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "sin")
+}
+
+fn native_sqrt(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "sqrt")
+}
+
+fn native_call(runtime: &mut dyn PyRuntime, args: CallArgs, name: &'static str) -> PyResult {
+    args.reject_keywords(&format!("math.{name}"))?;
+    let values = args
+        .positional()
+        .iter()
+        .cloned()
+        .map(|value| value.cast::<PyNumber>(runtime).map(PyNumber::as_f64))
+        .collect::<PyResult<Vec<_>>>()?;
+    runtime.charge_cpu(u64::try_from(values.len()).unwrap_or(u64::MAX))?;
+    let value = call(name, &values).map_err(math_error)?;
+    Ok(match value {
+        MathValue::Float(value) => Value::Float(value),
+        MathValue::Int(value) => Value::Int(value),
+        MathValue::Bool(value) => Value::Bool(value),
+    })
+}
+
+fn math_error(error: MathError) -> PyError {
+    let message = error.to_string();
+    match error {
+        MathError::ValueError(_) => PyError::value_error(message),
+        MathError::OverflowError(_) => PyError::overflow_error(message),
+        MathError::ZeroDivisionError(_) => PyError::zero_division_error(message),
+        MathError::Arity { .. } => PyError::type_error(message),
+        MathError::UnknownFunction(_) => PyError::runtime_error(message),
+    }
+}
+
 /// Values returned by the math functions in this shim.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MathValue {
@@ -61,6 +187,7 @@ const I64_INCLUSIVE_LOWER: f64 = -9_223_372_036_854_775_808.0; // -2**63
 /// Return a named numeric constant from the supported `math` surface.
 ///
 /// `inf` and `nan` are useful for deterministic wrappers and mirror Python's module constants.
+#[cfg(test)]
 pub fn constant(name: &str) -> Option<MathValue> {
     match name {
         "e" => Some(MathValue::Float(std::f64::consts::E)),

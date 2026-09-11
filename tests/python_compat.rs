@@ -195,6 +195,74 @@ print(json.dumps(payload, separators=(",", ":"), sort_keys=True))"#;
 }
 
 #[test]
+fn json_loads_builds_python_values_and_round_trips_in_order() {
+    let source = r#"import json
+value = json.loads('{"z": [1, true, null, "x"], "a": -2.5}')
+print(value["z"][0], value["z"][1], value["z"][2], value["z"][3], value["a"])
+print(json.dumps(value, separators=(",", ":"), sort_keys=True))"#;
+    let mut environment = Environment::new();
+    let argv = vec!["python3.14".into(), "-c".into(), source.into()];
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = shellsim::python::run_python(
+        &mut environment,
+        &argv,
+        Vec::new(),
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        stdout,
+        b"1 True None x -2.5\n{\"a\":-2.5,\"z\":[1,true,null,\"x\"]}\n"
+    );
+    assert!(stderr.is_empty());
+    if let Ok(reference) = Command::new("python3.14").arg("-c").arg(source).output() {
+        assert_eq!(status, reference.status.code().unwrap_or(1));
+        assert_eq!(stdout, reference.stdout);
+        assert_eq!(stderr, reference.stderr);
+    }
+}
+
+#[test]
+fn json_loads_rejects_invalid_input_and_unbounded_integers() {
+    for source in [
+        "import json; json.loads('{')",
+        "import json; json.loads('9223372036854775808')",
+        "import json; json.loads(1)",
+    ] {
+        let mut environment = Environment::new();
+        let argv = vec!["python3.14".into(), "-c".into(), source.into()];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = shellsim::python::run_python(
+            &mut environment,
+            &argv,
+            Vec::new(),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_ne!(status, 0, "source unexpectedly succeeded: {source}");
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+    }
+}
+
+#[test]
+fn native_module_errors_preserve_python_exception_kinds() {
+    assert_eq!(
+        run_shell(
+            "python3.14 -c 'import json; import math\ntry:\n    json.loads(\"{\")\nexcept ValueError:\n    print(\"json value\")\ntry:\n    math.sqrt(-1)\nexcept ValueError:\n    print(\"math value\")\ntry:\n    math.sqrt(\"x\")\nexcept TypeError:\n    print(\"math type\")'"
+        ),
+        (
+            0,
+            b"json value\nmath value\nmath type\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
 fn lambdas_and_keyed_sorted_preserve_stability() {
     let source = r#"items = [("b", 2), ("a", 3), ("a", 1)]
 print(sorted(items, key=lambda item: item[0]))
@@ -310,6 +378,67 @@ print(first.find("b"), second.find("b"), first.parent is second.parent)"#;
     assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(stdout, b"a b False\n");
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn user_class_inheritance_uses_c3_attribute_lookup() {
+    assert_eq!(
+        run_shell(
+            "python3.14 -c 'class A:\n    def __init__(self, value):\n        self.value = value\n    def source(self):\n        return \"A\"\nclass B(A):\n    pass\nclass C(A):\n    def source(self):\n        return \"C\"\nclass D(B, C):\n    pass\nd = D(7)\nprint(d.value, d.source(), D.source(d))'"
+        ),
+        (0, b"7 C C\n".to_vec(), Vec::new())
+    );
+
+    let (status, _stdout, stderr) = run_shell(
+        "python3.14 -c 'class X:\n    pass\nclass Y:\n    pass\nclass A(X, Y):\n    pass\nclass B(Y, X):\n    pass\nclass Invalid(A, B):\n    pass'",
+    );
+    assert_ne!(status, 0);
+    assert!(String::from_utf8_lossy(&stderr)
+        .contains("cannot create a consistent method resolution order"));
+}
+
+#[test]
+fn int_subclasses_preserve_identity_and_use_numeric_protocols() {
+    assert_eq!(
+        run_shell(
+            "python3.14 -c 'class UserId(int):\n    def next_id(self):\n        return self + 1\nvalue = UserId(12)\nzero = UserId()\nprint(value, int(value), value.next_id())\nprint(value == 12, value > 3, bool(value), bool(zero))'"
+        ),
+        (0, b"12 12 13\nTrue True True False\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn type_predicates_follow_user_mro_and_builtin_layouts() {
+    assert_eq!(
+        run_shell(
+            "python3.14 -c 'class Root(object):\n    pass\nclass UserId(int):\n    pass\nclass Child(UserId):\n    pass\nvalue = Child(4)\nprint(type(value) is Child, type(Child) is type)\nprint(isinstance(value, Child), isinstance(value, UserId), isinstance(value, int), isinstance(value, object))\nprint(issubclass(Child, UserId), issubclass(Child, int), issubclass(Child, object), issubclass(bool, int))\nprint(isinstance(Root(), Root))'"
+        ),
+        (
+            0,
+            b"True True\nTrue True True True\nTrue True True True\nTrue\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
+fn constrained_metaclasses_preserve_class_identity() {
+    assert_eq!(
+        run_shell(
+            "python3.14 -c 'class Meta(type):\n    label = \"model\"\nclass X(metaclass=Meta):\n    pass\nclass Child(X):\n    pass\nprint(type(int) is type, type(Meta) is type, type(X) is Meta, type(Child) is Meta)\nprint(isinstance(X, Meta), issubclass(Meta, type), isinstance(X(), X), X.label)'"
+        ),
+        (
+            0,
+            b"True True True True\nTrue True True model\n".to_vec(),
+            Vec::new()
+        )
+    );
+
+    let (status, _stdout, stderr) =
+        run_shell("python3.14 -c 'class Unsafe(type):\n    def __call__(self):\n        pass'");
+    assert_ne!(status, 0);
+    assert!(String::from_utf8_lossy(&stderr)
+        .contains("custom metaclass construction hooks are not implemented"));
 }
 
 #[test]

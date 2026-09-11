@@ -4,6 +4,51 @@
 //! constants static avoids locale and host-environment dependence; formatting helpers can be
 //! added separately when a VM adapter needs them.
 
+use super::super::native::{ModuleDef, PyConstant, ValueDef};
+
+pub(super) static MODULE: ModuleDef = ModuleDef {
+    name: "string",
+    functions: &[],
+    values: &[
+        ValueDef::Constant {
+            name: "ascii_lowercase",
+            value: PyConstant::String(ASCII_LOWERCASE),
+        },
+        ValueDef::Constant {
+            name: "ascii_uppercase",
+            value: PyConstant::String(ASCII_UPPERCASE),
+        },
+        ValueDef::Constant {
+            name: "ascii_letters",
+            value: PyConstant::String(ASCII_LETTERS),
+        },
+        ValueDef::Constant {
+            name: "digits",
+            value: PyConstant::String(DIGITS),
+        },
+        ValueDef::Constant {
+            name: "hexdigits",
+            value: PyConstant::String(HEXDIGITS),
+        },
+        ValueDef::Constant {
+            name: "octdigits",
+            value: PyConstant::String(OCTDIGITS),
+        },
+        ValueDef::Constant {
+            name: "punctuation",
+            value: PyConstant::String(PUNCTUATION),
+        },
+        ValueDef::Constant {
+            name: "whitespace",
+            value: PyConstant::String(WHITESPACE),
+        },
+        ValueDef::Constant {
+            name: "printable",
+            value: PyConstant::String(PRINTABLE),
+        },
+    ],
+};
+
 pub const ASCII_LOWERCASE: &str = "abcdefghijklmnopqrstuvwxyz";
 pub const ASCII_UPPERCASE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 pub const ASCII_LETTERS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -15,6 +60,7 @@ pub const WHITESPACE: &str = " \t\n\r\x0b\x0c";
 pub const PRINTABLE: &str = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ \t\n\r\x0b\x0c";
 
 /// Resolve a Python `string` module constant by its public name.
+#[cfg(test)]
 pub fn constant(name: &str) -> Option<&'static str> {
     match name {
         "ascii_lowercase" => Some(ASCII_LOWERCASE),
