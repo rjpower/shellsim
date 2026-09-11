@@ -5,11 +5,14 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
 
-use shellsim::Environment;
+use shellsim::{Environment, Limits};
 
 const OBJECT_MODEL_SUITE: &[u8] =
     include_bytes!("fixtures/python/object_model/test_object_model.py");
+const COUNT_10_MILLION: &[u8] =
+    include_bytes!("fixtures/python/performance/test_count_10_million.py");
 
 #[test]
 fn object_model_suite_runs_as_python_source() {
@@ -60,5 +63,38 @@ fn object_model_suite_passes_cpython_pytest_when_available() {
         "CPython pytest failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "manual release-mode throughput probe"]
+fn count_to_ten_million_benchmark() {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 100_000_000,
+        ..Limits::default()
+    });
+    let path = "/tests/test_count_10_million.py";
+    environment
+        .vfs
+        .put_file(path, COUNT_10_MILLION.to_vec(), 0o644)
+        .expect("install throughput probe");
+
+    let started = Instant::now();
+    let (outcome, stdout, stderr) = environment.run_script_capture(&format!("pytest {path}"));
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        stdout,
+        b"/tests/test_count_10_million.py::test_count_to_ten_million PASSED\n"
+    );
+    eprintln!(
+        "count-to-10m: {elapsed:.3?}, {} modeled CPU units",
+        outcome.usage.cpu_used
     );
 }
