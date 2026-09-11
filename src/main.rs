@@ -17,9 +17,10 @@ fn main() {
         run_script(&read_stdin(), &[]);
     }
     match args[1].as_str() {
-        "-c" => run_script(
+        "-c" => run_script_with_stdin(
             args.get(2).map(String::as_str).unwrap_or_default(),
             &args[3..],
+            &read_stdin_bytes(),
         ),
         "run" => {
             let Some(path) = args.get(2) else {
@@ -29,7 +30,7 @@ fn main() {
                 eprintln!("shellsim: cannot read {path}: {error}");
                 exit(2);
             });
-            run_script(&source, &args[3..]);
+            run_script_with_stdin(&source, &args[3..], &read_stdin_bytes());
         }
         "shell" => interactive_shell(&args[2..]),
         "eval" => evaluate(&args[2..]),
@@ -48,8 +49,16 @@ fn fresh_environment(limits: Limits, positional: &[String]) -> Environment {
 }
 
 fn run_script(source: &str, positional: &[String]) -> ! {
+    run_script_with_stdin(source, positional, &[])
+}
+
+fn run_script_with_stdin(source: &str, positional: &[String], stdin: &[u8]) -> ! {
     let mut env = fresh_environment(Limits::default(), positional);
-    exit(env.run_script(source));
+    let (outcome, out, err) = env.run_script_capture_with_stdin(source, stdin);
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(&out);
+    let _ = std::io::stderr().write_all(&err);
+    exit(outcome.exit_status);
 }
 
 #[derive(serde::Serialize)]
@@ -91,9 +100,12 @@ fn evaluate(args: &[String]) -> ! {
         i += 1;
     }
 
-    let source = source.unwrap_or_else(read_stdin);
+    let (source, stdin) = match source {
+        Some(source) => (source, read_stdin_bytes()),
+        None => (read_stdin(), Vec::new()),
+    };
     let mut env = fresh_environment(limits, &positional);
-    let (outcome, stdout, stderr) = env.run_script_capture(&source);
+    let (outcome, stdout, stderr) = env.run_script_capture_with_stdin(&source, &stdin);
     let status = outcome.exit_status;
     let report = EvalReport {
         outcome,
@@ -157,7 +169,24 @@ fn interactive_shell(args: &[String]) -> ! {
             }
         }
 
-        let (outcome, out, err) = env.run_script_capture(&line);
+        let mut action = line.clone();
+        while !shellsim::shell::heredocs_complete(&action) {
+            if show_prompt {
+                let _ = write!(stdout, "> ");
+                let _ = stdout.flush();
+            }
+            line.clear();
+            match input.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => action.push_str(&line),
+                Err(error) => {
+                    let _ = writeln!(stderr, "shellsim: input error: {error}");
+                    exit(1);
+                }
+            }
+        }
+
+        let (outcome, out, err) = env.run_script_capture(&action);
         let _ = stdout.write_all(&out);
         let _ = stderr.write_all(&err);
         let _ = stdout.flush();
@@ -198,6 +227,16 @@ fn read_stdin() -> String {
     let mut source = String::new();
     let _ = std::io::stdin().read_to_string(&mut source);
     source
+}
+
+fn read_stdin_bytes() -> Vec<u8> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return Vec::new();
+    }
+    let mut input = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut input);
+    input
 }
 
 fn usage_error(message: &str) -> ! {

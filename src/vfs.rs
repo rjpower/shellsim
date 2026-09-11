@@ -88,6 +88,8 @@ pub struct Vfs {
     /// this immediately before an effect; the VFS never consults the host clock.
     mutation_time_ms: u64,
     disk_limit: u64,
+    /// Directory nodes supplied by the base image rather than created by simulated actions.
+    baseline_dirs: std::collections::BTreeSet<String>,
     disk_used: u64,
     disk_peak: u64,
     read_bytes: Cell<u64>,
@@ -163,6 +165,7 @@ impl Vfs {
             nodes,
             mutation_time_ms: 0,
             disk_limit,
+            baseline_dirs: std::collections::BTreeSet::new(),
             disk_used,
             disk_peak: disk_used,
             read_bytes: Cell::new(0),
@@ -191,11 +194,26 @@ impl Vfs {
         self.mutation_time_ms
     }
 
+    /// Add immutable image-layout directories before simulated execution begins.
+    ///
+    /// Base-image nodes do not consume the writable disk quota. Subsequent mutations account for
+    /// all logical usage added beyond this initial layout.
+    pub(crate) fn seed_dirs<const N: usize>(&mut self, paths: [&str; N]) {
+        for path in paths {
+            let path = normalize(path);
+            self.nodes
+                .insert(path.clone(), Node::dir(0o755, self.mutation_time_ms));
+            self.baseline_dirs.insert(path);
+        }
+        self.refresh_usage();
+        self.disk_peak = self.disk_peak.max(self.disk_used);
+    }
+
     fn finish_mutation(&mut self, before: BTreeMap<String, Node>) -> Result<()> {
-        let used = logical_usage(&self.nodes);
+        let used = self.measured_usage();
         if used > self.disk_limit {
             self.nodes = before;
-            self.disk_used = logical_usage(&self.nodes);
+            self.disk_used = self.measured_usage();
             Err(VfsError::NoSpace)
         } else {
             self.disk_used = used;
@@ -205,7 +223,25 @@ impl Vfs {
     }
 
     fn refresh_usage(&mut self) {
-        self.disk_used = logical_usage(&self.nodes);
+        self.disk_used = self.measured_usage();
+    }
+
+    fn measured_usage(&self) -> u64 {
+        let present_baseline_dirs = self
+            .baseline_dirs
+            .iter()
+            .filter(|path| {
+                matches!(
+                    self.nodes.get(path.as_str()),
+                    Some(Node {
+                        kind: NodeKind::Dir,
+                        ..
+                    })
+                )
+            })
+            .count() as u64;
+        logical_usage(&self.nodes)
+            .saturating_sub(present_baseline_dirs.saturating_mul(NODE_OVERHEAD))
     }
 
     // ---- low level ----
