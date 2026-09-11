@@ -919,7 +919,13 @@ fn read_double_paren(chars: &[char]) -> (String, usize) {
 }
 
 fn run_capture(interp: &mut Interp, src: &str) -> String {
-    let ast = crate::shell::parse(src);
+    let ast = match crate::shell::parse(src) {
+        Ok(ast) => ast,
+        Err(_) => {
+            interp.last_status = 2;
+            return String::new();
+        }
+    };
     let mut out = Vec::new();
     let mut err = Vec::new();
     crate::exec::exec(interp, &ast, Vec::new(), &mut out, &mut err);

@@ -47,6 +47,49 @@ fn common_bash_guard_idioms() {
 }
 
 #[test]
+fn malformed_compound_syntax_never_executes_a_partial_ast() {
+    for source in [
+        "echo partial; if true; then echo no",
+        "echo partial; for item in one; do echo no",
+        "echo partial; while true; do echo no",
+        "echo partial; (echo no",
+        "echo partial; echo 'no",
+    ] {
+        let (status, out, err) = run(source);
+        assert_eq!(status, 2, "wrong status for {source:?}");
+        assert_eq!(out, "", "partial syntax tree executed for {source:?}");
+        assert!(
+            err.starts_with("shellsim: syntax error:"),
+            "missing parse diagnostic for {source:?}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn valid_compound_syntax_still_executes() {
+    assert_eq!(
+        run("if true; then for item in one two; do (echo \"$item\"); done; fi"),
+        (0, "one\ntwo\n".into(), String::new())
+    );
+}
+
+#[test]
+fn completed_background_jobs_are_queryable_and_waitable() {
+    assert_eq!(
+        run("false & jobs; wait %1; echo $?"),
+        (0, "[1] Done false\n1\n".into(), String::new())
+    );
+    assert_eq!(
+        run("alias ll='ls -l'"),
+        (
+            2,
+            String::new(),
+            "shellsim: builtin is not supported\n".into()
+        )
+    );
+}
+
+#[test]
 fn python_repl_persists_and_returns_to_shell() {
     let mut env = Environment::new();
     let (_, entered, _) = env.run_script_capture("python");

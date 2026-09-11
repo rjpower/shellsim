@@ -1,6 +1,6 @@
 //! Shell builtins: state-mutating commands (cd, export, set, …), control-flow signals
 //! (exit/return/break/continue/shift), `test`/`[`, `read`, `let`, `source`/`eval`, and the
-//! family of no-op builtins that have no meaning in a process-less sandbox.
+//! small job-table queries. Unsupported process and interactive controls fail explicitly.
 
 use std::collections::HashMap;
 
@@ -33,27 +33,85 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["test", "["], Trust::Real, cmd_test);
     reg(m, &["[["], Trust::Real, cmd_dbracket);
     reg(m, &["read"], Trust::Real, cmd_read);
+    reg(m, &["wait"], Trust::Real, cmd_wait);
+    reg(m, &["jobs"], Trust::Real, cmd_jobs);
     reg(
         m,
         &[
-            "trap", "wait", "jobs", "disown", "umask", "ulimit", "hash", "complete", "shopt",
-            "bind", "history", "exec",
+            "trap", "disown", "umask", "ulimit", "hash", "complete", "shopt", "bind", "history",
+            "exec",
         ],
-        Trust::Real,
-        cmd_noop,
+        Trust::NoOp,
+        cmd_unsupported,
     );
-    reg(m, &["kill", "killall", "pkill"], Trust::Real, cmd_noop);
+    reg(
+        m,
+        &["kill", "killall", "pkill"],
+        Trust::NoOp,
+        cmd_unsupported,
+    );
     reg(m, &["type", "which"], Trust::Real, cmd_which);
     reg(m, &["command"], Trust::Real, cmd_command);
-    reg(m, &["alias", "unalias"], Trust::Real, cmd_noop);
+    reg(m, &["alias", "unalias"], Trust::NoOp, cmd_unsupported);
     reg(m, &["getopts"], Trust::Real, cmd_getopts);
     reg(m, &["let"], Trust::Real, cmd_let);
-    reg(m, &["mapfile", "readarray"], Trust::Real, cmd_noop);
-    reg(m, &["pushd", "popd", "dirs"], Trust::Real, cmd_noop);
+    reg(m, &["mapfile", "readarray"], Trust::NoOp, cmd_unsupported);
+    reg(m, &["pushd", "popd", "dirs"], Trust::NoOp, cmd_unsupported);
 }
 
-fn cmd_noop(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {
+fn cmd_unsupported(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
+    ewln(io.err, "shellsim: builtin is not supported");
+    2
+}
+
+fn cmd_jobs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let print_pids = match args {
+        [] => false,
+        [flag] if flag == "-p" => true,
+        _ => {
+            ewln(io.err, "jobs: only -p is supported");
+            return 2;
+        }
+    };
+    for job in &interp.jobs {
+        if print_pids {
+            wln(io.out, &job.id.to_string());
+        } else {
+            let state = if job.done { "Done" } else { "Running" };
+            wln(io.out, &format!("[{}] {state} {}", job.id, job.cmd));
+        }
+    }
     0
+}
+
+fn cmd_wait(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.is_empty() {
+        return 0;
+    }
+    let mut status = 0;
+    for argument in args {
+        let id = argument
+            .strip_prefix('%')
+            .unwrap_or(argument)
+            .parse::<u32>();
+        let Ok(id) = id else {
+            ewln(io.err, &format!("wait: {argument}: invalid job id"));
+            status = 127;
+            continue;
+        };
+        match interp.jobs.iter().find(|job| job.id == id) {
+            Some(job) if job.done => status = job.status,
+            Some(_) => {
+                ewln(io.err, &format!("wait: {argument}: job is not complete"));
+                status = 127;
+            }
+            None => {
+                ewln(io.err, &format!("wait: {argument}: no such job"));
+                status = 127;
+            }
+        }
+    }
+    status
 }
 
 fn cmd_true(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {

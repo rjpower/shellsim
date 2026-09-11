@@ -19,8 +19,9 @@ pub enum ArrayVal {
 
 /// A simulated background job (started with `&`). Because there is no real concurrency,
 /// a job is just a captured AST that will be run-to-completion when the scheduler decides
-/// to (e.g. on `wait`, or when the foreground needs its effects). For most tasks the body
-/// is run immediately and synchronously, which is indistinguishable for file-state checks.
+/// to. Jobs currently run immediately and synchronously, after which `jobs` and `wait` expose
+/// their modeled identifier and status. This is indistinguishable for many file-state checks but
+/// does not model overlapping work.
 pub struct Job {
     pub id: u32,
     pub cmd: String,

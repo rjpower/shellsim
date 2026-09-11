@@ -25,7 +25,6 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
             "npm",
             "node",
             "cargo",
-            "make",
             "cmake",
             "gcc",
             "g++",

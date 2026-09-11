@@ -19,7 +19,9 @@ mod awk;
 mod builtins;
 mod echo;
 mod fs;
+mod git;
 mod hashing;
+mod makecmd;
 mod net;
 pub(crate) mod pkg;
 mod printf;
@@ -133,7 +135,9 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     system::register(&mut m);
     text::register(&mut m);
     fs::register(&mut m);
+    git::register(&mut m);
     hashing::register(&mut m);
+    makecmd::register(&mut m);
     net::register(&mut m);
     proc::register(&mut m);
     pkg::register(&mut m);
@@ -159,7 +163,7 @@ pub fn run(
     if let Some(spec) = registry().get(cmd) {
         match spec.trust {
             Trust::NoOp => {
-                // NoOp commands (package managers / build tools) are recorded as unsupported,
+                // NoOp commands (package managers and native compilers) are recorded as unsupported,
                 // preserving the legacy `note_unsupported(cmd)` behavior for that arm.
                 interp.note_unsupported(cmd);
                 interp.trust_noop.insert(cmd.to_string());
@@ -269,7 +273,15 @@ impl Interp {
                 .stop_reason()
                 .map_or(137, |r| r.exit_status());
         }
-        let ast = crate::shell::parse(src);
+        let ast = match crate::shell::parse(src) {
+            Ok(ast) => ast,
+            Err(error) => {
+                err.extend_from_slice(format!("shellsim: syntax error: {error}\n").as_bytes());
+                self.last_status = 2;
+                self.resources.restore_memory(memory_mark);
+                return 2;
+            }
+        };
         let r = self.returning.take();
         let code = crate::exec::exec(self, &ast, Vec::new(), out, err);
         self.resources.restore_memory(memory_mark);

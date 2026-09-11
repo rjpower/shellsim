@@ -48,10 +48,11 @@ operation explicitly models latency. Blocking advances directly to the next even
 sleeping a host thread. Equal-time events use insertion order. Background jobs still execute
 synchronously, so independent sleeps do not yet overlap.
 
-Native compilation is outside the model. Compilers and build tools are recorded `NoOp` commands:
-pretending to compile can keep a setup script moving, but no executable artifact is produced.
-Running arbitrary emitted machine code would bypass every modeled capability and resource boundary.
-A future `make` subset may safely execute shell-only recipes through the existing interpreter.
+Native compilation is outside the model. Compiler commands are recorded as `NoOp`: pretending to
+compile can keep a setup script moving, but no executable artifact is produced. Running arbitrary
+emitted machine code would bypass every modeled capability and resource boundary. The partial
+`make` implementation parses a bounded Makefile graph and executes shell-only recipes through the
+existing interpreter; it never invokes a host build tool.
 
 ## Resource accounting
 
@@ -141,4 +142,3 @@ Tests must not depend on host elapsed time, locale, network, filesystem contents
 iteration. Compatibility tests should prefer semantic assertions; exact checked output is
 appropriate when formatting is the contract. Never weaken a lint, skip a test, or rewrite a
 differential fixture merely to make a gate pass.
-

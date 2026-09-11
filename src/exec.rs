@@ -860,7 +860,7 @@ mod array_tests {
     /// Run a snippet and capture stdout as a String.
     fn run(src: &str) -> String {
         let mut i = Interp::new();
-        let ast = crate::shell::parse(src);
+        let ast = crate::shell::parse(src).expect("array test source should parse");
         let mut out = Vec::new();
         let mut err = Vec::new();
         crate::exec::exec(&mut i, &ast, Vec::new(), &mut out, &mut err);

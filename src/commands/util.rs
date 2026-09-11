@@ -308,6 +308,8 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "df",
     "free",
     "ps",
+    "git",
+    "make",
 ];
 
 #[cfg(test)]

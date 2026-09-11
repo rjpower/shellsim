@@ -6,6 +6,34 @@
 //! tilde and globbing). It is not a complete bash, but it is faithful where it matters.
 
 use crate::interp::Interp;
+use std::fmt;
+
+/// A syntax error found before shell execution begins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShellError {
+    /// Input ended before a required token or delimiter was found.
+    UnexpectedEof { expected: String },
+    /// A token appeared where the grammar required something else.
+    UnexpectedToken { found: String, expected: String },
+    /// A quoted word was not terminated.
+    UnclosedQuote(char),
+}
+
+impl fmt::Display for ShellError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedEof { expected } => {
+                write!(f, "unexpected end of file (expected {expected})")
+            }
+            Self::UnexpectedToken { found, expected } => {
+                write!(f, "unexpected token {found} (expected {expected})")
+            }
+            Self::UnclosedQuote(quote) => write!(f, "unclosed {quote} quote"),
+        }
+    }
+}
+
+impl std::error::Error for ShellError {}
 
 // ===================== AST =====================
 
@@ -99,6 +127,7 @@ struct Lexer {
     i: usize,
     toks: Vec<Tok>,
     heredocs_complete: bool,
+    error: Option<ShellError>,
 }
 
 impl Lexer {
@@ -108,6 +137,7 @@ impl Lexer {
             i: 0,
             toks: Vec::new(),
             heredocs_complete: true,
+            error: None,
         }
     }
 
@@ -118,7 +148,7 @@ impl Lexer {
         self.chars.get(self.i + o).copied()
     }
 
-    fn tokenize(mut self) -> (Vec<Tok>, bool) {
+    fn tokenize(mut self) -> (Vec<Tok>, bool, Option<ShellError>) {
         // pending heredocs: (delim, quoted, token-index placeholder)
         let mut pending: Vec<(String, bool, usize)> = Vec::new();
         while let Some(c) = self.peek() {
@@ -292,7 +322,7 @@ impl Lexer {
             }
         }
         self.toks.push(Tok::Eof);
-        (self.toks, self.heredocs_complete)
+        (self.toks, self.heredocs_complete, self.error)
     }
 
     fn prev_is_boundary(&self) -> bool {
@@ -327,6 +357,9 @@ impl Lexer {
                 self.i += 1;
             }
         }
+        self.error.get_or_insert(ShellError::UnexpectedEof {
+            expected: "`))`".to_string(),
+        });
         self.chars[start..].iter().collect()
     }
 
@@ -425,17 +458,23 @@ impl Lexer {
                 '\'' => {
                     w.push(c);
                     self.i += 1;
+                    let mut closed = false;
                     while let Some(n) = self.peek() {
                         w.push(n);
                         self.i += 1;
                         if n == '\'' {
+                            closed = true;
                             break;
                         }
+                    }
+                    if !closed {
+                        self.error.get_or_insert(ShellError::UnclosedQuote('\''));
                     }
                 }
                 '"' => {
                     w.push(c);
                     self.i += 1;
+                    let mut closed = false;
                     while let Some(n) = self.peek() {
                         w.push(n);
                         self.i += 1;
@@ -447,8 +486,12 @@ impl Lexer {
                             continue;
                         }
                         if n == '"' {
+                            closed = true;
                             break;
                         }
+                    }
+                    if !closed {
+                        self.error.get_or_insert(ShellError::UnclosedQuote('"'));
                     }
                 }
                 '$' if self.at(1) == Some('(') => {
@@ -462,12 +505,17 @@ impl Lexer {
                 '`' => {
                     w.push(c);
                     self.i += 1;
+                    let mut closed = false;
                     while let Some(n) = self.peek() {
                         w.push(n);
                         self.i += 1;
                         if n == '`' {
+                            closed = true;
                             break;
                         }
+                    }
+                    if !closed {
+                        self.error.get_or_insert(ShellError::UnclosedQuote('`'));
                     }
                 }
                 '{' | '}' => {
@@ -578,6 +626,11 @@ impl Lexer {
                 }
             }
         }
+        if depth != 0 {
+            self.error.get_or_insert(ShellError::UnexpectedEof {
+                expected: "`)`".to_string(),
+            });
+        }
         out
     }
 
@@ -597,6 +650,11 @@ impl Lexer {
                 }
             }
         }
+        if depth != 0 {
+            self.error.get_or_insert(ShellError::UnexpectedEof {
+                expected: "`)`".to_string(),
+            });
+        }
         out
     }
 }
@@ -606,6 +664,7 @@ impl Lexer {
 struct Parser {
     toks: Vec<Tok>,
     i: usize,
+    error: Option<ShellError>,
 }
 
 const RESERVED: &[&str] = &[
@@ -615,7 +674,11 @@ const RESERVED: &[&str] = &[
 
 impl Parser {
     fn new(toks: Vec<Tok>) -> Self {
-        Parser { toks, i: 0 }
+        Parser {
+            toks,
+            i: 0,
+            error: None,
+        }
     }
 
     fn peek(&self) -> &Tok {
@@ -647,11 +710,19 @@ impl Parser {
         let mut nodes = Vec::new();
         self.skip_newlines();
         while !matches!(self.peek(), Tok::Eof) {
+            if self.error.is_some() {
+                break;
+            }
             if matches!(self.peek(), Tok::Op(o) if o == ")" ) {
                 break;
             }
+            let position = self.i;
             let n = self.parse_and_or();
             nodes.push(n);
+            if self.i == position {
+                self.expected("command");
+                break;
+            }
             self.skip_terminators();
             // stop at block enders
             if self.at_block_end() {
@@ -731,6 +802,12 @@ impl Parser {
 
     fn parse_command(&mut self) -> Node {
         self.skip_blank_newlines();
+        if matches!(self.peek(), Tok::Eof)
+            || matches!(self.peek(), Tok::Op(op) if [")", "|", "&&", "||"].contains(&op.as_str()))
+        {
+            self.expected("command");
+            return Node::Empty;
+        }
         // compound commands (may carry a trailing redirect, e.g. `while …; done < file`)
         if self.word_is("if") {
             let n = self.parse_if();
@@ -788,6 +865,11 @@ impl Parser {
                     body: Box::new(body),
                 };
             }
+        }
+        if matches!(self.peek(), Tok::Word(word) if RESERVED.contains(&word.as_str()) && word != "[[")
+        {
+            self.expected("command");
+            return Node::Empty;
         }
         self.parse_simple()
     }
@@ -945,9 +1027,15 @@ impl Parser {
     }
 
     fn take_word(&mut self) -> String {
-        match self.next() {
-            Tok::Word(w) => w,
-            _ => String::new(),
+        match self.peek().clone() {
+            Tok::Word(w) => {
+                self.i += 1;
+                w
+            }
+            _ => {
+                self.expected("word");
+                String::new()
+            }
         }
     }
 
@@ -994,6 +1082,8 @@ impl Parser {
     fn expect_op(&mut self, op: &str) {
         if matches!(self.peek(), Tok::Op(o) if o == op) {
             self.i += 1;
+        } else {
+            self.expected(&format!("`{op}`"));
         }
     }
 
@@ -1001,7 +1091,24 @@ impl Parser {
         self.skip_newlines();
         if self.word_is(kw) {
             self.i += 1;
+        } else {
+            self.expected(&format!("`{kw}`"));
         }
+    }
+
+    fn expected(&mut self, expected: &str) {
+        if self.error.is_some() {
+            return;
+        }
+        self.error = Some(match self.peek() {
+            Tok::Eof => ShellError::UnexpectedEof {
+                expected: expected.to_string(),
+            },
+            token => ShellError::UnexpectedToken {
+                found: token_description(token),
+                expected: expected.to_string(),
+            },
+        });
     }
 
     fn parse_if(&mut self) -> Node {
@@ -1100,6 +1207,10 @@ impl Parser {
         self.skip_newlines();
         let mut arms = Vec::new();
         while !self.word_is("esac") && !matches!(self.peek(), Tok::Eof) {
+            if self.error.is_some() {
+                break;
+            }
+            let position = self.i;
             // optional leading (
             if matches!(self.peek(), Tok::Op(o) if o == "(") {
                 self.i += 1;
@@ -1122,9 +1233,28 @@ impl Parser {
                 self.i += 1;
             }
             self.skip_newlines();
+            if self.i == position {
+                self.expected("case arm");
+                break;
+            }
         }
         self.expect_word("esac");
         Node::Case { word, arms }
+    }
+}
+
+fn token_description(token: &Tok) -> String {
+    match token {
+        Tok::Word(word) => format!("`{word}`"),
+        Tok::Op(op) => format!("`{op}`"),
+        Tok::Less => "`<`".to_string(),
+        Tok::Great => "`>`".to_string(),
+        Tok::DGreat => "`>>`".to_string(),
+        Tok::Heredoc(_, _) => "heredoc".to_string(),
+        Tok::Arithmetic(_) => "arithmetic command".to_string(),
+        Tok::HereString(_) => "here-string".to_string(),
+        Tok::GreatAmp(_) | Tok::RedirFd(_, _) => "redirection".to_string(),
+        Tok::Eof => "end of file".to_string(),
     }
 }
 
@@ -1169,10 +1299,18 @@ impl Node {}
 // possible after definition, so they are part of the enum below via re-export. To keep the
 // single definition, add them to the enum at top. (See additions.)
 
-pub fn parse(src: &str) -> Node {
-    let (toks, _) = Lexer::new(src).tokenize();
+/// Parse a complete shell action without executing any partial syntax tree.
+pub fn parse(src: &str) -> Result<Node, ShellError> {
+    let (toks, _, lexer_error) = Lexer::new(src).tokenize();
+    if let Some(error) = lexer_error {
+        return Err(error);
+    }
     let mut p = Parser::new(toks);
-    p.parse_program()
+    let node = p.parse_program();
+    if p.error.is_none() && !matches!(p.peek(), Tok::Eof) {
+        p.expected("end of input");
+    }
+    p.error.map_or(Ok(node), Err)
 }
 
 /// Return whether every heredoc opened in `src` has its terminating delimiter.
@@ -1180,7 +1318,7 @@ pub fn parse(src: &str) -> Node {
 /// The action console uses this narrow completeness check to collect a standard pasted heredoc
 /// before executing it. Other multiline shell constructs remain complete-action inputs.
 pub fn heredocs_complete(src: &str) -> bool {
-    let (_, complete) = Lexer::new(src).tokenize();
+    let (_, complete, _) = Lexer::new(src).tokenize();
     complete
 }
 
@@ -1255,8 +1393,14 @@ impl Interp {
         let code = if self.resources.reserve_memory(parser_memory)
             && self.resources.charge_cpu(src.len() as u64)
         {
-            let ast = parse(src);
-            crate::exec::exec(self, &ast, stdin, &mut out, &mut err)
+            match parse(src) {
+                Ok(ast) => crate::exec::exec(self, &ast, stdin, &mut out, &mut err),
+                Err(error) => {
+                    err.extend_from_slice(format!("shellsim: syntax error: {error}\n").as_bytes());
+                    self.last_status = 2;
+                    2
+                }
+            }
         } else {
             self.resources
                 .stop_reason()
@@ -1283,5 +1427,44 @@ impl Interp {
         if !err.is_empty() {
             let _ = std::io::stderr().write_all(err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse, ShellError};
+
+    #[test]
+    fn incomplete_compound_commands_are_parse_errors() {
+        for source in [
+            "if true; then echo no",
+            "for item in one; do echo no",
+            "while true; do echo no",
+            "until false; do echo no",
+            "(echo no",
+        ] {
+            assert!(
+                matches!(parse(source), Err(ShellError::UnexpectedEof { .. })),
+                "source unexpectedly parsed: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unterminated_quotes_are_parse_errors() {
+        for (source, quote) in [("echo 'no", '\''), ("echo \"no", '"'), ("echo `no", '`')] {
+            assert!(matches!(
+                parse(source),
+                Err(ShellError::UnclosedQuote(found)) if found == quote
+            ));
+        }
+    }
+
+    #[test]
+    fn complete_compound_commands_still_parse() {
+        assert!(parse(
+            "if true; then for item in one; do (echo \"$item\"); done; else echo no; fi"
+        )
+        .is_ok());
     }
 }
