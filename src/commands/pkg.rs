@@ -4,8 +4,8 @@
 //! installed package names into [`Interp::packages`] so bootstrap probes such as `pip list`
 //! remain deterministic. Package contents are absent, so installers remain [`Trust::NoOp`].
 //!
-//! Build tools / compilers (`gcc`/`make`/`cargo`/…) stay pure no-ops: see the
-//! `COMPILERS.md` survey for why we deliberately don't simulate native compilation.
+//! Build tools / compilers (`gcc`/`make`/`cargo`/…) stay pure no-ops: see
+//! `docs/implementation.md` for why shellsim deliberately does not simulate native compilation.
 
 use std::collections::HashMap;
 

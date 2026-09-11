@@ -169,6 +169,8 @@ pub(super) trait PyRuntime {
     fn repr(&mut self, value: &PyValue) -> PyResult<String>;
     fn equals(&mut self, left: &PyValue, right: &PyValue) -> PyResult<bool>;
     fn compare(&mut self, left: &PyValue, right: &PyValue) -> PyResult<Ordering>;
+    /// Resolve an attribute through the runtime's descriptor and MRO protocol.
+    fn get_attribute(&mut self, value: PyValue, name: &str) -> PyResult<Option<PyValue>>;
     fn list_items(&mut self, list: PyList) -> PyResult<Vec<PyValue>>;
     fn tuple_items(&mut self, tuple: PyTuple) -> PyResult<Vec<PyValue>>;
     fn dict_items(&mut self, dict: PyDict) -> PyResult<Vec<(PyValue, PyValue)>>;
@@ -187,6 +189,7 @@ pub(super) trait PyRuntime {
     fn new_list(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
     fn new_tuple(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
     fn new_dict(&mut self, items: Vec<(PyValue, PyValue)>) -> PyResult<PyValue>;
+    fn new_set(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
     fn new_string(&mut self, value: String) -> PyResult<PyValue>;
     fn property_getter(&self, property: PyProperty) -> PyResult<PyValue>;
     fn new_property(&mut self, getter: PyValue, setter: Option<PyValue>) -> PyResult<PyValue>;

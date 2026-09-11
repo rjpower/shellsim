@@ -53,35 +53,11 @@ CPU/disk deltas, stdout, stderr, command trace, and unsupported capabilities.
 
 ## Virtual time
 
-An environment owns one deterministic `Timeline`; neither shell commands nor the Python engine
-read the host clock or block a host thread. Its clock domains are intentionally separate:
-
-- **Monotonic time** starts at zero and orders sleeps, deadlines, and injected events.
-- **Wall time** is the fixed default epoch `2025-01-01T00:00:00Z` plus monotonic time and an
-  explicit adjustment. Adjusting wall time never changes a deadline.
-- **Process CPU time** derives from deterministic resource fuel (one CPU unit is one virtual
-  microsecond) and never advances monotonic or wall time.
-
-Scheduled events use `(deadline_ns, insertion_sequence)` ordering, so simultaneous events replay
-in a stable order. Pending-event count and scheduling horizon are bounded. Cloning a `Timeline`
-captures its clocks, ordering sequence, pending events, and ready events; no hidden host state is
-needed to replay it.
-
-`sleep` and Python `time.sleep()` schedule a wake event. When the current executor has no runnable
-work, it jumps directly to the next event. `timeout` schedules a deadline event and interrupts
-nested shell or Python execution at that instant. `date`, Python `time.time*`, filesystem mutation
-times, and those deadlines all observe the same environment timeline. Python `time.monotonic*`,
-`perf_counter*`, and `process_time*` expose their corresponding domains.
-
-Runnable commands and bytecode consume zero virtual duration unless an operation explicitly
-models latency. Thus a timeout is observed at a blocking/yield point, while CPU fuel bounds a
-zero-time busy loop; shellsim does not invent a host-dependent instructions-per-second rate.
-
-The executor still evaluates `&` jobs synchronously, so independent background sleeps do not yet
-overlap. The timeline/event contract is designed for the next scheduler step: background AST
-frames become resumable tasks, runnable tasks execute in stable task-id order, and time advances
-only when the runnable set is empty. This limitation is explicit rather than approximating
-concurrency by guessing durations.
+An environment owns deterministic monotonic, wall, and process-CPU clocks. Sleeps and deadlines
+advance the event queue without blocking a host thread; VFS timestamps and Python observe the same
+timeline. Runnable work has zero virtual duration and is bounded by CPU fuel. Background jobs still
+execute synchronously, so independent sleeps do not overlap. See
+[docs/implementation.md](docs/implementation.md) for the state, scheduler, and replay contracts.
 
 ## Persistent shell sessions
 
@@ -136,9 +112,9 @@ if !env.charge_cpu(input.len() as u64) {
 }
 ```
 
-New commands should live in their own module. Multiple names can share one behavioral module.
-`echo`, `printf`, and `sort` demonstrate the layout. Older implementations still grouped by family
-already use the same metered context and can be split mechanically when revised.
+New commands should live in a focused module and use only the modeled command context. See
+[docs/implementation.md](docs/implementation.md) for the integration checklist, trust levels,
+resource rules, and the reason native compilers remain outside the simulation.
 
 The current command set includes filesystem and text coreutils, `grep`, `sed`, a useful partial
 `awk`, hashes and encoders, virtual `curl`/`wget`, shell builtins, minimal package/Python launchers,
@@ -161,9 +137,9 @@ starred assignment/calls, f-strings, VFS-only imports, common iterator/container
 modeled REPL/script/stdin/shebang entrypoints. Unsupported syntax and APIs fail loudly with a
 diagnostic.
 
-Native Python modules use the erased value ABI and checked object views described in
-[`PYTHON_RUNTIME_MODEL.md`](PYTHON_RUNTIME_MODEL.md). The layout keeps module definitions small
-while routing allocation, recursion, and work through the interpreter's resource meter.
+Native Python modules use an erased value ABI, checked object views, declarative type/module tables,
+and narrow modeled capabilities. See [docs/python.md](docs/python.md) for the goals, value and
+object model, extension workflow, compatibility evidence, and explicit frontiers.
 
 The requested stdlib gate is 18/18 exact CPython 3.14 probes for these APIs: `sys.executable`,
 `os.getenv`, `collections.defaultdict`, `itertools.count`/`islice`, `heapq.heapify`/`heappop`,
@@ -180,9 +156,6 @@ explicitly. The 100-row TaskTrove mini corpus is differential-tested with per-ro
 supported, one async frontier), and one complete `build-system-task-ordering` solution matches
 CPython 3.14. CPU fuel, modeled memory, output, source/wrapper size, and nesting limits keep this
 general-purpose slice safe and deliberately slow.
-
-See [`PYTHON_3_14_PROPOSAL.md`](PYTHON_3_14_PROPOSAL.md) for the architecture, target extensions,
-module matrix, and validation plan.
 
 ## Library API
 
@@ -224,6 +197,8 @@ src/commands/system.rs simulated environment/system queries
 src/python/            Python 3.14 lexer, parser, bytecode compiler, and metered VM
 src/clock.rs           virtual clock
 src/net.rs             virtual route-table network
+docs/implementation.md architecture and command integration guide
+docs/python.md         Python goals, runtime model, and extension guide
 ```
 
 Run the unit and resource-invariant tests with `cargo test`.

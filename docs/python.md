@@ -1,0 +1,155 @@
+# Python in shellsim
+
+Shellsim implements a deterministic, resource-bounded Python 3.14 subset in Rust. Its purpose is
+to run ordinary Python embedded in agent tasks without granting access to host Python, native
+extensions, the host filesystem, processes, network, environment, locale, or clock. Compatibility
+is defined by accepted source behavior and differential tests. Unsupported syntax and APIs fail
+explicitly.
+
+The interpreter is intentionally not CPython-compatible at the ABI or bytecode level. It consumes
+Python source and uses shellsim-owned data structures throughout.
+
+## Execution pipeline
+
+`python`, `python3`, and `python3.14` all enter `src/python/mod.rs`. The supported entrypoints are
+`-c`, stdin, VFS script files and shebangs, the persistent shell-owned REPL, and the bounded
+`pytest` and `unittest` runners.
+
+```text
+source -> lexer -> AST parser -> semantic bytecode compiler -> metered stack VM
+                                                            |
+                                                            +-> native modules
+                                                            +-> shellsim VFS, clock, and environment
+```
+
+The lexer and parser are UTF-8 and indentation aware. The compiler emits a typed internal
+instruction enum rather than CPython opcodes. The VM charges CPU per instruction and bounds
+source size, nesting, calls, allocation, iteration, and output. Product code never delegates
+unsupported input to a host interpreter.
+
+Ordinary invocations receive fresh Python globals, modules, and heap state. Intended machine
+effects, such as VFS writes and resource consumption, persist in the surrounding `Environment`.
+The REPL is the explicit exception and retains its `ReplState` between shell actions.
+
+## Values and identity
+
+Every Python value crosses runtime and native-module boundaries as a 16-byte `PyValue`:
+
+```text
+PyValue { payload: u64, aux: [u8; 7], tag: ValueTag }
+
+ValueTag
+  None | Bool | Int | Float | SmallString
+  Object(ObjectId) | Native(closed interpreter handle)
+```
+
+`None`, booleans, bounded integers, floats, and UTF-8 strings up to fifteen bytes are immediate.
+Long strings, arbitrary-precision integers, mutable values, exceptions, classes, and other values
+requiring distinct identity live in the invocation arena. Each arena entry has a semantic
+`TypeId`, optional attributes, and a typed payload.
+
+Physical tags do not define Python types. `type_id(value)` maps immediate storage to canonical
+builtin types and arena values to the type in their object header. `PyKind` exists only to obtain a
+checked native view such as `PyNumber`, `PyString`, `PyList`, or `PyDict`.
+
+There is no separate identity field. Arena values use `ObjectId`; immediate values are canonical
+by representation, with floats compared by exact bits for identity. Container equality and
+membership check identity before equality, preserving reflexive behavior for a stored NaN.
+
+## Types, descriptors, and operators
+
+The runtime bootstraps canonical `object`, `type`, and builtin type objects. User types carry direct
+bases, a metered C3 MRO, a metaclass, attributes, layout, and cached protocol slots. Supported
+class construction includes metaclass selection, `__prepare__`, `type.__new__`, `__set_name__`,
+`__init_subclass__`, and metaclass `__init__` and `__call__`.
+
+Attribute lookup follows Python's descriptor order:
+
+1. data descriptors through the MRO;
+2. the instance dictionary;
+3. ordinary attributes and non-data descriptors through the MRO;
+4. descriptor binding through `__get__`;
+5. a missing-attribute result.
+
+Python functions, native methods, `property`, `staticmethod`, and `classmethod` use this path.
+Zero-argument `super()` uses the function's captured defining class and the receiver's C3 MRO.
+`int` subclasses have an integer instance layout while preserving their user-defined type.
+
+Important dunder methods populate cached slots for calls, construction, attributes, display,
+truth, iteration, arithmetic, comparison, and containment. Bytecode arithmetic asks the operand
+types for the appropriate slot. Numeric slots cast both erased operands to `PyNumber`, covering
+immediate integers, heap big integers, floats, booleans, and `int` subclass payloads without VM
+tag-specific arithmetic branches.
+
+## Native Python APIs
+
+Native functions and methods use one erased ABI:
+
+```rust
+fn(&mut dyn PyRuntime, CallArgs) -> PyResult<PyValue>
+fn(&mut dyn PyRuntime, PyValue, CallArgs) -> PyResult<PyValue>
+```
+
+Implementations immediately cast values to checked views and return structured `PyError` values.
+Mutable views take metered snapshots and commit only after an operation succeeds. They never hold
+arena borrows across allocation or Python calls.
+
+`ModuleDef`, `FunctionDef`, `ValueDef`, `NativeTypeDef`, and `MethodDef` provide declarative module
+and type tables. Most modules receive only `PyRuntime`. Narrow traits expose modeled state where
+required: `time` receives the virtual clock and `os` receives the simulated environment. A module
+must not inspect VM stacks, heap payload variants, or `Environment` directly.
+
+The current registry contains bounded slices of `argparse`, `bisect`, `collections`, `dataclasses`,
+`enum`, `functools`, `heapq`, `itertools`, `json`, `math`, `os`, `pytest`, `re`, `string`,
+`subprocess`, `sys`, `time`, `typing`, and `unittest`. `subprocess` is an importable fail-closed
+frontier and has no host process capability.
+
+## Supported behavior and frontiers
+
+The useful current language surface includes containers, arbitrary-precision integer arithmetic,
+control flow, functions, closures, defaults and `*args`, comprehensions, classes, inheritance,
+descriptors, constrained metaclasses, exceptions, context managers, decorators, f-strings,
+suspended generators, VFS imports, and common builtins. Basic string/list/dict/set APIs and
+`map`, `filter`, `reversed`, `getattr`, and `hasattr` use native descriptors or erased runtime
+protocols.
+
+Iterators are deliberately bounded. Some APIs that are lazy in CPython materialize a metered
+snapshot before returning an iterator. Generator expressions are currently eager, and generators
+cannot suspend across cleanup regions. These choices are deterministic and fail on resource
+limits, but their side-effect timing can differ from CPython.
+
+Other explicit frontiers include:
+
+- async functions, async iterators, async fixtures, and structural pattern matching;
+- generator `send`, `throw`, `close`, and `yield from`;
+- custom exception subclasses and complete attribute interception;
+- complete bytes/bytearray, slicing, deletion, hashing, and dict-view semantics;
+- `exec`, `eval`, `compile`, code objects, pickle, weak references, and garbage collection;
+- native extensions, arbitrary import hooks, host-backed modules, and full pytest/unittest.
+
+The checked stdlib probe set covers 18 named APIs, not entire modules. The TaskTrove mini corpus
+currently supports 99 of 100 checked cases, with async behavior as the recorded frontier. A
+portable CPython-basic sample passes 61 of 64 isolated behaviors; the remaining probes cover the
+three deeper object/generator items named above. Raw CPython `Lib/test` files are not a useful
+file-level target because they depend heavily on CPython's private test harness and internals.
+
+## Extending Python support
+
+For a native function or method:
+
+1. Add a `FunctionDef` or `MethodDef` in the relevant `src/python/stdlib` module.
+2. Accept and return only erased `PyValue` values at the boundary.
+3. Cast locally to checked views and call `PyRuntime` protocols for comparison, iteration,
+   attributes, calls, allocation, and mutation.
+4. Add the narrowest runtime operation only when several implementations need a semantic protocol;
+   do not expose heap representations.
+5. Charge work and reserve worst-case growth before host allocation or mutation.
+6. Return a structured Python error for invalid input and a resource error for exhaustion.
+7. Add a Python-source compatibility test that also runs on CPython, plus Rust tests for resource
+   stops or simulator-only state.
+
+For language behavior, keep parsing, compilation, and execution separate. Add syntax tests at the
+parser/compiler layer, semantic behavior through source fixtures, and an explicit rejection test
+for the unsupported edge. Any filesystem, process, clock, environment, or network requirement
+must be implemented against a narrow modeled capability before Python code can observe it.
+

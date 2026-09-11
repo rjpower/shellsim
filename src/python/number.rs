@@ -55,6 +55,64 @@ pub(super) fn as_f64(heap: &Heap, value: &PyValue) -> Option<f64> {
     }
 }
 
+/// Parse the textual forms accepted by the bounded `int` constructor.
+///
+/// The result remains decimal text so allocation and immediate-versus-bigint selection continue
+/// through [`PyRuntime::new_integer`]. Bases use Python's `0` autodetection or the range 2..=36.
+pub(super) fn parse_integer_text(text: &str, requested_base: i64) -> PyResult<String> {
+    if requested_base != 0 && !(2..=36).contains(&requested_base) {
+        return Err(PyError::value_error(
+            "int() base must be >= 2 and <= 36, or 0",
+        ));
+    }
+    let mut text = text.trim();
+    let negative = text.starts_with('-');
+    if text.starts_with(['-', '+']) {
+        text = &text[1..];
+    }
+    if text.is_empty() {
+        return Err(PyError::value_error("invalid literal for int()"));
+    }
+
+    let prefixed = text.len() >= 2 && text.as_bytes()[0] == b'0';
+    let prefix_base = if prefixed {
+        match text.as_bytes()[1].to_ascii_lowercase() {
+            b'x' => Some(16),
+            b'o' => Some(8),
+            b'b' => Some(2),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let base = if requested_base == 0 {
+        prefix_base.unwrap_or(10)
+    } else {
+        u32::try_from(requested_base).expect("validated positive base")
+    };
+    let had_prefix = prefix_base == Some(base);
+    if had_prefix {
+        text = &text[2..];
+    }
+    if text.is_empty()
+        || text.ends_with('_')
+        || text.contains("__")
+        || (text.starts_with('_') && !had_prefix)
+    {
+        return Err(PyError::value_error("invalid literal for int()"));
+    }
+    let digits = text.strip_prefix('_').unwrap_or(text).replace('_', "");
+    if digits.is_empty() || !digits.chars().all(|character| character.is_digit(base)) {
+        return Err(PyError::value_error("invalid literal for int()"));
+    }
+    let mut value = BigInt::parse_bytes(digits.as_bytes(), base)
+        .ok_or_else(|| PyError::value_error("invalid literal for int()"))?;
+    if negative {
+        value = -value;
+    }
+    Ok(value.to_string())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum PyNumber {
     Int(i64),
@@ -239,5 +297,21 @@ pub(super) fn runtime_repeat_count(
             .to_usize()
             .map(Some)
             .ok_or_else(|| PyError::overflow_error("sequence repeat is too large"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_integer_text;
+
+    #[test]
+    fn integer_text_parsing_handles_bases_signs_and_separators() {
+        assert_eq!(parse_integer_text("ff", 16).unwrap(), "255");
+        assert_eq!(parse_integer_text(" -0b1_010 ", 0).unwrap(), "-10");
+        assert_eq!(parse_integer_text("0x_ff", 16).unwrap(), "255");
+        assert!(parse_integer_text("10", 1).is_err());
+        assert!(parse_integer_text("_10", 10).is_err());
+        assert!(parse_integer_text("1__0", 10).is_err());
+        assert!(parse_integer_text("2", 2).is_err());
     }
 }

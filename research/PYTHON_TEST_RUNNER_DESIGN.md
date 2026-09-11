@@ -1,6 +1,6 @@
 # Minimal Python test-runner design
 
-This note narrows the `pytest`/`unittest` item in `PYTHON_3_14_PROPOSAL.md` to a safe,
+This historical note narrows the `pytest`/`unittest` design now summarized in `docs/python.md` to a safe,
 auditable compatibility runner. It is not a plan to embed upstream pytest, load plugins, or
 implement arbitrary test-framework reflection.
 

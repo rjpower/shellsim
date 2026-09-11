@@ -1,0 +1,144 @@
+# Shellsim implementation
+
+Shellsim is a deterministic in-process operating environment for evaluating agent-written shell
+and Python programs. It models useful behavior with Rust implementations and explicit state. It
+does not execute host commands or use the host filesystem as the simulated working environment.
+
+## Architecture
+
+An `Environment` owns all machine and session state:
+
+```text
+Environment
+  ProcessState     variables, arrays, functions, cwd, options, jobs, Python REPL
+  Vfs              files, directories, symlinks, metadata, disk quota
+  Timeline         monotonic/wall/process clocks and scheduled events
+  VirtualNet       deterministic route table and responses
+  Resources        CPU, memory, disk/output accounting and stop reason
+```
+
+Shell source flows through `src/shell.rs`, expansion in `src/expand.rs`, and the executor in
+`src/exec.rs`. The executor dispatches commands through `src/commands/mod.rs`. Commands receive a
+`CommandContext` plus explicit `Io`; unknown commands may resolve to executable scripts in the VFS
+and otherwise become recorded compatibility gaps. Python uses its own source pipeline described in
+[python.md](python.md) and shares only modeled environment capabilities.
+
+Reusing an `Environment` preserves the VFS, cwd, variables, functions, arrays, package markers,
+virtual time/network state, command history, Python REPL, and cumulative resource usage. `exit`,
+`set -e` termination, and CPU/memory/output exhaustion make the session terminal. Disk-full errors
+remain recoverable.
+
+## Simulation boundaries
+
+The VFS is the only filesystem visible to simulated code. Mutations are quota-atomic, deletion
+releases capacity, and the environment supplies virtual wall timestamps. Commands and Python code
+must never fall through to `std::fs`, `std::process`, host environment variables, host networking,
+or host time.
+
+Time has three domains:
+
+| Domain | Source | Use |
+|---|---|---|
+| Monotonic | nanoseconds since environment creation | sleeps, deadlines, causal ordering |
+| Wall | fixed UTC epoch + monotonic + explicit adjustment | `date`, Python time, VFS timestamps |
+| Process CPU | deterministic CPU fuel at 1 microsecond per unit | accounting APIs |
+
+Wall adjustments cannot move monotonic deadlines. CPU work consumes no virtual wall time unless an
+operation explicitly models latency. Blocking advances directly to the next event rather than
+sleeping a host thread. Equal-time events use insertion order. Background jobs still execute
+synchronously, so independent sleeps do not yet overlap.
+
+Native compilation is outside the model. Compilers and build tools are recorded `NoOp` commands:
+pretending to compile can keep a setup script moving, but no executable artifact is produced.
+Running arbitrary emitted machine code would bypass every modeled capability and resource boundary.
+A future `make` subset may safely execute shell-only recipes through the existing interpreter.
+
+## Resource accounting
+
+The resource model is deterministic and approximate:
+
+- CPU is monotonic fuel charged for parsing, dispatch, bytecode, input/output, and algorithms.
+- Memory is a modeled working set; command-frame reservations are released when the frame returns.
+- Disk is current logical VFS content plus fixed node overhead and is enforced inside `Vfs`.
+- Output is a hard cap on materialized stdout and stderr.
+
+Use checked or saturating arithmetic for sizes derived from simulated input. Reserve a conservative
+result bound before constructing or mutating large host data structures, and charge loops before
+unbounded work. Resource exhaustion returns status 137 with a typed `StopReason`; it must not leave
+partially committed VFS or collection state.
+
+Every registered command has coarse base CPU and memory costs. Dynamic implementations add charges
+for their actual input and algorithms. Nested dispatch tracks output already charged by children so
+the parent does not double-count it.
+
+## Commands and trust
+
+Commands have the uniform signature:
+
+```rust
+fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
+```
+
+`args` excludes `argv[0]`; stdin is owned input and stdout/stderr are explicit buffers. The central
+registry assigns each name a function, base costs, and a trust level:
+
+- `Real`: the supported behavior is intended to be faithful;
+- `Partial`: a documented subset such as `sed`, `jq`, or a package facade;
+- `NoOp`: pretend-success compatibility with no claimed effect, recorded as unsupported.
+
+Trust is observable telemetry. Do not mark a partial tool `Real`, silently ignore unsupported
+options, or invoke a host binary to fill a gap.
+
+## Adding or extending a tool
+
+1. Read the closest command module and its integration tests. Choose an existing behavioral module
+   or create a focused file under `src/commands/` with a `//!` overview.
+2. Implement the `CmdFn` using only `CommandContext`, `Io`, VFS operations, virtual time/network,
+   and nested shellsim dispatch. Never use ambient host capabilities.
+3. Register all supported names in the module's `register` function with an honest `Trust` level.
+   Add the module to `src/commands/mod.rs` when it is new.
+4. Validate options and operands explicitly. Unsupported behavior should return a useful status and
+   record the gap rather than producing a plausible but incorrect result.
+5. Charge dynamic CPU and reserve memory before reading, expanding, sorting, parsing, or producing
+   unbounded data. Let VFS primitives enforce disk capacity atomically.
+6. Put small parsing/algorithm invariants beside the implementation. Add integration tests for
+   stdout, stderr, status, persistent state, malformed input, exhaustion, and the unsupported edge.
+   Use a reference differential when the behavior is deterministic.
+
+When a tool needs a new machine capability, add it to `Environment` as modeled state with a narrow
+interface and deterministic tests first. A convenience abstraction is not authorization to expose
+the corresponding host facility.
+
+## Repository map
+
+```text
+src/interp.rs          Environment and persistent ProcessState
+src/resources.rs       limits, accounting, outcomes, command telemetry
+src/vfs.rs             quota-enforced in-memory filesystem
+src/clock.rs           virtual clocks and bounded event queue
+src/net.rs             virtual route-table network
+src/shell.rs           shell lexer/parser and capture API
+src/expand.rs          shell word and parameter expansion
+src/exec.rs            metered shell executor and control flow
+src/commands/          command registry and native implementations
+src/python/            Python lexer, parser, compiler, object model, VM, and stdlib
+tests/                 cross-module, differential, resource, and acceptance behavior
+tests/fixtures/        checked shell/Python inputs and expected outputs
+research/              inventories and historical design evidence
+```
+
+## Validation
+
+Use a narrow test while iterating. Before committing, run:
+
+```sh
+./infra/pre-commit.py --all-files --fix
+./infra/pre-commit.py --all-files
+./infra/ci/run_tests.py
+```
+
+Tests must not depend on host elapsed time, locale, network, filesystem contents, or unordered map
+iteration. Compatibility tests should prefer semantic assertions; exact checked output is
+appropriate when formatting is the contract. Never weaken a lint, skip a test, or rewrite a
+differential fixture merely to make a gate pass.
+

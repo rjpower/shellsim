@@ -4,6 +4,9 @@ Shellsim accepts focused changes that improve a concrete simulated behavior, clo
 compatibility gap, or strengthen a safety boundary. Please open an issue before a broad redesign
 or a speculative refactor.
 
+Read [docs/implementation.md](docs/implementation.md) before adding a command or machine capability,
+and [docs/python.md](docs/python.md) before changing the Python runtime or native modules.
+
 This workflow adapts the contribution discipline used by
 [Marin](https://github.com/marin-community/marin/blob/main/docs/dev-guide/contributing.md) and its
 [engineering guidelines](https://github.com/marin-community/marin/blob/main/docs/explanations/guidelines.md)

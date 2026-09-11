@@ -691,6 +691,9 @@ impl<'a> Vm<'a> {
                 if let Some(builtin_type) = builtin_type {
                     return Some(Value::Native(NativeValue::BuiltinType(builtin_type)));
                 }
+                if let Some(function) = super::stdlib::core::builtin_function(name) {
+                    return Some(Value::Native(NativeValue::NativeFunction(function)));
+                }
                 let builtin = match name {
                     "print" => Builtin::Print,
                     "exit" | "quit" => Builtin::Exit,
@@ -910,16 +913,25 @@ impl<'a> Vm<'a> {
 
     fn load_attribute(&mut self, name: &str) -> Result<(), String> {
         let owner = self.pop()?;
+        let value = self
+            .resolve_attribute(owner, name)?
+            .ok_or_else(|| format!("attribute {name:?} is not implemented"))?;
+        self.stack.push(value);
+        Ok(())
+    }
+
+    /// Resolve one attribute without involving the operand stack.
+    ///
+    /// Missing attributes return `None`; errors raised while invoking descriptors remain errors.
+    /// This distinction lets `getattr` and `hasattr` share the bytecode lookup path.
+    fn resolve_attribute(&mut self, owner: Value, name: &str) -> Result<Option<Value>, String> {
         if let Some(NativeValue::Module(module)) = owner.native_value() {
             if let Some(function) = module.function(name) {
-                self.stack
-                    .push(Value::Native(NativeValue::NativeFunction(function)));
-                return Ok(());
+                return Ok(Some(Value::Native(NativeValue::NativeFunction(function))));
             }
             if let Some(value) = module.value(name) {
                 let value = value.get(self).map_err(|error| error.to_string())?;
-                self.stack.push(value);
-                return Ok(());
+                return Ok(Some(value));
             }
         }
         let owner_type = self.type_id(&owner)?;
@@ -933,29 +945,19 @@ impl<'a> Vm<'a> {
             })
         {
             if method.name == "__new__" {
-                self.stack
-                    .push(Value::Native(NativeValue::NativeMethod(method)));
-                return Ok(());
+                return Ok(Some(Value::Native(NativeValue::NativeMethod(method))));
             }
             let bound = self.allocate_object(Object::DescriptorBoundMethod {
                 receiver: owner,
                 descriptor: Value::Native(NativeValue::NativeMethod(method)),
                 owner: None,
             })?;
-            self.stack.push(bound);
-            return Ok(());
+            return Ok(Some(bound));
         }
         if let Some(id) = owner.object_id() {
             match self.state.heap.get(id)?.clone() {
                 Object::Module { scope, .. } => {
-                    let value = self
-                        .state
-                        .heap
-                        .scope_get(scope, name)
-                        .cloned()
-                        .ok_or_else(|| format!("module has no attribute {name:?}"))?;
-                    self.stack.push(value);
-                    return Ok(());
+                    return Ok(self.state.heap.scope_get(scope, name).copied());
                 }
                 Object::Class { .. } => {
                     let mut entry = self.class_attribute_entry(id, name)?;
@@ -968,11 +970,11 @@ impl<'a> Vm<'a> {
                             entry = self.class_attribute_entry(metaclass, name)?;
                         }
                     }
-                    let (defining_class, descriptor) =
-                        entry.ok_or_else(|| format!("class has no attribute {name:?}"))?;
+                    let Some((defining_class, descriptor)) = entry else {
+                        return Ok(None);
+                    };
                     let value = self.bind_descriptor(descriptor, None, id, defining_class)?;
-                    self.stack.push(value);
-                    return Ok(());
+                    return Ok(Some(value));
                 }
                 Object::EnumMember {
                     name: member_name,
@@ -981,10 +983,9 @@ impl<'a> Vm<'a> {
                     let value = match name {
                         "name" => self.allocate_string(member_name)?,
                         "value" => value,
-                        _ => return Err(format!("enum member has no attribute {name:?}")),
+                        _ => return Ok(None),
                     };
-                    self.stack.push(value);
-                    return Ok(());
+                    return Ok(Some(value));
                 }
                 Object::Instance { class, .. } => {
                     let class_entry = self.class_attribute_entry(class, name)?;
@@ -996,8 +997,7 @@ impl<'a> Vm<'a> {
                                 class,
                                 defining_class,
                             )?;
-                            self.stack.push(value);
-                            return Ok(());
+                            return Ok(Some(value));
                         }
                     }
                     let instance = owner
@@ -1007,15 +1007,14 @@ impl<'a> Vm<'a> {
                         .attribute(self, name)
                         .map_err(|error| error.to_string())?
                     {
-                        self.stack.push(value);
-                        return Ok(());
+                        return Ok(Some(value));
                     }
-                    let (defining_class, descriptor) =
-                        class_entry.ok_or_else(|| format!("instance has no attribute {name:?}"))?;
+                    let Some((defining_class, descriptor)) = class_entry else {
+                        return Ok(None);
+                    };
                     let value =
                         self.bind_descriptor(descriptor, Some(owner), class, defining_class)?;
-                    self.stack.push(value);
-                    return Ok(());
+                    return Ok(Some(value));
                 }
                 Object::Super {
                     start_class,
@@ -1029,25 +1028,21 @@ impl<'a> Vm<'a> {
                         accessed_class,
                         defining_class,
                     )?;
-                    self.stack.push(value);
-                    return Ok(());
+                    return Ok(Some(value));
                 }
                 Object::Match { .. } => {}
                 Object::ArgumentParser { prog, .. } => {
                     if name == "prog" {
                         let prog = self.allocate_string(prog)?;
-                        self.stack.push(prog);
-                        return Ok(());
+                        return Ok(Some(prog));
                     }
                 }
                 Object::Namespace { values } => {
                     let value = values
                         .iter()
                         .find(|(key, _)| key == name)
-                        .map(|(_, value)| *value)
-                        .ok_or_else(|| format!("namespace has no attribute {name:?}"))?;
-                    self.stack.push(value);
-                    return Ok(());
+                        .map(|(_, value)| *value);
+                    return Ok(value);
                 }
                 _ => {}
             }
@@ -1055,12 +1050,11 @@ impl<'a> Vm<'a> {
         let value = if matches!(owner.native_value(), Some(NativeValue::UnitTestBase))
             && name == "__name__"
         {
-            self.allocate_string("TestCase".into())?
+            Some(self.allocate_string("TestCase".into())?)
         } else {
-            return Err(format!("attribute {name:?} is not implemented"));
+            None
         };
-        self.stack.push(value);
-        Ok(())
+        Ok(value)
     }
 
     fn store_attribute(&mut self, owner: Value, name: &str, value: Value) -> Result<(), String> {
@@ -2168,15 +2162,45 @@ impl<'a> Vm<'a> {
                 })
             }
             BuiltinType::Int => {
-                expect_arity(&arguments, 0, 1)?;
-                match arguments.first() {
-                    None => Value::Int(0),
-                    Some(value) if self.is_bigint(value)? => *value,
-                    Some(value) => Value::Int(
-                        protocol::int_value(&self.state.heap, value)
-                            .or_else(|| value.as_int())
-                            .ok_or("int() argument is not supported")?,
-                    ),
+                expect_arity(&arguments, 0, 2)?;
+                if let Some(base) = arguments.get(1) {
+                    let base = protocol::int_value(&self.state.heap, base).ok_or_else(|| {
+                        self.record_native_error(PyError::type_error(
+                            "int() base must be an integer",
+                        ))
+                    })?;
+                    let text = protocol::string_value(&self.state.heap, &arguments[0])?
+                        .ok_or_else(|| {
+                            self.record_native_error(PyError::type_error(
+                                "int() can't convert non-string with explicit base",
+                            ))
+                        })?;
+                    self.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
+                    let decimal = super::number::parse_integer_text(&text, base)
+                        .map_err(|error| self.record_native_error(error))?;
+                    self.new_integer(&decimal)
+                        .map_err(|error| self.record_native_error(error))?
+                } else {
+                    match arguments.first() {
+                        None => Value::Int(0),
+                        Some(value) if self.is_bigint(value)? => *value,
+                        Some(value)
+                            if protocol::string_value(&self.state.heap, value)?.is_some() =>
+                        {
+                            let text =
+                                protocol::string_value(&self.state.heap, value)?.expect("guarded");
+                            self.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
+                            let decimal = super::number::parse_integer_text(&text, 10)
+                                .map_err(|error| self.record_native_error(error))?;
+                            self.new_integer(&decimal)
+                                .map_err(|error| self.record_native_error(error))?
+                        }
+                        Some(value) => Value::Int(
+                            protocol::int_value(&self.state.heap, value)
+                                .or_else(|| value.as_int())
+                                .ok_or("int() argument is not supported")?,
+                        ),
+                    }
                 }
             }
             BuiltinType::Float => {
@@ -4314,6 +4338,11 @@ impl PyRuntime for Vm<'_> {
             .map_err(PyError::type_error)
     }
 
+    fn get_attribute(&mut self, value: Value, name: &str) -> PyResult<Option<Value>> {
+        self.resolve_attribute(value, name)
+            .map_err(PyError::runtime_error)
+    }
+
     fn list_items(&mut self, list: PyList) -> PyResult<Vec<Value>> {
         let id = list.object_id();
         let length = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
@@ -4709,6 +4738,10 @@ impl PyRuntime for Vm<'_> {
 
     fn new_dict(&mut self, items: Vec<(Value, Value)>) -> PyResult<Value> {
         Vm::allocate_object(self, Object::Dict(items)).map_err(PyError::resource_error)
+    }
+
+    fn new_set(&mut self, items: Vec<Value>) -> PyResult<Value> {
+        Vm::allocate_object(self, Object::Set(items)).map_err(PyError::resource_error)
     }
 
     fn new_integer(&mut self, decimal: &str) -> PyResult<Value> {

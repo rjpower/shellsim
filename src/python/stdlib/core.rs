@@ -8,9 +8,33 @@ use std::cmp::Ordering;
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, MethodDef, NativeTypeDef, PyDict, PyError, PyKind, PyList, PyProperty, PyResult,
-    PyRuntime, PySequence, PySet, PyString, PyValue, PyValueCast,
+    CallArgs, FunctionDef, MethodDef, NativeTypeDef, PyCallable, PyDict, PyError, PyKind, PyList,
+    PyProperty, PyResult, PyRuntime, PySequence, PySet, PyString, PyValue, PyValueCast,
 };
+
+static BUILTINS: &[FunctionDef] = &[
+    builtin("map", builtin_map),
+    builtin("filter", builtin_filter),
+    builtin("reversed", builtin_reversed),
+    builtin("getattr", builtin_getattr),
+    builtin("hasattr", builtin_hasattr),
+];
+
+/// Resolve capability-free builtins implemented through the erased runtime API.
+pub(crate) fn builtin_function(name: &str) -> Option<&'static FunctionDef> {
+    BUILTINS.iter().find(|function| function.name == name)
+}
+
+const fn builtin(
+    name: &'static str,
+    call: fn(&mut dyn PyRuntime, CallArgs) -> PyResult,
+) -> FunctionDef {
+    FunctionDef {
+        module: "builtins",
+        name,
+        call,
+    }
+}
 
 pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
     name: "str",
@@ -21,6 +45,9 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "startswith", string_startswith),
         method("str", "endswith", string_endswith),
         method("str", "split", string_split),
+        method("str", "join", string_join),
+        method("str", "replace", string_replace),
+        method("str", "format", string_format),
     ],
 };
 
@@ -31,6 +58,9 @@ pub(crate) static LIST_TYPE: NativeTypeDef = NativeTypeDef {
         method("list", "extend", list_extend),
         method("list", "pop", list_pop),
         method("list", "remove", list_remove),
+        method("list", "reverse", list_reverse),
+        method("list", "count", list_count),
+        method("list", "index", list_index),
         method("list", "sort", list_sort),
     ],
 };
@@ -43,6 +73,8 @@ pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
         method("dict", "values", dict_values),
         method("dict", "items", dict_items),
         method("dict", "setdefault", dict_setdefault),
+        method("dict", "update", dict_update),
+        method("dict", "pop", dict_pop),
     ],
 };
 
@@ -53,6 +85,7 @@ pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
         method("set", "update", set_update),
         method("set", "remove", set_remove),
         method("set", "discard", set_discard),
+        method("set", "union", set_union),
     ],
 };
 
@@ -182,6 +215,141 @@ fn string_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     runtime.new_list(values)
 }
 
+fn string_join(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.join", 1, 1)?;
+    args.reject_keywords("str.join")?;
+    let PyString(separator) = receiver.cast(runtime)?;
+    let iterator = runtime.iterator(args.positional()[0])?;
+    let mut parts = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(value) = runtime.iterator_next(iterator)? {
+        runtime.charge_cpu(1)?;
+        let PyString(value) = value.cast(runtime)?;
+        bytes = bytes
+            .checked_add(value.len())
+            .ok_or_else(|| PyError::resource_error("joined string is too large"))?;
+        parts.push(value);
+    }
+    bytes = bytes
+        .checked_add(
+            separator
+                .len()
+                .saturating_mul(parts.len().saturating_sub(1)),
+        )
+        .ok_or_else(|| PyError::resource_error("joined string is too large"))?;
+    runtime.reserve_memory(bytes)?;
+    runtime.charge_cpu(u64::try_from(bytes).unwrap_or(u64::MAX))?;
+    runtime.new_string(parts.join(&separator))
+}
+
+fn string_replace(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.replace", 2, 3)?;
+    args.reject_keywords("str.replace")?;
+    let PyString(value) = receiver.cast(runtime)?;
+    let PyString(old) = args.positional()[0].cast(runtime)?;
+    let PyString(new) = args.positional()[1].cast(runtime)?;
+    let count = args.positional().get(2).map_or(Ok(None), |value| {
+        runtime
+            .int_value(value)
+            .ok_or_else(|| PyError::type_error("replace count must be an integer"))
+            .map(|value| usize::try_from(value).ok())
+    })?;
+    let possible = if old.is_empty() {
+        value.chars().count().saturating_add(1)
+    } else {
+        value.matches(&old).count()
+    };
+    let replacements = count.map_or(possible, |count| count.min(possible));
+    let growth = new.len().saturating_sub(old.len());
+    let bound = value
+        .len()
+        .checked_add(growth.saturating_mul(replacements))
+        .ok_or_else(|| PyError::resource_error("replacement string is too large"))?;
+    runtime.reserve_memory(bound)?;
+    runtime.charge_cpu(u64::try_from(bound).unwrap_or(u64::MAX))?;
+    let result = match count {
+        Some(count) => value.replacen(&old, &new, count),
+        None => value.replace(&old, &new),
+    };
+    runtime.new_string(result)
+}
+
+fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let PyString(template) = receiver.cast(runtime)?;
+    let mut result = String::new();
+    let mut characters = template.chars().peekable();
+    let mut automatic = 0usize;
+    let mut used_automatic = false;
+    let mut used_manual_index = false;
+    while let Some(character) = characters.next() {
+        runtime.charge_cpu(1)?;
+        match character {
+            '{' if characters.peek() == Some(&'{') => {
+                characters.next();
+                result.push('{');
+            }
+            '}' if characters.peek() == Some(&'}') => {
+                characters.next();
+                result.push('}');
+            }
+            '{' => {
+                let mut field = String::new();
+                loop {
+                    match characters.next() {
+                        Some('}') => break,
+                        Some('{') | None => {
+                            return Err(PyError::value_error("unmatched '{' in format string"))
+                        }
+                        Some(character) => field.push(character),
+                    }
+                }
+                if field.contains(['!', ':']) {
+                    return Err(PyError::value_error(
+                        "format conversions and specifications are not implemented",
+                    ));
+                }
+                let value = if field.is_empty() {
+                    if used_manual_index {
+                        return Err(PyError::value_error(
+                            "cannot switch from manual field specification to automatic field numbering",
+                        ));
+                    }
+                    used_automatic = true;
+                    let value = args
+                        .positional()
+                        .get(automatic)
+                        .ok_or_else(|| PyError::value_error("replacement index out of range"))?;
+                    automatic = automatic.saturating_add(1);
+                    *value
+                } else if let Ok(index) = field.parse::<usize>() {
+                    if used_automatic {
+                        return Err(PyError::value_error(
+                            "cannot switch from automatic field numbering to manual field specification",
+                        ));
+                    }
+                    used_manual_index = true;
+                    *args
+                        .positional()
+                        .get(index)
+                        .ok_or_else(|| PyError::value_error("replacement index out of range"))?
+                } else {
+                    *args
+                        .keywords()
+                        .iter()
+                        .find(|(name, _)| name == &field)
+                        .map(|(_, value)| value)
+                        .ok_or_else(|| PyError::exception("KeyError", field.clone()))?
+                };
+                result.push_str(&runtime.display(&value)?);
+            }
+            '}' => return Err(PyError::value_error("single '}' in format string")),
+            character => result.push(character),
+        }
+    }
+    runtime.reserve_memory(result.len())?;
+    runtime.new_string(result)
+}
+
 fn split_text(value: &str, separator: Option<&str>, maximum: Option<i64>) -> Vec<String> {
     let unlimited = maximum.is_none_or(|maximum| maximum < 0);
     let limit = maximum
@@ -282,6 +450,64 @@ fn list_remove(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     values.remove(position);
     runtime.replace_list_items(list, values)?;
     Ok(Value::None)
+}
+
+fn list_reverse(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("list.reverse", 0, 0)?;
+    args.reject_keywords("list.reverse")?;
+    let list = receiver.cast::<PyList>(runtime)?;
+    let mut values = list.items(runtime)?;
+    runtime.charge_cpu(u64::try_from(values.len()).unwrap_or(u64::MAX))?;
+    values.reverse();
+    runtime.replace_list_items(list, values)?;
+    Ok(Value::None)
+}
+
+fn list_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("list.count", 1, 1)?;
+    args.reject_keywords("list.count")?;
+    let values = receiver.cast::<PyList>(runtime)?.items(runtime)?;
+    let mut count = 0i64;
+    for value in values {
+        runtime.charge_cpu(1)?;
+        if runtime.equals(&value, &args.positional()[0])? {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| PyError::overflow_error("list is too large"))?;
+        }
+    }
+    Ok(Value::Int(count))
+}
+
+fn list_index(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("list.index", 1, 3)?;
+    args.reject_keywords("list.index")?;
+    let values = receiver.cast::<PyList>(runtime)?.items(runtime)?;
+    let length =
+        i64::try_from(values.len()).map_err(|_| PyError::overflow_error("list too large"))?;
+    let endpoint = |value: Option<&PyValue>, default: i64| -> PyResult<i64> {
+        value.map_or(Ok(default), |value| {
+            runtime
+                .int_value(value)
+                .ok_or_else(|| PyError::type_error("slice index must be an integer"))
+        })
+    };
+    let normalize = |value: i64| {
+        if value < 0 {
+            length.saturating_add(value).max(0)
+        } else {
+            value.min(length)
+        }
+    };
+    let start = normalize(endpoint(args.positional().get(1), 0)?);
+    let stop = normalize(endpoint(args.positional().get(2), length)?);
+    for index in start..stop {
+        runtime.charge_cpu(1)?;
+        if runtime.equals(&values[index as usize], &args.positional()[0])? {
+            return Ok(Value::Int(index));
+        }
+    }
+    Err(PyError::value_error("list.index(x): x not in list"))
 }
 
 fn list_sort(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -408,6 +634,58 @@ fn dict_projection(
     runtime.new_list(values)
 }
 
+fn dict_update(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.update", 0, 1)?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    let mut entries = dict.items(runtime)?;
+    let mut additions = Vec::new();
+    if let Some(source) = args.positional().first() {
+        if runtime.kind(source)? == PyKind::Dict {
+            additions.extend(source.cast::<PyDict>(runtime)?.items(runtime)?);
+        } else {
+            let iterator = runtime.iterator(*source)?;
+            while let Some(item) = runtime.iterator_next(iterator)? {
+                let pair = item.cast::<PySequence>(runtime)?.items(runtime)?;
+                if pair.len() != 2 {
+                    return Err(PyError::value_error(
+                        "dictionary update sequence element has length other than 2",
+                    ));
+                }
+                additions.push((pair[0], pair[1]));
+            }
+        }
+    }
+    for (name, value) in args.keywords() {
+        additions.push((runtime.new_string(name.clone())?, *value));
+    }
+    for (key, value) in additions {
+        if let Some(position) = find_entry(runtime, &entries, &key)? {
+            entries[position].1 = value;
+        } else {
+            runtime.reserve_memory(96)?;
+            entries.push((key, value));
+        }
+    }
+    runtime.replace_dict_items(dict, entries)?;
+    Ok(Value::None)
+}
+
+fn dict_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.pop", 1, 2)?;
+    args.reject_keywords("dict.pop")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    let mut entries = dict.items(runtime)?;
+    if let Some(position) = find_entry(runtime, &entries, &args.positional()[0])? {
+        let (_, value) = entries.remove(position);
+        runtime.replace_dict_items(dict, entries)?;
+        return Ok(value);
+    }
+    if let Some(default) = args.positional().get(1) {
+        return Ok(*default);
+    }
+    Err(PyError::exception("KeyError", "key not found"))
+}
+
 fn set_add(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     set_modify(runtime, receiver, args, SetOperation::Add)
 }
@@ -476,6 +754,118 @@ fn set_modify(
     }
     runtime.replace_set_items(set, values)?;
     Ok(Value::None)
+}
+
+fn set_union(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("set.union")?;
+    let mut values = receiver.cast::<PySet>(runtime)?.items(runtime)?;
+    for source in args.positional() {
+        let iterator = runtime.iterator(*source)?;
+        while let Some(value) = runtime.iterator_next(iterator)? {
+            let mut present = false;
+            for candidate in &values {
+                runtime.charge_cpu(1)?;
+                if runtime.equals(candidate, &value)? {
+                    present = true;
+                    break;
+                }
+            }
+            if !present {
+                runtime.reserve_memory(64)?;
+                values.push(value);
+            }
+        }
+    }
+    runtime.new_set(values)
+}
+
+fn builtin_map(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("map", 2, usize::MAX)?;
+    args.reject_keywords("map")?;
+    let function = args.positional()[0].cast::<PyCallable>(runtime)?;
+    let mut iterators = Vec::new();
+    for value in &args.positional()[1..] {
+        iterators.push(runtime.iterator(*value)?);
+    }
+    let mut result = Vec::new();
+    loop {
+        let mut values = Vec::with_capacity(iterators.len());
+        for iterator in &iterators {
+            let Some(value) = runtime.iterator_next(*iterator)? else {
+                return runtime.new_iterator(result);
+            };
+            values.push(value);
+        }
+        runtime.reserve_memory(64)?;
+        result.push(
+            function
+                .clone()
+                .call(runtime, CallArgs::new(values, Vec::new()))?,
+        );
+    }
+}
+
+fn builtin_filter(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("filter", 2, 2)?;
+    args.reject_keywords("filter")?;
+    let predicate = (runtime.kind(&args.positional()[0])? != PyKind::None)
+        .then(|| args.positional()[0].cast::<PyCallable>(runtime))
+        .transpose()?;
+    let iterator = runtime.iterator(args.positional()[1])?;
+    let mut result = Vec::new();
+    while let Some(value) = runtime.iterator_next(iterator)? {
+        let selected = match &predicate {
+            Some(predicate) => {
+                let result = predicate
+                    .clone()
+                    .call(runtime, CallArgs::new(vec![value], Vec::new()))?;
+                runtime.truth(&result)?
+            }
+            None => runtime.truth(&value)?,
+        };
+        if selected {
+            runtime.reserve_memory(64)?;
+            result.push(value);
+        }
+    }
+    runtime.new_iterator(result)
+}
+
+fn builtin_reversed(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("reversed", 1, 1)?;
+    args.reject_keywords("reversed")?;
+    let iterator = runtime.iterator(args.positional()[0])?;
+    let mut values = Vec::new();
+    while let Some(value) = runtime.iterator_next(iterator)? {
+        runtime.reserve_memory(64)?;
+        values.push(value);
+    }
+    runtime.charge_cpu(u64::try_from(values.len()).unwrap_or(u64::MAX))?;
+    values.reverse();
+    runtime.new_iterator(values)
+}
+
+fn builtin_getattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("getattr", 2, 3)?;
+    args.reject_keywords("getattr")?;
+    let PyString(name) = args.positional()[1].cast(runtime)?;
+    match runtime.get_attribute(args.positional()[0], &name)? {
+        Some(value) => Ok(value),
+        None => args.positional().get(2).copied().ok_or_else(|| {
+            PyError::exception("AttributeError", format!("attribute {name:?} not found"))
+        }),
+    }
+}
+
+fn builtin_hasattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("hasattr", 2, 2)?;
+    args.reject_keywords("hasattr")?;
+    let PyString(name) = args.positional()[1].cast(runtime)?;
+    Ok(Value::Bool(
+        runtime
+            .get_attribute(args.positional()[0], &name)?
+            .is_some(),
+    ))
 }
 
 fn property_setter(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

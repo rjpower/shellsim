@@ -142,3 +142,18 @@ fn arbitrary_precision_arithmetic_is_metered_before_growth() {
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn string_join_reserves_its_result_before_host_growth() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "separator = 'x' * 1000\nseparator.join(['a'] * 200)",
+        Limits {
+            memory: 40 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 40 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
