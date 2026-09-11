@@ -1,5 +1,8 @@
 //! A small UTF-8-aware lexer. It owns Python escape handling rather than reusing shell rules.
 
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
+
 use super::source::Span;
 use super::token::{Token, TokenKind};
 
@@ -91,12 +94,28 @@ impl<'a> Lexer<'a> {
                         TokenKind::Minus
                     }
                 }
-                '*' => self.single(TokenKind::Star),
-                '%' => self.single(TokenKind::Percent),
-                '&' => self.single(TokenKind::Ampersand),
-                '^' => self.single(TokenKind::Caret),
+                '*' => {
+                    self.bump();
+                    if self.peek() == Some('*') {
+                        self.bump();
+                        if self.peek() == Some('=') {
+                            self.bump();
+                            TokenKind::DoubleStarEqual
+                        } else {
+                            TokenKind::DoubleStar
+                        }
+                    } else if self.peek() == Some('=') {
+                        self.bump();
+                        TokenKind::StarEqual
+                    } else {
+                        TokenKind::Star
+                    }
+                }
+                '%' => self.either('=', TokenKind::PercentEqual, TokenKind::Percent),
+                '&' => self.either('=', TokenKind::AmpersandEqual, TokenKind::Ampersand),
+                '^' => self.either('=', TokenKind::CaretEqual, TokenKind::Caret),
                 '~' => self.single(TokenKind::Tilde),
-                '|' => self.single(TokenKind::Pipe),
+                '|' => self.either('=', TokenKind::PipeEqual, TokenKind::Pipe),
                 '\\' if self.source[self.offset..].starts_with("\\\n") => {
                     self.bump();
                     self.bump();
@@ -132,7 +151,15 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     if self.peek() == Some('/') {
                         self.bump();
-                        TokenKind::DoubleSlash
+                        if self.peek() == Some('=') {
+                            self.bump();
+                            TokenKind::DoubleSlashEqual
+                        } else {
+                            TokenKind::DoubleSlash
+                        }
+                    } else if self.peek() == Some('=') {
+                        self.bump();
+                        TokenKind::SlashEqual
                     } else {
                         TokenKind::Slash
                     }
@@ -201,6 +228,7 @@ impl<'a> Lexer<'a> {
             "return" => TokenKind::Return,
             "break" => TokenKind::Break,
             "continue" => TokenKind::Continue,
+            "global" => TokenKind::Global,
             "nonlocal" => TokenKind::Nonlocal,
             "pass" => TokenKind::Pass,
             "assert" => TokenKind::Assert,
@@ -221,6 +249,14 @@ impl<'a> Lexer<'a> {
     fn number(&mut self, start: Span, leading_dot: bool) -> Result<TokenKind, LexError> {
         let offset = self.offset;
         let mut is_float = leading_dot;
+
+        if !leading_dot && self.peek() == Some('0') {
+            if let Some(prefix @ ('x' | 'X' | 'o' | 'O' | 'b' | 'B')) =
+                self.source[self.offset..].chars().nth(1)
+            {
+                return self.radix_integer(start, prefix);
+            }
+        }
 
         if leading_dot {
             self.bump(); // '.'
@@ -266,6 +302,42 @@ impl<'a> Lexer<'a> {
                 .map(TokenKind::Integer)
                 .unwrap_or_else(|_| TokenKind::BigInteger(spelling)))
         }
+    }
+
+    fn radix_integer(&mut self, start: Span, prefix: char) -> Result<TokenKind, LexError> {
+        let radix = match prefix.to_ascii_lowercase() {
+            'x' => 16,
+            'o' => 8,
+            'b' => 2,
+            _ => unreachable!("validated radix prefix"),
+        };
+        self.bump();
+        self.bump();
+        let digits_start = self.offset;
+        while self
+            .peek()
+            .is_some_and(|character| character == '_' || character.is_digit(radix))
+        {
+            self.bump();
+        }
+        let spelling = &self.source[digits_start..self.offset];
+        if spelling.is_empty()
+            || spelling == "_"
+            || spelling.ends_with('_')
+            || spelling.contains("__")
+        {
+            return Err(self.error(start, "invalid prefixed integer literal"));
+        }
+        let digits = spelling
+            .strip_prefix('_')
+            .unwrap_or(spelling)
+            .replace('_', "");
+        let value = BigInt::parse_bytes(digits.as_bytes(), radix)
+            .ok_or_else(|| self.error(start, "invalid prefixed integer literal"))?;
+        Ok(value
+            .to_i64()
+            .map(TokenKind::Integer)
+            .unwrap_or_else(|| TokenKind::BigInteger(value.to_string())))
     }
 
     /// Consume one run of decimal digits and separators.  Return whether at
@@ -574,6 +646,20 @@ mod tests {
             tokens[0].kind,
             TokenKind::BigInteger("999999999999999999999999999999".into())
         );
+    }
+
+    #[test]
+    fn prefixed_integer_literals_are_normalized_to_decimal_values() {
+        let tokens = lex("0xff 0o20 0b1_010 0x8000000000000000").unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::Integer(255)));
+        assert!(matches!(tokens[1].kind, TokenKind::Integer(16)));
+        assert!(matches!(tokens[2].kind, TokenKind::Integer(10)));
+        assert!(matches!(
+            &tokens[3].kind,
+            TokenKind::BigInteger(value) if value == "9223372036854775808"
+        ));
+        assert!(lex("0x_ ").is_err());
+        assert!(lex("0b2").is_err());
     }
 
     #[test]

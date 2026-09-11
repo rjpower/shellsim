@@ -163,6 +163,7 @@ enum NumericOperation {
     Add,
     Subtract,
     Multiply,
+    Power,
     Divide,
     FloorDivide,
     Remainder,
@@ -229,6 +230,22 @@ pub(super) fn slot_multiply(
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
     slot_binary(runtime, left, right, NumericOperation::Multiply)
+}
+
+pub(super) fn slot_power(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_binary(runtime, left, right, NumericOperation::Power)
+}
+
+pub(super) fn slot_reflected_power(
+    runtime: &mut dyn PyRuntime,
+    right: PyValue,
+    left: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_binary(runtime, left, right, NumericOperation::Power)
 }
 
 pub(super) fn slot_divide(
@@ -343,6 +360,20 @@ fn slot_binary(
             NumericOperation::Add => left + right,
             NumericOperation::Subtract => left - right,
             NumericOperation::Multiply => left * right,
+            NumericOperation::Power => {
+                if left == 0.0 && right < 0.0 {
+                    return Err(PyError::zero_division_error(
+                        "0.0 cannot be raised to a negative power",
+                    ));
+                }
+                let value = left.powf(right);
+                if value.is_nan() {
+                    return Err(PyError::value_error(
+                        "negative number cannot be raised to a fractional power",
+                    ));
+                }
+                value
+            }
             NumericOperation::Divide => left / right,
             NumericOperation::FloorDivide => (left / right).floor(),
             NumericOperation::Remainder => left - (left / right).floor() * right,
@@ -360,11 +391,46 @@ fn slot_binary(
         }
         return Ok(Some(PyValue::Float(left / right)));
     }
+    if matches!(operation, NumericOperation::Power) {
+        let exponent = integer_decimal(right)
+            .parse::<BigInt>()
+            .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
+        if exponent.is_negative() {
+            let left = left.into_f64()?;
+            let right = exponent
+                .to_f64()
+                .ok_or_else(|| PyError::overflow_error("power exponent is too large"))?;
+            if left == 0.0 {
+                return Err(PyError::zero_division_error(
+                    "0.0 cannot be raised to a negative power",
+                ));
+            }
+            return Ok(Some(PyValue::Float(left.powf(right))));
+        }
+        let exponent = exponent
+            .to_u32()
+            .ok_or_else(|| PyError::resource_error("power exponent is too large"))?;
+        let left = integer_decimal(left);
+        let result_bound = left
+            .len()
+            .checked_mul(exponent as usize)
+            .and_then(|bytes| bytes.checked_add(2))
+            .ok_or_else(|| PyError::resource_error("power result is too large"))?;
+        runtime.charge_cpu(u64::try_from(result_bound.max(1)).unwrap_or(u64::MAX))?;
+        runtime.reserve_memory(result_bound)?;
+        let left = left
+            .parse::<BigInt>()
+            .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
+        return runtime
+            .new_integer(&left.pow(exponent).to_string())
+            .map(Some);
+    }
     if let (PyNumber::Int(left), PyNumber::Int(right)) = (&left, &right) {
         let result = match operation {
             NumericOperation::Add => left.checked_add(*right),
             NumericOperation::Subtract => left.checked_sub(*right),
             NumericOperation::Multiply => left.checked_mul(*right),
+            NumericOperation::Power => unreachable!("power returned above"),
             NumericOperation::Divide => unreachable!("division returned above"),
             NumericOperation::FloorDivide | NumericOperation::Remainder => None,
             NumericOperation::BitwiseAnd => Some(*left & *right),
@@ -390,6 +456,7 @@ fn slot_binary(
         | NumericOperation::BitwiseXor
         | NumericOperation::BitwiseOr => left.len().max(right.len()).saturating_add(2),
         NumericOperation::Multiply => work.saturating_add(1),
+        NumericOperation::Power => unreachable!("power returned above"),
         NumericOperation::FloorDivide | NumericOperation::Remainder => {
             left.len().max(right.len()).saturating_add(2)
         }
@@ -416,6 +483,7 @@ fn slot_binary(
         NumericOperation::Add => left + right,
         NumericOperation::Subtract => left - right,
         NumericOperation::Multiply => left * right,
+        NumericOperation::Power => unreachable!("power returned above"),
         NumericOperation::Divide => unreachable!("division returned above"),
         NumericOperation::FloorDivide => bigint_floor_div(&left, &right),
         NumericOperation::Remainder => {

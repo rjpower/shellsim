@@ -24,7 +24,7 @@ pub enum StatementKind {
         names: Vec<(String, String)>,
     },
     Assign {
-        target: AssignmentTarget,
+        targets: Vec<AssignmentTarget>,
         value: Expression,
     },
     AugmentedAssign {
@@ -32,7 +32,7 @@ pub enum StatementKind {
         operator: BinaryOperator,
         value: Expression,
     },
-    Delete(String),
+    Delete(AssignmentTarget),
     Expression(Expression),
     If {
         test: Expression,
@@ -72,6 +72,7 @@ pub enum StatementKind {
     Return(Option<Expression>),
     Break,
     Continue,
+    Global(Vec<String>),
     Nonlocal(Vec<String>),
     Pass,
     Assert {
@@ -296,6 +297,7 @@ pub enum BinaryOperator {
     Add,
     Subtract,
     Multiply,
+    Power,
     Divide,
     FloorDivide,
     Remainder,

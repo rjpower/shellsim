@@ -9,12 +9,17 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
     match name {
         "abc" => Some(include_str!("source/abc.py")),
         "csv" => Some(include_str!("source/csv.py")),
+        "datetime" => Some(include_str!("source/datetime.py")),
+        "collections" => Some(include_str!("source/collections.py")),
         "glob" => Some(include_str!("source/glob.py")),
         "hashlib" => Some(include_str!("source/hashlib.py")),
         "_io" => Some(include_str!("source/io.py")),
+        "json" => Some(include_str!("source/json.py")),
         "logging" => Some(include_str!("source/logging.py")),
+        "os" => Some(include_str!("source/os.py")),
         "pathlib" => Some(include_str!("source/pathlib.py")),
         "uuid" => Some(include_str!("source/uuid.py")),
+        "zlib" => Some(include_str!("source/zlib.py")),
         _ => None,
     }
 }

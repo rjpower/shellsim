@@ -16,17 +16,35 @@ pub(crate) static ENVIRONMENT_TYPE: NativeTypeDef = NativeTypeDef {
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
-    name: "os",
-    functions: &[FunctionDef {
-        module: "os",
-        name: "getenv",
-        call: getenv,
-    }],
+    name: "_os",
+    functions: &[
+        FunctionDef {
+            module: "_os",
+            name: "getenv",
+            call: getenv,
+        },
+        FunctionDef {
+            module: "_os",
+            name: "getcwd",
+            call: getcwd,
+        },
+    ],
     values: &[ValueDef::Factory {
         name: "environ",
         get: environ,
     }],
 };
+
+fn getcwd(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("os.getcwd", 0, 0)?;
+    args.reject_keywords("os.getcwd")?;
+    runtime.new_string(
+        runtime
+            .environment()
+            .get("PWD")
+            .unwrap_or_else(|| "/".into()),
+    )
+}
 
 fn getenv(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("os.getenv", 1, 2)?;

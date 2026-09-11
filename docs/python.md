@@ -113,14 +113,22 @@ facade. `PyModuleLoader` performs VFS-only source discovery for imports. Both ow
 resource charging, quota translation, and mutation-time synchronization; `vm.rs` contains no VFS
 operations and neither boundary can reach the host filesystem.
 
-The current registry contains bounded slices of `argparse`, `bisect`, `collections`, `dataclasses`,
-`enum`, `functools`, `heapq`, `itertools`, `json`, `math`, `os`, `pytest`, `re`, `string`,
-`subprocess`, `sys`, `time`, `typing`, and `unittest`. A separate closed frozen-source registry
-bundles Python implementations with `include_str!` and executes them through the ordinary compiler
-and module namespace. `abc`, `csv`, `glob`, `hashlib`, `io`, `logging`, `pathlib`, and `uuid` use
-this path. Filesystem-facing modules call a small private facade over `PyFilesystem`; `hashlib`
-delegates only its exact digest core to a private native primitive. `subprocess` is an importable
-fail-closed frontier and has no host process capability.
+The registry contains bounded native slices of modules such as `argparse`, `bisect`, `dataclasses`,
+`enum`, `functools`, `heapq`, `itertools`, `math`, `pytest`, `re`, `string`, `subprocess`, `sys`,
+`time`, `typing`, and `unittest`. A separate closed frozen-source registry bundles Python
+implementations with `include_str!` and executes them through the ordinary compiler and module
+namespace. `abc`, `collections`, `csv`, `datetime`, `glob`, `hashlib`, `io`, `json`, `logging`,
+`os`, `pathlib`, `uuid`, and `zlib` use this path. Source modules may import small private native
+cores for algorithms or modeled capabilities that Python cannot implement directly. Filesystem
+modules share `_shellsim_vfs`; `collections` imports only native `defaultdict`; `json`, `hashlib`,
+and `zlib` delegate their bounded codec, digest, or checksum primitives. `subprocess` remains an
+importable fail-closed frontier and has no host process capability.
+
+Prefer frozen Python for module policy, composition, and ordinary object behavior. Add a private
+native primitive only for a modeled capability, an algorithm that must meter host allocation
+before it occurs, or representation-level behavior such as byte codecs. This keeps module APIs
+expressed in the same object protocols as user programs and keeps the VM independent of stdlib
+names.
 
 ## Supported behavior and frontiers
 
@@ -141,7 +149,8 @@ Other explicit frontiers include:
 - async functions, async iterators, async fixtures, and structural pattern matching;
 - generator `send`, `throw`, `close`, and `yield from`;
 - custom exception subclasses and complete attribute interception;
-- complete bytes/bytearray, multidimensional slicing, deletion, hashing, and dict-view semantics;
+- byte-preserving bytes/bytearray, multidimensional slicing, attribute deletion, hashing, and
+  dict-view semantics;
 - `exec`, `eval`, `compile`, code objects, pickle, weak references, and garbage collection;
 - native extensions, arbitrary import hooks, host-backed modules, and full pytest/unittest.
 

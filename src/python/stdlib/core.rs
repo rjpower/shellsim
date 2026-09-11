@@ -999,6 +999,50 @@ pub(crate) fn slot_tuple_multiply(
     slot_sequence_multiply(runtime, PyKind::Tuple, sequence, count)
 }
 
+pub(crate) fn slot_list_delete_item(
+    runtime: &mut dyn PyRuntime,
+    owner: PyValue,
+    index: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let list = owner.cast::<PyList>(runtime)?;
+    let Some(index) = runtime.int_value(&index) else {
+        return Ok(None);
+    };
+    let mut items = runtime.list_items(list)?;
+    let length = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    let index = if index < 0 {
+        index.checked_add(length)
+    } else {
+        Some(index)
+    }
+    .and_then(|index| usize::try_from(index).ok())
+    .filter(|index| *index < items.len())
+    .ok_or_else(|| PyError::exception("IndexError", "list assignment index out of range"))?;
+    items.remove(index);
+    runtime.replace_list_items(list, items)?;
+    Ok(Some(PyValue::None))
+}
+
+pub(crate) fn slot_dict_delete_item(
+    runtime: &mut dyn PyRuntime,
+    owner: PyValue,
+    key: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let dict = owner.cast::<PyDict>(runtime)?;
+    let mut items = runtime.dict_items(dict)?;
+    let mut found = None;
+    for (index, (candidate, _)) in items.iter().enumerate() {
+        if runtime.equals(candidate, &key)? {
+            found = Some(index);
+            break;
+        }
+    }
+    let index = found.ok_or_else(|| PyError::exception("KeyError", "key not found"))?;
+    items.remove(index);
+    runtime.replace_dict_items(dict, items)?;
+    Ok(Some(PyValue::None))
+}
+
 fn slot_sequence_multiply(
     runtime: &mut dyn PyRuntime,
     kind: PyKind,

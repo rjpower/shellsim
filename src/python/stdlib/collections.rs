@@ -1,4 +1,4 @@
-//! Constructors for the bounded :mod:`collections` compatibility surface.
+//! Native primitives used by the frozen :mod:`collections` implementation.
 //!
 //! Stateful mapping behavior remains a runtime object protocol; this module only validates the
 //! public constructor and requests a capability-free object from [`PyRuntime`].
@@ -8,9 +8,9 @@ use super::super::native::{
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
-    name: "collections",
+    name: "_collections",
     functions: &[FunctionDef {
-        module: "collections",
+        module: "_collections",
         name: "defaultdict",
         call: defaultdict,
     }],

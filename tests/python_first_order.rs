@@ -136,3 +136,47 @@ print(f"{'x':>3} {['a']!r}")
         (0, "12.35 0012.346 00042\n  x ['a']\n".into(), String::new())
     );
 }
+
+#[test]
+fn compact_language_wins_match_python_semantics() {
+    let source = r#"
+a = b = 0x10 + 0o10 + 0b10
+a ^= 3
+b **= 2
+if a == 25: a += 1; b //= 2
+print(a, b)
+print(-2 ** 2, 2 ** -2, 2 ** 3 ** 2)
+
+class Power:
+    def __pow__(self, other):
+        return 40 + other
+
+print(Power() ** 2)
+
+state = 1
+def bump():
+    global state
+    state += 1
+bump()
+values = {'keep': 1, 'remove': 2}
+del values['remove']
+print(state, values)
+
+class Bag:
+    def __init__(self):
+        self.deleted = None
+    def __delitem__(self, key):
+        self.deleted = key
+bag = Bag()
+del bag['item']
+print(bag.deleted)
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "26 338\n-4 0.25 512\n42\n2 {'keep': 1}\nitem\n".into(),
+            String::new()
+        )
+    );
+}

@@ -151,11 +151,12 @@ Native Python modules use an erased value ABI, checked object views, declarative
 and narrow modeled capabilities. See [docs/python.md](docs/python.md) for the goals, value and
 object model, extension workflow, compatibility evidence, and explicit frontiers.
 
-The requested stdlib gate is 19/19 exact CPython 3.14 probes for these APIs: `sys.executable`,
+The requested stdlib gate is 20/20 exact CPython 3.14 probes for these APIs: `sys.executable`,
 `os.getenv`, `collections.defaultdict`, `itertools.count`/`islice`, `heapq.heapify`/`heappop`,
 `bisect.bisect_left`, `math.sqrt`/`ceil`, `string.digits`, `json.dumps(sort_keys=...)`, `re.sub`,
 `functools.reduce`, `dataclasses.dataclass`, `typing.List[...]`, `enum.Enum`,
-`argparse.ArgumentParser.prog`, `csv.reader`/`writer`, `import subprocess`, and the
+`argparse.ArgumentParser.prog`, `csv.reader`/`writer`, source-backed `Counter`, `deque`, `json`,
+`os.path`, `datetime`, and `zlib.crc32`, `import subprocess`, and the
 `pytest`/`unittest.TestCase` entry points. These are intentionally partial module slices, not
 claims of complete stdlib support.
 

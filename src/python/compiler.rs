@@ -15,6 +15,7 @@ pub fn compile(program: Program) -> Code {
         finalizers: Vec::new(),
         protected_regions: Vec::new(),
         in_function: false,
+        globals: HashSet::new(),
         nonlocals: HashSet::new(),
         structural_depth: 0,
     };
@@ -38,6 +39,7 @@ struct Compiler {
     /// at compile time rather than losing that state in a suspended generator.
     protected_regions: Vec<&'static str>,
     in_function: bool,
+    globals: HashSet<String>,
     nonlocals: HashSet<String>,
     structural_depth: usize,
 }
@@ -102,9 +104,15 @@ impl Compiler {
                 }
                 self.emit(Operation::PopTop, span);
             }
-            StatementKind::Assign { target, value } => {
+            StatementKind::Assign { targets, value } => {
                 self.expression(value);
-                self.store_target(target, span);
+                let last = targets.len().saturating_sub(1);
+                for (index, target) in targets.into_iter().enumerate() {
+                    if index != last {
+                        self.emit(Operation::Copy(1), span);
+                    }
+                    self.store_target(target, span);
+                }
             }
             StatementKind::AnnotatedAssign { target, value } => {
                 if let Some(value) = value {
@@ -119,9 +127,31 @@ impl Compiler {
             } => {
                 self.augmented_assignment(target, operator, value, span);
             }
-            StatementKind::Delete(name) => {
-                self.emit(Operation::DeleteName(name), span);
-            }
+            StatementKind::Delete(target) => match target {
+                AssignmentTarget::Name(name) => {
+                    if self.globals.contains(&name) {
+                        self.emit(Operation::DeleteGlobal(name), span);
+                    } else {
+                        self.emit(Operation::DeleteName(name), span);
+                    }
+                }
+                AssignmentTarget::Subscript { value, index } => {
+                    self.expression(value);
+                    self.expression(index);
+                    self.emit(Operation::DeleteSubscript, span);
+                }
+                AssignmentTarget::Attribute { .. }
+                | AssignmentTarget::Sequence(_)
+                | AssignmentTarget::Star(_) => {
+                    self.emit(
+                        Operation::RuntimeError(
+                            "this deletion target is not implemented; names and subscripts are supported"
+                                .into(),
+                        ),
+                        span,
+                    );
+                }
+            },
             StatementKind::Expression(expression) => {
                 self.expression(expression);
                 self.emit(Operation::PopExpression, span);
@@ -202,6 +232,7 @@ impl Compiler {
                     finalizers: Vec::new(),
                     protected_regions: Vec::new(),
                     in_function: true,
+                    globals: HashSet::new(),
                     nonlocals: HashSet::new(),
                     structural_depth: self.structural_depth,
                 };
@@ -252,6 +283,7 @@ impl Compiler {
                     finalizers: Vec::new(),
                     protected_regions: Vec::new(),
                     in_function: false,
+                    globals: HashSet::new(),
                     nonlocals: HashSet::new(),
                     structural_depth: self.structural_depth,
                 };
@@ -361,6 +393,9 @@ impl Compiler {
                 };
                 self.emit_finalizers(span);
                 self.emit(Operation::Jump(target), span);
+            }
+            StatementKind::Global(names) => {
+                self.globals.extend(names);
             }
             StatementKind::Nonlocal(names) => {
                 if !self.in_function {
@@ -646,7 +681,9 @@ impl Compiler {
     }
 
     fn store_name(&mut self, name: String, span: Span) {
-        if self.nonlocals.contains(&name) {
+        if self.globals.contains(&name) {
+            self.emit(Operation::StoreGlobal(name), span);
+        } else if self.nonlocals.contains(&name) {
             self.emit(Operation::StoreNonlocal(name), span);
         } else {
             self.emit(Operation::StoreName(name), span);
@@ -855,6 +892,7 @@ impl Compiler {
                     finalizers: Vec::new(),
                     protected_regions: Vec::new(),
                     in_function: true,
+                    globals: HashSet::new(),
                     nonlocals: HashSet::new(),
                     structural_depth: self.structural_depth,
                 };
@@ -969,6 +1007,7 @@ impl Compiler {
             finalizers: Vec::new(),
             protected_regions: Vec::new(),
             in_function: true,
+            globals: HashSet::new(),
             nonlocals: HashSet::new(),
             structural_depth: self.structural_depth,
         };
@@ -1018,6 +1057,7 @@ impl Compiler {
             finalizers: Vec::new(),
             protected_regions: Vec::new(),
             in_function: true,
+            globals: HashSet::new(),
             nonlocals: HashSet::new(),
             structural_depth: self.structural_depth,
         };

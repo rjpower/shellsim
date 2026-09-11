@@ -1,6 +1,7 @@
 """Small Path facade over shellsim's modeled VFS."""
 
 import _shellsim_vfs
+import os
 
 
 def _join(left, right):
@@ -23,6 +24,9 @@ class Path:
 
     def __truediv__(self, other):
         return Path(_join(self._path, str(other)))
+
+    def __eq__(self, other):
+        return isinstance(other, Path) and self._path == other._path
 
     def joinpath(self, other):
         return self / other
@@ -73,6 +77,32 @@ class Path:
 
     def glob(self, pattern):
         return [Path(value) for value in _shellsim_vfs.glob(_join(self._path, pattern))]
+
+    def rglob(self, pattern):
+        matches = []
+        pending = [self]
+        while pending:
+            directory = pending.pop()
+            matches.extend(directory.glob(pattern))
+            for child in directory.glob("*"):
+                if child.is_dir():
+                    pending.append(child)
+        return matches
+
+    def iterdir(self):
+        return self.glob("*")
+
+    def resolve(self):
+        return Path(os.path.abspath(self._path))
+
+    @classmethod
+    def cwd(cls):
+        return cls(os.getcwd())
+
+    def with_suffix(self, suffix):
+        if self.suffix == "":
+            return Path(self._path + suffix)
+        return Path(self._path[:-len(self.suffix)] + suffix)
 
     def open(self, mode="r", encoding=None, newline=None):
         return open(self._path, mode, encoding, newline)

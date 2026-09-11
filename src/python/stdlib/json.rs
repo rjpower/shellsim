@@ -15,15 +15,15 @@ const MAX_JSON_INPUT: usize = 1024 * 1024;
 const MAX_JSON_DEPTH: usize = 128;
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
-    name: "json",
+    name: "_json",
     functions: &[
         FunctionDef {
-            module: "json",
+            module: "_json",
             name: "dumps",
             call: dumps,
         },
         FunctionDef {
-            module: "json",
+            module: "_json",
             name: "loads",
             call: loads,
         },
@@ -103,8 +103,10 @@ fn dumps(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let mut item_separator = ", ".to_string();
     let mut key_separator = ": ".to_string();
     let mut sort_keys = false;
+    let mut indent = None;
     let mut saw_separators = false;
     let mut saw_sort_keys = false;
+    let mut saw_indent = false;
     for (name, value) in args.keywords() {
         match name.as_str() {
             "separators" if !saw_separators => {
@@ -122,7 +124,21 @@ fn dumps(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
                 sort_keys = runtime.truth(value)?;
                 saw_sort_keys = true;
             }
-            "separators" | "sort_keys" => {
+            "indent" if !saw_indent => {
+                if !matches!(runtime.kind(value)?, PyKind::None) {
+                    let value = runtime.int_value(value).ok_or_else(|| {
+                        PyError::type_error("json.dumps indent must be an integer")
+                    })?;
+                    let value = usize::try_from(value.max(0))
+                        .map_err(|_| PyError::value_error("json.dumps indent is too large"))?;
+                    if value > 16 {
+                        return Err(PyError::value_error("json.dumps indent exceeds 16"));
+                    }
+                    indent = Some(value);
+                }
+                saw_indent = true;
+            }
+            "separators" | "sort_keys" | "indent" => {
                 return Err(PyError::type_error(format!(
                     "json.dumps got multiple values for keyword {name:?}"
                 )))
@@ -137,20 +153,23 @@ fn dumps(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 
     let value = args.positional()[0];
     let bound = size_bound(runtime, value, 0, &mut Vec::new())?;
+    let whitespace_factor = indent
+        .unwrap_or(0)
+        .saturating_mul(MAX_JSON_DEPTH)
+        .saturating_add(2);
     let bound = bound
-        .checked_add(bound / 2)
+        .checked_mul(whitespace_factor)
+        .and_then(|bytes| bytes.checked_add(bound / 2))
         .and_then(|bytes| bytes.checked_add(256))
         .ok_or_else(|| PyError::resource_error("json result is too large"))?;
     runtime.reserve_memory(bound)?;
-    let rendered = dump_value(
-        runtime,
-        value,
-        &item_separator,
-        &key_separator,
+    let options = EncodeOptions {
+        item_separator: &item_separator,
+        key_separator: &key_separator,
         sort_keys,
-        0,
-        &mut Vec::new(),
-    )?;
+        indent,
+    };
+    let rendered = dump_value(runtime, value, options, 0, &mut Vec::new())?;
     runtime.new_string(rendered)
 }
 
@@ -162,12 +181,18 @@ fn sequence_items(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<P
     }
 }
 
+#[derive(Clone, Copy)]
+struct EncodeOptions<'a> {
+    item_separator: &'a str,
+    key_separator: &'a str,
+    sort_keys: bool,
+    indent: Option<usize>,
+}
+
 fn dump_value(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
-    item_separator: &str,
-    key_separator: &str,
-    sort_keys: bool,
+    options: EncodeOptions<'_>,
     depth: usize,
     active: &mut Vec<PyIdentity>,
 ) -> PyResult<String> {
@@ -223,23 +248,22 @@ fn dump_value(
                 let values = sequence_items(runtime, value)?;
                 let mut rendered = Vec::with_capacity(values.len());
                 for value in values {
-                    rendered.push(dump_value(
-                        runtime,
-                        value,
-                        item_separator,
-                        key_separator,
-                        sort_keys,
-                        depth + 1,
-                        active,
-                    )?);
+                    rendered.push(dump_value(runtime, value, options, depth + 1, active)?);
                 }
                 active.pop();
-                Ok(format!("[{}]", rendered.join(item_separator)))
+                Ok(join_json_container(
+                    '[',
+                    ']',
+                    rendered,
+                    options.item_separator,
+                    options.indent,
+                    depth,
+                ))
             }
             PyKind::Dict => {
                 active.push(id);
                 let mut entries = value.cast::<PyDict>(runtime)?.items(runtime)?;
-                if sort_keys {
+                if options.sort_keys {
                     for (key, _) in &entries {
                         if runtime.string_value(key)?.is_none() {
                             return Err(PyError::type_error(
@@ -275,24 +299,45 @@ fn dump_value(
                     };
                     let key = serde_json::to_string(&key)
                         .map_err(|error| PyError::value_error(error.to_string()))?;
-                    let value = dump_value(
-                        runtime,
-                        value,
-                        item_separator,
-                        key_separator,
-                        sort_keys,
-                        depth + 1,
-                        active,
-                    )?;
-                    rendered.push(format!("{key}{key_separator}{value}"));
+                    let value = dump_value(runtime, value, options, depth + 1, active)?;
+                    rendered.push(format!("{key}{}{value}", options.key_separator));
                 }
                 active.pop();
-                Ok(format!("{{{}}}", rendered.join(item_separator)))
+                Ok(join_json_container(
+                    '{',
+                    '}',
+                    rendered,
+                    options.item_separator,
+                    options.indent,
+                    depth,
+                ))
             }
             _ => Err(PyError::type_error("object is not JSON serializable")),
         };
     }
     Err(PyError::type_error("object is not JSON serializable"))
+}
+
+fn join_json_container(
+    open: char,
+    close: char,
+    values: Vec<String>,
+    separator: &str,
+    indent: Option<usize>,
+    depth: usize,
+) -> String {
+    let Some(indent) = indent else {
+        return format!("{open}{}{close}", values.join(separator));
+    };
+    if values.is_empty() {
+        return format!("{open}{close}");
+    }
+    let inner = " ".repeat(indent.saturating_mul(depth.saturating_add(1)));
+    let outer = " ".repeat(indent.saturating_mul(depth));
+    format!(
+        "{open}\n{inner}{}\n{outer}{close}",
+        values.join(&format!(",\n{inner}"))
+    )
 }
 
 fn size_bound(

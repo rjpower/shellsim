@@ -973,7 +973,7 @@ mod tests {
 
     #[test]
     fn unsupported_python_fails_loudly() {
-        let (status, _, err) = run("for x in range(3): print(x)");
+        let (status, _, err) = run("print(1 @ 2)");
         assert_eq!(status, 2);
         assert!(err.contains("unsupported"));
     }

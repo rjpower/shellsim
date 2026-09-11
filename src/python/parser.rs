@@ -329,7 +329,7 @@ impl Parser {
             };
             StatementKind::Import { module, binding }
         } else if self.take(|kind| matches!(kind, TokenKind::Del)).is_some() {
-            StatementKind::Delete(self.name("expected a variable name after 'del'")?)
+            StatementKind::Delete(assignment_target(self.postfix()?)?)
         } else if self
             .take(|kind| matches!(kind, TokenKind::Return))
             .is_some()
@@ -352,6 +352,18 @@ impl Parser {
             .is_some()
         {
             StatementKind::Continue
+        } else if self
+            .take(|kind| matches!(kind, TokenKind::Global))
+            .is_some()
+        {
+            let mut names = Vec::new();
+            loop {
+                names.push(self.name("expected a binding after 'global'")?);
+                if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
+                    break;
+                }
+            }
+            StatementKind::Global(names)
         } else if self
             .take(|kind| matches!(kind, TokenKind::Nonlocal))
             .is_some()
@@ -413,26 +425,17 @@ impl Parser {
                     }
                 }
             } else if self.take(|kind| matches!(kind, TokenKind::Equal)).is_some() {
-                StatementKind::Assign {
-                    target: assignment_target(expression)?,
-                    value: self.tuple_expression()?,
+                let mut targets = vec![assignment_target(expression)?];
+                let mut value = self.tuple_expression()?;
+                while self.take(|kind| matches!(kind, TokenKind::Equal)).is_some() {
+                    targets.push(assignment_target(value)?);
+                    value = self.tuple_expression()?;
                 }
-            } else if self
-                .take(|kind| matches!(kind, TokenKind::PlusEqual))
-                .is_some()
-            {
+                StatementKind::Assign { targets, value }
+            } else if let Some(operator) = self.augmented_operator() {
                 StatementKind::AugmentedAssign {
                     target: assignment_target(expression)?,
-                    operator: BinaryOperator::Add,
-                    value: self.tuple_expression()?,
-                }
-            } else if self
-                .take(|kind| matches!(kind, TokenKind::MinusEqual))
-                .is_some()
-            {
-                StatementKind::AugmentedAssign {
-                    target: assignment_target(expression)?,
-                    operator: BinaryOperator::Subtract,
+                    operator,
                     value: self.tuple_expression()?,
                 }
             } else {
@@ -498,10 +501,31 @@ impl Parser {
             |kind| matches!(kind, TokenKind::Colon),
             "expected ':' before suite",
         )?;
-        self.expect(
-            |kind| matches!(kind, TokenKind::Newline),
-            "expected a newline before indented suite",
-        )?;
+        if !self.at(|kind| matches!(kind, TokenKind::Newline)) {
+            let mut statements = Vec::new();
+            loop {
+                let statement = self.statement()?;
+                if statement.kind.is_compound() {
+                    return Err(self.error("compound statement is not allowed in a simple suite"));
+                }
+                statements.push(statement);
+                if self
+                    .take(|kind| matches!(kind, TokenKind::Semicolon))
+                    .is_none()
+                {
+                    break;
+                }
+                if self.at(|kind| matches!(kind, TokenKind::Newline)) {
+                    break;
+                }
+            }
+            self.expect(
+                |kind| matches!(kind, TokenKind::Newline),
+                "expected a newline after simple suite",
+            )?;
+            return Ok(statements);
+        }
+        self.advance();
         self.separators();
         self.expect(
             |kind| matches!(kind, TokenKind::Indent),
@@ -1068,7 +1092,44 @@ impl Parser {
                 span,
             });
         }
-        self.postfix()
+        self.power()
+    }
+
+    fn power(&mut self) -> Result<Expression, ParseError> {
+        let left = self.postfix()?;
+        if self
+            .take(|kind| matches!(kind, TokenKind::DoubleStar))
+            .is_none()
+        {
+            return Ok(left);
+        }
+        let right = self.unary()?;
+        Ok(Expression {
+            span: left.span.through(right.span),
+            kind: ExpressionKind::Binary {
+                left: Box::new(left),
+                operator: BinaryOperator::Power,
+                right: Box::new(right),
+            },
+        })
+    }
+
+    fn augmented_operator(&mut self) -> Option<BinaryOperator> {
+        let operator = match self.peek().kind {
+            TokenKind::PlusEqual => BinaryOperator::Add,
+            TokenKind::MinusEqual => BinaryOperator::Subtract,
+            TokenKind::StarEqual => BinaryOperator::Multiply,
+            TokenKind::DoubleStarEqual => BinaryOperator::Power,
+            TokenKind::SlashEqual => BinaryOperator::Divide,
+            TokenKind::DoubleSlashEqual => BinaryOperator::FloorDivide,
+            TokenKind::PercentEqual => BinaryOperator::Remainder,
+            TokenKind::AmpersandEqual => BinaryOperator::BitwiseAnd,
+            TokenKind::CaretEqual => BinaryOperator::BitwiseXor,
+            TokenKind::PipeEqual => BinaryOperator::BitwiseOr,
+            _ => return None,
+        };
+        self.advance();
+        Some(operator)
     }
 
     fn postfix(&mut self) -> Result<Expression, ParseError> {

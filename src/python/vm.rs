@@ -200,6 +200,7 @@ pub(super) enum Builtin {
     Zip,
     Any,
     All,
+    Iter,
     Next,
     Property,
     StaticMethod,
@@ -355,6 +356,11 @@ impl<'a> Vm<'a> {
                 Operation::LoadName(name) => self.load_name(name),
                 Operation::StoreName(name) => self.store_name(name),
                 Operation::StoreNonlocal(name) => self.store_nonlocal(name),
+                Operation::StoreGlobal(name) => {
+                    let value = self.pop().map_err(|error| (error, instruction.span))?;
+                    self.state.locals.insert(name.clone(), value);
+                    Ok(())
+                }
                 Operation::StoreAttribute(name) => {
                     let owner = self.pop().map_err(|error| (error, instruction.span))?;
                     let value = self.pop().map_err(|error| (error, instruction.span))?;
@@ -369,6 +375,11 @@ impl<'a> Vm<'a> {
                         Ok(())
                     }
                 }
+                Operation::DeleteGlobal(name) => {
+                    self.state.locals.remove(name);
+                    Ok(())
+                }
+                Operation::DeleteSubscript => self.delete_subscript(),
                 Operation::Import(name) => self.import(name),
                 Operation::LoadAttribute(name) => self.load_attribute(name),
                 Operation::LoadSubscript => self.load_subscript(),
@@ -737,6 +748,7 @@ impl<'a> Vm<'a> {
                 "zip" => Builtin::Zip,
                 "any" => Builtin::Any,
                 "all" => Builtin::All,
+                "iter" => Builtin::Iter,
                 "next" => Builtin::Next,
                 "property" => Builtin::Property,
                 "staticmethod" => Builtin::StaticMethod,
@@ -1145,6 +1157,10 @@ impl<'a> Vm<'a> {
     fn load_subscript(&mut self) -> Result<(), String> {
         let index = self.pop()?;
         let owner = self.pop()?;
+        if let Some(value) = self.invoke_slot(&owner, Slot::GetItem, "__getitem__", vec![index])? {
+            self.stack.push(value);
+            return Ok(());
+        }
         let value = if matches!(owner.native_value(), Some(NativeValue::TypingList)) {
             let parameter = match index.native_value() {
                 Some(NativeValue::BuiltinType(BuiltinType::Int)) => "int".to_string(),
@@ -1313,6 +1329,12 @@ impl<'a> Vm<'a> {
         let index = self.pop()?;
         let owner = self.pop()?;
         let value = self.pop()?;
+        if self
+            .invoke_slot(&owner, Slot::SetItem, "__setitem__", vec![index, value])?
+            .is_some()
+        {
+            return Ok(());
+        }
         let Some(id) = owner.object_id() else {
             return Err("object does not support item assignment".into());
         };
@@ -1389,6 +1411,14 @@ impl<'a> Vm<'a> {
             | Object::ClassMethod { .. }
             | Object::Super { .. } => return Err("object does not support item assignment".into()),
         }
+        Ok(())
+    }
+
+    fn delete_subscript(&mut self) -> Result<(), String> {
+        let index = self.pop()?;
+        let owner = self.pop()?;
+        self.invoke_slot(&owner, Slot::DeleteItem, "__delitem__", vec![index])?
+            .ok_or("object does not support item deletion")?;
         Ok(())
     }
 
@@ -2856,6 +2886,7 @@ impl<'a> Vm<'a> {
                 Slot::ReflectedMultiply,
                 "__rmul__",
             ),
+            BinaryOperator::Power => (Slot::Power, "__pow__", Slot::ReflectedPower, "__rpow__"),
             BinaryOperator::Divide => (
                 Slot::Divide,
                 "__truediv__",
@@ -3411,6 +3442,15 @@ impl<'a> Vm<'a> {
             }
             Builtin::Length => {
                 expect_arity(&arguments, 1, 1)?;
+                if let Some(value) =
+                    self.invoke_slot(&arguments[0], Slot::Length, "__len__", Vec::new())?
+                {
+                    let length = value.as_int().ok_or("__len__() should return an integer")?;
+                    if length < 0 {
+                        return Err("__len__() should return >= 0".into());
+                    }
+                    return Ok(CallResult::Value(Value::Int(length)));
+                }
                 let length = if let Some(value) =
                     protocol::string_value(&self.state.heap, &arguments[0])?
                 {
@@ -3550,6 +3590,16 @@ impl<'a> Vm<'a> {
                     .invoke_slot(&arguments[0], Slot::Absolute, "__abs__", Vec::new())?
                     .ok_or("bad operand type for abs()")?;
                 Ok(CallResult::Value(value))
+            }
+            Builtin::Iter => {
+                expect_arity(&arguments, 1, 1)?;
+                let values = self.iterable_values(&arguments[0])?;
+                Ok(CallResult::Value(self.allocate_object(
+                    Object::Iterator {
+                        values,
+                        position: 0,
+                    },
+                )?))
             }
             Builtin::Next => {
                 expect_arity(&arguments, 1, 2)?;

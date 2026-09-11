@@ -101,6 +101,11 @@ impl PyFilesystem for Interp {
         let absolute_pattern = resolve_against(&self.cwd, pattern);
         let pattern = glob::Pattern::new(&absolute_pattern)
             .map_err(|error| PyError::value_error(format!("invalid glob pattern: {error}")))?;
+        let match_options = glob::MatchOptions {
+            require_literal_separator: true,
+            require_literal_leading_dot: true,
+            ..glob::MatchOptions::new()
+        };
 
         // Meter every candidate before matching. Reserving a conservative result bound before
         // collection also prevents a large modeled directory from driving unmetered host growth.
@@ -114,7 +119,7 @@ impl PyFilesystem for Interp {
         Ok(self
             .vfs
             .all_paths()
-            .filter(|(path, _)| pattern.matches_path(Path::new(path)))
+            .filter(|(path, _)| pattern.matches_path_with(Path::new(path), match_options))
             .map(|(path, _)| {
                 if relative {
                     path.strip_prefix(&cwd_prefix).unwrap_or(path).to_string()

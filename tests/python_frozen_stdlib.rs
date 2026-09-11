@@ -119,12 +119,21 @@ directory = Path('/tmp/data')
 directory.mkdir(parents=True)
 (directory / 'a.txt').write_text('a')
 (directory / 'b.json').write_text('b')
+(directory / 'nested').mkdir()
+(directory / 'nested' / 'c.txt').write_text('c')
 print(glob.glob('/tmp/data/*.txt'))
 print([path.name for path in directory.glob('*.json')])
+print([str(path) for path in directory.rglob('*.txt')])
+print([path.name for path in directory.iterdir()])
 "#;
     assert_eq!(
         run(source),
-        (0, "['/tmp/data/a.txt']\n['b.json']\n".into(), String::new())
+        (
+            0,
+            "['/tmp/data/a.txt']\n['b.json']\n['/tmp/data/a.txt', '/tmp/data/nested/c.txt']\n['a.txt', 'b.json', 'nested']\n"
+                .into(),
+            String::new()
+        )
     );
 }
 
@@ -171,6 +180,119 @@ print(str(first), first.hex, first != second)
             String::new(),
         )
     );
+}
+
+#[test]
+fn frozen_collections_use_generic_container_protocols() {
+    let source = r#"
+from collections import Counter, deque, defaultdict
+
+counts = Counter("abracadabra")
+print(counts["a"], counts["z"], counts.most_common(2), counts.total())
+counts.subtract("ab")
+print(list(counts.elements()))
+
+values = deque([1, 2, 3], 3)
+values.append(4)
+values.appendleft(0)
+values.rotate(-1)
+print(len(values), values[0], list(values), values.popleft())
+print(defaultdict(list)["missing"])
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "5 0 [('a', 5), ('b', 2)] 11\n['a', 'a', 'a', 'a', 'b', 'r', 'r', 'c', 'd']\n3 2 [2, 3, 0] 2\n[]\n".into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
+fn frozen_json_stream_helpers_wrap_the_bounded_codec() {
+    let source = r#"
+import json
+
+class Buffer:
+    def __init__(self):
+        self.value = ""
+    def write(self, value):
+        self.value += value
+    def read(self):
+        return self.value
+
+stream = Buffer()
+json.dump({'b': 2, 'a': 1}, stream, sort_keys=True)
+print(stream.value)
+print(json.load(stream))
+print(json.dumps({'a': [1, 2]}, indent=2))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "{\"a\": 1, \"b\": 2}\n{'a': 1, 'b': 2}\n{\n  \"a\": [\n    1,\n    2\n  ]\n}\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn frozen_os_path_helpers_use_only_modeled_state() {
+    let source = r#"
+import os
+
+print(os.getcwd(), os.getenv('HOME'))
+print(os.path.join('/tmp', 'a', 'b.txt'))
+print(os.path.basename('/tmp/a/b.txt'), os.path.dirname('/tmp/a/b.txt'))
+print(os.path.splitext('/tmp/a/b.txt'))
+print(os.path.normpath('/tmp/a/../b'), os.path.abspath('work'))
+os.makedirs('/tmp/tree/leaf', exist_ok=True)
+print(os.path.exists('/tmp/tree'), os.path.isdir('/tmp/tree/leaf'))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "/ /root\n/tmp/a/b.txt\nb.txt /tmp/a\n('/tmp/a/b', '.txt')\n/tmp/b /work\nTrue True\n"
+                .into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn frozen_datetime_uses_the_virtual_clock_and_gregorian_arithmetic() {
+    let source = r#"
+from datetime import UTC, date, datetime, timedelta, timezone
+
+print(datetime.now(timezone.utc).isoformat())
+print(datetime.fromtimestamp(0, UTC).strftime('%Y-%m-%d %H:%M:%S'))
+start = datetime.strptime('2024-02-28', '%Y-%m-%d')
+end = start + timedelta(days=2)
+print(end.strftime('%Y-%m-%d'), (end - start).days)
+print(datetime.fromisoformat('2024-01-02T03:04:05Z').timestamp())
+print(date.today())
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "2025-01-01T00:00:00+00:00\n1970-01-01 00:00:00\n2024-03-01 2\n1704164645.0\n2025-01-01\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn frozen_zlib_exposes_exact_crc_and_rejects_byte_decompression() {
+    assert_eq!(
+        run("import zlib\nprint(zlib.crc32(b'123456789'))"),
+        (0, "3421780262\n".into(), String::new())
+    );
+    let (_, _, error) = run("import zlib\nzlib.decompress('data')");
+    assert!(error.contains("requires byte-preserving PyBytes support"));
 }
 
 #[test]

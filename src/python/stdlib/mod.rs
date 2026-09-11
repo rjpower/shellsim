@@ -26,6 +26,7 @@ pub mod time;
 pub mod typing;
 pub mod unittest;
 mod vfs;
+mod zlib;
 
 use super::native::ModuleDef;
 
@@ -46,18 +47,19 @@ pub(super) fn frozen_builtin(name: &str) -> Option<(&'static str, &'static str)>
 pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
     match name {
         "argparse" => Some(&argparse::MODULE),
-        "json" => Some(&json::MODULE),
+        "_json" => Some(&json::MODULE),
         "bisect" => Some(&bisect::MODULE),
-        "collections" => Some(&collections::MODULE),
+        "_collections" => Some(&collections::MODULE),
         "dataclasses" => Some(&dataclasses::MODULE),
         "enum" => Some(&r#enum::MODULE),
         "heapq" => Some(&heapq::MODULE),
         "_hashlib" => Some(&hashlib::MODULE),
         "_shellsim_vfs" => Some(&vfs::MODULE),
+        "_zlib" => Some(&zlib::MODULE),
         "functools" => Some(&functools::MODULE),
         "itertools" => Some(&itertools::MODULE),
         "math" => Some(&math::MODULE),
-        "os" => Some(&os::MODULE),
+        "_os" => Some(&os::MODULE),
         "pytest" => Some(&pytest::MODULE),
         "re" => Some(&re::MODULE),
         "string" => Some(&string::MODULE),

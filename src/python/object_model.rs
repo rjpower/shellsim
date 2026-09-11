@@ -138,6 +138,9 @@ pub struct TypeSlots {
     pub hash: Option<SlotValue>,
     pub iter: Option<SlotValue>,
     pub next: Option<SlotValue>,
+    pub length: Option<SlotValue>,
+    pub get_item: Option<SlotValue>,
+    pub set_item: Option<SlotValue>,
     pub positive: Option<SlotValue>,
     pub negative: Option<SlotValue>,
     pub invert: Option<SlotValue>,
@@ -148,6 +151,8 @@ pub struct TypeSlots {
     pub reflected_subtract: Option<SlotValue>,
     pub multiply: Option<SlotValue>,
     pub reflected_multiply: Option<SlotValue>,
+    pub power: Option<SlotValue>,
+    pub reflected_power: Option<SlotValue>,
     pub divide: Option<SlotValue>,
     pub reflected_divide: Option<SlotValue>,
     pub floor_divide: Option<SlotValue>,
@@ -163,6 +168,7 @@ pub struct TypeSlots {
     pub equal: Option<SlotValue>,
     pub less_than: Option<SlotValue>,
     pub contains: Option<SlotValue>,
+    pub delete_item: Option<SlotValue>,
 }
 
 /// A cached Python descriptor or a native implementation attached directly to a builtin type.
@@ -187,6 +193,9 @@ pub enum Slot {
     Hash,
     Iter,
     Next,
+    Length,
+    GetItem,
+    SetItem,
     Positive,
     Negative,
     Invert,
@@ -197,6 +206,8 @@ pub enum Slot {
     ReflectedSubtract,
     Multiply,
     ReflectedMultiply,
+    Power,
+    ReflectedPower,
     Divide,
     ReflectedDivide,
     FloorDivide,
@@ -212,10 +223,11 @@ pub enum Slot {
     Equal,
     LessThan,
     Contains,
+    DeleteItem,
 }
 
 impl Slot {
-    const ALL: [Self; 36] = [
+    const ALL: [Self; 42] = [
         Self::Call,
         Self::New,
         Self::Init,
@@ -227,6 +239,9 @@ impl Slot {
         Self::Hash,
         Self::Iter,
         Self::Next,
+        Self::Length,
+        Self::GetItem,
+        Self::SetItem,
         Self::Positive,
         Self::Negative,
         Self::Invert,
@@ -237,6 +252,8 @@ impl Slot {
         Self::ReflectedSubtract,
         Self::Multiply,
         Self::ReflectedMultiply,
+        Self::Power,
+        Self::ReflectedPower,
         Self::Divide,
         Self::ReflectedDivide,
         Self::FloorDivide,
@@ -252,6 +269,7 @@ impl Slot {
         Self::Equal,
         Self::LessThan,
         Self::Contains,
+        Self::DeleteItem,
     ];
 }
 
@@ -270,6 +288,9 @@ impl TypeSlots {
             hash: get("__hash__"),
             iter: get("__iter__"),
             next: get("__next__"),
+            length: get("__len__"),
+            get_item: get("__getitem__"),
+            set_item: get("__setitem__"),
             positive: get("__pos__"),
             negative: get("__neg__"),
             invert: get("__invert__"),
@@ -280,6 +301,8 @@ impl TypeSlots {
             reflected_subtract: get("__rsub__"),
             multiply: get("__mul__"),
             reflected_multiply: get("__rmul__"),
+            power: get("__pow__"),
+            reflected_power: get("__rpow__"),
             divide: get("__truediv__"),
             reflected_divide: get("__rtruediv__"),
             floor_divide: get("__floordiv__"),
@@ -295,6 +318,7 @@ impl TypeSlots {
             equal: get("__eq__"),
             less_than: get("__lt__"),
             contains: get("__contains__"),
+            delete_item: get("__delitem__"),
         }
     }
 
@@ -311,6 +335,9 @@ impl TypeSlots {
             &self.hash,
             &self.iter,
             &self.next,
+            &self.length,
+            &self.get_item,
+            &self.set_item,
             &self.positive,
             &self.negative,
             &self.invert,
@@ -321,6 +348,8 @@ impl TypeSlots {
             &self.reflected_subtract,
             &self.multiply,
             &self.reflected_multiply,
+            &self.power,
+            &self.reflected_power,
             &self.divide,
             &self.reflected_divide,
             &self.floor_divide,
@@ -336,6 +365,7 @@ impl TypeSlots {
             &self.equal,
             &self.less_than,
             &self.contains,
+            &self.delete_item,
         ]
         .into_iter()
         .filter(|slot| slot.is_some())
@@ -355,6 +385,9 @@ impl TypeSlots {
             Slot::Hash => self.hash.as_ref(),
             Slot::Iter => self.iter.as_ref(),
             Slot::Next => self.next.as_ref(),
+            Slot::Length => self.length.as_ref(),
+            Slot::GetItem => self.get_item.as_ref(),
+            Slot::SetItem => self.set_item.as_ref(),
             Slot::Positive => self.positive.as_ref(),
             Slot::Negative => self.negative.as_ref(),
             Slot::Invert => self.invert.as_ref(),
@@ -365,6 +398,8 @@ impl TypeSlots {
             Slot::ReflectedSubtract => self.reflected_subtract.as_ref(),
             Slot::Multiply => self.multiply.as_ref(),
             Slot::ReflectedMultiply => self.reflected_multiply.as_ref(),
+            Slot::Power => self.power.as_ref(),
+            Slot::ReflectedPower => self.reflected_power.as_ref(),
             Slot::Divide => self.divide.as_ref(),
             Slot::ReflectedDivide => self.reflected_divide.as_ref(),
             Slot::FloorDivide => self.floor_divide.as_ref(),
@@ -380,6 +415,7 @@ impl TypeSlots {
             Slot::Equal => self.equal.as_ref(),
             Slot::LessThan => self.less_than.as_ref(),
             Slot::Contains => self.contains.as_ref(),
+            Slot::DeleteItem => self.delete_item.as_ref(),
         }
     }
 
@@ -396,6 +432,9 @@ impl TypeSlots {
             Slot::Hash => &mut self.hash,
             Slot::Iter => &mut self.iter,
             Slot::Next => &mut self.next,
+            Slot::Length => &mut self.length,
+            Slot::GetItem => &mut self.get_item,
+            Slot::SetItem => &mut self.set_item,
             Slot::Positive => &mut self.positive,
             Slot::Negative => &mut self.negative,
             Slot::Invert => &mut self.invert,
@@ -406,6 +445,8 @@ impl TypeSlots {
             Slot::ReflectedSubtract => &mut self.reflected_subtract,
             Slot::Multiply => &mut self.multiply,
             Slot::ReflectedMultiply => &mut self.reflected_multiply,
+            Slot::Power => &mut self.power,
+            Slot::ReflectedPower => &mut self.reflected_power,
             Slot::Divide => &mut self.divide,
             Slot::ReflectedDivide => &mut self.reflected_divide,
             Slot::FloorDivide => &mut self.floor_divide,
@@ -421,6 +462,7 @@ impl TypeSlots {
             Slot::Equal => &mut self.equal,
             Slot::LessThan => &mut self.less_than,
             Slot::Contains => &mut self.contains,
+            Slot::DeleteItem => &mut self.delete_item,
         } = Some(value);
     }
 }
@@ -655,6 +697,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
         slots.reflected_subtract = Some(intrinsic(super::number::slot_reflected_subtract));
         slots.multiply = Some(intrinsic(super::number::slot_multiply));
         slots.reflected_multiply = Some(intrinsic(super::number::slot_multiply));
+        slots.power = Some(intrinsic(super::number::slot_power));
+        slots.reflected_power = Some(intrinsic(super::number::slot_reflected_power));
         slots.divide = Some(intrinsic(super::number::slot_divide));
         slots.reflected_divide = Some(intrinsic(super::number::slot_reflected_divide));
         slots.floor_divide = Some(intrinsic(super::number::slot_floor_divide));
@@ -677,6 +721,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.add = Some(intrinsic(super::stdlib::core::slot_list_add));
     slots.multiply = Some(intrinsic(super::stdlib::core::slot_list_multiply));
     slots.reflected_multiply = Some(intrinsic(super::stdlib::core::slot_list_multiply));
+    slots.delete_item = Some(intrinsic(super::stdlib::core::slot_list_delete_item));
+
+    types[BuiltinType::Dict as usize].slots.delete_item =
+        Some(intrinsic(super::stdlib::core::slot_dict_delete_item));
 
     let slots = &mut types[BuiltinType::Tuple as usize].slots;
     slots.add = Some(intrinsic(super::stdlib::core::slot_tuple_add));
