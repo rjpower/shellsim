@@ -17,10 +17,10 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
 fn native_reduce(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("reduce", 2, 3)?;
     args.reject_keywords("reduce")?;
-    let function = args.positional()[0].clone().cast::<PyCallable>(runtime)?;
-    let iterator = runtime.iterator(args.positional()[1].clone())?;
+    let function = args.positional()[0].cast::<PyCallable>(runtime)?;
+    let iterator = runtime.iterator(args.positional()[1])?;
     let mut accumulator = match args.positional().get(2) {
-        Some(initial) => initial.clone(),
+        Some(initial) => *initial,
         None => runtime.iterator_next(iterator)?.ok_or_else(|| {
             PyError::value_error("reduce() of empty sequence with no initial value")
         })?,

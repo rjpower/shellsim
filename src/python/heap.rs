@@ -5,10 +5,12 @@
 //! changing `Value` or bytecode.
 
 use crate::resources::Resources;
+use num_bigint::BigInt;
 use std::collections::HashMap;
 
 use super::bytecode::Code;
-use super::native::MethodDef;
+use super::native::PyArgumentSpec;
+use super::object_model::{BuiltinType, TypeId};
 use super::Value;
 
 /// Storage layout inherited by user-defined classes.
@@ -29,11 +31,26 @@ pub enum InstancePayload {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(usize);
 
+impl ObjectId {
+    pub(super) const fn from_raw(value: usize) -> Self {
+        Self(value)
+    }
+
+    pub(super) const fn as_raw(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScopeId(usize);
 
 #[derive(Clone, Debug)]
 pub enum Object {
+    String(String),
+    Exception {
+        kind: String,
+        message: String,
+    },
     List(Vec<Value>),
     Tuple(Vec<Value>),
     Dict(Vec<(Value, Value)>),
@@ -42,13 +59,18 @@ pub enum Object {
         entries: Vec<(Value, Value)>,
     },
     Set(Vec<Value>),
+    BigInt(BigInt),
     Function {
         name: String,
         code: Code,
         closure: Option<ScopeId>,
         defaults: Vec<Value>,
+        /// Class captured when this function is installed by a class body.
+        defining_class: Option<ObjectId>,
     },
     Class {
+        /// Semantic type identity used by instances of this class.
+        instance_type: TypeId,
         name: String,
         /// Direct user-defined bases in source order.
         bases: Vec<ObjectId>,
@@ -65,19 +87,15 @@ pub enum Object {
     Instance {
         class: ObjectId,
         payload: InstancePayload,
-        attributes: HashMap<String, Value>,
     },
     EnumMember {
         name: String,
         value: Value,
     },
-    PythonBoundMethod {
+    DescriptorBoundMethod {
         receiver: Value,
-        function: ObjectId,
-    },
-    NativeBoundMethod {
-        receiver: Value,
-        method: &'static MethodDef,
+        descriptor: Value,
+        owner: Option<ObjectId>,
     },
     Iterator {
         values: Vec<Value>,
@@ -100,10 +118,6 @@ pub enum Object {
         exhausted: bool,
         running: bool,
     },
-    BoundMethod {
-        receiver: Value,
-        method: Method,
-    },
     Module {
         name: String,
         scope: ScopeId,
@@ -125,7 +139,7 @@ pub enum Object {
     },
     ArgumentParser {
         prog: String,
-        arguments: Vec<ArgumentSpec>,
+        arguments: Vec<PyArgumentSpec>,
     },
     Namespace {
         values: Vec<(String, Value)>,
@@ -133,56 +147,35 @@ pub enum Object {
     RaisesContext {
         expected: String,
     },
-}
-
-#[derive(Clone, Debug)]
-pub struct ArgumentSpec {
-    pub names: Vec<String>,
-    pub dest: String,
-    pub required: bool,
-    pub default: Value,
-    pub store_true: bool,
-    pub integer: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum Method {
-    StringStrip,
-    StringLStrip,
-    StringRStrip,
-    StringStartsWith,
-    StringEndsWith,
-    StringSplit,
-    ListAppend,
-    ListExtend,
-    ListPop,
-    ListRemove,
-    ListSort,
-    DictGet,
-    DictKeys,
-    DictValues,
-    DictItems,
-    DictSetDefault,
-    SetAdd,
-    SetUpdate,
-    SetRemove,
-    SetDiscard,
-    ArgumentParserAddArgument,
-    ArgumentParserParseArgs,
-    RaisesEnter,
-    RaisesExit,
-    UnitTestAssertEqual,
-    UnitTestAssertTrue,
-    UnitTestAssertFalse,
-    UnitTestAssertIsNone,
-    UnitTestAssertRaises,
+    Property {
+        getter: Value,
+        setter: Option<Value>,
+    },
+    StaticMethod {
+        callable: Value,
+    },
+    ClassMethod {
+        callable: Value,
+    },
+    Super {
+        start_class: ObjectId,
+        receiver: Value,
+    },
 }
 
 #[derive(Default, Debug)]
 pub struct Heap {
-    objects: Vec<Object>,
+    objects: Vec<HeapObject>,
     scopes: Vec<Scope>,
     modeled_bytes: u64,
+}
+
+/// Common header shared by every arena-backed Python object.
+#[derive(Clone, Debug)]
+struct HeapObject {
+    type_id: TypeId,
+    attributes: HashMap<String, Value>,
+    payload: Object,
 }
 
 #[derive(Debug)]
@@ -196,13 +189,67 @@ impl Heap {
     pub fn get(&self, id: ObjectId) -> Result<&Object, String> {
         self.objects
             .get(id.0)
+            .map(|object| &object.payload)
             .ok_or_else(|| "invalid object reference".into())
     }
 
     pub fn get_mut(&mut self, id: ObjectId) -> Result<&mut Object, String> {
         self.objects
             .get_mut(id.0)
+            .map(|object| &mut object.payload)
             .ok_or_else(|| "invalid object reference".into())
+    }
+
+    pub fn type_id(&self, id: ObjectId) -> Result<TypeId, String> {
+        self.objects
+            .get(id.0)
+            .map(|object| object.type_id)
+            .ok_or_else(|| "invalid object reference".into())
+    }
+
+    pub fn attribute(&self, id: ObjectId, name: &str) -> Result<Option<&Value>, String> {
+        Ok(self
+            .objects
+            .get(id.0)
+            .ok_or("invalid object reference")?
+            .attributes
+            .get(name))
+    }
+
+    pub fn has_attribute(&self, id: ObjectId, name: &str) -> Result<bool, String> {
+        Ok(self
+            .objects
+            .get(id.0)
+            .ok_or("invalid object reference")?
+            .attributes
+            .contains_key(name))
+    }
+
+    pub fn insert_attribute(
+        &mut self,
+        id: ObjectId,
+        name: String,
+        value: Value,
+    ) -> Result<(), String> {
+        self.objects
+            .get_mut(id.0)
+            .ok_or("invalid object reference")?
+            .attributes
+            .insert(name, value);
+        Ok(())
+    }
+
+    pub fn extend_attributes(
+        &mut self,
+        id: ObjectId,
+        values: impl IntoIterator<Item = (String, Value)>,
+    ) -> Result<(), String> {
+        self.objects
+            .get_mut(id.0)
+            .ok_or("invalid object reference")?
+            .attributes
+            .extend(values);
+        Ok(())
     }
 
     pub fn modeled_bytes(&self) -> u64 {
@@ -339,8 +386,54 @@ impl Heap {
             .checked_add(bytes)
             .ok_or("modeled heap size overflow")?;
         let id = ObjectId(self.objects.len());
-        self.objects.push(object);
+        let type_id = self.infer_type_id(&object)?;
+        self.objects.push(HeapObject {
+            type_id,
+            attributes: HashMap::new(),
+            payload: object,
+        });
         Ok(Value::Object(id))
+    }
+
+    fn infer_type_id(&self, object: &Object) -> Result<TypeId, String> {
+        Ok(match object {
+            Object::String(_) => BuiltinType::String.id(),
+            Object::Exception { .. } => BuiltinType::Exception.id(),
+            Object::List(_) => BuiltinType::List.id(),
+            Object::Tuple(_) => BuiltinType::Tuple.id(),
+            Object::Dict(_) | Object::DefaultDict { .. } => BuiltinType::Dict.id(),
+            Object::Set(_) => BuiltinType::Set.id(),
+            Object::BigInt(_) => BuiltinType::Int.id(),
+            Object::Function { .. } | Object::DescriptorBoundMethod { .. } => {
+                BuiltinType::Function.id()
+            }
+            Object::Class { metaclass, .. } => match metaclass.native_value() {
+                Some(super::vm::NativeValue::BuiltinType(builtin)) => builtin.id(),
+                _ if metaclass.object_id().is_some() => {
+                    match self.get(metaclass.object_id().expect("checked above"))? {
+                        Object::Class { instance_type, .. } => *instance_type,
+                        _ => return Err("class metaclass is not a class".into()),
+                    }
+                }
+                _ => return Err("class has an invalid metaclass".into()),
+            },
+            Object::Instance { class, .. } => match self.get(*class)? {
+                Object::Class { instance_type, .. } => *instance_type,
+                _ => return Err("instance class is not a class".into()),
+            },
+            Object::Iterator { .. } | Object::CountIterator { .. } => BuiltinType::Iterator.id(),
+            Object::Generator { .. } => BuiltinType::Generator.id(),
+            Object::Module { .. } => BuiltinType::Module.id(),
+            Object::Regex { .. } => BuiltinType::Regex.id(),
+            Object::Match { .. } => BuiltinType::Match.id(),
+            Object::ArgumentParser { .. } => BuiltinType::ArgumentParser.id(),
+            Object::RaisesContext { .. } => BuiltinType::RaisesContext.id(),
+            Object::EnumMember { .. } | Object::Namespace { .. } => BuiltinType::Native.id(),
+            Object::Property { .. } => BuiltinType::Property.id(),
+            Object::StaticMethod { .. } | Object::ClassMethod { .. } | Object::Super { .. } => {
+                BuiltinType::Native.id()
+            }
+        })
     }
 
     pub fn reserve_growth(&mut self, bytes: u64, resources: &mut Resources) -> Result<(), String> {
@@ -359,7 +452,14 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
     const HEADER: u64 = 32;
     const VALUE: u64 = 24;
     let slots = match object {
+        Object::String(value) => value.len(),
+        Object::Exception { kind, message } => kind
+            .len()
+            .checked_add(message.len())
+            .ok_or("modeled object size overflow")?,
         Object::List(values) | Object::Tuple(values) | Object::Set(values) => values.len(),
+        Object::BigInt(value) => usize::try_from(value.bits().saturating_add(7) / 8)
+            .map_err(|_| "modeled big integer size overflow")?,
         Object::Dict(entries) => entries
             .len()
             .checked_mul(2)
@@ -380,6 +480,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .and_then(|size| size.checked_add(defaults.len()))
             .ok_or("modeled object size overflow")?,
         Object::Class {
+            instance_type: _,
             name,
             bases,
             mro,
@@ -399,13 +500,12 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .and_then(|size| size.checked_add(dataclass_fields.len()))
             .and_then(|size| size.checked_add(enum_members.len()))
             .ok_or("modeled object size overflow")?,
-        Object::Instance { attributes, .. } => attributes.len(),
+        Object::Instance { .. } => 0,
         Object::EnumMember { name, .. } => name
             .len()
             .checked_add(1)
             .ok_or("modeled object size overflow")?,
-        Object::PythonBoundMethod { .. } => 2,
-        Object::NativeBoundMethod { .. } => 2,
+        Object::DescriptorBoundMethod { .. } => 3,
         Object::Iterator { values, .. } => values.len(),
         Object::CountIterator { .. } => 2,
         Object::Generator {
@@ -420,7 +520,6 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .and_then(|size| size.checked_add(handlers.len()))
             .and_then(|size| size.checked_add(stack.len()))
             .ok_or("modeled object size overflow")?,
-        Object::BoundMethod { .. } => 1,
         Object::Module { name, .. } => name.len(),
         Object::Regex { pattern, .. } => pattern.len(),
         Object::Match { text, groups, .. } => text
@@ -438,6 +537,9 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .ok_or("modeled object size overflow")?,
         Object::Namespace { values } => values.len(),
         Object::RaisesContext { expected } => expected.len(),
+        Object::Property { setter, .. } => 1 + usize::from(setter.is_some()),
+        Object::StaticMethod { .. } | Object::ClassMethod { .. } => 1,
+        Object::Super { .. } => 2,
     };
     let slots = u64::try_from(slots).map_err(|_| "modeled object size overflow")?;
     HEADER

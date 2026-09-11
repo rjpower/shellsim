@@ -242,6 +242,7 @@ pub enum Constant {
     None,
     Bool(bool),
     Integer(i64),
+    BigInteger(String),
     Float(f64),
     String(String),
 }

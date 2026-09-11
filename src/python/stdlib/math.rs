@@ -2,17 +2,17 @@
 //!
 //! This module contains no shellsim or host capabilities.  The VM can translate its `MathValue`
 //! and `MathError` values into Python objects/exceptions when it wires the module into imports.
-//! Functions intentionally accept `f64`: Python's `math` functions coerce real-number inputs,
-//! while integer conversion and arbitrary-precision integers belong to the VM's value layer.
+//! Functions intentionally accept `f64`: [`PyNumber`] performs checked coercion from immediate
+//! and arbitrary-precision integers without exposing either VM representation here.
 
 use std::fmt;
 
+use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyResult, PyRuntime, PyValueCast,
     ValueDef,
 };
 use super::super::number::PyNumber;
-use super::super::Value;
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "math",
@@ -111,7 +111,7 @@ fn native_call(runtime: &mut dyn PyRuntime, args: CallArgs, name: &'static str) 
         .positional()
         .iter()
         .cloned()
-        .map(|value| value.cast::<PyNumber>(runtime).map(PyNumber::as_f64))
+        .map(|value| value.cast::<PyNumber>(runtime).and_then(PyNumber::into_f64))
         .collect::<PyResult<Vec<_>>>()?;
     runtime.charge_cpu(u64::try_from(values.len()).unwrap_or(u64::MAX))?;
     let value = call(name, &values).map_err(math_error)?;

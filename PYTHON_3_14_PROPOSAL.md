@@ -29,8 +29,9 @@ The current language slice includes functions, closures, recursion, classes and 
 comprehensions, suspended generators, exceptions, `try`/`except`/`else`/`finally`, context managers,
 `assert`, decorators, definition-time defaults, `*args`, starred assignment/calls, f-strings, and
 VFS-only imports. The runtime deliberately models only the semantics it can enforce: generator
-expressions are eagerly materialized, generators cannot suspend across cleanup regions, and the
-object model does not yet provide general descriptors or inheritance.
+expressions are eagerly materialized and generators cannot suspend across cleanup regions. The
+object model provides C3 inheritance, cached protocol slots, descriptors, `super`, builtin
+subclass layouts, and metaclass construction hooks within the explicitly supported syntax.
 
 The requested-library probe gate is now 18/18 exact probes against CPython 3.14 when available.
 Those probes cover only these named APIs: `sys.executable`; `os.getenv`; `collections.defaultdict`;

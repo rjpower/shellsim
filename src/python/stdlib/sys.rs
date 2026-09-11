@@ -1,6 +1,19 @@
 //! Static interpreter metadata and invocation values for the modeled Python process.
 
-use super::super::native::{ModuleDef, PyConstant, PyMarker, PyResult, PyRuntime, ValueDef};
+use super::super::native::PyValue as Value;
+use super::super::native::{
+    CallArgs, MethodDef, ModuleDef, NativeTypeDef, PyConstant, PyMarker, PyResult, PyRuntime,
+    ValueDef,
+};
+
+pub(crate) static STREAM_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "shellsim.stream",
+    methods: &[MethodDef {
+        type_name: "shellsim.stream",
+        name: "write",
+        call: write,
+    }],
+};
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "sys",
@@ -47,4 +60,12 @@ fn stdout(runtime: &mut dyn PyRuntime) -> PyResult {
 
 fn stderr(runtime: &mut dyn PyRuntime) -> PyResult {
     Ok(runtime.marker(PyMarker::Stderr))
+}
+
+fn write(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    args.expect_positional("stream.write", 1, 1)?;
+    args.reject_keywords("stream.write")?;
+    let text = runtime.display(&args.positional()[0])?;
+    let written = runtime.write_stream(&receiver, &text)?;
+    Ok(Value::Int(i64::try_from(written).unwrap_or(i64::MAX)))
 }

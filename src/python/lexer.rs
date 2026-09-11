@@ -247,10 +247,10 @@ impl<'a> Lexer<'a> {
                 .map(TokenKind::Float)
                 .map_err(|_| self.error(start, "invalid decimal floating-point literal"))
         } else {
-            spelling
+            Ok(spelling
                 .parse::<i64>()
                 .map(TokenKind::Integer)
-                .map_err(|_| self.error(start, "integer is outside this implementation's range"))
+                .unwrap_or_else(|_| TokenKind::BigInteger(spelling)))
         }
     }
 
@@ -486,9 +486,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_out_of_range_integer_instead_of_wrapping() {
-        let error = lex("999999999999999999999999999999").unwrap_err();
-        assert!(error.message.contains("outside"));
+    fn preserves_out_of_range_integer_spelling_for_bigint_parsing() {
+        let tokens = lex("999999999999999999999999999999").unwrap();
+        assert_eq!(
+            tokens[0].kind,
+            TokenKind::BigInteger("999999999999999999999999999999".into())
+        );
     }
 
     #[test]

@@ -45,9 +45,25 @@ print(1.2 + .5, 1.2 * 2, 5.0 / 2, 1e2 == 100)
 }
 
 #[test]
-fn integer_overflow_and_malformed_decimal_literals_fail_loudly() {
+fn arbitrary_precision_integer_literals_and_arithmetic_match_python() {
+    let source = r#"x = 9223372036854775808
+print(x)
+print(9223372036854775807 + 1)
+print(-(-9223372036854775808))
+print(x * x)
+print(-x // 3, -x % 3)
+print(x == 9223372036854775808, x > 1)
+print(9007199254740993 == 9007199254740992.0, 9007199254740993 > 9007199254740992.0)
+print(abs(-x), sum([x, x]), int(x), float(x) > 9e18)
+print([1] * -9223372036854775809, -9223372036854775809 * (1,))
+"#;
+    let simulated = run(source);
+    assert_eq!(simulated, (0, b"9223372036854775808\n9223372036854775808\n9223372036854775808\n85070591730234615865843651857942052864\n-3074457345618258603 1\nTrue True\nFalse True\n9223372036854775808 18446744073709551616 9223372036854775808 True\n[] ()\n".to_vec(), Vec::new()));
+}
+
+#[test]
+fn malformed_decimal_literals_fail_loudly() {
     for source in [
-        "print(9223372036854775808)",
         "print(1__2)",
         "print(1_.2)",
         "print(1._2)",

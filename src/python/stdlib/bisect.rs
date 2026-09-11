@@ -6,10 +6,10 @@
 
 use std::cmp::Ordering;
 
+use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyError, PyResult, PyRuntime, PySequence, PyValueCast,
 };
-use super::super::Value;
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "bisect",
@@ -25,7 +25,6 @@ fn native_bisect_left(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("bisect_left", 2, 2)?;
     args.reject_keywords("bisect_left")?;
     let values = args.positional()[0]
-        .clone()
         .cast::<PySequence>(runtime)?
         .items(runtime)?;
     let needle = &args.positional()[1];

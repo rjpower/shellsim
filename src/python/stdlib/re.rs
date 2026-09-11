@@ -5,11 +5,11 @@
 
 use regex::{Regex, RegexBuilder};
 
+use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyConstant, PyError, PyIndex,
     PyMatch, PyRegex, PyResult, PyRuntime, PyString, PyValue, PyValueCast, ValueDef,
 };
-use super::super::Value;
 
 pub(super) const IGNORECASE: u32 = 2;
 pub(super) const MULTILINE: u32 = 8;
@@ -101,14 +101,11 @@ fn compiled_capture(
     args.reject_keywords("compiled regex match")?;
     let regex = receiver.cast::<PyRegex>(runtime)?;
     let (pattern, flags) = runtime.regex_parts(regex)?;
+    let pattern = runtime.new_string(pattern)?;
     capture(
         runtime,
         CallArgs::new(
-            vec![
-                Value::String(pattern),
-                args.positional()[0].clone(),
-                Value::Int(i64::from(flags)),
-            ],
+            vec![pattern, args.positional()[0], Value::Int(i64::from(flags))],
             Vec::new(),
         ),
         mode,
@@ -133,14 +130,11 @@ fn compiled_find(
     args.reject_keywords("compiled regex find")?;
     let regex = receiver.cast::<PyRegex>(runtime)?;
     let (pattern, flags) = runtime.regex_parts(regex)?;
+    let pattern = runtime.new_string(pattern)?;
     find(
         runtime,
         CallArgs::new(
-            vec![
-                Value::String(pattern),
-                args.positional()[0].clone(),
-                Value::Int(i64::from(flags)),
-            ],
+            vec![pattern, args.positional()[0], Value::Int(i64::from(flags))],
             Vec::new(),
         ),
         return_matches,
@@ -153,13 +147,14 @@ fn pattern_sub(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     let regex = receiver.cast::<PyRegex>(runtime)?;
     let (pattern, flags) = runtime.regex_parts(regex)?;
     let count = args.positional().get(2).cloned().unwrap_or(Value::Int(0));
+    let pattern = runtime.new_string(pattern)?;
     sub(
         runtime,
         CallArgs::new(
             vec![
-                Value::String(pattern),
-                args.positional()[0].clone(),
-                args.positional()[1].clone(),
+                pattern,
+                args.positional()[0],
+                args.positional()[1],
                 count,
                 Value::Int(i64::from(flags)),
             ],
@@ -180,25 +175,24 @@ fn match_group(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
         .unwrap_or(0);
     let index = usize::try_from(index).map_err(|_| PyError::value_error("no such group"))?;
     let data = runtime.match_data(receiver.cast::<PyMatch>(runtime)?)?;
-    Ok(data
-        .groups
-        .get(index)
-        .cloned()
-        .flatten()
-        .map_or(Value::None, Value::String))
+    match data.groups.get(index).cloned().flatten() {
+        Some(value) => runtime.new_string(value),
+        None => Ok(Value::None),
+    }
 }
 
 fn match_groups(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("re.Match.groups", 0, 0)?;
     args.reject_keywords("re.Match.groups")?;
     let data = runtime.match_data(receiver.cast::<PyMatch>(runtime)?)?;
-    runtime.new_tuple(
-        data.groups
-            .into_iter()
-            .skip(1)
-            .map(|group| group.map_or(Value::None, Value::String))
-            .collect(),
-    )
+    let mut groups = Vec::new();
+    for group in data.groups.into_iter().skip(1) {
+        groups.push(match group {
+            Some(value) => runtime.new_string(value)?,
+            None => Value::None,
+        });
+    }
+    runtime.new_tuple(groups)
 }
 
 fn match_start(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -372,29 +366,30 @@ fn find(runtime: &mut dyn PyRuntime, args: CallArgs, return_matches: bool) -> Py
             ));
         }
         runtime.reserve_memory(64)?;
-        let value = if return_matches {
-            allocate_match(runtime, &text, &captures)?
-        } else {
-            match capture_count {
-                0 => Value::String(captures[0].to_string()),
-                1 => Value::String(
-                    captures
-                        .get(1)
-                        .map_or_else(String::new, |matched| matched.as_str().to_string()),
-                ),
-                _ => runtime.new_tuple(
-                    (1..=capture_count)
-                        .map(|index| {
-                            Value::String(
+        let value =
+            if return_matches {
+                allocate_match(runtime, &text, &captures)?
+            } else {
+                match capture_count {
+                    0 => runtime.new_string(captures[0].to_string())?,
+                    1 => runtime.new_string(
+                        captures
+                            .get(1)
+                            .map_or_else(String::new, |matched| matched.as_str().to_string()),
+                    )?,
+                    _ => {
+                        let mut groups = Vec::with_capacity(capture_count);
+                        for index in 1..=capture_count {
+                            groups.push(runtime.new_string(
                                 captures.get(index).map_or_else(String::new, |matched| {
                                     matched.as_str().to_string()
                                 }),
-                            )
-                        })
-                        .collect(),
-                )?,
-            }
-        };
+                            )?);
+                        }
+                        runtime.new_tuple(groups)?
+                    }
+                }
+            };
         values.push(value);
     }
     if return_matches {
@@ -452,7 +447,7 @@ fn sub(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
             .replacen(&text, count as usize, replacement.as_str())
             .into_owned()
     };
-    Ok(Value::String(rendered))
+    runtime.new_string(rendered)
 }
 
 fn escape(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -460,7 +455,7 @@ fn escape(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.reject_keywords("re.escape")?;
     let text = string_arg(runtime, &args.positional()[0], "escape input", MAX_INPUT)?;
     runtime.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
-    Ok(Value::String(python_escape(&text)))
+    runtime.new_string(python_escape(&text))
 }
 
 fn flags_arg(
@@ -495,7 +490,7 @@ fn string_arg(
     label: &str,
     maximum: usize,
 ) -> PyResult<String> {
-    let PyString(value) = value.clone().cast(runtime)?;
+    let PyString(value) = (*value).cast(runtime)?;
     if value.len() > maximum {
         Err(PyError::value_error(format!(
             "{label} exceeds the bounded regex input limit"

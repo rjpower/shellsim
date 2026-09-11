@@ -1085,6 +1085,7 @@ impl Parser {
         let token = self.advance().clone();
         let kind = match token.kind {
             TokenKind::Integer(value) => ExpressionKind::Constant(Constant::Integer(value)),
+            TokenKind::BigInteger(value) => ExpressionKind::Constant(Constant::BigInteger(value)),
             TokenKind::Float(value) => ExpressionKind::Constant(Constant::Float(value)),
             TokenKind::String(value) => ExpressionKind::Constant(Constant::String(value)),
             TokenKind::FString(value) => self.fstring_expression(value, token.span)?,

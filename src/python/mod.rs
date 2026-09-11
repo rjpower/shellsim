@@ -11,6 +11,7 @@ mod heap;
 mod lexer;
 mod native;
 mod number;
+mod object_model;
 mod parser;
 mod protocol;
 mod source;
@@ -33,31 +34,265 @@ const MAX_RUNNER_FILE_BYTES: usize = 256 * 1024;
 const MAX_RUNNER_SOURCE_BYTES: usize = 512 * 1024;
 const MAX_RUNNER_WRAPPER_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Debug)]
-enum Value {
-    String(String),
-    Int(i64),
-    Float(f64),
-    Bool(bool),
+/// Physical storage discriminator kept separate from Python's semantic [`object_model::TypeId`].
+///
+/// Tags describe storage only. Python semantics come from the value's registered `TypeId`, so a
+/// short string and a heap string have the same Python type despite different physical tags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum ValueTag {
+    SmallString0,
+    SmallString1,
+    SmallString2,
+    SmallString3,
+    SmallString4,
+    SmallString5,
+    SmallString6,
+    SmallString7,
+    SmallString8,
+    SmallString9,
+    SmallString10,
+    SmallString11,
+    SmallString12,
+    SmallString13,
+    SmallString14,
+    SmallString15,
+    Int,
+    Float,
+    Bool,
     None,
-    Object(heap::ObjectId),
-    Native(vm::NativeValue),
-    Exception { kind: String, message: String },
+    Object,
+    Native,
+}
+
+/// Compact, copyable Python value used by the VM and native-module ABI.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+struct Value {
+    payload: u64,
+    aux: [u8; 7],
+    tag: ValueTag,
 }
 
 impl Value {
-    fn as_int(&self) -> Option<i64> {
-        match self {
-            Self::Int(value) => Some(*value),
-            Self::Float(value) if value.is_finite() => Some(*value as i64),
-            Self::Bool(value) => Some(i64::from(*value)),
-            Self::String(value) => value.parse().ok(),
-            Self::None
-            | Self::Object(_)
-            | Self::Native(_)
-            | Self::Float(_)
-            | Self::Exception { .. } => None,
+    #[allow(non_snake_case)]
+    const fn Int(value: i64) -> Self {
+        Self {
+            payload: value as u64,
+            aux: [0; 7],
+            tag: ValueTag::Int,
         }
+    }
+
+    #[allow(non_snake_case)]
+    const fn Float(value: f64) -> Self {
+        Self {
+            payload: value.to_bits(),
+            aux: [0; 7],
+            tag: ValueTag::Float,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    const fn Bool(value: bool) -> Self {
+        Self {
+            payload: value as u64,
+            aux: [0; 7],
+            tag: ValueTag::Bool,
+        }
+    }
+
+    #[allow(non_upper_case_globals)]
+    const None: Self = Self {
+        payload: 0,
+        aux: [0; 7],
+        tag: ValueTag::None,
+    };
+
+    #[allow(non_snake_case)]
+    const fn Object(value: heap::ObjectId) -> Self {
+        Self {
+            payload: value.as_raw() as u64,
+            aux: [0; 7],
+            tag: ValueTag::Object,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn Native(value: vm::NativeValue) -> Self {
+        let (payload, native_tag) = value.encode();
+        let mut aux = [0; 7];
+        aux[0] = native_tag;
+        Self {
+            payload,
+            aux,
+            tag: ValueTag::Native,
+        }
+    }
+
+    fn inline_string(value: &str) -> Option<Self> {
+        if value.len() > 15 {
+            return None;
+        }
+        let mut bytes = [0; 15];
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        let mut payload = [0; 8];
+        payload.copy_from_slice(&bytes[..8]);
+        let mut aux = [0; 7];
+        aux.copy_from_slice(&bytes[8..]);
+        Some(Self {
+            payload: u64::from_ne_bytes(payload),
+            aux,
+            tag: string_tag(value.len()),
+        })
+    }
+
+    fn inline_string_value(&self) -> Option<String> {
+        let length = self.inline_string_len()?;
+        let mut bytes = [0; 15];
+        bytes[..8].copy_from_slice(&self.payload.to_ne_bytes());
+        bytes[8..].copy_from_slice(&self.aux);
+        Some(
+            std::str::from_utf8(&bytes[..length])
+                .expect("inline strings originate from UTF-8")
+                .to_string(),
+        )
+    }
+
+    const fn inline_string_len(&self) -> Option<usize> {
+        let raw = self.tag as u8;
+        if raw <= ValueTag::SmallString15 as u8 {
+            Some(raw as usize)
+        } else {
+            None
+        }
+    }
+
+    const fn tag(&self) -> ValueTag {
+        self.tag
+    }
+
+    const fn immediate_int(&self) -> Option<i64> {
+        match self.tag {
+            ValueTag::Int => Some(self.payload as i64),
+            ValueTag::Bool => Some(self.payload as i64),
+            _ => None,
+        }
+    }
+
+    const fn float_value(&self) -> Option<f64> {
+        match self.tag {
+            ValueTag::Float => Some(f64::from_bits(self.payload)),
+            _ => None,
+        }
+    }
+
+    const fn bool_value(&self) -> Option<bool> {
+        match self.tag {
+            ValueTag::Bool => Some(self.payload != 0),
+            _ => None,
+        }
+    }
+
+    const fn object_id(&self) -> Option<heap::ObjectId> {
+        match self.tag {
+            ValueTag::Object => Some(heap::ObjectId::from_raw(self.payload as usize)),
+            _ => None,
+        }
+    }
+
+    fn native_value(&self) -> Option<vm::NativeValue> {
+        match self.tag {
+            ValueTag::Native => Some(vm::NativeValue::decode(self.payload, self.aux[0])),
+            _ => None,
+        }
+    }
+
+    const fn is_none(&self) -> bool {
+        matches!(self.tag, ValueTag::None)
+    }
+
+    fn as_int(&self) -> Option<i64> {
+        if let Some(value) = self.immediate_int() {
+            return Some(value);
+        }
+        if let Some(value) = self.float_value().filter(|value| value.is_finite()) {
+            return Some(value as i64);
+        }
+        self.inline_string_value()?.parse().ok()
+    }
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(value) = self.inline_string_value() {
+            return formatter.debug_tuple("String").field(&value).finish();
+        }
+        match self.tag {
+            ValueTag::Int => formatter
+                .debug_tuple("Int")
+                .field(&(self.payload as i64))
+                .finish(),
+            ValueTag::Float => formatter
+                .debug_tuple("Float")
+                .field(&f64::from_bits(self.payload))
+                .finish(),
+            ValueTag::Bool => formatter
+                .debug_tuple("Bool")
+                .field(&(self.payload != 0))
+                .finish(),
+            ValueTag::None => formatter.write_str("None"),
+            ValueTag::Object => formatter
+                .debug_tuple("Object")
+                .field(&self.object_id())
+                .finish(),
+            ValueTag::Native => formatter
+                .debug_tuple("Native")
+                .field(&self.native_value())
+                .finish(),
+            _ => unreachable!("small strings returned above"),
+        }
+    }
+}
+
+const fn string_tag(length: usize) -> ValueTag {
+    match length {
+        0 => ValueTag::SmallString0,
+        1 => ValueTag::SmallString1,
+        2 => ValueTag::SmallString2,
+        3 => ValueTag::SmallString3,
+        4 => ValueTag::SmallString4,
+        5 => ValueTag::SmallString5,
+        6 => ValueTag::SmallString6,
+        7 => ValueTag::SmallString7,
+        8 => ValueTag::SmallString8,
+        9 => ValueTag::SmallString9,
+        10 => ValueTag::SmallString10,
+        11 => ValueTag::SmallString11,
+        12 => ValueTag::SmallString12,
+        13 => ValueTag::SmallString13,
+        14 => ValueTag::SmallString14,
+        15 => ValueTag::SmallString15,
+        _ => panic!("inline string length exceeds payload"),
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<Value>() == 16);
+
+#[cfg(test)]
+mod value_layout_tests {
+    use super::*;
+
+    #[test]
+    fn compact_values_are_exactly_sixteen_bytes() {
+        assert_eq!(std::mem::size_of::<Value>(), 16);
+        assert_eq!(
+            Value::inline_string("123456789012345")
+                .unwrap()
+                .inline_string_len(),
+            Some(15)
+        );
+        assert!(Value::inline_string("1234567890123456").is_none());
     }
 }
 
@@ -66,6 +301,7 @@ impl Value {
 pub struct ReplState {
     locals: HashMap<String, Value>,
     heap: heap::Heap,
+    types: object_model::TypeRegistry,
     modules: HashMap<String, Value>,
     import_paths: Vec<String>,
 }

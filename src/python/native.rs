@@ -14,8 +14,16 @@ use super::Value;
 /// The erased value exchanged by native modules and the VM.
 pub(super) type PyValue = Value;
 
+/// Opaque stable identity for an arena-backed Python value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PyIdentity(pub(super) ObjectId);
+
 /// Result of a Python runtime operation.
 pub(super) type PyResult<T = PyValue> = Result<T, PyError>;
+
+/// Native implementation stored directly in a binary protocol slot.
+pub(super) type BinarySlotFn =
+    fn(&mut dyn PyRuntime, PyValue, PyValue) -> PyResult<Option<PyValue>>;
 
 /// Stable error categories produced by native Python operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +118,9 @@ pub(super) enum PyKind {
 pub(super) enum PyNativeKind {
     Regex,
     Match,
+    ArgumentParser,
+    RaisesContext,
+    Property,
 }
 
 /// Interpreter-owned marker values exported by compatibility modules.
@@ -145,13 +156,25 @@ pub(super) trait PyRuntime {
     fn charge_cpu(&mut self, units: u64) -> PyResult<()>;
     fn kind(&self, value: &PyValue) -> PyResult<PyKind>;
     fn native_kind(&self, value: &PyValue) -> PyResult<Option<PyNativeKind>>;
+    fn identity(&self, value: &PyValue) -> Option<PyIdentity>;
     fn int_value(&self, value: &PyValue) -> Option<i64>;
-    fn truth(&self, value: &PyValue) -> PyResult<bool>;
-    fn display(&self, value: &PyValue) -> PyResult<String>;
-    fn compare(&self, left: &PyValue, right: &PyValue) -> PyResult<Ordering>;
+    fn string_value(&self, value: &PyValue) -> PyResult<Option<String>>;
+    fn is_integer_type(&self, value: &PyValue) -> bool;
+    /// Return an exact decimal rendering for any Python integer representation.
+    fn integer_text(&self, value: &PyValue) -> PyResult<Option<String>>;
+    /// Write only to an interpreter-owned simulated stream marker.
+    fn write_stream(&mut self, stream: &PyValue, text: &str) -> PyResult<usize>;
+    fn truth(&mut self, value: &PyValue) -> PyResult<bool>;
+    fn display(&mut self, value: &PyValue) -> PyResult<String>;
+    fn repr(&mut self, value: &PyValue) -> PyResult<String>;
+    fn equals(&mut self, left: &PyValue, right: &PyValue) -> PyResult<bool>;
+    fn compare(&mut self, left: &PyValue, right: &PyValue) -> PyResult<Ordering>;
     fn list_items(&mut self, list: PyList) -> PyResult<Vec<PyValue>>;
     fn tuple_items(&mut self, tuple: PyTuple) -> PyResult<Vec<PyValue>>;
     fn dict_items(&mut self, dict: PyDict) -> PyResult<Vec<(PyValue, PyValue)>>;
+    fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(PyValue, PyValue)>) -> PyResult<()>;
+    fn set_items(&mut self, set: PySet) -> PyResult<Vec<PyValue>>;
+    fn replace_set_items(&mut self, set: PySet, items: Vec<PyValue>) -> PyResult<()>;
     fn instance_attribute(&self, instance: PyInstance, name: &str) -> PyResult<Option<PyValue>>;
     fn replace_list_items(&mut self, list: PyList, items: Vec<PyValue>) -> PyResult<()>;
     fn call_value(&mut self, callable: PyValue, args: CallArgs) -> PyResult<PyValue>;
@@ -164,6 +187,19 @@ pub(super) trait PyRuntime {
     fn new_list(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
     fn new_tuple(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
     fn new_dict(&mut self, items: Vec<(PyValue, PyValue)>) -> PyResult<PyValue>;
+    fn new_string(&mut self, value: String) -> PyResult<PyValue>;
+    fn property_getter(&self, property: PyProperty) -> PyResult<PyValue>;
+    fn new_property(&mut self, getter: PyValue, setter: Option<PyValue>) -> PyResult<PyValue>;
+    /// Allocate a class through the runtime's single `type.__new__` implementation.
+    fn new_type(
+        &mut self,
+        metaclass: PyValue,
+        name: String,
+        bases: PyValue,
+        namespace: PyValue,
+    ) -> PyResult<PyValue>;
+    /// Parse and allocate a Python integer without imposing an immediate-width limit.
+    fn new_integer(&mut self, decimal: &str) -> PyResult<PyValue>;
     fn new_regex(&mut self, pattern: String, flags: u32) -> PyResult<PyValue>;
     fn new_match(
         &mut self,
@@ -179,8 +215,19 @@ pub(super) trait PyRuntime {
     fn argv0(&self) -> String;
     fn new_argv(&mut self) -> PyResult<PyValue>;
     fn new_argument_parser(&mut self, program: String) -> PyResult<PyValue>;
+    fn argument_parser_parts(
+        &mut self,
+        parser: PyArgumentParser,
+    ) -> PyResult<(String, Vec<PyArgumentSpec>)>;
+    fn append_argument(
+        &mut self,
+        parser: PyArgumentParser,
+        argument: PyArgumentSpec,
+    ) -> PyResult<()>;
+    fn command_arguments(&self) -> Vec<String>;
     fn new_namespace(&mut self, values: Vec<(String, PyValue)>) -> PyResult<PyValue>;
     fn new_raises_context(&mut self, expected: String) -> PyResult<PyValue>;
+    fn raises_expected(&self, context: PyRaisesContext) -> PyResult<String>;
     fn exception_type_name(&self, value: &PyValue) -> Option<&'static str>;
     fn clock(&mut self) -> &mut dyn PyClock;
     fn environment(&self) -> &dyn PyEnvironment;
@@ -228,14 +275,13 @@ pub(super) struct PyString(pub String);
 
 impl FromPyValue for PyString {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        match value {
-            Value::String(value) => Ok(Self(value)),
-            other => {
-                let actual = runtime.type_name(&other)?;
-                Err(PyError::type_error(format!(
-                    "expected a string, got {actual}"
-                )))
-            }
+        if let Some(value) = runtime.string_value(&value)? {
+            Ok(Self(value))
+        } else {
+            let actual = runtime.type_name(&value)?;
+            Err(PyError::type_error(format!(
+                "expected a string, got {actual}"
+            )))
         }
     }
 }
@@ -265,7 +311,7 @@ impl PyRegex {
 
 impl FromPyValue for PyRegex {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Value::Object(id) = value else {
+        let Some(id) = value.object_id() else {
             return Err(PyError::type_error("expected a compiled regex"));
         };
         if runtime.native_kind(&Value::Object(id))? == Some(PyNativeKind::Regex) {
@@ -288,7 +334,7 @@ impl PyMatch {
 
 impl FromPyValue for PyMatch {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Value::Object(id) = value else {
+        let Some(id) = value.object_id() else {
             return Err(PyError::type_error("expected a regex match"));
         };
         if runtime.native_kind(&Value::Object(id))? == Some(PyNativeKind::Match) {
@@ -306,13 +352,70 @@ pub(super) struct PyMatchData {
     pub end: usize,
 }
 
+/// Owned definition of one bounded ``argparse`` argument.
+#[derive(Clone, Debug)]
+pub(super) struct PyArgumentSpec {
+    pub names: Vec<String>,
+    pub dest: String,
+    pub required: bool,
+    pub default: PyValue,
+    pub store_true: bool,
+    pub integer: bool,
+}
+
+/// Checked handle to an interpreter-owned argument parser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PyArgumentParser(ObjectId);
+
+impl PyArgumentParser {
+    pub(super) fn object_id(self) -> ObjectId {
+        self.0
+    }
+}
+
+impl FromPyValue for PyArgumentParser {
+    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
+        let Some(id) = value.object_id() else {
+            return Err(PyError::type_error("expected ArgumentParser"));
+        };
+        if runtime.native_kind(&Value::Object(id))? == Some(PyNativeKind::ArgumentParser) {
+            Ok(Self(id))
+        } else {
+            Err(PyError::type_error("expected ArgumentParser"))
+        }
+    }
+}
+
+/// Checked handle to a context returned by ``pytest.raises``.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PyRaisesContext(ObjectId);
+
+impl PyRaisesContext {
+    pub(super) fn object_id(self) -> ObjectId {
+        self.0
+    }
+}
+
+impl FromPyValue for PyRaisesContext {
+    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
+        let Some(id) = value.object_id() else {
+            return Err(PyError::type_error("expected pytest.raises context"));
+        };
+        if runtime.native_kind(&Value::Object(id))? == Some(PyNativeKind::RaisesContext) {
+            Ok(Self(id))
+        } else {
+            Err(PyError::type_error("expected pytest.raises context"))
+        }
+    }
+}
+
 /// Checked handle to an arena-backed Python list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PyList(ObjectId);
 
 impl FromPyValue for PyList {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Value::Object(id) = value else {
+        let Some(id) = value.object_id() else {
             let actual = runtime.type_name(&value)?;
             return Err(PyError::type_error(format!("expected list, got {actual}")));
         };
@@ -342,7 +445,7 @@ pub(super) struct PyTuple(ObjectId);
 
 impl FromPyValue for PyTuple {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Value::Object(id) = value else {
+        let Some(id) = value.object_id() else {
             let actual = runtime.type_name(&value)?;
             return Err(PyError::type_error(format!("expected tuple, got {actual}")));
         };
@@ -448,7 +551,7 @@ impl PyCallable {
 
 impl FromPyValue for PyIterator {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Value::Object(id) = value else {
+        let Some(id) = value.object_id() else {
             return Err(PyError::type_error("expected an iterator"));
         };
         if matches!(
@@ -468,7 +571,7 @@ pub(super) struct PyDict(ObjectId);
 
 impl FromPyValue for PyDict {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Value::Object(id) = value else {
+        let Some(id) = value.object_id() else {
             let actual = runtime.type_name(&value)?;
             return Err(PyError::type_error(format!("expected dict, got {actual}")));
         };
@@ -492,13 +595,63 @@ impl PyDict {
     }
 }
 
+/// Checked handle to an arena-backed Python set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PySet(ObjectId);
+
+impl FromPyValue for PySet {
+    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
+        let Some(id) = value.object_id() else {
+            return Err(PyError::type_error("expected set"));
+        };
+        if runtime.kind(&Value::Object(id))? == PyKind::Set {
+            Ok(Self(id))
+        } else {
+            Err(PyError::type_error("expected set"))
+        }
+    }
+}
+
+impl PySet {
+    pub(super) fn object_id(self) -> ObjectId {
+        self.0
+    }
+
+    pub fn items(self, runtime: &mut dyn PyRuntime) -> PyResult<Vec<PyValue>> {
+        runtime.set_items(self)
+    }
+}
+
+/// Checked handle to the standard `property` descriptor payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PyProperty(ObjectId);
+
+impl FromPyValue for PyProperty {
+    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
+        let Some(id) = value.object_id() else {
+            return Err(PyError::type_error("expected property"));
+        };
+        if runtime.native_kind(&Value::Object(id))? == Some(PyNativeKind::Property) {
+            Ok(Self(id))
+        } else {
+            Err(PyError::type_error("expected property"))
+        }
+    }
+}
+
+impl PyProperty {
+    pub(super) fn object_id(self) -> ObjectId {
+        self.0
+    }
+}
+
 /// Checked handle to an arena-backed Python instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PyInstance(ObjectId);
 
 impl FromPyValue for PyInstance {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Value::Object(id) = value else {
+        let Some(id) = value.object_id() else {
             let actual = runtime.type_name(&value)?;
             return Err(PyError::type_error(format!(
                 "expected instance, got {actual}"
@@ -538,7 +691,7 @@ impl PyClass {
 
 impl FromPyValue for PyClass {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Value::Object(id) = value else {
+        let Some(id) = value.object_id() else {
             return Err(PyError::type_error("expected a class"));
         };
         if runtime.kind(&Value::Object(id))? == PyKind::Class {
@@ -675,14 +828,6 @@ pub(super) struct NativeTypeDef {
     pub methods: &'static [MethodDef],
 }
 
-impl NativeTypeDef {
-    pub fn method(&'static self, name: &str) -> Option<&'static MethodDef> {
-        self.methods
-            .iter()
-            .find(|method| method.name == name && method.type_name == self.name)
-    }
-}
-
 /// Static values supported directly by declarative module definitions.
 pub(super) enum PyConstant {
     Int(i64),
@@ -714,7 +859,7 @@ impl ValueDef {
             Self::Constant { value, .. } => Ok(match value {
                 PyConstant::Int(value) => Value::Int(*value),
                 PyConstant::Float(value) => Value::Float(*value),
-                PyConstant::String(value) => Value::String((*value).to_string()),
+                PyConstant::String(value) => return runtime.new_string((*value).to_string()),
             }),
             Self::Factory { get, .. } => get(runtime),
         }

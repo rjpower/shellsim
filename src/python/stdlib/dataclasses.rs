@@ -24,8 +24,8 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
 fn dataclass(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("dataclass", 1, 1)?;
     args.reject_keywords("dataclass")?;
-    let value = args.positional()[0].clone();
-    let class = value.clone().cast::<PyClass>(runtime)?;
+    let value = args.positional()[0];
+    let class = value.cast::<PyClass>(runtime)?;
     runtime.mark_dataclass(class)?;
     Ok(value)
 }

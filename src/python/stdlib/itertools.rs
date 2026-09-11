@@ -48,9 +48,9 @@ fn native_islice(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("islice", 2, 4)?;
     args.reject_keywords("islice")?;
     let values = args.positional();
-    let iterable = values[0].clone();
+    let iterable = values[0];
     let index =
-        |value: &super::super::Value| value.clone().cast::<PyIndex>(runtime).map(|value| value.0);
+        |value: &super::super::Value| (*value).cast::<PyIndex>(runtime).map(|value| value.0);
     let (start, stop, step) = match values {
         [_, stop] => (0, index(stop)?, 1),
         [_, start, stop] => (index(start)?, index(stop)?, 1),

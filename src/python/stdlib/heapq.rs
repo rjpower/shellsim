@@ -6,10 +6,10 @@
 
 use std::cmp::Ordering;
 
+use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyError, PyList, PyResult, PyRuntime, PyValue, PyValueCast,
 };
-use super::super::Value;
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "heapq",
@@ -31,7 +31,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
 fn native_heapify(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("heapify", 1, 1)?;
     args.reject_keywords("heapify")?;
-    let list = args.positional()[0].clone().cast::<PyList>(runtime)?;
+    let list = args.positional()[0].cast::<PyList>(runtime)?;
     let mut values = list.items(runtime)?;
     dynamic_heapify(runtime, &mut values)?;
     runtime.replace_list_items(list, values)?;
@@ -41,7 +41,7 @@ fn native_heapify(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 fn native_heappop(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("heappop", 1, 1)?;
     args.reject_keywords("heappop")?;
-    let list = args.positional()[0].clone().cast::<PyList>(runtime)?;
+    let list = args.positional()[0].cast::<PyList>(runtime)?;
     let mut values = list.items(runtime)?;
     let last = values
         .pop()

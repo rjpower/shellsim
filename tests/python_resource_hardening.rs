@@ -113,8 +113,10 @@ fn json_dumps_has_a_preallocation_bound() {
 
 #[test]
 fn json_loads_reserves_parser_and_object_memory() {
+    let payload = format!("[{}]", vec!["0"; 4_000].join(","));
+    let source = format!("import json; json.loads({payload:?})");
     let (status, stdout, stderr, usage) = run_with_limits(
-        "import json; json.loads('[0,0,0,0,0,0,0,0,0,0]' * 1000)",
+        &source,
         Limits {
             memory: 32 * 1024,
             ..Limits::unlimited()
@@ -122,6 +124,21 @@ fn json_loads_reserves_parser_and_object_memory() {
     );
     assert_eq!(status, 137);
     assert!(usage.memory_peak <= 32 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn arbitrary_precision_arithmetic_is_metered_before_growth() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "value = 9223372036854775808\nfor _ in range(100):\n    value = value * value",
+        Limits {
+            memory: 64 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 64 * 1024);
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 }

@@ -297,12 +297,14 @@ impl Compiler {
                         return;
                     }
                 };
+                for decorator in &decorators {
+                    self.expression(decorator.clone());
+                }
                 self.statement(Statement {
                     kind: *statement,
                     span,
                 });
-                for decorator in decorators.into_iter().rev() {
-                    self.expression(decorator);
+                for _ in decorators.into_iter().rev() {
                     self.emit(Operation::LoadName(name.clone()), span);
                     self.emit(
                         Operation::Call {

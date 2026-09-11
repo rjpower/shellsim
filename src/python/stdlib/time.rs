@@ -89,10 +89,7 @@ fn process_time_ns(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 fn sleep(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("time.sleep", 1, 1)?;
     args.reject_keywords("time.sleep")?;
-    let seconds = args.positional()[0]
-        .clone()
-        .cast::<PyNumber>(runtime)?
-        .as_f64();
+    let seconds = args.positional()[0].cast::<PyNumber>(runtime)?.into_f64()?;
     if !seconds.is_finite() || seconds < 0.0 {
         return Err(PyError::value_error(
             "time.sleep() length must be a finite non-negative number",

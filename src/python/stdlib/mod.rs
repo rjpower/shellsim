@@ -6,6 +6,7 @@
 pub mod argparse;
 pub mod bisect;
 pub mod collections;
+pub mod core;
 pub mod dataclasses;
 pub mod r#enum;
 pub mod functools;

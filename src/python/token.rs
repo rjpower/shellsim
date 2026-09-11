@@ -6,8 +6,8 @@ use super::source::Span;
 pub enum TokenKind {
     Name(String),
     Integer(i64),
-    /// A decimal floating-point literal. The VM has no arbitrary precision
-    /// numeric type, so validation happens in the lexer and stores an f64.
+    BigInteger(String),
+    /// A decimal floating-point literal validated by the lexer and stored as an f64.
     Float(f64),
     String(String),
     FString(String),
