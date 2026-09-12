@@ -36,7 +36,14 @@ pub enum DescriptorError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IoPoll<T> {
     Ready(T),
-    Blocked,
+    Blocked(IoWait),
+}
+
+/// Exact pipe condition needed to resume a blocked descriptor operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoWait {
+    PipeReadable(PipeId),
+    PipeWritable(PipeId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -309,15 +316,15 @@ impl DescriptorArena {
             OpenDescription::Null => Ok(IoPoll::Ready(Vec::new())),
             OpenDescription::File { .. } => Err(DescriptorError::WrongAccess),
             OpenDescription::PipeReader(pipe) => {
-                let pipe = self
+                let state = self
                     .pipes
                     .get_mut(&pipe)
                     .ok_or(DescriptorError::InvalidFd)?;
-                if pipe.bytes.is_empty() && pipe.writers > 0 {
-                    return Ok(IoPoll::Blocked);
+                if state.bytes.is_empty() && state.writers > 0 {
+                    return Ok(IoPoll::Blocked(IoWait::PipeReadable(pipe)));
                 }
-                let count = maximum.min(pipe.bytes.len());
-                Ok(IoPoll::Ready(pipe.bytes.drain(..count).collect()))
+                let count = maximum.min(state.bytes.len());
+                Ok(IoPoll::Ready(state.bytes.drain(..count).collect()))
             }
             _ => Err(DescriptorError::WrongAccess),
         }
@@ -349,19 +356,19 @@ impl DescriptorArena {
             OpenDescription::Null => Ok(IoPoll::Ready(bytes.len())),
             OpenDescription::File { .. } => Err(DescriptorError::WrongAccess),
             OpenDescription::PipeWriter(pipe) => {
-                let pipe = self
+                let state = self
                     .pipes
                     .get_mut(&pipe)
                     .ok_or(DescriptorError::InvalidFd)?;
-                if pipe.readers == 0 {
+                if state.readers == 0 {
                     return Err(DescriptorError::BrokenPipe);
                 }
-                let available = pipe.capacity.saturating_sub(pipe.bytes.len());
+                let available = state.capacity.saturating_sub(state.bytes.len());
                 if available == 0 {
-                    return Ok(IoPoll::Blocked);
+                    return Ok(IoPoll::Blocked(IoWait::PipeWritable(pipe)));
                 }
                 let count = available.min(bytes.len());
-                pipe.bytes.extend(&bytes[..count]);
+                state.bytes.extend(&bytes[..count]);
                 Ok(IoPoll::Ready(count))
             }
             _ => Err(DescriptorError::WrongAccess),
@@ -444,6 +451,23 @@ impl DescriptorArena {
             .checked_add(u64::try_from(bytes).map_err(|_| DescriptorError::OutputLimit)?)
             .ok_or(DescriptorError::OutputLimit)?;
         Ok(())
+    }
+
+    /// Return the pipe and endpoint direction for scheduler readiness notifications.
+    pub(crate) fn pipe_endpoint(
+        &self,
+        id: DescriptionId,
+    ) -> Result<Option<(PipeId, bool)>, DescriptorError> {
+        let description = &self
+            .descriptions
+            .get(&id)
+            .ok_or(DescriptorError::InvalidFd)?
+            .description;
+        Ok(match description {
+            OpenDescription::PipeReader(pipe) => Some((*pipe, true)),
+            OpenDescription::PipeWriter(pipe) => Some((*pipe, false)),
+            _ => None,
+        })
     }
 }
 
@@ -556,9 +580,15 @@ mod tests {
         let mut fds = FdTable::new();
         fds.install(0, reader, &mut arena).unwrap();
         fds.install(1, writer, &mut arena).unwrap();
-        assert_eq!(arena.read(reader, 8).unwrap(), IoPoll::Blocked);
+        assert_eq!(
+            arena.read(reader, 8).unwrap(),
+            IoPoll::Blocked(IoWait::PipeReadable(1))
+        );
         assert_eq!(arena.write(writer, b"abcde").unwrap(), IoPoll::Ready(3));
-        assert_eq!(arena.write(writer, b"de").unwrap(), IoPoll::Blocked);
+        assert_eq!(
+            arena.write(writer, b"de").unwrap(),
+            IoPoll::Blocked(IoWait::PipeWritable(1))
+        );
         assert_eq!(
             arena.read(reader, 2).unwrap(),
             IoPoll::Ready(b"ab".to_vec())
@@ -581,7 +611,10 @@ mod tests {
         parent.install(1, writer, &mut arena).unwrap();
         let mut child = parent.fork(&mut arena).unwrap();
         parent.close(1, &mut arena).unwrap();
-        assert_eq!(arena.read(reader, 1).unwrap(), IoPoll::Blocked);
+        assert_eq!(
+            arena.read(reader, 1).unwrap(),
+            IoPoll::Blocked(IoWait::PipeReadable(1))
+        );
         child.close(1, &mut arena).unwrap();
         assert_eq!(arena.read(reader, 1).unwrap(), IoPoll::Ready(Vec::new()));
         parent.close_all(&mut arena);

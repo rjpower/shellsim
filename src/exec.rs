@@ -529,7 +529,7 @@ fn read_all_fd(interp: &mut Interp, fd: i32) -> Result<Vec<u8>, String> {
                 }
                 output.extend_from_slice(&bytes);
             }
-            IoPoll::Blocked => return Err("descriptor read would block".to_string()),
+            IoPoll::Blocked(_) => return Err("descriptor read would block".to_string()),
         }
     }
 }
@@ -537,7 +537,7 @@ fn read_all_fd(interp: &mut Interp, fd: i32) -> Result<Vec<u8>, String> {
 fn write_all_fd(interp: &mut Interp, fd: i32, mut bytes: &[u8]) -> Result<(), String> {
     while !bytes.is_empty() {
         match interp.write_fd(fd, bytes)? {
-            IoPoll::Ready(0) | IoPoll::Blocked => {
+            IoPoll::Ready(0) | IoPoll::Blocked(_) => {
                 return Err("descriptor write would block".to_string());
             }
             IoPoll::Ready(written) => bytes = &bytes[written..],

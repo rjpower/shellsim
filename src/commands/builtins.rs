@@ -596,7 +596,7 @@ fn read_one_line(interp: &mut Interp, io: &Io) -> Option<String> {
                 }
                 line.push(bytes[0]);
             }
-            crate::descriptors::IoPoll::Blocked => return None,
+            crate::descriptors::IoPoll::Blocked(_) => return None,
         }
     }
     if !consumed {

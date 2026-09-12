@@ -29,6 +29,11 @@ stage, background jobs finish before the prompt returns, and Python `Popen` cann
 process. Do not describe these operations as concurrent until phases 3 through 5 meet their
 removal criteria.
 
+The readiness handshake needed by phase 3 is present: blocked descriptor operations return a
+typed pipe-readable or pipe-writable condition, process code can suspend on that exact condition,
+and successful peer I/O wakes matching tasks in stable blocking order. Continuation polling can
+therefore yield directly into scheduler state without stringly typed wake keys or host polling.
+
 ## Non-negotiable invariants
 
 - Simulated input never reaches a host process, descriptor, filesystem, network, environment, or

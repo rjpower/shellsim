@@ -44,6 +44,7 @@ pub enum SchedulerError {
 pub struct Scheduler {
     states: BTreeMap<ProcessId, TaskState>,
     runnable: VecDeque<ProcessId>,
+    blocked: VecDeque<ProcessId>,
     current: Option<ProcessId>,
 }
 
@@ -53,6 +54,7 @@ impl Scheduler {
         Self {
             states: BTreeMap::from([(root, TaskState::Running)]),
             runnable: VecDeque::new(),
+            blocked: VecDeque::new(),
             current: Some(root),
         }
     }
@@ -82,6 +84,7 @@ impl Scheduler {
     pub fn block_current(&mut self, reason: WaitReason) -> Result<ProcessId, SchedulerError> {
         let pid = self.current.take().ok_or(SchedulerError::NoRunningTask)?;
         self.states.insert(pid, TaskState::Blocked(reason));
+        self.blocked.push_back(pid);
         Ok(pid)
     }
 
@@ -97,6 +100,7 @@ impl Scheduler {
         match self.states.get(&pid).copied() {
             Some(TaskState::Blocked(_)) => {
                 self.states.insert(pid, TaskState::Runnable);
+                self.blocked.retain(|blocked| *blocked != pid);
                 self.runnable.push_back(pid);
                 Ok(())
             }
@@ -106,6 +110,21 @@ impl Scheduler {
             }
             None => Err(SchedulerError::UnknownTask),
         }
+    }
+
+    /// Wake all tasks waiting on one modeled resource in stable blocking order.
+    pub fn wake_waiters(&mut self, reason: WaitReason) -> usize {
+        let waiting: Vec<ProcessId> = self
+            .blocked
+            .iter()
+            .copied()
+            .filter(|pid| self.state(*pid) == Some(TaskState::Blocked(reason)))
+            .collect();
+        for pid in &waiting {
+            self.wake(*pid)
+                .expect("blocked queue contains a known blocked task");
+        }
+        waiting.len()
     }
 
     /// Dispatch the next runnable task, or `None` when every retained task is blocked/exited.
@@ -180,5 +199,32 @@ mod tests {
         assert_eq!(scheduler.wake(99), Err(SchedulerError::UnknownTask));
         assert_eq!(scheduler.current(), Some(1));
         assert_eq!(scheduler.state(1), Some(TaskState::Running));
+    }
+
+    #[test]
+    fn resource_wakes_preserve_the_order_tasks_blocked() {
+        let mut scheduler = Scheduler::new(1);
+        scheduler.spawn(2).unwrap();
+        scheduler.spawn(3).unwrap();
+        scheduler
+            .block_current(WaitReason::PipeReadable(7))
+            .unwrap();
+        assert_eq!(scheduler.dispatch().unwrap(), Some(2));
+        scheduler
+            .block_current(WaitReason::PipeReadable(7))
+            .unwrap();
+        assert_eq!(scheduler.dispatch().unwrap(), Some(3));
+        scheduler
+            .block_current(WaitReason::PipeWritable(7))
+            .unwrap();
+
+        assert_eq!(scheduler.wake_waiters(WaitReason::PipeReadable(7)), 2);
+        assert_eq!(scheduler.dispatch().unwrap(), Some(1));
+        scheduler.yield_current().unwrap();
+        assert_eq!(scheduler.dispatch().unwrap(), Some(2));
+        assert_eq!(
+            scheduler.state(3),
+            Some(TaskState::Blocked(WaitReason::PipeWritable(7)))
+        );
     }
 }

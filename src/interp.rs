@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::clock::{Clock, EventId};
 use crate::descriptors::{
-    DescriptionId, DescriptorArena, DescriptorError, Fd, FdTable, IoPoll, MAX_CAPTURE_BYTES,
+    DescriptionId, DescriptorArena, DescriptorError, Fd, FdTable, IoPoll, IoWait, MAX_CAPTURE_BYTES,
 };
 use crate::net::VirtualNet;
 use crate::process::{ProcessId, ProcessTable};
@@ -547,9 +547,20 @@ impl Environment {
                 .map_err(descriptor_message)?;
             return Ok(IoPoll::Ready(bytes));
         }
-        self.descriptors
+        let result = self
+            .descriptors
             .read(description, maximum)
-            .map_err(descriptor_message)
+            .map_err(descriptor_message)?;
+        if matches!(result, IoPoll::Ready(_)) {
+            if let Some((pipe, true)) = self
+                .descriptors
+                .pipe_endpoint(description)
+                .map_err(descriptor_message)?
+            {
+                self.scheduler.wake_waiters(WaitReason::PipeWritable(pipe));
+            }
+        }
+        Ok(result)
     }
 
     /// Write to an active process descriptor, routing file effects only through the VFS.
@@ -577,9 +588,32 @@ impl Environment {
                 .map_err(descriptor_message)?;
             return Ok(IoPoll::Ready(bytes.len()));
         }
-        self.descriptors
+        let result = self
+            .descriptors
             .write(description, bytes)
-            .map_err(descriptor_message)
+            .map_err(descriptor_message)?;
+        if matches!(result, IoPoll::Ready(_)) {
+            if let Some((pipe, false)) = self
+                .descriptors
+                .pipe_endpoint(description)
+                .map_err(descriptor_message)?
+            {
+                self.scheduler.wake_waiters(WaitReason::PipeReadable(pipe));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Suspend the active task on the exact readiness condition returned by descriptor I/O.
+    pub fn block_on_io(&mut self, wait: IoWait) -> Result<(), String> {
+        let reason = match wait {
+            IoWait::PipeReadable(pipe) => WaitReason::PipeReadable(pipe),
+            IoWait::PipeWritable(pipe) => WaitReason::PipeWritable(pipe),
+        };
+        self.scheduler
+            .block_current(reason)
+            .map(|_| ())
+            .map_err(|error| format!("unable to block process on descriptor: {error:?}"))
     }
 
     /// Record a package name installed by a compatibility command.
@@ -945,5 +979,29 @@ mod process_state_tests {
         assert_eq!(environment.process.active, root);
         assert_eq!(environment.process.states.len(), 1);
         assert_eq!(environment.get_var("scope").as_deref(), Some("parent"));
+    }
+
+    #[test]
+    fn pipe_io_wakes_the_exact_blocked_descriptor_waiter() {
+        let mut environment = Environment::new();
+        let (reader, writer) = environment.descriptors.open_pipe(8).unwrap();
+        environment.install_new_description(0, reader).unwrap();
+        environment.install_new_description(1, writer).unwrap();
+
+        let IoPoll::Blocked(wait) = environment.read_fd(0, 1).unwrap() else {
+            panic!("empty pipe with a live writer must block");
+        };
+        environment.block_on_io(wait).unwrap();
+        assert_eq!(
+            environment.scheduler.state(environment.pid),
+            Some(crate::scheduler::TaskState::Blocked(
+                WaitReason::PipeReadable(1)
+            ))
+        );
+        assert_eq!(environment.write_fd(1, b"x").unwrap(), IoPoll::Ready(1));
+        assert_eq!(
+            environment.scheduler.state(environment.pid),
+            Some(crate::scheduler::TaskState::Runnable)
+        );
     }
 }
