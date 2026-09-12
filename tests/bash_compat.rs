@@ -248,6 +248,38 @@ fn source_and_eval_execute_inline_continuation_frames() {
 }
 
 #[test]
+fn command_substitutions_use_scheduled_captured_children() {
+    assert_eq!(
+        run("(sleep 1; printf ready > /tmp/marker) & value=$(sleep 2; cat /tmp/marker); printf '<%s>' \"$value\"; wait"),
+        (0, "<ready>".into(), String::new())
+    );
+    assert_eq!(
+        run("printf '<%s>:<%s>' \"$(printf 'a b\\n\\n')\" `printf legacy`; env | rg '^__SHELLSIM_COMMAND_SUBSTITUTION_'"),
+        (1, "<a b>:<legacy>".into(), String::new())
+    );
+    assert_eq!(
+        run("result=$(false); printf '%s' $?"),
+        (0, "1".into(), String::new())
+    );
+    assert_eq!(
+        run("(sleep 1; printf 'one two' > /tmp/items) & for item in $(sleep 2; cat /tmp/items); do printf '[%s]' \"$item\"; done; wait"),
+        (0, "[one][two]".into(), String::new())
+    );
+    assert_eq!(
+        run("case \"$(printf ready)\" in $(printf 'r*')) printf case;; esac; printf redirected > \"$(printf /tmp/output)\"; cat /tmp/output; cat <<EOF\n$(printf heredoc)\nEOF"),
+        (0, "caseredirectedheredoc\n".into(), String::new())
+    );
+    assert_eq!(
+        run("(sleep 1; printf 2 > /tmp/start) & (( value = $(sleep 2; cat /tmp/start) + 1 )); printf '%s:%s' \"$value\" $?; wait"),
+        (0, "3:0".into(), String::new())
+    );
+    assert_eq!(
+        run("(sleep 1; printf 1 > /tmp/start) & for (( i=$(sleep 2; cat /tmp/start); i<3; i=$(printf \"$((i+1))\") )); do printf '%s' \"$i\"; done; wait"),
+        (0, "12".into(), String::new())
+    );
+}
+
+#[test]
 fn python_repl_persists_and_returns_to_shell() {
     let mut env = Environment::new();
     let (_, entered, _) = env.run_script_capture("python");

@@ -252,6 +252,11 @@ impl DescriptorArena {
         Ok(())
     }
 
+    /// Retain an open description for machine-owned continuation state outside an FD table.
+    pub(crate) fn retain_handle(&mut self, id: DescriptionId) -> Result<(), DescriptorError> {
+        self.retain(id)
+    }
+
     fn release(&mut self, id: DescriptionId) -> Result<(), DescriptorError> {
         let entry = self
             .descriptions
@@ -293,6 +298,11 @@ impl DescriptorArena {
             }
         }
         Ok(())
+    }
+
+    /// Release a machine-owned continuation reference created by [`Self::retain_handle`].
+    pub(crate) fn release_handle(&mut self, id: DescriptionId) -> Result<(), DescriptorError> {
+        self.release(id)
     }
 
     pub fn read(

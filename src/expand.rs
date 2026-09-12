@@ -4,6 +4,121 @@
 use crate::interp::Interp;
 use crate::vfs::resolve_against;
 
+/// One syntactic command substitution within a shell word.
+pub(crate) struct CommandSubstitution {
+    pub start: usize,
+    pub end: usize,
+    pub source: String,
+}
+
+/// Find the first command substitution that is active under shell quoting rules.
+pub(crate) fn find_command_substitution(word: &str) -> Option<CommandSubstitution> {
+    let bytes = word.as_bytes();
+    let mut index = 0usize;
+    let mut quote = None;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if quote != Some(b'\'') => index = index.saturating_add(2),
+            b'\'' if quote != Some(b'"') => {
+                quote = if quote == Some(b'\'') {
+                    None
+                } else {
+                    Some(b'\'')
+                };
+                index += 1;
+            }
+            b'"' if quote != Some(b'\'') => {
+                quote = if quote == Some(b'"') {
+                    None
+                } else {
+                    Some(b'"')
+                };
+                index += 1;
+            }
+            b'`' if quote != Some(b'\'') => {
+                let start = index;
+                index += 1;
+                let body_start = index;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index = index.saturating_add(2);
+                    } else if bytes[index] == b'`' {
+                        return Some(CommandSubstitution {
+                            start,
+                            end: index + 1,
+                            source: word[body_start..index].to_string(),
+                        });
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'$' if quote != Some(b'\'')
+                && bytes.get(index + 1) == Some(&b'(')
+                && bytes.get(index + 2) != Some(&b'(') =>
+            {
+                let start = index;
+                let body_start = index + 2;
+                index = body_start;
+                let mut depth = 1usize;
+                let mut inner_quote = None;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' if inner_quote != Some(b'\'') => index = index.saturating_add(2),
+                        b'\'' if inner_quote != Some(b'"') => {
+                            inner_quote = if inner_quote == Some(b'\'') {
+                                None
+                            } else {
+                                Some(b'\'')
+                            };
+                            index += 1;
+                        }
+                        b'"' if inner_quote != Some(b'\'') => {
+                            inner_quote = if inner_quote == Some(b'"') {
+                                None
+                            } else {
+                                Some(b'"')
+                            };
+                            index += 1;
+                        }
+                        b'`' if inner_quote.is_none() => {
+                            index += 1;
+                            while index < bytes.len() {
+                                if bytes[index] == b'\\' {
+                                    index = index.saturating_add(2);
+                                } else if bytes[index] == b'`' {
+                                    index += 1;
+                                    break;
+                                } else {
+                                    index += 1;
+                                }
+                            }
+                        }
+                        b'(' if inner_quote.is_none() => {
+                            depth += 1;
+                            index += 1;
+                        }
+                        b')' if inner_quote.is_none() => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some(CommandSubstitution {
+                                    start,
+                                    end: index + 1,
+                                    source: word[body_start..index].to_string(),
+                                });
+                            }
+                            index += 1;
+                        }
+                        _ => index += 1,
+                    }
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 /// A piece of an expanding word, tracking whether it came from a quoted context
 /// (quoted text is never word-split or glob-expanded).
 struct Part {
@@ -919,32 +1034,14 @@ fn read_double_paren(chars: &[char]) -> (String, usize) {
 }
 
 fn run_capture(interp: &mut Interp, src: &str) -> String {
-    let ast = match crate::shell::parse(src) {
-        Ok(ast) => ast,
-        Err(_) => {
-            interp.last_status = 2;
-            return String::new();
-        }
-    };
-    let Some((status, out)) = crate::exec::exec_child_capture_stdout(
-        interp,
-        &ast,
-        Vec::new(),
-        crate::exec::ChildExecution {
-            command: "$(command substitution)",
-            new_shell: false,
-            retain: false,
-        },
-    ) else {
-        interp.last_status = 125;
-        return String::new();
-    };
-    interp.last_status = status;
-    let mut s = String::from_utf8_lossy(&out).into_owned();
-    while s.ends_with('\n') {
-        s.pop();
-    }
-    s
+    interp.last_status = 125;
+    interp.pending_stderr.extend_from_slice(
+        format!(
+            "shellsim: internal error: command substitution reached synchronous expansion: {src}\n"
+        )
+        .as_bytes(),
+    );
+    String::new()
 }
 
 pub fn eval_arith(interp: &mut Interp, expr: &str) -> i64 {
@@ -1354,5 +1451,21 @@ mod tests {
         assert_eq!(expand_word(&mut i, "${F%%.*}", true), vec!["file"]);
         assert_eq!(expand_word(&mut i, "${F#*.}", true), vec!["tar.gz"]);
         assert_eq!(expand_word(&mut i, "${F##*.}", true), vec!["gz"]);
+    }
+
+    #[test]
+    fn command_substitution_scanner_obeys_quotes_and_nesting() {
+        assert!(find_command_substitution("'$(ignored)'").is_none());
+        assert!(find_command_substitution("$((1 + 2))").is_none());
+        let found = find_command_substitution("prefix$(printf '%s' \"a)b\")suffix").unwrap();
+        assert_eq!(found.source, "printf '%s' \"a)b\"");
+        assert_eq!(
+            &"prefix$(printf '%s' \"a)b\")suffix"[found.start..found.end],
+            "$(printf '%s' \"a)b\")"
+        );
+        assert_eq!(
+            find_command_substitution("x`echo y`z").unwrap().source,
+            "echo y"
+        );
     }
 }

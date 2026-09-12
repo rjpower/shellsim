@@ -849,8 +849,8 @@ impl Parser {
     }
 
     fn at_block_end(&self) -> bool {
-        matches!(self.peek(), Tok::Word(w) if ["then","elif","else","fi","do","done","esac","}",")",";;"].contains(&w.as_str()))
-            || matches!(self.peek(), Tok::Op(o) if o == ")" )
+        matches!(self.peek(), Tok::Word(w) if ["then","elif","else","fi","do","done","esac","}",")"].contains(&w.as_str()))
+            || matches!(self.peek(), Tok::Op(o) if o == ")" || o == ";;")
     }
 
     fn skip_terminators(&mut self) {
@@ -1272,10 +1272,7 @@ impl Parser {
         self.i += 1; // for
         if let Tok::Arithmetic(expression) = self.peek().clone() {
             self.i += 1;
-            let mut parts = expression.splitn(3, ';');
-            let init = parts.next().unwrap_or_default().trim().to_string();
-            let cond = parts.next().unwrap_or_default().trim().to_string();
-            let update = parts.next().unwrap_or_default().trim().to_string();
+            let [init, cond, update] = split_c_for_expression(&expression);
             self.skip_terminators();
             self.expect_word("do");
             let body = self.parse_program();
@@ -1367,6 +1364,64 @@ impl Parser {
         self.expect_word("esac");
         Node::Case { word, arms }
     }
+}
+
+fn split_c_for_expression(expression: &str) -> [String; 3] {
+    let mut boundaries = Vec::with_capacity(2);
+    let mut quote = None;
+    let mut escaped = false;
+    let mut parens = 0_u32;
+    let mut braces = 0_u32;
+    let mut brackets = 0_u32;
+    for (index, ch) in expression.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = if quote == Some(ch) {
+                None
+            } else if quote.is_none() {
+                Some(ch)
+            } else {
+                quote
+            };
+            continue;
+        }
+        if quote.is_some() {
+            continue;
+        }
+        match ch {
+            '(' => parens = parens.saturating_add(1),
+            ')' => parens = parens.saturating_sub(1),
+            '{' => braces = braces.saturating_add(1),
+            '}' => braces = braces.saturating_sub(1),
+            '[' => brackets = brackets.saturating_add(1),
+            ']' => brackets = brackets.saturating_sub(1),
+            ';' if parens == 0 && braces == 0 && brackets == 0 => {
+                boundaries.push(index);
+                if boundaries.len() == 2 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let first = boundaries.first().copied().unwrap_or(expression.len());
+    let second = boundaries.get(1).copied().unwrap_or(expression.len());
+    [
+        expression[..first].trim().to_string(),
+        expression[first.saturating_add(1).min(expression.len())..second]
+            .trim()
+            .to_string(),
+        expression[second.saturating_add(1).min(expression.len())..]
+            .trim()
+            .to_string(),
+    ]
 }
 
 fn token_description(token: &Tok) -> String {
@@ -1592,5 +1647,10 @@ mod tests {
             "if true; then for item in one; do (echo \"$item\"); done; else echo no; fi"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn case_arm_terminators_stop_the_arm_body() {
+        assert!(parse("case value in v*) printf yes;; *) printf no;; esac").is_ok());
     }
 }

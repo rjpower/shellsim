@@ -84,6 +84,44 @@ const SHELL_POLL_QUANTUM: usize = 1;
 
 enum ShellFrame {
     Eval(Node),
+    PrepareCommand(PreparedCommand),
+    RunCommand {
+        assigns: Vec<(String, String)>,
+        words: Vec<String>,
+        temporary_variables: Vec<(String, Option<String>)>,
+        substitution_status: Option<i32>,
+    },
+    AwaitCommandSubstitution {
+        command: PreparedCommand,
+        pid: crate::process::ProcessId,
+        capture: crate::descriptors::DescriptionId,
+        variable: String,
+        previous: Option<String>,
+    },
+    PrepareFor(PreparedFor),
+    AwaitForSubstitution {
+        state: PreparedFor,
+        pid: crate::process::ProcessId,
+        capture: crate::descriptors::DescriptionId,
+        variable: String,
+        previous: Option<String>,
+    },
+    PrepareCase(PreparedCase),
+    AwaitCaseSubstitution {
+        state: PreparedCase,
+        pid: crate::process::ProcessId,
+        capture: crate::descriptors::DescriptionId,
+        variable: String,
+        previous: Option<String>,
+    },
+    PrepareArithmetic(PreparedArithmetic),
+    AwaitArithmeticSubstitution {
+        state: PreparedArithmetic,
+        pid: crate::process::ProcessId,
+        capture: crate::descriptors::DescriptionId,
+        start: usize,
+        end: usize,
+    },
     Sequence {
         nodes: Vec<Node>,
         next: usize,
@@ -186,6 +224,63 @@ enum ShellFrame {
         next: usize,
         pipefail: bool,
     },
+}
+
+struct PreparedCommand {
+    assigns: Vec<(String, String)>,
+    words: Vec<String>,
+    redirects: Vec<Redirect>,
+    temporary_variables: Vec<(String, Option<String>)>,
+    substitution_status: Option<i32>,
+}
+
+struct PreparedFor {
+    var: String,
+    words: Vec<String>,
+    body: Node,
+    temporary_variables: Vec<(String, Option<String>)>,
+}
+
+struct PreparedCase {
+    word: String,
+    arms: Vec<(Vec<String>, Node)>,
+    temporary_variables: Vec<(String, Option<String>)>,
+}
+
+struct PreparedArithmetic {
+    expression: String,
+    continuation: ArithmeticContinuation,
+}
+
+enum ArithmeticContinuation {
+    Command,
+    CForInit {
+        cond: String,
+        update: String,
+        body: Node,
+    },
+    CForCondition {
+        cond: String,
+        update: String,
+        body: Node,
+        iterations: usize,
+        body_status: i32,
+    },
+    CForUpdate {
+        cond: String,
+        update: String,
+        body: Node,
+        iterations: usize,
+        body_status: i32,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ExpansionLocation {
+    AssignmentKey(usize),
+    AssignmentValue(usize),
+    Word(usize),
+    Redirect(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,9 +412,379 @@ impl ShellContinuation {
         self.frames.push(ShellFrame::Eval(node));
     }
 
+    fn prepare_command(&mut self, interp: &mut Interp, mut command: PreparedCommand) {
+        if let Some((location, substitution)) = next_command_substitution(&command) {
+            if !self.ensure_capacity(interp, 1) {
+                restore_command_variables(interp, command.temporary_variables);
+                return;
+            }
+            let (variable, previous) = match new_substitution_variable(interp) {
+                Ok(variable) => variable,
+                Err(message) => {
+                    write_diagnostic(interp, &message);
+                    restore_command_variables(interp, command.temporary_variables);
+                    self.status = 125;
+                    return;
+                }
+            };
+            let replacement = format!("${{{variable}}}");
+            replace_substitution(&mut command, location, &substitution, &replacement);
+            let (pid, capture) = match start_command_substitution(interp, &substitution.source) {
+                Ok(child) => child,
+                Err((status, message)) => {
+                    if !message.is_empty() {
+                        write_diagnostic(interp, &message);
+                    }
+                    restore_command_variables(interp, command.temporary_variables);
+                    self.status = status;
+                    return;
+                }
+            };
+            self.frames.push(ShellFrame::AwaitCommandSubstitution {
+                command,
+                pid,
+                capture,
+                variable,
+                previous,
+            });
+            self.switched = true;
+            return;
+        }
+
+        let needed = 1 + usize::from(!command.redirects.is_empty());
+        if !self.ensure_capacity(interp, needed) {
+            restore_command_variables(interp, command.temporary_variables);
+            return;
+        }
+        if !command.redirects.is_empty() {
+            match begin_redirects(interp, &command.redirects) {
+                Ok(scope) => self.frames.push(ShellFrame::RestoreRedirect(scope)),
+                Err(error) => {
+                    write_diagnostic(interp, &format!("shellsim: redirection: {error}\n"));
+                    restore_command_variables(interp, command.temporary_variables);
+                    self.status = 1;
+                    return;
+                }
+            }
+        }
+        self.frames.push(ShellFrame::RunCommand {
+            assigns: command.assigns,
+            words: command.words,
+            temporary_variables: command.temporary_variables,
+            substitution_status: command.substitution_status,
+        });
+    }
+
+    fn prepare_for(&mut self, interp: &mut Interp, mut state: PreparedFor) {
+        if let Some((index, substitution)) =
+            state.words.iter().enumerate().find_map(|(index, word)| {
+                crate::expand::find_command_substitution(word)
+                    .map(|substitution| (index, substitution))
+            })
+        {
+            if !self.ensure_capacity(interp, 1) {
+                restore_command_variables(interp, state.temporary_variables);
+                return;
+            }
+            let (variable, previous) = match new_substitution_variable(interp) {
+                Ok(variable) => variable,
+                Err(message) => {
+                    write_diagnostic(interp, &message);
+                    restore_command_variables(interp, state.temporary_variables);
+                    self.status = 125;
+                    return;
+                }
+            };
+            state.words[index].replace_range(
+                substitution.start..substitution.end,
+                &format!("${{{variable}}}"),
+            );
+            let (pid, capture) = match start_command_substitution(interp, &substitution.source) {
+                Ok(child) => child,
+                Err((status, message)) => {
+                    if !message.is_empty() {
+                        write_diagnostic(interp, &message);
+                    }
+                    restore_command_variables(interp, state.temporary_variables);
+                    self.status = status;
+                    return;
+                }
+            };
+            self.frames.push(ShellFrame::AwaitForSubstitution {
+                state,
+                pid,
+                capture,
+                variable,
+                previous,
+            });
+            self.switched = true;
+            return;
+        }
+        if !self.ensure_capacity(interp, 1) {
+            restore_command_variables(interp, state.temporary_variables);
+            return;
+        }
+        let items = expand_words(interp, &state.words);
+        restore_command_variables(interp, state.temporary_variables);
+        self.status = 0;
+        self.frames.push(ShellFrame::ForNext {
+            var: state.var,
+            items,
+            body: state.body,
+            next: 0,
+            body_status: 0,
+        });
+    }
+
+    fn prepare_case(&mut self, interp: &mut Interp, mut state: PreparedCase) {
+        let found = crate::expand::find_command_substitution(&state.word)
+            .map(|substitution| (None, substitution))
+            .or_else(|| {
+                state
+                    .arms
+                    .iter()
+                    .enumerate()
+                    .find_map(|(arm, (patterns, _))| {
+                        patterns.iter().enumerate().find_map(|(pattern, value)| {
+                            crate::expand::find_command_substitution(value)
+                                .map(|substitution| (Some((arm, pattern)), substitution))
+                        })
+                    })
+            });
+        if let Some((location, substitution)) = found {
+            if !self.ensure_capacity(interp, 1) {
+                restore_command_variables(interp, state.temporary_variables);
+                return;
+            }
+            let (variable, previous) = match new_substitution_variable(interp) {
+                Ok(variable) => variable,
+                Err(message) => {
+                    write_diagnostic(interp, &message);
+                    restore_command_variables(interp, state.temporary_variables);
+                    self.status = 125;
+                    return;
+                }
+            };
+            let target = match location {
+                None => &mut state.word,
+                Some((arm, pattern)) => &mut state.arms[arm].0[pattern],
+            };
+            target.replace_range(
+                substitution.start..substitution.end,
+                &format!("${{{variable}}}"),
+            );
+            let (pid, capture) = match start_command_substitution(interp, &substitution.source) {
+                Ok(child) => child,
+                Err((status, message)) => {
+                    if !message.is_empty() {
+                        write_diagnostic(interp, &message);
+                    }
+                    restore_command_variables(interp, state.temporary_variables);
+                    self.status = status;
+                    return;
+                }
+            };
+            self.frames.push(ShellFrame::AwaitCaseSubstitution {
+                state,
+                pid,
+                capture,
+                variable,
+                previous,
+            });
+            self.switched = true;
+            return;
+        }
+        if !self.ensure_capacity(interp, 1) {
+            restore_command_variables(interp, state.temporary_variables);
+            return;
+        }
+        let subject = expand_word(interp, &state.word, false).join(" ");
+        let arms = state.arms;
+        let expanded_patterns = arms
+            .iter()
+            .map(|(patterns, _)| {
+                patterns
+                    .iter()
+                    .map(|pattern| expand_word(interp, pattern, false).join(" "))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        restore_command_variables(interp, state.temporary_variables);
+        self.status = 0;
+        'arms: for ((_, body), patterns) in arms.into_iter().zip(expanded_patterns) {
+            for pattern in patterns {
+                if case_match(&pattern, &subject) {
+                    self.frames.push(ShellFrame::Eval(body));
+                    break 'arms;
+                }
+            }
+        }
+    }
+
+    fn prepare_arithmetic(&mut self, interp: &mut Interp, state: PreparedArithmetic) {
+        if let Some(substitution) = crate::expand::find_command_substitution(&state.expression) {
+            if !self.ensure_capacity(interp, 1) {
+                return;
+            }
+            let (pid, capture) = match start_command_substitution(interp, &substitution.source) {
+                Ok(child) => child,
+                Err((status, message)) => {
+                    if !message.is_empty() {
+                        write_diagnostic(interp, &message);
+                    }
+                    self.status = status;
+                    return;
+                }
+            };
+            self.frames.push(ShellFrame::AwaitArithmeticSubstitution {
+                state,
+                pid,
+                capture,
+                start: substitution.start,
+                end: substitution.end,
+            });
+            self.switched = true;
+            return;
+        }
+
+        let value = if matches!(
+            &state.continuation,
+            ArithmeticContinuation::CForCondition { .. }
+        ) && state.expression.is_empty()
+        {
+            1
+        } else {
+            crate::expand::eval_arith(interp, &state.expression)
+        };
+        match state.continuation {
+            ArithmeticContinuation::Command => {
+                self.status = i32::from(value == 0);
+            }
+            ArithmeticContinuation::CForInit { cond, update, body } => {
+                self.status = 0;
+                self.push(
+                    interp,
+                    ShellFrame::CForCheck {
+                        cond,
+                        update,
+                        body,
+                        iterations: 0,
+                        body_status: 0,
+                    },
+                );
+            }
+            ArithmeticContinuation::CForCondition {
+                cond,
+                update,
+                body,
+                iterations,
+                body_status,
+            } => {
+                if should_unwind(interp) || iterations >= 5_000 || value == 0 {
+                    self.status = body_status;
+                } else if self.push(
+                    interp,
+                    ShellFrame::CForAfterBody {
+                        cond,
+                        update,
+                        body: body.clone(),
+                        iterations: iterations + 1,
+                    },
+                ) {
+                    self.push(interp, ShellFrame::Eval(body));
+                }
+            }
+            ArithmeticContinuation::CForUpdate {
+                cond,
+                update,
+                body,
+                iterations,
+                body_status,
+            } => {
+                self.push(
+                    interp,
+                    ShellFrame::CForCheck {
+                        cond,
+                        update,
+                        body,
+                        iterations,
+                        body_status,
+                    },
+                );
+            }
+        }
+    }
+
     fn step(&mut self, interp: &mut Interp, frame: ShellFrame) {
         match frame {
             ShellFrame::Eval(node) => self.eval(interp, node),
+            ShellFrame::PrepareCommand(command) => self.prepare_command(interp, command),
+            ShellFrame::RunCommand {
+                assigns,
+                words,
+                temporary_variables,
+                substitution_status,
+            } => self.eval_command(
+                interp,
+                assigns,
+                words,
+                temporary_variables,
+                substitution_status,
+            ),
+            ShellFrame::AwaitCommandSubstitution {
+                mut command,
+                pid,
+                capture,
+                variable,
+                previous,
+            } => {
+                let (status, value) = finish_command_substitution(interp, pid, capture);
+                interp.set_var(&variable, value);
+                command.temporary_variables.push((variable, previous));
+                command.substitution_status = Some(status);
+                self.push(interp, ShellFrame::PrepareCommand(command));
+            }
+            ShellFrame::PrepareFor(state) => self.prepare_for(interp, state),
+            ShellFrame::AwaitForSubstitution {
+                mut state,
+                pid,
+                capture,
+                variable,
+                previous,
+            } => {
+                let (_, value) = finish_command_substitution(interp, pid, capture);
+                interp.set_var(&variable, value);
+                state.temporary_variables.push((variable, previous));
+                self.push(interp, ShellFrame::PrepareFor(state));
+            }
+            ShellFrame::PrepareCase(state) => self.prepare_case(interp, state),
+            ShellFrame::AwaitCaseSubstitution {
+                mut state,
+                pid,
+                capture,
+                variable,
+                previous,
+            } => {
+                let (_, value) = finish_command_substitution(interp, pid, capture);
+                interp.set_var(&variable, value);
+                state.temporary_variables.push((variable, previous));
+                self.push(interp, ShellFrame::PrepareCase(state));
+            }
+            ShellFrame::PrepareArithmetic(state) => self.prepare_arithmetic(interp, state),
+            ShellFrame::AwaitArithmeticSubstitution {
+                mut state,
+                pid,
+                capture,
+                start,
+                end,
+            } => {
+                let (_, value) = finish_command_substitution(interp, pid, capture);
+                let value = if value.trim().is_empty() { "0" } else { &value };
+                state
+                    .expression
+                    .replace_range(start..end, &format!("({value})"));
+                self.push(interp, ShellFrame::PrepareArithmetic(state));
+            }
             ShellFrame::Sequence { nodes, next } => {
                 if next > 0 && should_unwind(interp) {
                     if interp.deadline_interrupt.is_some() {
@@ -537,21 +1002,22 @@ impl ShellContinuation {
                 iterations,
                 body_status,
             } => {
-                if should_unwind(interp)
-                    || iterations >= 5_000
-                    || (!cond.is_empty() && crate::expand::eval_arith(interp, &cond) == 0)
-                {
+                if should_unwind(interp) || iterations >= 5_000 {
                     self.status = body_status;
-                } else if self.push(
-                    interp,
-                    ShellFrame::CForAfterBody {
-                        cond,
-                        update,
-                        body: body.clone(),
-                        iterations: iterations + 1,
-                    },
-                ) {
-                    self.push(interp, ShellFrame::Eval(body));
+                } else {
+                    self.push(
+                        interp,
+                        ShellFrame::PrepareArithmetic(PreparedArithmetic {
+                            expression: cond.clone(),
+                            continuation: ArithmeticContinuation::CForCondition {
+                                cond,
+                                update,
+                                body,
+                                iterations,
+                                body_status,
+                            },
+                        }),
+                    );
                 }
             }
             ShellFrame::CForAfterBody {
@@ -568,16 +1034,18 @@ impl ShellContinuation {
                     interp.loop_continue -= 1;
                 }
                 if !should_unwind(interp) {
-                    let _ = crate::expand::eval_arith(interp, &update);
                     self.push(
                         interp,
-                        ShellFrame::CForCheck {
-                            cond,
-                            update,
-                            body,
-                            iterations,
-                            body_status: self.status,
-                        },
+                        ShellFrame::PrepareArithmetic(PreparedArithmetic {
+                            expression: update.clone(),
+                            continuation: ArithmeticContinuation::CForUpdate {
+                                cond,
+                                update,
+                                body,
+                                iterations,
+                                body_status: self.status,
+                            },
+                        }),
                     );
                 }
             }
@@ -825,7 +1293,18 @@ impl ShellContinuation {
                 assigns,
                 words,
                 redirects,
-            } => self.eval_command(interp, assigns, words, redirects),
+            } => {
+                self.push(
+                    interp,
+                    ShellFrame::PrepareCommand(PreparedCommand {
+                        assigns,
+                        words,
+                        redirects,
+                        temporary_variables: Vec::new(),
+                        substitution_status: None,
+                    }),
+                );
+            }
             Node::ArgvCommand(argv) => self.eval_external_argv(interp, argv, Vec::new(), true),
             Node::Pipeline(stages) => self.spawn_pipeline(interp, stages),
             Node::And(lhs, rhs) => {
@@ -910,17 +1389,14 @@ impl ShellContinuation {
                 );
             }
             Node::For { var, words, body } => {
-                let items = expand_words(interp, &words);
-                self.status = 0;
                 self.push(
                     interp,
-                    ShellFrame::ForNext {
+                    ShellFrame::PrepareFor(PreparedFor {
                         var,
-                        items,
+                        words,
                         body: *body,
-                        next: 0,
-                        body_status: 0,
-                    },
+                        temporary_variables: Vec::new(),
+                    }),
                 );
             }
             Node::CFor {
@@ -929,38 +1405,40 @@ impl ShellContinuation {
                 update,
                 body,
             } => {
-                let _ = crate::expand::eval_arith(interp, &init);
-                self.status = 0;
                 self.push(
                     interp,
-                    ShellFrame::CForCheck {
-                        cond,
-                        update,
-                        body: *body,
-                        iterations: 0,
-                        body_status: 0,
-                    },
+                    ShellFrame::PrepareArithmetic(PreparedArithmetic {
+                        expression: init,
+                        continuation: ArithmeticContinuation::CForInit {
+                            cond,
+                            update,
+                            body: *body,
+                        },
+                    }),
                 );
             }
             Node::Case { word, arms } => {
-                let subject = expand_word(interp, &word, false).join(" ");
-                self.status = 0;
-                'arms: for (patterns, body) in arms {
-                    for pattern in patterns {
-                        let pattern = expand_word(interp, &pattern, false).join(" ");
-                        if case_match(&pattern, &subject) {
-                            self.push(interp, ShellFrame::Eval(body));
-                            break 'arms;
-                        }
-                    }
-                }
+                self.push(
+                    interp,
+                    ShellFrame::PrepareCase(PreparedCase {
+                        word,
+                        arms,
+                        temporary_variables: Vec::new(),
+                    }),
+                );
             }
             Node::FuncDef { name, body } => {
                 interp.funcs.insert(name, *body);
                 self.status = 0;
             }
             Node::Arithmetic(expression) => {
-                self.status = i32::from(crate::expand::eval_arith(interp, &expression) == 0);
+                self.push(
+                    interp,
+                    ShellFrame::PrepareArithmetic(PreparedArithmetic {
+                        expression,
+                        continuation: ArithmeticContinuation::Command,
+                    }),
+                );
             }
         }
     }
@@ -970,39 +1448,20 @@ impl ShellContinuation {
         interp: &mut Interp,
         assigns: Vec<(String, String)>,
         words: Vec<String>,
-        redirects: Vec<Redirect>,
+        temporary_variables: Vec<(String, Option<String>)>,
+        substitution_status: Option<i32>,
     ) {
-        if !redirects.is_empty() {
-            match begin_redirects(interp, &redirects) {
-                Ok(scope) => {
-                    if self.push(interp, ShellFrame::RestoreRedirect(scope)) {
-                        self.push(
-                            interp,
-                            ShellFrame::Eval(Node::Command {
-                                assigns,
-                                words,
-                                redirects: Vec::new(),
-                            }),
-                        );
-                    }
-                }
-                Err(error) => {
-                    write_diagnostic(interp, &format!("shellsim: redirection: {error}\n"));
-                    self.status = 1;
-                }
-            }
-            return;
-        }
-
         let argv = expand_argv(interp, &words);
         if argv.is_empty() {
             for (key, value) in &assigns {
                 apply_assignment(interp, key, value);
             }
-            self.status = 0;
+            restore_command_variables(interp, temporary_variables);
+            self.status = substitution_status.unwrap_or(0);
             return;
         }
         let variables = install_command_variables(interp, &assigns);
+        restore_command_variables(interp, temporary_variables);
         interp.cmd_trace.push(argv[0].clone());
         if let Some(body) = interp.funcs.get(&argv[0]).cloned() {
             let positional = std::mem::replace(&mut interp.positional, argv[1..].to_vec());
@@ -1169,6 +1628,136 @@ impl ShellContinuation {
         });
         self.blocked = Some(crate::scheduler::WaitReason::Child(pids[0]));
     }
+}
+
+fn next_command_substitution(
+    command: &PreparedCommand,
+) -> Option<(ExpansionLocation, crate::expand::CommandSubstitution)> {
+    for (index, (key, value)) in command.assigns.iter().enumerate() {
+        if let Some(substitution) = crate::expand::find_command_substitution(key) {
+            return Some((ExpansionLocation::AssignmentKey(index), substitution));
+        }
+        if let Some(substitution) = crate::expand::find_command_substitution(value) {
+            return Some((ExpansionLocation::AssignmentValue(index), substitution));
+        }
+    }
+    for (index, word) in command.words.iter().enumerate() {
+        if let Some(substitution) = crate::expand::find_command_substitution(word) {
+            return Some((ExpansionLocation::Word(index), substitution));
+        }
+    }
+    for (index, redirect) in command.redirects.iter().enumerate() {
+        if redirect.op != RedirOp::HeredocRaw {
+            if let Some(substitution) = crate::expand::find_command_substitution(&redirect.target) {
+                return Some((ExpansionLocation::Redirect(index), substitution));
+            }
+        }
+    }
+    None
+}
+
+fn replace_substitution(
+    command: &mut PreparedCommand,
+    location: ExpansionLocation,
+    substitution: &crate::expand::CommandSubstitution,
+    replacement: &str,
+) {
+    let target = match location {
+        ExpansionLocation::AssignmentKey(index) => &mut command.assigns[index].0,
+        ExpansionLocation::AssignmentValue(index) => &mut command.assigns[index].1,
+        ExpansionLocation::Word(index) => &mut command.words[index],
+        ExpansionLocation::Redirect(index) => &mut command.redirects[index].target,
+    };
+    target.replace_range(substitution.start..substitution.end, replacement);
+}
+
+fn new_substitution_variable(interp: &mut Interp) -> Result<(String, Option<String>), String> {
+    loop {
+        let identifier = interp
+            .next_temp_id()
+            .ok_or_else(|| "shellsim: command substitution identity exhausted\n".to_string())?;
+        let variable = format!("__SHELLSIM_COMMAND_SUBSTITUTION_{identifier}");
+        if interp.get_var(&variable).is_none() && !interp.exported.contains(&variable) {
+            return Ok((variable, None));
+        }
+        if !interp.resources.charge_cpu(1) {
+            return Err(
+                "shellsim: resource limit exceeded during command substitution\n".to_string(),
+            );
+        }
+    }
+}
+
+fn finish_command_substitution(
+    interp: &mut Interp,
+    pid: crate::process::ProcessId,
+    capture: crate::descriptors::DescriptionId,
+) -> (i32, String) {
+    let status = match interp.processes.get(pid).map(|record| record.status) {
+        Some(crate::process::ProcessStatus::Exited(status)) => status,
+        _ => {
+            write_diagnostic(
+                interp,
+                &format!("shellsim: command substitution child {pid} did not exit\n"),
+            );
+            125
+        }
+    };
+    let mut bytes = interp
+        .descriptors
+        .drain_capture(capture)
+        .unwrap_or_default();
+    let _ = interp.descriptors.release_handle(capture);
+    interp.processes.reap(pid);
+    let _ = interp.scheduler.reap(pid);
+    while bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn start_command_substitution(
+    interp: &mut Interp,
+    source: &str,
+) -> Result<(crate::process::ProcessId, crate::descriptors::DescriptionId), (i32, String)> {
+    let mut diagnostic = Vec::new();
+    let ast = crate::commands::parse_shell_source(interp, source, &mut diagnostic)
+        .map_err(|status| (status, String::from_utf8_lossy(&diagnostic).into_owned()))?;
+    let input = interp
+        .descriptors
+        .open_input(Vec::new())
+        .map_err(|error| (125, format!("shellsim: command substitution: {error:?}\n")))?;
+    let capture = match interp.descriptors.open_capture() {
+        Ok(capture) => capture,
+        Err(error) => {
+            let _ = interp.descriptors.discard_unreferenced(input);
+            return Err((125, format!("shellsim: command substitution: {error:?}\n")));
+        }
+    };
+    if let Err(error) = interp.descriptors.retain_handle(capture) {
+        let _ = interp.descriptors.discard_unreferenced(input);
+        let _ = interp.descriptors.discard_unreferenced(capture);
+        return Err((125, format!("shellsim: command substitution: {error:?}\n")));
+    }
+    let pid = match interp.start_child("$(command substitution)", false) {
+        Ok(pid) => pid,
+        Err(error) => {
+            let _ = interp.descriptors.discard_unreferenced(input);
+            let _ = interp.descriptors.release_handle(capture);
+            return Err((125, format!("shellsim: {error}\n")));
+        }
+    };
+    interp
+        .install_process_description(pid, 0, input)
+        .expect("command substitution child must accept a valid input description");
+    interp
+        .install_process_description(pid, 1, capture)
+        .expect("command substitution child must accept a valid capture description");
+    interp
+        .process
+        .set_continuation(pid, Some(ShellContinuation::new(&ast)))
+        .expect("command substitution child must accept a continuation");
+    Ok((pid, capture))
 }
 
 fn rollback_pipeline(
@@ -2026,67 +2615,6 @@ fn split_top_level_words(s: &str) -> Vec<String> {
         words.push(cur);
     }
     words
-}
-
-/// Lifecycle policy for one synchronous logical child execution.
-pub(crate) struct ChildExecution<'a> {
-    pub command: &'a str,
-    pub new_shell: bool,
-    pub retain: bool,
-}
-
-/// Execute one logical child against shared machine state and restore its parent shell state.
-pub(crate) fn exec_child(
-    interp: &mut Interp,
-    node: &Node,
-    child: ChildExecution<'_>,
-) -> Option<(i32, crate::process::ProcessId)> {
-    let pid = match interp.start_child(child.command, child.new_shell) {
-        Ok(child) => child,
-        Err(error) => {
-            write_diagnostic(interp, &format!("shellsim: {error}\n"));
-            return None;
-        }
-    };
-    let status = exec_node(interp, node);
-    interp.finish_child(pid, status);
-    if !child.retain {
-        interp.processes.reap(pid);
-        let _ = interp.scheduler.reap(pid);
-    }
-    Some((status, pid))
-}
-
-pub(crate) fn exec_child_capture_stdout(
-    interp: &mut Interp,
-    node: &Node,
-    stdin: Vec<u8>,
-    child: ChildExecution<'_>,
-) -> Option<(i32, Vec<u8>)> {
-    let saved = interp.process.fds.fork(&mut interp.descriptors).ok()?;
-    let input = interp.descriptors.open_input(stdin).ok()?;
-    if interp.install_new_description(0, input).is_err() {
-        restore_fds(interp, saved);
-        return None;
-    }
-    let output = match interp.descriptors.open_capture() {
-        Ok(output) => output,
-        Err(_) => {
-            restore_fds(interp, saved);
-            return None;
-        }
-    };
-    if interp.install_new_description(1, output).is_err() {
-        restore_fds(interp, saved);
-        return None;
-    }
-    let result = exec_child(interp, node, child);
-    let bytes = interp
-        .descriptors
-        .capture(output)
-        .map_or_else(|_| Vec::new(), <[u8]>::to_vec);
-    restore_fds(interp, saved);
-    result.map(|(status, _)| (status, bytes))
 }
 
 fn expand_heredoc(interp: &mut Interp, body: &str) -> String {

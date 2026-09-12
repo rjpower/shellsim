@@ -35,12 +35,13 @@ affected stage. Nested `sh`/`bash` script execution from an ordinary shell conti
 a scheduler-owned child and resumes through a typed child-wait state. Executable shell scripts
 resolved through the VFS use that same child path, including buffered standard input. Python
 `Popen` now launches the same stored argv continuations and drives them at a nested cooperative
-scheduling boundary, with live PIDs and bounded descriptor pipes. Command substitution and
-synchronous command-to-command shell adapters still use recursive child adapters. `source` and
-`eval` inject parsed frames into the current continuation, preserving their same-process semantics
-without nesting the executor on the Rust stack. The Python bytecode VM itself is not yet a
-scheduler-owned resumable continuation, so Python execution cannot be interleaved at arbitrary
-bytecode instructions.
+scheduling boundary, with live PIDs and bounded descriptor pipes. Command substitutions in
+commands, redirects, here-documents, `for`, `case`, arithmetic commands, and every phase of
+C-style `for` loops launch scheduler-owned captured children. `source` and `eval` inject parsed
+frames into the current continuation, preserving their same-process semantics without nesting the
+executor on the Rust stack. The old recursive captured-child adapter has been removed. The Python
+bytecode VM itself is not yet a scheduler-owned resumable continuation, so Python execution cannot
+be interleaved at arbitrary bytecode instructions.
 
 The readiness handshake needed by phase 3 is present: blocked descriptor operations return a
 typed pipe-readable or pipe-writable condition, process code can suspend on that exact condition,
@@ -55,9 +56,10 @@ memory ownership, which is required once children overlap instead of exiting in 
 Ordinary foreground subshells, pipelines, and shell-command invocations now suspend their parent
 and switch through the scheduler without a nested Rust executor call. Python subprocess operations
 use live handles and the scheduler rather than the removed synchronous runner, but the calling VM
-remains on the Rust stack while the scheduler runs child quanta. Command substitution, VFS
-Python shebang execution, Make recipes, and other synchronous native command-to-command adapters
-keep phase 3 incomplete.
+remains on the Rust stack while the scheduler runs child quanta. Command substitution is now part
+of the retained shell continuation and preserves its capture and child identity across timer and
+descriptor waits. VFS Python shebang execution, Make recipes, Python bytecode, and synchronous
+native command-to-command adapters such as `xargs`, `env`, and `timeout` keep phase 3 incomplete.
 
 ## Non-negotiable invariants
 
