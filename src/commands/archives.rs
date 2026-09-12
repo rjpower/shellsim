@@ -204,6 +204,19 @@ fn transform(
     }
 }
 
+/// Compress a tar byte stream with shellsim's deterministic gzip envelope.
+pub(super) fn gzip_bytes(interp: &mut CommandContext<'_>, input: &[u8]) -> Result<Vec<u8>, String> {
+    transform(interp, Operation::Compress, 6, input)
+}
+
+/// Decompress a bounded gzip byte stream for another modeled archive command.
+pub(super) fn gunzip_bytes(
+    interp: &mut CommandContext<'_>,
+    input: &[u8],
+) -> Result<Vec<u8>, String> {
+    transform(interp, Operation::Decompress, 6, input)
+}
+
 fn output_name(path: &str, operation: Operation) -> Result<String, String> {
     match operation {
         Operation::Compress => {

@@ -34,6 +34,7 @@ mod proc;
 mod rgcmd;
 mod sort;
 mod system;
+mod tarcmd;
 mod text;
 pub mod util;
 
@@ -183,6 +184,7 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     printf::register(&mut m);
     sort::register(&mut m);
     system::register(&mut m);
+    tarcmd::register(&mut m);
     text::register(&mut m);
     fs::register(&mut m);
     git::register(&mut m);

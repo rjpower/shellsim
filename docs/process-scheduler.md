@@ -180,7 +180,9 @@ After the process and I/O foundations are complete, improve commands in evidence
    operations remain explicitly unsupported.
 4. Atomic, bounded VFS-only patch application is present for unified diffs and the common
    `*** Begin Patch` agent format. Deterministic VFS-only `gzip`, `gunzip`, and `zcat` support
-   bounded compression, decompression, files, and streams. Add tar and zip containers next.
+   bounded compression, decompression, files, and streams. Tar creation, listing, extraction, and
+   gzip composition support regular files and directories with atomic traversal-safe extraction.
+   Add zip containers next.
 5. Extend Make only alongside observed syntax and graph semantics; do not emulate native compiler
    artifacts with successful no-ops.
 

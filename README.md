@@ -132,10 +132,10 @@ New commands should live in a focused module and use only the modeled command co
 resource rules, and the reason native compilers remain outside the simulation.
 
 The current command set includes filesystem and text coreutils, `grep`, `sed`, a useful partial
-`awk`, hashes and encoders, bounded `gzip`/`gunzip`/`zcat`, virtual `curl`/`wget`, deterministic Git
-and Make subsets, shell builtins, minimal package/Python launchers, and simulated system queries
-such as `env`, `printenv`, `uname`, `id`, `nproc`, `df`, `free`, and `ps`. Partial commands are
-surfaced in evaluation reports instead of being presented as fully faithful implementations.
+`awk`, hashes and encoders, bounded tar and gzip tools, virtual `curl`/`wget`, deterministic Git and
+Make subsets, shell builtins, minimal package/Python launchers, and simulated system queries such
+as `env`, `printenv`, `uname`, `id`, `nproc`, `df`, `free`, and `ps`. Partial commands are surfaced
+in evaluation reports instead of being presented as fully faithful implementations.
 
 Disk enforcement lives inside `Vfs`, so direct command mutations cannot bypass capacity checks.
 Commands should still surface `VfsError::NoSpace` with a non-zero status.
