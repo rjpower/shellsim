@@ -149,3 +149,65 @@ fn restore_and_reset_move_index_worktree_and_head_coherently() {
     assert_eq!(run(&mut env, "git status --short").1, "?? untracked\n");
     assert_eq!(run(&mut env, "git log -1 --oneline").1.lines().count(), 1);
 }
+
+#[test]
+fn local_config_and_tracked_file_queries_support_agent_setup() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init project").0, 0);
+    assert_eq!(
+        run(
+            &mut env,
+            "cd /project; git config user.name Agent; git config user.email agent@example.test; git config --get user.name; git config --list",
+        ),
+        (
+            0,
+            "Agent\nuser.email=agent@example.test\nuser.name=Agent\n".into(),
+            String::new()
+        )
+    );
+    env.vfs
+        .put_file("/project/top.txt", b"top\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/project/src/lib.rs", b"lib\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "cd /project; git add .").0, 0);
+    assert_eq!(
+        run(&mut env, "cd /project; git ls-files").1,
+        "src/lib.rs\ntop.txt\n"
+    );
+    assert_eq!(run(&mut env, "cd /project/src; git ls-files").1, "lib.rs\n");
+    assert_eq!(
+        run(&mut env, "cd /project/src; git rev-parse --show-prefix").1,
+        "src/\n"
+    );
+    assert_eq!(
+        run(&mut env, "cd /project; git rev-parse --git-dir").1,
+        "/project/.git\n"
+    );
+}
+
+#[test]
+fn diff_check_reports_new_trailing_whitespace() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs
+        .put_file("/file", b"clean\nend\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add file; git commit -m clean").0, 0);
+    env.vfs
+        .put_file("/file", b"clean\nnew trailing \nend\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(
+        run(&mut env, "git diff --check"),
+        (
+            2,
+            "file:2: trailing whitespace.\n+new trailing \n".into(),
+            String::new()
+        )
+    );
+    assert_eq!(
+        run(&mut env, "git add file; git diff --cached --check").0,
+        2
+    );
+}

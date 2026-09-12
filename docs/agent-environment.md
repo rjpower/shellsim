@@ -82,9 +82,10 @@ mean that the requested effect occurred.
 Git and Make follow the same structure as the Python runtime: a small coherent state model
 and parser, thin command-facing adapters, deterministic algorithms, explicit unsupported
 frontiers, and tests against observable behavior. A simple slow implementation is preferable to
-special cases in the shell executor. Git now has a VFS-native tree, blob, commit, and ref model
-supporting the local edit/stage/commit/diff/history/branch/switch/restore/reset loop; remotes and
-merge algorithms remain outside that baseline.
+special cases in the shell executor. Git now has a VFS-native tree, blob, commit, ref, and
+local-config model supporting the local edit/stage/commit/diff/history/branch/switch/restore/reset
+loop, tracked-file queries, and whitespace validation; remotes and merge algorithms remain outside
+that baseline.
 
 ## Minimal process model
 

@@ -16,6 +16,7 @@ use crate::vfs::{parent_of, resolve_against, NodeKind, Result as VfsResult};
 const GIT_DIR: &str = ".git";
 const HEAD: &str = "HEAD";
 const INDEX: &str = "index";
+const CONFIG: &str = "config";
 const MAIN_REF: &str = "refs/heads/main";
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
@@ -40,6 +41,8 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         "show" => git_show(ctx, &args[1..], io),
         "restore" => git_restore(ctx, &args[1..], io),
         "reset" => git_reset(ctx, &args[1..], io),
+        "config" => git_config(ctx, &args[1..], io),
+        "ls-files" => git_ls_files(ctx, &args[1..], io),
         other => usage(io, &format!("unsupported subcommand: {other}")),
     }
 }
@@ -269,6 +272,7 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     }
     let head = git_path(&target, HEAD);
     let index = git_path(&target, INDEX);
+    let config = git_path(&target, CONFIG);
     if let Err(error) = write_vfs(ctx, &head, format!("ref: {MAIN_REF}\n").as_bytes()) {
         io.err
             .extend_from_slice(format!("git init: {error}\n").as_bytes());
@@ -279,6 +283,13 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             .extend_from_slice(format!("git init: {error}\n").as_bytes());
         return 1;
     }
+    if !ctx.vfs.is_file("/", &config) {
+        if let Err(error) = write_vfs(ctx, &config, &[]) {
+            io.err
+                .extend_from_slice(format!("git init: {error}\n").as_bytes());
+            return 1;
+        }
+    }
     io.out
         .extend_from_slice(format!("Initialized empty Git repository in {git}/\n").as_bytes());
     0
@@ -286,6 +297,171 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
 
 fn load_index(interp: &Interp, root: &str) -> Option<BTreeMap<String, String>> {
     read_tree(interp, &git_path(root, INDEX))
+}
+
+fn load_config(ctx: &mut CommandContext<'_>, root: &str) -> Result<BTreeMap<String, String>, i32> {
+    let bytes = ctx
+        .fs_read_limited("/", &git_path(root, CONFIG), 256 * 1024)
+        .map_err(|_| 128)?;
+    let text = String::from_utf8(bytes).map_err(|_| 128)?;
+    let mut config = BTreeMap::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('\t') else {
+            return Err(128);
+        };
+        if config.len() == 256 || !valid_config_key(key) {
+            return Err(128);
+        }
+        config.insert(key.to_string(), value.to_string());
+    }
+    Ok(config)
+}
+
+fn valid_config_key(key: &str) -> bool {
+    key.contains('.')
+        && !key.starts_with('.')
+        && !key.ends_with('.')
+        && !key.contains("..")
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+}
+
+fn write_config(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    config: &BTreeMap<String, String>,
+) -> VfsResult<()> {
+    let mut bytes = Vec::new();
+    for (key, value) in config {
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.push(b'\t');
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(b'\n');
+    }
+    write_vfs(ctx, &git_path(root, CONFIG), &bytes)
+}
+
+fn git_config(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = find_repo_root(ctx) else {
+        return repo_error(io);
+    };
+    let args = if args.first().is_some_and(|arg| arg == "--local") {
+        &args[1..]
+    } else {
+        args
+    };
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--global" | "--system"))
+    {
+        return usage(io, "only repository-local config is available");
+    }
+    let mut config = match load_config(ctx, &root) {
+        Ok(config) => config,
+        Err(status) => {
+            io.err
+                .extend_from_slice(b"fatal: invalid simulated config\n");
+            return status;
+        }
+    };
+    match args {
+        [flag] if flag == "--list" => {
+            for (key, value) in config {
+                io.out
+                    .extend_from_slice(format!("{key}={value}\n").as_bytes());
+            }
+            0
+        }
+        [flag, key] if flag == "--get" => {
+            config.get(&key.to_ascii_lowercase()).map_or(1, |value| {
+                io.out.extend_from_slice(format!("{value}\n").as_bytes());
+                0
+            })
+        }
+        [flag, key] if flag == "--unset" => {
+            if config.remove(&key.to_ascii_lowercase()).is_none() {
+                return 5;
+            }
+            write_config(ctx, &root, &config).map_or(1, |()| 0)
+        }
+        [key] if !key.starts_with('-') => {
+            config.get(&key.to_ascii_lowercase()).map_or(1, |value| {
+                io.out.extend_from_slice(format!("{value}\n").as_bytes());
+                0
+            })
+        }
+        [key, value] if !key.starts_with('-') => {
+            let key = key.to_ascii_lowercase();
+            if !valid_config_key(&key)
+                || value.len() > 4096
+                || value.contains(['\0', '\n', '\r', '\t'])
+            {
+                return usage(io, "invalid config key or value");
+            }
+            if config.len() == 256 && !config.contains_key(&key) {
+                return usage(io, "too many config entries");
+            }
+            config.insert(key, value.clone());
+            write_config(ctx, &root, &config).map_or(1, |()| 0)
+        }
+        _ => usage(
+            io,
+            "usage: git config [--local] [--get|--unset] NAME [VALUE]",
+        ),
+    }
+}
+
+fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = find_repo_root(ctx) else {
+        return repo_error(io);
+    };
+    let mut nul = false;
+    let mut error_unmatch = false;
+    let mut paths = Vec::new();
+    let mut options = true;
+    for arg in args {
+        match arg.as_str() {
+            "--" if options => options = false,
+            "--cached" if options => {}
+            "--error-unmatch" if options => error_unmatch = true,
+            "-z" if options => nul = true,
+            value if options && value.starts_with('-') => {
+                return usage(io, &format!("unsupported ls-files option: {value}"))
+            }
+            value => paths.push(value.to_string()),
+        }
+    }
+    let index = load_index(ctx, &root).unwrap_or_default();
+    let cwd_prefix = relative_path(&root, &ctx.cwd).unwrap_or_default();
+    let cwd_prefix = (!cwd_prefix.is_empty()).then(|| format!("{cwd_prefix}/"));
+    let mut matched = false;
+    for path in index.keys() {
+        let displayed = cwd_prefix
+            .as_deref()
+            .and_then(|prefix| path.strip_prefix(prefix))
+            .unwrap_or(path);
+        if cwd_prefix.is_some() && displayed == path {
+            continue;
+        }
+        if !paths.is_empty()
+            && !paths.iter().any(|selected| {
+                displayed == selected || displayed.starts_with(&format!("{selected}/"))
+            })
+        {
+            continue;
+        }
+        matched = true;
+        io.out.extend_from_slice(displayed.as_bytes());
+        io.out.push(if nul { 0 } else { b'\n' });
+    }
+    if error_unmatch && !matched {
+        io.err
+            .extend_from_slice(b"error: pathspec did not match any files\n");
+        1
+    } else {
+        0
+    }
 }
 
 fn head_commit(interp: &Interp, root: &str) -> Option<String> {
@@ -370,9 +546,9 @@ fn head_tree(interp: &Interp, root: &str) -> BTreeMap<String, String> {
 fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     if args
         .iter()
-        .any(|arg| arg != "--short" && arg != "--porcelain")
+        .any(|arg| arg != "--short" && arg != "--porcelain" && arg != "--porcelain=v1")
     {
-        return usage(io, "only --short/--porcelain are supported");
+        return usage(io, "only --short/--porcelain=v1 are supported");
     }
     let Some(root) = find_repo_root(ctx) else {
         return repo_error(io);
@@ -728,19 +904,69 @@ fn emit_diff(io: &mut Io, path: &str, old: Option<&[u8]>, new: Option<&[u8]>) {
     }
 }
 
+fn emit_whitespace_errors(io: &mut Io, path: &str, old: Option<&[u8]>, new: Option<&[u8]>) -> bool {
+    let old: Vec<String> = old
+        .map(|bytes| {
+            String::from_utf8_lossy(bytes)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let new: Vec<String> = new
+        .map(|bytes| {
+            String::from_utf8_lossy(bytes)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let prefix = old
+        .iter()
+        .zip(&new)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let changed_end = new.len().saturating_sub(suffix);
+    let mut found = false;
+    for (offset, line) in new[prefix..changed_end].iter().enumerate() {
+        if line.ends_with([' ', '\t']) {
+            found = true;
+            io.out.extend_from_slice(
+                format!(
+                    "{path}:{}: trailing whitespace.\n+{line}\n",
+                    prefix + offset + 1
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    found
+}
+
 fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut cached = false;
     let mut name_only = false;
+    let mut check = false;
     let mut paths = Vec::new();
     for arg in args {
         match arg.as_str() {
             "--cached" | "--staged" => cached = true,
             "--name-only" => name_only = true,
+            "--check" => check = true,
             arg if arg.starts_with('-') => {
                 return usage(io, &format!("unsupported diff option: {arg}"))
             }
             path => paths.push(path.to_string()),
         }
+    }
+    if check && name_only {
+        return usage(io, "--check cannot be combined with --name-only");
     }
     let Some(root) = find_repo_root(ctx) else {
         return repo_error(io);
@@ -769,6 +995,7 @@ fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut names = BTreeSet::new();
     names.extend(left_tree.keys().cloned());
     names.extend(right_tree.keys().cloned());
+    let mut whitespace_error = false;
     for path in names {
         if !selected(&path) || left_tree.get(&path) == right_tree.get(&path) {
             continue;
@@ -786,11 +1013,20 @@ fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             } else {
                 read_work_file(ctx, &root, &path)
             };
-            emit_diff(io, &path, old.as_deref(), new.as_deref());
+            if check {
+                whitespace_error |=
+                    emit_whitespace_errors(io, &path, old.as_deref(), new.as_deref());
+            } else {
+                emit_diff(io, &path, old.as_deref(), new.as_deref());
+            }
         }
     }
     ctx.resources.release_memory(work_reserved);
-    0
+    if whitespace_error {
+        2
+    } else {
+        0
+    }
 }
 
 fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -804,6 +1040,20 @@ fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
         }
         [flag] if flag == "--is-inside-work-tree" => {
             io.out.extend_from_slice(b"true\n");
+            0
+        }
+        [flag] if flag == "--git-dir" => {
+            io.out
+                .extend_from_slice(format!("{}\n", path_join(&root, GIT_DIR)).as_bytes());
+            0
+        }
+        [flag] if flag == "--show-prefix" => {
+            let prefix = relative_path(&root, &ctx.cwd).unwrap_or_default();
+            if prefix.is_empty() {
+                io.out.push(b'\n');
+            } else {
+                io.out.extend_from_slice(format!("{prefix}/\n").as_bytes());
+            }
             0
         }
         [] => {
