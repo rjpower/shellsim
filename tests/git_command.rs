@@ -78,3 +78,74 @@ fn resolves_head_and_rejects_unsupported_operations() {
     assert_eq!(unsupported.0, 2);
     assert!(unsupported.2.contains("unsupported subcommand"));
 }
+
+#[test]
+fn branches_switch_worktrees_and_preserve_independent_history() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs
+        .put_file("/file", b"main\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add file; git commit -m initial").0, 0);
+    let initial = run(&mut env, "git rev-parse HEAD").1.trim().to_string();
+
+    assert_eq!(run(&mut env, "git switch -c feature").0, 0);
+    env.vfs
+        .put_file("/file", b"feature\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add file; git commit -m feature").0, 0);
+    let feature = run(&mut env, "git rev-parse HEAD").1.trim().to_string();
+    assert_ne!(initial, feature);
+
+    assert_eq!(run(&mut env, "git switch main").0, 0);
+    assert_eq!(env.vfs.read("/", "/file").unwrap(), b"main\n");
+    assert_eq!(run(&mut env, "git rev-parse --abbrev-ref HEAD").1, "main\n");
+    assert_eq!(run(&mut env, "git branch --show-current").1, "main\n");
+    assert_eq!(run(&mut env, "git branch").1, "  feature\n* main\n");
+    assert_eq!(
+        run(&mut env, "git log --oneline").1,
+        format!("{} initial\n", &initial[..7])
+    );
+    let shown = run(&mut env, "git show feature");
+    assert_eq!(shown.0, 0, "{}", shown.2);
+    assert!(shown.1.contains("feature"), "{}", shown.1);
+    assert!(shown.1.contains("-main\n+feature\n"), "{}", shown.1);
+
+    env.vfs
+        .put_file("/file", b"changed\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git diff --name-only").1, "file\n");
+    assert!(run(&mut env, "git status")
+        .1
+        .starts_with("On branch main\n"));
+}
+
+#[test]
+fn restore_and_reset_move_index_worktree_and_head_coherently() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs.put_file("/file", b"one\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add file; git commit -m one").0, 0);
+    let first = run(&mut env, "git rev-parse HEAD").1.trim().to_string();
+
+    env.vfs.put_file("/file", b"two\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git restore file").0, 0);
+    assert_eq!(env.vfs.read("/", "/file").unwrap(), b"one\n");
+
+    env.vfs.put_file("/file", b"two\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add file; git commit -m two").0, 0);
+    env.vfs
+        .put_file("/staged", b"remove me\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/untracked", b"keep me\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add staged").0, 0);
+    assert_eq!(run(&mut env, &format!("git reset --hard {first}")).0, 0);
+    assert_eq!(run(&mut env, "git rev-parse HEAD").1.trim(), first);
+    assert_eq!(env.vfs.read("/", "/file").unwrap(), b"one\n");
+    assert!(!env.vfs.exists("/", "/staged"));
+    assert_eq!(env.vfs.read("/", "/untracked").unwrap(), b"keep me\n");
+    assert_eq!(run(&mut env, "git status --short").1, "?? untracked\n");
+    assert_eq!(run(&mut env, "git log -1 --oneline").1.lines().count(), 1);
+}

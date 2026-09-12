@@ -164,8 +164,10 @@ After the process and I/O foundations are complete, improve commands in evidence
 2. Add a bounded `rg` implementation with useful recursive search, glob/type filters, line and
    filename output, fixed strings, regexes, hidden files, binary policy, and familiar exit codes.
    This baseline is complete; unsupported options fail explicitly.
-3. Expand Git coherently around status, diff, log, show, branch, checkout/switch, add/reset, and
-   commits. Repository state stays VFS-only; network remotes remain explicit fixtures or rejected.
+3. The coherent Git baseline now covers human and porcelain status, staged and working-tree diff,
+   name-only diff, bounded history, show, refs, branch creation/listing/deletion, checkout/switch,
+   restore, reset, add, and commits. Repository state stays VFS-only; merges, remotes, and network
+   operations remain explicitly unsupported.
 4. Add patch application and bounded tar/zip/gzip operations needed by agent workflows.
 5. Extend Make only alongside observed syntax and graph semantics; do not emulate native compiler
    artifacts with successful no-ops.

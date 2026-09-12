@@ -59,7 +59,7 @@ agent cannot safely treat as Bash:
 | invoke a VFS executable through `PATH` | executable shell/Python scripts resolve in the VFS | extend formats only from observed needs |
 | incomplete `if` statement | now rejected before execution | keep parser failure all-or-nothing and bounded |
 | `cat /dev/null` | now succeeds with an empty read | add descriptor-backed devices separately |
-| `git status` | modeled short/porcelain status | expand the coherent repository subset only as task evidence requires |
+| `git status` | modeled human and porcelain status | expand the coherent repository subset only as task evidence requires |
 | `make test` | executes explicit shell recipes | add Make syntax deliberately and reject unsupported constructs |
 
 Several formerly silent builtins, including process controls, aliases, directory-stack commands,
@@ -78,10 +78,12 @@ mean that the requested effect occurred.
 7. Add small common conveniences: aliases, directory stack, `mapfile`, jobs, wait, recursive
    search, patch application, and basic archive tools.
 
-Git and Make should follow the same structure as the Python runtime: a small coherent state model
+Git and Make follow the same structure as the Python runtime: a small coherent state model
 and parser, thin command-facing adapters, deterministic algorithms, explicit unsupported
 frontiers, and tests against observable behavior. A simple slow implementation is preferable to
-special cases in the shell executor.
+special cases in the shell executor. Git now has a VFS-native tree, blob, commit, and ref model
+supporting the local edit/stage/commit/diff/history/branch/switch/restore/reset loop; remotes and
+merge algorithms remain outside that baseline.
 
 ## Minimal process model
 
@@ -105,10 +107,12 @@ Process
   state: Runnable | Sleeping | Exited(status)
 ```
 
-The synchronous implementation now creates logical children for isolation, `$$`, `BASHPID`,
-`$PPID`, `$!`, dynamic `ps`, jobs, and wait status ownership. Pipelines retain materialized bounded
-buffers while running each stage in a child state. Cooperative scheduling can follow at explicit
-blocking points such as sleep, pipe I/O, process wait, and virtual service operations.
+The process implementation creates logical children for isolation, `$$`, `BASHPID`, `$PPID`,
+`$!`, dynamic `ps`, jobs, and wait status ownership. Background jobs, sleeps, waits, subshells, and
+pipeline stages run through deterministic cooperative continuations. Pipeline descriptors use
+bounded buffers with backpressure, so producers and consumers can overlap without eager whole-pipe
+materialization. Command substitution and nested interpreter adapters remain synchronous and are
+the next scheduler migration boundary.
 
 Python `subprocess.run`, `call`, `check_call`, and `check_output` execute only registered commands
 and VFS shell or Python scripts. The first synchronous slice models capture, inheritance, cwd/env
