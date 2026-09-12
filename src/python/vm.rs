@@ -16,8 +16,8 @@ use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentSpec, PyByteArray, PyCallable,
     PyClass, PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyIdentity,
     PyInstance, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyNativeKind,
-    PyProcessOutput, PyProcessRequest, PyProcessRunner, PyProperty, PyRaisesContext, PyRegex,
-    PyResult, PyRuntime, PySet, PyStdio, PyTuple, PyValueCast,
+    PyProcessHandle, PyProcessOutput, PyProcessRunner, PyProcessStartRequest, PyProperty,
+    PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyTuple, PyValueCast,
 };
 use super::object_model::{BuiltinType, PyLayout, Slot, SlotValue, TypeId};
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
@@ -5212,39 +5212,64 @@ impl PyRuntime for Vm<'_> {
 }
 
 impl PyProcessRunner for Vm<'_> {
-    fn run(&mut self, request: PyProcessRequest) -> PyResult<PyProcessOutput> {
-        let stdout_mode = request.stdout;
-        let stderr_mode = request.stderr;
-        let mut output = super::process::run(self.interp, request)?;
-        let mut stdout = output.stdout.take().unwrap_or_default();
-        let stderr = output.stderr.take().unwrap_or_default();
+    fn start(&mut self, request: PyProcessStartRequest) -> PyResult<PyProcessHandle> {
+        super::process::start(self.interp, request)
+    }
 
-        if stderr_mode == PyStdio::MergeStdout {
-            stdout.extend_from_slice(&stderr);
-        }
+    fn poll(&mut self, handle: PyProcessHandle) -> PyResult<Option<i32>> {
+        super::process::poll(self.interp, handle)
+    }
 
-        output.stdout = match stdout_mode {
-            PyStdio::Inherit => {
-                // The command dispatcher already metered and truncated child output. Forwarding
-                // it into the parent's sink must not charge the same bytes a second time.
-                self.out.extend_from_slice(&stdout);
-                None
-            }
-            PyStdio::Pipe => Some(stdout),
-            PyStdio::DevNull => None,
-            PyStdio::MergeStdout => {
-                return Err(PyError::value_error("stdout cannot use STDERR"));
-            }
-        };
-        output.stderr = match stderr_mode {
-            PyStdio::Inherit => {
-                self.err.extend_from_slice(&stderr);
-                None
-            }
-            PyStdio::Pipe => Some(stderr),
-            PyStdio::DevNull | PyStdio::MergeStdout => None,
-        };
+    fn wait(
+        &mut self,
+        handle: PyProcessHandle,
+        timeout_ns: Option<u64>,
+    ) -> PyResult<PyProcessOutput> {
+        let mut output = super::process::wait(self.interp, handle, timeout_ns)?;
+        self.out
+            .extend_from_slice(&std::mem::take(&mut output.inherited_stdout));
+        self.err
+            .extend_from_slice(&std::mem::take(&mut output.inherited_stderr));
         Ok(output)
+    }
+
+    fn communicate(
+        &mut self,
+        handle: PyProcessHandle,
+        input: Vec<u8>,
+        timeout_ns: Option<u64>,
+    ) -> PyResult<PyProcessOutput> {
+        let mut output = super::process::communicate(self.interp, handle, input, timeout_ns)?;
+        self.out
+            .extend_from_slice(&std::mem::take(&mut output.inherited_stdout));
+        self.err
+            .extend_from_slice(&std::mem::take(&mut output.inherited_stderr));
+        Ok(output)
+    }
+
+    fn read_pipe(
+        &mut self,
+        handle: PyProcessHandle,
+        fd: i32,
+        amount: Option<usize>,
+    ) -> PyResult<Vec<u8>> {
+        super::process::read_pipe(self.interp, handle, fd, amount)
+    }
+
+    fn write_pipe(&mut self, handle: PyProcessHandle, input: Vec<u8>) -> PyResult<usize> {
+        super::process::write_pipe(self.interp, handle, input)
+    }
+
+    fn close_pipe(&mut self, handle: PyProcessHandle, fd: i32) -> PyResult<()> {
+        super::process::close_pipe(self.interp, handle, fd)
+    }
+
+    fn send_signal(
+        &mut self,
+        handle: PyProcessHandle,
+        signal: crate::process::Signal,
+    ) -> PyResult<()> {
+        super::process::send_signal(self.interp, handle, signal)
     }
 }
 

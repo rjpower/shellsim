@@ -127,12 +127,13 @@ path. Source modules may import small private native
 cores for algorithms or modeled capabilities that Python cannot implement directly. Filesystem
 modules share `_shellsim_vfs`; `collections` imports only native `defaultdict`; `json`, `hashlib`,
 and `zlib` delegate their bounded codec, digest, or checksum primitives. `subprocess` delegates
-only direct argv execution to `_shellsim_subprocess`: `run`, `call`, `check_call`, and
-`check_output` execute registered commands and VFS scripts as synchronous logical children.
-Captured and inherited streams, bytes/text input and output, cwd, replacement environments,
-return codes, checks, and virtual-clock timeouts are modeled. `shell=True` invokes shellsim's own
-shell and cannot select a host shell. Live `Popen` children remain unsupported until the process
-scheduler and descriptor table can represent pipes and overlapping execution.
+only logical child creation, scheduling, descriptor I/O, status, and signals to
+`_shellsim_subprocess`. Its Python source defines `Popen`, `run`, `call`, `check_call`, and
+`check_output`. Children are live scheduler tasks, so independent sleeps overlap and bounded
+stdin/stdout/stderr pipes apply backpressure. Binary and text stream objects, duplex
+`communicate`, retry after timeout, cwd, replacement environments, return codes, checks, and
+virtual deadlines are modeled. `shell=True` invokes shellsim's own shell and cannot select a host
+shell. Host process setup, native file descriptors, and session manipulation are rejected.
 
 Prefer frozen Python for module policy, composition, and ordinary object behavior. Add a private
 native primitive only for a modeled capability, an algorithm that must meter host allocation

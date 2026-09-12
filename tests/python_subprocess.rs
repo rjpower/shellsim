@@ -107,6 +107,114 @@ print(output.strip())
 }
 
 #[test]
+fn popen_children_overlap_and_poll_without_advancing_virtual_time() {
+    let mut environment = Environment::new();
+    let result = run(
+        &mut environment,
+        r#"
+import subprocess
+import time
+slow = subprocess.Popen(["sleep", "2"])
+fast = subprocess.Popen(["sleep", "1"])
+print(slow.pid != fast.pid, slow.poll(), time.monotonic())
+print(slow.wait(), fast.poll(), time.monotonic())
+"#,
+    );
+    assert_eq!(
+        result,
+        (0, "True None 0.0\n0 0 2.0\n".into(), String::new())
+    );
+}
+
+#[test]
+fn popen_communicate_drains_duplex_pipes_larger_than_capacity() {
+    let mut environment = Environment::new();
+    let result = run(
+        &mut environment,
+        r#"
+import subprocess
+data = b"abcdefgh" * 20000
+process = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+stdout, stderr = process.communicate(data)
+print(process.returncode, len(stdout), stdout == data, stderr)
+"#,
+    );
+    assert_eq!(result, (0, "0 160000 True b''\n".into(), String::new()));
+}
+
+#[test]
+fn popen_exposes_binary_and_text_pipe_streams() {
+    let mut environment = Environment::new();
+    let result = run(
+        &mut environment,
+        r#"
+import subprocess
+binary = subprocess.Popen(["printf", "abcdef"], stdout=subprocess.PIPE)
+print(binary.stdout.read(2), binary.stdout.read(), binary.wait())
+text = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+print(text.stdin.write("one\ntwo\n"), text.stdin.flush())
+text.stdin.close()
+print(text.stdout.readline().strip(), text.stdout.read().strip(), text.wait())
+print(text.stdin.closed, text.stdout.readable(), text.stdout.fileno())
+"#,
+    );
+    assert_eq!(result.0, 0, "{}", result.2);
+    assert_eq!(
+        result.1,
+        "b'ab' b'cdef' 0\n8 None\none two 0\nTrue True 1\n"
+    );
+}
+
+#[test]
+fn popen_timeout_keeps_child_live_and_terminate_reports_negative_signal() {
+    let mut environment = Environment::new();
+    let result = run(
+        &mut environment,
+        r#"
+import subprocess
+import time
+from subprocess import TimeoutExpired
+process = subprocess.Popen(["sleep", "10"])
+try:
+    process.wait(timeout=1)
+except TimeoutExpired:
+    print("timeout", process.poll(), time.monotonic())
+process.terminate()
+print(process.wait(), time.monotonic())
+"#,
+    );
+    assert_eq!(
+        result,
+        (0, "timeout None 1.0\n-15 1.0\n".into(), String::new())
+    );
+    assert_eq!(environment.clock.pending_len(), 0);
+}
+
+#[test]
+fn communicate_retry_preserves_partial_input_progress() {
+    let mut environment = Environment::new();
+    let result = run(
+        &mut environment,
+        r#"
+import subprocess
+from subprocess import TimeoutExpired
+process = subprocess.Popen(["sleep", "10"], stdin=subprocess.PIPE,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+try:
+    process.communicate(b"x" * 100000, timeout=1)
+except TimeoutExpired:
+    print("timed out", process.poll())
+process.kill()
+stdout, stderr = process.communicate()
+print(process.returncode, stdout, stderr)
+"#,
+    );
+    assert_eq!(result.0, 0, "{}", result.2);
+    assert_eq!(result.1, "timed out None\n-9 b'' b''\n");
+}
+
+#[test]
 fn timeout_and_host_capability_requests_fail_explicitly() {
     let mut environment = Environment::new();
     let result = run(

@@ -7,6 +7,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::descriptors::FdTable;
+
 /// PID assigned to a simulated process.
 pub type ProcessId = u32;
 
@@ -90,6 +92,29 @@ pub struct ProcessRecord {
     /// Snapshot of descriptor targets for generated `/proc/PID/fd` views.
     pub descriptors: BTreeMap<i32, String>,
     pub status: ProcessStatus,
+}
+
+/// Parent-owned descriptor endpoints and collected state for one live child handle.
+///
+/// The handle is machine state rather than Python heap state so native facades can refer to it by
+/// PID without exposing descriptor arena identities to simulated code.
+pub(crate) struct LiveChild {
+    pub owner: ProcessId,
+    pub endpoints: FdTable,
+    pub status: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub communicated: bool,
+    /// Input retained across timed-out `communicate` calls.
+    pub communicate_input: Option<Vec<u8>>,
+    /// First byte not yet accepted by the child stdin pipe.
+    pub communicate_offset: usize,
+    pub stdin_pipe: bool,
+    pub stdout_pipe: bool,
+    pub stderr_pipe: bool,
+    pub stdout_inherit: bool,
+    pub stderr_inherit: bool,
+    pub terminating_signal: Option<Signal>,
 }
 
 /// Machine-wide allocator and process record store.

@@ -169,29 +169,65 @@ pub(super) enum PyStdio {
     MergeStdout,
 }
 
-/// Fully-owned request passed across the Python/process capability boundary.
-pub(super) struct PyProcessRequest {
-    pub argv: Vec<String>,
-    pub stdin: Vec<u8>,
-    pub cwd: Option<String>,
-    pub environment: Option<BTreeMap<String, String>>,
-    pub timeout_ns: Option<u64>,
-    pub stdout: PyStdio,
-    pub stderr: PyStdio,
-}
-
-/// Completed result from shellsim's synchronous logical process runner.
+/// Snapshot returned by a live logical process operation.
 pub(super) struct PyProcessOutput {
     pub status: i32,
     pub stdout: Option<Vec<u8>>,
     pub stderr: Option<Vec<u8>>,
     pub timed_out: bool,
+    /// Bytes destined for the calling Python command's inherited streams.
+    pub inherited_stdout: Vec<u8>,
+    pub inherited_stderr: Vec<u8>,
+}
+
+/// Fully-owned request for a child that outlives the native launch call.
+pub(super) struct PyProcessStartRequest {
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub environment: Option<BTreeMap<String, String>>,
+    pub stdin: PyStdio,
+    pub stdout: PyStdio,
+    pub stderr: PyStdio,
+}
+
+/// Stable logical child identity returned by a live launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PyProcessHandle {
+    pub pid: u32,
 }
 
 /// Explicit process-launch capability. Implementations must dispatch only modeled commands and
 /// VFS scripts and must never fall back to an ambient host process.
 pub(super) trait PyProcessRunner {
-    fn run(&mut self, request: PyProcessRequest) -> PyResult<PyProcessOutput>;
+    fn start(&mut self, request: PyProcessStartRequest) -> PyResult<PyProcessHandle>;
+    fn poll(&mut self, handle: PyProcessHandle) -> PyResult<Option<i32>>;
+    fn wait(
+        &mut self,
+        handle: PyProcessHandle,
+        timeout_ns: Option<u64>,
+    ) -> PyResult<PyProcessOutput>;
+    fn communicate(
+        &mut self,
+        handle: PyProcessHandle,
+        input: Vec<u8>,
+        timeout_ns: Option<u64>,
+    ) -> PyResult<PyProcessOutput>;
+    /// Read at most `amount` bytes, or through EOF when omitted, from a captured child stream.
+    fn read_pipe(
+        &mut self,
+        handle: PyProcessHandle,
+        fd: i32,
+        amount: Option<usize>,
+    ) -> PyResult<Vec<u8>>;
+    /// Write bytes to a captured child stdin, cooperatively scheduling while the pipe is full.
+    fn write_pipe(&mut self, handle: PyProcessHandle, input: Vec<u8>) -> PyResult<usize>;
+    /// Close one parent-side captured stream endpoint.
+    fn close_pipe(&mut self, handle: PyProcessHandle, fd: i32) -> PyResult<()>;
+    fn send_signal(
+        &mut self,
+        handle: PyProcessHandle,
+        signal: crate::process::Signal,
+    ) -> PyResult<()>;
 }
 
 /// Metered access to shellsim's simulated filesystem.

@@ -115,11 +115,12 @@ bounded buffers with backpressure, so producers and consumers can overlap withou
 materialization. Command substitution and nested interpreter adapters remain synchronous and are
 the next scheduler migration boundary.
 
-Python `subprocess.run`, `call`, `check_call`, and `check_output` execute only registered commands
-and VFS shell or Python scripts. The first synchronous slice models capture, inheritance, cwd/env
-isolation, status checks, and virtual deadlines; it never calls a host process. Live `Popen` pipes
-remain tied to the future resumable scheduler and descriptor table. Arbitrary host executables,
-`preexec_fn`, and native session manipulation remain rejected.
+Python `Popen`, `run`, `call`, `check_call`, and `check_output` execute only registered commands and
+VFS shell or Python scripts. Live children use scheduler continuations and bounded descriptor
+pipes; capture, inheritance, binary/text streams, duplex communication, cwd/env isolation,
+status, signals, and virtual deadlines are modeled. The calling Python VM drives child quanta at
+a nested cooperative boundary but is not itself resumable scheduler state. Arbitrary host
+executables, `preexec_fn`, and native session manipulation remain rejected.
 
 ## Synthetic `/proc` and `/dev`
 
@@ -165,8 +166,9 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
 4. Synthetic `/proc` and `/dev`, then bounded Python subprocess operations.
 5. Common agent conveniences. Bounded recursive `rg` and atomic patch application are present;
    archives and richer text tools remain.
-6. Cooperative background scheduling, bounded pipes, and default signal delivery are present;
-   process groups, handlers, and live Python process handles remain.
+6. Cooperative background scheduling, bounded pipes, default signal delivery, and live Python
+   process handles are present; process groups, handlers, and scheduler-owned Python VM frames
+   remain.
 7. Persistent workspace protocol, evaluation scenarios, and external-agent experiments.
 
 Every phase retains the existing security rule: simulated input can use only explicitly modeled

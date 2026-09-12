@@ -31,9 +31,11 @@ quanta. Shell `sleep` and `usleep` register resumable command entry points: they
 on a virtual-timeline event, allow other tasks to run, and advance time only when the runnable
 queue is empty. Pipeline stages are created together and exchange bytes through bounded pipe
 descriptors; command input and output are resumable frames so backpressure suspends only the
-affected stage. Command substitution still uses a synchronous child adapter, and Python `Popen`
-cannot expose a live process. Do not describe those remaining operations as concurrent until
-phases 3 through 5 meet their removal criteria.
+affected stage. Python `Popen` now launches the same stored argv continuations and drives them at
+a nested cooperative scheduling boundary, with live PIDs and bounded descriptor pipes. Command
+substitution and nested-shell adapters still use synchronous child adapters. The Python bytecode
+VM itself is not yet a scheduler-owned resumable continuation, so Python execution cannot be
+interleaved at arbitrary bytecode instructions.
 
 The readiness handshake needed by phase 3 is present: blocked descriptor operations return a
 typed pipe-readable or pipe-writable condition, process code can suspend on that exact condition,
@@ -46,9 +48,10 @@ frames polled in fixed work quanta and retained on `ProcessState`. Same-process 
 no longer recurses through the Rust stack. Fork allocations also have independently releasable
 memory ownership, which is required once children overlap instead of exiting in stack order.
 Ordinary foreground subshells and pipelines now suspend their parent and switch through the
-scheduler without a nested Rust executor call. Command substitution, nested-shell adapters, and
-Python's synchronous subprocess facade still use the run-to-completion child adapter, so phase 3
-remains incomplete.
+scheduler without a nested Rust executor call. Python subprocess operations use live handles and
+the scheduler rather than the removed synchronous runner, but the calling VM remains on the Rust
+stack while the scheduler runs child quanta. Command substitution and nested-shell adapters keep
+phase 3 incomplete.
 
 ## Non-negotiable invariants
 
@@ -145,7 +148,7 @@ Required compatibility cases include overlapping sleeps, file races with determi
 `yes | head`, early reader close, multi-stage pipelines, blocked writers, pipeline status and
 `pipefail`, job status transitions, nested deadlines, and resource exhaustion without deadlock.
 
-## Phase 5: minimal signals and Python `Popen`
+## Phase 5: minimal signals and Python `Popen` (baseline complete)
 
 Pending `KILL`, `TERM`, `INT`, `HUP`, `CHLD`, and `PIPE` signals now live on process state and are
 delivered at scheduler boundaries. Terminating signals wake blocked tasks, use conventional
@@ -154,9 +157,13 @@ ignored disposition. The shell `kill` builtin supports PID/job targets, supporte
 numbers, existence probes, and signal listing. Custom handlers and process groups remain explicit
 future work.
 
-Build `Popen` over live process handles and descriptor-backed streams. Implement `poll`, `wait`,
-`communicate`, context management, timeout termination, capture, and reaping. `communicate` must
-drain both outputs while supplying input so bounded pipes cannot deadlock.
+`Popen` is built over live process handles and descriptor-backed streams. `poll`, `wait`,
+`communicate`, signal termination, context management, timeouts, capture, and reaping use real
+logical child state. `stdin`, `stdout`, and `stderr` expose small binary/text file-like facades.
+`communicate` drains both outputs while supplying input, and retains its write cursor across a
+timeout so retry cannot duplicate input. Unsupported host setup and session options fail before
+launch. Full process groups, custom signal handlers, and arbitrary Python-bytecode suspension are
+outside this baseline.
 
 ## Phase 6: agent command fidelity
 

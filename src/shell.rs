@@ -44,6 +44,11 @@ pub enum Node {
         words: Vec<String>,
         redirects: Vec<Redirect>,
     },
+    /// Pre-expanded argv supplied by an internal modeled process launcher.
+    ///
+    /// The parser never constructs this variant. It prevents Python subprocess arguments from
+    /// being interpreted a second time as shell source.
+    ArgvCommand(Vec<String>),
     Pipeline(Vec<Node>),
     And(Box<Node>, Box<Node>),
     Or(Box<Node>, Box<Node>),
@@ -120,6 +125,7 @@ impl Node {
                         .saturating_add(48)
                 })
                 .saturating_add(redirects(redirections)),
+            Self::ArgvCommand(words) => strings(words),
             Self::Pipeline(nodes) | Self::Seq(nodes) => nodes.iter().fold(0, |total, node| {
                 total.saturating_add(node.estimated_bytes())
             }),

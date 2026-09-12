@@ -50,6 +50,8 @@ pub struct Environment {
     pub descriptors: DescriptorArena,
     /// Complete process-local contexts keyed by logical PID, with one active context.
     pub process: ProcessStates,
+    /// Parent-side endpoints retained for live subprocess handles.
+    pub(crate) live_children: BTreeMap<ProcessId, crate::process::LiveChild>,
     next_temp_id: u64,
     /// Trace of every external command name executed.
     pub cmd_trace: Vec<String>,
@@ -417,6 +419,7 @@ impl Environment {
                 fork_allocation_bytes: 0,
                 detached_output: false,
             }),
+            live_children: BTreeMap::new(),
             next_temp_id: 0,
             cmd_trace: Vec::new(),
             unsupported: Vec::new(),
@@ -451,6 +454,15 @@ impl Environment {
 
     /// Create a runnable pipeline stage whose descriptors are connected before dispatch.
     pub(crate) fn start_pipeline_child(
+        &mut self,
+        command: &str,
+        new_shell: bool,
+    ) -> Result<ProcessId, String> {
+        self.create_child(command, new_shell, false, false)
+    }
+
+    /// Create a parent-managed live child for a language-level process handle.
+    pub(crate) fn start_live_child(
         &mut self,
         command: &str,
         new_shell: bool,
@@ -546,6 +558,62 @@ impl Environment {
         state.fds.install(fd, description, &mut self.descriptors)?;
         self.refresh_descriptor_snapshot(pid);
         Ok(())
+    }
+
+    /// Configure cwd and exported environment for a retained child before its first dispatch.
+    pub(crate) fn configure_process(
+        &mut self,
+        pid: ProcessId,
+        cwd: Option<String>,
+        environment: Option<BTreeMap<String, String>>,
+    ) -> Result<(), String> {
+        let state = self
+            .process
+            .states
+            .get_mut(&pid)
+            .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
+        if let Some(cwd) = cwd {
+            state.cwd = cwd;
+            state.vars.insert("PWD".to_string(), state.cwd.clone());
+            state.exported.insert("PWD".to_string());
+        }
+        if let Some(environment) = environment {
+            state.vars.clear();
+            state.arrays.clear();
+            state.exported.clear();
+            for (name, value) in &environment {
+                state.vars.insert(name.clone(), value.clone());
+                state.exported.insert(name.clone());
+            }
+            state.vars.insert("PWD".to_string(), state.cwd.clone());
+            state.exported.insert("PWD".to_string());
+        }
+        let exported = state
+            .exported
+            .iter()
+            .filter_map(|name| {
+                state
+                    .vars
+                    .get(name)
+                    .map(|value| (name.clone(), value.clone()))
+            })
+            .collect();
+        self.processes.update_current(pid, &state.cwd, exported);
+        Ok(())
+    }
+
+    /// Resolve a descriptor belonging to a retained process without activating it.
+    pub(crate) fn process_description(
+        &self,
+        pid: ProcessId,
+        fd: Fd,
+    ) -> Result<DescriptionId, DescriptorError> {
+        self.process
+            .states
+            .get(&pid)
+            .ok_or(DescriptorError::InvalidFd)?
+            .fds
+            .get(fd)
     }
 
     /// Restore the parent after a synchronous child and optionally retain the exited record.
