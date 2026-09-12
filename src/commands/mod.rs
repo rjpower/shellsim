@@ -26,6 +26,7 @@ mod git;
 mod hashing;
 mod makecmd;
 mod net;
+mod patch;
 pub(crate) mod pkg;
 mod printf;
 mod proc;
@@ -186,6 +187,7 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     hashing::register(&mut m);
     makecmd::register(&mut m);
     net::register(&mut m);
+    patch::register(&mut m);
     proc::register(&mut m);
     rgcmd::register(&mut m);
     pkg::register(&mut m);

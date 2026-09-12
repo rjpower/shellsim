@@ -76,7 +76,8 @@ mean that the requested effect occurred.
 6. Resolve executable VFS scripts through `PATH` and honor executable metadata. Complete for
    shell/Python shebangs and explicit rejection of unsupported interpreters.
 7. Add small common conveniences: aliases, directory stack, `mapfile`, jobs, wait, recursive
-   search, patch application, and basic archive tools.
+   search, patch application, and basic archive tools. Recursive search and atomic VFS-only patch
+   application are now present.
 
 Git and Make follow the same structure as the Python runtime: a small coherent state model
 and parser, thin command-facing adapters, deterministic algorithms, explicit unsupported
@@ -162,8 +163,8 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
 2. Clean Git and Make foundations with useful deterministic subsets.
 3. Logical process records, jobs, wait, descriptors, and dynamic `ps`.
 4. Synthetic `/proc` and `/dev`, then bounded Python subprocess operations.
-5. Common agent conveniences. Bounded recursive `rg` is present; patching, archives, and richer
-   text tools remain.
+5. Common agent conveniences. Bounded recursive `rg` and atomic patch application are present;
+   archives and richer text tools remain.
 6. Cooperative background scheduling and bounded pipes are present; a small signal model remains.
 7. Persistent workspace protocol, evaluation scenarios, and external-agent experiments.
 
