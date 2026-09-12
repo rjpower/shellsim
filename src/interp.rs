@@ -50,7 +50,8 @@ pub struct Environment {
     pub scheduler: Scheduler,
     /// Machine-owned open descriptions shared by forked process descriptor tables.
     pub descriptors: DescriptorArena,
-    pub process: ProcessState,
+    /// Complete process-local contexts keyed by logical PID, with one active context.
+    pub process: ProcessStates,
     next_temp_id: u64,
     /// Trace of every external command name executed.
     pub cmd_trace: Vec<String>,
@@ -116,11 +117,76 @@ pub struct ProcessState {
     pub(crate) fds: FdTable,
 }
 
+/// Machine-owned process contexts.
+///
+/// Field access dereferences to the active context for compatibility with command code, while
+/// inactive parents and runnable siblings remain stored by PID for scheduler activation.
+pub struct ProcessStates {
+    active: ProcessId,
+    states: BTreeMap<ProcessId, ProcessState>,
+}
+
+impl ProcessStates {
+    fn new(root: ProcessState) -> Self {
+        let active = root.pid;
+        Self {
+            active,
+            states: BTreeMap::from([(active, root)]),
+        }
+    }
+
+    fn activate(&mut self, pid: ProcessId) -> Result<(), String> {
+        if !self.states.contains_key(&pid) {
+            return Err(format!("process state does not exist for PID {pid}"));
+        }
+        self.active = pid;
+        Ok(())
+    }
+
+    fn insert(&mut self, state: ProcessState) -> Result<(), String> {
+        let pid = state.pid;
+        if self.states.insert(pid, state).is_some() {
+            return Err(format!("process state already exists for PID {pid}"));
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, pid: ProcessId) -> Option<ProcessState> {
+        self.states.remove(&pid)
+    }
+
+    fn current(&self) -> &ProcessState {
+        self.states
+            .get(&self.active)
+            .expect("active process state must exist")
+    }
+
+    fn current_mut(&mut self) -> &mut ProcessState {
+        self.states
+            .get_mut(&self.active)
+            .expect("active process state must exist")
+    }
+}
+
+impl Deref for ProcessStates {
+    type Target = ProcessState;
+
+    fn deref(&self) -> &Self::Target {
+        self.current()
+    }
+}
+
+impl DerefMut for ProcessStates {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.current_mut()
+    }
+}
+
 const MAX_FORK_STATE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Parent state retained while one logical child runs synchronously.
 pub(crate) struct ParentProcess {
-    state: ProcessState,
+    pid: ProcessId,
     memory_mark: u64,
 }
 
@@ -206,13 +272,13 @@ impl Deref for Environment {
     type Target = ProcessState;
 
     fn deref(&self) -> &Self::Target {
-        &self.process
+        self.process.current()
     }
 }
 
 impl DerefMut for Environment {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.process
+        self.process.current_mut()
     }
 }
 
@@ -279,7 +345,7 @@ impl Environment {
             processes,
             scheduler: Scheduler::new(ROOT_PID),
             descriptors,
-            process: ProcessState {
+            process: ProcessStates::new(ProcessState {
                 pid: ROOT_PID,
                 ppid: 0,
                 shell_pid: ROOT_PID,
@@ -307,7 +373,7 @@ impl Environment {
                 input_pos: 0,
                 python_repl: None,
                 fds,
-            },
+            }),
             next_temp_id: 0,
             cmd_trace: Vec::new(),
             unsupported: Vec::new(),
@@ -380,10 +446,18 @@ impl Environment {
                 return Err(format!("unexpected child dispatch result: {result:?}"));
             }
         }
+        let parent_pid = self.process.pid;
         let child = self.process.fork_for_child(pid, new_shell, child_fds);
-        let state = std::mem::replace(&mut self.process, child);
+        self.process.insert(child)?;
+        self.process.activate(pid)?;
         self.refresh_descriptor_snapshot(pid);
-        Ok((pid, ParentProcess { state, memory_mark }))
+        Ok((
+            pid,
+            ParentProcess {
+                pid: parent_pid,
+                memory_mark,
+            },
+        ))
     }
 
     /// Restore the parent after a synchronous child and optionally retain the exited record.
@@ -399,13 +473,17 @@ impl Environment {
         self.processes.update_descriptors(pid, BTreeMap::new());
         self.processes.exit(pid, status, &self.process.cwd);
         let _ = self.scheduler.exit_current(status);
-        let _ = self.scheduler.wake(parent.state.pid);
+        let _ = self.scheduler.wake(parent.pid);
         let _ = self.scheduler.dispatch();
         if !retain {
             self.processes.reap(pid);
             let _ = self.scheduler.reap(pid);
         }
-        self.process = parent.state;
+        let removed = self.process.remove(pid);
+        debug_assert!(removed.is_some(), "finished child state must exist");
+        self.process
+            .activate(parent.pid)
+            .expect("retained parent process state must exist");
         if child_deadline_interrupt.is_some() {
             self.process.deadline_interrupt = child_deadline_interrupt;
         }
@@ -840,3 +918,32 @@ impl Default for Environment {
 
 /// Compatibility name for callers written against the original shell simulator API.
 pub type Interp = Environment;
+
+#[cfg(test)]
+mod process_state_tests {
+    use super::*;
+
+    #[test]
+    fn inactive_parent_context_remains_machine_owned_while_child_runs() {
+        let mut environment = Environment::new();
+        let root = environment.pid;
+        environment.set_var("scope", "parent");
+
+        let (child, parent) = environment.start_child("probe", false).unwrap();
+        assert_eq!(environment.process.active, child);
+        assert_eq!(environment.process.states.len(), 2);
+        assert_eq!(
+            environment.process.states[&root]
+                .vars
+                .get("scope")
+                .map(String::as_str),
+            Some("parent")
+        );
+        environment.set_var("scope", "child");
+
+        environment.finish_child(child, parent, 0, false);
+        assert_eq!(environment.process.active, root);
+        assert_eq!(environment.process.states.len(), 1);
+        assert_eq!(environment.get_var("scope").as_deref(), Some("parent"));
+    }
+}

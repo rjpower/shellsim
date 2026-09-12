@@ -18,11 +18,16 @@ ordered, including descriptor duplication, close, append, invalid input paths, a
 `/dev` descriptor aliases. The public finite-buffer execution API is now only a harness adapter
 that installs and captures descriptors.
 
-Phase 2 is next. Child state is still activated by swapping one `ProcessState` into the
-`Environment`, and the recursive executor still runs each scheduled child to completion.
-Pipelines consequently materialize each stage's output before starting the next stage, background
-jobs finish before the prompt returns, and Python `Popen` cannot expose a live process. Do not
-describe these operations as concurrent until phases 2 through 5 meet their removal criteria.
+Phase 2 is complete. Complete `ProcessState` values now live in a machine-owned PID map. Creating
+a child retains the parent in that map, and scheduler dispatch changes the active PID rather than
+moving parent state through recursive executor frames. Exit removes the finished execution
+context while the process table independently retains zombie status until reaping.
+
+Phase 3 is next. The shell executor itself is still recursive and invokes each scheduled child to
+completion. Pipelines consequently materialize each stage's output before starting the next
+stage, background jobs finish before the prompt returns, and Python `Popen` cannot expose a live
+process. Do not describe these operations as concurrent until phases 3 through 5 meet their
+removal criteria.
 
 ## Non-negotiable invariants
 
@@ -83,7 +88,7 @@ Completion removes executor-local `RedirPlan`, eager descriptor aliases, and dir
 path handling. Tests cover shared offsets, append, duplication order, close, invalid descriptors,
 fork inheritance, descriptor exhaustion, output limits, and pseudo-filesystem visibility.
 
-## Phase 2: stored process contexts
+## Phase 2: stored process contexts (complete)
 
 Move complete child `ProcessState` values into machine-owned process entries. Replace
 `start_child`/`finish_child` swapping with explicit creation, activation, exit, and reaping APIs.
