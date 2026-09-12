@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 
 use crate::clock::{Clock, EventId};
-use crate::descriptors::{DescriptorArena, FdTable};
+use crate::descriptors::{
+    DescriptionId, DescriptorArena, DescriptorError, Fd, FdTable, IoPoll, MAX_CAPTURE_BYTES,
+};
 use crate::net::VirtualNet;
 use crate::process::{ProcessId, ProcessTable};
 use crate::resources::{Limits, Resources, RunOutcome};
@@ -421,6 +423,87 @@ impl Environment {
         self.processes.update_descriptors(pid, descriptors);
     }
 
+    /// Install a newly allocated open description, discarding it if the process table rejects
+    /// the requested descriptor number.
+    pub(crate) fn install_new_description(
+        &mut self,
+        fd: Fd,
+        description: DescriptionId,
+    ) -> Result<(), DescriptorError> {
+        if let Err(error) = self
+            .process
+            .fds
+            .install(fd, description, &mut self.descriptors)
+        {
+            let _ = self.descriptors.discard_unreferenced(description);
+            return Err(error);
+        }
+        self.refresh_descriptor_snapshot(self.process.pid);
+        Ok(())
+    }
+
+    /// Read from an active process descriptor without granting access to host handles.
+    pub(crate) fn read_fd(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, String> {
+        let description = self.process.fds.get(fd).map_err(descriptor_message)?;
+        if let Some(file) = self
+            .descriptors
+            .file_state(description)
+            .map_err(descriptor_message)?
+        {
+            if !file.readable {
+                return Err("descriptor is not open for reading".to_string());
+            }
+            let cursor = usize::try_from(file.cursor)
+                .map_err(|_| "file cursor exceeds addressable memory".to_string())?;
+            let data = self
+                .fs_read_limited("/", &file.path, MAX_CAPTURE_BYTES)
+                .map_err(|error| error.to_string())?;
+            let end = cursor.saturating_add(maximum).min(data.len());
+            let bytes = if cursor >= data.len() {
+                Vec::new()
+            } else {
+                data[cursor..end].to_vec()
+            };
+            self.descriptors
+                .advance_file(description, bytes.len())
+                .map_err(descriptor_message)?;
+            return Ok(IoPoll::Ready(bytes));
+        }
+        self.descriptors
+            .read(description, maximum)
+            .map_err(descriptor_message)
+    }
+
+    /// Write to an active process descriptor, routing file effects only through the VFS.
+    pub(crate) fn write_fd(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, String> {
+        let description = self.process.fds.get(fd).map_err(descriptor_message)?;
+        if let Some(file) = self
+            .descriptors
+            .file_state(description)
+            .map_err(descriptor_message)?
+        {
+            if !file.writable {
+                return Err("descriptor is not open for writing".to_string());
+            }
+            let cursor = usize::try_from(file.cursor)
+                .map_err(|_| "file cursor exceeds addressable memory".to_string())?;
+            self.sync_vfs_time();
+            if let Err(error) = self.vfs.write_at("/", &file.path, cursor, bytes) {
+                if file.remove_on_first_write_error && cursor == 0 {
+                    let _ = self.vfs.remove_file("/", &file.path);
+                }
+                return Err(error.to_string());
+            }
+            self.descriptors
+                .advance_file(description, bytes.len())
+                .map_err(descriptor_message)?;
+            return Ok(IoPoll::Ready(bytes.len()));
+        }
+        self.descriptors
+            .write(description, bytes)
+            .map_err(descriptor_message)
+    }
+
     /// Record a package name installed by a compatibility command.
     pub fn install_package(&mut self, import_name: &str) {
         let name = import_name.trim();
@@ -732,6 +815,21 @@ impl Environment {
             .map(crate::resources::StopReason::exit_status)
             .or(self.exiting)
     }
+}
+
+fn descriptor_message(error: DescriptorError) -> String {
+    match error {
+        DescriptorError::InvalidFd => "bad file descriptor",
+        DescriptorError::WrongAccess => "descriptor is not open for that operation",
+        DescriptorError::DescriptorLimit => "process descriptor limit exceeded",
+        DescriptorError::DescriptionLimit => "open-description limit exceeded",
+        DescriptorError::PipeLimit => "pipe limit exceeded",
+        DescriptorError::InvalidPipeCapacity => "invalid pipe capacity",
+        DescriptorError::BrokenPipe => "broken pipe",
+        DescriptorError::OutputLimit => "descriptor output limit exceeded",
+        DescriptorError::ReferenceOverflow => "descriptor reference limit exceeded",
+    }
+    .to_string()
 }
 
 impl Default for Environment {

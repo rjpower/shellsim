@@ -602,6 +602,52 @@ impl Vfs {
         self.finish_mutation(before)
     }
 
+    /// Write bytes at a file offset, extending the file with zeroes when needed.
+    ///
+    /// Descriptor-backed writes use this operation so duplicated descriptors share a cursor
+    /// without exposing the VFS's storage representation. The caller must create the file before
+    /// writing; this keeps open/create policy at the descriptor boundary.
+    pub(crate) fn write_at(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<()> {
+        let target = self.write_target(cwd, path)?;
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| VfsError::Invalid(path.to_string()))?;
+        let existing_len = match self.nodes.get(&target) {
+            Some(Node {
+                kind: NodeKind::File(bytes),
+                ..
+            }) => bytes.len(),
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => return Err(VfsError::IsADir(path.to_string())),
+            Some(_) => return Err(VfsError::Invalid(path.to_string())),
+            None => return Err(VfsError::NotFound(path.to_string())),
+        };
+        let growth = end.saturating_sub(existing_len) as u64;
+        if self.disk_used.saturating_add(growth) > self.disk_limit {
+            return Err(VfsError::NoSpace);
+        }
+
+        let before = self.nodes.clone();
+        let node = self.nodes.get_mut(&target).expect("file was checked above");
+        let NodeKind::File(bytes) = &mut node.kind else {
+            unreachable!("file was checked above")
+        };
+        if end > bytes.len() {
+            bytes.resize(end, 0);
+        }
+        bytes[offset..end].copy_from_slice(data);
+        node.mtime = self.mutation_time_ms;
+        self.finish_mutation(before)
+    }
+
     pub fn mkdir(&mut self, cwd: &str, path: &str) -> Result<()> {
         let target = self.write_target(cwd, path)?;
         let before = self.nodes.clone();

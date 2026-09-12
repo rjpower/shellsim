@@ -8,18 +8,21 @@ failure, exhaustion, and unsupported boundaries are tested.
 
 ## Implementation status
 
-The first kernel slice is present. `scheduler.rs` provides bounded FIFO runnable, running, blocked,
-exited, wake, and reap transitions. Every existing logical child now passes through those
-transitions: its parent is observably blocked while the child runs, and `/proc/PID/status` derives
-running/sleeping state from the scheduler. `descriptors.rs` provides bounded shared open
-descriptions, per-process descriptor maps, capture/input/null endpoints, and bounded pipes with
-backpressure, shared cursors, endpoint lifetime, broken-pipe behavior, and EOF.
+Phase 1 is complete. `scheduler.rs` provides bounded FIFO runnable, running, blocked, exited,
+wake, and reap transitions. `descriptors.rs` provides bounded shared open descriptions,
+per-process descriptor maps, VFS file/input/capture/null endpoints, and bounded pipes with
+backpressure, shared cursors, endpoint lifetime, broken-pipe behavior, and EOF. Every process owns
+an FD table, children inherit shared descriptions, `/proc/PID/fd` is generated from that table,
+and shell commands route input and output through descriptors. Redirections are transactional and
+ordered, including descriptor duplication, close, append, invalid input paths, and the standard
+`/dev` descriptor aliases. The public finite-buffer execution API is now only a harness adapter
+that installs and captures descriptors.
 
-The executor still invokes one scheduled child to completion and still routes command I/O through
-eager `Vec` buffers. Therefore phases 1 through 4 are not complete: the next change is to attach FD
-tables to process contexts and migrate ordered redirection, followed by stored continuations and
-actual interleaving. Do not describe background execution or `Popen` as concurrent until those
-removal criteria have been met.
+Phase 2 is next. Child state is still activated by swapping one `ProcessState` into the
+`Environment`, and the recursive executor still runs each scheduled child to completion.
+Pipelines consequently materialize each stage's output before starting the next stage, background
+jobs finish before the prompt returns, and Python `Popen` cannot expose a live process. Do not
+describe these operations as concurrent until phases 2 through 5 meet their removal criteria.
 
 ## Non-negotiable invariants
 
@@ -65,7 +68,7 @@ The scheduler polls a runnable process until it exits or returns a typed blockin
 process is runnable, it advances the virtual timeline to the next event and wakes affected tasks.
 It does not spin, sleep a host thread, or use nondeterministic work stealing.
 
-## Phase 1: descriptor foundation
+## Phase 1: descriptor foundation (complete)
 
 Introduce a bounded descriptor arena and per-process `FdTable`. Seed descriptors 0, 1, and 2 with
 explicit input/output captures. Model VFS open descriptions, null, and captures before pipes.

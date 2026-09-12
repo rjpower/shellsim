@@ -926,14 +926,10 @@ fn run_capture(interp: &mut Interp, src: &str) -> String {
             return String::new();
         }
     };
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let Some((status, _)) = crate::exec::exec_child(
+    let Some((status, out)) = crate::exec::exec_child_capture_stdout(
         interp,
         &ast,
         Vec::new(),
-        &mut out,
-        &mut err,
         crate::exec::ChildExecution {
             command: "$(command substitution)",
             new_shell: false,

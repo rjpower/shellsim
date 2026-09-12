@@ -3,9 +3,12 @@
 use crate::expand::{expand_word, expand_words};
 use crate::interp::Interp;
 use crate::shell::{Node, RedirOp, Redirect};
+use crate::{descriptors::IoPoll, vfs::resolve_against};
 
-/// Execute a node. `stdin` is the input byte stream (from a pipe or empty). Command output
-/// is appended to `out`/`err` unless redirected. Returns the exit status.
+/// Execute a node with finite input and capture its terminal output.
+///
+/// The byte-buffer API is the harness boundary. Internally, execution installs those streams as
+/// process descriptors so redirection, duplication, and child inheritance use one model.
 pub fn exec(
     interp: &mut Interp,
     node: &Node,
@@ -13,6 +16,68 @@ pub fn exec(
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> i32 {
+    let saved = match interp.process.fds.fork(&mut interp.descriptors) {
+        Ok(saved) => saved,
+        Err(error) => {
+            err.extend_from_slice(
+                format!("shellsim: unable to save descriptors: {error:?}\n").as_bytes(),
+            );
+            return 125;
+        }
+    };
+    let input = match interp.descriptors.open_input(stdin) {
+        Ok(description) => description,
+        Err(error) => return restore_failed_setup(interp, saved, err, error),
+    };
+    if let Err(error) = interp.install_new_description(0, input) {
+        return restore_failed_setup(interp, saved, err, error);
+    }
+    let stdout = match interp.descriptors.open_capture() {
+        Ok(description) => description,
+        Err(error) => return restore_failed_setup(interp, saved, err, error),
+    };
+    if let Err(error) = interp.install_new_description(1, stdout) {
+        return restore_failed_setup(interp, saved, err, error);
+    }
+    let stderr = match interp.descriptors.open_capture() {
+        Ok(description) => description,
+        Err(error) => return restore_failed_setup(interp, saved, err, error),
+    };
+    if let Err(error) = interp.install_new_description(2, stderr) {
+        return restore_failed_setup(interp, saved, err, error);
+    }
+
+    let status = exec_node(interp, node);
+    if let Ok(bytes) = interp.descriptors.capture(stdout) {
+        out.extend_from_slice(bytes);
+    }
+    if let Ok(bytes) = interp.descriptors.capture(stderr) {
+        err.extend_from_slice(bytes);
+    }
+    restore_fds(interp, saved);
+    status
+}
+
+fn restore_failed_setup(
+    interp: &mut Interp,
+    saved: crate::descriptors::FdTable,
+    err: &mut Vec<u8>,
+    error: crate::descriptors::DescriptorError,
+) -> i32 {
+    restore_fds(interp, saved);
+    err.extend_from_slice(
+        format!("shellsim: unable to install descriptors: {error:?}\n").as_bytes(),
+    );
+    125
+}
+
+fn restore_fds(interp: &mut Interp, saved: crate::descriptors::FdTable) {
+    interp.process.fds.close_all(&mut interp.descriptors);
+    interp.process.fds = saved;
+    interp.refresh_descriptor_snapshot(interp.process.pid);
+}
+
+fn exec_node(interp: &mut Interp, node: &Node) -> i32 {
     if !interp.resources.charge_cpu(10) {
         return interp
             .resources
@@ -33,26 +98,26 @@ pub fn exec(
     }
     let status = match node {
         Node::Empty => 0,
-        Node::Command { .. } => exec_command(interp, node, stdin, out, err),
-        Node::Pipeline(stages) => exec_pipeline(interp, stages, stdin, out, err),
+        Node::Command { .. } => exec_command(interp, node),
+        Node::Pipeline(stages) => exec_pipeline(interp, stages),
         Node::And(a, b) => {
-            let sa = exec_cond(interp, a, stdin.clone(), out, err);
+            let sa = exec_cond(interp, a);
             if sa == 0 && interp.exiting.is_none() {
-                exec(interp, b, stdin, out, err)
+                exec_node(interp, b)
             } else {
                 sa
             }
         }
         Node::Or(a, b) => {
-            let sa = exec_cond(interp, a, stdin.clone(), out, err);
+            let sa = exec_cond(interp, a);
             if sa != 0 && interp.exiting.is_none() {
-                exec(interp, b, stdin, out, err)
+                exec_node(interp, b)
             } else {
                 sa
             }
         }
         Node::Not(a) => {
-            let sa = exec_cond(interp, a, stdin, out, err);
+            let sa = exec_cond(interp, a);
             if sa == 0 {
                 1
             } else {
@@ -65,7 +130,7 @@ pub fn exec(
                 if interp.resources.is_stopped() {
                     break;
                 }
-                s = exec(interp, n, stdin.clone(), out, err);
+                s = exec_node(interp, n);
                 if interp.exiting.is_some() || interp.returning.is_some() {
                     break;
                 }
@@ -85,44 +150,34 @@ pub fn exec(
         }
         Node::Background(a) => {
             let cmd = describe(a);
-            let mut bout = Vec::new();
-            let mut berr = Vec::new();
             let Some((s, pid)) = exec_child(
                 interp,
                 a,
-                Vec::new(),
-                &mut bout,
-                &mut berr,
                 ChildExecution {
                     command: &cmd,
                     new_shell: false,
                     retain: true,
                 },
             ) else {
-                err.extend_from_slice(b"shellsim: unable to create background process\n");
+                write_diagnostic(interp, "shellsim: unable to create background process\n");
                 return 125;
             };
             let Some(id) = interp.new_job(pid, cmd) else {
                 interp.processes.reap(pid);
                 let _ = interp.scheduler.reap(pid);
-                err.extend_from_slice(b"shellsim: job table limit exceeded\n");
+                write_diagnostic(interp, "shellsim: job table limit exceeded\n");
                 return 125;
             };
             if let Some(job) = interp.jobs.iter_mut().find(|job| job.id == id) {
                 job.done = true;
                 job.status = s;
             }
-            out.extend(bout);
-            err.extend(berr);
             interp.set_var("!", pid.to_string());
             0
         }
         Node::Subshell(a) => exec_child(
             interp,
             a,
-            stdin,
-            out,
-            err,
             ChildExecution {
                 command: "(subshell)",
                 new_shell: false,
@@ -130,36 +185,9 @@ pub fn exec(
             },
         )
         .map_or(125, |(status, _)| status),
-        Node::Group(a) => exec(interp, a, stdin, out, err),
+        Node::Group(a) => exec_node(interp, a),
         Node::Redirected(inner, redirs) => {
-            let mut local_out = Vec::new();
-            let mut local_err = Vec::new();
-            let plan = plan_redirects(interp, redirs);
-            // Make a `< file` input available to `read` across loop iterations via a cursor.
-            let has_stdin = redirs.iter().any(|r| r.fd == 0);
-            let saved = if has_stdin {
-                let s = (std::mem::take(&mut interp.input_stream), interp.input_pos);
-                interp.input_stream = plan.stdin.clone();
-                interp.input_pos = 0;
-                Some(s)
-            } else {
-                None
-            };
-            let mut s = exec(
-                interp,
-                inner,
-                plan.stdin.clone(),
-                &mut local_out,
-                &mut local_err,
-            );
-            if let Some((stream, pos)) = saved {
-                interp.input_stream = stream;
-                interp.input_pos = pos;
-            }
-            if !apply_outputs(interp, &plan, &local_out, &local_err, out, err) {
-                s = 1;
-            }
-            s
+            with_redirects(interp, redirs, |interp| exec_node(interp, inner))
         }
         Node::If {
             cond,
@@ -167,16 +195,16 @@ pub fn exec(
             elifs,
             els,
         } => {
-            if exec_cond(interp, cond, stdin.clone(), out, err) == 0 {
-                exec(interp, then, stdin, out, err)
+            if exec_cond(interp, cond) == 0 {
+                exec_node(interp, then)
             } else {
                 for (c, b) in elifs {
-                    if exec_cond(interp, c, stdin.clone(), out, err) == 0 {
-                        return exec(interp, b, stdin, out, err);
+                    if exec_cond(interp, c) == 0 {
+                        return exec_node(interp, b);
                     }
                 }
                 if let Some(e) = els {
-                    exec(interp, e, stdin, out, err)
+                    exec_node(interp, e)
                 } else {
                     0
                 }
@@ -195,12 +223,12 @@ pub fn exec(
                 if guard > 5_000 {
                     break;
                 }
-                let c = exec_cond(interp, cond, Vec::new(), out, err);
+                let c = exec_cond(interp, cond);
                 let go = if *until { c != 0 } else { c == 0 };
                 if !go || interp.exiting.is_some() {
                     break;
                 }
-                s = exec(interp, body, Vec::new(), out, err);
+                s = exec_node(interp, body);
                 if interp.loop_break > 0 {
                     interp.loop_break -= 1;
                     break;
@@ -223,7 +251,7 @@ pub fn exec(
                     break;
                 }
                 interp.set_var(var, item);
-                s = exec(interp, body, Vec::new(), out, err);
+                s = exec_node(interp, body);
                 if interp.loop_break > 0 {
                     interp.loop_break -= 1;
                     break;
@@ -252,7 +280,7 @@ pub fn exec(
                     break;
                 }
                 guard += 1;
-                status = exec(interp, body, Vec::new(), out, err);
+                status = exec_node(interp, body);
                 if interp.loop_break > 0 {
                     interp.loop_break -= 1;
                     break;
@@ -273,7 +301,7 @@ pub fn exec(
                 for pat in pats {
                     let p = expand_word(interp, pat, false).join(" ");
                     if case_match(&p, &subject) {
-                        return exec(interp, body, stdin, out, err);
+                        return exec_node(interp, body);
                     }
                 }
             }
@@ -296,15 +324,9 @@ pub fn exec(
 }
 
 /// Execute as a condition: errexit is suppressed inside.
-fn exec_cond(
-    interp: &mut Interp,
-    node: &Node,
-    stdin: Vec<u8>,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
-) -> i32 {
+fn exec_cond(interp: &mut Interp, node: &Node) -> i32 {
     interp.cond_depth += 1;
-    let s = exec(interp, node, stdin, out, err);
+    let s = exec_node(interp, node);
     interp.cond_depth -= 1;
     s
 }
@@ -316,127 +338,219 @@ fn describe(node: &Node) -> String {
     }
 }
 
-struct RedirPlan {
-    stdin: Vec<u8>,
-    /// final destination for fd1 and fd2: None=parent buffer, Some((path,append))=file
-    out_dest: OutDest,
-    err_dest: OutDest,
+fn with_redirects(
+    interp: &mut Interp,
+    redirects: &[Redirect],
+    run: impl FnOnce(&mut Interp) -> i32,
+) -> i32 {
+    let memory_mark = interp.resources.memory_mark();
+    let snapshot_bytes = interp.vfs.disk_used().saturating_add(4 * 1024);
+    if !interp.resources.reserve_memory(snapshot_bytes) {
+        write_diagnostic(
+            interp,
+            "shellsim: redirection: memory limit exceeded while preparing redirections\n",
+        );
+        return 1;
+    }
+    let vfs_before = interp.vfs.clone();
+    let saved = match interp.process.fds.fork(&mut interp.descriptors) {
+        Ok(saved) => saved,
+        Err(error) => {
+            write_diagnostic(interp, &format!("shellsim: redirection: {error:?}\n"));
+            interp.resources.restore_memory(memory_mark);
+            return 1;
+        }
+    };
+    if let Err(error) = apply_redirects(interp, redirects) {
+        restore_fds(interp, saved);
+        interp.vfs = vfs_before;
+        interp.resources.restore_memory(memory_mark);
+        write_diagnostic(interp, &format!("shellsim: redirection: {error}\n"));
+        return 1;
+    }
+    let status = run(interp);
+    restore_fds(interp, saved);
+    interp.resources.restore_memory(memory_mark);
+    status
 }
 
-#[derive(Clone)]
-enum OutDest {
-    Parent,
-    File(String, bool), // (path, append)
-}
-
-fn plan_redirects(interp: &mut Interp, redirs: &[Redirect]) -> RedirPlan {
-    let mut stdin = Vec::new();
-    let mut out_dest = OutDest::Parent;
-    let mut err_dest = OutDest::Parent;
-    for r in redirs {
-        match r.op {
+/// Apply redirections from left to right. `dup` retains the open description selected at that
+/// point, so `2>&1 >file` and `>file 2>&1` have distinct, Bash-compatible destinations.
+fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), String> {
+    for redirect in redirects {
+        match redirect.op {
             RedirOp::Read => {
-                let path = expand_word(interp, &r.target, true).join(" ");
-                stdin = interp.vfs.read(&interp.cwd, &path).unwrap_or_default();
+                let path = redirect_path(interp, &redirect.target)?;
+                if let Some(source) = device_fd(&path) {
+                    interp
+                        .process
+                        .fds
+                        .duplicate(source, redirect.fd, &mut interp.descriptors)
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                } else if path == "/dev/null" {
+                    let description = interp
+                        .descriptors
+                        .open_null()
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    interp
+                        .install_new_description(redirect.fd, description)
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                } else {
+                    interp
+                        .fs_metadata("/", &path, true)
+                        .map_err(|error| error.to_string())?;
+                    let description = interp
+                        .descriptors
+                        .open_file(path.clone(), 0, true, false, false)
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    interp
+                        .install_new_description(redirect.fd, description)
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                }
             }
-            RedirOp::Heredoc => {
-                // expand $, command subs in body
-                let expanded = expand_heredoc(interp, &r.target);
-                stdin = expanded.into_bytes();
-            }
-            RedirOp::HeredocRaw => {
-                stdin = r.target.clone().into_bytes();
-            }
-            RedirOp::HereString => {
-                stdin = expand_word(interp, &r.target, false).join(" ").into_bytes();
-                stdin.push(b'\n');
+            RedirOp::Heredoc | RedirOp::HeredocRaw | RedirOp::HereString => {
+                let mut bytes = match redirect.op {
+                    RedirOp::Heredoc => expand_heredoc(interp, &redirect.target).into_bytes(),
+                    RedirOp::HeredocRaw => redirect.target.clone().into_bytes(),
+                    RedirOp::HereString => {
+                        let mut bytes = expand_word(interp, &redirect.target, false)
+                            .join(" ")
+                            .into_bytes();
+                        bytes.push(b'\n');
+                        bytes
+                    }
+                    _ => unreachable!(),
+                };
+                let description = interp
+                    .descriptors
+                    .open_input(std::mem::take(&mut bytes))
+                    .map_err(|error| format!("here document: {error:?}"))?;
+                interp
+                    .install_new_description(redirect.fd, description)
+                    .map_err(|error| format!("here document: {error:?}"))?;
             }
             RedirOp::Write | RedirOp::Append => {
-                let path = expand_word(interp, &r.target, true).join(" ");
-                let dest = OutDest::File(path, r.op == RedirOp::Append);
-                if r.fd == 2 {
-                    err_dest = dest;
-                } else {
-                    out_dest = dest;
+                let path = redirect_path(interp, &redirect.target)?;
+                if let Some(source) = device_fd(&path) {
+                    interp
+                        .process
+                        .fds
+                        .duplicate(source, redirect.fd, &mut interp.descriptors)
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    continue;
                 }
+                if path == "/dev/null" {
+                    let description = interp
+                        .descriptors
+                        .open_null()
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    interp
+                        .install_new_description(redirect.fd, description)
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    continue;
+                }
+                let created_by_open = !interp.vfs.lexists("/", &path);
+                interp.sync_vfs_time();
+                let cursor = if redirect.op == RedirOp::Append {
+                    interp
+                        .vfs
+                        .append("/", &path, &[], 0o644)
+                        .map_err(|error| error.to_string())?;
+                    interp
+                        .vfs
+                        .file_len("/", &path)
+                        .map_err(|error| error.to_string())? as u64
+                } else {
+                    interp
+                        .vfs
+                        .write("/", &path, &[], 0o644)
+                        .map_err(|error| error.to_string())?;
+                    0
+                };
+                let description = interp
+                    .descriptors
+                    .open_file(path.clone(), cursor, false, true, created_by_open)
+                    .map_err(|error| format!("{path}: {error:?}"))?;
+                interp
+                    .install_new_description(redirect.fd, description)
+                    .map_err(|error| format!("{path}: {error:?}"))?;
             }
             RedirOp::DupOut => {
-                // &N : duplicate target fd's destination
-                let tgt = r.target.trim_start_matches('&');
-                let src = tgt.parse::<i32>().unwrap_or(1);
-                let dup = if src == 1 {
-                    out_dest.clone()
-                } else {
-                    err_dest.clone()
-                };
-                if r.fd == 2 {
-                    err_dest = dup;
-                } else {
-                    out_dest = dup;
+                let source = redirect
+                    .target
+                    .trim_start_matches('&')
+                    .parse::<i32>()
+                    .map_err(|_| format!("bad file descriptor: {}", redirect.target))?;
+                interp
+                    .process
+                    .fds
+                    .duplicate(source, redirect.fd, &mut interp.descriptors)
+                    .map_err(|error| format!("{}: {error:?}", redirect.target))?;
+            }
+            RedirOp::Close => {
+                interp
+                    .process
+                    .fds
+                    .close(redirect.fd, &mut interp.descriptors)
+                    .map_err(|error| format!("{}: {error:?}", redirect.fd))?;
+            }
+        }
+        interp.refresh_descriptor_snapshot(interp.process.pid);
+    }
+    Ok(())
+}
+
+fn redirect_path(interp: &mut Interp, word: &str) -> Result<String, String> {
+    let fields = expand_word(interp, word, true);
+    if fields.len() != 1 {
+        return Err(format!("{word}: ambiguous redirect"));
+    }
+    Ok(resolve_against(&interp.cwd, &fields[0]))
+}
+
+fn device_fd(path: &str) -> Option<i32> {
+    match path {
+        "/dev/stdin" => Some(0),
+        "/dev/stdout" => Some(1),
+        "/dev/stderr" => Some(2),
+        _ => path.strip_prefix("/dev/fd/")?.parse().ok(),
+    }
+}
+
+fn read_all_fd(interp: &mut Interp, fd: i32) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    loop {
+        match interp.read_fd(fd, 64 * 1024)? {
+            IoPoll::Ready(bytes) if bytes.is_empty() => return Ok(output),
+            IoPoll::Ready(bytes) => {
+                if output.len().saturating_add(bytes.len()) > crate::descriptors::MAX_CAPTURE_BYTES
+                {
+                    return Err("input exceeds descriptor capture limit".to_string());
                 }
+                output.extend_from_slice(&bytes);
             }
+            IoPoll::Blocked => return Err("descriptor read would block".to_string()),
         }
-    }
-    RedirPlan {
-        stdin,
-        out_dest,
-        err_dest,
     }
 }
 
-fn apply_outputs(
-    interp: &mut Interp,
-    plan: &RedirPlan,
-    local_out: &[u8],
-    local_err: &[u8],
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
-) -> bool {
-    let mut ok = true;
-    match &plan.out_dest {
-        OutDest::Parent => out.extend_from_slice(local_out),
-        OutDest::File(path, _) if path == "/dev/null" => {}
-        OutDest::File(path, _) if path == "/dev/stdout" => out.extend_from_slice(local_out),
-        OutDest::File(path, _) if path == "/dev/stderr" => err.extend_from_slice(local_out),
-        OutDest::File(p, append) => {
-            if let Err(error) = write_to(interp, p, local_out, *append) {
-                err.extend_from_slice(format!("shellsim: {p}: {error}\n").as_bytes());
-                ok = false;
+fn write_all_fd(interp: &mut Interp, fd: i32, mut bytes: &[u8]) -> Result<(), String> {
+    while !bytes.is_empty() {
+        match interp.write_fd(fd, bytes)? {
+            IoPoll::Ready(0) | IoPoll::Blocked => {
+                return Err("descriptor write would block".to_string());
             }
+            IoPoll::Ready(written) => bytes = &bytes[written..],
         }
     }
-    match &plan.err_dest {
-        OutDest::Parent => err.extend_from_slice(local_err),
-        OutDest::File(path, _) if path == "/dev/null" => {}
-        OutDest::File(path, _) if path == "/dev/stdout" => out.extend_from_slice(local_err),
-        OutDest::File(path, _) if path == "/dev/stderr" => err.extend_from_slice(local_err),
-        OutDest::File(p, append) => {
-            if let Err(error) = write_to(interp, p, local_err, *append) {
-                err.extend_from_slice(format!("shellsim: {p}: {error}\n").as_bytes());
-                ok = false;
-            }
-        }
-    }
-    ok
+    Ok(())
 }
 
-fn write_to(interp: &mut Interp, path: &str, data: &[u8], append: bool) -> crate::vfs::Result<()> {
-    interp.sync_vfs_time();
-    let cwd = interp.cwd.clone();
-    if append {
-        interp.vfs.append(&cwd, path, data, 0o644)
-    } else {
-        interp.vfs.write(&cwd, path, data, 0o644)
-    }
+fn write_diagnostic(interp: &mut Interp, message: &str) {
+    let _ = write_all_fd(interp, 2, message.as_bytes());
 }
 
-fn exec_command(
-    interp: &mut Interp,
-    node: &Node,
-    stdin: Vec<u8>,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
-) -> i32 {
+fn exec_command(interp: &mut Interp, node: &Node) -> i32 {
     let (assigns, words, redirects) = match node {
         Node::Command {
             assigns,
@@ -445,7 +559,15 @@ fn exec_command(
         } => (assigns, words, redirects),
         _ => unreachable!(),
     };
+    if !redirects.is_empty() {
+        return with_redirects(interp, redirects, |interp| {
+            exec_command_parts(interp, assigns, words)
+        });
+    }
+    exec_command_parts(interp, assigns, words)
+}
 
+fn exec_command_parts(interp: &mut Interp, assigns: &[(String, String)], words: &[String]) -> i32 {
     // No command words → assignments are persistent (including array assignments).
     // Words that look like array-assignment literals (`name=( … )`, `name[i]=v`) are kept
     // verbatim — they must not be word-split/globbed — so `declare`/`local` can parse them.
@@ -453,13 +575,6 @@ fn exec_command(
     if argv.is_empty() {
         for (k, v) in assigns {
             apply_assignment(interp, k, v);
-        }
-        // a bare redirection like `> file` still truncates
-        if !redirects.is_empty() {
-            let plan = plan_redirects(interp, redirects);
-            if !apply_outputs(interp, &plan, &[], &[], out, err) {
-                return 1;
-            }
         }
         return 0;
     }
@@ -470,14 +585,6 @@ fn exec_command(
         .iter()
         .map(|(k, v)| (k.clone(), expand_word(interp, v, false).join(" ")))
         .collect();
-
-    // Set up redirects.
-    let plan = plan_redirects(interp, redirects);
-    let cmd_stdin = if redirects.iter().any(|r| r.fd == 0) {
-        plan.stdin.clone()
-    } else {
-        stdin
-    };
 
     // Temporary assignments apply only for the duration of this command (we set then restore).
     let saved: Vec<(String, Option<String>)> = expanded_assigns
@@ -497,10 +604,22 @@ fn exec_command(
     let mut status = if let Some(body) = interp.funcs.get(&argv[0]).cloned() {
         // function call: set positional params
         let saved_pos = std::mem::replace(&mut interp.positional, argv[1..].to_vec());
-        let s = exec(interp, &body, cmd_stdin, &mut local_out, &mut local_err);
+        let s = exec_node(interp, &body);
         interp.positional = saved_pos;
         interp.returning.take().unwrap_or(s)
     } else {
+        let cmd_stdin = if argv[0] == "read" {
+            Vec::new()
+        } else {
+            match read_all_fd(interp, 0) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    local_err
+                        .extend_from_slice(format!("shellsim: {}: {error}\n", argv[0]).as_bytes());
+                    Vec::new()
+                }
+            }
+        };
         crate::commands::run(interp, &argv, cmd_stdin, &mut local_out, &mut local_err)
     };
 
@@ -516,7 +635,15 @@ fn exec_command(
         }
     }
 
-    if !apply_outputs(interp, &plan, &local_out, &local_err, out, err) {
+    let mut output_failed = false;
+    if let Err(error) = write_all_fd(interp, 1, &local_out) {
+        write_diagnostic(interp, &format!("shellsim: {}: {error}\n", argv[0]));
+        output_failed = true;
+    }
+    if write_all_fd(interp, 2, &local_err).is_err() {
+        output_failed = true;
+    }
+    if output_failed {
         status = 1;
     }
     status
@@ -775,14 +902,14 @@ fn split_top_level_words(s: &str) -> Vec<String> {
     words
 }
 
-fn exec_pipeline(
-    interp: &mut Interp,
-    stages: &[Node],
-    stdin: Vec<u8>,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
-) -> i32 {
-    let mut input = stdin;
+fn exec_pipeline(interp: &mut Interp, stages: &[Node]) -> i32 {
+    let mut input = match read_all_fd(interp, 0) {
+        Ok(input) => input,
+        Err(error) => {
+            write_diagnostic(interp, &format!("shellsim: pipeline: {error}\n"));
+            return 1;
+        }
+    };
     let mut last_status = 0;
     let mut statuses = Vec::new();
     for (idx, stage) in stages.iter().enumerate() {
@@ -790,28 +917,27 @@ fn exec_pipeline(
             break;
         }
         let is_last = idx == stages.len() - 1;
-        let mut stage_out = Vec::new();
-        // stderr of all stages flows to the shared err
         let command = describe(stage);
-        let Some((status, _)) = exec_child(
+        let Some((status, stage_out)) = exec_child_capture_stdout(
             interp,
             stage,
             std::mem::take(&mut input),
-            &mut stage_out,
-            err,
             ChildExecution {
                 command: &command,
                 new_shell: false,
                 retain: false,
             },
         ) else {
-            err.extend_from_slice(b"shellsim: unable to create pipeline process\n");
+            write_diagnostic(interp, "shellsim: unable to create pipeline process\n");
             return 125;
         };
         last_status = status;
         statuses.push(last_status);
         if is_last {
-            out.extend_from_slice(&stage_out);
+            if let Err(error) = write_all_fd(interp, 1, &stage_out) {
+                write_diagnostic(interp, &format!("shellsim: pipeline: {error}\n"));
+                return 1;
+            }
         } else {
             input = stage_out;
         }
@@ -838,21 +964,50 @@ pub(crate) struct ChildExecution<'a> {
 pub(crate) fn exec_child(
     interp: &mut Interp,
     node: &Node,
-    stdin: Vec<u8>,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
     child: ChildExecution<'_>,
 ) -> Option<(i32, crate::process::ProcessId)> {
     let (pid, parent) = match interp.start_child(child.command, child.new_shell) {
         Ok(child) => child,
         Err(error) => {
-            err.extend_from_slice(format!("shellsim: {error}\n").as_bytes());
+            write_diagnostic(interp, &format!("shellsim: {error}\n"));
             return None;
         }
     };
-    let status = exec(interp, node, stdin, out, err);
+    let status = exec_node(interp, node);
     interp.finish_child(pid, parent, status, child.retain);
     Some((status, pid))
+}
+
+pub(crate) fn exec_child_capture_stdout(
+    interp: &mut Interp,
+    node: &Node,
+    stdin: Vec<u8>,
+    child: ChildExecution<'_>,
+) -> Option<(i32, Vec<u8>)> {
+    let saved = interp.process.fds.fork(&mut interp.descriptors).ok()?;
+    let input = interp.descriptors.open_input(stdin).ok()?;
+    if interp.install_new_description(0, input).is_err() {
+        restore_fds(interp, saved);
+        return None;
+    }
+    let output = match interp.descriptors.open_capture() {
+        Ok(output) => output,
+        Err(_) => {
+            restore_fds(interp, saved);
+            return None;
+        }
+    };
+    if interp.install_new_description(1, output).is_err() {
+        restore_fds(interp, saved);
+        return None;
+    }
+    let result = exec_child(interp, node, child);
+    let bytes = interp
+        .descriptors
+        .capture(output)
+        .map_or_else(|_| Vec::new(), <[u8]>::to_vec);
+    restore_fds(interp, saved);
+    result.map(|(status, _)| (status, bytes))
 }
 
 fn expand_heredoc(interp: &mut Interp, body: &str) -> String {

@@ -41,9 +41,21 @@ pub enum IoPoll<T> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OpenDescription {
-    Input { bytes: Vec<u8>, cursor: usize },
-    Capture { bytes: Vec<u8> },
+    Input {
+        bytes: Vec<u8>,
+        cursor: usize,
+    },
+    Capture {
+        bytes: Vec<u8>,
+    },
     Null,
+    File {
+        path: String,
+        cursor: u64,
+        readable: bool,
+        writable: bool,
+        remove_on_first_write_error: bool,
+    },
     PipeReader(PipeId),
     PipeWriter(PipeId),
 }
@@ -58,6 +70,16 @@ struct Pipe {
     capacity: usize,
     readers: u32,
     writers: u32,
+}
+
+/// VFS-facing state stored in one shared file description.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FileState {
+    pub path: String,
+    pub cursor: u64,
+    pub readable: bool,
+    pub writable: bool,
+    pub remove_on_first_write_error: bool,
 }
 
 /// Machine-owned descriptions and pipes shared by all process descriptor tables.
@@ -97,6 +119,25 @@ impl DescriptorArena {
 
     pub fn open_null(&mut self) -> Result<DescriptionId, DescriptorError> {
         self.allocate(OpenDescription::Null)
+    }
+
+    /// Open a VFS path description. The caller performs creation/truncation and all VFS I/O;
+    /// this arena owns only shared cursor and access state.
+    pub fn open_file(
+        &mut self,
+        path: String,
+        cursor: u64,
+        readable: bool,
+        writable: bool,
+        remove_on_first_write_error: bool,
+    ) -> Result<DescriptionId, DescriptorError> {
+        self.allocate(OpenDescription::File {
+            path,
+            cursor,
+            readable,
+            writable,
+            remove_on_first_write_error,
+        })
     }
 
     /// Create the two independently reference-counted descriptions for one pipe.
@@ -159,6 +200,33 @@ impl DescriptorArena {
             },
         );
         Ok(id)
+    }
+
+    /// Discard a description that could not be installed into a descriptor table.
+    ///
+    /// Allocation intentionally starts with no references so callers can construct an open
+    /// description before selecting its descriptor number. Only that unowned state is removable
+    /// through this method; installed descriptions must be released through [`FdTable`].
+    pub(crate) fn discard_unreferenced(
+        &mut self,
+        id: DescriptionId,
+    ) -> Result<(), DescriptorError> {
+        let entry = self
+            .descriptions
+            .get(&id)
+            .ok_or(DescriptorError::InvalidFd)?;
+        if entry.references != 0 {
+            return Err(DescriptorError::WrongAccess);
+        }
+        let description = self
+            .descriptions
+            .remove(&id)
+            .expect("description was checked above")
+            .description;
+        if let OpenDescription::PipeReader(pipe) | OpenDescription::PipeWriter(pipe) = description {
+            self.pipes.remove(&pipe);
+        }
+        Ok(())
     }
 
     fn retain(&mut self, id: DescriptionId) -> Result<(), DescriptorError> {
@@ -239,6 +307,7 @@ impl DescriptorArena {
                 Ok(IoPoll::Ready(result))
             }
             OpenDescription::Null => Ok(IoPoll::Ready(Vec::new())),
+            OpenDescription::File { .. } => Err(DescriptorError::WrongAccess),
             OpenDescription::PipeReader(pipe) => {
                 let pipe = self
                     .pipes
@@ -278,6 +347,7 @@ impl DescriptorArena {
                 Ok(IoPoll::Ready(bytes.len()))
             }
             OpenDescription::Null => Ok(IoPoll::Ready(bytes.len())),
+            OpenDescription::File { .. } => Err(DescriptorError::WrongAccess),
             OpenDescription::PipeWriter(pipe) => {
                 let pipe = self
                     .pipes
@@ -322,10 +392,58 @@ impl DescriptorArena {
                 format!("pipe:[{id}]")
             }
             OpenDescription::Null => "/dev/null".to_string(),
+            OpenDescription::File { path, .. } => path.clone(),
             OpenDescription::PipeReader(pipe) | OpenDescription::PipeWriter(pipe) => {
                 format!("pipe:[{pipe}]")
             }
         })
+    }
+
+    /// Return the VFS-specific state for a file description.
+    pub(crate) fn file_state(
+        &self,
+        id: DescriptionId,
+    ) -> Result<Option<FileState>, DescriptorError> {
+        let description = &self
+            .descriptions
+            .get(&id)
+            .ok_or(DescriptorError::InvalidFd)?
+            .description;
+        Ok(match description {
+            OpenDescription::File {
+                path,
+                cursor,
+                readable,
+                writable,
+                remove_on_first_write_error,
+            } => Some(FileState {
+                path: path.clone(),
+                cursor: *cursor,
+                readable: *readable,
+                writable: *writable,
+                remove_on_first_write_error: *remove_on_first_write_error,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Advance one shared file cursor after successful VFS I/O.
+    pub(crate) fn advance_file(
+        &mut self,
+        id: DescriptionId,
+        bytes: usize,
+    ) -> Result<(), DescriptorError> {
+        let entry = self
+            .descriptions
+            .get_mut(&id)
+            .ok_or(DescriptorError::InvalidFd)?;
+        let OpenDescription::File { cursor, .. } = &mut entry.description else {
+            return Err(DescriptorError::WrongAccess);
+        };
+        *cursor = cursor
+            .checked_add(u64::try_from(bytes).map_err(|_| DescriptorError::OutputLimit)?)
+            .ok_or(DescriptorError::OutputLimit)?;
+        Ok(())
     }
 }
 
@@ -468,5 +586,44 @@ mod tests {
         assert_eq!(arena.read(reader, 1).unwrap(), IoPoll::Ready(Vec::new()));
         parent.close_all(&mut arena);
         child.close_all(&mut arena);
+    }
+
+    #[test]
+    fn descriptor_limit_rejects_growth_without_leaking_the_new_description() {
+        let mut arena = DescriptorArena::new();
+        let mut fds = FdTable::new();
+        for fd in 0..MAX_FDS_PER_PROCESS as Fd {
+            let description = arena.open_null().unwrap();
+            fds.install(fd, description, &mut arena).unwrap();
+        }
+        let rejected = arena.open_null().unwrap();
+        assert_eq!(
+            fds.install(MAX_FDS_PER_PROCESS as Fd, rejected, &mut arena),
+            Err(DescriptorError::DescriptorLimit)
+        );
+        arena.discard_unreferenced(rejected).unwrap();
+        assert_eq!(arena.descriptions.len(), MAX_FDS_PER_PROCESS);
+    }
+
+    #[test]
+    fn duplicated_file_descriptors_share_the_open_cursor() {
+        let mut arena = DescriptorArena::new();
+        let file = arena
+            .open_file("/work/value".into(), 3, true, true, false)
+            .unwrap();
+        let mut fds = FdTable::new();
+        fds.install(4, file, &mut arena).unwrap();
+        fds.duplicate(4, 5, &mut arena).unwrap();
+        arena.advance_file(fds.get(4).unwrap(), 2).unwrap();
+        assert_eq!(
+            arena.file_state(fds.get(5).unwrap()).unwrap(),
+            Some(FileState {
+                path: "/work/value".into(),
+                cursor: 5,
+                readable: true,
+                writable: true,
+                remove_on_first_write_error: false,
+            })
+        );
     }
 }

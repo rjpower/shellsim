@@ -106,6 +106,59 @@ fn child_shell_boundaries_isolate_local_state_but_share_files() {
 }
 
 #[test]
+fn redirections_use_ordered_process_descriptors() {
+    assert_eq!(
+        run("sh -c 'printf out; missing-command' > /both 2>&1; cat /both"),
+        (
+            0,
+            "outmissing-command: command not found\n".into(),
+            String::new()
+        )
+    );
+    assert_eq!(
+        run("sh -c 'printf out; missing-command' 2>&1 > /only-out; cat /only-out"),
+        (
+            0,
+            "missing-command: command not found\nout".into(),
+            String::new()
+        )
+    );
+    assert_eq!(
+        run("{ readlink /proc/self/fd/1; } > /target; cat /target"),
+        (0, "/target\n".into(), String::new())
+    );
+}
+
+#[test]
+fn missing_input_redirection_fails_before_running_the_command() {
+    let (status, out, err) = run("cat < /missing; echo $?");
+    assert_eq!(status, 0);
+    assert_eq!(out, "1\n");
+    assert!(err.contains("No such file or directory: /missing"), "{err}");
+}
+
+#[test]
+fn descriptor_close_and_failed_redirect_setup_are_explicit() {
+    assert_eq!(
+        run("printf hidden >&-; echo visible"),
+        (
+            0,
+            "visible\n".into(),
+            "shellsim: printf: bad file descriptor\n".into()
+        )
+    );
+    let (status, out, err) = run("echo hidden 1>&9; echo $?");
+    assert_eq!(status, 0);
+    assert_eq!(out, "1\n");
+    assert!(err.contains("InvalidFd"), "{err}");
+
+    let mut env = Environment::new();
+    let (_, _, err) = env.run_script_capture("printf value > /created > /missing/result");
+    assert!(!env.vfs.lexists("/", "/created"));
+    assert!(String::from_utf8_lossy(&err).contains("No such file or directory"));
+}
+
+#[test]
 fn logical_process_ids_back_jobs_wait_and_ps() {
     assert_eq!(
         run("printf '%s:%s:%s\n' \"$$\" \"$BASHPID\" \"$PPID\"; (printf '%s:%s:%s\n' \"$$\" \"$BASHPID\" \"$PPID\")"),

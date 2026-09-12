@@ -194,6 +194,7 @@ pub enum RedirOp {
     Write,      // >
     Append,     // >>
     DupOut,     // >&N  / N>&M
+    Close,      // >&-
     Heredoc,    // << (target carries the already-captured body; quoted flag in op variant below)
     HeredocRaw, // << with quoted delimiter (no expansion of body)
     HereString, // <<< word
@@ -212,6 +213,7 @@ enum Tok {
     Arithmetic(String),    // (( expression ))
     HereString(String),    // <<< word
     GreatAmp(i32),         // >&N captured fd source default 1; store dest in word? we encode as op
+    CloseOut,              // >&-
     RedirFd(i32, String),  // e.g. 2> with op ; we keep simple
     Eof,
 }
@@ -356,6 +358,11 @@ impl Lexer {
                     } else if self.at(1) == Some('&') {
                         // >&N
                         self.i += 2;
+                        if self.peek() == Some('-') {
+                            self.i += 1;
+                            self.toks.push(Tok::CloseOut);
+                            continue;
+                        }
                         let mut n = String::new();
                         while let Some(d) = self.peek() {
                             if d.is_ascii_digit() {
@@ -381,6 +388,11 @@ impl Lexer {
                             self.toks.push(Tok::RedirFd(fd, ">>".into()));
                         } else if self.at(1) == Some('&') {
                             self.i += 2;
+                            if self.peek() == Some('-') {
+                                self.i += 1;
+                                self.toks.push(Tok::RedirFd(fd, ">&-".into()));
+                                continue;
+                            }
                             let mut n = String::new();
                             while let Some(d) = self.peek() {
                                 if d.is_ascii_digit() {
@@ -1047,6 +1059,14 @@ impl Parser {
                         target: format!("&{n}"),
                     });
                 }
+                Tok::CloseOut => {
+                    self.i += 1;
+                    redirects.push(Redirect {
+                        fd: 1,
+                        op: RedirOp::Close,
+                        target: "-".into(),
+                    });
+                }
                 Tok::RedirFd(fd, op) => {
                     self.i += 1;
                     if op == "&>" {
@@ -1060,6 +1080,12 @@ impl Parser {
                             fd: 2,
                             op: RedirOp::DupOut,
                             target: "&1".into(),
+                        });
+                    } else if op == ">&-" {
+                        redirects.push(Redirect {
+                            fd,
+                            op: RedirOp::Close,
+                            target: "-".into(),
                         });
                     } else if let Some(rest) = op.strip_prefix(">&") {
                         redirects.push(Redirect {
@@ -1347,7 +1373,7 @@ fn token_description(token: &Tok) -> String {
         Tok::Heredoc(_, _) => "heredoc".to_string(),
         Tok::Arithmetic(_) => "arithmetic command".to_string(),
         Tok::HereString(_) => "here-string".to_string(),
-        Tok::GreatAmp(_) | Tok::RedirFd(_, _) => "redirection".to_string(),
+        Tok::GreatAmp(_) | Tok::CloseOut | Tok::RedirFd(_, _) => "redirection".to_string(),
         Tok::Eof => "end of file".to_string(),
     }
 }

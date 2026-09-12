@@ -584,7 +584,26 @@ fn read_one_line(interp: &mut Interp, io: &Io) -> Option<String> {
         interp.input_pos += adv;
         return Some(l);
     }
-    None
+    let mut line = Vec::new();
+    let mut consumed = false;
+    while line.len() < crate::descriptors::MAX_CAPTURE_BYTES {
+        match interp.read_fd(0, 1).ok()? {
+            crate::descriptors::IoPoll::Ready(bytes) if bytes.is_empty() => break,
+            crate::descriptors::IoPoll::Ready(bytes) => {
+                consumed = true;
+                if bytes[0] == b'\n' {
+                    break;
+                }
+                line.push(bytes[0]);
+            }
+            crate::descriptors::IoPoll::Blocked => return None,
+        }
+    }
+    if !consumed {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&line).into_owned())
+    }
 }
 
 fn cmd_which(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
