@@ -671,12 +671,8 @@ impl Environment {
         self.processes.exit(pid, status, &self.process.cwd);
         self.clock.cancel_task_events(u64::from(pid));
         let _ = self.scheduler.exit_current(status);
-        if self.scheduler.state(parent_pid)
-            == Some(crate::scheduler::TaskState::Blocked(WaitReason::Child(pid)))
-        {
-            let _ = self.scheduler.wake(parent_pid);
-        }
-        self.scheduler.wake_waiters(WaitReason::ChildActivity(pid));
+        self.scheduler.wake_child_waiters(pid);
+        self.scheduler.wake_child_activity_waiters(pid);
         let scheduled = self.scheduler.dispatch().ok().flatten();
         let removed = self.process.remove(pid);
         debug_assert!(removed.is_some(), "finished child state must exist");
@@ -879,7 +875,7 @@ impl Environment {
     /// observes descendant I/O without teaching the scheduler about descriptor ownership.
     fn wake_child_activity_waiters(&mut self, mut pid: ProcessId) {
         for _ in 0..crate::process::MAX_PROCESSES {
-            self.scheduler.wake_waiters(WaitReason::ChildActivity(pid));
+            self.scheduler.wake_child_activity_waiters(pid);
             let Some(parent) = self.processes.get(pid).map(|record| record.ppid) else {
                 break;
             };

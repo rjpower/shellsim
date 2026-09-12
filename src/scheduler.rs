@@ -20,6 +20,10 @@ pub enum WaitReason {
     Child(ProcessId),
     /// Any descriptor progress or exit within a modeled child's process subtree.
     ChildActivity(ProcessId),
+    /// Child completion, bounded by an absolute virtual monotonic deadline.
+    ChildDeadline(ProcessId, u64),
+    /// Child-tree descriptor progress or completion, bounded by a virtual deadline.
+    ChildActivityDeadline(ProcessId, u64),
 }
 
 /// Scheduler-owned lifecycle for one logical task.
@@ -121,6 +125,43 @@ impl Scheduler {
             .iter()
             .copied()
             .filter(|pid| self.state(*pid) == Some(TaskState::Blocked(reason)))
+            .collect();
+        for pid in &waiting {
+            self.wake(*pid)
+                .expect("blocked queue contains a known blocked task");
+        }
+        waiting.len()
+    }
+
+    /// Wake tasks whose next child-status check may now complete.
+    pub fn wake_child_waiters(&mut self, child: ProcessId) -> usize {
+        self.wake_matching(|reason| {
+            matches!(
+                reason,
+                WaitReason::Child(pid) | WaitReason::ChildDeadline(pid, _) if pid == child
+            )
+        })
+    }
+
+    /// Wake tasks coordinating pipe activity anywhere beneath one child handle.
+    pub fn wake_child_activity_waiters(&mut self, child: ProcessId) -> usize {
+        self.wake_matching(|reason| {
+            matches!(
+                reason,
+                WaitReason::ChildActivity(pid) | WaitReason::ChildActivityDeadline(pid, _)
+                    if pid == child
+            )
+        })
+    }
+
+    fn wake_matching(&mut self, predicate: impl Fn(WaitReason) -> bool) -> usize {
+        let waiting: Vec<ProcessId> = self
+            .blocked
+            .iter()
+            .copied()
+            .filter(|pid| {
+                matches!(self.state(*pid), Some(TaskState::Blocked(reason)) if predicate(reason))
+            })
             .collect();
         for pid in &waiting {
             self.wake(*pid)
@@ -257,6 +298,37 @@ mod tests {
         assert_eq!(
             scheduler.state(3),
             Some(TaskState::Blocked(WaitReason::PipeWritable(7)))
+        );
+    }
+
+    #[test]
+    fn child_wakes_include_deadlines_but_keep_activity_distinct() {
+        let mut scheduler = Scheduler::new(1);
+        scheduler.spawn(2).unwrap();
+        scheduler.spawn(3).unwrap();
+        scheduler
+            .block_current(WaitReason::ChildDeadline(9, 100))
+            .unwrap();
+        assert_eq!(scheduler.dispatch().unwrap(), Some(2));
+        scheduler
+            .block_current(WaitReason::ChildActivityDeadline(9, 100))
+            .unwrap();
+        assert_eq!(scheduler.dispatch().unwrap(), Some(3));
+        scheduler.block_current(WaitReason::Child(8)).unwrap();
+
+        assert_eq!(scheduler.wake_child_waiters(9), 1);
+        assert_eq!(scheduler.state(1), Some(TaskState::Runnable));
+        assert_eq!(
+            scheduler.state(2),
+            Some(TaskState::Blocked(WaitReason::ChildActivityDeadline(
+                9, 100
+            )))
+        );
+        assert_eq!(scheduler.wake_child_activity_waiters(9), 1);
+        assert_eq!(scheduler.state(2), Some(TaskState::Runnable));
+        assert_eq!(
+            scheduler.state(3),
+            Some(TaskState::Blocked(WaitReason::Child(8)))
         );
     }
 }

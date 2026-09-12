@@ -113,6 +113,10 @@ pub(crate) struct LiveChild {
     pub pending_stdin_write: Option<Vec<u8>>,
     /// First byte of `pending_stdin_write` not yet accepted by the pipe.
     pub pending_stdin_offset: usize,
+    /// Virtual deadline retained across retries of `Popen.wait(timeout=...)`.
+    pub wait_event: Option<crate::clock::EventId>,
+    /// Virtual deadline retained across retries of `Popen.communicate(timeout=...)`.
+    pub communicate_event: Option<crate::clock::EventId>,
     pub stdin_pipe: bool,
     pub stdout_pipe: bool,
     pub stderr_pipe: bool,

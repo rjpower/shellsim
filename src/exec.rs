@@ -2139,11 +2139,16 @@ fn handle_ready_events(interp: &mut Interp) -> Result<(), String> {
                 let Ok(pid) = crate::process::ProcessId::try_from(task) else {
                     continue;
                 };
-                if interp.scheduler.state(pid)
-                    == Some(crate::scheduler::TaskState::Blocked(
-                        crate::scheduler::WaitReason::Timer(event.id.deadline_ns()),
-                    ))
-                {
+                let deadline = event.id.deadline_ns();
+                let timed_wait = matches!(
+                    interp.scheduler.state(pid),
+                    Some(crate::scheduler::TaskState::Blocked(
+                        crate::scheduler::WaitReason::Timer(value)
+                            | crate::scheduler::WaitReason::ChildDeadline(_, value)
+                            | crate::scheduler::WaitReason::ChildActivityDeadline(_, value)
+                    )) if value == deadline
+                );
+                if timed_wait {
                     interp
                         .scheduler
                         .wake(pid)

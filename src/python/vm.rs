@@ -5697,19 +5697,16 @@ impl PyProcessRunner for Vm<'_> {
         handle: PyProcessHandle,
         timeout_ns: Option<u64>,
     ) -> PyResult<PyProcessOutput> {
-        let mut output =
-            if self.mode.scheduler_owned && self.native_suspend_allowed && timeout_ns.is_none() {
-                match super::process::wait_if_ready(self.interp, handle)? {
-                    Some(output) => output,
-                    None => {
-                        return Err(PyError::suspend(crate::scheduler::WaitReason::Child(
-                            handle.pid,
-                        )))
-                    }
+        let mut output = if self.mode.scheduler_owned && self.native_suspend_allowed {
+            match super::process::wait_if_ready(self.interp, handle, timeout_ns)? {
+                Ok(output) => output,
+                Err(reason) => {
+                    return Err(PyError::suspend(reason));
                 }
-            } else {
-                super::process::wait(self.interp, handle, timeout_ns)?
-            };
+            }
+        } else {
+            super::process::wait(self.interp, handle, timeout_ns)?
+        };
         self.out
             .extend_from_slice(&std::mem::take(&mut output.inherited_stdout));
         self.err
@@ -5723,19 +5720,16 @@ impl PyProcessRunner for Vm<'_> {
         input: Vec<u8>,
         timeout_ns: Option<u64>,
     ) -> PyResult<PyProcessOutput> {
-        let mut output =
-            if self.mode.scheduler_owned && self.native_suspend_allowed && timeout_ns.is_none() {
-                match super::process::communicate_if_ready(self.interp, handle, input)? {
-                    Some(output) => output,
-                    None => {
-                        return Err(PyError::suspend(
-                            crate::scheduler::WaitReason::ChildActivity(handle.pid),
-                        ))
-                    }
+        let mut output = if self.mode.scheduler_owned && self.native_suspend_allowed {
+            match super::process::communicate_if_ready(self.interp, handle, input, timeout_ns)? {
+                Ok(output) => output,
+                Err(reason) => {
+                    return Err(PyError::suspend(reason));
                 }
-            } else {
-                super::process::communicate(self.interp, handle, input, timeout_ns)?
-            };
+            }
+        } else {
+            super::process::communicate(self.interp, handle, input, timeout_ns)?
+        };
         self.out
             .extend_from_slice(&std::mem::take(&mut output.inherited_stdout));
         self.err

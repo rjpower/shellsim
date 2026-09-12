@@ -40,8 +40,9 @@ need instruction-level continuations. Native bytecode calls can now retain norma
 and retry after a typed wake: direct `time.sleep` uses the timer path and unbounded
 `Popen.wait()` uses the child path, and unbounded `communicate()` retries on child-tree activity
 while retaining partial duplex progress. Direct stream reads and writes wait on exact descriptor
-readiness and retain partial write cursors. Timeout-bearing subprocess operations still need a
-child-or-deadline wait before the old nested scheduler bridge can be removed.
+readiness and retain partial write cursors. Timeout-bearing subprocess operations combine those
+resource keys with virtual deadline events. The nested scheduler helper is now confined to the
+explicitly synchronous `run_python` embedding API.
 
 Reusing an `Environment` preserves the VFS, cwd, variables, functions, arrays, package markers,
 virtual time/network state, command history, Python REPL, and cumulative resource usage. `exit`,

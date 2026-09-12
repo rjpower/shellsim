@@ -259,6 +259,42 @@ fn python_pipe_streams_suspend_on_exact_descriptor_readiness() {
 }
 
 #[test]
+fn python_subprocess_deadlines_race_child_progress_cooperatively() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "python3.14 -c 'import subprocess\nimport time\nfrom subprocess import TimeoutExpired\nprocess = subprocess.Popen([\"sleep\", \"10\"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)\ntry:\n    process.communicate(b\"x\" * 100000, timeout=2)\nexcept TimeoutExpired:\n    print(\"timeout\", process.poll(), time.monotonic())\nprocess.kill()\nstdout, stderr = process.communicate()\nprint(\"done\", process.returncode, stdout, time.monotonic())' & python3.14 -c 'import time\ntime.sleep(1)\nprint(\"one\")' & wait",
+        ),
+        (
+            0,
+            "one\ntimeout None 2.0\ndone -9 b'' 2.0\n".into(),
+            String::new()
+        )
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
+    assert_eq!(environment.clock.pending_len(), 0);
+}
+
+#[test]
+fn python_wait_deadlines_cancel_on_completion_and_fire_on_timeout() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "python3.14 -c 'import subprocess\nimport time\nprocess = subprocess.Popen([\"sleep\", \"1\"])\nprint(\"fast\", process.wait(timeout=10), time.monotonic())' & python3.14 -c 'import subprocess\nimport time\nfrom subprocess import TimeoutExpired\nprocess = subprocess.Popen([\"sleep\", \"10\"])\ntry:\n    process.wait(timeout=2)\nexcept TimeoutExpired:\n    print(\"slow\", process.poll(), time.monotonic())\nprocess.kill()\nprint(process.wait(), time.monotonic())' & wait",
+        ),
+        (
+            0,
+            "fast 0 1.0\nslow None 2.0\n-9 2.0\n".into(),
+            String::new()
+        )
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
+    assert_eq!(environment.clock.pending_len(), 0);
+}
+
+#[test]
 fn timeout_terminates_a_scheduler_blocked_python_process() {
     let mut environment = Environment::new();
     assert_eq!(

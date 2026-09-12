@@ -77,6 +77,8 @@ pub(super) fn start(
             communicate_offset: 0,
             pending_stdin_write: None,
             pending_stdin_offset: 0,
+            wait_event: None,
+            communicate_event: None,
             stdin_pipe: request.stdin == PyStdio::Pipe,
             stdout_pipe: request.stdout == PyStdio::Pipe,
             stderr_pipe: request.stderr == PyStdio::Pipe,
@@ -116,7 +118,8 @@ pub(super) fn wait(
 pub(super) fn wait_if_ready(
     interp: &mut Interp,
     process: PyProcessHandle,
-) -> PyResult<Option<PyProcessOutput>> {
+    timeout_ns: Option<u64>,
+) -> PyResult<Result<PyProcessOutput, crate::scheduler::WaitReason>> {
     checked_owner(interp, process)?;
     let mut handle = interp
         .live_children
@@ -129,12 +132,23 @@ pub(super) fn wait_if_ready(
             process_status(interp, process.pid)
                 .map(|status| python_returncode(handle.terminating_signal, status))
         });
-        let Some(status) = status else {
-            return Ok(None);
+        if let Some(status) = status {
+            handle.status = Some(status);
+            cancel_event(interp, &mut handle.wait_event);
+            reap_process(interp, process.pid);
+            return Ok(Ok(output_from_handle(&mut handle, false)));
+        }
+        let Some(deadline) = operation_deadline(interp, &mut handle.wait_event, timeout_ns)? else {
+            return Ok(Err(crate::scheduler::WaitReason::Child(process.pid)));
         };
-        handle.status = Some(status);
-        reap_process(interp, process.pid);
-        Ok(Some(output_from_handle(&mut handle, false)))
+        if interp.clock.monotonic_ns() >= deadline {
+            cancel_event(interp, &mut handle.wait_event);
+            return Ok(Ok(output_from_handle(&mut handle, true)));
+        }
+        Ok(Err(crate::scheduler::WaitReason::ChildDeadline(
+            process.pid,
+            deadline,
+        )))
     })();
     interp.live_children.insert(process.pid, handle);
     result
@@ -187,7 +201,8 @@ pub(super) fn communicate_if_ready(
     interp: &mut Interp,
     process: PyProcessHandle,
     input: Vec<u8>,
-) -> PyResult<Option<PyProcessOutput>> {
+    timeout_ns: Option<u64>,
+) -> PyResult<Result<PyProcessOutput, crate::scheduler::WaitReason>> {
     checked_owner(interp, process)?;
     let mut handle = interp
         .live_children
@@ -195,7 +210,24 @@ pub(super) fn communicate_if_ready(
         .ok_or_else(|| PyError::runtime_error("unknown subprocess handle"))?;
     let result = (|| {
         prepare_communicate(&mut handle, input)?;
-        communicate_progress(interp, process.pid, &mut handle)
+        if let Some(output) = communicate_progress(interp, process.pid, &mut handle)? {
+            cancel_event(interp, &mut handle.communicate_event);
+            return Ok(Ok(output));
+        }
+        let Some(deadline) = operation_deadline(interp, &mut handle.communicate_event, timeout_ns)?
+        else {
+            return Ok(Err(crate::scheduler::WaitReason::ChildActivity(
+                process.pid,
+            )));
+        };
+        if interp.clock.monotonic_ns() >= deadline {
+            cancel_event(interp, &mut handle.communicate_event);
+            return Ok(Ok(output_from_handle(&mut handle, true)));
+        }
+        Ok(Err(crate::scheduler::WaitReason::ChildActivityDeadline(
+            process.pid,
+            deadline,
+        )))
     })();
     interp.live_children.insert(process.pid, handle);
     result
@@ -686,6 +718,36 @@ fn deadline(interp: &Interp, timeout_ns: Option<u64>) -> PyResult<Option<u64>> {
                 .ok_or_else(|| PyError::value_error("subprocess timeout is too large"))
         })
         .transpose()
+}
+
+fn operation_deadline(
+    interp: &mut Interp,
+    event: &mut Option<crate::clock::EventId>,
+    timeout_ns: Option<u64>,
+) -> PyResult<Option<u64>> {
+    let Some(timeout_ns) = timeout_ns else {
+        return Ok(None);
+    };
+    if let Some(event) = event {
+        return Ok(Some(event.deadline_ns()));
+    }
+    let scheduled = interp
+        .clock
+        .schedule_after(
+            timeout_ns,
+            crate::clock::EventKind::WakeTask {
+                task: u64::from(interp.process.pid),
+            },
+        )
+        .map_err(|error| PyError::runtime_error(error.to_string()))?;
+    *event = Some(scheduled);
+    Ok(Some(scheduled.deadline_ns()))
+}
+
+fn cancel_event(interp: &mut Interp, event: &mut Option<crate::clock::EventId>) {
+    if let Some(event) = event.take() {
+        interp.clock.cancel(event);
+    }
 }
 
 fn write_communicate_input(interp: &mut Interp, handle: &mut LiveChild) -> PyResult<()> {
