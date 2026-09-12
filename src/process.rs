@@ -32,6 +32,8 @@ pub struct ProcessRecord {
     pub cwd: String,
     /// Exported environment captured at creation or the latest inspection point.
     pub environment: BTreeMap<String, String>,
+    /// Snapshot of descriptor targets for generated `/proc/PID/fd` views.
+    pub descriptors: BTreeMap<i32, String>,
     pub status: ProcessStatus,
 }
 
@@ -53,6 +55,7 @@ impl ProcessTable {
                 command: "bash".to_string(),
                 cwd,
                 environment,
+                descriptors: BTreeMap::new(),
                 status: ProcessStatus::Running,
             },
         );
@@ -83,6 +86,7 @@ impl ProcessTable {
                 command: command.to_string(),
                 cwd: cwd.to_string(),
                 environment,
+                descriptors: BTreeMap::new(),
                 status: ProcessStatus::Running,
             },
         );
@@ -107,6 +111,13 @@ impl ProcessTable {
         if let Some(record) = self.records.get_mut(&pid) {
             record.cwd = cwd.to_string();
             record.environment = environment;
+        }
+    }
+
+    /// Update the descriptor links visible for one retained process.
+    pub fn update_descriptors(&mut self, pid: ProcessId, descriptors: BTreeMap<i32, String>) {
+        if let Some(record) = self.records.get_mut(&pid) {
+            record.descriptors = descriptors;
         }
     }
 

@@ -111,6 +111,7 @@ fn lookup(env: &Environment, cwd: &str, path: &str, follow_self: bool) -> Option
             "cmdline".to_string(),
             "cwd".to_string(),
             "environ".to_string(),
+            "fd".to_string(),
             "status".to_string(),
         ])),
         "cwd" => Some(PseudoNode::Symlink(cwd.to_string())),
@@ -149,6 +150,21 @@ fn lookup(env: &Environment, cwd: &str, path: &str, follow_self: bool) -> Option
                 value.push(0);
             }
             Some(PseudoNode::File(value))
+        }
+        "fd" => Some(PseudoNode::Directory(
+            process
+                .descriptors
+                .keys()
+                .map(ToString::to_string)
+                .collect(),
+        )),
+        descriptor if descriptor.starts_with("fd/") => {
+            let fd = descriptor[3..].parse::<i32>().ok()?;
+            process
+                .descriptors
+                .get(&fd)
+                .cloned()
+                .map(PseudoNode::Symlink)
         }
         "status" => {
             let task_state = env.scheduler.state(pid);

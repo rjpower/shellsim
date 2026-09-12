@@ -309,6 +309,24 @@ impl DescriptorArena {
             _ => Err(DescriptorError::WrongAccess),
         }
     }
+
+    /// Stable synthetic target used by `/proc/PID/fd` without exposing implementation details.
+    pub fn label(&self, id: DescriptionId) -> Result<String, DescriptorError> {
+        let description = &self
+            .descriptions
+            .get(&id)
+            .ok_or(DescriptorError::InvalidFd)?
+            .description;
+        Ok(match description {
+            OpenDescription::Input { .. } | OpenDescription::Capture { .. } => {
+                format!("pipe:[{id}]")
+            }
+            OpenDescription::Null => "/dev/null".to_string(),
+            OpenDescription::PipeReader(pipe) | OpenDescription::PipeWriter(pipe) => {
+                format!("pipe:[{pipe}]")
+            }
+        })
+    }
 }
 
 /// Per-process mapping from small integers to shared machine descriptions.

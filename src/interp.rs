@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 
 use crate::clock::{Clock, EventId};
+use crate::descriptors::{DescriptorArena, FdTable};
 use crate::net::VirtualNet;
 use crate::process::{ProcessId, ProcessTable};
 use crate::resources::{Limits, Resources, RunOutcome};
@@ -45,6 +46,8 @@ pub struct Environment {
     pub processes: ProcessTable,
     /// Deterministic runnable/blocked lifecycle for logical process execution.
     pub scheduler: Scheduler,
+    /// Machine-owned open descriptions shared by forked process descriptor tables.
+    pub descriptors: DescriptorArena,
     pub process: ProcessState,
     next_temp_id: u64,
     /// Trace of every external command name executed.
@@ -107,6 +110,8 @@ pub struct ProcessState {
     /// process state lets an agent enter Python in one shell action and continue it in later
     /// actions without giving the shim access to host stdin.
     pub python_repl: Option<crate::python::ReplState>,
+    /// Unix-style descriptor map inherited by logical children.
+    pub(crate) fds: FdTable,
 }
 
 const MAX_FORK_STATE_BYTES: u64 = 32 * 1024 * 1024;
@@ -118,7 +123,7 @@ pub(crate) struct ParentProcess {
 }
 
 impl ProcessState {
-    fn fork_for_child(&self, pid: ProcessId, new_shell: bool) -> Self {
+    fn fork_for_child(&self, pid: ProcessId, new_shell: bool, fds: FdTable) -> Self {
         Self {
             pid,
             ppid: self.pid,
@@ -146,6 +151,7 @@ impl ProcessState {
             input_stream: self.input_stream.clone(),
             input_pos: self.input_pos,
             python_repl: None,
+            fds,
         }
     }
 
@@ -171,6 +177,7 @@ impl ProcessState {
                     .fold(0, |total, value| total.saturating_add(string(value))),
             )
             .saturating_add(self.input_stream.len() as u64);
+        bytes = bytes.saturating_add((self.fds.iter().count() as u64).saturating_mul(16));
         for (name, value) in &self.arrays {
             bytes = bytes.saturating_add(string(name));
             bytes = bytes.saturating_add(match value {
@@ -233,6 +240,21 @@ impl Environment {
             exported.insert(k.to_string());
         }
         let clock = Clock::new();
+        let mut descriptors = DescriptorArena::new();
+        let mut fds = FdTable::new();
+        for (fd, description) in [
+            (
+                0,
+                descriptors
+                    .open_input(Vec::new())
+                    .expect("stdin descriptor"),
+            ),
+            (1, descriptors.open_capture().expect("stdout descriptor")),
+            (2, descriptors.open_capture().expect("stderr descriptor")),
+        ] {
+            fds.install(fd, description, &mut descriptors)
+                .expect("standard descriptor table");
+        }
         let mut vfs = Vfs::with_disk_limit(limits.disk);
         vfs.set_mutation_time(clock.unix_ms());
         vfs.seed_dirs(["/root", "/tmp", "/work"]);
@@ -241,13 +263,20 @@ impl Environment {
             .iter()
             .filter_map(|name| vars.get(name).map(|value| (name.clone(), value.clone())))
             .collect();
+        let descriptor_snapshot = fds
+            .iter()
+            .filter_map(|(fd, id)| descriptors.label(id).ok().map(|label| (fd, label)))
+            .collect();
+        let mut processes = ProcessTable::new(ROOT_PID, "/".to_string(), process_environment);
+        processes.update_descriptors(ROOT_PID, descriptor_snapshot);
         Environment {
             vfs,
             clock,
             net: VirtualNet::new(),
             resources: Resources::new(limits),
-            processes: ProcessTable::new(ROOT_PID, "/".to_string(), process_environment),
+            processes,
             scheduler: Scheduler::new(ROOT_PID),
+            descriptors,
             process: ProcessState {
                 pid: ROOT_PID,
                 ppid: 0,
@@ -275,6 +304,7 @@ impl Environment {
                 input_stream: Vec::new(),
                 input_pos: 0,
                 python_repl: None,
+                fds,
             },
             next_temp_id: 0,
             cmd_trace: Vec::new(),
@@ -306,22 +336,32 @@ impl Environment {
             return Err("memory limit exceeded while creating child process".to_string());
         }
         let environment: BTreeMap<String, String> = self.child_env().into_iter().collect();
+        let mut child_fds = match self.process.fds.fork(&mut self.descriptors) {
+            Ok(fds) => fds,
+            Err(error) => {
+                self.resources.restore_memory(memory_mark);
+                return Err(format!("unable to inherit descriptors: {error:?}"));
+            }
+        };
         self.processes
             .update_current(self.process.pid, &self.process.cwd, environment.clone());
         let Some(pid) =
             self.processes
                 .spawn(self.process.pid, command, &self.process.cwd, environment)
         else {
+            child_fds.close_all(&mut self.descriptors);
             self.resources.restore_memory(memory_mark);
             return Err("logical process limit exceeded".to_string());
         };
         if let Err(error) = self.scheduler.block_current(WaitReason::Child(pid)) {
+            child_fds.close_all(&mut self.descriptors);
             self.processes.exit(pid, 125, &self.process.cwd);
             self.processes.reap(pid);
             self.resources.restore_memory(memory_mark);
             return Err(format!("unable to suspend parent process: {error:?}"));
         }
         if let Err(error) = self.scheduler.spawn(pid) {
+            child_fds.close_all(&mut self.descriptors);
             let _ = self.scheduler.wake(self.process.pid);
             let _ = self.scheduler.dispatch();
             self.processes.exit(pid, 125, &self.process.cwd);
@@ -332,13 +372,15 @@ impl Environment {
         match self.scheduler.dispatch() {
             Ok(Some(scheduled)) if scheduled == pid => {}
             result => {
+                child_fds.close_all(&mut self.descriptors);
                 self.processes.exit(pid, 125, &self.process.cwd);
                 self.resources.restore_memory(memory_mark);
                 return Err(format!("unexpected child dispatch result: {result:?}"));
             }
         }
-        let child = self.process.fork_for_child(pid, new_shell);
+        let child = self.process.fork_for_child(pid, new_shell, child_fds);
         let state = std::mem::replace(&mut self.process, child);
+        self.refresh_descriptor_snapshot(pid);
         Ok((pid, ParentProcess { state, memory_mark }))
     }
 
@@ -351,6 +393,8 @@ impl Environment {
         retain: bool,
     ) {
         let child_deadline_interrupt = self.process.deadline_interrupt;
+        self.process.fds.close_all(&mut self.descriptors);
+        self.processes.update_descriptors(pid, BTreeMap::new());
         self.processes.exit(pid, status, &self.process.cwd);
         let _ = self.scheduler.exit_current(status);
         let _ = self.scheduler.wake(parent.state.pid);
@@ -364,6 +408,17 @@ impl Environment {
             self.process.deadline_interrupt = child_deadline_interrupt;
         }
         self.resources.restore_memory(parent.memory_mark);
+    }
+
+    /// Synchronize the active descriptor table into generated process metadata.
+    pub(crate) fn refresh_descriptor_snapshot(&mut self, pid: ProcessId) {
+        let descriptors = self
+            .process
+            .fds
+            .iter()
+            .filter_map(|(fd, id)| self.descriptors.label(id).ok().map(|label| (fd, label)))
+            .collect();
+        self.processes.update_descriptors(pid, descriptors);
     }
 
     /// Record a package name installed by a compatibility command.

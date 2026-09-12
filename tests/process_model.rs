@@ -25,6 +25,16 @@ fn proc_self_describes_the_active_logical_shell() {
 
     assert_eq!(run(&mut env, "readlink /proc/self").1, "1234\n");
     assert_eq!(run(&mut env, "readlink /proc/self/cwd").1, "/\n");
+    assert_eq!(
+        run(&mut env, "ls /proc/self/fd")
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        vec!["0", "1", "2"]
+    );
+    assert!(run(&mut env, "readlink /proc/self/fd/1")
+        .1
+        .starts_with("pipe:["));
     let listing = run(&mut env, "ls /proc");
     assert_eq!(listing.0, 0, "{}", listing.2);
     assert!(listing.1.contains("1234"), "{}", listing.1);
@@ -65,6 +75,7 @@ fn exited_background_process_exists_until_wait_reaps_it() {
     assert!(status.contains("ExitCode:\t1"), "{status}");
     assert_eq!(env.scheduler.state(1_235), Some(TaskState::Exited(1)));
     assert_eq!(env.scheduler.current(), Some(1_234));
+    assert!(run(&mut env, "ls /proc/1235/fd").1.trim().is_empty());
     assert_eq!(run(&mut env, "wait 1235").0, 1);
     assert!(env.fs_read("/", "/proc/1235/status").is_err());
     assert_eq!(env.scheduler.state(1_235), None);
