@@ -77,6 +77,12 @@ pub(crate) enum CommandResume {
         status: i32,
         stop_on_error: bool,
     },
+    Timeout {
+        pid: crate::process::ProcessId,
+        deadline: Option<crate::clock::EventId>,
+        preserve_status: bool,
+        result_override: Option<i32>,
+    },
 }
 
 /// One scheduler-owned argv invocation requested by a modeled native command.
@@ -371,6 +377,46 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
                 },
             ),
         },
+        CommandResume::Timeout {
+            pid,
+            deadline,
+            preserve_status,
+            result_override,
+        } => match interp.processes.get(pid).map(|record| record.status) {
+            Some(crate::process::ProcessStatus::Exited(status)) => {
+                let timed_out = deadline
+                    .is_some_and(|event| interp.clock.monotonic_ns() >= event.deadline_ns());
+                if let Some(deadline) = deadline {
+                    interp.clock.cancel(deadline);
+                }
+                if timed_out {
+                    for descendant in interp.processes.process_tree(pid).into_iter().rev() {
+                        if descendant != pid {
+                            interp.processes.reap(descendant);
+                            let _ = interp.scheduler.reap(descendant);
+                        }
+                    }
+                }
+                interp.processes.reap(pid);
+                let _ = interp.scheduler.reap(pid);
+                CommandPoll::Ready(result_override.unwrap_or({
+                    if timed_out && !preserve_status {
+                        124
+                    } else {
+                        status
+                    }
+                }))
+            }
+            _ => CommandPoll::Blocked(
+                WaitReason::Child(pid),
+                CommandResume::Timeout {
+                    pid,
+                    deadline,
+                    preserve_status,
+                    result_override,
+                },
+            ),
+        },
     }
 }
 
@@ -397,16 +443,36 @@ fn start_child_sequence_item(
     if command.argv.is_empty() {
         return CommandPoll::Ready(status);
     }
-    let input = match interp.descriptors.open_input(command.stdin) {
-        Ok(input) => input,
-        Err(_) => return CommandPoll::Ready(125),
+    let pid = match start_child_command(interp, command) {
+        Ok(pid) => pid,
+        Err(status) => return CommandPoll::Ready(status),
     };
+    CommandPoll::Switched(CommandResume::ChildSequence {
+        pid,
+        remaining,
+        status,
+        stop_on_error,
+    })
+}
+
+/// Start one configured argv child and switch the scheduler to it.
+pub(crate) fn start_child_command(
+    interp: &mut Interp,
+    command: ChildCommand,
+) -> Result<crate::process::ProcessId, i32> {
+    if command.argv.is_empty() {
+        return Err(0);
+    }
+    let input = interp
+        .descriptors
+        .open_input(command.stdin)
+        .map_err(|_| 125)?;
     let display = command.argv.join(" ");
     let pid = match interp.start_child(&display, true) {
         Ok(pid) => pid,
         Err(_) => {
             let _ = interp.descriptors.discard_unreferenced(input);
-            return CommandPoll::Ready(125);
+            return Err(125);
         }
     };
     interp
@@ -424,12 +490,7 @@ fn start_child_sequence_item(
             )),
         )
         .expect("new child process must accept an argv continuation");
-    CommandPoll::Switched(CommandResume::ChildSequence {
-        pid,
-        remaining,
-        status,
-        stop_on_error,
-    })
+    Ok(pid)
 }
 
 fn dispatch(

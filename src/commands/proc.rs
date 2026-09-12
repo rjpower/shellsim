@@ -7,16 +7,18 @@ use crate::clock::{
     BlockOutcome, EventKind, MAIN_TASK_ID, NANOS_PER_MICROSECOND, NANOS_PER_SECOND,
 };
 use crate::commands::util::{ewln, parse_duration_ns, wln};
-use crate::commands::{CommandContext, CommandPoll, CommandResume, CommandSpec, Io, Trust};
+use crate::commands::{
+    ChildCommand, CommandContext, CommandPoll, CommandResume, CommandSpec, Io, Trust,
+};
 use crate::interp::Interp;
 use crate::scheduler::WaitReason;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_resumable};
+    use super::{reg, reg_buffered_resumable, reg_resumable};
     // time / scheduling (virtual clock, never blocks)
     reg_resumable(m, &["sleep"], Trust::Real, cmd_sleep, start_sleep);
     reg_resumable(m, &["usleep"], Trust::Real, cmd_usleep, start_usleep);
-    reg(m, &["timeout"], Trust::Partial, cmd_timeout);
+    reg_buffered_resumable(m, &["timeout"], Trust::Partial, cmd_timeout, start_timeout);
     reg(m, &["date"], Trust::Real, cmd_date);
     reg(m, &["sync"], Trust::Real, |_, _, _| 0);
 
@@ -158,48 +160,22 @@ fn cmd_usleep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
 }
 
 fn cmd_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    // Capability-free subset: deadline semantics are real; signal selection is accepted but the
-    // synchronous executor reports GNU timeout's conventional 124 instead of modeling signals.
-    let mut index = 0;
-    let mut preserve_status = false;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--preserve-status" => {
-                preserve_status = true;
-                index += 1;
-            }
-            "--foreground" => index += 1,
-            "-s" | "--signal" | "-k" | "--kill-after" => index += 2,
-            option if option.starts_with("--signal=") || option.starts_with("--kill-after=") => {
-                index += 1
-            }
-            _ => break,
-        }
-    }
-    let Some(duration_argument) = args.get(index) else {
-        ewln(io.err, "timeout: missing operand");
-        return 125;
-    };
-    let duration = match parse_duration_ns(duration_argument) {
-        Ok(duration) => duration,
+    let invocation = match parse_timeout(args) {
+        Ok(invocation) => invocation,
         Err(error) => {
             ewln(io.err, &format!("timeout: {error}"));
             return 125;
         }
     };
-    let rest: Vec<String> = args.iter().skip(index + 1).cloned().collect();
-    if rest.is_empty() {
-        ewln(io.err, "timeout: missing command");
-        return 125;
-    }
-    // GNU timeout treats zero as disabling the timeout.
-    let deadline = if duration == 0 {
+    // This entry remains for synchronous native callers. Ordinary shell execution uses
+    // `start_timeout`, which delivers a signal to a scheduler-owned child.
+    let deadline = if invocation.duration == 0 {
         None
     } else {
-        match interp
-            .clock
-            .schedule_after(duration, EventKind::Deadline { task: MAIN_TASK_ID })
-        {
+        match interp.clock.schedule_after(
+            invocation.duration,
+            EventKind::Deadline { task: MAIN_TASK_ID },
+        ) {
             Ok(event) => Some(event),
             Err(error) => {
                 ewln(io.err, &format!("timeout: {error}"));
@@ -207,22 +183,142 @@ fn cmd_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
             }
         }
     };
-    let stdin = std::mem::take(&mut io.stdin);
-    let status = crate::commands::run(interp, &rest, stdin, io.out, io.err);
+    let status = crate::commands::run(
+        interp,
+        &invocation.argv,
+        std::mem::take(&mut io.stdin),
+        io.out,
+        io.err,
+    );
     let interrupted = interp.deadline_interrupt;
     if let Some(deadline) = deadline {
         interp.clock.cancel(deadline);
         if interrupted == Some(deadline) {
             interp.deadline_interrupt = None;
-            return if preserve_status { status } else { 124 };
+            return if invocation.preserve_status {
+                status
+            } else {
+                124
+            };
         }
     }
-    // An enclosing timeout fired.  Preserve its interrupt so that its own command frame unwinds.
     if interrupted.is_some() {
         124
     } else {
         status
     }
+}
+
+fn start_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let invocation = match parse_timeout(args) {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            ewln(io.err, &format!("timeout: {error}"));
+            return CommandPoll::Ready(125);
+        }
+    };
+    let pid = match crate::commands::start_child_command(
+        interp,
+        ChildCommand {
+            argv: invocation.argv,
+            stdin: std::mem::take(&mut io.stdin),
+            cwd: None,
+            environment: None,
+        },
+    ) {
+        Ok(pid) => pid,
+        Err(status) => return CommandPoll::Ready(status),
+    };
+    let (deadline, result_override) = if invocation.duration == 0 {
+        (None, None)
+    } else {
+        match interp.clock.schedule_after(
+            invocation.duration,
+            EventKind::SignalTask {
+                task: u64::from(pid),
+                signal: invocation.signal,
+                descendants: true,
+            },
+        ) {
+            Ok(event) => (Some(event), None),
+            Err(_) => {
+                let _ = interp.send_signal(pid, crate::process::Signal::Kill);
+                (None, Some(125))
+            }
+        }
+    };
+    CommandPoll::Switched(CommandResume::Timeout {
+        pid,
+        deadline,
+        preserve_status: invocation.preserve_status,
+        result_override,
+    })
+}
+
+struct TimeoutInvocation {
+    duration: u64,
+    preserve_status: bool,
+    signal: crate::process::Signal,
+    argv: Vec<String>,
+}
+
+fn parse_timeout(args: &[String]) -> Result<TimeoutInvocation, String> {
+    let mut index = 0;
+    let mut preserve_status = false;
+    let mut signal = crate::process::Signal::Terminate;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--preserve-status" => {
+                preserve_status = true;
+                index += 1;
+            }
+            "--foreground" => index += 1,
+            "-s" | "--signal" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "option requires a signal".to_string())?;
+                signal = crate::process::Signal::parse(value)
+                    .filter(|signal| signal.terminates())
+                    .ok_or_else(|| format!("unsupported signal '{value}'"))?;
+                index += 2;
+            }
+            option if option.starts_with("--signal=") => {
+                let value = option.trim_start_matches("--signal=");
+                signal = crate::process::Signal::parse(value)
+                    .filter(|signal| signal.terminates())
+                    .ok_or_else(|| format!("unsupported signal '{value}'"))?;
+                index += 1;
+            }
+            "-k" | "--kill-after" => {
+                return Err("--kill-after is unsupported".to_string());
+            }
+            option if option.starts_with("--kill-after=") => {
+                return Err("--kill-after is unsupported".to_string());
+            }
+            "--" => {
+                index += 1;
+                break;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unsupported option '{option}'"));
+            }
+            _ => break,
+        }
+    }
+    let duration = parse_duration_ns(
+        args.get(index)
+            .ok_or_else(|| "missing operand".to_string())?,
+    )?;
+    let argv = args[index + 1..].to_vec();
+    if argv.is_empty() {
+        return Err("missing command".to_string());
+    }
+    Ok(TimeoutInvocation {
+        duration,
+        preserve_status,
+        signal,
+        argv,
+    })
 }
 
 fn cmd_date(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

@@ -104,6 +104,24 @@ fn timeout_interrupts_nested_shell_at_its_deadline() {
         (0, "status:124\n1735689601\n".into(), String::new(),)
     );
     assert_eq!(environment.clock.monotonic_ns(), NANOS_PER_SECOND);
+    let (_, processes, errors) = run(&mut environment, "ps -ef");
+    assert!(errors.is_empty());
+    assert!(!processes.contains(" 1235 "), "{processes}");
+    assert!(!processes.contains(" 1236 "), "{processes}");
+}
+
+#[test]
+fn timeout_can_preserve_the_modeled_signal_status() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "timeout --preserve-status --signal=KILL 1 sleep 10; echo status:$?",
+        )
+        .1,
+        "status:137\n"
+    );
+    assert_eq!(environment.clock.monotonic_ns(), NANOS_PER_SECOND);
 }
 
 #[test]

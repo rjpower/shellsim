@@ -211,6 +211,36 @@ impl ProcessTable {
         self.records.values()
     }
 
+    /// Return one process tree in stable PID order, including `root` when it is retained.
+    pub(crate) fn process_tree(&self, root: ProcessId) -> Vec<ProcessId> {
+        let mut selected = vec![root];
+        let mut index = 0;
+        while index < selected.len() {
+            let parent = selected[index];
+            for record in self.records.values() {
+                if record.ppid == parent && !selected.contains(&record.pid) {
+                    selected.push(record.pid);
+                }
+            }
+            index += 1;
+        }
+        selected.retain(|pid| self.records.contains_key(pid));
+        selected.sort_unstable();
+        selected
+    }
+
+    /// Return the running portion of [`Self::process_tree`].
+    pub(crate) fn running_process_tree(&self, root: ProcessId) -> Vec<ProcessId> {
+        self.process_tree(root)
+            .into_iter()
+            .filter(|pid| {
+                self.records
+                    .get(pid)
+                    .is_some_and(|record| record.status == ProcessStatus::Running)
+            })
+            .collect()
+    }
+
     /// Reap an exited child. The root and running processes cannot be removed.
     pub fn reap(&mut self, pid: ProcessId) -> Option<ProcessRecord> {
         if matches!(self.records.get(&pid)?.status, ProcessStatus::Exited(_)) {

@@ -60,8 +60,9 @@ remains on the Rust stack while the scheduler runs child quanta. Command substit
 of the retained shell continuation and preserves its capture and child identity across timer and
 descriptor waits. Native command adapters can now launch a typed sequence of scheduler-owned argv
 children; `env` uses it with an isolated launch environment and `xargs` uses it for ordered
-invocations. VFS Python shebang execution, Make recipes, Python bytecode, and remaining synchronous
-adapters such as `timeout` and the `command` builtin keep phase 3 incomplete.
+invocations. `timeout` schedules typed signal delivery to the child's retained process tree and
+reaps that tree after expiry. VFS Python shebang execution, Make recipes, Python bytecode, and the
+remaining synchronous `command` builtin keep phase 3 incomplete.
 
 ## Non-negotiable invariants
 

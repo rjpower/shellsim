@@ -2090,6 +2090,22 @@ fn handle_ready_events(interp: &mut Interp) -> Result<(), String> {
                         .map_err(|error| format!("{error:?}"))?;
                 }
             }
+            crate::clock::EventKind::SignalTask {
+                task,
+                signal,
+                descendants,
+            } => {
+                if let Ok(pid) = crate::process::ProcessId::try_from(task) {
+                    let targets = if descendants {
+                        interp.processes.running_process_tree(pid)
+                    } else {
+                        vec![pid]
+                    };
+                    for target in targets.into_iter().rev() {
+                        let _ = interp.send_signal(target, signal);
+                    }
+                }
+            }
             crate::clock::EventKind::External { .. } => {}
         }
     }

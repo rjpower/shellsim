@@ -47,6 +47,12 @@ pub enum EventKind {
     Deadline {
         task: u64,
     },
+    /// Deliver a modeled signal to one logical process at a virtual monotonic instant.
+    SignalTask {
+        task: u64,
+        signal: crate::process::Signal,
+        descendants: bool,
+    },
     /// An effect injected by a simulator driver.  Both fields are opaque deterministic data;
     /// they never grant access to the host environment.
     External {
@@ -285,7 +291,9 @@ impl Timeline {
             .pending
             .iter()
             .filter_map(|(id, kind)| match kind {
-                EventKind::WakeTask { task: owner } | EventKind::Deadline { task: owner }
+                EventKind::WakeTask { task: owner }
+                | EventKind::Deadline { task: owner }
+                | EventKind::SignalTask { task: owner, .. }
                     if *owner == task =>
                 {
                     Some(*id)
@@ -299,7 +307,9 @@ impl Timeline {
         self.ready.retain(|event| {
             !matches!(
                 event.kind,
-                EventKind::WakeTask { task: owner } | EventKind::Deadline { task: owner }
+                EventKind::WakeTask { task: owner }
+                | EventKind::Deadline { task: owner }
+                | EventKind::SignalTask { task: owner, .. }
                     if owner == task
             )
         });
