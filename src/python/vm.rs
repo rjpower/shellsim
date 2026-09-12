@@ -5749,10 +5749,22 @@ impl PyProcessRunner for Vm<'_> {
         fd: i32,
         amount: Option<usize>,
     ) -> PyResult<Vec<u8>> {
+        if self.mode.scheduler_owned && self.native_suspend_allowed {
+            return match super::process::read_pipe_if_ready(self.interp, handle, fd, amount)? {
+                Ok(bytes) => Ok(bytes),
+                Err(reason) => Err(PyError::suspend(reason)),
+            };
+        }
         super::process::read_pipe(self.interp, handle, fd, amount)
     }
 
     fn write_pipe(&mut self, handle: PyProcessHandle, input: Vec<u8>) -> PyResult<usize> {
+        if self.mode.scheduler_owned && self.native_suspend_allowed {
+            return match super::process::write_pipe_if_ready(self.interp, handle, input)? {
+                Ok(written) => Ok(written),
+                Err(reason) => Err(PyError::suspend(reason)),
+            };
+        }
         super::process::write_pipe(self.interp, handle, input)
     }
 

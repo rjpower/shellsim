@@ -37,8 +37,8 @@ resolved through the VFS use that same child path, including buffered standard i
 `Popen` now launches the same stored argv continuations, with live PIDs and bounded descriptor
 pipes. An unbounded `Popen.wait()` retains its normalized native call on the active bytecode frame
 and suspends on the child's typed wait key. Unbounded `communicate()` retries on typed child-tree
-activity, preserving partial duplex progress; timeout-bearing waits and stream I/O still use the
-nested cooperative bridge. Command substitutions in
+activity, preserving partial duplex progress. Direct pipe reads and writes suspend on exact
+descriptor readiness; timeout-bearing waits still use the nested cooperative bridge. Command substitutions in
 commands, redirects, here-documents, `for`, `case`, arithmetic commands, and every phase of
 C-style `for` loops launch scheduler-owned captured children. `source` and `eval` inject parsed
 frames into the current continuation, preserving their same-process semantics without nesting the
@@ -64,8 +64,8 @@ memory ownership, which is required once children overlap instead of exiting in 
 Ordinary foreground subshells, pipelines, and shell-command invocations now suspend their parent
 and switch through the scheduler without a nested Rust executor call. Python subprocess operations
 use live handles and the scheduler rather than the removed synchronous runner. Unbounded child
-waits and communication now leave the VM stack and block the owning logical process;
-timeout-bearing waits and descriptor operations still run child quanta through the nested bridge. Command
+waits, communication, and stream I/O now leave the VM stack and block the owning logical process;
+timeout-bearing waits still run child quanta through the nested bridge. Command
 substitution is now part
 of the retained shell continuation and preserves its capture and child identity across timer and
 descriptor waits. Native command adapters can now launch a typed sequence of scheduler-owned argv
@@ -155,9 +155,9 @@ condition, loop, function, redirection, `errexit`, and cleanup semantics in fram
 Keep ordinary native commands synchronous. Convert only commands that may block into resumable
 tasks. Python code, operand stacks, exception regions, and top-level instruction state are now
 owned by a retained command continuation. Ordinary bytecode calls now push explicit return frames.
-The next executor changes should apply the retryable native-call frame to descriptor operations,
-then split compound native operations around their Python callbacks. Direct Python timer sleeps,
-unbounded child waits, and duplex communication already use typed scheduler result paths.
+The next executor changes should support child-or-deadline waits, then split compound native
+operations around their Python callbacks. Direct Python timer sleeps, unbounded child waits,
+duplex communication, and pipe streams already use typed scheduler result paths.
 
 The shell-side recursive child adapters are removed from normal execution. Python operand,
 scope, exception, context-manager, and method state is now separated from the VM's temporary
@@ -165,8 +165,8 @@ environment borrows, and executing code objects own their code, instruction poin
 stack in explicit bytecode frames. Ordinary user-function dispatch pushes and returns through that
 owned frame stack without Rust recursion. Compound operations such as constructors, sorting keys,
 and protocol callbacks retain synchronous inner calls for now. Phase completion requires reifying
-those callbacks and deleting the nested scheduler bridge still used by timeout-bearing and
-descriptor-oriented Python methods. Deep or
+those callbacks and deleting the nested scheduler bridge still used by timeout-bearing Python
+methods. Deep or
 adversarial input must remain bounded independently of the host stack.
 
 ## Phase 4: deterministic scheduler and pipes

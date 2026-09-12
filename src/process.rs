@@ -109,6 +109,10 @@ pub(crate) struct LiveChild {
     pub communicate_input: Option<Vec<u8>>,
     /// First byte not yet accepted by the child stdin pipe.
     pub communicate_offset: usize,
+    /// Bytes retained while a direct Python stdin write is suspended by pipe backpressure.
+    pub pending_stdin_write: Option<Vec<u8>>,
+    /// First byte of `pending_stdin_write` not yet accepted by the pipe.
+    pub pending_stdin_offset: usize,
     pub stdin_pipe: bool,
     pub stdout_pipe: bool,
     pub stderr_pipe: bool,

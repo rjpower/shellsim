@@ -118,15 +118,15 @@ Python command execution now retains owned VM state and yields between bounded i
 ordinary user-function calls use the same explicit frame stack. Calls initiated inside compound
 native operations are one remaining interpreter scheduler boundary. Direct `time.sleep` calls
 suspend on the shared virtual timeline, unbounded `Popen.wait()` suspends on a typed child wait,
-and unbounded `communicate()` retries on child-tree activity. Timeout-bearing waits and descriptor
-I/O still use the nested bridge.
+and unbounded `communicate()` retries on child-tree activity. Direct stream operations use exact
+descriptor readiness; timeout-bearing waits still use the nested bridge.
 
 Python `Popen`, `run`, `call`, `check_call`, and `check_output` execute only registered commands and
 VFS shell or Python scripts. Live children use scheduler continuations and bounded descriptor
 pipes; capture, inheritance, binary/text streams, duplex communication, cwd/env isolation,
 status, signals, and virtual deadlines are modeled. A top-level Python command is resumable and
-ordinary child waits and communication retain retryable native-call frames. Stream operations and
-deadline-bearing waits still drive child quanta through the legacy nested boundary. Arbitrary host executables, `preexec_fn`, and
+ordinary child waits, communication, and stream operations retain retryable native-call frames.
+Deadline-bearing waits still drive child quanta through the legacy nested boundary. Arbitrary host executables, `preexec_fn`, and
 native session manipulation remain rejected.
 
 ## Synthetic `/proc` and `/dev`

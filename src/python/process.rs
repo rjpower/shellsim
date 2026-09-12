@@ -75,6 +75,8 @@ pub(super) fn start(
             communicated: false,
             communicate_input: None,
             communicate_offset: 0,
+            pending_stdin_write: None,
+            pending_stdin_offset: 0,
             stdin_pipe: request.stdin == PyStdio::Pipe,
             stdout_pipe: request.stdout == PyStdio::Pipe,
             stderr_pipe: request.stderr == PyStdio::Pipe,
@@ -87,12 +89,7 @@ pub(super) fn start(
 }
 
 pub(super) fn poll(interp: &mut Interp, handle: PyProcessHandle) -> PyResult<Option<i32>> {
-    let owner = checked_owner(interp, handle)?;
-    if live_status(interp, handle.pid).is_none() {
-        crate::exec::drive_scheduler_step(interp, handle.pid, Some(interp.clock.monotonic_ns()))
-            .map_err(PyError::runtime_error)?;
-    }
-    debug_assert_eq!(interp.process.pid, owner);
+    checked_owner(interp, handle)?;
     record_status(interp, handle.pid)
 }
 
@@ -311,6 +308,62 @@ pub(super) fn read_pipe(
     result
 }
 
+/// Attempt one scheduler-owned stream read without dispatching the child.
+pub(super) fn read_pipe_if_ready(
+    interp: &mut Interp,
+    process: PyProcessHandle,
+    fd: i32,
+    amount: Option<usize>,
+) -> PyResult<Result<Vec<u8>, crate::scheduler::WaitReason>> {
+    checked_owner(interp, process)?;
+    if !matches!(fd, 1 | 2) {
+        return Err(PyError::value_error("only stdout and stderr are readable"));
+    }
+    let mut handle = interp
+        .live_children
+        .remove(&process.pid)
+        .ok_or_else(|| PyError::runtime_error("unknown subprocess handle"))?;
+    let result = (|| {
+        let captured = if fd == 1 {
+            handle.stdout_pipe
+        } else {
+            handle.stderr_pipe
+        };
+        if !captured {
+            return Err(PyError::value_error("stream was not opened with PIPE"));
+        }
+        if amount == Some(0) {
+            return Ok(Ok(Vec::new()));
+        }
+        drain_output(interp, &mut handle, fd)?;
+        let available = if fd == 1 {
+            handle.stdout.len()
+        } else {
+            handle.stderr.len()
+        };
+        let endpoint_closed = handle.endpoints.get(fd).is_err();
+        if amount.is_some_and(|limit| available >= limit) || endpoint_closed {
+            let take = amount.map_or(available, |limit| limit.min(available));
+            let buffer = if fd == 1 {
+                &mut handle.stdout
+            } else {
+                &mut handle.stderr
+            };
+            return Ok(Ok(buffer.drain(..take).collect()));
+        }
+        let description = handle
+            .endpoints
+            .get(fd)
+            .map_err(|error| PyError::runtime_error(descriptor_message(error)))?;
+        Ok(Err(crate::scheduler::WaitReason::PipeReadable(pipe_id(
+            interp,
+            description,
+        )?)))
+    })();
+    interp.live_children.insert(process.pid, handle);
+    result
+}
+
 fn read_pipe_inner(
     interp: &mut Interp,
     pid: u32,
@@ -365,6 +418,65 @@ pub(super) fn write_pipe(
     let result = write_pipe_inner(interp, process.pid, &input, &mut handle);
     interp.live_children.insert(process.pid, handle);
     result.map(|()| input_len)
+}
+
+/// Attempt a direct Python stdin write until it completes or reaches bounded-pipe backpressure.
+pub(super) fn write_pipe_if_ready(
+    interp: &mut Interp,
+    process: PyProcessHandle,
+    input: Vec<u8>,
+) -> PyResult<Result<usize, crate::scheduler::WaitReason>> {
+    checked_owner(interp, process)?;
+    let mut handle = interp
+        .live_children
+        .remove(&process.pid)
+        .ok_or_else(|| PyError::runtime_error("unknown subprocess handle"))?;
+    let result = (|| {
+        if !handle.stdin_pipe {
+            return Err(PyError::value_error("stdin was not opened with PIPE"));
+        }
+        match &handle.pending_stdin_write {
+            None => handle.pending_stdin_write = Some(input),
+            Some(previous) if previous == &input => {}
+            Some(_) => {
+                return Err(PyError::value_error(
+                    "stdin write differs from the suspended call",
+                ))
+            }
+        }
+        let bytes = handle.pending_stdin_write.as_deref().unwrap_or_default();
+        let description = handle
+            .endpoints
+            .get(0)
+            .map_err(|_| PyError::runtime_error("write to closed subprocess stdin"))?;
+        match interp
+            .descriptors
+            .write(description, &bytes[handle.pending_stdin_offset..])
+            .map_err(|error| PyError::runtime_error(descriptor_message(error)))?
+        {
+            IoPoll::Ready(written) => {
+                handle.pending_stdin_offset = handle.pending_stdin_offset.saturating_add(written);
+                wake_io(interp, IoWait::PipeReadable(pipe_id(interp, description)?));
+                if handle.pending_stdin_offset == bytes.len() {
+                    let length = bytes.len();
+                    handle.pending_stdin_write = None;
+                    handle.pending_stdin_offset = 0;
+                    return Ok(Ok(length));
+                }
+            }
+            IoPoll::Blocked(_) => {
+                if process_status(interp, process.pid).is_some() {
+                    return Err(PyError::runtime_error("broken subprocess stdin pipe"));
+                }
+            }
+        }
+        Ok(Err(crate::scheduler::WaitReason::PipeWritable(pipe_id(
+            interp,
+            description,
+        )?)))
+    })();
+    interp.live_children.insert(process.pid, handle);
+    result
 }
 
 fn write_pipe_inner(

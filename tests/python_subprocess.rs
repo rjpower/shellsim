@@ -127,6 +127,22 @@ print(slow.wait(), fast.poll(), time.monotonic())
 }
 
 #[test]
+fn popen_poll_observes_without_dispatching_the_child() {
+    let mut environment = Environment::new();
+    let result = run(
+        &mut environment,
+        r#"
+import os
+import subprocess
+process = subprocess.Popen(["touch", "/polled"])
+print(process.poll(), os.path.exists("/polled"))
+print(process.wait(), os.path.exists("/polled"))
+"#,
+    );
+    assert_eq!(result, (0, "None False\n0 True\n".into(), String::new()));
+}
+
+#[test]
 fn popen_communicate_drains_duplex_pipes_larger_than_capacity() {
     let mut environment = Environment::new();
     let result = run(

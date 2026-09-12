@@ -242,6 +242,23 @@ fn python_communicate_retries_on_duplex_child_activity() {
 }
 
 #[test]
+fn python_pipe_streams_suspend_on_exact_descriptor_readiness() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "python3.14 -c 'import subprocess\nimport time\nprocess = subprocess.Popen([\"sh\", \"-c\", \"sleep 2; printf read\"], stdout=subprocess.PIPE)\nprint(process.stdout.read(), process.wait(), time.monotonic())' & python3.14 -c 'import subprocess\nimport time\ndata = b\"x\" * 100000\nprocess = subprocess.Popen([\"sh\", \"-c\", \"sleep 1; cat >/dev/null\"], stdin=subprocess.PIPE)\nwritten = process.stdin.write(data)\nprocess.stdin.close()\nprint(\"wrote\", written, process.wait(), time.monotonic())' & wait",
+        ),
+        (
+            0,
+            "wrote 100000 0 1.0\nb'read' 0 2.0\n".into(),
+            String::new()
+        )
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
+}
+
+#[test]
 fn timeout_terminates_a_scheduler_blocked_python_process() {
     let mut environment = Environment::new();
     assert_eq!(
