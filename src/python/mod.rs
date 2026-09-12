@@ -409,12 +409,12 @@ pub fn run_repl_line(
     out: Out,
     err: Out,
 ) -> (i32, bool) {
-    let memory_mark = interp.resources.memory_mark();
     let scratch = 10 * 1024 + source.len() as u64;
-    if !interp.resources.reserve_memory(scratch)
-        || !interp.resources.charge_cpu(100 + source.len() as u64)
-    {
-        interp.resources.restore_memory(memory_mark);
+    if !interp.resources.reserve_memory(scratch) {
+        return (137, false);
+    }
+    if !interp.resources.charge_cpu(100 + source.len() as u64) {
+        interp.resources.release_memory(scratch);
         return (137, false);
     }
 
@@ -438,7 +438,7 @@ pub fn run_repl_line(
             (2, true)
         }
     };
-    interp.resources.restore_memory(memory_mark);
+    interp.resources.release_memory(scratch);
     if stay {
         out.extend_from_slice(b">>> ");
     }

@@ -54,6 +54,7 @@ enum OpenDescription {
     },
     Capture {
         bytes: Vec<u8>,
+        delivered: usize,
     },
     Null,
     File {
@@ -121,7 +122,10 @@ impl DescriptorArena {
     }
 
     pub fn open_capture(&mut self) -> Result<DescriptionId, DescriptorError> {
-        self.allocate(OpenDescription::Capture { bytes: Vec::new() })
+        self.allocate(OpenDescription::Capture {
+            bytes: Vec::new(),
+            delivered: 0,
+        })
     }
 
     pub fn open_null(&mut self) -> Result<DescriptionId, DescriptorError> {
@@ -344,7 +348,7 @@ impl DescriptorArena {
         match kind {
             OpenDescription::Capture { .. } => {
                 let entry = self.descriptions.get_mut(&id).expect("description exists");
-                let OpenDescription::Capture { bytes: output } = &mut entry.description else {
+                let OpenDescription::Capture { bytes: output, .. } = &mut entry.description else {
                     unreachable!()
                 };
                 if output.len().saturating_add(bytes.len()) > MAX_CAPTURE_BYTES {
@@ -382,9 +386,23 @@ impl DescriptorArena {
             .ok_or(DescriptorError::InvalidFd)?
             .description
         {
-            OpenDescription::Capture { bytes } => Ok(bytes),
+            OpenDescription::Capture { bytes, .. } => Ok(bytes),
             _ => Err(DescriptorError::WrongAccess),
         }
+    }
+
+    /// Return capture bytes not previously delivered and advance its delivery cursor.
+    pub fn drain_capture(&mut self, id: DescriptionId) -> Result<Vec<u8>, DescriptorError> {
+        let entry = self
+            .descriptions
+            .get_mut(&id)
+            .ok_or(DescriptorError::InvalidFd)?;
+        let OpenDescription::Capture { bytes, delivered } = &mut entry.description else {
+            return Err(DescriptorError::WrongAccess);
+        };
+        let output = bytes[*delivered..].to_vec();
+        *delivered = bytes.len();
+        Ok(output)
     }
 
     /// Stable synthetic target used by `/proc/PID/fd` without exposing implementation details.

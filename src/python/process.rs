@@ -43,7 +43,7 @@ pub(super) fn run(interp: &mut Interp, request: PyProcessRequest) -> PyResult<Py
         .transpose()?;
 
     let command = request.argv.join(" ");
-    let (pid, parent) = match interp.start_child(&command, true) {
+    let pid = match interp.start_child(&command, true) {
         Ok(child) => child,
         Err(error) => {
             if let Some(deadline) = deadline {
@@ -89,7 +89,9 @@ pub(super) fn run(interp: &mut Interp, request: PyProcessRequest) -> PyResult<Py
             interp.deadline_interrupt = None;
         }
     }
-    interp.finish_child(pid, parent, status, false);
+    interp.finish_child(pid, status);
+    interp.processes.reap(pid);
+    let _ = interp.scheduler.reap(pid);
 
     Ok(PyProcessOutput {
         status,

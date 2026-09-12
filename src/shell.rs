@@ -1508,11 +1508,9 @@ impl Interp {
             self.last_status = code;
             return (self.outcome(code), out, err);
         }
-        let memory_mark = self.resources.memory_mark();
         let parser_memory = 8 * 1024 + (src.len() as u64).saturating_mul(2);
-        let code = if self.resources.reserve_memory(parser_memory)
-            && self.resources.charge_cpu(src.len() as u64)
-        {
+        let parser_reserved = self.resources.reserve_memory(parser_memory);
+        let code = if parser_reserved && self.resources.charge_cpu(src.len() as u64) {
             match parse(src) {
                 Ok(ast) => crate::exec::exec(self, &ast, stdin, &mut out, &mut err),
                 Err(error) => {
@@ -1526,7 +1524,9 @@ impl Interp {
                 .stop_reason()
                 .map_or(137, |reason| reason.exit_status())
         };
-        self.resources.restore_memory(memory_mark);
+        if parser_reserved {
+            self.resources.release_memory(parser_memory);
+        }
         let status = self.exiting.unwrap_or(code);
         (self.outcome(status), out, err)
     }

@@ -48,11 +48,13 @@ pub fn exec(
     }
 
     let status = exec_node(interp, node);
-    if let Ok(bytes) = interp.descriptors.capture(stdout) {
-        out.extend_from_slice(bytes);
+    out.extend_from_slice(&std::mem::take(&mut interp.pending_stdout));
+    err.extend_from_slice(&std::mem::take(&mut interp.pending_stderr));
+    if let Ok(bytes) = interp.descriptors.drain_capture(stdout) {
+        out.extend_from_slice(&bytes);
     }
-    if let Ok(bytes) = interp.descriptors.capture(stderr) {
-        err.extend_from_slice(bytes);
+    if let Ok(bytes) = interp.descriptors.drain_capture(stderr) {
+        err.extend_from_slice(&bytes);
     }
     restore_fds(interp, saved);
     status
@@ -78,7 +80,7 @@ fn restore_fds(interp: &mut Interp, saved: crate::descriptors::FdTable) {
 }
 
 const MAX_SHELL_FRAMES: usize = 4_096;
-const SHELL_POLL_QUANTUM: usize = 256;
+const SHELL_POLL_QUANTUM: usize = 1;
 
 enum ShellFrame {
     Eval(Node),
@@ -152,17 +154,23 @@ enum ShellFrame {
         positional: Vec<String>,
         variables: Vec<(String, Option<String>)>,
     },
+    AwaitChild {
+        pid: crate::process::ProcessId,
+        reap: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShellPoll {
     Pending,
+    Switched,
     Ready(i32),
 }
 
 pub(crate) struct ShellContinuation {
     frames: Vec<ShellFrame>,
     status: i32,
+    switched: bool,
 }
 
 impl ShellContinuation {
@@ -170,16 +178,21 @@ impl ShellContinuation {
         Self {
             frames: vec![ShellFrame::Eval(node.clone())],
             status: 0,
+            switched: false,
         }
     }
 
     pub(crate) fn poll(&mut self, interp: &mut Interp, budget: usize) -> ShellPoll {
+        self.switched = false;
         for _ in 0..budget.max(1) {
             let Some(frame) = self.frames.pop() else {
                 return ShellPoll::Ready(self.status);
             };
             self.step(interp, frame);
             interp.last_status = self.status;
+            if self.switched {
+                return ShellPoll::Switched;
+            }
         }
         if self.frames.is_empty() {
             ShellPoll::Ready(self.status)
@@ -512,6 +525,22 @@ impl ShellContinuation {
                 self.status = interp.returning.take().unwrap_or(self.status);
                 restore_command_variables(interp, variables);
             }
+            ShellFrame::AwaitChild { pid, reap } => {
+                self.status = match interp.processes.get(pid).map(|record| record.status) {
+                    Some(crate::process::ProcessStatus::Exited(status)) => status,
+                    _ => {
+                        write_diagnostic(
+                            interp,
+                            &format!("shellsim: child {pid} resumed without exit status\n"),
+                        );
+                        125
+                    }
+                };
+                if reap {
+                    interp.processes.reap(pid);
+                    let _ = interp.scheduler.reap(pid);
+                }
+            }
         }
     }
 
@@ -574,18 +603,7 @@ impl ShellContinuation {
                 self.push(interp, ShellFrame::Sequence { nodes, next: 0 });
             }
             Node::Background(inner) => self.status = exec_background(interp, &inner),
-            Node::Subshell(inner) => {
-                self.status = exec_child(
-                    interp,
-                    &inner,
-                    ChildExecution {
-                        command: "(subshell)",
-                        new_shell: false,
-                        retain: false,
-                    },
-                )
-                .map_or(125, |(status, _)| status);
-            }
+            Node::Subshell(inner) => self.spawn_child(interp, *inner, "(subshell)", true),
             Node::Group(inner) => {
                 self.push(interp, ShellFrame::Eval(*inner));
             }
@@ -743,6 +761,25 @@ impl ShellContinuation {
             restore_command_variables(interp, variables);
         }
     }
+
+    fn spawn_child(&mut self, interp: &mut Interp, node: Node, command: &str, reap: bool) {
+        if !self.ensure_capacity(interp, 1) {
+            return;
+        }
+        let parent_pid = interp.process.pid;
+        match interp.start_child(command, false) {
+            Ok(pid) => {
+                self.frames.push(ShellFrame::AwaitChild { pid, reap });
+                interp.process.shell_continuation = Some(ShellContinuation::new(&node));
+                self.switched = true;
+                debug_assert_ne!(parent_pid, interp.process.pid);
+            }
+            Err(error) => {
+                write_diagnostic(interp, &format!("shellsim: {error}\n"));
+                self.status = 125;
+            }
+        }
+    }
 }
 
 fn should_unwind(interp: &Interp) -> bool {
@@ -762,8 +799,25 @@ fn exec_node(interp: &mut Interp, node: &Node) -> i32 {
         );
         return 125;
     }
+    let target_pid = interp.process.pid;
     interp.process.shell_continuation = Some(ShellContinuation::new(node));
+    if interp.scheduler.has_runnable() {
+        interp
+            .scheduler
+            .yield_current()
+            .expect("active process must own the running scheduler slot");
+        let scheduled = interp
+            .scheduler
+            .dispatch()
+            .expect("runnable queue must contain valid tasks")
+            .expect("a runnable task was checked above");
+        interp
+            .process
+            .activate(scheduled)
+            .expect("scheduled task must own process state");
+    }
     loop {
+        let owner_pid = interp.process.pid;
         let mut continuation = interp
             .process
             .shell_continuation
@@ -771,37 +825,57 @@ fn exec_node(interp: &mut Interp, node: &Node) -> i32 {
             .expect("active process continuation was installed above");
         match continuation.poll(interp, SHELL_POLL_QUANTUM) {
             ShellPoll::Pending => {
-                interp.process.shell_continuation = Some(continuation);
+                interp
+                    .process
+                    .set_continuation(owner_pid, Some(continuation))
+                    .expect("polled process state must remain present");
+                if interp.scheduler.has_runnable() {
+                    interp
+                        .scheduler
+                        .yield_current()
+                        .expect("polled process must be the running scheduler task");
+                    let scheduled = interp
+                        .scheduler
+                        .dispatch()
+                        .expect("runnable queue must contain valid tasks")
+                        .expect("a runnable task was checked above");
+                    interp
+                        .process
+                        .activate(scheduled)
+                        .expect("scheduled task must own process state");
+                }
             }
-            ShellPoll::Ready(status) => return status,
+            ShellPoll::Switched => {
+                interp
+                    .process
+                    .set_continuation(owner_pid, Some(continuation))
+                    .expect("suspended parent process state must remain present");
+            }
+            ShellPoll::Ready(status) if owner_pid == target_pid => return status,
+            ShellPoll::Ready(status) => interp.finish_child(owner_pid, status),
         }
     }
 }
 
 fn exec_background(interp: &mut Interp, node: &Node) -> i32 {
     let command = describe(node);
-    let Some((status, pid)) = exec_child(
-        interp,
-        node,
-        ChildExecution {
-            command: &command,
-            new_shell: false,
-            retain: true,
-        },
-    ) else {
-        write_diagnostic(interp, "shellsim: unable to create background process\n");
-        return 125;
+    let pid = match interp.start_background_child(&command, false) {
+        Ok(pid) => pid,
+        Err(error) => {
+            write_diagnostic(interp, &format!("shellsim: {error}\n"));
+            return 125;
+        }
     };
+    interp
+        .process
+        .set_continuation(pid, Some(ShellContinuation::new(node)))
+        .expect("new background child state must exist");
     let Some(id) = interp.new_job(pid, command) else {
-        interp.processes.reap(pid);
-        let _ = interp.scheduler.reap(pid);
+        interp.cancel_unstarted_child(pid);
         write_diagnostic(interp, "shellsim: job table limit exceeded\n");
         return 125;
     };
-    if let Some(job) = interp.jobs.iter_mut().find(|job| job.id == id) {
-        job.done = true;
-        job.status = status;
-    }
+    debug_assert!(interp.jobs.iter().any(|job| job.id == id && !job.done));
     interp.set_var("!", pid.to_string());
     0
 }
@@ -815,11 +889,10 @@ fn describe(node: &Node) -> String {
 
 struct RedirectScope {
     saved: crate::descriptors::FdTable,
-    memory_mark: u64,
+    reserved_memory: u64,
 }
 
 fn begin_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<RedirectScope, String> {
-    let memory_mark = interp.resources.memory_mark();
     let snapshot_bytes = interp.vfs.disk_used().saturating_add(4 * 1024);
     if !interp.resources.reserve_memory(snapshot_bytes) {
         return Err("memory limit exceeded while preparing redirections".to_string());
@@ -828,22 +901,25 @@ fn begin_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<Redire
     let saved = match interp.process.fds.fork(&mut interp.descriptors) {
         Ok(saved) => saved,
         Err(error) => {
-            interp.resources.restore_memory(memory_mark);
+            interp.resources.release_memory(snapshot_bytes);
             return Err(format!("{error:?}"));
         }
     };
     if let Err(error) = apply_redirects(interp, redirects) {
         restore_fds(interp, saved);
         interp.vfs = vfs_before;
-        interp.resources.restore_memory(memory_mark);
+        interp.resources.release_memory(snapshot_bytes);
         return Err(error);
     }
-    Ok(RedirectScope { saved, memory_mark })
+    Ok(RedirectScope {
+        saved,
+        reserved_memory: snapshot_bytes,
+    })
 }
 
 fn end_redirects(interp: &mut Interp, scope: RedirectScope) {
     restore_fds(interp, scope.saved);
-    interp.resources.restore_memory(scope.memory_mark);
+    interp.resources.release_memory(scope.reserved_memory);
 }
 
 /// Apply redirections from left to right. `dup` retains the open description selected at that
@@ -1401,7 +1477,7 @@ pub(crate) fn exec_child(
     node: &Node,
     child: ChildExecution<'_>,
 ) -> Option<(i32, crate::process::ProcessId)> {
-    let (pid, parent) = match interp.start_child(child.command, child.new_shell) {
+    let pid = match interp.start_child(child.command, child.new_shell) {
         Ok(child) => child,
         Err(error) => {
             write_diagnostic(interp, &format!("shellsim: {error}\n"));
@@ -1409,7 +1485,11 @@ pub(crate) fn exec_child(
         }
     };
     let status = exec_node(interp, node);
-    interp.finish_child(pid, parent, status, child.retain);
+    interp.finish_child(pid, status);
+    if !child.retain {
+        interp.processes.reap(pid);
+        let _ = interp.scheduler.reap(pid);
+    }
     Some((status, pid))
 }
 

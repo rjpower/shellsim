@@ -63,6 +63,9 @@ pub struct Environment {
     pub trust_partial: std::collections::BTreeSet<String>,
     /// Packages recorded by lightweight package-manager compatibility commands.
     pub packages: std::collections::BTreeSet<String>,
+    /// Terminal bytes produced by detached children after their originating action returned.
+    pub(crate) pending_stdout: Vec<u8>,
+    pub(crate) pending_stderr: Vec<u8>,
 }
 
 /// Shell-local state for the single process currently executing in an [`Environment`].
@@ -119,6 +122,7 @@ pub struct ProcessState {
     pub(crate) shell_continuation: Option<crate::exec::ShellContinuation>,
     /// Memory reserved for this forked context and released independently at exit.
     fork_allocation_bytes: u64,
+    detached_output: bool,
 }
 
 /// Machine-owned process contexts.
@@ -139,7 +143,7 @@ impl ProcessStates {
         }
     }
 
-    fn activate(&mut self, pid: ProcessId) -> Result<(), String> {
+    pub(crate) fn activate(&mut self, pid: ProcessId) -> Result<(), String> {
         if !self.states.contains_key(&pid) {
             return Err(format!("process state does not exist for PID {pid}"));
         }
@@ -170,6 +174,19 @@ impl ProcessStates {
             .get_mut(&self.active)
             .expect("active process state must exist")
     }
+
+    pub(crate) fn set_continuation(
+        &mut self,
+        pid: ProcessId,
+        continuation: Option<crate::exec::ShellContinuation>,
+    ) -> Result<(), String> {
+        let state = self
+            .states
+            .get_mut(&pid)
+            .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
+        state.shell_continuation = continuation;
+        Ok(())
+    }
 }
 
 impl Deref for ProcessStates {
@@ -188,11 +205,6 @@ impl DerefMut for ProcessStates {
 
 const MAX_FORK_STATE_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Parent state retained while one logical child runs synchronously.
-pub(crate) struct ParentProcess {
-    pid: ProcessId,
-}
-
 impl ProcessState {
     fn fork_for_child(
         &self,
@@ -200,6 +212,7 @@ impl ProcessState {
         new_shell: bool,
         fds: FdTable,
         fork_allocation_bytes: u64,
+        detached_output: bool,
     ) -> Self {
         Self {
             pid,
@@ -231,6 +244,7 @@ impl ProcessState {
             fds,
             shell_continuation: None,
             fork_allocation_bytes,
+            detached_output,
         }
     }
 
@@ -386,6 +400,7 @@ impl Environment {
                 fds,
                 shell_continuation: None,
                 fork_allocation_bytes: 0,
+                detached_output: false,
             }),
             next_temp_id: 0,
             cmd_trace: Vec::new(),
@@ -393,6 +408,8 @@ impl Environment {
             trust_noop: std::collections::BTreeSet::new(),
             trust_partial: std::collections::BTreeSet::new(),
             packages: std::collections::BTreeSet::new(),
+            pending_stdout: Vec::new(),
+            pending_stderr: Vec::new(),
         }
     }
 
@@ -404,7 +421,25 @@ impl Environment {
         &mut self,
         command: &str,
         new_shell: bool,
-    ) -> Result<(ProcessId, ParentProcess), String> {
+    ) -> Result<ProcessId, String> {
+        self.create_child(command, new_shell, true)
+    }
+
+    /// Create a runnable child without blocking or switching away from the active parent.
+    pub(crate) fn start_background_child(
+        &mut self,
+        command: &str,
+        new_shell: bool,
+    ) -> Result<ProcessId, String> {
+        self.create_child(command, new_shell, false)
+    }
+
+    fn create_child(
+        &mut self,
+        command: &str,
+        new_shell: bool,
+        foreground: bool,
+    ) -> Result<ProcessId, String> {
         let fork_bytes = self.process.fork_memory_bytes();
         if fork_bytes > MAX_FORK_STATE_BYTES {
             return Err("shell state exceeds the 32 MiB fork limit".to_string());
@@ -431,78 +466,104 @@ impl Environment {
             self.resources.release_memory(allocation_bytes);
             return Err("logical process limit exceeded".to_string());
         };
-        if let Err(error) = self.scheduler.block_current(WaitReason::Child(pid)) {
-            child_fds.close_all(&mut self.descriptors);
-            self.processes.exit(pid, 125, &self.process.cwd);
-            self.processes.reap(pid);
-            self.resources.release_memory(allocation_bytes);
-            return Err(format!("unable to suspend parent process: {error:?}"));
+        if foreground {
+            if let Err(error) = self.scheduler.block_current(WaitReason::Child(pid)) {
+                child_fds.close_all(&mut self.descriptors);
+                self.processes.exit(pid, 125, &self.process.cwd);
+                self.processes.reap(pid);
+                self.resources.release_memory(allocation_bytes);
+                return Err(format!("unable to suspend parent process: {error:?}"));
+            }
         }
         if let Err(error) = self.scheduler.spawn(pid) {
             child_fds.close_all(&mut self.descriptors);
-            let _ = self.scheduler.wake(self.process.pid);
-            let _ = self.scheduler.dispatch();
+            if foreground {
+                let _ = self.scheduler.wake(self.process.pid);
+                let _ = self.scheduler.dispatch();
+            }
             self.processes.exit(pid, 125, &self.process.cwd);
             self.processes.reap(pid);
             self.resources.release_memory(allocation_bytes);
             return Err(format!("unable to schedule child process: {error:?}"));
         }
-        match self.scheduler.dispatch() {
-            Ok(Some(scheduled)) if scheduled == pid => {}
-            result => {
-                child_fds.close_all(&mut self.descriptors);
-                self.processes.exit(pid, 125, &self.process.cwd);
-                self.resources.release_memory(allocation_bytes);
-                return Err(format!("unexpected child dispatch result: {result:?}"));
-            }
-        }
-        let parent_pid = self.process.pid;
-        let child = self
-            .process
-            .fork_for_child(pid, new_shell, child_fds, allocation_bytes);
+        let child =
+            self.process
+                .fork_for_child(pid, new_shell, child_fds, allocation_bytes, !foreground);
         self.process.insert(child)?;
-        self.process.activate(pid)?;
         self.refresh_descriptor_snapshot(pid);
-        Ok((pid, ParentProcess { pid: parent_pid }))
+        if foreground {
+            match self.scheduler.dispatch() {
+                Ok(Some(scheduled)) if scheduled == pid => {}
+                result => return Err(format!("unexpected child dispatch result: {result:?}")),
+            }
+            self.process.activate(pid)?;
+        }
+        Ok(pid)
     }
 
     /// Restore the parent after a synchronous child and optionally retain the exited record.
-    pub(crate) fn finish_child(
-        &mut self,
-        pid: ProcessId,
-        parent: ParentProcess,
-        status: i32,
-        retain: bool,
-    ) {
+    pub(crate) fn finish_child(&mut self, pid: ProcessId, status: i32) {
         let child_deadline_interrupt = self.process.deadline_interrupt;
         let fork_allocation_bytes = self.process.fork_allocation_bytes;
+        let parent_pid = self.process.ppid;
+        if self.process.detached_output {
+            let stdout = self.process.fds.get(1).ok();
+            let stderr = self.process.fds.get(2).ok();
+            if let Some(stdout) = stdout {
+                if let Ok(bytes) = self.descriptors.drain_capture(stdout) {
+                    append_pending(&mut self.pending_stdout, &bytes);
+                }
+            }
+            if let Some(stderr) = stderr.filter(|stderr| Some(*stderr) != stdout) {
+                if let Ok(bytes) = self.descriptors.drain_capture(stderr) {
+                    append_pending(&mut self.pending_stderr, &bytes);
+                }
+            }
+        }
         self.process.fds.close_all(&mut self.descriptors);
         self.processes.update_descriptors(pid, BTreeMap::new());
         self.processes.exit(pid, status, &self.process.cwd);
         let _ = self.scheduler.exit_current(status);
-        let _ = self.scheduler.wake(parent.pid);
-        let _ = self.scheduler.dispatch();
-        if !retain {
-            self.processes.reap(pid);
-            let _ = self.scheduler.reap(pid);
-        }
+        let _ = self.scheduler.wake(parent_pid);
+        let scheduled = self.scheduler.dispatch().ok().flatten();
         let removed = self.process.remove(pid);
         debug_assert!(removed.is_some(), "finished child state must exist");
-        self.process
-            .activate(parent.pid)
-            .expect("retained parent process state must exist");
-        if child_deadline_interrupt.is_some() {
-            self.process.deadline_interrupt = child_deadline_interrupt;
+        if let Some(parent) = self.process.states.get_mut(&parent_pid) {
+            if let Some(job) = parent.jobs.iter_mut().find(|job| job.pid == pid) {
+                job.done = true;
+                job.status = status;
+            }
+            if child_deadline_interrupt.is_some() {
+                parent.deadline_interrupt = child_deadline_interrupt;
+            }
+        }
+        if let Some(scheduled) = scheduled {
+            self.process
+                .activate(scheduled)
+                .expect("scheduled process state must exist");
         }
         self.resources.release_memory(fork_allocation_bytes);
+    }
+
+    /// Roll back a background child whose process-local setup failed before dispatch.
+    pub(crate) fn cancel_unstarted_child(&mut self, pid: ProcessId) {
+        if let Some(mut child) = self.process.remove(pid) {
+            child.fds.close_all(&mut self.descriptors);
+            self.resources.release_memory(child.fork_allocation_bytes);
+        }
+        let _ = self.scheduler.discard_runnable(pid);
+        self.processes.exit(pid, 125, &self.process.cwd);
+        self.processes.reap(pid);
     }
 
     /// Synchronize the active descriptor table into generated process metadata.
     pub(crate) fn refresh_descriptor_snapshot(&mut self, pid: ProcessId) {
         let descriptors = self
             .process
-            .fds
-            .iter()
+            .states
+            .get(&pid)
+            .into_iter()
+            .flat_map(|state| state.fds.iter())
             .filter_map(|(fd, id)| self.descriptors.label(id).ok().map(|label| (fd, label)))
             .collect();
         self.processes.update_descriptors(pid, descriptors);
@@ -951,6 +1012,11 @@ fn descriptor_message(error: DescriptorError) -> String {
     .to_string()
 }
 
+fn append_pending(destination: &mut Vec<u8>, bytes: &[u8]) {
+    let available = MAX_CAPTURE_BYTES.saturating_sub(destination.len());
+    destination.extend_from_slice(&bytes[..bytes.len().min(available)]);
+}
+
 impl Default for Environment {
     fn default() -> Self {
         Self::new()
@@ -970,7 +1036,7 @@ mod process_state_tests {
         let root = environment.pid;
         environment.set_var("scope", "parent");
 
-        let (child, parent) = environment.start_child("probe", false).unwrap();
+        let child = environment.start_child("probe", false).unwrap();
         assert_eq!(environment.process.active, child);
         assert_eq!(environment.process.states.len(), 2);
         assert_eq!(
@@ -982,7 +1048,9 @@ mod process_state_tests {
         );
         environment.set_var("scope", "child");
 
-        environment.finish_child(child, parent, 0, false);
+        environment.finish_child(child, 0);
+        environment.processes.reap(child);
+        environment.scheduler.reap(child).unwrap();
         assert_eq!(environment.process.active, root);
         assert_eq!(environment.process.states.len(), 1);
         assert_eq!(environment.get_var("scope").as_deref(), Some("parent"));

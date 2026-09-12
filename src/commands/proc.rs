@@ -293,7 +293,7 @@ fn run_shell_child(
     positional: Vec<String>,
     io: &mut Io,
 ) -> i32 {
-    let (pid, parent) = match interp.start_child("bash", true) {
+    let pid = match interp.start_child("bash", true) {
         Ok(child) => child,
         Err(error) => {
             ewln(io.err, &format!("bash: {error}"));
@@ -302,7 +302,9 @@ fn run_shell_child(
     };
     interp.positional = positional;
     let status = interp.run_script_into(source, io.out, io.err);
-    interp.finish_child(pid, parent, status, false);
+    interp.finish_child(pid, status);
+    interp.processes.reap(pid);
+    let _ = interp.scheduler.reap(pid);
     status
 }
 

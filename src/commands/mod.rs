@@ -176,17 +176,19 @@ pub fn run(
         let cpu_before = interp.resources.cpu_used();
         let disk_before = interp.vfs.disk_used();
         let fs_read_before = interp.vfs.read_bytes();
-        let memory_mark = interp.resources.memory_mark();
         let input_bytes = stdin.len() as u64;
         let arg_bytes = args.iter().map(|a| a.len() as u64).sum::<u64>();
+        let working_memory = spec.base_memory.saturating_add(input_bytes);
         if !interp
             .resources
             .charge_cpu(spec.base_cpu.saturating_add(arg_bytes))
-            || !interp
-                .resources
-                .reserve_memory(spec.base_memory.saturating_add(input_bytes))
         {
-            interp.resources.restore_memory(memory_mark);
+            return interp
+                .resources
+                .stop_reason()
+                .map_or(137, |r| r.exit_status());
+        }
+        if !interp.resources.reserve_memory(working_memory) {
             return interp
                 .resources
                 .stop_reason()
@@ -224,7 +226,7 @@ pub fn run(
                 .saturating_add(interp.vfs.read_bytes().saturating_sub(fs_read_before)),
         );
         let _ = interp.resources.charge_output(unaccounted_output);
-        interp.resources.restore_memory(memory_mark);
+        interp.resources.release_memory(working_memory);
         interp
             .resources
             .record_command(cmd, cpu_before, disk_before, interp.vfs.disk_used());
@@ -262,12 +264,15 @@ fn standard_utility_name(path: &str) -> Option<&str> {
 /// Provide `run_script_into` for nested execution (source, eval, scripts).
 impl Interp {
     pub fn run_script_into(&mut self, src: &str, out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
-        let memory_mark = self.resources.memory_mark();
         let parser_memory = 8 * 1024 + (src.len() as u64).saturating_mul(2);
-        if !self.resources.reserve_memory(parser_memory)
-            || !self.resources.charge_cpu(src.len() as u64)
-        {
-            self.resources.restore_memory(memory_mark);
+        if !self.resources.reserve_memory(parser_memory) {
+            return self
+                .resources
+                .stop_reason()
+                .map_or(137, |r| r.exit_status());
+        }
+        if !self.resources.charge_cpu(src.len() as u64) {
+            self.resources.release_memory(parser_memory);
             return self
                 .resources
                 .stop_reason()
@@ -278,13 +283,13 @@ impl Interp {
             Err(error) => {
                 err.extend_from_slice(format!("shellsim: syntax error: {error}\n").as_bytes());
                 self.last_status = 2;
-                self.resources.restore_memory(memory_mark);
+                self.resources.release_memory(parser_memory);
                 return 2;
             }
         };
         let r = self.returning.take();
         let code = crate::exec::exec(self, &ast, Vec::new(), out, err);
-        self.resources.restore_memory(memory_mark);
+        self.resources.release_memory(parser_memory);
         if r.is_some() {
             self.returning = r;
         }

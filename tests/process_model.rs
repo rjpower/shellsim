@@ -66,9 +66,15 @@ fn proc_environment_is_exported_sorted_and_nul_delimited() {
 }
 
 #[test]
-fn exited_background_process_exists_until_wait_reaps_it() {
+fn background_process_runs_on_a_later_scheduler_turn_and_wait_reaps_it() {
     let mut env = Environment::new();
     assert_eq!(run(&mut env, "false &").0, 0);
+    let status = env.fs_read("/", "/proc/1235/status").unwrap();
+    let status = String::from_utf8(status).unwrap();
+    assert!(status.contains("State:\tR (running)"), "{status}");
+    assert_eq!(env.scheduler.state(1_235), Some(TaskState::Runnable));
+    assert_eq!(run(&mut env, "jobs").1, "[1] Done false\n");
+
     let status = env.fs_read("/", "/proc/1235/status").unwrap();
     let status = String::from_utf8(status).unwrap();
     assert!(status.contains("State:\tZ (zombie)"), "{status}");
@@ -79,6 +85,24 @@ fn exited_background_process_exists_until_wait_reaps_it() {
     assert_eq!(run(&mut env, "wait 1235").0, 1);
     assert!(env.fs_read("/", "/proc/1235/status").is_err());
     assert_eq!(env.scheduler.state(1_235), None);
+}
+
+#[test]
+fn detached_output_is_delivered_once_when_the_child_later_exits() {
+    let mut env = Environment::new();
+    let (first, stdout, stderr) = env.run_script_capture("printf delayed &");
+    assert_eq!(first.exit_status, 0);
+    assert!(first.usage.memory_current > 0);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+
+    let (second, stdout, stderr) = env.run_script_capture("printf foreground");
+    assert_eq!(second.exit_status, 0);
+    assert_eq!(stdout, b"delayedforeground");
+    assert!(stderr.is_empty());
+    assert_eq!(second.usage.memory_current, 0);
+
+    assert_eq!(run(&mut env, "true").1, "");
 }
 
 #[test]

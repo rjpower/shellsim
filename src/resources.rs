@@ -1,7 +1,8 @@
 //! Deterministic resource accounting for the simulated environment.
 //!
-//! CPU is monotonic fuel. Memory is a modeled concurrent working set and is restored at
-//! command-frame boundaries. Output is a hard guardrail for materialized stdout/stderr.
+//! CPU is monotonic fuel. Memory is a modeled concurrent working set whose independently owned
+//! reservations are released explicitly. Output is a hard guardrail for materialized
+//! stdout/stderr.
 
 use serde::{Deserialize, Serialize};
 

@@ -151,6 +151,11 @@ impl Scheduler {
         self.current
     }
 
+    /// Whether another task is queued to run after the current task yields or exits.
+    pub fn has_runnable(&self) -> bool {
+        !self.runnable.is_empty()
+    }
+
     pub fn state(&self, pid: ProcessId) -> Option<TaskState> {
         self.states.get(&pid).copied()
     }
@@ -165,6 +170,16 @@ impl Scheduler {
             Some(_) => Err(SchedulerError::InvalidTransition),
             None => Err(SchedulerError::UnknownTask),
         }
+    }
+
+    /// Remove a task that failed setup before it was ever dispatched.
+    pub(crate) fn discard_runnable(&mut self, pid: ProcessId) -> Result<(), SchedulerError> {
+        if self.states.get(&pid) != Some(&TaskState::Runnable) {
+            return Err(SchedulerError::InvalidTransition);
+        }
+        self.states.remove(&pid);
+        self.runnable.retain(|queued| *queued != pid);
+        Ok(())
     }
 }
 

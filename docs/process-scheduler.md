@@ -23,11 +23,14 @@ a child retains the parent in that map, and scheduler dispatch changes the activ
 moving parent state through recursive executor frames. Exit removes the finished execution
 context while the process table independently retains zombie status until reaping.
 
-Phase 3 is next. The shell executor itself is still recursive and invokes each scheduled child to
-completion. Pipelines consequently materialize each stage's output before starting the next
-stage, background jobs finish before the prompt returns, and Python `Popen` cannot expose a live
-process. Do not describe these operations as concurrent until phases 3 through 5 meet their
-removal criteria.
+Phase 3 is in progress. Shell control flow and ordinary subshells run as stored continuations.
+Background commands are inserted as runnable tasks, return before execution, retain their fork
+allocation while alive, and make detached terminal output available exactly once after they later
+run. The scheduler switches the active PID between retained process contexts in one-instruction
+quanta. Pipelines and command substitution still use a synchronous child adapter, native
+blocking commands do not yet suspend, and Python `Popen` cannot expose a live process. Do not
+describe those remaining operations as concurrent until phases 3 through 5 meet their removal
+criteria.
 
 The readiness handshake needed by phase 3 is present: blocked descriptor operations return a
 typed pipe-readable or pipe-writable condition, process code can suspend on that exact condition,
@@ -39,8 +42,10 @@ conditions, loops, case selection, functions, positional restoration, and redire
 frames polled in fixed work quanta and retained on `ProcessState`. Same-process shell control flow
 no longer recurses through the Rust stack. Fork allocations also have independently releasable
 memory ownership, which is required once children overlap instead of exiting in stack order.
-Foreground child creation and pipelines still use the synchronous child adapter, and native
-blocking commands do not yet return `Pending`, so phase 3 remains incomplete.
+Ordinary foreground subshells now suspend their parent and switch through the scheduler without a
+nested Rust executor call. Pipelines, command substitution, nested-shell adapters, and Python's
+synchronous subprocess facade still use the run-to-completion child adapter. Native blocking
+commands do not yet return `Pending`, so phase 3 remains incomplete.
 
 ## Non-negotiable invariants
 
@@ -121,15 +126,16 @@ Keep ordinary native commands synchronous. Convert only commands that may block 
 tasks. The Python bytecode VM keeps its instruction pointer and yields when a native modeled
 operation blocks.
 
-Completion requires deleting recursive child run-to-completion scheduling. Deep or adversarial
-input remains bounded independently of the host stack.
+Completion requires deleting the remaining recursive child run-to-completion adapters. Deep or
+adversarial input remains bounded independently of the host stack.
 
 ## Phase 4: deterministic scheduler and pipes
 
-Add a FIFO runnable queue with stable sequence numbers and explicit wake keys. Add bounded pipe
-objects with reader/writer reference counts and backpressure. Pipeline stages start together and
-communicate through pipe descriptors. Background jobs return before their process exits. `wait`
-blocks and resumes on child exit.
+The FIFO runnable queue, typed wake keys, bounded pipe objects, reader/writer reference counts,
+backpressure, and asynchronously runnable background shell continuations are present. The next
+steps are timer waits and event-loop clock advancement, concurrent pipeline stage construction,
+and a resumable `wait`. Pipeline stages must start together and communicate through pipe
+descriptors rather than materialized stage buffers.
 
 Required compatibility cases include overlapping sleeps, file races with deterministic ordering,
 `yes | head`, early reader close, multi-stage pipelines, blocked writers, pipeline status and
