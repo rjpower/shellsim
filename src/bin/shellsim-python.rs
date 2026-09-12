@@ -132,7 +132,7 @@ fn run(options: Options) -> Result<i32, String> {
             outcome,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            unsupported: environment.process.unsupported.clone(),
+            unsupported: environment.unsupported.clone(),
         };
         println!(
             "{}",

@@ -102,8 +102,10 @@ heredocs and here-strings, command/arithmetic substitution, brace expansion, par
 globbing, `[[...]]`, and frequently used `set` options including `pipefail`.
 
 Standard paths such as `/bin/sh` and `/usr/bin/env` resolve to their simulated commands. More
-specialized Bash behavior, including process substitution, traps/signals, coprocesses, job timing,
-and exact subshell isolation, remains outside the faithful subset.
+specialized Bash behavior, including process substitution, traps/signals, coprocesses, concurrent
+job timing, and exact descriptor semantics, remains outside the faithful subset. Logical children
+provide isolated shell state, stable PIDs, `jobs`/`wait`, dynamic `ps`, and generated `/proc` views
+without creating host processes.
 
 ## Command implementations
 
@@ -203,6 +205,8 @@ the action takes precedence. New environments include `/root`, `/tmp`, and `/wor
 ```text
 src/resources.rs       limits, accounting, outcomes, command usage
 src/interp.rs          machine Environment and shell-local ProcessState
+src/process.rs         bounded logical process identities and lifecycle
+src/pseudo_fs.rs       generated read-only /proc and finite /dev views
 src/vfs.rs             quota-enforced in-memory filesystem
 src/shell.rs           lexer, parser, capture API
 src/expand.rs          shell expansion

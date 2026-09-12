@@ -586,7 +586,7 @@ fn expand_dollar(interp: &mut Interp, chars: &[char], _in_quotes: bool) -> (Stri
             let val = expand_param(interp, &inner);
             (val, 1 + consumed, false)
         }
-        c if c == '?' || c == '$' || c == '#' || c == '@' || c == '*' => {
+        c if matches!(c, '?' | '$' | '#' | '@' | '*' | '!') => {
             let val = interp.get_var(&c.to_string()).unwrap_or_default();
             (val, 2, false)
         }
@@ -667,7 +667,7 @@ fn expand_param(interp: &mut Interp, inner: &str) -> String {
 fn apply_op_from_rest(interp: &mut Interp, name: &str, rest: &str, cur: Option<String>) -> String {
     // substring slice `${var:offset:len}` (offset not one of the named ops)
     let ops = [
-        ":-", ":=", ":+", ":?", "##", "#", "%%", "%", "//", "/", "^^", "^", ",,", ",",
+        ":-", ":=", ":+", ":?", "-", "+", "##", "#", "%%", "%", "//", "/", "^^", "^", ",,", ",",
     ];
     for op in ops {
         if let Some(arg) = rest.strip_prefix(op) {
@@ -928,7 +928,22 @@ fn run_capture(interp: &mut Interp, src: &str) -> String {
     };
     let mut out = Vec::new();
     let mut err = Vec::new();
-    crate::exec::exec(interp, &ast, Vec::new(), &mut out, &mut err);
+    let Some((status, _)) = crate::exec::exec_child(
+        interp,
+        &ast,
+        Vec::new(),
+        &mut out,
+        &mut err,
+        crate::exec::ChildExecution {
+            command: "$(command substitution)",
+            new_shell: false,
+            retain: false,
+        },
+    ) else {
+        interp.last_status = 125;
+        return String::new();
+    };
+    interp.last_status = status;
     let mut s = String::from_utf8_lossy(&out).into_owned();
     while s.ends_with('\n') {
         s.pop();

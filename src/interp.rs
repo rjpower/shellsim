@@ -5,6 +5,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::clock::{Clock, EventId};
 use crate::net::VirtualNet;
+use crate::process::{ProcessId, ProcessTable};
 use crate::resources::{Limits, Resources, RunOutcome};
 use crate::vfs::Vfs;
 
@@ -22,8 +23,10 @@ pub enum ArrayVal {
 /// to. Jobs currently run immediately and synchronously, after which `jobs` and `wait` expose
 /// their modeled identifier and status. This is indistinguishable for many file-state checks but
 /// does not model overlapping work.
+#[derive(Clone, Debug)]
 pub struct Job {
     pub id: u32,
+    pub pid: ProcessId,
     pub cmd: String,
     pub done: bool,
     pub status: i32,
@@ -37,11 +40,30 @@ pub struct Environment {
     pub net: VirtualNet,
     /// Deterministic CPU, transient-memory, and output accounting for this environment.
     pub resources: Resources,
+    /// Machine-wide logical process identities and retained child statuses.
+    pub processes: ProcessTable,
     pub process: ProcessState,
+    next_temp_id: u64,
+    /// Trace of every external command name executed.
+    pub cmd_trace: Vec<String>,
+    /// Commands requested that shellsim does not implement.
+    pub unsupported: Vec<String>,
+    /// Commands that deliberately used a successful compatibility no-op.
+    pub trust_noop: std::collections::BTreeSet<String>,
+    /// Commands that implement a documented subset.
+    pub trust_partial: std::collections::BTreeSet<String>,
+    /// Packages recorded by lightweight package-manager compatibility commands.
+    pub packages: std::collections::BTreeSet<String>,
 }
 
 /// Shell-local state for the single process currently executing in an [`Environment`].
 pub struct ProcessState {
+    /// PID of the currently executing logical process.
+    pub pid: ProcessId,
+    /// PID of the logical parent process.
+    pub ppid: ProcessId,
+    /// PID expanded by `$$`; preserved across Bash subshells.
+    pub shell_pid: ProcessId,
     /// shell + environment variables (we don't distinguish exported vs not for simplicity,
     /// except that `env`/child python only sees exported ones, tracked in `exported`)
     pub vars: HashMap<String, String>,
@@ -63,9 +85,7 @@ pub struct ProcessState {
     pub opt_pipefail: bool,
     pub jobs: Vec<Job>,
     next_job_id: u32,
-    /// Deterministic identity source kept separate from virtual time.
-    next_temp_id: u64,
-    /// recursion / loop-control signaling
+    /// Recursion and loop-control signaling.
     pub loop_break: u32,
     pub loop_continue: u32,
     pub returning: Option<i32>,
@@ -80,20 +100,94 @@ pub struct ProcessState {
     /// persistent input stream + cursor for `read` inside `while read…; done < file`
     pub input_stream: Vec<u8>,
     pub input_pos: usize,
-    /// trace of every external command name executed (telemetry for "what did we cover")
-    pub cmd_trace: Vec<String>,
-    /// commands requested that we don't implement (coverage gaps)
-    pub unsupported: Vec<String>,
-    /// command names that ran as `Trust::NoOp` (ignored — e.g. apt-get) during this run
-    pub trust_noop: std::collections::BTreeSet<String>,
-    /// command names that ran as `Trust::Partial` (subset impl — e.g. jq/sed) during this run
-    pub trust_partial: std::collections::BTreeSet<String>,
-    /// Package names recorded by the lightweight `pip`/`uv`/`conda` compatibility commands.
-    pub packages: std::collections::BTreeSet<String>,
     /// A foreground Python REPL, when `python` was invoked without a program. Keeping this in
     /// process state lets an agent enter Python in one shell action and continue it in later
     /// actions without giving the shim access to host stdin.
     pub python_repl: Option<crate::python::ReplState>,
+}
+
+const MAX_FORK_STATE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Parent state retained while one logical child runs synchronously.
+pub(crate) struct ParentProcess {
+    state: ProcessState,
+    memory_mark: u64,
+}
+
+impl ProcessState {
+    fn fork_for_child(&self, pid: ProcessId, new_shell: bool) -> Self {
+        Self {
+            pid,
+            ppid: self.pid,
+            shell_pid: if new_shell { pid } else { self.shell_pid },
+            vars: self.vars.clone(),
+            arrays: self.arrays.clone(),
+            exported: self.exported.clone(),
+            cwd: self.cwd.clone(),
+            funcs: self.funcs.clone(),
+            last_status: self.last_status,
+            positional: self.positional.clone(),
+            opt_errexit: self.opt_errexit,
+            opt_nounset: self.opt_nounset,
+            opt_xtrace: self.opt_xtrace,
+            opt_pipefail: self.opt_pipefail,
+            jobs: Vec::new(),
+            next_job_id: 1,
+            loop_break: 0,
+            loop_continue: 0,
+            returning: None,
+            exiting: None,
+            cond_depth: self.cond_depth,
+            deadline_interrupt: self.deadline_interrupt,
+            uid: self.uid,
+            input_stream: self.input_stream.clone(),
+            input_pos: self.input_pos,
+            python_repl: None,
+        }
+    }
+
+    fn fork_memory_bytes(&self) -> u64 {
+        let string = |value: &String| (value.len() as u64).saturating_add(24);
+        let mut bytes = self
+            .vars
+            .iter()
+            .fold(0_u64, |total, (name, value)| {
+                total
+                    .saturating_add(string(name))
+                    .saturating_add(string(value))
+            })
+            .saturating_add(
+                self.exported
+                    .iter()
+                    .fold(0, |total, value| total.saturating_add(string(value))),
+            )
+            .saturating_add(string(&self.cwd))
+            .saturating_add(
+                self.positional
+                    .iter()
+                    .fold(0, |total, value| total.saturating_add(string(value))),
+            )
+            .saturating_add(self.input_stream.len() as u64);
+        for (name, value) in &self.arrays {
+            bytes = bytes.saturating_add(string(name));
+            bytes = bytes.saturating_add(match value {
+                ArrayVal::Indexed(values) => values.iter().fold(0, |total, value| {
+                    total.saturating_add(value.as_ref().map_or(0, string))
+                }),
+                ArrayVal::Assoc(values) => values.iter().fold(0, |total, (name, value)| {
+                    total
+                        .saturating_add(string(name))
+                        .saturating_add(string(value))
+                }),
+            });
+        }
+        for (name, body) in &self.funcs {
+            bytes = bytes
+                .saturating_add(string(name))
+                .saturating_add(body.estimated_bytes());
+        }
+        bytes
+    }
 }
 
 impl Deref for Environment {
@@ -116,7 +210,7 @@ impl Environment {
     }
 
     pub fn with_limits(limits: Limits) -> Self {
-        let mut vars = HashMap::new();
+        let mut vars: HashMap<String, String> = HashMap::new();
         vars.insert("HOME".into(), "/root".into());
         vars.insert(
             "PATH".into(),
@@ -139,12 +233,21 @@ impl Environment {
         let mut vfs = Vfs::with_disk_limit(limits.disk);
         vfs.set_mutation_time(clock.unix_ms());
         vfs.seed_dirs(["/root", "/tmp", "/work"]);
+        const ROOT_PID: ProcessId = 1_234;
+        let process_environment = exported
+            .iter()
+            .filter_map(|name| vars.get(name).map(|value| (name.clone(), value.clone())))
+            .collect();
         Environment {
             vfs,
             clock,
             net: VirtualNet::new(),
             resources: Resources::new(limits),
+            processes: ProcessTable::new(ROOT_PID, "/".to_string(), process_environment),
             process: ProcessState {
+                pid: ROOT_PID,
+                ppid: 0,
+                shell_pid: ROOT_PID,
                 vars,
                 arrays: HashMap::new(),
                 exported,
@@ -158,7 +261,6 @@ impl Environment {
                 opt_pipefail: false,
                 jobs: Vec::new(),
                 next_job_id: 1,
-                next_temp_id: 0,
                 loop_break: 0,
                 loop_continue: 0,
                 returning: None,
@@ -168,14 +270,70 @@ impl Environment {
                 uid: 0,
                 input_stream: Vec::new(),
                 input_pos: 0,
-                cmd_trace: Vec::new(),
-                unsupported: Vec::new(),
-                trust_noop: std::collections::BTreeSet::new(),
-                trust_partial: std::collections::BTreeSet::new(),
-                packages: std::collections::BTreeSet::new(),
                 python_repl: None,
             },
+            next_temp_id: 0,
+            cmd_trace: Vec::new(),
+            unsupported: Vec::new(),
+            trust_noop: std::collections::BTreeSet::new(),
+            trust_partial: std::collections::BTreeSet::new(),
+            packages: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// Enter a synchronous logical child while retaining the parent shell state.
+    ///
+    /// Machine capabilities remain on `Environment`; only process-local state is copied. The
+    /// caller must pair a successful call with [`Environment::finish_child`].
+    pub(crate) fn start_child(
+        &mut self,
+        command: &str,
+        new_shell: bool,
+    ) -> Result<(ProcessId, ParentProcess), String> {
+        let fork_bytes = self.process.fork_memory_bytes();
+        if fork_bytes > MAX_FORK_STATE_BYTES {
+            return Err("shell state exceeds the 32 MiB fork limit".to_string());
+        }
+        let memory_mark = self.resources.memory_mark();
+        if !self
+            .resources
+            .reserve_memory(fork_bytes.saturating_add(256))
+        {
+            return Err("memory limit exceeded while creating child process".to_string());
+        }
+        let environment: BTreeMap<String, String> = self.child_env().into_iter().collect();
+        self.processes
+            .update_current(self.process.pid, &self.process.cwd, environment.clone());
+        let Some(pid) =
+            self.processes
+                .spawn(self.process.pid, command, &self.process.cwd, environment)
+        else {
+            self.resources.restore_memory(memory_mark);
+            return Err("logical process limit exceeded".to_string());
+        };
+        let child = self.process.fork_for_child(pid, new_shell);
+        let state = std::mem::replace(&mut self.process, child);
+        Ok((pid, ParentProcess { state, memory_mark }))
+    }
+
+    /// Restore the parent after a synchronous child and optionally retain the exited record.
+    pub(crate) fn finish_child(
+        &mut self,
+        pid: ProcessId,
+        parent: ParentProcess,
+        status: i32,
+        retain: bool,
+    ) {
+        let child_deadline_interrupt = self.process.deadline_interrupt;
+        self.processes.exit(pid, status, &self.process.cwd);
+        if !retain {
+            self.processes.reap(pid);
+        }
+        self.process = parent.state;
+        if child_deadline_interrupt.is_some() {
+            self.process.deadline_interrupt = child_deadline_interrupt;
+        }
+        self.resources.restore_memory(parent.memory_mark);
     }
 
     /// Record a package name installed by a compatibility command.
@@ -201,10 +359,69 @@ impl Environment {
         self.vfs.set_mutation_time(self.clock.unix_ms());
     }
 
+    /// Read through the generated pseudo-filesystem before consulting persistent VFS state.
+    pub fn fs_read(&self, cwd: &str, path: &str) -> crate::vfs::Result<Vec<u8>> {
+        crate::pseudo_fs::read(self, cwd, path).unwrap_or_else(|| self.vfs.read(cwd, path))
+    }
+
+    /// Return a generated or persistent file length without exposing its backing implementation.
+    pub fn fs_file_len(&self, cwd: &str, path: &str) -> crate::vfs::Result<usize> {
+        if let Some(result) = crate::pseudo_fs::read(self, cwd, path) {
+            result.map(|data| data.len())
+        } else {
+            self.vfs.file_len(cwd, path)
+        }
+    }
+
+    /// Read a finite generated or persistent file after enforcing a caller-provided bound.
+    pub fn fs_read_limited(
+        &self,
+        cwd: &str,
+        path: &str,
+        limit: usize,
+    ) -> crate::vfs::Result<Vec<u8>> {
+        if let Some(result) = crate::pseudo_fs::read(self, cwd, path) {
+            let data = result?;
+            if data.len() > limit {
+                return Err(crate::vfs::VfsError::TooLarge {
+                    path: path.to_string(),
+                    limit,
+                });
+            }
+            Ok(data)
+        } else {
+            self.vfs.read_limited(cwd, path, limit)
+        }
+    }
+
+    /// Inspect generated or persistent filesystem metadata through one capability boundary.
+    pub fn fs_metadata(
+        &self,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+    ) -> crate::vfs::Result<crate::vfs::Node> {
+        crate::pseudo_fs::metadata(self, cwd, path, follow)
+            .unwrap_or_else(|| self.vfs.metadata(cwd, path, follow))
+    }
+
+    /// List a generated or persistent directory.
+    pub fn fs_list_dir(&self, cwd: &str, path: &str) -> crate::vfs::Result<Vec<String>> {
+        crate::pseudo_fs::list_dir(self, cwd, path).unwrap_or_else(|| self.vfs.list_dir(cwd, path))
+    }
+
+    /// Read a generated or persistent symbolic link.
+    pub fn fs_read_link(&self, cwd: &str, path: &str) -> crate::vfs::Result<String> {
+        crate::pseudo_fs::read_link(self, cwd, path)
+            .unwrap_or_else(|| self.vfs.read_link(cwd, path))
+    }
+
     pub fn get_var(&self, name: &str) -> Option<String> {
         match name {
             "?" => Some(self.last_status.to_string()),
-            "$" => Some("1234".to_string()), // deterministic fake PID
+            "$" => Some(self.shell_pid.to_string()),
+            "PPID" => Some(self.ppid.to_string()),
+            "BASHPID" => Some(self.pid.to_string()),
             "#" => Some(self.positional.len().to_string()),
             "PWD" => Some(self.cwd.clone()),
             "@" | "*" => Some(self.positional.join(" ")),
@@ -382,16 +599,20 @@ impl Environment {
         env
     }
 
-    pub fn new_job(&mut self, cmd: String) -> u32 {
+    pub fn new_job(&mut self, pid: ProcessId, cmd: String) -> Option<u32> {
+        if self.jobs.len() >= crate::process::MAX_PROCESSES {
+            return None;
+        }
         let id = self.next_job_id;
-        self.next_job_id += 1;
+        self.next_job_id = self.next_job_id.checked_add(1)?;
         self.jobs.push(Job {
             id,
+            pid,
             cmd,
             done: false,
             status: 0,
         });
-        id
+        Some(id)
     }
 
     pub(crate) fn next_temp_id(&mut self) -> Option<u64> {

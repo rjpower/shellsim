@@ -147,10 +147,10 @@ pub fn read_inputs(interp: &Interp, files: &[&String], stdin: &[u8]) -> (Vec<u8>
         data.extend_from_slice(stdin);
     } else {
         for f in files {
-            if f.as_str() == "-" {
+            if matches!(f.as_str(), "-" | "/dev/stdin") {
                 data.extend_from_slice(stdin);
             } else {
-                match interp.vfs.read(&interp.cwd, f) {
+                match interp.fs_read(&interp.cwd, f) {
                     Ok(d) => data.extend(d),
                     Err(e) => errors.push(format!("{f}: {e}")),
                 }

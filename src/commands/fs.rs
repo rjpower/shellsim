@@ -44,8 +44,14 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     };
     let mut status = 0;
     for p in &paths {
-        if interp.vfs.is_dir(&interp.cwd, p) {
-            let mut entries = match interp.vfs.list_dir(&interp.cwd, p) {
+        if matches!(
+            interp.fs_metadata(&interp.cwd, p, true),
+            Ok(crate::vfs::Node {
+                kind: crate::vfs::NodeKind::Dir,
+                ..
+            })
+        ) {
+            let mut entries = match interp.fs_list_dir(&interp.cwd, p) {
                 Ok(e) => e,
                 Err(e) => {
                     ewln(io.err, &format!("ls: {e}"));
@@ -67,16 +73,22 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                         continue;
                     }
                     let sub = format!("{}/{}", p.trim_end_matches('/'), e);
-                    if interp.vfs.is_dir(&interp.cwd, &sub) {
+                    if matches!(
+                        interp.fs_metadata(&interp.cwd, &sub, true),
+                        Ok(crate::vfs::Node {
+                            kind: crate::vfs::NodeKind::Dir,
+                            ..
+                        })
+                    ) {
                         wln(io.out, "");
                         wln(io.out, &format!("{sub}:"));
-                        if let Ok(se) = interp.vfs.list_dir(&interp.cwd, &sub) {
+                        if let Ok(se) = interp.fs_list_dir(&interp.cwd, &sub) {
                             emit_listing(interp, &sub, &se, long, one, io.out);
                         }
                     }
                 }
             }
-        } else if interp.vfs.lexists(&interp.cwd, p) {
+        } else if interp.fs_metadata(&interp.cwd, p, false).is_ok() {
             wln(io.out, p);
         } else {
             ewln(
@@ -107,7 +119,7 @@ fn emit_listing(
             } else {
                 format!("{}/{}", dir.trim_end_matches('/'), e)
             };
-            let (typ, mode, size) = match interp.vfs.metadata(&interp.cwd, &full, false) {
+            let (typ, mode, size) = match interp.fs_metadata(&interp.cwd, &full, false) {
                 Ok(n) => {
                     let t = match n.kind {
                         crate::vfs::NodeKind::Dir => 'd',
@@ -475,7 +487,7 @@ fn realpath_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -
                     Err(_) => return 1,
                 }
             } else {
-                match interp.vfs.read_link(&interp.cwd, p) {
+                match interp.fs_read_link(&interp.cwd, p) {
                     Ok(t) => wln(io.out, &t),
                     Err(_) => {
                         ewln(io.err, &format!("readlink: {p}: Invalid argument"));
@@ -513,7 +525,7 @@ fn cmd_stat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     }
     let _ = ops;
     for f in &files {
-        match interp.vfs.metadata(&interp.cwd, f, true) {
+        match interp.fs_metadata(&interp.cwd, f, true) {
             Ok(n) => {
                 let size = match &n.kind {
                     crate::vfs::NodeKind::File(d) => d.len(),

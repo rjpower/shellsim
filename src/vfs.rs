@@ -59,6 +59,7 @@ pub enum VfsError {
     Invalid(String),
     NoSpace,
     TooLarge { path: String, limit: usize },
+    ReadOnly(String),
 }
 
 impl std::fmt::Display for VfsError {
@@ -75,6 +76,7 @@ impl std::fmt::Display for VfsError {
             VfsError::TooLarge { path, limit } => {
                 write!(f, "file too large: {path} (limit {limit} bytes)")
             }
+            VfsError::ReadOnly(path) => write!(f, "Read-only filesystem: {path}"),
         }
     }
 }
@@ -119,6 +121,17 @@ pub fn normalize(path: &str) -> String {
         "/".to_string()
     } else {
         format!("/{}", out.join("/"))
+    }
+}
+
+fn reject_pseudo_mutation(path: &str) -> Result<()> {
+    if ["/proc", "/dev"]
+        .iter()
+        .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+    {
+        Err(VfsError::ReadOnly(path.to_string()))
+    } else {
+        Ok(())
     }
 }
 
@@ -524,6 +537,7 @@ impl Vfs {
     /// Map a path to where the node should actually live (parent symlinks resolved).
     fn write_target(&self, cwd: &str, path: &str) -> Result<String> {
         let abs = resolve_against(cwd, path);
+        reject_pseudo_mutation(&abs)?;
         let parent = parent_of(&abs).unwrap_or_else(|| "/".to_string());
         let real_parent = self.realpath(&parent, true)?;
         let name = basename(&abs);
@@ -535,8 +549,8 @@ impl Vfs {
     }
 
     pub fn write(&mut self, cwd: &str, path: &str, data: &[u8], mode: Mode) -> Result<()> {
-        let before = self.nodes.clone();
         let target = self.write_target(cwd, path)?;
+        let before = self.nodes.clone();
         self.require_parent_dir(&target)?;
         match self.nodes.get_mut(&target) {
             Some(Node {
@@ -562,8 +576,8 @@ impl Vfs {
     }
 
     pub fn append(&mut self, cwd: &str, path: &str, data: &[u8], mode: Mode) -> Result<()> {
-        let before = self.nodes.clone();
         let target = self.write_target(cwd, path)?;
+        let before = self.nodes.clone();
         self.require_parent_dir(&target)?;
         match self.nodes.get_mut(&target) {
             Some(Node {
@@ -589,8 +603,8 @@ impl Vfs {
     }
 
     pub fn mkdir(&mut self, cwd: &str, path: &str) -> Result<()> {
-        let before = self.nodes.clone();
         let target = self.write_target(cwd, path)?;
+        let before = self.nodes.clone();
         if self.nodes.contains_key(&target) {
             return Err(VfsError::Exists(path.to_string()));
         }
@@ -601,8 +615,9 @@ impl Vfs {
     }
 
     pub fn mkdir_all(&mut self, cwd: &str, path: &str) -> Result<()> {
-        let before = self.nodes.clone();
         let abs = resolve_against(cwd, path);
+        reject_pseudo_mutation(&abs)?;
+        let before = self.nodes.clone();
         let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
         // resolve symlinks progressively
         let mut cur = "/".to_string();
@@ -635,6 +650,7 @@ impl Vfs {
 
     pub fn remove_file(&mut self, cwd: &str, path: &str) -> Result<()> {
         let abs = resolve_against(cwd, path);
+        reject_pseudo_mutation(&abs)?;
         let real = self.realpath(&abs, false)?;
         match self.nodes.get(&real) {
             Some(Node {
@@ -652,6 +668,7 @@ impl Vfs {
 
     pub fn remove_all(&mut self, cwd: &str, path: &str) -> Result<()> {
         let abs = resolve_against(cwd, path);
+        reject_pseudo_mutation(&abs)?;
         let real = self.realpath(&abs, false)?;
         if !self.nodes.contains_key(&real) {
             return Err(VfsError::NotFound(path.to_string()));
@@ -665,6 +682,7 @@ impl Vfs {
 
     pub fn rmdir(&mut self, cwd: &str, path: &str) -> Result<()> {
         let abs = resolve_against(cwd, path);
+        reject_pseudo_mutation(&abs)?;
         let real = self.realpath(&abs, true)?;
         match self.nodes.get(&real) {
             Some(Node {
@@ -684,13 +702,14 @@ impl Vfs {
     }
 
     pub fn rename(&mut self, cwd: &str, from: &str, to: &str) -> Result<()> {
-        let before = self.nodes.clone();
         let from_abs = resolve_against(cwd, from);
+        reject_pseudo_mutation(&from_abs)?;
         let from_real = self.realpath(&from_abs, false)?;
         if !self.nodes.contains_key(&from_real) {
             return Err(VfsError::NotFound(from.to_string()));
         }
         let mut to_target = self.write_target(cwd, to)?;
+        let before = self.nodes.clone();
         // moving into an existing directory
         if matches!(
             self.nodes.get(&to_target),
@@ -717,19 +736,20 @@ impl Vfs {
     }
 
     pub fn copy_file(&mut self, cwd: &str, from: &str, to: &str) -> Result<()> {
+        reject_pseudo_mutation(&resolve_against(cwd, to))?;
         let data = self.read(cwd, from)?;
         let mode = self.metadata(cwd, from, true)?.mode;
         self.write(cwd, to, &data, mode)
     }
 
     pub fn copy_recursive(&mut self, cwd: &str, from: &str, to: &str) -> Result<()> {
-        let before = self.nodes.clone();
         let from_abs = resolve_against(cwd, from);
         let from_real = self.realpath(&from_abs, true)?;
         if !self.is_dir(cwd, from) {
             return self.copy_file(cwd, from, to);
         }
         let mut to_target = self.write_target(cwd, to)?;
+        let before = self.nodes.clone();
         if matches!(
             self.nodes.get(&to_target),
             Some(Node {
@@ -755,8 +775,8 @@ impl Vfs {
     }
 
     pub fn symlink(&mut self, cwd: &str, target: &str, linkpath: &str) -> Result<()> {
-        let before = self.nodes.clone();
         let link_target = self.write_target(cwd, linkpath)?;
+        let before = self.nodes.clone();
         if self.nodes.contains_key(&link_target) {
             return Err(VfsError::Exists(linkpath.to_string()));
         }
@@ -775,8 +795,8 @@ impl Vfs {
     }
 
     pub fn touch(&mut self, cwd: &str, path: &str, mtime: u64) -> Result<()> {
-        let before = self.nodes.clone();
         let target = self.write_target(cwd, path)?;
+        let before = self.nodes.clone();
         match self.nodes.get_mut(&target) {
             Some(n) => n.mtime = mtime,
             None => {
@@ -791,6 +811,7 @@ impl Vfs {
 
     pub fn chmod(&mut self, cwd: &str, path: &str, mode: Mode) -> Result<()> {
         let abs = resolve_against(cwd, path);
+        reject_pseudo_mutation(&abs)?;
         let real = self.realpath(&abs, true)?;
         self.nodes
             .get_mut(&real)
@@ -806,6 +827,7 @@ impl Vfs {
         gid: Option<u32>,
     ) -> Result<()> {
         let abs = resolve_against(cwd, path);
+        reject_pseudo_mutation(&abs)?;
         let real = self.realpath(&abs, true)?;
         let n = self
             .nodes
@@ -830,8 +852,9 @@ impl Vfs {
 
     /// Insert a file directly at an absolute path, creating parent dirs.
     pub fn put_file(&mut self, abs: &str, data: Vec<u8>, mode: Mode) -> Result<()> {
-        let before = self.nodes.clone();
         let norm = normalize(abs);
+        reject_pseudo_mutation(&norm)?;
+        let before = self.nodes.clone();
         if let Some(parent) = parent_of(&norm) {
             self.mkdir_all("/", &parent)?;
         }
@@ -841,8 +864,9 @@ impl Vfs {
     }
 
     pub fn put_dir(&mut self, abs: &str, mode: Mode) -> Result<()> {
-        let before = self.nodes.clone();
         let norm = normalize(abs);
+        reject_pseudo_mutation(&norm)?;
+        let before = self.nodes.clone();
         self.mkdir_all("/", &norm)?;
         if let Some(n) = self.nodes.get_mut(&norm) {
             n.mode = mode;

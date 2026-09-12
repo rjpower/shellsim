@@ -261,11 +261,7 @@ fn cmd_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                 let src = args.get(i + 1).cloned().unwrap_or_default();
                 // `sh -c SCRIPT [name [args…]]`: name is $0, the rest are $1+
                 let extra = args.get(i + 3..).map(|s| s.to_vec()).unwrap_or_default();
-                let saved = std::mem::replace(&mut interp.positional, extra);
-                let code = interp.run_script_into(&src, io.out, io.err);
-                interp.positional = saved;
-                interp.exiting = None;
-                return code;
+                return run_shell_child(interp, &src, extra, io);
             }
             "-o" => {
                 i += 2;
@@ -276,11 +272,7 @@ fn cmd_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             s => {
                 if let Ok(src) = interp.vfs.read_string(&interp.cwd, s) {
                     let extra = args.get(i + 1..).map(|x| x.to_vec()).unwrap_or_default();
-                    let saved = std::mem::replace(&mut interp.positional, extra);
-                    let code = interp.run_script_into(&src, io.out, io.err);
-                    interp.positional = saved;
-                    interp.exiting = None;
-                    return code;
+                    return run_shell_child(interp, &src, extra, io);
                 }
                 crate::commands::util::ewln(
                     io.err,
@@ -292,9 +284,26 @@ fn cmd_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     }
     // no -c and no file → run stdin as a script
     let src = String::from_utf8_lossy(&io.stdin).into_owned();
-    let code = interp.run_script_into(&src, io.out, io.err);
-    interp.exiting = None;
-    code
+    run_shell_child(interp, &src, Vec::new(), io)
+}
+
+fn run_shell_child(
+    interp: &mut CommandContext<'_>,
+    source: &str,
+    positional: Vec<String>,
+    io: &mut Io,
+) -> i32 {
+    let (pid, parent) = match interp.start_child("bash", true) {
+        Ok(child) => child,
+        Err(error) => {
+            ewln(io.err, &format!("bash: {error}"));
+            return 125;
+        }
+    };
+    interp.positional = positional;
+    let status = interp.run_script_into(source, io.out, io.err);
+    interp.finish_child(pid, parent, status, false);
+    status
 }
 
 /// `uv` / `uvx` / `uv run` / `uv tool run`: package-management subcommands update the simulated

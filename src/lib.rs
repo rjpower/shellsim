@@ -19,6 +19,8 @@ pub mod interp;
 pub mod jqcmd;
 pub mod net;
 pub mod netcmd;
+pub mod process;
+pub mod pseudo_fs;
 pub mod python;
 pub mod resources;
 pub mod sandbox;

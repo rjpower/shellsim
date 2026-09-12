@@ -10,8 +10,10 @@ An `Environment` owns all machine and session state:
 
 ```text
 Environment
-  ProcessState     variables, arrays, functions, cwd, options, jobs, Python REPL
+  ProcessState     active variables, arrays, functions, cwd, options, jobs, Python REPL
+  ProcessTable     bounded PID/PPID records and child lifecycle status
   Vfs              files, directories, symlinks, metadata, disk quota
+  PseudoFs         generated read-only /proc and finite /dev views
   Timeline         monotonic/wall/process clocks and scheduled events
   VirtualNet       deterministic route table and responses
   Resources        CPU, memory, disk/output accounting and stop reason
@@ -23,6 +25,12 @@ Shell source flows through `src/shell.rs`, expansion in `src/expand.rs`, and the
 and otherwise become recorded compatibility gaps. Python uses its own source pipeline described in
 [python.md](python.md) and shares only modeled environment capabilities.
 
+Subshells, command substitutions, pipeline stages, background jobs, and nested shells run by
+swapping in a forked `ProcessState`. VFS, clocks, virtual network, resources, package markers, and
+telemetry remain machine-wide. The parent state is restored when the synchronous child finishes,
+so local mutations do not leak while filesystem effects remain visible. Exited background process
+records remain until `wait` reaps them.
+
 Reusing an `Environment` preserves the VFS, cwd, variables, functions, arrays, package markers,
 virtual time/network state, command history, Python REPL, and cumulative resource usage. `exit`,
 `set -e` termination, and CPU/memory/output exhaustion make the session terminal. Disk-full errors
@@ -30,10 +38,11 @@ remain recoverable.
 
 ## Simulation boundaries
 
-The VFS is the only filesystem visible to simulated code. Mutations are quota-atomic, deletion
-releases capacity, and the environment supplies virtual wall timestamps. Commands and Python code
-must never fall through to `std::fs`, `std::process`, host environment variables, host networking,
-or host time.
+The VFS and generated pseudo-filesystem facade are the only filesystems visible to simulated code.
+VFS mutations are quota-atomic, deletion releases capacity, and the environment supplies virtual
+wall timestamps. `/proc` and finite `/dev` nodes are generated from modeled state, consume no disk,
+and reject mutation. Commands and Python code must never fall through to `std::fs`, `std::process`,
+host environment variables, host networking, or host time.
 
 Time has three domains:
 
@@ -114,6 +123,8 @@ the corresponding host facility.
 
 ```text
 src/interp.rs          Environment and persistent ProcessState
+src/process.rs         bounded logical PID and lifecycle records
+src/pseudo_fs.rs       generated read-only /proc and finite /dev views
 src/resources.rs       limits, accounting, outcomes, command telemetry
 src/vfs.rs             quota-enforced in-memory filesystem
 src/clock.rs           virtual clocks and bounded event queue

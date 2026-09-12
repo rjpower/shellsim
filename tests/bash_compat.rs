@@ -90,6 +90,46 @@ fn completed_background_jobs_are_queryable_and_waitable() {
 }
 
 #[test]
+fn child_shell_boundaries_isolate_local_state_but_share_files() {
+    assert_eq!(
+        run("x=parent; (x=child; cd /tmp; printf saved > child-file); printf '%s:%s:' \"$x\" \"$PWD\"; cat /tmp/child-file"),
+        (0, "parent:/:saved".into(), String::new())
+    );
+    assert_eq!(
+        run("X=outer; value=$(cd /tmp; X=inner; printf captured); printf '%s:%s:%s\n' \"$X\" \"$PWD\" \"$value\""),
+        (0, "outer:/:captured\n".into(), String::new())
+    );
+    assert_eq!(
+        run("printf value | read piped; echo ${piped-unset}; sh -c 'cd /tmp; X=inner'; printf '%s:%s\n' \"${X-unset}\" \"$PWD\""),
+        (0, "unset\nunset:/\n".into(), String::new())
+    );
+}
+
+#[test]
+fn logical_process_ids_back_jobs_wait_and_ps() {
+    assert_eq!(
+        run("printf '%s:%s:%s\n' \"$$\" \"$BASHPID\" \"$PPID\"; (printf '%s:%s:%s\n' \"$$\" \"$BASHPID\" \"$PPID\")"),
+        (0, "1234:1234:0\n1234:1235:1234\n".into(), String::new())
+    );
+    assert_eq!(
+        run("sleep 0 & printf '%s\n' \"$!\"; jobs -p; wait \"$!\"; jobs -p"),
+        (0, "1235\n1235\n".into(), String::new())
+    );
+    let (status, output, error) = run("(ps -ef)");
+    assert_eq!(status, 0, "{error}");
+    assert!(output.contains(" 1234 "), "{output}");
+    assert!(output.contains(" 1235 "), "{output}");
+}
+
+#[test]
+fn nested_shells_remain_under_outer_timeout() {
+    assert_eq!(
+        run("timeout 1 sh -c 'sleep 2'; echo $?"),
+        (0, "124\n".into(), String::new())
+    );
+}
+
+#[test]
 fn python_repl_persists_and_returns_to_shell() {
     let mut env = Environment::new();
     let (_, entered, _) = env.run_script_capture("python");

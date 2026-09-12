@@ -111,14 +111,10 @@ fn evaluate(args: &[String]) -> ! {
         outcome,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        unsupported: std::mem::take(&mut env.process.unsupported),
-        commands: std::mem::take(&mut env.process.cmd_trace),
-        noop_commands: std::mem::take(&mut env.process.trust_noop)
-            .into_iter()
-            .collect(),
-        partial_commands: std::mem::take(&mut env.process.trust_partial)
-            .into_iter()
-            .collect(),
+        unsupported: std::mem::take(&mut env.unsupported),
+        commands: std::mem::take(&mut env.cmd_trace),
+        noop_commands: std::mem::take(&mut env.trust_noop).into_iter().collect(),
+        partial_commands: std::mem::take(&mut env.trust_partial).into_iter().collect(),
     };
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
     exit(status);

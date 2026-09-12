@@ -75,7 +75,7 @@ fn cmd_jobs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     };
     for job in &interp.jobs {
         if print_pids {
-            wln(io.out, &job.id.to_string());
+            wln(io.out, &job.pid.to_string());
         } else {
             let state = if job.done { "Done" } else { "Running" };
             wln(io.out, &format!("[{}] {state} {}", job.id, job.cmd));
@@ -86,21 +86,35 @@ fn cmd_jobs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
 
 fn cmd_wait(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     if args.is_empty() {
+        let pids = interp.jobs.iter().map(|job| job.pid).collect::<Vec<_>>();
+        interp.jobs.clear();
+        for pid in pids {
+            interp.processes.reap(pid);
+        }
         return 0;
     }
     let mut status = 0;
     for argument in args {
-        let id = argument
+        let parsed = argument
             .strip_prefix('%')
             .unwrap_or(argument)
             .parse::<u32>();
-        let Ok(id) = id else {
+        let Ok(identifier) = parsed else {
             ewln(io.err, &format!("wait: {argument}: invalid job id"));
             status = 127;
             continue;
         };
-        match interp.jobs.iter().find(|job| job.id == id) {
-            Some(job) if job.done => status = job.status,
+        let position = if argument.starts_with('%') {
+            interp.jobs.iter().position(|job| job.id == identifier)
+        } else {
+            interp.jobs.iter().position(|job| job.pid == identifier)
+        };
+        match position {
+            Some(position) if interp.jobs[position].done => {
+                let job = interp.jobs.remove(position);
+                status = job.status;
+                interp.processes.reap(job.pid);
+            }
             Some(_) => {
                 ewln(io.err, &format!("wait: {argument}: job is not complete"));
                 status = 127;

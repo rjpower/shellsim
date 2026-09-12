@@ -44,17 +44,18 @@ fn reserve_memory(interp: &mut Interp, bytes: usize) -> PyResult<()> {
 impl PyFilesystem for Interp {
     fn read_text(&mut self, path: &str) -> PyResult<String> {
         let length = self
-            .vfs
-            .file_len(&self.cwd, path)
+            .fs_file_len(&self.cwd, path)
             .map_err(|error| PyError::runtime_error(error.to_string()))?;
         if length > MAX_TEXT_FILE {
             return Err(PyError::resource_error("text file exceeds the 4 MiB limit"));
         }
         reserve_memory(self, length)?;
         charge_cpu(self, length)?;
-        self.vfs
-            .read_string_limited(&self.cwd, path, MAX_TEXT_FILE)
-            .map_err(|error| PyError::runtime_error(error.to_string()))
+        let bytes = self
+            .fs_read_limited(&self.cwd, path, MAX_TEXT_FILE)
+            .map_err(|error| PyError::runtime_error(error.to_string()))?;
+        String::from_utf8(bytes)
+            .map_err(|_| PyError::runtime_error(format!("file is not UTF-8: {path}")))
     }
 
     fn write_text(&mut self, path: &str, contents: &str) -> PyResult<()> {
@@ -72,8 +73,7 @@ impl PyFilesystem for Interp {
 
     fn read_bytes(&mut self, path: &str) -> PyResult<Vec<u8>> {
         let length = self
-            .vfs
-            .file_len(&self.cwd, path)
+            .fs_file_len(&self.cwd, path)
             .map_err(|error| PyError::runtime_error(error.to_string()))?;
         if length > MAX_TEXT_FILE {
             return Err(PyError::resource_error(
@@ -82,8 +82,7 @@ impl PyFilesystem for Interp {
         }
         reserve_memory(self, length)?;
         charge_cpu(self, length)?;
-        self.vfs
-            .read_limited(&self.cwd, path, MAX_TEXT_FILE)
+        self.fs_read_limited(&self.cwd, path, MAX_TEXT_FILE)
             .map_err(|error| PyError::runtime_error(error.to_string()))
     }
 

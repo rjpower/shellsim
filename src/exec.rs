@@ -85,30 +85,51 @@ pub fn exec(
         }
         Node::Background(a) => {
             let cmd = describe(a);
-            let id = interp.new_job(cmd);
-            // Run synchronously (deterministic); file effects land immediately. `wait` is a no-op.
             let mut bout = Vec::new();
             let mut berr = Vec::new();
-            let s = exec(interp, a, Vec::new(), &mut bout, &mut berr);
-            if let Some(j) = interp.jobs.iter_mut().find(|j| j.id == id) {
-                j.done = true;
-                j.status = s;
+            let Some((s, pid)) = exec_child(
+                interp,
+                a,
+                Vec::new(),
+                &mut bout,
+                &mut berr,
+                ChildExecution {
+                    command: &cmd,
+                    new_shell: false,
+                    retain: true,
+                },
+            ) else {
+                err.extend_from_slice(b"shellsim: unable to create background process\n");
+                return 125;
+            };
+            let Some(id) = interp.new_job(pid, cmd) else {
+                interp.processes.reap(pid);
+                err.extend_from_slice(b"shellsim: job table limit exceeded\n");
+                return 125;
+            };
+            if let Some(job) = interp.jobs.iter_mut().find(|job| job.id == id) {
+                job.done = true;
+                job.status = s;
             }
             out.extend(bout);
             err.extend(berr);
-            interp.set_var("!", id.to_string());
+            interp.set_var("!", pid.to_string());
             0
         }
-        Node::Subshell(a) | Node::Group(a) => {
-            // a real subshell would isolate env; we approximate Group exactly and Subshell
-            // closely enough for file-state tasks (cwd is saved/restored for subshells).
-            let saved_cwd = interp.cwd.clone();
-            let s = exec(interp, a, stdin, out, err);
-            if matches!(node, Node::Subshell(_)) {
-                interp.cwd = saved_cwd;
-            }
-            s
-        }
+        Node::Subshell(a) => exec_child(
+            interp,
+            a,
+            stdin,
+            out,
+            err,
+            ChildExecution {
+                command: "(subshell)",
+                new_shell: false,
+                retain: false,
+            },
+        )
+        .map_or(125, |(status, _)| status),
+        Node::Group(a) => exec(interp, a, stdin, out, err),
         Node::Redirected(inner, redirs) => {
             let mut local_out = Vec::new();
             let mut local_err = Vec::new();
@@ -373,6 +394,9 @@ fn apply_outputs(
     let mut ok = true;
     match &plan.out_dest {
         OutDest::Parent => out.extend_from_slice(local_out),
+        OutDest::File(path, _) if path == "/dev/null" => {}
+        OutDest::File(path, _) if path == "/dev/stdout" => out.extend_from_slice(local_out),
+        OutDest::File(path, _) if path == "/dev/stderr" => err.extend_from_slice(local_out),
         OutDest::File(p, append) => {
             if let Err(error) = write_to(interp, p, local_out, *append) {
                 err.extend_from_slice(format!("shellsim: {p}: {error}\n").as_bytes());
@@ -382,6 +406,9 @@ fn apply_outputs(
     }
     match &plan.err_dest {
         OutDest::Parent => err.extend_from_slice(local_err),
+        OutDest::File(path, _) if path == "/dev/null" => {}
+        OutDest::File(path, _) if path == "/dev/stdout" => out.extend_from_slice(local_err),
+        OutDest::File(path, _) if path == "/dev/stderr" => err.extend_from_slice(local_err),
         OutDest::File(p, append) => {
             if let Err(error) = write_to(interp, p, local_err, *append) {
                 err.extend_from_slice(format!("shellsim: {p}: {error}\n").as_bytes());
@@ -393,12 +420,6 @@ fn apply_outputs(
 }
 
 fn write_to(interp: &mut Interp, path: &str, data: &[u8], append: bool) -> crate::vfs::Result<()> {
-    if path == "/dev/null" {
-        return Ok(());
-    }
-    if path == "/dev/stdout" {
-        return Ok(());
-    }
     interp.sync_vfs_time();
     let cwd = interp.cwd.clone();
     if append {
@@ -770,13 +791,23 @@ fn exec_pipeline(
         let is_last = idx == stages.len() - 1;
         let mut stage_out = Vec::new();
         // stderr of all stages flows to the shared err
-        last_status = exec(
+        let command = describe(stage);
+        let Some((status, _)) = exec_child(
             interp,
             stage,
             std::mem::take(&mut input),
             &mut stage_out,
             err,
-        );
+            ChildExecution {
+                command: &command,
+                new_shell: false,
+                retain: false,
+            },
+        ) else {
+            err.extend_from_slice(b"shellsim: unable to create pipeline process\n");
+            return 125;
+        };
+        last_status = status;
         statuses.push(last_status);
         if is_last {
             out.extend_from_slice(&stage_out);
@@ -793,6 +824,34 @@ fn exec_pipeline(
     } else {
         last_status
     }
+}
+
+/// Lifecycle policy for one synchronous logical child execution.
+pub(crate) struct ChildExecution<'a> {
+    pub command: &'a str,
+    pub new_shell: bool,
+    pub retain: bool,
+}
+
+/// Execute one logical child against shared machine state and restore its parent shell state.
+pub(crate) fn exec_child(
+    interp: &mut Interp,
+    node: &Node,
+    stdin: Vec<u8>,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+    child: ChildExecution<'_>,
+) -> Option<(i32, crate::process::ProcessId)> {
+    let (pid, parent) = match interp.start_child(child.command, child.new_shell) {
+        Ok(child) => child,
+        Err(error) => {
+            err.extend_from_slice(format!("shellsim: {error}\n").as_bytes());
+            return None;
+        }
+    };
+    let status = exec(interp, node, stdin, out, err);
+    interp.finish_child(pid, parent, status, child.retain);
+    Some((status, pid))
 }
 
 fn expand_heredoc(interp: &mut Interp, body: &str) -> String {

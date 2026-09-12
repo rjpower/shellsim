@@ -10,10 +10,11 @@ This document records the September 2026 review and the first implementation tra
 review findings are retained where they explain the roadmap; completion notes identify behavior
 that is now implemented.
 
-The first tranche added typed all-or-nothing shell parse failures with a parser progress invariant,
-made unsupported no-op builtins fail explicitly, exposed already-completed background jobs through
-`jobs` and `wait`, and added bounded VFS-only Git and shell-recipe Make subsets. Process isolation,
-concurrent job execution, pseudo-filesystems, and the workspace protocol remain future work.
+The first tranche added typed all-or-nothing shell parse failures, honest builtin failures, and
+bounded VFS-only Git and shell-recipe Make subsets. The second added bounded logical process
+records, child shell-state isolation, PID-backed jobs and `wait`, dynamic `ps`, and generated
+read-only `/proc` plus finite `/dev` views. Concurrent job execution, descriptor routing, signals,
+and the workspace protocol remain future work.
 
 ## Product boundary
 
@@ -33,13 +34,13 @@ capabilities.
 |---|---|---|
 | Isolation and determinism | Strong | Seccomp is defense in depth, not complete host filesystem confinement |
 | Resource limits | Strong | Some expansion paths still need tighter preallocation bounds |
-| Virtual filesystem | Useful core | No pseudo-filesystems, devices, permission enforcement, or workspace diff |
+| Virtual filesystem | Useful core | First pseudo-files exist; permission enforcement and workspace diff remain |
 | Virtual time | Strong | Background sleeps do not overlap |
 | Virtual network | Useful fixture model | Request routes rather than sockets or running services |
-| Shell grammar | Broad partial subset | Isolation, redirection, and options still have correctness gaps |
+| Shell grammar | Broad partial subset | Redirection, descriptor, and option behavior still has correctness gaps |
 | Commands | Broad surface | Several partial operations or successful no-ops are misleading |
 | Python | Substantial bounded interpreter | Arbitrary projects and third-party ecosystems remain out of scope |
-| Processes and jobs | Minimal | One mutable process, synchronous jobs, and static process reporting |
+| Processes and jobs | Useful synchronous model | Jobs do not overlap and signals are not modeled |
 | Build ecosystem | Useful first slice | Git and Make are deliberately small; native compilation remains out of scope |
 | Harness integration | Early foundation | No persistent machine protocol, workspace export, or trajectory runner |
 | Observability | Good | Compatibility reporting is command-level rather than invocation-level |
@@ -52,12 +53,12 @@ agent cannot safely treat as Bash:
 
 | Probe | Observed behavior | Required behavior |
 |---|---|---|
-| `X=outer; (X=inner); echo "$X"` | prints `inner` | prints `outer` |
-| `printf x \| read X; echo "$X"` | prints `x` | child pipeline state does not leak |
-| `sleep 1 & echo "$!"` | `$!` is not a PID | stable child PID |
+| `X=outer; (X=inner); echo "$X"` | now prints `outer` | preserve child-state isolation |
+| `printf x \| read X; echo "$X"` | pipeline state no longer leaks | preserve per-stage isolation |
+| `sleep 1 & echo "$!"` | now returns a stable logical PID | add overlap only with a bounded scheduler |
 | invoke a VFS executable through `PATH` | command not found | resolve and execute it |
 | incomplete `if` statement | now rejected before execution | keep parser failure all-or-nothing and bounded |
-| `cat /dev/null` | missing file | successful empty read |
+| `cat /dev/null` | now succeeds with an empty read | add descriptor-backed devices separately |
 | `git status` | modeled short/porcelain status | expand the coherent repository subset only as task evidence requires |
 | `make test` | executes explicit shell recipes | add Make syntax deliberately and reject unsupported constructs |
 
@@ -103,11 +104,10 @@ Process
   state: Runnable | Sleeping | Exited(status)
 ```
 
-Creating logical child records immediately provides correct state isolation, `$$`, `$PPID`, `$!`,
-dynamic `ps`, jobs, wait, and an ownership model for exit status. Pipelines may initially retain
-materialized bounded buffers while running each stage in a child snapshot. Cooperative scheduling
-can follow at explicit blocking points such as sleep, pipe I/O, process wait, and virtual service
-operations.
+The synchronous implementation now creates logical children for isolation, `$$`, `BASHPID`,
+`$PPID`, `$!`, dynamic `ps`, jobs, and wait status ownership. Pipelines retain materialized bounded
+buffers while running each stage in a child state. Cooperative scheduling can follow at explicit
+blocking points such as sleep, pipe I/O, process wait, and virtual service operations.
 
 Python `subprocess.run` and `check_output` can eventually execute only registered commands and VFS
 shell or Python scripts. Arbitrary host executables, `preexec_fn`, and native session manipulation
@@ -115,13 +115,14 @@ must remain rejected.
 
 ## Synthetic `/proc` and `/dev`
 
-`/proc` should be a dynamic read-only view of modeled machine state rather than copied host data or
-static VFS files. A useful first slice is `/proc/self`, per-process `status`, `cmdline`, `environ`,
+`/proc` is now a dynamic read-only view of modeled machine state rather than copied host data or
+static VFS files. The first slice provides `/proc/self`, per-process `status`, `cmdline`, `environ`,
 and `cwd`, plus deterministic `uptime`, `meminfo`, `cpuinfo`, `version`, and `mounts`.
 
-Typed pseudo-devices should cover `/dev/null`, `/dev/zero`, `/dev/stdin`, `/dev/stdout`, and
-`/dev/stderr`. A seeded deterministic `/dev/urandom` may be added if task evidence requires it.
-Signals can begin with `INT`, `TERM`, `KILL`, and `HUP`, delivered only at scheduler boundaries.
+The finite pseudo-device slice provides `/dev/null` and standard-descriptor links. Descriptor-backed
+I/O is still required before those links have full read/write semantics. `/dev/zero` and random
+devices require bounded streaming interfaces and are intentionally not exposed through eager file
+reads. Signals can begin with `INT`, `TERM`, `KILL`, and `HUP` at scheduler boundaries.
 
 These views must never proxy the host's `/proc`, devices, processes, or random source.
 

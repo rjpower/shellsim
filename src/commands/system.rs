@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use crate::commands::util::{ewln, wln};
 use crate::commands::{reg, CommandContext, CommandSpec, Io, Trust};
+use crate::process::ProcessStatus;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["env"], Trust::Real, cmd_env);
@@ -281,9 +282,64 @@ fn cmd_free(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     0
 }
 
-fn cmd_ps(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
-    wln(io.out, "    PID TTY          TIME CMD");
-    wln(io.out, "   1234 pts/0    00:00:00 bash");
+fn cmd_ps(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let aux = args == ["aux"];
+    let flags_valid = args.iter().all(|argument| {
+        argument.starts_with('-') && argument[1..].chars().all(|flag| matches!(flag, 'e' | 'f'))
+    });
+    if !args.is_empty() && !aux && !flags_valid {
+        ewln(
+            io.err,
+            "ps: only ps, ps -e/-f/-ef, and ps aux are supported",
+        );
+        return 2;
+    }
+    let full = !aux && args.iter().any(|argument| argument.contains('f'));
+    let pid = interp.pid;
+    let cwd = interp.cwd.clone();
+    let environment = interp.child_env().into_iter().collect();
+    interp.processes.update_current(pid, &cwd, environment);
+    if aux {
+        wln(
+            io.out,
+            "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND",
+        );
+    } else if full {
+        wln(
+            io.out,
+            "UID          PID    PPID  C STIME TTY          TIME CMD",
+        );
+    } else {
+        wln(io.out, "    PID TTY          TIME CMD");
+    }
+    for process in interp.processes.iter() {
+        let state = match process.status {
+            ProcessStatus::Running => "R",
+            ProcessStatus::Exited(_) => "Z",
+        };
+        if aux {
+            wln(
+                io.out,
+                &format!(
+                    "root      {:>5}  0.0  0.0      0     0 ?        {state:<4} 00:00   0:00 {}",
+                    process.pid, process.command
+                ),
+            );
+        } else if full {
+            wln(
+                io.out,
+                &format!(
+                    "root       {:>5} {:>7}  0 00:00 ?        00:00:00 {}",
+                    process.pid, process.ppid, process.command
+                ),
+            );
+        } else {
+            wln(
+                io.out,
+                &format!("{:>7} ?        00:00:00 {}", process.pid, process.command),
+            );
+        }
+    }
     0
 }
 

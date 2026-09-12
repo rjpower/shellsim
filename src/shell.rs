@@ -87,6 +87,100 @@ pub enum Node {
     Empty,
 }
 
+impl Node {
+    /// Estimate owned bytes copied when a shell process forks its function table.
+    ///
+    /// The estimate is deliberately conservative and saturating. It is used only to reject or
+    /// meter a child-state clone before performing host allocations.
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        const NODE_OVERHEAD: u64 = std::mem::size_of::<Node>() as u64;
+        let strings = |values: &[String]| {
+            values.iter().fold(0_u64, |total, value| {
+                total.saturating_add(value.len() as u64).saturating_add(24)
+            })
+        };
+        let redirects = |values: &[Redirect]| {
+            values.iter().fold(0_u64, |total, value| {
+                total
+                    .saturating_add(value.target.len() as u64)
+                    .saturating_add(std::mem::size_of::<Redirect>() as u64)
+            })
+        };
+        NODE_OVERHEAD.saturating_add(match self {
+            Self::Command {
+                assigns,
+                words,
+                redirects: redirections,
+            } => assigns
+                .iter()
+                .fold(strings(words), |total, (name, value)| {
+                    total
+                        .saturating_add(name.len() as u64)
+                        .saturating_add(value.len() as u64)
+                        .saturating_add(48)
+                })
+                .saturating_add(redirects(redirections)),
+            Self::Pipeline(nodes) | Self::Seq(nodes) => nodes.iter().fold(0, |total, node| {
+                total.saturating_add(node.estimated_bytes())
+            }),
+            Self::And(left, right) | Self::Or(left, right) => left
+                .estimated_bytes()
+                .saturating_add(right.estimated_bytes()),
+            Self::Background(node) | Self::Subshell(node) | Self::Group(node) | Self::Not(node) => {
+                node.estimated_bytes()
+            }
+            Self::If {
+                cond,
+                then,
+                elifs,
+                els,
+            } => elifs
+                .iter()
+                .fold(
+                    cond.estimated_bytes()
+                        .saturating_add(then.estimated_bytes()),
+                    |total, (condition, body)| {
+                        total
+                            .saturating_add(condition.estimated_bytes())
+                            .saturating_add(body.estimated_bytes())
+                    },
+                )
+                .saturating_add(els.as_deref().map_or(0, Self::estimated_bytes)),
+            Self::For { var, words, body } => (var.len() as u64)
+                .saturating_add(strings(words))
+                .saturating_add(body.estimated_bytes()),
+            Self::CFor {
+                init,
+                cond,
+                update,
+                body,
+            } => (init.len() as u64)
+                .saturating_add(cond.len() as u64)
+                .saturating_add(update.len() as u64)
+                .saturating_add(body.estimated_bytes()),
+            Self::While { cond, body, .. } => cond
+                .estimated_bytes()
+                .saturating_add(body.estimated_bytes()),
+            Self::Case { word, arms } => {
+                arms.iter()
+                    .fold(word.len() as u64, |total, (patterns, body)| {
+                        total
+                            .saturating_add(strings(patterns))
+                            .saturating_add(body.estimated_bytes())
+                    })
+            }
+            Self::FuncDef { name, body } => {
+                (name.len() as u64).saturating_add(body.estimated_bytes())
+            }
+            Self::Arithmetic(expression) => expression.len() as u64,
+            Self::Redirected(node, redirections) => node
+                .estimated_bytes()
+                .saturating_add(redirects(redirections)),
+            Self::Empty => 0,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Redirect {
     pub fd: i32, // 0 stdin, 1 stdout, 2 stderr
