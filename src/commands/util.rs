@@ -250,34 +250,46 @@ pub fn resolve_executable(interp: &Interp, name: &str) -> ExecutableLookup {
 }
 
 /// Run a previously resolved executable script from the VFS.
-pub fn try_exec_script(
+pub(crate) fn try_exec_script(
     interp: &mut Interp,
     path: &str,
     args: &[String],
     stdin: &[u8],
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
-) -> Option<i32> {
+    resumable: bool,
+) -> Option<crate::commands::CommandPoll> {
     let data = interp.vfs.read("/", path).ok()?;
     let text = String::from_utf8_lossy(&data);
-    let saved_pos = std::mem::replace(&mut interp.positional, args.to_vec());
     let first = text.lines().next().unwrap_or("");
     let code = if first.starts_with("#!") && first.contains("python") {
         // python script
         let mut a = vec!["python3.14".to_string(), path.to_string()];
         a.extend(args.iter().cloned());
-        crate::python::run_python(interp, &a, stdin.to_vec(), out, err)
+        crate::commands::CommandPoll::Ready(crate::python::run_python(
+            interp,
+            &a,
+            stdin.to_vec(),
+            out,
+            err,
+        ))
     } else if !first.starts_with("#!")
         || first.split_whitespace().next().is_some_and(|interpreter| {
             matches!(interpreter, "#!/bin/sh" | "#!/bin/bash" | "#!/usr/bin/bash")
         })
     {
-        interp.run_script_into(&text, out, err)
+        if resumable {
+            super::proc::start_shell_source(interp, &text, args.to_vec(), Some(stdin.to_vec()), err)
+        } else {
+            let saved_pos = std::mem::replace(&mut interp.positional, args.to_vec());
+            let status = interp.run_script_into(&text, out, err);
+            interp.positional = saved_pos;
+            crate::commands::CommandPoll::Ready(status)
+        }
     } else {
         ewln(err, &format!("{path}: unsupported script interpreter"));
-        126
+        crate::commands::CommandPoll::Ready(126)
     };
-    interp.positional = saved_pos;
     Some(code)
 }
 

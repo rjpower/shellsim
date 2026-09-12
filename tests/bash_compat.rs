@@ -57,6 +57,14 @@ fn path_resolves_only_executable_vfs_scripts() {
         "{}",
         interpreter.2
     );
+    assert_eq!(
+        run("mkdir /tools; printf '%s\n' '#!/bin/sh' 'sleep 2' 'cat /tmp/ready' > /tools/yielding; chmod +x /tools/yielding; (sleep 1; printf scheduled > /tmp/ready) & PATH=/tools yielding; wait"),
+        (0, "scheduled".into(), String::new())
+    );
+    assert_eq!(
+        run("mkdir /tools; printf '%s\n' '#!/bin/sh' 'cat' > /tools/read-input; chmod +x /tools/read-input; printf piped | PATH=/tools read-input"),
+        (0, "piped".into(), String::new())
+    );
 }
 
 #[test]

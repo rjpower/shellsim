@@ -408,8 +408,10 @@ fn dispatch(
     interp.sync_vfs_time();
     match util::resolve_executable(interp, requested) {
         util::ExecutableLookup::Found(path) => {
-            if let Some(code) = util::try_exec_script(interp, &path, args, &stdin, out, err) {
-                return CommandPoll::Ready(code);
+            if let Some(result) =
+                util::try_exec_script(interp, &path, args, &stdin, out, err, resumable)
+            {
+                return result;
             }
         }
         util::ExecutableLookup::NotExecutable(path) => {

@@ -325,6 +325,17 @@ fn start_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> Co
     let Some((source, positional)) = shell_invocation(interp, args, io) else {
         return CommandPoll::Ready(127);
     };
+    start_shell_source(interp, &source, positional, None, io.err)
+}
+
+/// Parse and launch one shell source as a scheduler-owned child.
+pub(crate) fn start_shell_source(
+    interp: &mut Interp,
+    source: &str,
+    positional: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    err: &mut Vec<u8>,
+) -> CommandPoll {
     let parser_memory = 8 * 1024 + (source.len() as u64).saturating_mul(2);
     if !interp.resources.reserve_memory(parser_memory) {
         return CommandPoll::Ready(
@@ -335,7 +346,7 @@ fn start_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> Co
         );
     }
     let parsed = if interp.resources.charge_cpu(source.len() as u64) {
-        crate::shell::parse(&source).map_err(|error| error.to_string())
+        crate::shell::parse(source).map_err(|error| error.to_string())
     } else {
         Err("resource limit exceeded".to_string())
     };
@@ -343,17 +354,35 @@ fn start_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> Co
     let ast = match parsed {
         Ok(ast) => ast,
         Err(error) => {
-            ewln(io.err, &format!("shellsim: syntax error: {error}"));
+            ewln(err, &format!("shellsim: syntax error: {error}"));
             return CommandPoll::Ready(2);
         }
+    };
+    let input = match stdin {
+        Some(stdin) => match interp.descriptors.open_input(stdin) {
+            Ok(input) => Some(input),
+            Err(error) => {
+                ewln(err, &format!("bash: unable to prepare stdin: {error:?}"));
+                return CommandPoll::Ready(125);
+            }
+        },
+        None => None,
     };
     let pid = match interp.start_child("bash", true) {
         Ok(pid) => pid,
         Err(error) => {
-            ewln(io.err, &format!("bash: {error}"));
+            if let Some(input) = input {
+                let _ = interp.descriptors.discard_unreferenced(input);
+            }
+            ewln(err, &format!("bash: {error}"));
             return CommandPoll::Ready(125);
         }
     };
+    if let Some(input) = input {
+        interp
+            .install_process_description(pid, 0, input)
+            .expect("new child process must accept a valid stdin description");
+    }
     interp
         .set_process_positional(pid, positional)
         .expect("new child process state must retain positional arguments");
