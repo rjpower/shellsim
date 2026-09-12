@@ -4,6 +4,7 @@ use crate::interp::Interp;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -255,7 +256,19 @@ struct Vm<'a> {
     interactive: bool,
     out: Out<'a>,
     err: Out<'a>,
+    execution: VmState,
+}
+
+/// State that must survive when bytecode execution yields to the process scheduler.
+///
+/// Keeping this state independent from the VM's temporary borrows is the first half of making a
+/// Python process resumable. `Interp`, output descriptors, and the persistent Python heap are
+/// borrowed only while a scheduler quantum is being polled; operand and semantic stacks belong to
+/// the process continuation.
+#[derive(Default)]
+struct VmState {
     stack: Vec<Value>,
+    bytecode_frames: Vec<BytecodeFrame>,
     local_scopes: Vec<ScopeId>,
     class_scopes: Vec<ScopeId>,
     class_bindings: Vec<Vec<String>>,
@@ -264,6 +277,27 @@ struct Vm<'a> {
     exception_stack: Vec<RaisedException>,
     with_contexts: Vec<Value>,
     method_frames: Vec<(super::heap::ObjectId, Value)>,
+}
+
+/// An executing code object's resumable control state.
+struct BytecodeFrame {
+    code: Code,
+    instruction_pointer: usize,
+    handlers: Vec<(usize, usize)>,
+}
+
+impl Deref for Vm<'_> {
+    type Target = VmState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.execution
+    }
+}
+
+impl DerefMut for Vm<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.execution
+    }
 }
 
 impl<'a> Vm<'a> {
@@ -282,15 +316,7 @@ impl<'a> Vm<'a> {
             interactive,
             out,
             err,
-            stack: Vec::new(),
-            local_scopes: Vec::new(),
-            class_scopes: Vec::new(),
-            class_bindings: Vec::new(),
-            call_depth: 0,
-            pending_exception: None,
-            exception_stack: Vec::new(),
-            with_contexts: Vec::new(),
-            method_frames: Vec::new(),
+            execution: VmState::default(),
         }
     }
 
@@ -336,14 +362,39 @@ impl<'a> Vm<'a> {
     fn execute_code_from(
         &mut self,
         code: &Code,
-        mut instruction_pointer: usize,
+        instruction_pointer: usize,
         handlers: &mut Vec<(usize, usize)>,
     ) -> Result<Execution, (String, super::source::Span)> {
+        self.bytecode_frames.push(BytecodeFrame {
+            code: code.clone(),
+            instruction_pointer,
+            handlers: std::mem::take(handlers),
+        });
+        let result = self.execute_active_frame();
+        let frame = self
+            .bytecode_frames
+            .pop()
+            .expect("active bytecode frame must remain installed");
+        *handlers = frame.handlers;
+        result
+    }
+
+    fn execute_active_frame(&mut self) -> Result<Execution, (String, super::source::Span)> {
         loop {
             if self.interp.deadline_interrupt.is_some() {
                 return Ok(Execution::Exit(124));
             }
-            let Some(instruction) = code.instructions.get(instruction_pointer) else {
+            let instruction_pointer = self
+                .bytecode_frames
+                .last()
+                .expect("bytecode execution requires an active frame")
+                .instruction_pointer;
+            let Some(instruction) = self
+                .bytecode_frames
+                .last()
+                .and_then(|frame| frame.code.instructions.get(instruction_pointer))
+                .cloned()
+            else {
                 return Err((
                     "instruction pointer left the code object".into(),
                     super::source::Span::default(),
@@ -412,7 +463,7 @@ impl<'a> Vm<'a> {
                 Operation::ForIterator(target) => match self.for_iterator() {
                     Ok(true) => Ok(()),
                     Ok(false) => {
-                        instruction_pointer = *target;
+                        self.active_frame_mut().instruction_pointer = *target;
                         continue;
                     }
                     Err(error) => Err(error),
@@ -440,12 +491,12 @@ impl<'a> Vm<'a> {
                 Operation::Swap(depth) => self.swap(*depth),
                 Operation::PopTop => self.pop().map(|_| ()),
                 Operation::Jump(target) => {
-                    instruction_pointer = *target;
+                    self.active_frame_mut().instruction_pointer = *target;
                     continue;
                 }
                 Operation::JumpIfFalseOrPop(target) => match self.jump_if_or_pop(false) {
                     Ok(true) => {
-                        instruction_pointer = *target;
+                        self.active_frame_mut().instruction_pointer = *target;
                         continue;
                     }
                     Ok(false) => Ok(()),
@@ -453,7 +504,7 @@ impl<'a> Vm<'a> {
                 },
                 Operation::JumpIfTrueOrPop(target) => match self.jump_if_or_pop(true) {
                     Ok(true) => {
-                        instruction_pointer = *target;
+                        self.active_frame_mut().instruction_pointer = *target;
                         continue;
                     }
                     Ok(false) => Ok(()),
@@ -465,7 +516,7 @@ impl<'a> Vm<'a> {
                         .truth_value(&value)
                         .map_err(|error| (error, instruction.span))?
                     {
-                        instruction_pointer = *target;
+                        self.active_frame_mut().instruction_pointer = *target;
                         continue;
                     }
                     Ok(())
@@ -505,11 +556,13 @@ impl<'a> Vm<'a> {
                     }
                 }
                 Operation::TryBegin(target) => {
-                    handlers.push((*target, self.stack.len()));
+                    let depth = self.stack.len();
+                    self.active_frame_mut().handlers.push((*target, depth));
                     Ok(())
                 }
                 Operation::TryEnd => {
-                    handlers
+                    self.active_frame_mut()
+                        .handlers
                         .pop()
                         .ok_or("invalid bytecode exception handler")
                         .map_err(|e| (e.to_string(), instruction.span))?;
@@ -664,28 +717,35 @@ impl<'a> Vm<'a> {
             };
             if let Err(error) = result {
                 if let Some(exception) = self.pending_exception.take() {
-                    if let Some((target, depth)) = handlers.pop() {
+                    if let Some((target, depth)) = self.active_frame_mut().handlers.pop() {
                         self.stack.truncate(depth);
                         self.stack.push(exception.value);
                         self.exception_stack.push(exception);
-                        instruction_pointer = target;
+                        self.active_frame_mut().instruction_pointer = target;
                         continue;
                     }
                     self.pending_exception = Some(exception);
                 }
                 return Err((error, instruction.span));
             }
-            instruction_pointer += 1;
+            self.active_frame_mut().instruction_pointer += 1;
         }
+    }
+
+    fn active_frame_mut(&mut self) -> &mut BytecodeFrame {
+        self.bytecode_frames
+            .last_mut()
+            .expect("bytecode execution requires an active frame")
     }
 
     fn load_name(&mut self, name: &str) -> Result<(), String> {
         if name == "__class__" {
-            let (class, _) = self
+            let class = self
                 .method_frames
                 .last()
+                .map(|(class, _)| *class)
                 .ok_or("__class__ is only defined inside a class method body")?;
-            self.stack.push(Value::Object(*class));
+            self.stack.push(Value::Object(class));
             return Ok(());
         }
         let local_scope = self.local_scopes.last().copied();
@@ -1477,7 +1537,8 @@ impl<'a> Vm<'a> {
         if self.stack.len() < default_count {
             return Err("invalid bytecode stack effect while creating function".into());
         }
-        let defaults = self.stack.split_off(self.stack.len() - default_count);
+        let defaults_start = self.stack.len() - default_count;
+        let defaults = self.stack.split_off(defaults_start);
         let mut closure = self.local_scopes.last().copied();
         if closure.is_some() && closure == self.class_scopes.last().copied() {
             closure = self
@@ -1514,7 +1575,8 @@ impl<'a> Vm<'a> {
             return Err("invalid bytecode stack effect while creating class".into());
         }
         let explicit_metaclass = has_metaclass.then(|| self.stack.pop().expect("checked above"));
-        let bases = self.stack.split_off(self.stack.len() - base_count);
+        let bases_start = self.stack.len() - base_count;
+        let bases = self.stack.split_off(bases_start);
         let is_enum =
             bases.len() == 1 && matches!(bases[0].native_value(), Some(NativeValue::EnumBase));
         let is_unittest =
@@ -3123,7 +3185,8 @@ impl<'a> Vm<'a> {
         if self.stack.len() < count + 1 {
             return Err("invalid bytecode stack effect".into());
         }
-        let mut raw_arguments = self.stack.split_off(self.stack.len() - count);
+        let arguments_start = self.stack.len() - count;
+        let mut raw_arguments = self.stack.split_off(arguments_start);
         let keyword_values = raw_arguments.split_off(positional);
         if starred[..positional].iter().any(|expanded| *expanded)
             && keyword_names
@@ -4316,14 +4379,16 @@ impl<'a> Vm<'a> {
         if self.stack.len() < count {
             return Err("invalid bytecode stack effect".into());
         }
-        Ok(self.stack.split_off(self.stack.len() - count))
+        let start = self.stack.len() - count;
+        Ok(self.stack.split_off(start))
     }
 
     fn copy(&mut self, depth: usize) -> Result<(), String> {
         if depth == 0 || depth > self.stack.len() {
             return Err("invalid bytecode copy depth".into());
         }
-        self.stack.push(self.stack[self.stack.len() - depth]);
+        let value = self.stack[self.stack.len() - depth];
+        self.stack.push(value);
         Ok(())
     }
 

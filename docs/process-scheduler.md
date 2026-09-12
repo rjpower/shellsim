@@ -147,8 +147,12 @@ tasks. The next executor change must move Python bytecode state, operand stacks,
 and user-function call frames out of temporary Rust borrows and into an owned continuation. Native
 modeled operations can then return the same typed ready/block/switch result as shell frames.
 
-The shell-side recursive child adapters are removed from normal execution. Phase completion now
-requires the owned Python continuation and deletion of the synchronous Python VM entry path. Deep
+The shell-side recursive child adapters are removed from normal execution. Python operand,
+scope, exception, context-manager, and method state is now separated from the VM's temporary
+environment borrows, and executing code objects own their code, instruction pointer, and handler
+stack in explicit bytecode frames. User-function dispatch still enters those owned frames through
+recursive Rust calls. Phase completion therefore requires making that frame stack iterative,
+retaining it on the process continuation, and deleting the synchronous Python VM entry path. Deep
 or adversarial input must remain bounded independently of the host stack.
 
 ## Phase 4: deterministic scheduler and pipes
