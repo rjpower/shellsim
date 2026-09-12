@@ -196,6 +196,8 @@ pub(super) struct PyProcessStartRequest {
     pub stdin: PyStdio,
     pub stdout: PyStdio,
     pub stderr: PyStdio,
+    /// Establish the child as leader of a new modeled process group.
+    pub start_new_session: bool,
 }
 
 /// Stable logical child identity returned by a live launch.

@@ -74,6 +74,8 @@ pub struct ProcessState {
     pub pid: ProcessId,
     /// PID of the logical parent process.
     pub ppid: ProcessId,
+    /// Process group inherited across ordinary forks or established by a group leader.
+    pub process_group: ProcessId,
     /// PID expanded by `$$`; preserved across Bash subshells.
     pub shell_pid: ProcessId,
     /// shell + environment variables (we don't distinguish exported vs not for simplicity,
@@ -224,6 +226,7 @@ impl ProcessState {
     fn fork_for_child(
         &self,
         pid: ProcessId,
+        process_group: ProcessId,
         new_shell: bool,
         fds: FdTable,
         fork_allocation_bytes: u64,
@@ -232,6 +235,7 @@ impl ProcessState {
         Self {
             pid,
             ppid: self.pid,
+            process_group,
             shell_pid: if new_shell { pid } else { self.shell_pid },
             vars: self.vars.clone(),
             arrays: self.arrays.clone(),
@@ -389,6 +393,7 @@ impl Environment {
             process: ProcessStates::new(ProcessState {
                 pid: ROOT_PID,
                 ppid: 0,
+                process_group: ROOT_PID,
                 shell_pid: ROOT_PID,
                 vars,
                 arrays: HashMap::new(),
@@ -440,7 +445,7 @@ impl Environment {
         command: &str,
         new_shell: bool,
     ) -> Result<ProcessId, String> {
-        self.create_child(command, new_shell, true, false)
+        self.create_child(command, new_shell, true, false, false)
     }
 
     /// Create a runnable child without blocking or switching away from the active parent.
@@ -449,7 +454,7 @@ impl Environment {
         command: &str,
         new_shell: bool,
     ) -> Result<ProcessId, String> {
-        self.create_child(command, new_shell, false, true)
+        self.create_child(command, new_shell, false, true, true)
     }
 
     /// Create a runnable pipeline stage whose descriptors are connected before dispatch.
@@ -458,7 +463,7 @@ impl Environment {
         command: &str,
         new_shell: bool,
     ) -> Result<ProcessId, String> {
-        self.create_child(command, new_shell, false, false)
+        self.create_child(command, new_shell, false, false, false)
     }
 
     /// Create a parent-managed live child for a language-level process handle.
@@ -466,8 +471,9 @@ impl Environment {
         &mut self,
         command: &str,
         new_shell: bool,
+        new_process_group: bool,
     ) -> Result<ProcessId, String> {
-        self.create_child(command, new_shell, false, false)
+        self.create_child(command, new_shell, false, false, new_process_group)
     }
 
     fn create_child(
@@ -476,6 +482,7 @@ impl Environment {
         new_shell: bool,
         foreground: bool,
         detached_output: bool,
+        new_process_group: bool,
     ) -> Result<ProcessId, String> {
         let fork_bytes = self.process.fork_memory_bytes();
         if fork_bytes > MAX_FORK_STATE_BYTES {
@@ -495,10 +502,14 @@ impl Environment {
         };
         self.processes
             .update_current(self.process.pid, &self.process.cwd, environment.clone());
-        let Some(pid) =
-            self.processes
-                .spawn(self.process.pid, command, &self.process.cwd, environment)
-        else {
+        let inherited_group = (!new_process_group).then_some(self.process.process_group);
+        let Some(pid) = self.processes.spawn(
+            self.process.pid,
+            inherited_group,
+            command,
+            &self.process.cwd,
+            environment,
+        ) else {
             child_fds.close_all(&mut self.descriptors);
             self.resources.release_memory(allocation_bytes);
             return Err("logical process limit exceeded".to_string());
@@ -525,6 +536,11 @@ impl Environment {
         }
         let child = self.process.fork_for_child(
             pid,
+            if new_process_group {
+                pid
+            } else {
+                self.process.process_group
+            },
             new_shell,
             child_fds,
             allocation_bytes,
@@ -676,6 +692,7 @@ impl Environment {
         let scheduled = self.scheduler.dispatch().ok().flatten();
         let removed = self.process.remove(pid);
         debug_assert!(removed.is_some(), "finished child state must exist");
+        let parent_retained = self.process.states.contains_key(&parent_pid);
         if let Some(parent) = self.process.states.get_mut(&parent_pid) {
             if let Some(job) = parent.jobs.iter_mut().find(|job| job.pid == pid) {
                 job.done = true;
@@ -690,6 +707,10 @@ impl Environment {
             self.process
                 .activate(scheduled)
                 .expect("scheduled process state must exist");
+        }
+        if !parent_retained && !self.live_children.contains_key(&pid) {
+            self.processes.reap(pid);
+            let _ = self.scheduler.reap(pid);
         }
         self.resources.release_memory(fork_allocation_bytes);
     }
@@ -717,6 +738,22 @@ impl Environment {
             self.scheduler
                 .wake(pid)
                 .map_err(|error| format!("unable to wake process {pid}: {error:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// Queue a signal for every running member of one modeled process group.
+    pub(crate) fn send_signal_group(
+        &mut self,
+        process_group: ProcessId,
+        signal: Signal,
+    ) -> Result<(), String> {
+        let members = self.processes.running_group(process_group);
+        if members.is_empty() {
+            return Err(format!("process group {process_group} does not exist"));
+        }
+        for pid in members {
+            self.send_signal(pid, signal)?;
         }
         Ok(())
     }

@@ -163,6 +163,21 @@ fn kill_queues_signals_for_jobs_and_supports_existence_probes() {
 }
 
 #[test]
+fn job_signals_reach_the_background_process_group() {
+    let mut env = Environment::new();
+    let result = run(
+        &mut env,
+        "(sleep 10) & sleep 1; kill -0 -- -$!; kill -TERM %1; wait %1; echo status:$?",
+    );
+    assert_eq!(result, (0, "status:143\n".into(), String::new()));
+    let retained = env.processes.iter().cloned().collect::<Vec<_>>();
+    assert!(
+        retained.iter().all(|process| process.pid == 1_234),
+        "{retained:?}"
+    );
+}
+
+#[test]
 fn a_signal_to_the_persistent_shell_terminates_the_session() {
     let mut env = Environment::new();
     let result = run(&mut env, "kill -HUP $$; echo unreachable");

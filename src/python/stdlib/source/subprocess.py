@@ -195,14 +195,16 @@ class Popen:
             raise ValueError("executable is not supported by shellsim subprocess")
         if preexec_fn is not None or startupinfo is not None or creationflags != 0:
             raise ValueError("host process setup options are not supported by shellsim")
-        if start_new_session or pass_fds != () or user is not None or group is not None:
+        if pass_fds != () or user is not None or group is not None:
             raise ValueError("process identity/session options are not supported by shellsim")
         if extra_groups is not None or umask != -1 or process_group is not None:
             raise ValueError("process identity/session options are not supported by shellsim")
         self._text = bool(text) or bool(universal_newlines) or encoding is not None
         self.encoding = encoding
         self.errors = errors
-        self._handle = _shellsim_subprocess.start(args, cwd, env, stdin, stdout, stderr)
+        self._handle = _shellsim_subprocess.start(
+            args, cwd, env, stdin, stdout, stderr, bool(start_new_session)
+        )
         self.pid = self._handle
         self.returncode = None
         self.stdin = _Pipe(self, 0, False) if stdin == PIPE else None

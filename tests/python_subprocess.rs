@@ -208,6 +208,27 @@ print(process.wait(), time.monotonic())
 }
 
 #[test]
+fn popen_start_new_session_creates_a_modeled_process_group() {
+    let mut environment = Environment::new();
+    let result = run(
+        &mut environment,
+        r#"
+import subprocess
+process = subprocess.Popen(
+    ["sh", "-c", "cat /proc/self/status"],
+    stdout=subprocess.PIPE,
+    text=True,
+    start_new_session=True,
+)
+stdout, stderr = process.communicate()
+group = [line for line in stdout.split("\n") if line.startswith("NSpgid:")][0]
+print(process.pid, group)
+"#,
+    );
+    assert_eq!(result, (0, "1235 NSpgid:\t1235\n".into(), String::new()));
+}
+
+#[test]
 fn communicate_retry_preserves_partial_input_progress() {
     let mut environment = Environment::new();
     let result = run(
@@ -305,7 +326,13 @@ fn logical_process_exhaustion_fails_before_command_execution() {
     for index in 1..MAX_PROCESSES {
         environment
             .processes
-            .spawn(1_234, &format!("occupied-{index}"), "/", Default::default())
+            .spawn(
+                1_234,
+                Some(1_234),
+                &format!("occupied-{index}"),
+                "/",
+                Default::default(),
+            )
             .expect("fill logical process table");
     }
     let result = run(

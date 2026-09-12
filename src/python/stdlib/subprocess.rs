@@ -77,7 +77,7 @@ fn timeout_expired(runtime: &mut dyn PyRuntime) -> PyResult {
 }
 
 fn start(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("_shellsim_subprocess.start", 6, 6)?;
+    args.expect_positional("_shellsim_subprocess.start", 7, 7)?;
     args.reject_keywords("_shellsim_subprocess.start")?;
     let values = args.positional();
     let request = PyProcessStartRequest {
@@ -87,6 +87,9 @@ fn start(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         stdin: stdio(runtime, values[3], false)?,
         stdout: stdio(runtime, values[4], false)?,
         stderr: stdio(runtime, values[5], true)?,
+        start_new_session: values[6]
+            .bool_value()
+            .ok_or_else(|| PyError::type_error("start_new_session must be a bool"))?,
     };
     let handle = runtime.processes().start(request)?;
     Ok(PyValue::Int(i64::from(handle.pid)))

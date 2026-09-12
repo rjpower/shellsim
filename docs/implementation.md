@@ -31,7 +31,9 @@ jobs, sleeps, waits, subshells, and pipeline stages suspend and resume through t
 scheduler. Pipeline bytes flow through bounded descriptor-backed pipes. VFS, clocks, virtual
 network, resources, package markers, and telemetry remain machine-wide, so local process mutation
 does not leak while filesystem effects remain visible. Exited background records remain until
-`wait` reaps them. Command substitutions, nested shells and scripts, Make recipes, `env`, `xargs`,
+`wait` reaps them. Background jobs lead modeled process groups, ordinary descendants inherit group
+identity, and group signals are delivered at scheduler boundaries. Command substitutions, nested
+shells and scripts, Make recipes, `env`, `xargs`,
 `timeout`, and the `command` builtin all use retained continuations or scheduled argv children.
 Python commands retain compiled code, VM state, output, and top-level bytecode frames in command
 continuations and yield after bounded instruction quanta. Ordinary bytecode user-function calls

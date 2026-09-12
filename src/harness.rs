@@ -118,6 +118,7 @@ pub struct InspectResult {
 pub struct ProcessView {
     pub pid: u32,
     pub ppid: u32,
+    pub process_group: u32,
     pub command: String,
     pub cwd: String,
     pub status: ProcessViewStatus,
@@ -386,6 +387,7 @@ fn process_view(record: &ProcessRecord) -> ProcessView {
     ProcessView {
         pid: record.pid,
         ppid: record.ppid,
+        process_group: record.process_group,
         command: record.command.clone(),
         cwd: record.cwd.clone(),
         status: match record.status {

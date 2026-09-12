@@ -29,7 +29,7 @@ pub(super) fn start(
     let owner = interp.process.pid;
     let command = request.argv.join(" ");
     let pid = interp
-        .start_live_child(&command, true)
+        .start_live_child(&command, true, request.start_new_session)
         .map_err(PyError::resource_error)?;
     let mut endpoints = FdTable::new();
     let setup = (|| -> Result<(), String> {

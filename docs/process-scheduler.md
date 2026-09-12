@@ -197,8 +197,10 @@ future work.
 logical child state. `stdin`, `stdout`, and `stderr` expose small binary/text file-like facades.
 `communicate` drains both outputs while supplying input, and retains its write cursor across a
 timeout so retry cannot duplicate input. Unsupported host setup and session options fail before
-launch. Full process groups, custom signal handlers, and resumable compound native callbacks are
-outside this baseline.
+launch. Background jobs are process-group leaders, descendants inherit group identity, job and
+negative-PGID signals target all running members, and `Popen(start_new_session=True)` establishes a
+new modeled group. Terminal foreground-group control, arbitrary `setpgid`, custom signal handlers,
+and resumable compound native callbacks remain outside this baseline.
 
 ## Phase 6: agent command fidelity
 

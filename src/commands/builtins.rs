@@ -126,20 +126,21 @@ fn cmd_kill(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     }
     let mut status = 0;
     for target in targets {
-        let Some(pid) = resolve_kill_target(interp, &target) else {
+        let Some(resolved) = resolve_kill_target(interp, &target) else {
             ewln(io.err, &format!("kill: {target}: no such process or job"));
             status = 1;
             continue;
         };
         if let Some(signal) = signal {
-            if let Err(error) = interp.send_signal(pid, signal) {
+            let result = match resolved {
+                KillTarget::Process(pid) => interp.send_signal(pid, signal),
+                KillTarget::Group(process_group) => interp.send_signal_group(process_group, signal),
+            };
+            if let Err(error) = result {
                 ewln(io.err, &format!("kill: {target}: {error}"));
                 status = 1;
             }
-        } else if !matches!(
-            interp.processes.get(pid).map(|record| record.status),
-            Some(crate::process::ProcessStatus::Running)
-        ) {
+        } else if !kill_target_exists(interp, resolved) {
             ewln(io.err, &format!("kill: {target}: no such process"));
             status = 1;
         }
@@ -157,17 +158,40 @@ fn parse_signal(value: &str) -> Result<Option<crate::process::Signal>, String> {
     }
 }
 
-fn resolve_kill_target(interp: &CommandContext<'_>, target: &str) -> Option<u32> {
+#[derive(Clone, Copy)]
+enum KillTarget {
+    Process(u32),
+    Group(u32),
+}
+
+fn resolve_kill_target(interp: &CommandContext<'_>, target: &str) -> Option<KillTarget> {
     if let Some(job) = target.strip_prefix('%') {
         let id = job.parse::<u32>().ok()?;
         interp
             .jobs
             .iter()
             .find(|job| job.id == id)
-            .map(|job| job.pid)
+            .map(|job| KillTarget::Group(job.pid))
+    } else if target == "0" {
+        Some(KillTarget::Group(interp.process.process_group))
+    } else if let Some(group) = target.strip_prefix('-') {
+        let process_group = group.parse::<u32>().ok()?;
+        (process_group != 0).then_some(KillTarget::Group(process_group))
     } else {
         let pid = target.parse::<u32>().ok()?;
-        (pid != 0).then_some(pid)
+        (pid != 0).then_some(KillTarget::Process(pid))
+    }
+}
+
+fn kill_target_exists(interp: &CommandContext<'_>, target: KillTarget) -> bool {
+    match target {
+        KillTarget::Process(pid) => matches!(
+            interp.processes.get(pid).map(|record| record.status),
+            Some(crate::process::ProcessStatus::Running)
+        ),
+        KillTarget::Group(process_group) => {
+            !interp.processes.running_group(process_group).is_empty()
+        }
     }
 }
 

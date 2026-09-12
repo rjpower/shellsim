@@ -179,8 +179,8 @@ fn lookup(env: &Environment, cwd: &str, path: &str, follow_self: bool) -> Option
             let exit = status.map_or(String::new(), |status| format!("ExitCode:\t{status}\n"));
             Some(PseudoNode::File(
                 format!(
-                    "Name:\t{}\nState:\t{state}\nPid:\t{}\nPPid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n{exit}",
-                    process.command, process.pid, process.ppid,
+                    "Name:\t{}\nState:\t{state}\nPid:\t{}\nPPid:\t{}\nNSpgid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n{exit}",
+                    process.command, process.pid, process.ppid, process.process_group,
                 )
                 .into_bytes(),
             ))

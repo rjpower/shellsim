@@ -85,6 +85,8 @@ pub enum ProcessStatus {
 pub struct ProcessRecord {
     pub pid: ProcessId,
     pub ppid: ProcessId,
+    /// Process-group identity used for job-wide signal delivery.
+    pub process_group: ProcessId,
     pub command: String,
     pub cwd: String,
     /// Exported environment captured at creation or the latest inspection point.
@@ -140,6 +142,7 @@ impl ProcessTable {
             ProcessRecord {
                 pid: root_pid,
                 ppid: 0,
+                process_group: root_pid,
                 command: "bash".to_string(),
                 cwd,
                 environment,
@@ -157,6 +160,7 @@ impl ProcessTable {
     pub fn spawn(
         &mut self,
         ppid: ProcessId,
+        process_group: Option<ProcessId>,
         command: &str,
         cwd: &str,
         environment: BTreeMap<String, String>,
@@ -171,6 +175,7 @@ impl ProcessTable {
             ProcessRecord {
                 pid,
                 ppid,
+                process_group: process_group.unwrap_or(pid),
                 command: command.to_string(),
                 cwd: cwd.to_string(),
                 environment,
@@ -217,6 +222,17 @@ impl ProcessTable {
     /// Iterate records in stable PID order.
     pub fn iter(&self) -> impl Iterator<Item = &ProcessRecord> {
         self.records.values()
+    }
+
+    /// Return running members of one process group in stable PID order.
+    pub fn running_group(&self, process_group: ProcessId) -> Vec<ProcessId> {
+        self.records
+            .values()
+            .filter(|record| {
+                record.process_group == process_group && record.status == ProcessStatus::Running
+            })
+            .map(|record| record.pid)
+            .collect()
     }
 
     /// Return one process tree in stable PID order, including `root` when it is retained.
@@ -267,10 +283,11 @@ mod tests {
     fn pids_are_stable_and_exited_children_are_reapable() {
         let mut table = ProcessTable::new(1_000, "/".to_string(), BTreeMap::new());
         let child = table
-            .spawn(1_000, "worker", "/work", BTreeMap::new())
+            .spawn(1_000, Some(1_000), "worker", "/work", BTreeMap::new())
             .unwrap();
         assert_eq!(child, 1_001);
         assert_eq!(table.get(child).unwrap().ppid, 1_000);
+        assert_eq!(table.get(child).unwrap().process_group, 1_000);
         table.exit(child, 7, "/tmp");
         assert_eq!(table.get(child).unwrap().status, ProcessStatus::Exited(7));
         assert_eq!(table.reap(child).unwrap().cwd, "/tmp");
@@ -282,15 +299,31 @@ mod tests {
         let mut table = ProcessTable::new(1_000, "/".to_string(), BTreeMap::new());
         let mut last = 1_000;
         for _ in 1..MAX_PROCESSES {
-            last = table.spawn(1_000, "worker", "/", BTreeMap::new()).unwrap();
+            last = table
+                .spawn(1_000, Some(1_000), "worker", "/", BTreeMap::new())
+                .unwrap();
         }
         assert!(table
-            .spawn(1_000, "overflow", "/", BTreeMap::new())
+            .spawn(1_000, Some(1_000), "overflow", "/", BTreeMap::new())
             .is_none());
         table.exit(last, 0, "/");
         table.reap(last).unwrap();
         assert!(table
-            .spawn(1_000, "replacement", "/", BTreeMap::new())
+            .spawn(1_000, None, "replacement", "/", BTreeMap::new())
             .is_some());
+    }
+
+    #[test]
+    fn new_groups_use_the_child_pid_and_are_queryable() {
+        let mut table = ProcessTable::new(1_000, "/".to_string(), BTreeMap::new());
+        let leader = table
+            .spawn(1_000, None, "leader", "/", BTreeMap::new())
+            .unwrap();
+        let member = table
+            .spawn(leader, Some(leader), "member", "/", BTreeMap::new())
+            .unwrap();
+        assert_eq!(table.running_group(leader), vec![leader, member]);
+        table.exit(leader, 0, "/");
+        assert_eq!(table.running_group(leader), vec![member]);
     }
 }
