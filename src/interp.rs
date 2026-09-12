@@ -7,6 +7,7 @@ use crate::clock::{Clock, EventId};
 use crate::net::VirtualNet;
 use crate::process::{ProcessId, ProcessTable};
 use crate::resources::{Limits, Resources, RunOutcome};
+use crate::scheduler::{Scheduler, WaitReason};
 use crate::vfs::Vfs;
 
 /// A bash array value. Indexed arrays are sparse (`arr[5]=x` on an empty array is legal),
@@ -42,6 +43,8 @@ pub struct Environment {
     pub resources: Resources,
     /// Machine-wide logical process identities and retained child statuses.
     pub processes: ProcessTable,
+    /// Deterministic runnable/blocked lifecycle for logical process execution.
+    pub scheduler: Scheduler,
     pub process: ProcessState,
     next_temp_id: u64,
     /// Trace of every external command name executed.
@@ -244,6 +247,7 @@ impl Environment {
             net: VirtualNet::new(),
             resources: Resources::new(limits),
             processes: ProcessTable::new(ROOT_PID, "/".to_string(), process_environment),
+            scheduler: Scheduler::new(ROOT_PID),
             process: ProcessState {
                 pid: ROOT_PID,
                 ppid: 0,
@@ -311,6 +315,28 @@ impl Environment {
             self.resources.restore_memory(memory_mark);
             return Err("logical process limit exceeded".to_string());
         };
+        if let Err(error) = self.scheduler.block_current(WaitReason::Child(pid)) {
+            self.processes.exit(pid, 125, &self.process.cwd);
+            self.processes.reap(pid);
+            self.resources.restore_memory(memory_mark);
+            return Err(format!("unable to suspend parent process: {error:?}"));
+        }
+        if let Err(error) = self.scheduler.spawn(pid) {
+            let _ = self.scheduler.wake(self.process.pid);
+            let _ = self.scheduler.dispatch();
+            self.processes.exit(pid, 125, &self.process.cwd);
+            self.processes.reap(pid);
+            self.resources.restore_memory(memory_mark);
+            return Err(format!("unable to schedule child process: {error:?}"));
+        }
+        match self.scheduler.dispatch() {
+            Ok(Some(scheduled)) if scheduled == pid => {}
+            result => {
+                self.processes.exit(pid, 125, &self.process.cwd);
+                self.resources.restore_memory(memory_mark);
+                return Err(format!("unexpected child dispatch result: {result:?}"));
+            }
+        }
         let child = self.process.fork_for_child(pid, new_shell);
         let state = std::mem::replace(&mut self.process, child);
         Ok((pid, ParentProcess { state, memory_mark }))
@@ -326,8 +352,12 @@ impl Environment {
     ) {
         let child_deadline_interrupt = self.process.deadline_interrupt;
         self.processes.exit(pid, status, &self.process.cwd);
+        let _ = self.scheduler.exit_current(status);
+        let _ = self.scheduler.wake(parent.state.pid);
+        let _ = self.scheduler.dispatch();
         if !retain {
             self.processes.reap(pid);
+            let _ = self.scheduler.reap(pid);
         }
         self.process = parent.state;
         if child_deadline_interrupt.is_some() {

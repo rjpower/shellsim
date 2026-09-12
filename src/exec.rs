@@ -104,6 +104,7 @@ pub fn exec(
             };
             let Some(id) = interp.new_job(pid, cmd) else {
                 interp.processes.reap(pid);
+                let _ = interp.scheduler.reap(pid);
                 err.extend_from_slice(b"shellsim: job table limit exceeded\n");
                 return 125;
             };

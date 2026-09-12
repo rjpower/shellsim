@@ -12,6 +12,7 @@
 
 pub mod clock;
 pub mod commands;
+pub mod descriptors;
 pub mod exec;
 pub mod expand;
 pub mod hashes;
@@ -24,6 +25,7 @@ pub mod pseudo_fs;
 pub mod python;
 pub mod resources;
 pub mod sandbox;
+pub mod scheduler;
 pub mod shell;
 pub mod vfs;
 

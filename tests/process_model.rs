@@ -3,7 +3,7 @@
 //! The suite checks observable shell behavior and directly verifies that generated `/proc` state
 //! neither enters nor mutates the persistent VFS.
 
-use shellsim::{Environment, Limits, StopReason};
+use shellsim::{scheduler::TaskState, Environment, Limits, StopReason};
 
 fn run(env: &mut Environment, source: &str) -> (i32, String, String) {
     let (outcome, stdout, stderr) = env.run_script_capture(source);
@@ -32,6 +32,16 @@ fn proc_self_describes_the_active_logical_shell() {
 }
 
 #[test]
+fn proc_reports_a_parent_blocked_while_its_child_runs() {
+    let mut env = Environment::new();
+    let status = run(&mut env, "(cat /proc/1234/status)");
+    assert_eq!(status.0, 0, "{}", status.2);
+    assert!(status.1.contains("State:\tS (sleeping)"), "{}", status.1);
+    assert_eq!(env.scheduler.current(), Some(1_234));
+    assert_eq!(env.scheduler.state(1_234), Some(TaskState::Running));
+}
+
+#[test]
 fn proc_environment_is_exported_sorted_and_nul_delimited() {
     let mut env = Environment::new();
     assert_eq!(run(&mut env, "LOCAL=hidden; export PUBLIC=shown").0, 0);
@@ -53,8 +63,11 @@ fn exited_background_process_exists_until_wait_reaps_it() {
     let status = String::from_utf8(status).unwrap();
     assert!(status.contains("State:\tZ (zombie)"), "{status}");
     assert!(status.contains("ExitCode:\t1"), "{status}");
+    assert_eq!(env.scheduler.state(1_235), Some(TaskState::Exited(1)));
+    assert_eq!(env.scheduler.current(), Some(1_234));
     assert_eq!(run(&mut env, "wait 1235").0, 1);
     assert!(env.fs_read("/", "/proc/1235/status").is_err());
+    assert_eq!(env.scheduler.state(1_235), None);
 }
 
 #[test]

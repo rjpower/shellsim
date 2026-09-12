@@ -7,6 +7,7 @@
 
 use crate::interp::Environment;
 use crate::process::ProcessStatus;
+use crate::scheduler::TaskState;
 use crate::vfs::{resolve_against, Node, NodeKind, VfsError};
 
 enum PseudoNode {
@@ -150,9 +151,14 @@ fn lookup(env: &Environment, cwd: &str, path: &str, follow_self: bool) -> Option
             Some(PseudoNode::File(value))
         }
         "status" => {
-            let (state, status) = match process.status {
-                ProcessStatus::Running => ("R (running)", None),
-                ProcessStatus::Exited(status) => ("Z (zombie)", Some(status)),
+            let task_state = env.scheduler.state(pid);
+            let (state, status) = match (process.status, task_state) {
+                (ProcessStatus::Exited(status), _) | (_, Some(TaskState::Exited(status))) => {
+                    ("Z (zombie)", Some(status))
+                }
+                (_, Some(TaskState::Blocked(_))) => ("S (sleeping)", None),
+                (_, Some(TaskState::Runnable | TaskState::Running))
+                | (ProcessStatus::Running, None) => ("R (running)", None),
             };
             let exit = status.map_or(String::new(), |status| format!("ExitCode:\t{status}\n"));
             Some(PseudoNode::File(

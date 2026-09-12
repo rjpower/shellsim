@@ -90,6 +90,7 @@ fn cmd_wait(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         interp.jobs.clear();
         for pid in pids {
             interp.processes.reap(pid);
+            let _ = interp.scheduler.reap(pid);
         }
         return 0;
     }
@@ -114,6 +115,7 @@ fn cmd_wait(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                 let job = interp.jobs.remove(position);
                 status = job.status;
                 interp.processes.reap(job.pid);
+                let _ = interp.scheduler.reap(job.pid);
             }
             Some(_) => {
                 ewln(io.err, &format!("wait: {argument}: job is not complete"));
