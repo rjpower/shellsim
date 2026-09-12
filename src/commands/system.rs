@@ -1,14 +1,17 @@
 //! Small system-introspection commands. Their answers describe the simulated environment rather
 //! than the host running shellsim.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::commands::util::{ewln, wln};
-use crate::commands::{reg, CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{
+    reg, reg_buffered_resumable, ChildCommand, CommandContext, CommandPoll, CommandSpec, Io, Trust,
+};
+use crate::interp::Interp;
 use crate::process::ProcessStatus;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    reg(m, &["env"], Trust::Real, cmd_env);
+    reg_buffered_resumable(m, &["env"], Trust::Real, cmd_env, start_env);
     reg(m, &["printenv"], Trust::Real, cmd_printenv);
     reg(m, &["envsubst"], Trust::Partial, cmd_envsubst);
     reg(m, &["uname"], Trust::Real, cmd_uname);
@@ -25,60 +28,125 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
 }
 
 fn cmd_env(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let action = match parse_env_action(interp, args) {
+        Ok(action) => action,
+        Err(error) => {
+            ewln(io.err, &format!("env: {error}"));
+            return 125;
+        }
+    };
     let saved_vars = interp.vars.clone();
     let saved_arrays = interp.arrays.clone();
     let saved_exported = interp.exported.clone();
     let saved_cwd = interp.cwd.clone();
-    let mut clear = false;
-    let mut unset = Vec::new();
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-i" | "--ignore-environment" => clear = true,
-            "-u" | "--unset" => {
-                i += 1;
-                if let Some(name) = args.get(i) {
-                    unset.push(name.clone());
-                }
-            }
-            arg if arg.starts_with('-') => {}
-            _ => break,
-        }
-        i += 1;
-    }
-    if clear {
-        interp.vars.clear();
-        interp.exported.clear();
-    }
-    for name in unset {
-        interp.vars.remove(&name);
-        interp.exported.remove(&name);
-    }
-    while let Some(arg) = args.get(i) {
-        let Some((name, value)) = arg.split_once('=') else {
-            break;
-        };
-        interp.set_var(name, value);
-        interp.export(name);
-        i += 1;
+    interp.vars = action.environment.clone().into_iter().collect();
+    interp.arrays.clear();
+    interp.exported = action.environment.keys().cloned().collect();
+    if let Some(cwd) = &action.cwd {
+        interp.cwd = cwd.clone();
     }
 
-    let status = if i == args.len() {
-        let mut entries = interp.child_env().into_iter().collect::<Vec<_>>();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, value) in entries {
+    let status = if action.argv.is_empty() {
+        for (name, value) in &action.environment {
             wln(io.out, &format!("{name}={value}"));
         }
         0
     } else {
-        let argv = args[i..].to_vec();
-        crate::commands::run(interp, &argv, io.stdin.clone(), io.out, io.err)
+        crate::commands::run(interp, &action.argv, io.stdin.clone(), io.out, io.err)
     };
     interp.vars = saved_vars;
     interp.arrays = saved_arrays;
     interp.exported = saved_exported;
     interp.cwd = saved_cwd;
     status
+}
+
+fn start_env(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let action = match parse_env_action(interp, args) {
+        Ok(action) => action,
+        Err(error) => {
+            ewln(io.err, &format!("env: {error}"));
+            return CommandPoll::Ready(125);
+        }
+    };
+    if action.argv.is_empty() {
+        for (name, value) in action.environment {
+            wln(io.out, &format!("{name}={value}"));
+        }
+        return CommandPoll::Ready(0);
+    }
+    crate::commands::start_child_sequence(
+        interp,
+        vec![ChildCommand {
+            argv: action.argv,
+            stdin: std::mem::take(&mut io.stdin),
+            cwd: action.cwd,
+            environment: Some(action.environment),
+        }],
+        true,
+    )
+}
+
+struct EnvAction {
+    environment: BTreeMap<String, String>,
+    cwd: Option<String>,
+    argv: Vec<String>,
+}
+
+fn parse_env_action(interp: &Interp, args: &[String]) -> Result<EnvAction, String> {
+    let mut environment = interp.child_env().into_iter().collect::<BTreeMap<_, _>>();
+    let mut cwd = None;
+    let mut index = 0;
+    let mut options = true;
+    while options && index < args.len() {
+        match args[index].as_str() {
+            "--" => {
+                options = false;
+                index += 1;
+            }
+            "-i" | "--ignore-environment" => {
+                environment.clear();
+                index += 1;
+            }
+            "-u" | "--unset" => {
+                let name = args
+                    .get(index + 1)
+                    .ok_or_else(|| "option requires an argument -- 'u'".to_string())?;
+                environment.remove(name);
+                index += 2;
+            }
+            "-C" | "--chdir" => {
+                let directory = args
+                    .get(index + 1)
+                    .ok_or_else(|| "option requires an argument -- 'C'".to_string())?;
+                let resolved = crate::vfs::resolve_against(&interp.cwd, directory);
+                if !interp.vfs.is_dir("/", &resolved) {
+                    return Err(format!("cannot change directory to '{directory}'"));
+                }
+                cwd = Some(interp.vfs.realpath(&resolved, true).unwrap_or(resolved));
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unrecognized option '{option}'"));
+            }
+            _ => options = false,
+        }
+    }
+    while let Some(argument) = args.get(index) {
+        let Some((name, value)) = argument.split_once('=') else {
+            break;
+        };
+        if name.is_empty() || name.contains('=') {
+            break;
+        }
+        environment.insert(name.to_string(), value.to_string());
+        index += 1;
+    }
+    Ok(EnvAction {
+        environment,
+        cwd,
+        argv: args[index..].to_vec(),
+    })
 }
 
 fn cmd_printenv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

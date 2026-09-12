@@ -58,8 +58,10 @@ and switch through the scheduler without a nested Rust executor call. Python sub
 use live handles and the scheduler rather than the removed synchronous runner, but the calling VM
 remains on the Rust stack while the scheduler runs child quanta. Command substitution is now part
 of the retained shell continuation and preserves its capture and child identity across timer and
-descriptor waits. VFS Python shebang execution, Make recipes, Python bytecode, and synchronous
-native command-to-command adapters such as `xargs`, `env`, and `timeout` keep phase 3 incomplete.
+descriptor waits. Native command adapters can now launch a typed sequence of scheduler-owned argv
+children; `env` uses it with an isolated launch environment and `xargs` uses it for ordered
+invocations. VFS Python shebang execution, Make recipes, Python bytecode, and remaining synchronous
+adapters such as `timeout` and the `command` builtin keep phase 3 incomplete.
 
 ## Non-negotiable invariants
 

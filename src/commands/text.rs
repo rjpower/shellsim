@@ -5,11 +5,11 @@
 use std::collections::HashMap;
 
 use crate::commands::util::{ewln, lines_of, read_inputs, split_flags, w, wln};
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{ChildCommand, CommandContext, CommandPoll, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
+    use super::{reg, reg_buffered_resumable};
     reg(m, &["cat"], Trust::Real, cmd_cat);
     reg(m, &["tac"], Trust::Real, cmd_tac);
     reg(m, &["tee"], Trust::Real, cmd_tee);
@@ -35,7 +35,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
         Trust::Partial,
         cmd_passthrough,
     );
-    reg(m, &["xargs"], Trust::Real, cmd_xargs);
+    reg_buffered_resumable(m, &["xargs"], Trust::Real, cmd_xargs, start_xargs);
     reg(m, &["comm"], Trust::Real, cmd_comm);
     reg(m, &["diff"], Trust::Partial, cmd_diff);
     reg(m, &["cmp"], Trust::Real, cmd_cmp);
@@ -503,49 +503,114 @@ fn cmd_passthrough(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io
 }
 
 fn cmd_xargs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    // xargs [-n N] [-I {}] cmd... : run cmd with stdin tokens appended
+    let commands = match xargs_commands(args, &io.stdin, io.err) {
+        Ok(commands) => commands,
+        Err(status) => return status,
+    };
+    let mut status = 0;
+    for argv in commands {
+        status = crate::commands::run(interp, &argv, Vec::new(), io.out, io.err);
+    }
+    status
+}
+
+fn start_xargs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let commands = match xargs_commands(args, &io.stdin, io.err) {
+        Ok(commands) => commands,
+        Err(status) => return CommandPoll::Ready(status),
+    };
+    crate::commands::start_child_sequence(
+        interp,
+        commands
+            .into_iter()
+            .map(|argv| ChildCommand {
+                argv,
+                stdin: Vec::new(),
+                cwd: None,
+                environment: None,
+            })
+            .collect(),
+        false,
+    )
+}
+
+fn xargs_commands(
+    args: &[String],
+    stdin: &[u8],
+    err: &mut Vec<u8>,
+) -> Result<Vec<Vec<String>>, i32> {
     let mut i = 0;
     let mut replace: Option<String> = None;
     let mut nper: Option<usize> = None;
+    let mut nul_delimited = false;
     while i < args.len() {
         match args[i].as_str() {
             "-I" => {
-                replace = args.get(i + 1).cloned();
+                let Some(value) = args.get(i + 1) else {
+                    ewln(err, "xargs: option requires an argument -- 'I'");
+                    return Err(1);
+                };
+                replace = Some(value.clone());
                 i += 2;
             }
             "-n" => {
-                nper = args.get(i + 1).and_then(|s| s.parse().ok());
+                let Some(value) = args.get(i + 1).and_then(|s| s.parse().ok()) else {
+                    ewln(err, "xargs: invalid number for -n");
+                    return Err(1);
+                };
+                if value == 0 {
+                    ewln(err, "xargs: -n requires a positive number");
+                    return Err(1);
+                }
+                nper = Some(value);
                 i += 2;
             }
-            "-0" | "-r" => {
+            "-0" => {
+                nul_delimited = true;
                 i += 1;
+            }
+            "-r" | "--no-run-if-empty" => i += 1,
+            "--" => {
+                i += 1;
+                break;
+            }
+            option if option.starts_with('-') => {
+                ewln(err, &format!("xargs: unsupported option '{option}'"));
+                return Err(1);
             }
             _ => break,
         }
     }
     let cmd: Vec<String> = args[i..].to_vec();
     if cmd.is_empty() {
-        return 0;
+        ewln(err, "xargs: missing command");
+        return Err(1);
     }
-    let tokens: Vec<String> = String::from_utf8_lossy(&io.stdin)
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect();
-    let mut status = 0;
+    let input = String::from_utf8_lossy(stdin);
+    let tokens: Vec<String> = if nul_delimited {
+        input
+            .split('\0')
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        input.split_whitespace().map(str::to_string).collect()
+    };
+    let mut commands = Vec::new();
     if let Some(ph) = replace {
-        for t in &tokens {
-            let argv: Vec<String> = cmd.iter().map(|c| c.replace(&ph, t)).collect();
-            status = crate::commands::run(interp, &argv, Vec::new(), io.out, io.err);
+        for token in &tokens {
+            let argv: Vec<String> = cmd.iter().map(|c| c.replace(&ph, token)).collect();
+            commands.push(argv);
         }
     } else {
         let chunk = nper.unwrap_or(tokens.len().max(1));
         for batch in tokens.chunks(chunk.max(1)) {
             let mut argv = cmd.clone();
             argv.extend(batch.iter().cloned());
-            status = crate::commands::run(interp, &argv, Vec::new(), io.out, io.err);
+            commands.push(argv);
         }
     }
-    status
+    Ok(commands)
 }
 
 fn cmd_comm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

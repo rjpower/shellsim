@@ -71,6 +71,20 @@ pub(crate) enum CommandResume {
         status: i32,
         explicit: bool,
     },
+    ChildSequence {
+        pid: crate::process::ProcessId,
+        remaining: std::collections::VecDeque<ChildCommand>,
+        status: i32,
+        stop_on_error: bool,
+    },
+}
+
+/// One scheduler-owned argv invocation requested by a modeled native command.
+pub(crate) struct ChildCommand {
+    pub argv: Vec<String>,
+    pub stdin: Vec<u8>,
+    pub cwd: Option<String>,
+    pub environment: Option<std::collections::BTreeMap<String, String>>,
 }
 
 type ResumableCmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> CommandPoll;
@@ -122,6 +136,7 @@ pub enum Trust {
 pub struct CommandSpec {
     pub run: CmdFn,
     resume: Option<ResumableCmdFn>,
+    resume_before_input: bool,
     pub trust: Trust,
     pub base_cpu: u64,
     pub base_memory: u64,
@@ -153,6 +168,7 @@ fn reg_costed(
             CommandSpec {
                 run: f,
                 resume: None,
+                resume_before_input: false,
                 trust: t,
                 base_cpu,
                 base_memory,
@@ -176,11 +192,28 @@ fn reg_resumable(
             CommandSpec {
                 run,
                 resume: Some(resume),
+                resume_before_input: true,
                 trust,
                 base_cpu: 100,
                 base_memory: 10 * 1024,
             },
         );
+    }
+}
+
+/// Register a resumable command whose continuation needs the command's complete bounded input.
+fn reg_buffered_resumable(
+    map: &mut HashMap<&'static str, CommandSpec>,
+    names: &[&'static str],
+    trust: Trust,
+    run: CmdFn,
+    resume: ResumableCmdFn,
+) {
+    reg_resumable(map, names, trust, run, resume);
+    for name in names {
+        map.get_mut(name)
+            .expect("newly registered command must exist")
+            .resume_before_input = false;
     }
 }
 
@@ -246,7 +279,7 @@ pub(crate) fn poll(
 
 /// Whether the command has a continuation-aware entry point that does not consume standard
 /// input before it can suspend.
-pub(crate) fn is_resumable(argv: &[String]) -> bool {
+pub(crate) fn starts_before_input(argv: &[String]) -> bool {
     if argv.len() == 1
         && argv
             .first()
@@ -258,7 +291,7 @@ pub(crate) fn is_resumable(argv: &[String]) -> bool {
         let command = standard_utility_name(requested).unwrap_or(requested);
         registry()
             .get(command)
-            .is_some_and(|spec| spec.resume.is_some())
+            .is_some_and(|spec| spec.resume.is_some() && spec.resume_before_input)
     })
 }
 
@@ -310,7 +343,93 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
             }
             CommandPoll::Ready(status)
         }
+        CommandResume::ChildSequence {
+            pid,
+            mut remaining,
+            mut status,
+            stop_on_error,
+        } => match interp.processes.get(pid).map(|record| record.status) {
+            Some(crate::process::ProcessStatus::Exited(child_status)) => {
+                interp.processes.reap(pid);
+                let _ = interp.scheduler.reap(pid);
+                status = child_status;
+                if stop_on_error && status != 0 {
+                    CommandPoll::Ready(status)
+                } else if let Some(command) = remaining.pop_front() {
+                    start_child_sequence_item(interp, command, remaining, status, stop_on_error)
+                } else {
+                    CommandPoll::Ready(status)
+                }
+            }
+            _ => CommandPoll::Blocked(
+                WaitReason::Child(pid),
+                CommandResume::ChildSequence {
+                    pid,
+                    remaining,
+                    status,
+                    stop_on_error,
+                },
+            ),
+        },
     }
+}
+
+/// Launch argv invocations sequentially as ordinary scheduler-owned logical children.
+pub(crate) fn start_child_sequence(
+    interp: &mut Interp,
+    commands: Vec<ChildCommand>,
+    stop_on_error: bool,
+) -> CommandPoll {
+    let mut commands = std::collections::VecDeque::from(commands);
+    let Some(command) = commands.pop_front() else {
+        return CommandPoll::Ready(0);
+    };
+    start_child_sequence_item(interp, command, commands, 0, stop_on_error)
+}
+
+fn start_child_sequence_item(
+    interp: &mut Interp,
+    command: ChildCommand,
+    remaining: std::collections::VecDeque<ChildCommand>,
+    status: i32,
+    stop_on_error: bool,
+) -> CommandPoll {
+    if command.argv.is_empty() {
+        return CommandPoll::Ready(status);
+    }
+    let input = match interp.descriptors.open_input(command.stdin) {
+        Ok(input) => input,
+        Err(_) => return CommandPoll::Ready(125),
+    };
+    let display = command.argv.join(" ");
+    let pid = match interp.start_child(&display, true) {
+        Ok(pid) => pid,
+        Err(_) => {
+            let _ = interp.descriptors.discard_unreferenced(input);
+            return CommandPoll::Ready(125);
+        }
+    };
+    interp
+        .install_process_description(pid, 0, input)
+        .expect("new child process must accept prepared standard input");
+    interp
+        .configure_process(pid, command.cwd, command.environment)
+        .expect("new child process must accept its launch configuration");
+    interp
+        .process
+        .set_continuation(
+            pid,
+            Some(crate::exec::ShellContinuation::new(
+                &crate::shell::Node::ArgvCommand(command.argv),
+            )),
+        )
+        .expect("new child process must accept an argv continuation");
+    CommandPoll::Switched(CommandResume::ChildSequence {
+        pid,
+        remaining,
+        status,
+        stop_on_error,
+    })
 }
 
 fn dispatch(

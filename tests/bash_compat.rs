@@ -280,6 +280,22 @@ fn command_substitutions_use_scheduled_captured_children() {
 }
 
 #[test]
+fn native_command_adapters_launch_scheduled_children() {
+    assert_eq!(
+        run("(sleep 1; printf ready > /tmp/marker) & env TEST=child bash -c 'sleep 2; cat /tmp/marker; printf :$TEST'; printf ':%s' \"${TEST:-}\"; wait"),
+        (0, "ready:child:".into(), String::new())
+    );
+    assert_eq!(
+        run("(sleep 1; printf ready > /tmp/marker) & printf 'one\\ntwo\\n' | xargs -n 1 sh -c 'sleep 2; printf \"<$1>:\"; cat /tmp/marker' _; wait"),
+        (0, "<one>:ready<two>:ready".into(), String::new())
+    );
+    assert_eq!(
+        run("printf 'a\\0b c\\0' | xargs -0 -n 1 printf '<%s>'"),
+        (0, "<a><b c>".into(), String::new())
+    );
+}
+
+#[test]
 fn python_repl_persists_and_returns_to_shell() {
     let mut env = Environment::new();
     let (_, entered, _) = env.run_script_capture("python");
