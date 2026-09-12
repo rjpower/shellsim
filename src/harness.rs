@@ -11,6 +11,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use crate::net::NetworkRequest;
 use crate::process::{ProcessRecord, ProcessStatus};
 use crate::vfs::{Node, NodeKind, Vfs};
 use crate::{Environment, Limits, RunOutcome};
@@ -91,6 +92,8 @@ pub struct ExecuteResult {
     pub unsupported: Vec<String>,
     pub noop_commands: Vec<String>,
     pub partial_commands: Vec<String>,
+    pub network_requests: Vec<NetworkRequest>,
+    pub dropped_network_requests: u64,
 }
 
 /// Exact VFS file bytes and metadata.
@@ -107,6 +110,8 @@ pub struct InspectResult {
     pub cwd: String,
     pub outcome: RunOutcome,
     pub processes: Vec<ProcessView>,
+    pub network_requests: Vec<NetworkRequest>,
+    pub dropped_network_requests: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,6 +278,8 @@ impl HarnessSession {
         let unsupported_start = self.environment.unsupported.len();
         let noop_before = self.environment.trust_noop.clone();
         let partial_before = self.environment.trust_partial.clone();
+        let network_start = self.environment.net.log.len();
+        let dropped_network_start = self.environment.net.dropped_requests;
         let (outcome, stdout, stderr) = self
             .environment
             .run_script_capture_with_stdin(source, stdin);
@@ -294,6 +301,12 @@ impl HarnessSession {
                 .difference(&partial_before)
                 .cloned()
                 .collect(),
+            network_requests: self.environment.net.log[network_start..].to_vec(),
+            dropped_network_requests: self
+                .environment
+                .net
+                .dropped_requests
+                .saturating_sub(dropped_network_start),
         }))
     }
 
@@ -338,6 +351,8 @@ impl HarnessSession {
                 .iter()
                 .map(process_view)
                 .collect(),
+            network_requests: self.environment.net.log.clone(),
+            dropped_network_requests: self.environment.net.dropped_requests,
         }
     }
 

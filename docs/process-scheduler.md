@@ -198,8 +198,9 @@ are bounded; the line-oriented exchange is directly replayable. The Codex or Cla
 outside the simulation and receives only these tools.
 
 Bounded transactional host-directory ingestion is shared by `serve --root` and
-`shellsim-python`. Network-request reporting, scenario manifests, transcript persistence,
-cloning, and concrete model-client adapters remain before this phase is complete.
+`shellsim-python`. Per-action and retained virtual-network request reporting is also present.
+Scenario manifests, transcript persistence, cloning, and concrete model-client adapters remain
+before this phase is complete.
 
 ## Validation milestones
 

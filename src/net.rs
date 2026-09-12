@@ -8,6 +8,23 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
+
+/// Maximum retained request records. Further attempts are counted without growing memory.
+pub const MAX_REQUEST_LOG: usize = 4_096;
+const MAX_REQUEST_FIELD_BYTES: usize = 8 * 1024;
+
+/// One deterministic virtual-network attempt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NetworkRequest {
+    /// Bounded HTTP method supplied by the simulated command.
+    pub method: String,
+    /// Bounded URL supplied by the simulated command.
+    pub url: String,
+    /// Whether the request resolved to a configured virtual route.
+    pub matched: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct HttpResponse {
     pub status: u16,
@@ -53,7 +70,9 @@ pub struct Route {
 pub struct VirtualNet {
     routes: Vec<Route>,
     /// request log for debugging / reward shaping
-    pub log: Vec<(String, String)>,
+    pub log: Vec<NetworkRequest>,
+    /// Attempts omitted after [`MAX_REQUEST_LOG`] records were retained.
+    pub dropped_requests: u64,
     /// arbitrary host:port "services" that tests may probe (registered as up/down)
     pub listening: HashMap<String, bool>,
 }
@@ -95,19 +114,38 @@ impl VirtualNet {
     /// Match a request. Returns the matching route's static parts; VfsFile bodies must be
     /// resolved by the caller against the VFS.
     pub fn resolve(&mut self, method: &str, url: &str) -> Option<Route> {
-        self.log.push((method.to_string(), url.to_string()));
-        for r in &self.routes {
+        let route = self.routes.iter().find(|r| {
             if let Some(m) = &r.method {
                 if !m.eq_ignore_ascii_case(method) {
-                    continue;
+                    return false;
                 }
             }
-            if pattern_matches(&r.pattern, url) {
-                return Some(r.clone());
-            }
+            pattern_matches(&r.pattern, url)
+        });
+        if self.log.len() < MAX_REQUEST_LOG {
+            self.log.push(NetworkRequest {
+                method: bounded_field(method),
+                url: bounded_field(url),
+                matched: route.is_some(),
+            });
+        } else {
+            self.dropped_requests = self.dropped_requests.saturating_add(1);
         }
-        None
+        route.cloned()
     }
+}
+
+fn bounded_field(value: &str) -> String {
+    if value.len() <= MAX_REQUEST_FIELD_BYTES {
+        return value.to_string();
+    }
+    value
+        .chars()
+        .scan(0usize, |bytes, character| {
+            *bytes = bytes.saturating_add(character.len_utf8());
+            (*bytes <= MAX_REQUEST_FIELD_BYTES).then_some(character)
+        })
+        .collect()
 }
 
 /// Very small glob matcher: `*` matches any run of characters. Anchored at both ends.
@@ -162,5 +200,19 @@ mod tests {
         let r = net.resolve("GET", "https://example.com/data.json").unwrap();
         assert_eq!(r.status, 200);
         assert!(net.resolve("GET", "https://nope.com").is_none());
+        assert!(net.log[0].matched);
+        assert!(!net.log[1].matched);
+    }
+
+    #[test]
+    fn request_log_is_bounded_and_counts_overflow() {
+        let mut net = VirtualNet::new();
+        for index in 0..MAX_REQUEST_LOG + 3 {
+            assert!(net
+                .resolve("GET", &format!("https://invalid/{index}"))
+                .is_none());
+        }
+        assert_eq!(net.log.len(), MAX_REQUEST_LOG);
+        assert_eq!(net.dropped_requests, 3);
     }
 }

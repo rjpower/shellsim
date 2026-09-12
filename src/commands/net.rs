@@ -66,8 +66,8 @@ fn cmd_net(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             0
         }
         Some("log") => {
-            for (m, u) in &interp.net.log {
-                wln(io.out, &format!("{m} {u}"));
+            for request in &interp.net.log {
+                wln(io.out, &format!("{} {}", request.method, request.url));
             }
             0
         }

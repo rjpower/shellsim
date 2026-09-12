@@ -54,6 +54,11 @@ file bytes, modes, directories, or symlink targets. A checkpoint clones only a b
 `reset_workspace` restores that VFS checkpoint but deliberately does not rewind CPU fuel, virtual
 time, process history, shell variables, or terminal resource exhaustion.
 
+Action results include the bounded per-action virtual-network request delta with method, URL, and
+whether a route matched. Inspection returns the retained request log and a dropped-record count;
+once the fixed log capacity is reached, later attempts increment that count without growing host
+memory.
+
 `serve --root PATH` and `shellsim-python` share `host_ingest.rs`. This trusted startup-only adapter
 canonicalizes the selected root, rejects symlinks, special files, and non-UTF-8 names, skips common
 dependency/build trees, preserves basic modes, applies file-count and VFS disk limits, and rolls

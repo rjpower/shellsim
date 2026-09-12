@@ -94,6 +94,7 @@ fn persistent_protocol_replays_actions_and_workspace_changes() {
         r#"{"id":5,"op":"reset_workspace"}"#,
         r#"{"id":6,"op":"read_file","path":"note"}"#,
         r#"{"id":7,"op":"inspect"}"#,
+        r#"{"id":8,"op":"execute","source":"net route https://example.test 200 ok; curl https://example.test"}"#,
     ]
     .join("\n")
         + "\n";
@@ -110,7 +111,7 @@ fn persistent_protocol_replays_actions_and_workspace_changes() {
         .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
 
-    assert_eq!(responses.len(), 7);
+    assert_eq!(responses.len(), 8);
     assert!(responses.iter().all(|response| response["ok"] == true));
     assert_eq!(responses[2]["result"]["kind"], "execute");
     assert_eq!(responses[2]["result"]["stdout_base64"], "aGVsbG8gd29ybGQ=");
@@ -119,6 +120,15 @@ fn persistent_protocol_replays_actions_and_workspace_changes() {
     assert_eq!(responses[5]["result"]["data_base64"], "aGVsbG8=");
     assert_eq!(responses[6]["result"]["kind"], "inspect");
     assert_eq!(responses[6]["result"]["cwd"], "/work");
+    assert_eq!(responses[7]["result"]["stdout_base64"], "b2s=");
+    assert_eq!(
+        responses[7]["result"]["network_requests"][0]["method"],
+        "GET"
+    );
+    assert_eq!(
+        responses[7]["result"]["network_requests"][0]["matched"],
+        true
+    );
 }
 
 #[test]
