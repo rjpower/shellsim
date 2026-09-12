@@ -158,9 +158,30 @@ enum ShellFrame {
         variables: Vec<(String, Option<String>)>,
         continuation: crate::commands::CommandResume,
     },
+    ReadCommandInput {
+        argv: Vec<String>,
+        variables: Vec<(String, Option<String>)>,
+        stdin: Vec<u8>,
+        reserved: u64,
+    },
+    WriteCommandOutput {
+        command: String,
+        variables: Vec<(String, Option<String>)>,
+        status: i32,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        stdout_offset: usize,
+        stderr_offset: usize,
+    },
     AwaitChild {
         pid: crate::process::ProcessId,
         reap: bool,
+    },
+    AwaitPipeline {
+        pids: Vec<crate::process::ProcessId>,
+        statuses: Vec<i32>,
+        next: usize,
+        pipefail: bool,
     },
 }
 
@@ -559,6 +580,123 @@ impl ShellContinuation {
                     }
                 }
             }
+            ShellFrame::ReadCommandInput {
+                argv,
+                variables,
+                mut stdin,
+                mut reserved,
+            } => {
+                if argv[0] != "read" {
+                    match interp.read_fd(0, crate::descriptors::DEFAULT_PIPE_CAPACITY) {
+                        Ok(IoPoll::Ready(bytes)) if !bytes.is_empty() => {
+                            let bytes_len = bytes.len() as u64;
+                            if !interp.resources.reserve_memory(bytes_len) {
+                                interp.resources.release_memory(reserved);
+                                restore_command_variables(interp, variables);
+                                self.status = 137;
+                                return;
+                            }
+                            reserved = reserved.saturating_add(bytes_len);
+                            stdin.extend_from_slice(&bytes);
+                            self.frames.push(ShellFrame::ReadCommandInput {
+                                argv,
+                                variables,
+                                stdin,
+                                reserved,
+                            });
+                            return;
+                        }
+                        Ok(IoPoll::Blocked(wait)) => {
+                            self.frames.push(ShellFrame::ReadCommandInput {
+                                argv,
+                                variables,
+                                stdin,
+                                reserved,
+                            });
+                            self.blocked = Some(io_wait_reason(wait));
+                            return;
+                        }
+                        Ok(IoPoll::Ready(_)) => {}
+                        Err(error) => {
+                            interp.resources.release_memory(reserved);
+                            write_diagnostic(interp, &format!("shellsim: {}: {error}\n", argv[0]));
+                            restore_command_variables(interp, variables);
+                            self.status = 1;
+                            return;
+                        }
+                    }
+                }
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                let result = crate::commands::poll(interp, &argv, stdin, &mut stdout, &mut stderr);
+                interp.resources.release_memory(reserved);
+                match result {
+                    crate::commands::CommandPoll::Ready(status) => {
+                        self.frames.push(ShellFrame::WriteCommandOutput {
+                            command: argv[0].clone(),
+                            variables,
+                            status,
+                            stdout,
+                            stderr,
+                            stdout_offset: 0,
+                            stderr_offset: 0,
+                        });
+                    }
+                    crate::commands::CommandPoll::Blocked(reason, continuation) => {
+                        debug_assert!(stdout.is_empty() && stderr.is_empty());
+                        self.frames.push(ShellFrame::ResumeCommand {
+                            variables,
+                            continuation,
+                        });
+                        self.blocked = Some(reason);
+                    }
+                }
+            }
+            ShellFrame::WriteCommandOutput {
+                command,
+                variables,
+                mut status,
+                stdout,
+                mut stderr,
+                mut stdout_offset,
+                mut stderr_offset,
+            } => {
+                let (fd, bytes, offset) = if stdout_offset < stdout.len() {
+                    (1, &stdout, &mut stdout_offset)
+                } else if stderr_offset < stderr.len() {
+                    (2, &stderr, &mut stderr_offset)
+                } else {
+                    self.status = status;
+                    restore_command_variables(interp, variables);
+                    return;
+                };
+                match interp.write_fd(fd, &bytes[*offset..]) {
+                    Ok(IoPoll::Ready(0)) => {
+                        *offset = bytes.len();
+                        status = 1;
+                    }
+                    Ok(IoPoll::Ready(written)) => *offset = offset.saturating_add(written),
+                    Ok(IoPoll::Blocked(wait)) => self.blocked = Some(io_wait_reason(wait)),
+                    Err(error) => {
+                        *offset = bytes.len();
+                        status = 1;
+                        if fd == 1 {
+                            stderr.extend_from_slice(
+                                format!("shellsim: {command}: {error}\n").as_bytes(),
+                            );
+                        }
+                    }
+                }
+                self.frames.push(ShellFrame::WriteCommandOutput {
+                    command,
+                    variables,
+                    status,
+                    stdout,
+                    stderr,
+                    stdout_offset,
+                    stderr_offset,
+                });
+            }
             ShellFrame::AwaitChild { pid, reap } => {
                 self.status = match interp.processes.get(pid).map(|record| record.status) {
                     Some(crate::process::ProcessStatus::Exited(status)) => status,
@@ -574,6 +712,43 @@ impl ShellContinuation {
                     interp.processes.reap(pid);
                     let _ = interp.scheduler.reap(pid);
                 }
+            }
+            ShellFrame::AwaitPipeline {
+                pids,
+                mut statuses,
+                mut next,
+                pipefail,
+            } => {
+                while let Some(pid) = pids.get(next).copied() {
+                    match interp.processes.get(pid).map(|record| record.status) {
+                        Some(crate::process::ProcessStatus::Exited(status)) => {
+                            statuses.push(status);
+                            interp.processes.reap(pid);
+                            let _ = interp.scheduler.reap(pid);
+                            next += 1;
+                        }
+                        _ => {
+                            self.frames.push(ShellFrame::AwaitPipeline {
+                                pids,
+                                statuses,
+                                next,
+                                pipefail,
+                            });
+                            self.blocked = Some(crate::scheduler::WaitReason::Child(pid));
+                            return;
+                        }
+                    }
+                }
+                let last = statuses.last().copied().unwrap_or(0);
+                self.status = if pipefail {
+                    statuses
+                        .into_iter()
+                        .rev()
+                        .find(|status| *status != 0)
+                        .unwrap_or(last)
+                } else {
+                    last
+                };
             }
         }
     }
@@ -601,7 +776,7 @@ impl ShellContinuation {
                 words,
                 redirects,
             } => self.eval_command(interp, assigns, words, redirects),
-            Node::Pipeline(stages) => self.status = exec_pipeline(interp, &stages),
+            Node::Pipeline(stages) => self.spawn_pipeline(interp, stages),
             Node::And(lhs, rhs) => {
                 interp.cond_depth = interp.cond_depth.saturating_add(1);
                 if self.push(
@@ -791,18 +966,36 @@ impl ShellContinuation {
             });
             self.frames.push(ShellFrame::Eval(body));
         } else {
-            match run_external_command(interp, &argv) {
-                crate::commands::CommandPoll::Ready(status) => {
-                    self.status = status;
-                    restore_command_variables(interp, variables);
+            if crate::commands::is_resumable(&argv) {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                match crate::commands::poll(interp, &argv, Vec::new(), &mut stdout, &mut stderr) {
+                    crate::commands::CommandPoll::Ready(status) => {
+                        self.frames.push(ShellFrame::WriteCommandOutput {
+                            command: argv[0].clone(),
+                            variables,
+                            status,
+                            stdout,
+                            stderr,
+                            stdout_offset: 0,
+                            stderr_offset: 0,
+                        });
+                    }
+                    crate::commands::CommandPoll::Blocked(reason, continuation) => {
+                        self.frames.push(ShellFrame::ResumeCommand {
+                            variables,
+                            continuation,
+                        });
+                        self.blocked = Some(reason);
+                    }
                 }
-                crate::commands::CommandPoll::Blocked(reason, continuation) => {
-                    self.frames.push(ShellFrame::ResumeCommand {
-                        variables,
-                        continuation,
-                    });
-                    self.blocked = Some(reason);
-                }
+            } else {
+                self.frames.push(ShellFrame::ReadCommandInput {
+                    argv,
+                    variables,
+                    stdin: Vec::new(),
+                    reserved: 0,
+                });
             }
         }
     }
@@ -827,6 +1020,95 @@ impl ShellContinuation {
                 self.status = 125;
             }
         }
+    }
+
+    fn spawn_pipeline(&mut self, interp: &mut Interp, stages: Vec<Node>) {
+        if stages.is_empty() {
+            self.status = 0;
+            return;
+        }
+        if !self.ensure_capacity(interp, 1) {
+            return;
+        }
+        let mut pipes = Vec::with_capacity(stages.len().saturating_sub(1));
+        for _ in 1..stages.len() {
+            match interp
+                .descriptors
+                .open_pipe(crate::descriptors::DEFAULT_PIPE_CAPACITY)
+            {
+                Ok(pipe) => pipes.push(pipe),
+                Err(error) => {
+                    for (reader, writer) in pipes {
+                        let _ = interp.descriptors.discard_unreferenced(reader);
+                        let _ = interp.descriptors.discard_unreferenced(writer);
+                    }
+                    write_diagnostic(interp, &format!("shellsim: pipeline: {error:?}\n"));
+                    self.status = 125;
+                    return;
+                }
+            }
+        }
+
+        let mut pids = Vec::with_capacity(stages.len());
+        for (index, stage) in stages.iter().enumerate() {
+            let command = describe(stage);
+            let pid = match interp.start_pipeline_child(&command, false) {
+                Ok(pid) => pid,
+                Err(error) => {
+                    rollback_pipeline(interp, pids, pipes);
+                    write_diagnostic(interp, &format!("shellsim: pipeline: {error}\n"));
+                    self.status = 125;
+                    return;
+                }
+            };
+            let setup = (|| {
+                if let Some((reader, _)) = index.checked_sub(1).and_then(|i| pipes.get(i)) {
+                    interp
+                        .install_process_description(pid, 0, *reader)
+                        .map_err(|error| format!("{error:?}"))?;
+                }
+                if let Some((_, writer)) = pipes.get(index) {
+                    interp
+                        .install_process_description(pid, 1, *writer)
+                        .map_err(|error| format!("{error:?}"))?;
+                }
+                interp
+                    .process
+                    .set_continuation(pid, Some(ShellContinuation::new(stage)))
+            })();
+            if let Err(error) = setup {
+                interp.cancel_unstarted_child(pid);
+                rollback_pipeline(interp, pids, pipes);
+                write_diagnostic(interp, &format!("shellsim: pipeline: {error}\n"));
+                self.status = 125;
+                return;
+            }
+            pids.push(pid);
+        }
+        self.frames.push(ShellFrame::AwaitPipeline {
+            pids: pids.clone(),
+            statuses: Vec::with_capacity(pids.len()),
+            next: 0,
+            pipefail: interp.opt_pipefail,
+        });
+        self.blocked = Some(crate::scheduler::WaitReason::Child(pids[0]));
+    }
+}
+
+fn rollback_pipeline(
+    interp: &mut Interp,
+    pids: Vec<crate::process::ProcessId>,
+    pipes: Vec<(
+        crate::descriptors::DescriptionId,
+        crate::descriptors::DescriptionId,
+    )>,
+) {
+    for pid in pids {
+        interp.cancel_unstarted_child(pid);
+    }
+    for (reader, writer) in pipes {
+        let _ = interp.descriptors.discard_unreferenced(reader);
+        let _ = interp.descriptors.discard_unreferenced(writer);
     }
 }
 
@@ -1202,23 +1484,6 @@ fn device_fd(path: &str) -> Option<i32> {
     }
 }
 
-fn read_all_fd(interp: &mut Interp, fd: i32) -> Result<Vec<u8>, String> {
-    let mut output = Vec::new();
-    loop {
-        match interp.read_fd(fd, 64 * 1024)? {
-            IoPoll::Ready(bytes) if bytes.is_empty() => return Ok(output),
-            IoPoll::Ready(bytes) => {
-                if output.len().saturating_add(bytes.len()) > crate::descriptors::MAX_CAPTURE_BYTES
-                {
-                    return Err("input exceeds descriptor capture limit".to_string());
-                }
-                output.extend_from_slice(&bytes);
-            }
-            IoPoll::Blocked(_) => return Err("descriptor read would block".to_string()),
-        }
-    }
-}
-
 fn write_all_fd(interp: &mut Interp, fd: i32, mut bytes: &[u8]) -> Result<(), String> {
     while !bytes.is_empty() {
         match interp.write_fd(fd, bytes)? {
@@ -1233,6 +1498,17 @@ fn write_all_fd(interp: &mut Interp, fd: i32, mut bytes: &[u8]) -> Result<(), St
 
 fn write_diagnostic(interp: &mut Interp, message: &str) {
     let _ = write_all_fd(interp, 2, message.as_bytes());
+}
+
+fn io_wait_reason(wait: crate::descriptors::IoWait) -> crate::scheduler::WaitReason {
+    match wait {
+        crate::descriptors::IoWait::PipeReadable(pipe) => {
+            crate::scheduler::WaitReason::PipeReadable(pipe)
+        }
+        crate::descriptors::IoWait::PipeWritable(pipe) => {
+            crate::scheduler::WaitReason::PipeWritable(pipe)
+        }
+    }
 }
 
 fn install_command_variables(
@@ -1265,36 +1541,6 @@ fn restore_command_variables(interp: &mut Interp, saved: Vec<(String, Option<Str
             }
         }
     }
-}
-
-fn run_external_command(interp: &mut Interp, argv: &[String]) -> crate::commands::CommandPoll {
-    let mut local_out = Vec::new();
-    let mut local_err = Vec::new();
-    let cmd_stdin = if argv[0] == "read" {
-        Vec::new()
-    } else {
-        match read_all_fd(interp, 0) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                local_err.extend_from_slice(format!("shellsim: {}: {error}\n", argv[0]).as_bytes());
-                Vec::new()
-            }
-        }
-    };
-    let mut result = crate::commands::poll(interp, argv, cmd_stdin, &mut local_out, &mut local_err);
-
-    let mut output_failed = false;
-    if let Err(error) = write_all_fd(interp, 1, &local_out) {
-        write_diagnostic(interp, &format!("shellsim: {}: {error}\n", argv[0]));
-        output_failed = true;
-    }
-    if write_all_fd(interp, 2, &local_err).is_err() {
-        output_failed = true;
-    }
-    if output_failed {
-        result = crate::commands::CommandPoll::Ready(1);
-    }
-    result
 }
 
 /// Expand a command's argv, but keep array-assignment literal words verbatim so the builtin
@@ -1548,57 +1794,6 @@ fn split_top_level_words(s: &str) -> Vec<String> {
         words.push(cur);
     }
     words
-}
-
-fn exec_pipeline(interp: &mut Interp, stages: &[Node]) -> i32 {
-    let mut input = match read_all_fd(interp, 0) {
-        Ok(input) => input,
-        Err(error) => {
-            write_diagnostic(interp, &format!("shellsim: pipeline: {error}\n"));
-            return 1;
-        }
-    };
-    let mut last_status = 0;
-    let mut statuses = Vec::new();
-    for (idx, stage) in stages.iter().enumerate() {
-        if interp.resources.is_stopped() {
-            break;
-        }
-        let is_last = idx == stages.len() - 1;
-        let command = describe(stage);
-        let Some((status, stage_out)) = exec_child_capture_stdout(
-            interp,
-            stage,
-            std::mem::take(&mut input),
-            ChildExecution {
-                command: &command,
-                new_shell: false,
-                retain: false,
-            },
-        ) else {
-            write_diagnostic(interp, "shellsim: unable to create pipeline process\n");
-            return 125;
-        };
-        last_status = status;
-        statuses.push(last_status);
-        if is_last {
-            if let Err(error) = write_all_fd(interp, 1, &stage_out) {
-                write_diagnostic(interp, &format!("shellsim: pipeline: {error}\n"));
-                return 1;
-            }
-        } else {
-            input = stage_out;
-        }
-    }
-    if interp.opt_pipefail {
-        statuses
-            .into_iter()
-            .rev()
-            .find(|s| *s != 0)
-            .unwrap_or(last_status)
-    } else {
-        last_status
-    }
 }
 
 /// Lifecycle policy for one synchronous logical child execution.

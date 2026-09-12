@@ -220,6 +220,17 @@ pub(crate) fn poll(
     dispatch(interp, argv, stdin, out, err, true)
 }
 
+/// Whether the command has a continuation-aware entry point that does not consume standard
+/// input before it can suspend.
+pub(crate) fn is_resumable(argv: &[String]) -> bool {
+    argv.first().is_some_and(|requested| {
+        let command = standard_utility_name(requested).unwrap_or(requested);
+        registry()
+            .get(command)
+            .is_some_and(|spec| spec.resume.is_some())
+    })
+}
+
 /// Continue command-owned state after the scheduler wakes its process.
 pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> CommandPoll {
     match continuation {

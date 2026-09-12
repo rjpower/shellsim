@@ -433,7 +433,7 @@ impl Environment {
         command: &str,
         new_shell: bool,
     ) -> Result<ProcessId, String> {
-        self.create_child(command, new_shell, true)
+        self.create_child(command, new_shell, true, false)
     }
 
     /// Create a runnable child without blocking or switching away from the active parent.
@@ -442,7 +442,16 @@ impl Environment {
         command: &str,
         new_shell: bool,
     ) -> Result<ProcessId, String> {
-        self.create_child(command, new_shell, false)
+        self.create_child(command, new_shell, false, true)
+    }
+
+    /// Create a runnable pipeline stage whose descriptors are connected before dispatch.
+    pub(crate) fn start_pipeline_child(
+        &mut self,
+        command: &str,
+        new_shell: bool,
+    ) -> Result<ProcessId, String> {
+        self.create_child(command, new_shell, false, false)
     }
 
     fn create_child(
@@ -450,6 +459,7 @@ impl Environment {
         command: &str,
         new_shell: bool,
         foreground: bool,
+        detached_output: bool,
     ) -> Result<ProcessId, String> {
         let fork_bytes = self.process.fork_memory_bytes();
         if fork_bytes > MAX_FORK_STATE_BYTES {
@@ -497,9 +507,13 @@ impl Environment {
             self.resources.release_memory(allocation_bytes);
             return Err(format!("unable to schedule child process: {error:?}"));
         }
-        let child =
-            self.process
-                .fork_for_child(pid, new_shell, child_fds, allocation_bytes, !foreground);
+        let child = self.process.fork_for_child(
+            pid,
+            new_shell,
+            child_fds,
+            allocation_bytes,
+            detached_output,
+        );
         self.process.insert(child)?;
         self.refresh_descriptor_snapshot(pid);
         if foreground {
@@ -511,6 +525,23 @@ impl Environment {
             self.process.activate(scheduled)?;
         }
         Ok(pid)
+    }
+
+    /// Replace one descriptor in a retained process before its continuation is dispatched.
+    pub(crate) fn install_process_description(
+        &mut self,
+        pid: ProcessId,
+        fd: Fd,
+        description: DescriptionId,
+    ) -> Result<(), DescriptorError> {
+        let state = self
+            .process
+            .states
+            .get_mut(&pid)
+            .ok_or(DescriptorError::InvalidFd)?;
+        state.fds.install(fd, description, &mut self.descriptors)?;
+        self.refresh_descriptor_snapshot(pid);
+        Ok(())
     }
 
     /// Restore the parent after a synchronous child and optionally retain the exited record.
@@ -532,7 +563,23 @@ impl Environment {
                 }
             }
         }
+        let endpoints = self
+            .process
+            .fds
+            .iter()
+            .filter_map(|(_, description)| {
+                self.descriptors.pipe_endpoint(description).ok().flatten()
+            })
+            .collect::<Vec<_>>();
         self.process.fds.close_all(&mut self.descriptors);
+        for (pipe, reader) in endpoints {
+            let reason = if reader {
+                WaitReason::PipeWritable(pipe)
+            } else {
+                WaitReason::PipeReadable(pipe)
+            };
+            self.scheduler.wake_waiters(reason);
+        }
         self.processes.update_descriptors(pid, BTreeMap::new());
         self.processes.exit(pid, status, &self.process.cwd);
         let _ = self.scheduler.exit_current(status);

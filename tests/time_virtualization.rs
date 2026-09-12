@@ -54,6 +54,19 @@ fn wait_suspends_until_a_live_background_child_exits() {
 }
 
 #[test]
+fn pipeline_stages_sleep_and_exchange_data_concurrently() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "{ sleep 2; printf slow; } | { sleep 1; cat; }",
+        ),
+        (0, "slow".into(), String::new())
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
+}
+
+#[test]
 fn date_uses_real_utc_calendar_fields() {
     let mut environment = Environment::new();
     assert_eq!(

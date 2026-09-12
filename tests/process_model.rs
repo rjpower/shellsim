@@ -73,6 +73,13 @@ fn background_process_runs_on_a_later_scheduler_turn_and_wait_reaps_it() {
     let status = String::from_utf8(status).unwrap();
     assert!(status.contains("State:\tR (running)"), "{status}");
     assert_eq!(env.scheduler.state(1_235), Some(TaskState::Runnable));
+    assert_eq!(run(&mut env, "jobs").1, "[1] Running false\n");
+    for _ in 0..8 {
+        if matches!(env.scheduler.state(1_235), Some(TaskState::Exited(1))) {
+            break;
+        }
+        run(&mut env, "true");
+    }
     assert_eq!(run(&mut env, "jobs").1, "[1] Done false\n");
 
     let status = env.fs_read("/", "/proc/1235/status").unwrap();
@@ -103,6 +110,15 @@ fn detached_output_is_delivered_once_when_the_child_later_exits() {
     assert_eq!(second.usage.memory_current, 0);
 
     assert_eq!(run(&mut env, "true").1, "");
+}
+
+#[test]
+fn pipeline_backpressure_moves_more_than_one_pipe_capacity() {
+    let mut env = Environment::new();
+    assert_eq!(
+        run(&mut env, "seq 20000 | wc -l"),
+        (0, "20000\n".into(), "".into())
+    );
 }
 
 #[test]
