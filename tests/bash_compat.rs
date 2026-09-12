@@ -156,6 +156,21 @@ fn directory_stack_is_process_local_and_bounded() {
 }
 
 #[test]
+fn mapfile_populates_bounded_indexed_arrays() {
+    assert_eq!(
+        run("printf 'zero\\none\\ntwo\\nthree\\n' > /tmp/lines; mapfile -t -s 1 -n 2 rows < /tmp/lines; printf '<%s>|<%s>|%s\\n' \"${rows[0]}\" \"${rows[1]}\" \"${#rows[@]}\"; mapfile -t -O 2 rows <<< tail; printf '%s:%s\\n' \"${rows[2]}\" \"${#rows[@]}\""),
+        (0, "<one>|<two>|2\ntail:3\n".into(), String::new())
+    );
+    assert_eq!(
+        run("printf 'a,b,' > /tmp/records; mapfile -t -d , values < /tmp/records; printf '%s-%s-%s\\n' \"${values[0]}\" \"${values[1]}\" \"${#values[@]}\""),
+        (0, "a-b-2\n".into(), String::new())
+    );
+    let invalid = run("mapfile -C callback rows");
+    assert_eq!(invalid.0, 2);
+    assert!(invalid.2.contains("unsupported option"), "{}", invalid.2);
+}
+
+#[test]
 fn child_shell_boundaries_isolate_local_state_but_share_files() {
     assert_eq!(
         run("x=parent; (x=child; cd /tmp; printf saved > child-file); printf '%s:%s:' \"$x\" \"$PWD\"; cat /tmp/child-file"),

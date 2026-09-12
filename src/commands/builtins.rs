@@ -51,7 +51,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["alias", "unalias"], Trust::NoOp, cmd_unsupported);
     reg(m, &["getopts"], Trust::Real, cmd_getopts);
     reg(m, &["let"], Trust::Real, cmd_let);
-    reg(m, &["mapfile", "readarray"], Trust::NoOp, cmd_unsupported);
+    reg(m, &["mapfile", "readarray"], Trust::Real, cmd_mapfile);
     reg(m, &["pushd"], Trust::Real, cmd_pushd);
     reg(m, &["popd"], Trust::Real, cmd_popd);
     reg(m, &["dirs"], Trust::Real, cmd_dirs);
@@ -863,6 +863,146 @@ fn cmd_read(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         }
     }
     0
+}
+
+const MAX_MAPFILE_RECORDS: usize = 100_000;
+
+fn cmd_mapfile(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut trim_delimiter = false;
+    let mut maximum = None;
+    let mut skip = 0usize;
+    let mut origin = None;
+    let mut delimiter = b'\n';
+    let mut name = "MAPFILE".to_string();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--" => {
+                index += 1;
+                if index < args.len() {
+                    name = args[index].clone();
+                    index += 1;
+                }
+                break;
+            }
+            "-t" => trim_delimiter = true,
+            "-n" | "-s" | "-O" | "-d" => {
+                let option = args[index].clone();
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    ewln(io.err, &format!("mapfile: {option} requires a value"));
+                    return 2;
+                };
+                match option.as_str() {
+                    "-n" => {
+                        maximum = match parse_mapfile_count(value, "-n", io) {
+                            Some(0) => None,
+                            Some(value) => Some(value),
+                            None => return 2,
+                        }
+                    }
+                    "-s" => {
+                        let Some(value) = parse_mapfile_count(value, "-s", io) else {
+                            return 2;
+                        };
+                        skip = value;
+                    }
+                    "-O" => {
+                        let Some(value) = parse_mapfile_count(value, "-O", io) else {
+                            return 2;
+                        };
+                        origin = Some(value);
+                    }
+                    "-d" => {
+                        delimiter = if value.is_empty() {
+                            0
+                        } else {
+                            let bytes = value.as_bytes();
+                            if bytes.len() != 1 {
+                                ewln(io.err, "mapfile: -d requires one byte or an empty value");
+                                return 2;
+                            }
+                            bytes[0]
+                        };
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            option if option.starts_with('-') => {
+                ewln(io.err, &format!("mapfile: unsupported option {option}"));
+                return 2;
+            }
+            value => {
+                name = value.to_string();
+                index += 1;
+                break;
+            }
+        }
+        index += 1;
+    }
+    if index != args.len() || !shell_identifier(&name) {
+        ewln(io.err, "mapfile: expected one valid array name");
+        return 2;
+    }
+    let mut output_index = origin.unwrap_or(0);
+    if origin.is_none() {
+        interp.set_array(&name, Vec::new());
+    } else {
+        interp.declare_indexed(&name);
+    }
+    let mut cursor = 0usize;
+    let mut seen = 0usize;
+    let mut stored = 0usize;
+    while cursor < io.stdin.len() {
+        let relative_end = io.stdin[cursor..]
+            .iter()
+            .position(|byte| *byte == delimiter);
+        let end = relative_end.map_or(io.stdin.len(), |offset| cursor + offset + 1);
+        if seen >= skip {
+            if maximum.is_some_and(|limit| stored >= limit) {
+                break;
+            }
+            if stored >= MAX_MAPFILE_RECORDS || output_index >= MAX_MAPFILE_RECORDS {
+                ewln(io.err, "mapfile: record limit exceeded");
+                return 1;
+            }
+            let mut record = &io.stdin[cursor..end];
+            if trim_delimiter && record.last() == Some(&delimiter) {
+                record = &record[..record.len() - 1];
+            }
+            interp.array_set(
+                &name,
+                &output_index.to_string(),
+                String::from_utf8_lossy(record).into_owned(),
+            );
+            output_index = output_index.saturating_add(1);
+            stored = stored.saturating_add(1);
+        }
+        seen = seen.saturating_add(1);
+        cursor = end;
+    }
+    0
+}
+
+fn parse_mapfile_count(value: &str, option: &str, io: &mut Io) -> Option<usize> {
+    match value.parse::<usize>() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            ewln(
+                io.err,
+                &format!("mapfile: {option} requires a non-negative integer"),
+            );
+            None
+        }
+    }
+}
+
+fn shell_identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 /// Read one line for `read`: from an explicit stdin pipe if present, else the persistent input
