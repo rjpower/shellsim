@@ -12,15 +12,6 @@ use serde::Serialize;
 use shellsim::{python, Environment, Limits, RunOutcome};
 
 const VFS_ROOT: &str = "/work";
-const MAX_HOST_FILES: usize = 10_000;
-const SKIPPED_DIRECTORIES: &[&str] = &[
-    ".git",
-    ".venv",
-    "venv",
-    "target",
-    "node_modules",
-    "__pycache__",
-];
 
 #[derive(Default)]
 struct Options {
@@ -81,7 +72,8 @@ fn run(options: Options) -> Result<i32, String> {
     let mut environment = Environment::with_limits(limits);
     environment.cwd = VFS_ROOT.to_string();
     environment.set_var("PWD", VFS_ROOT);
-    let mounted_files = mount_tree(&mut environment, &mount_root)?;
+    let mounted_files =
+        shellsim::host_ingest::mount_host_tree(&mut environment, &mount_root, VFS_ROOT)?;
 
     let pytest = options.pytest || (metadata.is_dir() && options.entry.is_none());
     let command = if pytest {
@@ -207,66 +199,6 @@ fn canonical(path: &Path, label: &str) -> Result<PathBuf, String> {
         .map_err(|error| format!("cannot resolve {label} {}: {error}", path.display()))
 }
 
-fn mount_tree(environment: &mut Environment, root: &Path) -> Result<usize, String> {
-    let mut pending = vec![(root.to_path_buf(), PathBuf::new())];
-    let mut files = 0usize;
-    while let Some((host, relative)) = pending.pop() {
-        let metadata = fs::symlink_metadata(&host)
-            .map_err(|error| format!("cannot inspect {}: {error}", host.display()))?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!("refusing host symlink {}", host.display()));
-        }
-        let destination = destination_path(&relative)?;
-        if metadata.is_dir() {
-            if destination != VFS_ROOT {
-                environment
-                    .vfs
-                    .put_dir(&destination, 0o755)
-                    .map_err(|error| format!("cannot create {destination}: {error}"))?;
-            }
-            let mut entries = fs::read_dir(&host)
-                .map_err(|error| format!("cannot read directory {}: {error}", host.display()))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("cannot read directory {}: {error}", host.display()))?;
-            entries.sort_by_key(|entry| entry.file_name());
-            for entry in entries.into_iter().rev() {
-                let name = entry.file_name();
-                let name = name
-                    .to_str()
-                    .ok_or_else(|| format!("non-UTF-8 host path below {}", host.display()))?;
-                if SKIPPED_DIRECTORIES.contains(&name)
-                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
-                {
-                    continue;
-                }
-                pending.push((entry.path(), relative.join(name)));
-            }
-        } else if metadata.is_file() {
-            files = files
-                .checked_add(1)
-                .ok_or_else(|| "host file count overflow".to_string())?;
-            if files > MAX_HOST_FILES {
-                return Err(format!(
-                    "project exceeds the {MAX_HOST_FILES}-file ingestion limit"
-                ));
-            }
-            if metadata.len() > environment.resources.limits().disk {
-                return Err(format!(
-                    "host file is larger than the configured VFS: {}",
-                    host.display()
-                ));
-            }
-            let contents = fs::read(&host)
-                .map_err(|error| format!("cannot read {}: {error}", host.display()))?;
-            environment
-                .vfs
-                .put_file(&destination, contents, 0o644)
-                .map_err(|error| format!("cannot import {}: {error}", host.display()))?;
-        }
-    }
-    Ok(files)
-}
-
 fn discover_tests(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut pending = vec![root.to_path_buf()];
     let mut tests = Vec::new();
@@ -287,7 +219,7 @@ fn discover_tests(root: &Path) -> Result<Vec<PathBuf>, String> {
                 let name = name
                     .to_str()
                     .ok_or_else(|| format!("non-UTF-8 host path below {}", path.display()))?;
-                if SKIPPED_DIRECTORIES.contains(&name)
+                if shellsim::host_ingest::DEFAULT_SKIPPED_DIRECTORIES.contains(&name)
                     && entry.file_type().is_ok_and(|kind| kind.is_dir())
                 {
                     continue;

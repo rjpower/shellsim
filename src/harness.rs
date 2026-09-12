@@ -193,6 +193,17 @@ impl HarnessSession {
         }
     }
 
+    /// Replace the diff/reset baseline with the current bounded VFS state.
+    pub fn checkpoint_workspace(&mut self) -> Result<(), String> {
+        if self.environment.vfs.disk_used() > MAX_TRANSFER_RAW_BYTES as u64 {
+            return Err(format!(
+                "workspace exceeds the {MAX_TRANSFER_RAW_BYTES}-byte checkpoint limit"
+            ));
+        }
+        self.baseline = self.environment.vfs.clone();
+        Ok(())
+    }
+
     fn apply(&mut self, operation: HarnessOperation) -> Result<HarnessResult, String> {
         match operation {
             HarnessOperation::Execute {
@@ -239,12 +250,7 @@ impl HarnessSession {
                 })
             }
             HarnessOperation::Checkpoint => {
-                if self.environment.vfs.disk_used() > MAX_TRANSFER_RAW_BYTES as u64 {
-                    return Err(format!(
-                        "workspace exceeds the {MAX_TRANSFER_RAW_BYTES}-byte checkpoint limit"
-                    ));
-                }
-                self.baseline = self.environment.vfs.clone();
+                self.checkpoint_workspace()?;
                 Ok(HarnessResult::Acknowledged)
             }
             HarnessOperation::WorkspaceDiff => Ok(HarnessResult::WorkspaceDiff {

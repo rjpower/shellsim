@@ -17,6 +17,7 @@ pub mod exec;
 pub mod expand;
 pub mod harness;
 pub mod hashes;
+pub mod host_ingest;
 pub mod interp;
 pub mod jqcmd;
 pub mod net;

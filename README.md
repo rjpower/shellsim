@@ -47,7 +47,7 @@ cargo build --release
 printf '%s\n' \
   '{"id":1,"op":"execute","source":"printf hello > result"}' \
   '{"id":2,"op":"workspace_diff"}' \
-  | ./target/release/shellsim serve
+  | ./target/release/shellsim serve --root ./project
 
 # Import a host Python project into a fresh VFS and run it in shellsim
 ./target/release/shellsim-python project/main.py -- arg1
@@ -58,9 +58,10 @@ printf '%s\n' \
 Limit values accept `k`, `m`, and `g` binary suffixes. Arguments after `--` in `eval` mode become
 shell positional parameters.
 
-`serve` retains one environment across requests. It supports shell actions, base64 file reads and
-writes confined to `/work`, stable path-level workspace diffs, checkpoints, VFS reset, listings,
-and process/resource inspection. One JSON response is emitted for each input line, which makes the
+`serve` retains one environment across requests. `--root` performs one trusted, bounded import
+before request processing. The protocol supports shell actions, base64 file reads and writes
+confined to `/work`, stable path-level workspace diffs, checkpoints, VFS reset, listings, and
+process/resource inspection. One JSON response is emitted for each input line, which makes the
 request/response stream directly replayable. See [docs/implementation.md](docs/implementation.md)
 for the protocol boundary and current limitations.
 
@@ -71,8 +72,9 @@ and optional pre-commit-hook guidelines.
 The JSON report contains the exit status, typed stop reason, limits, aggregate usage, per-command
 CPU/disk deltas, stdout, stderr, command trace, and unsupported capabilities.
 
-`shellsim-python` treats its host path as trusted harness input, copies the containing project into
-`/work`, then closes that boundary before simulated Python starts. A directory automatically
+`shellsim-python` and `serve --root` share one transactional importer. They treat the host path as
+trusted harness input, reject symlinks, preserve permission bits, copy the project into `/work`,
+then close that boundary before simulated execution starts. A Python directory automatically
 discovers `test_*.py` files; `--entry FILE` selects a script within a directory. Use `--root` to
 control which project tree is imported and the standard limit flags to constrain the run.
 

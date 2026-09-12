@@ -205,6 +205,7 @@ fn serve(args: &[String]) -> ! {
     use std::io::Write;
 
     let mut limits = Limits::default();
+    let mut host_root = None;
     let mut index = 0usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -212,6 +213,14 @@ fn serve(args: &[String]) -> ! {
             "--memory" => limits.memory = limit_value(args, &mut index, "--memory"),
             "--disk" => limits.disk = limit_value(args, &mut index, "--disk"),
             "--output" => limits.output = limit_value(args, &mut index, "--output"),
+            "--root" => {
+                index += 1;
+                host_root = Some(
+                    args.get(index)
+                        .cloned()
+                        .unwrap_or_else(|| usage_error("--root requires a path")),
+                );
+            }
             value => usage_error(&format!("unexpected serve argument: {value}")),
         }
         index += 1;
@@ -221,6 +230,18 @@ fn serve(args: &[String]) -> ! {
     let mut input = stdin.lock();
     let mut output = std::io::stdout().lock();
     let mut session = shellsim::harness::HarnessSession::new(limits);
+    if let Some(host_root) = host_root {
+        shellsim::host_ingest::mount_host_tree(
+            &mut session.environment,
+            std::path::Path::new(&host_root),
+            "/work",
+        )
+        .and_then(|_| session.checkpoint_workspace())
+        .unwrap_or_else(|error| {
+            eprintln!("shellsim serve: {error}");
+            exit(2);
+        });
+    }
     while let Some(line) = read_bounded_protocol_line(&mut input).unwrap_or_else(|error| {
         eprintln!("shellsim serve: input error: {error}");
         exit(1);

@@ -197,9 +197,9 @@ and resource, command, unsupported-operation, trust, and process reports. Reques
 are bounded; the line-oriented exchange is directly replayable. The Codex or Claude client stays
 outside the simulation and receives only these tools.
 
-Generic bounded host-directory ingestion, network-request reporting, scenario manifests,
-transcript persistence, cloning, and concrete model-client adapters remain before this phase is
-complete.
+Bounded transactional host-directory ingestion is shared by `serve --root` and
+`shellsim-python`. Network-request reporting, scenario manifests, transcript persistence,
+cloning, and concrete model-client adapters remain before this phase is complete.
 
 ## Validation milestones
 

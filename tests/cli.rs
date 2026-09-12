@@ -1,7 +1,35 @@
 //! CLI boundary tests exercise host stdin routing without granting simulated code host access.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new() -> Self {
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "shellsim-serve-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 fn run_with_stdin(args: &[&str], stdin: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_shellsim"))
@@ -120,4 +148,43 @@ fn persistent_protocol_reports_malformed_requests_and_continues() {
         .contains("confined to /work"));
     assert_eq!(responses[2]["ok"], true);
     assert_eq!(responses[2]["id"], 3);
+}
+
+#[test]
+fn persistent_protocol_can_checkpoint_a_trusted_host_snapshot() {
+    let project = TestDirectory::new();
+    std::fs::write(project.path().join("input.txt"), b"snapshot\0bytes").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .args(["serve", "--root"])
+        .arg(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"{\"id\":1,\"op\":\"read_file\",\"path\":\"input.txt\"}\n{\"id\":2,\"op\":\"workspace_diff\"}\n",
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        responses[0]["result"]["data_base64"],
+        "c25hcHNob3QAYnl0ZXM="
+    );
+    assert_eq!(responses[1]["result"]["changes"], serde_json::json!([]));
 }

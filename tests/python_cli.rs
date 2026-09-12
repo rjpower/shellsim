@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use shellsim::Environment;
+
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
@@ -160,4 +162,10 @@ fn project_ingestion_rejects_host_symlinks() {
 
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("refusing host symlink"));
+
+    let mut environment = Environment::new();
+    let error = shellsim::host_ingest::mount_host_tree(&mut environment, project.path(), "/work")
+        .unwrap_err();
+    assert!(error.contains("refusing host symlink"));
+    assert!(!environment.vfs.exists("/", "/work/main.py"));
 }

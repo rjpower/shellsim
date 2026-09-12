@@ -54,6 +54,11 @@ file bytes, modes, directories, or symlink targets. A checkpoint clones only a b
 `reset_workspace` restores that VFS checkpoint but deliberately does not rewind CPU fuel, virtual
 time, process history, shell variables, or terminal resource exhaustion.
 
+`serve --root PATH` and `shellsim-python` share `host_ingest.rs`. This trusted startup-only adapter
+canonicalizes the selected root, rejects symlinks, special files, and non-UTF-8 names, skips common
+dependency/build trees, preserves basic modes, applies file-count and VFS disk limits, and rolls
+back the entire import on failure. No request can reopen that host boundary.
+
 This is sufficient for a host-side agent adapter to replay tool calls without launching the agent
 inside shellsim. Generic host-directory ingestion, scenario manifests, transcript persistence,
 and Codex/Claude adapters remain harness-side work.
@@ -152,6 +157,7 @@ src/vfs.rs             quota-enforced in-memory filesystem
 src/clock.rs           virtual clocks and bounded event queue
 src/net.rs             virtual route-table network
 src/harness.rs         persistent typed agent-session boundary
+src/host_ingest.rs     trusted transactional host-to-VFS startup import
 src/shell.rs           shell lexer/parser and capture API
 src/expand.rs          shell word and parameter expansion
 src/exec.rs            metered shell executor and control flow
