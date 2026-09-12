@@ -1,5 +1,9 @@
 //! Compatibility and boundary tests for VFS-only compression commands.
 
+use std::io::Write;
+
+use flate2::write::DeflateEncoder;
+use flate2::Compression;
 use shellsim::{Environment, Limits, StopReason};
 
 #[test]
@@ -147,6 +151,140 @@ fn tar_rejects_traversal_and_rolls_back_extraction() {
     assert_eq!(status.exit_status, 2);
     assert!(String::from_utf8_lossy(&stderr).contains("symbolic-link parent"));
     assert!(!environment.vfs.exists("/", "/bad"));
+}
+
+#[test]
+fn zip_lists_and_extracts_binary_trees() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/work/tree").unwrap();
+    environment
+        .vfs
+        .write("/", "/work/tree/a.txt", b"alpha", 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .write("/", "/work/tree/b.bin", &[0, 1, 255], 0o600)
+        .unwrap();
+
+    let (status, stdout, stderr) = environment
+        .run_script_capture("cd /work; zip -qr /tmp/tree.zip tree; unzip -Z1 /tmp/tree.zip");
+    assert_eq!(
+        status.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"tree/\ntree/a.txt\ntree/b.bin\n");
+
+    environment.vfs.remove_all("/", "/work/tree").unwrap();
+    let (status, _, stderr) = environment.run_script_capture("unzip -q /tmp/tree.zip -d /work");
+    assert_eq!(
+        status.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        environment.vfs.read("/", "/work/tree/b.bin").unwrap(),
+        [0, 1, 255]
+    );
+}
+
+#[test]
+fn unzip_rejects_traversal_without_partial_extraction() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/goodx", b"payload", 0o644)
+        .unwrap();
+    let (status, _, stderr) = environment.run_script_capture("zip /tmp/unsafe.zip /goodx");
+    assert_eq!(
+        status.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let mut archive = environment.vfs.read("/", "/tmp/unsafe.zip").unwrap();
+    for start in 0..archive.len().saturating_sub(5) {
+        if &archive[start..start + 5] == b"goodx" {
+            archive[start..start + 5].copy_from_slice(b"../xx");
+        }
+    }
+    environment
+        .vfs
+        .write("/", "/tmp/unsafe.zip", &archive, 0o644)
+        .unwrap();
+
+    let (status, _, stderr) = environment.run_script_capture("unzip /tmp/unsafe.zip -d /work");
+    assert_eq!(status.exit_status, 2);
+    assert!(String::from_utf8_lossy(&stderr).contains("unsafe archive path"));
+    assert!(!environment.vfs.exists("/", "/xx"));
+}
+
+#[test]
+fn unzip_accepts_standard_deflated_entries() {
+    let mut environment = Environment::new();
+    let archive = one_file_deflated_zip("payload.bin", &[0, 1, 2, 255]);
+    environment
+        .vfs
+        .write("/", "/tmp/deflated.zip", &archive, 0o644)
+        .unwrap();
+
+    let (status, _, stderr) = environment.run_script_capture("unzip /tmp/deflated.zip -d /work");
+    assert_eq!(
+        status.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        environment.vfs.read("/", "/work/payload.bin").unwrap(),
+        [0, 1, 2, 255]
+    );
+}
+
+fn one_file_deflated_zip(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let crc = crc32fast::hash(data);
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+    archive.extend_from_slice(&20u16.to_le_bytes());
+    archive.extend_from_slice(&0u16.to_le_bytes());
+    archive.extend_from_slice(&8u16.to_le_bytes());
+    archive.extend_from_slice(&[0; 4]);
+    archive.extend_from_slice(&crc.to_le_bytes());
+    archive.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+    archive.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    archive.extend_from_slice(&0u16.to_le_bytes());
+    archive.extend_from_slice(name.as_bytes());
+    archive.extend_from_slice(&compressed);
+    let central_offset = archive.len() as u32;
+    archive.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+    archive.extend_from_slice(&0x031eu16.to_le_bytes());
+    archive.extend_from_slice(&20u16.to_le_bytes());
+    archive.extend_from_slice(&0u16.to_le_bytes());
+    archive.extend_from_slice(&8u16.to_le_bytes());
+    archive.extend_from_slice(&[0; 4]);
+    archive.extend_from_slice(&crc.to_le_bytes());
+    archive.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+    archive.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    archive.extend_from_slice(&[0; 8]);
+    archive.extend_from_slice(&(0o100644u32 << 16).to_le_bytes());
+    archive.extend_from_slice(&0u32.to_le_bytes());
+    archive.extend_from_slice(name.as_bytes());
+    let central_size = archive.len() as u32 - central_offset;
+    archive.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    archive.extend_from_slice(&[0; 4]);
+    archive.extend_from_slice(&1u16.to_le_bytes());
+    archive.extend_from_slice(&1u16.to_le_bytes());
+    archive.extend_from_slice(&central_size.to_le_bytes());
+    archive.extend_from_slice(&central_offset.to_le_bytes());
+    archive.extend_from_slice(&0u16.to_le_bytes());
+    archive
 }
 
 #[test]

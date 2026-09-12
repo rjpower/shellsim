@@ -37,6 +37,7 @@ mod system;
 mod tarcmd;
 mod text;
 pub mod util;
+mod zipcmd;
 
 /// Bundled standard I/O for a command invocation.
 pub struct Io<'a> {
@@ -203,6 +204,7 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     proc::register(&mut m);
     rgcmd::register(&mut m);
     pkg::register(&mut m);
+    zipcmd::register(&mut m);
     m
 }
 

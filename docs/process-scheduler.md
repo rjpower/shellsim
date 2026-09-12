@@ -188,7 +188,8 @@ After the process and I/O foundations are complete, improve commands in evidence
    `*** Begin Patch` agent format. Deterministic VFS-only `gzip`, `gunzip`, and `zcat` support
    bounded compression, decompression, files, and streams. Tar creation, listing, extraction, and
    gzip composition support regular files and directories with atomic traversal-safe extraction.
-   Add zip containers next.
+   ZIP creation, listing, and extraction support stored and deflated regular files plus directories,
+   with CRC validation and the same bounded, atomic traversal protections.
 5. Extend Make only alongside observed syntax and graph semantics; do not emulate native compiler
    artifacts with successful no-ops.
 

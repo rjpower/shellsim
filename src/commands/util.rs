@@ -364,6 +364,8 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "ps",
     "git",
     "make",
+    "zip",
+    "unzip",
 ];
 
 #[cfg(test)]
