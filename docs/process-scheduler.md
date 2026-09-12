@@ -31,10 +31,12 @@ quanta. Shell `sleep` and `usleep` register resumable command entry points: they
 on a virtual-timeline event, allow other tasks to run, and advance time only when the runnable
 queue is empty. Pipeline stages are created together and exchange bytes through bounded pipe
 descriptors; command input and output are resumable frames so backpressure suspends only the
-affected stage. Python `Popen` now launches the same stored argv continuations and drives them at
-a nested cooperative scheduling boundary, with live PIDs and bounded descriptor pipes. Command
-substitution and nested-shell adapters still use synchronous child adapters. The Python bytecode
-VM itself is not yet a scheduler-owned resumable continuation, so Python execution cannot be
+affected stage. Nested `sh`/`bash` script execution from an ordinary shell continuation now starts
+a scheduler-owned child and resumes through a typed child-wait state. Python `Popen` now launches
+the same stored argv continuations and drives them at a nested cooperative scheduling boundary,
+with live PIDs and bounded descriptor pipes. Command substitution and synchronous
+command-to-command shell adapters still use recursive child adapters. The Python bytecode VM
+itself is not yet a scheduler-owned resumable continuation, so Python execution cannot be
 interleaved at arbitrary bytecode instructions.
 
 The readiness handshake needed by phase 3 is present: blocked descriptor operations return a
@@ -47,11 +49,11 @@ conditions, loops, case selection, functions, positional restoration, and redire
 frames polled in fixed work quanta and retained on `ProcessState`. Same-process shell control flow
 no longer recurses through the Rust stack. Fork allocations also have independently releasable
 memory ownership, which is required once children overlap instead of exiting in stack order.
-Ordinary foreground subshells and pipelines now suspend their parent and switch through the
-scheduler without a nested Rust executor call. Python subprocess operations use live handles and
-the scheduler rather than the removed synchronous runner, but the calling VM remains on the Rust
-stack while the scheduler runs child quanta. Command substitution and nested-shell adapters keep
-phase 3 incomplete.
+Ordinary foreground subshells, pipelines, and shell-command invocations now suspend their parent
+and switch through the scheduler without a nested Rust executor call. Python subprocess operations
+use live handles and the scheduler rather than the removed synchronous runner, but the calling VM
+remains on the Rust stack while the scheduler runs child quanta. Command substitution, VFS
+shebang execution, and synchronous native command-to-command adapters keep phase 3 incomplete.
 
 ## Non-negotiable invariants
 

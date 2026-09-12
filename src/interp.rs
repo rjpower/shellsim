@@ -602,6 +602,21 @@ impl Environment {
         Ok(())
     }
 
+    /// Set positional parameters on a retained child without assuming it is currently active.
+    pub(crate) fn set_process_positional(
+        &mut self,
+        pid: ProcessId,
+        positional: Vec<String>,
+    ) -> Result<(), String> {
+        let state = self
+            .process
+            .states
+            .get_mut(&pid)
+            .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
+        state.positional = positional;
+        Ok(())
+    }
+
     /// Resolve a descriptor belonging to a retained process without activating it.
     pub(crate) fn process_description(
         &self,

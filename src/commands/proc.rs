@@ -21,7 +21,13 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["sync"], Trust::Real, |_, _, _| 0);
 
     // nested shells / uv-launched verifiers
-    reg(m, &["sh", "bash", "dash", "zsh"], Trust::Real, cmd_sh);
+    reg_resumable(
+        m,
+        &["sh", "bash", "dash", "zsh"],
+        Trust::Real,
+        cmd_sh,
+        start_sh,
+    );
     reg(m, &["uv", "uvx", "uvenv"], Trust::Partial, cmd_uv);
 
     // interpreters
@@ -308,6 +314,61 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 
 /// `sh`/`bash -c "…"` or a script file — run it through our own interpreter.
 fn cmd_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let Some((source, positional)) = shell_invocation(interp, args, io) else {
+        return 127;
+    };
+    run_shell_child(interp, &source, positional, io)
+}
+
+/// Start a nested shell as an ordinary scheduled child instead of recursively executing it.
+fn start_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let Some((source, positional)) = shell_invocation(interp, args, io) else {
+        return CommandPoll::Ready(127);
+    };
+    let parser_memory = 8 * 1024 + (source.len() as u64).saturating_mul(2);
+    if !interp.resources.reserve_memory(parser_memory) {
+        return CommandPoll::Ready(
+            interp
+                .resources
+                .stop_reason()
+                .map_or(137, |reason| reason.exit_status()),
+        );
+    }
+    let parsed = if interp.resources.charge_cpu(source.len() as u64) {
+        crate::shell::parse(&source).map_err(|error| error.to_string())
+    } else {
+        Err("resource limit exceeded".to_string())
+    };
+    interp.resources.release_memory(parser_memory);
+    let ast = match parsed {
+        Ok(ast) => ast,
+        Err(error) => {
+            ewln(io.err, &format!("shellsim: syntax error: {error}"));
+            return CommandPoll::Ready(2);
+        }
+    };
+    let pid = match interp.start_child("bash", true) {
+        Ok(pid) => pid,
+        Err(error) => {
+            ewln(io.err, &format!("bash: {error}"));
+            return CommandPoll::Ready(125);
+        }
+    };
+    interp
+        .set_process_positional(pid, positional)
+        .expect("new child process state must retain positional arguments");
+    interp
+        .process
+        .set_continuation(pid, Some(crate::exec::ShellContinuation::new(&ast)))
+        .expect("new child process state must accept a continuation");
+    CommandPoll::Switched(CommandResume::Child { pid, reap: true })
+}
+
+fn shell_invocation(
+    interp: &mut CommandContext<'_>,
+    args: &[String],
+    io: &mut Io,
+) -> Option<(String, Vec<String>)> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -315,7 +376,7 @@ fn cmd_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                 let src = args.get(i + 1).cloned().unwrap_or_default();
                 // `sh -c SCRIPT [name [args…]]`: name is $0, the rest are $1+
                 let extra = args.get(i + 3..).map(|s| s.to_vec()).unwrap_or_default();
-                return run_shell_child(interp, &src, extra, io);
+                return Some((src, extra));
             }
             "-o" => {
                 i += 2;
@@ -326,19 +387,19 @@ fn cmd_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             s => {
                 if let Ok(src) = interp.vfs.read_string(&interp.cwd, s) {
                     let extra = args.get(i + 1..).map(|x| x.to_vec()).unwrap_or_default();
-                    return run_shell_child(interp, &src, extra, io);
+                    return Some((src, extra));
                 }
                 crate::commands::util::ewln(
                     io.err,
-                    &format!("{}: {}: No such file or directory", args[0], s),
+                    &format!("bash: {s}: No such file or directory"),
                 );
-                return 127;
+                return None;
             }
         }
     }
     // no -c and no file → run stdin as a script
     let src = String::from_utf8_lossy(&io.stdin).into_owned();
-    run_shell_child(interp, &src, Vec::new(), io)
+    Some((src, Vec::new()))
 }
 
 fn run_shell_child(

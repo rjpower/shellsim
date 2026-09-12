@@ -52,11 +52,17 @@ pub type CmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> i32;
 pub(crate) enum CommandPoll {
     Ready(i32),
     Blocked(WaitReason, CommandResume),
+    /// Starting the command changed the active scheduler process.
+    Switched(CommandResume),
 }
 
 /// Command-owned state retained by the shell while a native command is suspended.
 pub(crate) enum CommandResume {
     Status(i32),
+    Child {
+        pid: crate::process::ProcessId,
+        reap: bool,
+    },
     Wait {
         pids: Vec<crate::process::ProcessId>,
         status: i32,
@@ -214,6 +220,9 @@ pub fn run(
         CommandPoll::Blocked(_, _) => {
             unreachable!("synchronous command dispatch cannot suspend")
         }
+        CommandPoll::Switched(_) => {
+            unreachable!("synchronous command dispatch cannot switch processes")
+        }
     }
 }
 
@@ -231,6 +240,13 @@ pub(crate) fn poll(
 /// Whether the command has a continuation-aware entry point that does not consume standard
 /// input before it can suspend.
 pub(crate) fn is_resumable(argv: &[String]) -> bool {
+    if argv.len() == 1
+        && argv
+            .first()
+            .is_some_and(|command| matches!(command.as_str(), "sh" | "bash" | "dash" | "zsh"))
+    {
+        return false;
+    }
     argv.first().is_some_and(|requested| {
         let command = standard_utility_name(requested).unwrap_or(requested);
         registry()
@@ -243,6 +259,20 @@ pub(crate) fn is_resumable(argv: &[String]) -> bool {
 pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> CommandPoll {
     match continuation {
         CommandResume::Status(status) => CommandPoll::Ready(status),
+        CommandResume::Child { pid, reap } => {
+            match interp.processes.get(pid).map(|record| record.status) {
+                Some(crate::process::ProcessStatus::Exited(status)) => {
+                    if reap {
+                        interp.processes.reap(pid);
+                        let _ = interp.scheduler.reap(pid);
+                    }
+                    CommandPoll::Ready(status)
+                }
+                _ => {
+                    CommandPoll::Blocked(WaitReason::Child(pid), CommandResume::Child { pid, reap })
+                }
+            }
+        }
         CommandResume::Wait {
             mut pids,
             mut status,
@@ -366,8 +396,10 @@ fn dispatch(
         interp
             .resources
             .record_command(cmd, cpu_before, disk_before, interp.vfs.disk_used());
-        if let Some(reason) = interp.resources.stop_reason() {
-            result = CommandPoll::Ready(reason.exit_status());
+        if !matches!(result, CommandPoll::Switched(_)) {
+            if let Some(reason) = interp.resources.stop_reason() {
+                result = CommandPoll::Ready(reason.exit_status());
+            }
         }
         return result;
     }

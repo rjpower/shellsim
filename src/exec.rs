@@ -284,6 +284,18 @@ impl ShellContinuation {
         }
     }
 
+    fn retain_switched_command(
+        &mut self,
+        variables: Vec<(String, Option<String>)>,
+        continuation: crate::commands::CommandResume,
+    ) {
+        self.frames.push(ShellFrame::ResumeCommand {
+            variables,
+            continuation,
+        });
+        self.switched = true;
+    }
+
     fn step(&mut self, interp: &mut Interp, frame: ShellFrame) {
         match frame {
             ShellFrame::Eval(node) => self.eval(interp, node),
@@ -571,6 +583,9 @@ impl ShellContinuation {
                         self.status = status;
                         restore_command_variables(interp, variables);
                     }
+                    crate::commands::CommandPoll::Switched(continuation) => {
+                        self.retain_switched_command(variables, continuation);
+                    }
                     crate::commands::CommandPoll::Blocked(reason, continuation) => {
                         self.frames.push(ShellFrame::ResumeCommand {
                             variables,
@@ -641,6 +656,10 @@ impl ShellContinuation {
                             stdout_offset: 0,
                             stderr_offset: 0,
                         });
+                    }
+                    crate::commands::CommandPoll::Switched(continuation) => {
+                        debug_assert!(stdout.is_empty() && stderr.is_empty());
+                        self.retain_switched_command(variables, continuation);
                     }
                     crate::commands::CommandPoll::Blocked(reason, continuation) => {
                         debug_assert!(stdout.is_empty() && stderr.is_empty());
@@ -999,6 +1018,10 @@ impl ShellContinuation {
                         stdout_offset: 0,
                         stderr_offset: 0,
                     });
+                }
+                crate::commands::CommandPoll::Switched(continuation) => {
+                    debug_assert!(stdout.is_empty() && stderr.is_empty());
+                    self.retain_switched_command(variables, continuation);
                 }
                 crate::commands::CommandPoll::Blocked(reason, continuation) => {
                     self.frames.push(ShellFrame::ResumeCommand {

@@ -215,6 +215,18 @@ fn nested_shells_remain_under_outer_timeout() {
 }
 
 #[test]
+fn nested_shells_yield_to_other_logical_processes() {
+    assert_eq!(
+        run("(sleep 1; printf ready > /tmp/marker) & bash -c 'sleep 2; cat /tmp/marker'; wait"),
+        (0, "ready".into(), String::new())
+    );
+    let (status, stdout, stderr) = run("bash -c 'echo partial; if true; then echo never'");
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("expected `fi`"), "{stderr}");
+}
+
+#[test]
 fn python_repl_persists_and_returns_to_shell() {
     let mut env = Environment::new();
     let (_, entered, _) = env.run_script_capture("python");
