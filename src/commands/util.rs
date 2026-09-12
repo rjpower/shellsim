@@ -263,16 +263,28 @@ pub(crate) fn try_exec_script(
     let text = String::from_utf8_lossy(&data);
     let first = text.lines().next().unwrap_or("");
     let code = if first.starts_with("#!") && first.contains("python") {
-        // python script
         let mut a = vec!["python3.14".to_string(), path.to_string()];
         a.extend(args.iter().cloned());
-        crate::commands::CommandPoll::Ready(crate::python::run_python(
-            interp,
-            &a,
-            stdin.to_vec(),
-            out,
-            err,
-        ))
+        if resumable {
+            crate::commands::start_child_sequence(
+                interp,
+                vec![crate::commands::ChildCommand {
+                    argv: a,
+                    stdin: stdin.to_vec(),
+                    cwd: None,
+                    environment: None,
+                }],
+                true,
+            )
+        } else {
+            crate::commands::CommandPoll::Ready(crate::python::run_python(
+                interp,
+                &a,
+                stdin.to_vec(),
+                out,
+                err,
+            ))
+        }
     } else if !first.starts_with("#!")
         || first.split_whitespace().next().is_some_and(|interpreter| {
             matches!(interpreter, "#!/bin/sh" | "#!/bin/bash" | "#!/usr/bin/bash")

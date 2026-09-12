@@ -54,6 +54,34 @@ fn builds_a_file_target_and_skips_it_when_up_to_date() {
 }
 
 #[test]
+fn recipes_run_as_scheduled_children() {
+    let mut env = Environment::new();
+    env.vfs
+        .put_file(
+            "/Makefile",
+            b"result:\n\t@sleep 2; cat /tmp/marker > result\n".to_vec(),
+            0o644,
+        )
+        .unwrap();
+    let (outcome, stdout, stderr) =
+        env.run_script_capture("(sleep 1; printf ready > /tmp/marker) & make; cat result; wait");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"ready");
+    assert_eq!(env.clock.monotonic_ns(), 2_000_000_000);
+
+    env.vfs
+        .put_file("/Makefile", b"broken:\n\t@false\n".to_vec(), 0o644)
+        .unwrap();
+    let (outcome, _, _) = env.run_script_capture("make broken");
+    assert_eq!(outcome.exit_status, 2);
+}
+
+#[test]
 fn supports_dry_run_and_explicit_file_directory() {
     let mut env = Environment::new();
     env.vfs.put_dir("/work/project", 0o755).unwrap();

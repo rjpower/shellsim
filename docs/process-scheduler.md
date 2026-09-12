@@ -61,8 +61,11 @@ of the retained shell continuation and preserves its capture and child identity 
 descriptor waits. Native command adapters can now launch a typed sequence of scheduler-owned argv
 children; `env` uses it with an isolated launch environment and `xargs` uses it for ordered
 invocations. `timeout` schedules typed signal delivery to the child's retained process tree and
-reaps that tree after expiry. VFS Python shebang execution, Make recipes, Python bytecode, and the
-remaining synchronous `command` builtin keep phase 3 incomplete.
+reaps that tree after expiry. Make evaluates its bounded dependency graph into an ordered recipe
+plan, then runs each recipe as a scheduler-owned shell child; a failed recipe stops the sequence.
+VFS Python shebangs now cross the same scheduled child boundary, and the `command` builtin injects
+an argv continuation into its current process instead of recursively dispatching. The Python
+bytecode VM remains the main phase 3 execution gap.
 
 ## Non-negotiable invariants
 

@@ -293,6 +293,10 @@ fn native_command_adapters_launch_scheduled_children() {
         run("printf 'a\\0b c\\0' | xargs -0 -n 1 printf '<%s>'"),
         (0, "<a><b c>".into(), String::new())
     );
+    assert_eq!(
+        run("(sleep 1; printf ready > /tmp/marker) & command bash -c 'sleep 2; cat /tmp/marker'; command cd /tmp; printf ':%s' \"$PWD\"; wait"),
+        (0, "ready:/tmp".into(), String::new())
+    );
 }
 
 #[test]

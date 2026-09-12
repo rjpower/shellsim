@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::commands::util::{ewln, wln};
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{ChildCommand, CommandContext, CommandPoll, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
 const MAX_MAKEFILE_BYTES: usize = 1024 * 1024;
@@ -21,7 +21,7 @@ const MAX_EXPANDED_BYTES: usize = 4 * 1024 * 1024;
 /// Register the modeled `make` command. The central command registry calls this function when
 /// the module is enabled; it is kept public so the registry can remain a thin composition layer.
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    super::reg(m, &["make"], Trust::Partial, cmd_make);
+    super::reg_buffered_resumable(m, &["make"], Trust::Partial, cmd_make, start_make);
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +51,29 @@ struct MakeRun<'a, 'b> {
     recipe_count: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PlannedTarget {
+    mtime: u64,
+    rebuilt: bool,
+}
+
+struct PlannedRecipe {
+    source: String,
+    display: String,
+}
+
+struct MakePlan<'a> {
+    interp: &'a mut Interp,
+    cwd: String,
+    vars: BTreeMap<String, String>,
+    phony: BTreeSet<String>,
+    rules: BTreeMap<String, Rule>,
+    visiting: BTreeSet<String>,
+    visited: BTreeMap<String, PlannedTarget>,
+    recipes: Vec<PlannedRecipe>,
+    recipe_count: usize,
+}
+
 fn cmd_make(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let Some(options) = parse_args(args) else {
         ewln(io.err, "make: unsupported option or malformed argument");
@@ -77,6 +100,77 @@ fn cmd_make(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         return 2;
     }
     run_make(interp, io, options, &makefile_path)
+}
+
+fn start_make(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let Some(options) = parse_args(args) else {
+        ewln(io.err, "make: unsupported option or malformed argument");
+        return CommandPoll::Ready(2);
+    };
+    let cwd = match options.directory.as_deref() {
+        Some(directory) => {
+            let resolved = crate::vfs::resolve_against(&interp.cwd, directory);
+            if !interp.vfs.is_dir("/", &resolved) {
+                ewln(io.err, &format!("make: {resolved}: No such directory"));
+                return CommandPoll::Ready(2);
+            }
+            interp.vfs.realpath(&resolved, true).unwrap_or(resolved)
+        }
+        None => interp.cwd.clone(),
+    };
+    let makefile_path = match options.file.as_deref() {
+        Some("-") => {
+            ewln(io.err, "make: reading makefiles from stdin is unsupported");
+            return CommandPoll::Ready(2);
+        }
+        Some(path) => path.to_string(),
+        None if interp.vfs.is_file(&cwd, "Makefile") => "Makefile".to_string(),
+        None if interp.vfs.is_file(&cwd, "makefile") => "makefile".to_string(),
+        None => {
+            ewln(
+                io.err,
+                "make: *** No targets specified and no makefile found.  Stop.",
+            );
+            return CommandPoll::Ready(2);
+        }
+    };
+    let recipes = match plan_make(interp, options, &cwd, &makefile_path) {
+        Ok(recipes) => recipes,
+        Err(error) => {
+            ewln(io.err, &format!("make: {error}"));
+            return CommandPoll::Ready(2);
+        }
+    };
+    if recipes.is_empty() {
+        return CommandPoll::Ready(0);
+    }
+    let mut commands = Vec::with_capacity(recipes.len());
+    for recipe in recipes {
+        if recipe.source.is_empty() {
+            wln(io.out, &recipe.display);
+            continue;
+        }
+        let source = if recipe.display.is_empty() {
+            format!("{} || exit 2", recipe.source)
+        } else {
+            format!(
+                "printf '%s\\n' {}; {} || exit 2",
+                shell_quote(&recipe.display),
+                recipe.source
+            )
+        };
+        commands.push(ChildCommand {
+            argv: vec!["bash".to_string(), "-c".to_string(), source],
+            stdin: Vec::new(),
+            cwd: Some(cwd.clone()),
+            environment: None,
+        });
+    }
+    crate::commands::start_child_sequence(interp, commands, true)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[derive(Default)]
@@ -210,6 +304,185 @@ fn execute_make(
         runner.build(&target, None)?;
     }
     Ok(())
+}
+
+fn plan_make(
+    interp: &mut Interp,
+    options: Options,
+    cwd: &str,
+    makefile_path: &str,
+) -> Result<Vec<PlannedRecipe>, String> {
+    let path = crate::vfs::resolve_against(cwd, makefile_path);
+    let size = interp.vfs.file_len("/", &path).map_err(|e| e.to_string())?;
+    if size > MAX_MAKEFILE_BYTES {
+        return Err(format!(
+            "makefile exceeds the {MAX_MAKEFILE_BYTES}-byte limit"
+        ));
+    }
+    let source = interp
+        .vfs
+        .read_string_limited("/", &path, MAX_MAKEFILE_BYTES)
+        .map_err(|e| e.to_string())?;
+    let mut makefile = parse_makefile(interp, &source)?;
+    for (name, value) in options.command_vars {
+        makefile.vars.insert(name, value);
+    }
+    let targets = if options.targets.is_empty() {
+        vec![makefile
+            .order
+            .first()
+            .cloned()
+            .ok_or_else(|| "no targets specified".to_string())?]
+    } else {
+        options.targets
+    };
+    let mut planner = MakePlan {
+        interp,
+        cwd: cwd.to_string(),
+        vars: makefile.vars,
+        phony: makefile.phony,
+        rules: makefile.rules,
+        visiting: BTreeSet::new(),
+        visited: BTreeMap::new(),
+        recipes: Vec::new(),
+        recipe_count: 0,
+    };
+    for target in targets {
+        planner.build(&target, None, options.dry_run)?;
+    }
+    Ok(planner.recipes)
+}
+
+impl MakePlan<'_> {
+    fn build(
+        &mut self,
+        target: &str,
+        parent: Option<&str>,
+        dry_run: bool,
+    ) -> Result<PlannedTarget, String> {
+        if self.visiting.contains(target) {
+            return Err(format!("circular dependency involving '{target}'"));
+        }
+        if let Some(result) = self.visited.get(target) {
+            return Ok(*result);
+        }
+        self.visiting.insert(target.to_string());
+        let rule = self.rules.get(target).cloned();
+        let exists = self.interp.vfs.exists(&self.cwd, target);
+        if rule.is_none() {
+            self.visiting.remove(target);
+            if exists {
+                let result = PlannedTarget {
+                    mtime: self.mtime(target),
+                    rebuilt: false,
+                };
+                self.visited.insert(target.to_string(), result);
+                return Ok(result);
+            }
+            return Err(format!("No rule to make target '{target}'"));
+        }
+        let rule = rule.expect("rule presence was checked");
+        let prerequisites = self.expand_prerequisites(target, &rule.prerequisites)?;
+        let mut prerequisite_results = Vec::with_capacity(prerequisites.len());
+        for prerequisite in &prerequisites {
+            prerequisite_results.push(self.build(prerequisite, Some(target), dry_run)?);
+        }
+        let target_mtime = self.mtime(target);
+        let needs = self.phony.contains(target)
+            || !exists
+            || prerequisite_results
+                .iter()
+                .any(|result| result.rebuilt || result.mtime > target_mtime);
+        if needs {
+            for recipe in &rule.recipes {
+                self.recipe_count = self.recipe_count.saturating_add(1);
+                if self.recipe_count > MAX_RECIPES {
+                    return Err(format!("recipe limit exceeded ({MAX_RECIPES})"));
+                }
+                let expanded = self.expand(recipe, target, parent, &prerequisites)?;
+                if expanded.trim().is_empty() {
+                    continue;
+                }
+                let silent = expanded.starts_with('@');
+                let command = if silent {
+                    expanded[1..].trim_start().to_string()
+                } else {
+                    expanded.clone()
+                };
+                self.recipes.push(PlannedRecipe {
+                    source: if dry_run { String::new() } else { command },
+                    display: if silent && !dry_run {
+                        String::new()
+                    } else {
+                        expanded.trim_start_matches('@').trim_start().to_string()
+                    },
+                });
+            }
+        }
+        self.visiting.remove(target);
+        let result = PlannedTarget {
+            mtime: target_mtime,
+            rebuilt: needs,
+        };
+        self.visited.insert(target.to_string(), result);
+        Ok(result)
+    }
+
+    fn mtime(&self, target: &str) -> u64 {
+        self.interp
+            .vfs
+            .metadata(&self.cwd, target, true)
+            .map(|node| node.mtime)
+            .unwrap_or(0)
+    }
+
+    fn expand(
+        &mut self,
+        recipe: &str,
+        target: &str,
+        _parent: Option<&str>,
+        prerequisites: &[String],
+    ) -> Result<String, String> {
+        if !self.interp.resources.charge_cpu(recipe.len() as u64) {
+            return Err("resource limit exceeded while expanding recipe".to_string());
+        }
+        expand_vars(
+            recipe,
+            &self.vars,
+            target,
+            prerequisites,
+            MAX_EXPANSION_DEPTH,
+        )
+    }
+
+    fn expand_prerequisites(
+        &mut self,
+        target: &str,
+        raw_prerequisites: &[String],
+    ) -> Result<Vec<String>, String> {
+        let source_bytes = raw_prerequisites
+            .iter()
+            .try_fold(0_u64, |total, value| total.checked_add(value.len() as u64))
+            .ok_or_else(|| "prerequisite expansion is too large".to_string())?;
+        if !self.interp.resources.charge_cpu(source_bytes) {
+            return Err("resource limit exceeded while expanding prerequisites".to_string());
+        }
+        let mut expanded = Vec::new();
+        for prerequisite in raw_prerequisites {
+            let value = expand_vars(prerequisite, &self.vars, target, &[], MAX_EXPANSION_DEPTH)?;
+            for name in value.split_whitespace() {
+                if expanded.len() >= MAX_TARGETS {
+                    return Err(format!(
+                        "expanded prerequisite limit exceeded ({MAX_TARGETS})"
+                    ));
+                }
+                validate_name(name, 0)
+                    .map_err(|_| format!("variable produced unsupported prerequisite '{name}'"))?;
+                expanded.push(name.to_string());
+            }
+        }
+        Ok(expanded)
+    }
 }
 
 fn parse_makefile(interp: &mut Interp, source: &str) -> Result<Makefile, String> {

@@ -47,7 +47,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["kill"], Trust::Real, cmd_kill);
     reg(m, &["killall", "pkill"], Trust::NoOp, cmd_unsupported);
     reg(m, &["type", "which"], Trust::Real, cmd_which);
-    reg(m, &["command"], Trust::Real, cmd_command);
+    reg_resumable(m, &["command"], Trust::Real, cmd_command, start_command);
     reg(m, &["alias", "unalias"], Trust::NoOp, cmd_unsupported);
     reg(m, &["getopts"], Trust::Real, cmd_getopts);
     reg(m, &["let"], Trust::Real, cmd_let);
@@ -816,6 +816,25 @@ fn cmd_command(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
         return 0;
     }
     crate::commands::run(interp, argv, io.stdin.clone(), io.out, io.err)
+}
+
+fn start_command(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    if args.is_empty() {
+        return CommandPoll::Ready(0);
+    }
+    if matches!(args.first().map(String::as_str), Some("-v" | "-V")) {
+        return CommandPoll::Ready(cmd_which(interp, &args[1..], io));
+    }
+    let argv = if args.first().map(String::as_str) == Some("--") {
+        &args[1..]
+    } else {
+        args
+    };
+    if argv.is_empty() {
+        CommandPoll::Ready(0)
+    } else {
+        CommandPoll::Inline(crate::shell::Node::ArgvCommand(argv.to_vec()))
+    }
 }
 
 fn cmd_let(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
