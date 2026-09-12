@@ -23,6 +23,8 @@ use super::native::{
 use super::object_model::{BuiltinType, PyLayout, Slot, SlotValue, TypeId};
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
 
+const VM_POLL_QUANTUM: usize = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NativeValue {
     Module(&'static ModuleDef),
@@ -227,27 +229,89 @@ pub(super) fn execute(
         .locals
         .entry("__name__".into())
         .or_insert_with(|| Value::inline_string("__main__").expect("short builtin string"));
-    let tokens = match super::lexer::lex(source) {
-        Ok(tokens) => tokens,
-        Err(error) => {
-            return ExecResult::Unsupported(format!(
-                "{} at line {}, column {}",
-                error.message, error.span.line, error.span.column
-            ))
-        }
-    };
-    let program = match super::parser::parse(tokens) {
+    let mut program = match VmProgram::compile(source) {
         Ok(program) => program,
-        Err(error) => {
-            return ExecResult::Unsupported(format!(
+        Err(result) => return result,
+    };
+    loop {
+        if let Some(result) = program.poll(interp, argv, state, interactive, out, err) {
+            return result;
+        }
+    }
+}
+
+/// Compiled Python and the transient bytecode state retained between bounded VM polls.
+pub(super) struct VmProgram {
+    code: Code,
+    execution: VmState,
+    started: bool,
+}
+
+impl VmProgram {
+    pub(super) fn compile(source: &str) -> Result<Self, ExecResult> {
+        let tokens = super::lexer::lex(source).map_err(|error| {
+            ExecResult::Unsupported(format!(
                 "{} at line {}, column {}",
                 error.message, error.span.line, error.span.column
             ))
+        })?;
+        let program = super::parser::parse(tokens).map_err(|error| {
+            ExecResult::Unsupported(format!(
+                "{} at line {}, column {}",
+                error.message, error.span.line, error.span.column
+            ))
+        })?;
+        Ok(Self {
+            code: super::compiler::compile(program),
+            execution: VmState::default(),
+            started: false,
+        })
+    }
+
+    /// Execute one bounded bytecode quantum, returning `None` while work remains runnable.
+    pub(super) fn poll(
+        &mut self,
+        interp: &mut Interp,
+        argv: &[String],
+        state: &mut ReplState,
+        interactive: bool,
+        out: Out,
+        err: Out,
+    ) -> Option<ExecResult> {
+        let mut vm = Vm::new(
+            interp,
+            argv,
+            state,
+            &mut self.execution,
+            interactive,
+            out,
+            err,
+        );
+        if !self.started {
+            let retained_heap = vm
+                .state
+                .heap
+                .modeled_bytes()
+                .saturating_add(vm.state.types.modeled_bytes());
+            if retained_heap != 0 && !vm.interp.resources.reserve_memory(retained_heap) {
+                return Some(ExecResult::Exit(137));
+            }
+            vm.bytecode_frames.push(BytecodeFrame {
+                code: self.code.clone(),
+                instruction_pointer: 0,
+                handlers: Vec::new(),
+            });
+            self.started = true;
         }
-    };
-    let code = super::compiler::compile(program);
-    let mut execution = VmState::default();
-    Vm::new(interp, argv, state, &mut execution, interactive, out, err).run(&code)
+        let execution = vm.execute_active_frame(VM_POLL_QUANTUM);
+        if matches!(execution, Ok(Execution::Pending)) {
+            return None;
+        }
+        vm.bytecode_frames
+            .pop()
+            .expect("completed program must retain its root frame");
+        Some(vm.render_execution(execution))
+    }
 }
 
 struct Vm<'a> {
@@ -322,16 +386,12 @@ impl<'a> Vm<'a> {
         }
     }
 
-    fn run(mut self, code: &Code) -> ExecResult {
-        let retained_heap = self
-            .state
-            .heap
-            .modeled_bytes()
-            .saturating_add(self.state.types.modeled_bytes());
-        if retained_heap != 0 && !self.interp.resources.reserve_memory(retained_heap) {
-            return ExecResult::Exit(137);
-        }
-        match self.execute_code(code) {
+    fn render_execution(
+        &mut self,
+        execution: Result<Execution, (String, super::source::Span)>,
+    ) -> ExecResult {
+        match execution {
+            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Halt) | Ok(Execution::Return(_)) | Ok(Execution::Yield(_, _)) => {
                 ExecResult::Continue
             }
@@ -372,7 +432,12 @@ impl<'a> Vm<'a> {
             instruction_pointer,
             handlers: std::mem::take(handlers),
         });
-        let result = self.execute_active_frame();
+        let result = loop {
+            match self.execute_active_frame(VM_POLL_QUANTUM) {
+                Ok(Execution::Pending) => {}
+                result => break result,
+            }
+        };
         let frame = self
             .bytecode_frames
             .pop()
@@ -381,8 +446,11 @@ impl<'a> Vm<'a> {
         result
     }
 
-    fn execute_active_frame(&mut self) -> Result<Execution, (String, super::source::Span)> {
-        loop {
+    fn execute_active_frame(
+        &mut self,
+        budget: usize,
+    ) -> Result<Execution, (String, super::source::Span)> {
+        for _ in 0..budget.max(1) {
             if self.interp.deadline_interrupt.is_some() {
                 return Ok(Execution::Exit(124));
             }
@@ -732,6 +800,7 @@ impl<'a> Vm<'a> {
             }
             self.active_frame_mut().instruction_pointer += 1;
         }
+        Ok(Execution::Pending)
     }
 
     fn active_frame_mut(&mut self) -> &mut BytecodeFrame {
@@ -1023,6 +1092,7 @@ impl<'a> Vm<'a> {
         }
         self.stack = outer_stack;
         match execution {
+            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Halt) => {
                 self.stack.push(module);
                 Ok(())
@@ -1757,6 +1827,7 @@ impl<'a> Vm<'a> {
         self.local_scopes.pop();
         self.stack = outer_stack;
         match execution {
+            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Halt) => {}
             Ok(Execution::Return(_)) => return Err("'return' outside function".into()),
             Ok(Execution::Yield(_, _)) => return Err("'yield' outside function".into()),
@@ -2846,6 +2917,7 @@ impl<'a> Vm<'a> {
         self.stack = outer_stack;
 
         match result {
+            Ok(Execution::Pending) => unreachable!("execute_code_from drains pending quanta"),
             Ok(Execution::Yield(value, next_instruction)) => {
                 if let Object::Generator {
                     instruction_pointer,
@@ -4057,6 +4129,7 @@ impl<'a> Vm<'a> {
         self.local_scopes.pop();
         self.stack = outer_stack;
         match result {
+            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Return(value)) => Ok(CallResult::Value(value)),
             Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
             Ok(Execution::Yield(_, _)) => {
@@ -5408,6 +5481,7 @@ enum CallResult {
 }
 
 enum Execution {
+    Pending,
     Halt,
     Return(Value),
     Yield(Value, usize),

@@ -33,8 +33,10 @@ network, resources, package markers, and telemetry remain machine-wide, so local
 does not leak while filesystem effects remain visible. Exited background records remain until
 `wait` reaps them. Command substitutions, nested shells and scripts, Make recipes, `env`, `xargs`,
 `timeout`, and the `command` builtin all use retained continuations or scheduled argv children.
-The Python VM can cooperatively drive its `Popen` children, but its own bytecode and call frames are
-not yet retained scheduler state.
+Python commands retain compiled code, VM state, output, and top-level bytecode frames in command
+continuations and yield after bounded instruction quanta. Python user-function calls and blocking
+native operations still need to become iterative frame transitions before the old nested scheduler
+bridge can be removed.
 
 Reusing an `Environment` preserves the VFS, cwd, variables, functions, arrays, package markers,
 virtual time/network state, command history, Python REPL, and cumulative resource usage. `exit`,

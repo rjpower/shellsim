@@ -33,12 +33,36 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["uv", "uvx", "uvenv"], Trust::Partial, cmd_uv);
 
     // interpreters
-    reg(m, &["python3"], Trust::Partial, cmd_python3);
-    reg(m, &["python"], Trust::Partial, cmd_python);
-    reg(m, &["python3.11"], Trust::Partial, cmd_python311);
-    reg(m, &["python3.12"], Trust::Partial, cmd_python312);
-    reg(m, &["python3.13"], Trust::Partial, cmd_python313);
-    reg(m, &["python3.14"], Trust::Partial, cmd_python314);
+    reg_buffered_resumable(m, &["python3"], Trust::Partial, cmd_python3, start_python3);
+    reg_buffered_resumable(m, &["python"], Trust::Partial, cmd_python, start_python);
+    reg_buffered_resumable(
+        m,
+        &["python3.11"],
+        Trust::Partial,
+        cmd_python311,
+        start_python311,
+    );
+    reg_buffered_resumable(
+        m,
+        &["python3.12"],
+        Trust::Partial,
+        cmd_python312,
+        start_python312,
+    );
+    reg_buffered_resumable(
+        m,
+        &["python3.13"],
+        Trust::Partial,
+        cmd_python313,
+        start_python313,
+    );
+    reg_buffered_resumable(
+        m,
+        &["python3.14"],
+        Trust::Partial,
+        cmd_python314,
+        start_python314,
+    );
     reg(m, &["pytest"], Trust::Partial, cmd_pytest);
     reg(m, &["jq"], Trust::Partial, cmd_jq);
 }
@@ -711,20 +735,38 @@ fn extract_dep_specs(toml_src: &str) -> Vec<String> {
 fn cmd_python3(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python3", args, io)
 }
+fn start_python3(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    start_python_impl(interp, "python3", args, io)
+}
 fn cmd_python(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python", args, io)
+}
+fn start_python(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    start_python_impl(interp, "python", args, io)
 }
 fn cmd_python311(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python3.11", args, io)
 }
+fn start_python311(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    start_python_impl(interp, "python3.11", args, io)
+}
 fn cmd_python312(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python3.12", args, io)
+}
+fn start_python312(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    start_python_impl(interp, "python3.12", args, io)
 }
 fn cmd_python313(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python3.13", args, io)
 }
+fn start_python313(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    start_python_impl(interp, "python3.13", args, io)
+}
 fn cmd_python314(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     python_impl(interp, "python3.14", args, io)
+}
+fn start_python314(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    start_python_impl(interp, "python3.14", args, io)
 }
 
 fn cmd_pytest(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -737,6 +779,29 @@ fn python_impl(interp: &mut Interp, name: &str, args: &[String], io: &mut Io) ->
     argv.extend(args.iter().cloned());
     let stdin = std::mem::take(&mut io.stdin);
     crate::python::run_python(interp, &argv, stdin, io.out, io.err)
+}
+
+fn start_python_impl(interp: &mut Interp, name: &str, args: &[String], io: &mut Io) -> CommandPoll {
+    let mut argv = vec![name.to_string()];
+    argv.extend(args.iter().cloned());
+    let stdin = std::mem::take(&mut io.stdin);
+    match crate::python::start_python(interp, &argv, stdin, io.out, io.err) {
+        crate::python::PythonCommandStart::Ready(status) => CommandPoll::Ready(status),
+        crate::python::PythonCommandStart::Running(mut continuation) => {
+            match continuation.poll(interp) {
+                Some(status) => {
+                    let (stdout, stderr) = (*continuation).into_output();
+                    io.out.extend_from_slice(&stdout);
+                    io.err.extend_from_slice(&stderr);
+                    CommandPoll::Ready(status)
+                }
+                None => CommandPoll::Yielded(CommandResume::Python {
+                    command: name.to_string(),
+                    continuation,
+                }),
+            }
+        }
+    }
 }
 
 fn cmd_jq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

@@ -314,24 +314,84 @@ enum ExecResult {
     Unsupported(String),
 }
 
+/// Owned Python command state retained by a shell continuation between scheduler quanta.
+pub(crate) struct PythonContinuation {
+    argv: Vec<String>,
+    state: ReplState,
+    program: vm::VmProgram,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Result of parsing and starting a Python command.
+pub(crate) enum PythonCommandStart {
+    Ready(i32),
+    Running(Box<PythonContinuation>),
+}
+
+impl PythonContinuation {
+    /// Run one bounded VM quantum. Completed output remains owned until the shell installs its
+    /// ordinary descriptor-write frames.
+    pub(crate) fn poll(&mut self, interp: &mut Interp) -> Option<i32> {
+        let result = self.program.poll(
+            interp,
+            &self.argv,
+            &mut self.state,
+            false,
+            &mut self.stdout,
+            &mut self.stderr,
+        )?;
+        Some(match result {
+            ExecResult::Continue => 0,
+            ExecResult::Exit(status) => status,
+            ExecResult::Unsupported(feature) => unsupported(interp, &feature, &mut self.stderr),
+        })
+    }
+
+    pub(crate) fn into_output(self) -> (Vec<u8>, Vec<u8>) {
+        (self.stdout, self.stderr)
+    }
+}
+
 pub fn run_python(interp: &mut Interp, argv: &[String], stdin: Vec<u8>, out: Out, err: Out) -> i32 {
+    match start_python(interp, argv, stdin, out, err) {
+        PythonCommandStart::Ready(status) => status,
+        PythonCommandStart::Running(mut continuation) => loop {
+            if let Some(status) = continuation.poll(interp) {
+                let (stdout, stderr) = (*continuation).into_output();
+                out.extend_from_slice(&stdout);
+                err.extend_from_slice(&stderr);
+                return status;
+            }
+        },
+    }
+}
+
+/// Prepare a Python command without borrowing the environment across execution quanta.
+pub(crate) fn start_python(
+    interp: &mut Interp,
+    argv: &[String],
+    stdin: Vec<u8>,
+    out: Out,
+    err: Out,
+) -> PythonCommandStart {
     let args = argv.get(1..).unwrap_or_default();
     if args
         .first()
         .is_some_and(|arg| arg == "--version" || arg == "-V")
     {
         out.extend_from_slice(b"Python 3.14.0\n");
-        return 0;
+        return PythonCommandStart::Ready(0);
     }
 
     if args.first().map(String::as_str) == Some("-m") {
-        return run_module(interp, &args[1..], out, err);
+        return PythonCommandStart::Ready(run_module(interp, &args[1..], out, err));
     }
 
     let (source, py_argv) = if args.first().map(String::as_str) == Some("-c") {
         let Some(source) = args.get(1).cloned() else {
             err.extend_from_slice(b"python: argument expected for the -c option\n");
-            return 2;
+            return PythonCommandStart::Ready(2);
         };
         let mut py_argv = vec!["-c".to_string()];
         py_argv.extend_from_slice(args.get(2..).unwrap_or_default());
@@ -349,9 +409,9 @@ pub fn run_python(interp: &mut Interp, argv: &[String], stdin: Vec<u8>, out: Out
         out.extend_from_slice(
             b"Python 3.14.0 (shellsim)\nType exit() or quit() to return to the shell.\n>>> ",
         );
-        return 0;
+        return PythonCommandStart::Ready(0);
     } else if args[0].starts_with('-') {
-        return unsupported(interp, &format!("option {}", args[0]), err);
+        return PythonCommandStart::Ready(unsupported(interp, &format!("option {}", args[0]), err));
     } else {
         let script = &args[0];
         let source = match interp.vfs.read_string(&interp.cwd, script) {
@@ -360,7 +420,7 @@ pub fn run_python(interp: &mut Interp, argv: &[String], stdin: Vec<u8>, out: Out
                 err.extend_from_slice(
                     format!("python: can't open file {script:?}: {error}\n").as_bytes(),
                 );
-                return 2;
+                return PythonCommandStart::Ready(2);
             }
         };
         let mut py_argv = vec![script.clone()];
@@ -372,7 +432,7 @@ pub fn run_python(interp: &mut Interp, argv: &[String], stdin: Vec<u8>, out: Out
     if !interp.resources.reserve_memory(scratch)
         || !interp.resources.charge_cpu(100 + source.len() as u64)
     {
-        return 137;
+        return PythonCommandStart::Ready(137);
     }
 
     let mut state = ReplState::default();
@@ -393,11 +453,24 @@ pub fn run_python(interp: &mut Interp, argv: &[String], stdin: Vec<u8>, out: Out
         }
     };
     state.import_paths.push(import_root);
-    match execute_source(interp, &source, &py_argv, &mut state, false, out, err) {
-        ExecResult::Continue => 0,
-        ExecResult::Exit(status) => status,
-        ExecResult::Unsupported(feature) => unsupported(interp, &feature, err),
-    }
+    state
+        .locals
+        .insert("__name__".into(), Value::inline_string("__main__").unwrap());
+    let program = match vm::VmProgram::compile(&source) {
+        Ok(program) => program,
+        Err(ExecResult::Unsupported(feature)) => {
+            return PythonCommandStart::Ready(unsupported(interp, &feature, err))
+        }
+        Err(ExecResult::Exit(status)) => return PythonCommandStart::Ready(status),
+        Err(ExecResult::Continue) => unreachable!("compilation cannot complete execution"),
+    };
+    PythonCommandStart::Running(Box::new(PythonContinuation {
+        argv: py_argv,
+        state,
+        program,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }))
 }
 
 /// Execute one action while Python owns the foreground session. The caller temporarily removes

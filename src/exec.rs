@@ -295,6 +295,7 @@ pub(crate) struct ShellContinuation {
     frames: Vec<ShellFrame>,
     status: i32,
     switched: bool,
+    yielded: bool,
     blocked: Option<crate::scheduler::WaitReason>,
 }
 
@@ -304,12 +305,14 @@ impl ShellContinuation {
             frames: vec![ShellFrame::Eval(node.clone())],
             status: 0,
             switched: false,
+            yielded: false,
             blocked: None,
         }
     }
 
     pub(crate) fn poll(&mut self, interp: &mut Interp, budget: usize) -> ShellPoll {
         self.switched = false;
+        self.yielded = false;
         self.blocked = None;
         for _ in 0..budget.max(1) {
             let Some(frame) = self.frames.pop() else {
@@ -319,6 +322,9 @@ impl ShellContinuation {
             interp.last_status = self.status;
             if self.switched {
                 return ShellPoll::Switched;
+            }
+            if self.yielded {
+                return ShellPoll::Pending;
             }
             if let Some(reason) = self.blocked.take() {
                 return ShellPoll::Blocked(reason);
@@ -1075,6 +1081,29 @@ impl ShellContinuation {
                         self.status = status;
                         restore_command_variables(interp, variables);
                     }
+                    crate::commands::CommandPoll::ReadyOutput {
+                        command,
+                        status,
+                        stdout,
+                        stderr,
+                    } => {
+                        self.frames.push(ShellFrame::WriteCommandOutput {
+                            command,
+                            variables,
+                            status,
+                            stdout,
+                            stderr,
+                            stdout_offset: 0,
+                            stderr_offset: 0,
+                        });
+                    }
+                    crate::commands::CommandPoll::Yielded(continuation) => {
+                        self.frames.push(ShellFrame::ResumeCommand {
+                            variables,
+                            continuation,
+                        });
+                        self.yielded = true;
+                    }
                     crate::commands::CommandPoll::Switched(continuation) => {
                         self.retain_switched_command(variables, continuation);
                     }
@@ -1151,6 +1180,30 @@ impl ShellContinuation {
                             stdout_offset: 0,
                             stderr_offset: 0,
                         });
+                    }
+                    crate::commands::CommandPoll::ReadyOutput {
+                        command,
+                        status,
+                        stdout,
+                        stderr,
+                    } => {
+                        self.frames.push(ShellFrame::WriteCommandOutput {
+                            command,
+                            variables,
+                            status,
+                            stdout,
+                            stderr,
+                            stdout_offset: 0,
+                            stderr_offset: 0,
+                        });
+                    }
+                    crate::commands::CommandPoll::Yielded(continuation) => {
+                        debug_assert!(stdout.is_empty() && stderr.is_empty());
+                        self.frames.push(ShellFrame::ResumeCommand {
+                            variables,
+                            continuation,
+                        });
+                        self.yielded = true;
                     }
                     crate::commands::CommandPoll::Switched(continuation) => {
                         debug_assert!(stdout.is_empty() && stderr.is_empty());
@@ -1508,6 +1561,30 @@ impl ShellContinuation {
                         stdout_offset: 0,
                         stderr_offset: 0,
                     });
+                }
+                crate::commands::CommandPoll::ReadyOutput {
+                    command,
+                    status,
+                    stdout,
+                    stderr,
+                } => {
+                    self.frames.push(ShellFrame::WriteCommandOutput {
+                        command,
+                        variables,
+                        status,
+                        stdout,
+                        stderr,
+                        stdout_offset: 0,
+                        stderr_offset: 0,
+                    });
+                }
+                crate::commands::CommandPoll::Yielded(continuation) => {
+                    debug_assert!(stdout.is_empty() && stderr.is_empty());
+                    self.frames.push(ShellFrame::ResumeCommand {
+                        variables,
+                        continuation,
+                    });
+                    self.yielded = true;
                 }
                 crate::commands::CommandPoll::Switched(continuation) => {
                     debug_assert!(stdout.is_empty() && stderr.is_empty());

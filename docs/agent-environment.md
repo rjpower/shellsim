@@ -114,15 +114,17 @@ pipeline stages run through deterministic cooperative continuations. Pipeline de
 bounded buffers with backpressure, so producers and consumers can overlap without eager whole-pipe
 materialization. Command substitution, shell-script adapters, Make recipes, timeout process trees,
 and the common `env`/`xargs` command adapters now use the same scheduler-owned process boundary.
-Reifying Python bytecode and call frames as owned process continuations is the remaining interpreter
-scheduler boundary.
+Python command execution now retains owned VM and top-level bytecode state and yields between
+bounded instruction quanta. Reifying user-function calls and blocking native calls as iterative
+frame transitions is the remaining interpreter scheduler boundary.
 
 Python `Popen`, `run`, `call`, `check_call`, and `check_output` execute only registered commands and
 VFS shell or Python scripts. Live children use scheduler continuations and bounded descriptor
 pipes; capture, inheritance, binary/text streams, duplex communication, cwd/env isolation,
-status, signals, and virtual deadlines are modeled. The calling Python VM drives child quanta at
-a nested cooperative boundary but is not itself resumable scheduler state. Arbitrary host
-executables, `preexec_fn`, and native session manipulation remain rejected.
+status, signals, and virtual deadlines are modeled. A top-level Python command is resumable, but a
+blocking subprocess method still drives child quanta through the legacy nested boundary until
+native calls can suspend an explicit Python frame. Arbitrary host executables, `preexec_fn`, and
+native session manipulation remain rejected.
 
 ## Synthetic `/proc` and `/dev`
 
@@ -168,9 +170,9 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
 4. Synthetic `/proc` and `/dev`, then bounded Python subprocess operations.
 5. Common agent conveniences. Bounded recursive `rg`, atomic patch application, gzip streams, and
    traversal-safe tar containers are present; zip containers and richer text tools remain.
-6. Cooperative background scheduling, bounded pipes, default signal delivery, and live Python
-   process handles are present; process groups, handlers, and scheduler-owned Python VM frames
-   remain.
+6. Cooperative background scheduling, bounded pipes, default signal delivery, live Python process
+   handles, and bounded top-level Python VM polling are present; process groups, handlers, and
+   iterative Python call/native frames remain.
 7. A persistent bounded NDJSON workspace protocol with execution, typed diffs, checkpoint/reset,
    file tools, inspection, and transactional host snapshot ingestion is present. Add scenario
    manifests, transcript persistence, cloning, and external-agent experiments.

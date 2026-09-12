@@ -52,6 +52,15 @@ pub type CmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> i32;
 /// Result of starting a command from a resumable shell continuation.
 pub(crate) enum CommandPoll {
     Ready(i32),
+    /// A command consumed one bounded work quantum and remains runnable.
+    Yielded(CommandResume),
+    /// A resumed command completed with buffered output for normal descriptor flushing.
+    ReadyOutput {
+        command: String,
+        status: i32,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
     Blocked(WaitReason, CommandResume),
     /// Starting the command changed the active scheduler process.
     Switched(CommandResume),
@@ -82,6 +91,10 @@ pub(crate) enum CommandResume {
         deadline: Option<crate::clock::EventId>,
         preserve_status: bool,
         result_override: Option<i32>,
+    },
+    Python {
+        command: String,
+        continuation: Box<crate::python::PythonContinuation>,
     },
 }
 
@@ -260,6 +273,12 @@ pub fn run(
 ) -> i32 {
     match dispatch(interp, argv, stdin, out, err, false) {
         CommandPoll::Ready(status) => status,
+        CommandPoll::ReadyOutput { .. } => {
+            unreachable!("synchronous command output must use its borrowed buffers")
+        }
+        CommandPoll::Yielded(_) => {
+            unreachable!("synchronous command dispatch cannot yield")
+        }
         CommandPoll::Blocked(_, _) => {
             unreachable!("synchronous command dispatch cannot suspend")
         }
@@ -416,6 +435,24 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
                     result_override,
                 },
             ),
+        },
+        CommandResume::Python {
+            command,
+            mut continuation,
+        } => match continuation.poll(interp) {
+            Some(status) => {
+                let (stdout, stderr) = (*continuation).into_output();
+                CommandPoll::ReadyOutput {
+                    command,
+                    status,
+                    stdout,
+                    stderr,
+                }
+            }
+            None => CommandPoll::Yielded(CommandResume::Python {
+                command,
+                continuation,
+            }),
         },
     }
 }
@@ -583,7 +620,7 @@ fn dispatch(
         interp
             .resources
             .record_command(cmd, cpu_before, disk_before, interp.vfs.disk_used());
-        if !matches!(result, CommandPoll::Switched(_)) {
+        if !matches!(result, CommandPoll::Switched(_) | CommandPoll::Yielded(_)) {
             if let Some(reason) = interp.resources.stop_reason() {
                 result = CommandPoll::Ready(reason.exit_status());
             }

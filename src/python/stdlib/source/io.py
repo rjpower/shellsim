@@ -69,6 +69,15 @@ class _File:
     def write(self, value):
         if self.closed or self._operation == "r":
             raise ValueError("file is not open for writing")
+        if self._operation == "a":
+            if _shellsim_vfs.exists(self.name):
+                self._data = self._read_file()
+            else:
+                self._data = self._empty
+            self._data += value
+            self._position = len(self._data)
+            self._write_file()
+            return len(value)
         before = self._data[:self._position]
         after_start = self._position + len(value)
         after = self._data[after_start:]

@@ -1,4 +1,5 @@
 use shellsim::clock::{DEFAULT_EPOCH_UTC_NS, NANOS_PER_MILLISECOND, NANOS_PER_SECOND};
+use shellsim::resources::Limits;
 use shellsim::Environment;
 use std::process::Command;
 
@@ -38,6 +39,35 @@ fn background_sleeps_overlap_under_the_cooperative_scheduler() {
     );
     assert_eq!(environment.clock.monotonic_ns(), 3 * NANOS_PER_SECOND);
     assert_eq!(environment.clock.slept_ns(), 6 * NANOS_PER_SECOND);
+}
+
+#[test]
+fn cpu_bound_python_processes_yield_between_bytecode_quanta() {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 100_000_000,
+        memory: 256 * 1024 * 1024,
+        ..Limits::default()
+    });
+    let source = r#"python3 -c "i = 0
+while i < 100:
+    open('/trace', 'a').write('a')
+    i += 1" &
+python3 -c "i = 0
+while i < 100:
+    open('/trace', 'a').write('b')
+    i += 1" &
+wait"#;
+    assert_eq!(
+        run(&mut environment, source),
+        (0, String::new(), String::new())
+    );
+    let trace = environment.vfs.read_string("/", "/trace").unwrap();
+    assert_eq!(trace.len(), 200);
+    assert!(trace.contains("ab"), "first process never yielded: {trace}");
+    assert!(
+        trace.contains("ba"),
+        "second process never yielded: {trace}"
+    );
 }
 
 #[test]
