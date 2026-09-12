@@ -42,7 +42,7 @@ capabilities.
 | Python | Substantial bounded interpreter | Arbitrary projects and third-party ecosystems remain out of scope |
 | Processes and jobs | Cooperative logical processes | Background jobs, waits, sleeps, bounded pipelines, and default signal dispositions are modeled; process groups and handlers remain |
 | Build ecosystem | Useful first slice | Git and Make are deliberately small; native compilation remains out of scope |
-| Harness integration | Useful foundation | Scenario assertions, cloning, transcript persistence, and model-client adapters remain |
+| Harness integration | Useful foundation | Session cloning, transcript persistence, and model-client adapters remain |
 | Observability | Good | Compatibility reporting is command-level rather than invocation-level |
 
 ## Observed shell gaps
@@ -179,8 +179,8 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
    handles, bounded Python VM polling, and retryable blocking native calls are present; process
    groups, handlers, and compound native callback frames remain.
 7. A persistent bounded NDJSON workspace protocol with execution, typed diffs, checkpoint/reset,
-   file tools, inspection, and transactional host snapshot ingestion is present. Add scenario
-   manifests, transcript persistence, cloning, and external-agent experiments.
+   file tools, inspection, transactional host snapshot ingestion, replay, and typed scenario
+   assertions is present. Add transcript persistence, cloning, and external-agent experiments.
 
 Every phase retains the existing security rule: simulated input can use only explicitly modeled
 state and must never fall through to host filesystem, process, network, environment, or clock

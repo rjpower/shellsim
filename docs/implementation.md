@@ -77,14 +77,17 @@ back the entire import on failure. No request can reopen that host boundary.
 
 `shellsim replay SCENARIO.ndjson` runs the same requests through a fresh session and emits one
 typed transcript record per action containing its zero-based sequence number, original request,
-and response. Scenario action lines remain subject to the 20 MiB request bound; a replay is capped
-at 4,096 actions and 64 MiB each of scenario and emitted transcript data. `--root` and resource
-limits have the same meaning as in `serve`, so a checked-in action stream can be rerun against a
-bounded host snapshot without changing the protocol.
+and response. A line may instead wrap a request as `{"request": {...}, "expect": {...}}` and
+assert exact success, exit status, base64 streams, unsupported, no-op, and partial commands,
+workspace change count, or an error substring. Assertion results are embedded in the transcript and
+any mismatch makes the replay exit with status 1 after all actions run. Scenario lines remain
+subject to the 20 MiB request bound; a replay is capped at 4,096 actions and 64 MiB each of scenario
+and emitted transcript data.
+`--root` and resource limits have the same meaning as in `serve`, so a checked-in action stream can
+be rerun against a bounded host snapshot without changing the protocol.
 
-This is sufficient for a host-side agent adapter to replay tool calls without launching the agent
-inside shellsim. Scenario assertions, session cloning, and Codex/Claude adapters remain
-harness-side work.
+This is sufficient for a host-side agent adapter to replay and assert tool calls without launching
+the agent inside shellsim. Session cloning and Codex/Claude adapters remain harness-side work.
 
 ## Simulation boundaries
 

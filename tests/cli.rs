@@ -251,3 +251,58 @@ fn scenario_replay_rejects_invalid_actions() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("action 1 is invalid"));
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn scenario_replay_checks_typed_expectations() {
+    let directory = TestDirectory::new();
+    let passing = directory.path().join("passing.ndjson");
+    std::fs::write(
+        &passing,
+        concat!(
+            "{\"request\":{\"id\":\"run\",\"op\":\"execute\",\"source\":\"printf ok > note; printf done\"},\"expect\":{\"ok\":true,\"exit_status\":0,\"stdout_base64\":\"ZG9uZQ==\",\"stderr_base64\":\"\",\"unsupported\":[],\"noop_commands\":[],\"partial_commands\":[]}}\n",
+            "{\"request\":{\"id\":\"diff\",\"op\":\"workspace_diff\"},\"expect\":{\"workspace_change_count\":1}}\n"
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .arg("replay")
+        .arg(&passing)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["assertion"]["passed"], true);
+    assert_eq!(records[1]["assertion"]["passed"], true);
+
+    let failing = directory.path().join("failing.ndjson");
+    std::fs::write(
+        &failing,
+        b"{\"request\":{\"op\":\"execute\",\"source\":\"false\"},\"expect\":{\"exit_status\":0}}\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .arg("replay")
+        .arg(&failing)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("assertion failed"));
+    let record: serde_json::Value =
+        serde_json::from_slice(output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout))
+            .unwrap();
+    assert_eq!(record["assertion"]["passed"], false);
+    assert!(record["assertion"]["failures"][0]
+        .as_str()
+        .unwrap()
+        .contains("exit_status"));
+}
