@@ -86,6 +86,8 @@ pub struct ProcessState {
     pub arrays: HashMap<String, ArrayVal>,
     pub exported: std::collections::BTreeSet<String>,
     pub cwd: String,
+    /// Bash-style directory stack, stored oldest-to-newest beneath the current directory.
+    pub directory_stack: Vec<String>,
     pub funcs: HashMap<String, crate::shell::Node>,
     /// `$?`
     pub last_status: i32,
@@ -241,6 +243,7 @@ impl ProcessState {
             arrays: self.arrays.clone(),
             exported: self.exported.clone(),
             cwd: self.cwd.clone(),
+            directory_stack: self.directory_stack.clone(),
             funcs: self.funcs.clone(),
             last_status: self.last_status,
             positional: self.positional.clone(),
@@ -284,6 +287,11 @@ impl ProcessState {
                     .fold(0, |total, value| total.saturating_add(string(value))),
             )
             .saturating_add(string(&self.cwd))
+            .saturating_add(
+                self.directory_stack
+                    .iter()
+                    .fold(0, |total, value| total.saturating_add(string(value))),
+            )
             .saturating_add(
                 self.positional
                     .iter()
@@ -399,6 +407,7 @@ impl Environment {
                 arrays: HashMap::new(),
                 exported,
                 cwd: "/".to_string(),
+                directory_stack: Vec::new(),
                 funcs: HashMap::new(),
                 last_status: 0,
                 positional: Vec::new(),

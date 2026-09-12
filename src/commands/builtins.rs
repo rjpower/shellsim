@@ -52,7 +52,9 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["getopts"], Trust::Real, cmd_getopts);
     reg(m, &["let"], Trust::Real, cmd_let);
     reg(m, &["mapfile", "readarray"], Trust::NoOp, cmd_unsupported);
-    reg(m, &["pushd", "popd", "dirs"], Trust::NoOp, cmd_unsupported);
+    reg(m, &["pushd"], Trust::Real, cmd_pushd);
+    reg(m, &["popd"], Trust::Real, cmd_popd);
+    reg(m, &["dirs"], Trust::Real, cmd_dirs);
 }
 
 fn cmd_unsupported(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
@@ -315,6 +317,11 @@ fn cmd_pwd(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i3
 }
 
 fn cmd_cd(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.len() > 1 {
+        ewln(io.err, "cd: too many arguments");
+        return 1;
+    }
+    let print = args.first().is_some_and(|argument| argument == "-");
     let target = match args.first().map(|s| s.as_str()) {
         None | Some("~") => interp.get_var("HOME").unwrap_or_else(|| "/".into()),
         Some("-") => interp
@@ -322,17 +329,119 @@ fn cmd_cd(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             .unwrap_or_else(|| interp.cwd.clone()),
         Some(p) => p.to_string(),
     };
-    let abs = crate::vfs::resolve_against(&interp.cwd, &target);
-    if interp.vfs.is_dir("/", &abs) {
-        let old = interp.cwd.clone();
-        interp.set_var("OLDPWD", old);
-        interp.cwd = interp.vfs.realpath(&abs, true).unwrap_or(abs);
-        let cwd = interp.cwd.clone();
-        interp.set_var("PWD", cwd);
-        0
+    match change_directory(interp, &target) {
+        Ok(()) => {
+            if print {
+                wln(io.out, &interp.cwd);
+            }
+            0
+        }
+        Err(()) => {
+            ewln(io.err, &format!("cd: {target}: No such file or directory"));
+            1
+        }
+    }
+}
+
+fn change_directory(interp: &mut CommandContext<'_>, target: &str) -> Result<(), ()> {
+    let absolute = crate::vfs::resolve_against(&interp.cwd, target);
+    if !interp.vfs.is_dir("/", &absolute) {
+        return Err(());
+    }
+    let old = interp.cwd.clone();
+    interp.set_var("OLDPWD", old);
+    interp.cwd = interp.vfs.realpath(&absolute, true).unwrap_or(absolute);
+    let cwd = interp.cwd.clone();
+    interp.set_var("PWD", cwd);
+    Ok(())
+}
+
+const MAX_DIRECTORY_STACK: usize = 256;
+
+fn cmd_pushd(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.len() > 1
+        || args
+            .first()
+            .is_some_and(|argument| argument.starts_with('-'))
+    {
+        ewln(io.err, "pushd: usage: pushd [DIR]");
+        return 2;
+    }
+    if interp.directory_stack.len() >= MAX_DIRECTORY_STACK {
+        ewln(io.err, "pushd: directory stack limit exceeded");
+        return 1;
+    }
+    let previous = interp.cwd.clone();
+    let target = match args.first() {
+        Some(target) => target.clone(),
+        None => match interp.directory_stack.pop() {
+            Some(target) => target,
+            None => {
+                ewln(io.err, "pushd: no other directory");
+                return 1;
+            }
+        },
+    };
+    if change_directory(interp, &target).is_err() {
+        if args.is_empty() {
+            interp.directory_stack.push(target.clone());
+        }
+        ewln(
+            io.err,
+            &format!("pushd: {target}: No such file or directory"),
+        );
+        return 1;
+    }
+    interp.directory_stack.push(previous);
+    print_directory_stack(interp, false, io);
+    0
+}
+
+fn cmd_popd(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if !args.is_empty() {
+        ewln(io.err, "popd: arguments are not supported");
+        return 2;
+    }
+    let Some(target) = interp.directory_stack.pop() else {
+        ewln(io.err, "popd: directory stack empty");
+        return 1;
+    };
+    if change_directory(interp, &target).is_err() {
+        interp.directory_stack.push(target.clone());
+        ewln(
+            io.err,
+            &format!("popd: {target}: No such file or directory"),
+        );
+        return 1;
+    }
+    print_directory_stack(interp, false, io);
+    0
+}
+
+fn cmd_dirs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    match args {
+        [] => print_directory_stack(interp, false, io),
+        [flag] if flag == "-p" => print_directory_stack(interp, true, io),
+        [flag] if flag == "-c" => interp.directory_stack.clear(),
+        _ => {
+            ewln(io.err, "dirs: only -c and -p are supported");
+            return 2;
+        }
+    }
+    0
+}
+
+fn print_directory_stack(interp: &CommandContext<'_>, one_per_line: bool, io: &mut Io) {
+    let entries = std::iter::once(&interp.cwd)
+        .chain(interp.directory_stack.iter().rev())
+        .cloned()
+        .collect::<Vec<_>>();
+    if one_per_line {
+        for entry in entries {
+            wln(io.out, &entry);
+        }
     } else {
-        ewln(io.err, &format!("cd: {target}: No such file or directory"));
-        1
+        wln(io.out, &entries.join(" "));
     }
 }
 

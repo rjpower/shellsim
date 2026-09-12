@@ -62,9 +62,10 @@ agent cannot safely treat as Bash:
 | `git status` | modeled human and porcelain status | expand the coherent repository subset only as task evidence requires |
 | `make test` | executes explicit shell recipes | add Make syntax deliberately and reject unsupported constructs |
 
-Several formerly silent builtins, including process controls, aliases, directory-stack commands,
-and `mapfile`, now fail explicitly. Unsupported behavior should remain observable; success must
-mean that the requested effect occurred.
+Several formerly silent builtins, including process controls, aliases, and `mapfile`, now fail
+explicitly. A bounded process-local directory stack supports `pushd`, `popd`, and common `dirs`
+forms. Unsupported behavior should remain observable; success must mean that the requested effect
+occurred.
 
 ### Shell priorities
 
@@ -76,8 +77,8 @@ mean that the requested effect occurred.
 6. Resolve executable VFS scripts through `PATH` and honor executable metadata. Complete for
    shell/Python shebangs and explicit rejection of unsupported interpreters.
 7. Add small common conveniences: aliases, directory stack, `mapfile`, jobs, wait, recursive
-   search, patch application, and basic archive tools. Recursive search and atomic VFS-only patch
-   application are now present.
+   search, patch application, and basic archive tools. Directory stacks, recursive search, and
+   atomic VFS-only patch application are now present.
 
 Git and Make follow the same structure as the Python runtime: a small coherent state model
 and parser, thin command-facing adapters, deterministic algorithms, explicit unsupported

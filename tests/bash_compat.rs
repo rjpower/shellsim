@@ -127,6 +127,35 @@ fn completed_background_jobs_are_queryable_and_waitable() {
 }
 
 #[test]
+fn directory_stack_is_process_local_and_bounded() {
+    assert_eq!(
+        run("mkdir -p /work/a /work/b; cd /work; pushd a; pushd ../b; dirs -p; popd; pwd; pushd; pwd; dirs -c; dirs"),
+        (
+            0,
+            concat!(
+                "/work/a /work\n",
+                "/work/b /work/a /work\n",
+                "/work/b\n/work/a\n/work\n",
+                "/work/a /work\n",
+                "/work/a\n",
+                "/work /work/a\n",
+                "/work\n",
+                "/work\n",
+            )
+            .into(),
+            String::new()
+        )
+    );
+    assert_eq!(
+        run("mkdir /a; pushd /a >/dev/null; (pushd /tmp >/dev/null; dirs); dirs"),
+        (0, "/tmp /a /\n/a /\n".into(), String::new())
+    );
+    let empty = run("popd");
+    assert_eq!(empty.0, 1);
+    assert!(empty.2.contains("directory stack empty"), "{}", empty.2);
+}
+
+#[test]
 fn child_shell_boundaries_isolate_local_state_but_share_files() {
     assert_eq!(
         run("x=parent; (x=child; cd /tmp; printf saved > child-file); printf '%s:%s:' \"$x\" \"$PWD\"; cat /tmp/child-file"),
