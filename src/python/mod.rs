@@ -14,6 +14,7 @@ mod native;
 mod number;
 mod object_model;
 mod parser;
+mod process;
 mod protocol;
 mod source;
 mod stdlib;

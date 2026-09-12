@@ -16,7 +16,8 @@ use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentSpec, PyByteArray, PyCallable,
     PyClass, PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyIdentity,
     PyInstance, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyNativeKind,
-    PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyTuple, PyValueCast,
+    PyProcessOutput, PyProcessRequest, PyProcessRunner, PyProperty, PyRaisesContext, PyRegex,
+    PyResult, PyRuntime, PySet, PyStdio, PyTuple, PyValueCast,
 };
 use super::object_model::{BuiltinType, PyLayout, Slot, SlotValue, TypeId};
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
@@ -133,6 +134,8 @@ fn exception_type_code(name: &str) -> u64 {
         "StopIteration" => 10,
         "Skipped" => 11,
         "Failed" => 12,
+        "CalledProcessError" => 13,
+        "TimeoutExpired" => 14,
         _ => unreachable!("exception type must come from the closed builtin table"),
     }
 }
@@ -152,6 +155,8 @@ fn exception_type_name(code: u64) -> &'static str {
         10 => "StopIteration",
         11 => "Skipped",
         12 => "Failed",
+        13 => "CalledProcessError",
+        14 => "TimeoutExpired",
         _ => unreachable!("invalid private exception-type handle"),
     }
 }
@@ -5185,6 +5190,10 @@ impl PyRuntime for Vm<'_> {
         }
     }
 
+    fn exception_type(&self, name: &'static str) -> Value {
+        Value::Native(NativeValue::ExceptionType(ExceptionType(name)))
+    }
+
     fn clock(&mut self) -> &mut dyn PyClock {
         self
     }
@@ -5195,6 +5204,47 @@ impl PyRuntime for Vm<'_> {
 
     fn filesystem(&mut self) -> &mut dyn PyFilesystem {
         self.interp
+    }
+
+    fn processes(&mut self) -> &mut dyn PyProcessRunner {
+        self
+    }
+}
+
+impl PyProcessRunner for Vm<'_> {
+    fn run(&mut self, request: PyProcessRequest) -> PyResult<PyProcessOutput> {
+        let stdout_mode = request.stdout;
+        let stderr_mode = request.stderr;
+        let mut output = super::process::run(self.interp, request)?;
+        let mut stdout = output.stdout.take().unwrap_or_default();
+        let stderr = output.stderr.take().unwrap_or_default();
+
+        if stderr_mode == PyStdio::MergeStdout {
+            stdout.extend_from_slice(&stderr);
+        }
+
+        output.stdout = match stdout_mode {
+            PyStdio::Inherit => {
+                // The command dispatcher already metered and truncated child output. Forwarding
+                // it into the parent's sink must not charge the same bytes a second time.
+                self.out.extend_from_slice(&stdout);
+                None
+            }
+            PyStdio::Pipe => Some(stdout),
+            PyStdio::DevNull => None,
+            PyStdio::MergeStdout => {
+                return Err(PyError::value_error("stdout cannot use STDERR"));
+            }
+        };
+        output.stderr = match stderr_mode {
+            PyStdio::Inherit => {
+                self.err.extend_from_slice(&stderr);
+                None
+            }
+            PyStdio::Pipe => Some(stderr),
+            PyStdio::DevNull | PyStdio::MergeStdout => None,
+        };
+        Ok(output)
     }
 }
 

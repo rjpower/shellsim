@@ -6,6 +6,7 @@
 //! capability.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use super::heap::ObjectId;
@@ -159,6 +160,40 @@ pub(super) trait PyEnvironment {
     fn get(&self, name: &str) -> Option<String>;
 }
 
+/// Standard-stream disposition for one simulated child process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PyStdio {
+    Inherit,
+    Pipe,
+    DevNull,
+    MergeStdout,
+}
+
+/// Fully-owned request passed across the Python/process capability boundary.
+pub(super) struct PyProcessRequest {
+    pub argv: Vec<String>,
+    pub stdin: Vec<u8>,
+    pub cwd: Option<String>,
+    pub environment: Option<BTreeMap<String, String>>,
+    pub timeout_ns: Option<u64>,
+    pub stdout: PyStdio,
+    pub stderr: PyStdio,
+}
+
+/// Completed result from shellsim's synchronous logical process runner.
+pub(super) struct PyProcessOutput {
+    pub status: i32,
+    pub stdout: Option<Vec<u8>>,
+    pub stderr: Option<Vec<u8>>,
+    pub timed_out: bool,
+}
+
+/// Explicit process-launch capability. Implementations must dispatch only modeled commands and
+/// VFS scripts and must never fall back to an ambient host process.
+pub(super) trait PyProcessRunner {
+    fn run(&mut self, request: PyProcessRequest) -> PyResult<PyProcessOutput>;
+}
+
 /// Metered access to shellsim's simulated filesystem.
 ///
 /// Implementations must remain confined to the interpreter-owned VFS. Native modules receive
@@ -266,9 +301,12 @@ pub(super) trait PyRuntime {
     fn new_raises_context(&mut self, expected: String) -> PyResult<PyValue>;
     fn raises_expected(&self, context: PyRaisesContext) -> PyResult<String>;
     fn exception_type_name(&self, value: &PyValue) -> Option<&'static str>;
+    /// Return one interpreter-owned exception class from the runtime's closed type table.
+    fn exception_type(&self, name: &'static str) -> PyValue;
     fn clock(&mut self) -> &mut dyn PyClock;
     fn environment(&self) -> &dyn PyEnvironment;
     fn filesystem(&mut self) -> &mut dyn PyFilesystem;
+    fn processes(&mut self) -> &mut dyn PyProcessRunner;
 
     fn type_name(&self, value: &PyValue) -> PyResult<&'static str> {
         Ok(match self.kind(value)? {

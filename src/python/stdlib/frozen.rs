@@ -22,6 +22,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "os" => Some(include_str!("source/os.py")),
         "pathlib" => Some(include_str!("source/pathlib.py")),
         "struct" => Some(include_str!("source/struct.py")),
+        "subprocess" => Some(include_str!("source/subprocess.py")),
         "tempfile" => Some(include_str!("source/tempfile.py")),
         "uuid" => Some(include_str!("source/uuid.py")),
         "zlib" => Some(include_str!("source/zlib.py")),

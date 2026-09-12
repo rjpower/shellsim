@@ -106,7 +106,8 @@ arena borrows across allocation or Python calls.
 
 `ModuleDef`, `FunctionDef`, `ValueDef`, `NativeTypeDef`, and `MethodDef` provide declarative module
 and type tables. Most modules receive only `PyRuntime`. Narrow traits expose modeled state where
-required: `time` receives the virtual clock and `os` receives the simulated environment. A module
+required: `time` receives the virtual clock, `os` receives the simulated environment, and the
+private subprocess core receives a logical-process runner. A module
 must not inspect VM stacks, heap payload variants, or `Environment` directly.
 
 Filesystem access is split into two explicit boundaries in `python/filesystem.rs`. `PyFilesystem`
@@ -121,11 +122,17 @@ The registry contains bounded native slices of modules such as `argparse`, `bise
 `time`, `typing`, and `unittest`. A separate closed frozen-source registry bundles Python
 implementations with `include_str!` and executes them through the ordinary compiler and module
 namespace. `abc`, `base64`, `codecs`, `collections`, `csv`, `datetime`, `glob`, `hashlib`, `io`,
-`json`, `logging`, `os`, `pathlib`, `struct`, `tempfile`, `uuid`, and `zlib` use this path. Source modules may import small private native
+`json`, `logging`, `os`, `pathlib`, `struct`, `subprocess`, `tempfile`, `uuid`, and `zlib` use this
+path. Source modules may import small private native
 cores for algorithms or modeled capabilities that Python cannot implement directly. Filesystem
 modules share `_shellsim_vfs`; `collections` imports only native `defaultdict`; `json`, `hashlib`,
-and `zlib` delegate their bounded codec, digest, or checksum primitives. `subprocess` remains an
-importable fail-closed frontier and has no host process capability.
+and `zlib` delegate their bounded codec, digest, or checksum primitives. `subprocess` delegates
+only direct argv execution to `_shellsim_subprocess`: `run`, `call`, `check_call`, and
+`check_output` execute registered commands and VFS scripts as synchronous logical children.
+Captured and inherited streams, bytes/text input and output, cwd, replacement environments,
+return codes, checks, and virtual-clock timeouts are modeled. `shell=True` invokes shellsim's own
+shell and cannot select a host shell. Live `Popen` children remain unsupported until the process
+scheduler and descriptor table can represent pipes and overlapping execution.
 
 Prefer frozen Python for module policy, composition, and ordinary object behavior. Add a private
 native primitive only for a modeled capability, an algorithm that must meter host allocation

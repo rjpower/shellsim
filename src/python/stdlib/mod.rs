@@ -68,7 +68,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "string" => Some(&string::MODULE),
         "_struct" => Some(&r#struct::MODULE),
         "sys" => Some(&sys::MODULE),
-        "subprocess" => Some(&subprocess::MODULE),
+        "_shellsim_subprocess" => Some(&subprocess::MODULE),
         "time" => Some(&time::MODULE),
         "typing" => Some(&typing::MODULE),
         "unittest" => Some(&unittest::MODULE),

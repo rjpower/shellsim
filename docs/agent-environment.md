@@ -109,9 +109,11 @@ The synchronous implementation now creates logical children for isolation, `$$`,
 buffers while running each stage in a child state. Cooperative scheduling can follow at explicit
 blocking points such as sleep, pipe I/O, process wait, and virtual service operations.
 
-Python `subprocess.run` and `check_output` can eventually execute only registered commands and VFS
-shell or Python scripts. Arbitrary host executables, `preexec_fn`, and native session manipulation
-must remain rejected.
+Python `subprocess.run`, `call`, `check_call`, and `check_output` execute only registered commands
+and VFS shell or Python scripts. The first synchronous slice models capture, inheritance, cwd/env
+isolation, status checks, and virtual deadlines; it never calls a host process. Live `Popen` pipes
+remain tied to the future resumable scheduler and descriptor table. Arbitrary host executables,
+`preexec_fn`, and native session manipulation remain rejected.
 
 ## Synthetic `/proc` and `/dev`
 
