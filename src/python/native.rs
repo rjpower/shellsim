@@ -44,6 +44,9 @@ pub(super) enum PyErrorKind {
     Resource,
     Exception(&'static str),
     Exit(i32),
+    /// Internal cooperative control flow. This must be consumed by the bytecode VM and never
+    /// materialized as a Python exception.
+    Suspend(crate::scheduler::WaitReason),
 }
 
 /// A structured Python error. Formatting is deferred to the VM boundary.
@@ -91,6 +94,11 @@ impl PyError {
 
     pub fn exit(status: i32) -> Self {
         Self::new(PyErrorKind::Exit(status), "Python callable requested exit")
+    }
+
+    /// Suspend a scheduler-owned native call until its modeled resource becomes ready.
+    pub fn suspend(reason: crate::scheduler::WaitReason) -> Self {
+        Self::new(PyErrorKind::Suspend(reason), "Python native call suspended")
     }
 }
 
@@ -860,6 +868,7 @@ impl FromPyValue for PyClass {
 }
 
 /// Owned arguments passed through the uniform native-call ABI.
+#[derive(Clone)]
 pub(super) struct CallArgs {
     positional: Vec<PyValue>,
     keywords: Vec<(String, PyValue)>,

@@ -112,6 +112,37 @@ pub(super) fn wait(
     result
 }
 
+/// Inspect one live child without dispatching any process work.
+///
+/// Scheduler-owned Python calls use this before blocking on a typed child wait. The child exit
+/// path wakes the parent, which retries this operation and collects output exactly once.
+pub(super) fn wait_if_ready(
+    interp: &mut Interp,
+    process: PyProcessHandle,
+) -> PyResult<Option<PyProcessOutput>> {
+    checked_owner(interp, process)?;
+    let mut handle = interp
+        .live_children
+        .remove(&process.pid)
+        .ok_or_else(|| PyError::runtime_error("unknown subprocess handle"))?;
+    let result = (|| {
+        drain_output(interp, &mut handle, 1)?;
+        drain_output(interp, &mut handle, 2)?;
+        let status = handle.status.or_else(|| {
+            process_status(interp, process.pid)
+                .map(|status| python_returncode(handle.terminating_signal, status))
+        });
+        let Some(status) = status else {
+            return Ok(None);
+        };
+        handle.status = Some(status);
+        reap_process(interp, process.pid);
+        Ok(Some(output_from_handle(&mut handle, false)))
+    })();
+    interp.live_children.insert(process.pid, handle);
+    result
+}
+
 fn wait_inner(
     interp: &mut Interp,
     pid: u32,

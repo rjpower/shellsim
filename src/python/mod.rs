@@ -339,11 +339,19 @@ impl PythonContinuation {
     /// Run one bounded VM quantum. Completed output remains owned until the shell installs its
     /// ordinary descriptor-write frames.
     pub(crate) fn poll(&mut self, interp: &mut Interp) -> PythonPoll {
+        self.poll_with_mode(interp, vm::VmMode::scheduled())
+    }
+
+    fn poll_synchronous(&mut self, interp: &mut Interp) -> PythonPoll {
+        self.poll_with_mode(interp, vm::VmMode::synchronous(false))
+    }
+
+    fn poll_with_mode(&mut self, interp: &mut Interp, mode: vm::VmMode) -> PythonPoll {
         let result = match self.program.poll(
             interp,
             &self.argv,
             &mut self.state,
-            vm::VmMode::scheduled(),
+            mode,
             &mut self.stdout,
             &mut self.stderr,
         ) {
@@ -367,7 +375,7 @@ pub fn run_python(interp: &mut Interp, argv: &[String], stdin: Vec<u8>, out: Out
     match start_python(interp, argv, stdin, out, err) {
         PythonCommandStart::Ready(status) => status,
         PythonCommandStart::Running(mut continuation) => loop {
-            match continuation.poll(interp) {
+            match continuation.poll_synchronous(interp) {
                 PythonPoll::Runnable => {}
                 PythonPoll::Blocked(_) => unreachable!("synchronous Python cannot suspend"),
                 PythonPoll::Ready(status) => {

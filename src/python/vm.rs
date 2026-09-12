@@ -269,7 +269,7 @@ pub(super) struct VmMode {
 }
 
 impl VmMode {
-    fn synchronous(interactive: bool) -> Self {
+    pub(super) fn synchronous(interactive: bool) -> Self {
         Self {
             interactive,
             scheduler_owned: false,
@@ -330,6 +330,7 @@ impl VmProgram {
                 instruction_pointer: 0,
                 handlers: Vec::new(),
                 function_return: None,
+                pending_native_call: None,
             });
             self.started = true;
         }
@@ -384,6 +385,17 @@ struct BytecodeFrame {
     instruction_pointer: usize,
     handlers: Vec<(usize, usize)>,
     function_return: Option<FunctionReturn>,
+    pending_native_call: Option<PendingNativeCall>,
+}
+
+/// A normalized native invocation retained while its modeled resource is unavailable.
+///
+/// Starred arguments have already been expanded and the calling instruction has advanced, so a
+/// wake retries exactly the native operation without repeating Python-visible argument work.
+struct PendingNativeCall {
+    function: &'static FunctionDef,
+    arguments: CallArgs,
+    call_span: super::source::Span,
 }
 
 struct FunctionReturn {
@@ -482,6 +494,7 @@ impl<'a> Vm<'a> {
             instruction_pointer,
             handlers: std::mem::take(handlers),
             function_return: None,
+            pending_native_call: None,
         });
         let result = loop {
             match self.execute_active_frame(VM_POLL_QUANTUM) {
@@ -504,6 +517,33 @@ impl<'a> Vm<'a> {
         'execution: for _ in 0..budget.max(1) {
             if self.interp.deadline_interrupt.is_some() {
                 return Ok(Execution::Exit(124));
+            }
+            if let Some(pending) = self.active_frame_mut().pending_native_call.take() {
+                let span = pending.call_span;
+                match self.resume_native_call(pending) {
+                    Ok(CallResult::Value(value)) => {
+                        self.stack.push(value);
+                        continue;
+                    }
+                    Ok(CallResult::Blocked(reason, value)) => {
+                        self.stack.push(value);
+                        return Ok(Execution::Blocked(reason));
+                    }
+                    Ok(CallResult::Retry(reason, pending)) => {
+                        self.active_frame_mut().pending_native_call = Some(pending);
+                        return Ok(Execution::Blocked(reason));
+                    }
+                    Ok(CallResult::Exit(status)) => return Ok(Execution::Exit(status)),
+                    Ok(CallResult::EnteredFrame) => {
+                        unreachable!("a retained native call cannot enter a Python frame")
+                    }
+                    Err(error) => {
+                        if self.propagate_error(error, span)? {
+                            continue 'execution;
+                        }
+                        unreachable!("propagate_error either enters a handler or returns an error")
+                    }
+                }
             }
             let instruction_pointer = self
                 .bytecode_frames
@@ -618,6 +658,11 @@ impl<'a> Vm<'a> {
                     Ok(CallResult::Blocked(reason, value)) => {
                         self.stack.push(value);
                         self.active_frame_mut().instruction_pointer += 1;
+                        return Ok(Execution::Blocked(reason));
+                    }
+                    Ok(CallResult::Retry(reason, pending)) => {
+                        self.active_frame_mut().instruction_pointer += 1;
+                        self.active_frame_mut().pending_native_call = Some(pending);
                         return Ok(Execution::Blocked(reason));
                     }
                     Ok(CallResult::Exit(status)) => return Ok(Execution::Exit(status)),
@@ -782,7 +827,9 @@ impl<'a> Vm<'a> {
                         CallResult::Value(value) => self.stack.push(value),
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
                         CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-                        CallResult::Blocked(_, _) => unreachable!("immediate call cannot suspend"),
+                        CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                            unreachable!("immediate call cannot suspend")
+                        }
                     }
                     Ok(())
                 }
@@ -803,7 +850,9 @@ impl<'a> Vm<'a> {
                         CallResult::Value(_) => Ok(()),
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
                         CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-                        CallResult::Blocked(_, _) => unreachable!("immediate call cannot suspend"),
+                        CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                            unreachable!("immediate call cannot suspend")
+                        }
                     }
                 }
                 Operation::WithExitException => {
@@ -833,7 +882,9 @@ impl<'a> Vm<'a> {
                         CallResult::Value(value) => value,
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
                         CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-                        CallResult::Blocked(_, _) => unreachable!("immediate call cannot suspend"),
+                        CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                            unreachable!("immediate call cannot suspend")
+                        }
                     };
                     if self
                         .truth_value(&result)
@@ -868,21 +919,11 @@ impl<'a> Vm<'a> {
                     return Ok(Execution::Halt);
                 }
             };
-            if let Err(mut error) = result {
-                let mut span = instruction.span;
-                loop {
-                    if self.enter_exception_handler() {
-                        continue 'execution;
-                    }
-                    let Some(function_return) = self.unwind_deferred_frame() else {
-                        return Err((error, span));
-                    };
-                    error = format!(
-                        "{error} in {} at line {}, column {}",
-                        function_return.name, span.line, span.column
-                    );
-                    span = function_return.call_span;
+            if let Err(error) = result {
+                if self.propagate_error(error, instruction.span)? {
+                    continue 'execution;
                 }
+                unreachable!("propagate_error either enters a handler or returns an error")
             }
             self.active_frame_mut().instruction_pointer += 1;
         }
@@ -893,6 +934,26 @@ impl<'a> Vm<'a> {
         self.bytecode_frames
             .last_mut()
             .expect("bytecode execution requires an active frame")
+    }
+
+    fn propagate_error(
+        &mut self,
+        mut error: String,
+        mut span: super::source::Span,
+    ) -> Result<bool, (String, super::source::Span)> {
+        loop {
+            if self.enter_exception_handler() {
+                return Ok(true);
+            }
+            let Some(function_return) = self.unwind_deferred_frame() else {
+                return Err((error, span));
+            };
+            error = format!(
+                "{error} in {} at line {}, column {}",
+                function_return.name, span.line, span.column
+            );
+            span = function_return.call_span;
+        }
     }
 
     fn finish_deferred_frame(&mut self, value: Value) -> bool {
@@ -1531,7 +1592,7 @@ impl<'a> Vm<'a> {
                             CallResult::EnteredFrame => {
                                 unreachable!("immediate call entered a frame")
                             }
-                            CallResult::Blocked(_, _) => {
+                            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
                                 unreachable!("immediate call cannot suspend")
                             }
                         };
@@ -2395,7 +2456,9 @@ impl<'a> Vm<'a> {
             CallResult::Value(value) => Ok(value),
             CallResult::Exit(status) => Err(format!("callable exited with status {status}")),
             CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
-            CallResult::Blocked(_, _) => unreachable!("immediate call cannot suspend"),
+            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                unreachable!("immediate call cannot suspend")
+            }
         }
     }
 
@@ -3625,7 +3688,7 @@ impl<'a> Vm<'a> {
                                     CallResult::EnteredFrame => {
                                         unreachable!("invoke_call is immediate")
                                     }
-                                    CallResult::Blocked(_, _) => {
+                                    CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
                                         unreachable!("immediate call cannot suspend")
                                     }
                                 }
@@ -3665,7 +3728,7 @@ impl<'a> Vm<'a> {
                                         CallResult::EnteredFrame => {
                                             unreachable!("invoke_call is immediate")
                                         }
-                                        CallResult::Blocked(_, _) => {
+                                        CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
                                             unreachable!("immediate call cannot suspend")
                                         }
                                     };
@@ -3764,7 +3827,7 @@ impl<'a> Vm<'a> {
                             CallResult::EnteredFrame => {
                                 unreachable!("immediate initializer entered a frame")
                             }
-                            CallResult::Blocked(_, _) => {
+                            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
                                 unreachable!("immediate initializer cannot suspend")
                             }
                         }
@@ -3810,6 +3873,14 @@ impl<'a> Vm<'a> {
         }
         if let Some(NativeValue::NativeFunction(function)) = function.native_value() {
             let call = CallArgs::new(arguments, keyword_arguments);
+            let retry = match mode {
+                CallMode::Deferred(call_span) => Some(PendingNativeCall {
+                    function,
+                    arguments: call.clone(),
+                    call_span,
+                }),
+                CallMode::Immediate => None,
+            };
             let previous_suspend = self.native_suspend_allowed;
             self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
             let result = (function.call)(self, call);
@@ -3823,6 +3894,12 @@ impl<'a> Vm<'a> {
                     kind: PyErrorKind::Exit(status),
                     ..
                 }) => Ok(CallResult::Exit(status)),
+                Err(PyError {
+                    kind: PyErrorKind::Suspend(reason),
+                    ..
+                }) => retry
+                    .map(|pending| CallResult::Retry(reason, pending))
+                    .ok_or_else(|| "native call suspended outside scheduler dispatch".into()),
                 Err(error) => Err(self.record_native_error(error)),
             };
         }
@@ -3952,7 +4029,7 @@ impl<'a> Vm<'a> {
                             CallResult::EnteredFrame => {
                                 unreachable!("immediate call entered a frame")
                             }
-                            CallResult::Blocked(_, _) => {
+                            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
                                 unreachable!("immediate call cannot suspend")
                             }
                         }
@@ -4338,6 +4415,7 @@ impl<'a> Vm<'a> {
                     outer_stack,
                     pop_method_frame,
                 }),
+                pending_native_call: None,
             });
             return Ok(CallResult::EnteredFrame);
         }
@@ -4472,7 +4550,7 @@ impl<'a> Vm<'a> {
             PyErrorKind::Overflow => Some("OverflowError"),
             PyErrorKind::Runtime => Some("RuntimeError"),
             PyErrorKind::Exception(kind) => Some(kind),
-            PyErrorKind::Resource | PyErrorKind::Exit(_) => None,
+            PyErrorKind::Resource | PyErrorKind::Exit(_) | PyErrorKind::Suspend(_) => None,
         };
         if let Some(kind) = kind {
             if let Ok(value) = self.allocate_exception(kind.to_string(), error.message.clone()) {
@@ -4483,6 +4561,33 @@ impl<'a> Vm<'a> {
             }
         }
         error.message
+    }
+
+    fn resume_native_call(&mut self, pending: PendingNativeCall) -> Result<CallResult, String> {
+        let retry = PendingNativeCall {
+            function: pending.function,
+            arguments: pending.arguments.clone(),
+            call_span: pending.call_span,
+        };
+        let previous_suspend = self.native_suspend_allowed;
+        self.native_suspend_allowed = true;
+        let result = (pending.function.call)(self, pending.arguments);
+        self.native_suspend_allowed = previous_suspend;
+        match result {
+            Ok(value) => match self.pending_wait.take() {
+                Some(reason) => Ok(CallResult::Blocked(reason, value)),
+                None => Ok(CallResult::Value(value)),
+            },
+            Err(PyError {
+                kind: PyErrorKind::Exit(status),
+                ..
+            }) => Ok(CallResult::Exit(status)),
+            Err(PyError {
+                kind: PyErrorKind::Suspend(reason),
+                ..
+            }) => Ok(CallResult::Retry(reason, retry)),
+            Err(error) => Err(self.record_native_error(error)),
+        }
     }
 
     fn allocate_object(&mut self, object: Object) -> Result<Value, String> {
@@ -5225,7 +5330,9 @@ impl PyRuntime for Vm<'_> {
             CallResult::Value(value) => Ok(value),
             CallResult::Exit(status) => Err(PyError::exit(status)),
             CallResult::EnteredFrame => unreachable!("runtime callback is immediate"),
-            CallResult::Blocked(_, _) => unreachable!("runtime callback cannot suspend"),
+            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                unreachable!("runtime callback cannot suspend")
+            }
         }
     }
 
@@ -5590,7 +5697,19 @@ impl PyProcessRunner for Vm<'_> {
         handle: PyProcessHandle,
         timeout_ns: Option<u64>,
     ) -> PyResult<PyProcessOutput> {
-        let mut output = super::process::wait(self.interp, handle, timeout_ns)?;
+        let mut output =
+            if self.mode.scheduler_owned && self.native_suspend_allowed && timeout_ns.is_none() {
+                match super::process::wait_if_ready(self.interp, handle)? {
+                    Some(output) => output,
+                    None => {
+                        return Err(PyError::suspend(crate::scheduler::WaitReason::Child(
+                            handle.pid,
+                        )))
+                    }
+                }
+            } else {
+                super::process::wait(self.interp, handle, timeout_ns)?
+            };
         self.out
             .extend_from_slice(&std::mem::take(&mut output.inherited_stdout));
         self.err
@@ -5714,6 +5833,7 @@ enum CallResult {
     Exit(i32),
     EnteredFrame,
     Blocked(crate::scheduler::WaitReason, Value),
+    Retry(crate::scheduler::WaitReason, PendingNativeCall),
 }
 
 #[derive(Clone, Copy)]

@@ -35,10 +35,11 @@ does not leak while filesystem effects remain visible. Exited background records
 `timeout`, and the `command` builtin all use retained continuations or scheduled argv children.
 Python commands retain compiled code, VM state, output, and top-level bytecode frames in command
 continuations and yield after bounded instruction quanta. Ordinary bytecode user-function calls
-use explicit return frames as well. Python calls made from within compound native operations and
-blocking native operations still need instruction-level continuations before the old nested
-scheduler bridge can be removed. Direct `time.sleep` is scheduler-blocking already and validates
-the typed timer-wait path through retained Python function frames.
+use explicit return frames as well. Python calls made from within compound native operations still
+need instruction-level continuations. Native bytecode calls can now retain normalized arguments
+and retry after a typed wake: direct `time.sleep` uses the timer path and unbounded
+`Popen.wait()` uses the child path. Timeout-bearing subprocess waits, `communicate`, and
+descriptor I/O still need migration before the old nested scheduler bridge can be removed.
 
 Reusing an `Environment` preserves the VFS, cwd, variables, functions, arrays, package markers,
 virtual time/network state, command history, Python REPL, and cumulative resource usage. `exit`,
