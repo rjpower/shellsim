@@ -300,6 +300,7 @@ impl VmProgram {
                 code: self.code.clone(),
                 instruction_pointer: 0,
                 handlers: Vec::new(),
+                function_return: None,
             });
             self.started = true;
         }
@@ -349,6 +350,21 @@ struct BytecodeFrame {
     code: Code,
     instruction_pointer: usize,
     handlers: Vec<(usize, usize)>,
+    function_return: Option<FunctionReturn>,
+}
+
+struct FunctionReturn {
+    name: String,
+    call_span: super::source::Span,
+    outer_stack: Vec<Value>,
+    pop_method_frame: bool,
+}
+
+struct FunctionInvocation {
+    arguments: Vec<Value>,
+    keyword_arguments: Vec<(String, Value)>,
+    mode: CallMode,
+    pop_method_frame: bool,
 }
 
 impl Deref for Vm<'_> {
@@ -431,6 +447,7 @@ impl<'a> Vm<'a> {
             code: code.clone(),
             instruction_pointer,
             handlers: std::mem::take(handlers),
+            function_return: None,
         });
         let result = loop {
             match self.execute_active_frame(VM_POLL_QUANTUM) {
@@ -450,7 +467,7 @@ impl<'a> Vm<'a> {
         &mut self,
         budget: usize,
     ) -> Result<Execution, (String, super::source::Span)> {
-        for _ in 0..budget.max(1) {
+        'execution: for _ in 0..budget.max(1) {
             if self.interp.deadline_interrupt.is_some() {
                 return Ok(Execution::Exit(124));
             }
@@ -549,10 +566,20 @@ impl<'a> Vm<'a> {
                     positional,
                     keywords,
                     starred,
-                } => match self.call(*positional, keywords, starred) {
+                } => match self.call(
+                    *positional,
+                    keywords,
+                    starred,
+                    CallMode::Deferred(instruction.span),
+                ) {
                     Ok(CallResult::Value(value)) => {
                         self.stack.push(value);
                         Ok(())
+                    }
+                    Ok(CallResult::EnteredFrame) => {
+                        let caller = self.bytecode_frames.len() - 2;
+                        self.bytecode_frames[caller].instruction_pointer += 1;
+                        continue;
                     }
                     Ok(CallResult::Exit(status)) => return Ok(Execution::Exit(status)),
                     Err(error) => Err(error),
@@ -593,6 +620,9 @@ impl<'a> Vm<'a> {
                 }
                 Operation::Return => {
                     let value = self.pop().map_err(|error| (error, instruction.span))?;
+                    if self.finish_deferred_frame(value) {
+                        continue;
+                    }
                     return Ok(Execution::Return(value));
                 }
                 Operation::Yield => {
@@ -706,9 +736,13 @@ impl<'a> Vm<'a> {
                     self.with_contexts.push(context);
                     self.load_attribute("__enter__")
                         .map_err(|e| (e, instruction.span))?;
-                    match self.call(0, &[], &[]).map_err(|e| (e, instruction.span))? {
+                    match self
+                        .call(0, &[], &[], CallMode::Immediate)
+                        .map_err(|e| (e, instruction.span))?
+                    {
                         CallResult::Value(value) => self.stack.push(value),
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
+                        CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
                     }
                     Ok(())
                 }
@@ -723,11 +757,12 @@ impl<'a> Vm<'a> {
                         .map_err(|e| (e, instruction.span))?;
                     self.stack.extend([Value::None, Value::None, Value::None]);
                     match self
-                        .call(3, &[], &[false, false, false])
+                        .call(3, &[], &[false, false, false], CallMode::Immediate)
                         .map_err(|e| (e, instruction.span))?
                     {
                         CallResult::Value(_) => Ok(()),
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
+                        CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
                     }
                 }
                 Operation::WithExitException => {
@@ -751,11 +786,12 @@ impl<'a> Vm<'a> {
                     self.stack
                         .extend([exception_kind, exception.value, Value::None]);
                     let result = match self
-                        .call(3, &[], &[false, false, false])
+                        .call(3, &[], &[false, false, false], CallMode::Immediate)
                         .map_err(|e| (e, instruction.span))?
                     {
                         CallResult::Value(value) => value,
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
+                        CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
                     };
                     if self
                         .truth_value(&result)
@@ -783,20 +819,28 @@ impl<'a> Vm<'a> {
                     }
                     Err(error) => Err(error),
                 },
-                Operation::Halt => return Ok(Execution::Halt),
-            };
-            if let Err(error) = result {
-                if let Some(exception) = self.pending_exception.take() {
-                    if let Some((target, depth)) = self.active_frame_mut().handlers.pop() {
-                        self.stack.truncate(depth);
-                        self.stack.push(exception.value);
-                        self.exception_stack.push(exception);
-                        self.active_frame_mut().instruction_pointer = target;
+                Operation::Halt => {
+                    if self.finish_deferred_frame(Value::None) {
                         continue;
                     }
-                    self.pending_exception = Some(exception);
+                    return Ok(Execution::Halt);
                 }
-                return Err((error, instruction.span));
+            };
+            if let Err(mut error) = result {
+                let mut span = instruction.span;
+                loop {
+                    if self.enter_exception_handler() {
+                        continue 'execution;
+                    }
+                    let Some(function_return) = self.unwind_deferred_frame() else {
+                        return Err((error, span));
+                    };
+                    error = format!(
+                        "{error} in {} at line {}, column {}",
+                        function_return.name, span.line, span.column
+                    );
+                    span = function_return.call_span;
+                }
             }
             self.active_frame_mut().instruction_pointer += 1;
         }
@@ -807,6 +851,59 @@ impl<'a> Vm<'a> {
         self.bytecode_frames
             .last_mut()
             .expect("bytecode execution requires an active frame")
+    }
+
+    fn finish_deferred_frame(&mut self, value: Value) -> bool {
+        let Some(_) = self
+            .bytecode_frames
+            .last()
+            .and_then(|frame| frame.function_return.as_ref())
+        else {
+            return false;
+        };
+        self.unwind_deferred_frame()
+            .expect("deferred function frame was checked above");
+        self.stack.push(value);
+        true
+    }
+
+    fn unwind_deferred_frame(&mut self) -> Option<FunctionReturn> {
+        self.bytecode_frames
+            .last()
+            .and_then(|frame| frame.function_return.as_ref())?;
+        let frame = self
+            .bytecode_frames
+            .pop()
+            .expect("deferred function frame was checked above");
+        let mut function_return = frame
+            .function_return
+            .expect("deferred function frame must own return state");
+        self.call_depth = self.call_depth.saturating_sub(1);
+        self.local_scopes
+            .pop()
+            .expect("deferred function frame must own a local scope");
+        if function_return.pop_method_frame {
+            self.method_frames
+                .pop()
+                .expect("deferred method frame must remain installed");
+        }
+        self.stack = std::mem::take(&mut function_return.outer_stack);
+        Some(function_return)
+    }
+
+    fn enter_exception_handler(&mut self) -> bool {
+        let Some(exception) = self.pending_exception.take() else {
+            return false;
+        };
+        let Some((target, depth)) = self.active_frame_mut().handlers.pop() else {
+            self.pending_exception = Some(exception);
+            return false;
+        };
+        self.stack.truncate(depth);
+        self.stack.push(exception.value);
+        self.exception_stack.push(exception);
+        self.active_frame_mut().instruction_pointer = target;
+        true
     }
 
     fn load_name(&mut self, name: &str) -> Result<(), String> {
@@ -1383,10 +1480,13 @@ impl<'a> Vm<'a> {
                         value
                     } else {
                         self.stack.push(factory);
-                        let value = match self.call(0, &[], &[])? {
+                        let value = match self.call(0, &[], &[], CallMode::Immediate)? {
                             CallResult::Value(value) => value,
                             CallResult::Exit(status) => {
                                 return Err(format!("default factory exited with status {status}"))
+                            }
+                            CallResult::EnteredFrame => {
+                                unreachable!("immediate call entered a frame")
                             }
                         };
                         self.state
@@ -2247,6 +2347,7 @@ impl<'a> Vm<'a> {
         match self.invoke_call(callable, arguments, Vec::new())? {
             CallResult::Value(value) => Ok(value),
             CallResult::Exit(status) => Err(format!("callable exited with status {status}")),
+            CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
         }
     }
 
@@ -2268,7 +2369,12 @@ impl<'a> Vm<'a> {
         self.stack.extend(arguments);
         self.stack
             .extend(keyword_arguments.into_iter().map(|(_, value)| value));
-        self.call(positional, &keyword_names, &vec![false; total])
+        self.call(
+            positional,
+            &keyword_names,
+            &vec![false; total],
+            CallMode::Immediate,
+        )
     }
 
     fn invoke_slot(
@@ -3249,6 +3355,7 @@ impl<'a> Vm<'a> {
         positional: usize,
         keyword_names: &[String],
         starred: &[bool],
+        mode: CallMode,
     ) -> Result<CallResult, String> {
         let count = positional
             .checked_add(keyword_names.len())
@@ -3296,9 +3403,8 @@ impl<'a> Vm<'a> {
                     defaults,
                     defining_class,
                 } => {
-                    if let (Some(owner), Some(receiver)) =
-                        (defining_class, arguments.first().cloned())
-                    {
+                    let method_frame = defining_class.zip(arguments.first().cloned());
+                    if let Some((owner, receiver)) = method_frame {
                         self.method_frames.push((owner, receiver));
                     }
                     let result = self.call_python_function(
@@ -3306,10 +3412,14 @@ impl<'a> Vm<'a> {
                         &code,
                         closure,
                         &defaults,
-                        arguments,
-                        keyword_arguments,
+                        FunctionInvocation {
+                            arguments,
+                            keyword_arguments,
+                            mode,
+                            pop_method_frame: method_frame.is_some(),
+                        },
                     );
-                    if defining_class.is_some() {
+                    if method_frame.is_some() && !matches!(result, Ok(CallResult::EnteredFrame)) {
                         self.method_frames.pop();
                     }
                     result
@@ -3339,10 +3449,14 @@ impl<'a> Vm<'a> {
                             &code,
                             closure,
                             &defaults,
-                            arguments,
-                            keyword_arguments,
+                            FunctionInvocation {
+                                arguments,
+                                keyword_arguments,
+                                mode,
+                                pop_method_frame: owner.is_some(),
+                            },
                         );
-                        if owner.is_some() {
+                        if owner.is_some() && !matches!(result, Ok(CallResult::EnteredFrame)) {
                             self.method_frames.pop();
                         }
                         result
@@ -3459,6 +3573,9 @@ impl<'a> Vm<'a> {
                                     CallResult::Exit(status) => {
                                         return Ok(CallResult::Exit(status))
                                     }
+                                    CallResult::EnteredFrame => {
+                                        unreachable!("invoke_call is immediate")
+                                    }
                                 }
                             } else {
                                 if !keyword_arguments.is_empty() || arguments.len() != 3 {
@@ -3492,6 +3609,9 @@ impl<'a> Vm<'a> {
                                         CallResult::Value(value) => value,
                                         CallResult::Exit(status) => {
                                             return Ok(CallResult::Exit(status))
+                                        }
+                                        CallResult::EnteredFrame => {
+                                            unreachable!("invoke_call is immediate")
                                         }
                                     };
                                     if !result.is_none() {
@@ -3574,14 +3694,21 @@ impl<'a> Vm<'a> {
                             &code,
                             closure,
                             &defaults,
-                            arguments,
-                            keyword_arguments,
+                            FunctionInvocation {
+                                arguments,
+                                keyword_arguments,
+                                mode: CallMode::Immediate,
+                                pop_method_frame: false,
+                            },
                         )? {
                             CallResult::Value(value) if value.is_none() => {}
                             CallResult::Value(_) => {
                                 return Err("__init__() should return None".into())
                             }
                             CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
+                            CallResult::EnteredFrame => {
+                                unreachable!("immediate initializer entered a frame")
+                            }
                         }
                     } else if layout == ClassLayout::Object
                         && (!arguments.is_empty() || !keyword_arguments.is_empty())
@@ -3754,9 +3881,12 @@ impl<'a> Vm<'a> {
                     let key = if let Some(function) = &key_function {
                         self.stack.push(*function);
                         self.stack.push(value);
-                        match self.call(1, &[], &[false])? {
+                        match self.call(1, &[], &[false], CallMode::Immediate)? {
                             CallResult::Value(key) => key,
                             CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
+                            CallResult::EnteredFrame => {
+                                unreachable!("immediate call entered a frame")
+                            }
                         }
                     } else {
                         value
@@ -4020,9 +4150,14 @@ impl<'a> Vm<'a> {
         code: &Code,
         closure: Option<ScopeId>,
         defaults: &[Value],
-        arguments: Vec<Value>,
-        keyword_arguments: Vec<(String, Value)>,
+        invocation: FunctionInvocation,
     ) -> Result<CallResult, String> {
+        let FunctionInvocation {
+            arguments,
+            keyword_arguments,
+            mode,
+            pop_method_frame,
+        } = invocation;
         if code
             .instructions
             .iter()
@@ -4124,6 +4259,20 @@ impl<'a> Vm<'a> {
         let outer_stack = std::mem::take(&mut self.stack);
         self.local_scopes.push(scope);
         self.call_depth += 1;
+        if let CallMode::Deferred(call_span) = mode {
+            self.bytecode_frames.push(BytecodeFrame {
+                code: code.clone(),
+                instruction_pointer: 0,
+                handlers: Vec::new(),
+                function_return: Some(FunctionReturn {
+                    name: name.to_string(),
+                    call_span,
+                    outer_stack,
+                    pop_method_frame,
+                }),
+            });
+            return Ok(CallResult::EnteredFrame);
+        }
         let result = self.execute_code(code);
         self.call_depth -= 1;
         self.local_scopes.pop();
@@ -4996,11 +5145,17 @@ impl PyRuntime for Vm<'_> {
         self.stack
             .extend(keywords.into_iter().map(|(_, value)| value));
         match self
-            .call(argument_count, &keyword_names, &unpacked)
+            .call(
+                argument_count,
+                &keyword_names,
+                &unpacked,
+                CallMode::Immediate,
+            )
             .map_err(PyError::runtime_error)?
         {
             CallResult::Value(value) => Ok(value),
             CallResult::Exit(status) => Err(PyError::exit(status)),
+            CallResult::EnteredFrame => unreachable!("runtime callback is immediate"),
         }
     }
 
@@ -5478,6 +5633,13 @@ impl PyEnvironment for Vm<'_> {
 enum CallResult {
     Value(Value),
     Exit(i32),
+    EnteredFrame,
+}
+
+#[derive(Clone, Copy)]
+enum CallMode {
+    Immediate,
+    Deferred(super::source::Span),
 }
 
 enum Execution {

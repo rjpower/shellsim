@@ -238,8 +238,10 @@ pub(super) trait PyProcessRunner {
 pub(super) trait PyFilesystem {
     fn read_text(&mut self, path: &str) -> PyResult<String>;
     fn write_text(&mut self, path: &str, contents: &str) -> PyResult<()>;
+    fn append_text(&mut self, path: &str, contents: &str) -> PyResult<usize>;
     fn read_bytes(&mut self, path: &str) -> PyResult<Vec<u8>>;
     fn write_bytes(&mut self, path: &str, contents: &[u8]) -> PyResult<()>;
+    fn append_bytes(&mut self, path: &str, contents: &[u8]) -> PyResult<usize>;
     fn remove_file(&mut self, path: &str) -> PyResult<()>;
     fn remove_tree(&mut self, path: &str) -> PyResult<()>;
     fn rename(&mut self, source: &str, destination: &str) -> PyResult<()>;

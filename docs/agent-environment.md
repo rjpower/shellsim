@@ -114,9 +114,9 @@ pipeline stages run through deterministic cooperative continuations. Pipeline de
 bounded buffers with backpressure, so producers and consumers can overlap without eager whole-pipe
 materialization. Command substitution, shell-script adapters, Make recipes, timeout process trees,
 and the common `env`/`xargs` command adapters now use the same scheduler-owned process boundary.
-Python command execution now retains owned VM and top-level bytecode state and yields between
-bounded instruction quanta. Reifying user-function calls and blocking native calls as iterative
-frame transitions is the remaining interpreter scheduler boundary.
+Python command execution now retains owned VM state and yields between bounded instruction quanta;
+ordinary user-function calls use the same explicit frame stack. Calls initiated inside compound
+native operations and blocking native calls are the remaining interpreter scheduler boundary.
 
 Python `Popen`, `run`, `call`, `check_call`, and `check_output` execute only registered commands and
 VFS shell or Python scripts. Live children use scheduler continuations and bounded descriptor
@@ -171,8 +171,8 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
 5. Common agent conveniences. Bounded recursive `rg`, atomic patch application, gzip streams, and
    traversal-safe tar containers are present; zip containers and richer text tools remain.
 6. Cooperative background scheduling, bounded pipes, default signal delivery, live Python process
-   handles, and bounded top-level Python VM polling are present; process groups, handlers, and
-   iterative Python call/native frames remain.
+   handles, bounded Python VM polling, and ordinary iterative Python calls are present; process
+   groups, handlers, compound native call frames, and blocking native suspension remain.
 7. A persistent bounded NDJSON workspace protocol with execution, typed diffs, checkpoint/reset,
    file tools, inspection, and transactional host snapshot ingestion is present. Add scenario
    manifests, transcript persistence, cloning, and external-agent experiments.

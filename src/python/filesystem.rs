@@ -71,6 +71,10 @@ impl PyFilesystem for Interp {
             })
     }
 
+    fn append_text(&mut self, path: &str, contents: &str) -> PyResult<usize> {
+        self.append_python_file(path, contents.as_bytes())
+    }
+
     fn read_bytes(&mut self, path: &str) -> PyResult<Vec<u8>> {
         let length = self
             .fs_file_len(&self.cwd, path)
@@ -97,6 +101,10 @@ impl PyFilesystem for Interp {
                 VfsError::NoSpace => PyError::resource_error(error.to_string()),
                 _ => PyError::runtime_error(error.to_string()),
             })
+    }
+
+    fn append_bytes(&mut self, path: &str, contents: &[u8]) -> PyResult<usize> {
+        self.append_python_file(path, contents)
     }
 
     fn remove_file(&mut self, path: &str) -> PyResult<()> {
@@ -181,6 +189,24 @@ impl PyFilesystem for Interp {
                 }
             })
             .collect())
+    }
+}
+
+impl Interp {
+    fn append_python_file(&mut self, path: &str, contents: &[u8]) -> PyResult<usize> {
+        reserve_memory(self, contents.len())?;
+        charge_cpu(self, contents.len())?;
+        let path = resolve_against(&self.cwd, path);
+        self.sync_vfs_time();
+        self.vfs
+            .append("/", &path, contents, 0o644)
+            .map_err(|error| match error {
+                VfsError::NoSpace => PyError::resource_error(error.to_string()),
+                _ => PyError::runtime_error(error.to_string()),
+            })?;
+        self.vfs
+            .file_len("/", &path)
+            .map_err(|error| PyError::runtime_error(error.to_string()))
     }
 }
 

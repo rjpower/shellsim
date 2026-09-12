@@ -70,13 +70,11 @@ class _File:
         if self.closed or self._operation == "r":
             raise ValueError("file is not open for writing")
         if self._operation == "a":
-            if _shellsim_vfs.exists(self.name):
-                self._data = self._read_file()
+            if self._binary:
+                self._position = _shellsim_vfs.append_bytes(self.name, value)
             else:
-                self._data = self._empty
+                self._position = _shellsim_vfs.append_text(self.name, value)
             self._data += value
-            self._position = len(self._data)
-            self._write_file()
             return len(value)
         before = self._data[:self._position]
         after_start = self._position + len(value)

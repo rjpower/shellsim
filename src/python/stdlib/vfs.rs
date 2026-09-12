@@ -1,7 +1,7 @@
 //! Private VFS primitives for frozen pure-Python stdlib facades.
 
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyBytes, PyResult, PyRuntime, PyString, PyValueCast,
+    CallArgs, FunctionDef, ModuleDef, PyBytes, PyError, PyResult, PyRuntime, PyString, PyValueCast,
 };
 use super::super::Value;
 
@@ -20,6 +20,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
         FunctionDef {
             module: "_shellsim_vfs",
+            name: "append_text",
+            call: append_text,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
             name: "read_bytes",
             call: read_bytes,
         },
@@ -27,6 +32,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             module: "_shellsim_vfs",
             name: "write_bytes",
             call: write_bytes,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "append_bytes",
+            call: append_bytes,
         },
         FunctionDef {
             module: "_shellsim_vfs",
@@ -91,6 +101,17 @@ fn write_text(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     Ok(Value::None)
 }
 
+fn append_text(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("_shellsim_vfs.append_text", 2, 2)?;
+    args.reject_keywords("_shellsim_vfs.append_text")?;
+    let PyString(path) = args.positional()[0].cast(runtime)?;
+    let PyString(contents) = args.positional()[1].cast(runtime)?;
+    let position = runtime.filesystem().append_text(&path, &contents)?;
+    i64::try_from(position)
+        .map(Value::Int)
+        .map_err(|_| PyError::overflow_error("file position exceeds Python int range"))
+}
+
 fn read_bytes(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.read_bytes", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.read_bytes")?;
@@ -108,6 +129,17 @@ fn write_bytes(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let PyBytes(contents) = args.positional()[1].cast(runtime)?;
     runtime.filesystem().write_bytes(&path, &contents)?;
     Ok(Value::None)
+}
+
+fn append_bytes(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("_shellsim_vfs.append_bytes", 2, 2)?;
+    args.reject_keywords("_shellsim_vfs.append_bytes")?;
+    let PyString(path) = args.positional()[0].cast(runtime)?;
+    let PyBytes(contents) = args.positional()[1].cast(runtime)?;
+    let position = runtime.filesystem().append_bytes(&path, &contents)?;
+    i64::try_from(position)
+        .map(Value::Int)
+        .map_err(|_| PyError::overflow_error("file position exceeds Python int range"))
 }
 
 fn exists(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {

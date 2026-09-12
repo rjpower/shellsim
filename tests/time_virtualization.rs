@@ -48,14 +48,18 @@ fn cpu_bound_python_processes_yield_between_bytecode_quanta() {
         memory: 256 * 1024 * 1024,
         ..Limits::default()
     });
-    let source = r#"python3 -c "i = 0
-while i < 100:
-    open('/trace', 'a').write('a')
-    i += 1" &
-python3 -c "i = 0
-while i < 100:
-    open('/trace', 'a').write('b')
-    i += 1" &
+    let source = r#"python3 -c "def run(value):
+    i = 0
+    while i < 100:
+        open('/trace', 'a').write(value)
+        i += 1
+run('a')" &
+python3 -c "def run(value):
+    i = 0
+    while i < 100:
+        open('/trace', 'a').write(value)
+        i += 1
+run('b')" &
 wait"#;
     assert_eq!(
         run(&mut environment, source),

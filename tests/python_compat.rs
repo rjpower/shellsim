@@ -738,6 +738,20 @@ fn executes_python_scripts_from_the_virtual_filesystem() {
     );
 }
 
+#[test]
+fn recursive_python_calls_stop_on_the_owned_frame_limit() {
+    let (status, stdout, stderr) = run_shell(
+        "python3.14 -c 'def recurse():\n    recurse()\nrecurse()\nprint(\"unreachable\")'",
+    );
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("maximum recursion depth exceeded"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
 /// When the development host has CPython 3.14, compare the same source and argv directly. The
 /// checked expectations above remain authoritative on builders where that executable is absent.
 #[test]

@@ -41,9 +41,10 @@ C-style `for` loops launch scheduler-owned captured children. `source` and `eval
 frames into the current continuation, preserving their same-process semantics without nesting the
 executor on the Rust stack. The old recursive captured-child adapter has been removed. Python
 commands now retain compiled code, VM state, and buffered output in typed command continuations;
-top-level bytecode yields in bounded quanta and CPU-bound Python processes interleave in FIFO
-order. Calls into user Python functions and blocking native methods still execute through nested
-Rust calls, so suspension is not yet available at every bytecode instruction.
+bytecode yields in bounded quanta and CPU-bound Python processes interleave in FIFO order. Ordinary
+user Python calls use explicit callee/return frames and retain exception unwinding across them.
+Callbacks made from within compound native operations and blocking native methods still execute
+through nested Rust calls, so suspension is not yet available at every bytecode instruction.
 
 The readiness handshake needed by phase 3 is present: blocked descriptor operations return a
 typed pipe-readable or pipe-writable condition, process code can suspend on that exact condition,
@@ -146,18 +147,19 @@ condition, loop, function, redirection, `errexit`, and cleanup semantics in fram
 
 Keep ordinary native commands synchronous. Convert only commands that may block into resumable
 tasks. Python code, operand stacks, exception regions, and top-level instruction state are now
-owned by a retained command continuation. The next executor change must replace recursive
-user-function calls with explicit return frames, after which native modeled operations can return
-the same typed ready/block/switch result as shell frames.
+owned by a retained command continuation. Ordinary bytecode calls now push explicit return frames.
+The next executor change must split compound native operations around their Python callbacks, after
+which blocking modeled operations can return the same typed ready/block/switch result as shell
+frames.
 
 The shell-side recursive child adapters are removed from normal execution. Python operand,
 scope, exception, context-manager, and method state is now separated from the VM's temporary
 environment borrows, and executing code objects own their code, instruction pointer, and handler
-stack in explicit bytecode frames. User-function dispatch still enters those owned frames through
-recursive Rust calls. Top-level frames are retained on the process command continuation and polled
-in bounded quanta. Phase completion therefore requires making the entire call stack iterative and
-deleting the nested scheduler bridge used by blocking Python methods. Deep or adversarial input
-must remain bounded independently of the host stack.
+stack in explicit bytecode frames. Ordinary user-function dispatch pushes and returns through that
+owned frame stack without Rust recursion. Compound operations such as constructors, sorting keys,
+and protocol callbacks retain synchronous inner calls for now. Phase completion requires reifying
+those callbacks and deleting the nested scheduler bridge used by blocking Python methods. Deep or
+adversarial input must remain bounded independently of the host stack.
 
 ## Phase 4: deterministic scheduler and pipes
 
