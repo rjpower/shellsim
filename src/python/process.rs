@@ -182,6 +182,28 @@ pub(super) fn communicate(
     result
 }
 
+/// Advance a scheduler-owned duplex exchange without dispatching another process.
+///
+/// `None` means the child must make more progress. Partial input and captured output remain on the
+/// live handle, so retrying after a child-activity wake cannot duplicate bytes.
+pub(super) fn communicate_if_ready(
+    interp: &mut Interp,
+    process: PyProcessHandle,
+    input: Vec<u8>,
+) -> PyResult<Option<PyProcessOutput>> {
+    checked_owner(interp, process)?;
+    let mut handle = interp
+        .live_children
+        .remove(&process.pid)
+        .ok_or_else(|| PyError::runtime_error("unknown subprocess handle"))?;
+    let result = (|| {
+        prepare_communicate(&mut handle, input)?;
+        communicate_progress(interp, process.pid, &mut handle)
+    })();
+    interp.live_children.insert(process.pid, handle);
+    result
+}
+
 fn communicate_inner(
     interp: &mut Interp,
     pid: u32,
@@ -189,8 +211,22 @@ fn communicate_inner(
     deadline: Option<u64>,
     handle: &mut LiveChild,
 ) -> PyResult<PyProcessOutput> {
+    prepare_communicate(handle, input)?;
+    loop {
+        if let Some(output) = communicate_progress(interp, pid, handle)? {
+            return Ok(output);
+        }
+        let exited = crate::exec::drive_scheduler_step(interp, pid, deadline)
+            .map_err(PyError::runtime_error)?;
+        if !exited && deadline.is_some_and(|limit| interp.clock.monotonic_ns() >= limit) {
+            return Ok(output_from_handle(handle, true));
+        }
+    }
+}
+
+fn prepare_communicate(handle: &mut LiveChild, input: Vec<u8>) -> PyResult<()> {
     if handle.communicated {
-        return Ok(output_from_handle(handle, false));
+        return Ok(());
     }
     if !input.is_empty() && !handle.stdin_pipe {
         return Err(PyError::value_error(
@@ -206,26 +242,33 @@ fn communicate_inner(
             ))
         }
     }
-    loop {
-        write_communicate_input(interp, handle)?;
-        drain_output(interp, handle, 1)?;
-        drain_output(interp, handle, 2)?;
-        if process_status(interp, pid).is_some() || handle.status.is_some() {
-            drain_output(interp, handle, 1)?;
-            drain_output(interp, handle, 2)?;
-            break;
-        }
-        let exited = crate::exec::drive_scheduler_step(interp, pid, deadline)
-            .map_err(PyError::runtime_error)?;
-        if !exited && deadline.is_some_and(|limit| interp.clock.monotonic_ns() >= limit) {
-            return Ok(output_from_handle(handle, true));
-        }
+    Ok(())
+}
+
+fn communicate_progress(
+    interp: &mut Interp,
+    pid: u32,
+    handle: &mut LiveChild,
+) -> PyResult<Option<PyProcessOutput>> {
+    if handle.communicated {
+        return Ok(Some(output_from_handle(handle, false)));
     }
-    handle.status = process_status(interp, pid)
-        .map(|status| python_returncode(handle.terminating_signal, status));
+    write_communicate_input(interp, handle)?;
+    drain_output(interp, handle, 1)?;
+    drain_output(interp, handle, 2)?;
+    let status = handle.status.or_else(|| {
+        process_status(interp, pid)
+            .map(|status| python_returncode(handle.terminating_signal, status))
+    });
+    let Some(status) = status else {
+        return Ok(None);
+    };
+    drain_output(interp, handle, 1)?;
+    drain_output(interp, handle, 2)?;
+    handle.status = Some(status);
     reap_process(interp, pid);
     handle.communicated = true;
-    Ok(output_from_handle(handle, false))
+    Ok(Some(output_from_handle(handle, false)))
 }
 
 pub(super) fn send_signal(

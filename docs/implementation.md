@@ -38,8 +38,9 @@ continuations and yield after bounded instruction quanta. Ordinary bytecode user
 use explicit return frames as well. Python calls made from within compound native operations still
 need instruction-level continuations. Native bytecode calls can now retain normalized arguments
 and retry after a typed wake: direct `time.sleep` uses the timer path and unbounded
-`Popen.wait()` uses the child path. Timeout-bearing subprocess waits, `communicate`, and
-descriptor I/O still need migration before the old nested scheduler bridge can be removed.
+`Popen.wait()` uses the child path, and unbounded `communicate()` retries on child-tree activity
+while retaining partial duplex progress. Timeout-bearing subprocess waits and descriptor I/O
+still need migration before the old nested scheduler bridge can be removed.
 
 Reusing an `Environment` preserves the VFS, cwd, variables, functions, arrays, package markers,
 virtual time/network state, command history, Python REPL, and cumulative resource usage. `exit`,

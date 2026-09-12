@@ -676,6 +676,7 @@ impl Environment {
         {
             let _ = self.scheduler.wake(parent_pid);
         }
+        self.scheduler.wake_waiters(WaitReason::ChildActivity(pid));
         let scheduled = self.scheduler.dispatch().ok().flatten();
         let removed = self.process.remove(pid);
         debug_assert!(removed.is_some(), "finished child state must exist");
@@ -820,6 +821,10 @@ impl Environment {
                 .map_err(descriptor_message)?
             {
                 self.scheduler.wake_waiters(WaitReason::PipeWritable(pipe));
+                // A Python parent may be coordinating several child pipes through one
+                // `communicate()` operation. Child activity is its retry signal; completion is
+                // still checked by the process layer before the call returns.
+                self.wake_child_activity_waiters(self.process.pid);
             }
         }
         Ok(result)
@@ -861,9 +866,28 @@ impl Environment {
                 .map_err(descriptor_message)?
             {
                 self.scheduler.wake_waiters(WaitReason::PipeReadable(pipe));
+                self.wake_child_activity_waiters(self.process.pid);
             }
         }
         Ok(result)
+    }
+
+    /// Wake coordinators of this process or any enclosing modeled child boundary.
+    ///
+    /// A launched argv may itself enter a shell child before touching inherited pipes. Walking the
+    /// bounded process ancestry ensures a Python `communicate()` waiting on the original handle
+    /// observes descendant I/O without teaching the scheduler about descriptor ownership.
+    fn wake_child_activity_waiters(&mut self, mut pid: ProcessId) {
+        for _ in 0..crate::process::MAX_PROCESSES {
+            self.scheduler.wake_waiters(WaitReason::ChildActivity(pid));
+            let Some(parent) = self.processes.get(pid).map(|record| record.ppid) else {
+                break;
+            };
+            if parent == pid {
+                break;
+            }
+            pid = parent;
+        }
     }
 
     /// Suspend the active task on the exact readiness condition returned by descriptor I/O.

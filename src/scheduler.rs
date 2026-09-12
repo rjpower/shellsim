@@ -18,6 +18,8 @@ pub enum WaitReason {
     PipeReadable(u32),
     PipeWritable(u32),
     Child(ProcessId),
+    /// Any descriptor progress or exit within a modeled child's process subtree.
+    ChildActivity(ProcessId),
 }
 
 /// Scheduler-owned lifecycle for one logical task.

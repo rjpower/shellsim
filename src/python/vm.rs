@@ -5723,7 +5723,19 @@ impl PyProcessRunner for Vm<'_> {
         input: Vec<u8>,
         timeout_ns: Option<u64>,
     ) -> PyResult<PyProcessOutput> {
-        let mut output = super::process::communicate(self.interp, handle, input, timeout_ns)?;
+        let mut output =
+            if self.mode.scheduler_owned && self.native_suspend_allowed && timeout_ns.is_none() {
+                match super::process::communicate_if_ready(self.interp, handle, input)? {
+                    Some(output) => output,
+                    None => {
+                        return Err(PyError::suspend(
+                            crate::scheduler::WaitReason::ChildActivity(handle.pid),
+                        ))
+                    }
+                }
+            } else {
+                super::process::communicate(self.interp, handle, input, timeout_ns)?
+            };
         self.out
             .extend_from_slice(&std::mem::take(&mut output.inherited_stdout));
         self.err

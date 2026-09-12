@@ -225,6 +225,23 @@ fn python_popen_waits_suspend_on_their_own_children() {
 }
 
 #[test]
+fn python_communicate_retries_on_duplex_child_activity() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "python3.14 -c 'import subprocess\nimport time\ndata = b\"x\" * 100000\nprocess = subprocess.Popen([\"sh\", \"-c\", \"sleep 2; cat\"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)\nstdout, stderr = process.communicate(data)\nprint(\"cat\", process.returncode, len(stdout), stdout == data, time.monotonic())' & python3.14 -c 'import time\ntime.sleep(1)\nprint(\"one\")' & wait",
+        ),
+        (
+            0,
+            "one\ncat 0 100000 True 2.0\n".into(),
+            String::new()
+        )
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
+}
+
+#[test]
 fn timeout_terminates_a_scheduler_blocked_python_process() {
     let mut environment = Environment::new();
     assert_eq!(
