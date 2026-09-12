@@ -19,7 +19,7 @@ use crate::{Environment, Limits, RunOutcome};
 const MAX_TRANSFER_RAW_BYTES: usize = 6 * 1024 * 1024;
 
 /// One protocol request. `id` is echoed verbatim so clients can correlate responses.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessRequest {
     #[serde(default)]
     pub id: Option<serde_json::Value>,
@@ -28,7 +28,7 @@ pub struct HarnessRequest {
 }
 
 /// Closed set of persistent harness operations.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum HarnessOperation {
     Execute {

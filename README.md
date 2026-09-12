@@ -49,6 +49,9 @@ printf '%s\n' \
   '{"id":2,"op":"workspace_diff"}' \
   | ./target/release/shellsim serve --root ./project
 
+# Replay a bounded scenario and emit paired request/response transcript records
+./target/release/shellsim replay scenario.ndjson --root ./project > transcript.ndjson
+
 # Import a host Python project into a fresh VFS and run it in shellsim
 ./target/release/shellsim-python project/main.py -- arg1
 ./target/release/shellsim-python project/tests --pytest
@@ -82,8 +85,9 @@ control which project tree is imported and the standard limit flags to constrain
 
 An environment owns deterministic monotonic, wall, and process-CPU clocks. Sleeps and deadlines
 advance the event queue without blocking a host thread; VFS timestamps and Python observe the same
-timeline. Runnable work has zero virtual duration and is bounded by CPU fuel. Background jobs still
-execute synchronously, so independent sleeps do not overlap. See
+timeline. Runnable work has zero virtual duration and is bounded by CPU fuel. Background jobs,
+pipelines, and nested shells run through the deterministic cooperative scheduler, so independent
+sleeps overlap in virtual time. See
 [docs/implementation.md](docs/implementation.md) for the state, scheduler, and replay contracts.
 
 ## Persistent shell sessions

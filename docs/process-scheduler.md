@@ -206,8 +206,9 @@ outside the simulation and receives only these tools.
 
 Bounded transactional host-directory ingestion is shared by `serve --root` and
 `shellsim-python`. Per-action and retained virtual-network request reporting is also present.
-Scenario manifests, transcript persistence, cloning, and concrete model-client adapters remain
-before this phase is complete.
+Bounded NDJSON scenario replay emits paired request/response transcript records. Scenario
+assertions, session cloning, and concrete model-client adapters remain before this phase is
+complete.
 
 ## Validation milestones
 

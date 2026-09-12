@@ -6,6 +6,7 @@
 //!   shellsim shell [limits]
 //!   shellsim eval [--cpu N] [--memory N] [--disk N] [--output N] -c '<command>'
 //!   shellsim serve [--cpu N] [--memory N] [--disk N] [--output N]
+//!   shellsim replay SCENARIO.ndjson [--root PATH] [limits]
 
 use std::process::exit;
 
@@ -36,6 +37,7 @@ fn main() {
         "shell" => interactive_shell(&args[2..]),
         "eval" => evaluate(&args[2..]),
         "serve" => serve(&args[2..]),
+        "replay" => replay(&args[2..]),
         command => usage_error(&format!("unknown command: {command}")),
     }
 }
@@ -200,10 +202,15 @@ fn interactive_shell(args: &[String]) -> ! {
 }
 
 const MAX_PROTOCOL_REQUEST_BYTES: usize = 20 * 1024 * 1024;
+const MAX_SCENARIO_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SCENARIO_ACTIONS: usize = 4_096;
 
-fn serve(args: &[String]) -> ! {
-    use std::io::Write;
+struct HarnessOptions {
+    limits: Limits,
+    host_root: Option<String>,
+}
 
+fn harness_options(args: &[String], command: &str) -> HarnessOptions {
     let mut limits = Limits::default();
     let mut host_root = None;
     let mut index = 0usize;
@@ -221,16 +228,16 @@ fn serve(args: &[String]) -> ! {
                         .unwrap_or_else(|| usage_error("--root requires a path")),
                 );
             }
-            value => usage_error(&format!("unexpected serve argument: {value}")),
+            value => usage_error(&format!("unexpected {command} argument: {value}")),
         }
         index += 1;
     }
+    HarnessOptions { limits, host_root }
+}
 
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
-    let mut output = std::io::stdout().lock();
-    let mut session = shellsim::harness::HarnessSession::new(limits);
-    if let Some(host_root) = host_root {
+fn harness_session(options: HarnessOptions, command: &str) -> shellsim::harness::HarnessSession {
+    let mut session = shellsim::harness::HarnessSession::new(options.limits);
+    if let Some(host_root) = options.host_root {
         shellsim::host_ingest::mount_host_tree(
             &mut session.environment,
             std::path::Path::new(&host_root),
@@ -238,10 +245,20 @@ fn serve(args: &[String]) -> ! {
         )
         .and_then(|_| session.checkpoint_workspace())
         .unwrap_or_else(|error| {
-            eprintln!("shellsim serve: {error}");
+            eprintln!("shellsim {command}: {error}");
             exit(2);
         });
     }
+    session
+}
+
+fn serve(args: &[String]) -> ! {
+    use std::io::Write;
+
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut output = std::io::stdout().lock();
+    let mut session = harness_session(harness_options(args, "serve"), "serve");
     while let Some(line) = read_bounded_protocol_line(&mut input).unwrap_or_else(|error| {
         eprintln!("shellsim serve: input error: {error}");
         exit(1);
@@ -259,6 +276,81 @@ fn serve(args: &[String]) -> ! {
         {
             exit(1);
         }
+    }
+    exit(0);
+}
+
+#[derive(serde::Serialize)]
+struct TranscriptRecord<'a> {
+    sequence: usize,
+    request: &'a shellsim::harness::HarnessRequest,
+    response: &'a shellsim::harness::HarnessResponse,
+}
+
+fn replay(args: &[String]) -> ! {
+    use std::io::{BufReader, Write};
+
+    let Some(path) = args.first() else {
+        usage_error("replay requires a scenario path");
+    };
+    let file = std::fs::File::open(path).unwrap_or_else(|error| {
+        eprintln!("shellsim replay: cannot read {path}: {error}");
+        exit(2);
+    });
+    let mut input = BufReader::new(file);
+    let mut output = std::io::stdout().lock();
+    let mut session = harness_session(harness_options(&args[1..], "replay"), "replay");
+    let mut input_bytes = 0usize;
+    let mut transcript_bytes = 0usize;
+    for sequence in 0..MAX_SCENARIO_ACTIONS {
+        let Some(line) = read_bounded_protocol_line(&mut input).unwrap_or_else(|error| {
+            eprintln!("shellsim replay: input error: {error}");
+            exit(1);
+        }) else {
+            exit(0);
+        };
+        let line = line.unwrap_or_else(|error| {
+            eprintln!("shellsim replay: action {}: {error}", sequence + 1);
+            exit(2);
+        });
+        input_bytes = input_bytes.saturating_add(line.len().saturating_add(1));
+        if input_bytes > MAX_SCENARIO_BYTES {
+            eprintln!("shellsim replay: scenario exceeds the {MAX_SCENARIO_BYTES}-byte limit");
+            exit(2);
+        }
+        let request = serde_json::from_slice::<shellsim::harness::HarnessRequest>(&line)
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "shellsim replay: action {} is invalid: {error}",
+                    sequence + 1
+                );
+                exit(2);
+            });
+        let response = session.handle(request.clone());
+        let record = serde_json::to_vec(&TranscriptRecord {
+            sequence,
+            request: &request,
+            response: &response,
+        })
+        .unwrap();
+        transcript_bytes = transcript_bytes.saturating_add(record.len() + 1);
+        if transcript_bytes > MAX_SCENARIO_BYTES {
+            eprintln!("shellsim replay: transcript exceeds the {MAX_SCENARIO_BYTES}-byte limit");
+            exit(2);
+        }
+        if output.write_all(&record).is_err() || output.write_all(b"\n").is_err() {
+            exit(1);
+        }
+    }
+    if read_bounded_protocol_line(&mut input)
+        .unwrap_or_else(|error| {
+            eprintln!("shellsim replay: input error: {error}");
+            exit(1);
+        })
+        .is_some()
+    {
+        eprintln!("shellsim replay: scenario exceeds the {MAX_SCENARIO_ACTIONS}-action limit");
+        exit(2);
     }
     exit(0);
 }
@@ -367,7 +459,7 @@ fn read_stdin_bytes() -> Vec<u8> {
 fn usage_error(message: &str) -> ! {
     eprintln!("shellsim: {message}");
     eprintln!(
-        "usage: shellsim -c SOURCE | run SCRIPT [ARGS...] | shell [LIMITS] | eval [LIMITS] -c SOURCE | serve [LIMITS]"
+        "usage: shellsim -c SOURCE | run SCRIPT [ARGS...] | shell [LIMITS] | eval [LIMITS] -c SOURCE | serve [LIMITS] | replay SCENARIO.ndjson [LIMITS]"
     );
     exit(2);
 }

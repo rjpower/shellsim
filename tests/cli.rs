@@ -198,3 +198,56 @@ fn persistent_protocol_can_checkpoint_a_trusted_host_snapshot() {
     );
     assert_eq!(responses[1]["result"]["changes"], serde_json::json!([]));
 }
+
+#[test]
+fn scenario_replay_emits_paired_transcript_records() {
+    let directory = TestDirectory::new();
+    let scenario = directory.path().join("scenario.ndjson");
+    std::fs::write(
+        &scenario,
+        concat!(
+            "{\"id\":\"write\",\"op\":\"execute\",\"source\":\"printf saved > note\"}\n",
+            "{\"id\":\"read\",\"op\":\"read_file\",\"path\":\"note\"}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .arg("replay")
+        .arg(&scenario)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["sequence"], 0);
+    assert_eq!(records[0]["request"]["id"], "write");
+    assert_eq!(records[0]["response"]["ok"], true);
+    assert_eq!(records[1]["request"]["id"], "read");
+    assert_eq!(records[1]["response"]["result"]["data_base64"], "c2F2ZWQ=");
+}
+
+#[test]
+fn scenario_replay_rejects_invalid_actions() {
+    let directory = TestDirectory::new();
+    let scenario = directory.path().join("invalid.ndjson");
+    std::fs::write(&scenario, b"not json\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .arg("replay")
+        .arg(&scenario)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("action 1 is invalid"));
+    assert!(output.stdout.is_empty());
+}
