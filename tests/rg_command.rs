@@ -101,3 +101,40 @@ fn search_materialization_obeys_the_modeled_memory_limit() {
     assert_eq!(outcome.stop_reason, Some(StopReason::MemoryExhausted));
     assert!(stdout.is_empty());
 }
+
+#[test]
+fn context_output_is_bounded_grouped_and_line_addressable() {
+    let mut environment = fixture();
+    environment
+        .vfs
+        .put_file(
+            "/workspace/context.txt",
+            b"before\nhit one\nafter\ngap\ngap\nbefore two\nhit two\nafter two\n".to_vec(),
+            0o644,
+        )
+        .unwrap();
+    assert_eq!(
+        run(&mut environment, "rg -B1 -A1 'hit' /workspace/context.txt"),
+        (
+            0,
+            "1-before\n2:hit one\n3-after\n--\n6-before two\n7:hit two\n8-after two\n".into(),
+            String::new()
+        )
+    );
+    let invalid = run(&mut environment, "rg -C1001 hit /workspace");
+    assert_eq!(invalid.0, 2);
+    assert!(invalid.2.contains("context limit"), "{}", invalid.2);
+}
+
+#[test]
+fn common_language_type_aliases_filter_recursive_search() {
+    let mut environment = fixture();
+    environment
+        .vfs
+        .put_file("/workspace/main.go", b"// TODO go\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(
+        run(&mut environment, "rg -tgo TODO /workspace").1,
+        "workspace/main.go:// TODO go\n"
+    );
+}

@@ -28,6 +28,8 @@ struct Options {
     text: bool,
     force_filename: Option<bool>,
     list_files: bool,
+    before_context: usize,
+    after_context: usize,
     globs: Vec<String>,
     types: Vec<String>,
     patterns: Vec<String>,
@@ -90,6 +92,26 @@ fn search_inputs(
         }
         let matcher = matcher.expect("search mode has a matcher");
         let text = String::from_utf8_lossy(&input.bytes);
+        if (options.before_context != 0 || options.after_context != 0)
+            && !options.quiet
+            && !options.count
+            && !options.files_with
+            && !options.files_without
+        {
+            let Some(matched_count) = search_with_context(
+                interp,
+                options,
+                matcher,
+                &input.label,
+                show_filename,
+                &text,
+                io,
+            ) else {
+                return 137;
+            };
+            any |= matched_count != 0;
+            continue;
+        }
         let mut matched_count = 0_usize;
         for (index, line) in text.lines().enumerate() {
             if !interp.charge_cpu(1_u64.saturating_add(line.len() as u64)) {
@@ -134,6 +156,63 @@ fn search_inputs(
         }
     }
     i32::from(!any)
+}
+
+fn search_with_context(
+    interp: &mut CommandContext<'_>,
+    options: &Options,
+    matcher: &Matcher,
+    label: &str,
+    show_filename: bool,
+    text: &str,
+    io: &mut Io,
+) -> Option<usize> {
+    let line_count = text.lines().count();
+    let reserved = (line_count as u64).saturating_mul(18);
+    if !interp.reserve_memory(reserved) {
+        return None;
+    }
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut matches = Vec::with_capacity(line_count);
+    let mut matched_count = 0_usize;
+    for line in &lines {
+        if !interp.charge_cpu(1_u64.saturating_add(line.len() as u64)) {
+            interp.resources.release_memory(reserved);
+            return None;
+        }
+        let matched = matcher.is_match(line) ^ options.invert;
+        matched_count = matched_count.saturating_add(usize::from(matched));
+        matches.push(matched);
+    }
+    let mut last_emitted = None;
+    for (matched_index, _) in matches.iter().enumerate().filter(|(_, matched)| **matched) {
+        let start = matched_index.saturating_sub(options.before_context);
+        let end = matched_index
+            .saturating_add(options.after_context)
+            .saturating_add(1)
+            .min(lines.len());
+        let first = last_emitted.map_or(start, |previous| start.max(previous + 1));
+        if first >= end {
+            continue;
+        }
+        if last_emitted.is_some_and(|previous| first > previous + 1) {
+            wln(io.out, "--");
+        }
+        for index in first..end {
+            let separator = if matches[index] { ':' } else { '-' };
+            let mut prefix = String::new();
+            if show_filename {
+                prefix.push_str(label);
+                prefix.push(separator);
+            }
+            prefix.push_str(&(index + 1).to_string());
+            prefix.push(separator);
+            wln(io.out, &format!("{prefix}{}", lines[index]));
+        }
+        last_emitted = Some(end - 1);
+    }
+    interp.resources.release_memory(reserved);
+    Some(matched_count)
 }
 
 struct Matcher(regex::Regex);
@@ -315,6 +394,11 @@ fn matches_types(types: &[String], path: &str) -> bool {
                 "sh" | "shell" => &["sh", "bash", "zsh"],
                 "c" => &["c", "h"],
                 "cpp" => &["cc", "cpp", "cxx", "hpp"],
+                "go" => &["go"],
+                "java" => &["java"],
+                "ruby" => &["rb"],
+                "html" => &["html", "htm"],
+                "css" => &["css", "scss", "sass", "less"],
                 _ => &[],
             };
             path.rsplit_once('.')
@@ -338,6 +422,17 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 .push(take_value(args, &mut index, argument)?),
             "-g" | "--glob" => options.globs.push(take_value(args, &mut index, argument)?),
             "-t" | "--type" => options.types.push(take_value(args, &mut index, argument)?),
+            "-A" | "--after-context" => {
+                options.after_context = context_value(args, &mut index, argument)?
+            }
+            "-B" | "--before-context" => {
+                options.before_context = context_value(args, &mut index, argument)?
+            }
+            "-C" | "--context" => {
+                let value = context_value(args, &mut index, argument)?;
+                options.before_context = value;
+                options.after_context = value;
+            }
             "-n" | "--line-number" => options.line = true,
             "-i" | "--ignore-case" => options.ignore_case = true,
             "-v" | "--invert-match" => options.invert = true,
@@ -357,6 +452,33 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             value if value.starts_with("--type=") => options.types.push(value[7..].to_string()),
             value if value.starts_with("--regexp=") => {
                 options.patterns.push(value[9..].to_string())
+            }
+            value if value.starts_with("--after-context=") => {
+                options.after_context = parse_context(&value[16..], "--after-context")?
+            }
+            value if value.starts_with("--before-context=") => {
+                options.before_context = parse_context(&value[17..], "--before-context")?
+            }
+            value if value.starts_with("--context=") => {
+                let context = parse_context(&value[10..], "--context")?;
+                options.before_context = context;
+                options.after_context = context;
+            }
+            value
+                if value.len() > 2
+                    && matches!(value.as_bytes()[1], b'A' | b'B' | b'C')
+                    && value[2..].bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                let context = parse_context(&value[2..], &value[..2])?;
+                match value.as_bytes()[1] {
+                    b'A' => options.after_context = context,
+                    b'B' => options.before_context = context,
+                    b'C' => {
+                        options.before_context = context;
+                        options.after_context = context;
+                    }
+                    _ => unreachable!("context option was matched above"),
+                }
             }
             value if value.starts_with("-g") && value.len() > 2 => {
                 options.globs.push(value[2..].to_string())
@@ -400,4 +522,19 @@ fn take_value(args: &[String], index: &mut usize, option: &str) -> Result<String
     args.get(*index)
         .cloned()
         .ok_or_else(|| format!("option {option} requires a value"))
+}
+
+fn context_value(args: &[String], index: &mut usize, option: &str) -> Result<usize, String> {
+    let value = take_value(args, index, option)?;
+    parse_context(&value, option)
+}
+
+fn parse_context(value: &str, option: &str) -> Result<usize, String> {
+    let context = value
+        .parse::<usize>()
+        .map_err(|_| format!("option {option} requires a non-negative integer"))?;
+    if context > 1_000 {
+        return Err(format!("option {option} exceeds the context limit"));
+    }
+    Ok(context)
 }
