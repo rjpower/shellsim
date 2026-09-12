@@ -1505,6 +1505,15 @@ impl ShellContinuation {
         substitution_status: Option<i32>,
     ) {
         let argv = expand_argv(interp, &words);
+        let argv = match expand_alias_argv(interp, argv) {
+            Ok(argv) => argv,
+            Err(message) => {
+                write_diagnostic(interp, &format!("shellsim: alias: {message}\n"));
+                restore_command_variables(interp, temporary_variables);
+                self.status = 2;
+                return;
+            }
+        };
         if argv.is_empty() {
             for (key, value) in &assigns {
                 apply_assignment(interp, key, value);
@@ -2474,6 +2483,25 @@ fn expand_argv(interp: &mut Interp, words: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+fn expand_alias_argv(interp: &mut Interp, mut argv: Vec<String>) -> Result<Vec<String>, String> {
+    let mut expanded = std::collections::BTreeSet::new();
+    while let Some(command) = argv.first() {
+        let Some(alias) = interp.aliases.get(command).cloned() else {
+            break;
+        };
+        if !expanded.insert(command.clone()) || expanded.len() > 32 {
+            return Err(format!("recursive alias involving {command:?}"));
+        }
+        let mut replacement = expand_argv(interp, &alias.words);
+        if replacement.is_empty() {
+            return Err(format!("alias {command:?} expands to an empty command"));
+        }
+        replacement.extend(argv.into_iter().skip(1));
+        argv = replacement;
+    }
+    Ok(argv)
 }
 
 /// True if `w` is an array-assignment literal that must not be split/globbed:

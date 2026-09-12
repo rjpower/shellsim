@@ -35,6 +35,13 @@ pub struct Job {
     pub status: i32,
 }
 
+/// Parsed simple-command alias retained as process-local shell state.
+#[derive(Clone, Debug)]
+pub(crate) struct AliasDefinition {
+    pub source: String,
+    pub words: Vec<String>,
+}
+
 /// Machine-wide state and limits shared by cooperatively scheduled logical processes.
 pub struct Environment {
     pub vfs: Vfs,
@@ -89,6 +96,8 @@ pub struct ProcessState {
     /// Bash-style directory stack, stored oldest-to-newest beneath the current directory.
     pub directory_stack: Vec<String>,
     pub funcs: HashMap<String, crate::shell::Node>,
+    /// Process-local simple-command aliases expanded before normal command dispatch.
+    pub(crate) aliases: HashMap<String, AliasDefinition>,
     /// `$?`
     pub last_status: i32,
     /// positional parameters `$1 $2 ... $@`
@@ -245,6 +254,7 @@ impl ProcessState {
             cwd: self.cwd.clone(),
             directory_stack: self.directory_stack.clone(),
             funcs: self.funcs.clone(),
+            aliases: self.aliases.clone(),
             last_status: self.last_status,
             positional: self.positional.clone(),
             opt_errexit: self.opt_errexit,
@@ -316,6 +326,17 @@ impl ProcessState {
             bytes = bytes
                 .saturating_add(string(name))
                 .saturating_add(body.estimated_bytes());
+        }
+        for (name, alias) in &self.aliases {
+            bytes = bytes
+                .saturating_add(string(name))
+                .saturating_add(string(&alias.source))
+                .saturating_add(
+                    alias
+                        .words
+                        .iter()
+                        .fold(0, |total, word| total.saturating_add(string(word))),
+                );
         }
         bytes
     }
@@ -409,6 +430,7 @@ impl Environment {
                 cwd: "/".to_string(),
                 directory_stack: Vec::new(),
                 funcs: HashMap::new(),
+                aliases: HashMap::new(),
                 last_status: 0,
                 positional: Vec::new(),
                 opt_errexit: false,

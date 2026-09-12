@@ -48,7 +48,8 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["killall", "pkill"], Trust::NoOp, cmd_unsupported);
     reg(m, &["type", "which"], Trust::Real, cmd_which);
     reg_resumable(m, &["command"], Trust::Real, cmd_command, start_command);
-    reg(m, &["alias", "unalias"], Trust::NoOp, cmd_unsupported);
+    reg(m, &["alias"], Trust::Partial, cmd_alias);
+    reg(m, &["unalias"], Trust::Real, cmd_unalias);
     reg(m, &["getopts"], Trust::Real, cmd_getopts);
     reg(m, &["let"], Trust::Real, cmd_let);
     reg(m, &["mapfile", "readarray"], Trust::Real, cmd_mapfile);
@@ -309,6 +310,91 @@ fn cmd_false(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -
 
 fn cmd_getopts(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {
     1 // signal "no more options" — scripts usually guard on this
+}
+
+fn cmd_alias(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.is_empty() {
+        let mut names = interp.aliases.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            print_alias(interp, &name, io);
+        }
+        return 0;
+    }
+    let mut status = 0;
+    for argument in args {
+        let Some((name, source)) = argument.split_once('=') else {
+            if interp.aliases.contains_key(argument) {
+                print_alias(interp, argument, io);
+            } else {
+                ewln(io.err, &format!("alias: {argument}: not found"));
+                status = 1;
+            }
+            continue;
+        };
+        if name.is_empty()
+            || name
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'$' | b'`'))
+        {
+            ewln(io.err, &format!("alias: invalid alias name: {name}"));
+            status = 1;
+            continue;
+        }
+        let words = match crate::shell::parse(source) {
+            Ok(crate::shell::Node::Command {
+                assigns,
+                words,
+                redirects,
+            }) if assigns.is_empty() && !words.is_empty() && redirects.is_empty() => words,
+            _ => {
+                ewln(
+                    io.err,
+                    &format!("alias: {name}: only simple-command aliases are supported"),
+                );
+                status = 2;
+                continue;
+            }
+        };
+        if interp.aliases.len() >= 256 && !interp.aliases.contains_key(name) {
+            ewln(io.err, "alias: alias limit exceeded");
+            return 1;
+        }
+        interp.aliases.insert(
+            name.to_string(),
+            crate::interp::AliasDefinition {
+                source: source.to_string(),
+                words,
+            },
+        );
+    }
+    status
+}
+
+fn print_alias(interp: &CommandContext<'_>, name: &str, io: &mut Io) {
+    if let Some(alias) = interp.aliases.get(name) {
+        let quoted = alias.source.replace('\'', "'\\''");
+        wln(io.out, &format!("alias {name}='{quoted}'"));
+    }
+}
+
+fn cmd_unalias(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args == ["-a"] {
+        interp.aliases.clear();
+        return 0;
+    }
+    if args.is_empty() {
+        ewln(io.err, "unalias: usage: unalias [-a] name ...");
+        return 2;
+    }
+    let mut status = 0;
+    for name in args {
+        if interp.aliases.remove(name).is_none() {
+            ewln(io.err, &format!("unalias: {name}: not found"));
+            status = 1;
+        }
+    }
+    status
 }
 
 fn cmd_pwd(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {

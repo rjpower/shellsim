@@ -117,12 +117,34 @@ fn completed_background_jobs_are_queryable_and_waitable() {
         (0, "[1] Done false\n1\n".into(), String::new())
     );
     assert_eq!(
-        run("alias ll='ls -l'"),
+        run("alias ll='echo alias'; ll works; alias ll; unalias ll; ll fails"),
         (
-            2,
-            String::new(),
-            "shellsim: builtin is not supported\n".into()
+            127,
+            "alias works\nalias ll='echo alias'\n".into(),
+            "ll: command not found\n".into()
         )
+    );
+}
+
+#[test]
+fn aliases_are_process_local_and_recursion_is_bounded() {
+    assert_eq!(
+        run("alias say='echo'; alias outer='say'; outer hello; (unalias say; say child); say parent"),
+        (
+            0,
+            "hello\nparent\n".into(),
+            "say: command not found\n".into()
+        )
+    );
+    let recursive = run("alias a=b; alias b=a; a");
+    assert_eq!(recursive.0, 2);
+    assert!(recursive.2.contains("recursive alias"), "{}", recursive.2);
+    let compound = run("alias bad='echo one; echo two'");
+    assert_eq!(compound.0, 2);
+    assert!(
+        compound.2.contains("simple-command aliases"),
+        "{}",
+        compound.2
     );
 }
 
