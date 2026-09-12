@@ -228,6 +228,17 @@ impl Timeline {
         self.schedule_at(deadline_ns, kind)
     }
 
+    /// Schedule a cooperative task wake and account the requested duration as sleep telemetry.
+    pub fn schedule_wake_after(
+        &mut self,
+        task: u64,
+        duration_ns: u64,
+    ) -> Result<EventId, TimelineError> {
+        let event = self.schedule_after(duration_ns, EventKind::WakeTask { task })?;
+        self.slept_ns = self.slept_ns.saturating_add(duration_ns);
+        Ok(event)
+    }
+
     pub fn schedule_at(
         &mut self,
         deadline_ns: u64,
@@ -330,8 +341,7 @@ impl Timeline {
         task: u64,
         duration_ns: u64,
     ) -> Result<BlockOutcome, TimelineError> {
-        let wake = self.schedule_after(duration_ns, EventKind::WakeTask { task })?;
-        self.slept_ns = self.slept_ns.saturating_add(duration_ns);
+        let wake = self.schedule_wake_after(task, duration_ns)?;
         loop {
             let fired = self.advance_to_next()?;
             for event in fired {

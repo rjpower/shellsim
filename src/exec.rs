@@ -154,6 +154,9 @@ enum ShellFrame {
         positional: Vec<String>,
         variables: Vec<(String, Option<String>)>,
     },
+    ResumeCommand {
+        variables: Vec<(String, Option<String>)>,
+    },
     AwaitChild {
         pid: crate::process::ProcessId,
         reap: bool,
@@ -163,6 +166,7 @@ enum ShellFrame {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShellPoll {
     Pending,
+    Blocked(crate::scheduler::WaitReason),
     Switched,
     Ready(i32),
 }
@@ -171,6 +175,7 @@ pub(crate) struct ShellContinuation {
     frames: Vec<ShellFrame>,
     status: i32,
     switched: bool,
+    blocked: Option<crate::scheduler::WaitReason>,
 }
 
 impl ShellContinuation {
@@ -179,11 +184,13 @@ impl ShellContinuation {
             frames: vec![ShellFrame::Eval(node.clone())],
             status: 0,
             switched: false,
+            blocked: None,
         }
     }
 
     pub(crate) fn poll(&mut self, interp: &mut Interp, budget: usize) -> ShellPoll {
         self.switched = false;
+        self.blocked = None;
         for _ in 0..budget.max(1) {
             let Some(frame) = self.frames.pop() else {
                 return ShellPoll::Ready(self.status);
@@ -192,6 +199,9 @@ impl ShellContinuation {
             interp.last_status = self.status;
             if self.switched {
                 return ShellPoll::Switched;
+            }
+            if let Some(reason) = self.blocked.take() {
+                return ShellPoll::Blocked(reason);
             }
         }
         if self.frames.is_empty() {
@@ -525,6 +535,14 @@ impl ShellContinuation {
                 self.status = interp.returning.take().unwrap_or(self.status);
                 restore_command_variables(interp, variables);
             }
+            ShellFrame::ResumeCommand { variables } => {
+                self.status = if interp.deadline_interrupt.is_some() {
+                    124
+                } else {
+                    0
+                };
+                restore_command_variables(interp, variables);
+            }
             ShellFrame::AwaitChild { pid, reap } => {
                 self.status = match interp.processes.get(pid).map(|record| record.status) {
                     Some(crate::process::ProcessStatus::Exited(status)) => status,
@@ -757,8 +775,16 @@ impl ShellContinuation {
             });
             self.frames.push(ShellFrame::Eval(body));
         } else {
-            self.status = run_external_command(interp, &argv);
-            restore_command_variables(interp, variables);
+            match run_external_command(interp, &argv) {
+                crate::commands::CommandPoll::Ready(status) => {
+                    self.status = status;
+                    restore_command_variables(interp, variables);
+                }
+                crate::commands::CommandPoll::Blocked(reason) => {
+                    self.frames.push(ShellFrame::ResumeCommand { variables });
+                    self.blocked = Some(reason);
+                }
+            }
         }
     }
 
@@ -770,7 +796,10 @@ impl ShellContinuation {
         match interp.start_child(command, false) {
             Ok(pid) => {
                 self.frames.push(ShellFrame::AwaitChild { pid, reap });
-                interp.process.shell_continuation = Some(ShellContinuation::new(&node));
+                interp
+                    .process
+                    .set_continuation(pid, Some(ShellContinuation::new(&node)))
+                    .expect("new child process state must exist");
                 self.switched = true;
                 debug_assert_ne!(parent_pid, interp.process.pid);
             }
@@ -817,12 +846,13 @@ fn exec_node(interp: &mut Interp, node: &Node) -> i32 {
             .expect("scheduled task must own process state");
     }
     loop {
+        wake_due_events(interp).expect("current virtual instant must remain valid");
         let owner_pid = interp.process.pid;
         let mut continuation = interp
             .process
             .shell_continuation
             .take()
-            .expect("active process continuation was installed above");
+            .unwrap_or_else(|| panic!("active process {owner_pid} has no shell continuation"));
         match continuation.poll(interp, SHELL_POLL_QUANTUM) {
             ShellPoll::Pending => {
                 interp
@@ -851,10 +881,98 @@ fn exec_node(interp: &mut Interp, node: &Node) -> i32 {
                     .set_continuation(owner_pid, Some(continuation))
                     .expect("suspended parent process state must remain present");
             }
+            ShellPoll::Blocked(reason) => {
+                interp
+                    .process
+                    .set_continuation(owner_pid, Some(continuation))
+                    .expect("blocked process state must remain present");
+                interp
+                    .scheduler
+                    .block_current(reason)
+                    .expect("polled process must be the running scheduler task");
+                dispatch_or_advance(interp)
+                    .expect("a blocking command must leave a modeled wake event");
+            }
             ShellPoll::Ready(status) if owner_pid == target_pid => return status,
-            ShellPoll::Ready(status) => interp.finish_child(owner_pid, status),
+            ShellPoll::Ready(status) => {
+                interp.finish_child(owner_pid, status);
+                if interp.scheduler.current().is_none() {
+                    dispatch_or_advance(interp)
+                        .expect("retained blocked processes must have a modeled wake event");
+                }
+            }
         }
     }
+}
+
+fn dispatch_or_advance(interp: &mut Interp) -> Result<(), String> {
+    loop {
+        if let Some(pid) = interp
+            .scheduler
+            .dispatch()
+            .map_err(|error| format!("{error:?}"))?
+        {
+            interp.process.activate(pid)?;
+            return Ok(());
+        }
+        let fired = interp
+            .clock
+            .advance_to_next()
+            .map_err(|error| error.to_string())?;
+        if fired.is_empty() {
+            return Err("all processes are blocked without a pending event".to_string());
+        }
+        handle_ready_events(interp)?;
+    }
+}
+
+fn wake_due_events(interp: &mut Interp) -> Result<(), String> {
+    interp
+        .clock
+        .advance_to(interp.clock.monotonic_ns())
+        .map_err(|error| error.to_string())?;
+    handle_ready_events(interp)
+}
+
+fn handle_ready_events(interp: &mut Interp) -> Result<(), String> {
+    while let Some(event) = interp.clock.pop_ready() {
+        match event.kind {
+            crate::clock::EventKind::WakeTask { task } => {
+                let Ok(pid) = crate::process::ProcessId::try_from(task) else {
+                    continue;
+                };
+                if interp.scheduler.state(pid)
+                    == Some(crate::scheduler::TaskState::Blocked(
+                        crate::scheduler::WaitReason::Timer(event.id.deadline_ns()),
+                    ))
+                {
+                    interp
+                        .scheduler
+                        .wake(pid)
+                        .map_err(|error| format!("{error:?}"))?;
+                }
+            }
+            crate::clock::EventKind::Deadline { task } => {
+                let waiters = if task == crate::clock::MAIN_TASK_ID {
+                    interp.scheduler.timer_waiters()
+                } else {
+                    crate::process::ProcessId::try_from(task)
+                        .ok()
+                        .into_iter()
+                        .collect()
+                };
+                for pid in waiters {
+                    interp.process.set_deadline_interrupt(pid, event.id)?;
+                    interp
+                        .scheduler
+                        .wake(pid)
+                        .map_err(|error| format!("{error:?}"))?;
+                }
+            }
+            crate::clock::EventKind::External { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn exec_background(interp: &mut Interp, node: &Node) -> i32 {
@@ -1130,7 +1248,7 @@ fn restore_command_variables(interp: &mut Interp, saved: Vec<(String, Option<Str
     }
 }
 
-fn run_external_command(interp: &mut Interp, argv: &[String]) -> i32 {
+fn run_external_command(interp: &mut Interp, argv: &[String]) -> crate::commands::CommandPoll {
     let mut local_out = Vec::new();
     let mut local_err = Vec::new();
     let cmd_stdin = if argv[0] == "read" {
@@ -1144,7 +1262,7 @@ fn run_external_command(interp: &mut Interp, argv: &[String]) -> i32 {
             }
         }
     };
-    let mut status = crate::commands::run(interp, argv, cmd_stdin, &mut local_out, &mut local_err);
+    let mut result = crate::commands::poll(interp, argv, cmd_stdin, &mut local_out, &mut local_err);
 
     let mut output_failed = false;
     if let Err(error) = write_all_fd(interp, 1, &local_out) {
@@ -1155,9 +1273,9 @@ fn run_external_command(interp: &mut Interp, argv: &[String]) -> i32 {
         output_failed = true;
     }
     if output_failed {
-        status = 1;
+        result = crate::commands::CommandPoll::Ready(1);
     }
-    status
+    result
 }
 
 /// Expand a command's argv, but keep array-assignment literal words verbatim so the builtin

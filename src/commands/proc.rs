@@ -7,14 +7,15 @@ use crate::clock::{
     BlockOutcome, EventKind, MAIN_TASK_ID, NANOS_PER_MICROSECOND, NANOS_PER_SECOND,
 };
 use crate::commands::util::{ewln, parse_duration_ns, wln};
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandContext, CommandPoll, CommandSpec, Io, Trust};
 use crate::interp::Interp;
+use crate::scheduler::WaitReason;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
+    use super::{reg, reg_resumable};
     // time / scheduling (virtual clock, never blocks)
-    reg(m, &["sleep"], Trust::Real, cmd_sleep);
-    reg(m, &["usleep"], Trust::Real, cmd_usleep);
+    reg_resumable(m, &["sleep"], Trust::Real, cmd_sleep, start_sleep);
+    reg_resumable(m, &["usleep"], Trust::Real, cmd_usleep, start_usleep);
     reg(m, &["timeout"], Trust::Partial, cmd_timeout);
     reg(m, &["date"], Trust::Real, cmd_date);
     reg(m, &["sync"], Trust::Real, |_, _, _| 0);
@@ -32,6 +33,56 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["python3.14"], Trust::Partial, cmd_python314);
     reg(m, &["pytest"], Trust::Partial, cmd_pytest);
     reg(m, &["jq"], Trust::Partial, cmd_jq);
+}
+
+fn start_sleep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    if args.is_empty() {
+        return CommandPoll::Ready(1);
+    }
+    let duration = args.iter().try_fold(0_u64, |total, argument| {
+        parse_duration_ns(argument).and_then(|part| {
+            total
+                .checked_add(part)
+                .ok_or_else(|| "duration is too large".to_string())
+        })
+    });
+    start_timer(interp, duration, "sleep", io)
+}
+
+fn start_usleep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let Some(argument) = args.first() else {
+        ewln(io.err, "usleep: missing operand");
+        return CommandPoll::Ready(1);
+    };
+    let duration = argument
+        .parse::<u64>()
+        .ok()
+        .and_then(|micros| micros.checked_mul(NANOS_PER_MICROSECOND))
+        .ok_or_else(|| format!("invalid time interval {argument:?}"));
+    start_timer(interp, duration, "usleep", io)
+}
+
+fn start_timer(
+    interp: &mut CommandContext<'_>,
+    duration: Result<u64, String>,
+    command: &str,
+    io: &mut Io,
+) -> CommandPoll {
+    let duration = match duration {
+        Ok(duration) => duration,
+        Err(error) => {
+            ewln(io.err, &format!("{command}: {error}"));
+            return CommandPoll::Ready(1);
+        }
+    };
+    let pid = interp.process.pid;
+    match interp.clock.schedule_wake_after(u64::from(pid), duration) {
+        Ok(event) => CommandPoll::Blocked(WaitReason::Timer(event.deadline_ns())),
+        Err(error) => {
+            ewln(io.err, &format!("{command}: {error}"));
+            CommandPoll::Ready(1)
+        }
+    }
 }
 
 fn cmd_sleep(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {

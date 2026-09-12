@@ -27,6 +27,20 @@ fn shell_wall_and_monotonic_time_advance_without_host_waiting() {
 }
 
 #[test]
+fn background_sleeps_overlap_under_the_cooperative_scheduler() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "(sleep 2; echo two) & (sleep 1; echo one) & sleep 3; echo end",
+        ),
+        (0, "one\ntwo\nend\n".into(), String::new())
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 3 * NANOS_PER_SECOND);
+    assert_eq!(environment.clock.slept_ns(), 6 * NANOS_PER_SECOND);
+}
+
+#[test]
 fn date_uses_real_utc_calendar_fields() {
     let mut environment = Environment::new();
     assert_eq!(

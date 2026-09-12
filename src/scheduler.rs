@@ -160,6 +160,21 @@ impl Scheduler {
         self.states.get(&pid).copied()
     }
 
+    /// Timer-blocked tasks in stable blocking order, used for legacy enclosing deadlines that do
+    /// not yet carry a concrete process ID.
+    pub(crate) fn timer_waiters(&self) -> Vec<ProcessId> {
+        self.blocked
+            .iter()
+            .copied()
+            .filter(|pid| {
+                matches!(
+                    self.state(*pid),
+                    Some(TaskState::Blocked(WaitReason::Timer(_)))
+                )
+            })
+            .collect()
+    }
+
     /// Remove an exited task after its parent has collected the status.
     pub fn reap(&mut self, pid: ProcessId) -> Result<i32, SchedulerError> {
         match self.states.get(&pid).copied() {

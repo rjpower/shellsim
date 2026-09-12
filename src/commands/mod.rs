@@ -1,9 +1,11 @@
 //! Built-in commands and coreutils, implemented natively against the VFS.
 //!
-//! Each command is a plain function with the uniform signature
+//! Ordinary commands are plain functions with the uniform signature
 //! [`CmdFn`] = `fn(&mut CommandContext, &[String], &mut Io) -> i32`, where the slice is `argv[1..]`
-//! and all I/O flows through the [`Io`] context (read `io.stdin`, write `io.out` / `io.err`).
-//! Builtins that mutate environment state (cd, export, set, …) do so through the context.
+//! and all I/O flows through the [`Io`] context. Commands that can block may additionally register
+//! a resumable start function; native callers retain the synchronous entry point while shell
+//! continuations receive a typed wait reason. Builtins that mutate environment state do so
+//! through the context.
 //!
 //! Commands are looked up in a [`OnceLock`]-backed registry that records each command's
 //! [`Trust`] level, so a run can report whether it stayed inside the faithfully-simulated
@@ -14,6 +16,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::OnceLock;
 
 use crate::interp::Interp;
+use crate::scheduler::WaitReason;
 
 mod awk;
 mod builtins;
@@ -40,6 +43,14 @@ pub struct Io<'a> {
 
 /// Uniform command signature. `args` is `argv[1..]`.
 pub type CmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> i32;
+
+/// Result of starting a command from a resumable shell continuation.
+pub(crate) enum CommandPoll {
+    Ready(i32),
+    Blocked(WaitReason),
+}
+
+type ResumableCmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> CommandPoll;
 
 /// The only environment handle handed to command implementations.
 ///
@@ -87,6 +98,7 @@ pub enum Trust {
 /// A registered command: its implementation and trust level.
 pub struct CommandSpec {
     pub run: CmdFn,
+    resume: Option<ResumableCmdFn>,
     pub trust: Trust,
     pub base_cpu: u64,
     pub base_memory: u64,
@@ -117,9 +129,33 @@ fn reg_costed(
             n,
             CommandSpec {
                 run: f,
+                resume: None,
                 trust: t,
                 base_cpu,
                 base_memory,
+            },
+        );
+    }
+}
+
+/// Register a command that can suspend when called by the shell while retaining a synchronous
+/// compatibility entry point for nested native dispatchers.
+fn reg_resumable(
+    map: &mut HashMap<&'static str, CommandSpec>,
+    names: &[&'static str],
+    trust: Trust,
+    run: CmdFn,
+    resume: ResumableCmdFn,
+) {
+    for &name in names {
+        map.insert(
+            name,
+            CommandSpec {
+                run,
+                resume: Some(resume),
+                trust,
+                base_cpu: 100,
+                base_memory: 10 * 1024,
             },
         );
     }
@@ -155,6 +191,31 @@ pub fn run(
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> i32 {
+    match dispatch(interp, argv, stdin, out, err, false) {
+        CommandPoll::Ready(status) => status,
+        CommandPoll::Blocked(_) => unreachable!("synchronous command dispatch cannot suspend"),
+    }
+}
+
+/// Start a command from a shell continuation, allowing registered blocking commands to suspend.
+pub(crate) fn poll(
+    interp: &mut Interp,
+    argv: &[String],
+    stdin: Vec<u8>,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+) -> CommandPoll {
+    dispatch(interp, argv, stdin, out, err, true)
+}
+
+fn dispatch(
+    interp: &mut Interp,
+    argv: &[String],
+    stdin: Vec<u8>,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+    resumable: bool,
+) -> CommandPoll {
     let requested = argv[0].as_str();
     // Agents frequently use explicit paths or `/usr/bin/env` shebangs. Standard utility paths
     // resolve to the same in-process command without pretending arbitrary host paths exist.
@@ -183,16 +244,20 @@ pub fn run(
             .resources
             .charge_cpu(spec.base_cpu.saturating_add(arg_bytes))
         {
-            return interp
-                .resources
-                .stop_reason()
-                .map_or(137, |r| r.exit_status());
+            return CommandPoll::Ready(
+                interp
+                    .resources
+                    .stop_reason()
+                    .map_or(137, |r| r.exit_status()),
+            );
         }
         if !interp.resources.reserve_memory(working_memory) {
-            return interp
-                .resources
-                .stop_reason()
-                .map_or(137, |r| r.exit_status());
+            return CommandPoll::Ready(
+                interp
+                    .resources
+                    .stop_reason()
+                    .map_or(137, |r| r.exit_status()),
+            );
         }
 
         let out_before = out.len();
@@ -201,7 +266,10 @@ pub fn run(
         interp.sync_vfs_time();
         let mut io = Io { stdin, out, err };
         let mut context = CommandContext { env: interp };
-        let mut status = (spec.run)(&mut context, args, &mut io);
+        let mut result = match (resumable, spec.resume) {
+            (true, Some(start)) => start(&mut context, args, &mut io),
+            _ => CommandPoll::Ready((spec.run)(&mut context, args, &mut io)),
+        };
         let out_bytes = io.out.len().saturating_sub(out_before);
         let err_bytes = io.err.len().saturating_sub(err_before);
         let output_bytes = out_bytes.saturating_add(err_bytes) as u64;
@@ -231,22 +299,22 @@ pub fn run(
             .resources
             .record_command(cmd, cpu_before, disk_before, interp.vfs.disk_used());
         if let Some(reason) = interp.resources.stop_reason() {
-            status = reason.exit_status();
+            result = CommandPoll::Ready(reason.exit_status());
         }
-        return status;
+        return result;
     }
 
     // ---- fallback: maybe it's an executable script in the VFS ----
     interp.sync_vfs_time();
     if let Some(code) = util::try_exec_script(interp, requested, args, &stdin, out, err) {
-        return code;
+        return CommandPoll::Ready(code);
     }
     // An unknown command the task actually invoked (a missing tool, a compiled binary we can't
     // run, …) is a genuine simulation gap — record it so the trust verdict reflects it.
     interp.note_unsupported(requested);
     interp.trust_noop.insert(requested.to_string());
     util::ewln(err, &format!("{requested}: command not found"));
-    127
+    CommandPoll::Ready(127)
 }
 
 fn standard_utility_name(path: &str) -> Option<&str> {

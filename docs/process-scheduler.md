@@ -27,10 +27,11 @@ Phase 3 is in progress. Shell control flow and ordinary subshells run as stored 
 Background commands are inserted as runnable tasks, return before execution, retain their fork
 allocation while alive, and make detached terminal output available exactly once after they later
 run. The scheduler switches the active PID between retained process contexts in one-instruction
-quanta. Pipelines and command substitution still use a synchronous child adapter, native
-blocking commands do not yet suspend, and Python `Popen` cannot expose a live process. Do not
-describe those remaining operations as concurrent until phases 3 through 5 meet their removal
-criteria.
+quanta. Shell `sleep` and `usleep` register resumable command entry points: they block their task
+on a virtual-timeline event, allow other tasks to run, and advance time only when the runnable
+queue is empty. Pipelines and command substitution still use a synchronous child adapter, and
+Python `Popen` cannot expose a live process. Do not describe those remaining operations as
+concurrent until phases 3 through 5 meet their removal criteria.
 
 The readiness handshake needed by phase 3 is present: blocked descriptor operations return a
 typed pipe-readable or pipe-writable condition, process code can suspend on that exact condition,
@@ -133,9 +134,9 @@ adversarial input remains bounded independently of the host stack.
 
 The FIFO runnable queue, typed wake keys, bounded pipe objects, reader/writer reference counts,
 backpressure, and asynchronously runnable background shell continuations are present. The next
-steps are timer waits and event-loop clock advancement, concurrent pipeline stage construction,
-and a resumable `wait`. Pipeline stages must start together and communicate through pipe
-descriptors rather than materialized stage buffers.
+timer waits and event-loop clock advancement are present. The next steps are concurrent pipeline
+stage construction and a resumable `wait`. Pipeline stages must start together and communicate
+through pipe descriptors rather than materialized stage buffers.
 
 Required compatibility cases include overlapping sleeps, file races with deterministic ordering,
 `yes | head`, early reader close, multi-stage pipelines, blocked writers, pipeline status and

@@ -187,6 +187,19 @@ impl ProcessStates {
         state.shell_continuation = continuation;
         Ok(())
     }
+
+    pub(crate) fn set_deadline_interrupt(
+        &mut self,
+        pid: ProcessId,
+        event: crate::clock::EventId,
+    ) -> Result<(), String> {
+        let state = self
+            .states
+            .get_mut(&pid)
+            .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
+        state.deadline_interrupt = Some(event);
+        Ok(())
+    }
 }
 
 impl Deref for ProcessStates {
@@ -492,11 +505,12 @@ impl Environment {
         self.process.insert(child)?;
         self.refresh_descriptor_snapshot(pid);
         if foreground {
-            match self.scheduler.dispatch() {
-                Ok(Some(scheduled)) if scheduled == pid => {}
-                result => return Err(format!("unexpected child dispatch result: {result:?}")),
-            }
-            self.process.activate(pid)?;
+            let scheduled = self
+                .scheduler
+                .dispatch()
+                .map_err(|error| format!("unable to dispatch child process: {error:?}"))?
+                .ok_or_else(|| "child process was not runnable after creation".to_string())?;
+            self.process.activate(scheduled)?;
         }
         Ok(pid)
     }
@@ -524,7 +538,11 @@ impl Environment {
         self.processes.update_descriptors(pid, BTreeMap::new());
         self.processes.exit(pid, status, &self.process.cwd);
         let _ = self.scheduler.exit_current(status);
-        let _ = self.scheduler.wake(parent_pid);
+        if self.scheduler.state(parent_pid)
+            == Some(crate::scheduler::TaskState::Blocked(WaitReason::Child(pid)))
+        {
+            let _ = self.scheduler.wake(parent_pid);
+        }
         let scheduled = self.scheduler.dispatch().ok().flatten();
         let removed = self.process.remove(pid);
         debug_assert!(removed.is_some(), "finished child state must exist");
