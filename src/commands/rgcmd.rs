@@ -28,6 +28,8 @@ struct Options {
     text: bool,
     force_filename: Option<bool>,
     list_files: bool,
+    only_matching: bool,
+    max_count: Option<usize>,
     before_context: usize,
     after_context: usize,
     globs: Vec<String>,
@@ -55,6 +57,20 @@ fn cmd_rg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             }
         }
     };
+    if options.only_matching
+        && (options.invert
+            || options.before_context != 0
+            || options.after_context != 0
+            || options.files_with
+            || options.files_without
+            || options.list_files)
+    {
+        ewln(
+            io.err,
+            "rg: --only-matching cannot be combined with inverse, context, or file-list modes",
+        );
+        return 2;
+    }
     let (inputs, reserved) = match collect_inputs(interp, &options, &io.stdin) {
         Ok(inputs) => inputs,
         Err(error) => {
@@ -114,6 +130,9 @@ fn search_inputs(
         }
         let mut matched_count = 0_usize;
         for (index, line) in text.lines().enumerate() {
+            if options.max_count == Some(0) {
+                break;
+            }
             if !interp.charge_cpu(1_u64.saturating_add(line.len() as u64)) {
                 return 137;
             }
@@ -122,6 +141,12 @@ fn search_inputs(
             }
             matched_count = matched_count.saturating_add(1);
             if options.quiet || options.count || options.files_with || options.files_without {
+                if options
+                    .max_count
+                    .is_some_and(|maximum| matched_count >= maximum)
+                {
+                    break;
+                }
                 continue;
             }
             let mut prefix = String::new();
@@ -133,7 +158,19 @@ fn search_inputs(
                 prefix.push_str(&(index + 1).to_string());
                 prefix.push(':');
             }
-            wln(io.out, &format!("{prefix}{line}"));
+            if options.only_matching {
+                for matched in matcher.find_iter(line) {
+                    wln(io.out, &format!("{prefix}{}", matched.as_str()));
+                }
+            } else {
+                wln(io.out, &format!("{prefix}{line}"));
+            }
+            if options
+                .max_count
+                .is_some_and(|maximum| matched_count >= maximum)
+            {
+                break;
+            }
         }
         let file_matches = matched_count > 0;
         let selected = if options.files_without {
@@ -180,7 +217,10 @@ fn search_with_context(
             interp.resources.release_memory(reserved);
             return None;
         }
-        let matched = matcher.is_match(line) ^ options.invert;
+        let matched = (matcher.is_match(line) ^ options.invert)
+            && options
+                .max_count
+                .is_none_or(|maximum| matched_count < maximum);
         matched_count = matched_count.saturating_add(usize::from(matched));
         matches.push(matched);
     }
@@ -220,6 +260,10 @@ struct Matcher(regex::Regex);
 impl Matcher {
     fn is_match(&self, line: &str) -> bool {
         self.0.is_match(line)
+    }
+
+    fn find_iter<'a>(&'a self, line: &'a str) -> impl Iterator<Item = regex::Match<'a>> {
+        self.0.find_iter(line)
     }
 }
 
@@ -434,6 +478,10 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 options.after_context = value;
             }
             "-n" | "--line-number" => options.line = true,
+            "-o" | "--only-matching" => options.only_matching = true,
+            "-m" | "--max-count" => {
+                options.max_count = Some(count_value(args, &mut index, argument)?)
+            }
             "-i" | "--ignore-case" => options.ignore_case = true,
             "-v" | "--invert-match" => options.invert = true,
             "-F" | "--fixed-strings" => options.fixed = true,
@@ -464,6 +512,16 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 options.before_context = context;
                 options.after_context = context;
             }
+            value if value.starts_with("--max-count=") => {
+                options.max_count = Some(parse_count(&value[12..], "--max-count")?)
+            }
+            value
+                if value.len() > 2
+                    && value.as_bytes()[1] == b'm'
+                    && value[2..].bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                options.max_count = Some(parse_count(&value[2..], "-m")?);
+            }
             value
                 if value.len() > 2
                     && matches!(value.as_bytes()[1], b'A' | b'B' | b'C')
@@ -493,6 +551,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 for flag in value[1..].chars() {
                     match flag {
                         'n' => options.line = true,
+                        'o' => options.only_matching = true,
                         'i' => options.ignore_case = true,
                         'v' => options.invert = true,
                         'F' => options.fixed = true,
@@ -537,4 +596,15 @@ fn parse_context(value: &str, option: &str) -> Result<usize, String> {
         return Err(format!("option {option} exceeds the context limit"));
     }
     Ok(context)
+}
+
+fn count_value(args: &[String], index: &mut usize, option: &str) -> Result<usize, String> {
+    let value = take_value(args, index, option)?;
+    parse_count(&value, option)
+}
+
+fn parse_count(value: &str, option: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("option {option} requires a non-negative integer"))
 }

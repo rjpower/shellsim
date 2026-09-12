@@ -138,3 +138,37 @@ fn common_language_type_aliases_filter_recursive_search() {
         "workspace/main.go:// TODO go\n"
     );
 }
+
+#[test]
+fn only_matching_and_max_count_bound_per_file_output() {
+    let mut environment = fixture();
+    environment
+        .vfs
+        .put_file(
+            "/workspace/matches.txt",
+            b"one=12 two=34\nthree=56\nfour=78\n".to_vec(),
+            0o644,
+        )
+        .unwrap();
+    assert_eq!(
+        run(
+            &mut environment,
+            "rg -n -o -m2 '[0-9]+' /workspace/matches.txt"
+        ),
+        (0, "1:12\n1:34\n2:56\n".into(), String::new())
+    );
+    assert_eq!(
+        run(
+            &mut environment,
+            "rg --max-count=1 -c '[0-9]+' /workspace/matches.txt"
+        ),
+        (0, "1\n".into(), String::new())
+    );
+    let incompatible = run(&mut environment, "rg -o -v number /workspace");
+    assert_eq!(incompatible.0, 2);
+    assert!(
+        incompatible.2.contains("cannot be combined"),
+        "{}",
+        incompatible.2
+    );
+}
