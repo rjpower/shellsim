@@ -39,6 +39,27 @@ fn standard_paths_and_environment_utilities() {
 }
 
 #[test]
+fn path_resolves_only_executable_vfs_scripts() {
+    assert_eq!(
+        run(
+            "mkdir /tools; printf '%s\n' '#!/bin/sh' 'printf path:$1' > /tools/hello; chmod +x /tools/hello; PATH=/tools command -v hello; PATH=/tools hello world",
+        ),
+        (0, "/tools/hello\npath:world".into(), String::new())
+    );
+    let denied = run("printf 'echo no' > /not-executable; /not-executable");
+    assert_eq!(denied.0, 126);
+    assert!(denied.2.contains("permission denied"), "{}", denied.2);
+    let interpreter =
+        run("printf '%s\n' '#!/host/interpreter' 'echo no' > /bad; chmod +x /bad; /bad");
+    assert_eq!(interpreter.0, 126);
+    assert!(
+        interpreter.2.contains("unsupported script interpreter"),
+        "{}",
+        interpreter.2
+    );
+}
+
+#[test]
 fn common_bash_guard_idioms() {
     assert_eq!(
         run("set -uo pipefail; false | true; echo $?; command -v awk; command echo ok; [[ abc =~ ^a ]] && echo match"),

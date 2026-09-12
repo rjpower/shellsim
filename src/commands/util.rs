@@ -210,31 +210,72 @@ pub fn glob_eq(pattern: &str, text: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Run a script file in the VFS if it exists and looks like a shell/python script.
+/// Result of resolving an external command entirely within the modeled filesystem.
+pub enum ExecutableLookup {
+    Found(String),
+    NotExecutable(String),
+    NotFound,
+}
+
+/// Resolve a command path using the process `PATH`, without consulting the host filesystem.
+pub fn resolve_executable(interp: &Interp, name: &str) -> ExecutableLookup {
+    let candidates = if name.contains('/') {
+        vec![crate::vfs::resolve_against(&interp.cwd, name)]
+    } else {
+        interp
+            .get_var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .map(|directory| {
+                let directory = if directory.is_empty() {
+                    interp.cwd.as_str()
+                } else {
+                    directory
+                };
+                crate::vfs::resolve_against(directory, name)
+            })
+            .collect()
+    };
+    let mut denied = None;
+    for path in candidates {
+        let Ok(metadata) = interp.fs_metadata("/", &path, true) else {
+            continue;
+        };
+        if matches!(metadata.kind, crate::vfs::NodeKind::File(_)) && metadata.mode & 0o111 != 0 {
+            return ExecutableLookup::Found(path);
+        }
+        denied.get_or_insert(path);
+    }
+    denied.map_or(ExecutableLookup::NotFound, ExecutableLookup::NotExecutable)
+}
+
+/// Run a previously resolved executable script from the VFS.
 pub fn try_exec_script(
     interp: &mut Interp,
-    name: &str,
+    path: &str,
     args: &[String],
     stdin: &[u8],
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> Option<i32> {
-    let path = if name.contains('/') {
-        crate::vfs::resolve_against(&interp.cwd, name)
-    } else {
-        return None;
-    };
-    let data = interp.vfs.read("/", &path).ok()?;
+    let data = interp.vfs.read("/", path).ok()?;
     let text = String::from_utf8_lossy(&data);
     let saved_pos = std::mem::replace(&mut interp.positional, args.to_vec());
     let first = text.lines().next().unwrap_or("");
-    let code = if first.starts_with("#!") && (first.contains("python")) {
+    let code = if first.starts_with("#!") && first.contains("python") {
         // python script
-        let mut a = vec!["python3.14".to_string(), name.to_string()];
+        let mut a = vec!["python3.14".to_string(), path.to_string()];
         a.extend(args.iter().cloned());
         crate::python::run_python(interp, &a, stdin.to_vec(), out, err)
-    } else {
+    } else if !first.starts_with("#!")
+        || first.split_whitespace().next().is_some_and(|interpreter| {
+            matches!(interpreter, "#!/bin/sh" | "#!/bin/bash" | "#!/usr/bin/bash")
+        })
+    {
         interp.run_script_into(&text, out, err)
+    } else {
+        ewln(err, &format!("{path}: unsupported script interpreter"));
+        126
     };
     interp.positional = saved_pos;
     Some(code)

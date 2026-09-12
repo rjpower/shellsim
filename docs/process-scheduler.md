@@ -159,8 +159,8 @@ drain both outputs while supplying input so bounded pipes cannot deadlock.
 
 After the process and I/O foundations are complete, improve commands in evidence-driven slices:
 
-1. Resolve VFS executables through exported `PATH`, honor executable metadata and shebangs, and
-   distinguish not-found from not-executable failures.
+1. Resolve VFS executables through process `PATH`, honor executable metadata and supported
+   shebangs, and distinguish not-found from not-executable failures. This foundation is complete.
 2. Add a bounded `rg` implementation with useful recursive search, glob/type filters, line and
    filename output, fixed strings, regexes, hidden files, binary policy, and familiar exit codes.
 3. Expand Git coherently around status, diff, log, show, branch, checkout/switch, add/reset, and

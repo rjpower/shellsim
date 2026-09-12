@@ -35,12 +35,12 @@ capabilities.
 | Isolation and determinism | Strong | Seccomp is defense in depth, not complete host filesystem confinement |
 | Resource limits | Strong | Some expansion paths still need tighter preallocation bounds |
 | Virtual filesystem | Useful core | First pseudo-files exist; permission enforcement and workspace diff remain |
-| Virtual time | Strong | Background sleeps do not overlap |
+| Virtual time | Strong | Signals and asynchronous Python waits remain incomplete |
 | Virtual network | Useful fixture model | Request routes rather than sockets or running services |
 | Shell grammar | Broad partial subset | Redirection, descriptor, and option behavior still has correctness gaps |
 | Commands | Broad surface | Several partial operations or successful no-ops are misleading |
 | Python | Substantial bounded interpreter | Arbitrary projects and third-party ecosystems remain out of scope |
-| Processes and jobs | Useful synchronous model | Jobs do not overlap and signals are not modeled |
+| Processes and jobs | Cooperative logical processes | Background jobs, waits, sleeps, and bounded pipelines overlap; signals are not modeled |
 | Build ecosystem | Useful first slice | Git and Make are deliberately small; native compilation remains out of scope |
 | Harness integration | Early foundation | No persistent machine protocol, workspace export, or trajectory runner |
 | Observability | Good | Compatibility reporting is command-level rather than invocation-level |
@@ -56,7 +56,7 @@ agent cannot safely treat as Bash:
 | `X=outer; (X=inner); echo "$X"` | now prints `outer` | preserve child-state isolation |
 | `printf x \| read X; echo "$X"` | pipeline state no longer leaks | preserve per-stage isolation |
 | `sleep 1 & echo "$!"` | now returns a stable logical PID | add overlap only with a bounded scheduler |
-| invoke a VFS executable through `PATH` | command not found | resolve and execute it |
+| invoke a VFS executable through `PATH` | executable shell/Python scripts resolve in the VFS | extend formats only from observed needs |
 | incomplete `if` statement | now rejected before execution | keep parser failure all-or-nothing and bounded |
 | `cat /dev/null` | now succeeds with an empty read | add descriptor-backed devices separately |
 | `git status` | modeled short/porcelain status | expand the coherent repository subset only as task evidence requires |
@@ -73,7 +73,8 @@ mean that the requested effect occurred.
 3. Isolate subshell, command-substitution, and pipeline shell state while sharing machine state.
 4. Make redirection failures, descriptor duplication, and pseudo-device behavior correct.
 5. Enforce declared shell options such as `nounset` and `xtrace`.
-6. Resolve executable VFS scripts through `PATH` and honor executable metadata.
+6. Resolve executable VFS scripts through `PATH` and honor executable metadata. Complete for
+   shell/Python shebangs and explicit rejection of unsupported interpreters.
 7. Add small common conveniences: aliases, directory stack, `mapfile`, jobs, wait, recursive
    search, patch application, and basic archive tools.
 

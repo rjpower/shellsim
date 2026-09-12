@@ -652,6 +652,10 @@ fn cmd_which(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
             wln(io.out, &format!("{a} is a function"));
         } else if known.contains(&a.as_str()) {
             wln(io.out, &format!("/usr/bin/{a}"));
+        } else if let crate::commands::util::ExecutableLookup::Found(path) =
+            crate::commands::util::resolve_executable(interp, a)
+        {
+            wln(io.out, &path);
         } else {
             ok = false;
         }

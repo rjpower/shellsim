@@ -364,10 +364,19 @@ fn dispatch(
         return result;
     }
 
-    // ---- fallback: maybe it's an executable script in the VFS ----
+    // ---- fallback: resolve an executable script without exposing the host PATH/filesystem ----
     interp.sync_vfs_time();
-    if let Some(code) = util::try_exec_script(interp, requested, args, &stdin, out, err) {
-        return CommandPoll::Ready(code);
+    match util::resolve_executable(interp, requested) {
+        util::ExecutableLookup::Found(path) => {
+            if let Some(code) = util::try_exec_script(interp, &path, args, &stdin, out, err) {
+                return CommandPoll::Ready(code);
+            }
+        }
+        util::ExecutableLookup::NotExecutable(path) => {
+            util::ewln(err, &format!("{requested}: {path}: permission denied"));
+            return CommandPoll::Ready(126);
+        }
+        util::ExecutableLookup::NotFound => {}
     }
     // An unknown command the task actually invoked (a missing tool, a compiled binary we can't
     // run, …) is a genuine simulation gap — record it so the trust verdict reflects it.

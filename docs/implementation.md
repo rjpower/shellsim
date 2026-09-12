@@ -53,9 +53,9 @@ Time has three domains:
 | Process CPU | deterministic CPU fuel at 1 microsecond per unit | accounting APIs |
 
 Wall adjustments cannot move monotonic deadlines. CPU work consumes no virtual wall time unless an
-operation explicitly models latency. Blocking advances directly to the next event rather than
-sleeping a host thread. Equal-time events use insertion order. Background jobs still execute
-synchronously, so independent sleeps do not yet overlap.
+operation explicitly models latency. Blocking suspends the current logical process; the scheduler
+runs other work and advances to the next event only when its runnable queue is empty. It never
+sleeps a host thread. Equal-time events use insertion order.
 
 Native compilation is outside the model. Compiler commands are recorded as `NoOp`: pretending to
 compile can keep a setup script moving, but no executable artifact is produced. Running arbitrary
