@@ -65,6 +65,14 @@ fn path_resolves_only_executable_vfs_scripts() {
         run("mkdir /tools; printf '%s\n' '#!/bin/sh' 'cat' > /tools/read-input; chmod +x /tools/read-input; printf piped | PATH=/tools read-input"),
         (0, "piped".into(), String::new())
     );
+    assert_eq!(
+        run("mkdir -p /work/tools; cd /work; printf '%s\n' '#!/bin/sh' 'printf relative' > tools/hello; chmod +x tools/hello; PATH=tools hello"),
+        (0, "relative".into(), String::new())
+    );
+    assert_eq!(
+        run("cd /work; printf '%s\n' '#!/bin/sh' 'printf current' > hello; chmod +x hello; PATH=:/usr/bin hello"),
+        (0, "current".into(), String::new())
+    );
 }
 
 #[test]

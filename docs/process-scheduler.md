@@ -75,8 +75,8 @@ invocations. `timeout` schedules typed signal delivery to the child's retained p
 reaps that tree after expiry. Make evaluates its bounded dependency graph into an ordered recipe
 plan, then runs each recipe as a scheduler-owned shell child; a failed recipe stops the sequence.
 VFS Python shebangs now cross the same scheduled child boundary, and the `command` builtin injects
-an argv continuation into its current process instead of recursively dispatching. The Python
-bytecode VM remains the main phase 3 execution gap.
+an argv continuation into its current process instead of recursively dispatching. Compound native
+operations that invoke Python callbacks remain the main phase 3 execution gap.
 
 ## Non-negotiable invariants
 
@@ -197,7 +197,7 @@ future work.
 logical child state. `stdin`, `stdout`, and `stderr` expose small binary/text file-like facades.
 `communicate` drains both outputs while supplying input, and retains its write cursor across a
 timeout so retry cannot duplicate input. Unsupported host setup and session options fail before
-launch. Full process groups, custom signal handlers, and arbitrary Python-bytecode suspension are
+launch. Full process groups, custom signal handlers, and resumable compound native callbacks are
 outside this baseline.
 
 ## Phase 6: agent command fidelity

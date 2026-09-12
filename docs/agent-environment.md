@@ -11,10 +11,10 @@ review findings are retained where they explain the roadmap; completion notes id
 that is now implemented.
 
 The first tranche added typed all-or-nothing shell parse failures, honest builtin failures, and
-bounded VFS-only Git and shell-recipe Make subsets. The second added bounded logical process
-records, child shell-state isolation, PID-backed jobs and `wait`, dynamic `ps`, and generated
-read-only `/proc` plus finite `/dev` views. Concurrent job execution, descriptor routing, signals,
-and the workspace protocol remain future work.
+bounded VFS-only Git and shell-recipe Make subsets. Later tranches added cooperative logical
+processes, descriptor-backed pipes, default signal delivery, resumable Python subprocesses, and a
+persistent workspace protocol. Process groups, custom signal handlers, compound Python callback
+frames, and concrete model-client experiments remain future work.
 
 ## Product boundary
 
@@ -34,15 +34,15 @@ capabilities.
 |---|---|---|
 | Isolation and determinism | Strong | Seccomp is defense in depth, not complete host filesystem confinement |
 | Resource limits | Strong | Some expansion paths still need tighter preallocation bounds |
-| Virtual filesystem | Useful core | First pseudo-files exist; permission enforcement and workspace diff remain |
-| Virtual time | Strong | Signals and asynchronous Python waits remain incomplete |
+| Virtual filesystem | Useful core | Permission enforcement remains deliberately partial |
+| Virtual time | Strong | Process groups and custom signal handlers remain incomplete |
 | Virtual network | Useful fixture model | Request routes rather than sockets or running services |
 | Shell grammar | Broad partial subset | Redirection, descriptor, and option behavior still has correctness gaps |
 | Commands | Broad surface | Several partial operations or successful no-ops are misleading |
 | Python | Substantial bounded interpreter | Arbitrary projects and third-party ecosystems remain out of scope |
 | Processes and jobs | Cooperative logical processes | Background jobs, waits, sleeps, bounded pipelines, and default signal dispositions are modeled; process groups and handlers remain |
 | Build ecosystem | Useful first slice | Git and Make are deliberately small; native compilation remains out of scope |
-| Harness integration | Early foundation | No persistent machine protocol, workspace export, or trajectory runner |
+| Harness integration | Useful foundation | Scenario assertions, cloning, transcript persistence, and model-client adapters remain |
 | Observability | Good | Compatibility reporting is command-level rather than invocation-level |
 
 ## Observed shell gaps
@@ -176,8 +176,8 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
    source context; atomic patch application, gzip streams, and traversal-safe tar and zip
    containers are present. Richer text tools remain.
 6. Cooperative background scheduling, bounded pipes, default signal delivery, live Python process
-   handles, bounded Python VM polling, and ordinary iterative Python calls are present; process
-   groups, handlers, compound native call frames, and blocking native suspension remain.
+   handles, bounded Python VM polling, and retryable blocking native calls are present; process
+   groups, handlers, and compound native callback frames remain.
 7. A persistent bounded NDJSON workspace protocol with execution, typed diffs, checkpoint/reset,
    file tools, inspection, and transactional host snapshot ingestion is present. Add scenario
    manifests, transcript persistence, cloning, and external-agent experiments.

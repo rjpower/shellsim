@@ -228,11 +228,11 @@ pub fn resolve_executable(interp: &Interp, name: &str) -> ExecutableLookup {
             .split(':')
             .map(|directory| {
                 let directory = if directory.is_empty() {
-                    interp.cwd.as_str()
+                    interp.cwd.clone()
                 } else {
-                    directory
+                    crate::vfs::resolve_against(&interp.cwd, directory)
                 };
-                crate::vfs::resolve_against(directory, name)
+                crate::vfs::resolve_against(&directory, name)
             })
             .collect()
     };
