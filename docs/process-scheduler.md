@@ -179,7 +179,8 @@ After the process and I/O foundations are complete, improve commands in evidence
    restore, reset, add, and commits. Repository state stays VFS-only; merges, remotes, and network
    operations remain explicitly unsupported.
 4. Atomic, bounded VFS-only patch application is present for unified diffs and the common
-   `*** Begin Patch` agent format. Add bounded tar/zip/gzip operations next.
+   `*** Begin Patch` agent format. Deterministic VFS-only `gzip`, `gunzip`, and `zcat` support
+   bounded compression, decompression, files, and streams. Add tar and zip containers next.
 5. Extend Make only alongside observed syntax and graph semantics; do not emulate native compiler
    artifacts with successful no-ops.
 

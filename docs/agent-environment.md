@@ -164,8 +164,8 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
 2. Clean Git and Make foundations with useful deterministic subsets.
 3. Logical process records, jobs, wait, descriptors, and dynamic `ps`.
 4. Synthetic `/proc` and `/dev`, then bounded Python subprocess operations.
-5. Common agent conveniences. Bounded recursive `rg` and atomic patch application are present;
-   archives and richer text tools remain.
+5. Common agent conveniences. Bounded recursive `rg`, atomic patch application, and gzip streams
+   are present; tar/zip containers and richer text tools remain.
 6. Cooperative background scheduling, bounded pipes, default signal delivery, and live Python
    process handles are present; process groups, handlers, and scheduler-owned Python VM frames
    remain.

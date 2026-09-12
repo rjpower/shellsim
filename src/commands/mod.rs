@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use crate::interp::Interp;
 use crate::scheduler::WaitReason;
 
+mod archives;
 mod awk;
 mod builtins;
 mod echo;
@@ -176,6 +177,7 @@ fn reg_resumable(
 fn build_registry() -> HashMap<&'static str, CommandSpec> {
     let mut m = HashMap::new();
     builtins::register(&mut m);
+    archives::register(&mut m);
     awk::register(&mut m);
     echo::register(&mut m);
     printf::register(&mut m);
