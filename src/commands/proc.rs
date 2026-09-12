@@ -336,27 +336,9 @@ pub(crate) fn start_shell_source(
     stdin: Option<Vec<u8>>,
     err: &mut Vec<u8>,
 ) -> CommandPoll {
-    let parser_memory = 8 * 1024 + (source.len() as u64).saturating_mul(2);
-    if !interp.resources.reserve_memory(parser_memory) {
-        return CommandPoll::Ready(
-            interp
-                .resources
-                .stop_reason()
-                .map_or(137, |reason| reason.exit_status()),
-        );
-    }
-    let parsed = if interp.resources.charge_cpu(source.len() as u64) {
-        crate::shell::parse(source).map_err(|error| error.to_string())
-    } else {
-        Err("resource limit exceeded".to_string())
-    };
-    interp.resources.release_memory(parser_memory);
-    let ast = match parsed {
+    let ast = match crate::commands::parse_shell_source(interp, source, err) {
         Ok(ast) => ast,
-        Err(error) => {
-            ewln(err, &format!("shellsim: syntax error: {error}"));
-            return CommandPoll::Ready(2);
-        }
+        Err(status) => return CommandPoll::Ready(status),
     };
     let input = match stdin {
         Some(stdin) => match interp.descriptors.open_input(stdin) {

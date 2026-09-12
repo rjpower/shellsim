@@ -21,8 +21,8 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
         Trust::Real,
         cmd_declare,
     );
-    reg(m, &["source", "."], Trust::Real, cmd_source);
-    reg(m, &["eval"], Trust::Real, cmd_eval);
+    reg_resumable(m, &["source", "."], Trust::Real, cmd_source, start_source);
+    reg_resumable(m, &["eval"], Trust::Real, cmd_eval, start_eval);
     reg(m, &["exit"], Trust::Real, cmd_exit);
     reg(m, &["return"], Trust::Real, cmd_return);
     reg(m, &["break"], Trust::Real, cmd_break);
@@ -522,9 +522,37 @@ fn cmd_source(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     }
 }
 
+fn start_source(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let Some(path) = args.first() else {
+        return CommandPoll::Ready(0);
+    };
+    let source = match interp.vfs.read_string(&interp.cwd, path) {
+        Ok(source) => source,
+        Err(_) => {
+            ewln(
+                io.err,
+                &format!("source: {path}: No such file or directory"),
+            );
+            return CommandPoll::Ready(1);
+        }
+    };
+    match crate::commands::parse_shell_source(interp, &source, io.err) {
+        Ok(ast) => CommandPoll::Inline(ast),
+        Err(status) => CommandPoll::Ready(status),
+    }
+}
+
 fn cmd_eval(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let src = args.join(" ");
     interp.run_script_into(&src, io.out, io.err)
+}
+
+fn start_eval(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let source = args.join(" ");
+    match crate::commands::parse_shell_source(interp, &source, io.err) {
+        Ok(ast) => CommandPoll::Inline(ast),
+        Err(status) => CommandPoll::Ready(status),
+    }
 }
 
 fn cmd_exit(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {

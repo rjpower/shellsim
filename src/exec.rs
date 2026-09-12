@@ -154,6 +154,9 @@ enum ShellFrame {
         positional: Vec<String>,
         variables: Vec<(String, Option<String>)>,
     },
+    FinishInlineCommand {
+        variables: Vec<(String, Option<String>)>,
+    },
     ResumeCommand {
         variables: Vec<(String, Option<String>)>,
         continuation: crate::commands::CommandResume,
@@ -273,6 +276,9 @@ impl ShellContinuation {
                     interp.positional = positional;
                     restore_command_variables(interp, variables);
                 }
+                ShellFrame::FinishInlineCommand { variables } => {
+                    restore_command_variables(interp, variables);
+                }
                 ShellFrame::Conditional { .. }
                 | ShellFrame::Negate
                 | ShellFrame::IfAfter { .. }
@@ -294,6 +300,21 @@ impl ShellContinuation {
             continuation,
         });
         self.switched = true;
+    }
+
+    fn enter_inline_command(
+        &mut self,
+        interp: &mut Interp,
+        variables: Vec<(String, Option<String>)>,
+        node: Node,
+    ) {
+        if !self.ensure_capacity(interp, 2) {
+            restore_command_variables(interp, variables);
+            return;
+        }
+        self.frames
+            .push(ShellFrame::FinishInlineCommand { variables });
+        self.frames.push(ShellFrame::Eval(node));
     }
 
     fn step(&mut self, interp: &mut Interp, frame: ShellFrame) {
@@ -569,6 +590,9 @@ impl ShellContinuation {
                 self.status = interp.returning.take().unwrap_or(self.status);
                 restore_command_variables(interp, variables);
             }
+            ShellFrame::FinishInlineCommand { variables } => {
+                restore_command_variables(interp, variables);
+            }
             ShellFrame::ResumeCommand {
                 variables,
                 continuation,
@@ -585,6 +609,9 @@ impl ShellContinuation {
                     }
                     crate::commands::CommandPoll::Switched(continuation) => {
                         self.retain_switched_command(variables, continuation);
+                    }
+                    crate::commands::CommandPoll::Inline(node) => {
+                        self.enter_inline_command(interp, variables, node);
                     }
                     crate::commands::CommandPoll::Blocked(reason, continuation) => {
                         self.frames.push(ShellFrame::ResumeCommand {
@@ -660,6 +687,10 @@ impl ShellContinuation {
                     crate::commands::CommandPoll::Switched(continuation) => {
                         debug_assert!(stdout.is_empty() && stderr.is_empty());
                         self.retain_switched_command(variables, continuation);
+                    }
+                    crate::commands::CommandPoll::Inline(node) => {
+                        debug_assert!(stdout.is_empty() && stderr.is_empty());
+                        self.enter_inline_command(interp, variables, node);
                     }
                     crate::commands::CommandPoll::Blocked(reason, continuation) => {
                         debug_assert!(stdout.is_empty() && stderr.is_empty());
@@ -1022,6 +1053,10 @@ impl ShellContinuation {
                 crate::commands::CommandPoll::Switched(continuation) => {
                     debug_assert!(stdout.is_empty() && stderr.is_empty());
                     self.retain_switched_command(variables, continuation);
+                }
+                crate::commands::CommandPoll::Inline(node) => {
+                    debug_assert!(stdout.is_empty() && stderr.is_empty());
+                    self.enter_inline_command(interp, variables, node);
                 }
                 crate::commands::CommandPoll::Blocked(reason, continuation) => {
                     self.frames.push(ShellFrame::ResumeCommand {

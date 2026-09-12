@@ -54,6 +54,8 @@ pub(crate) enum CommandPoll {
     Blocked(WaitReason, CommandResume),
     /// Starting the command changed the active scheduler process.
     Switched(CommandResume),
+    /// Continue by executing shell syntax in the current process context.
+    Inline(crate::shell::Node),
 }
 
 /// Command-owned state retained by the shell while a native command is suspended.
@@ -222,6 +224,9 @@ pub fn run(
         }
         CommandPoll::Switched(_) => {
             unreachable!("synchronous command dispatch cannot switch processes")
+        }
+        CommandPoll::Inline(_) => {
+            unreachable!("synchronous command dispatch cannot inject shell frames")
         }
     }
 }
@@ -428,6 +433,38 @@ fn dispatch(
     CommandPoll::Ready(127)
 }
 
+/// Parse bounded shell source while charging the common parser resource model.
+pub(crate) fn parse_shell_source(
+    interp: &mut Interp,
+    source: &str,
+    err: &mut Vec<u8>,
+) -> Result<crate::shell::Node, i32> {
+    let parser_memory = 8 * 1024 + (source.len() as u64).saturating_mul(2);
+    if !interp.resources.reserve_memory(parser_memory) {
+        return Err(interp
+            .resources
+            .stop_reason()
+            .map_or(137, |reason| reason.exit_status()));
+    }
+    let parsed = if interp.resources.charge_cpu(source.len() as u64) {
+        crate::shell::parse(source).map_err(|error| error.to_string())
+    } else {
+        Err(String::new())
+    };
+    interp.resources.release_memory(parser_memory);
+    match parsed {
+        Ok(ast) => Ok(ast),
+        Err(error) if error.is_empty() => Err(interp
+            .resources
+            .stop_reason()
+            .map_or(137, |reason| reason.exit_status())),
+        Err(error) => {
+            util::ewln(err, &format!("shellsim: syntax error: {error}"));
+            Err(2)
+        }
+    }
+}
+
 fn standard_utility_name(path: &str) -> Option<&str> {
     [
         "/bin/",
@@ -443,32 +480,15 @@ fn standard_utility_name(path: &str) -> Option<&str> {
 /// Provide `run_script_into` for nested execution (source, eval, scripts).
 impl Interp {
     pub fn run_script_into(&mut self, src: &str, out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
-        let parser_memory = 8 * 1024 + (src.len() as u64).saturating_mul(2);
-        if !self.resources.reserve_memory(parser_memory) {
-            return self
-                .resources
-                .stop_reason()
-                .map_or(137, |r| r.exit_status());
-        }
-        if !self.resources.charge_cpu(src.len() as u64) {
-            self.resources.release_memory(parser_memory);
-            return self
-                .resources
-                .stop_reason()
-                .map_or(137, |r| r.exit_status());
-        }
-        let ast = match crate::shell::parse(src) {
+        let ast = match parse_shell_source(self, src, err) {
             Ok(ast) => ast,
-            Err(error) => {
-                err.extend_from_slice(format!("shellsim: syntax error: {error}\n").as_bytes());
-                self.last_status = 2;
-                self.resources.release_memory(parser_memory);
-                return 2;
+            Err(status) => {
+                self.last_status = status;
+                return status;
             }
         };
         let r = self.returning.take();
         let code = crate::exec::exec(self, &ast, Vec::new(), out, err);
-        self.resources.release_memory(parser_memory);
         if r.is_some() {
             self.returning = r;
         }
