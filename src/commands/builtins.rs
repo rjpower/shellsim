@@ -5,11 +5,11 @@
 use std::collections::HashMap;
 
 use crate::commands::util::{ewln, split_flags, wln, KNOWN_COMMANDS};
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandContext, CommandPoll, CommandResume, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
+    use super::{reg, reg_resumable};
     reg(m, &["cd"], Trust::Real, cmd_cd);
     reg(m, &["pwd"], Trust::Real, cmd_pwd);
     reg(m, &["export"], Trust::Real, cmd_export);
@@ -33,7 +33,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["test", "["], Trust::Real, cmd_test);
     reg(m, &["[["], Trust::Real, cmd_dbracket);
     reg(m, &["read"], Trust::Real, cmd_read);
-    reg(m, &["wait"], Trust::Real, cmd_wait);
+    reg_resumable(m, &["wait"], Trust::Real, cmd_wait, start_wait);
     reg(m, &["jobs"], Trust::Real, cmd_jobs);
     reg(
         m,
@@ -128,6 +128,44 @@ fn cmd_wait(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         }
     }
     status
+}
+
+fn start_wait(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let explicit = !args.is_empty();
+    let pids = if args.is_empty() {
+        interp.jobs.iter().map(|job| job.pid).collect()
+    } else {
+        let mut pids = Vec::with_capacity(args.len());
+        for argument in args {
+            let parsed = argument
+                .strip_prefix('%')
+                .unwrap_or(argument)
+                .parse::<u32>();
+            let Ok(identifier) = parsed else {
+                ewln(io.err, &format!("wait: {argument}: invalid job id"));
+                return CommandPoll::Ready(127);
+            };
+            let job = if argument.starts_with('%') {
+                interp.jobs.iter().find(|job| job.id == identifier)
+            } else {
+                interp.jobs.iter().find(|job| job.pid == identifier)
+            };
+            let Some(job) = job else {
+                ewln(io.err, &format!("wait: {argument}: no such job"));
+                return CommandPoll::Ready(127);
+            };
+            pids.push(job.pid);
+        }
+        pids
+    };
+    crate::commands::resume(
+        interp,
+        CommandResume::Wait {
+            pids,
+            status: 0,
+            explicit,
+        },
+    )
 }
 
 fn cmd_true(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {

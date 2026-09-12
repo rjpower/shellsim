@@ -47,7 +47,17 @@ pub type CmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> i32;
 /// Result of starting a command from a resumable shell continuation.
 pub(crate) enum CommandPoll {
     Ready(i32),
-    Blocked(WaitReason),
+    Blocked(WaitReason, CommandResume),
+}
+
+/// Command-owned state retained by the shell while a native command is suspended.
+pub(crate) enum CommandResume {
+    Status(i32),
+    Wait {
+        pids: Vec<crate::process::ProcessId>,
+        status: i32,
+        explicit: bool,
+    },
 }
 
 type ResumableCmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> CommandPoll;
@@ -193,7 +203,9 @@ pub fn run(
 ) -> i32 {
     match dispatch(interp, argv, stdin, out, err, false) {
         CommandPoll::Ready(status) => status,
-        CommandPoll::Blocked(_) => unreachable!("synchronous command dispatch cannot suspend"),
+        CommandPoll::Blocked(_, _) => {
+            unreachable!("synchronous command dispatch cannot suspend")
+        }
     }
 }
 
@@ -206,6 +218,43 @@ pub(crate) fn poll(
     err: &mut Vec<u8>,
 ) -> CommandPoll {
     dispatch(interp, argv, stdin, out, err, true)
+}
+
+/// Continue command-owned state after the scheduler wakes its process.
+pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> CommandPoll {
+    match continuation {
+        CommandResume::Status(status) => CommandPoll::Ready(status),
+        CommandResume::Wait {
+            mut pids,
+            mut status,
+            explicit,
+        } => {
+            while let Some(pid) = pids.first().copied() {
+                let Some(position) = interp.jobs.iter().position(|job| job.pid == pid) else {
+                    pids.remove(0);
+                    continue;
+                };
+                if !interp.jobs[position].done {
+                    return CommandPoll::Blocked(
+                        WaitReason::Child(pid),
+                        CommandResume::Wait {
+                            pids,
+                            status,
+                            explicit,
+                        },
+                    );
+                }
+                let job = interp.jobs.remove(position);
+                if explicit {
+                    status = job.status;
+                }
+                interp.processes.reap(pid);
+                let _ = interp.scheduler.reap(pid);
+                pids.remove(0);
+            }
+            CommandPoll::Ready(status)
+        }
+    }
 }
 
 fn dispatch(

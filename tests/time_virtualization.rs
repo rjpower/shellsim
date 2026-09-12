@@ -41,6 +41,19 @@ fn background_sleeps_overlap_under_the_cooperative_scheduler() {
 }
 
 #[test]
+fn wait_suspends_until_a_live_background_child_exits() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "(sleep 2; false) & pid=$!; wait $pid; echo status:$?; date +%s",
+        ),
+        (0, "status:1\n1735689602\n".into(), String::new(),)
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
+}
+
+#[test]
 fn date_uses_real_utc_calendar_fields() {
     let mut environment = Environment::new();
     assert_eq!(

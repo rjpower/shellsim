@@ -7,7 +7,7 @@ use crate::clock::{
     BlockOutcome, EventKind, MAIN_TASK_ID, NANOS_PER_MICROSECOND, NANOS_PER_SECOND,
 };
 use crate::commands::util::{ewln, parse_duration_ns, wln};
-use crate::commands::{CommandContext, CommandPoll, CommandSpec, Io, Trust};
+use crate::commands::{CommandContext, CommandPoll, CommandResume, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 use crate::scheduler::WaitReason;
 
@@ -77,7 +77,10 @@ fn start_timer(
     };
     let pid = interp.process.pid;
     match interp.clock.schedule_wake_after(u64::from(pid), duration) {
-        Ok(event) => CommandPoll::Blocked(WaitReason::Timer(event.deadline_ns())),
+        Ok(event) => CommandPoll::Blocked(
+            WaitReason::Timer(event.deadline_ns()),
+            CommandResume::Status(0),
+        ),
         Err(error) => {
             ewln(io.err, &format!("{command}: {error}"));
             CommandPoll::Ready(1)

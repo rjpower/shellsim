@@ -156,6 +156,7 @@ enum ShellFrame {
     },
     ResumeCommand {
         variables: Vec<(String, Option<String>)>,
+        continuation: crate::commands::CommandResume,
     },
     AwaitChild {
         pid: crate::process::ProcessId,
@@ -535,13 +536,28 @@ impl ShellContinuation {
                 self.status = interp.returning.take().unwrap_or(self.status);
                 restore_command_variables(interp, variables);
             }
-            ShellFrame::ResumeCommand { variables } => {
-                self.status = if interp.deadline_interrupt.is_some() {
-                    124
+            ShellFrame::ResumeCommand {
+                variables,
+                continuation,
+            } => {
+                let result = if interp.deadline_interrupt.is_some() {
+                    crate::commands::CommandPoll::Ready(124)
                 } else {
-                    0
+                    crate::commands::resume(interp, continuation)
                 };
-                restore_command_variables(interp, variables);
+                match result {
+                    crate::commands::CommandPoll::Ready(status) => {
+                        self.status = status;
+                        restore_command_variables(interp, variables);
+                    }
+                    crate::commands::CommandPoll::Blocked(reason, continuation) => {
+                        self.frames.push(ShellFrame::ResumeCommand {
+                            variables,
+                            continuation,
+                        });
+                        self.blocked = Some(reason);
+                    }
+                }
             }
             ShellFrame::AwaitChild { pid, reap } => {
                 self.status = match interp.processes.get(pid).map(|record| record.status) {
@@ -780,8 +796,11 @@ impl ShellContinuation {
                     self.status = status;
                     restore_command_variables(interp, variables);
                 }
-                crate::commands::CommandPoll::Blocked(reason) => {
-                    self.frames.push(ShellFrame::ResumeCommand { variables });
+                crate::commands::CommandPoll::Blocked(reason, continuation) => {
+                    self.frames.push(ShellFrame::ResumeCommand {
+                        variables,
+                        continuation,
+                    });
                     self.blocked = Some(reason);
                 }
             }

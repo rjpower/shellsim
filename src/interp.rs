@@ -22,11 +22,10 @@ pub enum ArrayVal {
     Assoc(BTreeMap<String, String>),
 }
 
-/// A simulated background job (started with `&`). Because there is no real concurrency,
-/// a job is just a captured AST that will be run-to-completion when the scheduler decides
-/// to. Jobs currently run immediately and synchronously, after which `jobs` and `wait` expose
-/// their modeled identifier and status. This is indistinguishable for many file-state checks but
-/// does not model overlapping work.
+/// A simulated background job started with `&`.
+///
+/// Its process continuation is owned separately by [`ProcessStates`]. This shell-facing record
+/// supplies stable job IDs and retains exit status until `wait` reaps the process.
 #[derive(Clone, Debug)]
 pub struct Job {
     pub id: u32,
@@ -36,8 +35,7 @@ pub struct Job {
     pub status: i32,
 }
 
-/// Machine-wide state and limits. A future scheduler can attach multiple process states to the
-/// same machine; the initial implementation intentionally runs one process synchronously.
+/// Machine-wide state and limits shared by cooperatively scheduled logical processes.
 pub struct Environment {
     pub vfs: Vfs,
     pub clock: Clock,

@@ -134,8 +134,8 @@ adversarial input remains bounded independently of the host stack.
 
 The FIFO runnable queue, typed wake keys, bounded pipe objects, reader/writer reference counts,
 backpressure, and asynchronously runnable background shell continuations are present. The next
-timer waits and event-loop clock advancement are present. The next steps are concurrent pipeline
-stage construction and a resumable `wait`. Pipeline stages must start together and communicate
+timer waits, event-loop clock advancement, and scheduler-backed `wait` are present. The next step
+is concurrent pipeline stage construction. Pipeline stages must start together and communicate
 through pipe descriptors rather than materialized stage buffers.
 
 Required compatibility cases include overlapping sleeps, file races with deterministic ordering,
