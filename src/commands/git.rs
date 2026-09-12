@@ -4,8 +4,8 @@
 //! consulted.  The format is intentionally private and simple: the index is a sorted text map of
 //! relative paths to SHA-1 content hashes, immutable blobs are stored by hash, and commits contain
 //! a copy of the index map plus the message and parent. This supports common agent workflows
-//! (`init`, staging, commits, refs, history, switching, restore/reset, diff, and revision lookup)
-//! while rejecting unsupported Git features explicitly.
+//! (`init`, staging, commits, refs, history, switching, restore/reset, tracked file moves/removals,
+//! diff, and revision lookup) while rejecting unsupported Git features explicitly.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -43,6 +43,8 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         "reset" => git_reset(ctx, &args[1..], io),
         "config" => git_config(ctx, &args[1..], io),
         "ls-files" => git_ls_files(ctx, &args[1..], io),
+        "rm" => git_rm(ctx, &args[1..], io),
+        "mv" => git_mv(ctx, &args[1..], io),
         other => usage(io, &format!("unsupported subcommand: {other}")),
     }
 }
@@ -773,6 +775,201 @@ fn git_add_selected(
     0
 }
 
+fn repo_operand(cwd: &str, root: &str, operand: &str) -> Result<(String, String), String> {
+    let absolute = resolve_against(cwd, operand);
+    if !within(root, &absolute) || is_git_path(root, &absolute) {
+        return Err(format!("pathspec '{operand}' is outside the working tree"));
+    }
+    let relative = relative_path(root, &absolute)
+        .ok_or_else(|| format!("pathspec '{operand}' does not name a file"))?;
+    Ok((absolute, relative))
+}
+
+fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut cached = false;
+    let mut force = false;
+    let mut ignore_unmatch = false;
+    let mut operands = Vec::new();
+    let mut options = true;
+    for arg in args {
+        match arg.as_str() {
+            "--" if options => options = false,
+            "--cached" if options => cached = true,
+            "-f" | "--force" if options => force = true,
+            "--ignore-unmatch" if options => ignore_unmatch = true,
+            value if options && value.starts_with('-') => {
+                return usage(io, &format!("unsupported rm option: {value}"));
+            }
+            value => operands.push(value.to_string()),
+        }
+    }
+    if operands.is_empty() || operands.len() > 256 {
+        return usage(io, "git rm requires between 1 and 256 file paths");
+    }
+    let Some(root) = find_repo_root(ctx) else {
+        return repo_error(io);
+    };
+    let mut index = load_index(ctx, &root).unwrap_or_default();
+    let head = head_tree(ctx, &root);
+    let mut selected = Vec::new();
+    for operand in operands {
+        let (absolute, relative) = match repo_operand(&ctx.cwd, &root, &operand) {
+            Ok(paths) => paths,
+            Err(message) => return usage(io, &message),
+        };
+        let Some(index_hash) = index.get(&relative) else {
+            if ignore_unmatch {
+                continue;
+            }
+            io.err.extend_from_slice(
+                format!("fatal: pathspec '{operand}' did not match any files\n").as_bytes(),
+            );
+            return 128;
+        };
+        if ctx.vfs.is_dir("/", &absolute) {
+            return usage(io, "recursive git rm is not available");
+        }
+        if !cached && !ctx.vfs.is_file("/", &absolute) {
+            io.err
+                .extend_from_slice(format!("fatal: pathspec '{operand}' is missing\n").as_bytes());
+            return 128;
+        }
+        if !force {
+            let work_hash = match metered_file_hash(ctx, &absolute) {
+                Ok(hash) => hash,
+                Err(status) => return status,
+            };
+            let matches_work = work_hash.as_ref() == Some(index_hash);
+            let matches_head = head.get(&relative) == Some(index_hash);
+            let safe = if cached {
+                matches_work || matches_head
+            } else {
+                matches_work && matches_head
+            };
+            if !safe {
+                io.err.extend_from_slice(
+                    format!("error: the following file has staged or local changes: {relative}\n")
+                        .as_bytes(),
+                );
+                return 1;
+            }
+        }
+        selected.push((absolute, relative));
+    }
+    let reserved = ctx.vfs.disk_used().saturating_add(4 * 1024);
+    if !ctx.reserve_memory(reserved) {
+        return resource_error(ctx);
+    }
+    let before = ctx.vfs.clone();
+    let result = (|| -> Result<(), String> {
+        for (absolute, relative) in &selected {
+            if !cached {
+                ctx.vfs
+                    .remove_file("/", absolute)
+                    .map_err(|error| error.to_string())?;
+            }
+            index.remove(relative);
+        }
+        write_vfs(ctx, &git_path(&root, INDEX), &serialize_tree(&index))
+            .map_err(|error| error.to_string())
+    })();
+    if let Err(error) = result {
+        ctx.vfs = before;
+        io.err
+            .extend_from_slice(format!("git rm: {error}\n").as_bytes());
+        ctx.resources.release_memory(reserved);
+        return 1;
+    }
+    ctx.resources.release_memory(reserved);
+    0
+}
+
+fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let args = if args.first().is_some_and(|arg| arg == "--") {
+        &args[1..]
+    } else {
+        args
+    };
+    let [source, destination] = args else {
+        return usage(io, "usage: git mv SOURCE DESTINATION");
+    };
+    if source.starts_with('-') || destination.starts_with('-') {
+        return usage(io, "git mv options are not available");
+    }
+    let Some(root) = find_repo_root(ctx) else {
+        return repo_error(io);
+    };
+    let (source_absolute, source_relative) = match repo_operand(&ctx.cwd, &root, source) {
+        Ok(paths) => paths,
+        Err(message) => return usage(io, &message),
+    };
+    let (destination_absolute, destination_relative) =
+        match repo_operand(&ctx.cwd, &root, destination) {
+            Ok(paths) => paths,
+            Err(message) => return usage(io, &message),
+        };
+    let mut index = load_index(ctx, &root).unwrap_or_default();
+    if !index.contains_key(&source_relative) || !ctx.vfs.is_file("/", &source_absolute) {
+        io.err
+            .extend_from_slice(format!("fatal: bad source, source={source}\n").as_bytes());
+        return 128;
+    }
+    if ctx.vfs.exists("/", &destination_absolute) || index.contains_key(&destination_relative) {
+        io.err.extend_from_slice(
+            format!("fatal: destination exists, destination={destination}\n").as_bytes(),
+        );
+        return 128;
+    }
+    let file_len = match ctx.fs_file_len("/", &source_absolute) {
+        Ok(len) => len as u64,
+        Err(_) => return 128,
+    };
+    let reserved = ctx
+        .vfs
+        .disk_used()
+        .saturating_add(file_len)
+        .saturating_add(4 * 1024);
+    if !ctx.reserve_memory(reserved) {
+        return resource_error(ctx);
+    }
+    if !ctx.charge_cpu(file_len) {
+        ctx.resources.release_memory(reserved);
+        return resource_error(ctx);
+    }
+    let data = match ctx.fs_read_limited("/", &source_absolute, file_len as usize) {
+        Ok(data) => data,
+        Err(error) => {
+            io.err
+                .extend_from_slice(format!("git mv: {error}\n").as_bytes());
+            ctx.resources.release_memory(reserved);
+            return 1;
+        }
+    };
+    let hash = sha1(&data);
+    index.remove(&source_relative);
+    index.insert(destination_relative, hash.clone());
+    let before = ctx.vfs.clone();
+    let result = (|| -> Result<(), String> {
+        write_vfs(ctx, &git_path(&root, &format!("objects/{hash}")), &data)
+            .map_err(|error| error.to_string())?;
+        ctx.sync_vfs_time();
+        ctx.vfs
+            .rename("/", &source_absolute, &destination_absolute)
+            .map_err(|error| error.to_string())?;
+        write_vfs(ctx, &git_path(&root, INDEX), &serialize_tree(&index))
+            .map_err(|error| error.to_string())
+    })();
+    if let Err(error) = result {
+        ctx.vfs = before;
+        io.err
+            .extend_from_slice(format!("git mv: {error}\n").as_bytes());
+        ctx.resources.release_memory(reserved);
+        return 1;
+    }
+    ctx.resources.release_memory(reserved);
+    0
+}
+
 fn git_commit(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut message = None;
     let mut i = 0;
@@ -846,6 +1043,23 @@ fn git_commit(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
 
 fn read_work_file(ctx: &Interp, root: &str, path: &str) -> Option<Vec<u8>> {
     ctx.vfs.read("/", &path_join(root, path)).ok()
+}
+
+fn metered_file_hash(ctx: &mut CommandContext<'_>, path: &str) -> Result<Option<String>, i32> {
+    if !ctx.vfs.is_file("/", path) {
+        return Ok(None);
+    }
+    let length = ctx.fs_file_len("/", path).map_err(|_| 1)?;
+    if !ctx.reserve_memory(length as u64) {
+        return Err(resource_error(ctx));
+    }
+    if !ctx.charge_cpu(length as u64) {
+        ctx.resources.release_memory(length as u64);
+        return Err(resource_error(ctx));
+    }
+    let data = ctx.fs_read_limited("/", path, length);
+    ctx.resources.release_memory(length as u64);
+    data.map(|bytes| Some(sha1(&bytes))).map_err(|_| 1)
 }
 
 fn read_blob(ctx: &Interp, root: &str, hash: &str) -> Option<Vec<u8>> {

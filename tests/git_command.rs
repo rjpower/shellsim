@@ -211,3 +211,66 @@ fn diff_check_reports_new_trailing_whitespace() {
         2
     );
 }
+
+#[test]
+fn tracked_files_can_be_moved_and_removed_atomically() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs
+        .put_file("/old.txt", b"initial\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add old.txt; git commit -m initial").0, 0);
+
+    env.vfs
+        .put_file("/old.txt", b"modified\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git mv old.txt new.txt").0, 0);
+    assert!(!env.vfs.exists("/", "/old.txt"));
+    assert_eq!(env.vfs.read("/", "/new.txt").unwrap(), b"modified\n");
+    assert_eq!(
+        run(&mut env, "git status --short").1,
+        "A  new.txt\nD  old.txt\n"
+    );
+    assert_eq!(run(&mut env, "git commit -m moved").0, 0);
+
+    assert_eq!(run(&mut env, "git rm new.txt").0, 0);
+    assert!(!env.vfs.exists("/", "/new.txt"));
+    assert_eq!(run(&mut env, "git status --short").1, "D  new.txt\n");
+    assert_eq!(run(&mut env, "git commit -m removed").0, 0);
+
+    env.vfs
+        .put_file("/cached.txt", b"cached\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add cached.txt").0, 0);
+    assert_eq!(run(&mut env, "git rm --cached cached.txt").0, 0);
+    assert!(env.vfs.exists("/", "/cached.txt"));
+    assert_eq!(run(&mut env, "git status --short").1, "?? cached.txt\n");
+}
+
+#[test]
+fn git_rm_refuses_modified_files_without_force() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs.put_file("/file", b"one\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add file; git commit -m one").0, 0);
+    env.vfs.put_file("/file", b"two\n".to_vec(), 0o644).unwrap();
+
+    let refused = run(&mut env, "git rm file");
+    assert_eq!(refused.0, 1);
+    assert!(
+        refused.2.contains("staged or local changes"),
+        "{}",
+        refused.2
+    );
+    assert!(env.vfs.exists("/", "/file"));
+    assert_eq!(run(&mut env, "git rm -f file").0, 0);
+    assert!(!env.vfs.exists("/", "/file"));
+
+    env.vfs
+        .put_file("/kept", b"kept\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add kept; git commit -m kept").0, 0);
+    assert_ne!(run(&mut env, "git rm kept missing").0, 0);
+    assert!(env.vfs.exists("/", "/kept"));
+    assert_eq!(run(&mut env, "git status --short").1, "");
+}

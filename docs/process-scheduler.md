@@ -213,8 +213,8 @@ After the process and I/O foundations are complete, improve commands in evidence
 3. The coherent Git baseline now covers human and porcelain status, staged and working-tree diff,
    name-only and whitespace-checking diff, bounded history, show, refs, branch
    creation/listing/deletion, checkout/switch, restore, reset, add, commits, tracked-file queries,
-   and repository-local config. Repository state stays VFS-only; merges, remotes, and network
-   operations remain explicitly unsupported.
+   tracked file moves/removals, and repository-local config. Repository state stays VFS-only;
+   merges, remotes, and network operations remain explicitly unsupported.
 4. Atomic, bounded VFS-only patch application is present for unified diffs and the common
    `*** Begin Patch` agent format. Deterministic VFS-only `gzip`, `gunzip`, and `zcat` support
    bounded compression, decompression, files, and streams. Tar creation, listing, extraction, and
