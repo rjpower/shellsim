@@ -31,7 +31,10 @@ jobs, sleeps, waits, subshells, and pipeline stages suspend and resume through t
 scheduler. Pipeline bytes flow through bounded descriptor-backed pipes. VFS, clocks, virtual
 network, resources, package markers, and telemetry remain machine-wide, so local process mutation
 does not leak while filesystem effects remain visible. Exited background records remain until
-`wait` reaps them. Command substitution and a few nested native adapters still run synchronously.
+`wait` reaps them. Command substitutions, nested shells and scripts, Make recipes, `env`, `xargs`,
+`timeout`, and the `command` builtin all use retained continuations or scheduled argv children.
+The Python VM can cooperatively drive its `Popen` children, but its own bytecode and call frames are
+not yet retained scheduler state.
 
 Reusing an `Environment` preserves the VFS, cwd, variables, functions, arrays, package markers,
 virtual time/network state, command history, Python REPL, and cumulative resource usage. `exit`,

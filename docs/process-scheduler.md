@@ -143,11 +143,13 @@ bounded amount of work and returns `Ready(status)` or `Pending(BlockReason)`. Pr
 condition, loop, function, redirection, `errexit`, and cleanup semantics in frame data.
 
 Keep ordinary native commands synchronous. Convert only commands that may block into resumable
-tasks. The Python bytecode VM keeps its instruction pointer and yields when a native modeled
-operation blocks.
+tasks. The next executor change must move Python bytecode state, operand stacks, exception regions,
+and user-function call frames out of temporary Rust borrows and into an owned continuation. Native
+modeled operations can then return the same typed ready/block/switch result as shell frames.
 
-Completion requires deleting the remaining recursive child run-to-completion adapters. Deep or
-adversarial input remains bounded independently of the host stack.
+The shell-side recursive child adapters are removed from normal execution. Phase completion now
+requires the owned Python continuation and deletion of the synchronous Python VM entry path. Deep
+or adversarial input must remain bounded independently of the host stack.
 
 ## Phase 4: deterministic scheduler and pipes
 

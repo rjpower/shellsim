@@ -112,8 +112,10 @@ The process implementation creates logical children for isolation, `$$`, `BASHPI
 `$!`, dynamic `ps`, jobs, and wait status ownership. Background jobs, sleeps, waits, subshells, and
 pipeline stages run through deterministic cooperative continuations. Pipeline descriptors use
 bounded buffers with backpressure, so producers and consumers can overlap without eager whole-pipe
-materialization. Command substitution and nested interpreter adapters remain synchronous and are
-the next scheduler migration boundary.
+materialization. Command substitution, shell-script adapters, Make recipes, timeout process trees,
+and the common `env`/`xargs` command adapters now use the same scheduler-owned process boundary.
+Reifying Python bytecode and call frames as owned process continuations is the remaining interpreter
+scheduler boundary.
 
 Python `Popen`, `run`, `call`, `check_call`, and `check_output` execute only registered commands and
 VFS shell or Python scripts. Live children use scheduler continuations and bounded descriptor
