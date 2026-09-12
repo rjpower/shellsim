@@ -234,8 +234,17 @@ pub(super) fn execute(
         Err(result) => return result,
     };
     loop {
-        if let Some(result) = program.poll(interp, argv, state, interactive, out, err) {
-            return result;
+        match program.poll(
+            interp,
+            argv,
+            state,
+            VmMode::synchronous(interactive),
+            out,
+            err,
+        ) {
+            VmPoll::Runnable => {}
+            VmPoll::Blocked(_) => unreachable!("synchronous Python cannot suspend"),
+            VmPoll::Ready(result) => return result,
         }
     }
 }
@@ -245,6 +254,34 @@ pub(super) struct VmProgram {
     code: Code,
     execution: VmState,
     started: bool,
+}
+
+pub(super) enum VmPoll {
+    Runnable,
+    Blocked(crate::scheduler::WaitReason),
+    Ready(ExecResult),
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct VmMode {
+    interactive: bool,
+    scheduler_owned: bool,
+}
+
+impl VmMode {
+    fn synchronous(interactive: bool) -> Self {
+        Self {
+            interactive,
+            scheduler_owned: false,
+        }
+    }
+
+    pub(super) fn scheduled() -> Self {
+        Self {
+            interactive: false,
+            scheduler_owned: true,
+        }
+    }
 }
 
 impl VmProgram {
@@ -274,19 +311,11 @@ impl VmProgram {
         interp: &mut Interp,
         argv: &[String],
         state: &mut ReplState,
-        interactive: bool,
+        mode: VmMode,
         out: Out,
         err: Out,
-    ) -> Option<ExecResult> {
-        let mut vm = Vm::new(
-            interp,
-            argv,
-            state,
-            &mut self.execution,
-            interactive,
-            out,
-            err,
-        );
+    ) -> VmPoll {
+        let mut vm = Vm::new(interp, argv, state, &mut self.execution, mode, out, err);
         if !self.started {
             let retained_heap = vm
                 .state
@@ -294,7 +323,7 @@ impl VmProgram {
                 .modeled_bytes()
                 .saturating_add(vm.state.types.modeled_bytes());
             if retained_heap != 0 && !vm.interp.resources.reserve_memory(retained_heap) {
-                return Some(ExecResult::Exit(137));
+                return VmPoll::Ready(ExecResult::Exit(137));
             }
             vm.bytecode_frames.push(BytecodeFrame {
                 code: self.code.clone(),
@@ -305,13 +334,15 @@ impl VmProgram {
             self.started = true;
         }
         let execution = vm.execute_active_frame(VM_POLL_QUANTUM);
-        if matches!(execution, Ok(Execution::Pending)) {
-            return None;
+        match &execution {
+            Ok(Execution::Pending) => return VmPoll::Runnable,
+            Ok(Execution::Blocked(reason)) => return VmPoll::Blocked(*reason),
+            _ => {}
         }
         vm.bytecode_frames
             .pop()
             .expect("completed program must retain its root frame");
-        Some(vm.render_execution(execution))
+        VmPoll::Ready(vm.render_execution(execution))
     }
 }
 
@@ -320,7 +351,7 @@ struct Vm<'a> {
     argv: &'a [String],
     state: &'a mut ReplState,
     execution: &'a mut VmState,
-    interactive: bool,
+    mode: VmMode,
     out: Out<'a>,
     err: Out<'a>,
 }
@@ -340,6 +371,8 @@ struct VmState {
     class_bindings: Vec<Vec<String>>,
     call_depth: usize,
     pending_exception: Option<RaisedException>,
+    pending_wait: Option<crate::scheduler::WaitReason>,
+    native_suspend_allowed: bool,
     exception_stack: Vec<RaisedException>,
     with_contexts: Vec<Value>,
     method_frames: Vec<(super::heap::ObjectId, Value)>,
@@ -387,7 +420,7 @@ impl<'a> Vm<'a> {
         argv: &'a [String],
         state: &'a mut ReplState,
         execution: &'a mut VmState,
-        interactive: bool,
+        mode: VmMode,
         out: Out<'a>,
         err: Out<'a>,
     ) -> Self {
@@ -396,7 +429,7 @@ impl<'a> Vm<'a> {
             argv,
             state,
             execution,
-            interactive,
+            mode,
             out,
             err,
         }
@@ -408,6 +441,7 @@ impl<'a> Vm<'a> {
     ) -> ExecResult {
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
+            Ok(Execution::Blocked(_)) => unreachable!("synchronous Python cannot suspend"),
             Ok(Execution::Halt) | Ok(Execution::Return(_)) | Ok(Execution::Yield(_, _)) => {
                 ExecResult::Continue
             }
@@ -581,6 +615,11 @@ impl<'a> Vm<'a> {
                         self.bytecode_frames[caller].instruction_pointer += 1;
                         continue;
                     }
+                    Ok(CallResult::Blocked(reason, value)) => {
+                        self.stack.push(value);
+                        self.active_frame_mut().instruction_pointer += 1;
+                        return Ok(Execution::Blocked(reason));
+                    }
                     Ok(CallResult::Exit(status)) => return Ok(Execution::Exit(status)),
                     Err(error) => Err(error),
                 },
@@ -743,6 +782,7 @@ impl<'a> Vm<'a> {
                         CallResult::Value(value) => self.stack.push(value),
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
                         CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
+                        CallResult::Blocked(_, _) => unreachable!("immediate call cannot suspend"),
                     }
                     Ok(())
                 }
@@ -763,6 +803,7 @@ impl<'a> Vm<'a> {
                         CallResult::Value(_) => Ok(()),
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
                         CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
+                        CallResult::Blocked(_, _) => unreachable!("immediate call cannot suspend"),
                     }
                 }
                 Operation::WithExitException => {
@@ -792,6 +833,7 @@ impl<'a> Vm<'a> {
                         CallResult::Value(value) => value,
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
                         CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
+                        CallResult::Blocked(_, _) => unreachable!("immediate call cannot suspend"),
                     };
                     if self
                         .truth_value(&result)
@@ -807,7 +849,7 @@ impl<'a> Vm<'a> {
                 }
                 Operation::PopExpression => match self.pop() {
                     Ok(value) => {
-                        if self.interactive && !matches!(value, Value::None) {
+                        if self.mode.interactive && !matches!(value, Value::None) {
                             let rendered = match protocol::repr(&self.state.heap, &value) {
                                 Ok(rendered) => rendered,
                                 Err(error) => return Err((error, instruction.span)),
@@ -1190,6 +1232,7 @@ impl<'a> Vm<'a> {
         self.stack = outer_stack;
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
+            Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
             Ok(Execution::Halt) => {
                 self.stack.push(module);
                 Ok(())
@@ -1487,6 +1530,9 @@ impl<'a> Vm<'a> {
                             }
                             CallResult::EnteredFrame => {
                                 unreachable!("immediate call entered a frame")
+                            }
+                            CallResult::Blocked(_, _) => {
+                                unreachable!("immediate call cannot suspend")
                             }
                         };
                         self.state
@@ -1928,6 +1974,7 @@ impl<'a> Vm<'a> {
         self.stack = outer_stack;
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
+            Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
             Ok(Execution::Halt) => {}
             Ok(Execution::Return(_)) => return Err("'return' outside function".into()),
             Ok(Execution::Yield(_, _)) => return Err("'yield' outside function".into()),
@@ -2348,6 +2395,7 @@ impl<'a> Vm<'a> {
             CallResult::Value(value) => Ok(value),
             CallResult::Exit(status) => Err(format!("callable exited with status {status}")),
             CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
+            CallResult::Blocked(_, _) => unreachable!("immediate call cannot suspend"),
         }
     }
 
@@ -3024,6 +3072,7 @@ impl<'a> Vm<'a> {
 
         match result {
             Ok(Execution::Pending) => unreachable!("execute_code_from drains pending quanta"),
+            Ok(Execution::Blocked(_)) => unreachable!("generator execution cannot suspend"),
             Ok(Execution::Yield(value, next_instruction)) => {
                 if let Object::Generator {
                     instruction_pointer,
@@ -3576,6 +3625,9 @@ impl<'a> Vm<'a> {
                                     CallResult::EnteredFrame => {
                                         unreachable!("invoke_call is immediate")
                                     }
+                                    CallResult::Blocked(_, _) => {
+                                        unreachable!("immediate call cannot suspend")
+                                    }
                                 }
                             } else {
                                 if !keyword_arguments.is_empty() || arguments.len() != 3 {
@@ -3612,6 +3664,9 @@ impl<'a> Vm<'a> {
                                         }
                                         CallResult::EnteredFrame => {
                                             unreachable!("invoke_call is immediate")
+                                        }
+                                        CallResult::Blocked(_, _) => {
+                                            unreachable!("immediate call cannot suspend")
                                         }
                                     };
                                     if !result.is_none() {
@@ -3709,6 +3764,9 @@ impl<'a> Vm<'a> {
                             CallResult::EnteredFrame => {
                                 unreachable!("immediate initializer entered a frame")
                             }
+                            CallResult::Blocked(_, _) => {
+                                unreachable!("immediate initializer cannot suspend")
+                            }
                         }
                     } else if layout == ClassLayout::Object
                         && (!arguments.is_empty() || !keyword_arguments.is_empty())
@@ -3752,8 +3810,15 @@ impl<'a> Vm<'a> {
         }
         if let Some(NativeValue::NativeFunction(function)) = function.native_value() {
             let call = CallArgs::new(arguments, keyword_arguments);
-            return match (function.call)(self, call) {
-                Ok(value) => Ok(CallResult::Value(value)),
+            let previous_suspend = self.native_suspend_allowed;
+            self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+            let result = (function.call)(self, call);
+            self.native_suspend_allowed = previous_suspend;
+            return match result {
+                Ok(value) => match self.pending_wait.take() {
+                    Some(reason) => Ok(CallResult::Blocked(reason, value)),
+                    None => Ok(CallResult::Value(value)),
+                },
                 Err(PyError {
                     kind: PyErrorKind::Exit(status),
                     ..
@@ -3886,6 +3951,9 @@ impl<'a> Vm<'a> {
                             CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
                             CallResult::EnteredFrame => {
                                 unreachable!("immediate call entered a frame")
+                            }
+                            CallResult::Blocked(_, _) => {
+                                unreachable!("immediate call cannot suspend")
                             }
                         }
                     } else {
@@ -4279,6 +4347,7 @@ impl<'a> Vm<'a> {
         self.stack = outer_stack;
         match result {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
+            Ok(Execution::Blocked(_)) => unreachable!("immediate call cannot suspend"),
             Ok(Execution::Return(value)) => Ok(CallResult::Value(value)),
             Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
             Ok(Execution::Yield(_, _)) => {
@@ -5156,6 +5225,7 @@ impl PyRuntime for Vm<'_> {
             CallResult::Value(value) => Ok(value),
             CallResult::Exit(status) => Err(PyError::exit(status)),
             CallResult::EnteredFrame => unreachable!("runtime callback is immediate"),
+            CallResult::Blocked(_, _) => unreachable!("runtime callback cannot suspend"),
         }
     }
 
@@ -5609,6 +5679,15 @@ impl PyClock for Vm<'_> {
         if nanos > u64::MAX as f64 {
             return Err(PyError::overflow_error("time.sleep() length is too large"));
         }
+        if self.mode.scheduler_owned && self.native_suspend_allowed {
+            let event = self
+                .interp
+                .clock
+                .schedule_wake_after(u64::from(self.interp.process.pid), nanos as u64)
+                .map_err(|error| PyError::runtime_error(error.to_string()))?;
+            self.pending_wait = Some(crate::scheduler::WaitReason::Timer(event.deadline_ns()));
+            return Ok(());
+        }
         match self
             .interp
             .clock
@@ -5634,6 +5713,7 @@ enum CallResult {
     Value(Value),
     Exit(i32),
     EnteredFrame,
+    Blocked(crate::scheduler::WaitReason, Value),
 }
 
 #[derive(Clone, Copy)]
@@ -5644,6 +5724,7 @@ enum CallMode {
 
 enum Execution {
     Pending,
+    Blocked(crate::scheduler::WaitReason),
     Halt,
     Return(Value),
     Yield(Value, usize),

@@ -193,6 +193,34 @@ print(time.monotonic_ns())"#;
 }
 
 #[test]
+fn python_sleeps_suspend_their_process_on_the_shared_scheduler() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "python3.14 -c 'import time\ndef sleeper():\n    time.sleep(2)\n    print(\"two\")\nsleeper()' & python3.14 -c 'import time\ndef sleeper():\n    time.sleep(1)\n    print(\"one\")\nsleeper()' & wait",
+        ),
+        (0, "one\ntwo\n".into(), String::new())
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
+    assert_eq!(environment.clock.slept_ns(), 3 * NANOS_PER_SECOND);
+}
+
+#[test]
+fn timeout_terminates_a_scheduler_blocked_python_process() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "timeout 1 python3.14 -c 'import time; time.sleep(10); print(\"late\")'; echo status:$?",
+        ),
+        (0, "status:124\n".into(), String::new())
+    );
+    assert_eq!(environment.clock.monotonic_ns(), NANOS_PER_SECOND);
+    assert_eq!(environment.clock.pending_len(), 0);
+}
+
+#[test]
 fn process_time_is_cpu_fuel_and_does_not_advance_monotonic_time() {
     let mut environment = Environment::new();
     let (_, stdout, stderr) = run(

@@ -440,7 +440,7 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
             command,
             mut continuation,
         } => match continuation.poll(interp) {
-            Some(status) => {
+            crate::python::PythonPoll::Ready(status) => {
                 let (stdout, stderr) = (*continuation).into_output();
                 CommandPoll::ReadyOutput {
                     command,
@@ -449,10 +449,17 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
                     stderr,
                 }
             }
-            None => CommandPoll::Yielded(CommandResume::Python {
+            crate::python::PythonPoll::Runnable => CommandPoll::Yielded(CommandResume::Python {
                 command,
                 continuation,
             }),
+            crate::python::PythonPoll::Blocked(reason) => CommandPoll::Blocked(
+                reason,
+                CommandResume::Python {
+                    command,
+                    continuation,
+                },
+            ),
         },
     }
 }

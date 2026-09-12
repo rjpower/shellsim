@@ -37,7 +37,8 @@ Python commands retain compiled code, VM state, output, and top-level bytecode f
 continuations and yield after bounded instruction quanta. Ordinary bytecode user-function calls
 use explicit return frames as well. Python calls made from within compound native operations and
 blocking native operations still need instruction-level continuations before the old nested
-scheduler bridge can be removed.
+scheduler bridge can be removed. Direct `time.sleep` is scheduler-blocking already and validates
+the typed timer-wait path through retained Python function frames.
 
 Reusing an `Environment` preserves the VFS, cwd, variables, functions, arrays, package markers,
 virtual time/network state, command history, Python REPL, and cumulative resource usage. `exit`,

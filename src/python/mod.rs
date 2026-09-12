@@ -329,19 +329,29 @@ pub(crate) enum PythonCommandStart {
     Running(Box<PythonContinuation>),
 }
 
+pub(crate) enum PythonPoll {
+    Runnable,
+    Blocked(crate::scheduler::WaitReason),
+    Ready(i32),
+}
+
 impl PythonContinuation {
     /// Run one bounded VM quantum. Completed output remains owned until the shell installs its
     /// ordinary descriptor-write frames.
-    pub(crate) fn poll(&mut self, interp: &mut Interp) -> Option<i32> {
-        let result = self.program.poll(
+    pub(crate) fn poll(&mut self, interp: &mut Interp) -> PythonPoll {
+        let result = match self.program.poll(
             interp,
             &self.argv,
             &mut self.state,
-            false,
+            vm::VmMode::scheduled(),
             &mut self.stdout,
             &mut self.stderr,
-        )?;
-        Some(match result {
+        ) {
+            vm::VmPoll::Runnable => return PythonPoll::Runnable,
+            vm::VmPoll::Blocked(reason) => return PythonPoll::Blocked(reason),
+            vm::VmPoll::Ready(result) => result,
+        };
+        PythonPoll::Ready(match result {
             ExecResult::Continue => 0,
             ExecResult::Exit(status) => status,
             ExecResult::Unsupported(feature) => unsupported(interp, &feature, &mut self.stderr),
@@ -357,11 +367,15 @@ pub fn run_python(interp: &mut Interp, argv: &[String], stdin: Vec<u8>, out: Out
     match start_python(interp, argv, stdin, out, err) {
         PythonCommandStart::Ready(status) => status,
         PythonCommandStart::Running(mut continuation) => loop {
-            if let Some(status) = continuation.poll(interp) {
-                let (stdout, stderr) = (*continuation).into_output();
-                out.extend_from_slice(&stdout);
-                err.extend_from_slice(&stderr);
-                return status;
+            match continuation.poll(interp) {
+                PythonPoll::Runnable => {}
+                PythonPoll::Blocked(_) => unreachable!("synchronous Python cannot suspend"),
+                PythonPoll::Ready(status) => {
+                    let (stdout, stderr) = (*continuation).into_output();
+                    out.extend_from_slice(&stdout);
+                    err.extend_from_slice(&stderr);
+                    return status;
+                }
             }
         },
     }

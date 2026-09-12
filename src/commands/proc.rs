@@ -789,16 +789,25 @@ fn start_python_impl(interp: &mut Interp, name: &str, args: &[String], io: &mut 
         crate::python::PythonCommandStart::Ready(status) => CommandPoll::Ready(status),
         crate::python::PythonCommandStart::Running(mut continuation) => {
             match continuation.poll(interp) {
-                Some(status) => {
+                crate::python::PythonPoll::Ready(status) => {
                     let (stdout, stderr) = (*continuation).into_output();
                     io.out.extend_from_slice(&stdout);
                     io.err.extend_from_slice(&stderr);
                     CommandPoll::Ready(status)
                 }
-                None => CommandPoll::Yielded(CommandResume::Python {
-                    command: name.to_string(),
-                    continuation,
-                }),
+                crate::python::PythonPoll::Runnable => {
+                    CommandPoll::Yielded(CommandResume::Python {
+                        command: name.to_string(),
+                        continuation,
+                    })
+                }
+                crate::python::PythonPoll::Blocked(reason) => CommandPoll::Blocked(
+                    reason,
+                    CommandResume::Python {
+                        command: name.to_string(),
+                        continuation,
+                    },
+                ),
             }
         }
     }

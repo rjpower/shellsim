@@ -45,6 +45,8 @@ bytecode yields in bounded quanta and CPU-bound Python processes interleave in F
 user Python calls use explicit callee/return frames and retain exception unwinding across them.
 Callbacks made from within compound native operations and blocking native methods still execute
 through nested Rust calls, so suspension is not yet available at every bytecode instruction.
+Direct `time.sleep` calls are the first native suspension path: they register a typed timer wait,
+retain the active Python call frame, and resume after the scheduler wakes that process.
 
 The readiness handshake needed by phase 3 is present: blocked descriptor operations return a
 typed pipe-readable or pipe-writable condition, process code can suspend on that exact condition,
@@ -149,8 +151,8 @@ Keep ordinary native commands synchronous. Convert only commands that may block 
 tasks. Python code, operand stacks, exception regions, and top-level instruction state are now
 owned by a retained command continuation. Ordinary bytecode calls now push explicit return frames.
 The next executor change must split compound native operations around their Python callbacks, after
-which blocking modeled operations can return the same typed ready/block/switch result as shell
-frames.
+which retryable subprocess and descriptor operations can return the same typed
+ready/block/switch result as shell frames. Direct Python timer sleeps already use this result path.
 
 The shell-side recursive child adapters are removed from normal execution. Python operand,
 scope, exception, context-manager, and method state is now separated from the VM's temporary

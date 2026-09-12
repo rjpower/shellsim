@@ -117,6 +117,8 @@ and the common `env`/`xargs` command adapters now use the same scheduler-owned p
 Python command execution now retains owned VM state and yields between bounded instruction quanta;
 ordinary user-function calls use the same explicit frame stack. Calls initiated inside compound
 native operations and blocking native calls are the remaining interpreter scheduler boundary.
+Direct `time.sleep` calls already suspend on the shared virtual timeline; subprocess waits and
+descriptor I/O still use the nested bridge.
 
 Python `Popen`, `run`, `call`, `check_call`, and `check_output` execute only registered commands and
 VFS shell or Python scripts. Live children use scheduler continuations and bounded descriptor
