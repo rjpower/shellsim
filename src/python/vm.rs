@@ -246,17 +246,18 @@ pub(super) fn execute(
         }
     };
     let code = super::compiler::compile(program);
-    Vm::new(interp, argv, state, interactive, out, err).run(&code)
+    let mut execution = VmState::default();
+    Vm::new(interp, argv, state, &mut execution, interactive, out, err).run(&code)
 }
 
 struct Vm<'a> {
     interp: &'a mut Interp,
     argv: &'a [String],
     state: &'a mut ReplState,
+    execution: &'a mut VmState,
     interactive: bool,
     out: Out<'a>,
     err: Out<'a>,
-    execution: VmState,
 }
 
 /// State that must survive when bytecode execution yields to the process scheduler.
@@ -290,13 +291,13 @@ impl Deref for Vm<'_> {
     type Target = VmState;
 
     fn deref(&self) -> &Self::Target {
-        &self.execution
+        self.execution
     }
 }
 
 impl DerefMut for Vm<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.execution
+        self.execution
     }
 }
 
@@ -305,6 +306,7 @@ impl<'a> Vm<'a> {
         interp: &'a mut Interp,
         argv: &'a [String],
         state: &'a mut ReplState,
+        execution: &'a mut VmState,
         interactive: bool,
         out: Out<'a>,
         err: Out<'a>,
@@ -313,10 +315,10 @@ impl<'a> Vm<'a> {
             interp,
             argv,
             state,
+            execution,
             interactive,
             out,
             err,
-            execution: VmState::default(),
         }
     }
 
