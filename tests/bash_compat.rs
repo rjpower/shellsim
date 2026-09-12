@@ -159,6 +159,17 @@ fn descriptor_close_and_failed_redirect_setup_are_explicit() {
 }
 
 #[test]
+fn recursive_shell_functions_stop_at_the_continuation_limit() {
+    let (status, out, err) = run("recurse() { recurse nested; }; recurse outer; echo unreachable");
+    assert_eq!(status, 2);
+    assert_eq!(out, "");
+    assert!(
+        err.contains("shell continuation frame limit exceeded"),
+        "{err}"
+    );
+}
+
+#[test]
 fn logical_process_ids_back_jobs_wait_and_ps() {
     assert_eq!(
         run("printf '%s:%s:%s\n' \"$$\" \"$BASHPID\" \"$PPID\"; (printf '%s:%s:%s\n' \"$$\" \"$BASHPID\" \"$PPID\")"),

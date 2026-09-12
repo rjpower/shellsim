@@ -34,6 +34,14 @@ typed pipe-readable or pipe-writable condition, process code can suspend on that
 and successful peer I/O wakes matching tasks in stable blocking order. Continuation polling can
 therefore yield directly into scheduler state without stringly typed wake keys or host polling.
 
+Shell control flow now runs on a bounded explicit continuation stack. Sequences, boolean lists,
+conditions, loops, case selection, functions, positional restoration, and redirection cleanup are
+frames polled in fixed work quanta and retained on `ProcessState`. Same-process shell control flow
+no longer recurses through the Rust stack. Fork allocations also have independently releasable
+memory ownership, which is required once children overlap instead of exiting in stack order.
+Foreground child creation and pipelines still use the synchronous child adapter, and native
+blocking commands do not yet return `Pending`, so phase 3 remains incomplete.
+
 ## Non-negotiable invariants
 
 - Simulated input never reaches a host process, descriptor, filesystem, network, environment, or

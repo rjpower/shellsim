@@ -172,6 +172,13 @@ impl Resources {
         self.memory_current = mark.min(self.memory_current);
     }
 
+    /// Release an independently owned allocation from the concurrent working set.
+    ///
+    /// Unlike a frame mark, this is safe when other process allocations were reserved later.
+    pub fn release_memory(&mut self, bytes: u64) {
+        self.memory_current = self.memory_current.saturating_sub(bytes);
+    }
+
     pub fn charge_output(&mut self, bytes: u64) -> bool {
         if self.is_stopped() {
             return false;
@@ -278,5 +285,16 @@ mod tests {
         r.restore_memory(mark);
         assert_eq!(r.memory_current, 0);
         assert_eq!(r.memory_peak, 12);
+    }
+
+    #[test]
+    fn independently_owned_memory_can_be_released_out_of_order() {
+        let mut resources = Resources::new(Limits::unlimited());
+        assert!(resources.reserve_memory(10));
+        assert!(resources.reserve_memory(20));
+        resources.release_memory(10);
+        assert_eq!(resources.memory_mark(), 20);
+        resources.release_memory(20);
+        assert_eq!(resources.memory_mark(), 0);
     }
 }

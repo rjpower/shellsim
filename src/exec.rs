@@ -77,258 +77,733 @@ fn restore_fds(interp: &mut Interp, saved: crate::descriptors::FdTable) {
     interp.refresh_descriptor_snapshot(interp.process.pid);
 }
 
-fn exec_node(interp: &mut Interp, node: &Node) -> i32 {
-    if !interp.resources.charge_cpu(10) {
-        return interp
-            .resources
-            .stop_reason()
-            .map_or(137, |r| r.exit_status());
+const MAX_SHELL_FRAMES: usize = 4_096;
+const SHELL_POLL_QUANTUM: usize = 256;
+
+enum ShellFrame {
+    Eval(Node),
+    Sequence {
+        nodes: Vec<Node>,
+        next: usize,
+    },
+    Conditional {
+        rhs: Node,
+        run_on_success: bool,
+    },
+    Negate,
+    IfNext {
+        branches: Vec<(Node, Node)>,
+        next: usize,
+        els: Option<Node>,
+    },
+    IfAfter {
+        branches: Vec<(Node, Node)>,
+        next: usize,
+        els: Option<Node>,
+    },
+    WhileCheck {
+        cond: Node,
+        body: Node,
+        until: bool,
+        iterations: usize,
+        body_status: i32,
+    },
+    WhileAfterCondition {
+        cond: Node,
+        body: Node,
+        until: bool,
+        iterations: usize,
+        body_status: i32,
+    },
+    WhileAfterBody {
+        cond: Node,
+        body: Node,
+        until: bool,
+        iterations: usize,
+    },
+    ForNext {
+        var: String,
+        items: Vec<String>,
+        body: Node,
+        next: usize,
+        body_status: i32,
+    },
+    ForAfterBody {
+        var: String,
+        items: Vec<String>,
+        body: Node,
+        next: usize,
+    },
+    CForCheck {
+        cond: String,
+        update: String,
+        body: Node,
+        iterations: usize,
+        body_status: i32,
+    },
+    CForAfterBody {
+        cond: String,
+        update: String,
+        body: Node,
+        iterations: usize,
+    },
+    RestoreRedirect(RedirectScope),
+    FinishFunction {
+        positional: Vec<String>,
+        variables: Vec<(String, Option<String>)>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShellPoll {
+    Pending,
+    Ready(i32),
+}
+
+pub(crate) struct ShellContinuation {
+    frames: Vec<ShellFrame>,
+    status: i32,
+}
+
+impl ShellContinuation {
+    pub(crate) fn new(node: &Node) -> Self {
+        Self {
+            frames: vec![ShellFrame::Eval(node.clone())],
+            status: 0,
+        }
     }
-    if interp.exiting.is_some()
+
+    pub(crate) fn poll(&mut self, interp: &mut Interp, budget: usize) -> ShellPoll {
+        for _ in 0..budget.max(1) {
+            let Some(frame) = self.frames.pop() else {
+                return ShellPoll::Ready(self.status);
+            };
+            self.step(interp, frame);
+            interp.last_status = self.status;
+        }
+        if self.frames.is_empty() {
+            ShellPoll::Ready(self.status)
+        } else {
+            ShellPoll::Pending
+        }
+    }
+
+    fn push(&mut self, interp: &mut Interp, frame: ShellFrame) -> bool {
+        if self.frames.len() >= MAX_SHELL_FRAMES {
+            write_diagnostic(
+                interp,
+                "shellsim: shell continuation frame limit exceeded\n",
+            );
+            self.status = 2;
+            self.abort(interp);
+            false
+        } else {
+            self.frames.push(frame);
+            true
+        }
+    }
+
+    fn ensure_capacity(&mut self, interp: &mut Interp, additional: usize) -> bool {
+        if self.frames.len().saturating_add(additional) > MAX_SHELL_FRAMES {
+            write_diagnostic(
+                interp,
+                "shellsim: shell continuation frame limit exceeded\n",
+            );
+            self.status = 2;
+            self.abort(interp);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn abort(&mut self, interp: &mut Interp) {
+        for frame in std::mem::take(&mut self.frames).into_iter().rev() {
+            match frame {
+                ShellFrame::RestoreRedirect(scope) => end_redirects(interp, scope),
+                ShellFrame::FinishFunction {
+                    positional,
+                    variables,
+                } => {
+                    interp.positional = positional;
+                    restore_command_variables(interp, variables);
+                }
+                ShellFrame::Conditional { .. }
+                | ShellFrame::Negate
+                | ShellFrame::IfAfter { .. }
+                | ShellFrame::WhileAfterCondition { .. } => {
+                    interp.cond_depth = interp.cond_depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn step(&mut self, interp: &mut Interp, frame: ShellFrame) {
+        match frame {
+            ShellFrame::Eval(node) => self.eval(interp, node),
+            ShellFrame::Sequence { nodes, next } => {
+                if next > 0 && should_unwind(interp) {
+                    if interp.deadline_interrupt.is_some() {
+                        self.status = 124;
+                    }
+                    return;
+                }
+                if next > 0 && self.status != 0 && interp.opt_errexit && interp.cond_depth == 0 {
+                    interp.exiting = Some(self.status);
+                    return;
+                }
+                if let Some(node) = nodes.get(next).cloned() {
+                    if self.push(
+                        interp,
+                        ShellFrame::Sequence {
+                            nodes,
+                            next: next + 1,
+                        },
+                    ) {
+                        self.push(interp, ShellFrame::Eval(node));
+                    }
+                }
+            }
+            ShellFrame::Conditional {
+                rhs,
+                run_on_success,
+            } => {
+                interp.cond_depth = interp.cond_depth.saturating_sub(1);
+                if !should_unwind(interp) && (self.status == 0) == run_on_success {
+                    self.push(interp, ShellFrame::Eval(rhs));
+                }
+            }
+            ShellFrame::Negate => {
+                interp.cond_depth = interp.cond_depth.saturating_sub(1);
+                self.status = i32::from(self.status == 0);
+            }
+            ShellFrame::IfNext {
+                branches,
+                next,
+                els,
+            } => {
+                if let Some((condition, _)) = branches.get(next).cloned() {
+                    interp.cond_depth = interp.cond_depth.saturating_add(1);
+                    if self.push(
+                        interp,
+                        ShellFrame::IfAfter {
+                            branches,
+                            next,
+                            els,
+                        },
+                    ) {
+                        self.push(interp, ShellFrame::Eval(condition));
+                    }
+                } else if let Some(body) = els {
+                    self.push(interp, ShellFrame::Eval(body));
+                } else {
+                    self.status = 0;
+                }
+            }
+            ShellFrame::IfAfter {
+                branches,
+                next,
+                els,
+            } => {
+                interp.cond_depth = interp.cond_depth.saturating_sub(1);
+                if self.status == 0 && !should_unwind(interp) {
+                    self.push(interp, ShellFrame::Eval(branches[next].1.clone()));
+                } else if !should_unwind(interp) {
+                    self.push(
+                        interp,
+                        ShellFrame::IfNext {
+                            branches,
+                            next: next + 1,
+                            els,
+                        },
+                    );
+                }
+            }
+            ShellFrame::WhileCheck {
+                cond,
+                body,
+                until,
+                iterations,
+                body_status,
+            } => {
+                if should_unwind(interp) || iterations >= 5_000 {
+                    self.status = body_status;
+                    return;
+                }
+                interp.cond_depth = interp.cond_depth.saturating_add(1);
+                if self.push(
+                    interp,
+                    ShellFrame::WhileAfterCondition {
+                        cond: cond.clone(),
+                        body,
+                        until,
+                        iterations,
+                        body_status,
+                    },
+                ) {
+                    self.push(interp, ShellFrame::Eval(cond));
+                }
+            }
+            ShellFrame::WhileAfterCondition {
+                cond,
+                body,
+                until,
+                iterations,
+                body_status,
+            } => {
+                interp.cond_depth = interp.cond_depth.saturating_sub(1);
+                let enter = if until {
+                    self.status != 0
+                } else {
+                    self.status == 0
+                };
+                if enter && !should_unwind(interp) {
+                    if self.push(
+                        interp,
+                        ShellFrame::WhileAfterBody {
+                            cond,
+                            body: body.clone(),
+                            until,
+                            iterations: iterations + 1,
+                        },
+                    ) {
+                        self.push(interp, ShellFrame::Eval(body));
+                    }
+                } else {
+                    self.status = body_status;
+                }
+            }
+            ShellFrame::WhileAfterBody {
+                cond,
+                body,
+                until,
+                iterations,
+            } => {
+                if interp.loop_break > 0 {
+                    interp.loop_break -= 1;
+                    return;
+                }
+                if interp.loop_continue > 0 {
+                    interp.loop_continue -= 1;
+                }
+                if !should_unwind(interp) {
+                    self.push(
+                        interp,
+                        ShellFrame::WhileCheck {
+                            cond,
+                            body,
+                            until,
+                            iterations,
+                            body_status: self.status,
+                        },
+                    );
+                }
+            }
+            ShellFrame::ForNext {
+                var,
+                items,
+                body,
+                next,
+                body_status,
+            } => {
+                if should_unwind(interp) {
+                    self.status = body_status;
+                } else if let Some(item) = items.get(next).cloned() {
+                    interp.set_var(&var, item);
+                    if self.push(
+                        interp,
+                        ShellFrame::ForAfterBody {
+                            var,
+                            items,
+                            body: body.clone(),
+                            next: next + 1,
+                        },
+                    ) {
+                        self.push(interp, ShellFrame::Eval(body));
+                    }
+                } else {
+                    self.status = body_status;
+                }
+            }
+            ShellFrame::ForAfterBody {
+                var,
+                items,
+                body,
+                next,
+            } => {
+                if interp.loop_break > 0 {
+                    interp.loop_break -= 1;
+                    return;
+                }
+                if interp.loop_continue > 0 {
+                    interp.loop_continue -= 1;
+                }
+                if !should_unwind(interp) {
+                    self.push(
+                        interp,
+                        ShellFrame::ForNext {
+                            var,
+                            items,
+                            body,
+                            next,
+                            body_status: self.status,
+                        },
+                    );
+                }
+            }
+            ShellFrame::CForCheck {
+                cond,
+                update,
+                body,
+                iterations,
+                body_status,
+            } => {
+                if should_unwind(interp)
+                    || iterations >= 5_000
+                    || (!cond.is_empty() && crate::expand::eval_arith(interp, &cond) == 0)
+                {
+                    self.status = body_status;
+                } else if self.push(
+                    interp,
+                    ShellFrame::CForAfterBody {
+                        cond,
+                        update,
+                        body: body.clone(),
+                        iterations: iterations + 1,
+                    },
+                ) {
+                    self.push(interp, ShellFrame::Eval(body));
+                }
+            }
+            ShellFrame::CForAfterBody {
+                cond,
+                update,
+                body,
+                iterations,
+            } => {
+                if interp.loop_break > 0 {
+                    interp.loop_break -= 1;
+                    return;
+                }
+                if interp.loop_continue > 0 {
+                    interp.loop_continue -= 1;
+                }
+                if !should_unwind(interp) {
+                    let _ = crate::expand::eval_arith(interp, &update);
+                    self.push(
+                        interp,
+                        ShellFrame::CForCheck {
+                            cond,
+                            update,
+                            body,
+                            iterations,
+                            body_status: self.status,
+                        },
+                    );
+                }
+            }
+            ShellFrame::RestoreRedirect(scope) => end_redirects(interp, scope),
+            ShellFrame::FinishFunction {
+                positional,
+                variables,
+            } => {
+                interp.positional = positional;
+                self.status = interp.returning.take().unwrap_or(self.status);
+                restore_command_variables(interp, variables);
+            }
+        }
+    }
+
+    fn eval(&mut self, interp: &mut Interp, node: Node) {
+        if !interp.resources.charge_cpu(10) {
+            self.status = interp
+                .resources
+                .stop_reason()
+                .map_or(137, |reason| reason.exit_status());
+            return;
+        }
+        if should_unwind(interp) {
+            self.status = if interp.deadline_interrupt.is_some() {
+                124
+            } else {
+                interp.last_status
+            };
+            return;
+        }
+        match node {
+            Node::Empty => self.status = 0,
+            Node::Command {
+                assigns,
+                words,
+                redirects,
+            } => self.eval_command(interp, assigns, words, redirects),
+            Node::Pipeline(stages) => self.status = exec_pipeline(interp, &stages),
+            Node::And(lhs, rhs) => {
+                interp.cond_depth = interp.cond_depth.saturating_add(1);
+                if self.push(
+                    interp,
+                    ShellFrame::Conditional {
+                        rhs: *rhs,
+                        run_on_success: true,
+                    },
+                ) {
+                    self.push(interp, ShellFrame::Eval(*lhs));
+                }
+            }
+            Node::Or(lhs, rhs) => {
+                interp.cond_depth = interp.cond_depth.saturating_add(1);
+                if self.push(
+                    interp,
+                    ShellFrame::Conditional {
+                        rhs: *rhs,
+                        run_on_success: false,
+                    },
+                ) {
+                    self.push(interp, ShellFrame::Eval(*lhs));
+                }
+            }
+            Node::Not(inner) => {
+                interp.cond_depth = interp.cond_depth.saturating_add(1);
+                if self.push(interp, ShellFrame::Negate) {
+                    self.push(interp, ShellFrame::Eval(*inner));
+                }
+            }
+            Node::Seq(nodes) => {
+                self.status = 0;
+                self.push(interp, ShellFrame::Sequence { nodes, next: 0 });
+            }
+            Node::Background(inner) => self.status = exec_background(interp, &inner),
+            Node::Subshell(inner) => {
+                self.status = exec_child(
+                    interp,
+                    &inner,
+                    ChildExecution {
+                        command: "(subshell)",
+                        new_shell: false,
+                        retain: false,
+                    },
+                )
+                .map_or(125, |(status, _)| status);
+            }
+            Node::Group(inner) => {
+                self.push(interp, ShellFrame::Eval(*inner));
+            }
+            Node::Redirected(inner, redirects) => match begin_redirects(interp, &redirects) {
+                Ok(scope) => {
+                    if self.push(interp, ShellFrame::RestoreRedirect(scope)) {
+                        self.push(interp, ShellFrame::Eval(*inner));
+                    }
+                }
+                Err(error) => {
+                    write_diagnostic(interp, &format!("shellsim: redirection: {error}\n"));
+                    self.status = 1;
+                }
+            },
+            Node::If {
+                cond,
+                then,
+                elifs,
+                els,
+            } => {
+                let mut branches = Vec::with_capacity(elifs.len() + 1);
+                branches.push((*cond, *then));
+                branches.extend(elifs);
+                self.push(
+                    interp,
+                    ShellFrame::IfNext {
+                        branches,
+                        next: 0,
+                        els: els.map(|node| *node),
+                    },
+                );
+            }
+            Node::While { cond, body, until } => {
+                self.status = 0;
+                self.push(
+                    interp,
+                    ShellFrame::WhileCheck {
+                        cond: *cond,
+                        body: *body,
+                        until,
+                        iterations: 0,
+                        body_status: 0,
+                    },
+                );
+            }
+            Node::For { var, words, body } => {
+                let items = expand_words(interp, &words);
+                self.status = 0;
+                self.push(
+                    interp,
+                    ShellFrame::ForNext {
+                        var,
+                        items,
+                        body: *body,
+                        next: 0,
+                        body_status: 0,
+                    },
+                );
+            }
+            Node::CFor {
+                init,
+                cond,
+                update,
+                body,
+            } => {
+                let _ = crate::expand::eval_arith(interp, &init);
+                self.status = 0;
+                self.push(
+                    interp,
+                    ShellFrame::CForCheck {
+                        cond,
+                        update,
+                        body: *body,
+                        iterations: 0,
+                        body_status: 0,
+                    },
+                );
+            }
+            Node::Case { word, arms } => {
+                let subject = expand_word(interp, &word, false).join(" ");
+                self.status = 0;
+                'arms: for (patterns, body) in arms {
+                    for pattern in patterns {
+                        let pattern = expand_word(interp, &pattern, false).join(" ");
+                        if case_match(&pattern, &subject) {
+                            self.push(interp, ShellFrame::Eval(body));
+                            break 'arms;
+                        }
+                    }
+                }
+            }
+            Node::FuncDef { name, body } => {
+                interp.funcs.insert(name, *body);
+                self.status = 0;
+            }
+            Node::Arithmetic(expression) => {
+                self.status = i32::from(crate::expand::eval_arith(interp, &expression) == 0);
+            }
+        }
+    }
+
+    fn eval_command(
+        &mut self,
+        interp: &mut Interp,
+        assigns: Vec<(String, String)>,
+        words: Vec<String>,
+        redirects: Vec<Redirect>,
+    ) {
+        if !redirects.is_empty() {
+            match begin_redirects(interp, &redirects) {
+                Ok(scope) => {
+                    if self.push(interp, ShellFrame::RestoreRedirect(scope)) {
+                        self.push(
+                            interp,
+                            ShellFrame::Eval(Node::Command {
+                                assigns,
+                                words,
+                                redirects: Vec::new(),
+                            }),
+                        );
+                    }
+                }
+                Err(error) => {
+                    write_diagnostic(interp, &format!("shellsim: redirection: {error}\n"));
+                    self.status = 1;
+                }
+            }
+            return;
+        }
+
+        let argv = expand_argv(interp, &words);
+        if argv.is_empty() {
+            for (key, value) in &assigns {
+                apply_assignment(interp, key, value);
+            }
+            self.status = 0;
+            return;
+        }
+        let variables = install_command_variables(interp, &assigns);
+        interp.cmd_trace.push(argv[0].clone());
+        if let Some(body) = interp.funcs.get(&argv[0]).cloned() {
+            let positional = std::mem::replace(&mut interp.positional, argv[1..].to_vec());
+            if !self.ensure_capacity(interp, 2) {
+                interp.positional = positional;
+                restore_command_variables(interp, variables);
+                return;
+            }
+            self.frames.push(ShellFrame::FinishFunction {
+                positional,
+                variables,
+            });
+            self.frames.push(ShellFrame::Eval(body));
+        } else {
+            self.status = run_external_command(interp, &argv);
+            restore_command_variables(interp, variables);
+        }
+    }
+}
+
+fn should_unwind(interp: &Interp) -> bool {
+    interp.resources.is_stopped()
+        || interp.exiting.is_some()
         || interp.returning.is_some()
         || interp.loop_break > 0
         || interp.loop_continue > 0
         || interp.deadline_interrupt.is_some()
-    {
-        return if interp.deadline_interrupt.is_some() {
-            124
-        } else {
-            interp.last_status
-        };
-    }
-    let status = match node {
-        Node::Empty => 0,
-        Node::Command { .. } => exec_command(interp, node),
-        Node::Pipeline(stages) => exec_pipeline(interp, stages),
-        Node::And(a, b) => {
-            let sa = exec_cond(interp, a);
-            if sa == 0 && interp.exiting.is_none() {
-                exec_node(interp, b)
-            } else {
-                sa
-            }
-        }
-        Node::Or(a, b) => {
-            let sa = exec_cond(interp, a);
-            if sa != 0 && interp.exiting.is_none() {
-                exec_node(interp, b)
-            } else {
-                sa
-            }
-        }
-        Node::Not(a) => {
-            let sa = exec_cond(interp, a);
-            if sa == 0 {
-                1
-            } else {
-                0
-            }
-        }
-        Node::Seq(nodes) => {
-            let mut s = 0;
-            for n in nodes {
-                if interp.resources.is_stopped() {
-                    break;
-                }
-                s = exec_node(interp, n);
-                if interp.exiting.is_some() || interp.returning.is_some() {
-                    break;
-                }
-                if interp.deadline_interrupt.is_some() {
-                    s = 124;
-                    break;
-                }
-                if interp.loop_break > 0 || interp.loop_continue > 0 {
-                    break;
-                }
-                if s != 0 && interp.opt_errexit && interp.cond_depth == 0 {
-                    interp.exiting = Some(s);
-                    break;
-                }
-            }
-            s
-        }
-        Node::Background(a) => {
-            let cmd = describe(a);
-            let Some((s, pid)) = exec_child(
-                interp,
-                a,
-                ChildExecution {
-                    command: &cmd,
-                    new_shell: false,
-                    retain: true,
-                },
-            ) else {
-                write_diagnostic(interp, "shellsim: unable to create background process\n");
-                return 125;
-            };
-            let Some(id) = interp.new_job(pid, cmd) else {
-                interp.processes.reap(pid);
-                let _ = interp.scheduler.reap(pid);
-                write_diagnostic(interp, "shellsim: job table limit exceeded\n");
-                return 125;
-            };
-            if let Some(job) = interp.jobs.iter_mut().find(|job| job.id == id) {
-                job.done = true;
-                job.status = s;
-            }
-            interp.set_var("!", pid.to_string());
-            0
-        }
-        Node::Subshell(a) => exec_child(
-            interp,
-            a,
-            ChildExecution {
-                command: "(subshell)",
-                new_shell: false,
-                retain: false,
-            },
-        )
-        .map_or(125, |(status, _)| status),
-        Node::Group(a) => exec_node(interp, a),
-        Node::Redirected(inner, redirs) => {
-            with_redirects(interp, redirs, |interp| exec_node(interp, inner))
-        }
-        Node::If {
-            cond,
-            then,
-            elifs,
-            els,
-        } => {
-            if exec_cond(interp, cond) == 0 {
-                exec_node(interp, then)
-            } else {
-                for (c, b) in elifs {
-                    if exec_cond(interp, c) == 0 {
-                        return exec_node(interp, b);
-                    }
-                }
-                if let Some(e) = els {
-                    exec_node(interp, e)
-                } else {
-                    0
-                }
-            }
-        }
-        Node::While { cond, body, until } => {
-            let mut s = 0;
-            let mut guard = 0;
-            loop {
-                if interp.resources.is_stopped() {
-                    break;
-                }
-                guard += 1;
-                // bound runaway poll loops (e.g. `until curl ...; do sleep; done` against a
-                // service we don't simulate). Real task loops never need this many iterations.
-                if guard > 5_000 {
-                    break;
-                }
-                let c = exec_cond(interp, cond);
-                let go = if *until { c != 0 } else { c == 0 };
-                if !go || interp.exiting.is_some() {
-                    break;
-                }
-                s = exec_node(interp, body);
-                if interp.loop_break > 0 {
-                    interp.loop_break -= 1;
-                    break;
-                }
-                if interp.loop_continue > 0 {
-                    interp.loop_continue -= 1;
-                    continue;
-                }
-                if interp.exiting.is_some() || interp.returning.is_some() {
-                    break;
-                }
-            }
-            s
-        }
-        Node::For { var, words, body } => {
-            let items = expand_words(interp, words);
-            let mut s = 0;
-            for item in items {
-                if interp.resources.is_stopped() {
-                    break;
-                }
-                interp.set_var(var, item);
-                s = exec_node(interp, body);
-                if interp.loop_break > 0 {
-                    interp.loop_break -= 1;
-                    break;
-                }
-                if interp.loop_continue > 0 {
-                    interp.loop_continue -= 1;
-                    continue;
-                }
-                if interp.exiting.is_some() || interp.returning.is_some() {
-                    break;
-                }
-            }
-            s
-        }
-        Node::CFor {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            let _ = crate::expand::eval_arith(interp, init);
-            let mut status = 0;
-            let mut guard = 0usize;
-            while cond.is_empty() || crate::expand::eval_arith(interp, cond) != 0 {
-                if interp.resources.is_stopped() || guard >= 5_000 {
-                    break;
-                }
-                guard += 1;
-                status = exec_node(interp, body);
-                if interp.loop_break > 0 {
-                    interp.loop_break -= 1;
-                    break;
-                }
-                if interp.loop_continue > 0 {
-                    interp.loop_continue -= 1;
-                }
-                if interp.exiting.is_some() || interp.returning.is_some() {
-                    break;
-                }
-                let _ = crate::expand::eval_arith(interp, update);
-            }
-            status
-        }
-        Node::Case { word, arms } => {
-            let subject = expand_word(interp, word, false).join(" ");
-            for (pats, body) in arms {
-                for pat in pats {
-                    let p = expand_word(interp, pat, false).join(" ");
-                    if case_match(&p, &subject) {
-                        return exec_node(interp, body);
-                    }
-                }
-            }
-            0
-        }
-        Node::FuncDef { name, body } => {
-            interp.funcs.insert(name.clone(), (**body).clone());
-            0
-        }
-        Node::Arithmetic(expression) => {
-            if crate::expand::eval_arith(interp, expression) == 0 {
-                1
-            } else {
-                0
-            }
-        }
-    };
-    interp.last_status = status;
-    status
 }
 
-/// Execute as a condition: errexit is suppressed inside.
-fn exec_cond(interp: &mut Interp, node: &Node) -> i32 {
-    interp.cond_depth += 1;
-    let s = exec_node(interp, node);
-    interp.cond_depth -= 1;
-    s
+fn exec_node(interp: &mut Interp, node: &Node) -> i32 {
+    if interp.process.shell_continuation.is_some() {
+        write_diagnostic(
+            interp,
+            "shellsim: attempted to replace an active shell continuation\n",
+        );
+        return 125;
+    }
+    interp.process.shell_continuation = Some(ShellContinuation::new(node));
+    loop {
+        let mut continuation = interp
+            .process
+            .shell_continuation
+            .take()
+            .expect("active process continuation was installed above");
+        match continuation.poll(interp, SHELL_POLL_QUANTUM) {
+            ShellPoll::Pending => {
+                interp.process.shell_continuation = Some(continuation);
+            }
+            ShellPoll::Ready(status) => return status,
+        }
+    }
+}
+
+fn exec_background(interp: &mut Interp, node: &Node) -> i32 {
+    let command = describe(node);
+    let Some((status, pid)) = exec_child(
+        interp,
+        node,
+        ChildExecution {
+            command: &command,
+            new_shell: false,
+            retain: true,
+        },
+    ) else {
+        write_diagnostic(interp, "shellsim: unable to create background process\n");
+        return 125;
+    };
+    let Some(id) = interp.new_job(pid, command) else {
+        interp.processes.reap(pid);
+        let _ = interp.scheduler.reap(pid);
+        write_diagnostic(interp, "shellsim: job table limit exceeded\n");
+        return 125;
+    };
+    if let Some(job) = interp.jobs.iter_mut().find(|job| job.id == id) {
+        job.done = true;
+        job.status = status;
+    }
+    interp.set_var("!", pid.to_string());
+    0
 }
 
 fn describe(node: &Node) -> String {
@@ -338,40 +813,37 @@ fn describe(node: &Node) -> String {
     }
 }
 
-fn with_redirects(
-    interp: &mut Interp,
-    redirects: &[Redirect],
-    run: impl FnOnce(&mut Interp) -> i32,
-) -> i32 {
+struct RedirectScope {
+    saved: crate::descriptors::FdTable,
+    memory_mark: u64,
+}
+
+fn begin_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<RedirectScope, String> {
     let memory_mark = interp.resources.memory_mark();
     let snapshot_bytes = interp.vfs.disk_used().saturating_add(4 * 1024);
     if !interp.resources.reserve_memory(snapshot_bytes) {
-        write_diagnostic(
-            interp,
-            "shellsim: redirection: memory limit exceeded while preparing redirections\n",
-        );
-        return 1;
+        return Err("memory limit exceeded while preparing redirections".to_string());
     }
     let vfs_before = interp.vfs.clone();
     let saved = match interp.process.fds.fork(&mut interp.descriptors) {
         Ok(saved) => saved,
         Err(error) => {
-            write_diagnostic(interp, &format!("shellsim: redirection: {error:?}\n"));
             interp.resources.restore_memory(memory_mark);
-            return 1;
+            return Err(format!("{error:?}"));
         }
     };
     if let Err(error) = apply_redirects(interp, redirects) {
         restore_fds(interp, saved);
         interp.vfs = vfs_before;
         interp.resources.restore_memory(memory_mark);
-        write_diagnostic(interp, &format!("shellsim: redirection: {error}\n"));
-        return 1;
+        return Err(error);
     }
-    let status = run(interp);
-    restore_fds(interp, saved);
-    interp.resources.restore_memory(memory_mark);
-    status
+    Ok(RedirectScope { saved, memory_mark })
+}
+
+fn end_redirects(interp: &mut Interp, scope: RedirectScope) {
+    restore_fds(interp, scope.saved);
+    interp.resources.restore_memory(scope.memory_mark);
 }
 
 /// Apply redirections from left to right. `dup` retains the open description selected at that
@@ -550,43 +1022,14 @@ fn write_diagnostic(interp: &mut Interp, message: &str) {
     let _ = write_all_fd(interp, 2, message.as_bytes());
 }
 
-fn exec_command(interp: &mut Interp, node: &Node) -> i32 {
-    let (assigns, words, redirects) = match node {
-        Node::Command {
-            assigns,
-            words,
-            redirects,
-        } => (assigns, words, redirects),
-        _ => unreachable!(),
-    };
-    if !redirects.is_empty() {
-        return with_redirects(interp, redirects, |interp| {
-            exec_command_parts(interp, assigns, words)
-        });
-    }
-    exec_command_parts(interp, assigns, words)
-}
-
-fn exec_command_parts(interp: &mut Interp, assigns: &[(String, String)], words: &[String]) -> i32 {
-    // No command words → assignments are persistent (including array assignments).
-    // Words that look like array-assignment literals (`name=( … )`, `name[i]=v`) are kept
-    // verbatim — they must not be word-split/globbed — so `declare`/`local` can parse them.
-    let argv = expand_argv(interp, words);
-    if argv.is_empty() {
-        for (k, v) in assigns {
-            apply_assignment(interp, k, v);
-        }
-        return 0;
-    }
-
-    // With command words, the leading assignments are temporary (scalar only here; array
-    // command-prefixes don't occur in our corpus). Expand scalar values for set/restore.
+fn install_command_variables(
+    interp: &mut Interp,
+    assigns: &[(String, String)],
+) -> Vec<(String, Option<String>)> {
     let expanded_assigns: Vec<(String, String)> = assigns
         .iter()
         .map(|(k, v)| (k.clone(), expand_word(interp, v, false).join(" ")))
         .collect();
-
-    // Temporary assignments apply only for the duration of this command (we set then restore).
     let saved: Vec<(String, Option<String>)> = expanded_assigns
         .iter()
         .map(|(k, _)| (k.clone(), interp.vars.get(k).cloned()))
@@ -595,45 +1038,37 @@ fn exec_command_parts(interp: &mut Interp, assigns: &[(String, String)], words: 
         interp.set_var(k, v.clone());
         interp.export(k); // exported to child for the command
     }
+    saved
+}
 
-    let mut local_out = Vec::new();
-    let mut local_err = Vec::new();
-
-    interp.cmd_trace.push(argv[0].clone());
-
-    let mut status = if let Some(body) = interp.funcs.get(&argv[0]).cloned() {
-        // function call: set positional params
-        let saved_pos = std::mem::replace(&mut interp.positional, argv[1..].to_vec());
-        let s = exec_node(interp, &body);
-        interp.positional = saved_pos;
-        interp.returning.take().unwrap_or(s)
-    } else {
-        let cmd_stdin = if argv[0] == "read" {
-            Vec::new()
-        } else {
-            match read_all_fd(interp, 0) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    local_err
-                        .extend_from_slice(format!("shellsim: {}: {error}\n", argv[0]).as_bytes());
-                    Vec::new()
-                }
-            }
-        };
-        crate::commands::run(interp, &argv, cmd_stdin, &mut local_out, &mut local_err)
-    };
-
-    // restore temporary assignments
-    for (k, v) in saved {
-        match v {
-            Some(val) => {
-                interp.vars.insert(k, val);
+fn restore_command_variables(interp: &mut Interp, saved: Vec<(String, Option<String>)>) {
+    for (key, value) in saved {
+        match value {
+            Some(value) => {
+                interp.vars.insert(key, value);
             }
             None => {
-                interp.vars.remove(&k);
+                interp.vars.remove(&key);
             }
         }
     }
+}
+
+fn run_external_command(interp: &mut Interp, argv: &[String]) -> i32 {
+    let mut local_out = Vec::new();
+    let mut local_err = Vec::new();
+    let cmd_stdin = if argv[0] == "read" {
+        Vec::new()
+    } else {
+        match read_all_fd(interp, 0) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                local_err.extend_from_slice(format!("shellsim: {}: {error}\n", argv[0]).as_bytes());
+                Vec::new()
+            }
+        }
+    };
+    let mut status = crate::commands::run(interp, argv, cmd_stdin, &mut local_out, &mut local_err);
 
     let mut output_failed = false;
     if let Err(error) = write_all_fd(interp, 1, &local_out) {
@@ -1070,7 +1505,9 @@ fn glob_to_regex_body(pat: &str) -> String {
 
 #[cfg(test)]
 mod array_tests {
+    use super::{ShellContinuation, ShellPoll};
     use crate::interp::Interp;
+    use crate::shell::Node;
 
     /// Run a snippet and capture stdout as a String.
     fn run(src: &str) -> String {
@@ -1104,6 +1541,24 @@ mod array_tests {
             run(r#"a=(1 2 3); a[5]=six; echo "${!a[@]}"; echo "${a[@]}""#),
             "0 1 2 5\n1 2 3 six\n"
         );
+    }
+
+    #[test]
+    fn shell_continuations_stop_at_the_requested_poll_quantum() {
+        let mut interp = Interp::new();
+        let node = Node::Seq(vec![Node::Empty; 1_000]);
+        let mut continuation = ShellContinuation::new(&node);
+        assert_eq!(continuation.poll(&mut interp, 1), ShellPoll::Pending);
+
+        let mut polls = 1;
+        loop {
+            polls += 1;
+            if let ShellPoll::Ready(status) = continuation.poll(&mut interp, 17) {
+                assert_eq!(status, 0);
+                break;
+            }
+        }
+        assert!(polls > 1);
     }
 
     #[test]

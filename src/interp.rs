@@ -115,6 +115,10 @@ pub struct ProcessState {
     pub python_repl: Option<crate::python::ReplState>,
     /// Unix-style descriptor map inherited by logical children.
     pub(crate) fds: FdTable,
+    /// Resumable shell execution frames retained across scheduler activations.
+    pub(crate) shell_continuation: Option<crate::exec::ShellContinuation>,
+    /// Memory reserved for this forked context and released independently at exit.
+    fork_allocation_bytes: u64,
 }
 
 /// Machine-owned process contexts.
@@ -187,11 +191,16 @@ const MAX_FORK_STATE_BYTES: u64 = 32 * 1024 * 1024;
 /// Parent state retained while one logical child runs synchronously.
 pub(crate) struct ParentProcess {
     pid: ProcessId,
-    memory_mark: u64,
 }
 
 impl ProcessState {
-    fn fork_for_child(&self, pid: ProcessId, new_shell: bool, fds: FdTable) -> Self {
+    fn fork_for_child(
+        &self,
+        pid: ProcessId,
+        new_shell: bool,
+        fds: FdTable,
+        fork_allocation_bytes: u64,
+    ) -> Self {
         Self {
             pid,
             ppid: self.pid,
@@ -220,6 +229,8 @@ impl ProcessState {
             input_pos: self.input_pos,
             python_repl: None,
             fds,
+            shell_continuation: None,
+            fork_allocation_bytes,
         }
     }
 
@@ -373,6 +384,8 @@ impl Environment {
                 input_pos: 0,
                 python_repl: None,
                 fds,
+                shell_continuation: None,
+                fork_allocation_bytes: 0,
             }),
             next_temp_id: 0,
             cmd_trace: Vec::new(),
@@ -396,18 +409,15 @@ impl Environment {
         if fork_bytes > MAX_FORK_STATE_BYTES {
             return Err("shell state exceeds the 32 MiB fork limit".to_string());
         }
-        let memory_mark = self.resources.memory_mark();
-        if !self
-            .resources
-            .reserve_memory(fork_bytes.saturating_add(256))
-        {
+        let allocation_bytes = fork_bytes.saturating_add(256);
+        if !self.resources.reserve_memory(allocation_bytes) {
             return Err("memory limit exceeded while creating child process".to_string());
         }
         let environment: BTreeMap<String, String> = self.child_env().into_iter().collect();
         let mut child_fds = match self.process.fds.fork(&mut self.descriptors) {
             Ok(fds) => fds,
             Err(error) => {
-                self.resources.restore_memory(memory_mark);
+                self.resources.release_memory(allocation_bytes);
                 return Err(format!("unable to inherit descriptors: {error:?}"));
             }
         };
@@ -418,14 +428,14 @@ impl Environment {
                 .spawn(self.process.pid, command, &self.process.cwd, environment)
         else {
             child_fds.close_all(&mut self.descriptors);
-            self.resources.restore_memory(memory_mark);
+            self.resources.release_memory(allocation_bytes);
             return Err("logical process limit exceeded".to_string());
         };
         if let Err(error) = self.scheduler.block_current(WaitReason::Child(pid)) {
             child_fds.close_all(&mut self.descriptors);
             self.processes.exit(pid, 125, &self.process.cwd);
             self.processes.reap(pid);
-            self.resources.restore_memory(memory_mark);
+            self.resources.release_memory(allocation_bytes);
             return Err(format!("unable to suspend parent process: {error:?}"));
         }
         if let Err(error) = self.scheduler.spawn(pid) {
@@ -434,7 +444,7 @@ impl Environment {
             let _ = self.scheduler.dispatch();
             self.processes.exit(pid, 125, &self.process.cwd);
             self.processes.reap(pid);
-            self.resources.restore_memory(memory_mark);
+            self.resources.release_memory(allocation_bytes);
             return Err(format!("unable to schedule child process: {error:?}"));
         }
         match self.scheduler.dispatch() {
@@ -442,22 +452,18 @@ impl Environment {
             result => {
                 child_fds.close_all(&mut self.descriptors);
                 self.processes.exit(pid, 125, &self.process.cwd);
-                self.resources.restore_memory(memory_mark);
+                self.resources.release_memory(allocation_bytes);
                 return Err(format!("unexpected child dispatch result: {result:?}"));
             }
         }
         let parent_pid = self.process.pid;
-        let child = self.process.fork_for_child(pid, new_shell, child_fds);
+        let child = self
+            .process
+            .fork_for_child(pid, new_shell, child_fds, allocation_bytes);
         self.process.insert(child)?;
         self.process.activate(pid)?;
         self.refresh_descriptor_snapshot(pid);
-        Ok((
-            pid,
-            ParentProcess {
-                pid: parent_pid,
-                memory_mark,
-            },
-        ))
+        Ok((pid, ParentProcess { pid: parent_pid }))
     }
 
     /// Restore the parent after a synchronous child and optionally retain the exited record.
@@ -469,6 +475,7 @@ impl Environment {
         retain: bool,
     ) {
         let child_deadline_interrupt = self.process.deadline_interrupt;
+        let fork_allocation_bytes = self.process.fork_allocation_bytes;
         self.process.fds.close_all(&mut self.descriptors);
         self.processes.update_descriptors(pid, BTreeMap::new());
         self.processes.exit(pid, status, &self.process.cwd);
@@ -487,7 +494,7 @@ impl Environment {
         if child_deadline_interrupt.is_some() {
             self.process.deadline_interrupt = child_deadline_interrupt;
         }
-        self.resources.restore_memory(parent.memory_mark);
+        self.resources.release_memory(fork_allocation_bytes);
     }
 
     /// Synchronize the active descriptor table into generated process metadata.
