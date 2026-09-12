@@ -40,7 +40,7 @@ capabilities.
 | Shell grammar | Broad partial subset | Redirection, descriptor, and option behavior still has correctness gaps |
 | Commands | Broad surface | Several partial operations or successful no-ops are misleading |
 | Python | Substantial bounded interpreter | Arbitrary projects and third-party ecosystems remain out of scope |
-| Processes and jobs | Cooperative logical processes | Background jobs, waits, sleeps, and bounded pipelines overlap; signals are not modeled |
+| Processes and jobs | Cooperative logical processes | Background jobs, waits, sleeps, bounded pipelines, and default signal dispositions are modeled; process groups and handlers remain |
 | Build ecosystem | Useful first slice | Git and Make are deliberately small; native compilation remains out of scope |
 | Harness integration | Early foundation | No persistent machine protocol, workspace export, or trajectory runner |
 | Observability | Good | Compatibility reporting is command-level rather than invocation-level |
@@ -165,7 +165,8 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
 4. Synthetic `/proc` and `/dev`, then bounded Python subprocess operations.
 5. Common agent conveniences. Bounded recursive `rg` and atomic patch application are present;
    archives and richer text tools remain.
-6. Cooperative background scheduling and bounded pipes are present; a small signal model remains.
+6. Cooperative background scheduling, bounded pipes, and default signal delivery are present;
+   process groups, handlers, and live Python process handles remain.
 7. Persistent workspace protocol, evaluation scenarios, and external-agent experiments.
 
 Every phase retains the existing security rule: simulated input can use only explicitly modeled

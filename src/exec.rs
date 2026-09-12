@@ -1147,6 +1147,21 @@ fn exec_node(interp: &mut Interp, node: &Node) -> i32 {
             .expect("scheduled task must own process state");
     }
     loop {
+        let owner_pid = interp.process.pid;
+        if let Some(signal) = interp.take_terminating_signal() {
+            let status = 128 + signal.number();
+            if owner_pid == target_pid {
+                interp.process.shell_continuation = None;
+                interp.exiting = Some(status);
+                return status;
+            }
+            interp.finish_child(owner_pid, status);
+            if interp.scheduler.current().is_none() {
+                dispatch_or_advance(interp)
+                    .expect("signaled child must leave a runnable parent or modeled event");
+            }
+            continue;
+        }
         wake_due_events(interp).expect("current virtual instant must remain valid");
         let owner_pid = interp.process.pid;
         let mut continuation = interp

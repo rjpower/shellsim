@@ -1,7 +1,7 @@
 //! Deterministic logical process identities and lifecycle state.
 //!
 //! Shellsim never creates host processes. This table gives simulated children stable PIDs and
-//! parentage while execution remains synchronous. Running entries support process inspection;
+//! parentage across cooperative scheduler activations. Running entries support process inspection;
 //! exited background entries remain until `wait` reaps them. Fixed record and command-size bounds
 //! prevent simulated input from growing unbounded host state.
 
@@ -13,6 +13,61 @@ pub type ProcessId = u32;
 /// Maximum number of simultaneously retained logical process records.
 pub const MAX_PROCESSES: usize = 1_024;
 const MAX_COMMAND_BYTES: usize = 4 * 1024;
+
+/// Standard signals modeled by shellsim's default-disposition process layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Signal {
+    Hangup,
+    Interrupt,
+    Kill,
+    Pipe,
+    Terminate,
+    Child,
+}
+
+impl Signal {
+    /// Conventional Unix signal number used in shell exit statuses.
+    pub const fn number(self) -> i32 {
+        match self {
+            Self::Hangup => 1,
+            Self::Interrupt => 2,
+            Self::Kill => 9,
+            Self::Pipe => 13,
+            Self::Terminate => 15,
+            Self::Child => 17,
+        }
+    }
+
+    /// Whether the currently modeled default disposition terminates the target.
+    pub const fn terminates(self) -> bool {
+        !matches!(self, Self::Child)
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Hangup => "HUP",
+            Self::Interrupt => "INT",
+            Self::Kill => "KILL",
+            Self::Pipe => "PIPE",
+            Self::Terminate => "TERM",
+            Self::Child => "CHLD",
+        }
+    }
+
+    /// Parse a signal name with an optional `SIG` prefix, or a supported decimal number.
+    pub fn parse(value: &str) -> Option<Self> {
+        let upper = value.to_ascii_uppercase();
+        match upper.strip_prefix("SIG").unwrap_or(&upper) {
+            "1" | "HUP" => Some(Self::Hangup),
+            "2" | "INT" => Some(Self::Interrupt),
+            "9" | "KILL" => Some(Self::Kill),
+            "13" | "PIPE" => Some(Self::Pipe),
+            "15" | "TERM" => Some(Self::Terminate),
+            "17" | "CHLD" => Some(Self::Child),
+            _ => None,
+        }
+    }
+}
 
 /// Observable lifecycle state for a logical process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

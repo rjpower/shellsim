@@ -44,12 +44,8 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
         Trust::NoOp,
         cmd_unsupported,
     );
-    reg(
-        m,
-        &["kill", "killall", "pkill"],
-        Trust::NoOp,
-        cmd_unsupported,
-    );
+    reg(m, &["kill"], Trust::Real, cmd_kill);
+    reg(m, &["killall", "pkill"], Trust::NoOp, cmd_unsupported);
     reg(m, &["type", "which"], Trust::Real, cmd_which);
     reg(m, &["command"], Trust::Real, cmd_command);
     reg(m, &["alias", "unalias"], Trust::NoOp, cmd_unsupported);
@@ -81,6 +77,115 @@ fn cmd_jobs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             wln(io.out, &format!("[{}] {state} {}", job.id, job.cmd));
         }
     }
+    0
+}
+
+fn cmd_kill(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.first().is_some_and(|argument| argument == "-l") {
+        return list_signal(args.get(1), io);
+    }
+    let mut signal = Some(crate::process::Signal::Terminate);
+    let mut targets = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--" => {
+                targets.extend_from_slice(&args[index + 1..]);
+                break;
+            }
+            "-s" | "--signal" => {
+                index += 1;
+                let Some(name) = args.get(index) else {
+                    ewln(io.err, "kill: -s requires a signal");
+                    return 2;
+                };
+                signal = match parse_signal(name) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        ewln(io.err, &format!("kill: {error}"));
+                        return 2;
+                    }
+                };
+            }
+            option if option.starts_with('-') && option.len() > 1 && targets.is_empty() => {
+                signal = match parse_signal(&option[1..]) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        ewln(io.err, &format!("kill: {error}"));
+                        return 2;
+                    }
+                };
+            }
+            target => targets.push(target.to_string()),
+        }
+        index += 1;
+    }
+    if targets.is_empty() {
+        ewln(io.err, "kill: usage: kill [-s SIGNAL] PID|%JOB ...");
+        return 2;
+    }
+    let mut status = 0;
+    for target in targets {
+        let Some(pid) = resolve_kill_target(interp, &target) else {
+            ewln(io.err, &format!("kill: {target}: no such process or job"));
+            status = 1;
+            continue;
+        };
+        if let Some(signal) = signal {
+            if let Err(error) = interp.send_signal(pid, signal) {
+                ewln(io.err, &format!("kill: {target}: {error}"));
+                status = 1;
+            }
+        } else if !matches!(
+            interp.processes.get(pid).map(|record| record.status),
+            Some(crate::process::ProcessStatus::Running)
+        ) {
+            ewln(io.err, &format!("kill: {target}: no such process"));
+            status = 1;
+        }
+    }
+    status
+}
+
+fn parse_signal(value: &str) -> Result<Option<crate::process::Signal>, String> {
+    if value == "0" {
+        Ok(None)
+    } else {
+        crate::process::Signal::parse(value)
+            .map(Some)
+            .ok_or_else(|| format!("invalid signal: {value}"))
+    }
+}
+
+fn resolve_kill_target(interp: &CommandContext<'_>, target: &str) -> Option<u32> {
+    if let Some(job) = target.strip_prefix('%') {
+        let id = job.parse::<u32>().ok()?;
+        interp
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .map(|job| job.pid)
+    } else {
+        let pid = target.parse::<u32>().ok()?;
+        (pid != 0).then_some(pid)
+    }
+}
+
+fn list_signal(argument: Option<&String>, io: &mut Io) -> i32 {
+    let Some(argument) = argument else {
+        wln(io.out, "HUP INT KILL PIPE TERM CHLD");
+        return 0;
+    };
+    let normalized = argument
+        .parse::<i32>()
+        .ok()
+        .map(|number| if number > 128 { number - 128 } else { number })
+        .map_or_else(|| argument.clone(), |number| number.to_string());
+    let Some(signal) = crate::process::Signal::parse(&normalized) else {
+        ewln(io.err, &format!("kill: unknown signal {argument}"));
+        return 1;
+    };
+    wln(io.out, signal.name());
     0
 }
 

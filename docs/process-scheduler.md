@@ -147,9 +147,12 @@ Required compatibility cases include overlapping sleeps, file races with determi
 
 ## Phase 5: minimal signals and Python `Popen`
 
-Add pending `KILL`, `TERM`, `INT`, `HUP`, `CHLD`, and `PIPE` signals delivered at scheduler
-boundaries. Initially only default dispositions are required; unsupported handlers remain explicit.
-Add process groups only where foreground pipelines and group termination require them.
+Pending `KILL`, `TERM`, `INT`, `HUP`, `CHLD`, and `PIPE` signals now live on process state and are
+delivered at scheduler boundaries. Terminating signals wake blocked tasks, use conventional
+`128 + signal` statuses, and cancel abandoned timer events; `CHLD` is coalesced with its default
+ignored disposition. The shell `kill` builtin supports PID/job targets, supported signal names and
+numbers, existence probes, and signal listing. Custom handlers and process groups remain explicit
+future work.
 
 Build `Popen` over live process handles and descriptor-backed streams. Implement `poll`, `wait`,
 `communicate`, context management, timeout termination, capture, and reaping. `communicate` must

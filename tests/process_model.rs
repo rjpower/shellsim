@@ -150,3 +150,23 @@ fn process_fork_is_rejected_before_copying_unbounded_shell_state() {
     assert_eq!(outcome.stop_reason, Some(StopReason::MemoryExhausted));
     assert!(env.processes.get(1_235).is_none());
 }
+
+#[test]
+fn kill_queues_signals_for_jobs_and_supports_existence_probes() {
+    let mut env = Environment::new();
+    let result = run(
+        &mut env,
+        "sleep 10 & pid=$!; kill -0 $pid; kill -INT %1; wait $pid; echo status:$?; kill -l 130",
+    );
+    assert_eq!(result, (0, "status:130\nINT\n".into(), String::new()));
+    assert!(env.processes.get(1_235).is_none());
+}
+
+#[test]
+fn a_signal_to_the_persistent_shell_terminates_the_session() {
+    let mut env = Environment::new();
+    let result = run(&mut env, "kill -HUP $$; echo unreachable");
+    assert_eq!(result, (129, String::new(), String::new()));
+    assert!(env.is_terminated());
+    assert_eq!(env.termination_status(), Some(129));
+}

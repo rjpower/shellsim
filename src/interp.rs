@@ -8,7 +8,7 @@ use crate::descriptors::{
     DescriptionId, DescriptorArena, DescriptorError, Fd, FdTable, IoPoll, IoWait, MAX_CAPTURE_BYTES,
 };
 use crate::net::VirtualNet;
-use crate::process::{ProcessId, ProcessTable};
+use crate::process::{ProcessId, ProcessTable, Signal};
 use crate::resources::{Limits, Resources, RunOutcome};
 use crate::scheduler::{Scheduler, WaitReason};
 use crate::vfs::Vfs;
@@ -118,6 +118,8 @@ pub struct ProcessState {
     pub(crate) fds: FdTable,
     /// Resumable shell execution frames retained across scheduler activations.
     pub(crate) shell_continuation: Option<crate::exec::ShellContinuation>,
+    /// Coalesced standard signals awaiting delivery at a scheduler boundary.
+    pending_signals: std::collections::BTreeSet<Signal>,
     /// Memory reserved for this forked context and released independently at exit.
     fork_allocation_bytes: u64,
     detached_output: bool,
@@ -254,6 +256,7 @@ impl ProcessState {
             python_repl: None,
             fds,
             shell_continuation: None,
+            pending_signals: std::collections::BTreeSet::new(),
             fork_allocation_bytes,
             detached_output,
         }
@@ -410,6 +413,7 @@ impl Environment {
                 python_repl: None,
                 fds,
                 shell_continuation: None,
+                pending_signals: std::collections::BTreeSet::new(),
                 fork_allocation_bytes: 0,
                 detached_output: false,
             }),
@@ -582,6 +586,7 @@ impl Environment {
         }
         self.processes.update_descriptors(pid, BTreeMap::new());
         self.processes.exit(pid, status, &self.process.cwd);
+        self.clock.cancel_task_events(u64::from(pid));
         let _ = self.scheduler.exit_current(status);
         if self.scheduler.state(parent_pid)
             == Some(crate::scheduler::TaskState::Blocked(WaitReason::Child(pid)))
@@ -599,6 +604,7 @@ impl Environment {
             if child_deadline_interrupt.is_some() {
                 parent.deadline_interrupt = child_deadline_interrupt;
             }
+            parent.pending_signals.insert(Signal::Child);
         }
         if let Some(scheduled) = scheduled {
             self.process
@@ -606,6 +612,48 @@ impl Environment {
                 .expect("scheduled process state must exist");
         }
         self.resources.release_memory(fork_allocation_bytes);
+    }
+
+    /// Queue a supported signal for delivery when the target next reaches a scheduler boundary.
+    pub(crate) fn send_signal(&mut self, pid: ProcessId, signal: Signal) -> Result<(), String> {
+        if !matches!(
+            self.processes.get(pid).map(|record| record.status),
+            Some(crate::process::ProcessStatus::Running)
+        ) {
+            return Err(format!("process {pid} does not exist"));
+        }
+        let target = self
+            .process
+            .states
+            .get_mut(&pid)
+            .ok_or_else(|| format!("process {pid} has no execution context"))?;
+        target.pending_signals.insert(signal);
+        if signal.terminates()
+            && matches!(
+                self.scheduler.state(pid),
+                Some(crate::scheduler::TaskState::Blocked(_))
+            )
+        {
+            self.scheduler
+                .wake(pid)
+                .map_err(|error| format!("unable to wake process {pid}: {error:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// Deliver coalesced default-disposition signals for the active process.
+    pub(crate) fn take_terminating_signal(&mut self) -> Option<Signal> {
+        let signal = self
+            .process
+            .pending_signals
+            .iter()
+            .copied()
+            .find(|signal| signal.terminates());
+        self.process.pending_signals.clear();
+        if signal.is_some() {
+            self.clock.cancel_task_events(u64::from(self.process.pid));
+        }
+        signal
     }
 
     /// Roll back a background child whose process-local setup failed before dispatch.

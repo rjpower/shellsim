@@ -277,6 +277,35 @@ impl Timeline {
         self.pending.remove(&id).is_some()
     }
 
+    /// Cancel future wake/deadline events owned by one logical task.
+    ///
+    /// Process exit uses this to prevent an abandoned sleep from advancing virtual time later.
+    pub fn cancel_task_events(&mut self, task: u64) -> usize {
+        let ids = self
+            .pending
+            .iter()
+            .filter_map(|(id, kind)| match kind {
+                EventKind::WakeTask { task: owner } | EventKind::Deadline { task: owner }
+                    if *owner == task =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.pending.remove(id);
+        }
+        self.ready.retain(|event| {
+            !matches!(
+                event.kind,
+                EventKind::WakeTask { task: owner } | EventKind::Deadline { task: owner }
+                    if owner == task
+            )
+        });
+        ids.len()
+    }
+
     /// Advance to an exact monotonic instant and make every due event ready in stable order.
     pub fn advance_to(&mut self, target_ns: u64) -> Result<Vec<ScheduledEvent>, TimelineError> {
         if target_ns < self.monotonic_ns {
@@ -492,5 +521,25 @@ mod tests {
             timeline.schedule_after(1, EventKind::WakeTask { task: 1 }),
             Err(TimelineError::EventLimit { limit: 1 })
         ));
+    }
+
+    #[test]
+    fn canceling_task_events_removes_pending_and_ready_work() {
+        let mut timeline = Timeline::new();
+        timeline
+            .schedule_after(1, EventKind::WakeTask { task: 7 })
+            .unwrap();
+        timeline
+            .schedule_after(2, EventKind::Deadline { task: 7 })
+            .unwrap();
+        timeline
+            .schedule_after(3, EventKind::WakeTask { task: 8 })
+            .unwrap();
+        timeline.advance_to(1).unwrap();
+
+        assert_eq!(timeline.cancel_task_events(7), 1);
+        assert_eq!(timeline.ready_len(), 0);
+        assert_eq!(timeline.pending_len(), 1);
+        assert_eq!(timeline.next_deadline_ns(), Some(3));
     }
 }

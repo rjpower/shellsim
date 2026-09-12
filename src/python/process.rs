@@ -74,13 +74,16 @@ pub(super) fn run(interp: &mut Interp, request: PyProcessRequest) -> PyResult<Py
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let status = crate::commands::run(
+    let mut status = crate::commands::run(
         interp,
         &request.argv,
         request.stdin,
         &mut stdout,
         &mut stderr,
     );
+    if let Some(signal) = interp.take_terminating_signal() {
+        status = 128 + signal.number();
+    }
     let interrupted = interp.deadline_interrupt;
     let timed_out = deadline.is_some_and(|event| interrupted == Some(event));
     if let Some(deadline) = deadline {

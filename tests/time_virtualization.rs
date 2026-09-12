@@ -54,6 +54,20 @@ fn wait_suspends_until_a_live_background_child_exits() {
 }
 
 #[test]
+fn terminating_a_sleeping_child_cancels_its_future_wake() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "sleep 10 & pid=$!; sleep 1; kill -TERM $pid; wait $pid; echo status:$?; date +%s",
+        ),
+        (0, "status:143\n1735689601\n".into(), String::new())
+    );
+    assert_eq!(environment.clock.monotonic_ns(), NANOS_PER_SECOND);
+    assert_eq!(environment.clock.pending_len(), 0);
+}
+
+#[test]
 fn pipeline_stages_sleep_and_exchange_data_concurrently() {
     let mut environment = Environment::new();
     assert_eq!(
