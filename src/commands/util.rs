@@ -303,6 +303,7 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "cut",
     "tr",
     "grep",
+    "rg",
     "sed",
     "awk",
     "gawk",

@@ -158,8 +158,9 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
 2. Clean Git and Make foundations with useful deterministic subsets.
 3. Logical process records, jobs, wait, descriptors, and dynamic `ps`.
 4. Synthetic `/proc` and `/dev`, then bounded Python subprocess operations.
-5. Common agent conveniences such as recursive search, patching, archives, and richer text tools.
-6. Cooperative background scheduling, bounded pipes, and a small signal model.
+5. Common agent conveniences. Bounded recursive `rg` is present; patching, archives, and richer
+   text tools remain.
+6. Cooperative background scheduling and bounded pipes are present; a small signal model remains.
 7. Persistent workspace protocol, evaluation scenarios, and external-agent experiments.
 
 Every phase retains the existing security rule: simulated input can use only explicitly modeled

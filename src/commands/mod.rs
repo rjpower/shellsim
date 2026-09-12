@@ -29,6 +29,7 @@ mod net;
 pub(crate) mod pkg;
 mod printf;
 mod proc;
+mod rgcmd;
 mod sort;
 mod system;
 mod text;
@@ -186,6 +187,7 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     makecmd::register(&mut m);
     net::register(&mut m);
     proc::register(&mut m);
+    rgcmd::register(&mut m);
     pkg::register(&mut m);
     m
 }

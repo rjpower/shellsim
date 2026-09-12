@@ -21,15 +21,17 @@ Environment
 
 Shell source flows through `src/shell.rs`, expansion in `src/expand.rs`, and the executor in
 `src/exec.rs`. The executor dispatches commands through `src/commands/mod.rs`. Commands receive a
-`CommandContext` plus explicit `Io`; unknown commands may resolve to executable scripts in the VFS
-and otherwise become recorded compatibility gaps. Python uses its own source pipeline described in
-[python.md](python.md) and shares only modeled environment capabilities.
+`CommandContext` plus explicit `Io`; unknown commands resolve through the modeled process `PATH`
+to executable VFS scripts and otherwise become recorded compatibility gaps. The native `rg`
+implementation performs bounded, metered VFS-only recursive search. Python uses its own source
+pipeline described in [python.md](python.md) and shares only modeled environment capabilities.
 
-Subshells, command substitutions, pipeline stages, background jobs, and nested shells run by
-swapping in a forked `ProcessState`. VFS, clocks, virtual network, resources, package markers, and
-telemetry remain machine-wide. The parent state is restored when the synchronous child finishes,
-so local mutations do not leak while filesystem effects remain visible. Exited background process
-records remain until `wait` reaps them.
+Logical processes retain forked `ProcessState` values by PID. Shell continuations, background
+jobs, sleeps, waits, subshells, and pipeline stages suspend and resume through the deterministic
+scheduler. Pipeline bytes flow through bounded descriptor-backed pipes. VFS, clocks, virtual
+network, resources, package markers, and telemetry remain machine-wide, so local process mutation
+does not leak while filesystem effects remain visible. Exited background records remain until
+`wait` reaps them. Command substitution and a few nested native adapters still run synchronously.
 
 Reusing an `Environment` preserves the VFS, cwd, variables, functions, arrays, package markers,
 virtual time/network state, command history, Python REPL, and cumulative resource usage. `exit`,

@@ -163,6 +163,7 @@ After the process and I/O foundations are complete, improve commands in evidence
    shebangs, and distinguish not-found from not-executable failures. This foundation is complete.
 2. Add a bounded `rg` implementation with useful recursive search, glob/type filters, line and
    filename output, fixed strings, regexes, hidden files, binary policy, and familiar exit codes.
+   This baseline is complete; unsupported options fail explicitly.
 3. Expand Git coherently around status, diff, log, show, branch, checkout/switch, add/reset, and
    commits. Repository state stays VFS-only; network remotes remain explicit fixtures or rejected.
 4. Add patch application and bounded tar/zip/gzip operations needed by agent workflows.
