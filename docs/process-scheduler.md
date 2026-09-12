@@ -189,13 +189,17 @@ After the process and I/O foundations are complete, improve commands in evidence
 Each command slice records honest trust, validates options, uses semantic integration tests, and
 adds a differential test when the reference behavior is deterministic.
 
-## Phase 7: external agent harness
+## Phase 7: external agent harness (in progress)
 
-Expose a persistent, host-side protocol that creates an environment from a bounded snapshot,
-executes actions with explicit input, reads and writes VFS files, applies patches, returns a
-canonical workspace diff, and reports resources, commands, unsupported operations, network
-requests, and process state. The Codex or Claude client stays outside the simulation and receives
-only these tools. Episode definitions and transcripts must be replayable.
+The `HarnessSession` library and `shellsim serve` NDJSON frontend now retain an environment across
+explicit actions, base64 VFS file operations, checkpoint/reset, typed canonical workspace diffs,
+and resource, command, unsupported-operation, trust, and process reports. Requests and transfers
+are bounded; the line-oriented exchange is directly replayable. The Codex or Claude client stays
+outside the simulation and receives only these tools.
+
+Generic bounded host-directory ingestion, network-request reporting, scenario manifests,
+transcript persistence, cloning, and concrete model-client adapters remain before this phase is
+complete.
 
 ## Validation milestones
 

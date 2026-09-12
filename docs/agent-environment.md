@@ -169,7 +169,9 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
 6. Cooperative background scheduling, bounded pipes, default signal delivery, and live Python
    process handles are present; process groups, handlers, and scheduler-owned Python VM frames
    remain.
-7. Persistent workspace protocol, evaluation scenarios, and external-agent experiments.
+7. A persistent bounded NDJSON workspace protocol with execution, typed diffs, checkpoint/reset,
+   file tools, and inspection is present. Add scenario manifests, generic snapshot ingestion,
+   transcript persistence, cloning, and external-agent experiments.
 
 Every phase retains the existing security rule: simulated input can use only explicitly modeled
 state and must never fall through to host filesystem, process, network, environment, or clock

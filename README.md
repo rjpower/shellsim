@@ -43,6 +43,12 @@ cargo build --release
   --cpu 100k --memory 8m --disk 2m --output 64k \
   -c 'printf "b\na\n" | sort > result.txt; cat result.txt'
 
+# Persistent NDJSON harness session
+printf '%s\n' \
+  '{"id":1,"op":"execute","source":"printf hello > result"}' \
+  '{"id":2,"op":"workspace_diff"}' \
+  | ./target/release/shellsim serve
+
 # Import a host Python project into a fresh VFS and run it in shellsim
 ./target/release/shellsim-python project/main.py -- arg1
 ./target/release/shellsim-python project/tests --pytest
@@ -51,6 +57,12 @@ cargo build --release
 
 Limit values accept `k`, `m`, and `g` binary suffixes. Arguments after `--` in `eval` mode become
 shell positional parameters.
+
+`serve` retains one environment across requests. It supports shell actions, base64 file reads and
+writes confined to `/work`, stable path-level workspace diffs, checkpoints, VFS reset, listings,
+and process/resource inspection. One JSON response is emitted for each input line, which makes the
+request/response stream directly replayable. See [docs/implementation.md](docs/implementation.md)
+for the protocol boundary and current limitations.
 
 For development, `make format`, `make lint`, and `make test` are the canonical local commands and
 the exact entrypoints used by CI. See [CONTRIBUTING.md](CONTRIBUTING.md) for code, testing, review,

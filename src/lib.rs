@@ -15,6 +15,7 @@ pub mod commands;
 pub mod descriptors;
 pub mod exec;
 pub mod expand;
+pub mod harness;
 pub mod hashes;
 pub mod interp;
 pub mod jqcmd;

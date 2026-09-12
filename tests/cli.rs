@@ -55,3 +55,69 @@ fn structured_evaluation_receives_action_stdin() {
     assert_eq!(report["stdout"], "payload\n");
     assert_eq!(report["outcome"]["exit_status"], 0);
 }
+
+#[test]
+fn persistent_protocol_replays_actions_and_workspace_changes() {
+    let requests = [
+        r#"{"id":1,"op":"write_file","path":"note","data_base64":"aGVsbG8="}"#,
+        r#"{"id":2,"op":"checkpoint"}"#,
+        r#"{"id":3,"op":"execute","source":"printf ' world' >> note; cat note"}"#,
+        r#"{"id":4,"op":"workspace_diff"}"#,
+        r#"{"id":5,"op":"reset_workspace"}"#,
+        r#"{"id":6,"op":"read_file","path":"note"}"#,
+        r#"{"id":7,"op":"inspect"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    let output = run_with_stdin(&["serve"], requests.as_bytes());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(responses.len(), 7);
+    assert!(responses.iter().all(|response| response["ok"] == true));
+    assert_eq!(responses[2]["result"]["kind"], "execute");
+    assert_eq!(responses[2]["result"]["stdout_base64"], "aGVsbG8gd29ybGQ=");
+    assert_eq!(responses[3]["result"]["changes"][0]["path"], "/work/note");
+    assert_eq!(responses[3]["result"]["changes"][0]["change"], "modified");
+    assert_eq!(responses[5]["result"]["data_base64"], "aGVsbG8=");
+    assert_eq!(responses[6]["result"]["kind"], "inspect");
+    assert_eq!(responses[6]["result"]["cwd"], "/work");
+}
+
+#[test]
+fn persistent_protocol_reports_malformed_requests_and_continues() {
+    let output = run_with_stdin(
+        &["serve"],
+        b"not json\n{\"id\":2,\"op\":\"read_file\",\"path\":\"/tmp/host\"}\n{\"id\":3,\"op\":\"list_paths\"}\n",
+    );
+    assert!(output.status.success());
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 3);
+    assert_eq!(responses[0]["ok"], false);
+    assert!(responses[0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("invalid request"));
+    assert_eq!(responses[1]["ok"], false);
+    assert_eq!(responses[1]["id"], 2);
+    assert!(responses[1]["error"]
+        .as_str()
+        .unwrap()
+        .contains("confined to /work"));
+    assert_eq!(responses[2]["ok"], true);
+    assert_eq!(responses[2]["id"], 3);
+}

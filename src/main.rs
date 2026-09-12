@@ -5,6 +5,7 @@
 //!   shellsim run <script.sh> [args...]
 //!   shellsim shell [limits]
 //!   shellsim eval [--cpu N] [--memory N] [--disk N] [--output N] -c '<command>'
+//!   shellsim serve [--cpu N] [--memory N] [--disk N] [--output N]
 
 use std::process::exit;
 
@@ -34,6 +35,7 @@ fn main() {
         }
         "shell" => interactive_shell(&args[2..]),
         "eval" => evaluate(&args[2..]),
+        "serve" => serve(&args[2..]),
         command => usage_error(&format!("unknown command: {command}")),
     }
 }
@@ -197,6 +199,112 @@ fn interactive_shell(args: &[String]) -> ! {
     exit(env.last_status);
 }
 
+const MAX_PROTOCOL_REQUEST_BYTES: usize = 20 * 1024 * 1024;
+
+fn serve(args: &[String]) -> ! {
+    use std::io::Write;
+
+    let mut limits = Limits::default();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--cpu" => limits.cpu = limit_value(args, &mut index, "--cpu"),
+            "--memory" => limits.memory = limit_value(args, &mut index, "--memory"),
+            "--disk" => limits.disk = limit_value(args, &mut index, "--disk"),
+            "--output" => limits.output = limit_value(args, &mut index, "--output"),
+            value => usage_error(&format!("unexpected serve argument: {value}")),
+        }
+        index += 1;
+    }
+
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut output = std::io::stdout().lock();
+    let mut session = shellsim::harness::HarnessSession::new(limits);
+    while let Some(line) = read_bounded_protocol_line(&mut input).unwrap_or_else(|error| {
+        eprintln!("shellsim serve: input error: {error}");
+        exit(1);
+    }) {
+        let response = match line {
+            Ok(line) => match serde_json::from_slice::<shellsim::harness::HarnessRequest>(&line) {
+                Ok(request) => session.handle(request),
+                Err(error) => protocol_error(format!("invalid request: {error}")),
+            },
+            Err(error) => protocol_error(error),
+        };
+        if serde_json::to_writer(&mut output, &response).is_err()
+            || output.write_all(b"\n").is_err()
+            || output.flush().is_err()
+        {
+            exit(1);
+        }
+    }
+    exit(0);
+}
+
+fn protocol_error(message: String) -> shellsim::harness::HarnessResponse {
+    shellsim::harness::HarnessResponse {
+        id: None,
+        ok: false,
+        result: None,
+        error: Some(message),
+    }
+}
+
+fn read_bounded_protocol_line(
+    input: &mut impl std::io::BufRead,
+) -> std::io::Result<Option<Result<Vec<u8>, String>>> {
+    read_bounded_line(input, MAX_PROTOCOL_REQUEST_BYTES)
+}
+
+fn read_bounded_line(
+    input: &mut impl std::io::BufRead,
+    maximum: usize,
+) -> std::io::Result<Option<Result<Vec<u8>, String>>> {
+    let mut line = Vec::new();
+    let mut too_large = false;
+    let mut saw_input = false;
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            return if saw_input {
+                Ok(Some(if too_large {
+                    Err(format!("request exceeds the {maximum}-byte limit"))
+                } else {
+                    Ok(line)
+                }))
+            } else {
+                Ok(None)
+            };
+        }
+        saw_input = true;
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if !too_large {
+            let remaining = maximum.saturating_add(1).saturating_sub(line.len());
+            line.extend_from_slice(&available[..consumed.min(remaining)]);
+            too_large = line.len() > maximum;
+        }
+        let complete = available[..consumed].ends_with(b"\n");
+        input.consume(consumed);
+        if complete {
+            if !too_large {
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+            }
+            return Ok(Some(if too_large {
+                Err(format!("request exceeds the {maximum}-byte limit"))
+            } else {
+                Ok(line)
+            }));
+        }
+    }
+}
+
 fn limit_value(args: &[String], index: &mut usize, flag: &str) -> u64 {
     *index += 1;
     args.get(*index)
@@ -238,7 +346,22 @@ fn read_stdin_bytes() -> Vec<u8> {
 fn usage_error(message: &str) -> ! {
     eprintln!("shellsim: {message}");
     eprintln!(
-        "usage: shellsim -c SOURCE | run SCRIPT [ARGS...] | shell [LIMITS] | eval [LIMITS] -c SOURCE"
+        "usage: shellsim -c SOURCE | run SCRIPT [ARGS...] | shell [LIMITS] | eval [LIMITS] -c SOURCE | serve [LIMITS]"
     );
     exit(2);
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::read_bounded_line;
+    use std::io::Cursor;
+
+    #[test]
+    fn oversized_protocol_lines_are_discarded_without_losing_the_next_request() {
+        let mut input = Cursor::new(b"123456\n{}\n".to_vec());
+        let first = read_bounded_line(&mut input, 4).unwrap().unwrap();
+        assert_eq!(first.unwrap_err(), "request exceeds the 4-byte limit");
+        let second = read_bounded_line(&mut input, 4).unwrap().unwrap().unwrap();
+        assert_eq!(second, b"{}");
+    }
 }

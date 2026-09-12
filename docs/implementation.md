@@ -38,6 +38,26 @@ virtual time/network state, command history, Python REPL, and cumulative resourc
 `set -e` termination, and CPU/memory/output exhaustion make the session terminal. Disk-full errors
 remain recoverable.
 
+## Persistent harness protocol
+
+`shellsim serve` owns one `HarnessSession` and reads bounded newline-delimited JSON requests. The
+closed operation set is `execute`, `read_file`, `write_file`, `remove_path`, `list_paths`,
+`checkpoint`, `workspace_diff`, `reset_workspace`, and `inspect`. Each request may carry an
+arbitrary JSON `id`, which is echoed in its one-line response. Stream and file bytes are base64;
+the protocol never performs lossy text conversion.
+
+File operations are confined to the simulated `/work` tree. `execute` still sees the full modeled
+filesystem and all normal shellsim capabilities, never host state. Requests are capped at 20 MiB,
+individual binary transfers and diffs at 6 MiB, and byte decoding is charged before allocation.
+Workspace changes are typed, path-sorted added/modified/deleted records containing before/after
+file bytes, modes, directories, or symlink targets. A checkpoint clones only a bounded VFS;
+`reset_workspace` restores that VFS checkpoint but deliberately does not rewind CPU fuel, virtual
+time, process history, shell variables, or terminal resource exhaustion.
+
+This is sufficient for a host-side agent adapter to replay tool calls without launching the agent
+inside shellsim. Generic host-directory ingestion, scenario manifests, transcript persistence,
+and Codex/Claude adapters remain harness-side work.
+
 ## Simulation boundaries
 
 The VFS and generated pseudo-filesystem facade are the only filesystems visible to simulated code.
@@ -131,6 +151,7 @@ src/resources.rs       limits, accounting, outcomes, command telemetry
 src/vfs.rs             quota-enforced in-memory filesystem
 src/clock.rs           virtual clocks and bounded event queue
 src/net.rs             virtual route-table network
+src/harness.rs         persistent typed agent-session boundary
 src/shell.rs           shell lexer/parser and capture API
 src/expand.rs          shell word and parameter expansion
 src/exec.rs            metered shell executor and control flow
