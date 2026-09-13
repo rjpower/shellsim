@@ -87,6 +87,8 @@ pub struct ProcessRecord {
     pub ppid: ProcessId,
     /// Process-group identity used for job-wide signal delivery.
     pub process_group: ProcessId,
+    /// Session identity. A new session is also led by its first process group.
+    pub session_id: ProcessId,
     pub command: String,
     pub cwd: String,
     /// Exported environment captured at creation or the latest inspection point.
@@ -94,6 +96,55 @@ pub struct ProcessRecord {
     /// Snapshot of descriptor targets for generated `/proc/PID/fd` views.
     pub descriptors: BTreeMap<i32, String>,
     pub status: ProcessStatus,
+}
+
+/// Placement of a new logical child relative to its parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildPlacement {
+    /// Inherit both session and process group.
+    Inherit,
+    /// Lead a new process group within the parent's session, as for a background job.
+    NewProcessGroup,
+    /// Lead a new session and process group, as for `setsid` or Python `start_new_session`.
+    NewSession,
+}
+
+/// The single synthetic controlling terminal owned by the top-level shell session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllingTerminal {
+    pub session_id: ProcessId,
+    pub foreground_group: ProcessId,
+}
+
+impl ControllingTerminal {
+    /// Create a terminal initially controlled by its session leader's process group.
+    pub const fn new(session_id: ProcessId) -> Self {
+        Self {
+            session_id,
+            foreground_group: session_id,
+        }
+    }
+
+    /// Select a running group from the controlling session as foreground owner.
+    pub fn set_foreground(
+        &mut self,
+        processes: &ProcessTable,
+        process_group: ProcessId,
+    ) -> Result<(), String> {
+        let valid = processes.records.values().any(|record| {
+            record.status == ProcessStatus::Running
+                && record.session_id == self.session_id
+                && record.process_group == process_group
+        });
+        if !valid {
+            return Err(format!(
+                "process group {process_group} is not live in terminal session {}",
+                self.session_id
+            ));
+        }
+        self.foreground_group = process_group;
+        Ok(())
+    }
 }
 
 /// Parent-owned descriptor endpoints and collected state for one live child handle.
@@ -145,6 +196,7 @@ impl ProcessTable {
                 pid: root_pid,
                 ppid: 0,
                 process_group: root_pid,
+                session_id: root_pid,
                 command: "bash".to_string(),
                 cwd,
                 environment,
@@ -162,7 +214,7 @@ impl ProcessTable {
     pub fn spawn(
         &mut self,
         ppid: ProcessId,
-        process_group: Option<ProcessId>,
+        placement: ChildPlacement,
         command: &str,
         cwd: &str,
         environment: BTreeMap<String, String>,
@@ -172,12 +224,19 @@ impl ProcessTable {
         }
         let pid = self.next_pid;
         self.next_pid = self.next_pid.checked_add(1)?;
+        let parent = self.records.get(&ppid)?;
+        let (process_group, session_id) = match placement {
+            ChildPlacement::Inherit => (parent.process_group, parent.session_id),
+            ChildPlacement::NewProcessGroup => (pid, parent.session_id),
+            ChildPlacement::NewSession => (pid, pid),
+        };
         self.records.insert(
             pid,
             ProcessRecord {
                 pid,
                 ppid,
-                process_group: process_group.unwrap_or(pid),
+                process_group,
+                session_id,
                 command: command.to_string(),
                 cwd: cwd.to_string(),
                 environment,
@@ -285,7 +344,13 @@ mod tests {
     fn pids_are_stable_and_exited_children_are_reapable() {
         let mut table = ProcessTable::new(1_000, "/".to_string(), BTreeMap::new());
         let child = table
-            .spawn(1_000, Some(1_000), "worker", "/work", BTreeMap::new())
+            .spawn(
+                1_000,
+                ChildPlacement::Inherit,
+                "worker",
+                "/work",
+                BTreeMap::new(),
+            )
             .unwrap();
         assert_eq!(child, 1_001);
         assert_eq!(table.get(child).unwrap().ppid, 1_000);
@@ -302,16 +367,34 @@ mod tests {
         let mut last = 1_000;
         for _ in 1..MAX_PROCESSES {
             last = table
-                .spawn(1_000, Some(1_000), "worker", "/", BTreeMap::new())
+                .spawn(
+                    1_000,
+                    ChildPlacement::Inherit,
+                    "worker",
+                    "/",
+                    BTreeMap::new(),
+                )
                 .unwrap();
         }
         assert!(table
-            .spawn(1_000, Some(1_000), "overflow", "/", BTreeMap::new())
+            .spawn(
+                1_000,
+                ChildPlacement::Inherit,
+                "overflow",
+                "/",
+                BTreeMap::new()
+            )
             .is_none());
         table.exit(last, 0, "/");
         table.reap(last).unwrap();
         assert!(table
-            .spawn(1_000, None, "replacement", "/", BTreeMap::new())
+            .spawn(
+                1_000,
+                ChildPlacement::NewProcessGroup,
+                "replacement",
+                "/",
+                BTreeMap::new()
+            )
             .is_some());
     }
 
@@ -319,13 +402,57 @@ mod tests {
     fn new_groups_use_the_child_pid_and_are_queryable() {
         let mut table = ProcessTable::new(1_000, "/".to_string(), BTreeMap::new());
         let leader = table
-            .spawn(1_000, None, "leader", "/", BTreeMap::new())
+            .spawn(
+                1_000,
+                ChildPlacement::NewProcessGroup,
+                "leader",
+                "/",
+                BTreeMap::new(),
+            )
             .unwrap();
         let member = table
-            .spawn(leader, Some(leader), "member", "/", BTreeMap::new())
+            .spawn(
+                leader,
+                ChildPlacement::Inherit,
+                "member",
+                "/",
+                BTreeMap::new(),
+            )
             .unwrap();
         assert_eq!(table.running_group(leader), vec![leader, member]);
         table.exit(leader, 0, "/");
         assert_eq!(table.running_group(leader), vec![member]);
+    }
+
+    #[test]
+    fn groups_and_sessions_are_distinct_placements() {
+        let mut table = ProcessTable::new(1_000, "/".to_string(), BTreeMap::new());
+        let group = table
+            .spawn(
+                1_000,
+                ChildPlacement::NewProcessGroup,
+                "job",
+                "/",
+                BTreeMap::new(),
+            )
+            .unwrap();
+        let session = table
+            .spawn(
+                1_000,
+                ChildPlacement::NewSession,
+                "session",
+                "/",
+                BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(table.get(group).unwrap().process_group, group);
+        assert_eq!(table.get(group).unwrap().session_id, 1_000);
+        assert_eq!(table.get(session).unwrap().process_group, session);
+        assert_eq!(table.get(session).unwrap().session_id, session);
+
+        let mut terminal = ControllingTerminal::new(1_000);
+        terminal.set_foreground(&table, group).unwrap();
+        assert_eq!(terminal.foreground_group, group);
+        assert!(terminal.set_foreground(&table, session).is_err());
     }
 }

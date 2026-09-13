@@ -182,9 +182,10 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
    source context; atomic patch application, gzip streams, and traversal-safe tar and zip
    containers are present. Richer text tools remain.
 6. Cooperative background scheduling, bounded pipes, default signal delivery, live Python process
-   handles, bounded Python VM polling, retryable blocking native calls, and group-wide signal
-   delivery and bounded resumable shell handlers are present; terminal foreground control and
-   compound native callback frames remain.
+   handles, bounded Python VM polling, retryable blocking native calls, group-wide signal delivery,
+   bounded resumable shell handlers, distinct process sessions/groups, and synthetic terminal
+   foreground ownership are present; interactive stopped jobs and compound native callback frames
+   remain.
 7. A persistent bounded NDJSON workspace protocol with execution, typed diffs, checkpoint/reset,
    file tools, inspection, transactional host snapshot ingestion, replay, and typed scenario
    assertions is present. Retained actions expose bounded polling, explicit foreground

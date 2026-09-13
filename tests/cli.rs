@@ -290,6 +290,67 @@ fn persistent_protocol_cancels_an_action_without_terminating_its_session() {
 }
 
 #[test]
+fn persistent_protocol_reports_terminal_identity_and_signals_foreground_group() {
+    let requests = [
+        r#"{"id":1,"op":"start_execute","source":"sleep 10"}"#,
+        r#"{"id":2,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":false}"#,
+        r#"{"id":3,"op":"inspect"}"#,
+        r#"{"id":4,"op":"signal_foreground","signal":"INT"}"#,
+        r#"{"id":5,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":false}"#,
+    ]
+    .join("\n")
+        + "\n";
+    let output = run_with_stdin(&["serve"], requests.as_bytes());
+    assert!(output.status.success());
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(responses.iter().all(|response| response["ok"] == true));
+    assert_eq!(responses[2]["result"]["terminal"]["session_id"], 1234);
+    assert_eq!(
+        responses[2]["result"]["terminal"]["foreground_process_group"],
+        1234
+    );
+    assert_eq!(responses[2]["result"]["processes"][0]["session_id"], 1234);
+    assert_eq!(responses[4]["result"]["state"]["status"], 130);
+}
+
+#[test]
+fn persistent_protocol_transfers_and_restores_terminal_foreground_group() {
+    let requests = [
+        r#"{"id":1,"op":"execute","source":"sleep 10 &"}"#,
+        r#"{"id":2,"op":"set_foreground_process_group","process_group":1235}"#,
+        r#"{"id":3,"op":"inspect"}"#,
+        r#"{"id":4,"op":"signal_foreground","signal":"TERM"}"#,
+        r#"{"id":5,"op":"execute","source":"wait %1"}"#,
+        r#"{"id":6,"op":"inspect"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    let output = run_with_stdin(&["serve"], requests.as_bytes());
+    assert!(output.status.success());
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(responses.iter().all(|response| response["ok"] == true));
+    assert_eq!(
+        responses[2]["result"]["terminal"]["foreground_process_group"],
+        1235
+    );
+    assert_eq!(responses[4]["result"]["outcome"]["exit_status"], 143);
+    assert_eq!(
+        responses[5]["result"]["terminal"]["foreground_process_group"],
+        1234
+    );
+}
+
+#[test]
 fn persistent_protocol_routes_isolated_complete_state_forks() {
     let requests = [
         r#"{"id":1,"op":"execute","source":"X=parent; printf base > value"}"#,

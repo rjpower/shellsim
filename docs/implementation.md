@@ -55,8 +55,8 @@ remain recoverable.
 
 `shellsim serve` owns one `HarnessSession` and reads bounded newline-delimited JSON requests. The
 closed operation set includes one-shot `execute`; retained `start_execute`, `poll_action`,
-`write_stdin`, `close_stdin`, `read_action_output`, `signal_process`, `cancel_action`, and
-`drop_action`; plus
+`write_stdin`, `close_stdin`, `read_action_output`, `signal_process`, `signal_foreground`,
+`set_foreground_process_group`, `cancel_action`, and `drop_action`; plus
 `read_file`, `write_file`, `stat_path`, `make_directory`, `create_symlink`, `apply_patch`,
 `remove_path`, `list_paths`, `checkpoint`, `workspace_diff`, `reset_workspace`, and `inspect`. Each
 request may carry an arbitrary JSON `id`, which is echoed in
@@ -70,6 +70,12 @@ completed status-137 action record. The cancellation-induced shell exit is clear
 can execute another action. Separately grouped background jobs are not silently destroyed;
 `signal_process` remains the explicit mechanism for them. `drop_action` only releases an already
 completed record.
+
+Process records distinguish process-group and session identities. The synthetic controlling
+terminal owns one session and one foreground group. Harness clients can transfer that foreground
+ownership only to a live group in the terminal session and can send supported signals to the
+selected group. When its last process exits, ownership deterministically returns to the root shell
+group. Inspection and `/proc/PID/status` report the same terminal/session model.
 
 A retained action installs a shell continuation and isolated standard descriptors without driving
 the machine. Polls execute a bounded number of ordinary scheduler quanta. With `advance_time`

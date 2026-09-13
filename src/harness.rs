@@ -75,6 +75,12 @@ pub enum HarnessOperation {
         #[serde(default)]
         process_group: bool,
     },
+    SignalForeground {
+        signal: String,
+    },
+    SetForegroundProcessGroup {
+        process_group: u32,
+    },
     CancelAction {
         action_id: u64,
     },
@@ -252,6 +258,7 @@ pub struct InspectResult {
     pub actions: Vec<ActionView>,
     pub processes: Vec<ProcessView>,
     pub current_pid: Option<u32>,
+    pub terminal: TerminalView,
     pub monotonic_ns: u64,
     pub wall_time_ns: i128,
     pub pending_events: usize,
@@ -271,9 +278,17 @@ pub struct ProcessView {
     pub pid: u32,
     pub ppid: u32,
     pub process_group: u32,
+    pub session_id: u32,
     pub command: String,
     pub cwd: String,
     pub status: ProcessViewStatus,
+}
+
+/// Controlling terminal identity and current foreground ownership.
+#[derive(Debug, Serialize)]
+pub struct TerminalView {
+    pub session_id: u32,
+    pub foreground_process_group: u32,
 }
 
 /// Typed lifecycle state in an inspection response.
@@ -639,6 +654,16 @@ impl HarnessSession {
                 } else {
                     self.environment.send_signal(pid, signal)?;
                 }
+                Ok(HarnessResult::Acknowledged)
+            }
+            HarnessOperation::SignalForeground { signal } => {
+                let signal = crate::process::Signal::parse(&signal)
+                    .ok_or_else(|| format!("unsupported signal '{signal}'"))?;
+                self.environment.send_terminal_signal(signal)?;
+                Ok(HarnessResult::Acknowledged)
+            }
+            HarnessOperation::SetForegroundProcessGroup { process_group } => {
+                self.environment.set_terminal_foreground(process_group)?;
                 Ok(HarnessResult::Acknowledged)
             }
             HarnessOperation::CancelAction { action_id } => {
@@ -1090,6 +1115,10 @@ impl HarnessSession {
                 .map(|record| process_view(record, self.environment.scheduler.state(record.pid)))
                 .collect(),
             current_pid: self.environment.scheduler.current(),
+            terminal: TerminalView {
+                session_id: self.environment.terminal.session_id,
+                foreground_process_group: self.environment.terminal.foreground_group,
+            },
             monotonic_ns: self.environment.clock.monotonic_ns(),
             wall_time_ns,
             pending_events: self.environment.clock.pending_len(),
@@ -1176,6 +1205,7 @@ fn process_view(record: &ProcessRecord, task_state: Option<TaskState>) -> Proces
         pid: record.pid,
         ppid: record.ppid,
         process_group: record.process_group,
+        session_id: record.session_id,
         command: record.command.clone(),
         cwd: record.cwd.clone(),
         status: match (record.status, task_state) {

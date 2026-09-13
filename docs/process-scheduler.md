@@ -106,11 +106,14 @@ Environment
   Scheduler { runnable, blocked, current }
 
 Process
-  pid, ppid, process_group
+  pid, ppid, process_group, session_id
   argv, cwd, environment, shell state
   FdTable<Fd, FdEntry>
   Continuation
   Runnable | Blocked(reason) | Exited(status)
+
+ControllingTerminal
+  session_id, foreground_process_group
 
 OpenDescription
   VfsFile { node, offset, access, append }
@@ -146,6 +149,13 @@ The root session remains a retained process. Machine capabilities stay outside p
 Define typed process states and wait reasons. Fork-state accounting remains bounded, and failure is
 atomic. Existing subshell, command substitution, pipeline, nested-shell, and Python subprocess
 tests must pass without a compatibility adapter that recursively swaps the active process.
+
+Process identity now separates sessions from process groups. Background jobs lead a new group in
+the shell session; Python `start_new_session=True` leads both a new session and group. A synthetic
+controlling terminal tracks its session and foreground group, routes terminal-generated signals,
+and returns ownership to the shell group when the foreground job exits. `/proc/PID/status` exposes
+both `NSpgid` and `NSsid`. Interactive `fg`/`bg` syntax and stopped-process states remain outside the
+current subset.
 
 ## Phase 3: resumable execution
 
@@ -374,10 +384,10 @@ window and report later records as dropped. This preserves action-local sequence
 preventing repeated simulated commands or diagnostics from growing host memory without bound.
 
 The NDJSON protocol now includes `start_execute`, `poll_action`, `write_stdin`, `close_stdin`,
-`read_action_output`, `signal_process`, `cancel_action`, and `drop_action`; one-shot `execute` drives
-the same path. Cancellation terminates the foreground process group with bounded scheduler work,
-restores persistent descriptors, and leaves the session reusable; dropping remains completed-record
-cleanup.
+`read_action_output`, `signal_process`, `signal_foreground`, `set_foreground_process_group`,
+`cancel_action`, and `drop_action`; one-shot `execute` drives the same path. Cancellation terminates
+the foreground process group with bounded scheduler work, restores persistent descriptors, and
+leaves the session reusable; dropping remains completed-record cleanup.
 Active actions, their descriptor cursors, and their continuations survive complete-state library
 forks. The bounded `HarnessManager` now routes
 ordinary operations by optional `session_id`, supports complete-state `fork_session` and

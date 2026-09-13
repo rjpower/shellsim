@@ -221,11 +221,18 @@ process = subprocess.Popen(
     start_new_session=True,
 )
 stdout, stderr = process.communicate()
-group = [line for line in stdout.split("\n") if line.startswith("NSpgid:")][0]
-print(process.pid, group)
+identity = [line for line in stdout.split("\n") if line.startswith("NSpgid:") or line.startswith("NSsid:")]
+print(process.pid, identity)
 "#,
     );
-    assert_eq!(result, (0, "1235 NSpgid:\t1235\n".into(), String::new()));
+    assert_eq!(
+        result,
+        (
+            0,
+            "1235 ['NSpgid:\\t1235', 'NSsid:\\t1235']\n".into(),
+            String::new()
+        )
+    );
 }
 
 #[test]
@@ -328,7 +335,7 @@ fn logical_process_exhaustion_fails_before_command_execution() {
             .processes
             .spawn(
                 1_234,
-                Some(1_234),
+                shellsim::process::ChildPlacement::Inherit,
                 &format!("occupied-{index}"),
                 "/",
                 Default::default(),

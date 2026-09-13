@@ -22,6 +22,8 @@ fn proc_self_describes_the_active_logical_shell() {
     assert!(status.1.contains("Name:\tbash\n"), "{}", status.1);
     assert!(status.1.contains("Pid:\t1234\n"), "{}", status.1);
     assert!(status.1.contains("PPid:\t0\n"), "{}", status.1);
+    assert!(status.1.contains("NSpgid:\t1234\n"), "{}", status.1);
+    assert!(status.1.contains("NSsid:\t1234\n"), "{}", status.1);
 
     assert_eq!(run(&mut env, "readlink /proc/self").1, "1234\n");
     assert_eq!(run(&mut env, "readlink /proc/self/cwd").1, "/\n");
@@ -72,6 +74,8 @@ fn background_process_runs_on_a_later_scheduler_turn_and_wait_reaps_it() {
     let status = env.fs_read("/", "/proc/1235/status").unwrap();
     let status = String::from_utf8(status).unwrap();
     assert!(status.contains("State:\tR (running)"), "{status}");
+    assert!(status.contains("NSpgid:\t1235\n"), "{status}");
+    assert!(status.contains("NSsid:\t1234\n"), "{status}");
     assert_eq!(env.scheduler.state(1_235), Some(TaskState::Runnable));
     assert_eq!(run(&mut env, "jobs").1, "[1] Running false\n");
     for _ in 0..8 {
@@ -175,6 +179,16 @@ fn job_signals_reach_the_background_process_group() {
         retained.iter().all(|process| process.pid == 1_234),
         "{retained:?}"
     );
+}
+
+#[test]
+fn terminal_foreground_group_returns_to_shell_after_job_exit() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "sleep 10 &").0, 0);
+    env.terminal.set_foreground(&env.processes, 1_235).unwrap();
+    assert_eq!(env.terminal.foreground_group, 1_235);
+    assert_eq!(run(&mut env, "kill -TERM -- -1235; wait %1").0, 143);
+    assert_eq!(env.terminal.foreground_group, 1_234);
 }
 
 #[test]

@@ -70,6 +70,8 @@ pub struct Environment {
     pub resources: Resources,
     /// Machine-wide logical process identities and retained child statuses.
     pub processes: ProcessTable,
+    /// Synthetic controlling terminal and its foreground process group.
+    pub terminal: crate::process::ControllingTerminal,
     /// Deterministic runnable/blocked lifecycle for logical process execution.
     pub scheduler: Scheduler,
     /// Machine-owned open descriptions shared by forked process descriptor tables.
@@ -99,6 +101,8 @@ pub struct ProcessState {
     pub pid: ProcessId,
     /// PID of the logical parent process.
     pub ppid: ProcessId,
+    /// Session inherited from the parent or established by `start_new_session`.
+    pub session_id: ProcessId,
     /// Process group inherited across ordinary forks or established by a group leader.
     pub process_group: ProcessId,
     /// PID expanded by `$$`; preserved across Bash subshells.
@@ -259,18 +263,22 @@ const MAX_FORK_STATE_BYTES: u64 = 32 * 1024 * 1024;
 impl ProcessState {
     fn fork_for_child(
         &self,
-        pid: ProcessId,
-        process_group: ProcessId,
+        identity: &crate::process::ProcessRecord,
         new_shell: bool,
         fds: FdTable,
         fork_allocation_bytes: u64,
         detached_output: bool,
     ) -> Self {
         Self {
-            pid,
+            pid: identity.pid,
             ppid: self.pid,
-            process_group,
-            shell_pid: if new_shell { pid } else { self.shell_pid },
+            process_group: identity.process_group,
+            session_id: identity.session_id,
+            shell_pid: if new_shell {
+                identity.pid
+            } else {
+                self.shell_pid
+            },
             vars: self.vars.clone(),
             arrays: self.arrays.clone(),
             exported: self.exported.clone(),
@@ -460,12 +468,14 @@ impl Environment {
             net: VirtualNet::new(),
             resources: Resources::new(limits),
             processes,
+            terminal: crate::process::ControllingTerminal::new(ROOT_PID),
             scheduler: Scheduler::new(ROOT_PID),
             descriptors,
             process: ProcessStates::new(ProcessState {
                 pid: ROOT_PID,
                 ppid: 0,
                 process_group: ROOT_PID,
+                session_id: ROOT_PID,
                 shell_pid: ROOT_PID,
                 vars,
                 arrays: HashMap::new(),
@@ -520,7 +530,13 @@ impl Environment {
         command: &str,
         new_shell: bool,
     ) -> Result<ProcessId, String> {
-        self.create_child(command, new_shell, true, false, false)
+        self.create_child(
+            command,
+            new_shell,
+            true,
+            false,
+            crate::process::ChildPlacement::Inherit,
+        )
     }
 
     /// Create a runnable child without blocking or switching away from the active parent.
@@ -529,7 +545,13 @@ impl Environment {
         command: &str,
         new_shell: bool,
     ) -> Result<ProcessId, String> {
-        self.create_child(command, new_shell, false, true, true)
+        self.create_child(
+            command,
+            new_shell,
+            false,
+            true,
+            crate::process::ChildPlacement::NewProcessGroup,
+        )
     }
 
     /// Create a runnable pipeline stage whose descriptors are connected before dispatch.
@@ -538,7 +560,13 @@ impl Environment {
         command: &str,
         new_shell: bool,
     ) -> Result<ProcessId, String> {
-        self.create_child(command, new_shell, false, false, false)
+        self.create_child(
+            command,
+            new_shell,
+            false,
+            false,
+            crate::process::ChildPlacement::Inherit,
+        )
     }
 
     /// Create a parent-managed live child for a language-level process handle.
@@ -546,9 +574,19 @@ impl Environment {
         &mut self,
         command: &str,
         new_shell: bool,
-        new_process_group: bool,
+        new_session: bool,
     ) -> Result<ProcessId, String> {
-        self.create_child(command, new_shell, false, false, new_process_group)
+        self.create_child(
+            command,
+            new_shell,
+            false,
+            false,
+            if new_session {
+                crate::process::ChildPlacement::NewSession
+            } else {
+                crate::process::ChildPlacement::Inherit
+            },
+        )
     }
 
     fn create_child(
@@ -557,7 +595,7 @@ impl Environment {
         new_shell: bool,
         foreground: bool,
         detached_output: bool,
-        new_process_group: bool,
+        placement: crate::process::ChildPlacement,
     ) -> Result<ProcessId, String> {
         let fork_bytes = self.process.fork_memory_bytes();
         if fork_bytes > MAX_FORK_STATE_BYTES {
@@ -577,10 +615,9 @@ impl Environment {
         };
         self.processes
             .update_current(self.process.pid, &self.process.cwd, environment.clone());
-        let inherited_group = (!new_process_group).then_some(self.process.process_group);
         let Some(pid) = self.processes.spawn(
             self.process.pid,
-            inherited_group,
+            placement,
             command,
             &self.process.cwd,
             environment,
@@ -609,13 +646,13 @@ impl Environment {
             self.resources.release_memory(allocation_bytes);
             return Err(format!("unable to schedule child process: {error:?}"));
         }
+        let child_record = self
+            .processes
+            .get(pid)
+            .expect("new process record must be retained")
+            .clone();
         let child = self.process.fork_for_child(
-            pid,
-            if new_process_group {
-                pid
-            } else {
-                self.process.process_group
-            },
+            &child_record,
             new_shell,
             child_fds,
             allocation_bytes,
@@ -760,6 +797,13 @@ impl Environment {
         }
         self.processes.update_descriptors(pid, BTreeMap::new());
         self.processes.exit(pid, status, &self.process.cwd);
+        if self
+            .processes
+            .running_group(self.terminal.foreground_group)
+            .is_empty()
+        {
+            self.terminal.foreground_group = self.terminal.session_id;
+        }
         self.clock.cancel_task_events(u64::from(pid));
         let _ = self.scheduler.exit_current(status);
         self.scheduler.wake_child_waiters(pid);
@@ -837,6 +881,19 @@ impl Environment {
             self.send_signal(pid, signal)?;
         }
         Ok(())
+    }
+
+    /// Queue a terminal-generated signal for the current foreground process group.
+    pub(crate) fn send_terminal_signal(&mut self, signal: Signal) -> Result<(), String> {
+        self.send_signal_group(self.terminal.foreground_group, signal)
+    }
+
+    /// Transfer synthetic terminal foreground ownership to a live group in this session.
+    pub(crate) fn set_terminal_foreground(
+        &mut self,
+        process_group: ProcessId,
+    ) -> Result<(), String> {
+        self.terminal.set_foreground(&self.processes, process_group)
     }
 
     /// Select the next non-ignored signal action for the active process.
