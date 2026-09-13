@@ -237,19 +237,61 @@ fn scenario_replay_emits_paired_transcript_records() {
 }
 
 #[test]
+fn scenario_replay_persists_complete_transcript_without_overwrite() {
+    let directory = TestDirectory::new();
+    let scenario = directory.path().join("scenario.ndjson");
+    let transcript = directory.path().join("transcript.ndjson");
+    std::fs::write(
+        &scenario,
+        b"{\"id\":\"run\",\"op\":\"execute\",\"source\":\"printf saved\"}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .arg("replay")
+        .arg(&scenario)
+        .arg("--transcript")
+        .arg(&transcript)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&transcript).unwrap(), output.stdout);
+
+    std::fs::write(&transcript, b"keep\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .arg("replay")
+        .arg(&scenario)
+        .arg("--transcript")
+        .arg(&transcript)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("destination already exists"));
+    assert_eq!(std::fs::read(&transcript).unwrap(), b"keep\n");
+}
+
+#[test]
 fn scenario_replay_rejects_invalid_actions() {
     let directory = TestDirectory::new();
     let scenario = directory.path().join("invalid.ndjson");
+    let transcript = directory.path().join("transcript.ndjson");
     std::fs::write(&scenario, b"not json\n").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
         .arg("replay")
         .arg(&scenario)
+        .arg("--transcript")
+        .arg(&transcript)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("action 1 is invalid"));
     assert!(output.stdout.is_empty());
+    assert!(!transcript.exists());
 }
 
 #[test]

@@ -86,7 +86,9 @@ any mismatch makes the replay exit with status 1 after all actions run. Scenario
 subject to the 20 MiB request bound; a replay is capped at 4,096 actions and 64 MiB each of scenario
 and emitted transcript data.
 `--root` and resource limits have the same meaning as in `serve`, so a checked-in action stream can
-be rerun against a bounded host snapshot without changing the protocol.
+be rerun against a bounded host snapshot without changing the protocol. `--transcript PATH` also
+persists the emitted NDJSON after a complete replay. Publication is atomic and refuses to replace
+an existing path; malformed or incomplete scenarios leave no requested transcript file.
 
 This is sufficient for a host-side agent adapter to replay and assert tool calls without launching
 the agent inside shellsim. The library can fork a bounded `HarnessSession`, including scheduler,

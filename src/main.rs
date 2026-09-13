@@ -6,7 +6,7 @@
 //!   shellsim shell [limits]
 //!   shellsim eval [--cpu N] [--memory N] [--disk N] [--output N] -c '<command>'
 //!   shellsim serve [--cpu N] [--memory N] [--disk N] [--output N]
-//!   shellsim replay SCENARIO.ndjson [--root PATH] [limits]
+//!   shellsim replay SCENARIO.ndjson [--root PATH] [--transcript PATH] [limits]
 
 use std::process::exit;
 
@@ -437,15 +437,17 @@ fn replay(args: &[String]) -> ! {
     let Some(path) = args.first() else {
         usage_error("replay requires a scenario path");
     };
+    let (transcript_path, harness_args) = replay_options(&args[1..]);
     let file = std::fs::File::open(path).unwrap_or_else(|error| {
         eprintln!("shellsim replay: cannot read {path}: {error}");
         exit(2);
     });
     let mut input = BufReader::new(file);
     let mut output = std::io::stdout().lock();
-    let mut session = harness_session(harness_options(&args[1..], "replay"), "replay");
+    let mut session = harness_session(harness_options(&harness_args, "replay"), "replay");
     let mut input_bytes = 0usize;
     let mut transcript_bytes = 0usize;
+    let mut retained_transcript = transcript_path.as_ref().map(|_| Vec::new());
     let mut sequence = 0usize;
     let mut assertion_failed = false;
     while sequence < MAX_SCENARIO_ACTIONS {
@@ -499,6 +501,16 @@ fn replay(args: &[String]) -> ! {
         if output.write_all(&record).is_err() || output.write_all(b"\n").is_err() {
             exit(1);
         }
+        if let Some(transcript) = retained_transcript.as_mut() {
+            transcript
+                .try_reserve_exact(record.len().saturating_add(1))
+                .unwrap_or_else(|_| {
+                    eprintln!("shellsim replay: cannot allocate bounded transcript buffer");
+                    exit(1);
+                });
+            transcript.extend_from_slice(&record);
+            transcript.push(b'\n');
+        }
         sequence += 1;
     }
     if sequence == MAX_SCENARIO_ACTIONS
@@ -512,7 +524,85 @@ fn replay(args: &[String]) -> ! {
         eprintln!("shellsim replay: scenario exceeds the {MAX_SCENARIO_ACTIONS}-action limit");
         exit(2);
     }
+    if let (Some(path), Some(transcript)) = (transcript_path, retained_transcript) {
+        persist_transcript(std::path::Path::new(&path), &transcript).unwrap_or_else(|error| {
+            eprintln!("shellsim replay: cannot persist transcript to {path}: {error}");
+            exit(2);
+        });
+    }
     exit(i32::from(assertion_failed));
+}
+
+fn replay_options(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut transcript = None;
+    let mut harness_args = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        if args[index] == "--transcript" {
+            index += 1;
+            let path = args
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| usage_error("--transcript requires a path"));
+            if transcript.replace(path).is_some() {
+                usage_error("--transcript may only be specified once");
+            }
+        } else {
+            harness_args.push(args[index].clone());
+        }
+        index += 1;
+    }
+    (transcript, harness_args)
+}
+
+/// Install a completed transcript without exposing a partial file or replacing an existing path.
+fn persist_transcript(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut temporary = None;
+    for attempt in 0..128u32 {
+        let candidate = parent.join(format!(
+            ".shellsim-transcript-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let Some((temporary_path, mut file)) = temporary else {
+        return Err("could not allocate a temporary file after 128 attempts".to_string());
+    };
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::hard_link(&temporary_path, path)?;
+        std::fs::remove_file(&temporary_path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "destination already exists".to_string()
+        } else {
+            error.to_string()
+        }
+    })
 }
 
 fn protocol_error(message: String) -> shellsim::harness::HarnessResponse {
@@ -619,7 +709,7 @@ fn read_stdin_bytes() -> Vec<u8> {
 fn usage_error(message: &str) -> ! {
     eprintln!("shellsim: {message}");
     eprintln!(
-        "usage: shellsim -c SOURCE | run SCRIPT [ARGS...] | shell [LIMITS] | eval [LIMITS] -c SOURCE | serve [LIMITS] | replay SCENARIO.ndjson [LIMITS]"
+        "usage: shellsim -c SOURCE | run SCRIPT [ARGS...] | shell [LIMITS] | eval [LIMITS] -c SOURCE | serve [LIMITS] | replay SCENARIO.ndjson [--transcript PATH] [LIMITS]"
     );
     exit(2);
 }

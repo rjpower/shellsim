@@ -185,7 +185,7 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
 7. A persistent bounded NDJSON workspace protocol with execution, typed diffs, checkpoint/reset,
    file tools, inspection, transactional host snapshot ingestion, replay, and typed scenario
    assertions is present. Complete machine-state forks support deterministic library-side
-   branching. Add transcript persistence and external-agent experiments.
+   branching and atomic transcript persistence. Add external-agent experiments.
 
 Every phase retains the existing security rule: simulated input can use only explicitly modeled
 state and must never fall through to host filesystem, process, network, environment, or clock
