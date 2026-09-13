@@ -168,7 +168,10 @@ pub struct ActionView {
     pub outcome: Option<RunOutcome>,
     pub invocations: Vec<InvocationEvent>,
     pub dropped_invocations: u64,
+    pub commands: Vec<String>,
+    pub dropped_commands: u64,
     pub unsupported: Vec<String>,
+    pub dropped_unsupported: u64,
     pub network_requests: Vec<NetworkRequest>,
     pub dropped_network_requests: u64,
 }
@@ -200,7 +203,9 @@ pub struct ExecuteResult {
     pub stdout_base64: String,
     pub stderr_base64: String,
     pub commands: Vec<String>,
+    pub dropped_commands: u64,
     pub unsupported: Vec<String>,
+    pub dropped_unsupported: u64,
     pub noop_commands: Vec<String>,
     pub partial_commands: Vec<String>,
     pub invocations: Vec<InvocationEvent>,
@@ -253,6 +258,10 @@ pub struct InspectResult {
     pub ready_events: usize,
     pub invocations: Vec<InvocationEvent>,
     pub dropped_invocations: u64,
+    pub commands: Vec<String>,
+    pub dropped_commands: u64,
+    pub unsupported: Vec<String>,
+    pub dropped_unsupported: u64,
     pub network_requests: Vec<NetworkRequest>,
     pub dropped_network_requests: u64,
 }
@@ -343,11 +352,16 @@ struct RetainedAction {
     dropped_invocations_start: u64,
     dropped_invocations: u64,
     invocations: Vec<InvocationEvent>,
+    commands: Vec<String>,
+    dropped_commands: u64,
     unsupported: Vec<String>,
+    dropped_unsupported: u64,
     network_requests: Vec<NetworkRequest>,
     dropped_network_requests: u64,
     command_start: usize,
+    dropped_commands_start: u64,
     unsupported_start: usize,
+    dropped_unsupported_start: u64,
     network_start: usize,
     dropped_network_start: u64,
 }
@@ -368,11 +382,16 @@ impl RetainedAction {
             dropped_invocations_start: environment.invocations.dropped(),
             dropped_invocations: 0,
             invocations: Vec::new(),
+            commands: Vec::new(),
+            dropped_commands: 0,
             unsupported: Vec::new(),
+            dropped_unsupported: 0,
             network_requests: Vec::new(),
             dropped_network_requests: 0,
             command_start: environment.cmd_trace.len(),
+            dropped_commands_start: environment.cmd_trace.dropped(),
             unsupported_start: environment.unsupported.len(),
+            dropped_unsupported_start: environment.unsupported.dropped(),
             network_start: environment.net.log.len(),
             dropped_network_start: environment.net.dropped_requests,
         }
@@ -387,7 +406,16 @@ impl RetainedAction {
             .invocations
             .dropped()
             .saturating_sub(self.dropped_invocations_start);
-        self.unsupported = environment.unsupported[self.unsupported_start..].to_vec();
+        self.commands = environment.cmd_trace.values_since(self.command_start);
+        self.dropped_commands = environment
+            .cmd_trace
+            .dropped()
+            .saturating_sub(self.dropped_commands_start);
+        self.unsupported = environment.unsupported.values_since(self.unsupported_start);
+        self.dropped_unsupported = environment
+            .unsupported
+            .dropped()
+            .saturating_sub(self.dropped_unsupported_start);
         self.network_requests = environment.net.log[self.network_start..].to_vec();
         self.dropped_network_requests = environment
             .net
@@ -414,10 +442,31 @@ impl RetainedAction {
             } else {
                 self.dropped_invocations
             },
+            commands: if self.execution.is_some() {
+                environment.cmd_trace.values_since(self.command_start)
+            } else {
+                self.commands.clone()
+            },
+            dropped_commands: if self.execution.is_some() {
+                environment
+                    .cmd_trace
+                    .dropped()
+                    .saturating_sub(self.dropped_commands_start)
+            } else {
+                self.dropped_commands
+            },
             unsupported: if self.execution.is_some() {
-                environment.unsupported[self.unsupported_start..].to_vec()
+                environment.unsupported.values_since(self.unsupported_start)
             } else {
                 self.unsupported.clone()
+            },
+            dropped_unsupported: if self.execution.is_some() {
+                environment
+                    .unsupported
+                    .dropped()
+                    .saturating_sub(self.dropped_unsupported_start)
+            } else {
+                self.dropped_unsupported
             },
             network_requests: if self.execution.is_some() {
                 environment.net.log[self.network_start..].to_vec()
@@ -510,6 +559,8 @@ impl HarnessSession {
             .saturating_add(self.environment.pending_stdout.len() as u64)
             .saturating_add(self.environment.pending_stderr.len() as u64)
             .saturating_add(self.environment.invocations.modeled_bytes())
+            .saturating_add(self.environment.cmd_trace.modeled_bytes())
+            .saturating_add(self.environment.unsupported.modeled_bytes())
             .saturating_add(self.actions.values().fold(0_u64, |bytes, action| {
                 bytes
                     .saturating_add(action.stdout.len() as u64)
@@ -718,8 +769,10 @@ impl HarnessSession {
             outcome,
             stdout_base64: STANDARD.encode(action.stdout),
             stderr_base64: STANDARD.encode(action.stderr),
-            commands: self.environment.cmd_trace[action.command_start..].to_vec(),
+            commands: action.commands,
+            dropped_commands: action.dropped_commands,
             unsupported: action.unsupported,
+            dropped_unsupported: action.dropped_unsupported,
             noop_commands,
             partial_commands,
             invocations: action.invocations,
@@ -1043,6 +1096,10 @@ impl HarnessSession {
             ready_events: self.environment.clock.ready_len(),
             invocations: self.environment.invocations.events(),
             dropped_invocations: self.environment.invocations.dropped(),
+            commands: self.environment.cmd_trace.values(),
+            dropped_commands: self.environment.cmd_trace.dropped(),
+            unsupported: self.environment.unsupported.values(),
+            dropped_unsupported: self.environment.unsupported.dropped(),
             network_requests: self.environment.net.log.clone(),
             dropped_network_requests: self.environment.net.dropped_requests,
         }

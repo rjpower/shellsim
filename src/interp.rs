@@ -79,10 +79,10 @@ pub struct Environment {
     /// Parent-side endpoints retained for live subprocess handles.
     pub(crate) live_children: BTreeMap<ProcessId, crate::process::LiveChild>,
     next_temp_id: u64,
-    /// Trace of every external command name executed.
-    pub cmd_trace: Vec<String>,
-    /// Commands requested that shellsim does not implement.
-    pub unsupported: Vec<String>,
+    /// Bounded trace of external command names executed.
+    pub cmd_trace: crate::telemetry::BoundedTextLog,
+    /// Bounded diagnostics for capabilities shellsim does not implement.
+    pub unsupported: crate::telemetry::BoundedTextLog,
     /// Bounded ordered command occurrences, including suspended invocations.
     pub invocations: InvocationLog,
     /// Packages recorded by lightweight package-manager compatibility commands.
@@ -502,8 +502,8 @@ impl Environment {
             }),
             live_children: BTreeMap::new(),
             next_temp_id: 0,
-            cmd_trace: Vec::new(),
-            unsupported: Vec::new(),
+            cmd_trace: crate::telemetry::BoundedTextLog::default(),
+            unsupported: crate::telemetry::BoundedTextLog::default(),
             invocations: InvocationLog::default(),
             packages: std::collections::BTreeSet::new(),
             pending_stdout: Vec::new(),
@@ -1324,7 +1324,7 @@ impl Environment {
     }
 
     pub fn note_unsupported(&mut self, what: &str) {
-        self.unsupported.push(what.to_string());
+        self.unsupported.record(what);
     }
 
     pub fn outcome(&self, exit_status: i32) -> RunOutcome {

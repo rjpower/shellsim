@@ -268,24 +268,35 @@ pub fn strict_response_failures(sequence: usize, response: &HarnessResponse) -> 
         failures.push(format!("{prefix} returned an error"));
         return failures;
     }
-    let (invocations, dropped_invocations, unsupported, network, dropped_network) =
-        match response.result.as_ref() {
-            Some(HarnessResult::Execute(result)) => (
-                result.invocations.as_slice(),
-                result.dropped_invocations,
-                result.unsupported.as_slice(),
-                result.network_requests.as_slice(),
-                result.dropped_network_requests,
-            ),
-            Some(HarnessResult::Action(result)) => (
-                result.invocations.as_slice(),
-                result.dropped_invocations,
-                result.unsupported.as_slice(),
-                result.network_requests.as_slice(),
-                result.dropped_network_requests,
-            ),
-            _ => return failures,
-        };
+    let (
+        invocations,
+        dropped_invocations,
+        dropped_commands,
+        unsupported,
+        dropped_unsupported,
+        network,
+        dropped_network,
+    ) = match response.result.as_ref() {
+        Some(HarnessResult::Execute(result)) => (
+            result.invocations.as_slice(),
+            result.dropped_invocations,
+            result.dropped_commands,
+            result.unsupported.as_slice(),
+            result.dropped_unsupported,
+            result.network_requests.as_slice(),
+            result.dropped_network_requests,
+        ),
+        Some(HarnessResult::Action(result)) => (
+            result.invocations.as_slice(),
+            result.dropped_invocations,
+            result.dropped_commands,
+            result.unsupported.as_slice(),
+            result.dropped_unsupported,
+            result.network_requests.as_slice(),
+            result.dropped_network_requests,
+        ),
+        _ => return failures,
+    };
     if !unsupported.is_empty() {
         failures.push(format!("{prefix} used unsupported behavior"));
     }
@@ -298,7 +309,11 @@ pub fn strict_response_failures(sequence: usize, response: &HarnessResponse) -> 
     if network.iter().any(|request| !request.matched) {
         failures.push(format!("{prefix} made an unmatched network request"));
     }
-    if dropped_invocations != 0 || dropped_network != 0 {
+    if dropped_invocations != 0
+        || dropped_commands != 0
+        || dropped_unsupported != 0
+        || dropped_network != 0
+    {
         failures.push(format!(
             "{prefix} exceeded an observability retention bound"
         ));
@@ -416,7 +431,11 @@ pub fn check_final_expectation(
         }
     }
     if strict {
-        if inspect.dropped_invocations != 0 || inspect.dropped_network_requests != 0 {
+        if inspect.dropped_invocations != 0
+            || inspect.dropped_commands != 0
+            || inspect.dropped_unsupported != 0
+            || inspect.dropped_network_requests != 0
+        {
             failures.push("strict scenario exceeded an observability retention bound".to_string());
         }
         if inspect
@@ -429,6 +448,8 @@ pub fn check_final_expectation(
         if inspect.actions.iter().any(|action| {
             !action.unsupported.is_empty()
                 || action.dropped_invocations != 0
+                || action.dropped_commands != 0
+                || action.dropped_unsupported != 0
                 || action.dropped_network_requests != 0
                 || action
                     .invocations

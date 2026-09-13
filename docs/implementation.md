@@ -106,6 +106,12 @@ whether a route matched. Inspection returns the retained request log and a dropp
 once the fixed log capacity is reached, later attempts increment that count without growing host
 memory.
 
+The auxiliary command-name and unsupported-diagnostic logs are likewise bounded by entry count
+and retained string bytes. They keep their first window so action-start indices remain stable,
+then increment explicit `dropped_commands` and `dropped_unsupported` counters. Action, execute,
+inspection, evaluation, and Python-adapter reports expose those counters. The ordered invocation
+log remains the canonical command record and retains its rolling occurrence window.
+
 `serve --root PATH` and `shellsim-python` share `host_ingest.rs`. This trusted startup-only adapter
 canonicalizes the selected root, rejects symlinks, special files, and non-UTF-8 names, skips common
 dependency/build trees, preserves basic modes, applies file-count and VFS disk limits, and rolls

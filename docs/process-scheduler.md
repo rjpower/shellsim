@@ -369,6 +369,10 @@ names disappear. Completed action records retain only bounded metadata and captu
 clients release them explicitly. Session limits cover retained actions, capture bytes, process and
 descriptor state, telemetry, and forks before allocation.
 
+Command-name and unsupported-diagnostic compatibility logs retain a fixed append-only byte/count
+window and report later records as dropped. This preserves action-local sequence markers while
+preventing repeated simulated commands or diagnostics from growing host memory without bound.
+
 The NDJSON protocol now includes `start_execute`, `poll_action`, `write_stdin`, `close_stdin`,
 `read_action_output`, `signal_process`, `cancel_action`, and `drop_action`; one-shot `execute` drives
 the same path. Cancellation terminates the foreground process group with bounded scheduler work,

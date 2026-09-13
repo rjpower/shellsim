@@ -15,6 +15,68 @@ use crate::process::ProcessId;
 pub const MAX_INVOCATION_EVENTS: usize = 4_096;
 /// Maximum modeled heap bytes retained by command telemetry.
 pub const MAX_INVOCATION_BYTES: u64 = 4 * 1024 * 1024;
+/// Maximum retained entries in one auxiliary command or diagnostic log.
+pub const MAX_TEXT_EVENTS: usize = 4_096;
+/// Maximum string bytes retained by one auxiliary telemetry log.
+pub const MAX_TEXT_BYTES: u64 = 1024 * 1024;
+
+/// Append-only bounded strings with stable indices for action-local deltas.
+///
+/// Once full, this log retains its first window and counts later records as dropped. Stable
+/// indices let a suspended action keep a cheap marker without copying earlier telemetry.
+#[derive(Clone, Debug, Default)]
+pub struct BoundedTextLog {
+    entries: Vec<String>,
+    modeled_bytes: u64,
+    dropped: u64,
+}
+
+impl BoundedTextLog {
+    /// Record one string, or increment the dropped count without allocating past the bound.
+    pub fn record(&mut self, value: impl AsRef<str>) {
+        let value = value.as_ref();
+        let bytes = value.len() as u64;
+        if self.entries.len() >= MAX_TEXT_EVENTS
+            || bytes > MAX_TEXT_BYTES
+            || self.modeled_bytes.saturating_add(bytes) > MAX_TEXT_BYTES
+        {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        self.entries.push(value.to_string());
+        self.modeled_bytes = self.modeled_bytes.saturating_add(bytes);
+    }
+
+    /// Stable marker for a later [`BoundedTextLog::values_since`] query.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the retained window is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Clone retained values beginning at a previously observed marker.
+    pub fn values_since(&self, start: usize) -> Vec<String> {
+        self.entries.get(start..).unwrap_or_default().to_vec()
+    }
+
+    /// Clone the complete retained window.
+    pub fn values(&self) -> Vec<String> {
+        self.entries.clone()
+    }
+
+    /// Number of records rejected after reaching a count or byte bound.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// String bytes currently retained by this log.
+    pub fn modeled_bytes(&self) -> u64 {
+        self.modeled_bytes
+    }
+}
 
 /// How faithfully one command implementation models its namesake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -206,5 +268,18 @@ mod tests {
         assert_eq!(log.events().len(), MAX_INVOCATION_EVENTS);
         assert_eq!(log.dropped(), 1);
         assert_eq!(log.events()[0].sequence, 1);
+    }
+
+    #[test]
+    fn text_log_keeps_stable_markers_and_reports_overflow() {
+        let mut log = BoundedTextLog::default();
+        log.record("before");
+        let marker = log.len();
+        log.record("after");
+        log.record("x".repeat(MAX_TEXT_BYTES as usize));
+
+        assert_eq!(log.values_since(marker), ["after"]);
+        assert_eq!(log.dropped(), 1);
+        assert_eq!(log.modeled_bytes(), 11);
     }
 }

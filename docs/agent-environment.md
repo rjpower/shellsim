@@ -158,6 +158,9 @@ After shell, Git, Make, and process behavior are useful, add a host-side persist
 - report resource use, commands, unsupported operations, network requests, and processes;
 - reset or clone a deterministic snapshot when branching evaluation needs it.
 
+Every observability stream must be bounded and report dropped records. Absence of a retained event
+is not evidence that it did not occur once a drop counter is nonzero.
+
 Binary fields should use an explicit byte encoding rather than lossy JSON strings. The existing
 Python project ingestion should be factored into a generic trusted harness boundary. A thin MCP or
 model-API adapter can then connect an external agent to the service. Running the agent executable

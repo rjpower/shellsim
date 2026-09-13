@@ -1559,7 +1559,7 @@ impl Interp {
                 err.truncate(err.len().min(remaining));
             }
             let _ = self.resources.charge_output(produced);
-            self.cmd_trace.push("python:repl".to_string());
+            self.cmd_trace.record("python:repl");
             self.resources.record_command(
                 "python:repl",
                 cpu_before,

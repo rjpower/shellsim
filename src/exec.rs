@@ -1668,7 +1668,7 @@ impl ShellContinuation {
         }
         let variables = install_command_variables(interp, &assigns);
         restore_command_variables(interp, temporary_variables);
-        interp.cmd_trace.push(argv[0].clone());
+        interp.cmd_trace.record(&argv[0]);
         if let Some(body) = interp.funcs.get(&argv[0]).cloned() {
             let positional = std::mem::replace(&mut interp.positional, argv[1..].to_vec());
             if !self.ensure_capacity(interp, 2) {
@@ -1698,7 +1698,7 @@ impl ShellContinuation {
             return;
         }
         if record_trace {
-            interp.cmd_trace.push(argv[0].clone());
+            interp.cmd_trace.record(&argv[0]);
         }
         if crate::commands::starts_before_input(&argv) {
             let mut stdout = Vec::new();

@@ -33,6 +33,7 @@ struct Report {
     stdout: String,
     stderr: String,
     unsupported: Vec<String>,
+    dropped_unsupported: u64,
 }
 
 fn main() {
@@ -124,7 +125,8 @@ fn run(options: Options) -> Result<i32, String> {
             outcome,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            unsupported: environment.unsupported.clone(),
+            unsupported: environment.unsupported.values(),
+            dropped_unsupported: environment.unsupported.dropped(),
         };
         println!(
             "{}",
