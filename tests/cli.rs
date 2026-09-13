@@ -293,6 +293,41 @@ fn persistent_protocol_routes_isolated_complete_state_forks() {
 }
 
 #[test]
+fn persistent_protocol_exposes_typed_workspace_operations() {
+    let patch = "*** Begin Patch\n*** Update File: src/note\n@@\n-old\n+new\n*** End Patch\n";
+    let requests = [
+        r#"{"id":1,"op":"make_directory","path":"src","mode":488}"#.to_string(),
+        r#"{"id":2,"op":"write_file","path":"src/note","data_base64":"b2xkCg==","mode":416}"#
+            .to_string(),
+        r#"{"id":3,"op":"create_symlink","path":"note-link","target":"src/note"}"#.to_string(),
+        r#"{"id":4,"op":"stat_path","path":"note-link","follow_symlinks":false}"#.to_string(),
+        serde_json::json!({"id": 5, "op": "apply_patch", "patch": patch, "strip": 1}).to_string(),
+        r#"{"id":6,"op":"read_file","path":"src/note"}"#.to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let output = run_with_stdin(&["serve"], requests.as_bytes());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    assert!(responses.iter().all(|response| response["ok"] == true));
+    assert_eq!(responses[3]["result"]["kind"], "path_metadata");
+    assert_eq!(responses[3]["result"]["node_type"], "symlink");
+    assert_eq!(responses[3]["result"]["mode"], 0o777);
+    assert_eq!(responses[3]["result"]["symlink_target"], "src/note");
+    assert_eq!(responses[5]["result"]["data_base64"], "bmV3Cg==");
+}
+
+#[test]
 fn persistent_protocol_can_checkpoint_a_trusted_host_snapshot() {
     let project = TestDirectory::new();
     std::fs::write(project.path().join("input.txt"), b"snapshot\0bytes").unwrap();

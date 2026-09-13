@@ -28,7 +28,7 @@ mod git;
 mod hashing;
 mod makecmd;
 mod net;
-mod patch;
+pub(crate) mod patch;
 pub(crate) mod pkg;
 mod printf;
 mod proc;

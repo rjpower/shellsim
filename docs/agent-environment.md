@@ -188,7 +188,7 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
    stdin/output, modeled signals, and per-action telemetry over the same scheduler used by one-shot
    execution. A bounded session manager exposes complete machine-state forks through the protocol
    while preserving compatibility session zero. Atomic transcript persistence is present. Add
-   typed filesystem conveniences and external-agent experiments.
+   strict scenario metadata and external-agent experiments.
 
 Every phase retains the existing security rule: simulated input can use only explicitly modeled
 state and must never fall through to host filesystem, process, network, environment, or clock

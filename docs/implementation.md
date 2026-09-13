@@ -56,8 +56,9 @@ remain recoverable.
 `shellsim serve` owns one `HarnessSession` and reads bounded newline-delimited JSON requests. The
 closed operation set includes one-shot `execute`; retained `start_execute`, `poll_action`,
 `write_stdin`, `close_stdin`, `read_action_output`, `signal_process`, and `drop_action`; plus
-`read_file`, `write_file`, `remove_path`, `list_paths`, `checkpoint`, `workspace_diff`,
-`reset_workspace`, and `inspect`. Each request may carry an arbitrary JSON `id`, which is echoed in
+`read_file`, `write_file`, `stat_path`, `make_directory`, `create_symlink`, `apply_patch`,
+`remove_path`, `list_paths`, `checkpoint`, `workspace_diff`, `reset_workspace`, and `inspect`. Each
+request may carry an arbitrary JSON `id`, which is echoed in
 its one-line response. Stream and file bytes are base64; the protocol never performs lossy text
 conversion.
 
@@ -83,6 +84,12 @@ Workspace changes are typed, path-sorted added/modified/deleted records containi
 file bytes, modes, directories, or symlink targets. A checkpoint clones only a bounded VFS;
 `reset_workspace` restores that VFS checkpoint but deliberately does not rewind CPU fuel, virtual
 time, process history, shell variables, or terminal resource exhaustion.
+
+Typed metadata reports node kind, mode, ownership, virtual mtime, byte size, and an optional
+unfollowed symlink target. Directory creation has explicit parent and mode behavior. Harness patch
+application is fixed at `/work` and calls the same metered, atomic VFS patch engine as the simulated
+commands; invalid context, unsafe paths, oversized input, or resource exhaustion leave no partial
+file changes.
 
 Action results include ordered command occurrences and the bounded per-action virtual-network
 request delta with method, URL, and

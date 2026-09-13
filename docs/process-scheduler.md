@@ -376,7 +376,7 @@ forks. Explicit cancellation policy remains to be added. The bounded `HarnessMan
 ordinary operations by optional `session_id`, supports complete-state `fork_session` and
 `drop_session`, and retains at most eight independent machines. The current implicit session is a
 compatibility facade over manager entry zero, not an alternate implementation. Typed stat,
-directory, symlink, and patch operations can then be added without affecting execution semantics.
+directory, symlink, and atomic patch operations are now available without shell-command parsing.
 A Codex, Claude, or MCP adapter stays a thin client
 of this versioned protocol and never receives direct access to `Environment` capabilities.
 

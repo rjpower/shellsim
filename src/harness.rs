@@ -92,6 +92,27 @@ pub enum HarnessOperation {
         #[serde(default = "default_file_mode")]
         mode: u32,
     },
+    StatPath {
+        path: String,
+        #[serde(default = "default_true")]
+        follow_symlinks: bool,
+    },
+    MakeDirectory {
+        path: String,
+        #[serde(default = "default_directory_mode")]
+        mode: u32,
+        #[serde(default)]
+        parents: bool,
+    },
+    CreateSymlink {
+        path: String,
+        target: String,
+    },
+    ApplyPatch {
+        patch: String,
+        #[serde(default = "default_patch_strip")]
+        strip: usize,
+    },
     RemovePath {
         path: String,
     },
@@ -126,6 +147,7 @@ pub enum HarnessResult {
     ActionOutput(ActionOutput),
     Session { session_id: u64 },
     File(FileResult),
+    PathMetadata(PathMetadata),
     Paths { paths: Vec<String> },
     WorkspaceDiff { changes: Vec<WorkspaceChange> },
     Inspect(InspectResult),
@@ -189,6 +211,28 @@ pub struct FileResult {
     pub path: String,
     pub data_base64: String,
     pub mode: u32,
+}
+
+/// Exact VFS metadata for one workspace path.
+#[derive(Debug, Serialize)]
+pub struct PathMetadata {
+    pub path: String,
+    pub node_type: PathType,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime_ms: u64,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathType {
+    File,
+    Directory,
+    Symlink,
 }
 
 /// Stable process/resource inspection for an active session.
@@ -555,6 +599,7 @@ impl HarnessSession {
                 data_base64,
                 mode,
             } => {
+                validate_mode(mode)?;
                 let path = absolute_workspace_path(&path)?;
                 let (data, reserved) = self.decode_bytes(&data_base64)?;
                 let result = self
@@ -564,6 +609,51 @@ impl HarnessSession {
                     .map_err(|error| error.to_string());
                 self.environment.resources.release_memory(reserved);
                 result?;
+                Ok(HarnessResult::Acknowledged)
+            }
+            HarnessOperation::StatPath {
+                path,
+                follow_symlinks,
+            } => self.stat_path(&path, follow_symlinks),
+            HarnessOperation::MakeDirectory {
+                path,
+                mode,
+                parents,
+            } => {
+                validate_mode(mode)?;
+                let path = absolute_workspace_path(&path)?;
+                self.environment.sync_vfs_time();
+                if parents {
+                    self.environment
+                        .vfs
+                        .put_dir(&path, mode)
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    self.environment
+                        .vfs
+                        .mkdir("/", &path)
+                        .and_then(|_| self.environment.vfs.chmod("/", &path, mode))
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(HarnessResult::Acknowledged)
+            }
+            HarnessOperation::CreateSymlink { path, target } => {
+                if target.contains('\0') {
+                    return Err("symlink target contains NUL".to_string());
+                }
+                if target.len() > MAX_TRANSFER_RAW_BYTES {
+                    return Err("symlink target exceeds the transfer limit".to_string());
+                }
+                let path = absolute_workspace_path(&path)?;
+                self.environment.sync_vfs_time();
+                self.environment
+                    .vfs
+                    .symlink("/", &target, &path)
+                    .map_err(|error| error.to_string())?;
+                Ok(HarnessResult::Acknowledged)
+            }
+            HarnessOperation::ApplyPatch { patch, strip } => {
+                crate::commands::patch::apply_harness_patch(&mut self.environment, &patch, strip)?;
                 Ok(HarnessResult::Acknowledged)
             }
             HarnessOperation::RemovePath { path } => {
@@ -848,6 +938,33 @@ impl HarnessSession {
         }))
     }
 
+    fn stat_path(&self, path: &str, follow_symlinks: bool) -> Result<HarnessResult, String> {
+        let path = absolute_workspace_path(path)?;
+        let node = self
+            .environment
+            .vfs
+            .metadata("/", &path, follow_symlinks)
+            .map_err(|error| error.to_string())?;
+        let (node_type, size, symlink_target) = match node.kind {
+            NodeKind::File(data) => (PathType::File, data.len() as u64, None),
+            NodeKind::Dir => (PathType::Directory, 0, None),
+            NodeKind::Symlink(target) => {
+                let size = target.len() as u64;
+                (PathType::Symlink, size, Some(target))
+            }
+        };
+        Ok(HarnessResult::PathMetadata(PathMetadata {
+            path,
+            node_type,
+            mode: node.mode,
+            uid: node.uid,
+            gid: node.gid,
+            mtime_ms: node.mtime,
+            size,
+            symlink_target,
+        }))
+    }
+
     fn inspect(&self) -> InspectResult {
         let wall_time_ns = self
             .environment
@@ -1066,6 +1183,22 @@ fn default_poll_quanta() -> usize {
     1_024
 }
 
+fn default_directory_mode() -> u32 {
+    0o755
+}
+
+fn default_patch_strip() -> usize {
+    1
+}
+
+fn validate_mode(mode: u32) -> Result<(), String> {
+    if mode & !0o7777 == 0 {
+        Ok(())
+    } else {
+        Err(format!("invalid file mode {mode:#o}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1234,5 +1367,97 @@ mod tests {
         assert_eq!(STANDARD.decode(output.stdout_base64).unwrap(), b"hello");
         assert!(session.write_action_stdin(action_id, b"late").is_err());
         session.drop_action(action_id).unwrap();
+    }
+
+    #[test]
+    fn typed_workspace_operations_share_atomic_vfs_foundations() {
+        let mut session = HarnessSession::new(Limits::default());
+        assert!(session
+            .apply(HarnessOperation::MakeDirectory {
+                path: "nested/leaf".into(),
+                mode: 0o750,
+                parents: false,
+            })
+            .is_err());
+        session
+            .apply(HarnessOperation::MakeDirectory {
+                path: "nested/leaf".into(),
+                mode: 0o750,
+                parents: true,
+            })
+            .unwrap();
+        session
+            .apply(HarnessOperation::WriteFile {
+                path: "nested/leaf/note".into(),
+                data_base64: STANDARD.encode(b"old\n"),
+                mode: 0o640,
+            })
+            .unwrap();
+        session
+            .apply(HarnessOperation::CreateSymlink {
+                path: "link".into(),
+                target: "nested/leaf/note".into(),
+            })
+            .unwrap();
+        let HarnessResult::PathMetadata(link) = session
+            .stat_path("link", false)
+            .expect("lstat workspace link")
+        else {
+            panic!("stat returned the wrong result kind");
+        };
+        assert!(matches!(link.node_type, PathType::Symlink));
+        assert_eq!(link.symlink_target.as_deref(), Some("nested/leaf/note"));
+        let HarnessResult::PathMetadata(file) = session
+            .stat_path("link", true)
+            .expect("follow workspace link")
+        else {
+            panic!("stat returned the wrong result kind");
+        };
+        assert!(matches!(file.node_type, PathType::File));
+        assert_eq!(file.mode, 0o640);
+        assert_eq!(file.size, 4);
+
+        session.environment.run_script_capture("cd /");
+        session
+            .apply(HarnessOperation::ApplyPatch {
+                patch: "*** Begin Patch\n*** Update File: nested/leaf/note\n@@\n-old\n+new\n*** End Patch\n".into(),
+                strip: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            session
+                .environment
+                .vfs
+                .read("/", "/work/nested/leaf/note")
+                .unwrap(),
+            b"new\n"
+        );
+        assert!(!session.environment.vfs.exists("/", "/nested/leaf/note"));
+    }
+
+    #[test]
+    fn harness_patch_failure_is_atomic_and_bounded() {
+        let mut session = HarnessSession::new(Limits::default());
+        session
+            .environment
+            .vfs
+            .put_file("/work/note", b"keep\n".to_vec(), 0o644)
+            .unwrap();
+        let invalid = HarnessOperation::ApplyPatch {
+            patch:
+                "*** Begin Patch\n*** Update File: note\n@@\n-missing\n+changed\n*** End Patch\n"
+                    .into(),
+            strip: 1,
+        };
+        assert!(session.apply(invalid).is_err());
+        assert_eq!(
+            session.environment.vfs.read("/", "/work/note").unwrap(),
+            b"keep\n"
+        );
+        let oversized = HarnessOperation::ApplyPatch {
+            patch: "x".repeat(8 * 1024 * 1024 + 1),
+            strip: 1,
+        };
+        assert!(session.apply(oversized).unwrap_err().contains("8 MiB"));
     }
 }

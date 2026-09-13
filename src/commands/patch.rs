@@ -53,11 +53,13 @@ enum PatchLine {
 }
 
 fn cmd_apply_patch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    run_patch(ctx, args, io, true)
+    let cwd = ctx.cwd.clone();
+    run_patch(ctx, args, io, true, &cwd)
 }
 
 fn cmd_patch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    run_patch(ctx, args, io, false)
+    let cwd = ctx.cwd.clone();
+    run_patch(ctx, args, io, false, &cwd)
 }
 
 fn run_patch(
@@ -65,6 +67,7 @@ fn run_patch(
     args: &[String],
     io: &mut Io,
     agent_command: bool,
+    cwd: &str,
 ) -> i32 {
     let (strip, input_path) = match parse_options(agent_command, args) {
         Ok(options) => options,
@@ -102,12 +105,43 @@ fn run_patch(
         parse_unified_patch(text, strip)
     };
     let status = match parsed {
-        Ok(patches) if patches.len() <= MAX_FILE_PATCHES => apply_transaction(ctx, patches, io),
+        Ok(patches) if patches.len() <= MAX_FILE_PATCHES => {
+            apply_transaction(ctx, patches, io, cwd)
+        }
         Ok(_) => fail(io, 2, "too many files in patch"),
         Err(error) => fail(io, 2, &error),
     };
     ctx.resources.release_memory(reserved);
     status
+}
+
+/// Apply one trusted harness patch atomically beneath `/work` using the command's parser and
+/// resource model.
+pub(crate) fn apply_harness_patch(
+    interp: &mut crate::interp::Interp,
+    patch: &str,
+    strip: usize,
+) -> Result<(), String> {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut io = Io {
+        stdin: patch.as_bytes().to_vec(),
+        out: &mut stdout,
+        err: &mut stderr,
+    };
+    let mut context = CommandContext { env: interp };
+    let status = run_patch(
+        &mut context,
+        &[format!("-p{strip}")],
+        &mut io,
+        false,
+        "/work",
+    );
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&stderr).trim().to_string())
+    }
 }
 
 fn parse_options(agent_command: bool, args: &[String]) -> Result<(usize, Option<String>), String> {
@@ -411,10 +445,15 @@ fn parse_range(range: &str, header: &str) -> Result<(usize, usize), String> {
     Ok((start, count))
 }
 
-fn apply_transaction(ctx: &mut CommandContext<'_>, patches: Vec<FilePatch>, io: &mut Io) -> i32 {
+fn apply_transaction(
+    ctx: &mut CommandContext<'_>,
+    patches: Vec<FilePatch>,
+    io: &mut Io,
+    cwd: &str,
+) -> i32 {
     let before = ctx.vfs.clone();
     for patch in patches {
-        if let Err(error) = apply_file_patch(ctx, patch) {
+        if let Err(error) = apply_file_patch(ctx, patch, cwd) {
             ctx.vfs = before;
             return fail(io, 1, &error);
         }
@@ -422,8 +461,11 @@ fn apply_transaction(ctx: &mut CommandContext<'_>, patches: Vec<FilePatch>, io: 
     0
 }
 
-fn apply_file_patch(ctx: &mut CommandContext<'_>, patch: FilePatch) -> Result<(), String> {
-    let cwd = ctx.cwd.clone();
+fn apply_file_patch(
+    ctx: &mut CommandContext<'_>,
+    patch: FilePatch,
+    cwd: &str,
+) -> Result<(), String> {
     let source = patch.old_path.as_deref();
     let destination = patch.new_path.as_deref();
     if source.is_none() && destination.is_none() {
@@ -431,7 +473,7 @@ fn apply_file_patch(ctx: &mut CommandContext<'_>, patch: FilePatch) -> Result<()
     }
     let source_bytes = if let Some(path) = source {
         ctx.vfs
-            .read(&cwd, path)
+            .read(cwd, path)
             .map_err(|error| format!("{path}: {error}"))?
     } else {
         Vec::new()
@@ -491,18 +533,18 @@ fn apply_file_patch(ctx: &mut CommandContext<'_>, patch: FilePatch) -> Result<()
         ctx.sync_vfs_time();
         return ctx
             .vfs
-            .remove_file(&cwd, path)
+            .remove_file(cwd, path)
             .map_err(|error| format!("{path}: {error}"));
     }
     let path = destination.expect("non-deletion has a destination");
-    let absolute = resolve_against(&cwd, path);
+    let absolute = resolve_against(cwd, path);
     if let Some(parent) = parent_of(&absolute) {
         ctx.vfs
             .mkdir_all("/", &parent)
             .map_err(|error| format!("{path}: {error}"))?;
     }
     let mode = source
-        .and_then(|path| ctx.vfs.metadata(&cwd, path, true).ok())
+        .and_then(|path| ctx.vfs.metadata(cwd, path, true).ok())
         .and_then(|metadata| match metadata.kind {
             NodeKind::File(_) => Some(metadata.mode),
             _ => None,
@@ -514,7 +556,7 @@ fn apply_file_patch(ctx: &mut CommandContext<'_>, patch: FilePatch) -> Result<()
         .map_err(|error| format!("{path}: {error}"))?;
     if source.is_some_and(|source| source != path) {
         ctx.vfs
-            .remove_file(&cwd, source.unwrap())
+            .remove_file(cwd, source.unwrap())
             .map_err(|error| format!("{}: {error}", source.unwrap()))?;
     }
     Ok(())
