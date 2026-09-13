@@ -184,9 +184,10 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
    compound native callback frames remain.
 7. A persistent bounded NDJSON workspace protocol with execution, typed diffs, checkpoint/reset,
    file tools, inspection, transactional host snapshot ingestion, replay, and typed scenario
-   assertions is present. Retained actions expose bounded polling, typed waits, incremental
-   stdin/output, modeled signals, and per-action telemetry over the same scheduler used by one-shot
-   execution. A bounded session manager exposes complete machine-state forks through the protocol
+   assertions is present. Retained actions expose bounded polling, explicit foreground
+   cancellation, typed waits, incremental stdin/output, modeled signals, and per-action telemetry
+   over the same scheduler used by one-shot execution. A bounded session manager exposes complete
+   machine-state forks through the protocol
    while preserving compatibility session zero. Atomic transcript persistence, versioned scenario
    metadata, strict trust policy, and final state/resource assertions are present. Add
    external-agent experiments.

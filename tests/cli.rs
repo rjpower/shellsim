@@ -259,6 +259,37 @@ fn persistent_protocol_polls_retained_actions_and_streams_input_output() {
 }
 
 #[test]
+fn persistent_protocol_cancels_an_action_without_terminating_its_session() {
+    let requests = [
+        r#"{"id":1,"op":"start_execute","source":"sleep 10 | cat"}"#,
+        r#"{"id":2,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":false}"#,
+        r#"{"id":3,"op":"cancel_action","action_id":0}"#,
+        r#"{"id":4,"op":"execute","source":"printf reused"}"#,
+        r#"{"id":5,"op":"drop_action","action_id":0}"#,
+    ]
+    .join("\n")
+        + "\n";
+    let output = run_with_stdin(&["serve"], requests.as_bytes());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(responses.iter().all(|response| response["ok"] == true));
+    assert_eq!(responses[1]["result"]["state"]["state"], "blocked");
+    assert_eq!(responses[2]["result"]["state"]["state"], "complete");
+    assert_eq!(responses[2]["result"]["state"]["status"], 137);
+    assert_eq!(responses[3]["result"]["outcome"]["exit_status"], 0);
+    assert_eq!(responses[3]["result"]["stdout_base64"], "cmV1c2Vk");
+}
+
+#[test]
 fn persistent_protocol_routes_isolated_complete_state_forks() {
     let requests = [
         r#"{"id":1,"op":"execute","source":"X=parent; printf base > value"}"#,

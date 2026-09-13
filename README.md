@@ -57,6 +57,13 @@ printf '%s\n' \
   '{"id":4,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":true}' \
   | ./target/release/shellsim serve
 
+# Cancel a blocked foreground action while keeping the session reusable
+printf '%s\n' \
+  '{"id":1,"op":"start_execute","source":"sleep 60"}' \
+  '{"id":2,"op":"cancel_action","action_id":0}' \
+  '{"id":3,"op":"execute","source":"printf reused"}' \
+  | ./target/release/shellsim serve
+
 # Fork session zero and route an independent action to the branch
 printf '%s\n' \
   '{"id":1,"op":"fork_session","source":0}' \

@@ -370,9 +370,12 @@ clients release them explicitly. Session limits cover retained actions, capture 
 descriptor state, telemetry, and forks before allocation.
 
 The NDJSON protocol now includes `start_execute`, `poll_action`, `write_stdin`, `close_stdin`,
-`read_action_output`, `signal_process`, and `drop_action`; one-shot `execute` drives the same path.
+`read_action_output`, `signal_process`, `cancel_action`, and `drop_action`; one-shot `execute` drives
+the same path. Cancellation terminates the foreground process group with bounded scheduler work,
+restores persistent descriptors, and leaves the session reusable; dropping remains completed-record
+cleanup.
 Active actions, their descriptor cursors, and their continuations survive complete-state library
-forks. Explicit cancellation policy remains to be added. The bounded `HarnessManager` now routes
+forks. The bounded `HarnessManager` now routes
 ordinary operations by optional `session_id`, supports complete-state `fork_session` and
 `drop_session`, and retains at most eight independent machines. The current implicit session is a
 compatibility facade over manager entry zero, not an alternate implementation. Typed stat,

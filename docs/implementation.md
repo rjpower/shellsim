@@ -55,12 +55,21 @@ remain recoverable.
 
 `shellsim serve` owns one `HarnessSession` and reads bounded newline-delimited JSON requests. The
 closed operation set includes one-shot `execute`; retained `start_execute`, `poll_action`,
-`write_stdin`, `close_stdin`, `read_action_output`, `signal_process`, and `drop_action`; plus
+`write_stdin`, `close_stdin`, `read_action_output`, `signal_process`, `cancel_action`, and
+`drop_action`; plus
 `read_file`, `write_file`, `stat_path`, `make_directory`, `create_symlink`, `apply_patch`,
 `remove_path`, `list_paths`, `checkpoint`, `workspace_diff`, `reset_workspace`, and `inspect`. Each
 request may carry an arbitrary JSON `id`, which is echoed in
 its one-line response. Stream and file bytes are base64; the protocol never performs lossy text
 conversion.
+
+`cancel_action` is distinct from both signaling and dropping. It sends an uncatchable modeled
+signal to the action's foreground process group, closes its input, drives only bounded scheduler
+work without advancing virtual time, restores the persistent shell descriptors, and retains a
+completed status-137 action record. The cancellation-induced shell exit is cleared so the session
+can execute another action. Separately grouped background jobs are not silently destroyed;
+`signal_process` remains the explicit mechanism for them. `drop_action` only releases an already
+completed record.
 
 A retained action installs a shell continuation and isolated standard descriptors without driving
 the machine. Polls execute a bounded number of ordinary scheduler quanta. With `advance_time`

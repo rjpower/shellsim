@@ -22,6 +22,7 @@ const MAX_TRANSFER_RAW_BYTES: usize = 6 * 1024 * 1024;
 const MAX_SESSION_FORK_BYTES: u64 = 96 * 1024 * 1024;
 const MAX_RETAINED_ACTIONS: usize = 64;
 const MAX_POLL_QUANTA: usize = 100_000;
+const MAX_CANCEL_QUANTA: usize = 100_000;
 
 /// One protocol request. `id` is echoed verbatim so clients can correlate responses.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -73,6 +74,9 @@ pub enum HarnessOperation {
         signal: String,
         #[serde(default)]
         process_group: bool,
+    },
+    CancelAction {
+        action_id: u64,
     },
     DropAction {
         action_id: u64,
@@ -586,6 +590,9 @@ impl HarnessSession {
                 }
                 Ok(HarnessResult::Acknowledged)
             }
+            HarnessOperation::CancelAction { action_id } => {
+                self.cancel_action(action_id).map(HarnessResult::Action)
+            }
             HarnessOperation::DropAction { action_id } => {
                 self.drop_action(action_id)?;
                 Ok(HarnessResult::Acknowledged)
@@ -872,6 +879,46 @@ impl HarnessSession {
         result
     }
 
+    fn cancel_action(&mut self, action_id: u64) -> Result<ActionView, String> {
+        let mut action = self
+            .actions
+            .remove(&action_id)
+            .ok_or_else(|| format!("action {action_id} does not exist"))?;
+        let Some(mut execution) = action.execution.take() else {
+            self.actions.insert(action_id, action);
+            return Err(format!("action {action_id} is complete"));
+        };
+        let result = cancel_execution(
+            &mut self.environment,
+            &mut execution,
+            action_id,
+            action.root_pid,
+        );
+        let result = match result {
+            Ok(status) => {
+                execution.drain_output(
+                    &mut self.environment,
+                    &mut action.stdout,
+                    &mut action.stderr,
+                );
+                execution.restore(&mut self.environment);
+                if self.environment.exiting == Some(status) {
+                    self.environment.exiting = None;
+                }
+                self.environment.last_status = status;
+                action.complete(&self.environment, status);
+                self.active_action = None;
+                Ok(action.view(&self.environment))
+            }
+            Err(error) => {
+                action.execution = Some(execution);
+                Err(error)
+            }
+        };
+        self.actions.insert(action_id, action);
+        result
+    }
+
     fn read_action_output(&mut self, action_id: u64) -> Result<ActionOutput, String> {
         let mut action = self
             .actions
@@ -1025,6 +1072,46 @@ impl HarnessSession {
             }
         }
     }
+}
+
+fn cancel_execution(
+    environment: &mut Environment,
+    execution: &mut crate::exec::ShellExecution,
+    action_id: u64,
+    root_pid: u32,
+) -> Result<i32, String> {
+    let process_group = environment
+        .processes
+        .get(root_pid)
+        .map(|record| record.process_group)
+        .ok_or_else(|| format!("action {action_id} root process does not exist"))?;
+    let _ = execution.close_stdin(environment);
+    for pid in environment.processes.running_group(process_group) {
+        if pid != root_pid {
+            environment.send_signal(pid, crate::process::Signal::Kill)?;
+        }
+    }
+
+    let mut root_signaled = false;
+    for _ in 0..MAX_CANCEL_QUANTA {
+        let live_group = environment.processes.running_group(process_group);
+        if !root_signaled && live_group.iter().all(|pid| *pid == root_pid) {
+            environment.send_signal(root_pid, crate::process::Signal::Kill)?;
+            root_signaled = true;
+        }
+        match execution.poll(environment, false)? {
+            crate::exec::MachinePoll::Progress => {}
+            crate::exec::MachinePoll::Blocked => {
+                return Err(format!(
+                    "action {action_id} cancellation blocked without a modeled event"
+                ));
+            }
+            crate::exec::MachinePoll::Ready(status) => return Ok(status),
+        }
+    }
+    Err(format!(
+        "action {action_id} cancellation exceeded its work bound"
+    ))
 }
 
 fn process_view(record: &ProcessRecord, task_state: Option<TaskState>) -> ProcessView {
@@ -1459,5 +1546,39 @@ mod tests {
             strip: 1,
         };
         assert!(session.apply(oversized).unwrap_err().contains("8 MiB"));
+    }
+
+    #[test]
+    fn cancel_action_terminates_foreground_group_and_reuses_session() {
+        let mut session = HarnessSession::new(Limits::default());
+        let action_id = session
+            .start_action("sleep 10 | cat", &[], true)
+            .unwrap()
+            .action_id;
+        let blocked = session.poll_action(action_id, 100, false).unwrap();
+        assert!(matches!(blocked.state, ActionState::Blocked { .. }));
+        assert!(session.environment.clock.pending_len() > 0);
+
+        let cancelled = session.cancel_action(action_id).unwrap();
+        assert!(matches!(
+            cancelled.state,
+            ActionState::Complete { status: 137 }
+        ));
+        assert_eq!(cancelled.outcome.unwrap().exit_status, 137);
+        assert_eq!(session.environment.clock.pending_len(), 0);
+        assert!(session.active_action.is_none());
+        assert!(session
+            .environment
+            .processes
+            .running_group(cancelled.root_pid)
+            .iter()
+            .all(|pid| *pid == cancelled.root_pid));
+
+        let HarnessResult::Execute(reused) = session.execute("printf reused", &[]).unwrap() else {
+            panic!("reused session returned the wrong result kind");
+        };
+        assert_eq!(reused.outcome.exit_status, 0);
+        assert_eq!(STANDARD.decode(reused.stdout_base64).unwrap(), b"reused");
+        assert!(session.cancel_action(action_id).is_err());
     }
 }
