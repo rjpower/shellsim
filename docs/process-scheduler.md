@@ -183,14 +183,15 @@ Required compatibility cases include overlapping sleeps, file races with determi
 `yes | head`, early reader close, multi-stage pipelines, blocked writers, pipeline status and
 `pipefail`, job status transitions, nested deadlines, and resource exhaustion without deadlock.
 
-## Phase 5: minimal signals and Python `Popen` (baseline complete)
+## Phase 5: minimal signals and Python `Popen` (complete)
 
 Pending `KILL`, `TERM`, `INT`, `HUP`, `CHLD`, and `PIPE` signals now live on process state and are
 delivered at scheduler boundaries. Terminating signals wake blocked tasks, use conventional
 `128 + signal` statuses, and cancel abandoned timer events; `CHLD` is coalesced with its default
 ignored disposition. The shell `kill` builtin supports PID/job targets, supported signal names and
-numbers, existence probes, and signal listing. Custom handlers and process groups remain explicit
-future work.
+numbers, existence probes, and signal listing. `trap` installs bounded process-local default,
+ignored, and parsed shell-handler dispositions. Caught handlers are ordinary resumable shell
+frames, and interrupted timer, descriptor, and child operations retry their typed conditions.
 
 `Popen` is built over live process handles and descriptor-backed streams. `poll`, `wait`,
 `communicate`, signal termination, context management, timeouts, capture, and reaping use real
@@ -199,8 +200,69 @@ logical child state. `stdin`, `stdout`, and `stderr` expose small binary/text fi
 timeout so retry cannot duplicate input. Unsupported host setup and session options fail before
 launch. Background jobs are process-group leaders, descendants inherit group identity, job and
 negative-PGID signals target all running members, and `Popen(start_new_session=True)` establishes a
-new modeled group. Terminal foreground-group control, arbitrary `setpgid`, custom signal handlers,
+new modeled group. Terminal foreground-group control, arbitrary `setpgid`, Python signal callbacks,
 and resumable compound native callbacks remain outside this baseline.
+
+### Signal interruption and shell-trap design
+
+Signal handling extends the cooperative scheduler through the same continuation contract as
+timers, descriptors, and child completion. It must not add a second executor or make a scheduler
+wake synonymous with successful I/O or process completion.
+
+The model has three separate layers:
+
+```text
+Process signal state
+  pending: bounded coalesced set<Signal>
+  dispositions: Signal -> Default | Ignore | ShellHandler { source, parsed_body }
+
+Scheduler state
+  Runnable | Running | Blocked(WaitReason) | Exited(status)
+
+Language continuation
+  suspended operation frames
+  injected handler frames
+  saved pre-handler status
+```
+
+Queuing a signal changes only process signal state. A fatal default disposition or a caught
+handler makes a blocked task runnable; an ignored signal does not. On the task's next scheduler
+boundary, delivery removes one pending signal in stable signal-number order. Default terminating
+signals exit the process, ignored signals disappear, and a shell handler is inserted ahead of the
+existing `ShellContinuation`. The handler is therefore ordinary resumable shell code: it can use
+descriptors, launch or wait for children, block on virtual time, and consume the same resource
+budgets. A completion frame restores the status that was current before handler entry.
+
+Every suspended operation must treat a wake as advisory and poll its modeled condition again.
+Timer continuations retain their absolute virtual deadline; child waits check retained process
+status; descriptor operations retry against current readiness; combined child/deadline operations
+check both. If the condition remains false after a handler, the same frame returns the same typed
+`WaitReason` and blocks again. No `interrupted` boolean, synthetic success result, or command-name
+special case is needed.
+
+`trap` mutates the active process's disposition table atomically after parsing all signal operands
+and, for a handler, parsing the complete shell body. Empty source installs `Ignore`; `-` restores
+`Default`. `KILL` cannot be caught or ignored. The first slice covers the already modeled named
+signals and `trap -p`; exit/debug/error pseudo-traps are separate shell lifecycle events and remain
+explicitly unsupported. Handler source and parsed AST size count toward the existing bounded fork
+state. New executed shell programs reset caught handlers to default while preserving ignored
+signals, matching the Unix exec boundary; same-process functions retain dispositions.
+
+Implemented sequence:
+
+1. Replace wake-implies-success timer and foreground-child frames with condition-bearing,
+   retryable continuations.
+2. Add typed process-local dispositions and one signal-delivery API; route `CHLD` through the same
+   queue/wake path as `kill` and timeout delivery.
+3. Add bounded handler injection and status restoration to `ShellContinuation`.
+4. Implement the `trap` builtin on the disposition API and remove its successful no-op listing.
+5. Test caught and ignored signals during sleep, foreground waits, pipe backpressure, and handler
+   blocking; uncatchable `KILL`; disposition reset; coalescing; process groups; resource
+   exhaustion; and unsupported pseudo-traps.
+
+Terminal foreground-group control should later reuse this signal delivery path. A terminal object
+will own a foreground process-group ID, and terminal-generated `INT`/`HUP` will target that group;
+it must not be encoded as special behavior in `kill`, descriptors, or the shell parser.
 
 ## Phase 6: agent command fidelity
 

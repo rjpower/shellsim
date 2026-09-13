@@ -35,11 +35,11 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["read"], Trust::Real, cmd_read);
     reg_resumable(m, &["wait"], Trust::Real, cmd_wait, start_wait);
     reg(m, &["jobs"], Trust::Real, cmd_jobs);
+    reg(m, &["trap"], Trust::Real, cmd_trap);
     reg(
         m,
         &[
-            "trap", "disown", "umask", "ulimit", "hash", "complete", "shopt", "bind", "history",
-            "exec",
+            "disown", "umask", "ulimit", "hash", "complete", "shopt", "bind", "history", "exec",
         ],
         Trust::NoOp,
         cmd_unsupported,
@@ -61,6 +61,132 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
 fn cmd_unsupported(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
     ewln(io.err, "shellsim: builtin is not supported");
     2
+}
+
+const MAX_TRAP_STATE_BYTES: u64 = 1024 * 1024;
+
+fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.is_empty() {
+        print_traps(interp, &[], io);
+        return 0;
+    }
+    if args[0] == "-l" {
+        if args.len() != 1 {
+            ewln(io.err, "trap: -l does not accept operands");
+            return 2;
+        }
+        return list_signal(None, io);
+    }
+    if args[0] == "-p" {
+        let signals = match parse_trap_signals(&args[1..]) {
+            Ok(signals) => signals,
+            Err(error) => {
+                ewln(io.err, &format!("trap: {error}"));
+                return 2;
+            }
+        };
+        print_traps(interp, &signals, io);
+        return 0;
+    }
+
+    let action_index = usize::from(args[0] == "--");
+    let Some(action) = args.get(action_index) else {
+        ewln(io.err, "trap: missing action");
+        return 2;
+    };
+    let signal_args = &args[action_index + 1..];
+    if signal_args.is_empty() {
+        ewln(io.err, "trap: missing signal operand");
+        return 2;
+    }
+    let signals = match parse_trap_signals(signal_args) {
+        Ok(signals) => signals,
+        Err(error) => {
+            ewln(io.err, &format!("trap: {error}"));
+            return 2;
+        }
+    };
+    if signals.contains(&crate::process::Signal::Kill) {
+        ewln(io.err, "trap: SIGKILL cannot be caught or ignored");
+        return 1;
+    }
+
+    let disposition = if action == "-" {
+        None
+    } else if action.is_empty() {
+        Some(crate::interp::ShellSignalDisposition::Ignore)
+    } else {
+        let body = match crate::shell::parse(action) {
+            Ok(body) => body,
+            Err(error) => {
+                ewln(io.err, &format!("trap: invalid handler: {error}"));
+                return 2;
+            }
+        };
+        Some(crate::interp::ShellSignalDisposition::Handler {
+            source: action.clone(),
+            body,
+        })
+    };
+
+    let mut updated = interp.signal_dispositions.clone();
+    for signal in signals {
+        if let Some(disposition) = &disposition {
+            updated.insert(signal, disposition.clone());
+        } else {
+            updated.remove(&signal);
+        }
+    }
+    let state_bytes = updated.values().fold(0_u64, |total, disposition| {
+        total.saturating_add(match disposition {
+            crate::interp::ShellSignalDisposition::Ignore => 16,
+            crate::interp::ShellSignalDisposition::Handler { source, body } => (source.len()
+                as u64)
+                .saturating_add(body.estimated_bytes())
+                .saturating_add(32),
+        })
+    });
+    if state_bytes > MAX_TRAP_STATE_BYTES {
+        ewln(io.err, "trap: signal handler state exceeds the 1 MiB limit");
+        return 2;
+    }
+    interp.signal_dispositions = updated;
+    0
+}
+
+fn parse_trap_signals(values: &[String]) -> Result<Vec<crate::process::Signal>, String> {
+    let mut signals = Vec::with_capacity(values.len());
+    for value in values {
+        if value == "0" || value.eq_ignore_ascii_case("EXIT") {
+            return Err("EXIT traps are not supported".to_string());
+        }
+        let signal = crate::process::Signal::parse(value)
+            .ok_or_else(|| format!("invalid signal: {value}"))?;
+        if !signals.contains(&signal) {
+            signals.push(signal);
+        }
+    }
+    Ok(signals)
+}
+
+fn print_traps(interp: &CommandContext<'_>, selected: &[crate::process::Signal], io: &mut Io) {
+    for (signal, disposition) in &interp.signal_dispositions {
+        if !selected.is_empty() && !selected.contains(signal) {
+            continue;
+        }
+        let action = match disposition {
+            crate::interp::ShellSignalDisposition::Ignore => String::new(),
+            crate::interp::ShellSignalDisposition::Handler { source, .. } => source.clone(),
+        };
+        wln(
+            io.out,
+            &format!(
+                "trap -- '{}' SIG{}",
+                action.replace('\'', "'\\''"),
+                signal.name()
+            ),
+        );
+    }
 }
 
 fn cmd_jobs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

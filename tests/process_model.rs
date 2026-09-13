@@ -185,3 +185,65 @@ fn a_signal_to_the_persistent_shell_terminates_the_session() {
     assert!(env.is_terminated());
     assert_eq!(env.termination_status(), Some(129));
 }
+
+#[test]
+fn trap_dispositions_are_queryable_atomic_and_keep_kill_uncatchable() {
+    let mut env = Environment::new();
+    let result = run(&mut env, "trap 'printf caught' TERM; trap '' HUP; trap -p");
+    assert_eq!(
+        result,
+        (
+            0,
+            "trap -- '' SIGHUP\ntrap -- 'printf caught' SIGTERM\n".into(),
+            String::new(),
+        )
+    );
+
+    let result = run(&mut env, "trap 'printf bad' INT KILL; trap -p INT");
+    assert_eq!(result.0, 0);
+    assert!(result.1.is_empty());
+    assert!(
+        result.2.contains("SIGKILL cannot be caught"),
+        "{}",
+        result.2
+    );
+}
+
+#[test]
+fn child_signal_traps_and_exec_disposition_rules_use_process_state() {
+    let mut env = Environment::new();
+    assert_eq!(
+        run(
+            &mut env,
+            "trap 'printf child' CHLD; sleep 1 & wait; printf done",
+        ),
+        (0, "childdone".into(), String::new())
+    );
+
+    let mut env = Environment::new();
+    assert_eq!(
+        run(
+            &mut env,
+            "trap 'printf inherited' TERM; bash -c 'kill -TERM $$; printf unreachable'; printf status:$?",
+        ),
+        (0, "status:143".into(), String::new())
+    );
+
+    let mut env = Environment::new();
+    assert_eq!(
+        run(
+            &mut env,
+            "trap '' TERM; bash -c 'kill -TERM $$; printf survived'",
+        ),
+        (0, "survived".into(), String::new())
+    );
+}
+
+#[test]
+fn trap_state_growth_is_bounded_before_installation() {
+    let mut env = Environment::new();
+    let source = format!("trap '{}' TERM", "x".repeat(1024 * 1024));
+    let result = run(&mut env, &source);
+    assert_eq!(result.0, 2);
+    assert!(result.2.contains("handler state exceeds"), "{}", result.2);
+}

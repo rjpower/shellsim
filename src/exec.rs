@@ -196,6 +196,9 @@ enum ShellFrame {
     FinishInlineCommand {
         variables: Vec<(String, Option<String>)>,
     },
+    FinishSignalHandler {
+        previous_status: i32,
+    },
     ResumeCommand {
         variables: Vec<(String, Option<String>)>,
         continuation: crate::commands::CommandResume,
@@ -387,6 +390,7 @@ impl ShellContinuation {
                 ShellFrame::FinishInlineCommand { variables } => {
                     restore_command_variables(interp, variables);
                 }
+                ShellFrame::FinishSignalHandler { .. } => interp.finish_signal_handler(),
                 ShellFrame::Conditional { .. }
                 | ShellFrame::Negate
                 | ShellFrame::IfAfter { .. }
@@ -396,6 +400,17 @@ impl ShellContinuation {
                 _ => {}
             }
         }
+    }
+
+    fn inject_signal_handler(&mut self, interp: &mut Interp, body: Node) {
+        if !self.ensure_capacity(interp, 2) {
+            interp.finish_signal_handler();
+            return;
+        }
+        self.frames.push(ShellFrame::FinishSignalHandler {
+            previous_status: self.status,
+        });
+        self.frames.push(ShellFrame::Eval(body));
     }
 
     fn retain_switched_command(
@@ -1074,6 +1089,10 @@ impl ShellContinuation {
             ShellFrame::FinishInlineCommand { variables } => {
                 restore_command_variables(interp, variables);
             }
+            ShellFrame::FinishSignalHandler { previous_status } => {
+                interp.finish_signal_handler();
+                self.status = previous_status;
+            }
             ShellFrame::ResumeCommand {
                 variables,
                 continuation,
@@ -1276,19 +1295,22 @@ impl ShellContinuation {
                 });
             }
             ShellFrame::AwaitChild { pid, reap } => {
-                self.status = match interp.processes.get(pid).map(|record| record.status) {
-                    Some(crate::process::ProcessStatus::Exited(status)) => status,
-                    _ => {
-                        write_diagnostic(
-                            interp,
-                            &format!("shellsim: child {pid} resumed without exit status\n"),
-                        );
-                        125
+                match interp.processes.get(pid).map(|record| record.status) {
+                    Some(crate::process::ProcessStatus::Exited(status)) => {
+                        self.status = status;
+                        if reap {
+                            interp.processes.reap(pid);
+                            let _ = interp.scheduler.reap(pid);
+                        }
                     }
-                };
-                if reap {
-                    interp.processes.reap(pid);
-                    let _ = interp.scheduler.reap(pid);
+                    Some(crate::process::ProcessStatus::Running) => {
+                        self.frames.push(ShellFrame::AwaitChild { pid, reap });
+                        self.blocked = Some(crate::scheduler::WaitReason::Child(pid));
+                    }
+                    None => {
+                        write_diagnostic(interp, &format!("shellsim: child {pid} disappeared\n"));
+                        self.status = 125;
+                    }
                 }
             }
             ShellFrame::AwaitPipeline {
@@ -1906,19 +1928,32 @@ fn exec_node(interp: &mut Interp, node: &Node) -> i32 {
     }
     loop {
         let owner_pid = interp.process.pid;
-        if let Some(signal) = interp.take_terminating_signal() {
-            let status = 128 + signal.number();
-            if owner_pid == target_pid {
-                interp.process.shell_continuation = None;
-                interp.exiting = Some(status);
-                return status;
+        if let Some(delivery) = interp.take_signal_delivery() {
+            match delivery {
+                crate::interp::SignalDelivery::Terminate(signal) => {
+                    let status = 128 + signal.number();
+                    if owner_pid == target_pid {
+                        interp.process.shell_continuation = None;
+                        interp.exiting = Some(status);
+                        return status;
+                    }
+                    interp.finish_child(owner_pid, status);
+                    if interp.scheduler.current().is_none() {
+                        dispatch_or_advance(interp)
+                            .expect("signaled child must leave a runnable parent or modeled event");
+                    }
+                    continue;
+                }
+                crate::interp::SignalDelivery::Handler(body) => {
+                    let mut continuation = interp
+                        .process
+                        .shell_continuation
+                        .take()
+                        .expect("active signaled process must own a shell continuation");
+                    continuation.inject_signal_handler(interp, body);
+                    interp.process.shell_continuation = Some(continuation);
+                }
             }
-            interp.finish_child(owner_pid, status);
-            if interp.scheduler.current().is_none() {
-                dispatch_or_advance(interp)
-                    .expect("signaled child must leave a runnable parent or modeled event");
-            }
-            continue;
         }
         wake_due_events(interp).expect("current virtual instant must remain valid");
         let owner_pid = interp.process.pid;
@@ -2068,9 +2103,21 @@ pub(crate) fn drive_scheduler_step(
 fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
     wake_due_events(interp)?;
     let owner = interp.process.pid;
-    if let Some(signal) = interp.take_terminating_signal() {
-        interp.finish_child(owner, 128 + signal.number());
-        return Ok(());
+    if let Some(delivery) = interp.take_signal_delivery() {
+        match delivery {
+            crate::interp::SignalDelivery::Terminate(signal) => {
+                interp.finish_child(owner, 128 + signal.number());
+                return Ok(());
+            }
+            crate::interp::SignalDelivery::Handler(body) => {
+                let mut continuation =
+                    interp.process.shell_continuation.take().ok_or_else(|| {
+                        format!("scheduled process {owner} has no shell continuation")
+                    })?;
+                continuation.inject_signal_handler(interp, body);
+                interp.process.shell_continuation = Some(continuation);
+            }
+        }
     }
     let mut continuation = interp
         .process

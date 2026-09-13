@@ -42,6 +42,23 @@ pub(crate) struct AliasDefinition {
     pub words: Vec<String>,
 }
 
+/// Non-default shell behavior installed for one modeled signal.
+#[derive(Clone, Debug)]
+pub(crate) enum ShellSignalDisposition {
+    Ignore,
+    Handler {
+        source: String,
+        body: crate::shell::Node,
+    },
+}
+
+/// One signal action selected for the active process at a scheduler boundary.
+#[derive(Clone, Debug)]
+pub(crate) enum SignalDelivery {
+    Terminate(Signal),
+    Handler(crate::shell::Node),
+}
+
 /// Machine-wide state and limits shared by cooperatively scheduled logical processes.
 #[derive(Clone)]
 pub struct Environment {
@@ -137,6 +154,10 @@ pub struct ProcessState {
     pub(crate) shell_continuation: Option<crate::exec::ShellContinuation>,
     /// Coalesced standard signals awaiting delivery at a scheduler boundary.
     pending_signals: std::collections::BTreeSet<Signal>,
+    /// Non-default signal actions installed by the shell `trap` builtin.
+    pub(crate) signal_dispositions: BTreeMap<Signal, ShellSignalDisposition>,
+    /// Prevent ordinary caught signals from recursively interrupting their own handler.
+    handling_signal: bool,
     /// Memory reserved for this forked context and released independently at exit.
     fork_allocation_bytes: u64,
     detached_output: bool,
@@ -279,6 +300,18 @@ impl ProcessState {
             fds,
             shell_continuation: None,
             pending_signals: std::collections::BTreeSet::new(),
+            signal_dispositions: if new_shell {
+                self.signal_dispositions
+                    .iter()
+                    .filter(|(_, disposition)| {
+                        matches!(disposition, ShellSignalDisposition::Ignore)
+                    })
+                    .map(|(signal, disposition)| (*signal, disposition.clone()))
+                    .collect()
+            } else {
+                self.signal_dispositions.clone()
+            },
+            handling_signal: false,
             fork_allocation_bytes,
             detached_output,
         }
@@ -340,6 +373,14 @@ impl ProcessState {
                         .iter()
                         .fold(0, |total, word| total.saturating_add(string(word))),
                 );
+        }
+        for disposition in self.signal_dispositions.values() {
+            bytes = bytes.saturating_add(match disposition {
+                ShellSignalDisposition::Ignore => 16,
+                ShellSignalDisposition::Handler { source, body } => {
+                    string(source).saturating_add(body.estimated_bytes())
+                }
+            });
         }
         bytes
     }
@@ -455,6 +496,8 @@ impl Environment {
                 fds,
                 shell_continuation: None,
                 pending_signals: std::collections::BTreeSet::new(),
+                signal_dispositions: BTreeMap::new(),
+                handling_signal: false,
                 fork_allocation_bytes: 0,
                 detached_output: false,
             }),
@@ -735,12 +778,14 @@ impl Environment {
             if child_deadline_interrupt.is_some() {
                 parent.deadline_interrupt = child_deadline_interrupt;
             }
-            parent.pending_signals.insert(Signal::Child);
         }
         if let Some(scheduled) = scheduled {
             self.process
                 .activate(scheduled)
                 .expect("scheduled process state must exist");
+        }
+        if parent_retained {
+            let _ = self.send_signal(parent_pid, Signal::Child);
         }
         if !parent_retained && !self.live_children.contains_key(&pid) {
             self.processes.reap(pid);
@@ -763,7 +808,11 @@ impl Environment {
             .get_mut(&pid)
             .ok_or_else(|| format!("process {pid} has no execution context"))?;
         target.pending_signals.insert(signal);
-        if signal.terminates()
+        let disposition = target.signal_dispositions.get(&signal);
+        let interrupts = signal == Signal::Kill
+            || matches!(disposition, Some(ShellSignalDisposition::Handler { .. }))
+            || (disposition.is_none() && signal.terminates());
+        if interrupts
             && matches!(
                 self.scheduler.state(pid),
                 Some(crate::scheduler::TaskState::Blocked(_))
@@ -792,19 +841,40 @@ impl Environment {
         Ok(())
     }
 
-    /// Deliver coalesced default-disposition signals for the active process.
-    pub(crate) fn take_terminating_signal(&mut self) -> Option<Signal> {
-        let signal = self
-            .process
-            .pending_signals
-            .iter()
-            .copied()
-            .find(|signal| signal.terminates());
-        self.process.pending_signals.clear();
-        if signal.is_some() {
-            self.clock.cancel_task_events(u64::from(self.process.pid));
+    /// Select the next non-ignored signal action for the active process.
+    pub(crate) fn take_signal_delivery(&mut self) -> Option<SignalDelivery> {
+        loop {
+            let signal = if self.process.handling_signal {
+                self.process
+                    .pending_signals
+                    .contains(&Signal::Kill)
+                    .then_some(Signal::Kill)?
+            } else {
+                self.process.pending_signals.iter().next().copied()?
+            };
+            self.process.pending_signals.remove(&signal);
+            if signal == Signal::Kill {
+                self.clock.cancel_task_events(u64::from(self.process.pid));
+                return Some(SignalDelivery::Terminate(signal));
+            }
+            match self.process.signal_dispositions.get(&signal).cloned() {
+                Some(ShellSignalDisposition::Ignore) => continue,
+                Some(ShellSignalDisposition::Handler { body, .. }) => {
+                    self.process.handling_signal = true;
+                    return Some(SignalDelivery::Handler(body));
+                }
+                None if signal.terminates() => {
+                    self.clock.cancel_task_events(u64::from(self.process.pid));
+                    return Some(SignalDelivery::Terminate(signal));
+                }
+                None => continue,
+            }
         }
-        signal
+    }
+
+    /// Mark the active shell's caught-signal handler complete.
+    pub(crate) fn finish_signal_handler(&mut self) {
+        self.process.handling_signal = false;
     }
 
     /// Roll back a background child whose process-local setup failed before dispatch.

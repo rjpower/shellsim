@@ -42,6 +42,36 @@ fn background_sleeps_overlap_under_the_cooperative_scheduler() {
 }
 
 #[test]
+fn caught_signal_handler_can_block_without_completing_interrupted_sleep() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "trap 'sleep 2; printf caught' TERM; (sleep 1; kill -TERM $$) & sleep 10; printf done; date +%s",
+        ),
+        (
+            0,
+            "caughtdone1735689610\n".into(),
+            String::new(),
+        )
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 10 * NANOS_PER_SECOND);
+}
+
+#[test]
+fn caught_signal_during_foreground_child_retries_the_child_wait() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "trap 'printf caught' TERM; (sleep 1; kill -TERM $$) & bash -c 'sleep 5'; printf done; date +%s",
+        ),
+        (0, "caughtdone1735689605\n".into(), String::new())
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 5 * NANOS_PER_SECOND);
+}
+
+#[test]
 fn cpu_bound_python_processes_yield_between_bytecode_quanta() {
     let mut environment = Environment::with_limits(Limits {
         cpu: 100_000_000,

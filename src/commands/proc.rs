@@ -111,7 +111,10 @@ fn start_timer(
     match interp.clock.schedule_wake_after(u64::from(pid), duration) {
         Ok(event) => CommandPoll::Blocked(
             WaitReason::Timer(event.deadline_ns()),
-            CommandResume::Status(0),
+            CommandResume::Timer {
+                deadline_ns: event.deadline_ns(),
+                status: 0,
+            },
         ),
         Err(error) => {
             ewln(io.err, &format!("{command}: {error}"));

@@ -71,7 +71,10 @@ pub(crate) enum CommandPoll {
 /// Command-owned state retained by the shell while a native command is suspended.
 #[derive(Clone)]
 pub(crate) enum CommandResume {
-    Status(i32),
+    Timer {
+        deadline_ns: u64,
+        status: i32,
+    },
     Child {
         pid: crate::process::ProcessId,
         reap: bool,
@@ -325,7 +328,22 @@ pub(crate) fn starts_before_input(argv: &[String]) -> bool {
 /// Continue command-owned state after the scheduler wakes its process.
 pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> CommandPoll {
     match continuation {
-        CommandResume::Status(status) => CommandPoll::Ready(status),
+        CommandResume::Timer {
+            deadline_ns,
+            status,
+        } => {
+            if interp.clock.monotonic_ns() >= deadline_ns {
+                CommandPoll::Ready(status)
+            } else {
+                CommandPoll::Blocked(
+                    WaitReason::Timer(deadline_ns),
+                    CommandResume::Timer {
+                        deadline_ns,
+                        status,
+                    },
+                )
+            }
+        }
         CommandResume::Child { pid, reap } => {
             match interp.processes.get(pid).map(|record| record.status) {
                 Some(crate::process::ProcessStatus::Exited(status)) => {

@@ -16,7 +16,7 @@ pub type ProcessId = u32;
 pub const MAX_PROCESSES: usize = 1_024;
 const MAX_COMMAND_BYTES: usize = 4 * 1024;
 
-/// Standard signals modeled by shellsim's default-disposition process layer.
+/// Standard signals modeled by shellsim's process and shell-disposition layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Signal {
     Hangup,
