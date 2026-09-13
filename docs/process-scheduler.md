@@ -287,8 +287,9 @@ After the process and I/O foundations are complete, improve commands in evidence
    filename output, fixed strings, regexes, hidden files, binary policy, grouped before/after
    context, match-only output, per-file match limits, and familiar exit codes. This baseline is
    complete; unsupported options fail explicitly.
-3. The coherent Git baseline now covers human and porcelain status, staged and working-tree diff,
-   name-only and whitespace-checking diff, bounded history, show, refs, branch
+3. The coherent Git baseline now covers human and porcelain status including compact branch
+   headers, staged and working-tree diff, name-only, summary-stat, and whitespace-checking diff,
+   bounded history, show, refs, branch
    creation/listing/deletion, checkout/switch, restore, reset, add, commits, tracked-file queries,
    tracked file moves/removals, and repository-local config. Repository state stays VFS-only;
    merges, remotes, and network operations remain explicitly unsupported.

@@ -274,3 +274,27 @@ fn git_rm_refuses_modified_files_without_force() {
     assert!(env.vfs.exists("/", "/kept"));
     assert_eq!(run(&mut env, "git status --short").1, "");
 }
+
+#[test]
+fn compact_branch_status_and_diff_stat_support_agent_orientation() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs
+        .put_file("/file", b"keep\nold\nend\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add file; git commit -m base").0, 0);
+    env.vfs
+        .put_file("/file", b"keep\nnew\nextra\nend\n".to_vec(), 0o644)
+        .unwrap();
+
+    assert_eq!(run(&mut env, "git status -sb").1, "## main\n M file\n");
+    assert_eq!(
+        run(&mut env, "git diff --stat"),
+        (
+            0,
+            " file | 3 ++-\n 1 file changed, 2 insertions, 1 deletion\n".into(),
+            String::new()
+        )
+    );
+    assert_eq!(run(&mut env, "git add file; git diff --cached --stat").0, 0);
+}

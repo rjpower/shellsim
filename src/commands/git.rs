@@ -546,11 +546,18 @@ fn head_tree(interp: &Interp, root: &str) -> BTreeMap<String, String> {
 }
 
 fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    if args
-        .iter()
-        .any(|arg| arg != "--short" && arg != "--porcelain" && arg != "--porcelain=v1")
-    {
-        return usage(io, "only --short/--porcelain=v1 are supported");
+    let mut short = false;
+    let mut branch_header = false;
+    for arg in args {
+        match arg.as_str() {
+            "-s" | "--short" | "--porcelain" | "--porcelain=v1" => short = true,
+            "-b" | "--branch" => branch_header = true,
+            "-sb" | "-bs" => {
+                short = true;
+                branch_header = true;
+            }
+            _ => return usage(io, "only short/porcelain and branch status are supported"),
+        }
     }
     let Some(root) = find_repo_root(ctx) else {
         return repo_error(io);
@@ -597,8 +604,8 @@ fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
         entries.push((x, y, path));
     }
     ctx.resources.release_memory(work.reserved_memory);
-    if args.is_empty() {
-        let branch = current_branch(ctx, &root).unwrap_or_else(|| "HEAD".to_string());
+    let branch = current_branch(ctx, &root).unwrap_or_else(|| "HEAD".to_string());
+    if !short {
         io.out
             .extend_from_slice(format!("On branch {branch}\n\n").as_bytes());
         if entries.is_empty() {
@@ -612,6 +619,10 @@ fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             }
         }
     } else {
+        if branch_header {
+            io.out
+                .extend_from_slice(format!("## {branch}\n").as_bytes());
+        }
         for (x, y, path) in entries {
             io.out
                 .extend_from_slice(format!("{x}{y} {path}\n").as_bytes());
@@ -1167,20 +1178,25 @@ fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut cached = false;
     let mut name_only = false;
     let mut check = false;
+    let mut stat = false;
     let mut paths = Vec::new();
     for arg in args {
         match arg.as_str() {
             "--cached" | "--staged" => cached = true,
             "--name-only" => name_only = true,
             "--check" => check = true,
+            "--stat" => stat = true,
             arg if arg.starts_with('-') => {
                 return usage(io, &format!("unsupported diff option: {arg}"))
             }
             path => paths.push(path.to_string()),
         }
     }
-    if check && name_only {
-        return usage(io, "--check cannot be combined with --name-only");
+    if usize::from(check) + usize::from(name_only) + usize::from(stat) > 1 {
+        return usage(
+            io,
+            "--check, --name-only, and --stat are mutually exclusive",
+        );
     }
     let Some(root) = find_repo_root(ctx) else {
         return repo_error(io);
@@ -1210,6 +1226,9 @@ fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     names.extend(left_tree.keys().cloned());
     names.extend(right_tree.keys().cloned());
     let mut whitespace_error = false;
+    let mut stat_files = 0_usize;
+    let mut stat_insertions = 0_usize;
+    let mut stat_deletions = 0_usize;
     for path in names {
         if !selected(&path) || left_tree.get(&path) == right_tree.get(&path) {
             continue;
@@ -1230,10 +1249,38 @@ fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             if check {
                 whitespace_error |=
                     emit_whitespace_errors(io, &path, old.as_deref(), new.as_deref());
+            } else if stat {
+                let (insertions, deletions) = line_change_counts(old.as_deref(), new.as_deref());
+                stat_files = stat_files.saturating_add(1);
+                stat_insertions = stat_insertions.saturating_add(insertions);
+                stat_deletions = stat_deletions.saturating_add(deletions);
+                let total = insertions.saturating_add(deletions);
+                let graph_width = total.min(40);
+                let plus = insertions.min(graph_width);
+                let minus = graph_width.saturating_sub(plus);
+                io.out.extend_from_slice(
+                    format!(
+                        " {path} | {total} {}{}\n",
+                        "+".repeat(plus),
+                        "-".repeat(minus)
+                    )
+                    .as_bytes(),
+                );
             } else {
                 emit_diff(io, &path, old.as_deref(), new.as_deref());
             }
         }
+    }
+    if stat && stat_files != 0 {
+        io.out.extend_from_slice(
+            format!(
+                " {stat_files} file{} changed, {stat_insertions} insertion{}, {stat_deletions} deletion{}\n",
+                plural(stat_files),
+                plural(stat_insertions),
+                plural(stat_deletions)
+            )
+            .as_bytes(),
+        );
     }
     ctx.resources.release_memory(work_reserved);
     if whitespace_error {
@@ -1241,6 +1288,42 @@ fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     } else {
         0
     }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+fn line_change_counts(old: Option<&[u8]>, new: Option<&[u8]>) -> (usize, usize) {
+    let old = old.unwrap_or_default();
+    let new = new.unwrap_or_default();
+    let line_count = |bytes: &[u8]| {
+        bytes.iter().filter(|byte| **byte == b'\n').count()
+            + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"))
+    };
+    let prefix = old
+        .split_inclusive(|byte| *byte == b'\n')
+        .zip(new.split_inclusive(|byte| *byte == b'\n'))
+        .take_while(|(left, right)| left == right)
+        .count();
+    let remaining_old = line_count(old).saturating_sub(prefix);
+    let remaining_new = line_count(new).saturating_sub(prefix);
+    let suffix = old
+        .split_inclusive(|byte| *byte == b'\n')
+        .rev()
+        .zip(new.split_inclusive(|byte| *byte == b'\n').rev())
+        .take_while(|(left, right)| left == right)
+        .count()
+        .min(remaining_old)
+        .min(remaining_new);
+    (
+        remaining_new.saturating_sub(suffix),
+        remaining_old.saturating_sub(suffix),
+    )
 }
 
 fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
