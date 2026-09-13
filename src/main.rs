@@ -278,14 +278,15 @@ fn serve(args: &[String]) -> ! {
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut output = std::io::stdout().lock();
-    let mut session = harness_session(harness_options(args, "serve"), "serve");
+    let session = harness_session(harness_options(args, "serve"), "serve");
+    let mut manager = shellsim::harness_manager::HarnessManager::new(session);
     while let Some(line) = read_bounded_protocol_line(&mut input).unwrap_or_else(|error| {
         eprintln!("shellsim serve: input error: {error}");
         exit(1);
     }) {
         let response = match line {
             Ok(line) => match serde_json::from_slice::<shellsim::harness::HarnessRequest>(&line) {
-                Ok(request) => session.handle(request),
+                Ok(request) => manager.handle(request),
                 Err(error) => protocol_error(format!("invalid request: {error}")),
             },
             Err(error) => protocol_error(error),
@@ -464,7 +465,8 @@ fn replay(args: &[String]) -> ! {
     });
     let mut input = BufReader::new(file);
     let mut output = std::io::stdout().lock();
-    let mut session = harness_session(harness_options(&harness_args, "replay"), "replay");
+    let session = harness_session(harness_options(&harness_args, "replay"), "replay");
+    let mut manager = shellsim::harness_manager::HarnessManager::new(session);
     let mut input_bytes = 0usize;
     let mut transcript_bytes = 0usize;
     let mut retained_transcript = transcript_path.as_ref().map(|_| Vec::new());
@@ -497,7 +499,7 @@ fn replay(args: &[String]) -> ! {
             ScenarioAction::Request(request) => (request, None),
             ScenarioAction::Asserted { request, expect } => (request, Some(expect)),
         };
-        let response = session.handle(request.clone());
+        let response = manager.handle(request.clone());
         let assertion = expectation
             .as_ref()
             .map(|expected| check_expectation(expected, &response));

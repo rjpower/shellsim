@@ -16,6 +16,7 @@ pub mod descriptors;
 pub mod exec;
 pub mod expand;
 pub mod harness;
+pub mod harness_manager;
 pub mod hashes;
 pub mod host_ingest;
 pub mod interp;

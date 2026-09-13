@@ -70,6 +70,12 @@ and return only newly available bytes. At most one foreground action is active i
 64 completed action records may be retained, and an active action survives a complete-state session
 fork. The legacy `execute` operation drives this same retained path to completion.
 
+`serve` routes requests through a bounded `HarnessManager`. Omitting `session_id` selects session
+zero. `fork_session` creates a new monotonically identified session through the same bounded
+complete-state clone used by the library, including an active action; `drop_session` releases the
+whole independent machine. A connection retains at most eight sessions, and every source session
+must satisfy the 96 MiB modeled fork bound before cloning. Session state is never shared mutably.
+
 File operations are confined to the simulated `/work` tree. `execute` still sees the full modeled
 filesystem and all normal shellsim capabilities, never host state. Requests are capped at 20 MiB,
 individual binary transfers and diffs at 6 MiB, and byte decoding is charged before allocation.

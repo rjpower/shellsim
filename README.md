@@ -57,6 +57,12 @@ printf '%s\n' \
   '{"id":4,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":true}' \
   | ./target/release/shellsim serve
 
+# Fork session zero and route an independent action to the branch
+printf '%s\n' \
+  '{"id":1,"op":"fork_session","source":0}' \
+  '{"id":2,"session_id":1,"op":"execute","source":"printf branch"}' \
+  | ./target/release/shellsim serve
+
 # Replay a bounded scenario and emit paired request/response transcript records
 ./target/release/shellsim replay scenario.ndjson --root ./project > transcript.ndjson
 

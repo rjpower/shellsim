@@ -372,11 +372,12 @@ descriptor state, telemetry, and forks before allocation.
 The NDJSON protocol now includes `start_execute`, `poll_action`, `write_stdin`, `close_stdin`,
 `read_action_output`, `signal_process`, and `drop_action`; one-shot `execute` drives the same path.
 Active actions, their descriptor cursors, and their continuations survive complete-state library
-forks. Explicit cancellation policy remains to be added. A bounded `SessionManager` then adds
-`new_session`, `fork_session`, and `drop_session`, with every existing operation carrying a
-`session_id`. The current implicit session remains a compatibility facade over one manager entry,
-not an alternate implementation. Typed stat, directory, symlink, and patch operations can then be
-added without affecting execution semantics. A Codex, Claude, or MCP adapter stays a thin client
+forks. Explicit cancellation policy remains to be added. The bounded `HarnessManager` now routes
+ordinary operations by optional `session_id`, supports complete-state `fork_session` and
+`drop_session`, and retains at most eight independent machines. The current implicit session is a
+compatibility facade over manager entry zero, not an alternate implementation. Typed stat,
+directory, symlink, and patch operations can then be added without affecting execution semantics.
+A Codex, Claude, or MCP adapter stays a thin client
 of this versioned protocol and never receives direct access to `Environment` capabilities.
 
 ## Validation milestones

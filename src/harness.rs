@@ -28,6 +28,9 @@ const MAX_POLL_QUANTA: usize = 100_000;
 pub struct HarnessRequest {
     #[serde(default)]
     pub id: Option<serde_json::Value>,
+    /// Manager-owned session route. Omitted requests target compatibility session zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<u64>,
     #[serde(flatten)]
     pub operation: HarnessOperation,
 }
@@ -74,6 +77,12 @@ pub enum HarnessOperation {
     DropAction {
         action_id: u64,
     },
+    ForkSession {
+        source: u64,
+    },
+    DropSession {
+        target: u64,
+    },
     ReadFile {
         path: String,
     },
@@ -115,6 +124,7 @@ pub enum HarnessResult {
     Execute(ExecuteResult),
     Action(ActionView),
     ActionOutput(ActionOutput),
+    Session { session_id: u64 },
     File(FileResult),
     Paths { paths: Vec<String> },
     WorkspaceDiff { changes: Vec<WorkspaceChange> },
@@ -535,6 +545,9 @@ impl HarnessSession {
             HarnessOperation::DropAction { action_id } => {
                 self.drop_action(action_id)?;
                 Ok(HarnessResult::Acknowledged)
+            }
+            HarnessOperation::ForkSession { .. } | HarnessOperation::DropSession { .. } => {
+                Err("session lifecycle operations require a HarnessManager".to_string())
             }
             HarnessOperation::ReadFile { path } => self.read_file(&path),
             HarnessOperation::WriteFile {

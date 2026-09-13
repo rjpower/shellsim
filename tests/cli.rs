@@ -259,6 +259,40 @@ fn persistent_protocol_polls_retained_actions_and_streams_input_output() {
 }
 
 #[test]
+fn persistent_protocol_routes_isolated_complete_state_forks() {
+    let requests = [
+        r#"{"id":1,"op":"execute","source":"X=parent; printf base > value"}"#,
+        r#"{"id":2,"op":"fork_session","source":0}"#,
+        r#"{"id":3,"session_id":1,"op":"execute","source":"X=child; printf branch > value"}"#,
+        r#"{"id":4,"op":"execute","source":"printf '%s:' \"$X\"; cat value"}"#,
+        r#"{"id":5,"session_id":1,"op":"execute","source":"printf '%s:' \"$X\"; cat value"}"#,
+        r#"{"id":6,"op":"drop_session","target":1}"#,
+        r#"{"id":7,"session_id":1,"op":"inspect"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    let output = run_with_stdin(&["serve"], requests.as_bytes());
+    assert!(output.status.success());
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(responses[1]["result"]["kind"], "session");
+    assert_eq!(responses[1]["result"]["session_id"], 1);
+    assert_eq!(responses[3]["result"]["stdout_base64"], "cGFyZW50OmJhc2U=");
+    assert_eq!(responses[4]["result"]["stdout_base64"], "Y2hpbGQ6YnJhbmNo");
+    assert_eq!(responses[5]["ok"], true);
+    assert_eq!(responses[6]["ok"], false);
+    assert!(responses[6]["error"]
+        .as_str()
+        .unwrap()
+        .contains("session 1 does not exist"));
+}
+
+#[test]
 fn persistent_protocol_can_checkpoint_a_trusted_host_snapshot() {
     let project = TestDirectory::new();
     std::fs::write(project.path().join("input.txt"), b"snapshot\0bytes").unwrap();
