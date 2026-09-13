@@ -64,6 +64,9 @@ printf '%s\n' \
   '{"id":3,"op":"execute","source":"printf reused"}' \
   | ./target/release/shellsim serve
 
+# Running background jobs can return to the modeled terminal foreground
+./target/release/shellsim -c 'sleep 2 & fg %1; echo complete'
+
 # Fork session zero and route an independent action to the branch
 printf '%s\n' \
   '{"id":1,"op":"fork_session","source":0}' \

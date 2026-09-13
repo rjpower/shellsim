@@ -154,8 +154,9 @@ Process identity now separates sessions from process groups. Background jobs lea
 the shell session; Python `start_new_session=True` leads both a new session and group. A synthetic
 controlling terminal tracks its session and foreground group, routes terminal-generated signals,
 and returns ownership to the shell group when the foreground job exits. `/proc/PID/status` exposes
-both `NSpgid` and `NSsid`. Interactive `fg`/`bg` syntax and stopped-process states remain outside the
-current subset.
+both `NSpgid` and `NSsid`. `fg` transfers a running job through the existing resumable child wait;
+terminal signals can interrupt it and the shell regains ownership on exit. Stopped-process states,
+`SIGSTOP`/`SIGCONT`, and therefore honest `bg` behavior remain outside the current subset.
 
 ## Phase 3: resumable execution
 

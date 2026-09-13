@@ -35,6 +35,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["read"], Trust::Real, cmd_read);
     reg_resumable(m, &["wait"], Trust::Real, cmd_wait, start_wait);
     reg(m, &["jobs"], Trust::Real, cmd_jobs);
+    reg_resumable(m, &["fg"], Trust::Real, cmd_fg, start_fg);
     reg(m, &["trap"], Trust::Real, cmd_trap);
     reg(
         m,
@@ -207,6 +208,77 @@ fn cmd_jobs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         }
     }
     0
+}
+
+fn cmd_fg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let position = match foreground_job_position(interp, args) {
+        Ok(position) => position,
+        Err(error) => {
+            ewln(io.err, &format!("fg: {error}"));
+            return 1;
+        }
+    };
+    if !interp.jobs[position].done {
+        ewln(
+            io.err,
+            "fg: job is not complete in synchronous command context",
+        );
+        return 127;
+    }
+    reap_job(interp, position)
+}
+
+fn start_fg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let position = match foreground_job_position(interp, args) {
+        Ok(position) => position,
+        Err(error) => {
+            ewln(io.err, &format!("fg: {error}"));
+            return CommandPoll::Ready(1);
+        }
+    };
+    if interp.jobs[position].done {
+        return CommandPoll::Ready(reap_job(interp, position));
+    }
+    let pid = interp.jobs[position].pid;
+    if let Err(error) = interp.set_terminal_foreground(pid) {
+        ewln(io.err, &format!("fg: {error}"));
+        return CommandPoll::Ready(1);
+    }
+    crate::commands::resume(
+        interp,
+        CommandResume::Wait {
+            pids: vec![pid],
+            status: 0,
+            explicit: true,
+        },
+    )
+}
+
+fn foreground_job_position(interp: &CommandContext<'_>, args: &[String]) -> Result<usize, String> {
+    let selected = match args {
+        [] => interp.jobs.len().checked_sub(1),
+        [selected] if matches!(selected.as_str(), "%+" | "%%") => interp.jobs.len().checked_sub(1),
+        [selected] => {
+            let id = selected
+                .strip_prefix('%')
+                .unwrap_or(selected)
+                .parse::<u32>()
+                .map_err(|_| format!("{selected}: invalid job"))?;
+            interp
+                .jobs
+                .iter()
+                .position(|job| job.id == id || job.pid == id)
+        }
+        _ => return Err("usage: fg [%JOB]".to_string()),
+    };
+    selected.ok_or_else(|| "no such job".to_string())
+}
+
+fn reap_job(interp: &mut CommandContext<'_>, position: usize) -> i32 {
+    let job = interp.jobs.remove(position);
+    interp.processes.reap(job.pid);
+    let _ = interp.scheduler.reap(job.pid);
+    job.status
 }
 
 fn cmd_kill(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

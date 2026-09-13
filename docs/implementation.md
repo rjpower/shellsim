@@ -75,7 +75,8 @@ Process records distinguish process-group and session identities. The synthetic 
 terminal owns one session and one foreground group. Harness clients can transfer that foreground
 ownership only to a live group in the terminal session and can send supported signals to the
 selected group. When its last process exits, ownership deterministically returns to the root shell
-group. Inspection and `/proc/PID/status` report the same terminal/session model.
+group. `fg` uses the ordinary resumable child wait after transferring a running job. Inspection and
+`/proc/PID/status` report the same terminal/session model.
 
 A retained action installs a shell continuation and isolated standard descriptors without driving
 the machine. Polls execute a bounded number of ordinary scheduler quanta. With `advance_time`

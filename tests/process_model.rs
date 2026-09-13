@@ -192,6 +192,16 @@ fn terminal_foreground_group_returns_to_shell_after_job_exit() {
 }
 
 #[test]
+fn fg_uses_resumable_child_wait_and_restores_terminal() {
+    let mut env = Environment::new();
+    let result = run(&mut env, "sleep 2 & fg %1; printf 'status:%s' $?");
+    assert_eq!(result, (0, "status:0".into(), String::new()));
+    assert_eq!(env.clock.monotonic_ns(), 2_000_000_000);
+    assert_eq!(env.terminal.foreground_group, 1_234);
+    assert_eq!(run(&mut env, "fg").0, 1);
+}
+
+#[test]
 fn a_signal_to_the_persistent_shell_terminates_the_session() {
     let mut env = Environment::new();
     let result = run(&mut env, "kill -HUP $$; echo unreachable");
