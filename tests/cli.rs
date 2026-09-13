@@ -195,6 +195,70 @@ fn persistent_protocol_reports_ordered_invocations_and_scheduler_waits() {
 }
 
 #[test]
+fn persistent_protocol_polls_retained_actions_and_streams_input_output() {
+    let requests = [
+        r#"{"id":1,"op":"start_execute","source":"printf one; sleep 2; printf two"}"#,
+        r#"{"id":2,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":false}"#,
+        r#"{"id":3,"op":"read_action_output","action_id":0}"#,
+        r#"{"id":4,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":true}"#,
+        r#"{"id":5,"op":"read_action_output","action_id":0}"#,
+        r#"{"id":6,"op":"drop_action","action_id":0}"#,
+        r#"{"id":7,"op":"start_execute","source":"cat","stdin_closed":false}"#,
+        r#"{"id":8,"op":"poll_action","action_id":1,"work_quanta":100}"#,
+        r#"{"id":9,"op":"write_stdin","action_id":1,"data_base64":"aGVsbG8="}"#,
+        r#"{"id":10,"op":"close_stdin","action_id":1}"#,
+        r#"{"id":11,"op":"poll_action","action_id":1,"work_quanta":100}"#,
+        r#"{"id":12,"op":"read_action_output","action_id":1}"#,
+        r#"{"id":13,"op":"drop_action","action_id":1}"#,
+        r#"{"id":14,"op":"start_execute","source":"sleep 10"}"#,
+        r#"{"id":15,"op":"poll_action","action_id":2,"work_quanta":100}"#,
+        r#"{"id":16,"op":"signal_process","pid":1234,"signal":"BOGUS"}"#,
+        r#"{"id":17,"op":"signal_process","pid":1234,"signal":"INT"}"#,
+        r#"{"id":18,"op":"poll_action","action_id":2,"work_quanta":100}"#,
+    ]
+    .join("\n")
+        + "\n";
+    let output = run_with_stdin(&["serve"], requests.as_bytes());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    assert!(responses[..15]
+        .iter()
+        .all(|response| response["ok"] == true));
+    assert_eq!(responses[1]["result"]["state"]["state"], "blocked");
+    assert_eq!(responses[1]["result"]["state"]["reason"]["kind"], "timer");
+    assert_eq!(responses[2]["result"]["stdout_base64"], "b25l");
+    assert_eq!(responses[3]["result"]["state"]["state"], "complete");
+    assert_eq!(responses[4]["result"]["stdout_base64"], "dHdv");
+    assert_eq!(
+        responses[7]["result"]["state"]["reason"]["kind"],
+        "input_readable"
+    );
+    assert_eq!(responses[10]["result"]["state"]["state"], "complete");
+    assert_eq!(responses[11]["result"]["stdout_base64"], "aGVsbG8=");
+    assert_eq!(responses[11]["result"]["stdout_closed"], true);
+    assert_eq!(responses[14]["result"]["state"]["state"], "blocked");
+    assert_eq!(responses[15]["ok"], false);
+    assert!(responses[15]["error"]
+        .as_str()
+        .unwrap()
+        .contains("unsupported signal"));
+    assert_eq!(responses[16]["ok"], true);
+    assert_eq!(responses[17]["result"]["state"]["state"], "complete");
+    assert_eq!(responses[17]["result"]["state"]["status"], 130);
+    assert_eq!(responses[17]["result"]["invocations"][0]["status"], 130);
+}
+
+#[test]
 fn persistent_protocol_can_checkpoint_a_trusted_host_snapshot() {
     let project = TestDirectory::new();
     std::fs::write(project.path().join("input.txt"), b"snapshot\0bytes").unwrap();

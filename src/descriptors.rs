@@ -42,6 +42,7 @@ pub enum IoPoll<T> {
 /// Exact pipe condition needed to resume a blocked descriptor operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IoWait {
+    InputReadable(DescriptionId),
     PipeReadable(PipeId),
     PipeWritable(PipeId),
 }
@@ -51,6 +52,7 @@ enum OpenDescription {
     Input {
         bytes: Vec<u8>,
         cursor: usize,
+        closed: bool,
     },
     Capture {
         bytes: Vec<u8>,
@@ -121,7 +123,52 @@ impl DescriptorArena {
         if bytes.len() > MAX_CAPTURE_BYTES {
             return Err(DescriptorError::OutputLimit);
         }
-        self.allocate(OpenDescription::Input { bytes, cursor: 0 })
+        self.allocate(OpenDescription::Input {
+            bytes,
+            cursor: 0,
+            closed: true,
+        })
+    }
+
+    /// Create a bounded host-fed input channel that initially has no bytes and remains open.
+    pub fn open_stream_input(&mut self) -> Result<DescriptionId, DescriptorError> {
+        self.allocate(OpenDescription::Input {
+            bytes: Vec::new(),
+            cursor: 0,
+            closed: false,
+        })
+    }
+
+    /// Append explicitly supplied bytes to a streaming input description.
+    pub fn append_input(&mut self, id: DescriptionId, input: &[u8]) -> Result<(), DescriptorError> {
+        let entry = self
+            .descriptions
+            .get_mut(&id)
+            .ok_or(DescriptorError::InvalidFd)?;
+        let OpenDescription::Input { bytes, closed, .. } = &mut entry.description else {
+            return Err(DescriptorError::WrongAccess);
+        };
+        if *closed {
+            return Err(DescriptorError::WrongAccess);
+        }
+        if bytes.len().saturating_add(input.len()) > MAX_CAPTURE_BYTES {
+            return Err(DescriptorError::OutputLimit);
+        }
+        bytes.extend_from_slice(input);
+        Ok(())
+    }
+
+    /// Close a streaming input description so a drained reader observes EOF.
+    pub fn close_input(&mut self, id: DescriptionId) -> Result<(), DescriptorError> {
+        let entry = self
+            .descriptions
+            .get_mut(&id)
+            .ok_or(DescriptorError::InvalidFd)?;
+        let OpenDescription::Input { closed, .. } = &mut entry.description else {
+            return Err(DescriptorError::WrongAccess);
+        };
+        *closed = true;
+        Ok(())
     }
 
     pub fn open_capture(&mut self) -> Result<DescriptionId, DescriptorError> {
@@ -322,9 +369,17 @@ impl DescriptorArena {
         match kind {
             OpenDescription::Input { .. } => {
                 let entry = self.descriptions.get_mut(&id).expect("description exists");
-                let OpenDescription::Input { bytes, cursor } = &mut entry.description else {
+                let OpenDescription::Input {
+                    bytes,
+                    cursor,
+                    closed,
+                } = &mut entry.description
+                else {
                     unreachable!()
                 };
+                if *cursor == bytes.len() && !*closed {
+                    return Ok(IoPoll::Blocked(IoWait::InputReadable(id)));
+                }
                 let end = cursor.saturating_add(maximum).min(bytes.len());
                 let result = bytes[*cursor..end].to_vec();
                 *cursor = end;
@@ -602,6 +657,30 @@ mod tests {
             arena.read(fds.get(3).unwrap(), 2).unwrap(),
             IoPoll::Ready(b"cd".to_vec())
         );
+    }
+
+    #[test]
+    fn streaming_input_blocks_until_append_and_reaches_eof_after_close() {
+        let mut arena = DescriptorArena::new();
+        let input = arena.open_stream_input().unwrap();
+        arena.retain_handle(input).unwrap();
+        assert_eq!(
+            arena.read(input, 8).unwrap(),
+            IoPoll::Blocked(IoWait::InputReadable(input))
+        );
+        arena.append_input(input, b"abc").unwrap();
+        assert_eq!(arena.read(input, 2).unwrap(), IoPoll::Ready(b"ab".to_vec()));
+        assert_eq!(arena.read(input, 8).unwrap(), IoPoll::Ready(b"c".to_vec()));
+        arena.close_input(input).unwrap();
+        assert_eq!(arena.read(input, 8).unwrap(), IoPoll::Ready(Vec::new()));
+        arena.release_handle(input).unwrap();
+
+        let oversized = arena.open_stream_input().unwrap();
+        assert_eq!(
+            arena.append_input(oversized, &vec![0; MAX_CAPTURE_BYTES + 1]),
+            Err(DescriptorError::OutputLimit)
+        );
+        arena.discard_unreferenced(oversized).unwrap();
     }
 
     #[test]

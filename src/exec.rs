@@ -16,61 +16,164 @@ pub fn exec(
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> i32 {
-    let saved = match interp.process.fds.fork(&mut interp.descriptors) {
-        Ok(saved) => saved,
+    let mut execution = match ShellExecution::start(interp, node, &stdin, true) {
+        Ok(execution) => execution,
         Err(error) => {
-            err.extend_from_slice(
-                format!("shellsim: unable to save descriptors: {error:?}\n").as_bytes(),
-            );
+            err.extend_from_slice(format!("shellsim: {error}\n").as_bytes());
             return 125;
         }
     };
-    let input = match interp.descriptors.open_input(stdin) {
-        Ok(description) => description,
-        Err(error) => return restore_failed_setup(interp, saved, err, error),
+    let status = loop {
+        match execution.poll(interp, true) {
+            Ok(MachinePoll::Progress) => {}
+            Ok(MachinePoll::Blocked) => {
+                err.extend_from_slice(b"shellsim: all processes are blocked without an event\n");
+                break 125;
+            }
+            Ok(MachinePoll::Ready(status)) => break status,
+            Err(error) => {
+                err.extend_from_slice(format!("shellsim: scheduler: {error}\n").as_bytes());
+                break 125;
+            }
+        }
     };
-    if let Err(error) = interp.install_new_description(0, input) {
-        return restore_failed_setup(interp, saved, err, error);
-    }
-    let stdout = match interp.descriptors.open_capture() {
-        Ok(description) => description,
-        Err(error) => return restore_failed_setup(interp, saved, err, error),
-    };
-    if let Err(error) = interp.install_new_description(1, stdout) {
-        return restore_failed_setup(interp, saved, err, error);
-    }
-    let stderr = match interp.descriptors.open_capture() {
-        Ok(description) => description,
-        Err(error) => return restore_failed_setup(interp, saved, err, error),
-    };
-    if let Err(error) = interp.install_new_description(2, stderr) {
-        return restore_failed_setup(interp, saved, err, error);
-    }
-
-    let status = exec_node(interp, node);
-    out.extend_from_slice(&std::mem::take(&mut interp.pending_stdout));
-    err.extend_from_slice(&std::mem::take(&mut interp.pending_stderr));
-    if let Ok(bytes) = interp.descriptors.drain_capture(stdout) {
-        out.extend_from_slice(&bytes);
-    }
-    if let Ok(bytes) = interp.descriptors.drain_capture(stderr) {
-        err.extend_from_slice(&bytes);
-    }
-    restore_fds(interp, saved);
+    execution.drain_output(interp, out, err);
+    execution.restore(interp);
     status
 }
 
-fn restore_failed_setup(
-    interp: &mut Interp,
+/// Descriptor and continuation ownership for one foreground shell action.
+#[derive(Clone)]
+pub(crate) struct ShellExecution {
+    target_pid: u32,
     saved: crate::descriptors::FdTable,
-    err: &mut Vec<u8>,
-    error: crate::descriptors::DescriptorError,
-) -> i32 {
-    restore_fds(interp, saved);
-    err.extend_from_slice(
-        format!("shellsim: unable to install descriptors: {error:?}\n").as_bytes(),
-    );
-    125
+    stdin: crate::descriptors::DescriptionId,
+    stdout: crate::descriptors::DescriptionId,
+    stderr: crate::descriptors::DescriptionId,
+    stdin_closed: bool,
+}
+
+impl ShellExecution {
+    /// Install isolated action descriptors and a retained shell continuation.
+    pub(crate) fn start(
+        interp: &mut Interp,
+        node: &Node,
+        stdin: &[u8],
+        stdin_closed: bool,
+    ) -> Result<Self, String> {
+        let saved = interp
+            .process
+            .fds
+            .fork(&mut interp.descriptors)
+            .map_err(|error| format!("unable to save descriptors: {error:?}"))?;
+        let setup = (|| {
+            let input = if stdin_closed {
+                interp.descriptors.open_input(stdin.to_vec())?
+            } else {
+                let input = interp.descriptors.open_stream_input()?;
+                if let Err(error) = interp.descriptors.append_input(input, stdin) {
+                    let _ = interp.descriptors.discard_unreferenced(input);
+                    return Err(error);
+                }
+                input
+            };
+            interp.install_new_description(0, input)?;
+            let stdout = interp.descriptors.open_capture()?;
+            interp.install_new_description(1, stdout)?;
+            let stderr = interp.descriptors.open_capture()?;
+            interp.install_new_description(2, stderr)?;
+            Ok::<_, crate::descriptors::DescriptorError>((input, stdout, stderr))
+        })();
+        let (input, stdout, stderr) = match setup {
+            Ok(descriptions) => descriptions,
+            Err(error) => {
+                restore_fds(interp, saved);
+                return Err(format!("unable to install action descriptors: {error:?}"));
+            }
+        };
+        let target_pid = match start_node(interp, node) {
+            Ok(pid) => pid,
+            Err(status) => {
+                restore_fds(interp, saved);
+                return Err(format!(
+                    "unable to start shell continuation (status {status})"
+                ));
+            }
+        };
+        Ok(Self {
+            target_pid,
+            saved,
+            stdin: input,
+            stdout,
+            stderr,
+            stdin_closed,
+        })
+    }
+
+    pub(crate) fn target_pid(&self) -> u32 {
+        self.target_pid
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        interp: &mut Interp,
+        advance_time: bool,
+    ) -> Result<MachinePoll, String> {
+        poll_machine(interp, self.target_pid, advance_time)
+    }
+
+    /// Append bounded action input and wake only tasks waiting on this description.
+    pub(crate) fn write_stdin(&mut self, interp: &mut Interp, bytes: &[u8]) -> Result<(), String> {
+        if self.stdin_closed {
+            return Err("action stdin is closed".to_string());
+        }
+        interp
+            .descriptors
+            .append_input(self.stdin, bytes)
+            .map_err(|error| format!("unable to append action stdin: {error:?}"))?;
+        interp
+            .scheduler
+            .wake_waiters(crate::scheduler::WaitReason::InputReadable(self.stdin));
+        Ok(())
+    }
+
+    /// Close action input and wake a drained reader so it can observe EOF.
+    pub(crate) fn close_stdin(&mut self, interp: &mut Interp) -> Result<(), String> {
+        if self.stdin_closed {
+            return Ok(());
+        }
+        interp
+            .descriptors
+            .close_input(self.stdin)
+            .map_err(|error| format!("unable to close action stdin: {error:?}"))?;
+        self.stdin_closed = true;
+        interp
+            .scheduler
+            .wake_waiters(crate::scheduler::WaitReason::InputReadable(self.stdin));
+        Ok(())
+    }
+
+    /// Drain newly produced bytes without releasing action descriptors.
+    pub(crate) fn drain_output(
+        &mut self,
+        interp: &mut Interp,
+        stdout: &mut Vec<u8>,
+        stderr: &mut Vec<u8>,
+    ) {
+        stdout.extend_from_slice(&std::mem::take(&mut interp.pending_stdout));
+        stderr.extend_from_slice(&std::mem::take(&mut interp.pending_stderr));
+        if let Ok(bytes) = interp.descriptors.drain_capture(self.stdout) {
+            stdout.extend_from_slice(&bytes);
+        }
+        if let Ok(bytes) = interp.descriptors.drain_capture(self.stderr) {
+            stderr.extend_from_slice(&bytes);
+        }
+    }
+
+    /// Restore the persistent root descriptor table after action completion.
+    pub(crate) fn restore(self, interp: &mut Interp) {
+        restore_fds(interp, self.saved);
+    }
 }
 
 fn restore_fds(interp: &mut Interp, saved: crate::descriptors::FdTable) {
@@ -1913,13 +2016,25 @@ fn should_unwind(interp: &Interp) -> bool {
         || interp.deadline_interrupt.is_some()
 }
 
-fn exec_node(interp: &mut Interp, node: &Node) -> i32 {
+/// Result of one bounded machine scheduling quantum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MachinePoll {
+    /// One process or scheduler transition made progress.
+    Progress,
+    /// Every retained process is blocked and time advancement was disabled or impossible.
+    Blocked,
+    /// The requested foreground continuation completed.
+    Ready(i32),
+}
+
+/// Install a shell continuation without driving the scheduler.
+pub(crate) fn start_node(interp: &mut Interp, node: &Node) -> Result<u32, i32> {
     if interp.process.shell_continuation.is_some() {
         write_diagnostic(
             interp,
             "shellsim: attempted to replace an active shell continuation\n",
         );
-        return 125;
+        return Err(125);
     }
     let target_pid = interp.process.pid;
     interp.process.shell_continuation = Some(ShellContinuation::new(node));
@@ -1938,95 +2053,101 @@ fn exec_node(interp: &mut Interp, node: &Node) -> i32 {
             .activate(scheduled)
             .expect("scheduled task must own process state");
     }
-    loop {
-        let owner_pid = interp.process.pid;
-        if let Some(delivery) = interp.take_signal_delivery() {
-            match delivery {
-                crate::interp::SignalDelivery::Terminate(signal) => {
-                    let status = 128 + signal.number();
-                    if owner_pid == target_pid {
-                        interp.process.shell_continuation = None;
-                        interp.exiting = Some(status);
-                        return status;
-                    }
-                    interp.finish_child(owner_pid, status);
-                    if interp.scheduler.current().is_none() {
-                        dispatch_or_advance(interp)
-                            .expect("signaled child must leave a runnable parent or modeled event");
-                    }
-                    continue;
+    Ok(target_pid)
+}
+
+/// Poll one scheduler/process quantum for a retained foreground continuation.
+///
+/// When `advance_time` is false, an all-blocked machine is returned to its host-side driver
+/// without moving virtual time. When true, the next modeled event may fire before one runnable
+/// process is selected. No host clock or host process is consulted.
+pub(crate) fn poll_machine(
+    interp: &mut Interp,
+    target_pid: u32,
+    advance_time: bool,
+) -> Result<MachinePoll, String> {
+    if interp.scheduler.current().is_none() && !dispatch_available(interp, advance_time)? {
+        return Ok(MachinePoll::Blocked);
+    }
+    let owner_pid = interp.process.pid;
+    if let Some(delivery) = interp.take_signal_delivery() {
+        match delivery {
+            crate::interp::SignalDelivery::Terminate(signal) => {
+                let status = 128 + signal.number();
+                interp.invocations.finish_latest(
+                    owner_pid,
+                    status,
+                    interp.resources.cpu_used(),
+                    interp.vfs.disk_used(),
+                );
+                if owner_pid == target_pid {
+                    interp.process.shell_continuation = None;
+                    interp.exiting = Some(status);
+                    return Ok(MachinePoll::Ready(status));
                 }
-                crate::interp::SignalDelivery::Handler(body) => {
-                    let mut continuation = interp
-                        .process
-                        .shell_continuation
-                        .take()
-                        .expect("active signaled process must own a shell continuation");
-                    continuation.inject_signal_handler(interp, body);
-                    interp.process.shell_continuation = Some(continuation);
-                }
+                interp.finish_child(owner_pid, status);
+                return Ok(MachinePoll::Progress);
+            }
+            crate::interp::SignalDelivery::Handler(body) => {
+                let mut continuation =
+                    interp.process.shell_continuation.take().ok_or_else(|| {
+                        format!("active signaled process {owner_pid} has no shell continuation")
+                    })?;
+                continuation.inject_signal_handler(interp, body);
+                interp.process.shell_continuation = Some(continuation);
             }
         }
-        wake_due_events(interp).expect("current virtual instant must remain valid");
-        let owner_pid = interp.process.pid;
-        let mut continuation = interp
-            .process
-            .shell_continuation
-            .take()
-            .unwrap_or_else(|| panic!("active process {owner_pid} has no shell continuation"));
-        match continuation.poll(interp, SHELL_POLL_QUANTUM) {
-            ShellPoll::Pending => {
-                interp
-                    .process
-                    .set_continuation(owner_pid, Some(continuation))
-                    .expect("polled process state must remain present");
-                if interp.scheduler.has_runnable() {
-                    interp
-                        .scheduler
-                        .yield_current()
-                        .expect("polled process must be the running scheduler task");
-                    let scheduled = interp
-                        .scheduler
-                        .dispatch()
-                        .expect("runnable queue must contain valid tasks")
-                        .expect("a runnable task was checked above");
-                    interp
-                        .process
-                        .activate(scheduled)
-                        .expect("scheduled task must own process state");
-                }
-            }
-            ShellPoll::Switched => {
-                interp
-                    .process
-                    .set_continuation(owner_pid, Some(continuation))
-                    .expect("suspended parent process state must remain present");
-            }
-            ShellPoll::Blocked(reason) => {
-                interp
-                    .process
-                    .set_continuation(owner_pid, Some(continuation))
-                    .expect("blocked process state must remain present");
+    }
+    wake_due_events(interp)?;
+    let owner_pid = interp.process.pid;
+    let mut continuation = interp
+        .process
+        .shell_continuation
+        .take()
+        .ok_or_else(|| format!("active process {owner_pid} has no shell continuation"))?;
+    match continuation.poll(interp, SHELL_POLL_QUANTUM) {
+        ShellPoll::Pending => {
+            interp
+                .process
+                .set_continuation(owner_pid, Some(continuation))?;
+            if interp.scheduler.has_runnable() {
                 interp
                     .scheduler
-                    .block_current(reason)
-                    .expect("polled process must be the running scheduler task");
-                dispatch_or_advance(interp)
-                    .expect("a blocking command must leave a modeled wake event");
+                    .yield_current()
+                    .map_err(|error| format!("{error:?}"))?;
+                dispatch_available(interp, false)?;
             }
-            ShellPoll::Ready(status) if owner_pid == target_pid => return status,
-            ShellPoll::Ready(status) => {
-                interp.finish_child(owner_pid, status);
-                if interp.scheduler.current().is_none() {
-                    dispatch_or_advance(interp)
-                        .expect("retained blocked processes must have a modeled wake event");
-                }
+            Ok(MachinePoll::Progress)
+        }
+        ShellPoll::Switched => {
+            interp
+                .process
+                .set_continuation(owner_pid, Some(continuation))?;
+            Ok(MachinePoll::Progress)
+        }
+        ShellPoll::Blocked(reason) => {
+            interp
+                .process
+                .set_continuation(owner_pid, Some(continuation))?;
+            interp
+                .scheduler
+                .block_current(reason)
+                .map_err(|error| format!("{error:?}"))?;
+            if dispatch_available(interp, advance_time)? {
+                Ok(MachinePoll::Progress)
+            } else {
+                Ok(MachinePoll::Blocked)
             }
+        }
+        ShellPoll::Ready(status) if owner_pid == target_pid => Ok(MachinePoll::Ready(status)),
+        ShellPoll::Ready(status) => {
+            interp.finish_child(owner_pid, status);
+            Ok(MachinePoll::Progress)
         }
     }
 }
 
-fn dispatch_or_advance(interp: &mut Interp) -> Result<(), String> {
+fn dispatch_available(interp: &mut Interp, advance_time: bool) -> Result<bool, String> {
     loop {
         if let Some(pid) = interp
             .scheduler
@@ -2034,14 +2155,17 @@ fn dispatch_or_advance(interp: &mut Interp) -> Result<(), String> {
             .map_err(|error| format!("{error:?}"))?
         {
             interp.process.activate(pid)?;
-            return Ok(());
+            return Ok(true);
+        }
+        if !advance_time {
+            return Ok(false);
         }
         let fired = interp
             .clock
             .advance_to_next()
             .map_err(|error| error.to_string())?;
         if fired.is_empty() {
-            return Err("all processes are blocked without a pending event".to_string());
+            return Ok(false);
         }
         handle_ready_events(interp)?;
     }
@@ -2118,7 +2242,14 @@ fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
     if let Some(delivery) = interp.take_signal_delivery() {
         match delivery {
             crate::interp::SignalDelivery::Terminate(signal) => {
-                interp.finish_child(owner, 128 + signal.number());
+                let status = 128 + signal.number();
+                interp.invocations.finish_latest(
+                    owner,
+                    status,
+                    interp.resources.cpu_used(),
+                    interp.vfs.disk_used(),
+                );
+                interp.finish_child(owner, status);
                 return Ok(());
             }
             crate::interp::SignalDelivery::Handler(body) => {
@@ -2497,6 +2628,9 @@ fn write_diagnostic(interp: &mut Interp, message: &str) {
 
 fn io_wait_reason(wait: crate::descriptors::IoWait) -> crate::scheduler::WaitReason {
     match wait {
+        crate::descriptors::IoWait::InputReadable(description) => {
+            crate::scheduler::WaitReason::InputReadable(description)
+        }
         crate::descriptors::IoWait::PipeReadable(pipe) => {
             crate::scheduler::WaitReason::PipeReadable(pipe)
         }

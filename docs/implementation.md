@@ -54,10 +54,21 @@ remain recoverable.
 ## Persistent harness protocol
 
 `shellsim serve` owns one `HarnessSession` and reads bounded newline-delimited JSON requests. The
-closed operation set is `execute`, `read_file`, `write_file`, `remove_path`, `list_paths`,
-`checkpoint`, `workspace_diff`, `reset_workspace`, and `inspect`. Each request may carry an
-arbitrary JSON `id`, which is echoed in its one-line response. Stream and file bytes are base64;
-the protocol never performs lossy text conversion.
+closed operation set includes one-shot `execute`; retained `start_execute`, `poll_action`,
+`write_stdin`, `close_stdin`, `read_action_output`, `signal_process`, and `drop_action`; plus
+`read_file`, `write_file`, `remove_path`, `list_paths`, `checkpoint`, `workspace_diff`,
+`reset_workspace`, and `inspect`. Each request may carry an arbitrary JSON `id`, which is echoed in
+its one-line response. Stream and file bytes are base64; the protocol never performs lossy text
+conversion.
+
+A retained action installs a shell continuation and isolated standard descriptors without driving
+the machine. Polls execute a bounded number of ordinary scheduler quanta. With `advance_time`
+disabled, an all-blocked action returns its typed wait reason without moving the virtual clock;
+with it enabled, the scheduler may fire the next modeled event. Streaming stdin is a bounded input
+description with explicit append and EOF operations. Output reads use independent delivery cursors
+and return only newly available bytes. At most one foreground action is active in a session, up to
+64 completed action records may be retained, and an active action survives a complete-state session
+fork. The legacy `execute` operation drives this same retained path to completion.
 
 File operations are confined to the simulated `/work` tree. `execute` still sees the full modeled
 filesystem and all normal shellsim capabilities, never host state. Requests are capped at 20 MiB,
@@ -67,7 +78,8 @@ file bytes, modes, directories, or symlink targets. A checkpoint clones only a b
 `reset_workspace` restores that VFS checkpoint but deliberately does not rewind CPU fuel, virtual
 time, process history, shell variables, or terminal resource exhaustion.
 
-Action results include the bounded per-action virtual-network request delta with method, URL, and
+Action results include ordered command occurrences and the bounded per-action virtual-network
+request delta with method, URL, and
 whether a route matched. Inspection returns the retained request log and a dropped-record count;
 once the fixed log capacity is reached, later attempts increment that count without growing host
 memory.

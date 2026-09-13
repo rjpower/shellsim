@@ -139,8 +139,8 @@ native session manipulation remain rejected.
 static VFS files. The first slice provides `/proc/self`, per-process `status`, `cmdline`, `environ`,
 and `cwd`, plus deterministic `uptime`, `meminfo`, `cpuinfo`, `version`, and `mounts`.
 
-The finite pseudo-device slice provides `/dev/null` and standard-descriptor links. Descriptor-backed
-I/O is still required before those links have full read/write semantics. `/dev/zero` and random
+The finite pseudo-device slice provides descriptor-backed `/dev/null` and standard-descriptor
+links through the same per-process FD table used by redirections and pipes. `/dev/zero` and random
 devices require bounded streaming interfaces and are intentionally not exposed through eager file
 reads. Signals can begin with `INT`, `TERM`, `KILL`, and `HUP` at scheduler boundaries.
 
@@ -184,8 +184,10 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
    compound native callback frames remain.
 7. A persistent bounded NDJSON workspace protocol with execution, typed diffs, checkpoint/reset,
    file tools, inspection, transactional host snapshot ingestion, replay, and typed scenario
-   assertions is present. Complete machine-state forks support deterministic library-side
-   branching and atomic transcript persistence. Add external-agent experiments.
+   assertions is present. Retained actions expose bounded polling, typed waits, incremental
+   stdin/output, modeled signals, and per-action telemetry over the same scheduler used by one-shot
+   execution. Complete machine-state forks support deterministic library-side branching and atomic
+   transcript persistence. Add multi-session protocol ownership and external-agent experiments.
 
 Every phase retains the existing security rule: simulated input can use only explicitly modeled
 state and must never fall through to host filesystem, process, network, environment, or clock

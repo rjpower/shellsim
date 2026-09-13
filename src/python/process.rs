@@ -838,6 +838,9 @@ fn pipe_id(interp: &Interp, description: u32) -> PyResult<u32> {
 
 fn wake_io(interp: &mut Interp, wait: IoWait) {
     let reason = match wait {
+        IoWait::InputReadable(description) => {
+            crate::scheduler::WaitReason::InputReadable(description)
+        }
         IoWait::PipeReadable(pipe) => crate::scheduler::WaitReason::PipeReadable(pipe),
         IoWait::PipeWritable(pipe) => crate::scheduler::WaitReason::PipeWritable(pipe),
     };

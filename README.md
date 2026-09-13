@@ -49,6 +49,14 @@ printf '%s\n' \
   '{"id":2,"op":"workspace_diff"}' \
   | ./target/release/shellsim serve --root ./project
 
+# Retain an action, observe its timer wait, then permit virtual-time advancement
+printf '%s\n' \
+  '{"id":1,"op":"start_execute","source":"printf one; sleep 2; printf two"}' \
+  '{"id":2,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":false}' \
+  '{"id":3,"op":"read_action_output","action_id":0}' \
+  '{"id":4,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":true}' \
+  | ./target/release/shellsim serve
+
 # Replay a bounded scenario and emit paired request/response transcript records
 ./target/release/shellsim replay scenario.ndjson --root ./project > transcript.ndjson
 

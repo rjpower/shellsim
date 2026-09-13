@@ -1569,27 +1569,43 @@ impl Interp {
             self.last_status = code;
             return (self.outcome(code), out, err);
         }
-        let parser_memory = 8 * 1024 + (src.len() as u64).saturating_mul(2);
-        let parser_reserved = self.resources.reserve_memory(parser_memory);
-        let code = if parser_reserved && self.resources.charge_cpu(src.len() as u64) {
-            match parse(src) {
-                Ok(ast) => crate::exec::exec(self, &ast, stdin, &mut out, &mut err),
-                Err(error) => {
-                    err.extend_from_slice(format!("shellsim: syntax error: {error}\n").as_bytes());
-                    self.last_status = 2;
-                    2
-                }
+        let code = match self.parse_shell_action(src) {
+            Ok(ast) => crate::exec::exec(self, &ast, stdin, &mut out, &mut err),
+            Err((status, diagnostic)) => {
+                err.extend_from_slice(&diagnostic);
+                status
             }
-        } else {
-            self.resources
-                .stop_reason()
-                .map_or(137, |reason| reason.exit_status())
         };
-        if parser_reserved {
-            self.resources.release_memory(parser_memory);
-        }
         let status = self.exiting.unwrap_or(code);
         (self.outcome(status), out, err)
+    }
+
+    /// Parse one complete action under the shared deterministic parser budget.
+    pub(crate) fn parse_shell_action(&mut self, src: &str) -> Result<Node, (i32, Vec<u8>)> {
+        let parser_memory = 8 * 1024 + (src.len() as u64).saturating_mul(2);
+        if !self.resources.reserve_memory(parser_memory) {
+            let status = self
+                .resources
+                .stop_reason()
+                .map_or(137, |reason| reason.exit_status());
+            return Err((status, Vec::new()));
+        }
+        let parsed = if self.resources.charge_cpu(src.len() as u64) {
+            parse(src)
+                .map_err(|error| (2, format!("shellsim: syntax error: {error}\n").into_bytes()))
+        } else {
+            Err((
+                self.resources
+                    .stop_reason()
+                    .map_or(137, |reason| reason.exit_status()),
+                Vec::new(),
+            ))
+        };
+        self.resources.release_memory(parser_memory);
+        if let Err((status, _)) = &parsed {
+            self.last_status = *status;
+        }
+        parsed
     }
 
     /// Parse and run a whole script, returning the final exit status.

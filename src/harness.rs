@@ -20,6 +20,8 @@ use crate::{Environment, Limits, RunOutcome};
 
 const MAX_TRANSFER_RAW_BYTES: usize = 6 * 1024 * 1024;
 const MAX_SESSION_FORK_BYTES: u64 = 96 * 1024 * 1024;
+const MAX_RETAINED_ACTIONS: usize = 64;
+const MAX_POLL_QUANTA: usize = 100_000;
 
 /// One protocol request. `id` is echoed verbatim so clients can correlate responses.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -38,6 +40,39 @@ pub enum HarnessOperation {
         source: String,
         #[serde(default)]
         stdin_base64: String,
+    },
+    StartExecute {
+        source: String,
+        #[serde(default)]
+        stdin_base64: String,
+        #[serde(default = "default_true")]
+        stdin_closed: bool,
+    },
+    PollAction {
+        action_id: u64,
+        #[serde(default = "default_poll_quanta")]
+        work_quanta: usize,
+        #[serde(default)]
+        advance_time: bool,
+    },
+    WriteStdin {
+        action_id: u64,
+        data_base64: String,
+    },
+    CloseStdin {
+        action_id: u64,
+    },
+    ReadActionOutput {
+        action_id: u64,
+    },
+    SignalProcess {
+        pid: u32,
+        signal: String,
+        #[serde(default)]
+        process_group: bool,
+    },
+    DropAction {
+        action_id: u64,
     },
     ReadFile {
         path: String,
@@ -78,11 +113,48 @@ pub struct HarnessResponse {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HarnessResult {
     Execute(ExecuteResult),
+    Action(ActionView),
+    ActionOutput(ActionOutput),
     File(FileResult),
     Paths { paths: Vec<String> },
     WorkspaceDiff { changes: Vec<WorkspaceChange> },
     Inspect(InspectResult),
     Acknowledged,
+}
+
+/// Stable lifecycle and telemetry for one retained foreground action.
+#[derive(Debug, Serialize)]
+pub struct ActionView {
+    pub action_id: u64,
+    pub root_pid: u32,
+    pub state: ActionState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RunOutcome>,
+    pub invocations: Vec<InvocationEvent>,
+    pub dropped_invocations: u64,
+    pub unsupported: Vec<String>,
+    pub network_requests: Vec<NetworkRequest>,
+    pub dropped_network_requests: u64,
+}
+
+/// Retained action lifecycle. A blocked action can be resumed by input, a modeled event, or a
+/// later poll that permits virtual-time advancement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ActionState {
+    Running,
+    Blocked { reason: Option<WaitReasonView> },
+    Complete { status: i32 },
+}
+
+/// Newly available action stream bytes. Reads advance action-local delivery cursors.
+#[derive(Debug, Serialize)]
+pub struct ActionOutput {
+    pub action_id: u64,
+    pub stdout_base64: String,
+    pub stderr_base64: String,
+    pub stdout_closed: bool,
+    pub stderr_closed: bool,
 }
 
 /// Action output and telemetry. Stream bytes use explicit base64 without UTF-8 loss.
@@ -114,6 +186,7 @@ pub struct FileResult {
 pub struct InspectResult {
     pub cwd: String,
     pub outcome: RunOutcome,
+    pub actions: Vec<ActionView>,
     pub processes: Vec<ProcessView>,
     pub current_pid: Option<u32>,
     pub monotonic_ns: u64,
@@ -147,10 +220,11 @@ pub enum ProcessViewStatus {
 }
 
 /// Serializable scheduler wait reason without exposing implementation strings.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitReasonView {
     Timer { deadline_ns: u64 },
+    InputReadable { description: u32 },
     PipeReadable { pipe: u32 },
     PipeWritable { pipe: u32 },
     Child { pid: u32 },
@@ -191,6 +265,117 @@ pub enum WorkspaceNode {
 pub struct HarnessSession {
     pub environment: Environment,
     baseline: Vfs,
+    actions: std::collections::BTreeMap<u64, RetainedAction>,
+    active_action: Option<u64>,
+    next_action_id: u64,
+}
+
+#[derive(Clone)]
+struct RetainedAction {
+    id: u64,
+    root_pid: u32,
+    execution: Option<crate::exec::ShellExecution>,
+    state: ActionState,
+    outcome: Option<RunOutcome>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_cursor: usize,
+    stderr_cursor: usize,
+    invocation_start: u64,
+    dropped_invocations_start: u64,
+    dropped_invocations: u64,
+    invocations: Vec<InvocationEvent>,
+    unsupported: Vec<String>,
+    network_requests: Vec<NetworkRequest>,
+    dropped_network_requests: u64,
+    command_start: usize,
+    unsupported_start: usize,
+    network_start: usize,
+    dropped_network_start: u64,
+}
+
+impl RetainedAction {
+    fn new(id: u64, environment: &Environment) -> Self {
+        Self {
+            id,
+            root_pid: environment.process.pid,
+            execution: None,
+            state: ActionState::Running,
+            outcome: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_cursor: 0,
+            stderr_cursor: 0,
+            invocation_start: environment.invocations.next_sequence(),
+            dropped_invocations_start: environment.invocations.dropped(),
+            dropped_invocations: 0,
+            invocations: Vec::new(),
+            unsupported: Vec::new(),
+            network_requests: Vec::new(),
+            dropped_network_requests: 0,
+            command_start: environment.cmd_trace.len(),
+            unsupported_start: environment.unsupported.len(),
+            network_start: environment.net.log.len(),
+            dropped_network_start: environment.net.dropped_requests,
+        }
+    }
+
+    fn complete(&mut self, environment: &Environment, status: i32) {
+        let status = environment.termination_status().unwrap_or(status);
+        self.state = ActionState::Complete { status };
+        self.outcome = Some(environment.outcome(status));
+        self.invocations = environment.invocations.events_since(self.invocation_start);
+        self.dropped_invocations = environment
+            .invocations
+            .dropped()
+            .saturating_sub(self.dropped_invocations_start);
+        self.unsupported = environment.unsupported[self.unsupported_start..].to_vec();
+        self.network_requests = environment.net.log[self.network_start..].to_vec();
+        self.dropped_network_requests = environment
+            .net
+            .dropped_requests
+            .saturating_sub(self.dropped_network_start);
+    }
+
+    fn view(&self, environment: &Environment) -> ActionView {
+        ActionView {
+            action_id: self.id,
+            root_pid: self.root_pid,
+            state: self.state,
+            outcome: self.outcome.clone(),
+            invocations: if self.execution.is_some() {
+                environment.invocations.events_since(self.invocation_start)
+            } else {
+                self.invocations.clone()
+            },
+            dropped_invocations: if self.execution.is_some() {
+                environment
+                    .invocations
+                    .dropped()
+                    .saturating_sub(self.dropped_invocations_start)
+            } else {
+                self.dropped_invocations
+            },
+            unsupported: if self.execution.is_some() {
+                environment.unsupported[self.unsupported_start..].to_vec()
+            } else {
+                self.unsupported.clone()
+            },
+            network_requests: if self.execution.is_some() {
+                environment.net.log[self.network_start..].to_vec()
+            } else {
+                self.network_requests.clone()
+            },
+            dropped_network_requests: if self.execution.is_some() {
+                environment
+                    .net
+                    .dropped_requests
+                    .saturating_sub(self.dropped_network_start)
+            } else {
+                self.dropped_network_requests
+            },
+        }
+    }
 }
 
 impl HarnessSession {
@@ -204,6 +389,9 @@ impl HarnessSession {
         Self {
             environment,
             baseline,
+            actions: std::collections::BTreeMap::new(),
+            active_action: None,
+            next_action_id: 0,
         }
     }
 
@@ -264,6 +452,12 @@ impl HarnessSession {
             .saturating_add(self.environment.pending_stdout.len() as u64)
             .saturating_add(self.environment.pending_stderr.len() as u64)
             .saturating_add(self.environment.invocations.modeled_bytes())
+            .saturating_add(self.actions.values().fold(0_u64, |bytes, action| {
+                bytes
+                    .saturating_add(action.stdout.len() as u64)
+                    .saturating_add(action.stderr.len() as u64)
+                    .saturating_add(512)
+            }))
             .saturating_add(1024 * 1024);
         if estimate > MAX_SESSION_FORK_BYTES {
             return Err(format!(
@@ -273,6 +467,9 @@ impl HarnessSession {
         Ok(Self {
             environment: self.environment.clone(),
             baseline: self.baseline.clone(),
+            actions: self.actions.clone(),
+            active_action: self.active_action,
+            next_action_id: self.next_action_id,
         })
     }
 
@@ -286,6 +483,58 @@ impl HarnessSession {
                 let result = self.execute(&source, &stdin);
                 self.environment.resources.release_memory(reserved);
                 result
+            }
+            HarnessOperation::StartExecute {
+                source,
+                stdin_base64,
+                stdin_closed,
+            } => {
+                let (stdin, reserved) = self.decode_bytes(&stdin_base64)?;
+                let result = self.start_action(&source, &stdin, stdin_closed);
+                self.environment.resources.release_memory(reserved);
+                result.map(HarnessResult::Action)
+            }
+            HarnessOperation::PollAction {
+                action_id,
+                work_quanta,
+                advance_time,
+            } => self
+                .poll_action(action_id, work_quanta, advance_time)
+                .map(HarnessResult::Action),
+            HarnessOperation::WriteStdin {
+                action_id,
+                data_base64,
+            } => {
+                let (bytes, reserved) = self.decode_bytes(&data_base64)?;
+                let result = self.write_action_stdin(action_id, &bytes);
+                self.environment.resources.release_memory(reserved);
+                result?;
+                Ok(HarnessResult::Acknowledged)
+            }
+            HarnessOperation::CloseStdin { action_id } => {
+                self.close_action_stdin(action_id)?;
+                Ok(HarnessResult::Acknowledged)
+            }
+            HarnessOperation::ReadActionOutput { action_id } => self
+                .read_action_output(action_id)
+                .map(HarnessResult::ActionOutput),
+            HarnessOperation::SignalProcess {
+                pid,
+                signal,
+                process_group,
+            } => {
+                let signal = crate::process::Signal::parse(&signal)
+                    .ok_or_else(|| format!("unsupported signal '{signal}'"))?;
+                if process_group {
+                    self.environment.send_signal_group(pid, signal)?;
+                } else {
+                    self.environment.send_signal(pid, signal)?;
+                }
+                Ok(HarnessResult::Acknowledged)
+            }
+            HarnessOperation::DropAction { action_id } => {
+                self.drop_action(action_id)?;
+                Ok(HarnessResult::Acknowledged)
             }
             HarnessOperation::ReadFile { path } => self.read_file(&path),
             HarnessOperation::WriteFile {
@@ -341,39 +590,222 @@ impl HarnessSession {
     }
 
     fn execute(&mut self, source: &str, stdin: &[u8]) -> Result<HarnessResult, String> {
-        let command_start = self.environment.cmd_trace.len();
-        let unsupported_start = self.environment.unsupported.len();
-        let invocation_start = self.environment.invocations.next_sequence();
-        let dropped_invocations_start = self.environment.invocations.dropped();
-        let network_start = self.environment.net.log.len();
-        let dropped_network_start = self.environment.net.dropped_requests;
-        let (outcome, stdout, stderr) = self
-            .environment
-            .run_script_capture_with_stdin(source, stdin);
-        let invocations = self.environment.invocations.events_since(invocation_start);
-        let noop_commands = invocation_names(&invocations, CommandTrust::NoOp);
-        let partial_commands = invocation_names(&invocations, CommandTrust::Partial);
+        let action_id = self.start_action(source, stdin, true)?.action_id;
+        while self.active_action == Some(action_id) {
+            self.poll_action(action_id, MAX_POLL_QUANTA, true)?;
+        }
+        let action = self
+            .actions
+            .remove(&action_id)
+            .ok_or_else(|| format!("action {action_id} disappeared before completion"))?;
+        let outcome = action
+            .outcome
+            .clone()
+            .ok_or_else(|| format!("action {action_id} completed without an outcome"))?;
+        let noop_commands = invocation_names(&action.invocations, CommandTrust::NoOp);
+        let partial_commands = invocation_names(&action.invocations, CommandTrust::Partial);
         Ok(HarnessResult::Execute(ExecuteResult {
             outcome,
-            stdout_base64: STANDARD.encode(stdout),
-            stderr_base64: STANDARD.encode(stderr),
-            commands: self.environment.cmd_trace[command_start..].to_vec(),
-            unsupported: self.environment.unsupported[unsupported_start..].to_vec(),
+            stdout_base64: STANDARD.encode(action.stdout),
+            stderr_base64: STANDARD.encode(action.stderr),
+            commands: self.environment.cmd_trace[action.command_start..].to_vec(),
+            unsupported: action.unsupported,
             noop_commands,
             partial_commands,
-            invocations,
-            dropped_invocations: self
-                .environment
-                .invocations
-                .dropped()
-                .saturating_sub(dropped_invocations_start),
-            network_requests: self.environment.net.log[network_start..].to_vec(),
-            dropped_network_requests: self
-                .environment
-                .net
-                .dropped_requests
-                .saturating_sub(dropped_network_start),
+            invocations: action.invocations,
+            dropped_invocations: action.dropped_invocations,
+            network_requests: action.network_requests,
+            dropped_network_requests: action.dropped_network_requests,
         }))
+    }
+
+    fn start_action(
+        &mut self,
+        source: &str,
+        stdin: &[u8],
+        stdin_closed: bool,
+    ) -> Result<ActionView, String> {
+        if self.active_action.is_some() {
+            return Err("session already has an active foreground action".to_string());
+        }
+        if self.actions.len() >= MAX_RETAINED_ACTIONS {
+            return Err(format!(
+                "session retained-action limit exceeded ({MAX_RETAINED_ACTIONS})"
+            ));
+        }
+        let action_id = self.next_action_id;
+        self.next_action_id = self
+            .next_action_id
+            .checked_add(1)
+            .ok_or_else(|| "action identifier space exhausted".to_string())?;
+        let mut action = RetainedAction::new(action_id, &self.environment);
+
+        if let Some(status) = self.environment.termination_status() {
+            action.complete(&self.environment, status);
+        } else if self.environment.in_python_repl() {
+            let (outcome, stdout, stderr) = self
+                .environment
+                .run_script_capture_with_stdin(source, stdin);
+            action.stdout = stdout;
+            action.stderr = stderr;
+            action.complete(&self.environment, outcome.exit_status);
+            action.outcome = Some(outcome);
+        } else {
+            match self.environment.parse_shell_action(source) {
+                Ok(node) => {
+                    let execution = crate::exec::ShellExecution::start(
+                        &mut self.environment,
+                        &node,
+                        stdin,
+                        stdin_closed,
+                    )?;
+                    action.root_pid = execution.target_pid();
+                    action.execution = Some(execution);
+                    self.active_action = Some(action_id);
+                }
+                Err((status, diagnostic)) => {
+                    action.stderr = diagnostic;
+                    action.complete(&self.environment, status);
+                }
+            }
+        }
+        let view = action.view(&self.environment);
+        self.actions.insert(action_id, action);
+        Ok(view)
+    }
+
+    fn poll_action(
+        &mut self,
+        action_id: u64,
+        work_quanta: usize,
+        advance_time: bool,
+    ) -> Result<ActionView, String> {
+        if work_quanta == 0 || work_quanta > MAX_POLL_QUANTA {
+            return Err(format!(
+                "work_quanta must be between 1 and {MAX_POLL_QUANTA}"
+            ));
+        }
+        let mut action = self
+            .actions
+            .remove(&action_id)
+            .ok_or_else(|| format!("action {action_id} does not exist"))?;
+        let result = (|| {
+            let Some(mut execution) = action.execution.take() else {
+                return Ok(action.view(&self.environment));
+            };
+            action.state = ActionState::Running;
+            let mut completed = None;
+            for _ in 0..work_quanta {
+                let poll = match execution.poll(&mut self.environment, advance_time) {
+                    Ok(poll) => poll,
+                    Err(error) => {
+                        action.execution = Some(execution);
+                        return Err(error);
+                    }
+                };
+                match poll {
+                    crate::exec::MachinePoll::Progress => {}
+                    crate::exec::MachinePoll::Blocked => {
+                        let reason = match self.environment.scheduler.state(action.root_pid) {
+                            Some(TaskState::Blocked(reason)) => Some(wait_reason_view(reason)),
+                            _ => None,
+                        };
+                        action.state = ActionState::Blocked { reason };
+                        break;
+                    }
+                    crate::exec::MachinePoll::Ready(status) => {
+                        completed = Some(status);
+                        break;
+                    }
+                }
+            }
+            execution.drain_output(
+                &mut self.environment,
+                &mut action.stdout,
+                &mut action.stderr,
+            );
+            if let Some(status) = completed {
+                execution.restore(&mut self.environment);
+                action.complete(&self.environment, status);
+                self.active_action = None;
+            } else {
+                action.execution = Some(execution);
+            }
+            Ok(action.view(&self.environment))
+        })();
+        self.actions.insert(action_id, action);
+        result
+    }
+
+    fn write_action_stdin(&mut self, action_id: u64, bytes: &[u8]) -> Result<(), String> {
+        let mut action = self
+            .actions
+            .remove(&action_id)
+            .ok_or_else(|| format!("action {action_id} does not exist"))?;
+        let result = match action.execution.as_mut() {
+            Some(execution) => execution.write_stdin(&mut self.environment, bytes),
+            None => Err(format!("action {action_id} is complete")),
+        };
+        if result.is_ok() {
+            action.state = ActionState::Running;
+        }
+        self.actions.insert(action_id, action);
+        result
+    }
+
+    fn close_action_stdin(&mut self, action_id: u64) -> Result<(), String> {
+        let mut action = self
+            .actions
+            .remove(&action_id)
+            .ok_or_else(|| format!("action {action_id} does not exist"))?;
+        let result = match action.execution.as_mut() {
+            Some(execution) => execution.close_stdin(&mut self.environment),
+            None => Err(format!("action {action_id} is complete")),
+        };
+        if result.is_ok() {
+            action.state = ActionState::Running;
+        }
+        self.actions.insert(action_id, action);
+        result
+    }
+
+    fn read_action_output(&mut self, action_id: u64) -> Result<ActionOutput, String> {
+        let mut action = self
+            .actions
+            .remove(&action_id)
+            .ok_or_else(|| format!("action {action_id} does not exist"))?;
+        if let Some(execution) = action.execution.as_mut() {
+            execution.drain_output(
+                &mut self.environment,
+                &mut action.stdout,
+                &mut action.stderr,
+            );
+        }
+        let stdout = action.stdout[action.stdout_cursor..].to_vec();
+        let stderr = action.stderr[action.stderr_cursor..].to_vec();
+        action.stdout_cursor = action.stdout.len();
+        action.stderr_cursor = action.stderr.len();
+        let closed = action.execution.is_none();
+        self.actions.insert(action_id, action);
+        Ok(ActionOutput {
+            action_id,
+            stdout_base64: STANDARD.encode(stdout),
+            stderr_base64: STANDARD.encode(stderr),
+            stdout_closed: closed,
+            stderr_closed: closed,
+        })
+    }
+
+    fn drop_action(&mut self, action_id: u64) -> Result<(), String> {
+        let action = self
+            .actions
+            .get(&action_id)
+            .ok_or_else(|| format!("action {action_id} does not exist"))?;
+        if action.execution.is_some() {
+            return Err(format!("action {action_id} is still active"));
+        }
+        self.actions.remove(&action_id);
+        Ok(())
     }
 
     fn read_file(&self, path: &str) -> Result<HarnessResult, String> {
@@ -416,6 +848,11 @@ impl HarnessSession {
                 self.environment.vfs.disk_used(),
                 self.environment.vfs.disk_peak(),
             ),
+            actions: self
+                .actions
+                .values()
+                .map(|action| action.view(&self.environment))
+                .collect(),
             processes: self
                 .environment
                 .processes
@@ -484,6 +921,7 @@ fn process_view(record: &ProcessRecord, task_state: Option<TaskState>) -> Proces
 fn wait_reason_view(reason: WaitReason) -> WaitReasonView {
     match reason {
         WaitReason::Timer(deadline_ns) => WaitReasonView::Timer { deadline_ns },
+        WaitReason::InputReadable(description) => WaitReasonView::InputReadable { description },
         WaitReason::PipeReadable(pipe) => WaitReasonView::PipeReadable { pipe },
         WaitReason::PipeWritable(pipe) => WaitReasonView::PipeWritable { pipe },
         WaitReason::Child(pid) => WaitReasonView::Child { pid },
@@ -607,6 +1045,14 @@ fn default_root() -> String {
     "/work".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_poll_quanta() -> usize {
+    1_024
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,5 +1166,60 @@ mod tests {
             .invocations
             .iter()
             .any(|event| event.argv == ["sleep", "10"] && event.status.is_none()));
+    }
+
+    #[test]
+    fn retained_action_polls_time_and_output_incrementally() {
+        let mut session = HarnessSession::new(Limits::default());
+        let started = session
+            .start_action("printf one; sleep 2; printf two", &[], true)
+            .unwrap();
+        let action_id = started.action_id;
+        let blocked = session.poll_action(action_id, 100, false).unwrap();
+        assert_eq!(
+            blocked.state,
+            ActionState::Blocked {
+                reason: Some(WaitReasonView::Timer {
+                    deadline_ns: 2_000_000_000
+                })
+            }
+        );
+        assert_eq!(session.environment.clock.monotonic_ns(), 0);
+        let first = session.read_action_output(action_id).unwrap();
+        assert_eq!(STANDARD.decode(first.stdout_base64).unwrap(), b"one");
+        assert!(!first.stdout_closed);
+
+        let mut branch = session.fork().unwrap();
+        for machine in [&mut session, &mut branch] {
+            let complete = machine.poll_action(action_id, 100, true).unwrap();
+            assert_eq!(complete.state, ActionState::Complete { status: 0 });
+            assert_eq!(machine.environment.clock.monotonic_ns(), 2_000_000_000);
+            let final_output = machine.read_action_output(action_id).unwrap();
+            assert_eq!(STANDARD.decode(final_output.stdout_base64).unwrap(), b"two");
+            assert!(final_output.stdout_closed);
+        }
+    }
+
+    #[test]
+    fn retained_action_accepts_bounded_streaming_stdin() {
+        let mut session = HarnessSession::new(Limits::default());
+        let action_id = session.start_action("cat", &[], false).unwrap().action_id;
+        let blocked = session.poll_action(action_id, 100, false).unwrap();
+        assert!(matches!(
+            blocked.state,
+            ActionState::Blocked {
+                reason: Some(WaitReasonView::InputReadable { .. })
+            }
+        ));
+        session.write_action_stdin(action_id, b"hello").unwrap();
+        let blocked = session.poll_action(action_id, 100, false).unwrap();
+        assert!(matches!(blocked.state, ActionState::Blocked { .. }));
+        session.close_action_stdin(action_id).unwrap();
+        let complete = session.poll_action(action_id, 100, false).unwrap();
+        assert_eq!(complete.state, ActionState::Complete { status: 0 });
+        let output = session.read_action_output(action_id).unwrap();
+        assert_eq!(STANDARD.decode(output.stdout_base64).unwrap(), b"hello");
+        assert!(session.write_action_stdin(action_id, b"late").is_err());
+        session.drop_action(action_id).unwrap();
     }
 }

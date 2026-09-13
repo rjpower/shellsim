@@ -1028,6 +1028,7 @@ impl Environment {
     /// Suspend the active task on the exact readiness condition returned by descriptor I/O.
     pub fn block_on_io(&mut self, wait: IoWait) -> Result<(), String> {
         let reason = match wait {
+            IoWait::InputReadable(description) => WaitReason::InputReadable(description),
             IoWait::PipeReadable(pipe) => WaitReason::PipeReadable(pipe),
             IoWait::PipeWritable(pipe) => WaitReason::PipeWritable(pipe),
         };

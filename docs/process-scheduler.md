@@ -369,8 +369,10 @@ names disappear. Completed action records retain only bounded metadata and captu
 clients release them explicitly. Session limits cover retained actions, capture bytes, process and
 descriptor state, telemetry, and forks before allocation.
 
-The NDJSON protocol should add `start_execute`, `poll_action`, `write_stdin`, `close_stdin`,
-`read_output`, `signal`, `cancel_action`, and `drop_action`. A bounded `SessionManager` then adds
+The NDJSON protocol now includes `start_execute`, `poll_action`, `write_stdin`, `close_stdin`,
+`read_action_output`, `signal_process`, and `drop_action`; one-shot `execute` drives the same path.
+Active actions, their descriptor cursors, and their continuations survive complete-state library
+forks. Explicit cancellation policy remains to be added. A bounded `SessionManager` then adds
 `new_session`, `fork_session`, and `drop_session`, with every existing operation carrying a
 `session_id`. The current implicit session remains a compatibility facade over one manager entry,
 not an alternate implementation. Typed stat, directory, symlink, and patch operations can then be

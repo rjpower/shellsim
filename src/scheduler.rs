@@ -15,6 +15,7 @@ pub const MAX_TASKS: usize = crate::process::MAX_PROCESSES;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitReason {
     Timer(u64),
+    InputReadable(u32),
     PipeReadable(u32),
     PipeWritable(u32),
     Child(ProcessId),
