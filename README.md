@@ -66,6 +66,11 @@ printf '%s\n' \
 # Replay a bounded scenario and emit paired request/response transcript records
 ./target/release/shellsim replay scenario.ndjson --root ./project > transcript.ndjson
 
+# Enable format checks, strict trust, and final assertions with a metadata line
+printf '%s\n' '{"scenario":{"version":1,"strict":true,"final_expectation":{"active_action_count":0}}}' \
+  '{"op":"execute","source":"make test"}' > strict-scenario.ndjson
+./target/release/shellsim replay strict-scenario.ndjson
+
 # Import a host Python project into a fresh VFS and run it in shellsim
 ./target/release/shellsim-python project/main.py -- arg1
 ./target/release/shellsim-python project/tests --pytest

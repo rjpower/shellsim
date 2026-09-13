@@ -28,6 +28,7 @@ pub mod pseudo_fs;
 pub mod python;
 pub mod resources;
 pub mod sandbox;
+pub mod scenario;
 pub mod scheduler;
 pub mod shell;
 pub mod telemetry;

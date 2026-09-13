@@ -377,6 +377,8 @@ ordinary operations by optional `session_id`, supports complete-state `fork_sess
 `drop_session`, and retains at most eight independent machines. The current implicit session is a
 compatibility facade over manager entry zero, not an alternate implementation. Typed stat,
 directory, symlink, and atomic patch operations are now available without shell-command parsing.
+A versioned replay header can enforce strict command trust and final scheduler, process, workspace,
+and resource assertions without adding policy to the scheduler itself.
 A Codex, Claude, or MCP adapter stays a thin client
 of this versioned protocol and never receives direct access to `Environment` capabilities.
 

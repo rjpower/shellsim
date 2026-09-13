@@ -301,159 +301,36 @@ fn serve(args: &[String]) -> ! {
     exit(0);
 }
 
-#[derive(serde::Serialize)]
-struct TranscriptRecord<'a> {
-    sequence: usize,
-    request: &'a shellsim::harness::HarnessRequest,
-    response: &'a shellsim::harness::HarnessResponse,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expectation: Option<&'a ScenarioExpectation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    assertion: Option<&'a ScenarioAssertion>,
-}
-
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct ScenarioExpectation {
-    #[serde(default)]
-    ok: Option<bool>,
-    #[serde(default)]
-    exit_status: Option<i32>,
-    #[serde(default)]
-    stdout_base64: Option<String>,
-    #[serde(default)]
-    stderr_base64: Option<String>,
-    #[serde(default)]
-    unsupported: Option<Vec<String>>,
-    #[serde(default)]
-    noop_commands: Option<Vec<String>>,
-    #[serde(default)]
-    partial_commands: Option<Vec<String>>,
-    #[serde(default)]
-    workspace_change_count: Option<usize>,
-    #[serde(default)]
-    error_contains: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct ScenarioAssertion {
-    passed: bool,
-    failures: Vec<String>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum ScenarioAction {
-    Request(shellsim::harness::HarnessRequest),
-    Asserted {
-        request: shellsim::harness::HarnessRequest,
-        expect: ScenarioExpectation,
-    },
-}
-
-fn check_expectation(
-    expected: &ScenarioExpectation,
-    response: &shellsim::harness::HarnessResponse,
-) -> ScenarioAssertion {
-    use shellsim::harness::HarnessResult;
-
-    let mut failures = Vec::new();
-    if let Some(ok) = expected.ok {
-        if response.ok != ok {
-            failures.push(format!("expected ok={ok}, got {}", response.ok));
-        }
+fn emit_transcript_record(
+    output: &mut impl std::io::Write,
+    retained: &mut Option<Vec<u8>>,
+    transcript_bytes: &mut usize,
+    record: &[u8],
+) -> Result<(), String> {
+    *transcript_bytes = transcript_bytes.saturating_add(record.len().saturating_add(1));
+    if *transcript_bytes > MAX_SCENARIO_BYTES {
+        return Err(format!(
+            "transcript exceeds the {MAX_SCENARIO_BYTES}-byte limit"
+        ));
     }
-    let execute = match response.result.as_ref() {
-        Some(HarnessResult::Execute(result)) => Some(result),
-        _ => None,
-    };
-    if let Some(status) = expected.exit_status {
-        match execute {
-            Some(result) if result.outcome.exit_status == status => {}
-            Some(result) => failures.push(format!(
-                "expected exit_status={status}, got {}",
-                result.outcome.exit_status
-            )),
-            None => failures.push("exit_status requires an execute result".to_string()),
-        }
+    output
+        .write_all(record)
+        .map_err(|error| error.to_string())?;
+    output.write_all(b"\n").map_err(|error| error.to_string())?;
+    if let Some(transcript) = retained.as_mut() {
+        transcript
+            .try_reserve_exact(record.len().saturating_add(1))
+            .map_err(|_| "cannot allocate bounded transcript buffer".to_string())?;
+        transcript.extend_from_slice(record);
+        transcript.push(b'\n');
     }
-    for (name, expected_value, actual) in [
-        (
-            "stdout_base64",
-            expected.stdout_base64.as_ref(),
-            execute.map(|result| &result.stdout_base64),
-        ),
-        (
-            "stderr_base64",
-            expected.stderr_base64.as_ref(),
-            execute.map(|result| &result.stderr_base64),
-        ),
-    ] {
-        if let Some(expected_value) = expected_value {
-            match actual {
-                Some(actual) if actual == expected_value => {}
-                Some(actual) => failures.push(format!(
-                    "expected {name}={expected_value:?}, got {actual:?}"
-                )),
-                None => failures.push(format!("{name} requires an execute result")),
-            }
-        }
-    }
-    for (name, expected_values, actual) in [
-        (
-            "unsupported",
-            expected.unsupported.as_ref(),
-            execute.map(|result| &result.unsupported),
-        ),
-        (
-            "noop_commands",
-            expected.noop_commands.as_ref(),
-            execute.map(|result| &result.noop_commands),
-        ),
-        (
-            "partial_commands",
-            expected.partial_commands.as_ref(),
-            execute.map(|result| &result.partial_commands),
-        ),
-    ] {
-        if let Some(expected_values) = expected_values {
-            match actual {
-                Some(actual) if actual == expected_values => {}
-                Some(actual) => failures.push(format!(
-                    "expected {name}={expected_values:?}, got {actual:?}"
-                )),
-                None => failures.push(format!("{name} requires an execute result")),
-            }
-        }
-    }
-    if let Some(expected_count) = expected.workspace_change_count {
-        match response.result.as_ref() {
-            Some(HarnessResult::WorkspaceDiff { changes }) if changes.len() == expected_count => {}
-            Some(HarnessResult::WorkspaceDiff { changes }) => failures.push(format!(
-                "expected workspace_change_count={expected_count}, got {}",
-                changes.len()
-            )),
-            _ => {
-                failures.push("workspace_change_count requires a workspace_diff result".to_string())
-            }
-        }
-    }
-    if let Some(fragment) = &expected.error_contains {
-        match response.error.as_ref() {
-            Some(error) if error.contains(fragment) => {}
-            Some(error) => failures.push(format!(
-                "expected error containing {fragment:?}, got {error:?}"
-            )),
-            None => failures.push(format!("expected error containing {fragment:?}, got none")),
-        }
-    }
-    ScenarioAssertion {
-        passed: failures.is_empty(),
-        failures,
-    }
+    Ok(())
 }
 
 fn replay(args: &[String]) -> ! {
-    use std::io::{BufReader, Write};
+    use std::io::BufReader;
+
+    use shellsim::scenario::{self, Action, FinalExpectation, Header};
 
     let Some(path) = args.first() else {
         usage_error("replay requires a scenario path");
@@ -464,31 +341,84 @@ fn replay(args: &[String]) -> ! {
         exit(2);
     });
     let mut input = BufReader::new(file);
+    let mut input_bytes = 0usize;
+    let first_line = read_bounded_protocol_line(&mut input).unwrap_or_else(|error| {
+        eprintln!("shellsim replay: input error: {error}");
+        exit(1);
+    });
+    let (metadata, mut pending_action) = match first_line {
+        Some(Ok(line)) => {
+            input_bytes = line.len().saturating_add(1);
+            let is_header = serde_json::from_slice::<serde_json::Value>(&line)
+                .ok()
+                .is_some_and(|value| value.get("scenario").is_some());
+            if is_header {
+                let header = serde_json::from_slice::<Header>(&line).unwrap_or_else(|error| {
+                    eprintln!("shellsim replay: invalid scenario header: {error}");
+                    exit(2);
+                });
+                if header.scenario.version != scenario::FORMAT_VERSION {
+                    eprintln!(
+                        "shellsim replay: unsupported scenario version {} (expected {})",
+                        header.scenario.version,
+                        scenario::FORMAT_VERSION
+                    );
+                    exit(2);
+                }
+                (Some(header.scenario), None)
+            } else {
+                (None, Some(line))
+            }
+        }
+        Some(Err(error)) => {
+            eprintln!("shellsim replay: action 1: {error}");
+            exit(2);
+        }
+        None => (None, None),
+    };
     let mut output = std::io::stdout().lock();
     let session = harness_session(harness_options(&harness_args, "replay"), "replay");
     let mut manager = shellsim::harness_manager::HarnessManager::new(session);
-    let mut input_bytes = 0usize;
     let mut transcript_bytes = 0usize;
     let mut retained_transcript = transcript_path.as_ref().map(|_| Vec::new());
     let mut sequence = 0usize;
     let mut assertion_failed = false;
-    while sequence < MAX_SCENARIO_ACTIONS {
-        let Some(line) = read_bounded_protocol_line(&mut input).unwrap_or_else(|error| {
-            eprintln!("shellsim replay: input error: {error}");
+    let mut strict_failures = Vec::new();
+    if let Some(metadata) = metadata.as_ref() {
+        let record = scenario::serialize_header(metadata);
+        emit_transcript_record(
+            &mut output,
+            &mut retained_transcript,
+            &mut transcript_bytes,
+            &record,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("shellsim replay: {error}");
             exit(1);
-        }) else {
-            break;
-        };
-        let line = line.unwrap_or_else(|error| {
-            eprintln!("shellsim replay: action {}: {error}", sequence + 1);
-            exit(2);
         });
-        input_bytes = input_bytes.saturating_add(line.len().saturating_add(1));
+    }
+    while sequence < MAX_SCENARIO_ACTIONS {
+        let line = if let Some(line) = pending_action.take() {
+            line
+        } else {
+            let Some(line) = read_bounded_protocol_line(&mut input).unwrap_or_else(|error| {
+                eprintln!("shellsim replay: input error: {error}");
+                exit(1);
+            }) else {
+                break;
+            };
+            let line = line.unwrap_or_else(|error| {
+                eprintln!("shellsim replay: action {}: {error}", sequence + 1);
+                exit(2);
+            });
+            input_bytes = input_bytes.saturating_add(line.len().saturating_add(1));
+            line
+        };
         if input_bytes > MAX_SCENARIO_BYTES {
             eprintln!("shellsim replay: scenario exceeds the {MAX_SCENARIO_BYTES}-byte limit");
             exit(2);
         }
-        let action = serde_json::from_slice::<ScenarioAction>(&line).unwrap_or_else(|error| {
+        let action = serde_json::from_slice::<Action>(&line).unwrap_or_else(|error| {
             eprintln!(
                 "shellsim replay: action {} is invalid: {error}",
                 sequence + 1
@@ -496,43 +426,37 @@ fn replay(args: &[String]) -> ! {
             exit(2);
         });
         let (request, expectation) = match action {
-            ScenarioAction::Request(request) => (request, None),
-            ScenarioAction::Asserted { request, expect } => (request, Some(expect)),
+            Action::Request(request) => (request, None),
+            Action::Asserted { request, expect } => (request, Some(expect)),
         };
         let response = manager.handle(request.clone());
         let assertion = expectation
             .as_ref()
-            .map(|expected| check_expectation(expected, &response));
+            .map(|expected| scenario::check_expectation(expected, &response));
         if assertion.as_ref().is_some_and(|result| !result.passed) {
             assertion_failed = true;
             eprintln!("shellsim replay: action {} assertion failed", sequence + 1);
         }
-        let record = serde_json::to_vec(&TranscriptRecord {
+        if metadata.as_ref().is_some_and(|metadata| metadata.strict) {
+            strict_failures.extend(scenario::strict_response_failures(sequence, &response));
+        }
+        let record = scenario::serialize_action(
             sequence,
-            request: &request,
-            response: &response,
-            expectation: expectation.as_ref(),
-            assertion: assertion.as_ref(),
-        })
-        .unwrap();
-        transcript_bytes = transcript_bytes.saturating_add(record.len() + 1);
-        if transcript_bytes > MAX_SCENARIO_BYTES {
-            eprintln!("shellsim replay: transcript exceeds the {MAX_SCENARIO_BYTES}-byte limit");
-            exit(2);
-        }
-        if output.write_all(&record).is_err() || output.write_all(b"\n").is_err() {
+            &request,
+            &response,
+            expectation.as_ref(),
+            assertion.as_ref(),
+        );
+        emit_transcript_record(
+            &mut output,
+            &mut retained_transcript,
+            &mut transcript_bytes,
+            &record,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("shellsim replay: {error}");
             exit(1);
-        }
-        if let Some(transcript) = retained_transcript.as_mut() {
-            transcript
-                .try_reserve_exact(record.len().saturating_add(1))
-                .unwrap_or_else(|_| {
-                    eprintln!("shellsim replay: cannot allocate bounded transcript buffer");
-                    exit(1);
-                });
-            transcript.extend_from_slice(&record);
-            transcript.push(b'\n');
-        }
+        });
         sequence += 1;
     }
     if sequence == MAX_SCENARIO_ACTIONS
@@ -545,6 +469,37 @@ fn replay(args: &[String]) -> ! {
     {
         eprintln!("shellsim replay: scenario exceeds the {MAX_SCENARIO_ACTIONS}-action limit");
         exit(2);
+    }
+    if let Some(metadata) = metadata.as_ref() {
+        strict_failures.sort();
+        strict_failures.dedup();
+        let default_final = FinalExpectation::default();
+        let expected = metadata
+            .final_expectation
+            .as_ref()
+            .unwrap_or(&default_final);
+        let final_assertion = scenario::check_final_expectation(
+            &mut manager,
+            expected,
+            metadata.strict,
+            strict_failures,
+        );
+        if !final_assertion.passed {
+            assertion_failed = true;
+            eprintln!("shellsim replay: final assertion failed");
+        }
+        let record =
+            scenario::serialize_final(metadata.final_expectation.as_ref(), &final_assertion);
+        emit_transcript_record(
+            &mut output,
+            &mut retained_transcript,
+            &mut transcript_bytes,
+            &record,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("shellsim replay: {error}");
+            exit(1);
+        });
     }
     if let (Some(path), Some(transcript)) = (transcript_path, retained_transcript) {
         persist_transcript(std::path::Path::new(&path), &transcript).unwrap_or_else(|error| {

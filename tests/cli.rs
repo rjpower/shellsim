@@ -515,3 +515,110 @@ fn scenario_replay_checks_typed_expectations() {
         .unwrap()
         .contains("exit_status"));
 }
+
+#[test]
+fn versioned_scenario_enforces_strict_trust_and_final_resources() {
+    let directory = TestDirectory::new();
+    let passing = directory.path().join("strict-passing.ndjson");
+    std::fs::write(
+        &passing,
+        concat!(
+            "{\"scenario\":{\"version\":1,\"strict\":true,\"final_expectation\":{\"workspace_change_count\":1,\"exit_status\":0,\"active_action_count\":0,\"live_process_count\":1,\"cpu_used_at_most\":100000,\"memory_peak_at_most\":1048576,\"disk_current_at_most\":1048576,\"output_bytes_at_most\":1024}}}\n",
+            "{\"request\":{\"op\":\"execute\",\"source\":\"printf ok > note\"},\"expect\":{\"exit_status\":0}}\n"
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .arg("replay")
+        .arg(&passing)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0]["kind"], "scenario");
+    assert_eq!(records[1]["sequence"], 0);
+    assert_eq!(records[2]["kind"], "final");
+    assert_eq!(records[2]["assertion"]["passed"], true);
+
+    let untrusted = directory.path().join("strict-untrusted.ndjson");
+    std::fs::write(
+        &untrusted,
+        concat!(
+            "{\"scenario\":{\"version\":1,\"strict\":true}}\n",
+            "{\"op\":\"execute\",\"source\":\"printf abc | sed s/a/z/\"}\n"
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .arg("replay")
+        .arg(&untrusted)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("final assertion failed"));
+    let final_record: serde_json::Value = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .rfind(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .unwrap();
+    assert_eq!(final_record["assertion"]["passed"], false);
+    assert!(final_record["assertion"]["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|failure| failure.as_str().unwrap().contains("partial or no-op")));
+}
+
+#[test]
+fn versioned_scenario_rejects_unknown_versions_and_final_mismatches() {
+    let directory = TestDirectory::new();
+    let unknown = directory.path().join("unknown-version.ndjson");
+    std::fs::write(&unknown, b"{\"scenario\":{\"version\":2}}\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .arg("replay")
+        .arg(&unknown)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported scenario version 2"));
+
+    let mismatch = directory.path().join("final-mismatch.ndjson");
+    std::fs::write(
+        &mismatch,
+        concat!(
+            "{\"scenario\":{\"version\":1,\"final_expectation\":{\"workspace_change_count\":0,\"output_bytes_at_most\":0}}}\n",
+            "{\"op\":\"execute\",\"source\":\"printf output > note; printf visible\"}\n"
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .arg("replay")
+        .arg(&mismatch)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let final_record: serde_json::Value = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .rfind(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .unwrap();
+    let failures = final_record["assertion"]["failures"].as_array().unwrap();
+    assert!(failures
+        .iter()
+        .any(|failure| failure.as_str().unwrap().contains("workspace_change_count")));
+    assert!(failures
+        .iter()
+        .any(|failure| failure.as_str().unwrap().contains("output_bytes")));
+}

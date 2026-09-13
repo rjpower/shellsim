@@ -187,8 +187,9 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
    assertions is present. Retained actions expose bounded polling, typed waits, incremental
    stdin/output, modeled signals, and per-action telemetry over the same scheduler used by one-shot
    execution. A bounded session manager exposes complete machine-state forks through the protocol
-   while preserving compatibility session zero. Atomic transcript persistence is present. Add
-   strict scenario metadata and external-agent experiments.
+   while preserving compatibility session zero. Atomic transcript persistence, versioned scenario
+   metadata, strict trust policy, and final state/resource assertions are present. Add
+   external-agent experiments.
 
 Every phase retains the existing security rule: simulated input can use only explicitly modeled
 state and must never fall through to host filesystem, process, network, environment, or clock

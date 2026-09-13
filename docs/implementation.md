@@ -115,6 +115,20 @@ be rerun against a bounded host snapshot without changing the protocol. `--trans
 persists the emitted NDJSON after a complete replay. Publication is atomic and refuses to replace
 an existing path; malformed or incomplete scenarios leave no requested transcript file.
 
+A scenario may start with a versioned metadata record:
+
+```json
+{"scenario":{"version":1,"strict":true,"final_expectation":{"workspace_change_count":1,"active_action_count":0,"cpu_used_at_most":100000}}}
+```
+
+Versioned replays copy this metadata into the transcript and finish with a typed `final` assertion
+record. Version 1 can assert the selected session's final status, workspace change count, active
+action and live process counts, and upper bounds for CPU, peak memory, current disk use, and output.
+Strict mode additionally fails on any request error, partial or no-op command, unsupported
+behavior, unmatched virtual-network request, dropped observability record, or unfinished retained
+action. Unknown versions and metadata fields fail before executing an action. Action-only legacy
+NDJSON remains accepted and retains its existing transcript shape.
+
 This is sufficient for a host-side agent adapter to replay and assert tool calls without launching
 the agent inside shellsim. The library can fork a bounded `HarnessSession`, including scheduler,
 descriptor, process, Python, clock, network, resource, and checkpoint state, for deterministic
