@@ -141,6 +141,92 @@ before it occurs, or representation-level behavior such as byte codecs. This kee
 expressed in the same object protocols as user programs and keeps the VM independent of stdlib
 names.
 
+## Resumable call and native-frame design
+
+The remaining scheduler boundary is not specific to sorting. Native compound operations and VM
+helpers currently invoke Python callables synchronously in several places: keyed `sorted` and
+`list.sort`, `map`, `filter`, `functools.reduce`, `defaultdict` factories, descriptors, protocol
+slots, context managers, class construction, and metaclass hooks. A callback can therefore consume
+an unbounded nested Rust call and cannot suspend on virtual time, a child, or a descriptor.
+
+The complete design replaces immediate inner calls with one explicit VM frame stack:
+
+```text
+VmState
+  frames: Vec<VmFrame>
+
+VmFrame
+  Bytecode(BytecodeFrame)
+  Native(Box<dyn PyNativeFrame>)
+
+FrameStep
+  Continue
+  Call { callable: PyValue, arguments: CallArgs }
+  Return(PyValue)
+  Block(WaitReason)
+  Raise(PyError)
+  Exit(status)
+```
+
+The dispatcher alone resolves and invokes callables. A `Call` pushes a new bytecode, leaf-native,
+or stateful-native frame with an explicit return target. `Return` feeds one value to that target;
+`Raise` unwinds frames until a bytecode exception region accepts it; and `Block` leaves the entire
+stack owned by `VmState` until the logical process wakes. No frame runs a nested VM loop.
+
+Native module definitions retain the erased-value convention. A callable entry is one of:
+
+```text
+Leaf(fn(&mut dyn PyRuntime, CallArgs) -> PyResult<PyValue>)
+Stateful(fn(&mut dyn PyRuntime, CallArgs) -> PyResult<Box<dyn PyNativeFrame>>)
+```
+
+Leaf entries cover JSON codecs, numeric functions, hashing, and similar operations that do bounded
+work without invoking Python or blocking. A stateful entry creates a cloneable, type-erased frame.
+Its `step(runtime, returned_value)` method may request a Python call, block, or return. Concrete
+frames such as `SortFrame` and `ReduceFrame` live beside their module implementation, not in
+`vm.rs`. Function and bound-method descriptors use the same callable entry after receiver binding.
+Small `leaf(...)` and `stateful(...)` const constructors keep module tables declarative.
+
+`PyRuntime::call_value` is removed. Native code that needs a callback must return `FrameStep::Call`,
+which makes suspension and exception propagation mandatory rather than optional. Native leaf
+functions also cannot return the internal suspension error. Operations that may block, including
+`time.sleep` and subprocess stream methods, become stateful frames and retain their own absolute
+deadline, cursor, and partial progress. This subsumes the current retry-only
+`PendingNativeCall` path.
+
+VM semantic operations that can invoke user code use the same mechanism. Attribute access emits a
+call for `__get__`; protocol operations emit calls for slots; class construction is a frame that
+sequences `__new__` and `__init__`; and `with` bytecodes sequence `__enter__`/`__exit__` through
+explicit continuation state. Pure immediate-tag and native-slot fast paths may return directly,
+but they must produce the same `FrameStep` contract and may not invoke another callable.
+
+Every retained frame is cloneable because complete `HarnessSession` forks copy live Python state.
+Each frame reports conservative modeled bytes, is charged before installation, and releases that
+ownership on return or unwind. Each `step` performs bounded work and charges CPU before loops or
+host allocation. Compound mutations use snapshot-and-commit: for example, `SortFrame` gathers
+keys and orders a private vector before replacing list contents, so callback failure or resource
+exhaustion leaves the receiver unchanged.
+
+Migration is complete only when all of the following are true:
+
+1. Introduce the unified frame dispatcher and return targets while preserving ordinary bytecode
+   call behavior.
+2. Move current retryable sleeps, subprocess operations, and descriptor I/O to stateful native
+   frames; remove `PendingNativeCall` and `native_suspend_allowed`.
+3. Move `sorted` and `list.sort` to one shared sort frame, then migrate `reduce`, `map`, `filter`,
+   and `defaultdict` factories.
+4. Reify descriptor, slot, context-manager, constructor, and metaclass sequences as frames.
+5. Remove `CallMode::Immediate`, `invoke_call`, nested `execute_code` callback paths, and
+   `PyRuntime::call_value`. There is no synchronous compatibility executor left in scheduled
+   Python execution.
+6. Cover callback sleep and subprocess waits, descriptor and constructor callbacks, callback
+   exceptions, transactional mutation, frame/memory exhaustion, session cloning while blocked,
+   and deterministic interleaving between Python processes.
+
+The synchronous library embedding API drives this same frame dispatcher to completion. If it
+encounters a modeled block without a scheduler-owned process, it advances only through the
+existing virtual scheduler adapter; it does not regain a separate recursive evaluator.
+
 ## Supported behavior and frontiers
 
 The useful current language surface includes containers, arbitrary-precision integer arithmetic,

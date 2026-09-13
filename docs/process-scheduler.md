@@ -157,6 +157,8 @@ Keep ordinary native commands synchronous. Convert only commands that may block 
 tasks. Python code, operand stacks, exception regions, and top-level instruction state are now
 owned by a retained command continuation. Ordinary bytecode calls now push explicit return frames.
 The next executor change should split compound native operations around their Python callbacks.
+The unified bytecode/native frame migration is specified in `python.md`; completion removes every
+immediate nested-call path rather than special-casing individual builtins.
 Direct Python timer sleeps, child waits, duplex communication, pipe streams, and subprocess
 deadlines already use typed scheduler result paths.
 
