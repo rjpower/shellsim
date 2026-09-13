@@ -161,6 +161,43 @@ fn persistent_protocol_reports_malformed_requests_and_continues() {
 }
 
 #[test]
+fn mcp_stdio_exposes_the_persistent_simulated_workspace() {
+    let requests = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute","arguments":{"source":"printf hello > note"}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"note"}}}"#,
+    ]
+    .join("\n")
+        + "\n";
+    let output = run_with_stdin(&["mcp"], requests.as_bytes());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        responses.len(),
+        3,
+        "notifications must not receive responses"
+    );
+    assert_eq!(responses[0]["result"]["serverInfo"]["name"], "shellsim");
+    assert_eq!(responses[1]["result"]["isError"], false);
+    assert_eq!(responses[2]["result"]["content"][0]["text"], "hello");
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["result"]["path"],
+        "/work/note"
+    );
+}
+
+#[test]
 fn persistent_protocol_reports_ordered_invocations_and_scheduler_waits() {
     let requests = [
         r#"{"id":1,"op":"execute","source":"sed 's/a/b/' /missing"}"#,

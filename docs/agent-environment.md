@@ -13,8 +13,9 @@ that is now implemented.
 The first tranche added typed all-or-nothing shell parse failures, honest builtin failures, and
 bounded VFS-only Git and shell-recipe Make subsets. Later tranches added cooperative logical
 processes, descriptor-backed pipes, process-group signal delivery, resumable shell signal handlers,
-resumable Python subprocesses, and a persistent workspace protocol. Terminal job control, compound
-Python callback frames, and concrete model-client experiments remain future work.
+resumable Python subprocesses, and a persistent workspace protocol. Running foreground transfer
+through `fg` and a stdio MCP model-client adapter are now present. Stopped jobs, `bg`, compound
+Python callback frames, and end-to-end model experiments remain future work.
 
 ## Product boundary
 
@@ -24,9 +25,10 @@ Linux syscall behavior remain outside the simulation. A conventional container o
 more honest backend when a task requires those capabilities.
 
 The actual Codex or Claude client should run outside shellsim. Model access needs credentials,
-networking, and a native client runtime. A later host adapter can expose a persistent shellsim
-`Environment` as shell, file, patch, and inspection tools without granting simulated code host
-capabilities.
+networking, and a native client runtime. `shellsim mcp` exposes a persistent shellsim `Environment`
+as shell, file, patch, diff, checkpoint, fork, and inspection tools without granting simulated code
+host capabilities. The remaining experiment work is client orchestration, task selection, and
+scoring, not another simulated execution path.
 
 ## Capability assessment
 
@@ -40,9 +42,9 @@ capabilities.
 | Shell grammar | Broad partial subset | Redirection, descriptor, and option behavior still has correctness gaps |
 | Commands | Broad surface | Several partial operations or successful no-ops are misleading |
 | Python | Substantial bounded interpreter | Arbitrary projects and third-party ecosystems remain out of scope |
-| Processes and jobs | Cooperative logical processes | Background groups, waits, sleeps, bounded pipelines, and shell signal handlers are modeled; terminal job control remains |
+| Processes and jobs | Cooperative logical processes | Running foreground transfer is modeled; STOP/CONT and stopped-job resumption remain |
 | Build ecosystem | Useful first slice | Git and Make are deliberately small; native compilation remains out of scope |
-| Harness integration | Useful foundation | Concrete model-client adapters remain |
+| Harness integration | Useful foundation | Stdio MCP is present; end-to-end model evaluation and result scoring remain |
 | Observability | Good | Compatibility reporting is command-level rather than invocation-level |
 
 ## Observed shell gaps
@@ -194,7 +196,7 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
    machine-state forks through the protocol
    while preserving compatibility session zero. Atomic transcript persistence, versioned scenario
    metadata, strict trust policy, and final state/resource assertions are present. Add
-   external-agent experiments.
+   external-agent experiments. A thin stdio MCP adapter over this protocol is now present.
 
 Every phase retains the existing security rule: simulated input can use only explicitly modeled
 state and must never fall through to host filesystem, process, network, environment, or clock

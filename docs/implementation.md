@@ -151,10 +151,30 @@ behavior, unmatched virtual-network request, dropped observability record, or un
 action. Unknown versions and metadata fields fail before executing an action. Action-only legacy
 NDJSON remains accepted and retains its existing transcript shape.
 
-This is sufficient for a host-side agent adapter to replay and assert tool calls without launching
-the agent inside shellsim. The library can fork a bounded `HarnessSession`, including scheduler,
-descriptor, process, Python, clock, network, resource, and checkpoint state, for deterministic
-branching evaluation. Codex/Claude adapters remain harness-side work.
+The `shellsim mcp` command is a thin stdio Model Context Protocol adapter over the same
+`HarnessManager`. It provides shell execution, text-oriented workspace operations, typed
+inspection and diffs, checkpoint/reset, and bounded session forks. Its JSON-RPC transport owns no
+machine state and translates each call to a closed `HarnessOperation`; execution, confinement,
+metering, persistence, and errors therefore have the same behavior as `serve`. MCP messages are
+newline-delimited and capped at 20 MiB. Notifications receive no response, malformed requests do
+not end the connection, and tool failures use MCP's `isError` result while preserving the typed
+harness response in `structuredContent`.
+
+The external model client still runs outside shellsim. For example, after building a release
+binary, Codex can launch a session over stdio with:
+
+```sh
+codex mcp add shellsim -- /absolute/path/to/shellsim mcp --root /absolute/project/path
+```
+
+The configured `--root` is read exactly once by the trusted startup importer into simulated
+`/work`. Subsequent agent reads, writes, patches, commands, subprocesses, `/proc` access, clocks,
+and network requests operate only on modeled state; changes are not exported back to the host.
+Other MCP clients can launch the same command using their stdio server configuration.
+
+The library can fork a bounded `HarnessSession`, including scheduler, descriptor, process, Python,
+clock, network, resource, and checkpoint state, for deterministic branching evaluation. Replay is
+still the canonical way to turn a tool-call sequence into a checked deterministic fixture.
 
 ## Simulation boundaries
 

@@ -326,7 +326,9 @@ Bounded NDJSON scenario replay emits paired request/response transcript records,
 persist a completed transcript without overwriting an existing file, and supports typed
 expectations for status, byte streams, unsupported behavior, workspace changes, and errors. The
 library can fork a bounded complete machine session for deterministic evaluation branches.
-Concrete model-client adapters remain before this phase is complete.
+The stdio MCP adapter now maps external model clients onto these typed operations without owning
+parallel machine state. End-to-end model experiments and scoring remain before this phase is
+complete.
 
 ### Retained action design
 

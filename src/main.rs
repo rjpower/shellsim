@@ -6,6 +6,7 @@
 //!   shellsim shell [limits]
 //!   shellsim eval [--cpu N] [--memory N] [--disk N] [--output N] -c '<command>'
 //!   shellsim serve [--cpu N] [--memory N] [--disk N] [--output N]
+//!   shellsim mcp [--root PATH] [limits]
 //!   shellsim replay SCENARIO.ndjson [--root PATH] [--transcript PATH] [limits]
 
 use std::process::exit;
@@ -37,6 +38,7 @@ fn main() {
         "shell" => interactive_shell(&args[2..]),
         "eval" => evaluate(&args[2..]),
         "serve" => serve(&args[2..]),
+        "mcp" => mcp(&args[2..]),
         "replay" => replay(&args[2..]),
         command => usage_error(&format!("unknown command: {command}")),
     }
@@ -301,6 +303,21 @@ fn serve(args: &[String]) -> ! {
         {
             exit(1);
         }
+    }
+    exit(0);
+}
+
+fn mcp(args: &[String]) -> ! {
+    use std::io::BufReader;
+
+    let stdin = std::io::stdin();
+    let mut input = BufReader::new(stdin.lock());
+    let mut output = std::io::stdout().lock();
+    let session = harness_session(harness_options(args, "mcp"), "mcp");
+    let mut manager = shellsim::harness_manager::HarnessManager::new(session);
+    if let Err(error) = shellsim::mcp::serve(&mut input, &mut output, &mut manager) {
+        eprintln!("shellsim mcp: {error}");
+        exit(1);
     }
     exit(0);
 }

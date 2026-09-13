@@ -21,6 +21,7 @@ pub mod hashes;
 pub mod host_ingest;
 pub mod interp;
 pub mod jqcmd;
+pub mod mcp;
 pub mod net;
 pub mod netcmd;
 pub mod process;
