@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::net::NetworkRequest;
 use crate::process::{ProcessRecord, ProcessStatus};
+use crate::scheduler::{TaskState, WaitReason};
+use crate::telemetry::{CommandTrust, InvocationEvent};
 use crate::vfs::{Node, NodeKind, Vfs};
 use crate::{Environment, Limits, RunOutcome};
 
@@ -93,6 +95,8 @@ pub struct ExecuteResult {
     pub unsupported: Vec<String>,
     pub noop_commands: Vec<String>,
     pub partial_commands: Vec<String>,
+    pub invocations: Vec<InvocationEvent>,
+    pub dropped_invocations: u64,
     pub network_requests: Vec<NetworkRequest>,
     pub dropped_network_requests: u64,
 }
@@ -111,6 +115,13 @@ pub struct InspectResult {
     pub cwd: String,
     pub outcome: RunOutcome,
     pub processes: Vec<ProcessView>,
+    pub current_pid: Option<u32>,
+    pub monotonic_ns: u64,
+    pub wall_time_ns: i128,
+    pub pending_events: usize,
+    pub ready_events: usize,
+    pub invocations: Vec<InvocationEvent>,
+    pub dropped_invocations: u64,
     pub network_requests: Vec<NetworkRequest>,
     pub dropped_network_requests: u64,
 }
@@ -129,8 +140,23 @@ pub struct ProcessView {
 #[derive(Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ProcessViewStatus {
+    Runnable,
     Running,
+    Blocked { reason: WaitReasonView },
     Exited { status: i32 },
+}
+
+/// Serializable scheduler wait reason without exposing implementation strings.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitReasonView {
+    Timer { deadline_ns: u64 },
+    PipeReadable { pipe: u32 },
+    PipeWritable { pipe: u32 },
+    Child { pid: u32 },
+    ChildActivity { pid: u32 },
+    ChildDeadline { pid: u32, deadline_ns: u64 },
+    ChildActivityDeadline { pid: u32, deadline_ns: u64 },
 }
 
 /// One stable path-level difference from the last checkpoint.
@@ -237,6 +263,7 @@ impl HarnessSession {
             .saturating_add(usage.memory_current)
             .saturating_add(self.environment.pending_stdout.len() as u64)
             .saturating_add(self.environment.pending_stderr.len() as u64)
+            .saturating_add(self.environment.invocations.modeled_bytes())
             .saturating_add(1024 * 1024);
         if estimate > MAX_SESSION_FORK_BYTES {
             return Err(format!(
@@ -316,31 +343,30 @@ impl HarnessSession {
     fn execute(&mut self, source: &str, stdin: &[u8]) -> Result<HarnessResult, String> {
         let command_start = self.environment.cmd_trace.len();
         let unsupported_start = self.environment.unsupported.len();
-        let noop_before = self.environment.trust_noop.clone();
-        let partial_before = self.environment.trust_partial.clone();
+        let invocation_start = self.environment.invocations.next_sequence();
+        let dropped_invocations_start = self.environment.invocations.dropped();
         let network_start = self.environment.net.log.len();
         let dropped_network_start = self.environment.net.dropped_requests;
         let (outcome, stdout, stderr) = self
             .environment
             .run_script_capture_with_stdin(source, stdin);
+        let invocations = self.environment.invocations.events_since(invocation_start);
+        let noop_commands = invocation_names(&invocations, CommandTrust::NoOp);
+        let partial_commands = invocation_names(&invocations, CommandTrust::Partial);
         Ok(HarnessResult::Execute(ExecuteResult {
             outcome,
             stdout_base64: STANDARD.encode(stdout),
             stderr_base64: STANDARD.encode(stderr),
             commands: self.environment.cmd_trace[command_start..].to_vec(),
             unsupported: self.environment.unsupported[unsupported_start..].to_vec(),
-            noop_commands: self
+            noop_commands,
+            partial_commands,
+            invocations,
+            dropped_invocations: self
                 .environment
-                .trust_noop
-                .difference(&noop_before)
-                .cloned()
-                .collect(),
-            partial_commands: self
-                .environment
-                .trust_partial
-                .difference(&partial_before)
-                .cloned()
-                .collect(),
+                .invocations
+                .dropped()
+                .saturating_sub(dropped_invocations_start),
             network_requests: self.environment.net.log[network_start..].to_vec(),
             dropped_network_requests: self
                 .environment
@@ -378,6 +404,11 @@ impl HarnessSession {
     }
 
     fn inspect(&self) -> InspectResult {
+        let wall_time_ns = self
+            .environment
+            .clock
+            .wall_time_ns()
+            .unwrap_or(crate::clock::DEFAULT_EPOCH_UTC_NS);
         InspectResult {
             cwd: self.environment.cwd.clone(),
             outcome: self.environment.resources.outcome(
@@ -389,8 +420,15 @@ impl HarnessSession {
                 .environment
                 .processes
                 .iter()
-                .map(process_view)
+                .map(|record| process_view(record, self.environment.scheduler.state(record.pid)))
                 .collect(),
+            current_pid: self.environment.scheduler.current(),
+            monotonic_ns: self.environment.clock.monotonic_ns(),
+            wall_time_ns,
+            pending_events: self.environment.clock.pending_len(),
+            ready_events: self.environment.clock.ready_len(),
+            invocations: self.environment.invocations.events(),
+            dropped_invocations: self.environment.invocations.dropped(),
             network_requests: self.environment.net.log.clone(),
             dropped_network_requests: self.environment.net.dropped_requests,
         }
@@ -422,18 +460,51 @@ impl HarnessSession {
     }
 }
 
-fn process_view(record: &ProcessRecord) -> ProcessView {
+fn process_view(record: &ProcessRecord, task_state: Option<TaskState>) -> ProcessView {
     ProcessView {
         pid: record.pid,
         ppid: record.ppid,
         process_group: record.process_group,
         command: record.command.clone(),
         cwd: record.cwd.clone(),
-        status: match record.status {
-            ProcessStatus::Running => ProcessViewStatus::Running,
-            ProcessStatus::Exited(status) => ProcessViewStatus::Exited { status },
+        status: match (record.status, task_state) {
+            (ProcessStatus::Exited(status), _) | (_, Some(TaskState::Exited(status))) => {
+                ProcessViewStatus::Exited { status }
+            }
+            (_, Some(TaskState::Runnable)) => ProcessViewStatus::Runnable,
+            (_, Some(TaskState::Running)) => ProcessViewStatus::Running,
+            (_, Some(TaskState::Blocked(reason))) => ProcessViewStatus::Blocked {
+                reason: wait_reason_view(reason),
+            },
+            (ProcessStatus::Running, None) => ProcessViewStatus::Running,
         },
     }
+}
+
+fn wait_reason_view(reason: WaitReason) -> WaitReasonView {
+    match reason {
+        WaitReason::Timer(deadline_ns) => WaitReasonView::Timer { deadline_ns },
+        WaitReason::PipeReadable(pipe) => WaitReasonView::PipeReadable { pipe },
+        WaitReason::PipeWritable(pipe) => WaitReasonView::PipeWritable { pipe },
+        WaitReason::Child(pid) => WaitReasonView::Child { pid },
+        WaitReason::ChildActivity(pid) => WaitReasonView::ChildActivity { pid },
+        WaitReason::ChildDeadline(pid, deadline_ns) => {
+            WaitReasonView::ChildDeadline { pid, deadline_ns }
+        }
+        WaitReason::ChildActivityDeadline(pid, deadline_ns) => {
+            WaitReasonView::ChildActivityDeadline { pid, deadline_ns }
+        }
+    }
+}
+
+fn invocation_names(events: &[InvocationEvent], trust: CommandTrust) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| event.trust == trust)
+        .filter_map(|event| event.argv.first().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn workspace_diff(before: &Vfs, after: &Vfs) -> Result<Vec<WorkspaceChange>, String> {
@@ -609,5 +680,45 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("session fork limit"), "{error}");
+    }
+
+    #[test]
+    fn execute_reports_each_partial_command_in_its_own_action() {
+        let mut session = HarnessSession::new(Limits::default());
+        for _ in 0..2 {
+            let HarnessResult::Execute(result) = session
+                .execute("sed 's/a/b/' /missing", &[])
+                .expect("execute action")
+            else {
+                panic!("execute returned the wrong result kind");
+            };
+            assert_eq!(result.partial_commands, ["sed"]);
+            assert_eq!(result.invocations.len(), 1);
+            assert_eq!(result.invocations[0].trust, CommandTrust::Partial);
+            assert!(result.invocations[0].status.is_some());
+        }
+    }
+
+    #[test]
+    fn inspect_uses_scheduler_state_and_typed_wait_reasons() {
+        let mut session = HarnessSession::new(Limits::default());
+        session.environment.run_script_capture("sleep 10 &");
+        session.environment.run_script_capture("true");
+
+        let inspect = session.inspect();
+        assert_eq!(inspect.current_pid, Some(1_234));
+        assert_eq!(inspect.pending_events, 1);
+        assert!(inspect.processes.iter().any(|process| matches!(
+            process.status,
+            ProcessViewStatus::Blocked {
+                reason: WaitReasonView::Timer {
+                    deadline_ns: 10_000_000_000
+                }
+            }
+        )));
+        assert!(inspect
+            .invocations
+            .iter()
+            .any(|event| event.argv == ["sleep", "10"] && event.status.is_none()));
     }
 }

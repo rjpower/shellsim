@@ -11,6 +11,7 @@ use crate::net::VirtualNet;
 use crate::process::{ProcessId, ProcessTable, Signal};
 use crate::resources::{Limits, Resources, RunOutcome};
 use crate::scheduler::{Scheduler, WaitReason};
+use crate::telemetry::InvocationLog;
 use crate::vfs::Vfs;
 
 /// A bash array value. Indexed arrays are sparse (`arr[5]=x` on an empty array is legal),
@@ -82,10 +83,8 @@ pub struct Environment {
     pub cmd_trace: Vec<String>,
     /// Commands requested that shellsim does not implement.
     pub unsupported: Vec<String>,
-    /// Commands that deliberately used a successful compatibility no-op.
-    pub trust_noop: std::collections::BTreeSet<String>,
-    /// Commands that implement a documented subset.
-    pub trust_partial: std::collections::BTreeSet<String>,
+    /// Bounded ordered command occurrences, including suspended invocations.
+    pub invocations: InvocationLog,
     /// Packages recorded by lightweight package-manager compatibility commands.
     pub packages: std::collections::BTreeSet<String>,
     /// Terminal bytes produced by detached children after their originating action returned.
@@ -505,8 +504,7 @@ impl Environment {
             next_temp_id: 0,
             cmd_trace: Vec::new(),
             unsupported: Vec::new(),
-            trust_noop: std::collections::BTreeSet::new(),
-            trust_partial: std::collections::BTreeSet::new(),
+            invocations: InvocationLog::default(),
             packages: std::collections::BTreeSet::new(),
             pending_stdout: Vec::new(),
             pending_stderr: Vec::new(),

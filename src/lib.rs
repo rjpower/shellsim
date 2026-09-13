@@ -29,6 +29,7 @@ pub mod resources;
 pub mod sandbox;
 pub mod scheduler;
 pub mod shell;
+pub mod telemetry;
 pub mod vfs;
 
 pub use clock::{
@@ -36,3 +37,4 @@ pub use clock::{
 };
 pub use interp::{Environment, Interp, ProcessState};
 pub use resources::{Limits, RunOutcome, StopReason, Usage};
+pub use telemetry::{CommandTrust, InvocationEvent};

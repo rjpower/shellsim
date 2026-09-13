@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 
 use crate::interp::Interp;
 use crate::scheduler::WaitReason;
+pub use crate::telemetry::CommandTrust as Trust;
 
 mod archives;
 mod awk;
@@ -143,17 +144,6 @@ impl DerefMut for CommandContext<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.env
     }
-}
-
-/// How faithfully a command is simulated.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Trust {
-    /// Faithful implementation (coreutils / builtins we fully model).
-    Real,
-    /// A subset of the real behavior (jq, sed, grep, uv, …).
-    Partial,
-    /// Ignored / pretend-success (apt-get, pip, …).
-    NoOp,
 }
 
 /// A registered command: its implementation and trust level.
@@ -327,7 +317,7 @@ pub(crate) fn starts_before_input(argv: &[String]) -> bool {
 
 /// Continue command-owned state after the scheduler wakes its process.
 pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> CommandPoll {
-    match continuation {
+    let result = match continuation {
         CommandResume::Timer {
             deadline_ns,
             status,
@@ -481,7 +471,9 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
                 },
             ),
         },
-    }
+    };
+    finish_ready_invocation(interp, &result);
+    result
 }
 
 /// Launch argv invocations sequentially as ordinary scheduler-owned logical children.
@@ -571,16 +563,23 @@ fn dispatch(
     let cmd = standard_utility_name(requested).unwrap_or(requested);
     let args = &argv[1..];
     if let Some(spec) = registry().get(cmd) {
+        let unsupported_reason =
+            (spec.trust == Trust::NoOp).then(|| "successful compatibility no-op".to_string());
+        interp.invocations.begin(
+            interp.process.pid,
+            argv,
+            spec.trust,
+            unsupported_reason,
+            interp.resources.cpu_used(),
+            interp.vfs.disk_used(),
+        );
         match spec.trust {
             Trust::NoOp => {
                 // NoOp commands (package managers and native compilers) are recorded as unsupported,
                 // preserving the legacy `note_unsupported(cmd)` behavior for that arm.
                 interp.note_unsupported(cmd);
-                interp.trust_noop.insert(cmd.to_string());
             }
-            Trust::Partial => {
-                interp.trust_partial.insert(cmd.to_string());
-            }
+            Trust::Partial => {}
             Trust::Real => {}
         }
         let cpu_before = interp.resources.cpu_used();
@@ -593,20 +592,24 @@ fn dispatch(
             .resources
             .charge_cpu(spec.base_cpu.saturating_add(arg_bytes))
         {
-            return CommandPoll::Ready(
+            let result = CommandPoll::Ready(
                 interp
                     .resources
                     .stop_reason()
                     .map_or(137, |r| r.exit_status()),
             );
+            finish_ready_invocation(interp, &result);
+            return result;
         }
         if !interp.resources.reserve_memory(working_memory) {
-            return CommandPoll::Ready(
+            let result = CommandPoll::Ready(
                 interp
                     .resources
                     .stop_reason()
                     .map_or(137, |r| r.exit_status()),
             );
+            finish_ready_invocation(interp, &result);
+            return result;
         }
 
         let out_before = out.len();
@@ -652,6 +655,7 @@ fn dispatch(
                 result = CommandPoll::Ready(reason.exit_status());
             }
         }
+        finish_ready_invocation(interp, &result);
         return result;
     }
 
@@ -659,14 +663,43 @@ fn dispatch(
     interp.sync_vfs_time();
     match util::resolve_executable(interp, requested) {
         util::ExecutableLookup::Found(path) => {
+            interp.invocations.begin(
+                interp.process.pid,
+                argv,
+                Trust::Real,
+                None,
+                interp.resources.cpu_used(),
+                interp.vfs.disk_used(),
+            );
             if let Some(result) =
                 util::try_exec_script(interp, &path, args, &stdin, out, err, resumable)
             {
+                finish_ready_invocation(interp, &result);
                 return result;
             }
+            interp.invocations.finish_latest(
+                interp.process.pid,
+                126,
+                interp.resources.cpu_used(),
+                interp.vfs.disk_used(),
+            );
         }
         util::ExecutableLookup::NotExecutable(path) => {
+            interp.invocations.begin(
+                interp.process.pid,
+                argv,
+                Trust::Real,
+                None,
+                interp.resources.cpu_used(),
+                interp.vfs.disk_used(),
+            );
             util::ewln(err, &format!("{requested}: {path}: permission denied"));
+            interp.invocations.finish_latest(
+                interp.process.pid,
+                126,
+                interp.resources.cpu_used(),
+                interp.vfs.disk_used(),
+            );
             return CommandPoll::Ready(126);
         }
         util::ExecutableLookup::NotFound => {}
@@ -674,9 +707,38 @@ fn dispatch(
     // An unknown command the task actually invoked (a missing tool, a compiled binary we can't
     // run, …) is a genuine simulation gap — record it so the trust verdict reflects it.
     interp.note_unsupported(requested);
-    interp.trust_noop.insert(requested.to_string());
+    interp.invocations.begin(
+        interp.process.pid,
+        argv,
+        Trust::NoOp,
+        Some("command not found".to_string()),
+        interp.resources.cpu_used(),
+        interp.vfs.disk_used(),
+    );
     util::ewln(err, &format!("{requested}: command not found"));
+    interp.invocations.finish_latest(
+        interp.process.pid,
+        127,
+        interp.resources.cpu_used(),
+        interp.vfs.disk_used(),
+    );
     CommandPoll::Ready(127)
+}
+
+fn finish_ready_invocation(interp: &mut Interp, result: &CommandPoll) {
+    let status = match result {
+        CommandPoll::Ready(status) | CommandPoll::ReadyOutput { status, .. } => *status,
+        CommandPoll::Yielded(_)
+        | CommandPoll::Blocked(_, _)
+        | CommandPoll::Switched(_)
+        | CommandPoll::Inline(_) => return,
+    };
+    interp.invocations.finish_latest(
+        interp.process.pid,
+        status,
+        interp.resources.cpu_used(),
+        interp.vfs.disk_used(),
+    );
 }
 
 /// Parse bounded shell source while charging the common parser resource model.

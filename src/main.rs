@@ -74,6 +74,8 @@ struct EvalReport {
     commands: Vec<String>,
     noop_commands: Vec<String>,
     partial_commands: Vec<String>,
+    invocations: Vec<shellsim::InvocationEvent>,
+    dropped_invocations: u64,
 }
 
 fn evaluate(args: &[String]) -> ! {
@@ -111,17 +113,35 @@ fn evaluate(args: &[String]) -> ! {
     let mut env = fresh_environment(limits, &positional);
     let (outcome, stdout, stderr) = env.run_script_capture_with_stdin(&source, &stdin);
     let status = outcome.exit_status;
+    let invocations = env.invocations.events();
+    let noop_commands = invocation_names(&invocations, shellsim::CommandTrust::NoOp);
+    let partial_commands = invocation_names(&invocations, shellsim::CommandTrust::Partial);
     let report = EvalReport {
         outcome,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         unsupported: std::mem::take(&mut env.unsupported),
         commands: std::mem::take(&mut env.cmd_trace),
-        noop_commands: std::mem::take(&mut env.trust_noop).into_iter().collect(),
-        partial_commands: std::mem::take(&mut env.trust_partial).into_iter().collect(),
+        noop_commands,
+        partial_commands,
+        invocations,
+        dropped_invocations: env.invocations.dropped(),
     };
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
     exit(status);
+}
+
+fn invocation_names(
+    events: &[shellsim::InvocationEvent],
+    trust: shellsim::CommandTrust,
+) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| event.trust == trust)
+        .filter_map(|event| event.argv.first().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn interactive_shell(args: &[String]) -> ! {

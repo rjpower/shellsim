@@ -155,8 +155,11 @@ registry assigns each name a function, base costs, and a trust level:
 - `Partial`: a documented subset such as `sed`, `jq`, or a package facade;
 - `NoOp`: pretend-success compatibility with no claimed effect, recorded as unsupported.
 
-Trust is observable telemetry. Do not mark a partial tool `Real`, silently ignore unsupported
-options, or invoke a host binary to fill a gap.
+Trust is observable telemetry. The environment retains a bounded occurrence log with PID, argv,
+trust, completion status, and inclusive CPU/disk deltas; suspended commands remain visible with a
+null status. Per-action no-op and partial summaries are derived from that log, so invoking the same
+partial command in separate actions remains observable. Do not mark a partial tool `Real`, silently
+ignore unsupported options, or invoke a host binary to fill a gap.
 
 ## Adding or extending a tool
 

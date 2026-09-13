@@ -161,6 +161,40 @@ fn persistent_protocol_reports_malformed_requests_and_continues() {
 }
 
 #[test]
+fn persistent_protocol_reports_ordered_invocations_and_scheduler_waits() {
+    let requests = [
+        r#"{"id":1,"op":"execute","source":"sed 's/a/b/' /missing"}"#,
+        r#"{"id":2,"op":"execute","source":"sed 's/a/b/' /missing; sleep 10 &"}"#,
+        r#"{"id":3,"op":"execute","source":"true"}"#,
+        r#"{"id":4,"op":"inspect"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    let output = run_with_stdin(&["serve"], requests.as_bytes());
+    assert!(output.status.success());
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(responses[0]["result"]["partial_commands"][0], "sed");
+    assert_eq!(responses[1]["result"]["partial_commands"][0], "sed");
+    assert_eq!(responses[0]["result"]["invocations"][0]["trust"], "partial");
+    assert_eq!(responses[0]["result"]["invocations"][0]["status"], 0);
+    let processes = responses[3]["result"]["processes"].as_array().unwrap();
+    let sleeping = processes
+        .iter()
+        .find(|process| process["command"] == "sleep 10")
+        .expect("retained sleep process");
+    assert_eq!(sleeping["status"]["state"], "blocked");
+    assert_eq!(sleeping["status"]["reason"]["kind"], "timer");
+    assert_eq!(responses[3]["result"]["pending_events"], 1);
+    assert!(responses[3]["result"]["current_pid"].is_number());
+}
+
+#[test]
 fn persistent_protocol_can_checkpoint_a_trusted_host_snapshot() {
     let project = TestDirectory::new();
     std::fs::write(project.path().join("input.txt"), b"snapshot\0bytes").unwrap();

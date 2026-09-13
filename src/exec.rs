@@ -1088,6 +1088,12 @@ impl ShellContinuation {
             }
             ShellFrame::FinishInlineCommand { variables } => {
                 restore_command_variables(interp, variables);
+                interp.invocations.finish_latest(
+                    interp.process.pid,
+                    self.status,
+                    interp.resources.cpu_used(),
+                    interp.vfs.disk_used(),
+                );
             }
             ShellFrame::FinishSignalHandler { previous_status } => {
                 interp.finish_signal_handler();
@@ -1098,6 +1104,12 @@ impl ShellContinuation {
                 continuation,
             } => {
                 let result = if interp.deadline_interrupt.is_some() {
+                    interp.invocations.finish_latest(
+                        interp.process.pid,
+                        124,
+                        interp.resources.cpu_used(),
+                        interp.vfs.disk_used(),
+                    );
                     crate::commands::CommandPoll::Ready(124)
                 } else {
                     crate::commands::resume(interp, continuation)

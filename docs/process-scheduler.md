@@ -301,6 +301,13 @@ and resource, command, unsupported-operation, trust, and process reports. Reques
 are bounded; the line-oriented exchange is directly replayable. The Codex or Claude client stays
 outside the simulation and receives only these tools.
 
+Inspection takes lifecycle state from the scheduler rather than flattening every live process to
+`running`. It reports the current PID, runnable tasks, typed blocked wait reasons, exited statuses,
+virtual clock state, and pending event counts. A bounded ordered invocation log records every argv
+occurrence with its PID and trust level. Completed entries add status and inclusive resource deltas;
+suspended entries remain present with a null status. This is the observability basis for retained
+actions: polling will expose the same states rather than inventing a separate lifecycle model.
+
 Bounded transactional host-directory ingestion is shared by `serve --root` and
 `shellsim-python`. Per-action and retained virtual-network request reporting is also present.
 Bounded NDJSON scenario replay emits paired request/response transcript records, can atomically
@@ -308,6 +315,67 @@ persist a completed transcript without overwriting an existing file, and support
 expectations for status, byte streams, unsupported behavior, workspace changes, and errors. The
 library can fork a bounded complete machine session for deterministic evaluation branches.
 Concrete model-client adapters remain before this phase is complete.
+
+### Retained action design
+
+The harness must expose the same cooperative machine already used internally. It must not add a
+second executor around `run_script_capture_with_stdin`. The host-facing ownership model is:
+
+```text
+SessionManager
+  SessionId -> HarnessSession
+
+HarnessSession
+  Environment
+  workspace checkpoint
+  at most one active foreground Action
+  bounded completed Action records
+
+Action
+  ActionId
+  root PID and process group
+  stdin description and closed flag
+  stdout/stderr capture descriptions and read cursors
+  starting invocation/network/resource sequence markers
+  Running | Blocked(WaitReason) | Complete(status) | Cancelled(status)
+```
+
+One session accepts only one foreground action at a time because its persistent root shell has one
+ordered input stream. Background jobs from earlier actions remain ordinary scheduler tasks and may
+run while that action is polled. Independent concurrent branches use separate sessions created by
+the existing complete-state fork operation. Session and action identifiers are monotonically
+allocated, checked for overflow, and never supplied by simulated code.
+
+`start_execute` parses and installs the root shell continuation, explicit stdin description, and
+capture descriptions, but does not drive it to completion. `poll_action` invokes one shared
+machine driver with an explicit work budget. The driver polls runnable tasks in FIFO order and
+returns when the budget is spent, the foreground action completes, or all tasks are blocked. A
+poll option may permit advancing virtual time to the next modeled event; without it, an all-blocked
+machine remains blocked and host code can inspect or inject an already-authorized modeled event.
+There is no host sleep, wall-clock timeout, or command-specific polling path. The existing one-shot
+`execute` operation becomes `start_execute` followed by repeated polls with virtual-time advancement
+enabled, so compatibility and interactive clients exercise exactly the same scheduler.
+
+`write_stdin` appends bounded bytes to the action's descriptor and wakes its exact readers;
+`close_stdin` releases the final writer so reads observe EOF. `read_output` returns bounded deltas
+from explicit capture cursors and never removes bytes still needed by a session fork. `signal`
+queues a modeled signal through the existing process or process-group API. `cancel` is a policy
+operation implemented as a modeled signal followed by ordinary scheduler polls, with a bounded
+forced-cleanup frontier stated explicitly if graceful termination cannot progress.
+
+Action results use sequence markers into the ordered invocation and network logs, plus resource
+snapshots. Polling and output reads therefore do not consume telemetry or make repeated command
+names disappear. Completed action records retain only bounded metadata and capture references;
+clients release them explicitly. Session limits cover retained actions, capture bytes, process and
+descriptor state, telemetry, and forks before allocation.
+
+The NDJSON protocol should add `start_execute`, `poll_action`, `write_stdin`, `close_stdin`,
+`read_output`, `signal`, `cancel_action`, and `drop_action`. A bounded `SessionManager` then adds
+`new_session`, `fork_session`, and `drop_session`, with every existing operation carrying a
+`session_id`. The current implicit session remains a compatibility facade over one manager entry,
+not an alternate implementation. Typed stat, directory, symlink, and patch operations can then be
+added without affecting execution semantics. A Codex, Claude, or MCP adapter stays a thin client
+of this versioned protocol and never receives direct access to `Environment` capabilities.
 
 ## Validation milestones
 
