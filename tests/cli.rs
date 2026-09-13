@@ -198,6 +198,81 @@ fn mcp_stdio_exposes_the_persistent_simulated_workspace() {
 }
 
 #[test]
+fn retained_foreground_job_can_stop_and_resume_in_a_later_action() {
+    let requests = [
+        r#"{"id":1,"op":"start_execute","source":"sleep 10 & fg %1; printf 'fg:%s' $?"}"#,
+        r#"{"id":2,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":false}"#,
+        r#"{"id":3,"op":"signal_foreground","signal":"STOP"}"#,
+        r#"{"id":4,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":false}"#,
+        r#"{"id":5,"op":"read_action_output","action_id":0}"#,
+        r#"{"id":6,"op":"inspect"}"#,
+        r#"{"id":7,"op":"execute","source":"jobs; bg %1; wait %1"}"#,
+        r#"{"id":8,"op":"inspect"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    let output = run_with_stdin(&["serve"], requests.as_bytes());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(responses[3]["result"]["state"]["state"], "complete");
+    assert_eq!(responses[3]["result"]["state"]["status"], 0);
+    assert_eq!(responses[4]["result"]["stdout_base64"], "Zmc6MTQ3");
+    assert_eq!(
+        responses[5]["result"]["terminal"]["foreground_process_group"],
+        1234
+    );
+    let stopped = responses[5]["result"]["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|process| process["pid"] == 1235)
+        .unwrap();
+    assert_eq!(stopped["status"]["state"], "stopped");
+    assert_eq!(stopped["status"]["signal"], "STOP");
+    assert_eq!(responses[6]["result"]["outcome"]["exit_status"], 0);
+    assert_eq!(responses[7]["result"]["monotonic_ns"], 10_000_000_000_u64);
+}
+
+#[test]
+fn retained_action_reports_and_continues_a_stopped_foreground_group() {
+    let requests = [
+        r#"{"id":1,"op":"start_execute","source":"sleep 10; printf done"}"#,
+        r#"{"id":2,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":false}"#,
+        r#"{"id":3,"op":"signal_foreground","signal":"STOP"}"#,
+        r#"{"id":4,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":false}"#,
+        r#"{"id":5,"op":"signal_foreground","signal":"CONT"}"#,
+        r#"{"id":6,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":true}"#,
+        r#"{"id":7,"op":"read_action_output","action_id":0}"#,
+    ]
+    .join("\n")
+        + "\n";
+    let output = run_with_stdin(&["serve"], requests.as_bytes());
+    assert!(output.status.success());
+    let responses = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(responses[3]["result"]["state"]["state"], "stopped");
+    assert_eq!(responses[3]["result"]["state"]["signal"], "STOP");
+    assert_eq!(responses[5]["result"]["state"]["state"], "complete");
+    assert_eq!(responses[5]["result"]["state"]["status"], 0);
+    assert_eq!(responses[6]["result"]["stdout_base64"], "ZG9uZQ==");
+}
+
+#[test]
 fn persistent_protocol_reports_ordered_invocations_and_scheduler_waits() {
     let requests = [
         r#"{"id":1,"op":"execute","source":"sed 's/a/b/' /missing"}"#,

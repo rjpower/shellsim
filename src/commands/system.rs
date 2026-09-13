@@ -383,6 +383,7 @@ fn cmd_ps(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     for process in interp.processes.iter() {
         let state = match process.status {
             ProcessStatus::Running => "R",
+            ProcessStatus::Stopped(_) => "T",
             ProcessStatus::Exited(_) => "Z",
         };
         if aux {

@@ -149,10 +149,11 @@ heredocs and here-strings, command/arithmetic substitution, brace expansion, par
 globbing, `[[...]]`, and frequently used `set` options including `pipefail`.
 
 Standard paths such as `/bin/sh` and `/usr/bin/env` resolve to their simulated commands. More
-specialized Bash behavior, including process substitution, custom traps, coprocesses, process
-groups, and some descriptor forms, remains outside the faithful subset. Logical children provide
+specialized Bash behavior, including process substitution, trap pseudo-events, coprocesses,
+arbitrary process-group mutation, and some descriptor forms, remains outside the faithful subset. Logical children provide
 isolated shell state, stable PIDs, overlapping virtual-time jobs, bounded pipes, `jobs`/`wait`,
-default signal delivery, dynamic `ps`, and generated `/proc` views without creating host processes.
+default and caught signal delivery, `fg`/`bg` with STOP/CONT, dynamic `ps`, and generated `/proc`
+views without creating host processes.
 
 ## Command implementations
 

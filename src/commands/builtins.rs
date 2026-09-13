@@ -36,6 +36,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_resumable(m, &["wait"], Trust::Real, cmd_wait, start_wait);
     reg(m, &["jobs"], Trust::Real, cmd_jobs);
     reg_resumable(m, &["fg"], Trust::Real, cmd_fg, start_fg);
+    reg(m, &["bg"], Trust::Real, cmd_bg);
     reg(m, &["trap"], Trust::Real, cmd_trap);
     reg(
         m,
@@ -110,6 +111,14 @@ fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     if signals.contains(&crate::process::Signal::Kill) {
         ewln(io.err, "trap: SIGKILL cannot be caught or ignored");
         return 1;
+    }
+    if signals.contains(&crate::process::Signal::Stop) {
+        ewln(io.err, "trap: SIGSTOP cannot be caught or ignored");
+        return 1;
+    }
+    if signals.contains(&crate::process::Signal::Continue) {
+        ewln(io.err, "trap: SIGCONT handlers are not supported");
+        return 2;
     }
 
     let disposition = if action == "-" {
@@ -203,7 +212,11 @@ fn cmd_jobs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         if print_pids {
             wln(io.out, &job.pid.to_string());
         } else {
-            let state = if job.done { "Done" } else { "Running" };
+            let state = match job.state {
+                crate::interp::JobState::Running => "Running",
+                crate::interp::JobState::Stopped(_) => "Stopped",
+                crate::interp::JobState::Done(_) => "Done",
+            };
             wln(io.out, &format!("[{}] {state} {}", job.id, job.cmd));
         }
     }
@@ -218,7 +231,10 @@ fn cmd_fg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             return 1;
         }
     };
-    if !interp.jobs[position].done {
+    if !matches!(
+        interp.jobs[position].state,
+        crate::interp::JobState::Done(_)
+    ) {
         ewln(
             io.err,
             "fg: job is not complete in synchronous command context",
@@ -236,7 +252,10 @@ fn start_fg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> Co
             return CommandPoll::Ready(1);
         }
     };
-    if interp.jobs[position].done {
+    if matches!(
+        interp.jobs[position].state,
+        crate::interp::JobState::Done(_)
+    ) {
         return CommandPoll::Ready(reap_job(interp, position));
     }
     let pid = interp.jobs[position].pid;
@@ -244,17 +263,50 @@ fn start_fg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> Co
         ewln(io.err, &format!("fg: {error}"));
         return CommandPoll::Ready(1);
     }
-    crate::commands::resume(
-        interp,
-        CommandResume::Wait {
-            pids: vec![pid],
-            status: 0,
-            explicit: true,
-        },
-    )
+    if matches!(
+        interp.jobs[position].state,
+        crate::interp::JobState::Stopped(_)
+    ) {
+        if let Err(error) = interp.send_signal_group(pid, crate::process::Signal::Continue) {
+            interp.terminal.foreground_group = interp.terminal.session_id;
+            ewln(io.err, &format!("fg: {error}"));
+            return CommandPoll::Ready(1);
+        }
+    }
+    crate::commands::resume(interp, CommandResume::Foreground { pid })
+}
+
+fn cmd_bg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let position = match job_position(interp, args, "bg") {
+        Ok(position) => position,
+        Err(error) => {
+            ewln(io.err, &format!("bg: {error}"));
+            return 1;
+        }
+    };
+    let job = &interp.jobs[position];
+    if matches!(job.state, crate::interp::JobState::Done(_)) {
+        ewln(io.err, "bg: job has terminated");
+        return 1;
+    }
+    let (pid, id, command) = (job.pid, job.id, job.cmd.clone());
+    if let Err(error) = interp.send_signal_group(pid, crate::process::Signal::Continue) {
+        ewln(io.err, &format!("bg: {error}"));
+        return 1;
+    }
+    wln(io.out, &format!("[{id}] {command} &"));
+    0
 }
 
 fn foreground_job_position(interp: &CommandContext<'_>, args: &[String]) -> Result<usize, String> {
+    job_position(interp, args, "fg")
+}
+
+fn job_position(
+    interp: &CommandContext<'_>,
+    args: &[String],
+    command: &str,
+) -> Result<usize, String> {
     let selected = match args {
         [] => interp.jobs.len().checked_sub(1),
         [selected] if matches!(selected.as_str(), "%+" | "%%") => interp.jobs.len().checked_sub(1),
@@ -269,7 +321,7 @@ fn foreground_job_position(interp: &CommandContext<'_>, args: &[String]) -> Resu
                 .iter()
                 .position(|job| job.id == id || job.pid == id)
         }
-        _ => return Err("usage: fg [%JOB]".to_string()),
+        _ => return Err(format!("usage: {command} [%JOB]")),
     };
     selected.ok_or_else(|| "no such job".to_string())
 }
@@ -278,7 +330,10 @@ fn reap_job(interp: &mut CommandContext<'_>, position: usize) -> i32 {
     let job = interp.jobs.remove(position);
     interp.processes.reap(job.pid);
     let _ = interp.scheduler.reap(job.pid);
-    job.status
+    match job.state {
+        crate::interp::JobState::Done(status) => status,
+        crate::interp::JobState::Running | crate::interp::JobState::Stopped(_) => 127,
+    }
 }
 
 fn cmd_kill(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -388,17 +443,17 @@ fn kill_target_exists(interp: &CommandContext<'_>, target: KillTarget) -> bool {
     match target {
         KillTarget::Process(pid) => matches!(
             interp.processes.get(pid).map(|record| record.status),
-            Some(crate::process::ProcessStatus::Running)
+            Some(
+                crate::process::ProcessStatus::Running | crate::process::ProcessStatus::Stopped(_)
+            )
         ),
-        KillTarget::Group(process_group) => {
-            !interp.processes.running_group(process_group).is_empty()
-        }
+        KillTarget::Group(process_group) => !interp.processes.live_group(process_group).is_empty(),
     }
 }
 
 fn list_signal(argument: Option<&String>, io: &mut Io) -> i32 {
     let Some(argument) = argument else {
-        wln(io.out, "HUP INT KILL PIPE TERM CHLD");
+        wln(io.out, "HUP INT KILL PIPE TERM CHLD CONT STOP");
         return 0;
     };
     let normalized = argument
@@ -441,9 +496,17 @@ fn cmd_wait(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             interp.jobs.iter().position(|job| job.pid == identifier)
         };
         match position {
-            Some(position) if interp.jobs[position].done => {
+            Some(position)
+                if matches!(
+                    interp.jobs[position].state,
+                    crate::interp::JobState::Done(_)
+                ) =>
+            {
                 let job = interp.jobs.remove(position);
-                status = job.status;
+                status = match job.state {
+                    crate::interp::JobState::Done(status) => status,
+                    _ => unreachable!("matched a completed job"),
+                };
                 interp.processes.reap(job.pid);
                 let _ = interp.scheduler.reap(job.pid);
             }

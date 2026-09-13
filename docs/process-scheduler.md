@@ -8,7 +8,8 @@ failure, exhaustion, and unsupported boundaries are tested.
 
 ## Implementation status
 
-Phase 1 is complete. `scheduler.rs` provides bounded FIFO runnable, running, blocked, exited,
+Phase 1 is complete. `scheduler.rs` provides bounded FIFO runnable, running, blocked, stopped,
+exited,
 wake, and reap transitions. `descriptors.rs` provides bounded shared open descriptions,
 per-process descriptor maps, VFS file/input/capture/null endpoints, and bounded pipes with
 backpressure, shared cursors, endpoint lifetime, broken-pipe behavior, and EOF. Every process owns
@@ -110,7 +111,7 @@ Process
   argv, cwd, environment, shell state
   FdTable<Fd, FdEntry>
   Continuation
-  Runnable | Blocked(reason) | Exited(status)
+  Runnable | Blocked(reason) | Stopped(saved_state) | Exited(status)
 
 ControllingTerminal
   session_id, foreground_process_group
@@ -156,7 +157,25 @@ controlling terminal tracks its session and foreground group, routes terminal-ge
 and returns ownership to the shell group when the foreground job exits. `/proc/PID/status` exposes
 both `NSpgid` and `NSsid`. `fg` transfers a running job through the existing resumable child wait;
 terminal signals can interrupt it and the shell regains ownership on exit. Stopped-process states,
-`SIGSTOP`/`SIGCONT`, and therefore honest `bg` behavior remain outside the current subset.
+`SIGSTOP` and `SIGCONT` now use scheduler-owned stopped state. `jobs`, `ps`, generated `/proc`, and
+harness inspection report stopped processes; `bg` resumes them, and `fg` resumes a stopped job or
+returns the conventional stopped-signal status if a foreground job stops again.
+
+### Stopped-task design
+
+Stopping is orthogonal to resource blocking. A scheduler entry stores
+`Stopped(Runnable | Blocked(reason))`, while the process table records `Stopped(signal)` and the
+owning shell job records `Stopped(signal)`. These are views of one transition, not independent
+flags. `SIGSTOP` cannot be caught or ignored and is applied only at a scheduler boundary for the
+currently executing task. An inactive runnable or blocked task can transition immediately.
+
+A wake that occurs while a task is stopped changes its saved state from blocked to runnable but
+does not enqueue it. `SIGCONT` restores the saved scheduler state and appends runnable work to the
+ordinary FIFO queue. Other signals remain pending while stopped; `SIGKILL` first makes the task
+dispatchable so its uncatchable termination can be delivered. Child-state waiters are notified on
+both stop and exit. Ordinary `wait` continues waiting across a stop, while the dedicated foreground
+continuation returns control to the shell and restores terminal ownership. This keeps job control
+out of timers, pipes, child commands, and the shell parser.
 
 ## Phase 3: resumable execution
 
@@ -198,7 +217,8 @@ Required compatibility cases include overlapping sleeps, file races with determi
 
 ## Phase 5: minimal signals and Python `Popen` (complete)
 
-Pending `KILL`, `TERM`, `INT`, `HUP`, `CHLD`, and `PIPE` signals now live on process state and are
+Pending `KILL`, `TERM`, `INT`, `HUP`, `CHLD`, `PIPE`, and job-control signals now live on process
+state and are
 delivered at scheduler boundaries. Terminating signals wake blocked tasks, use conventional
 `128 + signal` statuses, and cancel abandoned timer events; `CHLD` is coalesced with its default
 ignored disposition. The shell `kill` builtin supports PID/job targets, supported signal names and
@@ -213,7 +233,7 @@ logical child state. `stdin`, `stdout`, and `stderr` expose small binary/text fi
 timeout so retry cannot duplicate input. Unsupported host setup and session options fail before
 launch. Background jobs are process-group leaders, descendants inherit group identity, job and
 negative-PGID signals target all running members, and `Popen(start_new_session=True)` establishes a
-new modeled group. Terminal foreground-group control, arbitrary `setpgid`, Python signal callbacks,
+new modeled group. Arbitrary `setpgid`, Python signal callbacks,
 and resumable compound native callbacks remain outside this baseline.
 
 ### Signal interruption and shell-trap design
@@ -273,9 +293,9 @@ Implemented sequence:
    blocking; uncatchable `KILL`; disposition reset; coalescing; process groups; resource
    exhaustion; and unsupported pseudo-traps.
 
-Terminal foreground-group control should later reuse this signal delivery path. A terminal object
-will own a foreground process-group ID, and terminal-generated `INT`/`HUP` will target that group;
-it must not be encoded as special behavior in `kill`, descriptors, or the shell parser.
+Terminal foreground-group control reuses this signal delivery path. A terminal object owns a
+foreground process-group ID, and terminal-generated signals target that group; this is not encoded
+as special behavior in `kill`, descriptors, or the shell parser.
 
 ## Phase 6: agent command fidelity
 

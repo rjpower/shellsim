@@ -184,11 +184,12 @@ pub struct ActionView {
 
 /// Retained action lifecycle. A blocked action can be resumed by input, a modeled event, or a
 /// later poll that permits virtual-time advancement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ActionState {
     Running,
     Blocked { reason: Option<WaitReasonView> },
+    Stopped { signal: String },
     Complete { status: i32 },
 }
 
@@ -298,6 +299,7 @@ pub enum ProcessViewStatus {
     Runnable,
     Running,
     Blocked { reason: WaitReasonView },
+    Stopped { signal: String },
     Exited { status: i32 },
 }
 
@@ -442,7 +444,7 @@ impl RetainedAction {
         ActionView {
             action_id: self.id,
             root_pid: self.root_pid,
-            state: self.state,
+            state: self.state.clone(),
             outcome: self.outcome.clone(),
             invocations: if self.execution.is_some() {
                 environment.invocations.events_since(self.invocation_start)
@@ -894,11 +896,26 @@ impl HarnessSession {
                 match poll {
                     crate::exec::MachinePoll::Progress => {}
                     crate::exec::MachinePoll::Blocked => {
-                        let reason = match self.environment.scheduler.state(action.root_pid) {
-                            Some(TaskState::Blocked(reason)) => Some(wait_reason_view(reason)),
-                            _ => None,
+                        action.state = match self.environment.scheduler.state(action.root_pid) {
+                            Some(TaskState::Stopped(_)) => {
+                                let signal = match self
+                                    .environment
+                                    .processes
+                                    .get(action.root_pid)
+                                    .map(|record| record.status)
+                                {
+                                    Some(ProcessStatus::Stopped(signal)) => signal.name(),
+                                    _ => "STOP",
+                                };
+                                ActionState::Stopped {
+                                    signal: signal.to_string(),
+                                }
+                            }
+                            Some(TaskState::Blocked(reason)) => ActionState::Blocked {
+                                reason: Some(wait_reason_view(reason)),
+                            },
+                            _ => ActionState::Blocked { reason: None },
                         };
-                        action.state = ActionState::Blocked { reason };
                         break;
                     }
                     crate::exec::MachinePoll::Ready(status) => {
@@ -1172,7 +1189,7 @@ fn cancel_execution(
         .map(|record| record.process_group)
         .ok_or_else(|| format!("action {action_id} root process does not exist"))?;
     let _ = execution.close_stdin(environment);
-    for pid in environment.processes.running_group(process_group) {
+    for pid in environment.processes.live_group(process_group) {
         if pid != root_pid {
             environment.send_signal(pid, crate::process::Signal::Kill)?;
         }
@@ -1180,7 +1197,7 @@ fn cancel_execution(
 
     let mut root_signaled = false;
     for _ in 0..MAX_CANCEL_QUANTA {
-        let live_group = environment.processes.running_group(process_group);
+        let live_group = environment.processes.live_group(process_group);
         if !root_signaled && live_group.iter().all(|pid| *pid == root_pid) {
             environment.send_signal(root_pid, crate::process::Signal::Kill)?;
             root_signaled = true;
@@ -1212,6 +1229,12 @@ fn process_view(record: &ProcessRecord, task_state: Option<TaskState>) -> Proces
             (ProcessStatus::Exited(status), _) | (_, Some(TaskState::Exited(status))) => {
                 ProcessViewStatus::Exited { status }
             }
+            (ProcessStatus::Stopped(signal), _) => ProcessViewStatus::Stopped {
+                signal: signal.name().to_string(),
+            },
+            (_, Some(TaskState::Stopped(_))) => ProcessViewStatus::Stopped {
+                signal: "STOP".to_string(),
+            },
             (_, Some(TaskState::Runnable)) => ProcessViewStatus::Runnable,
             (_, Some(TaskState::Running)) => ProcessViewStatus::Running,
             (_, Some(TaskState::Blocked(reason))) => ProcessViewStatus::Blocked {
@@ -1667,5 +1690,30 @@ mod tests {
         assert_eq!(reused.outcome.exit_status, 0);
         assert_eq!(STANDARD.decode(reused.stdout_base64).unwrap(), b"reused");
         assert!(session.cancel_action(action_id).is_err());
+    }
+
+    #[test]
+    fn cancel_action_terminates_a_stopped_foreground_group() {
+        let mut session = HarnessSession::new(Limits::default());
+        let action_id = session
+            .start_action("sleep 10", &[], true)
+            .unwrap()
+            .action_id;
+        session.poll_action(action_id, 100, false).unwrap();
+        session
+            .environment
+            .send_terminal_signal(crate::process::Signal::Stop)
+            .unwrap();
+        let stopped = session.poll_action(action_id, 100, false).unwrap();
+        assert_eq!(
+            stopped.state,
+            ActionState::Stopped {
+                signal: "STOP".to_string()
+            }
+        );
+
+        let cancelled = session.cancel_action(action_id).unwrap();
+        assert_eq!(cancelled.state, ActionState::Complete { status: 137 });
+        assert_eq!(session.environment.clock.pending_len(), 0);
     }
 }

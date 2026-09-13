@@ -85,6 +85,9 @@ pub(crate) enum CommandResume {
         status: i32,
         explicit: bool,
     },
+    Foreground {
+        pid: crate::process::ProcessId,
+    },
     ChildSequence {
         pid: crate::process::ProcessId,
         remaining: std::collections::VecDeque<ChildCommand>,
@@ -358,7 +361,7 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
                     pids.remove(0);
                     continue;
                 };
-                if !interp.jobs[position].done {
+                let crate::interp::JobState::Done(job_status) = interp.jobs[position].state else {
                     return CommandPoll::Blocked(
                         WaitReason::Child(pid),
                         CommandResume::Wait {
@@ -367,16 +370,37 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
                             explicit,
                         },
                     );
-                }
-                let job = interp.jobs.remove(position);
+                };
+                interp.jobs.remove(position);
                 if explicit {
-                    status = job.status;
+                    status = job_status;
                 }
                 interp.processes.reap(pid);
                 let _ = interp.scheduler.reap(pid);
                 pids.remove(0);
             }
             CommandPoll::Ready(status)
+        }
+        CommandResume::Foreground { pid } => {
+            match interp.jobs.iter().position(|job| job.pid == pid) {
+                None => CommandPoll::Ready(127),
+                Some(position) => match interp.jobs[position].state {
+                    crate::interp::JobState::Running => CommandPoll::Blocked(
+                        WaitReason::Child(pid),
+                        CommandResume::Foreground { pid },
+                    ),
+                    crate::interp::JobState::Stopped(signal) => {
+                        interp.terminal.foreground_group = interp.terminal.session_id;
+                        CommandPoll::Ready(128 + signal.number())
+                    }
+                    crate::interp::JobState::Done(status) => {
+                        interp.jobs.remove(position);
+                        interp.processes.reap(pid);
+                        let _ = interp.scheduler.reap(pid);
+                        CommandPoll::Ready(status)
+                    }
+                },
+            }
         }
         CommandResume::ChildSequence {
             pid,

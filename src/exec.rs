@@ -1418,7 +1418,10 @@ impl ShellContinuation {
                             let _ = interp.scheduler.reap(pid);
                         }
                     }
-                    Some(crate::process::ProcessStatus::Running) => {
+                    Some(
+                        crate::process::ProcessStatus::Running
+                        | crate::process::ProcessStatus::Stopped(_),
+                    ) => {
                         self.frames.push(ShellFrame::AwaitChild { pid, reap });
                         self.blocked = Some(crate::scheduler::WaitReason::Child(pid));
                     }
@@ -2088,6 +2091,14 @@ pub(crate) fn poll_machine(
                 interp.finish_child(owner_pid, status);
                 return Ok(MachinePoll::Progress);
             }
+            crate::interp::SignalDelivery::Stop(signal) => {
+                interp.stop_active_process(signal)?;
+                return if dispatch_available(interp, false)? {
+                    Ok(MachinePoll::Progress)
+                } else {
+                    Ok(MachinePoll::Blocked)
+                };
+            }
             crate::interp::SignalDelivery::Handler(body) => {
                 let mut continuation =
                     interp.process.shell_continuation.take().ok_or_else(|| {
@@ -2252,6 +2263,10 @@ fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
                 interp.finish_child(owner, status);
                 return Ok(());
             }
+            crate::interp::SignalDelivery::Stop(signal) => {
+                interp.stop_active_process(signal)?;
+                return Ok(());
+            }
             crate::interp::SignalDelivery::Handler(body) => {
                 let mut continuation =
                     interp.process.shell_continuation.take().ok_or_else(|| {
@@ -2352,7 +2367,14 @@ fn handle_ready_events(interp: &mut Interp) -> Result<(), String> {
                         crate::scheduler::WaitReason::Timer(value)
                             | crate::scheduler::WaitReason::ChildDeadline(_, value)
                             | crate::scheduler::WaitReason::ChildActivityDeadline(_, value)
-                    )) if value == deadline
+                    ))
+                        | Some(crate::scheduler::TaskState::Stopped(
+                            crate::scheduler::StoppedTask::Blocked(
+                                crate::scheduler::WaitReason::Timer(value)
+                                    | crate::scheduler::WaitReason::ChildDeadline(_, value)
+                                    | crate::scheduler::WaitReason::ChildActivityDeadline(_, value)
+                            )
+                        )) if value == deadline
                 );
                 if timed_wait {
                     interp
@@ -2385,7 +2407,7 @@ fn handle_ready_events(interp: &mut Interp) -> Result<(), String> {
             } => {
                 if let Ok(pid) = crate::process::ProcessId::try_from(task) {
                     let targets = if descendants {
-                        interp.processes.running_process_tree(pid)
+                        interp.processes.live_process_tree(pid)
                     } else {
                         vec![pid]
                     };
@@ -2418,7 +2440,10 @@ fn exec_background(interp: &mut Interp, node: &Node) -> i32 {
         write_diagnostic(interp, "shellsim: job table limit exceeded\n");
         return 125;
     };
-    debug_assert!(interp.jobs.iter().any(|job| job.id == id && !job.done));
+    debug_assert!(interp
+        .jobs
+        .iter()
+        .any(|job| job.id == id && job.state == crate::interp::JobState::Running));
     interp.set_var("!", pid.to_string());
     0
 }

@@ -25,6 +25,8 @@ pub enum Signal {
     Pipe,
     Terminate,
     Child,
+    Continue,
+    Stop,
 }
 
 impl Signal {
@@ -37,12 +39,17 @@ impl Signal {
             Self::Pipe => 13,
             Self::Terminate => 15,
             Self::Child => 17,
+            Self::Continue => 18,
+            Self::Stop => 19,
         }
     }
 
     /// Whether the currently modeled default disposition terminates the target.
     pub const fn terminates(self) -> bool {
-        !matches!(self, Self::Child)
+        matches!(
+            self,
+            Self::Hangup | Self::Interrupt | Self::Kill | Self::Pipe | Self::Terminate
+        )
     }
 
     pub const fn name(self) -> &'static str {
@@ -53,6 +60,8 @@ impl Signal {
             Self::Pipe => "PIPE",
             Self::Terminate => "TERM",
             Self::Child => "CHLD",
+            Self::Continue => "CONT",
+            Self::Stop => "STOP",
         }
     }
 
@@ -66,6 +75,8 @@ impl Signal {
             "13" | "PIPE" => Some(Self::Pipe),
             "15" | "TERM" => Some(Self::Terminate),
             "17" | "CHLD" => Some(Self::Child),
+            "18" | "CONT" => Some(Self::Continue),
+            "19" | "STOP" => Some(Self::Stop),
             _ => None,
         }
     }
@@ -76,6 +87,8 @@ impl Signal {
 pub enum ProcessStatus {
     /// The process is currently executing in the synchronous interpreter.
     Running,
+    /// The process is suspended by an uncatchable job-control stop.
+    Stopped(Signal),
     /// The process has completed and is waiting to be reaped.
     Exited(i32),
 }
@@ -132,7 +145,7 @@ impl ControllingTerminal {
         process_group: ProcessId,
     ) -> Result<(), String> {
         let valid = processes.records.values().any(|record| {
-            record.status == ProcessStatus::Running
+            !matches!(record.status, ProcessStatus::Exited(_))
                 && record.session_id == self.session_id
                 && record.process_group == process_group
         });
@@ -255,6 +268,24 @@ impl ProcessTable {
         }
     }
 
+    /// Mark a live process stopped while retaining its execution context.
+    pub fn stop(&mut self, pid: ProcessId, signal: Signal) {
+        if let Some(record) = self.records.get_mut(&pid) {
+            if !matches!(record.status, ProcessStatus::Exited(_)) {
+                record.status = ProcessStatus::Stopped(signal);
+            }
+        }
+    }
+
+    /// Mark a stopped process running again.
+    pub fn continue_process(&mut self, pid: ProcessId) {
+        if let Some(record) = self.records.get_mut(&pid) {
+            if matches!(record.status, ProcessStatus::Stopped(_)) {
+                record.status = ProcessStatus::Running;
+            }
+        }
+    }
+
     /// Update the live metadata for the currently executing process.
     pub fn update_current(
         &mut self,
@@ -296,6 +327,18 @@ impl ProcessTable {
             .collect()
     }
 
+    /// Return non-exited members of one process group in stable PID order.
+    pub fn live_group(&self, process_group: ProcessId) -> Vec<ProcessId> {
+        self.records
+            .values()
+            .filter(|record| {
+                record.process_group == process_group
+                    && !matches!(record.status, ProcessStatus::Exited(_))
+            })
+            .map(|record| record.pid)
+            .collect()
+    }
+
     /// Return one process tree in stable PID order, including `root` when it is retained.
     pub(crate) fn process_tree(&self, root: ProcessId) -> Vec<ProcessId> {
         let mut selected = vec![root];
@@ -314,14 +357,14 @@ impl ProcessTable {
         selected
     }
 
-    /// Return the running portion of [`Self::process_tree`].
-    pub(crate) fn running_process_tree(&self, root: ProcessId) -> Vec<ProcessId> {
+    /// Return the non-exited portion of [`Self::process_tree`].
+    pub(crate) fn live_process_tree(&self, root: ProcessId) -> Vec<ProcessId> {
         self.process_tree(root)
             .into_iter()
             .filter(|pid| {
                 self.records
                     .get(pid)
-                    .is_some_and(|record| record.status == ProcessStatus::Running)
+                    .is_some_and(|record| !matches!(record.status, ProcessStatus::Exited(_)))
             })
             .collect()
     }

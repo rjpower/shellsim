@@ -172,6 +172,9 @@ fn lookup(env: &Environment, cwd: &str, path: &str, follow_self: bool) -> Option
                 (ProcessStatus::Exited(status), _) | (_, Some(TaskState::Exited(status))) => {
                     ("Z (zombie)", Some(status))
                 }
+                (ProcessStatus::Stopped(_), _) | (_, Some(TaskState::Stopped(_))) => {
+                    ("T (stopped)", None)
+                }
                 (_, Some(TaskState::Blocked(_))) => ("S (sleeping)", None),
                 (_, Some(TaskState::Runnable | TaskState::Running))
                 | (ProcessStatus::Running, None) => ("R (running)", None),

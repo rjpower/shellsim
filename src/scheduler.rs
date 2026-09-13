@@ -33,7 +33,16 @@ pub enum TaskState {
     Runnable,
     Running,
     Blocked(WaitReason),
+    /// Suspended by job control while retaining the state used by `SIGCONT`.
+    Stopped(StoppedTask),
     Exited(i32),
+}
+
+/// Scheduler state restored when a stopped task receives `SIGCONT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoppedTask {
+    Runnable,
+    Blocked(WaitReason),
 }
 
 /// Errors reject invalid transitions without partially changing scheduler state.
@@ -113,9 +122,59 @@ impl Scheduler {
                 Ok(())
             }
             Some(TaskState::Runnable) => Ok(()),
+            Some(TaskState::Stopped(StoppedTask::Blocked(_))) => {
+                self.blocked.retain(|blocked| *blocked != pid);
+                self.states
+                    .insert(pid, TaskState::Stopped(StoppedTask::Runnable));
+                Ok(())
+            }
+            Some(TaskState::Stopped(StoppedTask::Runnable)) => Ok(()),
             Some(TaskState::Running | TaskState::Exited(_)) => {
                 Err(SchedulerError::InvalidTransition)
             }
+            None => Err(SchedulerError::UnknownTask),
+        }
+    }
+
+    /// Stop a live task without discarding the resource condition it was waiting on.
+    ///
+    /// Waking a stopped blocked task changes its saved resume state to runnable while leaving it
+    /// stopped. This prevents elapsed timers and descriptor readiness from being lost.
+    pub fn stop(&mut self, pid: ProcessId) -> Result<(), SchedulerError> {
+        let stopped = match self.states.get(&pid).copied() {
+            Some(TaskState::Runnable) => {
+                self.runnable.retain(|queued| *queued != pid);
+                StoppedTask::Runnable
+            }
+            Some(TaskState::Running) if self.current == Some(pid) => {
+                self.current = None;
+                StoppedTask::Runnable
+            }
+            Some(TaskState::Blocked(reason)) => StoppedTask::Blocked(reason),
+            Some(TaskState::Stopped(_)) => return Ok(()),
+            Some(TaskState::Running | TaskState::Exited(_)) => {
+                return Err(SchedulerError::InvalidTransition)
+            }
+            None => return Err(SchedulerError::UnknownTask),
+        };
+        self.states.insert(pid, TaskState::Stopped(stopped));
+        Ok(())
+    }
+
+    /// Continue a stopped task, restoring its runnable or blocked scheduler state.
+    pub fn continue_task(&mut self, pid: ProcessId) -> Result<(), SchedulerError> {
+        match self.states.get(&pid).copied() {
+            Some(TaskState::Stopped(StoppedTask::Runnable)) => {
+                self.states.insert(pid, TaskState::Runnable);
+                self.runnable.push_back(pid);
+                Ok(())
+            }
+            Some(TaskState::Stopped(StoppedTask::Blocked(reason))) => {
+                self.states.insert(pid, TaskState::Blocked(reason));
+                Ok(())
+            }
+            Some(TaskState::Runnable | TaskState::Running | TaskState::Blocked(_)) => Ok(()),
+            Some(TaskState::Exited(_)) => Err(SchedulerError::InvalidTransition),
             None => Err(SchedulerError::UnknownTask),
         }
     }
@@ -126,7 +185,14 @@ impl Scheduler {
             .blocked
             .iter()
             .copied()
-            .filter(|pid| self.state(*pid) == Some(TaskState::Blocked(reason)))
+            .filter(|pid| {
+                matches!(
+                    self.state(*pid),
+                    Some(TaskState::Blocked(blocked))
+                        | Some(TaskState::Stopped(StoppedTask::Blocked(blocked)))
+                        if blocked == reason
+                )
+            })
             .collect();
         for pid in &waiting {
             self.wake(*pid)
@@ -162,7 +228,12 @@ impl Scheduler {
             .iter()
             .copied()
             .filter(|pid| {
-                matches!(self.state(*pid), Some(TaskState::Blocked(reason)) if predicate(reason))
+                matches!(
+                    self.state(*pid),
+                    Some(TaskState::Blocked(reason))
+                        | Some(TaskState::Stopped(StoppedTask::Blocked(reason)))
+                        if predicate(reason)
+                )
             })
             .collect();
         for pid in &waiting {
@@ -215,6 +286,9 @@ impl Scheduler {
                 matches!(
                     self.state(*pid),
                     Some(TaskState::Blocked(WaitReason::Timer(_)))
+                        | Some(TaskState::Stopped(StoppedTask::Blocked(WaitReason::Timer(
+                            _
+                        ))))
                 )
             })
             .collect()
@@ -332,5 +406,28 @@ mod tests {
             scheduler.state(3),
             Some(TaskState::Blocked(WaitReason::Child(8)))
         );
+    }
+
+    #[test]
+    fn stopped_tasks_retain_waits_and_record_wakes_until_continued() {
+        let mut scheduler = Scheduler::new(1);
+        scheduler.spawn(2).unwrap();
+        scheduler
+            .block_current(WaitReason::PipeReadable(7))
+            .unwrap();
+        scheduler.stop(1).unwrap();
+        assert_eq!(
+            scheduler.state(1),
+            Some(TaskState::Stopped(StoppedTask::Blocked(
+                WaitReason::PipeReadable(7)
+            )))
+        );
+        assert_eq!(scheduler.wake_waiters(WaitReason::PipeReadable(7)), 1);
+        assert_eq!(
+            scheduler.state(1),
+            Some(TaskState::Stopped(StoppedTask::Runnable))
+        );
+        scheduler.continue_task(1).unwrap();
+        assert_eq!(scheduler.state(1), Some(TaskState::Runnable));
     }
 }

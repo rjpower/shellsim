@@ -14,8 +14,8 @@ The first tranche added typed all-or-nothing shell parse failures, honest builti
 bounded VFS-only Git and shell-recipe Make subsets. Later tranches added cooperative logical
 processes, descriptor-backed pipes, process-group signal delivery, resumable shell signal handlers,
 resumable Python subprocesses, and a persistent workspace protocol. Running foreground transfer
-through `fg` and a stdio MCP model-client adapter are now present. Stopped jobs, `bg`, compound
-Python callback frames, and end-to-end model experiments remain future work.
+through `fg`, stopped-job resumption through `bg`, and a stdio MCP model-client adapter are now
+present. Compound Python callback frames and end-to-end model experiments remain future work.
 
 ## Product boundary
 
@@ -42,7 +42,7 @@ scoring, not another simulated execution path.
 | Shell grammar | Broad partial subset | Redirection, descriptor, and option behavior still has correctness gaps |
 | Commands | Broad surface | Several partial operations or successful no-ops are misleading |
 | Python | Substantial bounded interpreter | Arbitrary projects and third-party ecosystems remain out of scope |
-| Processes and jobs | Cooperative logical processes | Running foreground transfer is modeled; STOP/CONT and stopped-job resumption remain |
+| Processes and jobs | Cooperative logical processes | Foreground transfer and STOP/CONT are modeled; advanced terminal modes and arbitrary process-group mutation remain |
 | Build ecosystem | Useful first slice | Git and Make are deliberately small; native compilation remains out of scope |
 | Harness integration | Useful foundation | Stdio MCP is present; end-to-end model evaluation and result scoring remain |
 | Observability | Good | Compatibility reporting is command-level rather than invocation-level |
@@ -186,7 +186,7 @@ workspace patch. Strict evaluation should fail when a no-op or unsupported featu
 6. Cooperative background scheduling, bounded pipes, default signal delivery, live Python process
    handles, bounded Python VM polling, retryable blocking native calls, group-wide signal delivery,
    bounded resumable shell handlers, distinct process sessions/groups, and synthetic terminal
-   foreground ownership are present; interactive stopped jobs and compound native callback frames
+   foreground ownership and stopped-job resumption are present; compound native callback frames
    remain.
 7. A persistent bounded NDJSON workspace protocol with execution, typed diffs, checkpoint/reset,
    file tools, inspection, transactional host snapshot ingestion, replay, and typed scenario

@@ -202,6 +202,63 @@ fn fg_uses_resumable_child_wait_and_restores_terminal() {
 }
 
 #[test]
+fn stopped_jobs_are_observable_and_resume_through_bg() {
+    let mut env = Environment::new();
+    let result = run(
+        &mut env,
+        "sleep 10 & kill -STOP %1; jobs; bg %1; wait %1; printf 'status:%s' $?",
+    );
+    assert_eq!(
+        result,
+        (
+            0,
+            "[1] Stopped sleep 10\n[1] sleep 10 &\nstatus:0".into(),
+            String::new(),
+        )
+    );
+    assert_eq!(env.clock.monotonic_ns(), 10_000_000_000);
+    assert_eq!(env.terminal.foreground_group, 1_234);
+}
+
+#[test]
+fn timer_wake_is_retained_while_a_job_is_stopped() {
+    let mut env = Environment::new();
+    let result = run(
+        &mut env,
+        "sleep 10 & sleep 1; kill -STOP %1; sleep 20; bg %1; wait %1; printf done",
+    );
+    assert_eq!(result, (0, "[1] sleep 10 &\ndone".into(), String::new()));
+    assert_eq!(env.clock.monotonic_ns(), 21_000_000_000);
+}
+
+#[test]
+fn terminating_signal_stays_pending_until_a_stopped_job_continues() {
+    let mut env = Environment::new();
+    let result = run(
+        &mut env,
+        "sleep 10 & sleep 1; kill -STOP %1; kill -TERM %1; kill -CONT %1; wait %1",
+    );
+    assert_eq!(result, (143, String::new(), String::new()));
+    assert_eq!(env.clock.monotonic_ns(), 1_000_000_000);
+}
+
+#[test]
+fn kill_reaches_a_stopped_job_and_proc_reports_the_state() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "sleep 10 & kill -STOP %1").0, 0);
+    let status = run(&mut env, "cat /proc/1235/status; ps aux");
+    assert_eq!(status.0, 0);
+    assert!(status.1.contains("State:\tT (stopped)\n"), "{}", status.1);
+    assert!(
+        status.1.contains(" T    00:00   0:00 sleep 10"),
+        "{}",
+        status.1
+    );
+    assert!(status.2.is_empty());
+    assert_eq!(run(&mut env, "kill -KILL %1; wait %1").0, 137);
+}
+
+#[test]
 fn a_signal_to_the_persistent_shell_terminates_the_session() {
     let mut env = Environment::new();
     let result = run(&mut env, "kill -HUP $$; echo unreachable");

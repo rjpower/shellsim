@@ -32,8 +32,15 @@ pub struct Job {
     pub id: u32,
     pub pid: ProcessId,
     pub cmd: String,
-    pub done: bool,
-    pub status: i32,
+    pub state: JobState,
+}
+
+/// Shell-visible lifecycle of a background job leader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobState {
+    Running,
+    Stopped(Signal),
+    Done(i32),
 }
 
 /// Parsed simple-command alias retained as process-local shell state.
@@ -57,6 +64,7 @@ pub(crate) enum ShellSignalDisposition {
 #[derive(Clone, Debug)]
 pub(crate) enum SignalDelivery {
     Terminate(Signal),
+    Stop(Signal),
     Handler(crate::shell::Node),
 }
 
@@ -814,8 +822,7 @@ impl Environment {
         let parent_retained = self.process.states.contains_key(&parent_pid);
         if let Some(parent) = self.process.states.get_mut(&parent_pid) {
             if let Some(job) = parent.jobs.iter_mut().find(|job| job.pid == pid) {
-                job.done = true;
-                job.status = status;
+                job.state = JobState::Done(status);
             }
             if child_deadline_interrupt.is_some() {
                 parent.deadline_interrupt = child_deadline_interrupt;
@@ -840,9 +847,27 @@ impl Environment {
     pub(crate) fn send_signal(&mut self, pid: ProcessId, signal: Signal) -> Result<(), String> {
         if !matches!(
             self.processes.get(pid).map(|record| record.status),
-            Some(crate::process::ProcessStatus::Running)
+            Some(
+                crate::process::ProcessStatus::Running | crate::process::ProcessStatus::Stopped(_)
+            )
         ) {
             return Err(format!("process {pid} does not exist"));
+        }
+        if signal == Signal::Continue {
+            self.continue_process(pid)?;
+            return Ok(());
+        }
+        if signal == Signal::Stop && self.scheduler.current() != Some(pid) {
+            self.stop_process(pid, signal)?;
+            return Ok(());
+        }
+        if signal == Signal::Kill
+            && matches!(
+                self.processes.get(pid).map(|record| record.status),
+                Some(crate::process::ProcessStatus::Stopped(_))
+            )
+        {
+            self.continue_process(pid)?;
         }
         let target = self
             .process
@@ -851,7 +876,7 @@ impl Environment {
             .ok_or_else(|| format!("process {pid} has no execution context"))?;
         target.pending_signals.insert(signal);
         let disposition = target.signal_dispositions.get(&signal);
-        let interrupts = signal == Signal::Kill
+        let interrupts = matches!(signal, Signal::Kill | Signal::Stop)
             || matches!(disposition, Some(ShellSignalDisposition::Handler { .. }))
             || (disposition.is_none() && signal.terminates());
         if interrupts
@@ -873,7 +898,7 @@ impl Environment {
         process_group: ProcessId,
         signal: Signal,
     ) -> Result<(), String> {
-        let members = self.processes.running_group(process_group);
+        let members = self.processes.live_group(process_group);
         if members.is_empty() {
             return Err(format!("process group {process_group} does not exist"));
         }
@@ -896,14 +921,69 @@ impl Environment {
         self.terminal.set_foreground(&self.processes, process_group)
     }
 
+    fn stop_process(&mut self, pid: ProcessId, signal: Signal) -> Result<(), String> {
+        self.scheduler
+            .stop(pid)
+            .map_err(|error| format!("unable to stop process {pid}: {error:?}"))?;
+        self.processes.stop(pid, signal);
+        for state in self.process.states.values_mut() {
+            if let Some(job) = state.jobs.iter_mut().find(|job| job.pid == pid) {
+                job.state = JobState::Stopped(signal);
+            }
+        }
+        self.scheduler.wake_child_waiters(pid);
+        self.scheduler.wake_child_activity_waiters(pid);
+        if self
+            .processes
+            .running_group(self.terminal.foreground_group)
+            .is_empty()
+        {
+            self.terminal.foreground_group = self.terminal.session_id;
+        }
+        Ok(())
+    }
+
+    fn continue_process(&mut self, pid: ProcessId) -> Result<(), String> {
+        self.scheduler
+            .continue_task(pid)
+            .map_err(|error| format!("unable to continue process {pid}: {error:?}"))?;
+        self.processes.continue_process(pid);
+        let has_pending_signal = self
+            .process
+            .states
+            .get(&pid)
+            .is_some_and(|state| !state.pending_signals.is_empty());
+        if has_pending_signal
+            && matches!(
+                self.scheduler.state(pid),
+                Some(crate::scheduler::TaskState::Blocked(_))
+            )
+        {
+            self.scheduler
+                .wake(pid)
+                .map_err(|error| format!("unable to wake continued process {pid}: {error:?}"))?;
+        }
+        for state in self.process.states.values_mut() {
+            if let Some(job) = state.jobs.iter_mut().find(|job| job.pid == pid) {
+                job.state = JobState::Running;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop the active process at a scheduler boundary and select no replacement itself.
+    pub(crate) fn stop_active_process(&mut self, signal: Signal) -> Result<(), String> {
+        let pid = self.process.pid;
+        self.stop_process(pid, signal)
+    }
+
     /// Select the next non-ignored signal action for the active process.
     pub(crate) fn take_signal_delivery(&mut self) -> Option<SignalDelivery> {
         loop {
             let signal = if self.process.handling_signal {
-                self.process
-                    .pending_signals
-                    .contains(&Signal::Kill)
-                    .then_some(Signal::Kill)?
+                [Signal::Kill, Signal::Stop]
+                    .into_iter()
+                    .find(|signal| self.process.pending_signals.contains(signal))?
             } else {
                 self.process.pending_signals.iter().next().copied()?
             };
@@ -911,6 +991,9 @@ impl Environment {
             if signal == Signal::Kill {
                 self.clock.cancel_task_events(u64::from(self.process.pid));
                 return Some(SignalDelivery::Terminate(signal));
+            }
+            if signal == Signal::Stop {
+                return Some(SignalDelivery::Stop(signal));
             }
             match self.process.signal_dispositions.get(&signal).cloned() {
                 Some(ShellSignalDisposition::Ignore) => continue,
@@ -1368,8 +1451,7 @@ impl Environment {
             id,
             pid,
             cmd,
-            done: false,
-            status: 0,
+            state: JobState::Running,
         });
         Some(id)
     }
