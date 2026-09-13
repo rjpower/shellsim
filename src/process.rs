@@ -100,6 +100,7 @@ pub struct ProcessRecord {
 ///
 /// The handle is machine state rather than Python heap state so native facades can refer to it by
 /// PID without exposing descriptor arena identities to simulated code.
+#[derive(Clone)]
 pub(crate) struct LiveChild {
     pub owner: ProcessId,
     pub endpoints: FdTable,
@@ -128,6 +129,7 @@ pub(crate) struct LiveChild {
 }
 
 /// Machine-wide allocator and process record store.
+#[derive(Clone)]
 pub struct ProcessTable {
     next_pid: ProcessId,
     records: BTreeMap<ProcessId, ProcessRecord>,

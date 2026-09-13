@@ -299,7 +299,7 @@ mod value_layout_tests {
 }
 
 /// Persistent locals for the deliberately-small foreground Python REPL.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct ReplState {
     locals: HashMap<String, Value>,
     heap: heap::Heap,
@@ -315,6 +315,7 @@ enum ExecResult {
 }
 
 /// Owned Python command state retained by a shell continuation between scheduler quanta.
+#[derive(Clone)]
 pub(crate) struct PythonContinuation {
     argv: Vec<String>,
     state: ReplState,

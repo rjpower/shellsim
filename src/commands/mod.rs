@@ -69,6 +69,7 @@ pub(crate) enum CommandPoll {
 }
 
 /// Command-owned state retained by the shell while a native command is suspended.
+#[derive(Clone)]
 pub(crate) enum CommandResume {
     Status(i32),
     Child {
@@ -99,6 +100,7 @@ pub(crate) enum CommandResume {
 }
 
 /// One scheduler-owned argv invocation requested by a modeled native command.
+#[derive(Clone)]
 pub(crate) struct ChildCommand {
     pub argv: Vec<String>,
     pub stdin: Vec<u8>,

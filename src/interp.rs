@@ -43,6 +43,7 @@ pub(crate) struct AliasDefinition {
 }
 
 /// Machine-wide state and limits shared by cooperatively scheduled logical processes.
+#[derive(Clone)]
 pub struct Environment {
     pub vfs: Vfs,
     pub clock: Clock,
@@ -76,6 +77,7 @@ pub struct Environment {
 }
 
 /// Shell-local state for the single process currently executing in an [`Environment`].
+#[derive(Clone)]
 pub struct ProcessState {
     /// PID of the currently executing logical process.
     pub pid: ProcessId,
@@ -144,6 +146,7 @@ pub struct ProcessState {
 ///
 /// Field access dereferences to the active context for compatibility with command code, while
 /// inactive parents and runnable siblings remain stored by PID for scheduler activation.
+#[derive(Clone)]
 pub struct ProcessStates {
     active: ProcessId,
     states: BTreeMap<ProcessId, ProcessState>,

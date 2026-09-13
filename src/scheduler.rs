@@ -47,6 +47,7 @@ pub enum SchedulerError {
 }
 
 /// Single-threaded FIFO scheduler with deterministic wake ordering.
+#[derive(Clone)]
 pub struct Scheduler {
     states: BTreeMap<ProcessId, TaskState>,
     runnable: VecDeque<ProcessId>,

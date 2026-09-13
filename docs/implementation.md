@@ -89,7 +89,9 @@ and emitted transcript data.
 be rerun against a bounded host snapshot without changing the protocol.
 
 This is sufficient for a host-side agent adapter to replay and assert tool calls without launching
-the agent inside shellsim. Session cloning and Codex/Claude adapters remain harness-side work.
+the agent inside shellsim. The library can fork a bounded `HarnessSession`, including scheduler,
+descriptor, process, Python, clock, network, resource, and checkpoint state, for deterministic
+branching evaluation. Codex/Claude adapters remain harness-side work.
 
 ## Simulation boundaries
 

@@ -68,11 +68,13 @@ enum OpenDescription {
     PipeWriter(PipeId),
 }
 
+#[derive(Clone)]
 struct DescriptionEntry {
     description: OpenDescription,
     references: u32,
 }
 
+#[derive(Clone)]
 struct Pipe {
     bytes: VecDeque<u8>,
     capacity: usize,
@@ -91,6 +93,7 @@ pub(crate) struct FileState {
 }
 
 /// Machine-owned descriptions and pipes shared by all process descriptor tables.
+#[derive(Clone)]
 pub struct DescriptorArena {
     next_description: DescriptionId,
     next_pipe: PipeId,

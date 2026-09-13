@@ -82,6 +82,7 @@ fn restore_fds(interp: &mut Interp, saved: crate::descriptors::FdTable) {
 const MAX_SHELL_FRAMES: usize = 4_096;
 const SHELL_POLL_QUANTUM: usize = 1;
 
+#[derive(Clone)]
 enum ShellFrame {
     Eval(Node),
     PrepareCommand(PreparedCommand),
@@ -226,6 +227,7 @@ enum ShellFrame {
     },
 }
 
+#[derive(Clone)]
 struct PreparedCommand {
     assigns: Vec<(String, String)>,
     words: Vec<String>,
@@ -234,6 +236,7 @@ struct PreparedCommand {
     substitution_status: Option<i32>,
 }
 
+#[derive(Clone)]
 struct PreparedFor {
     var: String,
     words: Vec<String>,
@@ -241,17 +244,20 @@ struct PreparedFor {
     temporary_variables: Vec<(String, Option<String>)>,
 }
 
+#[derive(Clone)]
 struct PreparedCase {
     word: String,
     arms: Vec<(Vec<String>, Node)>,
     temporary_variables: Vec<(String, Option<String>)>,
 }
 
+#[derive(Clone)]
 struct PreparedArithmetic {
     expression: String,
     continuation: ArithmeticContinuation,
 }
 
+#[derive(Clone)]
 enum ArithmeticContinuation {
     Command,
     CForInit {
@@ -291,6 +297,7 @@ pub(crate) enum ShellPoll {
     Ready(i32),
 }
 
+#[derive(Clone)]
 pub(crate) struct ShellContinuation {
     frames: Vec<ShellFrame>,
     status: i32,
@@ -2234,6 +2241,7 @@ fn describe(node: &Node) -> String {
     }
 }
 
+#[derive(Clone)]
 struct RedirectScope {
     saved: crate::descriptors::FdTable,
     reserved_memory: u64,

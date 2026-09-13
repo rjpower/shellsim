@@ -250,6 +250,7 @@ pub(super) fn execute(
 }
 
 /// Compiled Python and the transient bytecode state retained between bounded VM polls.
+#[derive(Clone)]
 pub(super) struct VmProgram {
     code: Code,
     execution: VmState,
@@ -363,7 +364,7 @@ struct Vm<'a> {
 /// Python process resumable. `Interp`, output descriptors, and the persistent Python heap are
 /// borrowed only while a scheduler quantum is being polled; operand and semantic stacks belong to
 /// the process continuation.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct VmState {
     stack: Vec<Value>,
     bytecode_frames: Vec<BytecodeFrame>,
@@ -380,6 +381,7 @@ struct VmState {
 }
 
 /// An executing code object's resumable control state.
+#[derive(Clone)]
 struct BytecodeFrame {
     code: Code,
     instruction_pointer: usize,
@@ -392,12 +394,14 @@ struct BytecodeFrame {
 ///
 /// Starred arguments have already been expanded and the calling instruction has advanced, so a
 /// wake retries exactly the native operation without repeating Python-visible argument work.
+#[derive(Clone)]
 struct PendingNativeCall {
     function: &'static FunctionDef,
     arguments: CallArgs,
     call_span: super::source::Span,
 }
 
+#[derive(Clone)]
 struct FunctionReturn {
     name: String,
     call_span: super::source::Span,

@@ -17,6 +17,7 @@ use crate::vfs::{Node, NodeKind, Vfs};
 use crate::{Environment, Limits, RunOutcome};
 
 const MAX_TRANSFER_RAW_BYTES: usize = 6 * 1024 * 1024;
+const MAX_SESSION_FORK_BYTES: u64 = 96 * 1024 * 1024;
 
 /// One protocol request. `id` is echoed verbatim so clients can correlate responses.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -208,6 +209,44 @@ impl HarnessSession {
         }
         self.baseline = self.environment.vfs.clone();
         Ok(())
+    }
+
+    /// Clone the complete deterministic machine state for a branching evaluation.
+    ///
+    /// Unlike a workspace checkpoint, a fork includes shell and Python state, descriptors and
+    /// pipe contents, logical processes, scheduler queues, timers, virtual-network fixtures,
+    /// telemetry, and resource counters. The estimate is checked before the host allocation;
+    /// each returned session subsequently owns and enforces an independent copy of its limits.
+    pub fn fork(&self) -> Result<Self, String> {
+        let current_disk = self.environment.vfs.disk_used();
+        let baseline_disk = self.baseline.disk_used();
+        if current_disk > MAX_TRANSFER_RAW_BYTES as u64
+            || baseline_disk > MAX_TRANSFER_RAW_BYTES as u64
+        {
+            return Err(format!(
+                "workspace exceeds the {MAX_TRANSFER_RAW_BYTES}-byte session fork limit"
+            ));
+        }
+        let usage = self
+            .environment
+            .resources
+            .outcome(0, current_disk, self.environment.vfs.disk_peak())
+            .usage;
+        let estimate = current_disk
+            .saturating_add(baseline_disk)
+            .saturating_add(usage.memory_current)
+            .saturating_add(self.environment.pending_stdout.len() as u64)
+            .saturating_add(self.environment.pending_stderr.len() as u64)
+            .saturating_add(1024 * 1024);
+        if estimate > MAX_SESSION_FORK_BYTES {
+            return Err(format!(
+                "session exceeds the {MAX_SESSION_FORK_BYTES}-byte fork limit"
+            ));
+        }
+        Ok(Self {
+            environment: self.environment.clone(),
+            baseline: self.baseline.clone(),
+        })
     }
 
     fn apply(&mut self, operation: HarnessOperation) -> Result<HarnessResult, String> {
@@ -495,4 +534,80 @@ fn default_file_mode() -> u32 {
 
 fn default_root() -> String {
     "/work".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_forks_preserve_and_isolate_complete_machine_state() {
+        let mut original = HarnessSession::new(Limits::default());
+        original
+            .environment
+            .run_script_capture("X=parent; printf base > /work/value; sleep 2 &");
+        original.checkpoint_workspace().unwrap();
+        let mut branch = original.fork().unwrap();
+
+        let (_, original_out, original_err) = original
+            .environment
+            .run_script_capture("wait; printf '%s:' \"$X\"; cat /work/value; date +%s");
+        let (_, branch_out, branch_err) = branch.environment.run_script_capture(
+            "X=branch; printf child > /work/value; wait; printf '%s:' \"$X\"; cat /work/value; date +%s",
+        );
+        assert!(
+            original_err.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&original_err)
+        );
+        assert!(
+            branch_err.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&branch_err)
+        );
+        let original_out = String::from_utf8_lossy(&original_out);
+        let branch_out = String::from_utf8_lossy(&branch_out);
+        assert!(original_out.starts_with("parent:base"), "{original_out}");
+        assert!(branch_out.starts_with("branch:child"), "{branch_out}");
+        assert_eq!(
+            original.environment.clock.monotonic_ns(),
+            branch.environment.clock.monotonic_ns()
+        );
+        assert!(
+            workspace_diff(&original.baseline, &original.environment.vfs)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            workspace_diff(&branch.baseline, &branch.environment.vfs)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_forks_deep_clone_python_heaps_and_reject_large_workspaces() {
+        let mut original = HarnessSession::new(Limits::default());
+        original.environment.run_script_capture("python");
+        original.environment.run_script_capture("items = [1]");
+        let mut branch = original.fork().unwrap();
+        branch.environment.run_script_capture("items.append(2)");
+        let (_, original_out, _) = original.environment.run_script_capture("print(items)");
+        let (_, branch_out, _) = branch.environment.run_script_capture("print(items)");
+        assert_eq!(String::from_utf8_lossy(&original_out), "[1]\n>>> ");
+        assert_eq!(String::from_utf8_lossy(&branch_out), "[1, 2]\n>>> ");
+
+        let mut oversized = HarnessSession::new(Limits::default());
+        oversized
+            .environment
+            .vfs
+            .put_file("/work/large", vec![0; MAX_TRANSFER_RAW_BYTES + 1], 0o644)
+            .unwrap();
+        let error = match oversized.fork() {
+            Ok(_) => panic!("oversized session fork unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.contains("session fork limit"), "{error}");
+    }
 }

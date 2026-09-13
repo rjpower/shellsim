@@ -165,7 +165,7 @@ pub enum Object {
     },
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Heap {
     objects: Vec<HeapObject>,
     scopes: Vec<Scope>,
@@ -180,7 +180,7 @@ struct HeapObject {
     payload: Object,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Scope {
     parent: Option<ScopeId>,
     uses_repl_globals: bool,
