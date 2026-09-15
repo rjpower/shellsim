@@ -2,19 +2,21 @@
 //! and reshaping (wc/sort/uniq/cut/tr/rev/nl/seq/paste/comm/diff/cmp), pattern tools
 //! (grep/sed), the fold/fmt passthroughs, xargs, and the small arithmetic helpers expr/bc.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::commands::util::{ewln, lines_of, read_inputs, split_flags, w, wln};
 use crate::commands::{ChildCommand, CommandContext, CommandPoll, CommandSpec, Io, Trust};
+use crate::descriptors::{DeviceStream, IoPoll, IoWait, DEVICE_READ_QUANTUM};
 use crate::interp::Interp;
+use crate::scheduler::WaitReason;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_buffered_resumable};
-    reg(m, &["cat"], Trust::Real, cmd_cat);
+    use super::{reg, reg_buffered_resumable, reg_resumable};
+    reg_resumable(m, &["cat"], Trust::Real, cmd_cat, start_cat);
     reg(m, &["tac"], Trust::Real, cmd_tac);
     reg(m, &["tee"], Trust::Real, cmd_tee);
     reg(m, &["yes"], Trust::Real, cmd_yes);
-    reg(m, &["head"], Trust::Real, cmd_head);
+    reg_resumable(m, &["head"], Trust::Real, cmd_head, start_head);
     reg(m, &["tail"], Trust::Real, cmd_tail);
     reg(m, &["wc"], Trust::Real, cmd_wc);
     reg(m, &["uniq"], Trust::Real, cmd_uniq);
@@ -42,6 +44,342 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["expr"], Trust::Real, cmd_expr);
     reg(m, &["bc"], Trust::Real, cmd_bc);
     reg(m, &["factor"], Trust::Real, |_, _, _| 0);
+}
+
+#[derive(Clone)]
+enum StreamSource {
+    Descriptor,
+    Device(DeviceStream),
+}
+
+#[derive(Clone)]
+pub(crate) struct StreamState {
+    sources: VecDeque<StreamSource>,
+    pending: Vec<u8>,
+    offset: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct HeadStream {
+    stream: StreamState,
+    bytes_remaining: Option<usize>,
+    lines_remaining: usize,
+    done: bool,
+}
+
+/// Continuation state for text commands that must preserve pipe backpressure.
+#[derive(Clone)]
+pub(crate) enum TextStream {
+    Cat(StreamState),
+    Head(HeadStream),
+}
+
+#[derive(Clone)]
+struct HeadOptions {
+    lines: usize,
+    bytes: Option<usize>,
+    files: Vec<String>,
+}
+
+fn parse_head_options(args: &[String]) -> HeadOptions {
+    let mut lines = 10usize;
+    let mut bytes = None;
+    let mut files = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(arg) = it.next() {
+        if arg == "-n" {
+            lines = it
+                .next()
+                .and_then(|value| value.trim_start_matches('-').parse().ok())
+                .unwrap_or(10);
+        } else if let Some(value) = arg.strip_prefix("-n") {
+            lines = value.trim_start_matches('-').parse().unwrap_or(10);
+        } else if arg == "-c" {
+            bytes = it.next().and_then(|value| value.parse().ok());
+        } else if let Some(value) = arg.strip_prefix("-c") {
+            bytes = value.parse().ok();
+        } else if arg.starts_with('-')
+            && arg.len() > 1
+            && arg[1..].chars().all(|character| character.is_ascii_digit())
+        {
+            lines = arg[1..].parse().unwrap_or(10);
+        } else if !arg.starts_with('-') || arg == "-" {
+            files.push(arg.clone());
+        }
+    }
+    HeadOptions {
+        lines,
+        bytes,
+        files,
+    }
+}
+
+fn stream_sources(cwd: &str, files: &[String]) -> Option<VecDeque<StreamSource>> {
+    if files.is_empty() {
+        return Some(VecDeque::from([StreamSource::Descriptor]));
+    }
+    files
+        .iter()
+        .map(|file| {
+            if file == "-" || file == "/dev/stdin" {
+                Some(StreamSource::Descriptor)
+            } else {
+                crate::pseudo_fs::device_kind(cwd, file)
+                    .map(DeviceStream::new)
+                    .map(StreamSource::Device)
+            }
+        })
+        .collect()
+}
+
+/// Return true when a command needs direct descriptor streaming instead of eager input capture.
+pub(super) fn streams_before_input(command: &str, args: &[String]) -> bool {
+    match command {
+        "cat" => {
+            if args
+                .iter()
+                .any(|arg| arg.starts_with('-') && arg != "-" && arg != "--")
+            {
+                return false;
+            }
+            let files = args
+                .iter()
+                .filter(|arg| arg.as_str() != "--")
+                .cloned()
+                .collect::<Vec<_>>();
+            stream_sources("/", &files).is_some()
+        }
+        "head" => stream_sources("/", &parse_head_options(args).files).is_some(),
+        _ => false,
+    }
+}
+
+fn start_cat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let files = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--")
+        .cloned()
+        .collect::<Vec<_>>();
+    let Some(sources) = stream_sources(&interp.cwd, &files) else {
+        return CommandPoll::Ready(cmd_cat(interp, args, io));
+    };
+    CommandPoll::Yielded(crate::commands::CommandResume::TextStream(TextStream::Cat(
+        StreamState {
+            sources,
+            pending: Vec::new(),
+            offset: 0,
+        },
+    )))
+}
+
+fn start_head(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    let options = parse_head_options(args);
+    let Some(sources) = stream_sources(&interp.cwd, &options.files) else {
+        return CommandPoll::Ready(cmd_head(interp, args, io));
+    };
+    CommandPoll::Yielded(crate::commands::CommandResume::TextStream(
+        TextStream::Head(HeadStream {
+            stream: StreamState {
+                sources,
+                pending: Vec::new(),
+                offset: 0,
+            },
+            bytes_remaining: options.bytes,
+            lines_remaining: options.lines,
+            done: options.bytes == Some(0) || (options.bytes.is_none() && options.lines == 0),
+        }),
+    ))
+}
+
+fn wait_reason(wait: IoWait) -> WaitReason {
+    match wait {
+        IoWait::InputReadable(description) => WaitReason::InputReadable(description),
+        IoWait::PipeReadable(pipe) => WaitReason::PipeReadable(pipe),
+        IoWait::PipeWritable(pipe) => WaitReason::PipeWritable(pipe),
+    }
+}
+
+enum FlushPoll {
+    Complete,
+    Yielded,
+    Blocked(WaitReason),
+    Failed(i32),
+}
+
+fn resource_status(interp: &Interp) -> i32 {
+    interp
+        .resources
+        .stop_reason()
+        .map_or(137, |reason| reason.exit_status())
+}
+
+fn flush_pending(interp: &mut Interp, state: &mut StreamState) -> FlushPoll {
+    if state.offset >= state.pending.len() {
+        state.pending.clear();
+        state.offset = 0;
+        return FlushPoll::Complete;
+    }
+    let output_remaining =
+        usize::try_from(interp.resources.output_remaining()).unwrap_or(usize::MAX);
+    if output_remaining == 0 {
+        let _ = interp.resources.charge_output(1);
+        return FlushPoll::Failed(resource_status(interp));
+    }
+    let cpu_remaining = usize::try_from(interp.resources.cpu_remaining()).unwrap_or(usize::MAX);
+    if cpu_remaining == 0 {
+        let _ = interp.resources.charge_cpu(1);
+        return FlushPoll::Failed(resource_status(interp));
+    }
+    let end = state
+        .offset
+        .saturating_add(output_remaining.min(cpu_remaining))
+        .min(state.pending.len());
+    match interp.write_fd(1, &state.pending[state.offset..end]) {
+        Ok(IoPoll::Ready(0)) => FlushPoll::Failed(1),
+        Ok(IoPoll::Ready(written)) => {
+            state.offset = state.offset.saturating_add(written);
+            if !interp.resources.charge_cpu(written as u64)
+                || !interp.resources.charge_output(written as u64)
+            {
+                return FlushPoll::Failed(resource_status(interp));
+            }
+            if state.offset == state.pending.len() {
+                state.pending.clear();
+                state.offset = 0;
+            }
+            FlushPoll::Yielded
+        }
+        Ok(IoPoll::Blocked(wait)) => FlushPoll::Blocked(wait_reason(wait)),
+        Err(error) if error.contains("BrokenPipe") => FlushPoll::Failed(141),
+        Err(_) => FlushPoll::Failed(1),
+    }
+}
+
+fn read_stream(
+    interp: &mut Interp,
+    sources: &mut VecDeque<StreamSource>,
+    maximum: usize,
+) -> Result<IoPoll<Vec<u8>>, i32> {
+    loop {
+        let Some(source) = sources.front_mut() else {
+            return Ok(IoPoll::Ready(Vec::new()));
+        };
+        let result = match source {
+            StreamSource::Descriptor => interp
+                .read_fd(0, maximum)
+                .map_err(|_| resource_status(interp))?,
+            StreamSource::Device(stream) => {
+                let maximum = maximum.min(DEVICE_READ_QUANTUM).min(
+                    usize::try_from(interp.resources.cpu_remaining() / 2).unwrap_or(usize::MAX),
+                );
+                if maximum == 0 {
+                    let _ = interp.resources.charge_cpu(1);
+                    return Err(resource_status(interp));
+                }
+                if !interp.resources.charge_cpu(maximum as u64) {
+                    return Err(resource_status(interp));
+                }
+                IoPoll::Ready(stream.read(maximum))
+            }
+        };
+        if matches!(&result, IoPoll::Ready(bytes) if bytes.is_empty()) {
+            sources.pop_front();
+            continue;
+        }
+        return Ok(result);
+    }
+}
+
+fn poll_cat(interp: &mut Interp, mut state: StreamState) -> CommandPoll {
+    if !state.pending.is_empty() {
+        return match flush_pending(interp, &mut state) {
+            FlushPoll::Complete | FlushPoll::Yielded => CommandPoll::Yielded(
+                crate::commands::CommandResume::TextStream(TextStream::Cat(state)),
+            ),
+            FlushPoll::Blocked(reason) => CommandPoll::Blocked(
+                reason,
+                crate::commands::CommandResume::TextStream(TextStream::Cat(state)),
+            ),
+            FlushPoll::Failed(status) => CommandPoll::Ready(status),
+        };
+    }
+    match read_stream(interp, &mut state.sources, DEVICE_READ_QUANTUM) {
+        Ok(IoPoll::Ready(bytes)) if bytes.is_empty() => CommandPoll::Ready(0),
+        Ok(IoPoll::Ready(bytes)) => {
+            state.pending = bytes;
+            CommandPoll::Yielded(crate::commands::CommandResume::TextStream(TextStream::Cat(
+                state,
+            )))
+        }
+        Ok(IoPoll::Blocked(wait)) => CommandPoll::Blocked(
+            wait_reason(wait),
+            crate::commands::CommandResume::TextStream(TextStream::Cat(state)),
+        ),
+        Err(status) => CommandPoll::Ready(status),
+    }
+}
+
+fn poll_head(interp: &mut Interp, mut state: HeadStream) -> CommandPoll {
+    if !state.stream.pending.is_empty() {
+        return match flush_pending(interp, &mut state.stream) {
+            FlushPoll::Complete | FlushPoll::Yielded => CommandPoll::Yielded(
+                crate::commands::CommandResume::TextStream(TextStream::Head(state)),
+            ),
+            FlushPoll::Blocked(reason) => CommandPoll::Blocked(
+                reason,
+                crate::commands::CommandResume::TextStream(TextStream::Head(state)),
+            ),
+            FlushPoll::Failed(status) => CommandPoll::Ready(status),
+        };
+    }
+    if state.done {
+        return CommandPoll::Ready(0);
+    }
+    let maximum = state
+        .bytes_remaining
+        .unwrap_or(DEVICE_READ_QUANTUM)
+        .min(DEVICE_READ_QUANTUM);
+    match read_stream(interp, &mut state.stream.sources, maximum) {
+        Ok(IoPoll::Ready(bytes)) if bytes.is_empty() => CommandPoll::Ready(0),
+        Ok(IoPoll::Ready(bytes)) => {
+            let take = if let Some(remaining) = &mut state.bytes_remaining {
+                let take = (*remaining).min(bytes.len());
+                *remaining = remaining.saturating_sub(take);
+                state.done = *remaining == 0;
+                take
+            } else {
+                let mut take = bytes.len();
+                for (index, byte) in bytes.iter().enumerate() {
+                    if *byte == b'\n' {
+                        state.lines_remaining = state.lines_remaining.saturating_sub(1);
+                        if state.lines_remaining == 0 {
+                            take = index + 1;
+                            state.done = true;
+                            break;
+                        }
+                    }
+                }
+                take
+            };
+            state.stream.pending.extend_from_slice(&bytes[..take]);
+            CommandPoll::Yielded(crate::commands::CommandResume::TextStream(
+                TextStream::Head(state),
+            ))
+        }
+        Ok(IoPoll::Blocked(wait)) => CommandPoll::Blocked(
+            wait_reason(wait),
+            crate::commands::CommandResume::TextStream(TextStream::Head(state)),
+        ),
+        Err(status) => CommandPoll::Ready(status),
+    }
+}
+
+/// Resume one bounded streaming text-command quantum.
+pub(crate) fn resume_stream(interp: &mut Interp, continuation: TextStream) -> CommandPoll {
+    match continuation {
+        TextStream::Cat(state) => poll_cat(interp, state),
+        TextStream::Head(state) => poll_head(interp, state),
+    }
 }
 
 fn cmd_cat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -103,34 +441,14 @@ fn cmd_yes(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
 }
 
 fn cmd_head(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let mut n = 10usize;
-    let mut bytes: Option<usize> = None;
-    let mut files = Vec::new();
-    let mut it = args.iter().peekable();
-    while let Some(a) = it.next() {
-        if a == "-n" {
-            n = it
-                .next()
-                .and_then(|s| s.trim_start_matches('-').parse().ok())
-                .unwrap_or(10);
-        } else if let Some(v) = a.strip_prefix("-n") {
-            n = v.trim_start_matches('-').parse().unwrap_or(10);
-        } else if a == "-c" {
-            bytes = it.next().and_then(|s| s.parse().ok());
-        } else if let Some(v) = a.strip_prefix("-c") {
-            bytes = v.parse().ok();
-        } else if a.starts_with('-') && a.len() > 1 && a[1..].chars().all(|c| c.is_ascii_digit()) {
-            n = a[1..].parse().unwrap_or(10);
-        } else if !a.starts_with('-') || a == "-" {
-            files.push(a);
-        }
-    }
+    let options = parse_head_options(args);
+    let files = options.files.iter().collect::<Vec<_>>();
     let (data, _e) = read_inputs(interp, &files, &io.stdin);
-    if let Some(b) = bytes {
+    if let Some(b) = options.bytes {
         io.out.extend_from_slice(&data[..b.min(data.len())]);
     } else {
         for (i, line) in String::from_utf8_lossy(&data).lines().enumerate() {
-            if i >= n {
+            if i >= options.lines {
                 break;
             }
             wln(io.out, line);

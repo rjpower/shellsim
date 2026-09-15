@@ -104,6 +104,7 @@ pub(crate) enum CommandResume {
         command: String,
         continuation: Box<crate::python::PythonContinuation>,
     },
+    TextStream(text::TextStream),
 }
 
 /// One scheduler-owned argv invocation requested by a modeled native command.
@@ -312,6 +313,9 @@ pub(crate) fn starts_before_input(argv: &[String]) -> bool {
     }
     argv.first().is_some_and(|requested| {
         let command = standard_utility_name(requested).unwrap_or(requested);
+        if matches!(command, "cat" | "head") {
+            return text::streams_before_input(command, &argv[1..]);
+        }
         registry()
             .get(command)
             .is_some_and(|spec| spec.resume.is_some() && spec.resume_before_input)
@@ -495,6 +499,7 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
                 },
             ),
         },
+        CommandResume::TextStream(continuation) => text::resume_stream(interp, continuation),
     };
     finish_ready_invocation(interp, &result);
     result

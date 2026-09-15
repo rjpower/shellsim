@@ -141,10 +141,11 @@ native session manipulation remain rejected.
 static VFS files. The first slice provides `/proc/self`, per-process `status`, `cmdline`, `environ`,
 and `cwd`, plus deterministic `uptime`, `meminfo`, `cpuinfo`, `version`, and `mounts`.
 
-The finite pseudo-device slice provides descriptor-backed `/dev/null` and standard-descriptor
-links through the same per-process FD table used by redirections and pipes. `/dev/zero` and random
-devices require bounded streaming interfaces and are intentionally not exposed through eager file
-reads. Signals can begin with `INT`, `TERM`, `KILL`, and `HUP` at scheduler boundaries.
+The pseudo-device slice provides descriptor-backed `/dev/null`, `/dev/zero`, `/dev/random`, and
+`/dev/urandom`, plus standard-descriptor links through the same per-process FD table used by
+redirections and pipes. Infinite devices generate bounded chunks under pipe backpressure. Random
+devices use distinct repeatable streams for deterministic tests and never read host entropy.
+Signals can begin with `INT`, `TERM`, `KILL`, and `HUP` at scheduler boundaries.
 
 These views must never proxy the host's `/proc`, devices, processes, or random source.
 

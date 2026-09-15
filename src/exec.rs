@@ -2505,6 +2505,14 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
                         .fds
                         .duplicate(source, redirect.fd, &mut interp.descriptors)
                         .map_err(|error| format!("{path}: {error:?}"))?;
+                } else if let Some(kind) = crate::pseudo_fs::device_kind("/", &path) {
+                    let description = interp
+                        .descriptors
+                        .open_device(kind, true, false)
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    interp
+                        .install_new_description(redirect.fd, description)
+                        .map_err(|error| format!("{path}: {error:?}"))?;
                 } else if path == "/dev/null" {
                     let description = interp
                         .descriptors
@@ -2561,6 +2569,16 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
                     let description = interp
                         .descriptors
                         .open_null()
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    interp
+                        .install_new_description(redirect.fd, description)
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    continue;
+                }
+                if let Some(kind) = crate::pseudo_fs::device_kind("/", &path) {
+                    let description = interp
+                        .descriptors
+                        .open_device(kind, false, true)
                         .map_err(|error| format!("{path}: {error:?}"))?;
                     interp
                         .install_new_description(redirect.fd, description)

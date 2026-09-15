@@ -144,6 +144,79 @@ fn pseudo_files_are_read_only_and_do_not_consume_vfs_disk() {
 }
 
 #[test]
+fn generated_devices_are_listed_and_stream_through_pipes_and_redirects() {
+    let mut env = Environment::new();
+    let listing = run(&mut env, "ls /dev");
+    assert_eq!(listing.0, 0, "{}", listing.2);
+    for name in ["null", "random", "urandom", "zero"] {
+        assert!(
+            listing.1.split_whitespace().any(|entry| entry == name),
+            "{}",
+            listing.1
+        );
+    }
+
+    let (outcome, stdout, stderr) =
+        env.run_script_capture("cat /dev/zero | head -c 32; head -c 8 < /dev/zero");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, vec![0; 40]);
+    assert!(stderr.is_empty());
+    assert_eq!(run(&mut env, "printf discarded > /dev/urandom").0, 0);
+}
+
+#[test]
+fn simulated_random_devices_are_deterministic_and_distinct() {
+    fn sample(path: &str) -> Vec<u8> {
+        let mut env = Environment::new();
+        let (outcome, stdout, stderr) = env.run_script_capture(&format!("head -c 64 {path}"));
+        assert_eq!(
+            outcome.exit_status,
+            0,
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        stdout
+    }
+
+    let random = sample("/dev/random");
+    let urandom = sample("/dev/urandom");
+    assert_eq!(random, sample("/dev/random"));
+    assert_eq!(urandom, sample("/dev/urandom"));
+    assert_ne!(random, urandom);
+    assert!(random.iter().any(|byte| *byte != 0));
+
+    for path in ["/dev/random", "/dev/urandom"] {
+        let mut env = Environment::new();
+        let (outcome, stdout, stderr) = env.run_script_capture(&format!("cat {path} | head"));
+        assert_eq!(
+            outcome.exit_status,
+            0,
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 10);
+    }
+}
+
+#[test]
+fn unterminated_infinite_device_stream_exhausts_cpu_fuel() {
+    let mut env = Environment::with_limits(Limits {
+        cpu: 5_000,
+        ..Limits::unlimited()
+    });
+    let (outcome, stdout, _) = env.run_script_capture("cat /dev/zero | head");
+
+    assert_eq!(outcome.exit_status, 137);
+    assert_eq!(outcome.stop_reason, Some(StopReason::CpuExhausted));
+    assert!(stdout.iter().all(|byte| *byte == 0));
+}
+
+#[test]
 fn process_fork_is_rejected_before_copying_unbounded_shell_state() {
     let mut env = Environment::with_limits(Limits {
         memory: 4 * 1024,
