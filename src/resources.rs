@@ -210,6 +210,11 @@ impl Resources {
         self.cpu_used
     }
 
+    /// Fuel still available before the next operation must stop the environment.
+    pub fn cpu_remaining(&self) -> u64 {
+        self.limits.cpu.saturating_sub(self.cpu_used)
+    }
+
     pub fn process_time_ns(&self) -> u64 {
         self.cpu_used.saturating_mul(CPU_UNIT_NANOS)
     }

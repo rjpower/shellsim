@@ -180,9 +180,9 @@ still the canonical way to turn a tool-call sequence into a checked deterministi
 
 The VFS and generated pseudo-filesystem facade are the only filesystems visible to simulated code.
 VFS mutations are quota-atomic, deletion releases capacity, and the environment supplies virtual
-wall timestamps. `/proc` and finite `/dev` nodes are generated from modeled state, consume no disk,
-and reject mutation. Commands and Python code must never fall through to `std::fs`, `std::process`,
-host environment variables, host networking, or host time.
+wall timestamps. `/proc` nodes and descriptor-backed `/dev` devices are generated from modeled
+state, consume no disk, and reject mutation. Commands and Python code must never fall through to
+`std::fs`, `std::process`, host environment variables, host networking, or host time.
 
 Time has three domains:
 

@@ -2,9 +2,10 @@
 //!
 //! These nodes are generated from `Environment` and never materialized in the VFS. They therefore
 //! cannot expose host `/proc`, consume simulated disk, or become stale snapshots. The interface is
-//! intentionally eager only for finite files; streaming devices such as `/dev/zero` remain outside
-//! the supported frontier.
+//! intentionally eager only for finite files; infinite devices are identified here but read
+//! through descriptor-backed bounded streams.
 
+use crate::descriptors::DeviceKind;
 use crate::interp::Environment;
 use crate::process::ProcessStatus;
 use crate::scheduler::TaskState;
@@ -12,6 +13,7 @@ use crate::vfs::{resolve_against, Node, NodeKind, VfsError};
 
 enum PseudoNode {
     File(Vec<u8>),
+    Device,
     Directory(Vec<String>),
     Symlink(String),
     Error(VfsError),
@@ -36,12 +38,16 @@ fn lookup(env: &Environment, cwd: &str, path: &str, follow_self: bool) -> Option
         "/dev" => {
             return Some(PseudoNode::Directory(vec![
                 "null".to_string(),
+                "random".to_string(),
                 "stderr".to_string(),
                 "stdin".to_string(),
                 "stdout".to_string(),
+                "urandom".to_string(),
+                "zero".to_string(),
             ]));
         }
         "/dev/null" => return Some(PseudoNode::File(Vec::new())),
+        "/dev/random" | "/dev/urandom" | "/dev/zero" => return Some(PseudoNode::Device),
         "/dev/stdin" => return Some(PseudoNode::Symlink("/proc/self/fd/0".to_string())),
         "/dev/stdout" => return Some(PseudoNode::Symlink("/proc/self/fd/1".to_string())),
         "/dev/stderr" => return Some(PseudoNode::Symlink("/proc/self/fd/2".to_string())),
@@ -200,6 +206,7 @@ fn lookup(env: &Environment, cwd: &str, path: &str, follow_self: bool) -> Option
 pub fn read(env: &Environment, cwd: &str, path: &str) -> Option<crate::vfs::Result<Vec<u8>>> {
     lookup(env, cwd, path, true).map(|node| match node {
         PseudoNode::File(data) => Ok(data),
+        PseudoNode::Device => Err(VfsError::Invalid(path.to_string())),
         PseudoNode::Directory(_) => Err(VfsError::IsADir(path.to_string())),
         PseudoNode::Symlink(_) => Err(VfsError::NotFound(path.to_string())),
         PseudoNode::Error(error) => Err(error),
@@ -216,6 +223,7 @@ pub fn metadata(
     lookup(env, cwd, path, follow).map(|node| {
         let (kind, mode) = match node {
             PseudoNode::File(data) => (NodeKind::File(data), 0o444),
+            PseudoNode::Device => (NodeKind::File(Vec::new()), 0o666),
             PseudoNode::Directory(_) => (NodeKind::Dir, 0o555),
             PseudoNode::Symlink(target) => (NodeKind::Symlink(target), 0o777),
             PseudoNode::Error(error) => return Err(error),
@@ -250,4 +258,14 @@ pub fn read_link(env: &Environment, cwd: &str, path: &str) -> Option<crate::vfs:
         PseudoNode::Error(error) => Err(error),
         _ => Err(VfsError::Invalid(path.to_string())),
     })
+}
+
+/// Identify a generated device path after resolving it against the simulated working directory.
+pub fn device_kind(cwd: &str, path: &str) -> Option<DeviceKind> {
+    match resolve_against(cwd, path).as_str() {
+        "/dev/zero" => Some(DeviceKind::Zero),
+        "/dev/random" => Some(DeviceKind::Random),
+        "/dev/urandom" => Some(DeviceKind::Urandom),
+        _ => None,
+    }
 }

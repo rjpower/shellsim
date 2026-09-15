@@ -1085,6 +1085,31 @@ impl Environment {
                 .map_err(descriptor_message)?;
             return Ok(IoPoll::Ready(bytes));
         }
+        let maximum = if self
+            .descriptors
+            .is_generated_device(description)
+            .map_err(descriptor_message)?
+        {
+            let maximum = maximum
+                .min(crate::descriptors::DEVICE_READ_QUANTUM)
+                .min(usize::try_from(self.resources.cpu_remaining() / 2).unwrap_or(usize::MAX));
+            if maximum == 0 {
+                let _ = self.resources.charge_cpu(1);
+                return Err(self.resources.stop_reason().map_or_else(
+                    || "device read limit exceeded".to_string(),
+                    |reason| reason.to_string(),
+                ));
+            }
+            if !self.resources.charge_cpu(maximum as u64) {
+                return Err(self.resources.stop_reason().map_or_else(
+                    || "device read limit exceeded".to_string(),
+                    |reason| reason.to_string(),
+                ));
+            }
+            maximum
+        } else {
+            maximum
+        };
         let result = self
             .descriptors
             .read(description, maximum)

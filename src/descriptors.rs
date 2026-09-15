@@ -18,6 +18,56 @@ pub const MAX_OPEN_DESCRIPTIONS: usize = 4_096;
 pub const MAX_PIPES: usize = 1_024;
 pub const DEFAULT_PIPE_CAPACITY: usize = 64 * 1024;
 pub const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum bytes produced by an infinite device in one scheduler quantum.
+pub const DEVICE_READ_QUANTUM: usize = 4 * 1024;
+
+/// Synthetic device kind. Random devices are deterministic and never consult host entropy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceKind {
+    Zero,
+    Random,
+    Urandom,
+}
+
+/// Per-open generated device state shared by duplicated descriptors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceStream {
+    kind: DeviceKind,
+    state: u64,
+}
+
+impl DeviceStream {
+    /// Start a deterministic stream for one synthetic device open.
+    pub fn new(kind: DeviceKind) -> Self {
+        let state = match kind {
+            DeviceKind::Zero => 0,
+            DeviceKind::Random => 0x243f_6a88_85a3_08d3,
+            DeviceKind::Urandom => 0x1319_8a2e_0370_7344,
+        };
+        Self { kind, state }
+    }
+
+    /// Produce exactly `maximum` bytes without accessing ambient randomness.
+    pub fn read(&mut self, maximum: usize) -> Vec<u8> {
+        if self.kind == DeviceKind::Zero {
+            return vec![0; maximum];
+        }
+        let mut bytes = Vec::with_capacity(maximum);
+        for _ in 0..maximum {
+            // xorshift64* is sufficient here: this stream models repeatable test input, not
+            // cryptographic entropy.
+            self.state ^= self.state >> 12;
+            self.state ^= self.state << 25;
+            self.state ^= self.state >> 27;
+            bytes.push((self.state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 56) as u8);
+        }
+        bytes
+    }
+
+    pub fn kind(&self) -> DeviceKind {
+        self.kind
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorError {
@@ -59,6 +109,11 @@ enum OpenDescription {
         delivered: usize,
     },
     Null,
+    Device {
+        stream: DeviceStream,
+        readable: bool,
+        writable: bool,
+    },
     File {
         path: String,
         cursor: u64,
@@ -180,6 +235,20 @@ impl DescriptorArena {
 
     pub fn open_null(&mut self) -> Result<DescriptionId, DescriptorError> {
         self.allocate(OpenDescription::Null)
+    }
+
+    /// Open a generated device. Writes are discarded and reads are produced on demand.
+    pub fn open_device(
+        &mut self,
+        kind: DeviceKind,
+        readable: bool,
+        writable: bool,
+    ) -> Result<DescriptionId, DescriptorError> {
+        self.allocate(OpenDescription::Device {
+            stream: DeviceStream::new(kind),
+            readable,
+            writable,
+        })
     }
 
     /// Open a VFS path description. The caller performs creation/truncation and all VFS I/O;
@@ -386,6 +455,16 @@ impl DescriptorArena {
                 Ok(IoPoll::Ready(result))
             }
             OpenDescription::Null => Ok(IoPoll::Ready(Vec::new())),
+            OpenDescription::Device { readable, .. } => {
+                if !readable {
+                    return Err(DescriptorError::WrongAccess);
+                }
+                let entry = self.descriptions.get_mut(&id).expect("description exists");
+                let OpenDescription::Device { stream, .. } = &mut entry.description else {
+                    unreachable!()
+                };
+                Ok(IoPoll::Ready(stream.read(maximum)))
+            }
             OpenDescription::File { .. } => Err(DescriptorError::WrongAccess),
             OpenDescription::PipeReader(pipe) => {
                 let state = self
@@ -426,6 +505,13 @@ impl DescriptorArena {
                 Ok(IoPoll::Ready(bytes.len()))
             }
             OpenDescription::Null => Ok(IoPoll::Ready(bytes.len())),
+            OpenDescription::Device { writable, .. } => {
+                if writable {
+                    Ok(IoPoll::Ready(bytes.len()))
+                } else {
+                    Err(DescriptorError::WrongAccess)
+                }
+            }
             OpenDescription::File { .. } => Err(DescriptorError::WrongAccess),
             OpenDescription::PipeWriter(pipe) => {
                 let state = self
@@ -485,6 +571,12 @@ impl DescriptorArena {
                 format!("pipe:[{id}]")
             }
             OpenDescription::Null => "/dev/null".to_string(),
+            OpenDescription::Device { stream, .. } => match stream.kind() {
+                DeviceKind::Zero => "/dev/zero",
+                DeviceKind::Random => "/dev/random",
+                DeviceKind::Urandom => "/dev/urandom",
+            }
+            .to_string(),
             OpenDescription::File { path, .. } => path.clone(),
             OpenDescription::PipeReader(pipe) | OpenDescription::PipeWriter(pipe) => {
                 format!("pipe:[{pipe}]")
@@ -518,6 +610,17 @@ impl DescriptorArena {
             }),
             _ => None,
         })
+    }
+
+    /// Whether a description produces an infinite generated byte stream when read.
+    pub(crate) fn is_generated_device(&self, id: DescriptionId) -> Result<bool, DescriptorError> {
+        Ok(matches!(
+            self.descriptions
+                .get(&id)
+                .ok_or(DescriptorError::InvalidFd)?
+                .description,
+            OpenDescription::Device { readable: true, .. }
+        ))
     }
 
     /// Advance one shared file cursor after successful VFS I/O.
@@ -657,6 +760,24 @@ mod tests {
             arena.read(fds.get(3).unwrap(), 2).unwrap(),
             IoPoll::Ready(b"cd".to_vec())
         );
+    }
+
+    #[test]
+    fn duplicated_random_device_descriptors_share_generator_state() {
+        let mut arena = DescriptorArena::new();
+        let random = arena.open_device(DeviceKind::Urandom, true, false).unwrap();
+        let mut fds = FdTable::new();
+        fds.install(3, random, &mut arena).unwrap();
+        fds.duplicate(3, 4, &mut arena).unwrap();
+        let IoPoll::Ready(first) = arena.read(fds.get(3).unwrap(), 4).unwrap() else {
+            panic!("generated device must be immediately readable");
+        };
+        let IoPoll::Ready(second) = arena.read(fds.get(4).unwrap(), 4).unwrap() else {
+            panic!("generated device must be immediately readable");
+        };
+
+        let expected = DeviceStream::new(DeviceKind::Urandom).read(8);
+        assert_eq!([first, second].concat(), expected);
     }
 
     #[test]
