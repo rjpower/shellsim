@@ -159,7 +159,7 @@ def test_embedding_does_not_seccomp_the_host_process() -> None:
     host_socket = socket.socket()
     host_socket.close()
 
-    assert completed.stdout == b"host subprocess\n"
+    assert completed.stdout.splitlines() == [b"host subprocess"]
 
 
 def test_check_returncode_raises_package_exception() -> None:
