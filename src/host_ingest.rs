@@ -5,6 +5,7 @@
 //! obeys the destination VFS quota, and rolls back the complete import on error. Simulated code
 //! has no reference to the host root or access to this adapter.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,12 +21,35 @@ pub const DEFAULT_SKIPPED_DIRECTORIES: &[&str] = &[
     "__pycache__",
 ];
 
+/// Observable result of importing one trusted host directory.
+///
+/// `skipped_directories` contains the names from [`DEFAULT_SKIPPED_DIRECTORIES`] that were
+/// encountered during this import. The fixed set keeps reporting bounded even when a host tree
+/// contains many skipped directories.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountReport {
+    pub files: usize,
+    pub skipped_directories: Vec<String>,
+}
+
 /// Import a canonicalized host directory at one absolute VFS destination.
 pub fn mount_host_tree(
     environment: &mut Environment,
     host_root: &Path,
     destination_root: &str,
 ) -> Result<usize, String> {
+    mount_host_tree_report(environment, host_root, destination_root).map(|report| report.files)
+}
+
+/// Import a canonicalized host directory and report intentional directory omissions.
+///
+/// The host directory is trusted harness input. The complete VFS mutation is rolled back when
+/// traversal, decoding, file-count enforcement, or disk accounting fails.
+pub fn mount_host_tree_report(
+    environment: &mut Environment,
+    host_root: &Path,
+    destination_root: &str,
+) -> Result<MountReport, String> {
     let host_root = host_root
         .canonicalize()
         .map_err(|error| format!("cannot resolve host root {}: {error}", host_root.display()))?;
@@ -41,7 +65,7 @@ pub fn mount_host_tree(
     let destination_root = crate::vfs::normalize(destination_root);
     let before = environment.vfs.clone();
     match mount_inner(environment, &host_root, &destination_root) {
-        Ok(files) => Ok(files),
+        Ok(report) => Ok(report),
         Err(error) => {
             environment.vfs = before;
             Err(error)
@@ -53,9 +77,10 @@ fn mount_inner(
     environment: &mut Environment,
     host_root: &Path,
     destination_root: &str,
-) -> Result<usize, String> {
+) -> Result<MountReport, String> {
     let mut pending = vec![(host_root.to_path_buf(), PathBuf::new())];
     let mut files = 0usize;
+    let mut skipped_directories = BTreeSet::new();
     while let Some((host, relative)) = pending.pop() {
         let metadata = fs::symlink_metadata(&host)
             .map_err(|error| format!("cannot inspect {}: {error}", host.display()))?;
@@ -83,6 +108,7 @@ fn mount_inner(
                 if DEFAULT_SKIPPED_DIRECTORIES.contains(&name)
                     && entry.file_type().is_ok_and(|kind| kind.is_dir())
                 {
+                    skipped_directories.insert(name.to_string());
                     continue;
                 }
                 pending.push((entry.path(), relative.join(name)));
@@ -112,7 +138,10 @@ fn mount_inner(
             return Err(format!("unsupported host file type: {}", host.display()));
         }
     }
-    Ok(files)
+    Ok(MountReport {
+        files,
+        skipped_directories: skipped_directories.into_iter().collect(),
+    })
 }
 
 fn destination_path(root: &str, relative: &Path) -> Result<String, String> {

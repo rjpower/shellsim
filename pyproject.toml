@@ -1,0 +1,44 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "shellsim"
+dynamic = ["version"]
+description = "Deterministic, resource-constrained shell and Python execution for tests"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "The shellsim authors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
+]
+keywords = ["sandbox", "shell", "simulation", "testing"]
+
+[project.urls]
+Homepage = "https://github.com/rjpower/shellsim"
+Issues = "https://github.com/rjpower/shellsim/issues"
+Repository = "https://github.com/rjpower/shellsim"
+
+[dependency-groups]
+test = ["pytest>=8"]
+
+[tool.maturin]
+manifest-path = "python/native/Cargo.toml"
+module-name = "shellsim._native"
+python-source = "python"
+features = ["pyo3/extension-module"]
+locked = true
+strip = true
+
+[tool.pytest.ini_options]
+testpaths = ["python_tests"]

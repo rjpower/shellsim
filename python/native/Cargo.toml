@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "shellsim-python-bindings"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for shellsim"
+license = "Apache-2.0"
+repository = "https://github.com/rjpower/shellsim"
+publish = false
+
+[lib]
+name = "shellsim_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["abi3-py39", "extension-module"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shellsim = { path = "../.." }
