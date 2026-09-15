@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "shellsim"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "crc32fast",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "shellsim-python-bindings"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pyo3",
  "serde",

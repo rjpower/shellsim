@@ -77,7 +77,7 @@ def test_terminal_without_arguments_opens_a_persistent_shell(monkeypatch) -> Non
 
 def test_root_is_a_disposable_snapshot_at_work(tmp_path: Path) -> None:
     host_file = tmp_path / "value.txt"
-    host_file.write_text("host\n")
+    host_file.write_bytes(b"host\n")
 
     completed = run_cli(
         "--root",
@@ -89,7 +89,7 @@ def test_root_is_a_disposable_snapshot_at_work(tmp_path: Path) -> None:
     assert completed.returncode == 0
     assert completed.stdout == b"host\nsimulated"
     assert completed.stderr == b""
-    assert host_file.read_text() == "host\n"
+    assert host_file.read_bytes() == b"host\n"
 
 
 def test_root_rejects_host_symlinks(tmp_path: Path) -> None:
