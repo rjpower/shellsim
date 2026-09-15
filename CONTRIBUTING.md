@@ -62,6 +62,16 @@ Before requesting review, run all safe tests through the same entrypoint as CI:
 make test
 ```
 
+Changes to the Python package should also build and test the installed artifact rather than import
+from the source tree:
+
+```sh
+uv build
+uv venv /tmp/shellsim-wheel-test
+uv pip install --python /tmp/shellsim-wheel-test/bin/python dist/*.whl pytest
+/tmp/shellsim-wheel-test/bin/python -m pytest python_tests
+```
+
 The safe suite is the full shellsim suite because it is local, deterministic, and does not require
 Docker, a cluster, or network access. Reference-implementation differentials skip their live
 comparison when the named reference binary is unavailable, while checked fixtures still run.

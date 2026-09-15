@@ -85,6 +85,17 @@ printf '%s\n' '{"scenario":{"version":1,"strict":true,"final_expectation":{"acti
 ./target/release/shellsim-python project/main.py -- arg1
 ./target/release/shellsim-python project/tests --pytest
 ./target/release/shellsim-python --json --root project project/main.py
+
+# Embed a persistent simulated environment from Python
+python -m pip install shellsim
+python - <<'PY'
+import shellsim
+
+environment = shellsim.Environment(cpu=100_000)
+environment.write_file("/work/main.py", "print(6 * 7)\n")
+result = environment.run("python3.14 /work/main.py")
+assert result.stdout == b"42\n"
+PY
 ```
 
 Limit values accept `k`, `m`, and `g` binary suffixes. Arguments after `--` in `eval` mode become
@@ -109,6 +120,15 @@ trusted harness input, reject symlinks, preserve permission bits, copy the proje
 then close that boundary before simulated execution starts. A Python directory automatically
 discovers `test_*.py` files; `--entry FILE` selects a script within a directory. Use `--root` to
 control which project tree is imported and the standard limit flags to constrain the run.
+
+The PyPI package exposes `shellsim.run` for one fresh action and `shellsim.Environment` for a
+persistent VFS, variables, processes, and cumulative resource budget. Results preserve stdout and
+stderr as bytes and include resource, unsupported-capability, no-op, partial-command, and invocation
+telemetry. `Environment.mount` is an explicit trusted-host operation with the same symlink rejection
+and rollback behavior as the CLI importer. The extension never installs the standalone binaries'
+process-wide seccomp filter, so importing or using it does not restrict the embedding Python
+process. Simulated programs still execute through the capability-free Rust library and cannot
+reach ambient host resources.
 
 ## Virtual time
 

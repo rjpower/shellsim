@@ -53,10 +53,18 @@ def checks(*, fix: bool) -> Sequence[Check]:
     """Build the ordered lint plan, optionally applying rustfmt before verifying it."""
 
     format_command = ("cargo", "fmt", "--all")
+    adapter_format_command = (
+        "cargo",
+        "fmt",
+        "--manifest-path",
+        "python/native/Cargo.toml",
+    )
     if not fix:
         format_command += ("--", "--check")
+        adapter_format_command += ("--", "--check")
     return (
         Check("rustfmt", format_command),
+        Check("python adapter rustfmt", adapter_format_command),
         Check(
             "clippy",
             (
@@ -74,6 +82,30 @@ def checks(*, fix: bool) -> Sequence[Check]:
             "rustdoc",
             ("cargo", "doc", "--locked", "--no-deps", "--all-features"),
             {"RUSTDOCFLAGS": "-D warnings"},
+        ),
+        Check(
+            "python adapter clippy",
+            (
+                "cargo",
+                "clippy",
+                "--locked",
+                "--manifest-path",
+                "python/native/Cargo.toml",
+                "--",
+                "-D",
+                "warnings",
+            ),
+        ),
+        Check(
+            "python syntax",
+            (
+                sys.executable,
+                "-m",
+                "py_compile",
+                "python/shellsim/__init__.py",
+                "python/shellsim/_api.py",
+                "python_tests/test_api.py",
+            ),
         ),
         Check("unstaged whitespace", ("git", "diff", "--check")),
         Check("staged whitespace", ("git", "diff", "--cached", "--check")),
