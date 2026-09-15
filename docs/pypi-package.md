@@ -33,6 +33,11 @@ tree through the existing bounded, symlink-rejecting ingestion path. It returns 
 that reports copied files and skipped directory names. Simulated commands must still receive no
 ambient host filesystem, process, network, environment, or clock access.
 
+The distribution also exposes a `shellsim` console entry point. It supports one-shot `-c` actions,
+piped shell source, and a persistent terminal session. `--root DIR` copies an explicitly trusted
+host tree into `/work` before execution; the copy is a disposable VFS snapshot and has no write-back
+path to the host.
+
 ## Repository precedent
 
 The current Marin-community repositories use several build backends, but the relevant boundary is

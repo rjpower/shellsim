@@ -29,6 +29,9 @@ Homepage = "https://github.com/rjpower/shellsim"
 Issues = "https://github.com/rjpower/shellsim/issues"
 Repository = "https://github.com/rjpower/shellsim"
 
+[project.scripts]
+shellsim = "shellsim._cli:main"
+
 [dependency-groups]
 test = ["pytest>=8"]
 
