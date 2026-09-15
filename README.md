@@ -96,6 +96,15 @@ environment.write_file("/work/main.py", "print(6 * 7)\n")
 result = environment.run("python3.14 /work/main.py")
 assert result.stdout == b"42\n"
 PY
+
+# Run the PyPI package as an ephemeral tool
+uvx shellsim -c 'printf "b\na\n" | sort'
+
+# Copy a trusted host project into /work, then modify only the disposable VFS snapshot
+uvx shellsim --root ./project -c 'pwd; find . -type f; make test'
+
+# Open a persistent interactive simulator rooted at a host-project snapshot
+uvx shellsim --root ./project
 ```
 
 Limit values accept `k`, `m`, and `g` binary suffixes. Arguments after `--` in `eval` mode become
@@ -129,6 +138,11 @@ and rollback behavior as the CLI importer. The extension never installs the stan
 process-wide seccomp filter, so importing or using it does not restrict the embedding Python
 process. Simulated programs still execute through the capability-free Rust library and cannot
 reach ambient host resources.
+
+The installed `shellsim` console command uses the same facade. With a terminal it opens a
+persistent simulated shell; with piped input it executes that input as shell source, and `-c`
+executes one action. `--root DIR` performs a bounded, symlink-rejecting snapshot copy into `/work`.
+Changes made by simulated commands are never written back to the host directory.
 
 ## Virtual time
 
