@@ -171,7 +171,19 @@ pub fn unescape(s: &str) -> String {
                 Some('t') => out.push('\t'),
                 Some('r') => out.push('\r'),
                 Some('\\') => out.push('\\'),
-                Some('0') => out.push('\0'),
+                Some(digit @ '0'..='7') => {
+                    let mut octal = String::from(digit);
+                    for _ in 1..3 {
+                        if chars.peek().is_some_and(|next| matches!(next, '0'..='7')) {
+                            octal.push(chars.next().expect("peeked octal digit"));
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(value) = u8::from_str_radix(&octal, 8) {
+                        out.push(char::from(value));
+                    }
+                }
                 Some('a') => out.push('\u{7}'),
                 Some('b') => out.push('\u{8}'),
                 Some(o) => {

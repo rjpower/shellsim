@@ -50,6 +50,13 @@ pub(crate) struct AliasDefinition {
     pub words: Vec<String>,
 }
 
+#[derive(Clone)]
+struct LocalBinding {
+    scalar: Option<String>,
+    array: Option<ArrayVal>,
+    exported: bool,
+}
+
 /// Non-default shell behavior installed for one modeled signal.
 #[derive(Clone, Debug)]
 pub(crate) enum ShellSignalDisposition {
@@ -126,6 +133,8 @@ pub struct ProcessState {
     /// Bash-style directory stack, stored oldest-to-newest beneath the current directory.
     pub directory_stack: Vec<String>,
     pub funcs: HashMap<String, crate::shell::Node>,
+    /// Saved bindings for each active shell-function scope.
+    local_scopes: Vec<HashMap<String, LocalBinding>>,
     /// Process-local simple-command aliases expanded before normal command dispatch.
     pub(crate) aliases: HashMap<String, AliasDefinition>,
     /// `$?`
@@ -136,6 +145,8 @@ pub struct ProcessState {
     pub opt_errexit: bool,
     pub opt_nounset: bool,
     pub opt_xtrace: bool,
+    /// Fatal diagnostic raised while expanding the current shell word.
+    pub(crate) expansion_error: Option<String>,
     /// `set -o pipefail`
     pub opt_pipefail: bool,
     pub jobs: Vec<Job>,
@@ -143,6 +154,8 @@ pub struct ProcessState {
     /// Recursion and loop-control signaling.
     pub loop_break: u32,
     pub loop_continue: u32,
+    /// Number of active shell loops, used to reject loop-control builtins out of context.
+    pub loop_depth: u32,
     pub returning: Option<i32>,
     pub exiting: Option<i32>,
     /// depth of "condition" contexts (if/while/&&/||/!) where `set -e` is suppressed
@@ -293,17 +306,20 @@ impl ProcessState {
             cwd: self.cwd.clone(),
             directory_stack: self.directory_stack.clone(),
             funcs: self.funcs.clone(),
+            local_scopes: self.local_scopes.clone(),
             aliases: self.aliases.clone(),
             last_status: self.last_status,
             positional: self.positional.clone(),
             opt_errexit: self.opt_errexit,
             opt_nounset: self.opt_nounset,
             opt_xtrace: self.opt_xtrace,
+            expansion_error: None,
             opt_pipefail: self.opt_pipefail,
             jobs: Vec::new(),
             next_job_id: 1,
             loop_break: 0,
             loop_continue: 0,
+            loop_depth: if new_shell { 0 } else { self.loop_depth },
             returning: None,
             exiting: None,
             cond_depth: self.cond_depth,
@@ -389,6 +405,25 @@ impl ProcessState {
                         .fold(0, |total, word| total.saturating_add(string(word))),
                 );
         }
+        for scope in &self.local_scopes {
+            for (name, binding) in scope {
+                bytes = bytes.saturating_add(string(name));
+                bytes = bytes.saturating_add(binding.scalar.as_ref().map_or(0, string));
+                if let Some(array) = &binding.array {
+                    bytes = bytes.saturating_add(match array {
+                        ArrayVal::Indexed(values) => values.iter().fold(0, |total, value| {
+                            total.saturating_add(value.as_ref().map_or(0, string))
+                        }),
+                        ArrayVal::Assoc(values) => values.iter().fold(0, |total, (key, value)| {
+                            total
+                                .saturating_add(string(key))
+                                .saturating_add(string(value))
+                        }),
+                    });
+                }
+            }
+        }
+        bytes = bytes.saturating_add(self.expansion_error.as_ref().map_or(0, string));
         for disposition in self.signal_dispositions.values() {
             bytes = bytes.saturating_add(match disposition {
                 ShellSignalDisposition::Ignore => 16,
@@ -491,17 +526,20 @@ impl Environment {
                 cwd: "/".to_string(),
                 directory_stack: Vec::new(),
                 funcs: HashMap::new(),
+                local_scopes: Vec::new(),
                 aliases: HashMap::new(),
                 last_status: 0,
                 positional: Vec::new(),
                 opt_errexit: false,
                 opt_nounset: false,
                 opt_xtrace: false,
+                expansion_error: None,
                 opt_pipefail: false,
                 jobs: Vec::new(),
                 next_job_id: 1,
                 loop_break: 0,
                 loop_continue: 0,
+                loop_depth: 0,
                 returning: None,
                 exiting: None,
                 cond_depth: 0,
@@ -1283,6 +1321,84 @@ impl Environment {
             .unwrap_or_else(|| self.vfs.read_link(cwd, path))
     }
 
+    /// Resolve a path across both persistent and generated filesystem nodes.
+    ///
+    /// Symlink expansion is bounded and never consults the host filesystem. `follow_final`
+    /// controls whether the last component is dereferenced, matching the metadata boundary.
+    pub fn fs_realpath(
+        &self,
+        cwd: &str,
+        path: &str,
+        follow_final: bool,
+    ) -> crate::vfs::Result<String> {
+        let mut pending = crate::vfs::resolve_against(cwd, path);
+        for _ in 0..40 {
+            let components = pending
+                .split('/')
+                .filter(|component| !component.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let mut resolved = "/".to_string();
+            let mut restarted = false;
+            for (index, component) in components.iter().enumerate() {
+                let candidate = if resolved == "/" {
+                    format!("/{component}")
+                } else {
+                    format!("{resolved}/{component}")
+                };
+                let node = self.fs_metadata("/", &candidate, false)?;
+                let is_final = index + 1 == components.len();
+                if matches!(node.kind, crate::vfs::NodeKind::Symlink(_))
+                    && (!is_final || follow_final)
+                {
+                    let target = self.fs_read_link("/", &candidate)?;
+                    let parent = crate::vfs::parent_of(&candidate).unwrap_or_else(|| "/".into());
+                    let mut replacement = crate::vfs::resolve_against(&parent, &target);
+                    if !is_final {
+                        replacement.push('/');
+                        replacement.push_str(&components[index + 1..].join("/"));
+                    }
+                    pending = crate::vfs::normalize(&replacement);
+                    restarted = true;
+                    break;
+                }
+                resolved = candidate;
+            }
+            if !restarted {
+                return Ok(resolved);
+            }
+        }
+        Err(crate::vfs::VfsError::Loop(pending))
+    }
+
+    /// Walk a persistent or generated tree without following symbolic links.
+    ///
+    /// The VFS and process table are bounded, so the returned set is finite. Results use stable
+    /// lexical order and include the starting path.
+    pub fn fs_walk(&self, cwd: &str, path: &str) -> crate::vfs::Result<Vec<String>> {
+        let start = crate::vfs::resolve_against(cwd, path);
+        self.fs_metadata("/", &start, false)?;
+        let mut pending = vec![start];
+        let mut paths = Vec::new();
+        while let Some(current) = pending.pop() {
+            let node = self.fs_metadata("/", &current, false)?;
+            let is_dir = matches!(node.kind, crate::vfs::NodeKind::Dir);
+            paths.push(current.clone());
+            if is_dir {
+                let mut entries = self.fs_list_dir("/", &current)?;
+                entries.sort();
+                for entry in entries.into_iter().rev() {
+                    pending.push(if current == "/" {
+                        format!("/{entry}")
+                    } else {
+                        format!("{current}/{entry}")
+                    });
+                }
+            }
+        }
+        Ok(paths)
+    }
+
     pub fn get_var(&self, name: &str) -> Option<String> {
         match name {
             "?" => Some(self.last_status.to_string()),
@@ -1317,6 +1433,56 @@ impl Environment {
         // as a fresh scalar (drop the array) — the common case in our scripts and lower-risk.
         self.arrays.remove(name);
         self.vars.insert(name.to_string(), val);
+    }
+
+    /// Enter a shell-function variable scope.
+    pub(crate) fn enter_function_scope(&mut self) {
+        self.local_scopes.push(HashMap::new());
+    }
+
+    /// Return whether `local` is valid in the current execution context.
+    pub(crate) fn in_function_scope(&self) -> bool {
+        !self.local_scopes.is_empty()
+    }
+
+    /// Save a binding once in the current function and reset it to an empty local value.
+    pub(crate) fn declare_local(&mut self, name: &str) {
+        let binding = LocalBinding {
+            scalar: self.vars.get(name).cloned(),
+            array: self.arrays.get(name).cloned(),
+            exported: self.exported.contains(name),
+        };
+        let Some(scope) = self.local_scopes.last_mut() else {
+            return;
+        };
+        if scope.contains_key(name) {
+            return;
+        }
+        scope.insert(name.to_string(), binding);
+        self.vars.remove(name);
+        self.arrays.remove(name);
+        self.exported.remove(name);
+    }
+
+    /// Restore bindings declared local by the function that just returned.
+    pub(crate) fn leave_function_scope(&mut self) {
+        let Some(scope) = self.local_scopes.pop() else {
+            return;
+        };
+        for (name, binding) in scope {
+            self.vars.remove(&name);
+            self.arrays.remove(&name);
+            self.exported.remove(&name);
+            if let Some(value) = binding.scalar {
+                self.vars.insert(name.clone(), value);
+            }
+            if let Some(value) = binding.array {
+                self.arrays.insert(name.clone(), value);
+            }
+            if binding.exported {
+                self.exported.insert(name);
+            }
+        }
     }
 
     pub fn export(&mut self, name: &str) {

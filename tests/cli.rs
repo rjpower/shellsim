@@ -294,7 +294,7 @@ fn persistent_protocol_reports_ordered_invocations_and_scheduler_waits() {
     assert_eq!(responses[0]["result"]["partial_commands"][0], "sed");
     assert_eq!(responses[1]["result"]["partial_commands"][0], "sed");
     assert_eq!(responses[0]["result"]["invocations"][0]["trust"], "partial");
-    assert_eq!(responses[0]["result"]["invocations"][0]["status"], 0);
+    assert_eq!(responses[0]["result"]["invocations"][0]["status"], 1);
     let processes = responses[3]["result"]["processes"].as_array().unwrap();
     let sleeping = processes
         .iter()

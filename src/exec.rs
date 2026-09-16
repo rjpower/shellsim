@@ -291,6 +291,7 @@ enum ShellFrame {
         body: Node,
         iterations: usize,
     },
+    FinishLoop,
     RestoreRedirect(RedirectScope),
     FinishFunction {
         positional: Vec<String>,
@@ -487,6 +488,7 @@ impl ShellContinuation {
                     positional,
                     variables,
                 } => {
+                    interp.leave_function_scope();
                     interp.positional = positional;
                     restore_command_variables(interp, variables);
                 }
@@ -494,6 +496,9 @@ impl ShellContinuation {
                     restore_command_variables(interp, variables);
                 }
                 ShellFrame::FinishSignalHandler { .. } => interp.finish_signal_handler(),
+                ShellFrame::FinishLoop => {
+                    interp.loop_depth = interp.loop_depth.saturating_sub(1);
+                }
                 ShellFrame::Conditional { .. }
                 | ShellFrame::Negate
                 | ShellFrame::IfAfter { .. }
@@ -656,6 +661,13 @@ impl ShellContinuation {
             return;
         }
         let items = expand_words(interp, &state.words);
+        if let Some(message) = interp.expansion_error.take() {
+            write_diagnostic(interp, &message);
+            restore_command_variables(interp, state.temporary_variables);
+            self.status = 1;
+            interp.exiting = Some(1);
+            return;
+        }
         restore_command_variables(interp, state.temporary_variables);
         self.status = 0;
         self.frames.push(ShellFrame::ForNext {
@@ -740,6 +752,13 @@ impl ShellContinuation {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        if let Some(message) = interp.expansion_error.take() {
+            write_diagnostic(interp, &message);
+            restore_command_variables(interp, state.temporary_variables);
+            self.status = 1;
+            interp.exiting = Some(1);
+            return;
+        }
         restore_command_variables(interp, state.temporary_variables);
         self.status = 0;
         'arms: for ((_, body), patterns) in arms.into_iter().zip(expanded_patterns) {
@@ -1180,11 +1199,15 @@ impl ShellContinuation {
                     );
                 }
             }
+            ShellFrame::FinishLoop => {
+                interp.loop_depth = interp.loop_depth.saturating_sub(1);
+            }
             ShellFrame::RestoreRedirect(scope) => end_redirects(interp, scope),
             ShellFrame::FinishFunction {
                 positional,
                 variables,
             } => {
+                interp.leave_function_scope();
                 interp.positional = positional;
                 self.status = interp.returning.take().unwrap_or(self.status);
                 restore_command_variables(interp, variables);
@@ -1266,7 +1289,7 @@ impl ShellContinuation {
                 mut stdin,
                 mut reserved,
             } => {
-                if argv[0] != "read" {
+                if crate::commands::buffers_standard_input(interp, &argv) {
                     match interp.read_fd(0, crate::descriptors::DEFAULT_PIPE_CAPACITY) {
                         Ok(IoPoll::Ready(bytes)) if !bytes.is_empty() => {
                             let bytes_len = bytes.len() as u64;
@@ -1577,27 +1600,31 @@ impl ShellContinuation {
             }
             Node::While { cond, body, until } => {
                 self.status = 0;
-                self.push(
-                    interp,
-                    ShellFrame::WhileCheck {
-                        cond: *cond,
-                        body: *body,
-                        until,
-                        iterations: 0,
-                        body_status: 0,
-                    },
-                );
+                if !self.ensure_capacity(interp, 2) {
+                    return;
+                }
+                interp.loop_depth = interp.loop_depth.saturating_add(1);
+                self.frames.push(ShellFrame::FinishLoop);
+                self.frames.push(ShellFrame::WhileCheck {
+                    cond: *cond,
+                    body: *body,
+                    until,
+                    iterations: 0,
+                    body_status: 0,
+                });
             }
             Node::For { var, words, body } => {
-                self.push(
-                    interp,
-                    ShellFrame::PrepareFor(PreparedFor {
-                        var,
-                        words,
-                        body: *body,
-                        temporary_variables: Vec::new(),
-                    }),
-                );
+                if !self.ensure_capacity(interp, 2) {
+                    return;
+                }
+                interp.loop_depth = interp.loop_depth.saturating_add(1);
+                self.frames.push(ShellFrame::FinishLoop);
+                self.frames.push(ShellFrame::PrepareFor(PreparedFor {
+                    var,
+                    words,
+                    body: *body,
+                    temporary_variables: Vec::new(),
+                }));
             }
             Node::CFor {
                 init,
@@ -1605,17 +1632,20 @@ impl ShellContinuation {
                 update,
                 body,
             } => {
-                self.push(
-                    interp,
-                    ShellFrame::PrepareArithmetic(PreparedArithmetic {
+                if !self.ensure_capacity(interp, 2) {
+                    return;
+                }
+                interp.loop_depth = interp.loop_depth.saturating_add(1);
+                self.frames.push(ShellFrame::FinishLoop);
+                self.frames
+                    .push(ShellFrame::PrepareArithmetic(PreparedArithmetic {
                         expression: init,
                         continuation: ArithmeticContinuation::CForInit {
                             cond,
                             update,
                             body: *body,
                         },
-                    }),
-                );
+                    }));
             }
             Node::Case { word, arms } => {
                 self.push(
@@ -1652,6 +1682,13 @@ impl ShellContinuation {
         substitution_status: Option<i32>,
     ) {
         let argv = expand_argv(interp, &words);
+        if let Some(message) = interp.expansion_error.take() {
+            write_diagnostic(interp, &message);
+            restore_command_variables(interp, temporary_variables);
+            self.status = 1;
+            interp.exiting = Some(1);
+            return;
+        }
         let argv = match expand_alias_argv(interp, argv) {
             Ok(argv) => argv,
             Err(message) => {
@@ -1670,6 +1707,14 @@ impl ShellContinuation {
             return;
         }
         let variables = install_command_variables(interp, &assigns);
+        if let Some(message) = interp.expansion_error.take() {
+            write_diagnostic(interp, &message);
+            restore_command_variables(interp, variables);
+            restore_command_variables(interp, temporary_variables);
+            self.status = 1;
+            interp.exiting = Some(1);
+            return;
+        }
         restore_command_variables(interp, temporary_variables);
         interp.cmd_trace.record(&argv[0]);
         if let Some(body) = interp.funcs.get(&argv[0]).cloned() {
@@ -1679,6 +1724,7 @@ impl ShellContinuation {
                 restore_command_variables(interp, variables);
                 return;
             }
+            interp.enter_function_scope();
             self.frames.push(ShellFrame::FinishFunction {
                 positional,
                 variables,
@@ -2547,6 +2593,10 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
                     }
                     _ => unreachable!(),
                 };
+                if let Some(message) = interp.expansion_error.take() {
+                    interp.exiting = Some(1);
+                    return Err(message.trim().to_string());
+                }
                 let description = interp
                     .descriptors
                     .open_input(std::mem::take(&mut bytes))
@@ -2638,6 +2688,10 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
 
 fn redirect_path(interp: &mut Interp, word: &str) -> Result<String, String> {
     let fields = expand_word(interp, word, true);
+    if let Some(message) = interp.expansion_error.take() {
+        interp.exiting = Some(1);
+        return Err(message.trim().to_string());
+    }
     if fields.len() != 1 {
         return Err(format!("{word}: ambiguous redirect"));
     }

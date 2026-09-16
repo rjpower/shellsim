@@ -21,7 +21,7 @@ fn format_args(format: &str, args: &[String]) -> String {
     let mut argument = 0;
     let chars: Vec<char> = format.chars().collect();
     let mut i = 0;
-    loop {
+    'formats: loop {
         let argument_at_start = argument;
         while i < chars.len() {
             if chars[i] != '%' {
@@ -53,7 +53,11 @@ fn format_args(format: &str, args: &[String]) -> String {
             i += 1;
             let arg = args.get(argument).cloned().unwrap_or_default();
             argument += 1;
-            out.push_str(&apply_conversion(&spec, conv, &arg));
+            let (rendered, stop) = apply_conversion(&spec, conv, &arg);
+            out.push_str(&rendered);
+            if stop {
+                break 'formats;
+            }
         }
         if argument >= args.len() || argument == argument_at_start {
             break;
@@ -63,9 +67,10 @@ fn format_args(format: &str, args: &[String]) -> String {
     out
 }
 
-fn apply_conversion(spec: &str, conversion: char, arg: &str) -> String {
-    let width = spec
-        .trim_start_matches('%')
+fn apply_conversion(spec: &str, conversion: char, arg: &str) -> (String, bool) {
+    let options = spec.trim_start_matches('%');
+    let width = options
+        .trim_start_matches(['-', '+', ' ', '0', '#'])
         .chars()
         .take_while(|c| c.is_ascii_digit())
         .collect::<String>()
@@ -73,8 +78,23 @@ fn apply_conversion(spec: &str, conversion: char, arg: &str) -> String {
         .ok();
     let left = spec.contains('-');
     let zero = spec.starts_with("%0") || spec.starts_with("%-0");
+    let positive_sign = if spec.contains('+') {
+        "+"
+    } else if spec.contains(' ') {
+        " "
+    } else {
+        ""
+    };
+    let mut stop = false;
     let body = match conversion {
-        'd' | 'i' => arg.trim().parse::<i64>().unwrap_or(0).to_string(),
+        'd' | 'i' => {
+            let value = arg.trim().parse::<i64>().unwrap_or(0);
+            if value >= 0 {
+                format!("{positive_sign}{value}")
+            } else {
+                value.to_string()
+            }
+        }
         'x' => format!("{:x}", arg.trim().parse::<i64>().unwrap_or(0)),
         'X' => format!("{:X}", arg.trim().parse::<i64>().unwrap_or(0)),
         'o' => format!("{:o}", arg.trim().parse::<i64>().unwrap_or(0)),
@@ -90,20 +110,36 @@ fn apply_conversion(spec: &str, conversion: char, arg: &str) -> String {
             .next()
             .map(|c| c.to_string())
             .unwrap_or_default(),
-        'b' => unescape(arg),
+        'b' => {
+            let (value, encountered_stop) = unescape_argument(arg);
+            stop = encountered_stop;
+            value
+        }
         _ => arg.to_string(),
     };
-    match width.filter(|width| body.len() < *width) {
+    let rendered = match width.filter(|width| body.len() < *width) {
         Some(width) => {
             let pad = if zero && !left { "0" } else { " " }.repeat(width - body.len());
             if left {
                 format!("{body}{pad}")
+            } else if zero
+                && (body.starts_with('-') || body.starts_with('+') || body.starts_with(' '))
+            {
+                format!("{}{pad}{}", &body[..1], &body[1..])
             } else {
                 format!("{pad}{body}")
             }
         }
         None => body,
-    }
+    };
+    (rendered, stop)
+}
+
+fn unescape_argument(argument: &str) -> (String, bool) {
+    let Some(index) = argument.find("\\c") else {
+        return (unescape(argument), false);
+    };
+    (unescape(&argument[..index]), true)
 }
 
 fn precision(spec: &str) -> Option<usize> {
