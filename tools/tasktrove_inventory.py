@@ -17,16 +17,17 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
-from collections import Counter
-from dataclasses import asdict, dataclass
 import hashlib
 import io
 import json
-from pathlib import PurePosixPath
 import re
 import sys
 import tarfile
-from typing import Any, Iterable
+from collections import Counter
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass
+from pathlib import PurePosixPath
+from typing import Any
 
 MAX_MEMBER_BYTES = 4 * 1024 * 1024
 MAX_TASK_BYTES = 64 * 1024 * 1024
@@ -267,9 +268,10 @@ HEREDOC_RE = re.compile(r"<<-?\s*(?P<quote>['\"]?)(?P<marker>[A-Za-z_][A-Za-z0-9
 
 def text_files(files: dict[str, bytes]) -> Iterable[tuple[str, str]]:
     for path, data in files.items():
-        if path.endswith((".py", ".sh", ".txt", ".toml", ".cfg", ".ini")) or PurePosixPath(
-            path
-        ).name in {"Dockerfile", "requirements.txt"}:
+        if path.endswith((".py", ".sh", ".txt", ".toml", ".cfg", ".ini")) or PurePosixPath(path).name in {
+            "Dockerfile",
+            "requirements.txt",
+        }:
             yield path, data.decode("utf-8", errors="replace")
 
 
@@ -362,10 +364,7 @@ def inventory_files(task: str, files: dict[str, bytes], errors: list[str]) -> Ta
             for source in python_heredocs(path, data)
         ],
     ]
-    python_files = [
-        inspect_python(path, data)
-        for path, data in python_sources
-    ]
+    python_files = [inspect_python(path, data) for path, data in python_sources]
 
     imports = sorted({name for file in python_files for name in file.imports})
     accesses = sorted({name for file in python_files for name in file.module_accesses})
@@ -454,9 +453,7 @@ def main() -> int:
         try:
             import pyarrow.parquet as parquet
         except ImportError as error:
-            raise SystemExit(
-                "reading Parquet requires pyarrow; run with `uv run --with pyarrow ...`"
-            ) from error
+            raise SystemExit("reading Parquet requires pyarrow; run with `uv run --with pyarrow ...`") from error
         table = parquet.read_table(source)
         rows = table.to_pylist()
         if args.limit is not None:

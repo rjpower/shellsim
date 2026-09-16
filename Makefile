@@ -1,4 +1,4 @@
-.PHONY: check format lint setup_pre_commit test
+.PHONY: check format lint review setup_pre_commit test
 
 PYTHON ?= python3
 
@@ -7,6 +7,9 @@ format:
 
 lint:
 	$(PYTHON) infra/pre-commit.py --all-files
+
+review:
+	$(PYTHON) infra/pre-commit.py --review
 
 test:
 	$(PYTHON) infra/ci/run_tests.py

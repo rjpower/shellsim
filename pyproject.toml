@@ -45,3 +45,25 @@ strip = true
 
 [tool.pytest.ini_options]
 testpaths = ["python_tests"]
+
+[tool.marin-style]
+checks = ["ruff-check", "ruff-format"]
+include = [
+    "infra/*.py",
+    "infra/**/*.py",
+    "python/**/*.py",
+    "python_tests/*.py",
+    "python_tests/**/*.py",
+    "tools/*.py",
+    "tools/**/*.py",
+]
+main_branch = "main"
+ruff_version = "0.14.3"
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "C4"]
+ignore = ["E501"]

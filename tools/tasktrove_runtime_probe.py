@@ -10,13 +10,13 @@ harness to enumerate inputs and invoke the capability-free shellsim runtime.
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
 import json
-from pathlib import Path
 import re
 import subprocess
 import tempfile
-from typing import Iterable
+from collections import Counter, defaultdict
+from collections.abc import Iterable
+from pathlib import Path
 
 from tasktrove_inventory import inspect_python, python_heredocs
 
@@ -66,8 +66,7 @@ def classify(diagnostic: str, unsupported: list[str], source: bytes | None = Non
     line = source_error_line(text, source) if source is not None else ""
     decoded = source.decode("utf-8", errors="replace") if source is not None else ""
     if ('"""' in line or "'''" in line) and (
-        "unterminated string literal" in text
-        or "expected a newline or ';' after statement" in text
+        "unterminated string literal" in text or "expected a newline or ';' after statement" in text
     ):
         return "syntax:triple-quoted-strings"
     if "unexpected character '\\\\'" in text:
@@ -77,8 +76,7 @@ def classify(diagnostic: str, unsupported: list[str], source: bytes | None = Non
     if "expected a module name after 'from'" in text:
         return "syntax:relative-import"
     if line.lstrip().startswith("async def ") or (
-        "decorators may only be applied" in text
-        and re.search(r"^\s*async\s+def\b", decoded, re.MULTILINE)
+        "decorators may only be applied" in text and re.search(r"^\s*async\s+def\b", decoded, re.MULTILINE)
     ):
         return "syntax:async-functions"
     if any(character in line for character in (" & ", " | ", " ^ ")) or any(
@@ -104,8 +102,7 @@ def invoke(runner: Path, arguments: list[str], timeout: float) -> tuple[bool, st
     try:
         result = subprocess.run(
             [str(runner), "--json", *arguments],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
