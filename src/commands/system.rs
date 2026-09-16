@@ -205,30 +205,67 @@ fn cmd_envsubst(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) 
 }
 
 fn cmd_uname(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let all = args.iter().any(|arg| arg == "-a" || arg == "--all");
-    if all {
-        wln(
-            io.out,
-            "Linux sandbox 6.6.0-shellsim #1 SMP x86_64 GNU/Linux",
-        );
-    } else if args.iter().any(|arg| arg.contains('m')) {
-        wln(io.out, "x86_64");
-    } else if args.iter().any(|arg| arg.contains('n')) {
-        wln(io.out, "sandbox");
-    } else if args.iter().any(|arg| arg.contains('r')) {
-        wln(io.out, "6.6.0-shellsim");
-    } else {
-        wln(io.out, "Linux");
+    let mut flags = Vec::new();
+    for argument in args {
+        if argument == "--all" {
+            flags.extend(['s', 'n', 'r', 'v', 'm', 'o']);
+            continue;
+        }
+        let Some(value) = argument.strip_prefix('-') else {
+            ewln(io.err, "uname: extra operand");
+            return 1;
+        };
+        if value.is_empty()
+            || value
+                .chars()
+                .any(|flag| !matches!(flag, 'a' | 's' | 'n' | 'r' | 'v' | 'm' | 'o'))
+        {
+            ewln(io.err, &format!("uname: unimplemented option '{argument}'"));
+            return 2;
+        }
+        for flag in value.chars() {
+            if flag == 'a' {
+                flags.extend(['s', 'n', 'r', 'v', 'm', 'o']);
+            } else {
+                flags.push(flag);
+            }
+        }
     }
+    if flags.is_empty() {
+        flags.push('s');
+    }
+    let mut values = Vec::new();
+    for flag in ['s', 'n', 'r', 'v', 'm', 'o'] {
+        if flags.contains(&flag) {
+            values.push(match flag {
+                's' => "Linux",
+                'n' => "sandbox",
+                'r' => "6.6.0-shellsim",
+                'v' => "#1 SMP",
+                'm' => "x86_64",
+                'o' => "GNU/Linux",
+                _ => unreachable!(),
+            });
+        }
+    }
+    wln(io.out, &values.join(" "));
     0
 }
 
-fn cmd_arch(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
+fn cmd_arch(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if !args.is_empty() {
+        ewln(io.err, "arch: unimplemented option or operand");
+        return 2;
+    }
     wln(io.out, "x86_64");
     0
 }
 
 fn cmd_hostname(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.iter().any(|arg| arg.starts_with('-') && arg != "-f") {
+        ewln(io.err, "hostname: unimplemented option");
+        return 2;
+    }
     if let Some(name) = args.iter().find(|arg| !arg.starts_with('-')) {
         interp.set_var("HOSTNAME", name);
         interp.export("HOSTNAME");
@@ -243,20 +280,52 @@ fn cmd_hostname(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
     0
 }
 
-fn cmd_whoami(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
+fn cmd_whoami(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if !args.is_empty() {
+        ewln(io.err, "whoami: unimplemented option or operand");
+        return 2;
+    }
     wln(io.out, if interp.uid == 0 { "root" } else { "user" });
     0
 }
 
 fn cmd_id(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut user = false;
+    let mut group = false;
+    let mut name_output = false;
+    for argument in args {
+        let Some(options) = argument.strip_prefix('-').filter(|value| !value.is_empty()) else {
+            ewln(io.err, "id: unimplemented user operand");
+            return 2;
+        };
+        for option in options.chars() {
+            match option {
+                'u' => user = true,
+                'g' => group = true,
+                'n' => name_output = true,
+                _ => {
+                    ewln(io.err, &format!("id: unimplemented option '-{option}'"));
+                    return 2;
+                }
+            }
+        }
+    }
+    if user && group {
+        ewln(io.err, "id: cannot print only user and only group");
+        return 1;
+    }
+    if name_output && !user && !group {
+        ewln(io.err, "id: option '-n' requires '-u' or '-g'");
+        return 1;
+    }
     let name = if interp.uid == 0 { "root" } else { "user" };
-    if args.iter().any(|arg| arg == "-u" || arg == "-g") {
-        wln(io.out, &interp.uid.to_string());
-    } else if args
-        .iter()
-        .any(|arg| arg == "-un" || arg == "-nu" || arg == "-gn" || arg == "-ng")
-    {
-        wln(io.out, name);
+    if user || group {
+        let value = if name_output {
+            name.to_string()
+        } else {
+            interp.uid.to_string()
+        };
+        wln(io.out, &value);
     } else {
         wln(
             io.out,
@@ -269,12 +338,20 @@ fn cmd_id(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     0
 }
 
-fn cmd_groups(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
+fn cmd_groups(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if !args.is_empty() {
+        ewln(io.err, "groups: unimplemented user operand");
+        return 2;
+    }
     wln(io.out, if interp.uid == 0 { "root" } else { "user" });
     0
 }
 
-fn cmd_nproc(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
+fn cmd_nproc(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if !args.is_empty() {
+        ewln(io.err, "nproc: unimplemented option");
+        return 2;
+    }
     wln(io.out, "1");
     0
 }
@@ -297,7 +374,20 @@ fn cmd_getconf(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
 }
 
 fn cmd_df(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args
+        .iter()
+        .any(|arg| arg.starts_with('-') && arg != "-h" && arg != "-k" && arg != "-P")
+    {
+        ewln(io.err, "df: unimplemented option");
+        return 2;
+    }
     let human = args.iter().any(|arg| arg.contains('h'));
+    for path in args.iter().filter(|argument| !argument.starts_with('-')) {
+        if interp.fs_metadata(&interp.cwd, path, true).is_err() {
+            ewln(io.err, &format!("df: {path}: No such file or directory"));
+            return 1;
+        }
+    }
     let limit = interp.resources.limits().disk;
     let used = interp.vfs.disk_used();
     let available = limit.saturating_sub(used);
@@ -328,6 +418,10 @@ fn cmd_df(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
 }
 
 fn cmd_free(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.iter().any(|arg| arg != "-b") {
+        ewln(io.err, "free: unimplemented option or operand");
+        return 2;
+    }
     let bytes = args.iter().any(|arg| arg == "-b");
     let divisor = if bytes { 1 } else { 1024 };
     let limit = interp.resources.limits().memory;

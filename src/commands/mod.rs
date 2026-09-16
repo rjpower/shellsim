@@ -166,6 +166,11 @@ fn registry() -> &'static HashMap<&'static str, CommandSpec> {
     REGISTRY.get_or_init(build_registry)
 }
 
+/// Return whether a name is implemented by the native command registry.
+pub(crate) fn is_registered(name: &str) -> bool {
+    registry().contains_key(name)
+}
+
 /// Register `f` under every name in `names` with trust `t`.
 fn reg(map: &mut HashMap<&'static str, CommandSpec>, names: &[&'static str], t: Trust, f: CmdFn) {
     reg_costed(map, names, t, 100, 10 * 1024, f);
@@ -320,6 +325,73 @@ pub(crate) fn starts_before_input(argv: &[String]) -> bool {
             .get(command)
             .is_some_and(|spec| spec.resume.is_some() && spec.resume_before_input)
     })
+}
+
+/// Whether the executor must materialize standard input for a buffered command.
+///
+/// Most shell builtins and filesystem/system utilities do not read fd 0. Keeping that distinction
+/// explicit prevents an unrelated command in a redirected loop body from draining the loop's
+/// input. Streaming commands (`cat` and `head`) bypass this path through `starts_before_input`.
+pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
+    let Some(requested) = argv.first() else {
+        return false;
+    };
+    let command = standard_utility_name(requested).unwrap_or(requested);
+    matches!(
+        command,
+        "apply_patch"
+            | "awk"
+            | "base32"
+            | "base64"
+            | "bc"
+            | "cat"
+            | "cksum"
+            | "column"
+            | "cut"
+            | "envsubst"
+            | "expand"
+            | "fgrep"
+            | "fmt"
+            | "fold"
+            | "grep"
+            | "gzip"
+            | "gunzip"
+            | "hexdump"
+            | "head"
+            | "jq"
+            | "mapfile"
+            | "md5sum"
+            | "nl"
+            | "od"
+            | "paste"
+            | "patch"
+            | "pr"
+            | "readarray"
+            | "rev"
+            | "rg"
+            | "sed"
+            | "sha1sum"
+            | "sha256sum"
+            | "sha512sum"
+            | "sort"
+            | "strings"
+            | "tac"
+            | "tail"
+            | "tee"
+            | "tr"
+            | "unexpand"
+            | "uniq"
+            | "wc"
+            | "xargs"
+            | "xxd"
+            | "zcat"
+    ) || registry()
+        .get(command)
+        .is_some_and(|spec| spec.resume.is_some() && !spec.resume_before_input)
+        || matches!(
+            util::resolve_executable(interp, requested),
+            util::ExecutableLookup::Found(_)
+        )
 }
 
 /// Continue command-owned state after the scheduler wakes its process.

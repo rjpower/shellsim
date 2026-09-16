@@ -148,6 +148,20 @@ pub fn expand_words(interp: &mut Interp, words: &[String]) -> Vec<String> {
     out
 }
 
+fn scalar_value(interp: &mut Interp, name: &str) -> String {
+    match interp.get_var(name) {
+        Some(value) => value,
+        None => {
+            if interp.opt_nounset && !matches!(name, "@" | "*") {
+                interp
+                    .expansion_error
+                    .get_or_insert_with(|| format!("shellsim: {name}: unbound variable\n"));
+            }
+            String::new()
+        }
+    }
+}
+
 /// Bash-style pre-expansion for the common `{a,b}` and `{1..5[..step]}` forms. Braces inside
 /// quotes and parameter expansions are left alone. The recursion and result count are bounded so
 /// an adversarial expansion cannot consume unmetered host memory.
@@ -570,7 +584,20 @@ fn try_array_words(
     chars: &[char],
     quoted: bool,
 ) -> Option<(Vec<String>, usize)> {
-    if chars.first() != Some(&'$') || chars.get(1) != Some(&'{') {
+    if chars.first() != Some(&'$') {
+        return None;
+    }
+    if matches!(chars.get(1), Some('@' | '*')) {
+        let parameter = chars[1];
+        let items = interp.positional.clone();
+        if quoted && parameter == '*' {
+            let ifs = interp.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+            let separator = ifs.chars().next().unwrap_or(' ').to_string();
+            return Some((vec![items.join(&separator)], 2));
+        }
+        return Some((items, 2));
+    }
+    if chars.get(1) != Some(&'{') {
         return None;
     }
     let (inner, consumed) = read_balanced(&chars[1..], '{', '}');
@@ -702,7 +729,7 @@ fn expand_dollar(interp: &mut Interp, chars: &[char], _in_quotes: bool) -> (Stri
             (val, 1 + consumed, false)
         }
         c if matches!(c, '?' | '$' | '#' | '@' | '*' | '!') => {
-            let val = interp.get_var(&c.to_string()).unwrap_or_default();
+            let val = scalar_value(interp, &c.to_string());
             (val, 2, false)
         }
         c if c.is_ascii_alphabetic() || c == '_' => {
@@ -712,7 +739,7 @@ fn expand_dollar(interp: &mut Interp, chars: &[char], _in_quotes: bool) -> (Stri
                 name.push(chars[i]);
                 i += 1;
             }
-            let val = interp.get_var(&name).unwrap_or_default();
+            let val = scalar_value(interp, &name);
             (val, i, false)
         }
         c if c.is_ascii_digit() => {
@@ -722,7 +749,7 @@ fn expand_dollar(interp: &mut Interp, chars: &[char], _in_quotes: bool) -> (Stri
                 name.push(chars[i]);
                 i += 1;
             }
-            let val = interp.get_var(&name).unwrap_or_default();
+            let val = scalar_value(interp, &name);
             (val, i, false)
         }
         _ => ("$".to_string(), 1, false),
@@ -773,7 +800,7 @@ fn expand_param(interp: &mut Interp, inner: &str) -> String {
     let rest = &inner[name_end..];
     let cur = interp.get_var(name);
     if rest.is_empty() {
-        return cur.unwrap_or_default();
+        return cur.unwrap_or_else(|| scalar_value(interp, name));
     }
     apply_op_from_rest(interp, name, rest, cur)
 }
@@ -782,7 +809,8 @@ fn expand_param(interp: &mut Interp, inner: &str) -> String {
 fn apply_op_from_rest(interp: &mut Interp, name: &str, rest: &str, cur: Option<String>) -> String {
     // substring slice `${var:offset:len}` (offset not one of the named ops)
     let ops = [
-        ":-", ":=", ":+", ":?", "-", "+", "##", "#", "%%", "%", "//", "/", "^^", "^", ",,", ",",
+        ":-", ":=", ":+", ":?", "-", "+", "?", "##", "#", "%%", "%", "//", "/", "^^", "^", ",,",
+        ",",
     ];
     for op in ops {
         if let Some(arg) = rest.strip_prefix(op) {
@@ -882,7 +910,36 @@ fn apply_param_op(
                 String::new()
             }
         }
-        ":?" => cur.unwrap_or_default(),
+        ":?" => {
+            if is_set {
+                cur.unwrap()
+            } else {
+                let message = if arg.is_empty() {
+                    format!("{name}: parameter null or not set")
+                } else {
+                    arg.to_string()
+                };
+                interp
+                    .expansion_error
+                    .get_or_insert_with(|| format!("shellsim: {message}\n"));
+                String::new()
+            }
+        }
+        "?" => {
+            if exists {
+                cur.unwrap()
+            } else {
+                let message = if arg.is_empty() {
+                    format!("{name}: parameter not set")
+                } else {
+                    arg.to_string()
+                };
+                interp
+                    .expansion_error
+                    .get_or_insert_with(|| format!("shellsim: {message}\n"));
+                String::new()
+            }
+        }
         "#" => strip_prefix_glob(&cur.unwrap_or_default(), arg, false),
         "##" => strip_prefix_glob(&cur.unwrap_or_default(), arg, true),
         "%" => strip_suffix_glob(&cur.unwrap_or_default(), arg, false),

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::commands::util::{ewln, split_flags, wln, KNOWN_COMMANDS};
+use crate::commands::util::{ewln, split_flags, wln};
 use crate::commands::{CommandContext, CommandPoll, CommandResume, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
@@ -15,12 +15,9 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["export"], Trust::Real, cmd_export);
     reg(m, &["unset"], Trust::Real, cmd_unset);
     reg(m, &["set"], Trust::Real, cmd_set);
-    reg(
-        m,
-        &["declare", "typeset", "local", "readonly"],
-        Trust::Real,
-        cmd_declare,
-    );
+    reg(m, &["declare", "typeset"], Trust::Real, cmd_declare);
+    reg(m, &["local"], Trust::Real, cmd_local);
+    reg(m, &["readonly"], Trust::Real, cmd_readonly);
     reg_resumable(m, &["source", "."], Trust::Real, cmd_source, start_source);
     reg_resumable(m, &["eval"], Trust::Real, cmd_eval, start_eval);
     reg(m, &["exit"], Trust::Real, cmd_exit);
@@ -30,7 +27,8 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["shift"], Trust::Real, cmd_shift);
     reg(m, &["true", ":"], Trust::Real, cmd_true);
     reg(m, &["false"], Trust::Real, cmd_false);
-    reg(m, &["test", "["], Trust::Real, cmd_test);
+    reg(m, &["test"], Trust::Real, cmd_test);
+    reg(m, &["["], Trust::Real, cmd_bracket);
     reg(m, &["[["], Trust::Real, cmd_dbracket);
     reg(m, &["read"], Trust::Real, cmd_read);
     reg_resumable(m, &["wait"], Trust::Real, cmd_wait, start_wait);
@@ -48,7 +46,8 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     );
     reg(m, &["kill"], Trust::Real, cmd_kill);
     reg(m, &["killall", "pkill"], Trust::NoOp, cmd_unsupported);
-    reg(m, &["type", "which"], Trust::Real, cmd_which);
+    reg(m, &["which"], Trust::Real, cmd_which);
+    reg(m, &["type"], Trust::Real, cmd_type);
     reg_resumable(m, &["command"], Trust::Real, cmd_command, start_command);
     reg(m, &["alias"], Trust::Partial, cmd_alias);
     reg(m, &["unalias"], Trust::Real, cmd_unalias);
@@ -61,7 +60,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
 }
 
 fn cmd_unsupported(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
-    ewln(io.err, "shellsim: builtin is not supported");
+    ewln(io.err, "unimplemented");
     2
 }
 
@@ -692,12 +691,18 @@ fn cmd_cd(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
 
 fn change_directory(interp: &mut CommandContext<'_>, target: &str) -> Result<(), ()> {
     let absolute = crate::vfs::resolve_against(&interp.cwd, target);
-    if !interp.vfs.is_dir("/", &absolute) {
+    if !matches!(
+        interp.fs_metadata("/", &absolute, true),
+        Ok(crate::vfs::Node {
+            kind: crate::vfs::NodeKind::Dir,
+            ..
+        })
+    ) {
         return Err(());
     }
     let old = interp.cwd.clone();
     interp.set_var("OLDPWD", old);
-    interp.cwd = interp.vfs.realpath(&absolute, true).unwrap_or(absolute);
+    interp.cwd = interp.fs_realpath("/", &absolute, true).unwrap_or(absolute);
     let cwd = interp.cwd.clone();
     interp.set_var("PWD", cwd);
     Ok(())
@@ -827,7 +832,7 @@ fn cmd_unset(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> 
     0
 }
 
-fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -836,23 +841,34 @@ fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i3
             "+e" => interp.opt_errexit = false,
             "-u" => interp.opt_nounset = true,
             "+u" => interp.opt_nounset = false,
-            "-x" => interp.opt_xtrace = true,
-            "+x" => interp.opt_xtrace = false,
+            "-x" | "+x" => {
+                ewln(io.err, "set: xtrace is unimplemented");
+                return 2;
+            }
             "-o" => {
                 if let Some(opt) = args.get(i + 1) {
                     match opt.as_str() {
                         "pipefail" => interp.opt_pipefail = true,
                         "errexit" => interp.opt_errexit = true,
                         "nounset" => interp.opt_nounset = true,
-                        _ => {}
+                        _ => {
+                            ewln(io.err, &format!("set: unimplemented option '{opt}'"));
+                            return 2;
+                        }
                     }
                     i += 1;
                 }
             }
             "+o" => {
                 if let Some(opt) = args.get(i + 1) {
-                    if opt == "pipefail" {
-                        interp.opt_pipefail = false;
+                    match opt.as_str() {
+                        "pipefail" => interp.opt_pipefail = false,
+                        "errexit" => interp.opt_errexit = false,
+                        "nounset" => interp.opt_nounset = false,
+                        _ => {
+                            ewln(io.err, &format!("set: unimplemented option '{opt}'"));
+                            return 2;
+                        }
                     }
                     i += 1;
                 }
@@ -866,13 +882,22 @@ fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i3
                     match option {
                         'e' => interp.opt_errexit = true,
                         'u' => interp.opt_nounset = true,
-                        'x' => interp.opt_xtrace = true,
+                        'x' => {
+                            ewln(io.err, "set: xtrace is unimplemented");
+                            return 2;
+                        }
                         'o' if args.get(i + 1).map(String::as_str) == Some("pipefail") => {
                             interp.opt_pipefail = true;
                             i += 1;
                         }
-                        'o' => {}
-                        _ => {}
+                        'o' => {
+                            ewln(io.err, "set: option name required after -o");
+                            return 2;
+                        }
+                        other => {
+                            ewln(io.err, &format!("set: unimplemented option '-{other}'"));
+                            return 2;
+                        }
                     }
                 }
             }
@@ -926,6 +951,22 @@ fn cmd_declare(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
         }
     }
     0
+}
+
+fn cmd_local(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if !interp.in_function_scope() {
+        ewln(io.err, "local: can only be used in a function");
+        return 1;
+    }
+    for argument in args.iter().filter(|argument| !argument.starts_with('-')) {
+        interp.declare_local(declare_name_of(argument));
+    }
+    cmd_declare(interp, args, io)
+}
+
+fn cmd_readonly(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
+    ewln(io.err, "readonly: unimplemented");
+    2
 }
 
 /// The bare variable name of a declare operand (`NAME`, `NAME=…`, `NAME[i]=…`, `NAME+=…`).
@@ -989,9 +1030,12 @@ fn print_declared(interp: &Interp, name: &str, io: &mut Io) {
 }
 
 fn cmd_source(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(path) = args.first() else { return 0 };
-    match interp.vfs.read_string(&interp.cwd, path) {
-        Ok(src) => interp.run_script_into(&src, io.out, io.err),
+    let Some(path) = args.first() else {
+        ewln(io.err, "source: filename argument required");
+        return 2;
+    };
+    match interp.fs_read(&interp.cwd, path) {
+        Ok(src) => interp.run_script_into(&String::from_utf8_lossy(&src), io.out, io.err),
         Err(_) => {
             ewln(
                 io.err,
@@ -1004,10 +1048,11 @@ fn cmd_source(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
 
 fn start_source(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
     let Some(path) = args.first() else {
-        return CommandPoll::Ready(0);
+        ewln(io.err, "source: filename argument required");
+        return CommandPoll::Ready(2);
     };
-    let source = match interp.vfs.read_string(&interp.cwd, path) {
-        Ok(source) => source,
+    let source = match interp.fs_read(&interp.cwd, path) {
+        Ok(source) => String::from_utf8_lossy(&source).into_owned(),
         Err(_) => {
             ewln(
                 io.err,
@@ -1035,36 +1080,119 @@ fn start_eval(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     }
 }
 
-fn cmd_exit(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
-    let code = args
-        .first()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(interp.last_status);
+fn cmd_exit(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.len() > 1 {
+        ewln(io.err, "exit: too many arguments");
+        return 1;
+    }
+    let code = match args.first() {
+        Some(value) => match value.parse::<i32>() {
+            Ok(value) => value.rem_euclid(256),
+            Err(_) => {
+                ewln(io.err, &format!("exit: {value}: numeric argument required"));
+                interp.exiting = Some(2);
+                return 2;
+            }
+        },
+        None => interp.last_status,
+    };
     interp.exiting = Some(code);
     code
 }
 
-fn cmd_return(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
-    let code = args
-        .first()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(interp.last_status);
+fn cmd_return(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if !interp.in_function_scope() {
+        ewln(io.err, "return: can only be used in a function");
+        return 1;
+    }
+    let code = match parse_control_status("return", args, interp.last_status, io) {
+        Ok(code) => code,
+        Err(status) => return status,
+    };
     interp.returning = Some(code);
     code
 }
 
-fn cmd_break(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
-    interp.loop_break = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+fn cmd_break(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if interp.loop_depth == 0 {
+        ewln(io.err, "break: only meaningful in a loop");
+        return 1;
+    }
+    let count = match parse_loop_count("break", args, io) {
+        Ok(count) => count,
+        Err(status) => return status,
+    };
+    interp.loop_break = count;
     0
 }
 
-fn cmd_continue(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
-    interp.loop_continue = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+fn cmd_continue(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if interp.loop_depth == 0 {
+        ewln(io.err, "continue: only meaningful in a loop");
+        return 1;
+    }
+    let count = match parse_loop_count("continue", args, io) {
+        Ok(count) => count,
+        Err(status) => return status,
+    };
+    interp.loop_continue = count;
     0
+}
+
+fn parse_control_status(
+    command: &str,
+    args: &[String],
+    default: i32,
+    io: &mut Io,
+) -> Result<i32, i32> {
+    if args.len() > 1 {
+        ewln(io.err, &format!("{command}: too many arguments"));
+        return Err(1);
+    }
+    match args.first() {
+        Some(value) => value
+            .parse::<i32>()
+            .map(|value| value.rem_euclid(256))
+            .map_err(|_| {
+                ewln(
+                    io.err,
+                    &format!("{command}: {value}: numeric argument required"),
+                );
+                2
+            }),
+        None => Ok(default),
+    }
+}
+
+fn parse_loop_count(command: &str, args: &[String], io: &mut Io) -> Result<u32, i32> {
+    if args.len() > 1 {
+        ewln(io.err, &format!("{command}: too many arguments"));
+        return Err(1);
+    }
+    match args.first().map(|value| value.parse::<u32>()) {
+        Some(Ok(0) | Err(_)) => {
+            ewln(
+                io.err,
+                &format!("{command}: loop count must be a positive integer"),
+            );
+            Err(1)
+        }
+        Some(Ok(value)) => Ok(value),
+        None => Ok(1),
+    }
 }
 
 fn cmd_shift(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
-    let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let n: usize = match args.first() {
+        Some(value) => match value.parse() {
+            Ok(value) => value,
+            Err(_) => return 1,
+        },
+        None => 1,
+    };
+    if n > interp.positional.len() {
+        return 1;
+    }
     for _ in 0..n {
         if interp.positional.is_empty() {
             break;
@@ -1074,21 +1202,33 @@ fn cmd_shift(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> 
     0
 }
 
-fn cmd_test(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
-    eval_test_cmd(interp, "[", args)
+fn cmd_test(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    eval_test_cmd(interp, "test", args, io)
 }
 
-fn cmd_dbracket(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
-    eval_test_cmd(interp, "[[", args)
+fn cmd_bracket(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    eval_test_cmd(interp, "[", args, io)
 }
 
-fn eval_test_cmd(interp: &mut Interp, cmd: &str, args: &[String]) -> i32 {
+fn cmd_dbracket(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    eval_test_cmd(interp, "[[", args, io)
+}
+
+fn eval_test_cmd(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i32 {
     let mut a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    if (cmd == "[" || cmd == "[[") && a.last() == Some(&"]").or(Some(&"]]")) {
+    let expected = if cmd == "[[" { "]]" } else { "]" };
+    if a.last() == Some(&expected) {
         a.pop();
+    } else if cmd == "[" || cmd == "[[" {
+        ewln(io.err, &format!("{cmd}: missing '{expected}'"));
+        return 2;
     }
-    if a.last() == Some(&"]") || a.last() == Some(&"]]") {
-        a.pop();
+    if a.len() == 3
+        && matches!(a[1], "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge")
+        && (a[0].trim().parse::<i64>().is_err() || a[2].trim().parse::<i64>().is_err())
+    {
+        ewln(io.err, &format!("{cmd}: integer expression expected"));
+        return 2;
     }
     let r = eval_test(interp, &a);
     if r {
@@ -1107,16 +1247,37 @@ fn eval_test(interp: &Interp, a: &[&str]) -> bool {
             match op {
                 "-z" => x.is_empty(),
                 "-n" => !x.is_empty(),
-                "-e" | "-a" => interp.vfs.lexists(&interp.cwd, x),
-                "-f" => interp.vfs.is_file(&interp.cwd, x),
-                "-d" => interp.vfs.is_dir(&interp.cwd, x),
+                "-e" | "-a" => interp.fs_metadata(&interp.cwd, x, true).is_ok(),
+                "-f" => matches!(
+                    interp
+                        .fs_metadata(&interp.cwd, x, true)
+                        .map(|node| node.kind),
+                    Ok(crate::vfs::NodeKind::File(_))
+                ),
+                "-d" => matches!(
+                    interp
+                        .fs_metadata(&interp.cwd, x, true)
+                        .map(|node| node.kind),
+                    Ok(crate::vfs::NodeKind::Dir)
+                ),
                 "-s" => interp
-                    .vfs
-                    .read(&interp.cwd, x)
-                    .map(|d| !d.is_empty())
-                    .unwrap_or(false),
-                "-r" | "-w" | "-x" => interp.vfs.lexists(&interp.cwd, x),
-                "-L" | "-h" => interp.vfs.is_symlink(&interp.cwd, x),
+                    .fs_file_len(&interp.cwd, x)
+                    .is_ok_and(|size| size > 0),
+                "-r" => interp
+                    .fs_metadata(&interp.cwd, x, true)
+                    .is_ok_and(|node| node.mode & 0o444 != 0),
+                "-w" => interp
+                    .fs_metadata(&interp.cwd, x, true)
+                    .is_ok_and(|node| node.mode & 0o222 != 0),
+                "-x" => interp
+                    .fs_metadata(&interp.cwd, x, true)
+                    .is_ok_and(|node| node.mode & 0o111 != 0),
+                "-L" | "-h" => matches!(
+                    interp
+                        .fs_metadata(&interp.cwd, x, false)
+                        .map(|node| node.kind),
+                    Ok(crate::vfs::NodeKind::Symlink(_))
+                ),
                 "-v" => interp.get_var(x).is_some() || interp.arrays.contains_key(x),
                 "!" => !eval_test(interp, &a[1..]),
                 _ => !op.is_empty(),
@@ -1138,8 +1299,20 @@ fn eval_test(interp: &Interp, a: &[&str]) -> bool {
                 "=~" => regex::Regex::new(y)
                     .map(|regex| regex.is_match(x))
                     .unwrap_or(false),
-                "-nt" => true,
-                "-ot" => false,
+                "-nt" => {
+                    let left = interp.fs_metadata(&interp.cwd, x, true).ok();
+                    let right = interp.fs_metadata(&interp.cwd, y, true).ok();
+                    left.as_ref().is_some_and(|left| {
+                        right.as_ref().is_none_or(|right| left.mtime > right.mtime)
+                    })
+                }
+                "-ot" => {
+                    let left = interp.fs_metadata(&interp.cwd, x, true).ok();
+                    let right = interp.fs_metadata(&interp.cwd, y, true).ok();
+                    right.as_ref().is_some_and(|right| {
+                        left.as_ref().is_none_or(|left| left.mtime < right.mtime)
+                    })
+                }
                 _ => false,
             }
         }
@@ -1398,13 +1571,33 @@ fn read_one_line(interp: &mut Interp, io: &Io) -> Option<String> {
 }
 
 fn cmd_which(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let known = KNOWN_COMMANDS;
+    command_lookup(interp, args, io, false)
+}
+
+fn cmd_type(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    command_lookup(interp, args, io, true)
+}
+
+fn command_lookup(
+    interp: &mut CommandContext<'_>,
+    args: &[String],
+    io: &mut Io,
+    describe: bool,
+) -> i32 {
     let mut ok = true;
     for a in args.iter().filter(|arg| !arg.starts_with('-')) {
         if interp.funcs.contains_key(a) {
             wln(io.out, &format!("{a} is a function"));
-        } else if known.contains(&a.as_str()) {
-            wln(io.out, &format!("/usr/bin/{a}"));
+        } else if crate::commands::is_registered(a) {
+            if describe {
+                if is_shell_builtin_name(a) {
+                    wln(io.out, &format!("{a} is a shell builtin"));
+                } else {
+                    wln(io.out, &format!("{a} is /usr/bin/{a}"));
+                }
+            } else {
+                wln(io.out, &format!("/usr/bin/{a}"));
+            }
         } else if let crate::commands::util::ExecutableLookup::Found(path) =
             crate::commands::util::resolve_executable(interp, a)
         {
@@ -1418,6 +1611,54 @@ fn cmd_which(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
     } else {
         1
     }
+}
+
+fn is_shell_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "." | ":"
+            | "["
+            | "[["
+            | "alias"
+            | "bg"
+            | "break"
+            | "cd"
+            | "command"
+            | "continue"
+            | "declare"
+            | "dirs"
+            | "echo"
+            | "eval"
+            | "exit"
+            | "export"
+            | "false"
+            | "fg"
+            | "getopts"
+            | "jobs"
+            | "kill"
+            | "let"
+            | "local"
+            | "mapfile"
+            | "popd"
+            | "printf"
+            | "pushd"
+            | "pwd"
+            | "read"
+            | "readarray"
+            | "readonly"
+            | "return"
+            | "set"
+            | "shift"
+            | "source"
+            | "test"
+            | "trap"
+            | "true"
+            | "type"
+            | "typeset"
+            | "unalias"
+            | "unset"
+            | "wait"
+    )
 }
 
 fn cmd_command(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

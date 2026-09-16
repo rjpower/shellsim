@@ -26,17 +26,40 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["readlink"], Trust::Real, cmd_readlink);
     reg(m, &["stat"], Trust::Real, cmd_stat);
     reg(m, &["find"], Trust::Real, cmd_find);
-    reg(m, &["du"], Trust::Partial, cmd_du);
+    reg(m, &["du"], Trust::Real, cmd_du);
     reg(m, &["mktemp"], Trust::Real, cmd_mktemp);
     reg(m, &["file"], Trust::Real, cmd_file);
 }
 
 fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _l) = split_flags(args);
+    let mut flags = Vec::new();
+    let mut ops = Vec::new();
+    let mut options = true;
+    for arg in args {
+        if options && arg == "--" {
+            options = false;
+        } else if options && arg.starts_with('-') && arg != "-" {
+            if arg.starts_with("--") {
+                ewln(io.err, &format!("ls: unimplemented option '{arg}'"));
+                return 2;
+            }
+            for flag in arg[1..].chars() {
+                if !matches!(flag, 'l' | 'a' | 'A' | '1' | 'R' | 'd') {
+                    ewln(io.err, &format!("ls: unimplemented option '-{flag}'"));
+                    return 2;
+                }
+                flags.push(flag);
+            }
+        } else {
+            ops.push(arg);
+        }
+    }
     let long = flags.contains(&'l');
     let all = flags.contains(&'a');
+    let almost_all = flags.contains(&'A');
     let one = flags.contains(&'1') || long;
     let recursive = flags.contains(&'R');
+    let directory_as_file = flags.contains(&'d');
     let paths: Vec<String> = if ops.is_empty() {
         vec![interp.cwd.clone()]
     } else {
@@ -44,6 +67,18 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     };
     let mut status = 0;
     for p in &paths {
+        if directory_as_file {
+            if interp.fs_metadata(&interp.cwd, p, false).is_ok() {
+                emit_listing(interp, ".", std::slice::from_ref(p), long, one, io.out);
+            } else {
+                ewln(
+                    io.err,
+                    &format!("ls: cannot access '{p}': No such file or directory"),
+                );
+                status = 2;
+            }
+            continue;
+        }
         if matches!(
             interp.fs_metadata(&interp.cwd, p, true),
             Ok(crate::vfs::Node {
@@ -59,7 +94,9 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                     continue;
                 }
             };
-            if all {
+            if !all && !almost_all {
+                entries.retain(|entry| !entry.starts_with('.'));
+            } else if all {
                 entries.insert(0, "..".into());
                 entries.insert(0, ".".into());
             }
@@ -68,24 +105,29 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             }
             emit_listing(interp, p, &entries, long, one, io.out);
             if recursive {
-                for e in &entries {
-                    if e == "." || e == ".." {
-                        continue;
-                    }
-                    let sub = format!("{}/{}", p.trim_end_matches('/'), e);
-                    if matches!(
-                        interp.fs_metadata(&interp.cwd, &sub, true),
+                let Ok(all_paths) = interp.fs_walk(&interp.cwd, p) else {
+                    status = 2;
+                    continue;
+                };
+                for sub in all_paths.into_iter().skip(1).filter(|path| {
+                    matches!(
+                        interp.fs_metadata("/", path, false),
                         Ok(crate::vfs::Node {
                             kind: crate::vfs::NodeKind::Dir,
                             ..
                         })
-                    ) {
-                        wln(io.out, "");
-                        wln(io.out, &format!("{sub}:"));
-                        if let Ok(se) = interp.fs_list_dir(&interp.cwd, &sub) {
-                            emit_listing(interp, &sub, &se, long, one, io.out);
-                        }
+                    )
+                }) {
+                    let mut sub_entries = interp.fs_list_dir("/", &sub).unwrap_or_default();
+                    if !all && !almost_all {
+                        sub_entries.retain(|entry| !entry.starts_with('.'));
+                    } else if all {
+                        sub_entries.insert(0, "..".into());
+                        sub_entries.insert(0, ".".into());
                     }
+                    wln(io.out, "");
+                    wln(io.out, &format!("{sub}:"));
+                    emit_listing(interp, &sub, &sub_entries, long, one, io.out);
                 }
             }
         } else if interp.fs_metadata(&interp.cwd, p, false).is_ok() {
@@ -170,8 +212,39 @@ fn mode_str(mode: u32) -> String {
     s
 }
 
+fn reject_options(
+    command: &str,
+    flags: &[char],
+    allowed: &str,
+    long: &[(&str, String)],
+    io: &mut Io,
+) -> bool {
+    if let Some(flag) = flags.iter().find(|flag| !allowed.contains(**flag)) {
+        ewln(
+            io.err,
+            &format!("{command}: unimplemented option '-{flag}'"),
+        );
+        return true;
+    }
+    if let Some((option, _)) = long.first() {
+        ewln(
+            io.err,
+            &format!("{command}: unimplemented option '--{option}'"),
+        );
+        return true;
+    }
+    false
+}
+
 fn cmd_mkdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _l) = split_flags(args);
+    let (flags, ops, long) = split_flags(args);
+    if reject_options("mkdir", &flags, "p", &long, io) {
+        return 2;
+    }
+    if ops.is_empty() {
+        ewln(io.err, "mkdir: missing operand");
+        return 1;
+    }
     let parents = flags.contains(&'p');
     let cwd = interp.cwd.clone();
     let mut status = 0;
@@ -182,20 +255,25 @@ fn cmd_mkdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
             interp.vfs.mkdir(&cwd, d)
         };
         if let Err(e) = r {
-            if !parents {
-                ewln(
-                    io.err,
-                    &format!("mkdir: cannot create directory '{d}': {e}"),
-                );
-                status = 1;
-            }
+            ewln(
+                io.err,
+                &format!("mkdir: cannot create directory '{d}': {e}"),
+            );
+            status = 1;
         }
     }
     status
 }
 
 fn cmd_rmdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (_f, ops, _l) = split_flags(args);
+    let (flags, ops, long) = split_flags(args);
+    if reject_options("rmdir", &flags, "", &long, io) {
+        return 2;
+    }
+    if ops.is_empty() {
+        ewln(io.err, "rmdir: missing operand");
+        return 1;
+    }
     let cwd = interp.cwd.clone();
     let mut status = 0;
     for d in &ops {
@@ -208,9 +286,19 @@ fn cmd_rmdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
 }
 
 fn cmd_rm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _l) = split_flags(args);
+    let (flags, ops, long) = split_flags(args);
+    if reject_options("rm", &flags, "rRf", &long, io) {
+        return 2;
+    }
     let recursive = flags.contains(&'r') || flags.contains(&'R');
     let force = flags.contains(&'f');
+    if ops.is_empty() {
+        if force {
+            return 0;
+        }
+        ewln(io.err, "rm: missing operand");
+        return 1;
+    }
     let cwd = interp.cwd.clone();
     let mut status = 0;
     for t in &ops {
@@ -230,7 +318,10 @@ fn cmd_rm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
 }
 
 fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _l) = split_flags(args);
+    let (flags, ops, long) = split_flags(args);
+    if reject_options("cp", &flags, "rRaf", &long, io) {
+        return 2;
+    }
     let recursive = flags.contains(&'r') || flags.contains(&'R') || flags.contains(&'a');
     if ops.len() < 2 {
         ewln(io.err, "cp: missing destination operand");
@@ -239,12 +330,41 @@ fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     let cwd = interp.cwd.clone();
     let dest = ops.last().unwrap();
     let sources = &ops[..ops.len() - 1];
+    let destination_is_dir = matches!(
+        interp.fs_metadata(&cwd, dest, true),
+        Ok(crate::vfs::Node {
+            kind: crate::vfs::NodeKind::Dir,
+            ..
+        })
+    );
+    if sources.len() > 1 && !destination_is_dir {
+        ewln(io.err, &format!("cp: target '{dest}' is not a directory"));
+        return 1;
+    }
     let mut status = 0;
     for s in sources {
-        let r = if recursive {
-            interp.vfs.copy_recursive(&cwd, s, dest)
+        if recursive
+            && matches!(
+                interp.fs_metadata(&cwd, s, false),
+                Ok(crate::vfs::Node {
+                    kind: crate::vfs::NodeKind::Symlink(_),
+                    ..
+                })
+            )
+        {
+            ewln(io.err, "cp: unimplemented recursive copy of symbolic links");
+            status = 2;
+            continue;
+        }
+        let target = if destination_is_dir {
+            format!("{}/{}", dest.trim_end_matches('/'), crate::vfs::basename(s))
         } else {
-            interp.vfs.copy_file(&cwd, s, dest)
+            (*dest).clone()
+        };
+        let r = if recursive {
+            interp.vfs.copy_recursive(&cwd, s, &target)
+        } else {
+            interp.vfs.copy_file(&cwd, s, &target)
         };
         if let Err(e) = r {
             ewln(io.err, &format!("cp: cannot copy '{s}': {e}"));
@@ -255,16 +375,35 @@ fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
 }
 
 fn cmd_mv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (_f, ops, _l) = split_flags(args);
+    let (flags, ops, long) = split_flags(args);
+    if reject_options("mv", &flags, "f", &long, io) {
+        return 2;
+    }
     if ops.len() < 2 {
         ewln(io.err, "mv: missing destination operand");
         return 1;
     }
     let cwd = interp.cwd.clone();
     let dest = ops.last().unwrap();
+    let destination_is_dir = matches!(
+        interp.fs_metadata(&cwd, dest, true),
+        Ok(crate::vfs::Node {
+            kind: crate::vfs::NodeKind::Dir,
+            ..
+        })
+    );
+    if ops.len() > 2 && !destination_is_dir {
+        ewln(io.err, &format!("mv: target '{dest}' is not a directory"));
+        return 1;
+    }
     let mut status = 0;
     for s in &ops[..ops.len() - 1] {
-        if let Err(e) = interp.vfs.rename(&cwd, s, dest) {
+        let target = if destination_is_dir {
+            format!("{}/{}", dest.trim_end_matches('/'), crate::vfs::basename(s))
+        } else {
+            (*dest).clone()
+        };
+        if let Err(e) = interp.vfs.rename(&cwd, s, &target) {
             ewln(io.err, &format!("mv: cannot move '{s}': {e}"));
             status = 1;
         }
@@ -273,7 +412,15 @@ fn cmd_mv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
 }
 
 fn cmd_touch(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.iter().any(|arg| arg.starts_with('-') && arg != "--") {
+        ewln(io.err, "touch: unimplemented option");
+        return 2;
+    }
     let (_f, ops, _l) = split_flags(args);
+    if ops.is_empty() {
+        ewln(io.err, "touch: missing file operand");
+        return 1;
+    }
     let cwd = interp.cwd.clone();
     let now = interp.clock.unix_ms();
     let mut status = 0;
@@ -287,7 +434,10 @@ fn cmd_touch(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
 }
 
 fn cmd_ln(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _l) = split_flags(args);
+    let (flags, ops, long) = split_flags(args);
+    if reject_options("ln", &flags, "sf", &long, io) {
+        return 2;
+    }
     let symbolic = flags.contains(&'s');
     if ops.len() < 2 {
         ewln(io.err, "ln: missing operand");
@@ -295,11 +445,11 @@ fn cmd_ln(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     }
     let cwd = interp.cwd.clone();
     let (target, link) = (ops[0], ops[1]);
-    let r = if symbolic {
-        interp.vfs.symlink(&cwd, target, link)
-    } else {
-        interp.vfs.copy_file(&cwd, target, link)
-    };
+    if !symbolic {
+        ewln(io.err, "ln: unimplemented hard links");
+        return 2;
+    }
+    let r = interp.vfs.symlink(&cwd, target, link);
     if let Err(e) = r {
         ewln(io.err, &format!("ln: {e}"));
         1
@@ -446,7 +596,12 @@ fn parse_owner(spec: &str) -> (Option<u32>, Option<u32>) {
 
 fn cmd_basename(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let Some(p) = args.first() else { return 1 };
-    let mut base = crate::vfs::basename(p.trim_end_matches('/')).to_string();
+    let trimmed = p.trim_end_matches('/');
+    let mut base = if trimmed.is_empty() && p.starts_with('/') {
+        "/".to_string()
+    } else {
+        crate::vfs::basename(trimmed).to_string()
+    };
     if let Some(suffix) = args.get(1) {
         if base.ends_with(suffix.as_str()) && &base != suffix {
             base = base[..base.len() - suffix.len()].to_string();
@@ -459,6 +614,10 @@ fn cmd_basename(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) 
 fn cmd_dirname(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let Some(p) = args.first() else { return 1 };
     let p = p.trim_end_matches('/');
+    if p.is_empty() {
+        wln(io.out, "/");
+        return 0;
+    }
     let d = match p.rfind('/') {
         Some(0) => "/".to_string(),
         Some(i) => p[..i].to_string(),
@@ -477,12 +636,20 @@ fn cmd_readlink(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
 }
 
 fn realpath_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _l) = split_flags(args);
+    let (flags, ops, long) = split_flags(args);
+    let allowed = if cmd == "readlink" { "f" } else { "" };
+    if reject_options(cmd, &flags, allowed, &long, io) {
+        return 2;
+    }
+    if ops.is_empty() {
+        ewln(io.err, &format!("{cmd}: missing operand"));
+        return 1;
+    }
     for p in &ops {
         if cmd == "readlink" {
             if flags.contains(&'f') {
                 let abs = crate::vfs::resolve_against(&interp.cwd, p);
-                match interp.vfs.realpath(&abs, true) {
+                match interp.fs_realpath("/", &abs, true) {
                     Ok(r) => wln(io.out, &r),
                     Err(_) => return 1,
                 }
@@ -497,9 +664,12 @@ fn realpath_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -
             }
         } else {
             let abs = crate::vfs::resolve_against(&interp.cwd, p);
-            match interp.vfs.realpath(&abs, true) {
+            match interp.fs_realpath("/", &abs, true) {
                 Ok(r) => wln(io.out, &r),
-                Err(_) => wln(io.out, &abs),
+                Err(error) => {
+                    ewln(io.err, &format!("realpath: {error}"));
+                    return 1;
+                }
             }
         }
     }
@@ -515,17 +685,49 @@ fn cmd_stat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     // also handle -c FORMAT
     let mut format = fmt;
     let mut files = Vec::new();
+    let follow = args.iter().any(|arg| arg == "-L" || arg == "--dereference");
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "-c" || a == "--format" {
             format = it.next().cloned();
+        } else if let Some(value) = a
+            .strip_prefix("--format=")
+            .or_else(|| a.strip_prefix("--printf="))
+        {
+            format = Some(value.to_string());
+        } else if a == "-L" || a == "--dereference" {
         } else if !a.starts_with('-') {
             files.push(a.clone());
+        } else {
+            ewln(io.err, &format!("stat: unimplemented option '{a}'"));
+            return 2;
         }
     }
     let _ = ops;
+    if files.is_empty() {
+        ewln(io.err, "stat: missing operand");
+        return 1;
+    }
+    if let Some(value) = &format {
+        let mut chars = value.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                let Some(code) = chars.next() else { break };
+                if !matches!(
+                    code,
+                    '%' | 's' | 'n' | 'a' | 'U' | 'u' | 'g' | 'Y' | 'F' | 'N'
+                ) {
+                    ewln(
+                        io.err,
+                        &format!("stat: unimplemented format directive '%{code}'"),
+                    );
+                    return 2;
+                }
+            }
+        }
+    }
     for f in &files {
-        match interp.fs_metadata(&interp.cwd, f, true) {
+        match interp.fs_metadata(&interp.cwd, f, follow) {
             Ok(n) => {
                 let size = match &n.kind {
                     crate::vfs::NodeKind::File(d) => d.len(),
@@ -533,13 +735,24 @@ fn cmd_stat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                 };
                 if let Some(fmt) = &format {
                     let s = fmt
+                        .replace("%%", "\0")
                         .replace("%s", &size.to_string())
                         .replace("%n", f)
                         .replace("%a", &format!("{:o}", n.mode))
                         .replace("%U", "root")
                         .replace("%u", &n.uid.to_string())
                         .replace("%g", &n.gid.to_string())
-                        .replace("%Y", &(n.mtime / 1000).to_string());
+                        .replace("%Y", &(n.mtime / 1000).to_string())
+                        .replace(
+                            "%F",
+                            match n.kind {
+                                crate::vfs::NodeKind::File(_) => "regular file",
+                                crate::vfs::NodeKind::Dir => "directory",
+                                crate::vfs::NodeKind::Symlink(_) => "symbolic link",
+                            },
+                        )
+                        .replace("%N", f)
+                        .replace('\0', "%");
                     wln(io.out, &s);
                 } else {
                     wln(io.out, &format!("  File: {f}\n  Size: {size}"));
@@ -561,30 +774,56 @@ fn cmd_find(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     let mut name_pat: Option<String> = None;
     let mut path_pat: Option<String> = None;
     let mut maxdepth: Option<usize> = None;
+    let mut print0 = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-type" => {
-                typ = args.get(i + 1).and_then(|s| s.chars().next());
+                let Some(value) = args.get(i + 1) else {
+                    ewln(io.err, "find: missing argument to '-type'");
+                    return 2;
+                };
+                if value.len() != 1 || !matches!(value.as_str(), "f" | "d" | "l") {
+                    ewln(io.err, &format!("find: unimplemented file type '{value}'"));
+                    return 2;
+                }
+                typ = value.chars().next();
                 i += 2;
             }
             "-name" => {
-                name_pat = args.get(i + 1).cloned();
+                let Some(value) = args.get(i + 1) else {
+                    ewln(io.err, "find: missing argument to '-name'");
+                    return 2;
+                };
+                name_pat = Some(value.clone());
                 i += 2;
             }
             "-path" => {
-                path_pat = args.get(i + 1).cloned();
+                let Some(value) = args.get(i + 1) else {
+                    ewln(io.err, "find: missing argument to '-path'");
+                    return 2;
+                };
+                path_pat = Some(value.clone());
                 i += 2;
             }
             "-maxdepth" => {
-                maxdepth = args.get(i + 1).and_then(|s| s.parse().ok());
+                let Some(value) = args.get(i + 1).and_then(|s| s.parse().ok()) else {
+                    ewln(io.err, "find: invalid argument to '-maxdepth'");
+                    return 2;
+                };
+                maxdepth = Some(value);
                 i += 2;
             }
-            "-print" | "-print0" => {
+            "-print" => {
+                i += 1;
+            }
+            "-print0" => {
+                print0 = true;
                 i += 1;
             }
             s if s.starts_with('-') => {
-                i += 2; // skip unknown predicate + arg
+                ewln(io.err, &format!("find: unimplemented predicate '{s}'"));
+                return 2;
             }
             s => {
                 paths.push(s.to_string());
@@ -598,7 +837,13 @@ fn cmd_find(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     for start in &paths {
         let abs = crate::vfs::resolve_against(&interp.cwd, start);
         let base_depth = abs.matches('/').count();
-        let mut all = interp.vfs.walk(&abs);
+        let mut all = match interp.fs_walk("/", &abs) {
+            Ok(paths) => paths,
+            Err(error) => {
+                ewln(io.err, &format!("find: {error}"));
+                return 1;
+            }
+        };
         all.sort();
         for p in all {
             if let Some(md) = maxdepth {
@@ -608,15 +853,21 @@ fn cmd_find(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                 }
             }
             let is_dir = matches!(
-                interp.vfs.metadata("/", &p, false).map(|n| n.kind),
+                interp.fs_metadata("/", &p, false).map(|n| n.kind),
                 Ok(crate::vfs::NodeKind::Dir)
             );
             if let Some(t) = typ {
                 let ok = match t {
                     'd' => is_dir,
-                    'f' => interp.vfs.is_file("/", &p),
-                    'l' => interp.vfs.is_symlink("/", &p),
-                    _ => true,
+                    'f' => matches!(
+                        interp.fs_metadata("/", &p, false).map(|n| n.kind),
+                        Ok(crate::vfs::NodeKind::File(_))
+                    ),
+                    'l' => matches!(
+                        interp.fs_metadata("/", &p, false).map(|n| n.kind),
+                        Ok(crate::vfs::NodeKind::Symlink(_))
+                    ),
+                    _ => false,
                 };
                 if !ok {
                     continue;
@@ -649,22 +900,63 @@ fn cmd_find(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                     p.clone()
                 }
             };
-            wln(io.out, &display);
+            if print0 {
+                io.out.extend_from_slice(display.as_bytes());
+                io.out.push(0);
+            } else {
+                wln(io.out, &display);
+            }
         }
     }
     0
 }
 
-fn cmd_du(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    wln(
-        io.out,
-        &format!("0\t{}", args.last().cloned().unwrap_or_else(|| ".".into())),
-    );
-    0
+fn cmd_du(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let (flags, ops, long) = split_flags(args);
+    if flags.iter().any(|flag| !matches!(flag, 's' | 'b')) || !long.is_empty() {
+        ewln(io.err, "du: unimplemented option");
+        return 2;
+    }
+    let bytes = flags.contains(&'b');
+    let paths = if ops.is_empty() {
+        vec!["."]
+    } else {
+        ops.iter().map(|path| path.as_str()).collect()
+    };
+    let mut status = 0;
+    for path in paths {
+        match interp.fs_walk(&interp.cwd, path) {
+            Ok(nodes) => {
+                let total = nodes.into_iter().fold(0usize, |sum, node| {
+                    sum.saturating_add(match interp.fs_metadata("/", &node, false) {
+                        Ok(crate::vfs::Node {
+                            kind: crate::vfs::NodeKind::File(data),
+                            ..
+                        }) => data.len(),
+                        _ => 0,
+                    })
+                });
+                let amount = if bytes {
+                    total
+                } else {
+                    total.saturating_add(1023) / 1024
+                };
+                wln(io.out, &format!("{amount}\t{path}"));
+            }
+            Err(error) => {
+                ewln(io.err, &format!("du: {error}"));
+                status = 1;
+            }
+        }
+    }
+    status
 }
 
 fn cmd_mktemp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _l) = split_flags(args);
+    let (flags, ops, long) = split_flags(args);
+    if reject_options("mktemp", &flags, "d", &long, io) {
+        return 2;
+    }
     let dir = flags.contains(&'d');
     let tmpl = ops.first().map(|s| s.as_str()).unwrap_or("tmp.XXXXXX");
     // Identity is deterministic but deliberately separate from time: creating a name is not a
@@ -680,20 +972,35 @@ fn cmd_mktemp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     } else {
         format!("/tmp/{name}")
     };
-    let _ = interp.vfs.mkdir_all("/", "/tmp");
-    if dir {
-        let _ = interp.vfs.mkdir_all("/", &path);
+    if let Err(error) = interp.vfs.mkdir_all("/", "/tmp") {
+        ewln(io.err, &format!("mktemp: {error}"));
+        return 1;
+    }
+    let result = if dir {
+        interp.vfs.mkdir("/", &path)
     } else {
-        let _ = interp.vfs.write("/", &path, b"", 0o600);
+        interp.vfs.write("/", &path, b"", 0o600)
+    };
+    if let Err(error) = result {
+        ewln(io.err, &format!("mktemp: {error}"));
+        return 1;
     }
     wln(io.out, &path);
     0
 }
 
 fn cmd_file(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (_f, ops, _l) = split_flags(args);
+    let (flags, ops, long) = split_flags(args);
+    if reject_options("file", &flags, "", &long, io) {
+        return 2;
+    }
+    if ops.is_empty() {
+        ewln(io.err, "file: missing operand");
+        return 1;
+    }
+    let mut status = 0;
     for p in &ops {
-        let desc = match interp.vfs.read(&interp.cwd, p) {
+        let desc = match interp.fs_read(&interp.cwd, p) {
             Ok(d) if d.is_empty() => "empty".to_string(),
             Ok(d)
                 if d.iter().all(|b| b.is_ascii() || *b >= 0x80)
@@ -702,10 +1009,23 @@ fn cmd_file(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                 "ASCII text".to_string()
             }
             Ok(_) => "data".to_string(),
-            Err(_) if interp.vfs.is_dir(&interp.cwd, p) => "directory".to_string(),
-            Err(_) => "cannot open".to_string(),
+            Err(_)
+                if matches!(
+                    interp.fs_metadata(&interp.cwd, p, false),
+                    Ok(crate::vfs::Node {
+                        kind: crate::vfs::NodeKind::Dir,
+                        ..
+                    })
+                ) =>
+            {
+                "directory".to_string()
+            }
+            Err(error) => {
+                status = 1;
+                format!("cannot open ({error})")
+            }
         };
         wln(io.out, &format!("{p}: {desc}"));
     }
-    0
+    status
 }

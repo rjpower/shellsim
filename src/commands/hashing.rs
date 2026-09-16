@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::commands::util::{read_inputs, split_flags, wln};
+use crate::commands::util::{ewln, read_inputs, split_flags, wln};
 use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
@@ -38,7 +38,10 @@ fn cmd_cksum(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
 fn hash_impl(interp: &mut Interp, algo: &str, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, _l) = split_flags(args);
     let check = flags.contains(&'c');
-    let _ = check;
+    if flags.iter().any(|flag| !matches!(flag, 'b' | 'c' | 't')) {
+        ewln(io.err, &format!("{algo}sum: unimplemented option"));
+        return 2;
+    }
     let compute = |data: &[u8]| -> String {
         match algo {
             "sha256" => crate::hashes::sha256_hex(data),
@@ -52,23 +55,79 @@ fn hash_impl(interp: &mut Interp, algo: &str, args: &[String], io: &mut Io) -> i
             _ => String::new(),
         }
     };
-    if ops.is_empty() {
-        wln(io.out, &format!("{}  -", compute(&io.stdin)));
-    } else {
-        for f in &ops {
-            match interp.vfs.read(&interp.cwd, f) {
-                Ok(d) => wln(io.out, &format!("{}  {}", compute(&d), f)),
-                Err(_) => return 1,
+    if check {
+        let manifests = if ops.is_empty() {
+            vec!["-"]
+        } else {
+            ops.iter().map(|value| value.as_str()).collect()
+        };
+        let mut status = 0;
+        for manifest in manifests {
+            let data = if manifest == "-" {
+                io.stdin.clone()
+            } else {
+                match interp.fs_read(&interp.cwd, manifest) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        ewln(io.err, &format!("{algo}sum: {manifest}: {error}"));
+                        status = 1;
+                        continue;
+                    }
+                }
+            };
+            for line in String::from_utf8_lossy(&data).lines() {
+                let Some((expected, filename)) = line.split_once(char::is_whitespace) else {
+                    ewln(io.err, &format!("{algo}sum: malformed checksum line"));
+                    status = 1;
+                    continue;
+                };
+                let filename = filename.trim_start().trim_start_matches('*');
+                match interp.fs_read(&interp.cwd, filename) {
+                    Ok(contents) if compute(&contents) == expected => {
+                        wln(io.out, &format!("{filename}: OK"))
+                    }
+                    Ok(_) => {
+                        wln(io.out, &format!("{filename}: FAILED"));
+                        status = 1;
+                    }
+                    Err(error) => {
+                        ewln(io.err, &format!("{algo}sum: {filename}: {error}"));
+                        status = 1;
+                    }
+                }
             }
         }
+        status
+    } else if ops.is_empty() {
+        wln(io.out, &format!("{}  -", compute(&io.stdin)));
+        0
+    } else {
+        let mut status = 0;
+        for f in &ops {
+            match interp.fs_read(&interp.cwd, f) {
+                Ok(d) => wln(io.out, &format!("{}  {}", compute(&d), f)),
+                Err(error) => {
+                    ewln(io.err, &format!("{algo}sum: {f}: {error}"));
+                    status = 1;
+                }
+            }
+        }
+        status
     }
-    0
 }
 
 fn cmd_base64(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, long) = split_flags(args);
+    if flags.iter().any(|flag| *flag != 'd') || long.iter().any(|(option, _)| *option != "decode") {
+        ewln(io.err, "base64: unimplemented option");
+        return 2;
+    }
     let decode = flags.contains(&'d') || long.iter().any(|(k, _)| *k == "decode");
-    let (data, _e) = read_inputs(interp, &ops, &io.stdin);
+    let (data, errors) = read_inputs(interp, &ops, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("base64: {error}"));
+        return 1;
+    }
     if decode {
         let s: String = String::from_utf8_lossy(&data)
             .chars()
@@ -87,7 +146,11 @@ fn cmd_base64(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
 
 fn cmd_hexdump(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (_f, ops, _l) = split_flags(args);
-    let (data, _e) = read_inputs(interp, &ops, &io.stdin);
+    let (data, errors) = read_inputs(interp, &ops, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("hexdump: {error}"));
+        return 1;
+    }
     let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
     wln(io.out, &hex);
     0
@@ -95,7 +158,11 @@ fn cmd_hexdump(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
 
 fn cmd_strings(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (_f, ops, _l) = split_flags(args);
-    let (data, _e) = read_inputs(interp, &ops, &io.stdin);
+    let (data, errors) = read_inputs(interp, &ops, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("strings: {error}"));
+        return 1;
+    }
     let mut cur = String::new();
     for &b in &data {
         if b.is_ascii_graphic() || b == b' ' {

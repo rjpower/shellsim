@@ -30,7 +30,6 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["nl"], Trust::Real, cmd_nl);
     reg(m, &["seq"], Trust::Real, cmd_seq);
     reg(m, &["paste"], Trust::Real, cmd_paste);
-    reg(m, &["head_tail_placeholder"], Trust::Real, |_, _, _| 0);
     reg(
         m,
         &["fold", "fmt", "expand", "unexpand", "column", "pr"],
@@ -43,7 +42,10 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["cmp"], Trust::Real, cmd_cmp);
     reg(m, &["expr"], Trust::Real, cmd_expr);
     reg(m, &["bc"], Trust::Real, cmd_bc);
-    reg(m, &["factor"], Trust::Real, |_, _, _| 0);
+    reg(m, &["factor"], Trust::Real, |_, _, io| {
+        ewln(io.err, "factor: unimplemented");
+        2
+    });
 }
 
 #[derive(Clone)]
@@ -81,23 +83,40 @@ struct HeadOptions {
     files: Vec<String>,
 }
 
-fn parse_head_options(args: &[String]) -> HeadOptions {
+fn parse_head_options(args: &[String]) -> Result<HeadOptions, String> {
     let mut lines = 10usize;
     let mut bytes = None;
     let mut files = Vec::new();
     let mut it = args.iter().peekable();
     while let Some(arg) = it.next() {
         if arg == "-n" {
-            lines = it
+            let value = it
                 .next()
-                .and_then(|value| value.trim_start_matches('-').parse().ok())
-                .unwrap_or(10);
+                .ok_or_else(|| "option requires an argument -- 'n'".to_string())?;
+            lines = value
+                .trim_start_matches('-')
+                .parse()
+                .map_err(|_| format!("invalid number of lines: {value}"))?;
         } else if let Some(value) = arg.strip_prefix("-n") {
-            lines = value.trim_start_matches('-').parse().unwrap_or(10);
+            lines = value
+                .trim_start_matches('-')
+                .parse()
+                .map_err(|_| format!("invalid number of lines: {value}"))?;
         } else if arg == "-c" {
-            bytes = it.next().and_then(|value| value.parse().ok());
+            let value = it
+                .next()
+                .ok_or_else(|| "option requires an argument -- 'c'".to_string())?;
+            bytes = Some(
+                value
+                    .parse()
+                    .map_err(|_| format!("invalid number of bytes: {value}"))?,
+            );
         } else if let Some(value) = arg.strip_prefix("-c") {
-            bytes = value.parse().ok();
+            bytes = Some(
+                value
+                    .parse()
+                    .map_err(|_| format!("invalid number of bytes: {value}"))?,
+            );
         } else if arg.starts_with('-')
             && arg.len() > 1
             && arg[1..].chars().all(|character| character.is_ascii_digit())
@@ -105,13 +124,15 @@ fn parse_head_options(args: &[String]) -> HeadOptions {
             lines = arg[1..].parse().unwrap_or(10);
         } else if !arg.starts_with('-') || arg == "-" {
             files.push(arg.clone());
+        } else {
+            return Err(format!("unimplemented option '{arg}'"));
         }
     }
-    HeadOptions {
+    Ok(HeadOptions {
         lines,
         bytes,
         files,
-    }
+    })
 }
 
 fn stream_sources(cwd: &str, files: &[String]) -> Option<VecDeque<StreamSource>> {
@@ -149,7 +170,9 @@ pub(super) fn streams_before_input(command: &str, args: &[String]) -> bool {
                 .collect::<Vec<_>>();
             stream_sources("/", &files).is_some()
         }
-        "head" => stream_sources("/", &parse_head_options(args).files).is_some(),
+        "head" => parse_head_options(args)
+            .ok()
+            .is_some_and(|options| stream_sources("/", &options.files).is_some()),
         _ => false,
     }
 }
@@ -173,7 +196,13 @@ fn start_cat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> C
 }
 
 fn start_head(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
-    let options = parse_head_options(args);
+    let options = match parse_head_options(args) {
+        Ok(options) => options,
+        Err(error) => {
+            ewln(io.err, &format!("head: {error}"));
+            return CommandPoll::Ready(1);
+        }
+    };
     let Some(sources) = stream_sources(&interp.cwd, &options.files) else {
         return CommandPoll::Ready(cmd_head(interp, args, io));
     };
@@ -387,8 +416,9 @@ fn cmd_cat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
     let number = flags.contains(&'n');
     let (data, errors) = read_inputs(interp, &ops, &io.stdin);
     if number {
-        for (i, line) in String::from_utf8_lossy(&data).lines().enumerate() {
-            wln(io.out, &format!("{:6}\t{}", i + 1, line));
+        for (i, line) in data.split_inclusive(|byte| *byte == b'\n').enumerate() {
+            w(io.out, &format!("{:6}\t", i + 1));
+            io.out.extend_from_slice(line);
         }
     } else {
         io.out.extend_from_slice(&data);
@@ -405,7 +435,11 @@ fn cmd_cat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
 
 fn cmd_tac(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (_f, ops, _l) = split_flags(args);
-    let (data, _e) = read_inputs(interp, &ops, &io.stdin);
+    let (data, errors) = read_inputs(interp, &ops, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("tac: {error}"));
+        return 1;
+    }
     let lines = lines_of(&data);
     for l in lines.iter().rev() {
         wln(io.out, l);
@@ -417,108 +451,233 @@ fn cmd_tee(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
     let (flags, ops, _l) = split_flags(args);
     let append = flags.contains(&'a');
     let cwd = interp.cwd.clone();
+    let mut status = 0;
     for f in &ops {
-        if append {
-            let _ = interp.vfs.append(&cwd, f, &io.stdin, 0o644);
+        let result = if append {
+            interp.vfs.append(&cwd, f, &io.stdin, 0o644)
         } else {
-            let _ = interp.vfs.write(&cwd, f, &io.stdin, 0o644);
+            interp.vfs.write(&cwd, f, &io.stdin, 0o644)
+        };
+        if let Err(error) = result {
+            ewln(io.err, &format!("tee: {f}: {error}"));
+            status = 1;
         }
     }
     io.out.extend_from_slice(&io.stdin);
-    0
+    status
 }
 
 fn cmd_yes(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let s = if args.is_empty() {
-        "y".to_string()
-    } else {
-        args.join(" ")
-    };
-    for _ in 0..1000 {
-        wln(io.out, &s);
-    }
-    0
+    let _ = args;
+    ewln(io.err, "yes: unimplemented streaming output");
+    2
 }
 
 fn cmd_head(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let options = parse_head_options(args);
-    let files = options.files.iter().collect::<Vec<_>>();
-    let (data, _e) = read_inputs(interp, &files, &io.stdin);
-    if let Some(b) = options.bytes {
-        io.out.extend_from_slice(&data[..b.min(data.len())]);
-    } else {
-        for (i, line) in String::from_utf8_lossy(&data).lines().enumerate() {
-            if i >= options.lines {
-                break;
-            }
-            wln(io.out, line);
+    let options = match parse_head_options(args) {
+        Ok(options) => options,
+        Err(error) => {
+            ewln(io.err, &format!("head: {error}"));
+            return 1;
         }
+    };
+    let mut status = 0;
+    let multiple = options.files.len() > 1;
+    let files = if options.files.is_empty() {
+        vec!["-".to_string()]
+    } else {
+        options.files
+    };
+    let mut emitted = false;
+    for file in files {
+        let data = if file == "-" {
+            io.stdin.clone()
+        } else {
+            match interp.fs_read(&interp.cwd, &file) {
+                Ok(data) => data,
+                Err(error) => {
+                    ewln(io.err, &format!("head: {file}: {error}"));
+                    status = 1;
+                    continue;
+                }
+            }
+        };
+        if multiple {
+            if emitted {
+                io.out.push(b'\n');
+            }
+            wln(io.out, &format!("==> {file} <=="));
+        }
+        if let Some(bytes) = options.bytes {
+            io.out.extend_from_slice(&data[..bytes.min(data.len())]);
+        } else {
+            for line in data
+                .split_inclusive(|byte| *byte == b'\n')
+                .take(options.lines)
+            {
+                io.out.extend_from_slice(line);
+            }
+        }
+        emitted = true;
     }
-    0
+    status
 }
 
 fn cmd_tail(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut n = 10usize;
+    let mut bytes = false;
     let mut from_start = false;
     let mut files = Vec::new();
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         if a == "-n" {
-            let v = it.next().cloned().unwrap_or_default();
+            let Some(v) = it.next().cloned() else {
+                ewln(io.err, "tail: option requires an argument -- 'n'");
+                return 1;
+            };
             from_start = v.starts_with('+');
-            n = v
-                .trim_start_matches('+')
-                .trim_start_matches('-')
-                .parse()
-                .unwrap_or(10);
+            n = match v.trim_start_matches('+').trim_start_matches('-').parse() {
+                Ok(value) => value,
+                Err(_) => {
+                    ewln(io.err, &format!("tail: invalid number of lines: {v}"));
+                    return 1;
+                }
+            };
+        } else if a == "-c" {
+            let Some(v) = it.next().cloned() else {
+                ewln(io.err, "tail: option requires an argument -- 'c'");
+                return 1;
+            };
+            bytes = true;
+            from_start = v.starts_with('+');
+            n = match v.trim_start_matches(['+', '-']).parse() {
+                Ok(value) => value,
+                Err(_) => {
+                    ewln(io.err, &format!("tail: invalid number of bytes: {v}"));
+                    return 1;
+                }
+            };
+        } else if let Some(v) = a.strip_prefix("-c") {
+            bytes = true;
+            from_start = v.starts_with('+');
+            n = match v.trim_start_matches(['+', '-']).parse() {
+                Ok(value) => value,
+                Err(_) => {
+                    ewln(io.err, &format!("tail: invalid number of bytes: {v}"));
+                    return 1;
+                }
+            };
+        } else if let Some(v) = a.strip_prefix('+').filter(|value| !value.is_empty()) {
+            from_start = true;
+            n = match v.parse() {
+                Ok(value) => value,
+                Err(_) => {
+                    ewln(io.err, &format!("tail: invalid number of lines: {a}"));
+                    return 1;
+                }
+            };
         } else if let Some(v) = a.strip_prefix("-n") {
             from_start = v.starts_with('+');
-            n = v
-                .trim_start_matches('+')
-                .trim_start_matches('-')
-                .parse()
-                .unwrap_or(10);
+            n = match v.trim_start_matches('+').trim_start_matches('-').parse() {
+                Ok(value) => value,
+                Err(_) => {
+                    ewln(io.err, &format!("tail: invalid number of lines: {v}"));
+                    return 1;
+                }
+            };
+        } else if let Some(v) = a.strip_prefix('-').filter(|value| {
+            !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+        }) {
+            n = v.parse().expect("validated decimal tail count");
         } else if a == "-f" || a == "-F" {
-            // no follow in sim
+            ewln(io.err, "tail: unimplemented follow mode");
+            return 2;
         } else if !a.starts_with('-') || a == "-" {
-            files.push(a);
+            files.push(a.clone());
+        } else {
+            ewln(io.err, &format!("tail: unimplemented option '{a}'"));
+            return 2;
         }
     }
-    let (data, _e) = read_inputs(interp, &files, &io.stdin);
-    let lines: Vec<&str> = String::from_utf8_lossy(&data)
-        .lines()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()
-        .leak()
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    if from_start {
-        for l in lines.iter().skip(n.saturating_sub(1)) {
-            wln(io.out, l);
-        }
+    let multiple = files.len() > 1;
+    let files = if files.is_empty() {
+        vec!["-".to_string()]
     } else {
-        let start = lines.len().saturating_sub(n);
-        for l in &lines[start..] {
-            wln(io.out, l);
+        files
+    };
+    let mut status = 0;
+    let mut emitted = false;
+    for file in files {
+        let data = if file == "-" {
+            io.stdin.clone()
+        } else {
+            match interp.fs_read(&interp.cwd, &file) {
+                Ok(data) => data,
+                Err(error) => {
+                    ewln(io.err, &format!("tail: {file}: {error}"));
+                    status = 1;
+                    continue;
+                }
+            }
+        };
+        if multiple {
+            if emitted {
+                io.out.push(b'\n');
+            }
+            wln(io.out, &format!("==> {file} <=="));
         }
+        if bytes {
+            let start = if from_start {
+                n.saturating_sub(1).min(data.len())
+            } else {
+                data.len().saturating_sub(n)
+            };
+            io.out.extend_from_slice(&data[start..]);
+        } else {
+            let lines = data
+                .split_inclusive(|byte| *byte == b'\n')
+                .collect::<Vec<_>>();
+            let start = if from_start {
+                n.saturating_sub(1).min(lines.len())
+            } else {
+                lines.len().saturating_sub(n)
+            };
+            for line in &lines[start..] {
+                io.out.extend_from_slice(line);
+            }
+        }
+        emitted = true;
     }
-    0
+    status
 }
 
 fn cmd_wc(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, _l) = split_flags(args);
-    let (cl, cw, cc) = (
+    if flags
+        .iter()
+        .any(|flag| !matches!(flag, 'l' | 'w' | 'c' | 'm'))
+    {
+        ewln(io.err, "wc: unimplemented option");
+        return 2;
+    }
+    let (cl, cw, cc, cm) = (
         flags.contains(&'l'),
         flags.contains(&'w'),
-        flags.contains(&'c') || flags.contains(&'m'),
+        flags.contains(&'c'),
+        flags.contains(&'m'),
     );
-    let none = !cl && !cw && !cc;
-    let print_one = |data: &[u8], out: &mut Vec<u8>, label: &str| {
+    let none = !cl && !cw && !cc && !cm;
+    let counts = |data: &[u8]| {
         let s = String::from_utf8_lossy(data);
-        let lines = s.matches('\n').count();
-        let words = s.split_whitespace().count();
-        let chars = data.len();
+        (
+            s.matches('\n').count(),
+            s.split_whitespace().count(),
+            data.len(),
+            s.chars().count(),
+        )
+    };
+    let print_counts = |values: (usize, usize, usize, usize), out: &mut Vec<u8>, label: &str| {
+        let (lines, words, bytes, chars) = values;
         let mut parts = Vec::new();
         if cl || none {
             parts.push(format!("{:>7}", lines));
@@ -527,6 +686,9 @@ fn cmd_wc(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             parts.push(format!("{:>7}", words));
         }
         if cc || none {
+            parts.push(format!("{:>7}", bytes));
+        }
+        if cm {
             parts.push(format!("{:>7}", chars));
         }
         let mut line = parts.join(" ");
@@ -537,41 +699,151 @@ fn cmd_wc(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         wln(out, line.trim_start());
     };
     if ops.is_empty() {
-        print_one(&io.stdin, io.out, "");
+        print_counts(counts(&io.stdin), io.out, "");
     } else {
+        let mut totals = (0usize, 0usize, 0usize, 0usize);
+        let mut status = 0;
         for f in &ops {
-            match interp.vfs.read(&interp.cwd, f) {
-                Ok(d) => print_one(&d, io.out, f),
-                Err(_) => return 1,
+            match interp.fs_read(&interp.cwd, f) {
+                Ok(data) => {
+                    let values = counts(&data);
+                    print_counts(values, io.out, f);
+                    totals.0 = totals.0.saturating_add(values.0);
+                    totals.1 = totals.1.saturating_add(values.1);
+                    totals.2 = totals.2.saturating_add(values.2);
+                    totals.3 = totals.3.saturating_add(values.3);
+                }
+                Err(error) => {
+                    ewln(io.err, &format!("wc: {f}: {error}"));
+                    status = 1;
+                }
             }
         }
+        if ops.len() > 1 {
+            print_counts(totals, io.out, "total");
+        }
+        return status;
     }
     0
 }
 
 fn cmd_uniq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _l) = split_flags(args);
-    let count = flags.contains(&'c');
-    let only_dup = flags.contains(&'d');
-    let only_uniq = flags.contains(&'u');
-    let (data, _e) = read_inputs(interp, &ops, &io.stdin);
-    let lines: Vec<String> = String::from_utf8_lossy(&data)
-        .lines()
-        .map(|s| s.to_string())
-        .collect();
+    let mut count = false;
+    let mut only_dup = false;
+    let mut only_uniq = false;
+    let mut ignore_case = false;
+    let mut skip_fields = 0usize;
+    let mut skip_chars = 0usize;
+    let mut operands = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let parse_count = |value: &str, option: &str, io: &mut Io| {
+            value.parse::<usize>().map_err(|_| {
+                ewln(
+                    io.err,
+                    &format!("uniq: invalid number for {option}: {value}"),
+                );
+                1
+            })
+        };
+        if argument == "-f" || argument == "-s" {
+            let Some(value) = args.get(index + 1) else {
+                ewln(io.err, &format!("uniq: {argument} requires an argument"));
+                return 1;
+            };
+            let parsed = match parse_count(value, argument, io) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+            if argument == "-f" {
+                skip_fields = parsed;
+            } else {
+                skip_chars = parsed;
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix("-f")
+            .filter(|value| !value.is_empty())
+        {
+            skip_fields = match parse_count(value, "-f", io) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+        } else if let Some(value) = argument
+            .strip_prefix("-s")
+            .filter(|value| !value.is_empty())
+        {
+            skip_chars = match parse_count(value, "-s", io) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+        } else if argument.starts_with('-') && argument != "-" {
+            for flag in argument[1..].chars() {
+                match flag {
+                    'c' => count = true,
+                    'd' => only_dup = true,
+                    'u' => only_uniq = true,
+                    'i' => ignore_case = true,
+                    _ => {
+                        ewln(io.err, &format!("uniq: unimplemented option '-{flag}'"));
+                        return 2;
+                    }
+                }
+            }
+        } else {
+            operands.push(argument);
+        }
+        index += 1;
+    }
+    if operands.len() > 1 {
+        ewln(io.err, "uniq: unimplemented output-file operand");
+        return 2;
+    }
+    let (data, errors) = read_inputs(interp, &operands, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("uniq: {error}"));
+        return 1;
+    }
+    let lines = data
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let key = |line: &[u8]| {
+        let text = String::from_utf8_lossy(line);
+        let mut offset = 0;
+        for _ in 0..skip_fields {
+            let rest = &text[offset..];
+            let blanks = rest.len() - rest.trim_start_matches(char::is_whitespace).len();
+            offset += blanks;
+            let rest = &text[offset..];
+            let field = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            offset += field;
+        }
+        let value = text[offset..].chars().skip(skip_chars).collect::<String>();
+        if ignore_case {
+            value.to_lowercase()
+        } else {
+            value
+        }
+    };
     let mut i = 0;
     while i < lines.len() {
         let mut j = i + 1;
-        while j < lines.len() && lines[j] == lines[i] {
+        let current = key(&lines[i]);
+        while j < lines.len() && key(&lines[j]) == current {
             j += 1;
         }
         let n = j - i;
         let show = (!only_dup && !only_uniq) || (only_dup && n > 1) || (only_uniq && n == 1);
         if show {
             if count {
-                wln(io.out, &format!("{:>7} {}", n, lines[i]));
+                w(io.out, &format!("{:>7} ", n));
+                io.out.extend_from_slice(&lines[i]);
             } else {
-                wln(io.out, &lines[i]);
+                io.out.extend_from_slice(&lines[i]);
             }
         }
         i = j;
@@ -608,7 +880,11 @@ fn cmd_cut(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             files.push(a);
         }
     }
-    let (data, _e) = read_inputs(interp, &files, &io.stdin);
+    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("cut: {error}"));
+        return 1;
+    }
     let parse_ranges = |spec: &str, max: usize| -> Vec<usize> {
         let mut idx = Vec::new();
         for part in spec.split(',') {
@@ -656,8 +932,24 @@ fn cmd_tr(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
     let delete = flags.contains(&'d');
     let squeeze = flags.contains(&'s');
     let complement = flags.contains(&'c');
+    if flags.iter().any(|flag| !matches!(flag, 'c' | 'd' | 's')) {
+        ewln(io.err, "tr: unimplemented option");
+        return 2;
+    }
+    let required = if delete || (squeeze && ops.len() == 1) {
+        1
+    } else {
+        2
+    };
+    if ops.len() != required {
+        ewln(io.err, "tr: missing or extra operand");
+        return 1;
+    }
     let set1 = ops.first().map(|s| expand_tr_set(s)).unwrap_or_default();
-    let set2 = ops.get(1).map(|s| expand_tr_set(s)).unwrap_or_default();
+    let set2 = ops
+        .get(1)
+        .map(|s| expand_tr_set(s))
+        .unwrap_or_else(|| set1.clone());
     let input = String::from_utf8_lossy(&io.stdin).into_owned();
     let mut result = String::new();
     if delete {
@@ -705,7 +997,16 @@ fn expand_tr_set(s: &str) -> Vec<char> {
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        if i + 2 < chars.len() && chars[i + 1] == '-' {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            out.push(match chars[i + 1] {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '\\' => '\\',
+                value => value,
+            });
+            i += 2;
+        } else if i + 2 < chars.len() && chars[i + 1] == '-' {
             let (lo, hi) = (chars[i], chars[i + 2]);
             for c in lo..=hi {
                 out.push(c);
@@ -721,16 +1022,37 @@ fn expand_tr_set(s: &str) -> Vec<char> {
 
 fn cmd_rev(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (_f, ops, _l) = split_flags(args);
-    let (data, _e) = read_inputs(interp, &ops, &io.stdin);
-    for line in String::from_utf8_lossy(&data).lines() {
-        wln(io.out, &line.chars().rev().collect::<String>());
+    let (data, errors) = read_inputs(interp, &ops, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("rev: {error}"));
+        return 1;
+    }
+    for line in data.split_inclusive(|byte| *byte == b'\n') {
+        let newline = line.ends_with(b"\n");
+        let content = if newline {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+        let reversed = String::from_utf8_lossy(content)
+            .chars()
+            .rev()
+            .collect::<String>();
+        w(io.out, &reversed);
+        if newline {
+            io.out.push(b'\n');
+        }
     }
     0
 }
 
 fn cmd_nl(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (_f, ops, _l) = split_flags(args);
-    let (data, _e) = read_inputs(interp, &ops, &io.stdin);
+    let (data, errors) = read_inputs(interp, &ops, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("nl: {error}"));
+        return 1;
+    }
     let mut n = 1;
     for line in String::from_utf8_lossy(&data).lines() {
         if line.is_empty() {
@@ -744,12 +1066,28 @@ fn cmd_nl(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
 }
 
 fn cmd_seq(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let nums: Vec<f64> = args.iter().filter_map(|a| a.parse().ok()).collect();
+    if args
+        .iter()
+        .any(|argument| argument.starts_with('-') && argument.parse::<f64>().is_err())
+    {
+        ewln(io.err, "seq: unimplemented option");
+        return 2;
+    }
+    let nums: Vec<f64> = match args.iter().map(|a| a.parse::<f64>()).collect() {
+        Ok(values) => values,
+        Err(_) => {
+            ewln(io.err, "seq: invalid floating point argument");
+            return 1;
+        }
+    };
     let (start, step, end) = match nums.len() {
         1 => (1.0, 1.0, nums[0]),
         2 => (nums[0], 1.0, nums[1]),
         3 => (nums[0], nums[1], nums[2]),
-        _ => return 1,
+        _ => {
+            ewln(io.err, "seq: missing or extra operand");
+            return 1;
+        }
     };
     let mut x = start;
     let int = start.fract() == 0.0 && step.fract() == 0.0 && end.fract() == 0.0;
@@ -763,6 +1101,9 @@ fn cmd_seq(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             wln(io.out, &fmt_num(x, int));
             x += step;
         }
+    } else {
+        ewln(io.err, "seq: zero increment");
+        return 1;
     }
     0
 }
@@ -784,24 +1125,31 @@ fn cmd_paste(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
             delim = it.next().and_then(|s| s.chars().next()).unwrap_or('\t');
         } else if let Some(d) = a.strip_prefix("-d") {
             delim = d.chars().next().unwrap_or('\t');
+        } else if a.starts_with('-') && a != "-" {
+            ewln(io.err, &format!("paste: unimplemented option '{a}'"));
+            return 2;
         } else {
             files.push(a.clone());
         }
     }
-    let columns: Vec<Vec<String>> = files
-        .iter()
-        .map(|f| {
-            if f == "-" {
-                lines_of(&io.stdin)
-            } else {
-                interp
-                    .vfs
-                    .read(&interp.cwd, f)
-                    .map(|d| lines_of(&d))
-                    .unwrap_or_default()
+    if files.is_empty() {
+        io.out.extend_from_slice(&io.stdin);
+        return 0;
+    }
+    let mut columns = Vec::new();
+    for file in &files {
+        if file == "-" {
+            columns.push(lines_of(&io.stdin));
+        } else {
+            match interp.fs_read(&interp.cwd, file) {
+                Ok(data) => columns.push(lines_of(&data)),
+                Err(error) => {
+                    ewln(io.err, &format!("paste: {file}: {error}"));
+                    return 1;
+                }
             }
-        })
-        .collect();
+        }
+    }
     let max = columns.iter().map(|c| c.len()).max().unwrap_or(0);
     for i in 0..max {
         let row: Vec<String> = columns
@@ -813,11 +1161,9 @@ fn cmd_paste(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
     0
 }
 
-fn cmd_passthrough(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (_f, ops, _l) = split_flags(args);
-    let (data, _e) = read_inputs(interp, &ops, &io.stdin);
-    io.out.extend_from_slice(&data);
-    0
+fn cmd_passthrough(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
+    ewln(io.err, "unimplemented");
+    2
 }
 
 fn cmd_xargs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -861,6 +1207,7 @@ fn xargs_commands(
     let mut replace: Option<String> = None;
     let mut nper: Option<usize> = None;
     let mut nul_delimited = false;
+    let mut no_run_if_empty = false;
     while i < args.len() {
         match args[i].as_str() {
             "-I" => {
@@ -870,6 +1217,10 @@ fn xargs_commands(
                 };
                 replace = Some(value.clone());
                 i += 2;
+            }
+            option if option.starts_with("-I") && option.len() > 2 => {
+                replace = Some(option[2..].to_string());
+                i += 1;
             }
             "-n" => {
                 let Some(value) = args.get(i + 1).and_then(|s| s.parse().ok()) else {
@@ -883,11 +1234,26 @@ fn xargs_commands(
                 nper = Some(value);
                 i += 2;
             }
+            option if option.starts_with("-n") && option.len() > 2 => {
+                let Some(value) = option[2..].parse().ok() else {
+                    ewln(err, "xargs: invalid number for -n");
+                    return Err(1);
+                };
+                if value == 0 {
+                    ewln(err, "xargs: -n requires a positive number");
+                    return Err(1);
+                }
+                nper = Some(value);
+                i += 1;
+            }
             "-0" => {
                 nul_delimited = true;
                 i += 1;
             }
-            "-r" | "--no-run-if-empty" => i += 1,
+            "-r" | "--no-run-if-empty" => {
+                no_run_if_empty = true;
+                i += 1;
+            }
             "--" => {
                 i += 1;
                 break;
@@ -899,10 +1265,9 @@ fn xargs_commands(
             _ => break,
         }
     }
-    let cmd: Vec<String> = args[i..].to_vec();
+    let mut cmd: Vec<String> = args[i..].to_vec();
     if cmd.is_empty() {
-        ewln(err, "xargs: missing command");
-        return Err(1);
+        cmd.push("echo".to_string());
     }
     let input = String::from_utf8_lossy(stdin);
     let tokens: Vec<String> = if nul_delimited {
@@ -914,6 +1279,13 @@ fn xargs_commands(
     } else {
         input.split_whitespace().map(str::to_string).collect()
     };
+    if tokens.is_empty() {
+        return Ok(if no_run_if_empty {
+            Vec::new()
+        } else {
+            vec![cmd]
+        });
+    }
     let mut commands = Vec::new();
     if let Some(ph) = replace {
         for token in &tokens {
@@ -981,14 +1353,20 @@ fn cmd_diff(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         ewln(io.err, "diff: missing operand");
         return 2;
     }
-    let a = interp
-        .vfs
-        .read_string(&interp.cwd, ops[0])
-        .unwrap_or_default();
-    let b = interp
-        .vfs
-        .read_string(&interp.cwd, ops[1])
-        .unwrap_or_default();
+    let a = match interp.fs_read(&interp.cwd, ops[0]) {
+        Ok(data) => String::from_utf8_lossy(&data).into_owned(),
+        Err(error) => {
+            ewln(io.err, &format!("diff: {}: {error}", ops[0]));
+            return 2;
+        }
+    };
+    let b = match interp.fs_read(&interp.cwd, ops[1]) {
+        Ok(data) => String::from_utf8_lossy(&data).into_owned(),
+        Err(error) => {
+            ewln(io.err, &format!("diff: {}: {error}", ops[1]));
+            return 2;
+        }
+    };
     if a == b {
         0
     } else {
@@ -1015,8 +1393,20 @@ fn cmd_cmp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
     if ops.len() < 2 {
         return 2;
     }
-    let a = interp.vfs.read(&interp.cwd, ops[0]).unwrap_or_default();
-    let b = interp.vfs.read(&interp.cwd, ops[1]).unwrap_or_default();
+    let a = match interp.fs_read(&interp.cwd, ops[0]) {
+        Ok(data) => data,
+        Err(error) => {
+            ewln(io.err, &format!("cmp: {}: {error}", ops[0]));
+            return 2;
+        }
+    };
+    let b = match interp.fs_read(&interp.cwd, ops[1]) {
+        Ok(data) => data,
+        Err(error) => {
+            ewln(io.err, &format!("cmp: {}: {error}", ops[1]));
+            return 2;
+        }
+    };
     if a == b {
         0
     } else {
@@ -1050,27 +1440,28 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
     let mut fixed = cmd == "fgrep";
     let mut word = false;
     let mut quiet = false;
-    let mut after = 0usize;
-    let mut pattern: Option<String> = None;
+    let mut suppress_errors = false;
+    let mut suppress_filename = false;
+    let mut patterns = Vec::new();
     let mut files = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a.starts_with('-') && a.len() > 1 && a != "-" {
             if let Some(p) = a.strip_prefix("-e") {
                 if p.is_empty() {
-                    pattern = it.next().cloned();
+                    let Some(pattern) = it.next() else {
+                        ewln(io.err, "grep: option requires an argument -- 'e'");
+                        return 2;
+                    };
+                    patterns.push(pattern.clone());
                 } else {
-                    pattern = Some(p.to_string());
+                    patterns.push(p.to_string());
                 }
                 continue;
             }
-            if let Some(n) = a.strip_prefix("-A") {
-                after = if n.is_empty() {
-                    it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
-                } else {
-                    n.parse().unwrap_or(0)
-                };
-                continue;
+            if a.starts_with("-A") || a.starts_with("-B") || a.starts_with("-C") {
+                ewln(io.err, &format!("grep: unimplemented context option '{a}'"));
+                return 2;
             }
             for c in a[1..].chars() {
                 match c {
@@ -1085,25 +1476,38 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
                     'F' => fixed = true,
                     'w' => word = true,
                     'q' => quiet = true,
-                    'h' | 's' | 'a' => {}
-                    _ => {}
+                    'h' => suppress_filename = true,
+                    's' => suppress_errors = true,
+                    'a' => {}
+                    _ => {
+                        ewln(io.err, &format!("grep: unimplemented option '-{c}'"));
+                        return 2;
+                    }
                 }
             }
-        } else if pattern.is_none() {
-            pattern = Some(a.clone());
+        } else if patterns.is_empty() {
+            patterns.push(a.clone());
         } else {
             files.push(a.clone());
         }
     }
     let _ = extended;
-    let Some(pat) = pattern else {
+    if patterns.is_empty() {
         ewln(io.err, "grep: no pattern");
         return 2;
-    };
+    }
     let mut pat_re = if fixed {
-        regex::escape(&pat)
+        patterns
+            .iter()
+            .map(|pattern| regex::escape(pattern))
+            .collect::<Vec<_>>()
+            .join("|")
     } else {
-        pat.clone()
+        patterns
+            .iter()
+            .map(|pattern| format!("(?:{pattern})"))
+            .collect::<Vec<_>>()
+            .join("|")
     };
     if word {
         pat_re = format!(r"\b(?:{pat_re})\b");
@@ -1113,33 +1517,60 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
         .build()
     {
         Ok(r) => r,
-        Err(_) => {
-            // fall back to fixed-string
-            regex::RegexBuilder::new(&regex::escape(&pat))
-                .case_insensitive(ignore_case)
-                .build()
-                .unwrap()
+        Err(error) => {
+            ewln(
+                io.err,
+                &format!("grep: invalid regular expression: {error}"),
+            );
+            return 2;
         }
     };
 
     // gather (label, data)
     let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut had_error = false;
     if files.is_empty() {
         inputs.push((String::new(), std::mem::take(&mut io.stdin)));
     } else if recursive {
         for f in &files {
             let abs = crate::vfs::resolve_against(&interp.cwd, f);
-            for p in interp.vfs.walk(&abs) {
-                if interp.vfs.is_file("/", &p) {
-                    inputs.push((p.clone(), interp.vfs.read("/", &p).unwrap_or_default()));
+            let paths = match interp.fs_walk("/", &abs) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    if !suppress_errors {
+                        ewln(io.err, &format!("grep: {error}"));
+                    }
+                    had_error = true;
+                    continue;
+                }
+            };
+            for p in paths {
+                if matches!(
+                    interp.fs_metadata("/", &p, false).map(|node| node.kind),
+                    Ok(crate::vfs::NodeKind::File(_))
+                ) {
+                    match interp.fs_read("/", &p) {
+                        Ok(data) => inputs.push((p.clone(), data)),
+                        Err(error) => {
+                            if !suppress_errors {
+                                ewln(io.err, &format!("grep: {error}"));
+                            }
+                            had_error = true;
+                        }
+                    }
                 }
             }
         }
     } else {
         for f in &files {
-            match interp.vfs.read(&interp.cwd, f) {
+            match interp.fs_read(&interp.cwd, f) {
                 Ok(d) => inputs.push((f.clone(), d)),
-                Err(e) => ewln(io.err, &format!("grep: {e}")),
+                Err(error) => {
+                    if !suppress_errors {
+                        ewln(io.err, &format!("grep: {f}: {error}"));
+                    }
+                    had_error = true;
+                }
             }
         }
     }
@@ -1158,7 +1589,7 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
                     continue;
                 }
                 let mut prefix = String::new();
-                if multi && !label.is_empty() {
+                if multi && !suppress_filename && !label.is_empty() {
                     prefix.push_str(label);
                     prefix.push(':');
                 }
@@ -1172,11 +1603,10 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
                 } else {
                     wln(io.out, &format!("{prefix}{line}"));
                 }
-                let _ = after;
             }
         }
         if count {
-            if multi && !label.is_empty() {
+            if multi && !suppress_filename && !label.is_empty() {
                 wln(io.out, &format!("{label}:{file_count}"));
             } else {
                 wln(io.out, &file_count.to_string());
@@ -1186,7 +1616,9 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
             wln(io.out, label);
         }
     }
-    if total_matches > 0 {
+    if had_error {
+        2
+    } else if total_matches > 0 {
         0
     } else {
         1
@@ -1203,7 +1635,10 @@ fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
     while let Some(a) = it.next() {
         if a == "-i" || a.starts_with("-i") {
             in_place = true;
-            if a.len() > 2 { /* suffix ignored */ }
+            if a.len() > 2 {
+                ewln(io.err, "sed: unimplemented in-place backup suffix");
+                return 2;
+            }
         } else if a == "-n" {
             quiet = true;
         } else if a == "-r" || a == "-E" {
@@ -1216,6 +1651,9 @@ fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             scripts.push(s.to_string());
         } else if a == "--" {
             continue;
+        } else if a.starts_with('-') {
+            ewln(io.err, &format!("sed: unimplemented option '{a}'"));
+            return 2;
         } else if scripts.is_empty() && !a.starts_with('-') {
             scripts.push(a.clone());
         } else {
@@ -1223,17 +1661,34 @@ fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
         }
     }
     let _ = extended;
-    let commands: Vec<SedCmd> = scripts.iter().flat_map(|s| parse_sed_script(s)).collect();
+    if scripts.is_empty() {
+        ewln(io.err, "sed: missing command");
+        return 1;
+    }
+    let mut commands = Vec::new();
+    for script in &scripts {
+        match parse_sed_script(script) {
+            Ok(parsed) => commands.extend(parsed),
+            Err(error) => {
+                ewln(io.err, &format!("sed: {error}"));
+                return 2;
+            }
+        }
+    }
 
     let process = |text: &str| -> String {
         let mut result = String::new();
-        for line in text.split_inclusive('\n') {
+        let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+        for (index, line) in lines.iter().enumerate() {
             let had_nl = line.ends_with('\n');
             let mut content = line.trim_end_matches('\n').to_string();
             let mut deleted = false;
             let mut printed_extra = Vec::new();
-            for cmd in &commands {
-                match cmd {
+            for operation in &commands {
+                if !operation.address.matches(index + 1, lines.len()) {
+                    continue;
+                }
+                match &operation.command {
                     SedCmd::Subst {
                         re,
                         rep,
@@ -1273,10 +1728,14 @@ fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
     if in_place && !files.is_empty() {
         let cwd = interp.cwd.clone();
         for f in &files {
-            match interp.vfs.read_string(&cwd, f) {
-                Ok(text) => {
+            match interp.fs_read(&cwd, f) {
+                Ok(data) => {
+                    let text = String::from_utf8_lossy(&data);
                     let new = process(&text);
-                    let _ = interp.vfs.write(&cwd, f, new.as_bytes(), 0o644);
+                    if let Err(error) = interp.vfs.write(&cwd, f, new.as_bytes(), 0o644) {
+                        ewln(io.err, &format!("sed: can't write {f}: {error}"));
+                        return 1;
+                    }
                 }
                 Err(e) => {
                     ewln(io.err, &format!("sed: can't read {f}: {e}"));
@@ -1286,11 +1745,36 @@ fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
         }
         0
     } else {
-        let (data, _e) = read_inputs(interp, &files.iter().collect::<Vec<_>>(), &io.stdin);
+        let (data, errors) = read_inputs(interp, &files.iter().collect::<Vec<_>>(), &io.stdin);
+        if let Some(error) = errors.first() {
+            ewln(io.err, &format!("sed: {error}"));
+            return 1;
+        }
         let text = String::from_utf8_lossy(&data);
         w(io.out, &process(&text));
         0
     }
+}
+
+enum SedAddress {
+    Every,
+    Line(usize),
+    Last,
+}
+
+impl SedAddress {
+    fn matches(&self, line: usize, total: usize) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Line(expected) => line == *expected,
+            Self::Last => line == total,
+        }
+    }
+}
+
+struct SedOperation {
+    address: SedAddress,
+    command: SedCmd,
 }
 
 enum SedCmd {
@@ -1306,27 +1790,53 @@ enum SedCmd {
     Print,
 }
 
-fn parse_sed_script(s: &str) -> Vec<SedCmd> {
+fn parse_sed_script(s: &str) -> Result<Vec<SedOperation>, String> {
     let mut cmds = Vec::new();
     for part in s.split(';') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        // strip a leading line address like `3` or `/re/` (best-effort: ignore numeric/`$`)
-        let body = part
-            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '$' || c == ',' || c == ' ');
+        let digit_count = part
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .count();
+        let (address, body) = if digit_count > 0 {
+            let line = part[..digit_count]
+                .parse()
+                .map_err(|_| "invalid line address".to_string())?;
+            (SedAddress::Line(line), part[digit_count..].trim_start())
+        } else if let Some(body) = part.strip_prefix('$') {
+            (SedAddress::Last, body.trim_start())
+        } else if part.starts_with('/') || part.contains(',') {
+            return Err(format!("unimplemented address in '{part}'"));
+        } else {
+            (SedAddress::Every, part)
+        };
         if let Some(rest) = body.strip_prefix('s') {
             if let Some(cmd) = parse_subst(rest) {
-                cmds.push(cmd);
+                cmds.push(SedOperation {
+                    address,
+                    command: cmd,
+                });
+            } else {
+                return Err(format!("invalid substitution '{body}'"));
             }
         } else if body == "d" {
-            cmds.push(SedCmd::Delete);
+            cmds.push(SedOperation {
+                address,
+                command: SedCmd::Delete,
+            });
         } else if body == "p" {
-            cmds.push(SedCmd::Print);
+            cmds.push(SedOperation {
+                address,
+                command: SedCmd::Print,
+            });
+        } else {
+            return Err(format!("unimplemented command '{body}'"));
         }
     }
-    cmds
+    Ok(cmds)
 }
 
 fn parse_subst(rest: &str) -> Option<SedCmd> {
