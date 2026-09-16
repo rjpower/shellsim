@@ -14,8 +14,9 @@ to this repository's Rust runtime and deterministic-simulation constraints.
 
 ## Setup
 
-Install rustup and Python 3. The checked-in `rust-toolchain.toml` pins Rust and installs `rustfmt`
-and `clippy`; the repository wrappers have no third-party Python dependencies:
+Install rustup, Python 3, and [uv](https://docs.astral.sh/uv/). The checked-in
+`rust-toolchain.toml` pins Rust and installs `rustfmt` and `clippy`; uv runs the exact marin-style
+revision recorded in `infra/marin-style.py` without adding it to shellsim's package dependencies:
 
 ```sh
 make check
@@ -37,16 +38,30 @@ The hook only installs local Git configuration. It does not modify global hooks.
 make lint
 ```
 
-It checks formatting, runs clippy over every target and feature with warnings denied, builds
-rustdoc with warnings denied, and rejects staged or unstaged whitespace errors. Apply safe
-formatting fixes with:
+It checks Rust and Python formatting, runs clippy over every target and feature with warnings
+denied, builds rustdoc with warnings denied, and rejects staged or unstaged whitespace errors.
+The Python checks cover repository tooling and the PyPI package, not simulated stdlib sources or
+compatibility fixtures. Apply safe formatting fixes with:
 
 ```sh
 make format
 ```
 
-The `--changed-files` and `--all-files` spellings are both accepted to match Marin's workflow.
-Rust module-wide formatting and semantic checks intentionally inspect the whole small crate.
+The `--changed-files` and `--all-files` spellings match Marin's workflow. Rust module-wide
+formatting and semantic checks intentionally inspect the whole small crate; Python checks honor
+the requested scope.
+
+Before opening a substantial pull request, run the advisory agentic review locally:
+
+```sh
+make review
+```
+
+The review fans out read-only agents over a shellsim-owned catalog, then composes their findings.
+It keeps marin-style's orchestration and safety restrictions while excluding Python- and
+Marin-monorepo-specific rules. Findings do not block CI. Use `--agent-command`, repeated
+`--lint-lane`, or `--no-lint-compose` with `infra/pre-commit.py --review` to inspect one lane or
+use another headless agent. Raw prompts and results are written below `/tmp/marin-style-lint/`.
 
 ## Testing
 
@@ -110,9 +125,10 @@ A pull request should lead with what changed and why. Before opening it:
 1. Run `make format`.
 2. Run `make lint`.
 3. Run `make test`.
-4. Review the diff for unrelated edits and accidental capability expansion.
-5. Report the exact validation results and remaining caveats.
-6. Link the issue with `Fixes #NNN` or `Part of #NNN` when applicable.
+4. Run `make review` for a substantial change and evaluate each advisory finding.
+5. Review the diff for unrelated edits and accidental capability expansion.
+6. Report the exact validation results and remaining caveats.
+7. Link the issue with `Fixes #NNN` or `Part of #NNN` when applicable.
 
 Use an imperative title of at most 72 characters, optionally beginning with a `[scope]` prefix.
 Do not use Conventional Commit prefixes such as `feat:` or `fix:`. Write the body so it can stand

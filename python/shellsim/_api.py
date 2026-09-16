@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
-from typing import Any, Mapping, Optional, Tuple, Union
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple, Union
 
 from . import _native
-
 
 SimulationError = _native.SimulationError
 
@@ -111,9 +111,7 @@ class RunResult:
         if self.returncode != 0:
             diagnostic = self.stderr_text.strip()
             suffix = f": {diagnostic}" if diagnostic else ""
-            raise SimulationError(
-                f"shellsim action exited with status {self.returncode}{suffix}"
-            )
+            raise SimulationError(f"shellsim action exited with status {self.returncode}{suffix}")
 
 
 class Environment:
@@ -138,11 +136,7 @@ class Environment:
         if limits is not None and not isinstance(limits, Limits):
             raise TypeError("limits must be a shellsim.Limits instance")
         resolved = limits or Limits(
-            **{
-                name: _validate_limit(name, value)
-                for name, value in overrides.items()
-                if value is not None
-            }
+            **{name: _validate_limit(name, value) for name, value in overrides.items() if value is not None}
         )
         self._native = _native.NativeEnvironment(
             resolved.cpu,
@@ -157,9 +151,7 @@ class Environment:
 
         return bool(self._native.terminated)
 
-    def run(
-        self, source: str, stdin: Union[bytes, bytearray, memoryview] = b""
-    ) -> RunResult:
+    def run(self, source: str, stdin: Union[bytes, bytearray, memoryview] = b"") -> RunResult:
         """Execute one complete shell action with an explicit input byte stream."""
 
         if not isinstance(source, str):
@@ -204,9 +196,7 @@ class Environment:
             raise TypeError("parents must be bool")
         self._native.mkdir(path, parents)
 
-    def mount(
-        self, host_root: Union[str, os.PathLike[str]], destination: str = "/work"
-    ) -> MountResult:
+    def mount(self, host_root: Union[str, os.PathLike[str]], destination: str = "/work") -> MountResult:
         """Copy an explicitly trusted host directory into the bounded VFS.
 
         The walk rejects symlinks and non-regular files, has a 10,000-file limit, and skips

@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
 import sys
+from collections.abc import Sequence
 from typing import Any, Optional
 
 from ._api import Environment, RunResult, SimulationError
-
 
 _MAX_U64 = (1 << 64) - 1
 
@@ -23,9 +22,7 @@ def _quantity(value: str) -> int:
     try:
         number = int(digits)
     except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            "expected a count, optionally suffixed with k, m, or g"
-        ) from error
+        raise argparse.ArgumentTypeError("expected a count, optionally suffixed with k, m, or g") from error
     result = number * multiplier
     if number < 0 or result > _MAX_U64:
         raise argparse.ArgumentTypeError(f"expected a count between 0 and {_MAX_U64}")
@@ -101,9 +98,7 @@ def _read_bytes(stream: Any) -> bytes:
     return data.encode() if isinstance(data, str) else data
 
 
-def _prepare_environment(
-    options: argparse.Namespace, stdout: Any, stderr: Any
-) -> tuple[Optional[Environment], int]:
+def _prepare_environment(options: argparse.Namespace, stdout: Any, stderr: Any) -> tuple[Optional[Environment], int]:
     """Create a simulated machine, import an optional host snapshot, and enter `/work`."""
 
     environment = Environment(
@@ -160,9 +155,7 @@ def main(arguments: Optional[Sequence[str]] = None) -> int:
 
     if options.command is not None:
         stdin = b"" if sys.stdin.isatty() else _read_bytes(sys.stdin)
-        result = _execute_action(
-            environment, options.command, stdin, sys.stdout, sys.stderr
-        )
+        result = _execute_action(environment, options.command, stdin, sys.stdout, sys.stderr)
         if result is None:
             return 1
         return result.returncode

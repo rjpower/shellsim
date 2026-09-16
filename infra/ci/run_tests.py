@@ -7,13 +7,12 @@ targets and features. Reference-binary differential tests retain their own avail
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 import logging
 import os
-from pathlib import Path
 import subprocess
 import sys
-
+from collections.abc import Sequence
+from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
