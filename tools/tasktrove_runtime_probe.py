@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Probe unchanged TaskTrove Python with the shellsim Python runner.
+"""Sample TaskTrove golden solutions and verifiers in shellsim.
 
-This is a compatibility probe, not a TaskTrove solver. It loads Python payloads from each
-reference solution and asks shellsim to collect each task's verifier suite. Results record only
-the first blocker reached for each source or suite. Host CPython is used only by this analysis
-harness to enumerate inputs and invoke the capability-free shellsim runtime.
+This is a prioritization probe, not a TaskTrove runner. It mounts each task's environment source
+at the Dockerfile's last WORKDIR, runs the golden solution, then runs the verifier in the same
+shellsim environment. It intentionally does not build Docker images or install dependencies.
 """
 
 from __future__ import annotations
@@ -12,202 +11,231 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
-import tempfile
+import shlex
+import sys
 from collections import Counter, defaultdict
-from collections.abc import Iterable
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Optional
 
-from tasktrove_inventory import inspect_python, python_heredocs
+WORKDIR = re.compile(r"^\s*WORKDIR\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class Action:
+    """Small stable subset of one shellsim result."""
+
+    phase: str
+    returncode: int
+    stop_reason: Optional[str]
+    unsupported: tuple[str, ...]
+    unsupported_commands: tuple[str, ...]
+    commands: tuple[str, ...]
+    stderr: str
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="extracted TaskTrove task-directory root")
-    parser.add_argument(
-        "--runner",
-        type=Path,
-        default=Path("target/release/shellsim-python"),
-        help="shellsim-python executable (default: target/release/shellsim-python)",
-    )
-    parser.add_argument("--limit", type=int, help="probe only the first N tasks")
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=10.0,
-        help="host timeout per invocation in seconds (default: 10)",
-    )
+    parser.add_argument("--task", action="append", default=[], help="sample only this task (repeatable)")
+    parser.add_argument("--limit", type=int, help="sample only the first N selected tasks")
+    parser.add_argument("--quiet", action="store_true", help="do not print task progress")
     return parser.parse_args()
 
 
-def source_error_line(diagnostic: str, source: bytes) -> str:
-    match = re.search(r" at line (\d+), column", diagnostic)
-    if not match:
-        return ""
-    lines = source.decode("utf-8", errors="replace").splitlines()
-    line_number = int(match.group(1))
-    return lines[line_number - 1] if 0 < line_number <= len(lines) else ""
+def task_workdir(task: Path) -> str:
+    """Use the last literal Docker WORKDIR, falling back to /work."""
+    dockerfile = task / "environment" / "Dockerfile"
+    matches = WORKDIR.findall(dockerfile.read_text(errors="replace")) if dockerfile.is_file() else []
+    value = matches[-1] if matches else "/work"
+    return value if value.startswith("/") and "$" not in value else "/work"
 
 
-def classify(diagnostic: str, unsupported: list[str], source: bytes | None = None) -> str:
-    """Map the first shellsim diagnostic to a stable feature-sized category."""
-    text = "\n".join([diagnostic, *unsupported])
-    module = re.search(r"no module named [\"']([^\"']+)", text)
-    if module:
-        return f"module:{module.group(1).split('.')[0]}"
-    option = re.search(r"pytest option ([^\s]+)", text)
-    if option:
-        return f"pytest-option:{option.group(1)}"
-    if "fixture arguments" in text:
-        return "pytest:fixtures"
-    if "decorators are unsupported" in text:
-        return "pytest:decorators"
-
-    line = source_error_line(text, source) if source is not None else ""
-    decoded = source.decode("utf-8", errors="replace") if source is not None else ""
-    if ('"""' in line or "'''" in line) and (
-        "unterminated string literal" in text or "expected a newline or ';' after statement" in text
-    ):
-        return "syntax:triple-quoted-strings"
-    if "unexpected character '\\\\'" in text:
-        return "syntax:explicit-line-continuation"
-    if "f-string" in text or re.search(r"\b(?:rf|fr)[\"']", line, re.IGNORECASE):
-        return "syntax:f-string-formatting"
-    if "expected a module name after 'from'" in text:
-        return "syntax:relative-import"
-    if line.lstrip().startswith("async def ") or (
-        "decorators may only be applied" in text and re.search(r"^\s*async\s+def\b", decoded, re.MULTILINE)
-    ):
-        return "syntax:async-functions"
-    if any(character in line for character in (" & ", " | ", " ^ ")) or any(
-        f"unexpected character '{character}'" in text for character in "&|^"
-    ):
-        return "syntax:bitwise-operators"
-    if re.search(r"\bif\b.+\belse\b", line):
-        return "syntax:conditional-expressions"
-    if re.search(r"\[[^\]]*:[^\]]*\]", line):
-        return "syntax:slices"
-    if "expected an indented suite" in text and line.lstrip().startswith("#"):
-        return "syntax:comment-first-suites"
-    if "expected" in text or "unsupported" in text or "not implemented" in text:
-        return f"language-api:{text.strip().splitlines()[0][:100]}"
-    if "AssertionError" in text or "FAILED" in text:
-        return "test-failure"
-    if not text.strip():
-        return "nonzero-without-diagnostic"
-    return f"runtime:{text.strip().splitlines()[0][:100]}"
-
-
-def invoke(runner: Path, arguments: list[str], timeout: float) -> tuple[bool, str, list[str]]:
-    try:
-        result = subprocess.run(
-            [str(runner), "--json", *arguments],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "host probe timeout", []
-    try:
-        report = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return False, result.stderr or result.stdout, []
-    return (
-        report["outcome"]["exit_status"] == 0,
-        report["stderr"],
-        report.get("unsupported", []),
+def observe(phase: str, result: Any) -> Action:
+    stderr = result.stderr_text
+    if len(stderr) > 2_000:
+        stderr = stderr[:2_000] + "\n[truncated]"
+    return Action(
+        phase=phase,
+        returncode=result.returncode,
+        stop_reason=result.stop_reason,
+        unsupported=tuple(result.unsupported),
+        unsupported_commands=tuple(result.unsupported_commands),
+        commands=tuple(result.commands),
+        stderr=stderr,
     )
 
 
-def solution_sources(task: Path) -> Iterable[tuple[str, bytes]]:
+def run(environment: Any, actions: list[Action], phase: str, source: str) -> Any:
+    result = environment.run(source)
+    actions.append(observe(phase, result))
+    return result
+
+
+def verifier_payload(tests: Path) -> Optional[str]:
+    python_tests = sorted(tests.rglob("test_*.py"))
+    if python_tests:
+        paths = [f"/tests/{path.relative_to(tests).as_posix()}" for path in python_tests]
+        return "cd /tests && pytest " + " ".join(shlex.quote(path) for path in paths)
+    if (tests / "ref_eval.py").is_file():
+        return "cd /tests && python /tests/ref_eval.py"
+    return None
+
+
+def phase_outcome(result: Any) -> str:
+    if result is None:
+        return "not_run"
+    if result.stop_reason:
+        return "resource_exhausted"
+    if result.unsupported or result.unsupported_commands:
+        return "explicit_boundary"
+    return "passed" if result.returncode == 0 else "failed"
+
+
+def reward(environment: Any) -> Optional[str]:
+    for path in ("/logs/verifier/reward.txt", "/log/reward.txt"):
+        try:
+            return environment.read_file(path).decode(errors="replace").strip()
+        except Exception:  # absent VFS paths use the public adapter error
+            pass
+    return None
+
+
+def replay(task: Path, environment_type: Any, limits_type: Any) -> dict[str, Any]:
+    environment = environment_type(limits_type(cpu=100_000_000, memory=256 << 20, disk=256 << 20, output=8 << 20))
+    actions: list[Action] = []
+    errors: list[str] = []
+    workdir = task_workdir(task)
+
+    try:
+        environment.mkdir(workdir, parents=True)
+        environment.mount(task / "environment", workdir)
+        run(environment, actions, "setup", f"cd {shlex.quote(workdir)}")
+    except Exception as error:
+        errors.append(f"environment: {error}")
+
+    solution_result = None
     solution = task / "solution"
-    if not solution.is_dir():
-        return
-    for path in sorted(solution.rglob("*.py")):
-        yield str(path.relative_to(solution)), path.read_bytes()
-    for path in sorted(solution.rglob("*.sh")):
-        yield from python_heredocs(str(path.relative_to(solution)), path.read_bytes())
+    if not environment.terminated and (solution / "solve.sh").is_file():
+        try:
+            environment.mount(solution, "/solution")
+            solution_result = run(
+                environment,
+                actions,
+                "solution",
+                f"cd {shlex.quote(workdir)} && bash /solution/solve.sh",
+            )
+        except Exception as error:
+            errors.append(f"solution: {error}")
+
+    wrapper_result = None
+    verifier_result = None
+    verifier_source = None
+    tests = task / "tests"
+    if not environment.terminated and tests.is_dir():
+        try:
+            environment.mount(tests, "/tests")
+            wrapper = tests / "test.sh"
+            if wrapper.is_file():
+                wrapper_result = run(environment, actions, "verifier_wrapper", "cd /tests && bash /tests/test.sh")
+            payload = verifier_payload(tests)
+            wrapper_clean = (
+                wrapper_result is not None
+                and wrapper_result.returncode == 0
+                and not wrapper_result.stop_reason
+                and not wrapper_result.unsupported
+                and not wrapper_result.unsupported_commands
+            )
+            if wrapper_clean or payload is None:
+                verifier_result = wrapper_result
+                verifier_source = "test.sh" if wrapper_result is not None else None
+            elif not environment.terminated:
+                run(environment, actions, "probe", "rm -f /logs/verifier/reward.txt /log/reward.txt")
+                verifier_result = run(environment, actions, "verifier", payload)
+                verifier_source = "normalized_python"
+        except Exception as error:
+            errors.append(f"verifier: {error}")
+
+    return {
+        "task": task.name,
+        "workdir": workdir,
+        "solution_outcome": phase_outcome(solution_result),
+        "verifier_wrapper_outcome": phase_outcome(wrapper_result),
+        "verifier_outcome": phase_outcome(verifier_result),
+        "verifier_source": verifier_source,
+        "reward": reward(environment),
+        "errors": errors,
+        "actions": [asdict(action) for action in actions],
+    }
+
+
+def gap_name(value: str) -> str:
+    module = re.search(r"no module named [\"']([^\"']+)", value)
+    if module:
+        return f"python-module:{module.group(1).split('.')[0]}"
+    if value.startswith("python:"):
+        return re.split(r" (?:at line|in /)", value, maxsplit=1)[0][:160]
+    if value.startswith("pip:"):
+        return re.split(r" at line", value, maxsplit=1)[0][:160]
+    return value[:160]
+
+
+def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
+    phases = ("solution_outcome", "verifier_wrapper_outcome", "verifier_outcome")
+    outcomes = {phase: dict(sorted(Counter(result[phase] for result in results).items())) for phase in phases}
+    gap_tasks: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    for result in results:
+        for action in result["actions"]:
+            gaps = {gap_name(value) for value in [*action["unsupported"], *action["unsupported_commands"]]}
+            for gap in gaps:
+                gap_tasks[action["phase"]][gap].add(result["task"])
+    gaps = {
+        phase: dict(sorted(((gap, len(tasks)) for gap, tasks in values.items()), key=lambda item: (-item[1], item[0])))
+        for phase, values in sorted(gap_tasks.items())
+    }
+    return {
+        "outcomes": outcomes,
+        "gap_task_counts": gaps,
+        "tasks_with_errors": sum(bool(result["errors"]) for result in results),
+    }
 
 
 def main() -> int:
-    args = parse_args()
-    source = args.source.resolve()
-    runner = args.runner.resolve()
-    if not runner.is_file():
-        raise SystemExit(f"runner does not exist: {runner}")
+    options = parse_args()
+    source = options.source.resolve()
     tasks = sorted(path.parent for path in source.glob("*/task.toml"))
-    if args.limit is not None:
-        tasks = tasks[: args.limit]
+    if options.task:
+        selected = set(options.task)
+        tasks = [task for task in tasks if task.name in selected]
+    if options.limit is not None:
+        tasks = tasks[: options.limit]
     if not tasks:
-        raise SystemExit(f"no task.toml files found below {source}")
+        raise SystemExit(f"no selected tasks found below {source}")
 
-    solution_results: list[tuple[str, str, str]] = []
-    verifier_results: list[tuple[str, str]] = []
-    feature_counts: dict[str, Counter[str]] = defaultdict(Counter)
-    with tempfile.TemporaryDirectory(prefix="shellsim-tasktrove-") as temporary_name:
-        temporary = Path(temporary_name)
-        for task in tasks:
-            for ordinal, (label, data) in enumerate(solution_sources(task)):
-                probe = temporary / task.name / str(ordinal)
-                probe.mkdir(parents=True)
-                path = probe / "probe.py"
-                path.write_bytes(data)
-                passed, diagnostic, unsupported = invoke(runner, [str(path)], args.timeout)
-                category = "pass" if passed else classify(diagnostic, unsupported, data)
-                solution_results.append((task.name, label, category))
-                inspected = inspect_python(label, data)
-                for imported in inspected.imports:
-                    feature_counts[category][f"import:{imported.split('.')[0]}"] += 1
-                for node, count in inspected.node_types.items():
-                    feature_counts[category][f"ast:{node}"] += count
+    try:
+        from shellsim import Environment, Limits
+    except ImportError as error:
+        raise SystemExit("install the local shellsim Python package before running this probe") from error
 
-            tests = task / "tests"
-            test_files = sorted(tests.rglob("test_*.py")) if tests.is_dir() else []
-            if test_files:
-                passed, diagnostic, unsupported = invoke(
-                    runner,
-                    ["--root", str(task), "--pytest", str(tests)],
-                    args.timeout,
-                )
-                test_source = b"\n".join(path.read_bytes() for path in test_files)
-                category = "pass" if passed else classify(diagnostic, unsupported, test_source)
-                verifier_results.append((task.name, category))
-
-    solution_categories = Counter(category for _, _, category in solution_results)
-    verifier_categories = Counter(category for _, category in verifier_results)
-    task_solutions: dict[str, list[str]] = defaultdict(list)
-    for task, _label, category in solution_results:
-        task_solutions[task].append(category)
-    result = {
-        "schema_version": 1,
-        "method": "first shellsim blocker when loading unchanged sources",
-        "source": str(source),
-        "tasks": len(tasks),
-        "solution_python_sources": len(solution_results),
-        "solution_source_passes": solution_categories["pass"],
-        "solution_tasks_with_sources": len(task_solutions),
-        "solution_tasks_all_sources_pass": sum(
-            all(value == "pass" for value in values) for values in task_solutions.values()
-        ),
-        "solution_failure_categories": dict(
-            sorted((key, value) for key, value in solution_categories.items() if key != "pass")
-        ),
-        "verifier_tasks": len(verifier_results),
-        "verifier_task_passes": verifier_categories["pass"],
-        "verifier_failure_categories": dict(
-            sorted((key, value) for key, value in verifier_categories.items() if key != "pass")
-        ),
-        "solution_failures": [
-            {"task": task, "source": label, "category": category}
-            for task, label, category in solution_results
-            if category != "pass"
-        ],
-        "failure_feature_counts": {
-            category: dict(counts.most_common()) for category, counts in sorted(feature_counts.items())
-        },
-    }
-    print(json.dumps(result, indent=2, sort_keys=True))
+    results = []
+    for index, task in enumerate(tasks, 1):
+        if not options.quiet:
+            print(f"[{index}/{len(tasks)}] {task.name}", file=sys.stderr)
+        results.append(replay(task, Environment, Limits))
+    print(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "method": "approximate task mount; golden solution; verifier wrapper with Python fallback",
+                "source": str(source),
+                "tasks": len(results),
+                "summary": summarize(results),
+                "results": results,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 

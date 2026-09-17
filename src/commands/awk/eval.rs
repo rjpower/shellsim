@@ -8,7 +8,7 @@ use crate::commands::{CommandContext, Io};
 
 const SUPPORTED_FUNCTIONS: &[&str] = &[
     "length", "substr", "index", "split", "sub", "gsub", "match", "tolower", "toupper", "int",
-    "sprintf",
+    "sprintf", "log",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -687,13 +687,14 @@ impl Runtime<'_, '_, '_> {
                     .unwrap_or(0);
                 Ok(Scalar::number(index as f64))
             }
-            "tolower" | "toupper" | "int" => {
+            "tolower" | "toupper" | "int" | "log" => {
                 self.arity(name, args, 1, 1)?;
                 let value = self.expr(&args[0])?;
                 Ok(match name {
                     "tolower" => Scalar::string(value.text.to_lowercase()),
                     "toupper" => Scalar::string(value.text.to_uppercase()),
                     "int" => Scalar::number(value.as_number().trunc()),
+                    "log" => Scalar::number(value.as_number().ln()),
                     _ => unreachable!(),
                 })
             }

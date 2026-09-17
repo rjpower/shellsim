@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "command": "find",
+  "options": ["-name", "-path", "-wholename", "-type", "-mindepth", "-maxdepth", "-print", "-print0", "-a", "-and", "-o", "-or", "-not", "!"]
+}

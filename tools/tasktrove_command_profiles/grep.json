@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "command": "grep",
+  "options": [
+    "-i", "-v", "-c", "-n", "-l", "-L", "-o", "-r", "-R", "-E", "-F", "-w", "-x", "-q", "-h", "-H", "-s", "-a", "-e", "-f", "-m", "-B", "-A", "-C",
+    "--ignore-case", "--invert-match", "--count", "--line-number", "--files-with-matches", "--files-without-match", "--only-matching", "--recursive", "--dereference-recursive", "--extended-regexp", "--fixed-strings", "--word-regexp", "--line-regexp", "--quiet", "--silent", "--no-filename", "--with-filename", "--no-messages", "--text", "--regexp", "--file", "--max-count", "--include", "--exclude", "--exclude-dir", "--before-context", "--after-context", "--context", "--color", "--help"
+  ]
+}
