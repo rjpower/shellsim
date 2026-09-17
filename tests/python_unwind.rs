@@ -92,6 +92,15 @@ fn abrupt_control_flow_exits_a_context_manager_once() {
 }
 
 #[test]
+fn loop_control_does_not_exit_an_enclosing_context_manager() {
+    let source = "class C:\n    def __enter__(self):\n        print('enter')\n    def __exit__(self, kind, value, traceback):\n        print('exit')\nwith C():\n    for value in [1, 2, 3]:\n        if value == 1:\n            continue\n        if value == 2:\n            break\nprint('done')";
+    let (status, out, err) = run(source);
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(out, "enter\nexit\ndone\n");
+    assert!(err.is_empty());
+}
+
+#[test]
 fn yield_in_cleanup_region_is_rejected_loudly() {
     let source = "def bad():\n    try:\n        yield 1\n    finally:\n        print('cleanup')\nprint(next(bad()))";
     let (status, out, err) = run(source);

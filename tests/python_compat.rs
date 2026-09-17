@@ -52,6 +52,49 @@ fn containers_comparisons_and_short_circuiting_use_python_protocols() {
 }
 
 #[test]
+fn sequence_ordering_uses_element_protocols_and_sets_use_subset_ordering() {
+    let source = r#"class Key:
+    def __init__(self, value):
+        self.value = value
+    def __eq__(self, other):
+        return self.value == other.value
+    def __lt__(self, other):
+        return self.value < other.value
+print((Key(1), 9) < (Key(2), 0))
+print([Key(2)] > [Key(1)])
+print({1} < {1, 2}, {1, 2} <= {2, 1}, {1, 2} >= {1})"#;
+    assert_eq!(
+        run_shell(&format!("python3.14 <<'PY'\n{source}\nPY")),
+        (0, b"True\nTrue\nTrue True True\n".to_vec(), Vec::new(),)
+    );
+}
+
+#[test]
+fn common_text_predicates_lines_and_collection_copies_match_python() {
+    let source = r#"print('ABC 12'.isupper(), 'abc 12'.islower(), ''.isupper())
+print('a\r\nb\nc\r'.splitlines(), 'a\r\nb\n'.splitlines(True))
+items = [[1]]
+items_copy = items.copy()
+items_copy.append([2])
+mapping = {'a': items}
+mapping_copy = mapping.copy()
+mapping_copy['b'] = 2
+values = {1, 2}
+values_copy = values.copy()
+values_copy.add(3)
+print(len(items), len(items_copy), mapping_copy['a'] is items, sorted(mapping_copy.keys()))
+print(sorted(values), sorted(values_copy))"#;
+    assert_eq!(
+        run_shell(&format!("python3.14 <<'PY'\n{source}\nPY")),
+        (
+            0,
+            b"True True False\n['a', 'b', 'c'] ['a\\r\\n', 'b\\n']\n1 2 True ['a', 'b']\n[1, 2] [1, 2, 3]\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
 fn indented_control_flow_functions_and_iteration_run_as_bytecode() {
     let source = r#"def fib(n):
     if n < 2:

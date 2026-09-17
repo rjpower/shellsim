@@ -1,8 +1,8 @@
 //! Compiler from the owned AST to typed stack-machine operations.
 
 use super::ast::{
-    AssignmentTarget, BooleanOperator, ComprehensionClause, Constant, Expression, ExpressionKind,
-    FStringPart, Program, Statement, StatementKind,
+    AssignmentTarget, BooleanOperator, ComprehensionClause, Constant, DictEntry, Expression,
+    ExpressionKind, FStringPart, Program, Statement, StatementKind,
 };
 use super::bytecode::{ClassField, Code, Instruction, Operation};
 use super::source::Span;
@@ -47,6 +47,7 @@ struct Compiler {
 struct LoopContext {
     continue_target: usize,
     iterator_on_stack: bool,
+    finalizer_depth: usize,
     breaks: Vec<usize>,
 }
 
@@ -180,6 +181,7 @@ impl Compiler {
                 self.loops.push(LoopContext {
                     continue_target: condition,
                     iterator_on_stack: false,
+                    finalizer_depth: self.finalizers.len(),
                     breaks: Vec::new(),
                 });
                 self.statements(body);
@@ -204,6 +206,7 @@ impl Compiler {
                 self.loops.push(LoopContext {
                     continue_target: next,
                     iterator_on_stack: true,
+                    finalizer_depth: self.finalizers.len(),
                     breaks: Vec::new(),
                 });
                 self.statements(body);
@@ -247,6 +250,7 @@ impl Compiler {
                             name: parameter.name.clone(),
                             has_default: parameter.default.is_some(),
                             variadic: parameter.variadic,
+                            keyword_only: parameter.keyword_only,
                         })
                         .collect(),
                 };
@@ -366,8 +370,10 @@ impl Compiler {
                 self.emit(Operation::Return, span);
             }
             StatementKind::Break => {
-                let Some(iterator_on_stack) =
-                    self.loops.last().map(|loop_| loop_.iterator_on_stack)
+                let Some((iterator_on_stack, finalizer_depth)) = self
+                    .loops
+                    .last()
+                    .map(|loop_| (loop_.iterator_on_stack, loop_.finalizer_depth))
                 else {
                     self.emit(Operation::RuntimeError("'break' outside loop".into()), span);
                     return;
@@ -375,7 +381,7 @@ impl Compiler {
                 if iterator_on_stack {
                     self.emit(Operation::PopTop, span);
                 }
-                self.emit_finalizers(span);
+                self.emit_finalizers_from(finalizer_depth, span);
                 let jump = self.emit(Operation::Jump(usize::MAX), span);
                 self.loops
                     .last_mut()
@@ -384,14 +390,18 @@ impl Compiler {
                     .push(jump);
             }
             StatementKind::Continue => {
-                let Some(target) = self.loops.last().map(|loop_| loop_.continue_target) else {
+                let Some((target, finalizer_depth)) = self
+                    .loops
+                    .last()
+                    .map(|loop_| (loop_.continue_target, loop_.finalizer_depth))
+                else {
                     self.emit(
                         Operation::RuntimeError("'continue' outside loop".into()),
                         span,
                     );
                     return;
                 };
-                self.emit_finalizers(span);
+                self.emit_finalizers_from(finalizer_depth, span);
                 self.emit(Operation::Jump(target), span);
             }
             StatementKind::Global(names) => {
@@ -455,17 +465,11 @@ impl Compiler {
                     if let Some(previous) = next_handler.take() {
                         self.patch_jump(previous, self.instructions.len());
                     }
-                    let exception_name = handler.kind.as_ref().and_then(|kind| match &kind.kind {
-                        super::ast::ExpressionKind::Name(name) => Some(name.clone()),
-                        _ => None,
-                    });
-                    if handler.kind.is_some() && exception_name.is_none() {
-                        self.emit(
-                            Operation::RuntimeError("exception type must be a name".into()),
-                            span,
-                        );
+                    let typed = handler.kind.is_some();
+                    if let Some(kind) = handler.kind {
+                        self.expression(kind);
                     }
-                    self.emit(Operation::MatchException(exception_name), span);
+                    self.emit(Operation::MatchException { typed }, span);
                     let skip = self.emit(Operation::PopJumpIfFalse(usize::MAX), span);
                     if let Some(name) = handler.name {
                         self.emit(Operation::StoreName(name), span);
@@ -557,11 +561,16 @@ impl Compiler {
     }
 
     fn emit_finalizers(&mut self, span: Span) {
+        self.emit_finalizers_from(0, span);
+    }
+
+    fn emit_finalizers_from(&mut self, depth: usize, span: Span) {
         // The innermost cleanup runs first, matching Python's nested finally
         // semantics.  Suppress the finalizer stack while compiling the cleanup
         // itself: a return in a finally body replaces the pending operation.
-        let finalizers = self.finalizers.clone();
-        self.finalizers.clear();
+        let saved = std::mem::take(&mut self.finalizers);
+        let finalizers = saved[depth..].to_vec();
+        self.finalizers.extend_from_slice(&saved[..depth]);
         for finalizer in finalizers.iter().rev() {
             match finalizer {
                 Cleanup::Finally(statements) => self.statements(statements.clone()),
@@ -575,7 +584,7 @@ impl Compiler {
                 }
             }
         }
-        self.finalizers = finalizers;
+        self.finalizers = saved;
     }
 
     fn finish_loop(&mut self, target: usize) {
@@ -762,12 +771,21 @@ impl Compiler {
                 self.emit(Operation::BuildTuple(count), span);
             }
             ExpressionKind::Dict(entries) => {
-                let count = entries.len();
-                for (key, value) in entries {
-                    self.expression(key);
-                    self.expression(value);
+                let mut unpacked = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    match entry {
+                        DictEntry::Pair(key, value) => {
+                            self.expression(key);
+                            self.expression(value);
+                            unpacked.push(false);
+                        }
+                        DictEntry::Unpack(value) => {
+                            self.expression(value);
+                            unpacked.push(true);
+                        }
+                    }
                 }
-                self.emit(Operation::BuildDict(count), span);
+                self.emit(Operation::BuildDict(unpacked), span);
             }
             ExpressionKind::Set(values) => {
                 let count = values.len();
@@ -852,6 +870,28 @@ impl Compiler {
                     span,
                 );
             }
+            ExpressionKind::SliceValue { start, stop, step } => {
+                let has_start = start.is_some();
+                let has_stop = stop.is_some();
+                let has_step = step.is_some();
+                if let Some(start) = start {
+                    self.expression(*start);
+                }
+                if let Some(stop) = stop {
+                    self.expression(*stop);
+                }
+                if let Some(step) = step {
+                    self.expression(*step);
+                }
+                self.emit(
+                    Operation::BuildSlice {
+                        has_start,
+                        has_stop,
+                        has_step,
+                    },
+                    span,
+                );
+            }
             ExpressionKind::Call {
                 function,
                 arguments,
@@ -909,6 +949,7 @@ impl Compiler {
                                     name: parameter.name.clone(),
                                     has_default: parameter.default.is_some(),
                                     variadic: parameter.variadic,
+                                    keyword_only: parameter.keyword_only,
                                 })
                                 .collect(),
                         }),
@@ -1062,7 +1103,7 @@ impl Compiler {
             structural_depth: self.structural_depth,
         };
         let result_name = "$__shellsim_comprehension_result".to_string();
-        nested.emit(Operation::BuildDict(0), span);
+        nested.emit(Operation::BuildDict(Vec::new()), span);
         nested.emit(Operation::StoreName(result_name.clone()), span);
         nested.emit_dict_comprehension_body(&clauses, 0, &key, &value, &result_name, span);
         nested.emit(Operation::LoadName(result_name), span);

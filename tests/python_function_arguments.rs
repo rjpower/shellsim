@@ -94,3 +94,21 @@ print((lambda *values: sum(values))(5, 6))"#;
     assert_eq!(stdout, b"10 10\n11\n");
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn keyword_only_arguments_use_the_ordinary_argument_binder() {
+    let source = r#"def configure(prefix, *, window, scale=2):
+    return prefix + window * scale
+def collect(prefix, *values, suffix):
+    return prefix + sum(values) + suffix
+print(configure(1, window=3))
+print(collect(1, 2, 3, suffix=4))
+print((lambda *, value=5: value)(value=7))"#;
+    let (status, stdout, stderr) = run(source);
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"7\n10\n7\n");
+    assert!(stderr.is_empty());
+
+    let (_, _, stderr) = run("def f(*, value): return value\nf(1)");
+    assert!(String::from_utf8_lossy(&stderr).contains("takes 0 positional arguments"));
+}

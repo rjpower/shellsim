@@ -2,6 +2,10 @@
 
 from _json import dumps, loads
 
+# The bounded native decoder reports ValueError. Using the same class object
+# keeps normal ``except json.JSONDecodeError`` code correct without a wrapper.
+JSONDecodeError = ValueError
+
 
 def dump(value, stream, sort_keys=False, separators=None, indent=None):
     if separators is None:

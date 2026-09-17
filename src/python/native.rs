@@ -354,8 +354,15 @@ pub(super) trait PyFilesystem {
     fn exists(&self, path: &str) -> bool;
     fn is_file(&self, path: &str) -> bool;
     fn is_dir(&self, path: &str) -> bool;
+    fn metadata(&self, path: &str) -> PyResult<PyFileMetadata>;
     fn mkdir(&mut self, path: &str, parents: bool, exist_ok: bool) -> PyResult<()>;
     fn glob(&mut self, pattern: &str) -> PyResult<Vec<String>>;
+}
+
+/// Stable metadata fields exposed by the modeled VFS to capability-scoped stdlib facades.
+pub(super) struct PyFileMetadata {
+    pub mode: u32,
+    pub size: usize,
 }
 
 /// Runtime value protocols and explicitly modeled services available to native modules.
@@ -391,6 +398,7 @@ pub(super) trait PyRuntime {
     fn get_attribute(&mut self, value: PyValue, name: &str) -> PyResult<Option<PyValue>>;
     fn list_items(&mut self, list: PyList) -> PyResult<Vec<PyValue>>;
     fn tuple_items(&mut self, tuple: PyTuple) -> PyResult<Vec<PyValue>>;
+    fn slice_parts(&self, value: &PyValue) -> Option<(Option<i64>, Option<i64>, Option<i64>)>;
     fn dict_items(&mut self, dict: PyDict) -> PyResult<Vec<(PyValue, PyValue)>>;
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(PyValue, PyValue)>) -> PyResult<()>;
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<PyValue>>;

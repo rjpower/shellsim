@@ -14,6 +14,7 @@ pub struct Parameter {
     pub name: String,
     pub has_default: bool,
     pub variadic: bool,
+    pub keyword_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,9 +48,16 @@ pub enum Operation {
         has_stop: bool,
         has_step: bool,
     },
+    BuildSlice {
+        has_start: bool,
+        has_stop: bool,
+        has_step: bool,
+    },
     BuildList(usize),
     BuildTuple(usize),
-    BuildDict(usize),
+    /// Build a dictionary from source-ordered entries. `true` consumes one
+    /// mapping while `false` consumes one key/value pair.
+    BuildDict(Vec<bool>),
     BuildSet(usize),
     UnpackSequence {
         count: usize,
@@ -93,7 +101,11 @@ pub enum Operation {
     Assert,
     TryBegin(usize),
     TryEnd,
-    MatchException(Option<String>),
+    /// Match the active exception. A typed handler leaves its exception-type
+    /// expression on the stack immediately above the raised value.
+    MatchException {
+        typed: bool,
+    },
     ClearException,
     Reraise,
     Raise(bool),

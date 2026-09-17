@@ -24,6 +24,24 @@ fn catches_typed_exception_and_runs_else_only_on_success() {
 }
 
 #[test]
+fn exception_handlers_accept_normal_type_tuples() {
+    let source = r#"try:
+    raise ValueError("bad")
+except (TypeError, ValueError) as error:
+    print("value", error)
+try:
+    raise RuntimeError("boom")
+except (TypeError, ValueError):
+    print("wrong")
+except RuntimeError:
+    print("runtime")"#;
+    let (status, stdout, stderr) = run_python(source);
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "value bad\nruntime\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn finally_runs_for_propagating_exception_and_function_frames() {
     let source = "def fail():\n    try:\n        raise RuntimeError('boom')\n    finally:\n        print('cleanup')\ntry:\n    fail()\nexcept Exception:\n    print('caught')";
     let (status, out, err) = run_python(source);

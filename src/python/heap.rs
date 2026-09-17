@@ -55,6 +55,11 @@ pub enum Object {
     },
     List(Vec<Value>),
     Tuple(Vec<Value>),
+    Slice {
+        start: Option<i64>,
+        stop: Option<i64>,
+        step: Option<i64>,
+    },
     Dict(Vec<(Value, Value)>),
     DefaultDict {
         factory: Value,
@@ -424,6 +429,7 @@ impl Heap {
             Object::Exception { .. } => BuiltinType::Exception.id(),
             Object::List(_) => BuiltinType::List.id(),
             Object::Tuple(_) => BuiltinType::Tuple.id(),
+            Object::Slice { .. } => BuiltinType::Native.id(),
             Object::Dict(_) | Object::DefaultDict { .. } => BuiltinType::Dict.id(),
             Object::Set(_) => BuiltinType::Set.id(),
             Object::BigInt(_) => BuiltinType::Int.id(),
@@ -485,6 +491,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .checked_add(message.len())
             .ok_or("modeled object size overflow")?,
         Object::List(values) | Object::Tuple(values) | Object::Set(values) => values.len(),
+        Object::Slice { .. } => 3,
         Object::BigInt(value) => usize::try_from(value.bits().saturating_add(7) / 8)
             .map_err(|_| "modeled big integer size overflow")?,
         Object::Dict(entries) => entries

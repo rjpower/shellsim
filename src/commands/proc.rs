@@ -578,7 +578,24 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         };
         crate::commands::pkg::install_packages(interp, &request.packages);
         update_pyproject(interp, &request.direct_specs);
-        ensure_venv(interp);
+        ensure_venv(interp, ".venv");
+        return 0;
+    }
+    if first == Some("init") {
+        if args.len() != 1 {
+            return uv_failure(interp, io, "init-options", "unsupported init option", 2);
+        }
+        let path = crate::vfs::resolve_against(&interp.cwd, "pyproject.toml");
+        if !interp.vfs.is_file("/", &path) {
+            let source = b"[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = []\n";
+            if let Err(error) = interp.vfs.put_file(&path, source.to_vec(), 0o644) {
+                ewln(
+                    io.err,
+                    &format!("uv: cannot create pyproject.toml: {error}"),
+                );
+                return 1;
+            }
+        }
         return 0;
     }
     if first == Some("remove") {
@@ -597,21 +614,30 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         if let Err(error) = uv_sync(interp) {
             return uv_failure(interp, io, &error, &error, 1);
         }
-        ensure_venv(interp);
+        ensure_venv(interp, ".venv");
         return 0;
     }
     if first == Some("pip") && args.get(1).map(String::as_str) == Some("install") {
-        if let Err(error) = crate::commands::pkg::install_args(interp, &args[2..]) {
+        let install_args = args[2..]
+            .iter()
+            .filter(|argument| argument.as_str() != "--system")
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(error) = crate::commands::pkg::install_args(interp, &install_args) {
             return uv_failure(interp, io, &error, &error, 1);
         }
-        ensure_venv(interp);
+        ensure_venv(interp, ".venv");
         return 0;
     }
     if first == Some("venv") {
-        if args.len() != 1 {
+        if args.len() > 2
+            || args
+                .get(1)
+                .is_some_and(|argument| argument.starts_with('-'))
+        {
             return uv_failure(interp, io, "venv-arguments", "unsupported venv argument", 2);
         }
-        ensure_venv(interp);
+        ensure_venv(interp, args.get(1).map_or(".venv", String::as_str));
         return 0;
     }
     // ---- run / tool run / uvx: route the embedded interpreter ----
@@ -631,25 +657,20 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             launcher_args
         }
     });
-    if let Some(option) = launcher_args
-        .and_then(|launcher_args| launcher_args.first())
-        .filter(|argument| argument.starts_with('-'))
-    {
-        return uv_failure(
-            interp,
-            io,
-            "launcher-options",
-            &format!("unsupported launcher option '{option}'"),
-            2,
-        );
-    }
-    if let Some(launcher_args) = launcher_args.filter(|args| {
+    let launcher_args = match launcher_args {
+        Some(arguments) => match uv_launcher_args(interp, arguments) {
+            Ok(arguments) => Some(arguments),
+            Err(error) => return uv_failure(interp, io, &error, &error, 2),
+        },
+        None => None,
+    };
+    if let Some(launcher_args) = launcher_args.as_ref().filter(|args| {
         args.first()
             .is_some_and(|program| program == "pytest" || program.ends_with("/pytest"))
     }) {
         return crate::python::run_pytest(interp, &launcher_args[1..], io.out, io.err);
     }
-    if let Some(launcher_args) = launcher_args.filter(|args| {
+    if let Some(launcher_args) = launcher_args.as_ref().filter(|args| {
         args.first()
             .is_some_and(|program| matches!(program.as_str(), "python" | "python3" | "python3.14"))
     }) {
@@ -668,6 +689,58 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     )
 }
 
+fn uv_launcher_args(interp: &mut Interp, args: &[String]) -> Result<Vec<String>, String> {
+    let mut index = 0;
+    let mut packages = Vec::new();
+    while let Some(argument) = args.get(index) {
+        let (option, attached) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(option, value)| {
+                (option, Some(value))
+            });
+        let needs_value = matches!(option, "-p" | "--python" | "-w" | "--with");
+        if !needs_value {
+            if argument == "--" {
+                index += 1;
+                break;
+            }
+            if argument.starts_with('-') {
+                return Err(format!("unsupported launcher option '{argument}'"));
+            }
+            break;
+        }
+        let value = if let Some(value) = attached {
+            value
+        } else {
+            index += 1;
+            args.get(index)
+                .map(String::as_str)
+                .ok_or_else(|| format!("option '{option}' requires a value"))?
+        };
+        if matches!(option, "-p" | "--python") {
+            if !matches!(
+                value,
+                "3.11"
+                    | "3.12"
+                    | "3.13"
+                    | "3.14"
+                    | "python3.11"
+                    | "python3.12"
+                    | "python3.13"
+                    | "python3.14"
+            ) {
+                return Err(format!("Python selector '{value}' is not modeled"));
+            }
+        } else {
+            packages.push(value.to_string());
+        }
+        index += 1;
+    }
+    let packages = crate::commands::pkg::resolve_package_specs(&packages)?;
+    crate::commands::pkg::install_packages(interp, &packages);
+    Ok(args[index..].to_vec())
+}
+
 fn uv_failure(
     interp: &mut CommandContext<'_>,
     io: &mut Io,
@@ -682,17 +755,25 @@ fn uv_failure(
 
 /// Create the marker files a real `uv`/`venv` would leave behind, so tasks that *inspect* the
 /// environment (a `.venv`, a `uv.lock`) see plausible state.
-fn ensure_venv(interp: &mut Interp) {
+fn ensure_venv(interp: &mut Interp, directory: &str) {
     let cwd = interp.cwd.clone();
-    for d in [".venv", ".venv/bin"] {
-        let p = crate::vfs::resolve_against(&cwd, d);
-        let _ = interp.vfs.mkdir_all("/", &p);
+    let root = crate::vfs::resolve_against(&cwd, directory);
+    for p in [&root, &format!("{root}/bin")] {
+        let _ = interp.vfs.mkdir_all("/", p);
     }
-    let py = crate::vfs::resolve_against(&cwd, ".venv/bin/python");
+    let py = format!("{root}/bin/python");
     if !interp.vfs.is_file("/", &py) {
         let _ = interp
             .vfs
             .put_file(&py, b"#!shellsim-venv\n".to_vec(), 0o755);
+    }
+    let activate = format!("{root}/bin/activate");
+    if !interp.vfs.is_file("/", &activate) {
+        let source = format!(
+            "VIRTUAL_ENV={}; export VIRTUAL_ENV; PATH=\"$VIRTUAL_ENV/bin:$PATH\"; export PATH\n",
+            shell_single_quote(&root)
+        );
+        let _ = interp.vfs.put_file(&activate, source.into_bytes(), 0o644);
     }
     let lock = crate::vfs::resolve_against(&cwd, "uv.lock");
     if !interp.vfs.is_file("/", &lock) {
@@ -700,6 +781,10 @@ fn ensure_venv(interp: &mut Interp) {
             .vfs
             .put_file(&lock, b"# shellsim uv.lock\n".to_vec(), 0o644);
     }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Validate every declared project or requirements dependency, then activate all of them atomically.

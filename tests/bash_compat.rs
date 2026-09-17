@@ -31,6 +31,19 @@ fn arithmetic_commands_and_c_style_for_loops() {
 }
 
 #[test]
+fn random_is_bounded_deterministic_and_assignment_reseeds_it() {
+    let source = "RANDOM=7; printf '%s ' \"$RANDOM\" \"$RANDOM\"; RANDOM=7; printf '%s\\n' \"$RANDOM\"; for ((i=0; i<20; i++)); do (( RANDOM >= 0 && RANDOM <= 32767 )) || exit 9; done";
+    let first = run(source);
+    let second = run(source);
+    assert_eq!(first, second);
+    assert_eq!(first.0, 0, "{}", first.2);
+    let values = first.1.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(values.len(), 3);
+    assert_eq!(values[0], values[2]);
+    assert_ne!(values[0], values[1]);
+}
+
+#[test]
 fn standard_paths_and_environment_utilities() {
     assert_eq!(
         run("FOO=outer; /usr/bin/env FOO=inner printenv FOO; echo $FOO; uname -m"),

@@ -89,6 +89,26 @@ class _Path:
 
 path = _Path()
 
+F_OK = 0
+X_OK = 1
+W_OK = 2
+R_OK = 4
+
+
+def access(path, mode):
+    if not _shellsim_vfs.exists(path):
+        return False
+    if mode == F_OK:
+        return True
+    permissions = _shellsim_vfs.stat(path)[0]
+    if mode & R_OK and permissions & 292 == 0:
+        return False
+    if mode & W_OK and permissions & 146 == 0:
+        return False
+    if mode & X_OK and permissions & 73 == 0:
+        return False
+    return True
+
 
 def makedirs(name, mode=511, exist_ok=False):
     _shellsim_vfs.mkdir(name, True, exist_ok)

@@ -147,6 +147,35 @@ print(f"{'x':>3} {['a']!r}")
 }
 
 #[test]
+fn adjacent_string_literals_are_folded_before_execution() {
+    let source = r#"
+name = "world"
+print("hello, " f"{name}" "!")
+print(b"ab" b"cd")
+"#;
+    assert_eq!(
+        run(source),
+        (0, "hello, world!\nb'abcd'\n".into(), String::new())
+    );
+    assert!(run("print(b'x' 'y')")
+        .2
+        .contains("cannot mix bytes and nonbytes"));
+}
+
+#[test]
+fn dictionary_unpacking_uses_source_order_and_last_value_wins() {
+    let source = r#"
+base = {"a": 1, "b": 2}
+print({**base, "b": 3, **{"c": 4}})
+"#;
+    assert_eq!(
+        run(source),
+        (0, "{'a': 1, 'b': 3, 'c': 4}\n".into(), String::new())
+    );
+    assert!(run("print({**[1, 2]})").2.contains("must be a mapping"));
+}
+
+#[test]
 fn compact_language_wins_match_python_semantics() {
     let source = r#"
 a = b = 0x10 + 0o10 + 0b10

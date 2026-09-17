@@ -66,6 +66,34 @@ fn no_tests_is_a_nonzero_collection_result() {
 }
 
 #[test]
+fn ctrf_option_writes_a_bounded_report_to_the_vfs() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .put_file(
+            "/test_sample.py",
+            b"def test_ok():\n    pass\n".to_vec(),
+            0o644,
+        )
+        .unwrap();
+    let (outcome, stdout, stderr) =
+        environment.run_script_capture("pytest --ctrf /logs/verifier/report.json /test_sample.py");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"/test_sample.py::test_ok PASSED\n");
+    let report = environment
+        .vfs
+        .read_string("/", "/logs/verifier/report.json")
+        .unwrap();
+    assert!(report.contains("\"tests\":1"), "{report}");
+    assert!(report.contains("\"passed\":1"), "{report}");
+}
+
+#[test]
 fn assert_failure_shape_matches_cpython() {
     let source = "assert 1 == 2, 'nope'\n";
     let Ok(probe) = Command::new("python3.14")

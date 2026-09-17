@@ -211,15 +211,42 @@ fn package_tools_only_succeed_for_effects_shellsim_can_supply() {
     assert_eq!(status, 2);
     assert!(stderr.contains("unsupported command"), "{stderr}");
 
-    let (status, stdout, stderr) =
-        text("uv run --with numpy python -c 'print(\"should not run\")'");
-    assert_eq!(status, 2);
-    assert!(stdout.is_empty());
-    assert!(stderr.contains("unsupported launcher option"), "{stderr}");
+    assert_eq!(
+        text("uv run --with numpy python -c 'print(\"supplied\")'"),
+        (0, "supplied\n".into(), String::new())
+    );
 
     let (status, _, stderr) = text("pip install --target /tmp/site numpy");
     assert_eq!(status, 1);
     assert!(stderr.contains("unsupported option"), "{stderr}");
+}
+
+#[test]
+fn uv_models_local_environments_projects_and_validated_launcher_options() {
+    assert_eq!(
+        text("cd /work; uv venv .testing; source .testing/bin/activate; printf '%s:%s\\n' \"$VIRTUAL_ENV\" \"$PATH\""),
+        (
+            0,
+            "/work/.testing:/work/.testing/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n".into(),
+            String::new(),
+        )
+    );
+    assert_eq!(
+        text(
+            "cd /work; uv init; grep -F '[project]' pyproject.toml; uv pip install --system numpy"
+        ),
+        (0, "[project]\n".into(), String::new())
+    );
+    assert_eq!(
+        text("printf 'def test_ok():\\n    pass\\n' > /test.py; uvx -p 3.13 -w pytest==8.4.1 -w pytest-json-ctrf==0.3.5 pytest /test.py"),
+        (0, "/test.py::test_ok PASSED\n".into(), String::new())
+    );
+    let (status, _, stderr) = text("uvx --with pandas pytest /test.py");
+    assert_eq!(status, 2);
+    assert!(
+        stderr.contains("package 'pandas' is not bundled"),
+        "{stderr}"
+    );
 }
 
 #[test]

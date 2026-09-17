@@ -633,9 +633,14 @@ impl<'a> Vm<'a> {
                     has_stop,
                     has_step,
                 } => self.load_slice(*has_start, *has_stop, *has_step),
+                Operation::BuildSlice {
+                    has_start,
+                    has_stop,
+                    has_step,
+                } => self.build_slice(*has_start, *has_stop, *has_step),
                 Operation::BuildList(count) => self.build_sequence(*count, SequenceKind::List),
                 Operation::BuildTuple(count) => self.build_sequence(*count, SequenceKind::Tuple),
-                Operation::BuildDict(count) => self.build_dict(*count),
+                Operation::BuildDict(unpacked) => self.build_dict(unpacked),
                 Operation::BuildSet(count) => self.build_set(*count),
                 Operation::UnpackSequence { count, star_index } => {
                     self.unpack_sequence(*count, *star_index)
@@ -784,15 +789,21 @@ impl<'a> Vm<'a> {
                         .map_err(|e| (e.to_string(), instruction.span))?;
                     Ok(())
                 }
-                Operation::MatchException(expected) => {
-                    let exception = self
+                Operation::MatchException { typed } => {
+                    let actual = self
                         .exception_stack
                         .last()
                         .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), instruction.span))?;
-                    let matches = expected.as_deref().is_none_or(|name| {
-                        name == "BaseException" || name == "Exception" || name == exception.kind
-                    });
+                        .map_err(|e| (e.to_string(), instruction.span))?
+                        .kind
+                        .clone();
+                    let matches = if *typed {
+                        let expected = self.pop().map_err(|error| (error, instruction.span))?;
+                        self.exception_type_matches(expected, &actual)
+                            .map_err(|error| (error, instruction.span))?
+                    } else {
+                        true
+                    };
                     self.stack.push(Value::Bool(matches));
                     Ok(())
                 }
@@ -1219,6 +1230,30 @@ impl<'a> Vm<'a> {
             .copied()
             .ok_or_else(|| format!("no binding for nonlocal {name:?} found"))?;
         self.state.heap.scope_store_nonlocal(scope, name, value)
+    }
+
+    fn exception_type_matches(&mut self, expected: Value, actual: &str) -> Result<bool, String> {
+        if let Some(NativeValue::ExceptionType(ExceptionType(name))) = expected.native_value() {
+            return Ok(name == "BaseException" || name == "Exception" || name == actual);
+        }
+        let Some(id) = expected.object_id() else {
+            return Err(
+                "catching classes that do not inherit from BaseException is not allowed".into(),
+            );
+        };
+        let Object::Tuple(types) = self.state.heap.get(id)? else {
+            return Err(
+                "catching classes that do not inherit from BaseException is not allowed".into(),
+            );
+        };
+        let types = types.clone();
+        for expected in types {
+            self.charge_cpu(1)?;
+            if self.exception_type_matches(expected, actual)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn store_global(&mut self, name: &str, value: Value) -> Result<(), String> {
@@ -1682,6 +1717,7 @@ impl<'a> Vm<'a> {
                 Object::String(_)
                 | Object::Bytes(_)
                 | Object::ByteArray(_)
+                | Object::Slice { .. }
                 | Object::Exception { .. }
                 | Object::BigInt(_)
                 | Object::Function { .. }
@@ -1790,6 +1826,44 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
+    fn build_slice(
+        &mut self,
+        has_start: bool,
+        has_stop: bool,
+        has_step: bool,
+    ) -> Result<(), String> {
+        let step = if has_step {
+            Some(
+                self.pop()?
+                    .as_int()
+                    .ok_or("slice step must be an integer")?,
+            )
+        } else {
+            None
+        };
+        let stop = if has_stop {
+            Some(
+                self.pop()?
+                    .as_int()
+                    .ok_or("slice stop must be an integer")?,
+            )
+        } else {
+            None
+        };
+        let start = if has_start {
+            Some(
+                self.pop()?
+                    .as_int()
+                    .ok_or("slice start must be an integer")?,
+            )
+        } else {
+            None
+        };
+        let value = self.allocate_object(Object::Slice { start, stop, step })?;
+        self.stack.push(value);
+        Ok(())
+    }
+
     fn store_subscript(&mut self) -> Result<(), String> {
         let index = self.pop()?;
         let owner = self.pop()?;
@@ -1850,6 +1924,7 @@ impl<'a> Vm<'a> {
             Object::String(_)
             | Object::Bytes(_)
             | Object::ByteArray(_)
+            | Object::Slice { .. }
             | Object::Exception { .. }
             | Object::Set(_)
             | Object::BigInt(_)
@@ -2662,6 +2737,31 @@ impl<'a> Vm<'a> {
     }
 
     fn compare_values(&mut self, left: &Value, right: &Value) -> Result<Ordering, String> {
+        if let (Some(left_id), Some(right_id)) = (left.object_id(), right.object_id()) {
+            let sequences = match (
+                self.state.heap.get(left_id)?,
+                self.state.heap.get(right_id)?,
+            ) {
+                (Object::List(left), Object::List(right))
+                | (Object::Tuple(left), Object::Tuple(right)) => {
+                    Some((left.clone(), right.clone()))
+                }
+                _ => None,
+            };
+            if let Some((left, right)) = sequences {
+                for (left, right) in left.iter().zip(&right) {
+                    self.charge_cpu(1)?;
+                    if protocol::identical(left, right) {
+                        continue;
+                    }
+                    let ordering = self.compare_values(left, right)?;
+                    if ordering != Ordering::Equal {
+                        return Ok(ordering);
+                    }
+                }
+                return Ok(left.len().cmp(&right.len()));
+            }
+        }
         if let Some(equal) = self.invoke_slot(left, Slot::Equal, "__eq__", vec![*right])? {
             if self.truth_value(&equal)? {
                 return Ok(Ordering::Equal);
@@ -3306,24 +3406,49 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
-    fn build_dict(&mut self, count: usize) -> Result<(), String> {
-        let values = self.take(count.checked_mul(2).ok_or("dictionary is too large")?)?;
-        let mut entries: Vec<(Value, Value)> = Vec::with_capacity(count);
-        for pair in values.chunks_exact(2) {
-            let key = pair[0];
-            let value = pair[1];
-            let mut replaced = false;
-            for (existing_key, existing_value) in &mut entries {
-                if protocol::identical(existing_key, &key)
-                    || protocol::equals(&self.state.heap, existing_key, &key)?
+    fn build_dict(&mut self, unpacked: &[bool]) -> Result<(), String> {
+        let value_count = unpacked
+            .iter()
+            .try_fold(0usize, |count, unpacked| {
+                count.checked_add(if *unpacked { 1 } else { 2 })
+            })
+            .ok_or("dictionary is too large")?;
+        let values = self.take(value_count)?;
+        let mut values = values.into_iter();
+        let mut entries: Vec<(Value, Value)> = Vec::with_capacity(unpacked.len());
+        for unpacked in unpacked {
+            let additions = if *unpacked {
+                let mapping = values.next().expect("dictionary stack contract");
+                match mapping
+                    .object_id()
+                    .map(|id| self.state.heap.get(id))
+                    .transpose()?
                 {
-                    *existing_value = value;
-                    replaced = true;
-                    break;
+                    Some(Object::Dict(entries)) | Some(Object::DefaultDict { entries, .. }) => {
+                        entries.clone()
+                    }
+                    _ => return Err("'**' argument must be a mapping".into()),
                 }
-            }
-            if !replaced {
-                entries.push((key, value));
+            } else {
+                vec![(
+                    values.next().expect("dictionary key stack contract"),
+                    values.next().expect("dictionary value stack contract"),
+                )]
+            };
+            for (key, value) in additions {
+                let mut replaced = false;
+                for (existing_key, existing_value) in &mut entries {
+                    if protocol::identical(existing_key, &key)
+                        || protocol::equals(&self.state.heap, existing_key, &key)?
+                    {
+                        *existing_value = value;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if !replaced {
+                    entries.push((key, value));
+                }
             }
         }
         let value = self
@@ -3465,6 +3590,12 @@ impl<'a> Vm<'a> {
                 "__mul__",
                 Slot::ReflectedMultiply,
                 "__rmul__",
+            ),
+            BinaryOperator::MatrixMultiply => (
+                Slot::MatrixMultiply,
+                "__matmul__",
+                Slot::ReflectedMatrixMultiply,
+                "__rmatmul__",
             ),
             BinaryOperator::Power => (Slot::Power, "__pow__", Slot::ReflectedPower, "__rpow__"),
             BinaryOperator::Divide => (
@@ -4129,6 +4260,7 @@ impl<'a> Vm<'a> {
                         | Object::String(_)
                         | Object::Bytes(_)
                         | Object::ByteArray(_)
+                        | Object::Slice { .. }
                         | Object::Exception { .. }
                         | Object::Function { .. }
                         | Object::Class { .. }
@@ -4484,24 +4616,28 @@ impl<'a> Vm<'a> {
             .parameters
             .iter()
             .position(|parameter| parameter.variadic);
-        let fixed_len = variadic_index.unwrap_or(code.parameters.len());
-        if variadic_index.is_none() && arguments.len() > fixed_len {
+        let positional_len = code
+            .parameters
+            .iter()
+            .position(|parameter| parameter.variadic || parameter.keyword_only)
+            .unwrap_or(code.parameters.len());
+        if variadic_index.is_none() && arguments.len() > positional_len {
             return Err(format!(
                 "{name}() takes {} positional arguments but {} were given",
-                fixed_len,
+                positional_len,
                 arguments.len()
             ));
         }
         let mut positional = arguments;
-        let extra_positional = if variadic_index.is_some() && positional.len() > fixed_len {
-            positional.split_off(fixed_len)
+        let extra_positional = if variadic_index.is_some() && positional.len() > positional_len {
+            positional.split_off(positional_len)
         } else {
             Vec::new()
         };
         let mut locals = code
             .parameters
             .iter()
-            .take(fixed_len)
+            .take(positional_len)
             .map(|parameter| parameter.name.clone())
             .zip(positional)
             .collect::<HashMap<_, _>>();
@@ -4514,7 +4650,7 @@ impl<'a> Vm<'a> {
             if !code
                 .parameters
                 .iter()
-                .any(|parameter| parameter.name == keyword)
+                .any(|parameter| parameter.name == keyword && !parameter.variadic)
             {
                 return Err(format!(
                     "{name}() got an unexpected keyword argument {keyword:?}"
@@ -4536,16 +4672,21 @@ impl<'a> Vm<'a> {
                 missing.1.name
             ));
         }
-        let default_start = fixed_len.saturating_sub(defaults.len());
-        if defaults.len() > fixed_len
-            || code.parameters[default_start..fixed_len]
+        if defaults.len()
+            != code
+                .parameters
                 .iter()
-                .any(|parameter| !parameter.has_default)
+                .filter(|parameter| parameter.has_default)
+                .count()
         {
             return Err(format!("{name}() has invalid default argument metadata"));
         }
-        for (index, default) in defaults.iter().enumerate() {
-            let parameter = &code.parameters[default_start + index];
+        for (parameter, default) in code
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.has_default)
+            .zip(defaults)
+        {
             locals
                 .entry(parameter.name.clone())
                 .or_insert_with(|| *default);
@@ -4614,24 +4755,28 @@ impl<'a> Vm<'a> {
             .parameters
             .iter()
             .position(|parameter| parameter.variadic);
-        let fixed_len = variadic_index.unwrap_or(code.parameters.len());
-        if variadic_index.is_none() && arguments.len() > fixed_len {
+        let positional_len = code
+            .parameters
+            .iter()
+            .position(|parameter| parameter.variadic || parameter.keyword_only)
+            .unwrap_or(code.parameters.len());
+        if variadic_index.is_none() && arguments.len() > positional_len {
             return Err(format!(
                 "{name}() takes {} positional arguments but {} were given",
-                fixed_len,
+                positional_len,
                 arguments.len()
             ));
         }
         let mut positional = arguments;
-        let extra_positional = if variadic_index.is_some() && positional.len() > fixed_len {
-            positional.split_off(fixed_len)
+        let extra_positional = if variadic_index.is_some() && positional.len() > positional_len {
+            positional.split_off(positional_len)
         } else {
             Vec::new()
         };
         let mut locals = code
             .parameters
             .iter()
-            .take(fixed_len)
+            .take(positional_len)
             .map(|parameter| parameter.name.clone())
             .zip(positional)
             .collect::<HashMap<_, _>>();
@@ -4643,7 +4788,7 @@ impl<'a> Vm<'a> {
             if !code
                 .parameters
                 .iter()
-                .any(|parameter| parameter.name == keyword)
+                .any(|parameter| parameter.name == keyword && !parameter.variadic)
             {
                 return Err(format!(
                     "{name}() got an unexpected keyword argument {keyword:?}"
@@ -4665,17 +4810,23 @@ impl<'a> Vm<'a> {
                 missing.name
             ));
         }
-        let default_start = fixed_len.saturating_sub(defaults.len());
-        if defaults.len() > fixed_len
-            || code.parameters[default_start..fixed_len]
+        if defaults.len()
+            != code
+                .parameters
                 .iter()
-                .any(|parameter| !parameter.has_default)
+                .filter(|parameter| parameter.has_default)
+                .count()
         {
             return Err(format!("{name}() has invalid default argument metadata"));
         }
-        for (index, default) in defaults.iter().enumerate() {
+        for (parameter, default) in code
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.has_default)
+            .zip(defaults)
+        {
             locals
-                .entry(code.parameters[default_start + index].name.clone())
+                .entry(parameter.name.clone())
                 .or_insert_with(|| *default);
         }
         let uses_repl_globals = closure
@@ -5051,6 +5202,7 @@ impl PyRuntime for Vm<'_> {
                 Object::List(_) => PyKind::List,
                 Object::BigInt(_) => PyKind::Int,
                 Object::Tuple(_) => PyKind::Tuple,
+                Object::Slice { .. } => PyKind::Native,
                 Object::Dict(_) | Object::DefaultDict { .. } => PyKind::Dict,
                 Object::Set(_) => PyKind::Set,
                 Object::Function { .. } | Object::DescriptorBoundMethod { .. } => PyKind::Function,
@@ -5308,6 +5460,14 @@ impl PyRuntime for Vm<'_> {
             Object::Tuple(items) => Ok(items.clone()),
             _ => Err(PyError::runtime_error("tuple handle changed object kind")),
         }
+    }
+
+    fn slice_parts(&self, value: &Value) -> Option<(Option<i64>, Option<i64>, Option<i64>)> {
+        let Object::Slice { start, stop, step } = self.state.heap.get(value.object_id()?).ok()?
+        else {
+            return None;
+        };
+        Some((*start, *stop, *step))
     }
 
     fn dict_items(&mut self, dict: PyDict) -> PyResult<Vec<(Value, Value)>> {
