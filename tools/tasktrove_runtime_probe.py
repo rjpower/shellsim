@@ -41,13 +41,15 @@ KNOWN_INSTRUCTIONS = {
     "WORKDIR",
 }
 PROVISIONING = re.compile(
-    r"\b(?:apt(?:-get)?|apk|yum|dnf|add-apt-repository|update-alternatives|conda|mamba|npm|yarn|pnpm)\b"
-    r"|\b(?:python(?:3(?:\.\d+)?)?\s+-m\s+pip|pip3?|pipx|uv\s+pip|gem|poetry)\s+(?:install|add)\b"
-    r"|\b(?:cargo|go)\s+install\b|\buv\s+(?:sync|add)\b"
-    r"|\b(?:git\s+clone|curl\s+[^|>]*https?://|wget\s+[^|>]*https?://)\b",
-    re.IGNORECASE,
+    r"(?:^|[;&|\n]\s*)(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+|sudo|env)\s+)*(?:\S*/)?"
+    r"(?:apt(?:-get)?|apk|yum|dnf|add-apt-repository|update-alternatives|conda|mamba|npm|yarn|pnpm)(?=\s|$)"
+    r"|(?:^|[;&|\n]\s*)(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+|sudo|env)\s+)*(?:\S*/)?"
+    r"(?:(?:python(?:3(?:\.\d+)?)?\s+-m\s+pip|pip3?|pipx|uv\s+pip|gem|poetry)\s+(?:install|add)\b"
+    r"|(?:cargo|go)\s+install\b|uv\s+(?:sync|add)\b|git\s+clone\b"
+    r"|(?:curl|wget)\s+[^|>]*https?://)",
+    re.IGNORECASE | re.MULTILINE,
 )
-HEREDOC = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+HEREDOC = re.compile(r"(?:^|\s)<<-?(?!<)\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
 
 
 @dataclass(frozen=True)
@@ -171,7 +173,26 @@ def expand_docker_environment(value: str, environment: dict[str, str]) -> str:
 
 def is_image_provisioning(argument: str) -> bool:
     """Return whether a Docker ``RUN`` needs capabilities outside the replay."""
-    return bool(PROVISIONING.search(argument) or argument.lstrip().startswith(("[", "--mount=", "<<")))
+    return bool(PROVISIONING.search(argument))
+
+
+def docker_run_source(argument: str) -> Optional[str]:
+    """Return shell source for ordinary and simple native-heredoc Docker RUN forms."""
+    stripped = argument.lstrip()
+    if not stripped.startswith("<<"):
+        return None if stripped.startswith(("[", "--mount=")) else argument
+    delimiter = HEREDOC.match(stripped)
+    lines = stripped.splitlines()
+    if delimiter is None or len(lines) < 2 or lines[-1].strip() != delimiter.group(1):
+        return None
+    return "\n".join(lines[1:-1])
+
+
+def shell_export(value: str) -> str:
+    """Quote a Docker ENV value while leaving variable references for shellsim to expand."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`")
+    escaped = escaped.replace("$(", "\\$(")
+    return f'"{escaped}"'
 
 
 def copy_local(environment: Any, context: Path, workdir: str, argument: str) -> Optional[str]:
@@ -260,11 +281,9 @@ def prepare_environment(environment: Any, task: Path, actions: list[Action]) -> 
                     run_action(environment, actions, "setup", label, f"cd {shlex.quote(workdir)}")
             elif operation == "ENV":
                 parsed = docker_environment(argument)
-                values = {
-                    name: expand_docker_environment(value, {**docker_env, **parsed}) for name, value in parsed.items()
-                }
+                values = {name: expand_docker_environment(value, docker_env) for name, value in parsed.items()}
                 docker_env.update(values)
-                exports = " ".join(f"{name}={shlex.quote(value)}" for name, value in values.items())
+                exports = " ".join(f"{name}={shell_export(value)}" for name, value in values.items())
                 run_action(environment, actions, "setup", label, f"export {exports}")
             elif operation == "COPY":
                 error = copy_local(environment, context, workdir, argument)
@@ -276,7 +295,11 @@ def prepare_environment(environment: Any, task: Path, actions: list[Action]) -> 
                 if is_image_provisioning(argument):
                     prerequisites.append(f"{label}: image provisioning: {argument.splitlines()[0]}")
                 else:
-                    run_action(environment, actions, "setup", label, argument)
+                    source = docker_run_source(argument)
+                    if source is None:
+                        prerequisites.append(f"{label}: Docker RUN form not executed: {argument.splitlines()[0]}")
+                    else:
+                        run_action(environment, actions, "setup", label, source)
             elif operation == "USER" and argument.strip() not in {"root", "0", "0:0"}:
                 prerequisites.append(f"{label}: user identity not modeled: {argument}")
             elif operation == "UNKNOWN":
@@ -301,9 +324,6 @@ def verifier_command(tests: Path) -> Optional[str]:
     reference = tests / "ref_eval.py"
     if reference.is_file():
         return "cd /tests && python /tests/ref_eval.py"
-    script = tests / "test.sh"
-    if script.is_file():
-        return "cd /tests && bash /tests/test.sh"
     return None
 
 
@@ -316,7 +336,12 @@ def read_reward(environment: Any) -> Optional[str]:
     return None
 
 
-def classify(actions: list[Action], verifier_returncode: Optional[int], reward: Optional[str]) -> str:
+def classify(
+    actions: list[Action],
+    verifier_returncode: Optional[int],
+    reward: Optional[str],
+    verifier_source: Optional[str] = None,
+) -> str:
     """Classify observed execution without guessing about unseen behavior."""
     for action in actions:
         if action.stop_reason:
@@ -325,7 +350,8 @@ def classify(actions: list[Action], verifier_returncode: Optional[int], reward: 
         return "no_verifier"
     boundary = any(
         (action.unsupported or action.unsupported_commands)
-        and action.phase not in {"verifier_wrapper", "verifier_harness"}
+        and action.phase != "verifier_harness"
+        and (action.phase != "verifier_wrapper" or verifier_source == "test.sh")
         for action in actions
     )
     if reward is not None:
@@ -392,11 +418,11 @@ def replay_task(task: Path, environment_type: Any, limits_type: Any, options: ar
     wrapper_result = None
     verifier_result = None
     verifier_source = None
-    command = verifier_command(tests) if tests.is_dir() else None
-    if command is None:
-        harness_errors.append("verifier payload is absent")
+    if not tests.is_dir():
+        harness_errors.append("verifier directory is absent")
     elif not environment.terminated:
         try:
+            command = verifier_command(tests)
             environment.mount(tests, "/tests")
             wrapper = tests / "test.sh"
             if wrapper.is_file():
@@ -417,7 +443,7 @@ def replay_task(task: Path, environment_type: Any, limits_type: Any, options: ar
             if wrapper_is_authoritative:
                 verifier_result = wrapper_result
                 verifier_source = "test.sh"
-            elif not environment.terminated:
+            elif command is not None and not environment.terminated:
                 run_action(
                     environment,
                     actions,
@@ -427,6 +453,11 @@ def replay_task(task: Path, environment_type: Any, limits_type: Any, options: ar
                 )
                 verifier_result = run_action(environment, actions, "verifier", "normalized payload", command)
                 verifier_source = "normalized_payload"
+            elif wrapper_result is not None:
+                verifier_result = wrapper_result
+                verifier_source = "test.sh"
+            else:
+                harness_errors.append("verifier payload is absent")
         except Exception as error:
             harness_errors.append(f"verifier mount/run: {error}")
 
@@ -434,12 +465,18 @@ def replay_task(task: Path, environment_type: Any, limits_type: Any, options: ar
     category = (
         "harness_error"
         if harness_errors and verifier_result is None
-        else classify(actions, None if verifier_result is None else verifier_result.returncode, reward)
+        else classify(
+            actions,
+            None if verifier_result is None else verifier_result.returncode,
+            reward,
+            verifier_source,
+        )
     )
     task_boundaries = [
         action
         for action in actions
-        if action.phase not in {"verifier_wrapper", "verifier_harness"}
+        if action.phase != "verifier_harness"
+        and (action.phase != "verifier_wrapper" or verifier_source == "test.sh")
         and (action.unsupported or action.unsupported_commands)
     ]
     wrapper_boundaries = [

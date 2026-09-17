@@ -37,18 +37,19 @@ The September 17, 2026 replay completes all 100 tasks without a harness error.
 | Clean exit | 50 | 14 | 14 |
 | Explicit shellsim boundary | 40 | 80 | 40 |
 | Nonzero without unsupported telemetry | 7 | 2 | 42 |
-| Resource exhaustion | 3 | 1 | 0 |
-| Not run after terminal exhaustion | 0 | 3 | 4 |
+| Resource exhaustion | 3 | 1 | 1 |
+| Not run after terminal exhaustion | 0 | 3 | 3 |
 
-The selected verifier result uses the unmodified wrapper for its 14 clean executions and the
-normalized payload for 82 tasks whose wrapper did not complete cleanly. Four tasks cannot reach a
-selected result after resource exhaustion.
+The selected verifier result uses the unmodified wrapper for its 14 clean executions and one
+wrapper resource stop, and the normalized payload for 82 tasks whose wrapper did not complete
+cleanly. Three tasks cannot reach a verifier after solution exhaustion.
 
 One task, `tsl-test-case-generation`, produces a positive partial reward of `0.8825`; no task
 produces full reward. At the task level, 67 replays reach an explicit task-payload boundary, three
 combine such a boundary with zero verifier reward, 25 are rejected by the verifier without an
 explicit task-payload boundary, four exhaust modeled resources, and one produces the partial
-reward. Provisioning-only boundaries in `test.sh` remain visible but do not determine this category.
+reward. Wrapper boundaries remain visible; when a normalized fallback exists, its task-facing
+result determines the category instead.
 
 Runtime evidence resolves dynamic commands and exposes interactions that argv inspection cannot.
 For example, one solution reaches AWK 1,010 times with a malformed expression because shellsim

@@ -80,6 +80,7 @@ def test_execution_classification_prefers_observed_boundaries() -> None:
     assert PROBE.classify([boundary], 1, None) == "explicit_boundary"
     assert PROBE.classify([boundary], 0, None) == "passed_with_boundary"
     assert PROBE.classify([boundary], 0, "0") == "boundary_and_verifier_failed"
+    assert PROBE.classify([boundary], 0, "0.5") == "partial_reward_with_boundary"
     assert PROBE.classify([], 1, None) == "verifier_failed"
     assert PROBE.classify([], 0, "1") == "passed"
     assert PROBE.classify([], 0, "0.5") == "partial_reward"
@@ -96,8 +97,13 @@ def test_provisioning_detection_covers_assignment_prefixes_and_package_managers(
     ]
 
     assert all(PROBE.is_image_provisioning(source) for source in provisioning)
-    assert PROBE.is_image_provisioning("<<EOF\necho generated\nEOF")
+    native_heredoc = "<<EOF\necho generated\nEOF"
+    assert not PROBE.is_image_provisioning(native_heredoc)
+    assert PROBE.docker_run_source(native_heredoc) == "echo generated"
+    assert PROBE.is_image_provisioning("<<EOF\napt-get install curl\nEOF")
     assert not PROBE.is_image_provisioning("python generate_data.py")
+    assert not PROBE.is_image_provisioning("rm -rf /var/lib/apt/lists/*")
+    assert not PROBE.is_image_provisioning("/opt/conda/bin/python generate.py")
 
 
 def test_docker_environment_supports_assignment_and_legacy_forms() -> None:
@@ -105,6 +111,7 @@ def test_docker_environment_supports_assignment_and_legacy_forms() -> None:
     assert PROBE.docker_environment("MESSAGE hello world") == {"MESSAGE": "hello world"}
     assert PROBE.expand_docker_environment("$ROOT/app", {"ROOT": "/work"}) == "/work/app"
     assert PROBE.expand_docker_environment("$PATH:/app", {"PATH": "/bin"}) == "/bin:/app"
+    assert PROBE.shell_export("/app/bin:$PATH") == '"/app/bin:$PATH"'
 
 
 def test_replay_runs_solution_then_verifier_in_one_environment(tmp_path: Path) -> None:
@@ -196,3 +203,45 @@ def test_replay_keeps_wrapper_boundary_separate_from_normalized_result(tmp_path:
     assert result["verifier_source"] == "normalized_payload"
     assert result["first_boundary"] is None
     assert result["first_wrapper_boundary"]["unsupported"] == ["apt-get"]
+
+
+def test_test_sh_only_verifier_is_not_reclassified_as_a_normalized_payload(tmp_path: Path) -> None:
+    task = tmp_path / "sample"
+    (task / "environment").mkdir(parents=True)
+    (task / "environment" / "Dockerfile").write_text("FROM python:3.13\nWORKDIR /app\n")
+    (task / "solution").mkdir()
+    (task / "solution" / "solve.sh").write_text("true\n")
+    (task / "tests").mkdir()
+    (task / "tests" / "test.sh").write_text("mvn test\n")
+
+    class Result:
+        returncode = 0
+        stop_reason = None
+        unsupported: tuple[str, ...] = ()
+        unsupported_commands: tuple[str, ...] = ()
+        commands: tuple[str, ...] = ()
+        stderr_text = ""
+
+    class WrapperBoundary(Result):
+        returncode = 127
+        unsupported = ("mvn",)
+        unsupported_commands = ("mvn",)
+        commands = ("mvn",)
+
+    class Environment(FakeEnvironment):
+        def __init__(self, _limits: object) -> None:
+            super().__init__()
+            self.terminated = False
+
+        def run(self, source: str) -> Result:
+            return WrapperBoundary() if source == "cd /tests && bash /tests/test.sh" else Result()
+
+        def read_file(self, _path: str) -> bytes:
+            raise RuntimeError("absent")
+
+    options = SimpleNamespace(cpu=1, memory=2, disk=3, output=4)
+    result = PROBE.replay_task(task, Environment, lambda **values: values, options)
+
+    assert result["category"] == "explicit_boundary"
+    assert result["verifier_source"] == "test.sh"
+    assert result["first_boundary"]["unsupported"] == ["mvn"]
