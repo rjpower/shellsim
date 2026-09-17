@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::native::{BinarySlotFn, TernarySlotFn, UnarySlotFn};
+use super::native::{BinarySlotFn, SliceSlotFn, TernarySlotFn, UnarySlotFn};
 use super::Value;
 
 /// Stable identity of a Python type within a [`ReplState`](super::ReplState).
@@ -49,10 +49,11 @@ pub(super) enum BuiltinType {
     ArgumentParser,
     RaisesContext,
     Property,
+    Array,
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 26] = [
+    pub(super) const ALL: [Self; 27] = [
         Self::Object,
         Self::Type,
         Self::None,
@@ -79,6 +80,7 @@ impl BuiltinType {
         Self::ArgumentParser,
         Self::RaisesContext,
         Self::Property,
+        Self::Array,
     ];
 
     pub(super) const fn id(self) -> TypeId {
@@ -113,6 +115,7 @@ impl BuiltinType {
             Self::ArgumentParser => "argparse.ArgumentParser",
             Self::RaisesContext => "pytest.raises",
             Self::Property => "property",
+            Self::Array => "numpy.ndarray",
         }
     }
 }
@@ -147,6 +150,7 @@ pub struct TypeSlots {
     pub length: Option<SlotValue>,
     pub get_item: Option<SlotValue>,
     pub set_item: Option<SlotValue>,
+    pub slice: Option<SlotValue>,
     pub positive: Option<SlotValue>,
     pub negative: Option<SlotValue>,
     pub invert: Option<SlotValue>,
@@ -172,7 +176,11 @@ pub struct TypeSlots {
     pub bitwise_or: Option<SlotValue>,
     pub reflected_bitwise_or: Option<SlotValue>,
     pub equal: Option<SlotValue>,
+    pub not_equal: Option<SlotValue>,
     pub less_than: Option<SlotValue>,
+    pub less_equal: Option<SlotValue>,
+    pub greater_than: Option<SlotValue>,
+    pub greater_equal: Option<SlotValue>,
     pub contains: Option<SlotValue>,
     pub delete_item: Option<SlotValue>,
 }
@@ -184,6 +192,7 @@ pub enum SlotValue {
     NativeBinary(BinarySlotFn),
     NativeTernary(TernarySlotFn),
     NativeUnary(UnarySlotFn),
+    NativeSlice(SliceSlotFn),
 }
 
 /// Protocol operations cached on each type after MRO resolution.
@@ -203,6 +212,7 @@ pub enum Slot {
     Length,
     GetItem,
     SetItem,
+    Slice,
     Positive,
     Negative,
     Invert,
@@ -228,13 +238,17 @@ pub enum Slot {
     BitwiseOr,
     ReflectedBitwiseOr,
     Equal,
+    NotEqual,
     LessThan,
+    LessEqual,
+    GreaterThan,
+    GreaterEqual,
     Contains,
     DeleteItem,
 }
 
 impl Slot {
-    const ALL: [Self; 42] = [
+    const ALL: [Self; 47] = [
         Self::Call,
         Self::New,
         Self::Init,
@@ -249,6 +263,7 @@ impl Slot {
         Self::Length,
         Self::GetItem,
         Self::SetItem,
+        Self::Slice,
         Self::Positive,
         Self::Negative,
         Self::Invert,
@@ -274,7 +289,11 @@ impl Slot {
         Self::BitwiseOr,
         Self::ReflectedBitwiseOr,
         Self::Equal,
+        Self::NotEqual,
         Self::LessThan,
+        Self::LessEqual,
+        Self::GreaterThan,
+        Self::GreaterEqual,
         Self::Contains,
         Self::DeleteItem,
     ];
@@ -298,6 +317,7 @@ impl TypeSlots {
             length: get("__len__"),
             get_item: get("__getitem__"),
             set_item: get("__setitem__"),
+            slice: None,
             positive: get("__pos__"),
             negative: get("__neg__"),
             invert: get("__invert__"),
@@ -323,7 +343,11 @@ impl TypeSlots {
             bitwise_or: get("__or__"),
             reflected_bitwise_or: get("__ror__"),
             equal: get("__eq__"),
+            not_equal: get("__ne__"),
             less_than: get("__lt__"),
+            less_equal: get("__le__"),
+            greater_than: get("__gt__"),
+            greater_equal: get("__ge__"),
             contains: get("__contains__"),
             delete_item: get("__delitem__"),
         }
@@ -345,6 +369,7 @@ impl TypeSlots {
             &self.length,
             &self.get_item,
             &self.set_item,
+            &self.slice,
             &self.positive,
             &self.negative,
             &self.invert,
@@ -370,7 +395,11 @@ impl TypeSlots {
             &self.bitwise_or,
             &self.reflected_bitwise_or,
             &self.equal,
+            &self.not_equal,
             &self.less_than,
+            &self.less_equal,
+            &self.greater_than,
+            &self.greater_equal,
             &self.contains,
             &self.delete_item,
         ]
@@ -395,6 +424,7 @@ impl TypeSlots {
             Slot::Length => self.length.as_ref(),
             Slot::GetItem => self.get_item.as_ref(),
             Slot::SetItem => self.set_item.as_ref(),
+            Slot::Slice => self.slice.as_ref(),
             Slot::Positive => self.positive.as_ref(),
             Slot::Negative => self.negative.as_ref(),
             Slot::Invert => self.invert.as_ref(),
@@ -420,7 +450,11 @@ impl TypeSlots {
             Slot::BitwiseOr => self.bitwise_or.as_ref(),
             Slot::ReflectedBitwiseOr => self.reflected_bitwise_or.as_ref(),
             Slot::Equal => self.equal.as_ref(),
+            Slot::NotEqual => self.not_equal.as_ref(),
             Slot::LessThan => self.less_than.as_ref(),
+            Slot::LessEqual => self.less_equal.as_ref(),
+            Slot::GreaterThan => self.greater_than.as_ref(),
+            Slot::GreaterEqual => self.greater_equal.as_ref(),
             Slot::Contains => self.contains.as_ref(),
             Slot::DeleteItem => self.delete_item.as_ref(),
         }
@@ -442,6 +476,7 @@ impl TypeSlots {
             Slot::Length => &mut self.length,
             Slot::GetItem => &mut self.get_item,
             Slot::SetItem => &mut self.set_item,
+            Slot::Slice => &mut self.slice,
             Slot::Positive => &mut self.positive,
             Slot::Negative => &mut self.negative,
             Slot::Invert => &mut self.invert,
@@ -467,7 +502,11 @@ impl TypeSlots {
             Slot::BitwiseOr => &mut self.bitwise_or,
             Slot::ReflectedBitwiseOr => &mut self.reflected_bitwise_or,
             Slot::Equal => &mut self.equal,
+            Slot::NotEqual => &mut self.not_equal,
             Slot::LessThan => &mut self.less_than,
+            Slot::LessEqual => &mut self.less_equal,
+            Slot::GreaterThan => &mut self.greater_than,
+            Slot::GreaterEqual => &mut self.greater_equal,
             Slot::Contains => &mut self.contains,
             Slot::DeleteItem => &mut self.delete_item,
         } = Some(value);
@@ -491,6 +530,7 @@ pub struct PyType {
 #[derive(Clone, Debug)]
 pub struct TypeRegistry {
     types: Vec<PyType>,
+    value_kinds: Vec<&'static super::native::ValueKindDef>,
 }
 
 impl Default for TypeRegistry {
@@ -565,8 +605,19 @@ impl Default for TypeRegistry {
             &mut types[BuiltinType::RaisesContext as usize],
             &super::stdlib::pytest::RAISES_CONTEXT_TYPE,
         );
+        install_native_methods(
+            &mut types[BuiltinType::Array as usize],
+            &super::stdlib::numpy::ARRAY_TYPE,
+        );
         install_builtin_slots(&mut types);
-        Self { types }
+        let mut registry = Self {
+            types,
+            value_kinds: Vec::new(),
+        };
+        for kind in super::stdlib::value_kinds() {
+            registry.register_value_kind(kind);
+        }
+        registry
     }
 }
 
@@ -659,6 +710,75 @@ impl TypeRegistry {
     pub fn attribute(&self, type_id: TypeId, name: &str) -> Result<Option<Value>, String> {
         Ok(self.get(type_id)?.attributes.get(name).cloned())
     }
+
+    fn register_value_kind(&mut self, kind: &'static super::native::ValueKindDef) {
+        let object = BuiltinType::Object.id();
+        let type_id = TypeId(u32::try_from(self.types.len()).expect("too many registered types"));
+        self.types.push(PyType {
+            name: kind.name.into(),
+            bases: vec![object],
+            mro: vec![object],
+            metaclass: BuiltinType::Type.id(),
+            attributes: HashMap::new(),
+            layout: PyLayout::Native,
+            slots: value_kind_slots(kind.slots),
+            value: Some(Value::Native(super::vm::NativeValue::ValueKind(kind))),
+        });
+        self.value_kinds.push(kind);
+        debug_assert_eq!(self.value_kind_type_id(kind), Some(type_id));
+    }
+
+    pub(super) fn value_kind_index(
+        &self,
+        kind: &'static super::native::ValueKindDef,
+    ) -> Option<u8> {
+        self.value_kinds
+            .iter()
+            .position(|candidate| std::ptr::eq(*candidate, kind))
+            .and_then(|index| u8::try_from(index).ok())
+    }
+
+    pub(super) fn value_kind_type_id(
+        &self,
+        kind: &'static super::native::ValueKindDef,
+    ) -> Option<TypeId> {
+        let index = self.value_kind_index(kind)?;
+        self.value_kind_type_id_by_index(index)
+    }
+
+    pub(super) fn value_kind_type_id_by_index(&self, index: u8) -> Option<TypeId> {
+        self.value_kinds.get(index as usize)?;
+        let offset = BuiltinType::ALL.len().checked_add(index as usize)?;
+        Some(TypeId(u32::try_from(offset).ok()?))
+    }
+
+    pub(super) fn value_kind(&self, index: u8) -> Option<&'static super::native::ValueKindDef> {
+        self.value_kinds.get(index as usize).copied()
+    }
+}
+
+fn value_kind_slots(slots: super::native::ValueKindSlots) -> TypeSlots {
+    let binary = SlotValue::NativeBinary;
+    let unary = SlotValue::NativeUnary;
+    TypeSlots {
+        repr: slots.repr.map(unary),
+        bool_: slots.bool_.map(unary),
+        add: slots.add.map(binary),
+        reflected_add: slots.reflected_add.map(binary),
+        subtract: slots.subtract.map(binary),
+        reflected_subtract: slots.reflected_subtract.map(binary),
+        multiply: slots.multiply.map(binary),
+        reflected_multiply: slots.reflected_multiply.map(binary),
+        divide: slots.divide.map(binary),
+        reflected_divide: slots.reflected_divide.map(binary),
+        equal: slots.equal.map(binary),
+        not_equal: slots.not_equal.map(binary),
+        less_than: slots.less_than.map(binary),
+        less_equal: slots.less_equal.map(binary),
+        greater_than: slots.greater_than.map(binary),
+        greater_equal: slots.greater_equal.map(binary),
+        ..TypeSlots::default()
+    }
 }
 
 fn builtin_metadata(builtin: BuiltinType) -> (Vec<TypeId>, Vec<TypeId>, TypeId, PyLayout) {
@@ -681,6 +801,7 @@ fn builtin_metadata(builtin: BuiltinType) -> (Vec<TypeId>, Vec<TypeId>, TypeId, 
         | BuiltinType::Environment
         | BuiltinType::ArgumentParser
         | BuiltinType::RaisesContext => (vec![object], vec![object], type_, PyLayout::Native),
+        BuiltinType::Array => (vec![object], vec![object], type_, PyLayout::Native),
         BuiltinType::Property => (vec![object], vec![object], type_, PyLayout::Object),
         _ => (vec![object], vec![object], type_, PyLayout::Object),
     }
@@ -762,6 +883,35 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.add = Some(intrinsic(super::stdlib::core::slot_tuple_add));
     slots.multiply = Some(intrinsic(super::stdlib::core::slot_tuple_multiply));
     slots.reflected_multiply = Some(intrinsic(super::stdlib::core::slot_tuple_multiply));
+
+    let slots = &mut types[BuiltinType::Array as usize].slots;
+    slots.repr = Some(unary(super::stdlib::numpy::slot_repr));
+    slots.bool_ = Some(unary(super::stdlib::numpy::slot_bool));
+    slots.iter = Some(unary(super::stdlib::numpy::slot_iter));
+    slots.length = Some(unary(super::stdlib::numpy::slot_length));
+    slots.get_item = Some(intrinsic(super::stdlib::numpy::slot_get_item));
+    slots.set_item = Some(SlotValue::NativeTernary(
+        super::stdlib::numpy::slot_set_item,
+    ));
+    slots.slice = Some(SlotValue::NativeSlice(super::stdlib::numpy::slot_slice));
+    slots.add = Some(intrinsic(super::stdlib::numpy::slot_add));
+    slots.reflected_add = Some(intrinsic(super::stdlib::numpy::slot_reflected_add));
+    slots.subtract = Some(intrinsic(super::stdlib::numpy::slot_subtract));
+    slots.reflected_subtract = Some(intrinsic(super::stdlib::numpy::slot_reflected_subtract));
+    slots.multiply = Some(intrinsic(super::stdlib::numpy::slot_multiply));
+    slots.reflected_multiply = Some(intrinsic(super::stdlib::numpy::slot_reflected_multiply));
+    slots.divide = Some(intrinsic(super::stdlib::numpy::slot_divide));
+    slots.reflected_divide = Some(intrinsic(super::stdlib::numpy::slot_reflected_divide));
+    slots.positive = Some(unary(super::stdlib::numpy::slot_positive));
+    slots.negative = Some(unary(super::stdlib::numpy::slot_negative));
+    slots.invert = Some(unary(super::stdlib::numpy::slot_invert));
+    slots.absolute = Some(unary(super::stdlib::numpy::slot_absolute));
+    slots.equal = Some(intrinsic(super::stdlib::numpy::slot_equal));
+    slots.not_equal = Some(intrinsic(super::stdlib::numpy::slot_not_equal));
+    slots.less_than = Some(intrinsic(super::stdlib::numpy::slot_less_than));
+    slots.less_equal = Some(intrinsic(super::stdlib::numpy::slot_less_equal));
+    slots.greater_than = Some(intrinsic(super::stdlib::numpy::slot_greater_than));
+    slots.greater_equal = Some(intrinsic(super::stdlib::numpy::slot_greater_equal));
 }
 
 #[cfg(test)]

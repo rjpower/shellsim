@@ -9,7 +9,7 @@ use num_bigint::BigInt;
 use std::collections::HashMap;
 
 use super::bytecode::Code;
-use super::native::PyArgumentSpec;
+use super::native::{PyArgumentSpec, PyArrayDtype, PyArrayLayout};
 use super::object_model::{BuiltinType, TypeId};
 use super::Value;
 
@@ -123,6 +123,14 @@ pub enum Object {
     Module {
         name: String,
         scope: ScopeId,
+    },
+    /// Flat type-erased storage shared by one or more array views.
+    ArrayStorage(Vec<Value>),
+    /// An ndarray view. Indices are mapped into `ArrayStorage` by the layout.
+    Array {
+        storage: ObjectId,
+        layout: PyArrayLayout,
+        dtype: PyArrayDtype,
     },
     /// A compiled regular expression.  The pattern is compiled at the operation boundary so
     /// regex execution never gets a host capability; keeping the source and flags here also
@@ -439,6 +447,8 @@ impl Heap {
             Object::Iterator { .. } | Object::CountIterator { .. } => BuiltinType::Iterator.id(),
             Object::Generator { .. } => BuiltinType::Generator.id(),
             Object::Module { .. } => BuiltinType::Module.id(),
+            Object::ArrayStorage(_) => BuiltinType::Native.id(),
+            Object::Array { .. } => BuiltinType::Array.id(),
             Object::Regex { .. } => BuiltinType::Regex.id(),
             Object::Match { .. } => BuiltinType::Match.id(),
             Object::ArgumentParser { .. } => BuiltinType::ArgumentParser.id(),
@@ -538,6 +548,13 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .and_then(|size| size.checked_add(stack.len()))
             .ok_or("modeled object size overflow")?,
         Object::Module { name, .. } => name.len(),
+        Object::ArrayStorage(values) => values.len(),
+        Object::Array { layout, .. } => layout
+            .shape
+            .len()
+            .checked_add(layout.strides.len())
+            .and_then(|size| size.checked_add(3))
+            .ok_or("modeled object size overflow")?,
         Object::Regex { pattern, .. } => pattern.len(),
         Object::Match { text, groups, .. } => text
             .len()

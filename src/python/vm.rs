@@ -14,11 +14,12 @@ use super::bytecode::{ClassField, Code, Operation};
 use super::filesystem::PyModuleLoader;
 use super::heap::{ClassLayout, InstancePayload, Object, ScopeId};
 use super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentSpec, PyByteArray, PyCallable,
-    PyClass, PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyIdentity,
-    PyInstance, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyNativeKind,
-    PyProcessHandle, PyProcessOutput, PyProcessRunner, PyProcessStartRequest, PyProperty,
-    PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyTuple, PyValueCast,
+    CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentSpec, PyArray, PyArrayDtype,
+    PyArrayLayout, PyBinaryOp, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment,
+    PyError, PyErrorKind, PyFilesystem, PyIdentity, PyInstance, PyIterator, PyKind, PyList,
+    PyMarker, PyMatch, PyMatchData, PyNativeKind, PyProcessHandle, PyProcessOutput,
+    PyProcessRunner, PyProcessStartRequest, PyProperty, PyRaisesContext, PyRegex, PyResult,
+    PyRuntime, PySet, PyTuple, PyValueCast,
 };
 use super::object_model::{BuiltinType, PyLayout, Slot, SlotValue, TypeId};
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
@@ -32,6 +33,7 @@ pub(super) enum NativeValue {
     BuiltinType(BuiltinType),
     NativeFunction(&'static FunctionDef),
     NativeMethod(&'static super::native::MethodDef),
+    ValueKind(&'static super::native::ValueKindDef),
     Stream(Stream),
     Environment,
     ExceptionType(ExceptionType),
@@ -55,6 +57,7 @@ impl NativeValue {
     const TYPING_LIST: u8 = 8;
     const ENUM_BASE: u8 = 9;
     const UNITTEST_BASE: u8 = 10;
+    const VALUE_KIND: u8 = 11;
 
     pub(super) fn encode(self) -> (u64, u8) {
         match self {
@@ -68,6 +71,10 @@ impl NativeValue {
             Self::NativeMethod(value) => (
                 value as *const super::native::MethodDef as usize as u64,
                 Self::NATIVE_METHOD,
+            ),
+            Self::ValueKind(value) => (
+                value as *const super::native::ValueKindDef as usize as u64,
+                Self::VALUE_KIND,
             ),
             Self::Stream(value) => (value as u64, Self::STREAM),
             Self::Environment => (0, Self::ENVIRONMENT),
@@ -117,6 +124,12 @@ impl NativeValue {
             Self::TYPING_LIST => Self::TypingList,
             Self::ENUM_BASE => Self::EnumBase,
             Self::UNITTEST_BASE => Self::UnitTestBase,
+            Self::VALUE_KIND => {
+                // SAFETY: `encode` stores a non-null pointer to a static `ValueKindDef`.
+                Self::ValueKind(unsafe {
+                    &*(payload as usize as *const super::native::ValueKindDef)
+                })
+            }
             _ => unreachable!("invalid private native-value tag"),
         }
     }
@@ -168,6 +181,7 @@ impl NativeValue {
     pub(super) fn repr(self) -> String {
         match self {
             Self::BuiltinType(builtin_type) => format!("<class '{}'>", builtin_type.name()),
+            Self::ValueKind(kind) => format!("<class '{}'>", kind.name),
             _ => "<native object>".into(),
         }
     }
@@ -1457,6 +1471,39 @@ impl<'a> Vm<'a> {
                         .map(|(_, value)| *value);
                     return Ok(value);
                 }
+                Object::Array { layout, dtype, .. } => {
+                    let value = match name {
+                        "shape" => Some(
+                            self.allocate_object(Object::Tuple(
+                                layout
+                                    .shape
+                                    .iter()
+                                    .map(|value| Value::Int(*value as i64))
+                                    .collect(),
+                            ))?,
+                        ),
+                        "ndim" => Some(Value::Int(layout.shape.len() as i64)),
+                        "size" => Some(Value::Int(
+                            layout
+                                .shape
+                                .iter()
+                                .try_fold(1usize, |total, dimension| total.checked_mul(*dimension))
+                                .ok_or("array size overflow")? as i64,
+                        )),
+                        "dtype" => Some(self.allocate_string(dtype.name().to_string())?),
+                        "T" => {
+                            let array = owner
+                                .cast::<PyArray>(self)
+                                .map_err(|error| error.to_string())?;
+                            Some(
+                                super::stdlib::numpy::transpose(self, array, None)
+                                    .map_err(|error| error.to_string())?,
+                            )
+                        }
+                        _ => None,
+                    };
+                    return Ok(value);
+                }
                 _ => {}
             }
         }
@@ -1625,6 +1672,8 @@ impl<'a> Vm<'a> {
                 | Object::CountIterator { .. }
                 | Object::Generator { .. }
                 | Object::Module { .. }
+                | Object::ArrayStorage(_)
+                | Object::Array { .. }
                 | Object::Regex { .. }
                 | Object::Match { .. }
                 | Object::ArgumentParser { .. }
@@ -1677,6 +1726,15 @@ impl<'a> Vm<'a> {
             None
         };
         let owner = self.pop()?;
+        if let Some(SlotValue::NativeSlice(call)) =
+            self.state.types.slot(self.type_id(&owner)?, Slot::Slice)?
+        {
+            let value = call(self, owner, start, stop, step)
+                .map_err(|error| self.record_native_error(error))?
+                .ok_or("slice operation declined by its registered type")?;
+            self.stack.push(value);
+            return Ok(());
+        }
         let value = if let Some(text) = protocol::string_value(&self.state.heap, &owner)? {
             let characters = text.chars().collect::<Vec<_>>();
             let indices = slice_indices(characters.len(), start, stop, step)?;
@@ -1783,6 +1841,8 @@ impl<'a> Vm<'a> {
             | Object::CountIterator { .. }
             | Object::Generator { .. }
             | Object::Module { .. }
+            | Object::ArrayStorage(_)
+            | Object::Array { .. }
             | Object::Regex { .. }
             | Object::Match { .. }
             | Object::ArgumentParser { .. }
@@ -2528,6 +2588,9 @@ impl<'a> Vm<'a> {
                 }
                 return call(self, *receiver).map_err(|error| self.record_native_error(error));
             }
+            SlotValue::NativeSlice(_) => {
+                return Err("slice protocol invoked through the wrong operation".into())
+            }
             SlotValue::Descriptor(descriptor) => descriptor,
         };
         let Some(id) = receiver.object_id() else {
@@ -2877,7 +2940,8 @@ impl<'a> Vm<'a> {
             | BuiltinType::RaisesContext
             | BuiltinType::Property
             | BuiltinType::Regex
-            | BuiltinType::Match => {
+            | BuiltinType::Match
+            | BuiltinType::Array => {
                 return Err(format!("cannot create '{}' instances", builtin_type.name()));
             }
         };
@@ -2887,6 +2951,7 @@ impl<'a> Vm<'a> {
     fn class_type_id(&self, value: &Value) -> Result<Option<TypeId>, String> {
         Ok(match value.native_value() {
             Some(NativeValue::BuiltinType(builtin)) => Some(builtin.id()),
+            Some(NativeValue::ValueKind(kind)) => self.state.types.value_kind_type_id(kind),
             _ if value.object_id().is_some() => {
                 match self.state.heap.get(value.object_id().unwrap())? {
                     Object::Class { instance_type, .. } => Some(*instance_type),
@@ -2907,8 +2972,13 @@ impl<'a> Vm<'a> {
             ValueTag::Bool => BuiltinType::Bool.id(),
             ValueTag::Int => BuiltinType::Int.id(),
             ValueTag::Float => BuiltinType::Float.id(),
+            ValueTag::Registered => self
+                .state
+                .types
+                .value_kind_type_id_by_index(value.registered_parts().expect("tag checked").0)
+                .ok_or("invalid registered value kind")?,
             ValueTag::Native => match value.native_value().expect("native tag checked") {
-                NativeValue::BuiltinType(_) => BuiltinType::Type.id(),
+                NativeValue::BuiltinType(_) | NativeValue::ValueKind(_) => BuiltinType::Type.id(),
                 NativeValue::Function(_)
                 | NativeValue::NativeFunction(_)
                 | NativeValue::NativeMethod(_) => BuiltinType::Function.id(),
@@ -3272,27 +3342,60 @@ impl<'a> Vm<'a> {
     fn compare(&mut self, operator: ComparisonOperator) -> Result<(), String> {
         let right = self.pop()?;
         let left = self.pop()?;
-        let slot_result = match operator {
-            ComparisonOperator::Equal | ComparisonOperator::NotEqual => {
+        let mut slot_result = match operator {
+            ComparisonOperator::Equal => {
                 self.invoke_slot(&left, Slot::Equal, "__eq__", vec![right])?
+            }
+            ComparisonOperator::NotEqual => {
+                self.invoke_slot(&left, Slot::NotEqual, "__ne__", vec![right])?
             }
             ComparisonOperator::Less => {
                 self.invoke_slot(&left, Slot::LessThan, "__lt__", vec![right])?
             }
+            ComparisonOperator::LessEqual => {
+                self.invoke_slot(&left, Slot::LessEqual, "__le__", vec![right])?
+            }
+            ComparisonOperator::Greater => {
+                self.invoke_slot(&left, Slot::GreaterThan, "__gt__", vec![right])?
+            }
+            ComparisonOperator::GreaterEqual => {
+                self.invoke_slot(&left, Slot::GreaterEqual, "__ge__", vec![right])?
+            }
             ComparisonOperator::In | ComparisonOperator::NotIn => {
                 self.invoke_slot(&right, Slot::Contains, "__contains__", vec![left])?
             }
-            _ => None,
+            ComparisonOperator::Is | ComparisonOperator::IsNot => None,
         };
-        if let Some(value) = slot_result {
-            let mut result = self.truth_value(&value)?;
-            if matches!(
-                operator,
-                ComparisonOperator::NotEqual | ComparisonOperator::NotIn
-            ) {
-                result = !result;
+        if slot_result.is_none() {
+            let reflected = match operator {
+                ComparisonOperator::Equal => Some((Slot::Equal, "__eq__")),
+                ComparisonOperator::NotEqual => Some((Slot::NotEqual, "__ne__")),
+                ComparisonOperator::Less => Some((Slot::GreaterThan, "__gt__")),
+                ComparisonOperator::LessEqual => Some((Slot::GreaterEqual, "__ge__")),
+                ComparisonOperator::Greater => Some((Slot::LessThan, "__lt__")),
+                ComparisonOperator::GreaterEqual => Some((Slot::LessEqual, "__le__")),
+                _ => None,
+            };
+            if let Some((slot, name)) = reflected {
+                slot_result = self.invoke_slot(&right, slot, name, vec![left])?;
             }
-            self.stack.push(Value::Bool(result));
+        }
+        if slot_result.is_none() && matches!(operator, ComparisonOperator::NotEqual) {
+            let mut equality = self.invoke_slot(&left, Slot::Equal, "__eq__", vec![right])?;
+            if equality.is_none() {
+                equality = self.invoke_slot(&right, Slot::Equal, "__eq__", vec![left])?;
+            }
+            if let Some(value) = equality {
+                slot_result = Some(Value::Bool(!self.truth_value(&value)?));
+            }
+        }
+        if let Some(value) = slot_result {
+            if matches!(operator, ComparisonOperator::NotIn) {
+                let result = !self.truth_value(&value)?;
+                self.stack.push(Value::Bool(result));
+            } else {
+                self.stack.push(value);
+            }
             return Ok(());
         }
         let result = match operator {
@@ -3849,6 +3952,12 @@ impl<'a> Vm<'a> {
         if let Some(NativeValue::BuiltinType(builtin_type)) = function.native_value() {
             return self.call_builtin_type(builtin_type, arguments, keyword_arguments);
         }
+        if let Some(NativeValue::ValueKind(kind)) = function.native_value() {
+            let call = CallArgs::new(arguments, keyword_arguments);
+            return (kind.construct)(self, call)
+                .map(CallResult::Value)
+                .map_err(|error| self.record_native_error(error));
+        }
         if let Some(NativeValue::ExceptionType(exception_type)) = function.native_value() {
             expect_arity(&arguments, 0, 1)?;
             let message = arguments
@@ -3985,6 +4094,8 @@ impl<'a> Vm<'a> {
                         | Object::CountIterator { .. }
                         | Object::Generator { .. }
                         | Object::Module { .. }
+                        | Object::ArrayStorage(_)
+                        | Object::Array { .. }
                         | Object::Regex { .. }
                         | Object::Match { .. }
                         | Object::ArgumentParser { .. }
@@ -4554,7 +4665,10 @@ impl<'a> Vm<'a> {
             PyErrorKind::Overflow => Some("OverflowError"),
             PyErrorKind::Runtime => Some("RuntimeError"),
             PyErrorKind::Exception(kind) => Some(kind),
-            PyErrorKind::Resource | PyErrorKind::Exit(_) | PyErrorKind::Suspend(_) => None,
+            PyErrorKind::Resource
+            | PyErrorKind::Raised
+            | PyErrorKind::Exit(_)
+            | PyErrorKind::Suspend(_) => None,
         };
         if let Some(kind) = kind {
             if let Ok(value) = self.allocate_exception(kind.to_string(), error.message.clone()) {
@@ -4877,6 +4991,7 @@ impl PyRuntime for Vm<'_> {
             ValueTag::Bool => PyKind::Bool,
             ValueTag::Int => PyKind::Int,
             ValueTag::Float => PyKind::Float,
+            ValueTag::Registered => PyKind::Native,
             ValueTag::Native => PyKind::Native,
             ValueTag::Object => match self
                 .state
@@ -4899,6 +5014,8 @@ impl PyRuntime for Vm<'_> {
                 Object::Iterator { .. } | Object::CountIterator { .. } => PyKind::Iterator,
                 Object::Generator { .. } => PyKind::Generator,
                 Object::Module { .. } => PyKind::Module,
+                Object::Array { .. } => PyKind::Array,
+                Object::ArrayStorage(_) => PyKind::Native,
                 Object::Regex { .. }
                 | Object::Match { .. }
                 | Object::ArgumentParser { .. }
@@ -4945,6 +5062,7 @@ impl PyRuntime for Vm<'_> {
                 Object::ArgumentParser { .. } => Some(PyNativeKind::ArgumentParser),
                 Object::RaisesContext { .. } => Some(PyNativeKind::RaisesContext),
                 Object::Property { .. } => Some(PyNativeKind::Property),
+                Object::Array { .. } => Some(PyNativeKind::Array),
                 _ => None,
             },
         )
@@ -5347,6 +5465,7 @@ impl PyRuntime for Vm<'_> {
                 Some(
                     NativeValue::Function(_)
                         | NativeValue::BuiltinType(_)
+                        | NativeValue::ValueKind(_)
                         | NativeValue::NativeFunction(_)
                         | NativeValue::ExceptionType(_)
                 )
@@ -5471,6 +5590,200 @@ impl PyRuntime for Vm<'_> {
         Vm::allocate_object(self, Object::Set(items)).map_err(PyError::resource_error)
     }
 
+    fn new_value_kind(
+        &self,
+        kind: &'static super::native::ValueKindDef,
+        payload: u64,
+    ) -> PyResult<Value> {
+        let index = self
+            .state
+            .types
+            .value_kind_index(kind)
+            .ok_or_else(|| PyError::runtime_error("value kind is not registered"))?;
+        Ok(Value::registered(index, payload))
+    }
+
+    fn value_kind_payload(
+        &self,
+        value: &Value,
+        kind: &'static super::native::ValueKindDef,
+    ) -> Option<u64> {
+        let (index, payload) = value.registered_parts()?;
+        std::ptr::eq(self.state.types.value_kind(index)?, kind).then_some(payload)
+    }
+
+    fn value_kind_type(&self, kind: &'static super::native::ValueKindDef) -> PyResult<Value> {
+        self.state
+            .types
+            .value_kind_type_id(kind)
+            .ok_or_else(|| PyError::runtime_error("value kind is not registered"))
+            .and_then(|type_id| {
+                self.state
+                    .types
+                    .value(type_id)
+                    .map_err(PyError::runtime_error)
+            })
+    }
+
+    fn new_array(
+        &mut self,
+        items: Vec<Value>,
+        shape: Vec<usize>,
+        dtype: PyArrayDtype,
+    ) -> PyResult<Value> {
+        let count = shape
+            .iter()
+            .try_fold(1usize, |total, dimension| total.checked_mul(*dimension))
+            .ok_or_else(|| PyError::value_error("array is too large"))?;
+        if count != items.len() {
+            return Err(PyError::runtime_error(
+                "array storage does not match its shape",
+            ));
+        }
+        let strides = super::stdlib::numpy::contiguous_strides(&shape)?;
+        let storage = Vm::allocate_object(self, Object::ArrayStorage(items))
+            .map_err(PyError::resource_error)?
+            .object_id()
+            .expect("allocated storage is an object");
+        Vm::allocate_object(
+            self,
+            Object::Array {
+                storage,
+                layout: PyArrayLayout {
+                    shape,
+                    strides,
+                    offset: 0,
+                },
+                dtype,
+            },
+        )
+        .map_err(PyError::resource_error)
+    }
+
+    fn new_array_view(&mut self, array: PyArray, layout: PyArrayLayout) -> PyResult<Value> {
+        if layout.shape.len() != layout.strides.len() {
+            return Err(PyError::runtime_error(
+                "array shape and strides have different ranks",
+            ));
+        }
+        let (storage, dtype) = match self
+            .state
+            .heap
+            .get(array.object_id())
+            .map_err(PyError::runtime_error)?
+        {
+            Object::Array { storage, dtype, .. } => (*storage, *dtype),
+            _ => return Err(PyError::runtime_error("array handle changed object kind")),
+        };
+        let storage_len = match self
+            .state
+            .heap
+            .get(storage)
+            .map_err(PyError::runtime_error)?
+        {
+            Object::ArrayStorage(values) => values.len(),
+            _ => return Err(PyError::runtime_error("array storage changed object kind")),
+        };
+        validate_array_layout(&layout, storage_len)?;
+        Vm::allocate_object(
+            self,
+            Object::Array {
+                storage,
+                layout,
+                dtype,
+            },
+        )
+        .map_err(PyError::resource_error)
+    }
+
+    fn array_layout(&self, array: PyArray) -> PyResult<(PyArrayLayout, PyArrayDtype)> {
+        match self
+            .state
+            .heap
+            .get(array.object_id())
+            .map_err(PyError::runtime_error)?
+        {
+            Object::Array { layout, dtype, .. } => Ok((layout.clone(), *dtype)),
+            _ => Err(PyError::runtime_error("array handle changed object kind")),
+        }
+    }
+
+    fn array_get(&mut self, array: PyArray, index: &[usize]) -> PyResult<Value> {
+        self.charge_cpu(1).map_err(PyError::resource_error)?;
+        let (storage, layout) = match self
+            .state
+            .heap
+            .get(array.object_id())
+            .map_err(PyError::runtime_error)?
+        {
+            Object::Array {
+                storage, layout, ..
+            } => (*storage, layout.clone()),
+            _ => return Err(PyError::runtime_error("array handle changed object kind")),
+        };
+        let offset = array_offset(&layout, index)?;
+        match self
+            .state
+            .heap
+            .get(storage)
+            .map_err(PyError::runtime_error)?
+        {
+            Object::ArrayStorage(values) => values
+                .get(offset)
+                .copied()
+                .ok_or_else(|| PyError::runtime_error("array offset is outside storage")),
+            _ => Err(PyError::runtime_error("array storage changed object kind")),
+        }
+    }
+
+    fn array_set(&mut self, array: PyArray, index: &[usize], value: Value) -> PyResult<()> {
+        self.charge_cpu(1).map_err(PyError::resource_error)?;
+        let (storage, layout) = match self
+            .state
+            .heap
+            .get(array.object_id())
+            .map_err(PyError::runtime_error)?
+        {
+            Object::Array {
+                storage, layout, ..
+            } => (*storage, layout.clone()),
+            _ => return Err(PyError::runtime_error("array handle changed object kind")),
+        };
+        let offset = array_offset(&layout, index)?;
+        match self
+            .state
+            .heap
+            .get_mut(storage)
+            .map_err(PyError::runtime_error)?
+        {
+            Object::ArrayStorage(values) => {
+                let destination = values
+                    .get_mut(offset)
+                    .ok_or_else(|| PyError::runtime_error("array offset is outside storage"))?;
+                *destination = value;
+                Ok(())
+            }
+            _ => Err(PyError::runtime_error("array storage changed object kind")),
+        }
+    }
+
+    fn binary_op(&mut self, operation: PyBinaryOp, left: Value, right: Value) -> PyResult<Value> {
+        let operation = match operation {
+            PyBinaryOp::Add => BinaryOperator::Add,
+            PyBinaryOp::Subtract => BinaryOperator::Subtract,
+            PyBinaryOp::Multiply => BinaryOperator::Multiply,
+            PyBinaryOp::Divide => BinaryOperator::Divide,
+        };
+        self.binary_value(operation, left, right)
+            .map_err(|message| {
+                if self.pending_exception.is_some() {
+                    PyError::new(PyErrorKind::Raised, message)
+                } else {
+                    PyError::type_error(message)
+                }
+            })
+    }
+
     fn new_integer(&mut self, decimal: &str) -> PyResult<Value> {
         self.charge_cpu(u64::try_from(decimal.len()).unwrap_or(u64::MAX))
             .map_err(PyError::resource_error)?;
@@ -5554,6 +5867,7 @@ impl PyRuntime for Vm<'_> {
             PyMarker::Environment => NativeValue::Environment,
             PyMarker::Stdout => NativeValue::Stream(Stream::Stdout),
             PyMarker::Stderr => NativeValue::Stream(Stream::Stderr),
+            PyMarker::ArrayType => NativeValue::BuiltinType(BuiltinType::Array),
         })
     }
 
@@ -5777,6 +6091,56 @@ impl PyProcessRunner for Vm<'_> {
     ) -> PyResult<()> {
         super::process::send_signal(self.interp, handle, signal)
     }
+}
+
+fn array_offset(layout: &PyArrayLayout, index: &[usize]) -> PyResult<usize> {
+    if index.len() != layout.shape.len() {
+        return Err(PyError::value_error("array index has the wrong rank"));
+    }
+    let mut offset = layout.offset;
+    for (axis, selected) in index.iter().enumerate() {
+        if *selected >= layout.shape[axis] {
+            return Err(PyError::value_error("array index is out of bounds"));
+        }
+        let selected = isize::try_from(*selected)
+            .map_err(|_| PyError::value_error("array offset overflow"))?;
+        offset = offset
+            .checked_add(
+                layout.strides[axis]
+                    .checked_mul(selected)
+                    .ok_or_else(|| PyError::value_error("array offset overflow"))?,
+            )
+            .ok_or_else(|| PyError::value_error("array offset overflow"))?;
+    }
+    usize::try_from(offset).map_err(|_| PyError::runtime_error("array offset is negative"))
+}
+
+fn validate_array_layout(layout: &PyArrayLayout, storage_len: usize) -> PyResult<()> {
+    super::stdlib::numpy::validate_rank(&layout.shape)?;
+    if layout.shape.contains(&0) {
+        return Ok(());
+    }
+    let mut minimum = layout.offset;
+    let mut maximum = layout.offset;
+    for (length, stride) in layout.shape.iter().zip(&layout.strides) {
+        let span = isize::try_from(length.saturating_sub(1))
+            .ok()
+            .and_then(|length| stride.checked_mul(length))
+            .ok_or_else(|| PyError::value_error("array offset overflow"))?;
+        if span < 0 {
+            minimum = minimum
+                .checked_add(span)
+                .ok_or_else(|| PyError::value_error("array offset overflow"))?;
+        } else {
+            maximum = maximum
+                .checked_add(span)
+                .ok_or_else(|| PyError::value_error("array offset overflow"))?;
+        }
+    }
+    if minimum < 0 || usize::try_from(maximum).map_or(true, |value| value >= storage_len) {
+        return Err(PyError::runtime_error("array view is outside storage"));
+    }
+    Ok(())
 }
 
 impl PyClock for Vm<'_> {

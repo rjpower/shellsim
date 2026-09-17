@@ -25,7 +25,7 @@ pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>>
     if let Some(value) = value.bool_value() {
         return Some(NumberRef::Int(i64::from(value)));
     }
-    if value.tag() == super::ValueTag::Int {
+    if matches!(value.tag(), super::ValueTag::Int) {
         return Some(NumberRef::Int(value.immediate_int().expect("tag checked")));
     }
     match value.object_id().and_then(|id| heap.get(id).ok())? {

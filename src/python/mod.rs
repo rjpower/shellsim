@@ -65,6 +65,7 @@ enum ValueTag {
     None,
     Object,
     Native,
+    Registered,
 }
 
 /// Compact, copyable Python value used by the VM and native-module ABI.
@@ -101,6 +102,23 @@ impl Value {
             payload: value as u64,
             aux: [0; 7],
             tag: ValueTag::Bool,
+        }
+    }
+
+    fn registered(kind: u8, payload: u64) -> Self {
+        let mut aux = [0; 7];
+        aux[0] = kind;
+        Self {
+            payload,
+            aux,
+            tag: ValueTag::Registered,
+        }
+    }
+
+    const fn registered_parts(&self) -> Option<(u8, u64)> {
+        match self.tag {
+            ValueTag::Registered => Some((self.aux[0], self.payload)),
+            _ => None,
         }
     }
 
@@ -251,6 +269,11 @@ impl std::fmt::Debug for Value {
             ValueTag::Native => formatter
                 .debug_tuple("Native")
                 .field(&self.native_value())
+                .finish(),
+            ValueTag::Registered => formatter
+                .debug_struct("Registered")
+                .field("kind", &self.aux[0])
+                .field("payload", &self.payload)
                 .finish(),
             _ => unreachable!("small strings returned above"),
         }
