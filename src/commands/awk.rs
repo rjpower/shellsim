@@ -72,8 +72,14 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                 };
                 variables.insert(name.to_string(), value.to_string());
             }
-            Key::ProgramFile => match env.vfs.read_string(&env.cwd, &value) {
-                Ok(source) => sources.push(source),
+            Key::ProgramFile => match env.vfs.read(&env.cwd, &value) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(source) => sources.push(source),
+                    Err(_) => {
+                        ewln(io.err, &format!("awk: {value}: program is not valid UTF-8"));
+                        return 2;
+                    }
+                },
                 Err(error) => {
                     ewln(io.err, &format!("awk: {value}: {error}"));
                     return 2;
@@ -92,6 +98,12 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         sources.push(source);
     }
     let source = sources.join("\n");
+    if !env.charge_cpu(source.len() as u64) {
+        return env
+            .resources
+            .stop_reason()
+            .map_or(137, |reason| reason.exit_status());
+    }
     let program = match parser::parse(&source).and_then(|program| {
         eval::validate(&program)?;
         Ok(program)
@@ -111,6 +123,17 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         } else {
             files.push(operand);
         }
+    }
+
+    if let Some(name) = ["NR", "FNR", "NF", "FILENAME", "RS"]
+        .into_iter()
+        .find(|name| variables.contains_key(*name))
+    {
+        ewln(
+            io.err,
+            &format!("awk: assignment to '{name}' is not supported"),
+        );
+        return 2;
     }
 
     let effective_separator = variables

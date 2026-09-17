@@ -107,6 +107,9 @@ impl Lexer<'_> {
             }
             value if value == '_' || value.is_ascii_alphabetic() => {
                 let ident = self.ident();
+                if matches!(ident.as_str(), "function" | "getline") {
+                    return Err(format!("unsupported keyword '{ident}'"));
+                }
                 let token = match ident.as_str() {
                     "BEGIN" => Token::Begin,
                     "END" => Token::End,

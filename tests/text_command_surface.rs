@@ -43,6 +43,15 @@ fn grep_rejects_incoherent_option_combinations_and_invalid_text() {
     assert_eq!(outcome.exit_status, 2);
     assert!(String::from_utf8_lossy(&stderr).contains("not valid UTF-8"));
 
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "patterns", &[0xff], 0o644)
+        .unwrap();
+    let (outcome, _, stderr) = environment.run_script_capture("grep -f patterns input");
+    assert_eq!(outcome.exit_status, 2);
+    assert!(String::from_utf8_lossy(&stderr).contains("not valid UTF-8"));
+
     let (status, _, stderr) = run("printf 'a\\0b' | grep a");
     assert_eq!(status, 2);
     assert!(stderr.contains("binary input is not supported"), "{stderr}");
@@ -75,6 +84,10 @@ fn sed_handles_delimiters_addresses_ranges_and_common_commands() {
         run("printf 'a\\nb\\nc\\n' | sed '1,2c changed; /changed/!s/c/C/'"),
         (0, "changed\nC\n".into(), String::new())
     );
+
+    let (status, _, stderr) = run("printf x | sed -n '0p'");
+    assert_eq!(status, 2);
+    assert!(stderr.contains("at least 1"), "{stderr}");
 }
 
 #[test]
@@ -101,6 +114,25 @@ fn sed_script_files_and_in_place_writes_preserve_mode() {
 }
 
 #[test]
+fn sed_rejects_invalid_script_files_and_occurrence_numbers() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "bad.sed", &[0xff], 0o644)
+        .unwrap();
+    let (outcome, _, stderr) = environment.run_script_capture("sed -f bad.sed");
+    assert_eq!(outcome.exit_status, 2);
+    assert!(String::from_utf8_lossy(&stderr).contains("not valid UTF-8"));
+
+    let (status, _, stderr) = run("printf a | sed 's/a/b/99999999999999999999'");
+    assert_eq!(status, 2);
+    assert!(
+        stderr.contains("invalid substitution occurrence"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn awk_supports_basic_control_flow_arrays_and_functions() {
     assert_eq!(
         run("awk 'BEGIN { for (i = 1; i <= 3; i++) { squares[i] = i * i } total = 0; for (key in squares) { if (key == 2) continue; total += squares[key] } print total, substr(\"hello\", 2, 3), index(\"abc\", \"b\") }'"),
@@ -122,25 +154,47 @@ fn awk_supports_basic_control_flow_arrays_and_functions() {
 
 #[test]
 fn awk_validates_the_whole_program_before_execution() {
-    let (status, stdout, stderr) = run("awk 'BEGIN { print \"must not print\"; unknown(1) }'");
-    assert_eq!(status, 2);
-    assert!(stdout.is_empty());
-    assert!(stderr.contains("unsupported function"), "{stderr}");
+    for (source, expected) in [
+        (
+            "awk 'BEGIN { print \"must not print\"; unknown(1) }'",
+            "unsupported function",
+        ),
+        (
+            "awk 'BEGIN { printf \"%q\", 1 }'",
+            "unsupported printf conversion",
+        ),
+        ("awk 'BEGIN { print 1 > \"out\" }'", "redirection"),
+        (
+            "printf 'one\\n' | awk -F '[' '{ print $1 }'",
+            "invalid field separator",
+        ),
+        ("awk 'BEGIN { getline value }'", "unsupported keyword"),
+        (
+            "awk 'BEGIN { NR = 4 }'",
+            "assignment to 'NR' is not supported",
+        ),
+        (
+            "awk -v NF=4 'BEGIN { print 1 }'",
+            "assignment to 'NF' is not supported",
+        ),
+    ] {
+        let (status, stdout, stderr) = run(source);
+        assert_eq!(status, 2, "{source}: {stderr}");
+        assert!(stdout.is_empty(), "{source}");
+        assert!(stderr.contains(expected), "{source}: {stderr}");
+    }
+}
 
-    let (status, stdout, stderr) = run("awk 'BEGIN { printf \"%q\", 1 }'");
-    assert_eq!(status, 2);
-    assert!(stdout.is_empty());
-    assert!(stderr.contains("unsupported printf conversion"), "{stderr}");
-
-    let (status, stdout, stderr) = run("awk 'BEGIN { print 1 > \"out\" }'");
-    assert_eq!(status, 2);
-    assert!(stdout.is_empty());
-    assert!(stderr.contains("redirection"), "{stderr}");
-
-    let (status, stdout, stderr) = run("printf 'one\\n' | awk -F '[' '{ print $1 }'");
-    assert_eq!(status, 2);
-    assert!(stdout.is_empty());
-    assert!(stderr.contains("invalid field separator"), "{stderr}");
+#[test]
+fn awk_rejects_invalid_utf8_program_files() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "bad.awk", &[0xff], 0o644)
+        .unwrap();
+    let (outcome, _, stderr) = environment.run_script_capture("awk -f bad.awk");
+    assert_eq!(outcome.exit_status, 2);
+    assert!(String::from_utf8_lossy(&stderr).contains("not valid UTF-8"));
 }
 
 #[test]
@@ -163,4 +217,53 @@ fn awk_loops_consume_modeled_cpu_fuel() {
     assert_eq!(outcome.stop_reason, Some(StopReason::CpuExhausted));
     assert_eq!(outcome.usage.cpu_used, 500);
     assert!(stdout.is_empty());
+}
+
+#[test]
+fn generated_text_and_field_growth_obey_resource_limits() {
+    for source in [
+        "awk 'BEGIN { $1000000000 = 1 }'",
+        "awk 'BEGIN { value = \"a\"; while (1) value = value value }'",
+        "printf a | sed 's/a/&&&&&&&&&&/g; s/a/&&&&&&&&&&/g; s/a/&&&&&&&&&&/g; s/a/&&&&&&&&&&/g; s/a/&&&&&&&&&&/g'",
+    ] {
+        let mut environment = Environment::with_limits(Limits {
+            memory: 128 * 1024,
+            ..Limits::unlimited()
+        });
+        let (outcome, _, _) = environment.run_script_capture(source);
+        assert_eq!(outcome.exit_status, 137, "{source}");
+        assert_eq!(outcome.stop_reason, Some(StopReason::MemoryExhausted));
+    }
+
+    let mut environment = Environment::with_limits(Limits {
+        output: 128,
+        ..Limits::unlimited()
+    });
+    let (outcome, stdout, _) =
+        environment.run_script_capture("awk 'BEGIN { printf \"%1000000000s\", \"x\" }'");
+    assert_eq!(outcome.exit_status, 137);
+    assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
+    assert!(stdout.is_empty());
+
+    let mut environment = Environment::with_limits(Limits {
+        output: 128,
+        ..Limits::unlimited()
+    });
+    let (outcome, _, _) = environment.run_script_capture(
+        "printf 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\\n' | sed -n 'p;p;p'",
+    );
+    assert_eq!(outcome.exit_status, 137);
+    assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
+
+    let mut environment = Environment::with_limits(Limits {
+        memory: 1024,
+        ..Limits::unlimited()
+    });
+    environment
+        .vfs
+        .write("/", "patterns", &vec![b'a'; 2048], 0o644)
+        .unwrap();
+    let (outcome, _, _) = environment.run_script_capture("grep -f patterns input");
+    assert_eq!(outcome.exit_status, 137);
+    assert_eq!(outcome.stop_reason, Some(StopReason::MemoryExhausted));
 }

@@ -126,7 +126,12 @@ fn validate_stmt(statement: &Stmt) -> Result<(), String> {
             }
             validate_stmt(body)?;
         }
-        Stmt::ForIn { body, .. } => validate_stmt(body)?,
+        Stmt::ForIn { name, body, .. } => {
+            if assignment_is_unsupported(name) {
+                return Err(format!("assignment to '{name}' is not supported"));
+            }
+            validate_stmt(body)?;
+        }
         Stmt::Delete(target) => validate_lvalue(target)?,
         Stmt::Exit(value) => {
             if let Some(value) = value {
@@ -146,6 +151,9 @@ fn validate_stmt(statement: &Stmt) -> Result<(), String> {
 
 fn validate_lvalue(target: &LValue) -> Result<(), String> {
     match target {
+        LValue::Variable(name) if assignment_is_unsupported(name) => {
+            Err(format!("assignment to '{name}' is not supported"))
+        }
         LValue::Variable(_) => Ok(()),
         LValue::Field(index) => validate_expr(index),
         LValue::Array { indices, .. } => {
@@ -216,7 +224,12 @@ pub(super) fn execute(
             }
         }
     }
-    let mut runtime = Runtime { env, io, state };
+    let mut runtime = Runtime {
+        env,
+        io,
+        state,
+        literal_regexes: HashMap::new(),
+    };
 
     let mut requested_exit = match runtime.phase(program, Phase::Begin) {
         Flow::Normal => None,
@@ -258,6 +271,7 @@ struct Runtime<'a, 'env, 'io> {
     env: &'a mut CommandContext<'env>,
     io: &'a mut Io<'io>,
     state: State,
+    literal_regexes: HashMap<String, regex::Regex>,
 }
 
 impl Runtime<'_, '_, '_> {
@@ -362,7 +376,9 @@ impl Runtime<'_, '_, '_> {
                     .unwrap_or_default();
                 keys.sort();
                 for key in keys {
-                    self.set_variable(name, Scalar::string(key));
+                    if let Err(flow) = self.set_variable(name, Scalar::string(key)) {
+                        return flow;
+                    }
                     match self.statement(body) {
                         Flow::Normal | Flow::Continue => {}
                         Flow::Break => return Flow::Normal,
@@ -416,12 +432,27 @@ impl Runtime<'_, '_, '_> {
                         Err(flow) => return flow,
                     }
                 }
-                match format_printf(&evaluated[0].text, &evaluated[1..]) {
+                let limit = usize::try_from(
+                    self.env
+                        .resources
+                        .output_remaining()
+                        .min(self.env.resources.limits().memory),
+                )
+                .unwrap_or(usize::MAX);
+                match format_printf(&evaluated[0].text, &evaluated[1..], limit) {
                     Ok(output) => {
                         self.io.out.extend_from_slice(output.as_bytes());
                         Flow::Normal
                     }
-                    Err(error) => Flow::Error(error),
+                    Err(FormatError::Invalid(error)) => Flow::Error(error),
+                    Err(FormatError::Limit) => {
+                        let remaining = self.env.resources.output_remaining();
+                        let _ = self
+                            .env
+                            .resources
+                            .charge_output(remaining.saturating_add(1));
+                        Flow::Exhausted
+                    }
                 }
             }
             Stmt::Expr(value) => self.expr(value).map_or_else(|flow| flow, |_| Flow::Normal),
@@ -435,9 +466,23 @@ impl Runtime<'_, '_, '_> {
         match expression {
             Expr::String(value) => Ok(Scalar::string(value.clone())),
             Expr::Number(value) => Ok(Scalar::number(*value)),
-            Expr::Regex(pattern) => regex::Regex::new(pattern)
-                .map(|regex| Scalar::number(regex.is_match(&self.state.record) as u8 as f64))
-                .map_err(|error| Flow::Error(format!("invalid regular expression: {error}"))),
+            Expr::Regex(pattern) => {
+                if !self.literal_regexes.contains_key(pattern) {
+                    if !self.env.charge_cpu(pattern.len() as u64) {
+                        return Err(Flow::Exhausted);
+                    }
+                    let regex = regex::Regex::new(pattern).map_err(|error| {
+                        Flow::Error(format!("invalid regular expression: {error}"))
+                    })?;
+                    self.literal_regexes.insert(pattern.clone(), regex);
+                }
+                let matched = self
+                    .literal_regexes
+                    .get(pattern)
+                    .expect("literal regex was inserted")
+                    .is_match(&self.state.record);
+                Ok(Scalar::number(matched as u8 as f64))
+            }
             Expr::Variable(name) => Ok(self.variable(name)),
             Expr::Field(index) => {
                 let index = self.expr(index)?.as_number().max(0.0) as usize;
@@ -460,13 +505,13 @@ impl Runtime<'_, '_, '_> {
                     right
                 } else {
                     let left = self.read_lvalue(target)?;
-                    let divisor = right.as_number();
+                    let operand = right.as_number();
                     let result = match op {
-                        AssignOp::Add => left.as_number() + divisor,
-                        AssignOp::Subtract => left.as_number() - divisor,
-                        AssignOp::Multiply => left.as_number() * divisor,
-                        AssignOp::Divide if divisor != 0.0 => left.as_number() / divisor,
-                        AssignOp::Remainder if divisor != 0.0 => left.as_number() % divisor,
+                        AssignOp::Add => left.as_number() + operand,
+                        AssignOp::Subtract => left.as_number() - operand,
+                        AssignOp::Multiply => left.as_number() * operand,
+                        AssignOp::Divide if operand != 0.0 => left.as_number() / operand,
+                        AssignOp::Remainder if operand != 0.0 => left.as_number() % operand,
                         AssignOp::Divide | AssignOp::Remainder => {
                             return Err(Flow::Error("division by zero".to_string()))
                         }
@@ -572,7 +617,7 @@ impl Runtime<'_, '_, '_> {
                     _ => unreachable!(),
                 })
             }
-            BinaryOp::Concat => Scalar::string(format!("{}{}", left.text, right.text)),
+            BinaryOp::Concat => return self.concatenate(&left.text, &right.text),
             BinaryOp::Add => Scalar::number(left.as_number() + right.as_number()),
             BinaryOp::Subtract => Scalar::number(left.as_number() - right.as_number()),
             BinaryOp::Multiply => Scalar::number(left.as_number() * right.as_number()),
@@ -589,6 +634,22 @@ impl Runtime<'_, '_, '_> {
                 unreachable!()
             }
         })
+    }
+
+    fn concatenate(&mut self, left: &str, right: &str) -> Result<Scalar, Flow> {
+        let bytes = (left.len() as u64).saturating_add(right.len() as u64);
+        if !self.env.reserve_memory(bytes) {
+            return Err(Flow::Exhausted);
+        }
+        if !self.env.charge_cpu(bytes) {
+            self.env.resources.release_memory(bytes);
+            return Err(Flow::Exhausted);
+        }
+        let mut output = String::with_capacity(bytes as usize);
+        output.push_str(left);
+        output.push_str(right);
+        self.env.resources.release_memory(bytes);
+        Ok(Scalar::string(output))
     }
 
     fn call(&mut self, name: &str, args: &[Expr]) -> Result<Scalar, Flow> {
@@ -646,9 +707,24 @@ impl Runtime<'_, '_, '_> {
                 for argument in args {
                     values.push(self.expr(argument)?);
                 }
-                format_printf(&values[0].text, &values[1..])
-                    .map(Scalar::string)
-                    .map_err(Flow::Error)
+                let limit =
+                    usize::try_from(self.env.resources.limits().memory).unwrap_or(usize::MAX);
+                match format_printf(&values[0].text, &values[1..], limit) {
+                    Ok(output) => {
+                        let bytes = output.len() as u64;
+                        if !self.env.reserve_memory(bytes) {
+                            return Err(Flow::Exhausted);
+                        }
+                        self.env.resources.release_memory(bytes);
+                        Ok(Scalar::string(output))
+                    }
+                    Err(FormatError::Invalid(error)) => Err(Flow::Error(error)),
+                    Err(FormatError::Limit) => {
+                        let request = self.env.resources.limits().memory.saturating_add(1);
+                        let _ = self.env.reserve_memory(request);
+                        Err(Flow::Exhausted)
+                    }
+                }
             }
             _ => Err(Flow::Error(format!("unsupported function '{name}'"))),
         }
@@ -724,8 +800,8 @@ impl Runtime<'_, '_, '_> {
         let found = regex.find(&value);
         let start = found.map_or(0, |matched| value[..matched.start()].chars().count() + 1);
         let length = found.map_or(-1, |matched| matched.as_str().chars().count() as i64);
-        self.set_variable("RSTART", Scalar::number(start as f64));
-        self.set_variable("RLENGTH", Scalar::number(length as f64));
+        self.set_variable("RSTART", Scalar::number(start as f64))?;
+        self.set_variable("RLENGTH", Scalar::number(length as f64))?;
         Ok(Scalar::number(start as f64))
     }
 
@@ -762,19 +838,26 @@ impl Runtime<'_, '_, '_> {
             "FS" => Scalar::string(self.state.fs.clone()),
             "OFS" => Scalar::string(self.state.ofs.clone()),
             "ORS" => Scalar::string(self.state.ors.clone()),
+            "RS" => Scalar::string("\n"),
             _ => self.state.vars.get(name).cloned().unwrap_or_default(),
         }
     }
 
-    fn set_variable(&mut self, name: &str, value: Scalar) {
+    fn set_variable(&mut self, name: &str, value: Scalar) -> Result<(), Flow> {
         match name {
             "FS" => self.state.fs = value.text,
             "OFS" => self.state.ofs = value.text,
             "ORS" => self.state.ors = value.text,
+            name if assignment_is_unsupported(name) => {
+                return Err(Flow::Error(format!(
+                    "assignment to '{name}' is not supported"
+                )))
+            }
             _ => {
                 self.state.vars.insert(name.to_string(), value);
             }
         }
+        Ok(())
     }
 
     fn field(&self, index: usize) -> Scalar {
@@ -818,17 +901,40 @@ impl Runtime<'_, '_, '_> {
 
     fn write_lvalue(&mut self, target: &LValue, value: Scalar) -> Result<(), Flow> {
         match target {
-            LValue::Variable(name) => self.set_variable(name, value),
+            LValue::Variable(name) => self.set_variable(name, value)?,
             LValue::Field(index) => {
                 let index = self.expr(index)?.as_number().max(0.0) as usize;
                 if index == 0 {
                     self.set_record(value.text)?;
                 } else {
+                    let missing = index.saturating_sub(self.state.fields.len());
+                    let vector_bytes =
+                        (missing as u64).saturating_mul(std::mem::size_of::<String>() as u64);
+                    let field_bytes = self
+                        .state
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .filter(|(position, _)| *position != index - 1)
+                        .map(|(_, field)| field.len() as u64)
+                        .fold(value.text.len() as u64, u64::saturating_add);
+                    let joined_bytes = field_bytes.saturating_add(
+                        ((index - 1) as u64).saturating_mul(self.state.ofs.len() as u64),
+                    );
+                    let scratch = vector_bytes.saturating_add(joined_bytes);
+                    if !self.env.reserve_memory(scratch) {
+                        return Err(Flow::Exhausted);
+                    }
+                    if !self.env.charge_cpu(scratch) {
+                        self.env.resources.release_memory(scratch);
+                        return Err(Flow::Exhausted);
+                    }
                     if self.state.fields.len() < index {
                         self.state.fields.resize(index, String::new());
                     }
                     self.state.fields[index - 1] = value.text;
                     self.state.record = self.state.fields.join(&self.state.ofs);
+                    self.env.resources.release_memory(scratch);
                 }
             }
             LValue::Array { name, indices } => {
@@ -883,6 +989,10 @@ impl Runtime<'_, '_, '_> {
     }
 }
 
+pub(super) fn assignment_is_unsupported(name: &str) -> bool {
+    matches!(name, "NR" | "FNR" | "NF" | "FILENAME" | "RS")
+}
+
 fn split_fields(record: &str, separator: &str) -> Result<Vec<String>, Flow> {
     if separator == " " || separator.is_empty() {
         return Ok(record.split_whitespace().map(str::to_string).collect());
@@ -925,17 +1035,36 @@ fn awk_replacement(value: &str) -> String {
     output
 }
 
-fn format_printf(format: &str, values: &[Scalar]) -> Result<String, String> {
+enum FormatError {
+    Invalid(String),
+    Limit,
+}
+
+fn format_printf(
+    format: &str,
+    values: &[Scalar],
+    maximum_bytes: usize,
+) -> Result<String, FormatError> {
     let mut output = String::new();
     let mut chars = format.chars().peekable();
     let mut value_index = 0usize;
     while let Some(character) = chars.next() {
         if character != '%' {
+            if output
+                .len()
+                .checked_add(character.len_utf8())
+                .is_none_or(|length| length > maximum_bytes)
+            {
+                return Err(FormatError::Limit);
+            }
             output.push(character);
             continue;
         }
         if chars.peek() == Some(&'%') {
             chars.next();
+            if output.len() >= maximum_bytes {
+                return Err(FormatError::Limit);
+            }
             output.push('%');
             continue;
         }
@@ -946,32 +1075,59 @@ fn format_printf(format: &str, values: &[Scalar]) -> Result<String, String> {
                 '-' => left = true,
                 '0' => zero = true,
                 '+' | ' ' => {}
-                '#' => return Err("unsupported printf flag '#'".to_string()),
+                '#' => {
+                    return Err(FormatError::Invalid(
+                        "unsupported printf flag '#'".to_string(),
+                    ))
+                }
                 _ => break,
             }
             chars.next();
         }
-        let width = take_digits(&mut chars).map(|value| value.parse::<usize>().unwrap_or(0));
+        let width = take_digits(&mut chars)
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| FormatError::Invalid("printf width is too large".to_string()))
+            })
+            .transpose()?;
         let precision = if chars.peek() == Some(&'.') {
             chars.next();
             Some(
                 take_digits(&mut chars)
                     .unwrap_or_default()
                     .parse::<usize>()
-                    .unwrap_or(0),
+                    .map_err(|_| {
+                        FormatError::Invalid("printf precision is too large".to_string())
+                    })?,
             )
         } else {
             None
         };
+        if width.is_some_and(|value| value > maximum_bytes)
+            || precision.is_some_and(|value| value > maximum_bytes)
+        {
+            return Err(FormatError::Limit);
+        }
         let conversion = chars
             .next()
-            .ok_or_else(|| "unterminated printf conversion".to_string())?;
+            .ok_or_else(|| FormatError::Invalid("unterminated printf conversion".to_string()))?;
         if !matches!(conversion, 's' | 'd' | 'i' | 'f' | 'g' | 'e' | 'c') {
-            return Err(format!("unsupported printf conversion '%{conversion}'"));
+            return Err(FormatError::Invalid(format!(
+                "unsupported printf conversion '%{conversion}'"
+            )));
         }
         let value = values.get(value_index).cloned().unwrap_or_default();
         value_index += 1;
+        if precision
+            .is_some_and(|limit| value.text.len().min(limit.saturating_mul(4)) > maximum_bytes)
+        {
+            return Err(FormatError::Limit);
+        }
         let mut rendered = match conversion {
+            's' if precision.is_none() && value.text.len() > maximum_bytes => {
+                return Err(FormatError::Limit)
+            }
             's' => precision.map_or(value.text.clone(), |limit| {
                 value.text.chars().take(limit).collect()
             }),
@@ -982,6 +1138,9 @@ fn format_printf(format: &str, values: &[Scalar]) -> Result<String, String> {
             'c' => value.text.chars().next().unwrap_or('\0').to_string(),
             _ => unreachable!(),
         };
+        if rendered.len() > maximum_bytes {
+            return Err(FormatError::Limit);
+        }
         if let Some(width) = width.filter(|width| *width > rendered.chars().count()) {
             let padding = width - rendered.chars().count();
             let fill = if zero && !left { '0' } else { ' ' };
@@ -990,6 +1149,13 @@ fn format_printf(format: &str, values: &[Scalar]) -> Result<String, String> {
             } else {
                 rendered = format!("{}{}", fill.to_string().repeat(padding), rendered);
             }
+        }
+        if output
+            .len()
+            .checked_add(rendered.len())
+            .is_none_or(|length| length > maximum_bytes)
+        {
+            return Err(FormatError::Limit);
         }
         output.push_str(&rendered);
     }

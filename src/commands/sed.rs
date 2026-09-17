@@ -69,8 +69,14 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             Key::Expression => scripts.push(option.value.expect("required option value")),
             Key::File => {
                 let file = option.value.expect("required option value");
-                match env.vfs.read_string(&env.cwd, &file) {
-                    Ok(script) => scripts.push(script),
+                match env.vfs.read(&env.cwd, &file) {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(script) => scripts.push(script),
+                        Err(_) => {
+                            ewln(io.err, &format!("sed: {file}: script is not valid UTF-8"));
+                            return 2;
+                        }
+                    },
                     Err(error) => {
                         ewln(io.err, &format!("sed: {file}: {error}"));
                         return 2;
@@ -188,7 +194,7 @@ struct Command {
 }
 
 impl Command {
-    fn selected(&mut self, line: usize, total: usize, text: &str) -> Selection {
+    fn selection_for(&mut self, line: usize, total: usize, text: &str) -> Selection {
         let selected = match (&self.first, &self.second) {
             (None, _) => Selection::Single,
             (Some(first), None) => {
@@ -268,6 +274,7 @@ fn process(
     commands: &mut [Command],
     quiet: bool,
 ) -> Result<String, i32> {
+    let memory_mark = env.resources.memory_mark();
     let scratch = (text.len() as u64)
         .saturating_mul(2)
         .saturating_add((commands.len() as u64).saturating_mul(64));
@@ -275,7 +282,7 @@ fn process(
         return Err(137);
     }
     let result = process_reserved(env, text, commands, quiet);
-    env.resources.release_memory(scratch);
+    env.resources.restore_memory(memory_mark);
     result
 }
 
@@ -298,7 +305,7 @@ fn process_reserved(
         let mut quit = false;
         let mut after = Vec::new();
         for command in commands.iter_mut() {
-            let selection = command.selected(index + 1, lines.len(), &pattern);
+            let selection = command.selection_for(index + 1, lines.len(), &pattern);
             if selection == Selection::No {
                 continue;
             }
@@ -310,24 +317,37 @@ fn process_reserved(
                     nth,
                     print,
                 } => {
+                    let bound = (pattern.len() as u64)
+                        .saturating_mul((replacement.len() as u64).saturating_add(1))
+                        .saturating_add(replacement.len() as u64);
+                    if !env.reserve_memory(bound) {
+                        return Err(137);
+                    }
+                    if !env
+                        .charge_cpu((pattern.len() as u64).saturating_add(replacement.len() as u64))
+                    {
+                        env.resources.release_memory(bound);
+                        return Err(137);
+                    }
                     let (result, substitutions) =
                         substitute(regex, replacement, &pattern, *global, *nth);
+                    env.resources.release_memory(bound);
                     pattern = result;
                     if *print && substitutions != 0 {
-                        push_line(&mut output, &pattern, true);
+                        push_line(env, &mut output, &pattern, true)?;
                     }
                 }
                 CommandKind::Delete => {
                     deleted = true;
                     break;
                 }
-                CommandKind::Print => push_line(&mut output, &pattern, true),
+                CommandKind::Print => push_line(env, &mut output, &pattern, true)?,
                 CommandKind::Quit => {
                     quit = true;
                     break;
                 }
                 CommandKind::Append(text) => after.push(text.clone()),
-                CommandKind::Insert(text) => push_line(&mut output, text, true),
+                CommandKind::Insert(text) => push_line(env, &mut output, text, true)?,
                 CommandKind::Change(text) => {
                     if selection != Selection::RangeBody {
                         pattern = text.clone();
@@ -348,16 +368,18 @@ fn process_reserved(
                         })
                         .collect();
                 }
-                CommandKind::LineNumber => push_line(&mut output, &(index + 1).to_string(), true),
+                CommandKind::LineNumber => {
+                    push_line(env, &mut output, &(index + 1).to_string(), true)?
+                }
             }
         }
         if changed {
-            push_line(&mut output, &pattern, true);
+            push_line(env, &mut output, &pattern, true)?;
         } else if !quiet && !deleted {
-            push_line(&mut output, &pattern, had_newline);
+            push_line(env, &mut output, &pattern, had_newline)?;
         }
         for text in after {
-            push_line(&mut output, &text, true);
+            push_line(env, &mut output, &text, true)?;
         }
         if quit {
             break;
@@ -366,11 +388,27 @@ fn process_reserved(
     Ok(output)
 }
 
-fn push_line(output: &mut String, text: &str, newline: bool) {
+fn push_line(
+    env: &mut CommandContext<'_>,
+    output: &mut String,
+    text: &str,
+    newline: bool,
+) -> Result<(), i32> {
+    let bytes = (text.len() as u64).saturating_add(u64::from(newline));
+    let projected = (output.len() as u64).saturating_add(bytes);
+    if projected > env.resources.output_remaining() {
+        let request = env.resources.output_remaining().saturating_add(1);
+        let _ = env.resources.charge_output(request);
+        return Err(137);
+    }
+    if !env.reserve_memory(bytes) || !env.charge_cpu(bytes) {
+        return Err(137);
+    }
     output.push_str(text);
     if newline {
         output.push('\n');
     }
+    Ok(())
 }
 
 fn substitute(
@@ -485,6 +523,9 @@ impl<'a> ScriptParser<'a> {
             let line = digits
                 .parse()
                 .map_err(|_| format!("invalid line address '{digits}'"))?;
+            if line == 0 {
+                return Err("line address must be at least 1".to_string());
+            }
             return Ok(Some(Address::Line(line)));
         }
         if self.take('$') {
@@ -516,12 +557,17 @@ impl<'a> ScriptParser<'a> {
         let ignore_case = flags.contains('i') || flags.contains('I');
         let global = flags.contains('g');
         let print = flags.contains('p');
-        let nth = flags
+        let digits = flags
             .chars()
             .filter(char::is_ascii_digit)
-            .collect::<String>()
-            .parse()
-            .unwrap_or(0);
+            .collect::<String>();
+        let nth = if digits.is_empty() {
+            0
+        } else {
+            digits
+                .parse()
+                .map_err(|_| format!("invalid substitution occurrence '{digits}'"))?
+        };
         let pattern = if self.extended {
             pattern
         } else {

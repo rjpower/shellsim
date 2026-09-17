@@ -1412,6 +1412,13 @@ fn cmd_fgrep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
 
 /// grep with the command name available (egrep/fgrep change default regex flavor).
 fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i32 {
+    let memory_mark = interp.resources.memory_mark();
+    let status = grep_impl_inner(interp, cmd, args, io);
+    interp.resources.restore_memory(memory_mark);
+    status
+}
+
+fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i32 {
     #[derive(Clone, Copy, PartialEq)]
     enum Key {
         IgnoreCase,
@@ -1587,10 +1594,27 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
         }
     }
     for file in pattern_files {
-        let content = match interp.vfs.read_string(&interp.cwd, &file) {
-            Ok(content) => content,
+        let bytes = match interp.vfs.read(&interp.cwd, &file) {
+            Ok(bytes) => bytes,
             Err(error) => {
                 ewln(io.err, &format!("grep: {file}: {error}"));
+                return 2;
+            }
+        };
+        let bytes_len = bytes.len() as u64;
+        if !interp.resources.reserve_memory(bytes_len) || !interp.resources.charge_cpu(bytes_len) {
+            return interp
+                .resources
+                .stop_reason()
+                .map_or(137, |reason| reason.exit_status());
+        }
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(_) => {
+                ewln(
+                    io.err,
+                    &format!("grep: {file}: pattern file is not valid UTF-8"),
+                );
                 return 2;
             }
         };
