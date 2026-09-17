@@ -58,5 +58,6 @@ python = []
 opt-level = 1
 
 [profile.release]
-opt-level = "s"
-lto = false
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
