@@ -126,6 +126,8 @@ pub(super) enum PyErrorKind {
     Runtime,
     Resource,
     Exception(&'static str),
+    /// A nested VM operation already stored the concrete Python exception.
+    Raised,
     Exit(i32),
     /// Internal cooperative control flow. This must be consumed by the bytecode VM and never
     /// materialized as a Python exception.

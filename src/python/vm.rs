@@ -4665,7 +4665,10 @@ impl<'a> Vm<'a> {
             PyErrorKind::Overflow => Some("OverflowError"),
             PyErrorKind::Runtime => Some("RuntimeError"),
             PyErrorKind::Exception(kind) => Some(kind),
-            PyErrorKind::Resource | PyErrorKind::Exit(_) | PyErrorKind::Suspend(_) => None,
+            PyErrorKind::Resource
+            | PyErrorKind::Raised
+            | PyErrorKind::Exit(_)
+            | PyErrorKind::Suspend(_) => None,
         };
         if let Some(kind) = kind {
             if let Ok(value) = self.allocate_exception(kind.to_string(), error.message.clone()) {
@@ -5772,7 +5775,13 @@ impl PyRuntime for Vm<'_> {
             PyBinaryOp::Divide => BinaryOperator::Divide,
         };
         self.binary_value(operation, left, right)
-            .map_err(PyError::type_error)
+            .map_err(|message| {
+                if self.pending_exception.is_some() {
+                    PyError::new(PyErrorKind::Raised, message)
+                } else {
+                    PyError::type_error(message)
+                }
+            })
     }
 
     fn new_integer(&mut self, decimal: &str) -> PyResult<Value> {

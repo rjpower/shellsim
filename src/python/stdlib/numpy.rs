@@ -249,7 +249,7 @@ fn construct(
         return runtime.new_array(values, layout.shape, dtype);
     }
     let mut values = Vec::new();
-    let shape = flatten(runtime, source, &mut values)?;
+    let shape = flatten(runtime, source, &mut values, 0)?;
     let inferred = infer_dtype(runtime, &values)?;
     let dtype = requested_dtype.unwrap_or(inferred);
     reserve_values(runtime, values.len())?;
@@ -265,7 +265,13 @@ fn flatten(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
     output: &mut Vec<PyValue>,
+    depth: usize,
 ) -> PyResult<Vec<usize>> {
+    if depth > MAX_ARRAY_RANK {
+        return Err(PyError::value_error(format!(
+            "arrays support at most {MAX_ARRAY_RANK} dimensions"
+        )));
+    }
     if registered_scalar(runtime, &value).is_some() {
         push_value(runtime, output, value)?;
         return Ok(Vec::new());
@@ -276,7 +282,7 @@ fn flatten(
             let mut child_shape = None;
             for item in items.iter().copied() {
                 runtime.charge_cpu(1)?;
-                let shape = flatten(runtime, item, output)?;
+                let shape = flatten(runtime, item, output, depth + 1)?;
                 if child_shape
                     .as_ref()
                     .is_some_and(|expected| expected != &shape)

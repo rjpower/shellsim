@@ -301,6 +301,14 @@ fn unsupported_or_invalid_array_operations_fail_explicitly() {
             "import numpy as np\nnp.zeros([1] * 65)",
             "arrays support at most 64 dimensions",
         ),
+        (
+            "import numpy as np\nvalue = 1\nfor _ in range(65):\n    value = [value]\nnp.array(value)",
+            "arrays support at most 64 dimensions",
+        ),
+        (
+            "import numpy as np\nnp.array([1.0]) / 0",
+            "ZeroDivisionError",
+        ),
     ] {
         assert_fails_with(source, expected);
     }
