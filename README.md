@@ -38,8 +38,12 @@ shellsim; they reject other packages instead of fetching them. See
 Common utilities accept clustered short options, long options, option values, and `--` through a
 shared parser. Each utility declares its supported options. For example, `grep` supports ordinary
 basic and extended regular expressions, recursive search, fixed strings, word and whole-line
-matching, counts, line numbers, match limits, and common output controls. Unsupported options exit
-nonzero with a direct diagnostic.
+matching, pattern files, include and exclude filters, context, counts, line numbers, match limits,
+and common output controls. `sed` covers addresses and ranges plus the common substitution,
+selection, text, transliteration, and early-exit commands. `awk` parses a typed language subset
+with record rules, control flow, fields, associative arrays, arithmetic, regular expressions, and
+the usual scalar functions. Unsupported syntax and options exit nonzero with a direct diagnostic;
+text processing is UTF-8-only unless a command documents a byte-oriented mode.
 
 ## Install and run
 

@@ -107,9 +107,10 @@ fn common_text_options_are_exact_or_explicitly_unsupported() {
         text("printf 'a\nb\nc\n' | sed '2d'; printf 'a\nb\n' | grep -e a -e b; printf 'a b\n' | xargs -n1 echo; printf 'aabb\n' | tr -s a-z"),
         (0, "a\nc\na\nb\na\nb\nab\n".into(), String::new())
     );
-    let (status, _, stderr) = text("printf 'a\nb\n' | grep -A1 a");
-    assert_eq!(status, 2);
-    assert!(stderr.contains("unsupported"), "{stderr}");
+    assert_eq!(
+        text("printf 'a\nb\nc\n' | grep -n -A1 a"),
+        (0, "1:a\n2-b\n".into(), String::new())
+    );
     let (status, _, stderr) = text("printf data | fold");
     assert_eq!(status, 127);
     assert!(stderr.contains("not implemented"), "{stderr}");
