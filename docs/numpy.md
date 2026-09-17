@@ -69,7 +69,7 @@ is:
 
 | Class | Canonical dtypes | Exported aliases | String codes |
 | --- | --- | --- | --- |
-| Boolean | `bool_` | none | `bool`, `bool_`, `?` |
+| Boolean | `bool_` | `bool` | `bool`, `bool_`, `?` |
 | Signed integer | `int8`, `int16`, `int32`, `int64` | `byte`, `short`, `intc`, `int_`, `intp`, `longlong` | `i1`, `i2`, `i4`, `i8` |
 | Unsigned integer | `uint8`, `uint16`, `uint32`, `uint64` | `ubyte`, `ushort`, `uintc`, `uint`, `uintp`, `ulonglong` | `u1`, `u2`, `u4`, `u8` |
 | Floating point | `float32`, `float64` | `single`, `double` | `f4`, `f8` |
@@ -78,9 +78,12 @@ Integer arithmetic wraps at its result width instead of promoting to Python's un
 Conversions reject values outside the requested integer dtype. Promotion chooses the wider type
 within one integer class; mixed signed and unsigned operands use the smallest signed type that can
 represent both, or `float64` when none can. `float32` combined with an integer wider than 16 bits
-promotes to `float64`. Python integers and floats enter generic array operations as `int64` and
-`float64`. Integer `sum`, `prod`, `cumsum`, and `cumprod` widen inputs below 64 bits to `int64` or
-`uint64`; `float32` floating reductions remain `float32`.
+promotes to `float64`. Python scalars are weak operands: integer scalars preserve an integer or
+floating array dtype when the value fits, and floating scalars preserve a floating array dtype.
+An out-of-range Python integer is rejected instead of wrapped. Integer `sum`, `prod`, `cumsum`,
+and `cumprod` widen inputs below 64 bits to `int64` or `uint64`; `float32` floating reductions
+remain `float32`. Floating unary functions preserve `float32` inputs and use `float64` for integer
+inputs because `float16` is outside the supported dtype boundary.
 
 Array access returns the corresponding registered NumPy scalar; `tolist` converts elements back
 to ordinary Python scalars, including the full `uint64` range.

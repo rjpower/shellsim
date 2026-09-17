@@ -332,6 +332,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             name: "ndarray",
             get: array_type,
         },
+        dtype_value("bool", bool_type),
         dtype_value("bool_", bool_type),
         dtype_value("int8", int8_type),
         dtype_value("byte", int8_type),
@@ -548,6 +549,13 @@ fn promote_dtype(left: PyArrayDtype, right: PyArrayDtype) -> PyArrayDtype {
     match (left.class, right.class) {
         (NumericClass::Bool, _) => right.dtype,
         (_, NumericClass::Bool) => left.dtype,
+        (NumericClass::Float, NumericClass::Float) => {
+            if left.bits.max(right.bits) == 64 {
+                PyArrayDtype::Float64
+            } else {
+                PyArrayDtype::Float32
+            }
+        }
         (NumericClass::Float, _) | (_, NumericClass::Float) => {
             let float = if left.class == NumericClass::Float {
                 left
@@ -559,7 +567,7 @@ fn promote_dtype(left: PyArrayDtype, right: PyArrayDtype) -> PyArrayDtype {
             } else {
                 left
             };
-            if float.bits == 64 || (other.class != NumericClass::Float && other.bits > 16) {
+            if float.bits == 64 || other.bits > 16 {
                 PyArrayDtype::Float64
             } else {
                 PyArrayDtype::Float32
@@ -587,6 +595,33 @@ fn promote_dtype(left: PyArrayDtype, right: PyArrayDtype) -> PyArrayDtype {
                 .map(signed_dtype)
                 .unwrap_or(PyArrayDtype::Float64)
         }
+    }
+}
+
+fn promote_operands(
+    left: PyArrayDtype,
+    right: PyArrayDtype,
+    left_is_weak: bool,
+    right_is_weak: bool,
+) -> PyArrayDtype {
+    match (left_is_weak, right_is_weak) {
+        (true, false) => promote_weak_scalar(right, left),
+        (false, true) => promote_weak_scalar(left, right),
+        _ => promote_dtype(left, right),
+    }
+}
+
+fn promote_weak_scalar(strong: PyArrayDtype, weak: PyArrayDtype) -> PyArrayDtype {
+    match (dtype_kind(strong).class, dtype_kind(weak).class) {
+        (_, NumericClass::Bool) => strong,
+        (NumericClass::Bool, NumericClass::Signed | NumericClass::Unsigned) => weak,
+        (NumericClass::Float, NumericClass::Signed | NumericClass::Unsigned) => strong,
+        (
+            NumericClass::Signed | NumericClass::Unsigned,
+            NumericClass::Signed | NumericClass::Unsigned,
+        ) => strong,
+        (NumericClass::Float, NumericClass::Float) => strong,
+        (_, NumericClass::Float) => PyArrayDtype::Float64,
     }
 }
 
@@ -628,7 +663,8 @@ fn dtype_keyword(
 }
 
 fn parse_dtype(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<PyArrayDtype> {
-    let rendered = if runtime.kind(&value)? == PyKind::String {
+    let is_string = runtime.kind(&value)? == PyKind::String;
+    let rendered = if is_string {
         value.cast::<PyString>(runtime)?.0
     } else {
         runtime.repr(&value)?
@@ -637,7 +673,11 @@ fn parse_dtype(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<PyArrayD
         .strip_prefix("<class '")
         .and_then(|name| name.strip_suffix("'>"))
         .unwrap_or(&rendered);
-    let name = name.strip_prefix("numpy.").unwrap_or(name);
+    let name = if is_string {
+        name
+    } else {
+        name.strip_prefix("numpy.").unwrap_or(name)
+    };
     NUMERIC_KINDS
         .iter()
         .find(|kind| kind.aliases.contains(&name))
@@ -872,6 +912,12 @@ fn pack_wrapping(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) ->
     kind.pack_payload(runtime, payload)
 }
 
+fn cast_scalar(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult<Scalar> {
+    let packed = pack_checked(runtime, value, dtype)?;
+    registered_scalar(runtime, &packed)
+        .ok_or_else(|| PyError::runtime_error("numeric cast produced an unregistered scalar"))
+}
+
 fn pack_bool(runtime: &dyn PyRuntime, value: bool) -> PyResult {
     pack_wrapping(
         runtime,
@@ -917,8 +963,10 @@ fn scalar_binary(
     right: PyValue,
     operation: PyBinaryOp,
 ) -> PyResult<Option<PyValue>> {
-    let left = scalar(runtime, left)?;
-    let right = scalar(runtime, right)?;
+    let left_is_weak = registered_scalar(runtime, &left).is_none();
+    let right_is_weak = registered_scalar(runtime, &right).is_none();
+    let mut left = scalar(runtime, left)?;
+    let mut right = scalar(runtime, right)?;
     if left.dtype == PyArrayDtype::Bool
         && right.dtype == PyArrayDtype::Bool
         && !matches!(operation, PyBinaryOp::Divide)
@@ -943,9 +991,15 @@ fn scalar_binary(
         )
         .map(Some);
     }
-    let mut dtype = promote_dtype(left.dtype, right.dtype);
+    let mut dtype = promote_operands(left.dtype, right.dtype, left_is_weak, right_is_weak);
     if matches!(operation, PyBinaryOp::Divide) && dtype_kind(dtype).class != NumericClass::Float {
         dtype = PyArrayDtype::Float64;
+    }
+    if left_is_weak {
+        left = cast_scalar(runtime, left, dtype)?;
+    }
+    if right_is_weak {
+        right = cast_scalar(runtime, right, dtype)?;
     }
     let class = dtype_kind(dtype).class;
     let value = match class {
@@ -1048,12 +1102,17 @@ pub(crate) fn slot_scalar_reflected_divide(
 }
 
 fn slot_scalar_repr(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
-    let text = match scalar(runtime, value)?.value {
+    let scalar = scalar(runtime, value)?;
+    let text = match scalar.value {
         ScalarValue::Bool(value) => if value { "True" } else { "False" }.into(),
         ScalarValue::Signed(value) => value.to_string(),
         ScalarValue::Unsigned(value) => value.to_string(),
         ScalarValue::Float(value) => {
-            let text = value.to_string();
+            let text = if scalar.dtype == PyArrayDtype::Float32 {
+                (value as f32).to_string()
+            } else {
+                value.to_string()
+            };
             if text.contains(['.', 'e', 'E']) {
                 text
             } else {
@@ -1832,7 +1891,9 @@ fn binary(
     )?;
     let left_dtype = operand_dtype(runtime, left, left_array.as_ref().map(|value| value.1))?;
     let right_dtype = operand_dtype(runtime, right, right_array.as_ref().map(|value| value.1))?;
-    let promoted = promote_dtype(left_dtype, right_dtype);
+    let left_is_weak = left_array.is_none() && registered_scalar(runtime, &left).is_none();
+    let right_is_weak = right_array.is_none() && registered_scalar(runtime, &right).is_none();
+    let promoted = promote_operands(left_dtype, right_dtype, left_is_weak, right_is_weak);
     let dtype =
         if operation == PyBinaryOp::Divide && dtype_kind(promoted).class != NumericClass::Float {
             PyArrayDtype::Float64
@@ -2282,7 +2343,12 @@ fn elementwise_extreme(
     )?;
     let left_dtype = operand_dtype(runtime, left, left_info.as_ref().map(|value| value.1))?;
     let right_dtype = operand_dtype(runtime, right, right_info.as_ref().map(|value| value.1))?;
-    let dtype = promote_dtype(left_dtype, right_dtype);
+    let dtype = promote_operands(
+        left_dtype,
+        right_dtype,
+        left_info.is_none() && registered_scalar(runtime, &left).is_none(),
+        right_info.is_none() && registered_scalar(runtime, &right).is_none(),
+    );
     let count = element_count(&shape)?;
     reserve_values(runtime, count)?;
     let mut values = Vec::with_capacity(count);
@@ -2354,7 +2420,12 @@ fn where_(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     )?;
     let left_dtype = operand_dtype(runtime, left, left_info.as_ref().map(|value| value.1))?;
     let right_dtype = operand_dtype(runtime, right, right_info.as_ref().map(|value| value.1))?;
-    let dtype = promote_dtype(left_dtype, right_dtype);
+    let dtype = promote_operands(
+        left_dtype,
+        right_dtype,
+        left_info.is_none() && registered_scalar(runtime, &left).is_none(),
+        right_info.is_none() && registered_scalar(runtime, &right).is_none(),
+    );
     let count = element_count(&shape)?;
     reserve_values(runtime, count)?;
     let mut values = Vec::with_capacity(count);
@@ -3839,6 +3910,11 @@ mod tests {
                 PyArrayDtype::Int32,
                 PyArrayDtype::Float64,
             ),
+            (
+                PyArrayDtype::Float32,
+                PyArrayDtype::Float64,
+                PyArrayDtype::Float64,
+            ),
         ] {
             assert_eq!(promote_dtype(left, right), expected);
             assert_eq!(promote_dtype(right, left), expected);
@@ -3855,5 +3931,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn python_scalars_are_weak_against_registered_dtypes() {
+        assert_eq!(
+            promote_operands(PyArrayDtype::Int8, PyArrayDtype::Int64, false, true,),
+            PyArrayDtype::Int8
+        );
+        assert_eq!(
+            promote_operands(PyArrayDtype::Float32, PyArrayDtype::Float64, false, true,),
+            PyArrayDtype::Float32
+        );
+        assert_eq!(
+            promote_operands(PyArrayDtype::Int8, PyArrayDtype::Float64, false, true,),
+            PyArrayDtype::Float64
+        );
     }
 }

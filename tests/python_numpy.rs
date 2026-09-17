@@ -139,6 +139,8 @@ for dtype in (np.bool_, np.int8, np.int16, np.int32, np.int64,
 print(np.byte is np.int8, np.short is np.int16, np.intc is np.int32)
 print(np.ubyte is np.uint8, np.ushort is np.uint16, np.uintc is np.uint32)
 print(np.single is np.float32, np.double is np.float64)
+print(np.bool is np.bool_, np.int_ is np.int64, np.intp is np.int64, np.longlong is np.int64)
+print(np.uint is np.uint64, np.uintp is np.uint64, np.ulonglong is np.uint64)
 for spelling in ('i1', 'i2', 'i4', 'i8', 'u1', 'u2', 'u4', 'u8', 'f4', 'f8'):
     print(np.array([1], dtype=spelling).dtype)
 print(np.array([]).dtype)
@@ -147,7 +149,7 @@ print(np.array([]).dtype)
         run(source),
         (
             0,
-            b"bool True\nint8 True\nint16 True\nint32 True\nint64 True\nuint8 True\nuint16 True\nuint32 True\nuint64 True\nfloat32 True\nfloat64 True\nTrue True True\nTrue True True\nTrue True\nint8\nint16\nint32\nint64\nuint8\nuint16\nuint32\nuint64\nfloat32\nfloat64\nfloat64\n".to_vec(),
+            b"bool True\nint8 True\nint16 True\nint32 True\nint64 True\nuint8 True\nuint16 True\nuint32 True\nuint64 True\nfloat32 True\nfloat64 True\nTrue True True\nTrue True True\nTrue True\nTrue True True True\nTrue True True\nint8\nint16\nint32\nint64\nuint8\nuint16\nuint32\nuint64\nfloat32\nfloat64\nfloat64\n".to_vec(),
             Vec::new(),
         )
     );
@@ -161,16 +163,24 @@ print(np.uint8(255) + np.uint8(1), type(np.int16(1) + np.uint16(1)))
 print(type(np.int32(1) + np.uint32(1)), type(np.int64(1) + np.uint64(1)))
 print(np.float32(16777216) + np.float32(1))
 print(type(np.float32(1) + np.int16(1)), type(np.float32(1) + np.int32(1)))
+print(type(np.float32(1) + np.float64(1)), type(np.float64(1) + np.float32(1)))
+print(np.array([np.float32(1), 2.5]).dtype, np.array([2.5, np.float32(1)]).dtype)
+print(np.float32(0.1))
 a = np.array([127, -128], dtype=np.int8) + np.array([1, 1], dtype=np.int8)
 print(a.dtype, a.tolist())
 b = np.array([255], dtype=np.uint8) + np.array([1], dtype=np.uint8)
 print(b.dtype, b.tolist(), (~b).tolist())
+for value in (np.array([100], dtype=np.int8) * 2,
+              np.array([1], dtype=np.uint8) + 1,
+              np.array([1], dtype=np.uint64) + 1,
+              np.array([1.5], dtype=np.float32) * 2.0):
+    print(value.dtype, value.tolist())
 "#;
     assert_eq!(
         run(source),
         (
             0,
-            b"-128 <class 'numpy.int16'>\n0 <class 'numpy.int32'>\n<class 'numpy.int64'> <class 'numpy.float64'>\n16777216.0\n<class 'numpy.float32'> <class 'numpy.float64'>\nint8 [-128, -127]\nuint8 [0] [255]\n".to_vec(),
+            b"-128 <class 'numpy.int16'>\n0 <class 'numpy.int32'>\n<class 'numpy.int64'> <class 'numpy.float64'>\n16777216.0\n<class 'numpy.float32'> <class 'numpy.float64'>\n<class 'numpy.float64'> <class 'numpy.float64'>\nfloat64 float64\n0.1\nint8 [-128, -127]\nuint8 [0] [255]\nint8 [-56]\nuint8 [2]\nuint64 [2]\nfloat32 [3.0]\n".to_vec(),
             Vec::new(),
         )
     );
@@ -208,12 +218,17 @@ fn fixed_width_conversions_reject_values_outside_the_declared_dtype() {
         "import numpy as np\nnp.int16(-32769)",
         "import numpy as np\nnp.uint8(-1)",
         "import numpy as np\nnp.uint32(4294967296)",
+        "import numpy as np\nnp.array([1], dtype=np.uint8) + 256",
     ] {
         assert_fails_with(source, "OverflowError");
     }
 
     assert_fails_with(
         "import numpy as np\nnp.array([1], dtype='float16')",
+        "unsupported numpy dtype",
+    );
+    assert_fails_with(
+        "import numpy as np\nnp.array([1], dtype='numpy.int8')",
         "unsupported numpy dtype",
     );
 }
