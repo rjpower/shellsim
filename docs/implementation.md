@@ -45,6 +45,12 @@ Text utilities use a shared option scanner for short clusters, long options, val
 operand boundary. The scanner only recognizes command-local option tables. It has no permissive
 fallback, so an accepted option always has an implementation in that command.
 
+Parser-sized utilities validate their complete program before consuming records or mutating files.
+The awk implementation tokenizes into a typed syntax tree and evaluates it directly with metered
+loops; it has no host-language or subprocess escape. Sed parses every `-e` and `-f` script before
+reading input, and in-place edits remain virtual-filesystem writes. Both deliberately reject their
+larger historical languages at named syntax boundaries.
+
 The standard for a supported command is ordinary usefulness, not exhaustive historical
 compatibility. Implement the common behavior as a coherent whole, reject the remaining frontier,
 and avoid module-shaped stubs whose successful behavior cannot be explained simply.

@@ -35,6 +35,7 @@ mod printf;
 mod proc;
 mod regex_compat;
 mod rgcmd;
+mod sed;
 mod sort;
 mod system;
 mod tarcmd;
@@ -284,6 +285,7 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     patch::register(&mut m);
     proc::register(&mut m);
     rgcmd::register(&mut m);
+    sed::register(&mut m);
     pkg::register(&mut m);
     zipcmd::register(&mut m);
     m
