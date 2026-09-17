@@ -5,10 +5,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::commands::util::{
-    basic_regex_to_rust, ewln, lines_of, parse_options, read_inputs, split_flags, w, wln,
-    OptionSpec,
-};
+use crate::commands::options::{parse_options_or_report, OptionSpec};
+use crate::commands::regex_compat::basic_regex_to_rust;
+use crate::commands::util::{ewln, lines_of, read_inputs, split_flags, w, wln};
 use crate::commands::{ChildCommand, CommandContext, CommandPoll, CommandSpec, Io, Trust};
 use crate::descriptors::{DeviceStream, IoPoll, IoWait, DEVICE_READ_QUANTUM};
 use crate::interp::Interp;
@@ -1436,12 +1435,8 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
         OptionSpec::required("max_count", Some('m'), Some("max-count")),
         OptionSpec::flag("help", None, Some("help")),
     ];
-    let parsed = match parse_options(args, OPTIONS) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            ewln(io.err, &format!("grep: {error}"));
-            return 2;
-        }
+    let Some(parsed) = parse_options_or_report("grep", args, OPTIONS, io.err) else {
+        return 2;
     };
     let mut ignore_case = false;
     let mut invert = false;
@@ -1684,12 +1679,8 @@ fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
         OptionSpec::required("expression", Some('e'), Some("expression")),
         OptionSpec::flag("help", None, Some("help")),
     ];
-    let parsed = match parse_options(args, OPTIONS) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            ewln(io.err, &format!("sed: {error}"));
-            return 2;
-        }
+    let Some(parsed) = parse_options_or_report("sed", args, OPTIONS, io.err) else {
+        return 2;
     };
     let mut in_place = false;
     let mut quiet = false;
@@ -1709,7 +1700,7 @@ fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             "expression" => scripts.push(option.value.expect("required option value")),
             "help" => {
                 w(io.out, "usage: sed [OPTIONS] SCRIPT [FILE...]\n");
-                w(io.out, "supported: -n -E -r -e SCRIPT -i[SUFFIX]\n");
+                w(io.out, "supported: -n -E -r -e SCRIPT -i\n");
                 return 0;
             }
             _ => unreachable!("option keys come from OPTIONS"),

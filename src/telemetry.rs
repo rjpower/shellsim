@@ -86,7 +86,7 @@ pub enum CommandTrust {
     Real,
     /// The implementation deliberately supports only a documented subset.
     Partial,
-    /// The command name is recognized but its capability is unavailable.
+    /// The command is unavailable, including unknown names and recognized capability boundaries.
     Unsupported,
 }
 

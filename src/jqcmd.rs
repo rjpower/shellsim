@@ -4,7 +4,7 @@
 //! `has(k)`, `to_entries`, `add`. Flags: `-r/--raw-output`, `-c/--compact-output`,
 //! `-n/--null-input`. Anything outside this set is reported as unsupported.
 
-use crate::commands::util::{parse_options, OptionSpec};
+use crate::commands::options::{parse_options_or_report, OptionSpec};
 use crate::interp::Interp;
 use serde_json::Value;
 
@@ -17,12 +17,8 @@ pub fn jq(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err: O
         OptionSpec::flag("null_input", Some('n'), Some("null-input")),
         OptionSpec::flag("help", None, Some("help")),
     ];
-    let parsed = match parse_options(args, OPTIONS) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            ewln(err, &format!("jq: {error}"));
-            return 2;
-        }
+    let Some(parsed) = parse_options_or_report("jq", args, OPTIONS, err) else {
+        return 2;
     };
     let mut raw = false;
     let mut compact = false;

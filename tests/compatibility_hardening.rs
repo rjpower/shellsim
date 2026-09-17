@@ -135,6 +135,17 @@ fn text_tools_share_option_boundaries_and_cover_common_forms() {
         text("printf 'x:10\\ny:2\\n' | sort -t: -k2n"),
         (0, "y:2\nx:10\n".into(), String::new())
     );
+    assert_eq!(
+        text("printf 'aa\\naa extra\\naa\\n' | grep -xm1 aa"),
+        (0, "aa\n".into(), String::new())
+    );
+    assert_eq!(
+        text("printf 'aa\\n' | grep -m0 aa"),
+        (1, String::new(), String::new())
+    );
+    let (status, _, stderr) = text("grep -m nope value");
+    assert_eq!(status, 2);
+    assert!(stderr.contains("invalid max count"), "{stderr}");
     for source in ["grep --wat", "sed --wat", "sort --wat", "jq -S ."] {
         let (status, _, stderr) = text(source);
         assert_eq!(status, 2, "{source}: {stderr}");
@@ -166,6 +177,33 @@ fn package_tools_only_succeed_for_effects_shellsim_can_supply() {
     let (status, _, stderr) = text("uv remove numpy");
     assert_eq!(status, 2);
     assert!(stderr.contains("unsupported command"), "{stderr}");
+
+    let (status, _, stderr) = text("pip install --target /tmp/site numpy");
+    assert_eq!(status, 1);
+    assert!(stderr.contains("unsupported option"), "{stderr}");
+}
+
+#[test]
+fn uv_sync_validates_all_dependencies_before_mutating_package_state() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write(
+            "/work",
+            "pyproject.toml",
+            b"[project]\ndependencies = [\"numpy\"]\n",
+            0o644,
+        )
+        .unwrap();
+    environment
+        .vfs
+        .write("/work", "requirements.txt", b"requests\n", 0o644)
+        .unwrap();
+
+    let (outcome, _, stderr) = environment.run_script_capture("cd /work; uv sync");
+    assert_eq!(outcome.exit_status, 1);
+    assert!(String::from_utf8_lossy(&stderr).contains("not bundled"));
+    assert!(!environment.packages.contains("numpy"));
 }
 
 #[test]

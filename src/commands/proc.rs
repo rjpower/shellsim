@@ -572,10 +572,8 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     }
     // ---- package management (takes priority so `uv pip install pytest` installs, not runs) ----
     if first == Some("add") {
-        if let Err(error) = crate::commands::pkg::register_install_args(interp, args) {
-            interp.note_unsupported(&format!("uv:{error}"));
-            ewln(io.err, &format!("uv: {error}"));
-            return 1;
+        if let Err(status) = install_uv_packages(interp, &args[1..], io) {
+            return status;
         }
         update_pyproject(interp, &install_specs_after(args, "add"));
         ensure_venv(interp);
@@ -601,10 +599,8 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         return 0;
     }
     if first == Some("pip") && args.get(1).map(String::as_str) == Some("install") {
-        if let Err(error) = crate::commands::pkg::register_install_args(interp, args) {
-            interp.note_unsupported(&format!("uv:{error}"));
-            ewln(io.err, &format!("uv: {error}"));
-            return 1;
+        if let Err(status) = install_uv_packages(interp, &args[2..], io) {
+            return status;
         }
         ensure_venv(interp);
         return 0;
@@ -654,6 +650,18 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         &format!("uv: unsupported invocation '{invocation}'"),
     );
     2
+}
+
+fn install_uv_packages(
+    interp: &mut CommandContext<'_>,
+    args: &[String],
+    io: &mut Io,
+) -> Result<(), i32> {
+    crate::commands::pkg::install_args(interp, args).map_err(|error| {
+        interp.note_unsupported(&format!("uv:{error}"));
+        ewln(io.err, &format!("uv: {error}"));
+        1
+    })
 }
 
 /// Collect the raw package specs following a `uv add` / `uv pip install` keyword (for pyproject).
@@ -711,24 +719,22 @@ fn ensure_venv(interp: &mut Interp) {
 /// `uv sync` / `uv lock`: register every dependency declared in `pyproject.toml`.
 fn uv_sync(interp: &mut Interp) -> Result<(), String> {
     let cwd = interp.cwd.clone();
+    let mut packages = Vec::new();
     let path = crate::vfs::resolve_against(&cwd, "pyproject.toml");
     if let Ok(content) = interp.vfs.read_string("/", &path) {
         // Pull each "name>=ver" / "name==ver" string out of the dependencies arrays.
-        let specs = extract_dep_specs(&content);
-        if !specs.is_empty() {
-            let mut args = vec!["install".to_string()];
-            args.extend(specs);
-            crate::commands::pkg::register_install_args(interp, &args)?;
-        }
+        packages.extend(crate::commands::pkg::resolve_package_specs(
+            &extract_dep_specs(&content),
+        )?);
     }
     // a requirements.txt next to it, if present
     let req = crate::vfs::resolve_against(&cwd, "requirements.txt");
     if interp.vfs.is_file("/", &req) {
-        crate::commands::pkg::register_install_args(
-            interp,
-            &["install".to_string(), "-r".to_string(), req],
-        )?;
+        packages.extend(crate::commands::pkg::resolve_requirements_file(
+            interp, &req,
+        )?);
     }
+    crate::commands::pkg::install_packages(interp, &packages);
     Ok(())
 }
 
@@ -770,8 +776,8 @@ fn extract_dep_specs(toml_src: &str) -> Vec<String> {
         if in_deps {
             for part in t.split(['"', '\'']) {
                 let p = part.trim().trim_end_matches(',');
-                // a dependency spec starts with a letter (name); package_name_of strips any
-                // version operator. Skips the `dependencies = [` token and bare punctuation.
+                // A dependency spec starts with a letter. Skip the dependencies token and bare
+                // punctuation; package validation later separates the name from its version.
                 if !p.is_empty()
                     && p.chars()
                         .next()

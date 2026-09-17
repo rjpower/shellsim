@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 
-use super::util::{ewln, parse_options, read_inputs, w, OptionSpec};
+use super::options::{parse_options_or_report, OptionSpec};
+use super::util::{ewln, read_inputs, w};
 use super::{reg_costed, CommandContext, CommandSpec, Io, Trust};
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
@@ -23,12 +24,8 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         OptionSpec::required("separator", Some('t'), Some("field-separator")),
         OptionSpec::flag("help", None, Some("help")),
     ];
-    let parsed = match parse_options(args, OPTIONS) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            ewln(io.err, &format!("sort: {error}"));
-            return 2;
-        }
+    let Some(parsed) = parse_options_or_report("sort", args, OPTIONS, io.err) else {
+        return 2;
     };
     let mut numeric = false;
     let mut reverse = false;
