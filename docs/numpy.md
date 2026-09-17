@@ -48,12 +48,13 @@ auditable, deterministic, and uniformly resource-metered.
 
 ## Compatibility target
 
-The first coherent slice includes:
+The supported surface includes:
 
 - construction with `array`, `asarray`, `zeros`, `ones`, `full`, and `arange`;
 - like-constructors, `linspace`, `eye`, and `identity`;
 - `shape`, `ndim`, `size`, `T`, signed-stride slices on the first axis, basic indexing,
-  integer-array gathers, boolean expressions and masks, assignment, iteration, `tolist`, `copy`,
+  integer-array gathers, boolean expressions and masks, full-coordinate and advanced-index
+  assignment, iteration, `tolist`, `copy`,
   `reshape`, `transpose`, `squeeze`, `expand_dims`, `swapaxes`, `broadcast_to`, `flatten`, and
   `ravel`;
 - elementwise `+`, `-`, `*`, `/`, rich comparisons, unary operators, common floating-point
@@ -70,14 +71,15 @@ integer. Float elements are IEEE-754 doubles. Array access returns the correspon
 NumPy scalar; `tolist` converts elements back to ordinary Python scalars. The `dtype` argument
 accepts `bool`, `int`, `int64`, `float`, and `float64` names and type objects.
 
-Explicitly unsupported in the first slice are NumPy's C ABI, buffers, structured/object/string
-dtypes, masked arrays, multidimensional slice syntax, mixed advanced indices inside a tuple,
-axis tuples and `keepdims` in reductions, batched matrix multiplication, `tensordot`, generalized
-`einsum`, linear algebra factorizations, random distributions, persistence formats, and
-performance guarantees. `einsum` is omitted because a coherent implementation requires label
-parsing, diagonal selection, contraction, output ordering, broadcasting, and ellipsis handling;
-a special-case spelling of matrix multiplication would not be an intelligible boundary.
-Unsupported arguments and operations fail rather than silently changing meaning.
+Explicitly unsupported are NumPy's C ABI, buffers, structured/object/string dtypes, masked arrays,
+arrays above 64 dimensions, multidimensional slice syntax, partial basic-index assignment, mixed
+advanced indices inside a tuple, axis tuples and `keepdims` in reductions, batched matrix
+multiplication, `tensordot`, generalized `einsum`, linear algebra factorizations, random
+distributions, persistence formats, and performance guarantees. `einsum` is omitted because a
+coherent implementation requires label parsing, diagonal selection, contraction, output ordering,
+broadcasting, and ellipsis handling; a special-case spelling of matrix multiplication would not be
+an intelligible boundary. Unsupported arguments and operations fail rather than silently changing
+meaning.
 
 ## Safety and accounting
 

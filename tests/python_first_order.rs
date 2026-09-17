@@ -56,6 +56,15 @@ print("yes" if values[:2] == [0, 1] else "no")
 }
 
 #[test]
+fn tuple_subscripts_work_for_ordinary_mapping_keys() {
+    let source = r#"
+values = {(1, 2): "pair", (1,): "single"}
+print(values[1, 2], values[1,])
+"#;
+    assert_eq!(run(source), (0, "pair single\n".into(), String::new()));
+}
+
+#[test]
 fn all_arithmetic_bytecodes_use_type_slots() {
     let source = r#"
 class Number:

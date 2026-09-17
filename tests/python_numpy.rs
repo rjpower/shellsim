@@ -22,6 +22,16 @@ fn run_with_environment(mut environment: Environment, source: &str) -> (i32, Vec
     (status, stdout, stderr)
 }
 
+fn assert_fails_with(source: &str, expected: &str) {
+    let (status, _, stderr) = run(source);
+    assert_ne!(status, 0, "operation unexpectedly succeeded: {source}");
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(
+        stderr.contains(expected),
+        "expected {expected:?} in failure for {source:?}, got {stderr:?}"
+    );
+}
+
 #[test]
 fn construction_indexing_and_views_share_storage() {
     let source = r#"import numpy as np
@@ -113,9 +123,10 @@ print(np.array([1], dtype=np.int64).dtype)
         )
     );
 
-    let (status, _, stderr) = run("import numpy as np\nnp.int64(9223372036854775808)");
-    assert_ne!(status, 0);
-    assert!(!stderr.is_empty());
+    assert_fails_with(
+        "import numpy as np\nnp.int64(9223372036854775808)",
+        "OverflowError",
+    );
 }
 
 #[test]
@@ -245,24 +256,53 @@ print(np.inner([1, 2], [3, 4]), np.outer([1, 2], [3, 4]).tolist())
 
 #[test]
 fn unsupported_or_invalid_array_operations_fail_explicitly() {
-    for source in [
-        "import numpy as np\nnp.array([[1], [2, 3]])",
-        "import numpy as np\nnp.array([1, 2]) + np.array([1, 2, 3])",
-        "import numpy as np\nnp.matmul(np.array([1, 2]), np.array([3, 4]))",
-        "import numpy as np\nnp.zeros((-1, 2))",
-        "import numpy as np\nnp.array([1], dtype='complex128')",
-        "import numpy as np\nbool(np.array([1, 2]))",
-        "import numpy as np\nnp.array([[1, 2]])[:, 0]",
+    for (source, expected) in [
+        (
+            "import numpy as np\nnp.array([[1], [2, 3]])",
+            "setting an array element with a sequence",
+        ),
+        (
+            "import numpy as np\nnp.array([1, 2]) + np.array([1, 2, 3])",
+            "operands could not be broadcast together",
+        ),
+        (
+            "import numpy as np\nnp.matmul(np.array([1, 2]), np.array([3, 4]))",
+            "matmul requires aligned two-dimensional arrays",
+        ),
+        (
+            "import numpy as np\nnp.zeros((-1, 2))",
+            "negative dimensions are not allowed",
+        ),
+        (
+            "import numpy as np\nnp.array([1], dtype='complex128')",
+            "unsupported numpy dtype",
+        ),
+        (
+            "import numpy as np\nbool(np.array([1, 2]))",
+            "truth value of an array",
+        ),
+        (
+            "import numpy as np\nnp.array([[1, 2]])[:, 0]",
+            "multidimensional slice syntax is not supported",
+        ),
+        (
+            "import numpy as np\na = np.zeros((2, 2)); a[0] = [1, 2]",
+            "partial basic-index assignment is not supported",
+        ),
+        (
+            "import numpy as np\na = np.zeros((2, 2)); a[[0, 1]] = [1, 2, 3]",
+            "operands could not be broadcast together",
+        ),
+        (
+            "import numpy as np\na = np.zeros((2, 2)); a[[0, 1]] = [[[1, 2], [3, 4]]]",
+            "assignment value cannot be broadcast to the indexed shape",
+        ),
+        (
+            "import numpy as np\nnp.zeros([1] * 65)",
+            "arrays support at most 64 dimensions",
+        ),
     ] {
-        let (status, _, stderr) = run(source);
-        assert_ne!(
-            status, 0,
-            "unsupported operation unexpectedly succeeded: {source}"
-        );
-        assert!(
-            !stderr.is_empty(),
-            "unsupported operation failed silently: {source}"
-        );
+        assert_fails_with(source, expected);
     }
 }
 

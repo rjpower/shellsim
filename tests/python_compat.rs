@@ -511,11 +511,11 @@ fn user_descriptors_follow_precedence_and_receive_set_name() {
 fn user_protocol_slots_dispatch_cached_dunder_methods() {
     assert_eq!(
         run_shell(
-            "python3.14 -c 'class NumberBox:\n    def __init__(self, value):\n        self.value = value\n    def __call__(self, amount):\n        return self.value + amount\n    def __add__(self, other):\n        return self.value + other\n    def __eq__(self, other):\n        return self.value == other\n    def __lt__(self, other):\n        return self.value < other\n    def __contains__(self, item):\n        return item == self.value\n    def __bool__(self):\n        return self.value != 0\n    def __str__(self):\n        return \"box\"\n    def __repr__(self):\n        return \"NumberBox\"\n    def __iter__(self):\n        return [self.value, self.value + 1]\nbox = NumberBox(4)\nzero = NumberBox(0)\nprint(box(3), box + 2, box == 4, box < 8, 4 in box)\nprint(bool(box), bool(zero), not zero)\nprint(str(box), repr(box), list(box))'"
+            "python3.14 -c 'class NumberBox:\n    def __init__(self, value):\n        self.value = value\n    def __call__(self, amount):\n        return self.value + amount\n    def __add__(self, other):\n        return self.value + other\n    def __eq__(self, other):\n        return self.value == other\n    def __lt__(self, other):\n        return self.value < other\n    def __contains__(self, item):\n        return item == self.value\n    def __bool__(self):\n        return self.value != 0\n    def __str__(self):\n        return \"box\"\n    def __repr__(self):\n        return \"NumberBox\"\n    def __iter__(self):\n        return [self.value, self.value + 1]\nbox = NumberBox(4)\nzero = NumberBox(0)\nprint(box(3), box + 2, box == 4, box != 4, box != 5, box < 8, 4 in box)\nprint(bool(box), bool(zero), not zero)\nprint(str(box), repr(box), list(box))'"
         ),
         (
             0,
-            b"7 6 True True True\nTrue False True\nbox NumberBox [4, 5]\n".to_vec(),
+            b"7 6 True False True True True\nTrue False True\nbox NumberBox [4, 5]\n".to_vec(),
             Vec::new()
         )
     );

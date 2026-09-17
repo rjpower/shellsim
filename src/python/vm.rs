@@ -3380,6 +3380,15 @@ impl<'a> Vm<'a> {
                 slot_result = self.invoke_slot(&right, slot, name, vec![left])?;
             }
         }
+        if slot_result.is_none() && matches!(operator, ComparisonOperator::NotEqual) {
+            let mut equality = self.invoke_slot(&left, Slot::Equal, "__eq__", vec![right])?;
+            if equality.is_none() {
+                equality = self.invoke_slot(&right, Slot::Equal, "__eq__", vec![left])?;
+            }
+            if let Some(value) = equality {
+                slot_result = Some(Value::Bool(!self.truth_value(&value)?));
+            }
+        }
         if let Some(value) = slot_result {
             if matches!(operator, ComparisonOperator::NotIn) {
                 let result = !self.truth_value(&value)?;
@@ -6098,6 +6107,7 @@ fn array_offset(layout: &PyArrayLayout, index: &[usize]) -> PyResult<usize> {
 }
 
 fn validate_array_layout(layout: &PyArrayLayout, storage_len: usize) -> PyResult<()> {
+    super::stdlib::numpy::validate_rank(&layout.shape)?;
     if layout.shape.contains(&0) {
         return Ok(());
     }

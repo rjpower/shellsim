@@ -1155,6 +1155,9 @@ impl Parser {
                     Some(self.expression()?)
                 };
                 if self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {
+                    if self.at(|kind| matches!(kind, TokenKind::Comma)) {
+                        return Err(self.error("multidimensional slice syntax is not supported"));
+                    }
                     let stop = if self
                         .at(|kind| matches!(kind, TokenKind::Colon | TokenKind::RightBracket))
                     {
@@ -1163,6 +1166,11 @@ impl Parser {
                         Some(self.expression()?)
                     };
                     let step = if self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {
+                        if self.at(|kind| matches!(kind, TokenKind::Comma)) {
+                            return Err(
+                                self.error("multidimensional slice syntax is not supported")
+                            );
+                        }
                         if self.at(|kind| matches!(kind, TokenKind::RightBracket)) {
                             None
                         } else {
@@ -1171,6 +1179,9 @@ impl Parser {
                     } else {
                         None
                     };
+                    if self.at(|kind| matches!(kind, TokenKind::Comma)) {
+                        return Err(self.error("multidimensional slice syntax is not supported"));
+                    }
                     let end = self.expect(
                         |kind| matches!(kind, TokenKind::RightBracket),
                         "expected ']' after slice",
@@ -1770,6 +1781,14 @@ mod tests {
     #[test]
     fn parses_chained_postfix_operations() {
         parse(lex("sys.stdout.write(sys.argv[1])").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn parses_tuple_subscripts_and_rejects_empty_tuple_members() {
+        parse(lex("pair = values[1, 2]\nsingle = values[1,]").unwrap()).unwrap();
+        let error = parse(lex("values[1,,2]").unwrap())
+            .expect_err("a tuple subscript cannot contain an empty member");
+        assert!(error.message.contains("expected an expression"));
     }
 
     #[test]
