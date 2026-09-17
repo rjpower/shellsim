@@ -11,11 +11,18 @@ use serde_json::Value;
 type Out<'a> = &'a mut Vec<u8>;
 
 pub fn jq(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err: Out) -> i32 {
-    const OPTIONS: &[OptionSpec] = &[
-        OptionSpec::flag("raw", Some('r'), Some("raw-output")),
-        OptionSpec::flag("compact", Some('c'), Some("compact-output")),
-        OptionSpec::flag("null_input", Some('n'), Some("null-input")),
-        OptionSpec::flag("help", None, Some("help")),
+    #[derive(Clone, Copy)]
+    enum Key {
+        Raw,
+        Compact,
+        NullInput,
+        Help,
+    }
+    const OPTIONS: &[OptionSpec<Key>] = &[
+        OptionSpec::flag(Key::Raw, Some('r'), Some("raw-output")),
+        OptionSpec::flag(Key::Compact, Some('c'), Some("compact-output")),
+        OptionSpec::flag(Key::NullInput, Some('n'), Some("null-input")),
+        OptionSpec::flag(Key::Help, None, Some("help")),
     ];
     let Some(parsed) = parse_options_or_report("jq", args, OPTIONS, err) else {
         return 2;
@@ -25,14 +32,13 @@ pub fn jq(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err: O
     let mut null_input = false;
     for option in parsed.options {
         match option.key {
-            "raw" => raw = true,
-            "compact" => compact = true,
-            "null_input" => null_input = true,
-            "help" => {
+            Key::Raw => raw = true,
+            Key::Compact => compact = true,
+            Key::NullInput => null_input = true,
+            Key::Help => {
                 out.extend_from_slice(b"usage: jq [-rcn] FILTER [FILE...]\n");
                 return 0;
             }
-            _ => unreachable!("option keys come from OPTIONS"),
         }
     }
     let mut operands = parsed.operands.into_iter();

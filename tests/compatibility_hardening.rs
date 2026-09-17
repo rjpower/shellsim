@@ -151,6 +151,14 @@ fn text_tools_share_option_boundaries_and_cover_common_forms() {
         assert_eq!(status, 2, "{source}: {stderr}");
         assert!(stderr.contains("unsupported option"), "{source}: {stderr}");
     }
+    for source in ["sed 's/a'", "sed 's/a/b/z'"] {
+        let (status, _, stderr) = text(source);
+        assert_eq!(status, 2, "{source}: {stderr}");
+        assert!(
+            stderr.contains("invalid substitution"),
+            "{source}: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -177,6 +185,12 @@ fn package_tools_only_succeed_for_effects_shellsim_can_supply() {
     let (status, _, stderr) = text("uv remove numpy");
     assert_eq!(status, 2);
     assert!(stderr.contains("unsupported command"), "{stderr}");
+
+    let (status, stdout, stderr) =
+        text("uv run --with numpy python -c 'print(\"should not run\")'");
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("unsupported launcher option"), "{stderr}");
 
     let (status, _, stderr) = text("pip install --target /tmp/site numpy");
     assert_eq!(status, 1);

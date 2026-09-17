@@ -14,15 +14,15 @@ pub(crate) enum OptionValue {
 
 /// One command-local option spelling mapped to a canonical key.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct OptionSpec {
-    pub key: &'static str,
+pub(crate) struct OptionSpec<Key> {
+    pub key: Key,
     pub short: Option<char>,
     pub long: Option<&'static str>,
     pub value: OptionValue,
 }
 
-impl OptionSpec {
-    pub const fn flag(key: &'static str, short: Option<char>, long: Option<&'static str>) -> Self {
+impl<Key: Copy> OptionSpec<Key> {
+    pub const fn flag(key: Key, short: Option<char>, long: Option<&'static str>) -> Self {
         Self {
             key,
             short,
@@ -31,11 +31,7 @@ impl OptionSpec {
         }
     }
 
-    pub const fn required(
-        key: &'static str,
-        short: Option<char>,
-        long: Option<&'static str>,
-    ) -> Self {
+    pub const fn required(key: Key, short: Option<char>, long: Option<&'static str>) -> Self {
         Self {
             key,
             short,
@@ -45,7 +41,7 @@ impl OptionSpec {
     }
 
     pub const fn optional_attached(
-        key: &'static str,
+        key: Key,
         short: Option<char>,
         long: Option<&'static str>,
     ) -> Self {
@@ -60,23 +56,35 @@ impl OptionSpec {
 
 /// One parsed option occurrence. Repeated options remain repeated and ordered.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParsedOption {
-    pub key: &'static str,
+pub(crate) struct ParsedOption<Key> {
+    pub key: Key,
     pub value: Option<String>,
 }
 
 /// Options and operands produced by the scanner.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ParsedArgs {
-    pub options: Vec<ParsedOption>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedArgs<Key> {
+    pub options: Vec<ParsedOption<Key>>,
     pub operands: Vec<String>,
+}
+
+impl<Key> Default for ParsedArgs<Key> {
+    fn default() -> Self {
+        Self {
+            options: Vec::new(),
+            operands: Vec::new(),
+        }
+    }
 }
 
 /// Scan ordinary Unix utility options using a small command-local specification table.
 ///
 /// The scanner handles the operand boundary, short clusters, attached or separate required
 /// values, long options, and attached long values. It does not attach semantics to names.
-pub(crate) fn parse_options(args: &[String], specs: &[OptionSpec]) -> Result<ParsedArgs, String> {
+pub(crate) fn parse_options<Key: Copy>(
+    args: &[String],
+    specs: &[OptionSpec<Key>],
+) -> Result<ParsedArgs<Key>, String> {
     let mut parsed = ParsedArgs::default();
     let mut operands_only = false;
     let mut index = 0;
@@ -161,12 +169,12 @@ pub(crate) fn parse_options(args: &[String], specs: &[OptionSpec]) -> Result<Par
 }
 
 /// Parse one command's options and emit its standard diagnostic on failure.
-pub(crate) fn parse_options_or_report(
+pub(crate) fn parse_options_or_report<Key: Copy>(
     command: &str,
     args: &[String],
-    specs: &[OptionSpec],
+    specs: &[OptionSpec<Key>],
     stderr: &mut Vec<u8>,
-) -> Option<ParsedArgs> {
+) -> Option<ParsedArgs<Key>> {
     match parse_options(args, specs) {
         Ok(parsed) => Some(parsed),
         Err(error) => {
@@ -182,11 +190,18 @@ mod tests {
 
     #[test]
     fn handles_clusters_values_and_operand_boundaries() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Key {
+            IgnoreCase,
+            Verbose,
+            Expression,
+            InPlace,
+        }
         let specs = [
-            OptionSpec::flag("ignore_case", Some('i'), Some("ignore-case")),
-            OptionSpec::flag("verbose", Some('v'), Some("verbose")),
-            OptionSpec::required("expression", Some('e'), Some("regexp")),
-            OptionSpec::optional_attached("in_place", Some('I'), Some("in-place")),
+            OptionSpec::flag(Key::IgnoreCase, Some('i'), Some("ignore-case")),
+            OptionSpec::flag(Key::Verbose, Some('v'), Some("verbose")),
+            OptionSpec::required(Key::Expression, Some('e'), Some("regexp")),
+            OptionSpec::optional_attached(Key::InPlace, Some('I'), Some("in-place")),
         ];
         let args = [
             "-iv".to_string(),
@@ -201,19 +216,19 @@ mod tests {
             parsed.options,
             [
                 ParsedOption {
-                    key: "ignore_case",
+                    key: Key::IgnoreCase,
                     value: None,
                 },
                 ParsedOption {
-                    key: "verbose",
+                    key: Key::Verbose,
                     value: None,
                 },
                 ParsedOption {
-                    key: "expression",
+                    key: Key::Expression,
                     value: Some("value".into()),
                 },
                 ParsedOption {
-                    key: "in_place",
+                    key: Key::InPlace,
                     value: Some(".bak".into()),
                 },
             ]
@@ -223,9 +238,14 @@ mod tests {
 
     #[test]
     fn rejects_unknown_and_malformed_options() {
+        #[derive(Clone, Copy, Debug)]
+        enum Key {
+            Quiet,
+            Expression,
+        }
         let specs = [
-            OptionSpec::flag("quiet", Some('q'), Some("quiet")),
-            OptionSpec::required("expression", Some('e'), Some("regexp")),
+            OptionSpec::flag(Key::Quiet, Some('q'), Some("quiet")),
+            OptionSpec::required(Key::Expression, Some('e'), Some("regexp")),
         ];
         assert_eq!(
             parse_options(&["--colour".into()], &specs).unwrap_err(),

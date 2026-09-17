@@ -572,44 +572,44 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     }
     // ---- package management (takes priority so `uv pip install pytest` installs, not runs) ----
     if first == Some("add") {
-        if let Err(status) = install_uv_packages(interp, &args[1..], io) {
-            return status;
-        }
-        update_pyproject(interp, &install_specs_after(args, "add"));
+        let request = match crate::commands::pkg::resolve_install_args(interp, &args[1..]) {
+            Ok(request) => request,
+            Err(error) => return uv_failure(interp, io, &error, &error, 1),
+        };
+        crate::commands::pkg::install_packages(interp, &request.packages);
+        update_pyproject(interp, &request.direct_specs);
         ensure_venv(interp);
         return 0;
     }
     if first == Some("remove") {
-        interp.note_unsupported("uv:remove");
-        ewln(io.err, "uv: unsupported command 'remove'");
-        return 2;
+        return uv_failure(interp, io, "remove", "unsupported command 'remove'", 2);
     }
     if matches!(first, Some("sync" | "lock")) {
         if args.len() != 1 {
-            interp.note_unsupported("uv:sync-options");
-            ewln(io.err, "uv: unsupported sync or lock option");
-            return 2;
+            return uv_failure(
+                interp,
+                io,
+                "sync-options",
+                "unsupported sync or lock option",
+                2,
+            );
         }
         if let Err(error) = uv_sync(interp) {
-            interp.note_unsupported(&format!("uv:{error}"));
-            ewln(io.err, &format!("uv: {error}"));
-            return 1;
+            return uv_failure(interp, io, &error, &error, 1);
         }
         ensure_venv(interp);
         return 0;
     }
     if first == Some("pip") && args.get(1).map(String::as_str) == Some("install") {
-        if let Err(status) = install_uv_packages(interp, &args[2..], io) {
-            return status;
+        if let Err(error) = crate::commands::pkg::install_args(interp, &args[2..]) {
+            return uv_failure(interp, io, &error, &error, 1);
         }
         ensure_venv(interp);
         return 0;
     }
     if first == Some("venv") {
         if args.len() != 1 {
-            interp.note_unsupported("uv:venv-arguments");
-            ewln(io.err, "uv: unsupported venv argument");
-            return 2;
+            return uv_failure(interp, io, "venv-arguments", "unsupported venv argument", 2);
         }
         ensure_venv(interp);
         return 0;
@@ -624,74 +624,60 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     } else {
         None
     };
-    if let Some((launcher_args, pos)) = launcher_args.and_then(|launcher_args| {
-        launcher_args
-            .iter()
-            .position(|a| a == "pytest" || a.ends_with("/pytest"))
-            .map(|position| (launcher_args, position))
-    }) {
-        return crate::python::run_pytest(interp, &launcher_args[pos + 1..], io.out, io.err);
+    let launcher_args = launcher_args.map(|launcher_args| {
+        if launcher_args.first().map(String::as_str) == Some("--") {
+            &launcher_args[1..]
+        } else {
+            launcher_args
+        }
+    });
+    if let Some(option) = launcher_args
+        .and_then(|launcher_args| launcher_args.first())
+        .filter(|argument| argument.starts_with('-'))
+    {
+        return uv_failure(
+            interp,
+            io,
+            "launcher-options",
+            &format!("unsupported launcher option '{option}'"),
+            2,
+        );
     }
-    if let Some((launcher_args, pos)) = launcher_args.and_then(|launcher_args| {
-        launcher_args
-            .iter()
-            .position(|a| matches!(a.as_str(), "python" | "python3" | "python3.14"))
-            .map(|position| (launcher_args, position))
+    if let Some(launcher_args) = launcher_args.filter(|args| {
+        args.first()
+            .is_some_and(|program| program == "pytest" || program.ends_with("/pytest"))
     }) {
-        let mut argv = vec![launcher_args[pos].clone()];
-        argv.extend(launcher_args[pos + 1..].iter().cloned());
+        return crate::python::run_pytest(interp, &launcher_args[1..], io.out, io.err);
+    }
+    if let Some(launcher_args) = launcher_args.filter(|args| {
+        args.first()
+            .is_some_and(|program| matches!(program.as_str(), "python" | "python3" | "python3.14"))
+    }) {
+        let mut argv = vec![launcher_args[0].clone()];
+        argv.extend(launcher_args[1..].iter().cloned());
         let stdin = std::mem::take(&mut io.stdin);
         return crate::python::run_python(interp, &argv, stdin, io.out, io.err);
     }
     let invocation = args.join(" ");
-    interp.note_unsupported(&format!("uv:{invocation}"));
-    ewln(
-        io.err,
-        &format!("uv: unsupported invocation '{invocation}'"),
-    );
-    2
+    uv_failure(
+        interp,
+        io,
+        &invocation,
+        &format!("unsupported invocation '{invocation}'"),
+        2,
+    )
 }
 
-fn install_uv_packages(
+fn uv_failure(
     interp: &mut CommandContext<'_>,
-    args: &[String],
     io: &mut Io,
-) -> Result<(), i32> {
-    crate::commands::pkg::install_args(interp, args).map_err(|error| {
-        interp.note_unsupported(&format!("uv:{error}"));
-        ewln(io.err, &format!("uv: {error}"));
-        1
-    })
-}
-
-/// Collect the raw package specs following a `uv add` / `uv pip install` keyword (for pyproject).
-fn install_specs_after(args: &[String], kw: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = false;
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        if a == kw {
-            seen = true;
-            i += 1;
-            continue;
-        }
-        if !seen {
-            i += 1;
-            continue;
-        }
-        if a == "--requirement" || a == "-r" {
-            i += 2;
-            continue;
-        }
-        if a.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        out.push(a.clone());
-        i += 1;
-    }
-    out
+    feature: &str,
+    diagnostic: &str,
+    status: i32,
+) -> i32 {
+    interp.note_unsupported(&format!("uv:{feature}"));
+    ewln(io.err, &format!("uv: {diagnostic}"));
+    status
 }
 
 /// Create the marker files a real `uv`/`venv` would leave behind, so tasks that *inspect* the
@@ -716,7 +702,7 @@ fn ensure_venv(interp: &mut Interp) {
     }
 }
 
-/// `uv sync` / `uv lock`: register every dependency declared in `pyproject.toml`.
+/// Validate project and requirements dependencies, then activate the bundled subset atomically.
 fn uv_sync(interp: &mut Interp) -> Result<(), String> {
     let cwd = interp.cwd.clone();
     let mut packages = Vec::new();

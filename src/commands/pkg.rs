@@ -1,8 +1,8 @@
 //! Package managers and build tools.
 //!
-//! pip and pip3 can activate the bundled numpy and pytest distributions without network access.
-//! Other package managers, packages, native toolchains, and external runtimes are explicit
-//! unsupported boundaries.
+//! pip, pip3, and the bounded uv paths can activate the bundled numpy and pytest distributions
+//! without network access. Other package managers, packages, native toolchains, and external
+//! runtimes are explicit unsupported boundaries.
 
 use std::collections::HashMap;
 
@@ -121,22 +121,35 @@ fn cmd_pip(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
 
 /// Validate package arguments completely, then activate every requested bundled package.
 pub(crate) fn install_args(interp: &mut Interp, args: &[String]) -> Result<(), String> {
-    let packages = resolve_install_args(interp, args)?;
-    install_packages(interp, &packages);
+    let request = resolve_install_args(interp, args)?;
+    install_packages(interp, &request.packages);
     Ok(())
+}
+
+/// A validated offline install request, including raw direct specs for uv project metadata.
+pub(crate) struct InstallRequest {
+    pub packages: Vec<String>,
+    pub direct_specs: Vec<String>,
 }
 
 /// Resolve package arguments without changing interpreter state.
 pub(crate) fn resolve_install_args(
     interp: &Interp,
     args: &[String],
-) -> Result<Vec<String>, String> {
-    const OPTIONS: &[OptionSpec] = &[
-        OptionSpec::required("requirement", Some('r'), Some("requirement")),
-        OptionSpec::flag("quiet", Some('q'), Some("quiet")),
-        OptionSpec::flag("no_deps", None, Some("no-deps")),
+) -> Result<InstallRequest, String> {
+    #[derive(Clone, Copy)]
+    enum Key {
+        Requirement,
+        Quiet,
+        NoDeps,
+        DisableVersionCheck,
+    }
+    const OPTIONS: &[OptionSpec<Key>] = &[
+        OptionSpec::required(Key::Requirement, Some('r'), Some("requirement")),
+        OptionSpec::flag(Key::Quiet, Some('q'), Some("quiet")),
+        OptionSpec::flag(Key::NoDeps, None, Some("no-deps")),
         OptionSpec::flag(
-            "disable_version_check",
+            Key::DisableVersionCheck,
             None,
             Some("disable-pip-version-check"),
         ),
@@ -145,18 +158,20 @@ pub(crate) fn resolve_install_args(
     let mut packages = resolve_package_specs(&parsed.operands)?;
     for option in parsed.options {
         match option.key {
-            "requirement" => packages.extend(resolve_requirements_file(
+            Key::Requirement => packages.extend(resolve_requirements_file(
                 interp,
                 &option.value.expect("required option value"),
             )?),
-            "quiet" | "no_deps" | "disable_version_check" => {}
-            _ => unreachable!("option keys come from OPTIONS"),
+            Key::Quiet | Key::NoDeps | Key::DisableVersionCheck => {}
         }
     }
     if packages.is_empty() {
         return Err("no packages specified".to_string());
     }
-    Ok(packages)
+    Ok(InstallRequest {
+        packages,
+        direct_specs: parsed.operands,
+    })
 }
 
 /// Resolve a requirements file without changing interpreter state.

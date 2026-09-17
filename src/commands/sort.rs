@@ -14,15 +14,26 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
 }
 
 fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    const OPTIONS: &[OptionSpec] = &[
-        OptionSpec::flag("numeric", Some('n'), Some("numeric-sort")),
-        OptionSpec::flag("reverse", Some('r'), Some("reverse")),
-        OptionSpec::flag("unique", Some('u'), Some("unique")),
-        OptionSpec::flag("fold_case", Some('f'), Some("ignore-case")),
-        OptionSpec::flag("stable", Some('s'), Some("stable")),
-        OptionSpec::required("key", Some('k'), Some("key")),
-        OptionSpec::required("separator", Some('t'), Some("field-separator")),
-        OptionSpec::flag("help", None, Some("help")),
+    #[derive(Clone, Copy)]
+    enum Key {
+        Numeric,
+        Reverse,
+        Unique,
+        FoldCase,
+        Stable,
+        Fields,
+        Separator,
+        Help,
+    }
+    const OPTIONS: &[OptionSpec<Key>] = &[
+        OptionSpec::flag(Key::Numeric, Some('n'), Some("numeric-sort")),
+        OptionSpec::flag(Key::Reverse, Some('r'), Some("reverse")),
+        OptionSpec::flag(Key::Unique, Some('u'), Some("unique")),
+        OptionSpec::flag(Key::FoldCase, Some('f'), Some("ignore-case")),
+        OptionSpec::flag(Key::Stable, Some('s'), Some("stable")),
+        OptionSpec::required(Key::Fields, Some('k'), Some("key")),
+        OptionSpec::required(Key::Separator, Some('t'), Some("field-separator")),
+        OptionSpec::flag(Key::Help, None, Some("help")),
     ];
     let Some(parsed) = parse_options_or_report("sort", args, OPTIONS, io.err) else {
         return 2;
@@ -35,12 +46,12 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut separator = None;
     for option in parsed.options {
         match option.key {
-            "numeric" => numeric = true,
-            "reverse" => reverse = true,
-            "unique" => unique = true,
-            "fold_case" => fold_case = true,
-            "stable" => {}
-            "key" => {
+            Key::Numeric => numeric = true,
+            Key::Reverse => reverse = true,
+            Key::Unique => unique = true,
+            Key::FoldCase => fold_case = true,
+            Key::Stable => {}
+            Key::Fields => {
                 let value = option.value.expect("required option value");
                 key = match parse_key(&value) {
                     Some(key) => Some(key),
@@ -53,7 +64,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                     }
                 };
             }
-            "separator" => {
+            Key::Separator => {
                 let value = option.value.expect("required option value");
                 let mut characters = value.chars();
                 separator = match (characters.next(), characters.next()) {
@@ -64,12 +75,11 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                     }
                 };
             }
-            "help" => {
+            Key::Help => {
                 w(io.out, "usage: sort [OPTIONS] [FILE...]\n");
                 w(io.out, "supported: -n -r -u -f -s -k KEY -t CHAR\n");
                 return 0;
             }
-            _ => unreachable!("option keys come from OPTIONS"),
         }
     }
     let operands = parsed.operands.iter().collect::<Vec<_>>();

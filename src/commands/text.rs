@@ -1413,27 +1413,48 @@ fn cmd_fgrep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
 
 /// grep with the command name available (egrep/fgrep change default regex flavor).
 fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i32 {
-    const OPTIONS: &[OptionSpec] = &[
-        OptionSpec::flag("ignore_case", Some('i'), Some("ignore-case")),
-        OptionSpec::flag("invert", Some('v'), Some("invert-match")),
-        OptionSpec::flag("count", Some('c'), Some("count")),
-        OptionSpec::flag("line_number", Some('n'), Some("line-number")),
-        OptionSpec::flag("files_with", Some('l'), Some("files-with-matches")),
-        OptionSpec::flag("only_match", Some('o'), Some("only-matching")),
-        OptionSpec::flag("recursive", Some('r'), Some("recursive")),
-        OptionSpec::flag("recursive", Some('R'), Some("dereference-recursive")),
-        OptionSpec::flag("extended", Some('E'), Some("extended-regexp")),
-        OptionSpec::flag("fixed", Some('F'), Some("fixed-strings")),
-        OptionSpec::flag("word", Some('w'), Some("word-regexp")),
-        OptionSpec::flag("line", Some('x'), Some("line-regexp")),
-        OptionSpec::flag("quiet", Some('q'), Some("quiet")),
-        OptionSpec::flag("quiet", None, Some("silent")),
-        OptionSpec::flag("no_filename", Some('h'), Some("no-filename")),
-        OptionSpec::flag("suppress_errors", Some('s'), Some("no-messages")),
-        OptionSpec::flag("text", Some('a'), Some("text")),
-        OptionSpec::required("regexp", Some('e'), Some("regexp")),
-        OptionSpec::required("max_count", Some('m'), Some("max-count")),
-        OptionSpec::flag("help", None, Some("help")),
+    #[derive(Clone, Copy)]
+    enum Key {
+        IgnoreCase,
+        Invert,
+        Count,
+        LineNumber,
+        FilesWith,
+        OnlyMatch,
+        Recursive,
+        Extended,
+        Fixed,
+        Word,
+        Line,
+        Quiet,
+        NoFilename,
+        SuppressErrors,
+        Text,
+        Regexp,
+        MaxCount,
+        Help,
+    }
+    const OPTIONS: &[OptionSpec<Key>] = &[
+        OptionSpec::flag(Key::IgnoreCase, Some('i'), Some("ignore-case")),
+        OptionSpec::flag(Key::Invert, Some('v'), Some("invert-match")),
+        OptionSpec::flag(Key::Count, Some('c'), Some("count")),
+        OptionSpec::flag(Key::LineNumber, Some('n'), Some("line-number")),
+        OptionSpec::flag(Key::FilesWith, Some('l'), Some("files-with-matches")),
+        OptionSpec::flag(Key::OnlyMatch, Some('o'), Some("only-matching")),
+        OptionSpec::flag(Key::Recursive, Some('r'), Some("recursive")),
+        OptionSpec::flag(Key::Recursive, Some('R'), Some("dereference-recursive")),
+        OptionSpec::flag(Key::Extended, Some('E'), Some("extended-regexp")),
+        OptionSpec::flag(Key::Fixed, Some('F'), Some("fixed-strings")),
+        OptionSpec::flag(Key::Word, Some('w'), Some("word-regexp")),
+        OptionSpec::flag(Key::Line, Some('x'), Some("line-regexp")),
+        OptionSpec::flag(Key::Quiet, Some('q'), Some("quiet")),
+        OptionSpec::flag(Key::Quiet, None, Some("silent")),
+        OptionSpec::flag(Key::NoFilename, Some('h'), Some("no-filename")),
+        OptionSpec::flag(Key::SuppressErrors, Some('s'), Some("no-messages")),
+        OptionSpec::flag(Key::Text, Some('a'), Some("text")),
+        OptionSpec::required(Key::Regexp, Some('e'), Some("regexp")),
+        OptionSpec::required(Key::MaxCount, Some('m'), Some("max-count")),
+        OptionSpec::flag(Key::Help, None, Some("help")),
     ];
     let Some(parsed) = parse_options_or_report("grep", args, OPTIONS, io.err) else {
         return 2;
@@ -1456,26 +1477,26 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
     let mut patterns = Vec::new();
     for option in parsed.options {
         match option.key {
-            "ignore_case" => ignore_case = true,
-            "invert" => invert = true,
-            "count" => count = true,
-            "line_number" => line_num = true,
-            "files_with" => files_with = true,
-            "only_match" => only_match = true,
-            "recursive" => recursive = true,
-            "extended" => {
+            Key::IgnoreCase => ignore_case = true,
+            Key::Invert => invert = true,
+            Key::Count => count = true,
+            Key::LineNumber => line_num = true,
+            Key::FilesWith => files_with = true,
+            Key::OnlyMatch => only_match = true,
+            Key::Recursive => recursive = true,
+            Key::Extended => {
                 extended = true;
                 fixed = false;
             }
-            "fixed" => fixed = true,
-            "word" => word = true,
-            "line" => line_regexp = true,
-            "quiet" => quiet = true,
-            "no_filename" => suppress_filename = true,
-            "suppress_errors" => suppress_errors = true,
-            "text" => {}
-            "regexp" => patterns.push(option.value.expect("required option value")),
-            "max_count" => {
+            Key::Fixed => fixed = true,
+            Key::Word => word = true,
+            Key::Line => line_regexp = true,
+            Key::Quiet => quiet = true,
+            Key::NoFilename => suppress_filename = true,
+            Key::SuppressErrors => suppress_errors = true,
+            Key::Text => {}
+            Key::Regexp => patterns.push(option.value.expect("required option value")),
+            Key::MaxCount => {
                 let value = option.value.expect("required option value");
                 max_count = match value.parse::<usize>() {
                     Ok(value) => Some(value),
@@ -1485,7 +1506,7 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
                     }
                 };
             }
-            "help" => {
+            Key::Help => {
                 w(io.out, "usage: grep [OPTIONS] PATTERN [FILE...]\n");
                 w(
                     io.out,
@@ -1493,7 +1514,6 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
                 );
                 return 0;
             }
-            _ => unreachable!("option keys come from OPTIONS"),
         }
     }
     let mut operands = parsed.operands;
@@ -1670,14 +1690,22 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
 }
 
 fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    const OPTIONS: &[OptionSpec] = &[
-        OptionSpec::optional_attached("in_place", Some('i'), Some("in-place")),
-        OptionSpec::flag("quiet", Some('n'), Some("quiet")),
-        OptionSpec::flag("quiet", None, Some("silent")),
-        OptionSpec::flag("extended", Some('r'), Some("regexp-extended")),
-        OptionSpec::flag("extended", Some('E'), None),
-        OptionSpec::required("expression", Some('e'), Some("expression")),
-        OptionSpec::flag("help", None, Some("help")),
+    #[derive(Clone, Copy)]
+    enum Key {
+        InPlace,
+        Quiet,
+        Extended,
+        Expression,
+        Help,
+    }
+    const OPTIONS: &[OptionSpec<Key>] = &[
+        OptionSpec::optional_attached(Key::InPlace, Some('i'), Some("in-place")),
+        OptionSpec::flag(Key::Quiet, Some('n'), Some("quiet")),
+        OptionSpec::flag(Key::Quiet, None, Some("silent")),
+        OptionSpec::flag(Key::Extended, Some('r'), Some("regexp-extended")),
+        OptionSpec::flag(Key::Extended, Some('E'), None),
+        OptionSpec::required(Key::Expression, Some('e'), Some("expression")),
+        OptionSpec::flag(Key::Help, None, Some("help")),
     ];
     let Some(parsed) = parse_options_or_report("sed", args, OPTIONS, io.err) else {
         return 2;
@@ -1688,22 +1716,21 @@ fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
     let mut extended = false;
     for option in parsed.options {
         match option.key {
-            "in_place" => {
+            Key::InPlace => {
                 in_place = true;
                 if option.value.is_some_and(|suffix| !suffix.is_empty()) {
                     ewln(io.err, "sed: unsupported in-place backup suffix");
                     return 2;
                 }
             }
-            "quiet" => quiet = true,
-            "extended" => extended = true,
-            "expression" => scripts.push(option.value.expect("required option value")),
-            "help" => {
+            Key::Quiet => quiet = true,
+            Key::Extended => extended = true,
+            Key::Expression => scripts.push(option.value.expect("required option value")),
+            Key::Help => {
                 w(io.out, "usage: sed [OPTIONS] SCRIPT [FILE...]\n");
                 w(io.out, "supported: -n -E -r -e SCRIPT -i\n");
                 return 0;
             }
-            _ => unreachable!("option keys come from OPTIONS"),
         }
     }
     let mut operands = parsed.operands;
