@@ -1,213 +1,409 @@
 #!/usr/bin/env python3
-"""Probe unchanged TaskTrove Python with the shellsim Python runner.
+"""Replay TaskTrove golden solutions and verifier payloads in shellsim.
 
-This is a compatibility probe, not a TaskTrove solver. It loads Python payloads from each
-reference solution and asks shellsim to collect each task's verifier suite. Results record only
-the first blocker reached for each source or suite. Host CPython is used only by this analysis
-harness to enumerate inputs and invoke the capability-free shellsim runtime.
+The probe models a TaskTrove image as shellsim's built-in userspace plus the Dockerfile's local
+``COPY``, ``ENV``, ``WORKDIR``, and deterministic ``RUN`` steps. Image provisioning commands are
+recorded as prerequisites instead of executed: downloading Debian or Python packages is an image
+build concern, while the replay is intended to measure shellsim's task-facing behavior. The
+unmodified golden ``solve.sh`` and the verifier's Python payload then run in one persistent
+environment, so generated files and runtime command names are observed directly.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import posixpath
 import re
-import subprocess
-import tempfile
-from collections import Counter, defaultdict
-from collections.abc import Iterable
+import shlex
+import sys
+from collections import Counter
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Optional
 
-from tasktrove_inventory import inspect_python, python_heredocs
+KNOWN_INSTRUCTIONS = {
+    "ADD",
+    "ARG",
+    "CMD",
+    "COPY",
+    "ENTRYPOINT",
+    "ENV",
+    "EXPOSE",
+    "FROM",
+    "HEALTHCHECK",
+    "LABEL",
+    "RUN",
+    "SHELL",
+    "STOPSIGNAL",
+    "USER",
+    "VOLUME",
+    "WORKDIR",
+}
+PROVISIONING = re.compile(
+    r"(?:^|[;&|]\s*|\b(?:sudo|env)\s+)"
+    r"(?:apt(?:-get)?|add-apt-repository|update-alternatives|conda|mamba|npm|yarn|pnpm)\b"
+    r"|\b(?:python(?:3(?:\.\d+)?)?\s+-m\s+pip|pip3?|uv\s+pip)\s+install\b"
+    r"|\b(?:git\s+clone|curl\s+[^|>]*https?://|wget\s+[^|>]*https?://)\b",
+    re.IGNORECASE,
+)
+HEREDOC = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+
+
+@dataclass(frozen=True)
+class DockerInstruction:
+    """One logical Dockerfile instruction and its source line."""
+
+    operation: str
+    argument: str
+    line: int
+
+
+@dataclass(frozen=True)
+class Action:
+    """Bounded observation from one shellsim action."""
+
+    phase: str
+    label: str
+    returncode: int
+    stop_reason: Optional[str]
+    unsupported: tuple[str, ...]
+    unsupported_commands: tuple[str, ...]
+    commands: tuple[str, ...]
+    stderr: str
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="extracted TaskTrove task-directory root")
-    parser.add_argument(
-        "--runner",
-        type=Path,
-        default=Path("target/release/shellsim-python"),
-        help="shellsim-python executable (default: target/release/shellsim-python)",
-    )
-    parser.add_argument("--limit", type=int, help="probe only the first N tasks")
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=10.0,
-        help="host timeout per invocation in seconds (default: 10)",
-    )
+    parser.add_argument("--task", action="append", default=[], help="replay only this task (repeatable)")
+    parser.add_argument("--limit", type=int, help="replay only the first N selected tasks")
+    parser.add_argument("--cpu", type=int, default=100_000_000, help="CPU fuel per task")
+    parser.add_argument("--memory", type=int, default=256 * 1024 * 1024, help="modeled memory bytes per task")
+    parser.add_argument("--disk", type=int, default=256 * 1024 * 1024, help="VFS bytes per task")
+    parser.add_argument("--output", type=int, default=8 * 1024 * 1024, help="output bytes per task")
+    parser.add_argument("--quiet", action="store_true", help="do not print task progress to stderr")
     return parser.parse_args()
 
 
-def source_error_line(diagnostic: str, source: bytes) -> str:
-    match = re.search(r" at line (\d+), column", diagnostic)
-    if not match:
-        return ""
-    lines = source.decode("utf-8", errors="replace").splitlines()
-    line_number = int(match.group(1))
-    return lines[line_number - 1] if 0 < line_number <= len(lines) else ""
+def docker_instructions(text: str) -> list[DockerInstruction]:
+    """Parse logical instructions, including continuations and shell heredocs.
+
+    This is deliberately not a general Dockerfile parser. Unknown top-level text is retained as an
+    ``UNKNOWN`` instruction so corpus syntax cannot disappear silently.
+    """
+    lines = text.splitlines()
+    instructions: list[DockerInstruction] = []
+    index = 0
+    while index < len(lines):
+        first_line = index + 1
+        raw = lines[index]
+        index += 1
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"([A-Za-z]+)\s+(.*)", stripped)
+        if not match or match.group(1).upper() not in KNOWN_INSTRUCTIONS:
+            instructions.append(DockerInstruction("UNKNOWN", stripped, first_line))
+            continue
+        operation = match.group(1).upper()
+        argument = match.group(2)
+        while raw.rstrip().endswith("\\") and index < len(lines):
+            argument = argument.rstrip()
+            argument = argument[:-1].rstrip() + " " + lines[index].strip()
+            raw = lines[index]
+            index += 1
+        delimiter = HEREDOC.search(argument)
+        if delimiter:
+            body: list[str] = []
+            while index < len(lines):
+                line = lines[index]
+                index += 1
+                body.append(line)
+                if line.strip() == delimiter.group(1):
+                    break
+            argument += "\n" + "\n".join(body)
+        instructions.append(DockerInstruction(operation, argument, first_line))
+    return instructions
 
 
-def classify(diagnostic: str, unsupported: list[str], source: bytes | None = None) -> str:
-    """Map the first shellsim diagnostic to a stable feature-sized category."""
-    text = "\n".join([diagnostic, *unsupported])
-    module = re.search(r"no module named [\"']([^\"']+)", text)
-    if module:
-        return f"module:{module.group(1).split('.')[0]}"
-    option = re.search(r"pytest option ([^\s]+)", text)
-    if option:
-        return f"pytest-option:{option.group(1)}"
-    if "fixture arguments" in text:
-        return "pytest:fixtures"
-    if "decorators are unsupported" in text:
-        return "pytest:decorators"
-
-    line = source_error_line(text, source) if source is not None else ""
-    decoded = source.decode("utf-8", errors="replace") if source is not None else ""
-    if ('"""' in line or "'''" in line) and (
-        "unterminated string literal" in text or "expected a newline or ';' after statement" in text
-    ):
-        return "syntax:triple-quoted-strings"
-    if "unexpected character '\\\\'" in text:
-        return "syntax:explicit-line-continuation"
-    if "f-string" in text or re.search(r"\b(?:rf|fr)[\"']", line, re.IGNORECASE):
-        return "syntax:f-string-formatting"
-    if "expected a module name after 'from'" in text:
-        return "syntax:relative-import"
-    if line.lstrip().startswith("async def ") or (
-        "decorators may only be applied" in text and re.search(r"^\s*async\s+def\b", decoded, re.MULTILINE)
-    ):
-        return "syntax:async-functions"
-    if any(character in line for character in (" & ", " | ", " ^ ")) or any(
-        f"unexpected character '{character}'" in text for character in "&|^"
-    ):
-        return "syntax:bitwise-operators"
-    if re.search(r"\bif\b.+\belse\b", line):
-        return "syntax:conditional-expressions"
-    if re.search(r"\[[^\]]*:[^\]]*\]", line):
-        return "syntax:slices"
-    if "expected an indented suite" in text and line.lstrip().startswith("#"):
-        return "syntax:comment-first-suites"
-    if "expected" in text or "unsupported" in text or "not implemented" in text:
-        return f"language-api:{text.strip().splitlines()[0][:100]}"
-    if "AssertionError" in text or "FAILED" in text:
-        return "test-failure"
-    if not text.strip():
-        return "nonzero-without-diagnostic"
-    return f"runtime:{text.strip().splitlines()[0][:100]}"
+def absolute_path(workdir: str, value: str) -> str:
+    """Resolve a Docker destination against its current working directory."""
+    return posixpath.normpath(value if value.startswith("/") else posixpath.join(workdir, value))
 
 
-def invoke(runner: Path, arguments: list[str], timeout: float) -> tuple[bool, str, list[str]]:
+def copy_local(environment: Any, context: Path, workdir: str, argument: str) -> Optional[str]:
+    """Apply the common local-source subset of Docker ``COPY``."""
     try:
-        result = subprocess.run(
-            [str(runner), "--json", *arguments],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "host probe timeout", []
+        words = shlex.split(argument)
+    except ValueError as error:
+        return f"COPY parse error: {error}"
+    flags = [word for word in words if word.startswith("--")]
+    words = [word for word in words if not word.startswith("--")]
+    if any(flag.startswith("--from=") for flag in flags):
+        return f"multi-stage COPY prerequisite: {argument}"
+    if flags:
+        return f"unsupported COPY flag: {' '.join(flags)}"
+    if len(words) != 2:
+        return f"unsupported COPY form: {argument}"
+    source_word, destination_word = words
+    source = (context / source_word).resolve()
     try:
-        report = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return False, result.stderr or result.stdout, []
-    return (
-        report["outcome"]["exit_status"] == 0,
-        report["stderr"],
-        report.get("unsupported", []),
+        source.relative_to(context.resolve())
+    except ValueError:
+        return f"COPY source escapes build context: {source_word}"
+    if not source.exists():
+        return f"COPY source does not exist: {source_word}"
+    destination = absolute_path(workdir, destination_word)
+    if source.is_dir():
+        environment.mkdir(destination, parents=True)
+        environment.mount(source, destination)
+        return None
+    if destination_word.endswith("/") or destination_word in {".", "./"} or destination == workdir:
+        destination = posixpath.join(destination, source.name)
+    environment.mkdir(posixpath.dirname(destination), parents=True)
+    environment.write_file(destination, source.read_bytes(), mode=source.stat().st_mode & 0o7777)
+    return None
+
+
+def action_from_result(phase: str, label: str, result: Any) -> Action:
+    """Reduce a public ``RunResult`` to stable, bounded replay evidence."""
+    stderr = result.stderr_text
+    if len(stderr) > 2_000:
+        stderr = stderr[:2_000] + "\n[truncated]"
+    return Action(
+        phase=phase,
+        label=label,
+        returncode=result.returncode,
+        stop_reason=result.stop_reason,
+        unsupported=tuple(result.unsupported),
+        unsupported_commands=tuple(result.unsupported_commands),
+        commands=tuple(result.commands),
+        stderr=stderr,
     )
 
 
-def solution_sources(task: Path) -> Iterable[tuple[str, bytes]]:
+def run_action(environment: Any, actions: list[Action], phase: str, label: str, source: str) -> Any:
+    result = environment.run(source)
+    actions.append(action_from_result(phase, label, result))
+    return result
+
+
+def prepare_environment(environment: Any, task: Path, actions: list[Action]) -> tuple[str, list[str]]:
+    """Materialize local image data and execute deterministic Docker setup in order."""
+    context = task / "environment"
+    dockerfile = context / "Dockerfile"
+    workdir = "/"
+    prerequisites: list[str] = []
+    stages = 0
+    for instruction in docker_instructions(dockerfile.read_text(errors="replace")):
+        operation, argument = instruction.operation, instruction.argument
+        label = f"Dockerfile:{instruction.line}"
+        if operation == "FROM":
+            stages += 1
+            if stages > 1:
+                prerequisites.append(f"{label}: additional image stage {argument}")
+        elif operation == "WORKDIR":
+            workdir = absolute_path(workdir, argument.strip())
+            environment.mkdir(workdir, parents=True)
+            run_action(environment, actions, "setup", label, f"cd {shlex.quote(workdir)}")
+        elif operation == "ENV":
+            run_action(environment, actions, "setup", label, f"export {argument}")
+        elif operation == "COPY":
+            error = copy_local(environment, context, workdir, argument)
+            if error:
+                prerequisites.append(f"{label}: {error}")
+        elif operation == "ADD":
+            prerequisites.append(f"{label}: ADD is not materialized: {argument}")
+        elif operation == "RUN":
+            if PROVISIONING.search(argument) or argument.lstrip().startswith(("[", "--mount=")):
+                prerequisites.append(f"{label}: image provisioning: {argument.splitlines()[0]}")
+            else:
+                run_action(environment, actions, "setup", label, argument)
+        elif operation == "USER" and argument.strip() not in {"root", "0", "0:0"}:
+            prerequisites.append(f"{label}: user identity not modeled: {argument}")
+        elif operation == "UNKNOWN":
+            prerequisites.append(f"{label}: unparsed Dockerfile text: {argument}")
+    environment.mkdir(workdir, parents=True)
+    run_action(environment, actions, "setup", "final WORKDIR", f"cd {shlex.quote(workdir)}")
+    return workdir, prerequisites
+
+
+def verifier_command(tests: Path) -> Optional[str]:
+    """Select the verifier payload without package-installing harness boilerplate."""
+    python_tests = sorted(tests.rglob("test_*.py"))
+    if python_tests:
+        paths = [f"/tests/{path.relative_to(tests).as_posix()}" for path in python_tests]
+        return "cd /tests && pytest " + " ".join(shlex.quote(path) for path in paths)
+    reference = tests / "ref_eval.py"
+    if reference.is_file():
+        return "cd /tests && python /tests/ref_eval.py"
+    script = tests / "test.sh"
+    if script.is_file():
+        return "cd /tests && bash /tests/test.sh"
+    return None
+
+
+def read_reward(environment: Any) -> Optional[str]:
+    for path in ("/logs/verifier/reward.txt", "/log/reward.txt"):
+        try:
+            return environment.read_file(path).decode("utf-8", errors="replace").strip()
+        except Exception:  # the public adapter raises SimulationError for absent VFS paths
+            pass
+    return None
+
+
+def classify(actions: list[Action], verifier_returncode: Optional[int], reward: Optional[str]) -> str:
+    """Classify observed execution without guessing about unseen behavior."""
+    for action in actions:
+        if action.stop_reason:
+            return "resource_exhausted"
+    if verifier_returncode is None:
+        return "no_verifier"
+    if reward is not None:
+        try:
+            score = float(reward)
+            if score <= 0:
+                return "verifier_failed"
+            if score < 1:
+                return "partial_reward"
+        except ValueError:
+            return "invalid_reward"
+        return "passed"
+    if verifier_returncode == 0:
+        return "passed"
+    if any(action.unsupported or action.unsupported_commands for action in actions):
+        return "explicit_boundary"
+    return "verifier_failed"
+
+
+def phase_outcome(result: Any) -> str:
+    """Describe one phase independently of later verifier evidence."""
+    if result is None:
+        return "not_run"
+    if result.stop_reason:
+        return "resource_exhausted"
+    if result.unsupported or result.unsupported_commands:
+        return "explicit_boundary"
+    return "passed" if result.returncode == 0 else "failed"
+
+
+def replay_task(task: Path, environment_type: Any, limits_type: Any, options: argparse.Namespace) -> dict[str, Any]:
+    environment = environment_type(
+        limits_type(cpu=options.cpu, memory=options.memory, disk=options.disk, output=options.output)
+    )
+    actions: list[Action] = []
+    harness_errors: list[str] = []
+    prerequisites: list[str] = []
+    workdir = "/"
+    try:
+        workdir, prerequisites = prepare_environment(environment, task, actions)
+    except Exception as error:
+        harness_errors.append(f"environment setup: {error}")
+
     solution = task / "solution"
-    if not solution.is_dir():
-        return
-    for path in sorted(solution.rglob("*.py")):
-        yield str(path.relative_to(solution)), path.read_bytes()
-    for path in sorted(solution.rglob("*.sh")):
-        yield from python_heredocs(str(path.relative_to(solution)), path.read_bytes())
+    solution_result = None
+    if solution.is_dir() and not environment.terminated:
+        try:
+            environment.mount(solution, "/solution")
+            solve = solution / "solve.sh"
+            if solve.is_file():
+                source = f"cd {shlex.quote(workdir)} && bash /solution/solve.sh"
+                solution_result = run_action(environment, actions, "solution", "solution/solve.sh", source)
+            else:
+                harness_errors.append("solution/solve.sh is absent")
+        except Exception as error:
+            harness_errors.append(f"solution mount/run: {error}")
+    else:
+        harness_errors.append("solution directory is absent")
+
+    tests = task / "tests"
+    verifier_result = None
+    command = verifier_command(tests) if tests.is_dir() else None
+    if command is None:
+        harness_errors.append("verifier payload is absent")
+    elif not environment.terminated:
+        try:
+            environment.mount(tests, "/tests")
+            verifier_result = run_action(environment, actions, "verifier", "verifier payload", command)
+        except Exception as error:
+            harness_errors.append(f"verifier mount/run: {error}")
+
+    reward = read_reward(environment)
+    category = (
+        "harness_error"
+        if harness_errors and verifier_result is None
+        else classify(actions, None if verifier_result is None else verifier_result.returncode, reward)
+    )
+    first_boundary = next(
+        (
+            {
+                "phase": action.phase,
+                "label": action.label,
+                "unsupported": list(action.unsupported),
+                "commands": list(action.unsupported_commands),
+            }
+            for action in actions
+            if action.unsupported or action.unsupported_commands
+        ),
+        None,
+    )
+    return {
+        "task": task.name,
+        "category": category,
+        "workdir": workdir,
+        "solution_returncode": None if solution_result is None else solution_result.returncode,
+        "solution_outcome": phase_outcome(solution_result),
+        "verifier_returncode": None if verifier_result is None else verifier_result.returncode,
+        "verifier_outcome": phase_outcome(verifier_result),
+        "reward": reward,
+        "first_boundary": first_boundary,
+        "image_prerequisites": prerequisites,
+        "harness_errors": harness_errors,
+        "actions": [asdict(action) for action in actions],
+    }
 
 
 def main() -> int:
-    args = parse_args()
-    source = args.source.resolve()
-    runner = args.runner.resolve()
-    if not runner.is_file():
-        raise SystemExit(f"runner does not exist: {runner}")
+    options = parse_args()
+    source = options.source.resolve()
     tasks = sorted(path.parent for path in source.glob("*/task.toml"))
-    if args.limit is not None:
-        tasks = tasks[: args.limit]
+    if options.task:
+        selected = set(options.task)
+        tasks = [task for task in tasks if task.name in selected]
+        missing = sorted(selected - {task.name for task in tasks})
+        if missing:
+            raise SystemExit(f"unknown task(s): {', '.join(missing)}")
+    if options.limit is not None:
+        tasks = tasks[: options.limit]
     if not tasks:
         raise SystemExit(f"no task.toml files found below {source}")
 
-    solution_results: list[tuple[str, str, str]] = []
-    verifier_results: list[tuple[str, str]] = []
-    feature_counts: dict[str, Counter[str]] = defaultdict(Counter)
-    with tempfile.TemporaryDirectory(prefix="shellsim-tasktrove-") as temporary_name:
-        temporary = Path(temporary_name)
-        for task in tasks:
-            for ordinal, (label, data) in enumerate(solution_sources(task)):
-                probe = temporary / task.name / str(ordinal)
-                probe.mkdir(parents=True)
-                path = probe / "probe.py"
-                path.write_bytes(data)
-                passed, diagnostic, unsupported = invoke(runner, [str(path)], args.timeout)
-                category = "pass" if passed else classify(diagnostic, unsupported, data)
-                solution_results.append((task.name, label, category))
-                inspected = inspect_python(label, data)
-                for imported in inspected.imports:
-                    feature_counts[category][f"import:{imported.split('.')[0]}"] += 1
-                for node, count in inspected.node_types.items():
-                    feature_counts[category][f"ast:{node}"] += count
+    try:
+        from shellsim import Environment, Limits
+    except ImportError as error:
+        raise SystemExit("install the local shellsim Python package before running this probe") from error
 
-            tests = task / "tests"
-            test_files = sorted(tests.rglob("test_*.py")) if tests.is_dir() else []
-            if test_files:
-                passed, diagnostic, unsupported = invoke(
-                    runner,
-                    ["--root", str(task), "--pytest", str(tests)],
-                    args.timeout,
-                )
-                test_source = b"\n".join(path.read_bytes() for path in test_files)
-                category = "pass" if passed else classify(diagnostic, unsupported, test_source)
-                verifier_results.append((task.name, category))
-
-    solution_categories = Counter(category for _, _, category in solution_results)
-    verifier_categories = Counter(category for _, category in verifier_results)
-    task_solutions: dict[str, list[str]] = defaultdict(list)
-    for task, _label, category in solution_results:
-        task_solutions[task].append(category)
-    result = {
-        "schema_version": 1,
-        "method": "first shellsim blocker when loading unchanged sources",
+    results = []
+    for index, task in enumerate(tasks, 1):
+        if not options.quiet:
+            print(f"[{index}/{len(tasks)}] {task.name}", file=sys.stderr)
+        results.append(replay_task(task, Environment, Limits, options))
+    categories = Counter(result["category"] for result in results)
+    solution_outcomes = Counter(result["solution_outcome"] for result in results)
+    verifier_outcomes = Counter(result["verifier_outcome"] for result in results)
+    output = {
+        "schema_version": 2,
+        "method": "golden solution and verifier payload in one persistent shellsim environment",
         "source": str(source),
-        "tasks": len(tasks),
-        "solution_python_sources": len(solution_results),
-        "solution_source_passes": solution_categories["pass"],
-        "solution_tasks_with_sources": len(task_solutions),
-        "solution_tasks_all_sources_pass": sum(
-            all(value == "pass" for value in values) for values in task_solutions.values()
-        ),
-        "solution_failure_categories": dict(
-            sorted((key, value) for key, value in solution_categories.items() if key != "pass")
-        ),
-        "verifier_tasks": len(verifier_results),
-        "verifier_task_passes": verifier_categories["pass"],
-        "verifier_failure_categories": dict(
-            sorted((key, value) for key, value in verifier_categories.items() if key != "pass")
-        ),
-        "solution_failures": [
-            {"task": task, "source": label, "category": category}
-            for task, label, category in solution_results
-            if category != "pass"
-        ],
-        "failure_feature_counts": {
-            category: dict(counts.most_common()) for category, counts in sorted(feature_counts.items())
-        },
+        "tasks": len(results),
+        "categories": dict(sorted(categories.items())),
+        "solution_outcomes": dict(sorted(solution_outcomes.items())),
+        "verifier_outcomes": dict(sorted(verifier_outcomes.items())),
+        "tasks_with_image_prerequisites": sum(bool(result["image_prerequisites"]) for result in results),
+        "results": results,
     }
-    print(json.dumps(result, indent=2, sort_keys=True))
+    print(json.dumps(output, indent=2, sort_keys=True))
     return 0
 
 

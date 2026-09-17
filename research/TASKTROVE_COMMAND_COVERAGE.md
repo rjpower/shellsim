@@ -1,7 +1,9 @@
 # TaskTrove shell-command coverage
 
-This note is a static prioritization sample for shellsim's command surface. It is not a task pass
-rate and it does not claim that a registered command implements every option used by a task.
+This note is the static companion to the execution-first workflow replay in
+`research/TASKTROVE_RUNTIME_SAMPLE.md`. It identifies command and option surfaces in code that may
+not execute. It is not a task pass rate and it does not claim that a registered command implements
+every option used by a task.
 
 ## Sample and method
 
@@ -30,7 +32,19 @@ the declared boundary, not that arbitrary input or hidden file state has the exp
 The approximation can still overcount shell functions, generated scripts, and shell syntax. A
 `missing` row remains a review queue, not proof of a missing binary.
 
-## Result after the command-surface pass
+## Relationship to runtime evidence
+
+Run `tools/tasktrove_runtime_probe.py` first. It executes the golden solution and verifier payload
+in one persistent shellsim environment, resolving dynamic executable names and testing their
+actual data flow. Use this census afterward to explain unreached paths and estimate how frequently
+a proposed interface occurs in source.
+
+The pinned runtime replay records 50 clean golden-solution exits, 40 explicit solution boundaries,
+seven nonzero solution exits without unsupported telemetry, and three solution resource stops.
+The verifier provides one positive partial reward and no full rewards. Those observations supersede
+any optimistic reading of the static `supported_surface` count below.
+
+## Static result after the command-surface pass
 
 | Source bucket | Calls | Real | Partial | Explicitly unsupported | Lexically unmatched |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -68,10 +82,10 @@ explicit boundaries across two tasks: one uses unsupported PCRE mode (`-P`), and
 leading-dash certificate marker without `-e` or `--`, which a normal option parser treats as an
 option.
 
-The 96 unclassified solution calls are 83 Python entrypoints, nine pip entrypoints, two unzip calls,
-and two ps calls. Python is intentionally not inferred from argv: a script path says nothing about
-its syntax, imports, or library use. That surface needs source/import analysis or execution
-telemetry rather than an optimistic CLI classification.
+The 96 statically unclassified solution calls are 83 Python entrypoints, nine pip entrypoints, two
+unzip calls, and two ps calls. The workflow replay executes those entrypoints instead of inferring
+compatibility from argv. It retains their exact diagnostics, command telemetry, and verifier
+effect; `unclassified` now means only that the static profile makes no independent claim.
 
 Verifier scripts are similarly dominated by program entrypoints rather than utility flags: 79
 `uv`, 46 `pytest`, 25 `uvx`, 12 Python, three pip, and one timeout call remain unclassified. The
@@ -79,5 +93,5 @@ report retains their normalized forms and per-task counts so a later package-too
 added without rescanning the corpus.
 
 There are also 47 dynamic executable positions in reference solutions and one in environment
-scripts. They are reported separately from the 1,380 and 348 literal-command counts; all are
-variable-selected commands and require runtime telemetry to resolve.
+scripts. They are reported separately from the 1,380 and 348 literal-command counts. The replay
+resolves any position that is reached; the static rows preserve the unreached remainder.

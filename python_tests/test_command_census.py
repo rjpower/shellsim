@@ -95,9 +95,7 @@ $runner --flag
 
     dd = command(result, "dd")
     assert dd["dynamic_invocations"] == 0
-    assert dd["compatibility"] == [
-        {"assessment": "supported_surface", "invocations": 1, "tasks": 1}
-    ]
+    assert dd["compatibility"] == [{"assessment": "supported_surface", "invocations": 1, "tasks": 1}]
 
 
 def test_census_consumes_multiword_option_values_before_shaping_operands(tmp_path: Path) -> None:
