@@ -592,18 +592,12 @@ fn execute_source(
 fn run_module(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
     match args.first().map(String::as_str) {
         Some("pip") => {
-            if args.get(1).map(String::as_str) == Some("install") {
-                if let Err(error) = crate::commands::pkg::install_args(interp, &args[2..]) {
-                    interp.note_unsupported(&format!("pip:{error}"));
-                    err.extend_from_slice(format!("pip: {error}\n").as_bytes());
-                    return 1;
-                }
-            } else {
-                err.extend_from_slice(b"pip: unsupported command\n");
-                interp.note_unsupported("pip:command");
-                return 2;
-            }
-            0
+            let mut io = crate::commands::Io {
+                stdin: Vec::new(),
+                out,
+                err,
+            };
+            crate::commands::pkg::run_pip(interp, &args[1..], &mut io)
         }
         Some("venv") => {
             let Some(dir) = args.iter().skip(1).find(|arg| !arg.starts_with('-')) else {

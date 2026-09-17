@@ -11,7 +11,7 @@ use serde_json::Value;
 type Out<'a> = &'a mut Vec<u8>;
 
 pub fn jq(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err: Out) -> i32 {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq)]
     enum Key {
         Raw,
         Compact,
@@ -24,8 +24,16 @@ pub fn jq(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err: O
         OptionSpec::flag(Key::NullInput, Some('n'), Some("null-input")),
         OptionSpec::flag(Key::Help, None, Some("help")),
     ];
-    let Some(parsed) = parse_options_or_report("jq", args, OPTIONS, err) else {
-        return 2;
+    let parsed = match parse_options_or_report(
+        "jq",
+        args,
+        OPTIONS,
+        (Key::Help, "usage: jq [-rcn] FILTER [FILE...]\n"),
+        out,
+        err,
+    ) {
+        Ok(parsed) => parsed,
+        Err(status) => return status,
     };
     let mut raw = false;
     let mut compact = false;
@@ -35,10 +43,7 @@ pub fn jq(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err: O
             Key::Raw => raw = true,
             Key::Compact => compact = true,
             Key::NullInput => null_input = true,
-            Key::Help => {
-                out.extend_from_slice(b"usage: jq [-rcn] FILTER [FILE...]\n");
-                return 0;
-            }
+            Key::Help => unreachable!("help is handled by the shared option parser"),
         }
     }
     let mut operands = parsed.operands.into_iter();

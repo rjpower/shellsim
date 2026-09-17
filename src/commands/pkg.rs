@@ -48,6 +48,11 @@ pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
 
 /// Implement the bounded pip surface used to activate bundled packages.
 fn cmd_pip(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    run_pip(interp, args, io)
+}
+
+/// Run the shared offline pip surface for both the command and `python -m pip` entry points.
+pub(crate) fn run_pip(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
     let mut sub_index = 0;
     while args.get(sub_index).is_some_and(|argument| {
         matches!(

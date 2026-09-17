@@ -1413,7 +1413,7 @@ fn cmd_fgrep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
 
 /// grep with the command name available (egrep/fgrep change default regex flavor).
 fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i32 {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq)]
     enum Key {
         IgnoreCase,
         Invert,
@@ -1456,8 +1456,19 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
         OptionSpec::required(Key::MaxCount, Some('m'), Some("max-count")),
         OptionSpec::flag(Key::Help, None, Some("help")),
     ];
-    let Some(parsed) = parse_options_or_report("grep", args, OPTIONS, io.err) else {
-        return 2;
+    let parsed = match parse_options_or_report(
+        "grep",
+        args,
+        OPTIONS,
+        (
+            Key::Help,
+            "usage: grep [OPTIONS] PATTERN [FILE...]\nsupported: -E -F -i -v -c -n -l -o -r -w -x -q -h -s -e -m\n",
+        ),
+        io.out,
+        io.err,
+    ) {
+        Ok(parsed) => parsed,
+        Err(status) => return status,
     };
     let mut ignore_case = false;
     let mut invert = false;
@@ -1506,14 +1517,7 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
                     }
                 };
             }
-            Key::Help => {
-                w(io.out, "usage: grep [OPTIONS] PATTERN [FILE...]\n");
-                w(
-                    io.out,
-                    "supported: -E -F -i -v -c -n -l -o -r -w -x -q -h -s -e -m\n",
-                );
-                return 0;
-            }
+            Key::Help => unreachable!("help is handled by the shared option parser"),
         }
     }
     let mut operands = parsed.operands;
@@ -1690,7 +1694,7 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
 }
 
 fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq)]
     enum Key {
         InPlace,
         Quiet,
@@ -1707,8 +1711,19 @@ fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
         OptionSpec::required(Key::Expression, Some('e'), Some("expression")),
         OptionSpec::flag(Key::Help, None, Some("help")),
     ];
-    let Some(parsed) = parse_options_or_report("sed", args, OPTIONS, io.err) else {
-        return 2;
+    let parsed = match parse_options_or_report(
+        "sed",
+        args,
+        OPTIONS,
+        (
+            Key::Help,
+            "usage: sed [OPTIONS] SCRIPT [FILE...]\nsupported: -n -E -r -e SCRIPT -i\n",
+        ),
+        io.out,
+        io.err,
+    ) {
+        Ok(parsed) => parsed,
+        Err(status) => return status,
     };
     let mut in_place = false;
     let mut quiet = false;
@@ -1726,11 +1741,7 @@ fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             Key::Quiet => quiet = true,
             Key::Extended => extended = true,
             Key::Expression => scripts.push(option.value.expect("required option value")),
-            Key::Help => {
-                w(io.out, "usage: sed [OPTIONS] SCRIPT [FILE...]\n");
-                w(io.out, "supported: -n -E -r -e SCRIPT -i\n");
-                return 0;
-            }
+            Key::Help => unreachable!("help is handled by the shared option parser"),
         }
     }
     let mut operands = parsed.operands;

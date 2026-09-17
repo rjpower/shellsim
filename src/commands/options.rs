@@ -168,18 +168,26 @@ pub(crate) fn parse_options<Key: Copy>(
     Ok(parsed)
 }
 
-/// Parse one command's options and emit its standard diagnostic on failure.
-pub(crate) fn parse_options_or_report<Key: Copy>(
+/// Parse one command's options, emit shared help, and report malformed input consistently.
+pub(crate) fn parse_options_or_report<Key: Copy + PartialEq>(
     command: &str,
     args: &[String],
     specs: &[OptionSpec<Key>],
+    help: (Key, &str),
+    stdout: &mut Vec<u8>,
     stderr: &mut Vec<u8>,
-) -> Option<ParsedArgs<Key>> {
+) -> Result<ParsedArgs<Key>, i32> {
     match parse_options(args, specs) {
-        Ok(parsed) => Some(parsed),
+        Ok(parsed) => {
+            if parsed.options.iter().any(|option| option.key == help.0) {
+                stdout.extend_from_slice(help.1.as_bytes());
+                return Err(0);
+            }
+            Ok(parsed)
+        }
         Err(error) => {
             stderr.extend_from_slice(format!("{command}: {error}\n").as_bytes());
-            None
+            Err(2)
         }
     }
 }

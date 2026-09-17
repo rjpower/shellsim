@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use super::options::{parse_options_or_report, OptionSpec};
-use super::util::{ewln, read_inputs, w};
+use super::util::{ewln, read_inputs};
 use super::{reg_costed, CommandContext, CommandSpec, Io, Trust};
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
@@ -14,7 +14,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
 }
 
 fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq)]
     enum Key {
         Numeric,
         Reverse,
@@ -35,8 +35,19 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         OptionSpec::required(Key::Separator, Some('t'), Some("field-separator")),
         OptionSpec::flag(Key::Help, None, Some("help")),
     ];
-    let Some(parsed) = parse_options_or_report("sort", args, OPTIONS, io.err) else {
-        return 2;
+    let parsed = match parse_options_or_report(
+        "sort",
+        args,
+        OPTIONS,
+        (
+            Key::Help,
+            "usage: sort [OPTIONS] [FILE...]\nsupported: -n -r -u -f -s -k KEY -t CHAR\n",
+        ),
+        io.out,
+        io.err,
+    ) {
+        Ok(parsed) => parsed,
+        Err(status) => return status,
     };
     let mut numeric = false;
     let mut reverse = false;
@@ -75,11 +86,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                     }
                 };
             }
-            Key::Help => {
-                w(io.out, "usage: sort [OPTIONS] [FILE...]\n");
-                w(io.out, "supported: -n -r -u -f -s -k KEY -t CHAR\n");
-                return 0;
-            }
+            Key::Help => unreachable!("help is handled by the shared option parser"),
         }
     }
     let operands = parsed.operands.iter().collect::<Vec<_>>();

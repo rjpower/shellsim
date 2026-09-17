@@ -164,8 +164,12 @@ fn text_tools_share_option_boundaries_and_cover_common_forms() {
 #[test]
 fn package_tools_only_succeed_for_effects_shellsim_can_supply() {
     assert_eq!(
-        text("pip install numpy; python -c 'import numpy; print(numpy.array([1, 2]).sum())'"),
-        (0, "3\n".into(), String::new())
+        text("pip install numpy; pip list"),
+        (0, "numpy 0.0.0\n".into(), String::new())
+    );
+    assert_eq!(
+        text("python -m pip install numpy; python -m pip freeze"),
+        (0, "numpy==0.0.0\n".into(), String::new())
     );
 
     let mut environment = Environment::new();
@@ -218,6 +222,13 @@ fn uv_sync_validates_all_dependencies_before_mutating_package_state() {
     assert_eq!(outcome.exit_status, 1);
     assert!(String::from_utf8_lossy(&stderr).contains("not bundled"));
     assert!(!environment.packages.contains("numpy"));
+}
+
+#[test]
+fn uv_sync_requires_project_metadata() {
+    let (status, _, stderr) = text("uv sync");
+    assert_eq!(status, 1);
+    assert!(stderr.contains("no pyproject.toml or requirements.txt found"));
 }
 
 #[test]

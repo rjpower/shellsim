@@ -702,20 +702,29 @@ fn ensure_venv(interp: &mut Interp) {
     }
 }
 
-/// Validate project and requirements dependencies, then activate the bundled subset atomically.
+/// Validate every declared project or requirements dependency, then activate all of them atomically.
 fn uv_sync(interp: &mut Interp) -> Result<(), String> {
     let cwd = interp.cwd.clone();
     let mut packages = Vec::new();
     let path = crate::vfs::resolve_against(&cwd, "pyproject.toml");
-    if let Ok(content) = interp.vfs.read_string("/", &path) {
+    let req = crate::vfs::resolve_against(&cwd, "requirements.txt");
+    let has_project = interp.vfs.is_file("/", &path);
+    let has_requirements = interp.vfs.is_file("/", &req);
+    if !has_project && !has_requirements {
+        return Err("no pyproject.toml or requirements.txt found".to_string());
+    }
+    if has_project {
+        let content = interp
+            .vfs
+            .read_string("/", &path)
+            .map_err(|error| format!("cannot read pyproject.toml: {error}"))?;
         // Pull each "name>=ver" / "name==ver" string out of the dependencies arrays.
         packages.extend(crate::commands::pkg::resolve_package_specs(
             &extract_dep_specs(&content),
         )?);
     }
     // a requirements.txt next to it, if present
-    let req = crate::vfs::resolve_against(&cwd, "requirements.txt");
-    if interp.vfs.is_file("/", &req) {
+    if has_requirements {
         packages.extend(crate::commands::pkg::resolve_requirements_file(
             interp, &req,
         )?);
