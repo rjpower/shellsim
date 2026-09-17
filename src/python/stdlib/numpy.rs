@@ -9,42 +9,243 @@ use std::cmp::Ordering;
 use super::super::native::{
     CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyArray, PyArrayDtype,
     PyArrayLayout, PyBinaryOp, PyError, PyIndex, PyKind, PyMarker, PyResult, PyRuntime, PySequence,
-    PyString, PyValue, PyValueCast, ValueDef, ValueKind, ValueKindDef, ValueKindSlots,
+    PyString, PyValue, PyValueCast, ValueDef, ValueKindDef, ValueKindSlots,
 };
 use super::super::number::{PyNumber, PyNumber as Number};
 use super::super::Value;
 
 const MAX_ARRAY_RANK: usize = 64;
 
-pub(super) static BOOL: ValueKind<bool> = ValueKind::new(
-    ValueKindDef {
-        name: "numpy.bool_",
-        construct: construct_bool,
-        slots: scalar_slots(),
-    },
-    |value| value as u64,
-    |payload| payload != 0,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumericClass {
+    Bool,
+    Signed,
+    Unsigned,
+    Float,
+}
+
+struct NumericKind {
+    definition: ValueKindDef,
+    dtype: PyArrayDtype,
+    class: NumericClass,
+    bits: u8,
+    aliases: &'static [&'static str],
+}
+
+impl NumericKind {
+    fn unpack(&'static self, runtime: &dyn PyRuntime, value: &PyValue) -> Option<Scalar> {
+        let payload = runtime.value_kind_payload(value, &self.definition)?;
+        let value = match self.class {
+            NumericClass::Bool => ScalarValue::Bool(payload != 0),
+            NumericClass::Signed => {
+                let shift = 64 - self.bits;
+                ScalarValue::Signed((((payload << shift) as i64) >> shift) as i128)
+            }
+            NumericClass::Unsigned => {
+                ScalarValue::Unsigned((payload & bit_mask(self.bits)) as u128)
+            }
+            NumericClass::Float if self.bits == 32 => {
+                ScalarValue::Float(f32::from_bits(payload as u32) as f64)
+            }
+            NumericClass::Float => ScalarValue::Float(f64::from_bits(payload)),
+        };
+        Some(Scalar {
+            dtype: self.dtype,
+            value,
+        })
+    }
+
+    fn pack_payload(&'static self, runtime: &dyn PyRuntime, payload: u64) -> PyResult {
+        runtime.new_value_kind(&self.definition, payload & bit_mask(self.bits))
+    }
+}
+
+macro_rules! numeric_kind {
+    ($static_name:ident, $constructor:ident, $getter:ident, $dtype:ident, $id:literal, $class:ident, $bits:literal, $dtype_name:literal, $python_name:literal, [$($alias:literal),+ $(,)?]) => {
+        impl PyArrayDtype {
+            #[allow(non_upper_case_globals)]
+            const $dtype: Self = Self::new($id, $dtype_name);
+        }
+
+        static $static_name: NumericKind = NumericKind {
+            definition: ValueKindDef {
+                name: concat!("numpy.", $python_name),
+                construct: $constructor,
+                slots: scalar_slots(),
+            },
+            dtype: PyArrayDtype::$dtype,
+            class: NumericClass::$class,
+            bits: $bits,
+            aliases: &[$($alias),+],
+        };
+
+        fn $constructor(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+            construct_scalar(runtime, args, &$static_name)
+        }
+
+        fn $getter(runtime: &mut dyn PyRuntime) -> PyResult {
+            runtime.value_kind_type(&$static_name.definition)
+        }
+    };
+}
+
+macro_rules! numeric_kinds {
+    ($(($static_name:ident, $constructor:ident, $getter:ident, $dtype:ident, $id:literal, $class:ident, $bits:literal, $dtype_name:literal, $python_name:literal, [$($alias:literal),+ $(,)?])),+ $(,)?) => {
+        $(numeric_kind!(
+            $static_name,
+            $constructor,
+            $getter,
+            $dtype,
+            $id,
+            $class,
+            $bits,
+            $dtype_name,
+            $python_name,
+            [$($alias),+]
+        );)+
+
+        static NUMERIC_KINDS: &[&NumericKind] = &[$(&$static_name),+];
+    };
+}
+
+numeric_kinds!(
+    (
+        BOOL,
+        construct_bool,
+        bool_type,
+        Bool,
+        0,
+        Bool,
+        1,
+        "bool",
+        "bool_",
+        ["bool", "bool_", "?"]
+    ),
+    (
+        INT8,
+        construct_int8,
+        int8_type,
+        Int8,
+        1,
+        Signed,
+        8,
+        "int8",
+        "int8",
+        ["int8", "byte", "i1"]
+    ),
+    (
+        INT16,
+        construct_int16,
+        int16_type,
+        Int16,
+        2,
+        Signed,
+        16,
+        "int16",
+        "int16",
+        ["int16", "short", "i2"]
+    ),
+    (
+        INT32,
+        construct_int32,
+        int32_type,
+        Int32,
+        3,
+        Signed,
+        32,
+        "int32",
+        "int32",
+        ["int32", "intc", "i4"]
+    ),
+    (
+        INT64,
+        construct_int64,
+        int64_type,
+        Int64,
+        4,
+        Signed,
+        64,
+        "int64",
+        "int64",
+        ["int", "int64", "int_", "intp", "longlong", "i8"]
+    ),
+    (
+        UINT8,
+        construct_uint8,
+        uint8_type,
+        UInt8,
+        5,
+        Unsigned,
+        8,
+        "uint8",
+        "uint8",
+        ["uint8", "ubyte", "u1"]
+    ),
+    (
+        UINT16,
+        construct_uint16,
+        uint16_type,
+        UInt16,
+        6,
+        Unsigned,
+        16,
+        "uint16",
+        "uint16",
+        ["uint16", "ushort", "u2"]
+    ),
+    (
+        UINT32,
+        construct_uint32,
+        uint32_type,
+        UInt32,
+        7,
+        Unsigned,
+        32,
+        "uint32",
+        "uint32",
+        ["uint32", "uintc", "u4"]
+    ),
+    (
+        UINT64,
+        construct_uint64,
+        uint64_type,
+        UInt64,
+        8,
+        Unsigned,
+        64,
+        "uint64",
+        "uint64",
+        ["uint64", "uint", "uintp", "ulonglong", "u8"]
+    ),
+    (
+        FLOAT32,
+        construct_float32,
+        float32_type,
+        Float32,
+        9,
+        Float,
+        32,
+        "float32",
+        "float32",
+        ["float32", "single", "f4"]
+    ),
+    (
+        FLOAT64,
+        construct_float64,
+        float64_type,
+        Float64,
+        10,
+        Float,
+        64,
+        "float64",
+        "float64",
+        ["float", "float64", "double", "f8"]
+    ),
 );
 
-pub(super) static INT64: ValueKind<i64> = ValueKind::new(
-    ValueKindDef {
-        name: "numpy.int64",
-        construct: construct_int64,
-        slots: scalar_slots(),
-    },
-    |value| value as u64,
-    |payload| payload as i64,
-);
-
-pub(super) static FLOAT64: ValueKind<f64> = ValueKind::new(
-    ValueKindDef {
-        name: "numpy.float64",
-        construct: construct_float64,
-        slots: scalar_slots(),
-    },
-    f64::to_bits,
-    f64::from_bits,
-);
+pub(super) fn value_kinds() -> impl Iterator<Item = &'static ValueKindDef> {
+    NUMERIC_KINDS.iter().map(|kind| &kind.definition)
+}
 
 const fn scalar_slots() -> ValueKindSlots {
     ValueKindSlots {
@@ -131,18 +332,32 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             name: "ndarray",
             get: array_type,
         },
-        ValueDef::Factory {
-            name: "bool_",
-            get: bool_type,
-        },
-        ValueDef::Factory {
-            name: "int64",
-            get: int64_type,
-        },
-        ValueDef::Factory {
-            name: "float64",
-            get: float64_type,
-        },
+        dtype_value("bool", bool_type),
+        dtype_value("bool_", bool_type),
+        dtype_value("int8", int8_type),
+        dtype_value("byte", int8_type),
+        dtype_value("int16", int16_type),
+        dtype_value("short", int16_type),
+        dtype_value("int32", int32_type),
+        dtype_value("intc", int32_type),
+        dtype_value("int64", int64_type),
+        dtype_value("int_", int64_type),
+        dtype_value("intp", int64_type),
+        dtype_value("longlong", int64_type),
+        dtype_value("uint8", uint8_type),
+        dtype_value("ubyte", uint8_type),
+        dtype_value("uint16", uint16_type),
+        dtype_value("ushort", uint16_type),
+        dtype_value("uint32", uint32_type),
+        dtype_value("uintc", uint32_type),
+        dtype_value("uint64", uint64_type),
+        dtype_value("uint", uint64_type),
+        dtype_value("uintp", uint64_type),
+        dtype_value("ulonglong", uint64_type),
+        dtype_value("float32", float32_type),
+        dtype_value("single", float32_type),
+        dtype_value("float64", float64_type),
+        dtype_value("double", float64_type),
     ],
 };
 
@@ -150,16 +365,8 @@ fn array_type(runtime: &mut dyn PyRuntime) -> PyResult {
     Ok(runtime.marker(PyMarker::ArrayType))
 }
 
-fn bool_type(runtime: &mut dyn PyRuntime) -> PyResult {
-    runtime.value_kind_type(&BOOL.definition)
-}
-
-fn int64_type(runtime: &mut dyn PyRuntime) -> PyResult {
-    runtime.value_kind_type(&INT64.definition)
-}
-
-fn float64_type(runtime: &mut dyn PyRuntime) -> PyResult {
-    runtime.value_kind_type(&FLOAT64.definition)
+const fn dtype_value(name: &'static str, get: fn(&mut dyn PyRuntime) -> PyResult) -> ValueDef {
+    ValueDef::Factory { name, get }
 }
 
 const fn function(
@@ -318,44 +525,130 @@ fn flatten(
 }
 
 fn infer_dtype(runtime: &dyn PyRuntime, values: &[PyValue]) -> PyResult<PyArrayDtype> {
+    if values.is_empty() {
+        return Ok(PyArrayDtype::Float64);
+    }
     let mut dtype = PyArrayDtype::Bool;
     for value in values {
-        if let Some(value) = registered_scalar(runtime, value) {
-            dtype = promote_scalar_dtype(dtype, value);
-            continue;
-        }
-        dtype = match runtime.kind(value)? {
-            PyKind::Bool => dtype,
-            PyKind::Int if dtype == PyArrayDtype::Bool => PyArrayDtype::Int,
-            PyKind::Int => dtype,
-            PyKind::Float => PyArrayDtype::Float,
-            _ => {
-                return Err(PyError::type_error(
-                    "numpy arrays require numeric scalar values",
-                ))
-            }
-        };
+        dtype = promote_dtype(dtype, scalar(runtime, *value)?.dtype);
     }
     Ok(dtype)
 }
 
-fn promote_scalar_dtype(current: PyArrayDtype, value: Scalar) -> PyArrayDtype {
-    promote_dtype(
-        current,
-        match value {
-            Scalar::Bool(_) => PyArrayDtype::Bool,
-            Scalar::Int(_) => PyArrayDtype::Int,
-            Scalar::Float(_) => PyArrayDtype::Float,
-        },
-    )
+const fn bit_mask(bits: u8) -> u64 {
+    if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
 }
 
 fn promote_dtype(left: PyArrayDtype, right: PyArrayDtype) -> PyArrayDtype {
-    match (left, right) {
-        (PyArrayDtype::Float, _) | (_, PyArrayDtype::Float) => PyArrayDtype::Float,
-        (PyArrayDtype::Int, _) | (_, PyArrayDtype::Int) => PyArrayDtype::Int,
-        (PyArrayDtype::Bool, PyArrayDtype::Bool) => PyArrayDtype::Bool,
+    let left = dtype_kind(left);
+    let right = dtype_kind(right);
+    match (left.class, right.class) {
+        (NumericClass::Bool, _) => right.dtype,
+        (_, NumericClass::Bool) => left.dtype,
+        (NumericClass::Float, NumericClass::Float) => {
+            if left.bits.max(right.bits) == 64 {
+                PyArrayDtype::Float64
+            } else {
+                PyArrayDtype::Float32
+            }
+        }
+        (NumericClass::Float, _) | (_, NumericClass::Float) => {
+            let float = if left.class == NumericClass::Float {
+                left
+            } else {
+                right
+            };
+            let other = if left.class == NumericClass::Float {
+                right
+            } else {
+                left
+            };
+            if float.bits == 64 || other.bits > 16 {
+                PyArrayDtype::Float64
+            } else {
+                PyArrayDtype::Float32
+            }
+        }
+        (NumericClass::Signed, NumericClass::Signed) => signed_dtype(left.bits.max(right.bits)),
+        (NumericClass::Unsigned, NumericClass::Unsigned) => {
+            unsigned_dtype(left.bits.max(right.bits))
+        }
+        (NumericClass::Signed, NumericClass::Unsigned)
+        | (NumericClass::Unsigned, NumericClass::Signed) => {
+            let signed_bits = if left.class == NumericClass::Signed {
+                left.bits
+            } else {
+                right.bits
+            };
+            let unsigned_bits = if left.class == NumericClass::Unsigned {
+                left.bits
+            } else {
+                right.bits
+            };
+            [8, 16, 32, 64]
+                .into_iter()
+                .find(|bits| *bits >= signed_bits && *bits > unsigned_bits)
+                .map(signed_dtype)
+                .unwrap_or(PyArrayDtype::Float64)
+        }
     }
+}
+
+fn promote_operands(
+    left: PyArrayDtype,
+    right: PyArrayDtype,
+    left_is_weak: bool,
+    right_is_weak: bool,
+) -> PyArrayDtype {
+    match (left_is_weak, right_is_weak) {
+        (true, false) => promote_weak_scalar(right, left),
+        (false, true) => promote_weak_scalar(left, right),
+        _ => promote_dtype(left, right),
+    }
+}
+
+fn promote_weak_scalar(strong: PyArrayDtype, weak: PyArrayDtype) -> PyArrayDtype {
+    match (dtype_kind(strong).class, dtype_kind(weak).class) {
+        (_, NumericClass::Bool) => strong,
+        (NumericClass::Bool, NumericClass::Signed | NumericClass::Unsigned) => weak,
+        (NumericClass::Float, NumericClass::Signed | NumericClass::Unsigned) => strong,
+        (
+            NumericClass::Signed | NumericClass::Unsigned,
+            NumericClass::Signed | NumericClass::Unsigned,
+        ) => strong,
+        (NumericClass::Float, NumericClass::Float) => strong,
+        (_, NumericClass::Float) => PyArrayDtype::Float64,
+    }
+}
+
+fn signed_dtype(bits: u8) -> PyArrayDtype {
+    match bits {
+        0..=8 => PyArrayDtype::Int8,
+        9..=16 => PyArrayDtype::Int16,
+        17..=32 => PyArrayDtype::Int32,
+        _ => PyArrayDtype::Int64,
+    }
+}
+
+fn unsigned_dtype(bits: u8) -> PyArrayDtype {
+    match bits {
+        0..=8 => PyArrayDtype::UInt8,
+        9..=16 => PyArrayDtype::UInt16,
+        17..=32 => PyArrayDtype::UInt32,
+        _ => PyArrayDtype::UInt64,
+    }
+}
+
+fn dtype_kind(dtype: PyArrayDtype) -> &'static NumericKind {
+    NUMERIC_KINDS
+        .iter()
+        .copied()
+        .find(|kind| kind.dtype == dtype)
+        .expect("every array dtype has a registered scalar kind")
 }
 
 fn dtype_keyword(
@@ -370,133 +663,298 @@ fn dtype_keyword(
 }
 
 fn parse_dtype(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<PyArrayDtype> {
-    let name = if runtime.kind(&value)? == PyKind::String {
+    let is_string = runtime.kind(&value)? == PyKind::String;
+    let rendered = if is_string {
         value.cast::<PyString>(runtime)?.0
     } else {
         runtime.repr(&value)?
     };
-    match name.as_str() {
-        "bool" | "<class 'bool'>" | "<class 'numpy.bool_'>" => Ok(PyArrayDtype::Bool),
-        "int" | "int64" | "<class 'int'>" | "<class 'numpy.int64'>" => Ok(PyArrayDtype::Int),
-        "float" | "float64" | "<class 'float'>" | "<class 'numpy.float64'>" => {
-            Ok(PyArrayDtype::Float)
-        }
-        _ => Err(PyError::type_error(format!(
-            "unsupported numpy dtype {name:?}"
-        ))),
-    }
+    let name = rendered
+        .strip_prefix("<class '")
+        .and_then(|name| name.strip_suffix("'>"))
+        .unwrap_or(&rendered);
+    let name = if is_string {
+        name
+    } else {
+        name.strip_prefix("numpy.").unwrap_or(name)
+    };
+    NUMERIC_KINDS
+        .iter()
+        .find(|kind| kind.aliases.contains(&name))
+        .map(|kind| kind.dtype)
+        .ok_or_else(|| PyError::type_error(format!("unsupported numpy dtype {rendered:?}")))
 }
 
-fn construct_bool(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("numpy.bool_", 0, 1)?;
-    args.reject_keywords("numpy.bool_")?;
+fn construct_scalar(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
+    kind: &'static NumericKind,
+) -> PyResult {
+    args.expect_positional(kind.definition.name, 0, 1)?;
+    args.reject_keywords(kind.definition.name)?;
+    let default = match kind.class {
+        NumericClass::Bool => Value::Bool(false),
+        NumericClass::Signed | NumericClass::Unsigned => Value::Int(0),
+        NumericClass::Float => Value::Float(0.0),
+    };
     convert(
         runtime,
-        args.positional()
-            .first()
-            .copied()
-            .unwrap_or(Value::Bool(false)),
-        PyArrayDtype::Bool,
-    )
-}
-
-fn construct_int64(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("numpy.int64", 0, 1)?;
-    args.reject_keywords("numpy.int64")?;
-    convert(
-        runtime,
-        args.positional().first().copied().unwrap_or(Value::Int(0)),
-        PyArrayDtype::Int,
-    )
-}
-
-fn construct_float64(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("numpy.float64", 0, 1)?;
-    args.reject_keywords("numpy.float64")?;
-    convert(
-        runtime,
-        args.positional()
-            .first()
-            .copied()
-            .unwrap_or(Value::Float(0.0)),
-        PyArrayDtype::Float,
+        args.positional().first().copied().unwrap_or(default),
+        kind.dtype,
     )
 }
 
 #[derive(Clone, Copy)]
-enum Scalar {
+enum ScalarValue {
     Bool(bool),
-    Int(i64),
+    Signed(i128),
+    Unsigned(u128),
     Float(f64),
+}
+
+#[derive(Clone, Copy)]
+struct Scalar {
+    dtype: PyArrayDtype,
+    value: ScalarValue,
 }
 
 impl Scalar {
     fn as_f64(self) -> f64 {
-        match self {
-            Self::Bool(value) => i64::from(value) as f64,
-            Self::Int(value) => value as f64,
-            Self::Float(value) => value,
+        match self.value {
+            ScalarValue::Bool(value) => i64::from(value) as f64,
+            ScalarValue::Signed(value) => value as f64,
+            ScalarValue::Unsigned(value) => value as f64,
+            ScalarValue::Float(value) => value,
+        }
+    }
+
+    fn as_i128(self) -> i128 {
+        match self.value {
+            ScalarValue::Bool(value) => i128::from(value),
+            ScalarValue::Signed(value) => value,
+            ScalarValue::Unsigned(value) => value as i128,
+            ScalarValue::Float(_) => unreachable!("float is not an integer operand"),
+        }
+    }
+
+    fn as_u128(self) -> u128 {
+        match self.value {
+            ScalarValue::Bool(value) => u128::from(value),
+            ScalarValue::Unsigned(value) => value,
+            ScalarValue::Signed(value) => value as u128,
+            ScalarValue::Float(_) => unreachable!("float is not an integer operand"),
         }
     }
 
     fn truth(self) -> bool {
-        match self {
-            Self::Bool(value) => value,
-            Self::Int(value) => value != 0,
-            Self::Float(value) => value != 0.0,
+        match self.value {
+            ScalarValue::Bool(value) => value,
+            ScalarValue::Signed(value) => value != 0,
+            ScalarValue::Unsigned(value) => value != 0,
+            ScalarValue::Float(value) => value != 0.0,
+        }
+    }
+
+    fn is_nan(self) -> bool {
+        matches!(self.value, ScalarValue::Float(value) if value.is_nan())
+    }
+
+    fn compare(self, other: Self) -> Option<Ordering> {
+        if matches!(self.value, ScalarValue::Float(_))
+            || matches!(other.value, ScalarValue::Float(_))
+        {
+            return self.as_f64().partial_cmp(&other.as_f64());
+        }
+        match (self.value, other.value) {
+            (ScalarValue::Signed(left), ScalarValue::Unsigned(right)) => {
+                if left < 0 {
+                    Some(Ordering::Less)
+                } else {
+                    (left as u128).partial_cmp(&right)
+                }
+            }
+            (ScalarValue::Unsigned(left), ScalarValue::Signed(right)) => {
+                if right < 0 {
+                    Some(Ordering::Greater)
+                } else {
+                    left.partial_cmp(&(right as u128))
+                }
+            }
+            _ => self.as_i128().partial_cmp(&other.as_i128()),
         }
     }
 }
 
 fn registered_scalar(runtime: &dyn PyRuntime, value: &PyValue) -> Option<Scalar> {
-    BOOL.unpack(runtime, value)
-        .map(Scalar::Bool)
-        .or_else(|| INT64.unpack(runtime, value).map(Scalar::Int))
-        .or_else(|| FLOAT64.unpack(runtime, value).map(Scalar::Float))
+    NUMERIC_KINDS
+        .iter()
+        .find_map(|kind| kind.unpack(runtime, value))
 }
 
 fn scalar(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Scalar> {
     if let Some(value) = registered_scalar(runtime, &value) {
         return Ok(value);
     }
+    if runtime.kind(&value)? == PyKind::Bool {
+        return Ok(Scalar {
+            dtype: PyArrayDtype::Bool,
+            value: ScalarValue::Bool(value.bool_value().expect("bool kind checked")),
+        });
+    }
     match value.cast::<Number>(runtime)? {
-        Number::Int(value) => Ok(Scalar::Int(value)),
-        Number::BigInt(value) => value
-            .parse::<i64>()
-            .map(Scalar::Int)
-            .map_err(|_| PyError::overflow_error("integer does not fit in numpy.int64")),
-        Number::Float(value) => Ok(Scalar::Float(value)),
+        Number::Int(value) => Ok(Scalar {
+            dtype: PyArrayDtype::Int64,
+            value: ScalarValue::Signed(value as i128),
+        }),
+        Number::BigInt(value) => {
+            if let Ok(value) = value.parse::<i64>() {
+                Ok(Scalar {
+                    dtype: PyArrayDtype::Int64,
+                    value: ScalarValue::Signed(value as i128),
+                })
+            } else if let Ok(value) = value.parse::<u64>() {
+                Ok(Scalar {
+                    dtype: PyArrayDtype::UInt64,
+                    value: ScalarValue::Unsigned(value as u128),
+                })
+            } else {
+                Err(PyError::overflow_error(
+                    "integer is outside the supported NumPy range",
+                ))
+            }
+        }
+        Number::Float(value) => Ok(Scalar {
+            dtype: PyArrayDtype::Float64,
+            value: ScalarValue::Float(value),
+        }),
     }
 }
 
 fn convert(runtime: &mut dyn PyRuntime, value: PyValue, dtype: PyArrayDtype) -> PyResult<PyValue> {
-    match dtype {
-        PyArrayDtype::Bool => {
-            let value = match registered_scalar(runtime, &value) {
-                Some(value) => value.truth(),
-                None => runtime.truth(&value)?,
-            };
-            BOOL.pack(runtime, value)
-        }
-        PyArrayDtype::Float => FLOAT64.pack(runtime, scalar(runtime, value)?.as_f64()),
-        PyArrayDtype::Int => match scalar(runtime, value)? {
-            Scalar::Bool(value) => INT64.pack(runtime, i64::from(value)),
-            Scalar::Int(value) => INT64.pack(runtime, value),
-            Scalar::Float(value) if value.is_finite() => {
-                let truncated = value.trunc();
-                if truncated < i64::MIN as f64 || truncated >= 9_223_372_036_854_775_808.0 {
-                    Err(PyError::overflow_error(
-                        "integer does not fit in numpy.int64",
-                    ))
-                } else {
-                    INT64.pack(runtime, truncated as i64)
-                }
-            }
-            Scalar::Float(_) => Err(PyError::overflow_error(
-                "cannot convert float infinity to integer",
-            )),
+    let value = match scalar(runtime, value) {
+        Ok(value) => value,
+        Err(_) if dtype == PyArrayDtype::Bool => Scalar {
+            dtype: PyArrayDtype::Bool,
+            value: ScalarValue::Bool(runtime.truth(&value)?),
         },
-    }
+        Err(error) => return Err(error),
+    };
+    pack_checked(runtime, value, dtype)
+}
+
+fn pack_checked(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult {
+    let kind = dtype_kind(dtype);
+    let converted = match kind.class {
+        NumericClass::Bool => ScalarValue::Bool(value.truth()),
+        NumericClass::Float => ScalarValue::Float(value.as_f64()),
+        NumericClass::Signed => {
+            let minimum = -(1i128 << (kind.bits - 1));
+            let maximum = (1i128 << (kind.bits - 1)) - 1;
+            let value = match value.value {
+                ScalarValue::Bool(value) => i128::from(value),
+                ScalarValue::Signed(value) => value,
+                ScalarValue::Unsigned(value) => i128::try_from(value).unwrap_or(i128::MAX),
+                ScalarValue::Float(value) if value.is_finite() => {
+                    let boundary = 2f64.powi(i32::from(kind.bits) - 1);
+                    if value < -boundary || value >= boundary {
+                        return Err(dtype_overflow(dtype));
+                    }
+                    value.trunc() as i128
+                }
+                ScalarValue::Float(_) => return Err(dtype_overflow(dtype)),
+            };
+            if !(minimum..=maximum).contains(&value) {
+                return Err(dtype_overflow(dtype));
+            }
+            ScalarValue::Signed(value)
+        }
+        NumericClass::Unsigned => {
+            let maximum = (1u128 << kind.bits) - 1;
+            let value = match value.value {
+                ScalarValue::Bool(value) => u128::from(value),
+                ScalarValue::Signed(value) if value >= 0 => value as u128,
+                ScalarValue::Signed(_) => return Err(dtype_overflow(dtype)),
+                ScalarValue::Unsigned(value) => value,
+                ScalarValue::Float(value) if value.is_finite() => {
+                    let boundary = 2f64.powi(i32::from(kind.bits));
+                    if value < 0.0 || value >= boundary {
+                        return Err(dtype_overflow(dtype));
+                    }
+                    value.trunc() as u128
+                }
+                ScalarValue::Float(_) => return Err(dtype_overflow(dtype)),
+            };
+            if value > maximum {
+                return Err(dtype_overflow(dtype));
+            }
+            ScalarValue::Unsigned(value)
+        }
+    };
+    pack_wrapping(
+        runtime,
+        Scalar {
+            dtype,
+            value: converted,
+        },
+        dtype,
+    )
+}
+
+fn pack_wrapping(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult {
+    let kind = dtype_kind(dtype);
+    let payload = match kind.class {
+        NumericClass::Bool => u64::from(value.truth()),
+        NumericClass::Signed => value.as_i128() as u64,
+        NumericClass::Unsigned => value.as_u128() as u64,
+        NumericClass::Float if kind.bits == 32 => (value.as_f64() as f32).to_bits() as u64,
+        NumericClass::Float => value.as_f64().to_bits(),
+    };
+    kind.pack_payload(runtime, payload)
+}
+
+fn cast_scalar(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult<Scalar> {
+    let packed = pack_checked(runtime, value, dtype)?;
+    registered_scalar(runtime, &packed)
+        .ok_or_else(|| PyError::runtime_error("numeric cast produced an unregistered scalar"))
+}
+
+fn pack_bool(runtime: &dyn PyRuntime, value: bool) -> PyResult {
+    pack_wrapping(
+        runtime,
+        Scalar {
+            dtype: PyArrayDtype::Bool,
+            value: ScalarValue::Bool(value),
+        },
+        PyArrayDtype::Bool,
+    )
+}
+
+fn pack_index(runtime: &dyn PyRuntime, value: usize) -> PyResult {
+    let value = i128::try_from(value)
+        .map_err(|_| PyError::overflow_error("array index exceeds numpy.int64"))?;
+    pack_wrapping(
+        runtime,
+        Scalar {
+            dtype: PyArrayDtype::Int64,
+            value: ScalarValue::Signed(value),
+        },
+        PyArrayDtype::Int64,
+    )
+}
+
+fn pack_float(runtime: &dyn PyRuntime, value: f64, dtype: PyArrayDtype) -> PyResult {
+    pack_wrapping(
+        runtime,
+        Scalar {
+            dtype,
+            value: ScalarValue::Float(value),
+        },
+        dtype,
+    )
+}
+
+fn dtype_overflow(dtype: PyArrayDtype) -> PyError {
+    PyError::overflow_error(format!("integer does not fit in numpy.{}", dtype.name()))
 }
 
 fn scalar_binary(
@@ -505,29 +963,17 @@ fn scalar_binary(
     right: PyValue,
     operation: PyBinaryOp,
 ) -> PyResult<Option<PyValue>> {
-    let left = scalar(runtime, left)?;
-    let right = scalar(runtime, right)?;
-    if matches!(operation, PyBinaryOp::Divide)
-        || matches!(left, Scalar::Float(_))
-        || matches!(right, Scalar::Float(_))
+    let left_is_weak = registered_scalar(runtime, &left).is_none();
+    let right_is_weak = registered_scalar(runtime, &right).is_none();
+    let mut left = scalar(runtime, left)?;
+    let mut right = scalar(runtime, right)?;
+    if left.dtype == PyArrayDtype::Bool
+        && right.dtype == PyArrayDtype::Bool
+        && !matches!(operation, PyBinaryOp::Divide)
     {
-        let left = left.as_f64();
-        let right = right.as_f64();
-        if matches!(operation, PyBinaryOp::Divide) && right == 0.0 {
-            return Err(PyError::zero_division_error("division by zero"));
-        }
         let value = match operation {
-            PyBinaryOp::Add => left + right,
-            PyBinaryOp::Subtract => left - right,
-            PyBinaryOp::Multiply => left * right,
-            PyBinaryOp::Divide => left / right,
-        };
-        return FLOAT64.pack(runtime, value).map(Some);
-    }
-    if let (Scalar::Bool(left), Scalar::Bool(right)) = (left, right) {
-        let value = match operation {
-            PyBinaryOp::Add => left || right,
-            PyBinaryOp::Multiply => left && right,
+            PyBinaryOp::Add => left.truth() || right.truth(),
+            PyBinaryOp::Multiply => left.truth() && right.truth(),
             PyBinaryOp::Subtract => {
                 return Err(PyError::type_error(
                     "numpy boolean subtract is not supported",
@@ -535,22 +981,76 @@ fn scalar_binary(
             }
             PyBinaryOp::Divide => unreachable!(),
         };
-        return BOOL.pack(runtime, value).map(Some);
+        return pack_wrapping(
+            runtime,
+            Scalar {
+                dtype: PyArrayDtype::Bool,
+                value: ScalarValue::Bool(value),
+            },
+            PyArrayDtype::Bool,
+        )
+        .map(Some);
     }
-    let integer = |value| match value {
-        Scalar::Bool(value) => i64::from(value),
-        Scalar::Int(value) => value,
-        Scalar::Float(_) => unreachable!(),
+    let mut dtype = promote_operands(left.dtype, right.dtype, left_is_weak, right_is_weak);
+    if matches!(operation, PyBinaryOp::Divide) && dtype_kind(dtype).class != NumericClass::Float {
+        dtype = PyArrayDtype::Float64;
+    }
+    if left_is_weak {
+        left = cast_scalar(runtime, left, dtype)?;
+    }
+    if right_is_weak {
+        right = cast_scalar(runtime, right, dtype)?;
+    }
+    let class = dtype_kind(dtype).class;
+    let value = match class {
+        NumericClass::Float => {
+            let left = left.as_f64();
+            let right = right.as_f64();
+            if matches!(operation, PyBinaryOp::Divide) && right == 0.0 {
+                return Err(PyError::zero_division_error("division by zero"));
+            }
+            let value = if dtype == PyArrayDtype::Float32 {
+                let left = left as f32;
+                let right = right as f32;
+                (match operation {
+                    PyBinaryOp::Add => left + right,
+                    PyBinaryOp::Subtract => left - right,
+                    PyBinaryOp::Multiply => left * right,
+                    PyBinaryOp::Divide => left / right,
+                }) as f64
+            } else {
+                match operation {
+                    PyBinaryOp::Add => left + right,
+                    PyBinaryOp::Subtract => left - right,
+                    PyBinaryOp::Multiply => left * right,
+                    PyBinaryOp::Divide => left / right,
+                }
+            };
+            ScalarValue::Float(value)
+        }
+        NumericClass::Signed => {
+            let left = left.as_i128();
+            let right = right.as_i128();
+            ScalarValue::Signed(match operation {
+                PyBinaryOp::Add => left.wrapping_add(right),
+                PyBinaryOp::Subtract => left.wrapping_sub(right),
+                PyBinaryOp::Multiply => left.wrapping_mul(right),
+                PyBinaryOp::Divide => unreachable!(),
+            })
+        }
+        NumericClass::Unsigned => {
+            let left = left.as_u128();
+            let right = right.as_u128();
+            ScalarValue::Unsigned(match operation {
+                PyBinaryOp::Add => left.wrapping_add(right),
+                PyBinaryOp::Subtract => left.wrapping_sub(right),
+                PyBinaryOp::Multiply => left.wrapping_mul(right),
+                PyBinaryOp::Divide => unreachable!(),
+            })
+        }
+        NumericClass::Bool => unreachable!("boolean pairs returned above"),
     };
-    let left = integer(left);
-    let right = integer(right);
-    let value = match operation {
-        PyBinaryOp::Add => left.wrapping_add(right),
-        PyBinaryOp::Subtract => left.wrapping_sub(right),
-        PyBinaryOp::Multiply => left.wrapping_mul(right),
-        PyBinaryOp::Divide => unreachable!(),
-    };
-    INT64.pack(runtime, value).map(Some)
+    pack_wrapping(runtime, Scalar { dtype, value }, dtype).map(Some)
 }
 
 pub(crate) fn slot_scalar_add(
@@ -602,11 +1102,17 @@ pub(crate) fn slot_scalar_reflected_divide(
 }
 
 fn slot_scalar_repr(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
-    let text = match scalar(runtime, value)? {
-        Scalar::Bool(value) => if value { "True" } else { "False" }.into(),
-        Scalar::Int(value) => value.to_string(),
-        Scalar::Float(value) => {
-            let text = value.to_string();
+    let scalar = scalar(runtime, value)?;
+    let text = match scalar.value {
+        ScalarValue::Bool(value) => if value { "True" } else { "False" }.into(),
+        ScalarValue::Signed(value) => value.to_string(),
+        ScalarValue::Unsigned(value) => value.to_string(),
+        ScalarValue::Float(value) => {
+            let text = if scalar.dtype == PyArrayDtype::Float32 {
+                (value as f32).to_string()
+            } else {
+                value.to_string()
+            };
             if text.contains(['.', 'e', 'E']) {
                 text
             } else {
@@ -626,9 +1132,9 @@ fn slot_scalar_equal(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    let left = scalar(runtime, left)?.as_f64();
-    let right = scalar(runtime, right)?.as_f64();
-    Ok(Some(Value::Bool(left == right)))
+    Ok(Some(Value::Bool(
+        scalar(runtime, left)?.compare(scalar(runtime, right)?) == Some(Ordering::Equal),
+    )))
 }
 
 fn slot_scalar_less_than(
@@ -636,9 +1142,9 @@ fn slot_scalar_less_than(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    let left = scalar(runtime, left)?.as_f64();
-    let right = scalar(runtime, right)?.as_f64();
-    Ok(Some(Value::Bool(left < right)))
+    Ok(Some(Value::Bool(
+        scalar(runtime, left)?.compare(scalar(runtime, right)?) == Some(Ordering::Less),
+    )))
 }
 
 fn slot_scalar_not_equal(
@@ -656,9 +1162,10 @@ fn slot_scalar_less_equal(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    Ok(Some(Value::Bool(
-        scalar(runtime, left)?.as_f64() <= scalar(runtime, right)?.as_f64(),
-    )))
+    Ok(Some(Value::Bool(matches!(
+        scalar(runtime, left)?.compare(scalar(runtime, right)?),
+        Some(Ordering::Less | Ordering::Equal)
+    ))))
 }
 
 fn slot_scalar_greater_than(
@@ -667,7 +1174,7 @@ fn slot_scalar_greater_than(
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
     Ok(Some(Value::Bool(
-        scalar(runtime, left)?.as_f64() > scalar(runtime, right)?.as_f64(),
+        scalar(runtime, left)?.compare(scalar(runtime, right)?) == Some(Ordering::Greater),
     )))
 }
 
@@ -676,9 +1183,10 @@ fn slot_scalar_greater_equal(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    Ok(Some(Value::Bool(
-        scalar(runtime, left)?.as_f64() >= scalar(runtime, right)?.as_f64(),
-    )))
+    Ok(Some(Value::Bool(matches!(
+        scalar(runtime, left)?.compare(scalar(runtime, right)?),
+        Some(Ordering::Greater | Ordering::Equal)
+    ))))
 }
 
 fn zeros(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -703,7 +1211,7 @@ fn filled(runtime: &mut dyn PyRuntime, args: CallArgs, name: &str, value: PyValu
     args.expect_positional(name, 1, 1)?;
     args.reject_unknown_keywords(name, &["dtype"])?;
     let shape = parse_shape(runtime, args.positional()[0])?;
-    let dtype = dtype_keyword(runtime, &args, name)?.unwrap_or(PyArrayDtype::Float);
+    let dtype = dtype_keyword(runtime, &args, name)?.unwrap_or(PyArrayDtype::Float64);
     let value = convert(runtime, value, dtype)?;
     allocate_filled(runtime, shape, value, dtype)
 }
@@ -843,9 +1351,9 @@ fn arange(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     runtime.charge_cpu(u64::try_from(count).unwrap_or(u64::MAX))?;
     let requested = dtype_keyword(runtime, &args, "numpy.arange")?;
     let dtype = requested.unwrap_or(if float_input {
-        PyArrayDtype::Float
+        PyArrayDtype::Float64
     } else {
-        PyArrayDtype::Int
+        PyArrayDtype::Int64
     });
     let mut values = Vec::with_capacity(count);
     for index in 0..count {
@@ -872,7 +1380,7 @@ fn linspace(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         Some(value) => runtime.truth(value)?,
         None => true,
     };
-    let dtype = dtype_keyword(runtime, &args, "numpy.linspace")?.unwrap_or(PyArrayDtype::Float);
+    let dtype = dtype_keyword(runtime, &args, "numpy.linspace")?.unwrap_or(PyArrayDtype::Float64);
     reserve_values(runtime, num)?;
     let mut values = Vec::with_capacity(num);
     let denominator = if endpoint { num.saturating_sub(1) } else { num };
@@ -913,7 +1421,7 @@ fn eye(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         .map(|value| value.cast::<PyIndex>(runtime).map(|value| value.0))
         .transpose()?
         .unwrap_or(0);
-    let dtype = dtype_keyword(runtime, &args, "numpy.eye")?.unwrap_or(PyArrayDtype::Float);
+    let dtype = dtype_keyword(runtime, &args, "numpy.eye")?.unwrap_or(PyArrayDtype::Float64);
     let count = rows
         .checked_mul(columns)
         .ok_or_else(|| PyError::value_error("array is too large"))?;
@@ -1155,6 +1663,28 @@ fn normalize_index(index: i64, length: usize) -> PyResult<usize> {
     }
 }
 
+fn boolean_index(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<bool> {
+    match scalar(runtime, value)?.value {
+        ScalarValue::Bool(value) => Ok(value),
+        _ => Err(PyError::runtime_error(
+            "boolean index array contains another scalar kind",
+        )),
+    }
+}
+
+fn integer_index(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<i64> {
+    let value = match scalar(runtime, value)?.value {
+        ScalarValue::Signed(value) => i64::try_from(value),
+        ScalarValue::Unsigned(value) => i64::try_from(value),
+        _ => {
+            return Err(PyError::runtime_error(
+                "integer index array contains another scalar kind",
+            ))
+        }
+    };
+    value.map_err(|_| PyError::value_error("index out of bounds"))
+}
+
 pub(crate) fn slot_set_item(
     runtime: &mut dyn PyRuntime,
     array: PyValue,
@@ -1227,7 +1757,7 @@ fn advanced_selection(
             .cast::<PySequence>(runtime)?
             .items(runtime)?
             .is_empty();
-        construct(runtime, index, empty.then_some(PyArrayDtype::Int))?
+        construct(runtime, index, empty.then_some(PyArrayDtype::Int64))?
     } else {
         index
     };
@@ -1238,9 +1768,7 @@ fn advanced_selection(
         PyArrayDtype::Bool if index_layout.shape == shape => {
             for_each_index(shape, |coordinate| {
                 let selected = runtime.array_get(indices, coordinate)?;
-                if BOOL.unpack(runtime, &selected).ok_or_else(|| {
-                    PyError::runtime_error("boolean index array contains another scalar kind")
-                })? {
+                if boolean_index(runtime, selected)? {
                     push_coordinate(runtime, &mut coordinates, coordinate.to_vec())?;
                 }
                 Ok(())
@@ -1253,9 +1781,7 @@ fn advanced_selection(
             let mut selected_rows = 0usize;
             for row in 0..shape[0] {
                 let selected = runtime.array_get(indices, &[row])?;
-                if !BOOL.unpack(runtime, &selected).ok_or_else(|| {
-                    PyError::runtime_error("boolean index array contains another scalar kind")
-                })? {
+                if !boolean_index(runtime, selected)? {
                     continue;
                 }
                 selected_rows += 1;
@@ -1274,12 +1800,15 @@ fn advanced_selection(
                 "boolean index must match the array or its first axis",
             ))
         }
-        PyArrayDtype::Int => {
+        dtype
+            if matches!(
+                dtype_kind(dtype).class,
+                NumericClass::Signed | NumericClass::Unsigned
+            ) =>
+        {
             for_each_index(&index_layout.shape, |index_coordinate| {
                 let selected = runtime.array_get(indices, index_coordinate)?;
-                let selected = INT64.unpack(runtime, &selected).ok_or_else(|| {
-                    PyError::runtime_error("integer index array contains another scalar kind")
-                })?;
+                let selected = integer_index(runtime, selected)?;
                 let row = normalize_index(selected, shape[0])?;
                 for_each_index(&shape[1..], |tail| {
                     let mut coordinate = vec![row];
@@ -1291,7 +1820,7 @@ fn advanced_selection(
             result.extend_from_slice(&shape[1..]);
             result
         }
-        PyArrayDtype::Float => {
+        _ => {
             return Err(PyError::type_error(
                 "arrays used as indices must be of integer or boolean type",
             ))
@@ -1362,11 +1891,15 @@ fn binary(
     )?;
     let left_dtype = operand_dtype(runtime, left, left_array.as_ref().map(|value| value.1))?;
     let right_dtype = operand_dtype(runtime, right, right_array.as_ref().map(|value| value.1))?;
-    let dtype = if operation == PyBinaryOp::Divide {
-        PyArrayDtype::Float
-    } else {
-        promote_dtype(left_dtype, right_dtype)
-    };
+    let left_is_weak = left_array.is_none() && registered_scalar(runtime, &left).is_none();
+    let right_is_weak = right_array.is_none() && registered_scalar(runtime, &right).is_none();
+    let promoted = promote_operands(left_dtype, right_dtype, left_is_weak, right_is_weak);
+    let dtype =
+        if operation == PyBinaryOp::Divide && dtype_kind(promoted).class != NumericClass::Float {
+            PyArrayDtype::Float64
+        } else {
+            promoted
+        };
     let count = element_count(&shape)?;
     reserve_values(runtime, count)?;
     let mut values = Vec::with_capacity(count);
@@ -1403,12 +1936,12 @@ fn operand_dtype(
         return Ok(dtype);
     }
     if let Some(value) = registered_scalar(runtime, &value) {
-        return Ok(promote_scalar_dtype(PyArrayDtype::Bool, value));
+        return Ok(value.dtype);
     }
     match runtime.kind(&value)? {
         PyKind::Bool => Ok(PyArrayDtype::Bool),
-        PyKind::Int => Ok(PyArrayDtype::Int),
-        PyKind::Float => Ok(PyArrayDtype::Float),
+        PyKind::Int => Ok(PyArrayDtype::Int64),
+        PyKind::Float => Ok(PyArrayDtype::Float64),
         _ => Err(PyError::type_error("numpy operand is not numeric")),
     }
 }
@@ -1537,17 +2070,22 @@ fn comparison(
     for_each_index(&shape, |index| {
         let left = broadcast_get(runtime, left, left_layout.as_ref(), index, &shape)?;
         let right = broadcast_get(runtime, right, right_layout.as_ref(), index, &shape)?;
-        let left = scalar(runtime, left)?.as_f64();
-        let right = scalar(runtime, right)?.as_f64();
+        let left = scalar(runtime, left)?;
+        let right = scalar(runtime, right)?;
+        let ordering = left.compare(right);
         let result = match operation {
-            CompareMap::Equal => left == right,
-            CompareMap::NotEqual => left != right,
-            CompareMap::Less => left < right,
-            CompareMap::LessEqual => left <= right,
-            CompareMap::Greater => left > right,
-            CompareMap::GreaterEqual => left >= right,
+            CompareMap::Equal => ordering == Some(Ordering::Equal),
+            CompareMap::NotEqual => ordering != Some(Ordering::Equal),
+            CompareMap::Less => ordering == Some(Ordering::Less),
+            CompareMap::LessEqual => {
+                matches!(ordering, Some(Ordering::Less | Ordering::Equal))
+            }
+            CompareMap::Greater => ordering == Some(Ordering::Greater),
+            CompareMap::GreaterEqual => {
+                matches!(ordering, Some(Ordering::Greater | Ordering::Equal))
+            }
         };
-        values.push(BOOL.pack(runtime, result)?);
+        values.push(pack_bool(runtime, result)?);
         Ok(())
     })?;
     runtime
@@ -1623,7 +2161,11 @@ fn unary_array(runtime: &mut dyn PyRuntime, array: PyArray, operation: UnaryMap)
         ));
     }
     let dtype = if float_output {
-        PyArrayDtype::Float
+        if input_dtype == PyArrayDtype::Float32 {
+            PyArrayDtype::Float32
+        } else {
+            PyArrayDtype::Float64
+        }
     } else {
         input_dtype
     };
@@ -1633,37 +2175,63 @@ fn unary_array(runtime: &mut dyn PyRuntime, array: PyArray, operation: UnaryMap)
     for_each_index(&layout.shape, |index| {
         let raw = runtime.array_get(array, index)?;
         let value = scalar(runtime, raw)?;
-        let mapped = match operation {
+        let mapped_value = match operation {
             UnaryMap::Positive => value,
-            UnaryMap::Negative => match value {
-                Scalar::Int(value) => Scalar::Int(value.wrapping_neg()),
-                Scalar::Float(value) => Scalar::Float(-value),
-                Scalar::Bool(_) => unreachable!(),
+            UnaryMap::Negative => match value.value {
+                ScalarValue::Signed(value) => Scalar {
+                    dtype,
+                    value: ScalarValue::Signed(value.wrapping_neg()),
+                },
+                ScalarValue::Unsigned(value) => Scalar {
+                    dtype,
+                    value: ScalarValue::Unsigned(0u128.wrapping_sub(value)),
+                },
+                ScalarValue::Float(value) => Scalar {
+                    dtype,
+                    value: ScalarValue::Float(-value),
+                },
+                ScalarValue::Bool(_) => unreachable!(),
             },
-            UnaryMap::Invert => match value {
-                Scalar::Bool(value) => Scalar::Bool(!value),
-                Scalar::Int(value) => Scalar::Int(!value),
-                Scalar::Float(_) => {
+            UnaryMap::Invert => match value.value {
+                ScalarValue::Bool(value) => Scalar {
+                    dtype,
+                    value: ScalarValue::Bool(!value),
+                },
+                ScalarValue::Signed(value) => Scalar {
+                    dtype,
+                    value: ScalarValue::Signed(!value),
+                },
+                ScalarValue::Unsigned(value) => Scalar {
+                    dtype,
+                    value: ScalarValue::Unsigned(!value),
+                },
+                ScalarValue::Float(_) => {
                     return Err(PyError::type_error(
                         "bitwise invert is not defined for floating arrays",
                     ))
                 }
             },
-            UnaryMap::Absolute => match value {
-                Scalar::Int(value) => Scalar::Int(value.wrapping_abs()),
-                Scalar::Float(value) => Scalar::Float(value.abs()),
-                Scalar::Bool(_) => unreachable!(),
+            UnaryMap::Absolute => match value.value {
+                ScalarValue::Signed(value) => Scalar {
+                    dtype,
+                    value: ScalarValue::Signed(value.wrapping_abs()),
+                },
+                ScalarValue::Float(value) => Scalar {
+                    dtype,
+                    value: ScalarValue::Float(value.abs()),
+                },
+                ScalarValue::Bool(_) | ScalarValue::Unsigned(_) => value,
             },
-            UnaryMap::Sqrt => Scalar::Float(value.as_f64().sqrt()),
-            UnaryMap::Exp => Scalar::Float(value.as_f64().exp()),
-            UnaryMap::Log => Scalar::Float(value.as_f64().ln()),
-            UnaryMap::Sin => Scalar::Float(value.as_f64().sin()),
-            UnaryMap::Cos => Scalar::Float(value.as_f64().cos()),
-            UnaryMap::Tan => Scalar::Float(value.as_f64().tan()),
-            UnaryMap::Floor => Scalar::Float(value.as_f64().floor()),
-            UnaryMap::Ceil => Scalar::Float(value.as_f64().ceil()),
+            UnaryMap::Sqrt => float_scalar(dtype, value.as_f64().sqrt()),
+            UnaryMap::Exp => float_scalar(dtype, value.as_f64().exp()),
+            UnaryMap::Log => float_scalar(dtype, value.as_f64().ln()),
+            UnaryMap::Sin => float_scalar(dtype, value.as_f64().sin()),
+            UnaryMap::Cos => float_scalar(dtype, value.as_f64().cos()),
+            UnaryMap::Tan => float_scalar(dtype, value.as_f64().tan()),
+            UnaryMap::Floor => float_scalar(dtype, value.as_f64().floor()),
+            UnaryMap::Ceil => float_scalar(dtype, value.as_f64().ceil()),
         };
-        values.push(pack_scalar(runtime, mapped, dtype)?);
+        values.push(pack_scalar(runtime, mapped_value, dtype)?);
         Ok(())
     })?;
     runtime.new_array(values, layout.shape, dtype)
@@ -1702,12 +2270,13 @@ pub(crate) fn slot_absolute(
 }
 
 fn pack_scalar(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult<PyValue> {
-    match (dtype, value) {
-        (PyArrayDtype::Bool, value) => BOOL.pack(runtime, value.truth()),
-        (PyArrayDtype::Int, Scalar::Int(value)) => INT64.pack(runtime, value),
-        (PyArrayDtype::Int, Scalar::Bool(value)) => INT64.pack(runtime, i64::from(value)),
-        (PyArrayDtype::Int, Scalar::Float(value)) => INT64.pack(runtime, value as i64),
-        (PyArrayDtype::Float, value) => FLOAT64.pack(runtime, value.as_f64()),
+    pack_wrapping(runtime, value, dtype)
+}
+
+fn float_scalar(dtype: PyArrayDtype, value: f64) -> Scalar {
+    Scalar {
+        dtype,
+        value: ScalarValue::Float(value),
     }
 }
 
@@ -1774,7 +2343,12 @@ fn elementwise_extreme(
     )?;
     let left_dtype = operand_dtype(runtime, left, left_info.as_ref().map(|value| value.1))?;
     let right_dtype = operand_dtype(runtime, right, right_info.as_ref().map(|value| value.1))?;
-    let dtype = promote_dtype(left_dtype, right_dtype);
+    let dtype = promote_operands(
+        left_dtype,
+        right_dtype,
+        left_info.is_none() && registered_scalar(runtime, &left).is_none(),
+        right_info.is_none() && registered_scalar(runtime, &right).is_none(),
+    );
     let count = element_count(&shape)?;
     reserve_values(runtime, count)?;
     let mut values = Vec::with_capacity(count);
@@ -1793,13 +2367,15 @@ fn elementwise_extreme(
             index,
             &shape,
         )?;
-        let ordering = scalar(runtime, left)?
-            .as_f64()
-            .total_cmp(&scalar(runtime, right)?.as_f64());
-        let selected = if (ordering == Ordering::Greater) == maximum {
-            left
-        } else {
-            right
+        let left_scalar = scalar(runtime, left)?;
+        let right_scalar = scalar(runtime, right)?;
+        let selected = match left_scalar.compare(right_scalar) {
+            Some(Ordering::Greater) if maximum => left,
+            Some(Ordering::Less) if !maximum => left,
+            Some(Ordering::Equal) => left,
+            None if left_scalar.is_nan() => left,
+            None if right_scalar.is_nan() => right,
+            _ => right,
         };
         values.push(convert(runtime, selected, dtype)?);
         Ok(())
@@ -1844,7 +2420,12 @@ fn where_(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     )?;
     let left_dtype = operand_dtype(runtime, left, left_info.as_ref().map(|value| value.1))?;
     let right_dtype = operand_dtype(runtime, right, right_info.as_ref().map(|value| value.1))?;
-    let dtype = promote_dtype(left_dtype, right_dtype);
+    let dtype = promote_operands(
+        left_dtype,
+        right_dtype,
+        left_info.is_none() && registered_scalar(runtime, &left).is_none(),
+        right_info.is_none() && registered_scalar(runtime, &right).is_none(),
+    );
     let count = element_count(&shape)?;
     reserve_values(runtime, count)?;
     let mut values = Vec::with_capacity(count);
@@ -1884,12 +2465,10 @@ fn tolist_axis(
 ) -> PyResult {
     if prefix.len() == shape.len() {
         let value = runtime.array_get(array, prefix)?;
-        return Ok(match registered_scalar(runtime, &value) {
-            Some(Scalar::Bool(value)) => Value::Bool(value),
-            Some(Scalar::Int(value)) => Value::Int(value),
-            Some(Scalar::Float(value)) => Value::Float(value),
-            None => value,
-        });
+        return match registered_scalar(runtime, &value) {
+            Some(value) => scalar_to_python(runtime, value),
+            None => Ok(value),
+        };
     }
     let axis = prefix.len();
     reserve_values(runtime, shape[axis])?;
@@ -1901,6 +2480,20 @@ fn tolist_axis(
         prefix.pop();
     }
     runtime.new_list(values)
+}
+
+fn scalar_to_python(runtime: &mut dyn PyRuntime, value: Scalar) -> PyResult {
+    match value.value {
+        ScalarValue::Bool(value) => Ok(Value::Bool(value)),
+        ScalarValue::Signed(value) => i64::try_from(value)
+            .map(Value::Int)
+            .map_err(|_| PyError::overflow_error("signed scalar exceeds Python integer range")),
+        ScalarValue::Unsigned(value) => match i64::try_from(value) {
+            Ok(value) => Ok(Value::Int(value)),
+            Err(_) => runtime.new_integer(&value.to_string()),
+        },
+        ScalarValue::Float(value) => Ok(Value::Float(value)),
+    }
 }
 
 fn method_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -2561,40 +3154,44 @@ fn arg_reduce(
             let mut index = output_index.to_vec();
             index.insert(axis, 0);
             let first = runtime.array_get(array, &index)?;
-            let mut best = scalar(runtime, first)?.as_f64();
+            let mut best = scalar(runtime, first)?;
             for selected in 1..axis_length {
                 index[axis] = selected;
                 let raw = runtime.array_get(array, &index)?;
-                let candidate = scalar(runtime, raw)?.as_f64();
-                if (maximum && candidate > best) || (!maximum && candidate < best) {
+                let candidate = scalar(runtime, raw)?;
+                let ordering = candidate.compare(best);
+                if (maximum && ordering == Some(Ordering::Greater))
+                    || (!maximum && ordering == Some(Ordering::Less))
+                {
                     best = candidate;
                     winner = selected;
                 }
             }
-            values.push(INT64.pack(runtime, winner as i64)?);
+            values.push(pack_index(runtime, winner)?);
             Ok(())
         })?;
-        return runtime.new_array(values, output_shape, PyArrayDtype::Int);
+        return runtime.new_array(values, output_shape, PyArrayDtype::Int64);
     }
     let mut winner = None;
-    let mut best = 0.0;
+    let mut best = None;
     let mut position = 0usize;
     for_each_index(&shape, |index| {
         let raw = runtime.array_get(array, index)?;
-        let candidate = scalar(runtime, raw)?.as_f64();
-        if winner.is_none() || (maximum && candidate > best) || (!maximum && candidate < best) {
+        let candidate = scalar(runtime, raw)?;
+        let ordering = best.and_then(|best| candidate.compare(best));
+        if winner.is_none()
+            || (maximum && ordering == Some(Ordering::Greater))
+            || (!maximum && ordering == Some(Ordering::Less))
+        {
             winner = Some(position);
-            best = candidate;
+            best = Some(candidate);
         }
         position += 1;
         Ok(())
     })?;
-    INT64.pack(
+    pack_index(
         runtime,
-        i64::try_from(
-            winner.ok_or_else(|| PyError::value_error("arg reduction of an empty sequence"))?,
-        )
-        .map_err(|_| PyError::overflow_error("array index overflow"))?,
+        winner.ok_or_else(|| PyError::value_error("arg reduction of an empty sequence"))?,
     )
 }
 
@@ -2636,20 +3233,16 @@ fn cumulative(
         let flattened = reshape(runtime, flattened, vec![count])?.cast(runtime)?;
         (flattened, vec![count], 0)
     };
-    let output_dtype = if dtype == PyArrayDtype::Bool {
-        PyArrayDtype::Int
+    let reduction = if product {
+        Reduction::Product
     } else {
-        dtype
+        Reduction::Sum
     };
+    let output_dtype = reduction_dtype(dtype, reduction);
     let count = element_count(&shape)?;
     reserve_values(runtime, count)?;
     let mut values = Vec::with_capacity(count);
     for_each_index(&shape, |index| {
-        let reduction = if product {
-            Reduction::Product
-        } else {
-            Reduction::Sum
-        };
         let mut total = reduction_identity(runtime, output_dtype, reduction)?;
         for selected in 0..=index[axis] {
             let mut source_index = index.to_vec();
@@ -2702,12 +3295,14 @@ fn statistic(
 ) -> PyResult {
     args.expect_positional(name, 0, 1)?;
     args.reject_unknown_keywords(name, &["axis"])?;
+    let (layout, input_dtype) = runtime.array_layout(array)?;
+    let shape = layout.shape;
+    let output_dtype = statistic_dtype(input_dtype, statistic_kind);
     let axis_value = args
         .positional()
         .first()
         .copied()
         .or(args.keyword(name, "axis")?.copied());
-    let shape = runtime.array_layout(array)?.0.shape;
     if let Some(axis) = axis_value {
         let PyIndex(axis) = axis.cast(runtime)?;
         return statistic_axis(
@@ -2716,6 +3311,7 @@ fn statistic(
             &shape,
             normalize_axis(axis, shape.len())?,
             statistic_kind,
+            output_dtype,
         );
     }
     let mut state = StatisticState::new(runtime, statistic_kind, element_count(&shape)?)?;
@@ -2723,7 +3319,7 @@ fn statistic(
         let value = runtime.array_get(array, index)?;
         state.observe(runtime, value)
     })?;
-    state.finish(runtime, statistic_kind)
+    state.finish(runtime, statistic_kind, output_dtype)
 }
 
 fn statistic_axis(
@@ -2732,6 +3328,7 @@ fn statistic_axis(
     shape: &[usize],
     axis: usize,
     statistic_kind: Statistic,
+    output_dtype: PyArrayDtype,
 ) -> PyResult {
     let mut output_shape = shape.to_vec();
     let axis_length = output_shape.remove(axis);
@@ -2746,15 +3343,20 @@ fn statistic_axis(
             let value = runtime.array_get(array, &index)?;
             state.observe(runtime, value)?;
         }
-        values.push(state.finish(runtime, statistic_kind)?);
+        values.push(state.finish(runtime, statistic_kind, output_dtype)?);
         Ok(())
     })?;
-    let dtype = if matches!(statistic_kind, Statistic::All | Statistic::Any) {
+    runtime.new_array(values, output_shape, output_dtype)
+}
+
+fn statistic_dtype(dtype: PyArrayDtype, statistic: Statistic) -> PyArrayDtype {
+    if matches!(statistic, Statistic::All | Statistic::Any) {
         PyArrayDtype::Bool
+    } else if dtype == PyArrayDtype::Float32 {
+        PyArrayDtype::Float32
     } else {
-        PyArrayDtype::Float
-    };
-    runtime.new_array(values, output_shape, dtype)
+        PyArrayDtype::Float64
+    }
 }
 
 struct StatisticState {
@@ -2811,23 +3413,25 @@ impl StatisticState {
         mut self,
         runtime: &mut dyn PyRuntime,
         statistic_kind: Statistic,
+        output_dtype: PyArrayDtype,
     ) -> PyResult<PyValue> {
         match statistic_kind {
-            Statistic::All => BOOL.pack(runtime, self.all),
-            Statistic::Any => BOOL.pack(runtime, self.any),
+            Statistic::All => pack_bool(runtime, self.all),
+            Statistic::Any => pack_bool(runtime, self.any),
             Statistic::Variance | Statistic::StdDev => {
                 let variance = if self.count == 0 {
                     f64::NAN
                 } else {
                     self.squared_deviation / self.count as f64
                 };
-                FLOAT64.pack(
+                pack_float(
                     runtime,
                     if matches!(statistic_kind, Statistic::StdDev) {
                         variance.sqrt()
                     } else {
                         variance
                     },
+                    output_dtype,
                 )
             }
             Statistic::Median => {
@@ -2845,7 +3449,7 @@ impl StatisticState {
                 } else {
                     ordered[middle]
                 };
-                FLOAT64.pack(runtime, value)
+                pack_float(runtime, value, output_dtype)
             }
         }
     }
@@ -2954,7 +3558,14 @@ fn reduce_values(
         if count == 0 {
             return Err(PyError::value_error("mean of empty array"));
         }
-        runtime.binary_op(PyBinaryOp::Divide, value, Value::Int(count as i64))
+        let count = i64::try_from(count)
+            .map_err(|_| PyError::overflow_error("array length exceeds numpy.int64"))?;
+        let divisor = convert(
+            runtime,
+            Value::Int(count),
+            reduction_dtype(dtype, reduction),
+        )?;
+        runtime.binary_op(PyBinaryOp::Divide, value, divisor)
     } else {
         Ok(value)
     }
@@ -3015,7 +3626,10 @@ fn reduce_axis(
             if axis_length == 0 {
                 return Err(PyError::value_error("mean of empty array"));
             }
-            value = runtime.binary_op(PyBinaryOp::Divide, value, Value::Int(axis_length as i64))?;
+            let divisor = i64::try_from(axis_length)
+                .map_err(|_| PyError::overflow_error("array length exceeds numpy.int64"))?;
+            let divisor = convert(runtime, Value::Int(divisor), output_dtype)?;
+            value = runtime.binary_op(PyBinaryOp::Divide, value, divisor)?;
         }
         values.push(value);
         Ok(())
@@ -3024,9 +3638,21 @@ fn reduce_axis(
 }
 
 fn reduction_dtype(dtype: PyArrayDtype, reduction: Reduction) -> PyArrayDtype {
+    let kind = dtype_kind(dtype);
     match reduction {
-        Reduction::Mean => PyArrayDtype::Float,
-        Reduction::Sum | Reduction::Product if dtype == PyArrayDtype::Bool => PyArrayDtype::Int,
+        Reduction::Mean if dtype == PyArrayDtype::Float32 => PyArrayDtype::Float32,
+        Reduction::Mean => PyArrayDtype::Float64,
+        Reduction::Sum | Reduction::Product
+            if matches!(kind.class, NumericClass::Bool | NumericClass::Signed)
+                && kind.bits < 64 =>
+        {
+            PyArrayDtype::Int64
+        }
+        Reduction::Sum | Reduction::Product
+            if kind.class == NumericClass::Unsigned && kind.bits < 64 =>
+        {
+            PyArrayDtype::UInt64
+        }
         _ => dtype,
     }
 }
@@ -3037,11 +3663,18 @@ fn reduction_identity(
     reduction: Reduction,
 ) -> PyResult<PyValue> {
     let one = matches!(reduction, Reduction::Product);
-    match reduction_dtype(dtype, reduction) {
-        PyArrayDtype::Bool => BOOL.pack(runtime, one),
-        PyArrayDtype::Int => INT64.pack(runtime, i64::from(one)),
-        PyArrayDtype::Float => FLOAT64.pack(runtime, f64::from(one)),
-    }
+    let dtype = reduction_dtype(dtype, reduction);
+    numeric_identity(runtime, dtype, one)
+}
+
+fn numeric_identity(runtime: &dyn PyRuntime, dtype: PyArrayDtype, one: bool) -> PyResult<PyValue> {
+    let value = match dtype_kind(dtype).class {
+        NumericClass::Bool => ScalarValue::Bool(one),
+        NumericClass::Signed => ScalarValue::Signed(i128::from(one)),
+        NumericClass::Unsigned => ScalarValue::Unsigned(u128::from(one)),
+        NumericClass::Float => ScalarValue::Float(f64::from(one)),
+    };
+    pack_wrapping(runtime, Scalar { dtype, value }, dtype)
 }
 
 fn dot(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -3058,7 +3691,7 @@ fn dot(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         if left_shape[0] != right_shape[0] {
             return Err(PyError::value_error("shapes are not aligned"));
         }
-        let mut total = reduction_identity(runtime, dtype, Reduction::Sum)?;
+        let mut total = numeric_identity(runtime, dtype, false)?;
         for inner in 0..left_shape[0] {
             let left_value = runtime.array_get(left, &[inner])?;
             let right_value = runtime.array_get(right, &[inner])?;
@@ -3100,7 +3733,7 @@ fn inner(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let mut values = Vec::with_capacity(count);
     let left_outer_rank = left_layout.shape.len() - 1;
     for_each_index(&shape, |output| {
-        let mut total = reduction_identity(runtime, dtype, Reduction::Sum)?;
+        let mut total = numeric_identity(runtime, dtype, false)?;
         for contracted in 0..inner {
             let mut left_index = output[..left_outer_rank].to_vec();
             left_index.push(contracted);
@@ -3177,7 +3810,7 @@ fn matmul_arrays(runtime: &mut dyn PyRuntime, left: PyArray, right: PyArray) -> 
     let dtype = product_dtype(left_dtype, right_dtype);
     for row in 0..shape[0] {
         for column in 0..shape[1] {
-            let mut total = reduction_identity(runtime, dtype, Reduction::Sum)?;
+            let mut total = numeric_identity(runtime, dtype, false)?;
             for inner in 0..left_shape[1] {
                 runtime.charge_cpu(1)?;
                 let left_value = runtime.array_get(left, &[row, inner])?;
@@ -3250,5 +3883,69 @@ mod tests {
     #[test]
     fn contiguous_layout_is_row_major() {
         assert_eq!(contiguous_strides(&[2, 3, 4]).unwrap(), vec![12, 4, 1]);
+    }
+
+    #[test]
+    fn promotion_uses_numeric_class_and_width() {
+        for (left, right, expected) in [
+            (PyArrayDtype::Int8, PyArrayDtype::Int8, PyArrayDtype::Int8),
+            (PyArrayDtype::Int8, PyArrayDtype::UInt8, PyArrayDtype::Int16),
+            (
+                PyArrayDtype::Int32,
+                PyArrayDtype::UInt32,
+                PyArrayDtype::Int64,
+            ),
+            (
+                PyArrayDtype::Int64,
+                PyArrayDtype::UInt64,
+                PyArrayDtype::Float64,
+            ),
+            (
+                PyArrayDtype::Float32,
+                PyArrayDtype::Int16,
+                PyArrayDtype::Float32,
+            ),
+            (
+                PyArrayDtype::Float32,
+                PyArrayDtype::Int32,
+                PyArrayDtype::Float64,
+            ),
+            (
+                PyArrayDtype::Float32,
+                PyArrayDtype::Float64,
+                PyArrayDtype::Float64,
+            ),
+        ] {
+            assert_eq!(promote_dtype(left, right), expected);
+            assert_eq!(promote_dtype(right, left), expected);
+        }
+    }
+
+    #[test]
+    fn numeric_registration_ids_and_aliases_are_unambiguous() {
+        for (index, left) in NUMERIC_KINDS.iter().enumerate() {
+            for right in &NUMERIC_KINDS[index + 1..] {
+                assert_ne!(left.dtype, right.dtype);
+                for alias in left.aliases {
+                    assert!(!right.aliases.contains(alias), "duplicate alias {alias}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn python_scalars_are_weak_against_registered_dtypes() {
+        assert_eq!(
+            promote_operands(PyArrayDtype::Int8, PyArrayDtype::Int64, false, true,),
+            PyArrayDtype::Int8
+        );
+        assert_eq!(
+            promote_operands(PyArrayDtype::Float32, PyArrayDtype::Float64, false, true,),
+            PyArrayDtype::Float32
+        );
+        assert_eq!(
+            promote_operands(PyArrayDtype::Int8, PyArrayDtype::Float64, false, true,),
+            PyArrayDtype::Float64
+        );
     }
 }

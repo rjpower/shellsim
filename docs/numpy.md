@@ -22,12 +22,11 @@ objects. Contiguous arrays use row-major strides. Reshape and transpose return v
 layout permits it; operations may make a simple contiguous copy when they cannot express a result
 as a view.
 
-Array elements are ordinary inline `PyValue`s, not arena objects. NumPy registers opaque
-`numpy.bool_`, `numpy.int64`, and `numpy.float64` value kinds when the interpreter is built. A
-registration supplies a constructor and protocol slots; only the NumPy module can pack or unpack
-its payload. The VM stores the payload and a registered-kind number, then dispatches every
-operation through the registered functions. It has no NumPy-specific scalar tags, coercions, or
-arithmetic branches.
+Array elements are ordinary inline `PyValue`s, not arena objects. NumPy registers each scalar kind
+from one local descriptor table. A row supplies the dtype, numeric class, width, constructor,
+aliases, and shared protocol slots; only the NumPy module can pack or unpack its payload. The VM
+stores the payload and a registered-kind number, then dispatches every operation through the
+registered functions. It has no NumPy-specific scalar tags, coercions, or arithmetic branches.
 
 ## Kernel model
 
@@ -65,21 +64,39 @@ The supported surface includes:
   `matmul`;
 - module functions that delegate to the corresponding array behavior.
 
-Numeric storage is type-erased but numeric behavior is not accidental. Integer elements are
-signed 64-bit values and arithmetic wraps at 64 bits instead of promoting to Python's unbounded
-integer. Float elements are IEEE-754 doubles. Array access returns the corresponding registered
-NumPy scalar; `tolist` converts elements back to ordinary Python scalars. The `dtype` argument
-accepts `bool`, `int`, `int64`, `float`, and `float64` names and type objects.
+Numeric storage is type-erased but numeric behavior is not accidental. The supported dtype table
+is:
 
-Explicitly unsupported are NumPy's C ABI, buffers, structured/object/string dtypes, masked arrays,
-arrays above 64 dimensions, multidimensional slice syntax, partial basic-index assignment, mixed
-advanced indices inside a tuple, axis tuples and `keepdims` in reductions, batched matrix
-multiplication, `tensordot`, generalized `einsum`, linear algebra factorizations, random
-distributions, persistence formats, and performance guarantees. `einsum` is omitted because a
-coherent implementation requires label parsing, diagonal selection, contraction, output ordering,
-broadcasting, and ellipsis handling; a special-case spelling of matrix multiplication would not be
-an intelligible boundary. Unsupported arguments and operations fail rather than silently changing
-meaning.
+| Class | Canonical dtypes | Exported aliases | String codes |
+| --- | --- | --- | --- |
+| Boolean | `bool_` | `bool` | `bool`, `bool_`, `?` |
+| Signed integer | `int8`, `int16`, `int32`, `int64` | `byte`, `short`, `intc`, `int_`, `intp`, `longlong` | `i1`, `i2`, `i4`, `i8` |
+| Unsigned integer | `uint8`, `uint16`, `uint32`, `uint64` | `ubyte`, `ushort`, `uintc`, `uint`, `uintp`, `ulonglong` | `u1`, `u2`, `u4`, `u8` |
+| Floating point | `float32`, `float64` | `single`, `double` | `f4`, `f8` |
+
+Integer arithmetic wraps at its result width instead of promoting to Python's unbounded integer.
+Conversions reject values outside the requested integer dtype. Promotion chooses the wider type
+within one integer class; mixed signed and unsigned operands use the smallest signed type that can
+represent both, or `float64` when none can. `float32` combined with an integer wider than 16 bits
+promotes to `float64`. Python scalars are weak operands: integer scalars preserve an integer or
+floating array dtype when the value fits, and floating scalars preserve a floating array dtype.
+An out-of-range Python integer is rejected instead of wrapped. Integer `sum`, `prod`, `cumsum`,
+and `cumprod` widen inputs below 64 bits to `int64` or `uint64`; `float32` floating reductions
+remain `float32`. Floating unary functions preserve `float32` inputs and use `float64` for integer
+inputs because `float16` is outside the supported dtype boundary.
+
+Array access returns the corresponding registered NumPy scalar; `tolist` converts elements back
+to ordinary Python scalars, including the full `uint64` range.
+
+Explicitly unsupported are `float16`, complex numbers, NumPy's C ABI, buffers,
+structured/object/string dtypes, masked arrays, arrays above 64 dimensions, multidimensional slice
+syntax, partial basic-index assignment, mixed advanced indices inside a tuple, axis tuples and
+`keepdims` in reductions, batched matrix multiplication, `tensordot`, generalized `einsum`, linear
+algebra factorizations, random distributions, persistence formats, and performance guarantees.
+`einsum` is omitted because a coherent implementation requires label parsing, diagonal selection,
+contraction, output ordering, broadcasting, and ellipsis handling; a special-case spelling of
+matrix multiplication would not be an intelligible boundary. Unsupported arguments and operations
+fail rather than silently changing meaning.
 
 ## Safety and accounting
 

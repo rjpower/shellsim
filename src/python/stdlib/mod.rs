@@ -34,12 +34,8 @@ mod zlib;
 use super::native::{ModuleDef, ValueKindDef};
 
 /// Collect inline value registrations without teaching the VM about module-owned types.
-pub(super) fn value_kinds() -> [&'static ValueKindDef; 3] {
-    [
-        &numpy::BOOL.definition,
-        &numpy::INT64.definition,
-        &numpy::FLOAT64.definition,
-    ]
+pub(super) fn value_kinds() -> impl Iterator<Item = &'static ValueKindDef> {
+    numpy::value_kinds()
 }
 
 /// Resolve a capability-free stdlib module implemented in ordinary Python source.
