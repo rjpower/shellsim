@@ -346,6 +346,7 @@ enum ExecResult {
 #[derive(Clone)]
 pub(crate) struct PythonContinuation {
     argv: Vec<String>,
+    stdin: Vec<u8>,
     state: ReplState,
     program: vm::VmProgram,
     stdout: Vec<u8>,
@@ -378,7 +379,10 @@ impl PythonContinuation {
     fn poll_with_mode(&mut self, interp: &mut Interp, mode: vm::VmMode) -> PythonPoll {
         let result = match self.program.poll(
             interp,
-            &self.argv,
+            vm::ProcessInput {
+                argv: &self.argv,
+                stdin: &self.stdin,
+            },
             &mut self.state,
             mode,
             &mut self.stdout,
@@ -439,20 +443,24 @@ pub(crate) fn start_python(
         return PythonCommandStart::Ready(run_module(interp, &args[1..], out, err));
     }
 
-    let (source, py_argv) = if args.first().map(String::as_str) == Some("-c") {
+    let (source, py_argv, execution_stdin) = if args.first().map(String::as_str) == Some("-c") {
         let Some(source) = args.get(1).cloned() else {
             err.extend_from_slice(b"python: argument expected for the -c option\n");
             return PythonCommandStart::Ready(2);
         };
         let mut py_argv = vec!["-c".to_string()];
         py_argv.extend_from_slice(args.get(2..).unwrap_or_default());
-        (source, py_argv)
+        (source, py_argv, stdin)
     } else if args.first().map(String::as_str) == Some("-")
         || (args.is_empty() && !stdin.is_empty())
     {
         let mut py_argv = vec![if args.is_empty() { "" } else { "-" }.to_string()];
         py_argv.extend_from_slice(args.get(1..).unwrap_or_default());
-        (String::from_utf8_lossy(&stdin).into_owned(), py_argv)
+        (
+            String::from_utf8_lossy(&stdin).into_owned(),
+            py_argv,
+            Vec::new(),
+        )
     } else if args.is_empty() {
         let mut state = ReplState::default();
         state.import_paths.push(interp.cwd.clone());
@@ -476,7 +484,7 @@ pub(crate) fn start_python(
         };
         let mut py_argv = vec![script.clone()];
         py_argv.extend_from_slice(&args[1..]);
-        (source, py_argv)
+        (source, py_argv, stdin)
     };
 
     let scratch = 10 * 1024 + source.len() as u64;
@@ -517,6 +525,7 @@ pub(crate) fn start_python(
     };
     PythonCommandStart::Running(Box::new(PythonContinuation {
         argv: py_argv,
+        stdin: execution_stdin,
         state,
         program,
         stdout: Vec::new(),

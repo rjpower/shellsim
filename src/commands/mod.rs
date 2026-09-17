@@ -22,7 +22,9 @@ pub use crate::telemetry::CommandTrust as Trust;
 mod archives;
 mod awk;
 mod builtins;
+mod dd;
 mod echo;
+mod find;
 mod fs;
 mod git;
 mod hashing;
@@ -40,6 +42,7 @@ mod sort;
 mod system;
 mod tarcmd;
 mod text;
+mod unavailable;
 pub mod util;
 mod zipcmd;
 
@@ -271,12 +274,15 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     builtins::register(&mut m);
     archives::register(&mut m);
     awk::register(&mut m);
+    dd::register(&mut m);
     echo::register(&mut m);
+    find::register(&mut m);
     printf::register(&mut m);
     sort::register(&mut m);
     system::register(&mut m);
     tarcmd::register(&mut m);
     text::register(&mut m);
+    unavailable::register(&mut m);
     fs::register(&mut m);
     git::register(&mut m);
     hashing::register(&mut m);
@@ -375,6 +381,7 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
             | "cksum"
             | "column"
             | "cut"
+            | "dd"
             | "envsubst"
             | "expand"
             | "fgrep"

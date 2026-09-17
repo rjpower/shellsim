@@ -47,6 +47,15 @@ struct MountMetadata {
     skipped_directories: Vec<String>,
 }
 
+struct MetadataStart {
+    command: usize,
+    dropped_commands: u64,
+    unsupported: usize,
+    dropped_unsupported: u64,
+    invocation: u64,
+    dropped_invocations: u64,
+}
+
 /// One persistent simulated machine owned by Python.
 #[pyclass(module = "shellsim._native")]
 struct NativeEnvironment {
@@ -79,6 +88,31 @@ impl NativeEnvironment {
                 let mut environment = self.lock_environment()?;
                 on_worker(&mut environment, move |environment| {
                     Ok(run_action(environment, &source, &stdin))
+                })
+            })
+            .map_err(SimulationError::new_err)?;
+        let metadata = serde_json::to_string(&metadata)
+            .map_err(|error| SimulationError::new_err(error.to_string()))?;
+        Ok((
+            metadata,
+            PyBytes::new(py, &stdout).unbind(),
+            PyBytes::new(py, &stderr).unbind(),
+        ))
+    }
+
+    /// Execute Python source directly without passing it through the shell parser.
+    fn run_python(
+        &self,
+        py: Python<'_>,
+        source: String,
+        argv: Vec<String>,
+        stdin: Vec<u8>,
+    ) -> PyResult<(String, Py<PyBytes>, Py<PyBytes>)> {
+        let (metadata, stdout, stderr) = py
+            .detach(|| {
+                let mut environment = self.lock_environment()?;
+                on_worker(&mut environment, move |environment| {
+                    Ok(run_python_action(environment, source, argv, stdin))
                 })
             })
             .map_err(SimulationError::new_err)?;
@@ -188,35 +222,70 @@ fn run_action(
     source: &str,
     stdin: &[u8],
 ) -> (RunMetadata, Vec<u8>, Vec<u8>) {
-    let command_start = environment.cmd_trace.len();
-    let dropped_commands_start = environment.cmd_trace.dropped();
-    let unsupported_start = environment.unsupported.len();
-    let dropped_unsupported_start = environment.unsupported.dropped();
-    let invocation_start = environment.invocations.next_sequence();
-    let dropped_invocations_start = environment.invocations.dropped();
+    let start = metadata_start(environment);
     let (outcome, stdout, stderr) = environment.run_script_capture_with_stdin(source, stdin);
-    let invocations = environment.invocations.events_since(invocation_start);
-    let metadata = RunMetadata {
+    (metadata_finish(environment, outcome, start), stdout, stderr)
+}
+
+fn run_python_action(
+    environment: &mut shellsim::Environment,
+    source: String,
+    arguments: Vec<String>,
+    stdin: Vec<u8>,
+) -> (RunMetadata, Vec<u8>, Vec<u8>) {
+    let start = metadata_start(environment);
+    let mut argv = vec!["python3.14".to_string(), "-c".to_string(), source];
+    argv.extend(arguments);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = shellsim::exec::exec(
+        environment,
+        &shellsim::shell::Node::ArgvCommand(argv),
+        stdin,
+        &mut stdout,
+        &mut stderr,
+    );
+    let outcome = environment.outcome(status);
+    (metadata_finish(environment, outcome, start), stdout, stderr)
+}
+
+fn metadata_start(environment: &shellsim::Environment) -> MetadataStart {
+    MetadataStart {
+        command: environment.cmd_trace.len(),
+        dropped_commands: environment.cmd_trace.dropped(),
+        unsupported: environment.unsupported.len(),
+        dropped_unsupported: environment.unsupported.dropped(),
+        invocation: environment.invocations.next_sequence(),
+        dropped_invocations: environment.invocations.dropped(),
+    }
+}
+
+fn metadata_finish(
+    environment: &shellsim::Environment,
+    outcome: RunOutcome,
+    start: MetadataStart,
+) -> RunMetadata {
+    let invocations = environment.invocations.events_since(start.invocation);
+    RunMetadata {
         outcome,
-        unsupported: environment.unsupported.values_since(unsupported_start),
+        unsupported: environment.unsupported.values_since(start.unsupported),
         dropped_unsupported: environment
             .unsupported
             .dropped()
-            .saturating_sub(dropped_unsupported_start),
-        commands: environment.cmd_trace.values_since(command_start),
+            .saturating_sub(start.dropped_unsupported),
+        commands: environment.cmd_trace.values_since(start.command),
         dropped_commands: environment
             .cmd_trace
             .dropped()
-            .saturating_sub(dropped_commands_start),
+            .saturating_sub(start.dropped_commands),
         unsupported_commands: invocation_names(&invocations, CommandTrust::Unsupported),
         partial_commands: invocation_names(&invocations, CommandTrust::Partial),
         invocations,
         dropped_invocations: environment
             .invocations
             .dropped()
-            .saturating_sub(dropped_invocations_start),
-    };
-    (metadata, stdout, stderr)
+            .saturating_sub(start.dropped_invocations),
+    }
 }
 
 fn invocation_names(events: &[InvocationEvent], trust: CommandTrust) -> Vec<String> {

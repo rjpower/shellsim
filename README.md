@@ -84,6 +84,16 @@ assert result.returncode == 0
 assert result.stdout == b"42\n"
 ```
 
+Python source can bypass shell parsing and quoting while using the same isolated runtime:
+
+```python
+result = shellsim.python.run("print(sum(range(10)))", argv=["example"])
+result.check_returncode()
+
+environment = shellsim.Environment()
+result = environment.run_python("print('persistent VFS, fresh Python interpreter')")
+```
+
 ## Agent harness
 
 `shellsim serve --root ./project` runs a persistent newline-delimited JSON session. It supports

@@ -242,6 +242,7 @@ pub(super) enum PyMarker {
     EnumBase,
     UnitTestBase,
     Environment,
+    Stdin,
     Stdout,
     Stderr,
     ArrayType,
@@ -374,6 +375,13 @@ pub(super) trait PyRuntime {
     fn integer_text(&self, value: &PyValue) -> PyResult<Option<String>>;
     /// Write only to an interpreter-owned simulated stream marker.
     fn write_stream(&mut self, stream: &PyValue, text: &str) -> PyResult<usize>;
+    /// Read text only from the invocation's modeled standard-input stream.
+    fn read_stream(
+        &mut self,
+        stream: &PyValue,
+        size: Option<usize>,
+        line: bool,
+    ) -> PyResult<String>;
     fn truth(&mut self, value: &PyValue) -> PyResult<bool>;
     fn display(&mut self, value: &PyValue) -> PyResult<String>;
     fn repr(&mut self, value: &PyValue) -> PyResult<String>;
