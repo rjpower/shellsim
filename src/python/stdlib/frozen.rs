@@ -21,6 +21,8 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "logging" => Some(include_str!("source/logging.py")),
         "os" => Some(include_str!("source/os.py")),
         "pathlib" => Some(include_str!("source/pathlib.py")),
+        "random" => Some(include_str!("source/random.py")),
+        "statistics" => Some(include_str!("source/statistics.py")),
         "struct" => Some(include_str!("source/struct.py")),
         "subprocess" => Some(include_str!("source/subprocess.py")),
         "tempfile" => Some(include_str!("source/tempfile.py")),

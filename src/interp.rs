@@ -1,5 +1,6 @@
 //! Interpreter state shared across the shell executor and all commands.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 
@@ -139,6 +140,8 @@ pub struct ProcessState {
     pub(crate) aliases: HashMap<String, AliasDefinition>,
     /// `$?`
     pub last_status: i32,
+    /// Deterministic state for Bash's special `$RANDOM` parameter.
+    random_state: Cell<u32>,
     /// positional parameters `$1 $2 ... $@`
     pub positional: Vec<String>,
     /// `set -e` / `set -u` / `set -x`
@@ -309,6 +312,7 @@ impl ProcessState {
             local_scopes: self.local_scopes.clone(),
             aliases: self.aliases.clone(),
             last_status: self.last_status,
+            random_state: Cell::new(self.random_state.get()),
             positional: self.positional.clone(),
             opt_errexit: self.opt_errexit,
             opt_nounset: self.opt_nounset,
@@ -529,6 +533,7 @@ impl Environment {
                 local_scopes: Vec::new(),
                 aliases: HashMap::new(),
                 last_status: 0,
+                random_state: Cell::new(1),
                 positional: Vec::new(),
                 opt_errexit: false,
                 opt_nounset: false,
@@ -1396,6 +1401,15 @@ impl Environment {
             "$" => Some(self.shell_pid.to_string()),
             "PPID" => Some(self.ppid.to_string()),
             "BASHPID" => Some(self.pid.to_string()),
+            "RANDOM" => {
+                let state = self
+                    .random_state
+                    .get()
+                    .wrapping_mul(1_103_515_245)
+                    .wrapping_add(12_345);
+                self.random_state.set(state);
+                Some(((state >> 16) & 0x7fff).to_string())
+            }
             "#" => Some(self.positional.len().to_string()),
             "PWD" => Some(self.cwd.clone()),
             "@" | "*" => Some(self.positional.join(" ")),
@@ -1417,6 +1431,13 @@ impl Environment {
 
     pub fn set_var(&mut self, name: &str, val: impl Into<String>) {
         let val = val.into();
+        if name == "RANDOM" {
+            let seed = val.parse::<u32>().unwrap_or(0);
+            self.random_state.set(seed);
+            self.vars.remove(name);
+            self.arrays.remove(name);
+            return;
+        }
         if name == "PWD" {
             self.cwd = val.clone();
         }

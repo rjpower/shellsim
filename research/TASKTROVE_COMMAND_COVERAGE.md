@@ -39,10 +39,11 @@ in one persistent shellsim environment, resolving dynamic executable names and t
 actual data flow. Use this census afterward to explain unreached paths and estimate how frequently
 a proposed interface occurs in source.
 
-The pinned runtime sample records 47 clean golden-solution exits, 38 explicit solution boundaries,
-12 other nonzero solution exits, and three solution resource stops. One verifier writes a positive
-partial reward. Those observations supersede any optimistic reading of the static
-`supported_surface` count below.
+After the cumulative compatibility batches, the pinned runtime sample records 49 clean
+golden-solution exits, 36 explicit solution boundaries, 12 other nonzero solution exits, and three
+solution resource stops. Eighteen selected verifiers and 16 unmodified verifier wrappers exit
+cleanly. One verifier writes a positive partial reward. Those observations supersede any
+optimistic reading of the static `supported_surface` count below.
 
 ## Static result after the command-surface pass
 

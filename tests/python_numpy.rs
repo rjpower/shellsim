@@ -73,13 +73,14 @@ print(a.mean(), a.min(), a.max())
 left = np.array([[1, 2], [3, 4]])
 right = np.array([[5, 6], [7, 8]])
 print(np.matmul(left, right).tolist())
+print((left @ right).tolist())
 print(np.dot(np.array([1, 2, 3]), np.array([4, 5, 6])))
 "#;
     assert_eq!(
         run(source),
         (
             0,
-            b"[[11, 22, 33], [14, 25, 36]]\n[[11, 22, 33], [14, 25, 36]]\n[[1, 3, 5], [7, 9, 11]]\n[[0.5, 1.0, 1.5], [2.0, 2.5, 3.0]]\n21 [5, 7, 9] [6, 15]\n3.5 1 6\n[[19, 22], [43, 50]]\n32\n".to_vec(),
+            b"[[11, 22, 33], [14, 25, 36]]\n[[11, 22, 33], [14, 25, 36]]\n[[1, 3, 5], [7, 9, 11]]\n[[0.5, 1.0, 1.5], [2.0, 2.5, 3.0]]\n21 [5, 7, 9] [6, 15]\n3.5 1 6\n[[19, 22], [43, 50]]\n[[19, 22], [43, 50]]\n32\n".to_vec(),
             Vec::new(),
         )
     );
@@ -314,6 +315,29 @@ print(a.tolist(), view.tolist())
 }
 
 #[test]
+fn multidimensional_basic_slices_are_views_for_reads_and_writes() {
+    let source = r#"import numpy as np
+values = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+print(values[:, 1].tolist())
+print(values[1:, ::-1].tolist())
+values[:2, 1:] = [[20, 30], [50, 60]]
+print(values.tolist())
+values[:, 0] = 0
+print(values.tolist())
+values[2] = [70, 80, 90]
+print(values.tolist())
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"[2, 5, 8]\n[[6, 5, 4], [9, 8, 7]]\n[[1, 20, 30], [4, 50, 60], [7, 8, 9]]\n[[0, 20, 30], [0, 50, 60], [0, 8, 9]]\n[[0, 20, 30], [0, 50, 60], [70, 80, 90]]\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
 fn shape_views_constructors_and_joining_use_shared_kernels() {
     let source = r#"import numpy as np
 a = np.array([[[1], [2]]])
@@ -384,14 +408,6 @@ fn unsupported_or_invalid_array_operations_fail_explicitly() {
         (
             "import numpy as np\nbool(np.array([1, 2]))",
             "truth value of an array",
-        ),
-        (
-            "import numpy as np\nnp.array([[1, 2]])[:, 0]",
-            "multidimensional slice syntax is not supported",
-        ),
-        (
-            "import numpy as np\na = np.zeros((2, 2)); a[0] = [1, 2]",
-            "partial basic-index assignment is not supported",
         ),
         (
             "import numpy as np\na = np.zeros((2, 2)); a[[0, 1]] = [1, 2, 3]",

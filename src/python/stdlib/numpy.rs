@@ -1590,6 +1590,13 @@ fn slice_plan(
 
 fn get_item(runtime: &mut dyn PyRuntime, array: PyArray, index: PyValue) -> PyResult<PyValue> {
     let (layout, _) = runtime.array_layout(array)?;
+    if runtime.kind(&index)? == PyKind::Tuple {
+        let raw = index.cast::<PySequence>(runtime)?.items(runtime)?;
+        if raw.iter().any(|value| runtime.slice_parts(value).is_some()) {
+            let layout = basic_slice_layout(runtime, &layout, &raw)?;
+            return runtime.new_array_view(array, layout);
+        }
+    }
     if matches!(runtime.kind(&index)?, PyKind::List | PyKind::Array) {
         let selection = advanced_selection(runtime, &layout.shape, index)?;
         reserve_values(runtime, selection.coordinates.len())?;
@@ -1693,6 +1700,50 @@ pub(crate) fn slot_set_item(
 ) -> PyResult<Option<PyValue>> {
     let array = array.cast::<PyArray>(runtime)?;
     let (layout, dtype) = runtime.array_layout(array)?;
+    let basic_components = if runtime.kind(&index)? == PyKind::Tuple {
+        Some(index.cast::<PySequence>(runtime)?.items(runtime)?)
+    } else if runtime.int_value(&index).is_some() && layout.shape.len() > 1 {
+        Some(vec![index])
+    } else {
+        None
+    };
+    if let Some(raw) = basic_components {
+        if raw.iter().any(|value| runtime.slice_parts(value).is_some())
+            || raw.len() < layout.shape.len()
+        {
+            let selection = basic_slice_layout(runtime, &layout, &raw)?;
+            let target = runtime.new_array_view(array, selection.clone())?;
+            let target = target.cast::<PyArray>(runtime)?;
+            let mut source = value;
+            if matches!(runtime.kind(&source)?, PyKind::List | PyKind::Tuple) {
+                source = construct(runtime, source, None)?;
+            }
+            let source_layout = if runtime.kind(&source)? == PyKind::Array {
+                Some(runtime.array_layout(source.cast(runtime)?)?.0)
+            } else {
+                None
+            };
+            if let Some(source_layout) = &source_layout {
+                if broadcast_shape(&selection.shape, &source_layout.shape)? != selection.shape {
+                    return Err(PyError::value_error(
+                        "assignment value cannot be broadcast to the indexed shape",
+                    ));
+                }
+            }
+            for_each_index(&selection.shape, |index| {
+                let value = broadcast_get(
+                    runtime,
+                    source,
+                    source_layout.as_ref(),
+                    index,
+                    &selection.shape,
+                )?;
+                let value = convert(runtime, value, dtype)?;
+                runtime.array_set(target, index, value)
+            })?;
+            return Ok(Some(Value::None));
+        }
+    }
     if matches!(runtime.kind(&index)?, PyKind::List | PyKind::Array) {
         let selection = advanced_selection(runtime, &layout.shape, index)?;
         let mut source = value;
@@ -1737,6 +1788,56 @@ pub(crate) fn slot_set_item(
     let value = convert(runtime, value, dtype)?;
     runtime.array_set(array, &indices, value)?;
     Ok(Some(Value::None))
+}
+
+fn basic_slice_layout(
+    runtime: &dyn PyRuntime,
+    layout: &PyArrayLayout,
+    components: &[PyValue],
+) -> PyResult<PyArrayLayout> {
+    if components.len() > layout.shape.len() {
+        return Err(PyError::value_error("too many indices for array"));
+    }
+    let mut offset = layout.offset;
+    let mut shape = Vec::with_capacity(layout.shape.len());
+    let mut strides = Vec::with_capacity(layout.strides.len());
+    for (axis, component) in components.iter().enumerate() {
+        if let Some((start, stop, step)) = runtime.slice_parts(component) {
+            let (first, count, step) = slice_plan(layout.shape[axis], start, stop, step)?;
+            if count != 0 {
+                offset = offset
+                    .checked_add(
+                        layout.strides[axis]
+                            .checked_mul(first)
+                            .ok_or_else(|| PyError::value_error("array offset overflow"))?,
+                    )
+                    .ok_or_else(|| PyError::value_error("array offset overflow"))?;
+            }
+            shape.push(count);
+            strides.push(
+                layout.strides[axis]
+                    .checked_mul(step)
+                    .ok_or_else(|| PyError::value_error("array stride overflow"))?,
+            );
+        } else {
+            let PyIndex(index) = (*component).cast(runtime)?;
+            let index = normalize_index(index, layout.shape[axis])?;
+            offset = offset
+                .checked_add(
+                    layout.strides[axis]
+                        .checked_mul(index as isize)
+                        .ok_or_else(|| PyError::value_error("array offset overflow"))?,
+                )
+                .ok_or_else(|| PyError::value_error("array offset overflow"))?;
+        }
+    }
+    shape.extend_from_slice(&layout.shape[components.len()..]);
+    strides.extend_from_slice(&layout.strides[components.len()..]);
+    Ok(PyArrayLayout {
+        shape,
+        strides,
+        offset,
+    })
 }
 
 struct AdvancedSelection {
@@ -2020,6 +2121,24 @@ binary_slots!(slot_add, slot_reflected_add, PyBinaryOp::Add);
 binary_slots!(slot_subtract, slot_reflected_subtract, PyBinaryOp::Subtract);
 binary_slots!(slot_multiply, slot_reflected_multiply, PyBinaryOp::Multiply);
 binary_slots!(slot_divide, slot_reflected_divide, PyBinaryOp::Divide);
+
+pub(crate) fn slot_matrix_multiply(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let left = coerce_array(runtime, left)?;
+    let right = coerce_array(runtime, right)?;
+    matmul_arrays(runtime, left, right).map(Some)
+}
+
+pub(crate) fn slot_reflected_matrix_multiply(
+    runtime: &mut dyn PyRuntime,
+    right: PyValue,
+    left: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_matrix_multiply(runtime, left, right)
+}
 
 #[derive(Clone, Copy)]
 enum CompareMap {

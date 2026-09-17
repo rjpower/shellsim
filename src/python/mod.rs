@@ -38,7 +38,7 @@ const MAX_RUNNER_WRAPPER_BYTES: usize = 1024 * 1024;
 
 /// Return whether an offline package command can supply this third-party distribution.
 pub(crate) fn is_bundled_distribution(name: &str) -> bool {
-    matches!(name, "numpy" | "pytest")
+    matches!(name, "numpy" | "pytest" | "pytest_json_ctrf")
 }
 
 /// Physical storage discriminator kept separate from Python's semantic [`object_model::TypeId`].
@@ -639,14 +639,30 @@ fn run_module(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
 /// share this interpreter's parser, compiler, exception machinery, and resource limits.
 pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
     let mut paths = Vec::new();
-    for arg in args {
-        if arg.starts_with('-') {
+    let mut ctrf = None;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--ctrf" {
+            index += 1;
+            let Some(path) = args.get(index) else {
+                err.extend_from_slice(b"pytest: --ctrf requires a path\n");
+                return 2;
+            };
+            ctrf = Some(path.clone());
+        } else if let Some(path) = arg.strip_prefix("--ctrf=") {
+            if path.is_empty() {
+                err.extend_from_slice(b"pytest: --ctrf requires a path\n");
+                return 2;
+            }
+            ctrf = Some(path.to_string());
+        } else if arg.starts_with('-') {
             if !matches!(arg.as_str(), "-q" | "-v" | "-rA" | "--tb=short") {
                 return unsupported(interp, &format!("pytest option {arg}"), err);
             }
         } else {
             paths.push(arg.clone());
         }
+        index += 1;
     }
     if paths.len() > MAX_RUNNER_FILES {
         return runner_limit(err, "pytest", "file count", MAX_RUNNER_FILES);
@@ -755,10 +771,42 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
     let _marker = fields.next();
     let failed = fields.next().and_then(|value| value.parse::<usize>().ok());
     out.extend_from_slice(&python_out[..marker_start]);
-    if failed != Some(0) {
+    let Some(failed) = failed else {
+        err.extend_from_slice(b"pytest: runner produced an invalid summary\n");
+        return 2;
+    };
+    if let Some(path) = ctrf {
+        if let Err(error) = write_ctrf(interp, &path, total, failed) {
+            err.extend_from_slice(
+                format!("pytest: cannot write CTRF report: {error}\n").as_bytes(),
+            );
+            return 2;
+        }
+    }
+    if failed != 0 {
         return 1;
     }
     0
+}
+
+fn write_ctrf(
+    interp: &mut Interp,
+    path: &str,
+    total: usize,
+    failed: usize,
+) -> crate::vfs::Result<()> {
+    let path = crate::vfs::resolve_against(&interp.cwd, path);
+    if let Some((parent, _)) = path.rsplit_once('/') {
+        interp
+            .vfs
+            .mkdir_all("/", if parent.is_empty() { "/" } else { parent })?;
+    }
+    let passed = total.saturating_sub(failed);
+    let report = format!(
+        "{{\"results\":{{\"tool\":{{\"name\":\"pytest\"}},\"summary\":{{\"tests\":{total},\"passed\":{passed},\"failed\":{failed},\"skipped\":0,\"pending\":0,\"other\":0}},\"tests\":[]}}}}\n"
+    );
+    interp.sync_vfs_time();
+    interp.vfs.put_file(&path, report.into_bytes(), 0o644)
 }
 
 /// Run the deliberately small, VFS-only unittest compatibility slice.  Discovery is limited to

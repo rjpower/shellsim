@@ -12,6 +12,16 @@ def _join(left, right):
     return left + "/" + right
 
 
+def _parts(value):
+    return [part for part in os.path.abspath(value).split("/") if part]
+
+
+class _StatResult:
+    def __init__(self, mode, size):
+        self.st_mode = mode
+        self.st_size = size
+
+
 class Path:
     def __init__(self, value="."):
         self._path = str(value)
@@ -45,6 +55,14 @@ class Path:
         if parent == "" and self._path.startswith("/"):
             parent = "/"
         return Path(parent)
+
+    @property
+    def parts(self):
+        absolute = self._path.startswith("/")
+        parts = tuple(part for part in self._path.split("/") if part and part != ".")
+        if absolute:
+            return ("/",) + parts
+        return parts
 
     @property
     def suffix(self):
@@ -94,6 +112,18 @@ class Path:
 
     def resolve(self):
         return Path(os.path.abspath(self._path))
+
+    def relative_to(self, other):
+        own = _parts(self._path)
+        base = _parts(str(other))
+        if own[:len(base)] != base:
+            raise ValueError(str(self) + " is not in the subpath of " + str(other))
+        remainder = own[len(base):]
+        return Path("." if len(remainder) == 0 else "/".join(remainder))
+
+    def stat(self):
+        mode, size = _shellsim_vfs.stat(self._path)
+        return _StatResult(mode, size)
 
     @classmethod
     def cwd(cls):

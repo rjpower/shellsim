@@ -46,6 +46,7 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "startswith", string_startswith),
         method("str", "endswith", string_endswith),
         method("str", "split", string_split),
+        method("str", "splitlines", string_splitlines),
         method("str", "join", string_join),
         method("str", "replace", string_replace),
         method("str", "format", string_format),
@@ -55,6 +56,8 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "isalnum", string_isalnum),
         method("str", "isalpha", string_isalpha),
         method("str", "isdigit", string_isdigit),
+        method("str", "islower", string_islower),
+        method("str", "isupper", string_isupper),
     ],
 };
 
@@ -92,6 +95,7 @@ pub(crate) static LIST_TYPE: NativeTypeDef = NativeTypeDef {
         method("list", "count", list_count),
         method("list", "index", list_index),
         method("list", "sort", list_sort),
+        method("list", "copy", list_copy),
     ],
 };
 
@@ -105,6 +109,7 @@ pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
         method("dict", "setdefault", dict_setdefault),
         method("dict", "update", dict_update),
         method("dict", "pop", dict_pop),
+        method("dict", "copy", dict_copy),
     ],
 };
 
@@ -116,6 +121,7 @@ pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
         method("set", "remove", set_remove),
         method("set", "discard", set_discard),
         method("set", "union", set_union),
+        method("set", "copy", set_copy),
     ],
 };
 
@@ -254,6 +260,37 @@ fn string_isalpha(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
 
 fn string_isdigit(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     string_predicate(runtime, receiver, args, char::is_numeric, "str.isdigit")
+}
+
+fn string_islower(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_case_predicate(runtime, receiver, args, false, "str.islower")
+}
+
+fn string_isupper(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_case_predicate(runtime, receiver, args, true, "str.isupper")
+}
+
+fn string_case_predicate(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    uppercase: bool,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 0, 0)?;
+    args.reject_keywords(name)?;
+    let PyString(value) = receiver.cast(runtime)?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    let mut cased = false;
+    for character in value.chars() {
+        if character.is_uppercase() || character.is_lowercase() {
+            cased = true;
+            if uppercase != character.is_uppercase() {
+                return Ok(PyValue::Bool(false));
+            }
+        }
+    }
+    Ok(PyValue::Bool(cased))
 }
 
 fn string_predicate(
@@ -539,6 +576,50 @@ fn string_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     runtime.new_list(values)
 }
 
+fn string_splitlines(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.splitlines", 0, 1)?;
+    args.reject_keywords("str.splitlines")?;
+    let keepends = args
+        .positional()
+        .first()
+        .map(|value| runtime.truth(value))
+        .transpose()?
+        .unwrap_or(false);
+    let PyString(value) = receiver.cast(runtime)?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut characters = value.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        let mut end = index + character.len_utf8();
+        let boundary = matches!(
+            character,
+            '\n' | '\r'
+                | '\u{000b}'
+                | '\u{000c}'
+                | '\u{001c}'
+                | '\u{001d}'
+                | '\u{001e}'
+                | '\u{0085}'
+                | '\u{2028}'
+                | '\u{2029}'
+        );
+        if !boundary {
+            continue;
+        }
+        if character == '\r' && characters.peek().is_some_and(|(_, next)| *next == '\n') {
+            end = characters.next().expect("peeked LF").0 + 1;
+        }
+        let line_end = if keepends { end } else { index };
+        lines.push(runtime.new_string(value[start..line_end].to_string())?);
+        start = end;
+    }
+    if start < value.len() {
+        lines.push(runtime.new_string(value[start..].to_string())?);
+    }
+    runtime.new_list(lines)
+}
+
 fn string_join(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.join", 1, 1)?;
     args.reject_keywords("str.join")?;
@@ -795,6 +876,13 @@ fn list_clear(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
     Ok(PyValue::None)
 }
 
+fn list_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("list.copy", 0, 0)?;
+    args.reject_keywords("list.copy")?;
+    let values = receiver.cast::<PyList>(runtime)?.items(runtime)?;
+    runtime.new_list(values)
+}
+
 fn list_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("list.count", 1, 1)?;
     args.reject_keywords("list.count")?;
@@ -1018,6 +1106,13 @@ fn dict_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     Err(PyError::exception("KeyError", "key not found"))
 }
 
+fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.copy", 0, 0)?;
+    args.reject_keywords("dict.copy")?;
+    let entries = receiver.cast::<PyDict>(runtime)?.items(runtime)?;
+    runtime.new_dict(entries)
+}
+
 fn set_add(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     set_modify(runtime, receiver, args, SetOperation::Add)
 }
@@ -1109,6 +1204,71 @@ fn set_union(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
         }
     }
     runtime.new_set(values)
+}
+
+fn set_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("set.copy", 0, 0)?;
+    args.reject_keywords("set.copy")?;
+    let values = receiver.cast::<PySet>(runtime)?.items(runtime)?;
+    runtime.new_set(values)
+}
+
+fn set_is_subset(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<(bool, bool)> {
+    let left = left.cast::<PySet>(runtime)?.items(runtime)?;
+    let right = right.cast::<PySet>(runtime)?.items(runtime)?;
+    let mut subset = true;
+    for value in &left {
+        let mut present = false;
+        for candidate in &right {
+            runtime.charge_cpu(1)?;
+            if runtime.equals(value, candidate)? {
+                present = true;
+                break;
+            }
+        }
+        if !present {
+            subset = false;
+            break;
+        }
+    }
+    Ok((subset, left.len() < right.len()))
+}
+
+pub(crate) fn slot_set_less(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (subset, smaller) = set_is_subset(runtime, left, right)?;
+    Ok(Some(Value::Bool(subset && smaller)))
+}
+
+pub(crate) fn slot_set_less_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(Some(Value::Bool(set_is_subset(runtime, left, right)?.0)))
+}
+
+pub(crate) fn slot_set_greater(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_set_less(runtime, right, left)
+}
+
+pub(crate) fn slot_set_greater_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_set_less_equal(runtime, right, left)
 }
 
 fn builtin_map(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {

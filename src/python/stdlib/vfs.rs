@@ -55,6 +55,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
         FunctionDef {
             module: "_shellsim_vfs",
+            name: "stat",
+            call: stat,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
             name: "mkdir",
             call: mkdir,
         },
@@ -161,6 +166,18 @@ fn is_dir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.reject_keywords("_shellsim_vfs.is_dir")?;
     let PyString(path) = args.positional()[0].cast(runtime)?;
     Ok(Value::Bool(runtime.filesystem().is_dir(&path)))
+}
+
+fn stat(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("_shellsim_vfs.stat", 1, 1)?;
+    args.reject_keywords("_shellsim_vfs.stat")?;
+    let PyString(path) = args.positional()[0].cast(runtime)?;
+    let metadata = runtime.filesystem().metadata(&path)?;
+    let mode = Value::Int(i64::from(metadata.mode));
+    let size = i64::try_from(metadata.size)
+        .map(Value::Int)
+        .map_err(|_| PyError::overflow_error("file size exceeds Python int range"))?;
+    runtime.new_tuple(vec![mode, size])
 }
 
 fn mkdir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {

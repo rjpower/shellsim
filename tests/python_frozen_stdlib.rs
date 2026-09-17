@@ -98,15 +98,29 @@ print(path.exists(), path.write_text('hello'), path.is_file(), path.read_text())
 with path.open('a') as stream:
     stream.write('!')
 print(path.read_text())
+print(path.relative_to(root), path.stat().st_size, path.stat().st_mode)
 "#;
     assert_eq!(
         run(source),
         (
             0,
-            "/tmp/sample.txt /tmp sample.txt sample .txt\nFalse 5 True hello\nhello!\n".into(),
+            "/tmp/sample.txt /tmp sample.txt sample .txt\nFalse 5 True hello\nhello!\nsample.txt 6 420\n".into(),
             String::new(),
         )
     );
+}
+
+#[test]
+fn pathlib_relative_to_rejects_paths_outside_the_base() {
+    let source = r#"
+from pathlib import Path
+
+try:
+    Path('/tmp/other').relative_to('/work')
+except ValueError as error:
+    print('ValueError')
+"#;
+    assert_eq!(run(source), (0, "ValueError\n".into(), String::new()));
 }
 
 #[test]
@@ -180,6 +194,62 @@ print(str(first), first.hex, first != second)
             String::new(),
         )
     );
+}
+
+#[test]
+fn frozen_random_is_deterministic_and_covers_common_sequence_helpers() {
+    let source = r#"
+import random
+
+random.seed(7)
+print(random.randint(1, 10), f'{random.random():.6f}', random.choice(['a', 'b', 'c']))
+values = [1, 2, 3, 4]
+random.shuffle(values)
+print(values, random.sample(values, 2))
+first = random.Random(11)
+second = random.Random(11)
+print(first.random() == second.random(), first.randrange(10, 20, 2))
+try:
+    random.randrange(0)
+except ValueError:
+    print('empty')
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "7 0.299265 b\n[3, 2, 1, 4] [1, 3]\nTrue 10\nempty\n".into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
+fn frozen_statistics_path_parts_json_error_and_access_cover_common_calls() {
+    let source = r#"import json
+import os
+import statistics
+from pathlib import Path
+
+print(statistics.fmean([1, 2, 6]))
+print(statistics.median([4, 1, 3, 2]), statistics.pstdev([2, 2]))
+print(statistics.multimode([1, 2, 1, 2, 3]))
+print(statistics.quantiles([0, 10, 20, 30, 40], n=4, method="inclusive"))
+print(Path("/work/item.txt").parts, Path("a/b").parts)
+Path("/work/tool").write_text("x")
+print(os.access("/work/tool", os.F_OK), os.access("/work/tool", os.R_OK), os.access("/missing", os.F_OK))
+try:
+    json.loads("{")
+except json.JSONDecodeError:
+    print("json-error")
+"#;
+    let (status, stdout, stderr) = run(source);
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        "3.0\n2.5 0.0\n[1, 2]\n[10.0, 20.0, 30.0]\n('/', 'work', 'item.txt') ('a', 'b')\nTrue True False\njson-error\n"
+    );
+    assert!(stderr.is_empty());
 }
 
 #[test]

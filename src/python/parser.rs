@@ -2,8 +2,8 @@
 
 use super::ast::{
     AssignmentTarget, BinaryOperator, BooleanOperator, CallArgument, ComparisonOperator,
-    ComprehensionClause, Constant, ExceptHandler, Expression, ExpressionKind, FStringPart,
-    Parameter, Program, Statement, StatementKind, UnaryOperator,
+    ComprehensionClause, Constant, DictEntry, ExceptHandler, Expression, ExpressionKind,
+    FStringPart, Parameter, Program, Statement, StatementKind, UnaryOperator,
 };
 use super::source::Span;
 use super::token::{Token, TokenKind};
@@ -29,6 +29,31 @@ struct Parser {
     current: usize,
     expression_depth: usize,
     compound_depth: usize,
+}
+
+enum ParsedSubscript {
+    Index(Expression),
+    Slice {
+        start: Option<Expression>,
+        stop: Option<Expression>,
+        step: Option<Expression>,
+    },
+}
+
+impl ParsedSubscript {
+    fn into_expression(self, span: Span) -> Expression {
+        match self {
+            Self::Index(expression) => expression,
+            Self::Slice { start, stop, step } => Expression {
+                kind: ExpressionKind::SliceValue {
+                    start: start.map(Box::new),
+                    stop: stop.map(Box::new),
+                    step: step.map(Box::new),
+                },
+                span,
+            },
+        }
+    }
 }
 
 impl Parser {
@@ -166,12 +191,20 @@ impl Parser {
             let mut parameters = Vec::new();
             let mut saw_default = false;
             let mut saw_variadic = false;
+            let mut keyword_only = false;
             if !self.at(|kind| matches!(kind, TokenKind::RightParen)) {
                 loop {
-                    if saw_variadic {
-                        return Err(self.error("parameters after *args are not supported yet"));
-                    }
                     let variadic = self.take(|kind| matches!(kind, TokenKind::Star)).is_some();
+                    if variadic && self.take(|kind| matches!(kind, TokenKind::Comma)).is_some() {
+                        if keyword_only {
+                            return Err(self.error("multiple '*' parameters are not allowed"));
+                        }
+                        keyword_only = true;
+                        continue;
+                    }
+                    if variadic && saw_variadic {
+                        return Err(self.error("multiple '*args' parameters are not allowed"));
+                    }
                     let name = self.name("expected a parameter name")?;
                     if self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {
                         self.skip_annotation(|kind| {
@@ -185,20 +218,26 @@ impl Parser {
                         if variadic {
                             return Err(self.error("*args cannot have a default"));
                         }
-                        saw_default = true;
+                        if !keyword_only {
+                            saw_default = true;
+                        }
                         Some(self.expression()?)
                     } else {
-                        if saw_default {
+                        if saw_default && !keyword_only {
                             return Err(self.error("non-default argument follows default argument"));
                         }
                         None
                     };
-                    saw_variadic |= variadic;
                     parameters.push(Parameter {
                         name,
                         default,
                         variadic,
+                        keyword_only: keyword_only && !variadic,
                     });
+                    if variadic {
+                        saw_variadic = true;
+                        keyword_only = true;
+                    }
                     if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
                         break;
                     }
@@ -711,31 +750,45 @@ impl Parser {
         let mut parameters = Vec::new();
         let mut saw_default = false;
         let mut saw_variadic = false;
+        let mut keyword_only = false;
         if !self.at(|kind| matches!(kind, TokenKind::Colon)) {
             loop {
-                if saw_variadic {
-                    return Err(self.error("parameters after *args are not supported yet"));
-                }
                 let variadic = self.take(|kind| matches!(kind, TokenKind::Star)).is_some();
+                if variadic && self.take(|kind| matches!(kind, TokenKind::Comma)).is_some() {
+                    if keyword_only {
+                        return Err(self.error("multiple '*' parameters are not allowed"));
+                    }
+                    keyword_only = true;
+                    continue;
+                }
+                if variadic && saw_variadic {
+                    return Err(self.error("multiple '*args' parameters are not allowed"));
+                }
                 let name = self.name("expected a lambda parameter")?;
                 let default = if self.take(|kind| matches!(kind, TokenKind::Equal)).is_some() {
                     if variadic {
                         return Err(self.error("*args cannot have a default"));
                     }
-                    saw_default = true;
+                    if !keyword_only {
+                        saw_default = true;
+                    }
                     Some(self.expression()?)
                 } else {
-                    if saw_default {
+                    if saw_default && !keyword_only {
                         return Err(self.error("non-default argument follows default argument"));
                     }
                     None
                 };
-                saw_variadic |= variadic;
                 parameters.push(Parameter {
                     name,
                     default,
                     variadic,
+                    keyword_only: keyword_only && !variadic,
                 });
+                if variadic {
+                    saw_variadic = true;
+                    keyword_only = true;
+                }
                 if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
                     break;
                 }
@@ -1040,6 +1093,8 @@ impl Parser {
         loop {
             let operator = if self.take(|kind| matches!(kind, TokenKind::Star)).is_some() {
                 Some(BinaryOperator::Multiply)
+            } else if self.take(|kind| matches!(kind, TokenKind::At)).is_some() {
+                Some(BinaryOperator::MatrixMultiply)
             } else if self
                 .take(|kind| matches!(kind, TokenKind::DoubleSlash))
                 .is_some()
@@ -1149,85 +1204,60 @@ impl Parser {
                 .take(|kind| matches!(kind, TokenKind::LeftBracket))
                 .is_some()
             {
-                let start_or_index = if self.at(|kind| matches!(kind, TokenKind::Colon)) {
-                    None
-                } else {
-                    Some(self.expression()?)
-                };
-                if self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {
-                    if self.at(|kind| matches!(kind, TokenKind::Comma)) {
-                        return Err(self.error("multidimensional slice syntax is not supported"));
-                    }
-                    let stop = if self
-                        .at(|kind| matches!(kind, TokenKind::Colon | TokenKind::RightBracket))
-                    {
-                        None
-                    } else {
-                        Some(self.expression()?)
-                    };
-                    let step = if self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {
-                        if self.at(|kind| matches!(kind, TokenKind::Comma)) {
-                            return Err(
-                                self.error("multidimensional slice syntax is not supported")
-                            );
-                        }
-                        if self.at(|kind| matches!(kind, TokenKind::RightBracket)) {
-                            None
-                        } else {
-                            Some(self.expression()?)
-                        }
-                    } else {
-                        None
-                    };
-                    if self.at(|kind| matches!(kind, TokenKind::Comma)) {
-                        return Err(self.error("multidimensional slice syntax is not supported"));
-                    }
-                    let end = self.expect(
-                        |kind| matches!(kind, TokenKind::RightBracket),
-                        "expected ']' after slice",
-                    )?;
-                    let span = value.span.through(end.span);
-                    value = Expression {
-                        kind: ExpressionKind::Slice {
-                            value: Box::new(value),
-                            start: start_or_index.map(Box::new),
-                            stop: stop.map(Box::new),
-                            step: step.map(Box::new),
-                        },
-                        span,
-                    };
-                    continue;
-                }
-                let first = start_or_index.ok_or_else(|| self.error("expected subscript index"))?;
-                let first_span = first.span;
-                let mut indices = vec![first];
+                let opening = self.previous().span;
+                let mut components = vec![self.subscript_component()?];
                 let mut saw_comma = false;
                 while self.take(|kind| matches!(kind, TokenKind::Comma)).is_some() {
                     saw_comma = true;
                     if self.at(|kind| matches!(kind, TokenKind::RightBracket)) {
                         break;
                     }
-                    indices.push(self.expression()?);
+                    components.push(self.subscript_component()?);
                 }
                 let end = self.expect(
                     |kind| matches!(kind, TokenKind::RightBracket),
                     "expected ']' after subscript",
                 )?;
-                let index = if saw_comma {
-                    Expression {
-                        kind: ExpressionKind::Tuple(indices),
-                        span: first_span.through(end.span),
-                    }
-                } else {
-                    indices.pop().expect("first subscript index was pushed")
-                };
                 let span = value.span.through(end.span);
-                value = Expression {
-                    kind: ExpressionKind::Subscript {
-                        value: Box::new(value),
-                        index: Box::new(index),
+                value = match components.pop() {
+                    Some(ParsedSubscript::Slice { start, stop, step }) if !saw_comma => {
+                        Expression {
+                            kind: ExpressionKind::Slice {
+                                value: Box::new(value),
+                                start: start.map(Box::new),
+                                stop: stop.map(Box::new),
+                                step: step.map(Box::new),
+                            },
+                            span,
+                        }
+                    }
+                    Some(ParsedSubscript::Index(index)) if !saw_comma => Expression {
+                        kind: ExpressionKind::Subscript {
+                            value: Box::new(value),
+                            index: Box::new(index),
+                        },
+                        span,
                     },
-                    span,
+                    last => {
+                        if let Some(last) = last {
+                            components.push(last);
+                        }
+                        let indices = components
+                            .into_iter()
+                            .map(|component| component.into_expression(opening.through(end.span)))
+                            .collect();
+                        let index = Expression {
+                            kind: ExpressionKind::Tuple(indices),
+                            span: opening.through(end.span),
+                        };
+                        Expression {
+                            kind: ExpressionKind::Subscript {
+                                value: Box::new(value),
+                                index: Box::new(index),
+                            },
+                            span,
+                        }
+                    }
                 };
             } else if self
                 .take(|kind| matches!(kind, TokenKind::LeftParen))
@@ -1307,15 +1337,51 @@ impl Parser {
         Ok(value)
     }
 
+    fn subscript_component(&mut self) -> Result<ParsedSubscript, ParseError> {
+        let start = if self.at(|kind| matches!(kind, TokenKind::Colon)) {
+            None
+        } else {
+            Some(self.expression()?)
+        };
+        if self.take(|kind| matches!(kind, TokenKind::Colon)).is_none() {
+            return start
+                .map(ParsedSubscript::Index)
+                .ok_or_else(|| self.error("expected subscript index"));
+        }
+        let stop = if self.at(|kind| {
+            matches!(
+                kind,
+                TokenKind::Colon | TokenKind::Comma | TokenKind::RightBracket
+            )
+        }) {
+            None
+        } else {
+            Some(self.expression()?)
+        };
+        let step = if self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {
+            if self.at(|kind| matches!(kind, TokenKind::Comma | TokenKind::RightBracket)) {
+                None
+            } else {
+                Some(self.expression()?)
+            }
+        } else {
+            None
+        };
+        Ok(ParsedSubscript::Slice { start, stop, step })
+    }
+
     fn atom(&mut self) -> Result<Expression, ParseError> {
         let token = self.advance().clone();
+        if matches!(
+            token.kind,
+            TokenKind::String(_) | TokenKind::Bytes(_) | TokenKind::FString { .. }
+        ) {
+            return self.string_atom(token);
+        }
         let kind = match token.kind {
             TokenKind::Integer(value) => ExpressionKind::Constant(Constant::Integer(value)),
             TokenKind::BigInteger(value) => ExpressionKind::Constant(Constant::BigInteger(value)),
             TokenKind::Float(value) => ExpressionKind::Constant(Constant::Float(value)),
-            TokenKind::String(value) => ExpressionKind::Constant(Constant::String(value)),
-            TokenKind::Bytes(value) => ExpressionKind::Constant(Constant::Bytes(value)),
-            TokenKind::FString { body, raw } => self.fstring_expression(body, raw, token.span)?,
             TokenKind::None => ExpressionKind::Constant(Constant::None),
             TokenKind::True => ExpressionKind::Constant(Constant::Bool(true)),
             TokenKind::False => ExpressionKind::Constant(Constant::Bool(false)),
@@ -1446,6 +1512,85 @@ impl Parser {
         })
     }
 
+    /// Fold Python's adjacent literal syntax while it is still a sequence of tokens.
+    /// Keeping this in the parser avoids introducing a runtime concatenation path for
+    /// values that CPython also combines at compile time.
+    fn string_atom(&mut self, first: Token) -> Result<Expression, ParseError> {
+        let start = first.span;
+        let mut end = first.span;
+        let mut bytes = None::<Vec<u8>>;
+        let mut parts = Vec::new();
+        let mut saw_fstring = false;
+        let mut token = Some(first);
+
+        while let Some(current) = token.take() {
+            end = current.span;
+            match current.kind {
+                TokenKind::String(value) => {
+                    if bytes.is_some() {
+                        return Err(ParseError {
+                            message: "cannot mix bytes and nonbytes literals".into(),
+                            span: current.span,
+                        });
+                    }
+                    parts.push(FStringPart::Text(value));
+                }
+                TokenKind::Bytes(value) => {
+                    if !parts.is_empty() || saw_fstring {
+                        return Err(ParseError {
+                            message: "cannot mix bytes and nonbytes literals".into(),
+                            span: current.span,
+                        });
+                    }
+                    bytes.get_or_insert_default().extend(value);
+                }
+                TokenKind::FString { body, raw } => {
+                    if bytes.is_some() {
+                        return Err(ParseError {
+                            message: "cannot mix bytes and nonbytes literals".into(),
+                            span: current.span,
+                        });
+                    }
+                    saw_fstring = true;
+                    let ExpressionKind::FString(mut next) =
+                        self.fstring_expression(body, raw, current.span)?
+                    else {
+                        unreachable!("f-string parsing always returns an f-string")
+                    };
+                    parts.append(&mut next);
+                }
+                _ => unreachable!("string_atom receives only literal tokens"),
+            }
+            if self.at(|kind| {
+                matches!(
+                    kind,
+                    TokenKind::String(_) | TokenKind::Bytes(_) | TokenKind::FString { .. }
+                )
+            }) {
+                token = Some(self.advance().clone());
+            }
+        }
+
+        let kind = if let Some(bytes) = bytes {
+            ExpressionKind::Constant(Constant::Bytes(bytes))
+        } else if saw_fstring {
+            ExpressionKind::FString(parts)
+        } else {
+            let mut value = String::new();
+            for part in parts {
+                let FStringPart::Text(text) = part else {
+                    unreachable!("plain strings contain only text")
+                };
+                value.push_str(&text);
+            }
+            ExpressionKind::Constant(Constant::String(value))
+        };
+        Ok(Expression {
+            kind,
+            span: start.through(end),
+        })
+    }
+
     fn brace_display(&mut self, start: Span) -> Result<Expression, ParseError> {
         if self
             .take(|kind| matches!(kind, TokenKind::RightBrace))
@@ -1454,6 +1599,25 @@ impl Parser {
             return Ok(Expression {
                 span: start.through(self.previous().span),
                 kind: ExpressionKind::Dict(Vec::new()),
+            });
+        }
+        if self
+            .take(|kind| matches!(kind, TokenKind::DoubleStar))
+            .is_some()
+        {
+            let mut entries = vec![DictEntry::Unpack(self.expression()?)];
+            while self.take(|kind| matches!(kind, TokenKind::Comma)).is_some()
+                && !self.at(|kind| matches!(kind, TokenKind::RightBrace))
+            {
+                entries.push(self.dict_entry()?);
+            }
+            self.expect(
+                |kind| matches!(kind, TokenKind::RightBrace),
+                "expected '}' after dictionary display",
+            )?;
+            return Ok(Expression {
+                span: start.through(self.previous().span),
+                kind: ExpressionKind::Dict(entries),
             });
         }
         let first = self.expression()?;
@@ -1474,16 +1638,11 @@ impl Parser {
                     },
                 });
             }
-            let mut entries = vec![(first, value)];
+            let mut entries = vec![DictEntry::Pair(first, value)];
             while self.take(|kind| matches!(kind, TokenKind::Comma)).is_some()
                 && !self.at(|kind| matches!(kind, TokenKind::RightBrace))
             {
-                let key = self.expression()?;
-                self.expect(
-                    |kind| matches!(kind, TokenKind::Colon),
-                    "expected ':' between dictionary key and value",
-                )?;
-                entries.push((key, self.expression()?));
+                entries.push(self.dict_entry()?);
             }
             self.expect(
                 |kind| matches!(kind, TokenKind::RightBrace),
@@ -1523,6 +1682,21 @@ impl Parser {
                 kind: ExpressionKind::Set(values),
             })
         }
+    }
+
+    fn dict_entry(&mut self) -> Result<DictEntry, ParseError> {
+        if self
+            .take(|kind| matches!(kind, TokenKind::DoubleStar))
+            .is_some()
+        {
+            return Ok(DictEntry::Unpack(self.expression()?));
+        }
+        let key = self.expression()?;
+        self.expect(
+            |kind| matches!(kind, TokenKind::Colon),
+            "expected ':' between dictionary key and value",
+        )?;
+        Ok(DictEntry::Pair(key, self.expression()?))
     }
 
     fn comprehension_clauses(

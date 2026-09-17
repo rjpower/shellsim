@@ -154,7 +154,7 @@ pub enum ExpressionKind {
     Name(String),
     List(Vec<Expression>),
     Tuple(Vec<Expression>),
-    Dict(Vec<(Expression, Expression)>),
+    Dict(Vec<DictEntry>),
     Set(Vec<Expression>),
     ListComprehension {
         element: Box<Expression>,
@@ -187,6 +187,11 @@ pub enum ExpressionKind {
     },
     Slice {
         value: Box<Expression>,
+        start: Option<Box<Expression>>,
+        stop: Option<Box<Expression>>,
+        step: Option<Box<Expression>>,
+    },
+    SliceValue {
         start: Option<Box<Expression>>,
         stop: Option<Box<Expression>>,
         step: Option<Box<Expression>>,
@@ -225,6 +230,12 @@ pub enum ExpressionKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum DictEntry {
+    Pair(Expression, Expression),
+    Unpack(Expression),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CallArgument {
     pub name: Option<String>,
     pub value: Expression,
@@ -252,6 +263,7 @@ pub struct Parameter {
     pub name: String,
     pub default: Option<Expression>,
     pub variadic: bool,
+    pub keyword_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -298,6 +310,7 @@ pub enum BinaryOperator {
     Add,
     Subtract,
     Multiply,
+    MatrixMultiply,
     Power,
     Divide,
     FloorDivide,

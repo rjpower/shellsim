@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::interp::Interp;
 use crate::vfs::{resolve_against, VfsError};
 
-use super::native::{PyError, PyFilesystem, PyResult};
+use super::native::{PyError, PyFileMetadata, PyFilesystem, PyResult};
 
 const MAX_TEXT_FILE: usize = 4 * 1024 * 1024;
 const MODELED_GLOB_RESULT_BYTES: usize = 64;
@@ -141,6 +141,21 @@ impl PyFilesystem for Interp {
 
     fn is_dir(&self, path: &str) -> bool {
         self.vfs.is_dir(&self.cwd, path)
+    }
+
+    fn metadata(&self, path: &str) -> PyResult<PyFileMetadata> {
+        let node = self
+            .fs_metadata(&self.cwd, path, true)
+            .map_err(|error| PyError::runtime_error(error.to_string()))?;
+        let size = match &node.kind {
+            crate::vfs::NodeKind::File(data) => data.len(),
+            crate::vfs::NodeKind::Symlink(target) => target.len(),
+            crate::vfs::NodeKind::Dir => 0,
+        };
+        Ok(PyFileMetadata {
+            mode: node.mode,
+            size,
+        })
     }
 
     fn mkdir(&mut self, path: &str, parents: bool, exist_ok: bool) -> PyResult<()> {

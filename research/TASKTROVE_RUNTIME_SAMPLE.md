@@ -24,28 +24,56 @@ rather than “how many TaskTrove tasks does shellsim solve?”
 python3 tools/tasktrove_runtime_probe.py /path/to/OpenThoughts-TBLite > replay.json
 ```
 
-## Result
+## Baseline and cumulative revision result
 
-The September 17, 2026 run samples all 100 tasks without a harness error.
+All September 17, 2026 runs sample the same 100 tasks without a harness error. The final run adds
+ordinary Python string and collection methods, VFS-backed pathlib operations, deterministic
+Python and Bash random values, modeled `uv` environment and launcher options, and bounded pytest
+CTRF output. It also adds ordinary Python syntax and argument binding, protocol-aware sequence and
+set comparisons, a capability-free `statistics` module, and NumPy `@` plus multidimensional
+strided indexing and assignment.
 
-| Outcome | Golden solution | Selected verifier |
-| --- | ---: | ---: |
-| Clean exit | 47 | 13 |
-| Explicit shellsim boundary | 38 | 39 |
-| Other nonzero result | 12 | 44 |
-| Resource exhaustion | 3 | 1 |
-| Not run after exhaustion | 0 | 4 |
+| Outcome | Golden before | Golden after | Verifier before | Verifier after | Wrapper before | Wrapper after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Clean exit | 47 | 49 | 13 | 18 | 13 | 16 |
+| Explicit shellsim boundary | 38 | 36 | 39 | 44 | 80 | 79 |
+| Other nonzero result | 12 | 12 | 44 | 33 | 3 | 1 |
+| Resource exhaustion | 3 | 3 | 0 | 1 | 1 | 1 |
+| Not run after exhaustion | 0 | 0 | 4 | 4 | 3 | 3 |
 
 One task, `tsl-test-case-generation`, writes a positive partial reward of `0.8825`. This is useful
 confirmation that solution state reaches a real verifier, but it is not a corpus pass-rate claim.
+The task and reward are unchanged after the revision batch.
 
-## Where support would help
+Five verifier payloads move from an explicit boundary or other failure to a clean exit:
+`api-endpoint-permission-canonicalizer` after `str.isupper()`, `bash-log-processor-fix` after
+`Path.relative_to()`, and `network-log-normalization` after `str.splitlines()`. The Bash `$RANDOM`
+implementation moves `neural-architecture-search-final` from an AWK parse boundary to a clean
+golden-solution exit. Protocol-aware tuple ordering moves `schedule-vacation` to a clean golden
+exit. Adjacent string and f-string literals let `sympy-bug-fix` run its wrapper and verifier
+cleanly, and `log-summary` also reaches a clean verifier.
 
-The broadest reached gap is Python itself. Language or ordinary object/API behavior stops 13
-solutions and 11 verifier payloads. The raw report preserves the exact diagnostic for each task;
-examples include unsupported expression and parameter forms, `argparse.add_subparsers`, string and
-path methods, ordering, and regex behavior. These are better candidates than adding another
-one-off binary because each extends the common execution substrate.
+Other additions expose the next honest boundary without changing the headline outcome. Collection
+`copy()` and set ordering let `service-deployment-wave-planner` continue to a later module
+boundary; `Path.stat()` and `json.JSONDecodeError` let `scan-linux-persistence-artifacts` run rather
+than fail during parsing; and `random` lets the gRPC verifier continue to its missing `socket`
+dependency. `statistics`, `Path.parts`, and `os.access` similarly move their tasks to later
+`argparse` or invalid-program behavior. These are forward movement, not passes.
+
+Verifier-wrapper ergonomics improve separately. Clean wrapper exits rise from 13 to 15, explicit
+wrapper boundaries fall from 80 to 77, and one former boundary becomes an ordinary downstream
+failure. The repeated `uv venv` boundary falls from 18 tasks to zero, `uv init` from four to zero,
+the generic `uv` launcher-option boundary from 23 to zero, pytest `--ctrf` from two to zero, and
+`uv pip install --system` from one to zero. Unbundled `--with` packages now retain specific package
+boundaries such as pandas, requests, and httpx.
+
+## Remaining reached boundaries
+
+The broadest remaining accidental gap is still Python language and stdlib behavior. Reached
+examples include assignment expressions in comprehensions, a few unsupported expression forms,
+`argparse.add_subparsers`, `importlib.util`, `os.chdir`, and the exception family used by
+`FileNotFoundError`. Each needs a coherent binding, loader, process-state, or exception contract;
+the sample no longer identifies another safe syntax shortcut in the same class as this batch.
 
 Missing third-party ecosystems are the next visible group, but most are intentional hard
 boundaries. Pandas stops five solutions and four verifiers. Pydantic stops three verifiers.
@@ -53,20 +81,10 @@ Unbundled packages stop six solution tasks. Implementing partial pandas, databas
 native scientific packages would violate shellsim's boundary policy.
 
 Small deterministic modules remain plausible additions. Verifiers reach `importlib` in two tasks
-and reach `random`, `shutil`, `traceback`, and `zipfile` in one task each. `sqlite3` is the most
-frequent missing verifier module at five tasks, but it should remain absent until shellsim can
-offer a coherent database contract rather than a partial module.
-
-The shell sample exposes one ordinary Bash omission: `$RANDOM` is empty. One architecture-search
-solution consequently sends malformed remainder expressions to AWK 1,010 times. A deterministic
-modeled `$RANDOM` would be small and broadly intelligible even though it occurs in only one sampled
-task.
-
-Verifier wrappers also show low-cost CLI compatibility opportunities: `uv` launcher options occur
-in 23 tasks, `uv venv` arguments in 18, and pytest's `--ctrf` in two. These are harness ergonomics,
-not task functionality, and should be accepted only when shellsim can give them harmless,
-predictable semantics. The 49 wrapper uses of `apt-get` remain an explicit image-provisioning
-boundary.
+and reach `shutil`, `traceback`, and `zipfile` in one task each. `sqlite3` is the most frequent
+missing verifier module at five tasks, but it should remain absent until shellsim can offer a
+coherent database contract rather than a partial module. The 49 reached wrapper uses of `apt-get`
+remain an explicit image-provisioning boundary.
 
 Unavailable system binaries such as `openssl`, `debugfs`, `setfacl`, compilers, service tools, and
 language runtimes each block only one or two golden solutions. The sample does not justify adding

@@ -126,6 +126,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::Exception { .. } => "<exception ...>",
                 Object::List(_) => "[...]",
                 Object::Tuple(_) => "(...)",
+                Object::Slice { .. } => "slice(...)",
                 Object::Dict(_) | Object::DefaultDict { .. } => "{...}",
                 Object::Set(_) => "set(...)",
                 Object::Function { .. } => "<function ...>",
@@ -173,6 +174,9 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                     [only] => format!("({only},)"),
                     _ => format!("({})", values.join(", ")),
                 }
+            }
+            Object::Slice { start, stop, step } => {
+                format!("slice({start:?}, {stop:?}, {step:?})")
             }
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 let mut rendered = Vec::with_capacity(entries.len());
@@ -279,6 +283,7 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         Object::ByteArray(value) => !value.is_empty(),
         Object::Exception { .. } => true,
         Object::List(values) | Object::Tuple(values) | Object::Set(values) => !values.is_empty(),
+        Object::Slice { .. } => true,
         Object::Dict(entries) | Object::DefaultDict { entries, .. } => !entries.is_empty(),
         Object::BigInt(value) => !value.is_zero(),
         Object::Instance {
@@ -595,7 +600,9 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
     }
     match container.object_id() {
         Some(id) => match heap.get(id)? {
-            Object::String(_) | Object::Exception { .. } => Err("object is not a container".into()),
+            Object::String(_) | Object::Exception { .. } | Object::Slice { .. } => {
+                Err("object is not a container".into())
+            }
             Object::Bytes(value) | Object::ByteArray(value) => {
                 let needle = int_value(heap, needle)
                     .and_then(|value| u8::try_from(value).ok())

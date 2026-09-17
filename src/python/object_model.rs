@@ -161,6 +161,8 @@ pub struct TypeSlots {
     pub reflected_subtract: Option<SlotValue>,
     pub multiply: Option<SlotValue>,
     pub reflected_multiply: Option<SlotValue>,
+    pub matrix_multiply: Option<SlotValue>,
+    pub reflected_matrix_multiply: Option<SlotValue>,
     pub power: Option<SlotValue>,
     pub reflected_power: Option<SlotValue>,
     pub divide: Option<SlotValue>,
@@ -223,6 +225,8 @@ pub enum Slot {
     ReflectedSubtract,
     Multiply,
     ReflectedMultiply,
+    MatrixMultiply,
+    ReflectedMatrixMultiply,
     Power,
     ReflectedPower,
     Divide,
@@ -248,7 +252,7 @@ pub enum Slot {
 }
 
 impl Slot {
-    const ALL: [Self; 47] = [
+    const ALL: [Self; 49] = [
         Self::Call,
         Self::New,
         Self::Init,
@@ -274,6 +278,8 @@ impl Slot {
         Self::ReflectedSubtract,
         Self::Multiply,
         Self::ReflectedMultiply,
+        Self::MatrixMultiply,
+        Self::ReflectedMatrixMultiply,
         Self::Power,
         Self::ReflectedPower,
         Self::Divide,
@@ -328,6 +334,8 @@ impl TypeSlots {
             reflected_subtract: get("__rsub__"),
             multiply: get("__mul__"),
             reflected_multiply: get("__rmul__"),
+            matrix_multiply: get("__matmul__"),
+            reflected_matrix_multiply: get("__rmatmul__"),
             power: get("__pow__"),
             reflected_power: get("__rpow__"),
             divide: get("__truediv__"),
@@ -380,6 +388,8 @@ impl TypeSlots {
             &self.reflected_subtract,
             &self.multiply,
             &self.reflected_multiply,
+            &self.matrix_multiply,
+            &self.reflected_matrix_multiply,
             &self.power,
             &self.reflected_power,
             &self.divide,
@@ -435,6 +445,8 @@ impl TypeSlots {
             Slot::ReflectedSubtract => self.reflected_subtract.as_ref(),
             Slot::Multiply => self.multiply.as_ref(),
             Slot::ReflectedMultiply => self.reflected_multiply.as_ref(),
+            Slot::MatrixMultiply => self.matrix_multiply.as_ref(),
+            Slot::ReflectedMatrixMultiply => self.reflected_matrix_multiply.as_ref(),
             Slot::Power => self.power.as_ref(),
             Slot::ReflectedPower => self.reflected_power.as_ref(),
             Slot::Divide => self.divide.as_ref(),
@@ -487,6 +499,8 @@ impl TypeSlots {
             Slot::ReflectedSubtract => &mut self.reflected_subtract,
             Slot::Multiply => &mut self.multiply,
             Slot::ReflectedMultiply => &mut self.reflected_multiply,
+            Slot::MatrixMultiply => &mut self.matrix_multiply,
+            Slot::ReflectedMatrixMultiply => &mut self.reflected_matrix_multiply,
             Slot::Power => &mut self.power,
             Slot::ReflectedPower => &mut self.reflected_power,
             Slot::Divide => &mut self.divide,
@@ -879,6 +893,12 @@ fn install_builtin_slots(types: &mut [PyType]) {
     types[BuiltinType::Dict as usize].slots.delete_item =
         Some(intrinsic(super::stdlib::core::slot_dict_delete_item));
 
+    let slots = &mut types[BuiltinType::Set as usize].slots;
+    slots.less_than = Some(intrinsic(super::stdlib::core::slot_set_less));
+    slots.less_equal = Some(intrinsic(super::stdlib::core::slot_set_less_equal));
+    slots.greater_than = Some(intrinsic(super::stdlib::core::slot_set_greater));
+    slots.greater_equal = Some(intrinsic(super::stdlib::core::slot_set_greater_equal));
+
     let slots = &mut types[BuiltinType::Tuple as usize].slots;
     slots.add = Some(intrinsic(super::stdlib::core::slot_tuple_add));
     slots.multiply = Some(intrinsic(super::stdlib::core::slot_tuple_multiply));
@@ -900,6 +920,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.reflected_subtract = Some(intrinsic(super::stdlib::numpy::slot_reflected_subtract));
     slots.multiply = Some(intrinsic(super::stdlib::numpy::slot_multiply));
     slots.reflected_multiply = Some(intrinsic(super::stdlib::numpy::slot_reflected_multiply));
+    slots.matrix_multiply = Some(intrinsic(super::stdlib::numpy::slot_matrix_multiply));
+    slots.reflected_matrix_multiply = Some(intrinsic(
+        super::stdlib::numpy::slot_reflected_matrix_multiply,
+    ));
     slots.divide = Some(intrinsic(super::stdlib::numpy::slot_divide));
     slots.reflected_divide = Some(intrinsic(super::stdlib::numpy::slot_reflected_divide));
     slots.positive = Some(unary(super::stdlib::numpy::slot_positive));
