@@ -89,33 +89,6 @@ impl fmt::Debug for ValueKindDef {
     }
 }
 
-/// A typed module-local handle for packing and unpacking one registered inline kind.
-pub(super) struct ValueKind<T> {
-    pub definition: ValueKindDef,
-    encode: fn(T) -> u64,
-    decode: fn(u64) -> T,
-}
-
-impl<T: Copy> ValueKind<T> {
-    pub const fn new(definition: ValueKindDef, encode: fn(T) -> u64, decode: fn(u64) -> T) -> Self {
-        Self {
-            definition,
-            encode,
-            decode,
-        }
-    }
-
-    pub fn pack(&'static self, runtime: &dyn PyRuntime, value: T) -> PyResult<PyValue> {
-        runtime.new_value_kind(&self.definition, (self.encode)(value))
-    }
-
-    pub fn unpack(&'static self, runtime: &dyn PyRuntime, value: &PyValue) -> Option<T> {
-        runtime
-            .value_kind_payload(value, &self.definition)
-            .map(self.decode)
-    }
-}
-
 /// Stable error categories produced by native Python operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PyErrorKind {
@@ -228,21 +201,20 @@ pub(super) enum PyNativeKind {
     Array,
 }
 
-/// Logical scalar family carried by a type-erased array.
+/// Opaque module-owned scalar identity carried by a type-erased array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PyArrayDtype {
-    Bool,
-    Int,
-    Float,
+pub(super) struct PyArrayDtype {
+    id: u8,
+    name: &'static str,
 }
 
 impl PyArrayDtype {
+    pub const fn new(id: u8, name: &'static str) -> Self {
+        Self { id, name }
+    }
+
     pub const fn name(self) -> &'static str {
-        match self {
-            Self::Bool => "bool",
-            Self::Int => "int64",
-            Self::Float => "float64",
-        }
+        self.name
     }
 }
 

@@ -130,6 +130,95 @@ print(np.array([1], dtype=np.int64).dtype)
 }
 
 #[test]
+fn ordinary_fixed_width_dtypes_share_one_registered_scalar_contract() {
+    let source = r#"import numpy as np
+for dtype in (np.bool_, np.int8, np.int16, np.int32, np.int64,
+              np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64):
+    a = np.array([0, 1], dtype=dtype)
+    print(a.dtype, type(a[0]) is dtype)
+print(np.byte is np.int8, np.short is np.int16, np.intc is np.int32)
+print(np.ubyte is np.uint8, np.ushort is np.uint16, np.uintc is np.uint32)
+print(np.single is np.float32, np.double is np.float64)
+for spelling in ('i1', 'i2', 'i4', 'i8', 'u1', 'u2', 'u4', 'u8', 'f4', 'f8'):
+    print(np.array([1], dtype=spelling).dtype)
+print(np.array([]).dtype)
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"bool True\nint8 True\nint16 True\nint32 True\nint64 True\nuint8 True\nuint16 True\nuint32 True\nuint64 True\nfloat32 True\nfloat64 True\nTrue True True\nTrue True True\nTrue True\nint8\nint16\nint32\nint64\nuint8\nuint16\nuint32\nuint64\nfloat32\nfloat64\nfloat64\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
+fn fixed_width_arithmetic_uses_the_dtype_table() {
+    let source = r#"import numpy as np
+print(np.int8(127) + np.int8(1), type(np.int8(1) + np.uint8(1)))
+print(np.uint8(255) + np.uint8(1), type(np.int16(1) + np.uint16(1)))
+print(type(np.int32(1) + np.uint32(1)), type(np.int64(1) + np.uint64(1)))
+print(np.float32(16777216) + np.float32(1))
+print(type(np.float32(1) + np.int16(1)), type(np.float32(1) + np.int32(1)))
+a = np.array([127, -128], dtype=np.int8) + np.array([1, 1], dtype=np.int8)
+print(a.dtype, a.tolist())
+b = np.array([255], dtype=np.uint8) + np.array([1], dtype=np.uint8)
+print(b.dtype, b.tolist(), (~b).tolist())
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"-128 <class 'numpy.int16'>\n0 <class 'numpy.int32'>\n<class 'numpy.int64'> <class 'numpy.float64'>\n16777216.0\n<class 'numpy.float32'> <class 'numpy.float64'>\nint8 [-128, -127]\nuint8 [0] [255]\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
+fn reductions_and_indices_respect_fixed_width_classes() {
+    let source = r#"import numpy as np
+signed = np.array([120, 10], dtype=np.int8)
+unsigned = np.array([250, 10], dtype=np.uint8)
+print(signed.sum(), type(signed.sum()), signed.cumsum().dtype, signed.cumsum().tolist())
+print(unsigned.sum(), type(unsigned.sum()), unsigned.cumsum().dtype, unsigned.cumsum().tolist())
+floating = np.array([1, 2], dtype=np.float32)
+print(type(floating.mean()), floating.mean(), type(floating.var()))
+matrix = np.array([[100, 100]], dtype=np.int8)
+product = np.matmul(matrix, np.array([[2], [2]], dtype=np.int8))
+print(product.dtype, product.tolist())
+rows = np.array([[1], [2], [3]])
+print(rows[np.array([2, 0], dtype=np.uint8)].tolist())
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"130 <class 'numpy.int64'> int64 [120, 130]\n260 <class 'numpy.uint64'> uint64 [250, 260]\n<class 'numpy.float32'> 1.5 <class 'numpy.float32'>\nint8 [[-112]]\n[[3], [1]]\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
+fn fixed_width_conversions_reject_values_outside_the_declared_dtype() {
+    for source in [
+        "import numpy as np\nnp.int8(128)",
+        "import numpy as np\nnp.int16(-32769)",
+        "import numpy as np\nnp.uint8(-1)",
+        "import numpy as np\nnp.uint32(4294967296)",
+    ] {
+        assert_fails_with(source, "OverflowError");
+    }
+
+    assert_fails_with(
+        "import numpy as np\nnp.array([1], dtype='float16')",
+        "unsupported numpy dtype",
+    );
+}
+
+#[test]
 fn boolean_and_integer_array_indexing_gather_and_assign() {
     let source = r#"import numpy as np
 a = np.array([[1, 2], [3, 4], [5, 6]])
