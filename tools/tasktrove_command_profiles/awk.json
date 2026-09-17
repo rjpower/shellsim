@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "command": "awk",
+  "options": ["-F", "-v", "-f", "--field-separator", "--assign", "--file", "--help"],
+  "features": ["conditionals", "loops", "functions", "arrays", "regex", "begin-end", "next-exit"],
+  "functions": ["length", "substr", "index", "split", "sub", "gsub", "match", "tolower", "toupper", "int", "sprintf", "log"]
+}

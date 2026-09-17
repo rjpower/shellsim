@@ -150,6 +150,10 @@ fn awk_supports_basic_control_flow_arrays_and_functions() {
         run("printf 'alpha\\ngem\\n' | awk '$0 ~ /^a/ { print } $0 !~ /a$/ { print \"no-a\" }'"),
         (0, "alpha\nno-a\n".into(), String::new())
     );
+    assert_eq!(
+        run("awk 'BEGIN { printf \"%.4f\\n\", log(8) / log(2) }'"),
+        (0, "3.0000\n".into(), String::new())
+    );
 }
 
 #[test]

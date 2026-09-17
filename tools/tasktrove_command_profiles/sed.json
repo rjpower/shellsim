@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "command": "sed",
+  "options": ["-i", "-n", "-r", "-E", "-e", "-f", "--in-place", "--quiet", "--silent", "--regexp-extended", "--expression", "--file", "--help"],
+  "features": ["substitution", "addresses", "ranges", "insert-append-change", "delete-print", "transliterate"]
+}

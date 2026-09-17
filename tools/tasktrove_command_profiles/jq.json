@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "command": "jq",
+  "options": ["-r", "-c", "-n", "-s", "-e", "--raw-output", "--compact-output", "--null-input", "--slurp", "--exit-status", "--arg", "--argjson", "--indent", "--help"],
+  "features": ["pipes", "iteration", "selection", "construction", "conditionals", "variables", "arithmetic", "comparison", "sorting"],
+  "functions": ["add", "contains", "has", "keys", "keys_unsorted", "length", "sort_by", "split", "to_entries", "tonumber", "type", "values"]
+}

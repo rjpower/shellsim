@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "command": "dd",
+  "operands": ["if", "of", "bs", "ibs", "obs", "count", "skip", "seek", "conv", "status"]
+}
