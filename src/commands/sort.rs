@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use super::util::{ewln, read_inputs};
+use super::util::{ewln, parse_options, read_inputs, w, OptionSpec};
 use super::{reg_costed, CommandContext, CommandSpec, Io, Trust};
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
@@ -13,58 +13,69 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
 }
 
 fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    const OPTIONS: &[OptionSpec] = &[
+        OptionSpec::flag("numeric", Some('n'), Some("numeric-sort")),
+        OptionSpec::flag("reverse", Some('r'), Some("reverse")),
+        OptionSpec::flag("unique", Some('u'), Some("unique")),
+        OptionSpec::flag("fold_case", Some('f'), Some("ignore-case")),
+        OptionSpec::flag("stable", Some('s'), Some("stable")),
+        OptionSpec::required("key", Some('k'), Some("key")),
+        OptionSpec::required("separator", Some('t'), Some("field-separator")),
+        OptionSpec::flag("help", None, Some("help")),
+    ];
+    let parsed = match parse_options(args, OPTIONS) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            ewln(io.err, &format!("sort: {error}"));
+            return 2;
+        }
+    };
     let mut numeric = false;
     let mut reverse = false;
     let mut unique = false;
     let mut fold_case = false;
     let mut key = None;
-    let mut operands = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let argument = &args[index];
-        if argument == "-k" {
-            let Some(value) = args.get(index + 1) else {
-                ewln(io.err, "sort: option requires an argument -- 'k'");
-                return 2;
-            };
-            key = parse_key(value);
-            if key.is_none() {
-                ewln(io.err, "sort: invalid field specification");
-                return 2;
-            }
-            index += 2;
-            continue;
-        }
-        if let Some(value) = argument
-            .strip_prefix("-k")
-            .filter(|value| !value.is_empty())
-        {
-            key = parse_key(value);
-            if key.is_none() {
-                ewln(io.err, "sort: invalid field specification");
-                return 2;
-            }
-            index += 1;
-            continue;
-        }
-        if argument.starts_with('-') && argument != "-" {
-            for flag in argument[1..].chars() {
-                match flag {
-                    'n' => numeric = true,
-                    'r' => reverse = true,
-                    'u' => unique = true,
-                    'f' => fold_case = true,
-                    _ => {
-                        ewln(io.err, &format!("sort: unimplemented option '-{flag}'"));
+    let mut separator = None;
+    for option in parsed.options {
+        match option.key {
+            "numeric" => numeric = true,
+            "reverse" => reverse = true,
+            "unique" => unique = true,
+            "fold_case" => fold_case = true,
+            "stable" => {}
+            "key" => {
+                let value = option.value.expect("required option value");
+                key = match parse_key(&value) {
+                    Some(key) => Some(key),
+                    None => {
+                        ewln(
+                            io.err,
+                            &format!("sort: unsupported field specification '{value}'"),
+                        );
                         return 2;
                     }
-                }
+                };
             }
-        } else {
-            operands.push(argument);
+            "separator" => {
+                let value = option.value.expect("required option value");
+                let mut characters = value.chars();
+                separator = match (characters.next(), characters.next()) {
+                    (Some(separator), None) => Some(separator),
+                    _ => {
+                        ewln(io.err, "sort: field separator must be one character");
+                        return 2;
+                    }
+                };
+            }
+            "help" => {
+                w(io.out, "usage: sort [OPTIONS] [FILE...]\n");
+                w(io.out, "supported: -n -r -u -f -s -k KEY -t CHAR\n");
+                return 0;
+            }
+            _ => unreachable!("option keys come from OPTIONS"),
         }
-        index += 1;
     }
+    let operands = parsed.operands.iter().collect::<Vec<_>>();
     let (data, errors) = read_inputs(env, &operands, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("sort: {error}"));
@@ -99,10 +110,16 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         };
         let field = |line: &[u8]| {
             let value = text(line);
-            key.and_then(|position| value.split_whitespace().nth(position).map(str::to_string))
-                .unwrap_or(value)
+            key.and_then(|key| {
+                if let Some(separator) = separator {
+                    value.split(separator).nth(key.field).map(str::to_string)
+                } else {
+                    value.split_whitespace().nth(key.field).map(str::to_string)
+                }
+            })
+            .unwrap_or(value)
         };
-        if numeric {
+        let ordering = if numeric || key.is_some_and(|key| key.numeric) {
             let number = |line: &[u8]| {
                 field(line)
                     .split_whitespace()
@@ -113,10 +130,15 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             number(a)
                 .partial_cmp(&number(b))
                 .unwrap_or(std::cmp::Ordering::Equal)
-        } else if fold_case {
+        } else if fold_case || key.is_some_and(|key| key.fold_case) {
             field(a).to_lowercase().cmp(&field(b).to_lowercase())
         } else {
             field(a).cmp(&field(b))
+        };
+        if key.is_some_and(|key| key.reverse) {
+            ordering.reverse()
+        } else {
+            ordering
         }
     };
     lines.sort_by(|a, b| compare(a, b));
@@ -133,14 +155,72 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     0
 }
 
-fn parse_key(value: &str) -> Option<usize> {
-    let mut bounds = value.split(',');
-    let start = bounds.next()?;
-    let field = start.parse::<usize>().ok()?;
-    if let Some(end) = bounds.next() {
-        if bounds.next().is_some() || end.parse::<usize>().ok()? != field {
-            return None;
+#[derive(Clone, Copy)]
+struct SortKey {
+    field: usize,
+    numeric: bool,
+    reverse: bool,
+    fold_case: bool,
+}
+
+fn parse_key_bound(value: &str) -> Option<SortKey> {
+    let digits = value
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .count();
+    if digits == 0 || value[digits..].contains('.') {
+        return None;
+    }
+    let field = value[..digits].parse::<usize>().ok()?.checked_sub(1)?;
+    let mut key = SortKey {
+        field,
+        numeric: false,
+        reverse: false,
+        fold_case: false,
+    };
+    for modifier in value[digits..].chars() {
+        match modifier {
+            'n' => key.numeric = true,
+            'r' => key.reverse = true,
+            'f' => key.fold_case = true,
+            _ => return None,
         }
     }
-    field.checked_sub(1)
+    Some(key)
+}
+
+fn parse_key(value: &str) -> Option<SortKey> {
+    let mut bounds = value.split(',');
+    let mut start = parse_key_bound(bounds.next()?)?;
+    if let Some(end) = bounds.next() {
+        let end = parse_key_bound(end)?;
+        if bounds.next().is_some() || end.field != start.field {
+            return None;
+        }
+        start.numeric |= end.numeric;
+        start.reverse |= end.reverse;
+        start.fold_case |= end.fold_case;
+    }
+    Some(start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key;
+
+    #[test]
+    fn key_parser_accepts_common_modifiers_and_rejects_ranges() {
+        let key = parse_key("2n").unwrap();
+        assert_eq!(key.field, 1);
+        assert!(key.numeric);
+
+        let key = parse_key("3,3rf").unwrap();
+        assert_eq!(key.field, 2);
+        assert!(key.reverse);
+        assert!(key.fold_case);
+
+        assert!(parse_key("2,3").is_none());
+        assert!(parse_key("2.1").is_none());
+        assert!(parse_key("2M").is_none());
+    }
 }

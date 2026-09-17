@@ -4,41 +4,44 @@
 //! `has(k)`, `to_entries`, `add`. Flags: `-r/--raw-output`, `-c/--compact-output`,
 //! `-n/--null-input`. Anything outside this set is reported as unsupported.
 
+use crate::commands::util::{parse_options, OptionSpec};
 use crate::interp::Interp;
 use serde_json::Value;
 
 type Out<'a> = &'a mut Vec<u8>;
 
 pub fn jq(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err: Out) -> i32 {
+    const OPTIONS: &[OptionSpec] = &[
+        OptionSpec::flag("raw", Some('r'), Some("raw-output")),
+        OptionSpec::flag("compact", Some('c'), Some("compact-output")),
+        OptionSpec::flag("null_input", Some('n'), Some("null-input")),
+        OptionSpec::flag("help", None, Some("help")),
+    ];
+    let parsed = match parse_options(args, OPTIONS) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            ewln(err, &format!("jq: {error}"));
+            return 2;
+        }
+    };
     let mut raw = false;
     let mut compact = false;
     let mut null_input = false;
-    let mut filter: Option<String> = None;
-    let mut files: Vec<String> = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "-r" | "--raw-output" => raw = true,
-            "-c" | "--compact-output" => compact = true,
-            "-n" | "--null-input" => null_input = true,
-            "-e" | "--exit-status" => {}
-            "-s" | "--slurp" => {}
-            "-S" | "--sort-keys" => {}
-            "--arg" => {
-                it.next();
-                it.next();
+    for option in parsed.options {
+        match option.key {
+            "raw" => raw = true,
+            "compact" => compact = true,
+            "null_input" => null_input = true,
+            "help" => {
+                out.extend_from_slice(b"usage: jq [-rcn] FILTER [FILE...]\n");
+                return 0;
             }
-            s if s.starts_with('-') && s.len() > 1 => {}
-            s => {
-                if filter.is_none() {
-                    filter = Some(s.to_string());
-                } else {
-                    files.push(s.to_string());
-                }
-            }
+            _ => unreachable!("option keys come from OPTIONS"),
         }
     }
-    let filter = filter.unwrap_or_else(|| ".".to_string());
+    let mut operands = parsed.operands.into_iter();
+    let filter = operands.next().unwrap_or_else(|| ".".to_string());
+    let files = operands.collect::<Vec<_>>();
     let input_bytes = if null_input {
         b"null".to_vec()
     } else if files.is_empty() {

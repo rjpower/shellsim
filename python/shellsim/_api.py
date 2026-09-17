@@ -88,7 +88,7 @@ class RunResult:
     dropped_unsupported: int
     commands: Tuple[str, ...]
     dropped_commands: int
-    noop_commands: Tuple[str, ...]
+    unsupported_commands: Tuple[str, ...]
     partial_commands: Tuple[str, ...]
     invocations: Tuple[Invocation, ...]
     dropped_invocations: int
@@ -283,7 +283,7 @@ def _decode_result(metadata_json: str, stdout: bytes, stderr: bytes) -> RunResul
         dropped_unsupported=metadata["dropped_unsupported"],
         commands=tuple(metadata["commands"]),
         dropped_commands=metadata["dropped_commands"],
-        noop_commands=tuple(metadata["noop_commands"]),
+        unsupported_commands=tuple(metadata["unsupported_commands"]),
         partial_commands=tuple(metadata["partial_commands"]),
         invocations=invocations,
         dropped_invocations=metadata["dropped_invocations"],

@@ -9,7 +9,7 @@ use crate::commands::{CommandContext, CommandPoll, CommandResume, CommandSpec, I
 use crate::interp::Interp;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_resumable};
+    use super::{reg, reg_resumable, reg_unsupported};
     reg(m, &["cd"], Trust::Real, cmd_cd);
     reg(m, &["pwd"], Trust::Real, cmd_pwd);
     reg(m, &["export"], Trust::Real, cmd_export);
@@ -17,7 +17,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["set"], Trust::Real, cmd_set);
     reg(m, &["declare", "typeset"], Trust::Real, cmd_declare);
     reg(m, &["local"], Trust::Real, cmd_local);
-    reg(m, &["readonly"], Trust::Real, cmd_readonly);
+    reg_unsupported(m, &["readonly"]);
     reg_resumable(m, &["source", "."], Trust::Real, cmd_source, start_source);
     reg_resumable(m, &["eval"], Trust::Real, cmd_eval, start_eval);
     reg(m, &["exit"], Trust::Real, cmd_exit);
@@ -36,32 +36,25 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_resumable(m, &["fg"], Trust::Real, cmd_fg, start_fg);
     reg(m, &["bg"], Trust::Real, cmd_bg);
     reg(m, &["trap"], Trust::Real, cmd_trap);
-    reg(
+    reg_unsupported(
         m,
         &[
             "disown", "umask", "ulimit", "hash", "complete", "shopt", "bind", "history", "exec",
         ],
-        Trust::NoOp,
-        cmd_unsupported,
     );
     reg(m, &["kill"], Trust::Real, cmd_kill);
-    reg(m, &["killall", "pkill"], Trust::NoOp, cmd_unsupported);
+    reg_unsupported(m, &["killall", "pkill"]);
     reg(m, &["which"], Trust::Real, cmd_which);
     reg(m, &["type"], Trust::Real, cmd_type);
     reg_resumable(m, &["command"], Trust::Real, cmd_command, start_command);
     reg(m, &["alias"], Trust::Partial, cmd_alias);
     reg(m, &["unalias"], Trust::Real, cmd_unalias);
-    reg(m, &["getopts"], Trust::Real, cmd_getopts);
+    reg_unsupported(m, &["getopts"]);
     reg(m, &["let"], Trust::Real, cmd_let);
     reg(m, &["mapfile", "readarray"], Trust::Real, cmd_mapfile);
     reg(m, &["pushd"], Trust::Real, cmd_pushd);
     reg(m, &["popd"], Trust::Real, cmd_popd);
     reg(m, &["dirs"], Trust::Real, cmd_dirs);
-}
-
-fn cmd_unsupported(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
-    ewln(io.err, "unimplemented");
-    2
 }
 
 const MAX_TRAP_STATE_BYTES: u64 = 1024 * 1024;
@@ -568,10 +561,6 @@ fn cmd_false(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -
     1
 }
 
-fn cmd_getopts(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {
-    1 // signal "no more options" — scripts usually guard on this
-}
-
 fn cmd_alias(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     if args.is_empty() {
         let mut names = interp.aliases.keys().cloned().collect::<Vec<_>>();
@@ -962,11 +951,6 @@ fn cmd_local(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
         interp.declare_local(declare_name_of(argument));
     }
     cmd_declare(interp, args, io)
-}
-
-fn cmd_readonly(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
-    ewln(io.err, "readonly: unimplemented");
-    2
 }
 
 /// The bare variable name of a declare operand (`NAME`, `NAME=…`, `NAME[i]=…`, `NAME+=…`).

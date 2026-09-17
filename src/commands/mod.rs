@@ -124,9 +124,15 @@ type ResumableCmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> Command
 /// environment-owned VFS and resource meter even while older bodies use field syntax.
 pub struct CommandContext<'a> {
     env: &'a mut Interp,
+    command_name: &'a str,
 }
 
 impl CommandContext<'_> {
+    /// Return the registered command name selected by the dispatcher.
+    pub fn command_name(&self) -> &str {
+        self.command_name
+    }
+
     pub fn charge_cpu(&mut self, units: u64) -> bool {
         self.env.resources.charge_cpu(units)
     }
@@ -174,6 +180,23 @@ pub(crate) fn is_registered(name: &str) -> bool {
 /// Register `f` under every name in `names` with trust `t`.
 fn reg(map: &mut HashMap<&'static str, CommandSpec>, names: &[&'static str], t: Trust, f: CmdFn) {
     reg_costed(map, names, t, 100, 10 * 1024, f);
+}
+
+/// Register command names that are intentionally unavailable in the simulated environment.
+///
+/// Keeping unavailable tools in the registry lets `type` and structured telemetry distinguish a
+/// known capability boundary from a misspelled command. Every invocation uses the same visible
+/// diagnostic and nonzero status.
+fn reg_unsupported(map: &mut HashMap<&'static str, CommandSpec>, names: &[&'static str]) {
+    reg(map, names, Trust::Unsupported, cmd_unsupported);
+}
+
+fn cmd_unsupported(context: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
+    util::ewln(
+        io.err,
+        &format!("{}: not implemented in shellsim", context.command_name()),
+    );
+    127
 }
 
 /// Register a command with deterministic, deliberately-coarse base resource costs.
@@ -665,7 +688,7 @@ fn dispatch(
     let args = &argv[1..];
     if let Some(spec) = registry().get(cmd) {
         let unsupported_reason =
-            (spec.trust == Trust::NoOp).then(|| "successful compatibility no-op".to_string());
+            (spec.trust == Trust::Unsupported).then(|| "not implemented in shellsim".to_string());
         interp.invocations.begin(
             interp.process.pid,
             argv,
@@ -675,9 +698,7 @@ fn dispatch(
             interp.vfs.disk_used(),
         );
         match spec.trust {
-            Trust::NoOp => {
-                // NoOp commands (package managers and native compilers) are recorded as unsupported,
-                // preserving the legacy `note_unsupported(cmd)` behavior for that arm.
+            Trust::Unsupported => {
                 interp.note_unsupported(cmd);
             }
             Trust::Partial => {}
@@ -718,7 +739,10 @@ fn dispatch(
         let output_meter_before = interp.resources.output_bytes();
         interp.sync_vfs_time();
         let mut io = Io { stdin, out, err };
-        let mut context = CommandContext { env: interp };
+        let mut context = CommandContext {
+            env: interp,
+            command_name: cmd,
+        };
         let mut result = match (resumable, spec.resume) {
             (true, Some(start)) => start(&mut context, args, &mut io),
             _ => CommandPoll::Ready((spec.run)(&mut context, args, &mut io)),
@@ -811,7 +835,7 @@ fn dispatch(
     interp.invocations.begin(
         interp.process.pid,
         argv,
-        Trust::NoOp,
+        Trust::Unsupported,
         Some("command not found".to_string()),
         interp.resources.cpu_used(),
         interp.vfs.disk_used(),

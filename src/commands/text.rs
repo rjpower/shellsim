@@ -1,21 +1,25 @@
-//! Text processing: output (echo/printf/cat/tac/tee/yes), windowing (head/tail), counting
-//! and reshaping (wc/sort/uniq/cut/tr/rev/nl/seq/paste/comm/diff/cmp), pattern tools
-//! (grep/sed), the fold/fmt passthroughs, xargs, and the small arithmetic helpers expr/bc.
+//! Text processing: output (cat/tac/tee), windowing (head/tail), counting and reshaping
+//! (wc/uniq/cut/tr/rev/nl/seq/paste/comm/diff/cmp), pattern tools (grep/sed), xargs, and the
+//! small arithmetic helpers expr/bc. Unavailable formatting utilities are registered here as
+//! explicit capability boundaries.
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::commands::util::{ewln, lines_of, read_inputs, split_flags, w, wln};
+use crate::commands::util::{
+    basic_regex_to_rust, ewln, lines_of, parse_options, read_inputs, split_flags, w, wln,
+    OptionSpec,
+};
 use crate::commands::{ChildCommand, CommandContext, CommandPoll, CommandSpec, Io, Trust};
 use crate::descriptors::{DeviceStream, IoPoll, IoWait, DEVICE_READ_QUANTUM};
 use crate::interp::Interp;
 use crate::scheduler::WaitReason;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_buffered_resumable, reg_resumable};
+    use super::{reg, reg_buffered_resumable, reg_resumable, reg_unsupported};
     reg_resumable(m, &["cat"], Trust::Real, cmd_cat, start_cat);
     reg(m, &["tac"], Trust::Real, cmd_tac);
     reg(m, &["tee"], Trust::Real, cmd_tee);
-    reg(m, &["yes"], Trust::Real, cmd_yes);
+    reg_unsupported(m, &["yes"]);
     reg_resumable(m, &["head"], Trust::Real, cmd_head, start_head);
     reg(m, &["tail"], Trust::Real, cmd_tail);
     reg(m, &["wc"], Trust::Real, cmd_wc);
@@ -30,22 +34,14 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["nl"], Trust::Real, cmd_nl);
     reg(m, &["seq"], Trust::Real, cmd_seq);
     reg(m, &["paste"], Trust::Real, cmd_paste);
-    reg(
-        m,
-        &["fold", "fmt", "expand", "unexpand", "column", "pr"],
-        Trust::Partial,
-        cmd_passthrough,
-    );
+    reg_unsupported(m, &["fold", "fmt", "expand", "unexpand", "column", "pr"]);
     reg_buffered_resumable(m, &["xargs"], Trust::Real, cmd_xargs, start_xargs);
     reg(m, &["comm"], Trust::Real, cmd_comm);
     reg(m, &["diff"], Trust::Partial, cmd_diff);
     reg(m, &["cmp"], Trust::Real, cmd_cmp);
     reg(m, &["expr"], Trust::Real, cmd_expr);
     reg(m, &["bc"], Trust::Real, cmd_bc);
-    reg(m, &["factor"], Trust::Real, |_, _, io| {
-        ewln(io.err, "factor: unimplemented");
-        2
-    });
+    reg_unsupported(m, &["factor"]);
 }
 
 #[derive(Clone)]
@@ -465,12 +461,6 @@ fn cmd_tee(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
     }
     io.out.extend_from_slice(&io.stdin);
     status
-}
-
-fn cmd_yes(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let _ = args;
-    ewln(io.err, "yes: unimplemented streaming output");
-    2
 }
 
 fn cmd_head(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -1161,11 +1151,6 @@ fn cmd_paste(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
     0
 }
 
-fn cmd_passthrough(_interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
-    ewln(io.err, "unimplemented");
-    2
-}
-
 fn cmd_xargs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let commands = match xargs_commands(args, &io.stdin, io.err) {
         Ok(commands) => commands,
@@ -1429,6 +1414,35 @@ fn cmd_fgrep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
 
 /// grep with the command name available (egrep/fgrep change default regex flavor).
 fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i32 {
+    const OPTIONS: &[OptionSpec] = &[
+        OptionSpec::flag("ignore_case", Some('i'), Some("ignore-case")),
+        OptionSpec::flag("invert", Some('v'), Some("invert-match")),
+        OptionSpec::flag("count", Some('c'), Some("count")),
+        OptionSpec::flag("line_number", Some('n'), Some("line-number")),
+        OptionSpec::flag("files_with", Some('l'), Some("files-with-matches")),
+        OptionSpec::flag("only_match", Some('o'), Some("only-matching")),
+        OptionSpec::flag("recursive", Some('r'), Some("recursive")),
+        OptionSpec::flag("recursive", Some('R'), Some("dereference-recursive")),
+        OptionSpec::flag("extended", Some('E'), Some("extended-regexp")),
+        OptionSpec::flag("fixed", Some('F'), Some("fixed-strings")),
+        OptionSpec::flag("word", Some('w'), Some("word-regexp")),
+        OptionSpec::flag("line", Some('x'), Some("line-regexp")),
+        OptionSpec::flag("quiet", Some('q'), Some("quiet")),
+        OptionSpec::flag("quiet", None, Some("silent")),
+        OptionSpec::flag("no_filename", Some('h'), Some("no-filename")),
+        OptionSpec::flag("suppress_errors", Some('s'), Some("no-messages")),
+        OptionSpec::flag("text", Some('a'), Some("text")),
+        OptionSpec::required("regexp", Some('e'), Some("regexp")),
+        OptionSpec::required("max_count", Some('m'), Some("max-count")),
+        OptionSpec::flag("help", None, Some("help")),
+    ];
+    let parsed = match parse_options(args, OPTIONS) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            ewln(io.err, &format!("grep: {error}"));
+            return 2;
+        }
+    };
     let mut ignore_case = false;
     let mut invert = false;
     let mut count = false;
@@ -1439,59 +1453,61 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
     let mut extended = cmd == "egrep";
     let mut fixed = cmd == "fgrep";
     let mut word = false;
+    let mut line_regexp = false;
     let mut quiet = false;
     let mut suppress_errors = false;
     let mut suppress_filename = false;
+    let mut max_count = None;
     let mut patterns = Vec::new();
-    let mut files = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a.starts_with('-') && a.len() > 1 && a != "-" {
-            if let Some(p) = a.strip_prefix("-e") {
-                if p.is_empty() {
-                    let Some(pattern) = it.next() else {
-                        ewln(io.err, "grep: option requires an argument -- 'e'");
-                        return 2;
-                    };
-                    patterns.push(pattern.clone());
-                } else {
-                    patterns.push(p.to_string());
-                }
-                continue;
+    for option in parsed.options {
+        match option.key {
+            "ignore_case" => ignore_case = true,
+            "invert" => invert = true,
+            "count" => count = true,
+            "line_number" => line_num = true,
+            "files_with" => files_with = true,
+            "only_match" => only_match = true,
+            "recursive" => recursive = true,
+            "extended" => {
+                extended = true;
+                fixed = false;
             }
-            if a.starts_with("-A") || a.starts_with("-B") || a.starts_with("-C") {
-                ewln(io.err, &format!("grep: unimplemented context option '{a}'"));
-                return 2;
-            }
-            for c in a[1..].chars() {
-                match c {
-                    'i' => ignore_case = true,
-                    'v' => invert = true,
-                    'c' => count = true,
-                    'n' => line_num = true,
-                    'l' => files_with = true,
-                    'o' => only_match = true,
-                    'r' | 'R' => recursive = true,
-                    'E' => extended = true,
-                    'F' => fixed = true,
-                    'w' => word = true,
-                    'q' => quiet = true,
-                    'h' => suppress_filename = true,
-                    's' => suppress_errors = true,
-                    'a' => {}
-                    _ => {
-                        ewln(io.err, &format!("grep: unimplemented option '-{c}'"));
+            "fixed" => fixed = true,
+            "word" => word = true,
+            "line" => line_regexp = true,
+            "quiet" => quiet = true,
+            "no_filename" => suppress_filename = true,
+            "suppress_errors" => suppress_errors = true,
+            "text" => {}
+            "regexp" => patterns.push(option.value.expect("required option value")),
+            "max_count" => {
+                let value = option.value.expect("required option value");
+                max_count = match value.parse::<usize>() {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        ewln(io.err, &format!("grep: invalid max count: {value}"));
                         return 2;
                     }
-                }
+                };
             }
-        } else if patterns.is_empty() {
-            patterns.push(a.clone());
-        } else {
-            files.push(a.clone());
+            "help" => {
+                w(io.out, "usage: grep [OPTIONS] PATTERN [FILE...]\n");
+                w(
+                    io.out,
+                    "supported: -E -F -i -v -c -n -l -o -r -w -x -q -h -s -e -m\n",
+                );
+                return 0;
+            }
+            _ => unreachable!("option keys come from OPTIONS"),
         }
     }
-    let _ = extended;
+    let mut operands = parsed.operands;
+    let files = if patterns.is_empty() && !operands.is_empty() {
+        patterns.push(operands.remove(0));
+        operands
+    } else {
+        operands
+    };
     if patterns.is_empty() {
         ewln(io.err, "grep: no pattern");
         return 2;
@@ -1503,6 +1519,24 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
             .collect::<Vec<_>>()
             .join("|")
     } else {
+        let patterns: Result<Vec<String>, String> = if extended {
+            Ok(patterns.clone())
+        } else {
+            patterns
+                .iter()
+                .map(|pattern| basic_regex_to_rust(pattern))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let patterns = match patterns {
+            Ok(patterns) => patterns,
+            Err(error) => {
+                ewln(
+                    io.err,
+                    &format!("grep: unsupported regular expression: {error}"),
+                );
+                return 2;
+            }
+        };
         patterns
             .iter()
             .map(|pattern| format!("(?:{pattern})"))
@@ -1511,6 +1545,9 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
     };
     if word {
         pat_re = format!(r"\b(?:{pat_re})\b");
+    }
+    if line_regexp {
+        pat_re = format!(r"^(?:{pat_re})$");
     }
     let re = match regex::RegexBuilder::new(&pat_re)
         .case_insensitive(ignore_case)
@@ -1580,12 +1617,21 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
         let mut file_count = 0;
         let mut matched_file = false;
         for (lineno, line) in String::from_utf8_lossy(data).lines().enumerate() {
+            if max_count == Some(0) {
+                break;
+            }
             let is_match = re.is_match(line) ^ invert;
             if is_match {
                 matched_file = true;
                 file_count += 1;
                 total_matches += 1;
-                if quiet || count || files_with {
+                if quiet {
+                    return 0;
+                }
+                if count || files_with {
+                    if files_with || max_count.is_some_and(|limit| file_count >= limit) {
+                        break;
+                    }
                     continue;
                 }
                 let mut prefix = String::new();
@@ -1602,6 +1648,9 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
                     }
                 } else {
                     wln(io.out, &format!("{prefix}{line}"));
+                }
+                if max_count.is_some_and(|limit| file_count >= limit) {
+                    break;
                 }
             }
         }
@@ -1626,48 +1675,64 @@ fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i3
 }
 
 fn cmd_sed(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    const OPTIONS: &[OptionSpec] = &[
+        OptionSpec::optional_attached("in_place", Some('i'), Some("in-place")),
+        OptionSpec::flag("quiet", Some('n'), Some("quiet")),
+        OptionSpec::flag("quiet", None, Some("silent")),
+        OptionSpec::flag("extended", Some('r'), Some("regexp-extended")),
+        OptionSpec::flag("extended", Some('E'), None),
+        OptionSpec::required("expression", Some('e'), Some("expression")),
+        OptionSpec::flag("help", None, Some("help")),
+    ];
+    let parsed = match parse_options(args, OPTIONS) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            ewln(io.err, &format!("sed: {error}"));
+            return 2;
+        }
+    };
     let mut in_place = false;
     let mut quiet = false;
     let mut scripts: Vec<String> = Vec::new();
     let mut extended = false;
-    let mut files = Vec::new();
-    let mut it = args.iter().peekable();
-    while let Some(a) = it.next() {
-        if a == "-i" || a.starts_with("-i") {
-            in_place = true;
-            if a.len() > 2 {
-                ewln(io.err, "sed: unimplemented in-place backup suffix");
-                return 2;
+    for option in parsed.options {
+        match option.key {
+            "in_place" => {
+                in_place = true;
+                if option.value.is_some_and(|suffix| !suffix.is_empty()) {
+                    ewln(io.err, "sed: unsupported in-place backup suffix");
+                    return 2;
+                }
             }
-        } else if a == "-n" {
-            quiet = true;
-        } else if a == "-r" || a == "-E" {
-            extended = true;
-        } else if a == "-e" {
-            if let Some(s) = it.next() {
-                scripts.push(s.clone());
+            "quiet" => quiet = true,
+            "extended" => extended = true,
+            "expression" => scripts.push(option.value.expect("required option value")),
+            "help" => {
+                w(io.out, "usage: sed [OPTIONS] SCRIPT [FILE...]\n");
+                w(io.out, "supported: -n -E -r -e SCRIPT -i[SUFFIX]\n");
+                return 0;
             }
-        } else if let Some(s) = a.strip_prefix("-e") {
-            scripts.push(s.to_string());
-        } else if a == "--" {
-            continue;
-        } else if a.starts_with('-') {
-            ewln(io.err, &format!("sed: unimplemented option '{a}'"));
-            return 2;
-        } else if scripts.is_empty() && !a.starts_with('-') {
-            scripts.push(a.clone());
-        } else {
-            files.push(a.clone());
+            _ => unreachable!("option keys come from OPTIONS"),
         }
     }
-    let _ = extended;
+    let mut operands = parsed.operands;
+    let files = if scripts.is_empty() && !operands.is_empty() {
+        scripts.push(operands.remove(0));
+        operands
+    } else {
+        operands
+    };
+    if in_place && files.is_empty() {
+        ewln(io.err, "sed: -i requires at least one file operand");
+        return 2;
+    }
     if scripts.is_empty() {
         ewln(io.err, "sed: missing command");
         return 1;
     }
     let mut commands = Vec::new();
     for script in &scripts {
-        match parse_sed_script(script) {
+        match parse_sed_script(script, extended) {
             Ok(parsed) => commands.extend(parsed),
             Err(error) => {
                 ewln(io.err, &format!("sed: {error}"));
@@ -1790,7 +1855,7 @@ enum SedCmd {
     Print,
 }
 
-fn parse_sed_script(s: &str) -> Result<Vec<SedOperation>, String> {
+fn parse_sed_script(s: &str, extended: bool) -> Result<Vec<SedOperation>, String> {
     let mut cmds = Vec::new();
     for part in s.split(';') {
         let part = part.trim();
@@ -1814,14 +1879,9 @@ fn parse_sed_script(s: &str) -> Result<Vec<SedOperation>, String> {
             (SedAddress::Every, part)
         };
         if let Some(rest) = body.strip_prefix('s') {
-            if let Some(cmd) = parse_subst(rest) {
-                cmds.push(SedOperation {
-                    address,
-                    command: cmd,
-                });
-            } else {
-                return Err(format!("invalid substitution '{body}'"));
-            }
+            let command = parse_subst(rest, extended)
+                .map_err(|error| format!("invalid substitution '{body}': {error}"))?;
+            cmds.push(SedOperation { address, command });
         } else if body == "d" {
             cmds.push(SedOperation {
                 address,
@@ -1839,8 +1899,11 @@ fn parse_sed_script(s: &str) -> Result<Vec<SedOperation>, String> {
     Ok(cmds)
 }
 
-fn parse_subst(rest: &str) -> Option<SedCmd> {
-    let delim = rest.chars().next()?;
+fn parse_subst(rest: &str, extended: bool) -> Result<SedCmd, String> {
+    let delim = rest
+        .chars()
+        .next()
+        .ok_or_else(|| "missing delimiter".to_string())?;
     let chars: Vec<char> = rest.chars().collect();
     let mut i = 1;
     let mut fields = [String::new(), String::new(), String::new()];
@@ -1866,7 +1929,16 @@ fn parse_subst(rest: &str) -> Option<SedCmd> {
         fields[fi].push(c);
         i += 1;
     }
+    if fi < 2 {
+        return Err("unterminated substitution".to_string());
+    }
     let (pat, rep, flags) = (&fields[0], &fields[1], &fields[2]);
+    if let Some(flag) = flags
+        .chars()
+        .find(|flag| !matches!(flag, 'g' | 'p' | 'i' | 'I' | '0'..='9'))
+    {
+        return Err(format!("unsupported flag '{flag}'"));
+    }
     let global = flags.contains('g');
     let ignore = flags.contains('i') || flags.contains('I');
     let print = flags.contains('p');
@@ -1876,13 +1948,18 @@ fn parse_subst(rest: &str) -> Option<SedCmd> {
         .collect::<String>()
         .parse()
         .unwrap_or(0);
-    let re = regex::RegexBuilder::new(pat)
+    let pattern = if extended {
+        pat.clone()
+    } else {
+        basic_regex_to_rust(pat)?
+    };
+    let re = regex::RegexBuilder::new(&pattern)
         .case_insensitive(ignore)
         .build()
-        .ok()?;
+        .map_err(|error| error.to_string())?;
     // convert sed replacement backrefs \1 -> ${1}
     let rep = convert_sed_replacement(rep);
-    Some(SedCmd::Subst {
+    Ok(SedCmd::Subst {
         re,
         rep,
         global,

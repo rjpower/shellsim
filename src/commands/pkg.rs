@@ -1,10 +1,10 @@
 //! Package managers and build tools.
 //!
-//! Installers (`pip`/`pip3`/`conda`/`pipx`) don't fetch anything, but they DO record the
-//! installed package names into [`Interp::packages`] so bootstrap probes such as `pip list`
-//! remain deterministic. Package contents are absent, so installers remain [`Trust::NoOp`].
+//! `pip`/`pip3` can activate the bundled `numpy` and `pytest` distributions without network
+//! access. Other package managers, packages, native toolchains, and external runtimes are
+//! explicit unsupported boundaries.
 //!
-//! Build tools / compilers (`gcc`/`make`/`cargo`/…) stay pure no-ops: see
+//! Build tools / compilers (`gcc`/`cargo`/…) fail visibly: see
 //! `docs/implementation.md` for why shellsim deliberately does not simulate native compilation.
 
 use std::collections::HashMap;
@@ -13,13 +13,13 @@ use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
-    // Real-ish: installers that update package state (still NoOp-trust: contents are absent).
-    reg(m, &["pip", "pip3", "conda", "pipx"], Trust::NoOp, cmd_pip);
-    // Pure no-ops: build tools, compilers, daemons, runtimes we don't simulate.
-    reg(
+    use super::{reg, reg_unsupported};
+    reg(m, &["pip", "pip3"], Trust::Partial, cmd_pip);
+    reg_unsupported(
         m,
         &[
+            "conda",
+            "pipx",
             "apt",
             "apt-get",
             "npm",
@@ -45,32 +45,35 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
             "rustc",
             "go",
         ],
-        Trust::NoOp,
-        cmd_noop,
     );
 }
 
-/// Pretend success; the dispatcher already recorded the command as unsupported.
-fn cmd_noop(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {
-    0
-}
-
-/// `pip install [flags] pkg[==ver] ...` / `pip install -r req.txt` / `conda install ...`.
-/// Records package names so the embedded libraries become importable. Other subcommands
-/// (`list`, `show`, `freeze`, `uninstall`, …) are handled enough to be plausible.
+/// Implement the bounded `pip` surface used to activate bundled packages.
 fn cmd_pip(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    // find the subcommand (first non-flag token)
-    let sub = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(|s| s.as_str())
-        .unwrap_or("");
+    let mut sub_index = 0;
+    while args.get(sub_index).is_some_and(|argument| {
+        matches!(
+            argument.as_str(),
+            "-q" | "--quiet" | "--disable-pip-version-check"
+        )
+    }) {
+        sub_index += 1;
+    }
+    let sub = args.get(sub_index).map(String::as_str).unwrap_or("");
     match sub {
-        "install" => {
-            register_install_args(interp, args);
-            0
-        }
+        "install" => match register_install_args(interp, args) {
+            Ok(_) => 0,
+            Err(error) => {
+                interp.note_unsupported(&format!("pip:{error}"));
+                crate::commands::util::ewln(io.err, &format!("pip: {error}"));
+                1
+            }
+        },
         "list" | "freeze" => {
+            if args.len() != sub_index + 1 {
+                crate::commands::util::ewln(io.err, "pip: unsupported option");
+                return 2;
+            }
             let mut names: Vec<&String> = interp.packages.iter().collect();
             names.sort();
             for n in names {
@@ -83,28 +86,42 @@ fn cmd_pip(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             0
         }
         "show" => {
-            // `pip show NAME` → minimal metadata if "installed"
-            if let Some(name) = args
-                .iter()
-                .rfind(|a| !a.starts_with('-'))
-                .filter(|a| a.as_str() != "show")
-            {
-                let key = normalize_pkg(name);
-                if interp.packages.contains(&key) || interp.packages.contains(name.as_str()) {
-                    crate::commands::util::wln(io.out, &format!("Name: {name}"));
-                    crate::commands::util::wln(io.out, "Version: 0.0.0");
-                }
+            let Some(name) = args
+                .get(sub_index + 1)
+                .filter(|_| args.len() == sub_index + 2)
+            else {
+                crate::commands::util::ewln(io.err, "pip: show requires one package name");
+                return 2;
+            };
+            let key = normalize_pkg(name);
+            if interp.packages.contains(&key) || interp.packages.contains(name.as_str()) {
+                crate::commands::util::wln(io.out, &format!("Name: {name}"));
+                crate::commands::util::wln(io.out, "Version: 0.0.0");
+                0
+            } else {
+                crate::commands::util::ewln(
+                    io.err,
+                    &format!("WARNING: Package(s) not found: {name}"),
+                );
+                1
             }
+        }
+        "--help" | "-h" | "" => {
+            crate::commands::util::wln(io.out, "usage: pip {install,list,freeze,show} [OPTIONS]");
             0
         }
-        _ => 0, // uninstall / download / config / wheel / cache → benign success
+        _ => {
+            interp.note_unsupported(&format!("pip:{sub}"));
+            crate::commands::util::ewln(io.err, &format!("pip: unsupported command '{sub}'"));
+            2
+        }
     }
 }
 
 /// Parse the token stream after `install` and register each concrete package. Handles version
 /// specifiers (`pkg==1.2`, `"pkg>=1"`), extras (`pkg[all]`), `-r requirements.txt`, and the
-/// common flags (skipping the values of value-taking ones). Shared by pip/conda/uv.
-pub fn register_install_args(interp: &mut Interp, args: &[String]) {
+/// common flags. The operation is validated completely before package state changes.
+pub fn register_install_args(interp: &mut Interp, args: &[String]) -> Result<Vec<String>, String> {
     // flags that consume the following token as a value (and aren't packages)
     const VALUE_FLAGS: &[&str] = &[
         "-i",
@@ -127,8 +144,17 @@ pub fn register_install_args(interp: &mut Interp, args: &[String]) {
         "--no-binary",
         "--only-binary",
     ];
+    const BOOLEAN_FLAGS: &[&str] = &[
+        "-q",
+        "--quiet",
+        "-U",
+        "--upgrade",
+        "--no-deps",
+        "--disable-pip-version-check",
+    ];
     let mut i = 0;
     let mut seen_sub = false;
+    let mut packages = Vec::new();
     while i < args.len() {
         let a = &args[i];
         if a == "install" || a == "add" {
@@ -137,19 +163,26 @@ pub fn register_install_args(interp: &mut Interp, args: &[String]) {
             continue;
         }
         if a == "-r" || a == "--requirement" {
-            if let Some(file) = args.get(i + 1) {
-                register_requirements_file(interp, file);
-            }
+            let file = args
+                .get(i + 1)
+                .ok_or_else(|| format!("option '{a}' requires an argument"))?;
+            packages.extend(requirements_file_packages(interp, file)?);
             i += 2;
             continue;
         }
         if VALUE_FLAGS.contains(&a.as_str()) {
+            if args.get(i + 1).is_none() {
+                return Err(format!("option '{a}' requires an argument"));
+            }
             i += 2;
             continue;
         }
-        if a.starts_with('-') {
+        if BOOLEAN_FLAGS.contains(&a.as_str()) {
             i += 1;
             continue;
+        }
+        if a.starts_with('-') {
+            return Err(format!("unsupported option '{a}'"));
         }
         if !seen_sub {
             // token before the subcommand (e.g. a `pip`-as-arg) — skip until we see install/add
@@ -163,29 +196,54 @@ pub fn register_install_args(interp: &mut Interp, args: &[String]) {
             || a.ends_with(".whl")
             || a.ends_with(".tar.gz")
         {
-            i += 1;
-            continue;
+            return Err(format!("unsupported package source '{a}'"));
         }
         if let Some(name) = package_name_of(a) {
-            interp.install_package(&name);
+            if !is_bundled_package(&name) {
+                return Err(format!("package '{name}' is not bundled"));
+            }
+            packages.push(name);
         }
         i += 1;
     }
+    if !seen_sub {
+        return Err("missing install command".to_string());
+    }
+    if packages.is_empty() {
+        return Err("no packages specified".to_string());
+    }
+    for name in &packages {
+        interp.install_package(name);
+    }
+    Ok(packages)
 }
 
-/// Read a requirements file from the VFS and register each requirement line.
-pub fn register_requirements_file(interp: &mut Interp, file: &str) {
-    if let Ok(src) = interp.vfs.read_string(&interp.cwd, file) {
-        for line in src.lines() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() || line.starts_with('-') {
-                continue;
+fn requirements_file_packages(interp: &Interp, file: &str) -> Result<Vec<String>, String> {
+    let src = interp
+        .vfs
+        .read_string(&interp.cwd, file)
+        .map_err(|error| format!("cannot read requirements file '{file}': {error}"))?;
+    let mut packages = Vec::new();
+    for line in src.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('-') {
+            return Err(format!("unsupported requirement option '{line}'"));
+        }
+        if let Some(name) = package_name_of(line) {
+            if !is_bundled_package(&name) {
+                return Err(format!("package '{name}' is not bundled"));
             }
-            if let Some(name) = package_name_of(line) {
-                interp.install_package(&name);
-            }
+            packages.push(name);
         }
     }
+    Ok(packages)
+}
+
+fn is_bundled_package(name: &str) -> bool {
+    matches!(name, "numpy" | "pytest")
 }
 
 /// Strip a requirement spec down to the *import* name we register. Returns None for things we

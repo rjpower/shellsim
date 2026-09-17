@@ -14,7 +14,7 @@ use crate::interp::Interp;
 use crate::scheduler::WaitReason;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_buffered_resumable, reg_resumable};
+    use super::{reg, reg_buffered_resumable, reg_resumable, reg_unsupported};
     // time / scheduling (virtual clock, never blocks)
     reg_resumable(m, &["sleep"], Trust::Real, cmd_sleep, start_sleep);
     reg_resumable(m, &["usleep"], Trust::Real, cmd_usleep, start_usleep);
@@ -30,7 +30,8 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
         cmd_sh,
         start_sh,
     );
-    reg(m, &["uv", "uvx", "uvenv"], Trust::Partial, cmd_uv);
+    reg(m, &["uv", "uvx"], Trust::Partial, cmd_uv);
+    reg_unsupported(m, &["uvenv"]);
 
     // interpreters
     reg_buffered_resumable(m, &["python3"], Trust::Partial, cmd_python3, start_python3);
@@ -561,49 +562,98 @@ fn run_shell_child(
 /// venv / installed-package state; `run`/`tool run`/`uvx` route the minimal Python shim
 /// to our engines so verifiers launched via uv still run.
 fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let has = |s: &str| args.iter().any(|a| a == s);
+    let first = args.first().map(String::as_str);
+    if matches!(first, Some("--help" | "-h")) {
+        wln(
+            io.out,
+            "usage: uv {add,pip install,sync,lock,venv,run,tool run} ...",
+        );
+        return 0;
+    }
     // ---- package management (takes priority so `uv pip install pytest` installs, not runs) ----
-    if has("add") {
-        crate::commands::pkg::register_install_args(interp, args);
+    if first == Some("add") {
+        if let Err(error) = crate::commands::pkg::register_install_args(interp, args) {
+            interp.note_unsupported(&format!("uv:{error}"));
+            ewln(io.err, &format!("uv: {error}"));
+            return 1;
+        }
         update_pyproject(interp, &install_specs_after(args, "add"));
         ensure_venv(interp);
         return 0;
     }
-    if has("remove") {
-        return 0;
+    if first == Some("remove") {
+        interp.note_unsupported("uv:remove");
+        ewln(io.err, "uv: unsupported command 'remove'");
+        return 2;
     }
-    if has("sync") || has("lock") {
-        uv_sync(interp);
+    if matches!(first, Some("sync" | "lock")) {
+        if args.len() != 1 {
+            interp.note_unsupported("uv:sync-options");
+            ewln(io.err, "uv: unsupported sync or lock option");
+            return 2;
+        }
+        if let Err(error) = uv_sync(interp) {
+            interp.note_unsupported(&format!("uv:{error}"));
+            ewln(io.err, &format!("uv: {error}"));
+            return 1;
+        }
         ensure_venv(interp);
         return 0;
     }
-    if has("pip") && has("install") {
-        crate::commands::pkg::register_install_args(interp, args);
+    if first == Some("pip") && args.get(1).map(String::as_str) == Some("install") {
+        if let Err(error) = crate::commands::pkg::register_install_args(interp, args) {
+            interp.note_unsupported(&format!("uv:{error}"));
+            ewln(io.err, &format!("uv: {error}"));
+            return 1;
+        }
         ensure_venv(interp);
         return 0;
     }
-    if has("venv") || has("init") {
+    if first == Some("venv") {
+        if args.len() != 1 {
+            interp.note_unsupported("uv:venv-arguments");
+            ewln(io.err, "uv: unsupported venv argument");
+            return 2;
+        }
         ensure_venv(interp);
         return 0;
     }
     // ---- run / tool run / uvx: route the embedded interpreter ----
-    if let Some(pos) = args
-        .iter()
-        .position(|a| a == "pytest" || a.ends_with("/pytest"))
-    {
-        return crate::python::run_pytest(interp, &args[pos + 1..], io.out, io.err);
+    let launcher_args = if interp.command_name() == "uvx" {
+        Some(args)
+    } else if first == Some("run") {
+        Some(&args[1..])
+    } else if first == Some("tool") && args.get(1).map(String::as_str) == Some("run") {
+        Some(&args[2..])
+    } else {
+        None
+    };
+    if let Some((launcher_args, pos)) = launcher_args.and_then(|launcher_args| {
+        launcher_args
+            .iter()
+            .position(|a| a == "pytest" || a.ends_with("/pytest"))
+            .map(|position| (launcher_args, position))
+    }) {
+        return crate::python::run_pytest(interp, &launcher_args[pos + 1..], io.out, io.err);
     }
-    if let Some(pos) = args
-        .iter()
-        .position(|a| matches!(a.as_str(), "python" | "python3" | "python3.14"))
-    {
-        let mut argv = vec![args[pos].clone()];
-        argv.extend(args[pos + 1..].iter().cloned());
+    if let Some((launcher_args, pos)) = launcher_args.and_then(|launcher_args| {
+        launcher_args
+            .iter()
+            .position(|a| matches!(a.as_str(), "python" | "python3" | "python3.14"))
+            .map(|position| (launcher_args, position))
+    }) {
+        let mut argv = vec![launcher_args[pos].clone()];
+        argv.extend(launcher_args[pos + 1..].iter().cloned());
         let stdin = std::mem::take(&mut io.stdin);
         return crate::python::run_python(interp, &argv, stdin, io.out, io.err);
     }
-    interp.note_unsupported(&args[0]);
-    0
+    let invocation = args.join(" ");
+    interp.note_unsupported(&format!("uv:{invocation}"));
+    ewln(
+        io.err,
+        &format!("uv: unsupported invocation '{invocation}'"),
+    );
+    2
 }
 
 /// Collect the raw package specs following a `uv add` / `uv pip install` keyword (for pyproject).
@@ -659,22 +709,27 @@ fn ensure_venv(interp: &mut Interp) {
 }
 
 /// `uv sync` / `uv lock`: register every dependency declared in `pyproject.toml`.
-fn uv_sync(interp: &mut Interp) {
+fn uv_sync(interp: &mut Interp) -> Result<(), String> {
     let cwd = interp.cwd.clone();
     let path = crate::vfs::resolve_against(&cwd, "pyproject.toml");
     if let Ok(content) = interp.vfs.read_string("/", &path) {
-        // pull each "name>=ver" / "name==ver" string out of the dependencies arrays
-        for spec in extract_dep_specs(&content) {
-            if let Some(name) = crate::commands::pkg::package_name_of(&spec) {
-                interp.install_package(&name);
-            }
+        // Pull each "name>=ver" / "name==ver" string out of the dependencies arrays.
+        let specs = extract_dep_specs(&content);
+        if !specs.is_empty() {
+            let mut args = vec!["install".to_string()];
+            args.extend(specs);
+            crate::commands::pkg::register_install_args(interp, &args)?;
         }
     }
     // a requirements.txt next to it, if present
     let req = crate::vfs::resolve_against(&cwd, "requirements.txt");
     if interp.vfs.is_file("/", &req) {
-        crate::commands::pkg::register_requirements_file(interp, &req);
+        crate::commands::pkg::register_install_args(
+            interp,
+            &["install".to_string(), "-r".to_string(), req],
+        )?;
     }
+    Ok(())
 }
 
 /// Add specs to `pyproject.toml`'s `[project] dependencies` (creating the file/section if absent).

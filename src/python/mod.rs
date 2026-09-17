@@ -588,7 +588,16 @@ fn run_module(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
     match args.first().map(String::as_str) {
         Some("pip") => {
             if args.get(1).map(String::as_str) == Some("install") {
-                crate::commands::pkg::register_install_args(interp, &args[1..]);
+                if let Err(error) = crate::commands::pkg::register_install_args(interp, &args[1..])
+                {
+                    interp.note_unsupported(&format!("pip:{error}"));
+                    err.extend_from_slice(format!("pip: {error}\n").as_bytes());
+                    return 1;
+                }
+            } else {
+                err.extend_from_slice(b"pip: unsupported command\n");
+                interp.note_unsupported("pip:command");
+                return 2;
             }
             0
         }

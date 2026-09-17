@@ -39,12 +39,12 @@ def test_stdin_is_explicit_and_byte_preserving() -> None:
     assert shellsim.run("cat", b"\x00\xff\n").stdout == b"\x00\xff\n"
 
 
-def test_fidelity_telemetry_exposes_noop_and_partial_commands() -> None:
-    result = shellsim.run("pip install sample; sed -n '1p' /missing")
+def test_fidelity_telemetry_exposes_unsupported_and_partial_commands() -> None:
+    result = shellsim.run("npm install; sed -n '1p' /missing")
 
-    assert "pip" in result.noop_commands
+    assert "npm" in result.unsupported_commands
     assert "sed" in result.partial_commands
-    assert {invocation.trust for invocation in result.invocations} >= {"no_op", "partial"}
+    assert {invocation.trust for invocation in result.invocations} >= {"unsupported", "partial"}
 
 
 def test_exhaustion_is_terminal_and_reuse_is_observable() -> None:
