@@ -12,12 +12,13 @@ bounded shellsim environment per task and retains that environment across setup,
 solution, and the verifier.
 
 The replay models the task image as shellsim's built-in userspace plus local Dockerfile `COPY`,
-`ENV`, `WORKDIR`, and deterministic `RUN` steps. Network, operating-system, and package
+`ENV`, `WORKDIR`, and non-provisioning `RUN` steps. Network, operating-system, and package
 provisioning steps are recorded as image prerequisites rather than executed. It then mounts and
-runs the unmodified `solution/solve.sh`. Finally, it mounts `/tests` and runs all `test_*.py` files
-with shellsim's pytest entry point, or the task's direct reference evaluator when it has no pytest
-file. This bypasses only verifier-wrapper provisioning and report-upload boilerplate such as
-`apt-get`, `curl`, and `uvx` installation.
+runs the unmodified `solution/solve.sh`. Finally, it mounts `/tests` and runs the unmodified
+`tests/test.sh`. When that wrapper reaches a shellsim boundary, the probe also runs a normalized
+verifier payload: all `test_*.py` files through shellsim's pytest entry point, or the task's direct
+reference evaluator when it has no pytest file. The normalized fallback does not reproduce
+arbitrary wrapper environment setup; its result is labeled separately from the wrapper result.
 
 Every phase records its status, resource stop, command trace, unsupported telemetry, and bounded
 stderr. The final result also records verifier reward, skipped image prerequisites, and harness
@@ -31,18 +32,23 @@ python3 tools/tasktrove_runtime_probe.py /path/to/OpenThoughts-TBLite > replay.j
 
 The September 17, 2026 replay completes all 100 tasks without a harness error.
 
-| Phase outcome | Golden solutions | Verifiers |
-| --- | ---: | ---: |
-| Clean exit | 50 | 14 |
-| Explicit shellsim boundary | 40 | 40 |
-| Nonzero without unsupported telemetry | 7 | 42 |
-| Resource exhaustion | 3 | 1 |
-| Not run after terminal exhaustion | 0 | 3 |
+| Phase outcome | Golden solutions | Unmodified `test.sh` | Selected verifier result |
+| --- | ---: | ---: | ---: |
+| Clean exit | 50 | 14 | 14 |
+| Explicit shellsim boundary | 40 | 80 | 40 |
+| Nonzero without unsupported telemetry | 7 | 2 | 42 |
+| Resource exhaustion | 3 | 1 | 0 |
+| Not run after terminal exhaustion | 0 | 3 | 4 |
+
+The selected verifier result uses the unmodified wrapper for its 14 clean executions and the
+normalized payload for 82 tasks whose wrapper did not complete cleanly. Four tasks cannot reach a
+selected result after resource exhaustion.
 
 One task, `tsl-test-case-generation`, produces a positive partial reward of `0.8825`; no task
-produces full reward. At the task level, 67 replays end at an explicit boundary, 28 are rejected by
-the verifier, four exhaust modeled resources, and one produces the partial reward. Three of the 28
-verifier-rejected tasks also record an earlier explicit boundary.
+produces full reward. At the task level, 67 replays reach an explicit task-payload boundary, three
+combine such a boundary with zero verifier reward, 25 are rejected by the verifier without an
+explicit task-payload boundary, four exhaust modeled resources, and one produces the partial
+reward. Provisioning-only boundaries in `test.sh` remain visible but do not determine this category.
 
 Runtime evidence resolves dynamic commands and exposes interactions that argv inspection cannot.
 For example, one solution reaches AWK 1,010 times with a malformed expression because shellsim
@@ -55,10 +61,11 @@ and importlib.
 
 ## Interpretation and limitations
 
-The verifier is the strongest available oracle, so a reward or assertion result takes precedence
-over a static classification. The raw phase evidence remains more important than the aggregate
+The verifier is the strongest available oracle, but boundary evidence is not discarded when the
+verifier assigns zero reward. The raw phase evidence remains more important than the aggregate
 category. A verifier failure without unsupported telemetry can mean a shellsim semantic mismatch,
-an earlier unmodeled image prerequisite, or a verifier assumption outside the replay mapping.
+an earlier unmodeled image prerequisite, a wrapper assumption omitted by the normalized fallback,
+or a verifier assumption outside the replay mapping.
 
 Eighty-eight tasks declare at least one image prerequisite that this replay does not provision.
 Arbitrary Docker builds, downloaded native packages, services, compilers, databases, and non-root

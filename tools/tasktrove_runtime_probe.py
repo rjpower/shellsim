@@ -2,7 +2,7 @@
 """Replay TaskTrove golden solutions and verifier payloads in shellsim.
 
 The probe models a TaskTrove image as shellsim's built-in userspace plus the Dockerfile's local
-``COPY``, ``ENV``, ``WORKDIR``, and deterministic ``RUN`` steps. Image provisioning commands are
+``COPY``, ``ENV``, ``WORKDIR``, and non-provisioning ``RUN`` steps. Image provisioning commands are
 recorded as prerequisites instead of executed: downloading Debian or Python packages is an image
 build concern, while the replay is intended to measure shellsim's task-facing behavior. The
 unmodified golden ``solve.sh`` and the verifier's Python payload then run in one persistent
@@ -41,9 +41,9 @@ KNOWN_INSTRUCTIONS = {
     "WORKDIR",
 }
 PROVISIONING = re.compile(
-    r"(?:^|[;&|]\s*|\b(?:sudo|env)\s+)"
-    r"(?:apt(?:-get)?|add-apt-repository|update-alternatives|conda|mamba|npm|yarn|pnpm)\b"
-    r"|\b(?:python(?:3(?:\.\d+)?)?\s+-m\s+pip|pip3?|uv\s+pip)\s+install\b"
+    r"\b(?:apt(?:-get)?|apk|yum|dnf|add-apt-repository|update-alternatives|conda|mamba|npm|yarn|pnpm)\b"
+    r"|\b(?:python(?:3(?:\.\d+)?)?\s+-m\s+pip|pip3?|pipx|uv\s+pip|gem|poetry)\s+(?:install|add)\b"
+    r"|\b(?:cargo|go)\s+install\b|\buv\s+(?:sync|add)\b"
     r"|\b(?:git\s+clone|curl\s+[^|>]*https?://|wget\s+[^|>]*https?://)\b",
     re.IGNORECASE,
 )
@@ -71,6 +71,15 @@ class Action:
     unsupported_commands: tuple[str, ...]
     commands: tuple[str, ...]
     stderr: str
+
+
+@dataclass(frozen=True)
+class SetupState:
+    """Docker-derived state retained even when one setup instruction fails."""
+
+    workdir: str
+    prerequisites: tuple[str, ...]
+    errors: tuple[str, ...]
 
 
 def parse_args() -> argparse.Namespace:
@@ -132,6 +141,39 @@ def absolute_path(workdir: str, value: str) -> str:
     return posixpath.normpath(value if value.startswith("/") else posixpath.join(workdir, value))
 
 
+def docker_environment(argument: str) -> dict[str, str]:
+    """Parse Docker's assignment and legacy two-word ``ENV`` forms."""
+    words = shlex.split(argument)
+    if not words:
+        raise ValueError("ENV requires a name and value")
+    if "=" not in words[0]:
+        if len(words) < 2:
+            raise ValueError("ENV requires a value")
+        return {words[0]: " ".join(words[1:])}
+    result: dict[str, str] = {}
+    for word in words:
+        name, separator, value = word.partition("=")
+        if not separator or not name:
+            raise ValueError(f"invalid ENV assignment: {word}")
+        result[name] = value
+    return result
+
+
+def expand_docker_environment(value: str, environment: dict[str, str]) -> str:
+    """Expand the variable forms used by corpus WORKDIR instructions."""
+
+    def replacement(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        return environment.get(name, match.group(0))
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", replacement, value)
+
+
+def is_image_provisioning(argument: str) -> bool:
+    """Return whether a Docker ``RUN`` needs capabilities outside the replay."""
+    return bool(PROVISIONING.search(argument) or argument.lstrip().startswith(("[", "--mount=", "<<")))
+
+
 def copy_local(environment: Any, context: Path, workdir: str, argument: str) -> Optional[str]:
     """Apply the common local-source subset of Docker ``COPY``."""
     try:
@@ -189,44 +231,65 @@ def run_action(environment: Any, actions: list[Action], phase: str, label: str, 
     return result
 
 
-def prepare_environment(environment: Any, task: Path, actions: list[Action]) -> tuple[str, list[str]]:
+def prepare_environment(environment: Any, task: Path, actions: list[Action]) -> SetupState:
     """Materialize local image data and execute deterministic Docker setup in order."""
     context = task / "environment"
     dockerfile = context / "Dockerfile"
     workdir = "/"
     prerequisites: list[str] = []
+    errors: list[str] = []
+    docker_env: dict[str, str] = {}
     stages = 0
     for instruction in docker_instructions(dockerfile.read_text(errors="replace")):
+        if environment.terminated:
+            break
         operation, argument = instruction.operation, instruction.argument
         label = f"Dockerfile:{instruction.line}"
-        if operation == "FROM":
-            stages += 1
-            if stages > 1:
-                prerequisites.append(f"{label}: additional image stage {argument}")
-        elif operation == "WORKDIR":
-            workdir = absolute_path(workdir, argument.strip())
+        try:
+            if operation == "FROM":
+                stages += 1
+                if stages > 1:
+                    prerequisites.append(f"{label}: additional image stage {argument}")
+            elif operation == "WORKDIR":
+                expanded = expand_docker_environment(argument.strip(), docker_env)
+                if "$" in expanded:
+                    prerequisites.append(f"{label}: unresolved WORKDIR variable: {argument}")
+                else:
+                    workdir = absolute_path(workdir, expanded)
+                    environment.mkdir(workdir, parents=True)
+                    run_action(environment, actions, "setup", label, f"cd {shlex.quote(workdir)}")
+            elif operation == "ENV":
+                parsed = docker_environment(argument)
+                values = {
+                    name: expand_docker_environment(value, {**docker_env, **parsed}) for name, value in parsed.items()
+                }
+                docker_env.update(values)
+                exports = " ".join(f"{name}={shlex.quote(value)}" for name, value in values.items())
+                run_action(environment, actions, "setup", label, f"export {exports}")
+            elif operation == "COPY":
+                error = copy_local(environment, context, workdir, argument)
+                if error:
+                    prerequisites.append(f"{label}: {error}")
+            elif operation == "ADD":
+                prerequisites.append(f"{label}: ADD is not materialized: {argument}")
+            elif operation == "RUN":
+                if is_image_provisioning(argument):
+                    prerequisites.append(f"{label}: image provisioning: {argument.splitlines()[0]}")
+                else:
+                    run_action(environment, actions, "setup", label, argument)
+            elif operation == "USER" and argument.strip() not in {"root", "0", "0:0"}:
+                prerequisites.append(f"{label}: user identity not modeled: {argument}")
+            elif operation == "UNKNOWN":
+                prerequisites.append(f"{label}: unparsed Dockerfile text: {argument}")
+        except Exception as error:
+            errors.append(f"{label}: {error}")
+    if not environment.terminated:
+        try:
             environment.mkdir(workdir, parents=True)
-            run_action(environment, actions, "setup", label, f"cd {shlex.quote(workdir)}")
-        elif operation == "ENV":
-            run_action(environment, actions, "setup", label, f"export {argument}")
-        elif operation == "COPY":
-            error = copy_local(environment, context, workdir, argument)
-            if error:
-                prerequisites.append(f"{label}: {error}")
-        elif operation == "ADD":
-            prerequisites.append(f"{label}: ADD is not materialized: {argument}")
-        elif operation == "RUN":
-            if PROVISIONING.search(argument) or argument.lstrip().startswith(("[", "--mount=")):
-                prerequisites.append(f"{label}: image provisioning: {argument.splitlines()[0]}")
-            else:
-                run_action(environment, actions, "setup", label, argument)
-        elif operation == "USER" and argument.strip() not in {"root", "0", "0:0"}:
-            prerequisites.append(f"{label}: user identity not modeled: {argument}")
-        elif operation == "UNKNOWN":
-            prerequisites.append(f"{label}: unparsed Dockerfile text: {argument}")
-    environment.mkdir(workdir, parents=True)
-    run_action(environment, actions, "setup", "final WORKDIR", f"cd {shlex.quote(workdir)}")
-    return workdir, prerequisites
+            run_action(environment, actions, "setup", "final WORKDIR", f"cd {shlex.quote(workdir)}")
+        except Exception as error:
+            errors.append(f"final WORKDIR: {error}")
+    return SetupState(workdir, tuple(prerequisites), tuple(errors))
 
 
 def verifier_command(tests: Path) -> Optional[str]:
@@ -260,19 +323,24 @@ def classify(actions: list[Action], verifier_returncode: Optional[int], reward: 
             return "resource_exhausted"
     if verifier_returncode is None:
         return "no_verifier"
+    boundary = any(
+        (action.unsupported or action.unsupported_commands)
+        and action.phase not in {"verifier_wrapper", "verifier_harness"}
+        for action in actions
+    )
     if reward is not None:
         try:
             score = float(reward)
             if score <= 0:
-                return "verifier_failed"
+                return "boundary_and_verifier_failed" if boundary else "verifier_failed"
             if score < 1:
-                return "partial_reward"
+                return "partial_reward_with_boundary" if boundary else "partial_reward"
         except ValueError:
             return "invalid_reward"
-        return "passed"
+        return "passed_with_boundary" if boundary else "passed"
     if verifier_returncode == 0:
-        return "passed"
-    if any(action.unsupported or action.unsupported_commands for action in actions):
+        return "passed_with_boundary" if boundary else "passed"
+    if boundary:
         return "explicit_boundary"
     return "verifier_failed"
 
@@ -294,16 +362,21 @@ def replay_task(task: Path, environment_type: Any, limits_type: Any, options: ar
     )
     actions: list[Action] = []
     harness_errors: list[str] = []
-    prerequisites: list[str] = []
     workdir = "/"
     try:
-        workdir, prerequisites = prepare_environment(environment, task, actions)
+        setup = prepare_environment(environment, task, actions)
+        workdir = setup.workdir
+        prerequisites = list(setup.prerequisites)
+        harness_errors.extend(setup.errors)
     except Exception as error:
+        prerequisites = []
         harness_errors.append(f"environment setup: {error}")
 
     solution = task / "solution"
     solution_result = None
-    if solution.is_dir() and not environment.terminated:
+    if not solution.is_dir():
+        harness_errors.append("solution directory is absent")
+    elif not environment.terminated:
         try:
             environment.mount(solution, "/solution")
             solve = solution / "solve.sh"
@@ -314,18 +387,46 @@ def replay_task(task: Path, environment_type: Any, limits_type: Any, options: ar
                 harness_errors.append("solution/solve.sh is absent")
         except Exception as error:
             harness_errors.append(f"solution mount/run: {error}")
-    else:
-        harness_errors.append("solution directory is absent")
 
     tests = task / "tests"
+    wrapper_result = None
     verifier_result = None
+    verifier_source = None
     command = verifier_command(tests) if tests.is_dir() else None
     if command is None:
         harness_errors.append("verifier payload is absent")
     elif not environment.terminated:
         try:
             environment.mount(tests, "/tests")
-            verifier_result = run_action(environment, actions, "verifier", "verifier payload", command)
+            wrapper = tests / "test.sh"
+            if wrapper.is_file():
+                wrapper_result = run_action(
+                    environment,
+                    actions,
+                    "verifier_wrapper",
+                    "tests/test.sh",
+                    "cd /tests && bash /tests/test.sh",
+                )
+            wrapper_is_authoritative = (
+                wrapper_result is not None
+                and wrapper_result.returncode == 0
+                and not wrapper_result.stop_reason
+                and not wrapper_result.unsupported
+                and not wrapper_result.unsupported_commands
+            )
+            if wrapper_is_authoritative:
+                verifier_result = wrapper_result
+                verifier_source = "test.sh"
+            elif not environment.terminated:
+                run_action(
+                    environment,
+                    actions,
+                    "verifier_harness",
+                    "clear wrapper reward",
+                    "rm -f /logs/verifier/reward.txt /log/reward.txt",
+                )
+                verifier_result = run_action(environment, actions, "verifier", "normalized payload", command)
+                verifier_source = "normalized_payload"
         except Exception as error:
             harness_errors.append(f"verifier mount/run: {error}")
 
@@ -335,29 +436,44 @@ def replay_task(task: Path, environment_type: Any, limits_type: Any, options: ar
         if harness_errors and verifier_result is None
         else classify(actions, None if verifier_result is None else verifier_result.returncode, reward)
     )
-    first_boundary = next(
-        (
-            {
-                "phase": action.phase,
-                "label": action.label,
-                "unsupported": list(action.unsupported),
-                "commands": list(action.unsupported_commands),
-            }
-            for action in actions
-            if action.unsupported or action.unsupported_commands
-        ),
-        None,
-    )
+    task_boundaries = [
+        action
+        for action in actions
+        if action.phase not in {"verifier_wrapper", "verifier_harness"}
+        and (action.unsupported or action.unsupported_commands)
+    ]
+    wrapper_boundaries = [
+        action
+        for action in actions
+        if action.phase == "verifier_wrapper" and (action.unsupported or action.unsupported_commands)
+    ]
+
+    def boundary_record(candidates: list[Action]) -> Optional[dict[str, Any]]:
+        if not candidates:
+            return None
+        action = candidates[0]
+        return {
+            "phase": action.phase,
+            "label": action.label,
+            "unsupported": list(action.unsupported),
+            "commands": list(action.unsupported_commands),
+        }
+
+    first_boundary = boundary_record(task_boundaries)
+    first_wrapper_boundary = boundary_record(wrapper_boundaries)
     return {
         "task": task.name,
         "category": category,
         "workdir": workdir,
         "solution_returncode": None if solution_result is None else solution_result.returncode,
         "solution_outcome": phase_outcome(solution_result),
+        "verifier_wrapper_outcome": phase_outcome(wrapper_result),
         "verifier_returncode": None if verifier_result is None else verifier_result.returncode,
         "verifier_outcome": phase_outcome(verifier_result),
+        "verifier_source": verifier_source,
         "reward": reward,
         "first_boundary": first_boundary,
+        "first_wrapper_boundary": first_wrapper_boundary,
         "image_prerequisites": prerequisites,
         "harness_errors": harness_errors,
         "actions": [asdict(action) for action in actions],
@@ -391,15 +507,19 @@ def main() -> int:
         results.append(replay_task(task, Environment, Limits, options))
     categories = Counter(result["category"] for result in results)
     solution_outcomes = Counter(result["solution_outcome"] for result in results)
+    wrapper_outcomes = Counter(result["verifier_wrapper_outcome"] for result in results)
     verifier_outcomes = Counter(result["verifier_outcome"] for result in results)
+    verifier_sources = Counter(result["verifier_source"] or "not_run" for result in results)
     output = {
         "schema_version": 2,
-        "method": "golden solution and verifier payload in one persistent shellsim environment",
+        "method": "golden solution, verifier wrapper, and normalized fallback in one shellsim environment",
         "source": str(source),
         "tasks": len(results),
         "categories": dict(sorted(categories.items())),
         "solution_outcomes": dict(sorted(solution_outcomes.items())),
+        "verifier_wrapper_outcomes": dict(sorted(wrapper_outcomes.items())),
         "verifier_outcomes": dict(sorted(verifier_outcomes.items())),
+        "verifier_sources": dict(sorted(verifier_sources.items())),
         "tasks_with_image_prerequisites": sum(bool(result["image_prerequisites"]) for result in results),
         "results": results,
     }
