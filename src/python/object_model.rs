@@ -912,6 +912,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.less_equal = Some(intrinsic(super::stdlib::numpy::slot_less_equal));
     slots.greater_than = Some(intrinsic(super::stdlib::numpy::slot_greater_than));
     slots.greater_equal = Some(intrinsic(super::stdlib::numpy::slot_greater_equal));
+
+    let stream = &mut types[BuiltinType::Stream as usize].slots;
+    stream.iter = Some(unary(super::stdlib::sys::slot_iter));
+    stream.next = Some(unary(super::stdlib::sys::slot_next));
 }
 
 #[cfg(test)]

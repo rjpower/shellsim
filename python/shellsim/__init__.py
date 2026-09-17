@@ -1,5 +1,6 @@
 """Typed Python interface to shellsim's deterministic execution environment."""
 
+from . import python as python
 from ._api import (
     CommandUsage,
     Environment,
@@ -22,4 +23,5 @@ __all__ = [
     "SimulationError",
     "Usage",
     "run",
+    "python",
 ]

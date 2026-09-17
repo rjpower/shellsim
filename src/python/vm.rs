@@ -112,10 +112,10 @@ impl NativeValue {
                     &*(payload as usize as *const super::native::MethodDef)
                 })
             }
-            Self::STREAM => Self::Stream(if payload == 0 {
-                Stream::Stdout
-            } else {
-                Stream::Stderr
+            Self::STREAM => Self::Stream(match payload {
+                0 => Stream::Stdin,
+                1 => Stream::Stdout,
+                _ => Stream::Stderr,
             }),
             Self::ENVIRONMENT => Self::Environment,
             Self::EXCEPTION_TYPE => {
@@ -152,6 +152,7 @@ fn exception_type_code(name: &str) -> u64 {
         "Failed" => 12,
         "CalledProcessError" => 13,
         "TimeoutExpired" => 14,
+        "EOFError" => 15,
         _ => unreachable!("exception type must come from the closed builtin table"),
     }
 }
@@ -173,6 +174,7 @@ fn exception_type_name(code: u64) -> &'static str {
         12 => "Failed",
         13 => "CalledProcessError",
         14 => "TimeoutExpired",
+        15 => "EOFError",
         _ => unreachable!("invalid private exception-type handle"),
     }
 }
@@ -199,6 +201,7 @@ struct RaisedException {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(super) enum Stream {
+    Stdin,
     Stdout,
     Stderr,
 }
@@ -207,6 +210,7 @@ pub(super) enum Stream {
 #[repr(u8)]
 pub(super) enum Builtin {
     Print,
+    Input,
     Exit,
     Repr,
     IsInstance,
@@ -250,7 +254,7 @@ pub(super) fn execute(
     loop {
         match program.poll(
             interp,
-            argv,
+            ProcessInput { argv, stdin: &[] },
             state,
             VmMode::synchronous(interactive),
             out,
@@ -324,13 +328,13 @@ impl VmProgram {
     pub(super) fn poll(
         &mut self,
         interp: &mut Interp,
-        argv: &[String],
+        input: ProcessInput<'_>,
         state: &mut ReplState,
         mode: VmMode,
         out: Out,
         err: Out,
     ) -> VmPoll {
-        let mut vm = Vm::new(interp, argv, state, &mut self.execution, mode, out, err);
+        let mut vm = Vm::new(interp, input, state, &mut self.execution, mode, out, err);
         if !self.started {
             let retained_heap = vm
                 .state
@@ -365,11 +369,18 @@ impl VmProgram {
 struct Vm<'a> {
     interp: &'a mut Interp,
     argv: &'a [String],
+    stdin: &'a [u8],
     state: &'a mut ReplState,
     execution: &'a mut VmState,
     mode: VmMode,
     out: Out<'a>,
     err: Out<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ProcessInput<'a> {
+    pub(super) argv: &'a [String],
+    pub(super) stdin: &'a [u8],
 }
 
 /// State that must survive when bytecode execution yields to the process scheduler.
@@ -392,6 +403,8 @@ struct VmState {
     exception_stack: Vec<RaisedException>,
     with_contexts: Vec<Value>,
     method_frames: Vec<(super::heap::ObjectId, Value)>,
+    stdin_position: usize,
+    stdin_text: Option<String>,
 }
 
 /// An executing code object's resumable control state.
@@ -447,7 +460,7 @@ impl DerefMut for Vm<'_> {
 impl<'a> Vm<'a> {
     fn new(
         interp: &'a mut Interp,
-        argv: &'a [String],
+        input: ProcessInput<'a>,
         state: &'a mut ReplState,
         execution: &'a mut VmState,
         mode: VmMode,
@@ -456,7 +469,8 @@ impl<'a> Vm<'a> {
     ) -> Self {
         Self {
             interp,
-            argv,
+            argv: input.argv,
+            stdin: input.stdin,
             state,
             execution,
             mode,
@@ -1085,6 +1099,7 @@ impl<'a> Vm<'a> {
             }
             let builtin = match name {
                 "print" => Builtin::Print,
+                "input" => Builtin::Input,
                 "exit" | "quit" => Builtin::Exit,
                 "repr" => Builtin::Repr,
                 "isinstance" => Builtin::IsInstance,
@@ -1144,6 +1159,11 @@ impl<'a> Vm<'a> {
                 "StopIteration" => {
                     return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
                         "StopIteration",
+                    ))))
+                }
+                "EOFError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "EOFError",
                     ))))
                 }
                 "AssertionError" => {
@@ -4033,6 +4053,30 @@ impl<'a> Vm<'a> {
                 self.write_output(Stream::Stdout, b"\n");
                 Ok(CallResult::Value(Value::None))
             }
+            Builtin::Input => {
+                expect_arity(&arguments, 0, 1)?;
+                if let Some(prompt) = arguments.first() {
+                    let prompt = self.display_value(prompt)?;
+                    self.write_output(Stream::Stdout, prompt.as_bytes());
+                }
+                let marker = Value::Native(NativeValue::Stream(Stream::Stdin));
+                let mut text = self
+                    .read_stream(&marker, None, true)
+                    .map_err(|error| self.record_native_error(error))?;
+                if text.is_empty() {
+                    return Err(self.record_native_error(PyError::exception(
+                        "EOFError",
+                        "EOF when reading a line",
+                    )));
+                }
+                if text.ends_with('\n') {
+                    text.pop();
+                    if text.ends_with('\r') {
+                        text.pop();
+                    }
+                }
+                Ok(CallResult::Value(self.allocate_string(text)?))
+            }
             Builtin::Exit => {
                 expect_arity(&arguments, 0, 1)?;
                 let status = arguments
@@ -4956,6 +5000,7 @@ impl<'a> Vm<'a> {
             return;
         }
         match stream {
+            Stream::Stdin => {}
             Stream::Stdout => self.out.extend_from_slice(&bytes[..allowed]),
             Stream::Stderr => self.err.extend_from_slice(&bytes[..allowed]),
         }
@@ -5095,8 +5140,62 @@ impl PyRuntime for Vm<'_> {
         let Some(NativeValue::Stream(stream)) = stream.native_value() else {
             return Err(PyError::type_error("expected a simulated stream"));
         };
+        if stream == Stream::Stdin {
+            return Err(PyError::value_error("standard input is not writable"));
+        }
         self.write_output(stream, text.as_bytes());
         Ok(text.chars().count())
+    }
+
+    fn read_stream(&mut self, stream: &Value, size: Option<usize>, line: bool) -> PyResult<String> {
+        if stream.native_value() != Some(NativeValue::Stream(Stream::Stdin)) {
+            return Err(PyError::value_error("only standard input is readable"));
+        }
+        if self.stdin_text.is_none() {
+            self.charge_cpu(u64::try_from(self.stdin.len()).unwrap_or(u64::MAX))
+                .map_err(PyError::runtime_error)?;
+            std::str::from_utf8(self.stdin)
+                .map_err(|_| PyError::value_error("standard input is not valid UTF-8"))?;
+            self.reserve_memory(self.stdin.len())?;
+            self.stdin_text = Some(
+                String::from_utf8(self.stdin.to_vec())
+                    .expect("stdin was validated as UTF-8 immediately above"),
+            );
+        }
+        let start = self
+            .stdin_position
+            .min(self.stdin_text.as_ref().map_or(0, String::len));
+        let available_len = self
+            .stdin_text
+            .as_ref()
+            .map_or(0, |text| text.len().saturating_sub(start));
+        self.charge_cpu(u64::try_from(available_len).unwrap_or(u64::MAX))
+            .map_err(PyError::runtime_error)?;
+        let length = {
+            let available = &self.stdin_text.as_ref().expect("initialized above")[start..];
+            let size_end = size.map_or(available.len(), |characters| {
+                available
+                    .char_indices()
+                    .nth(characters)
+                    .map_or(available.len(), |(offset, _)| offset)
+            });
+            let mut length = size_end;
+            if line {
+                if let Some(newline) = available.as_bytes()[..size_end]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                {
+                    length = newline + 1;
+                }
+            }
+            length
+        };
+        self.reserve_memory(length)?;
+        let text = self.stdin_text.as_ref().expect("initialized above")
+            [start..start.saturating_add(length)]
+            .to_string();
+        self.stdin_position = self.stdin_position.saturating_add(length);
+        Ok(text)
     }
 
     fn truth(&mut self, value: &Value) -> PyResult<bool> {
@@ -5865,6 +5964,7 @@ impl PyRuntime for Vm<'_> {
             PyMarker::EnumBase => NativeValue::EnumBase,
             PyMarker::UnitTestBase => NativeValue::UnitTestBase,
             PyMarker::Environment => NativeValue::Environment,
+            PyMarker::Stdin => NativeValue::Stream(Stream::Stdin),
             PyMarker::Stdout => NativeValue::Stream(Stream::Stdout),
             PyMarker::Stderr => NativeValue::Stream(Stream::Stderr),
             PyMarker::ArrayType => NativeValue::BuiltinType(BuiltinType::Array),

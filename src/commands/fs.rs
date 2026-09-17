@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::commands::util::{ewln, glob_eq, split_flags, wln};
+use crate::commands::util::{ewln, split_flags, wln};
 use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
@@ -25,7 +25,6 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["realpath"], Trust::Real, cmd_realpath);
     reg(m, &["readlink"], Trust::Real, cmd_readlink);
     reg(m, &["stat"], Trust::Real, cmd_stat);
-    reg(m, &["find"], Trust::Real, cmd_find);
     reg(m, &["du"], Trust::Real, cmd_du);
     reg(m, &["mktemp"], Trust::Real, cmd_mktemp);
     reg(m, &["file"], Trust::Real, cmd_file);
@@ -761,150 +760,6 @@ fn cmd_stat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             Err(e) => {
                 ewln(io.err, &format!("stat: {e}"));
                 return 1;
-            }
-        }
-    }
-    0
-}
-
-fn cmd_find(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    // supports: find [paths...] [-type f|d] [-name PAT] [-maxdepth N] [-path PAT]
-    let mut paths = Vec::new();
-    let mut typ: Option<char> = None;
-    let mut name_pat: Option<String> = None;
-    let mut path_pat: Option<String> = None;
-    let mut maxdepth: Option<usize> = None;
-    let mut print0 = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-type" => {
-                let Some(value) = args.get(i + 1) else {
-                    ewln(io.err, "find: missing argument to '-type'");
-                    return 2;
-                };
-                if value.len() != 1 || !matches!(value.as_str(), "f" | "d" | "l") {
-                    ewln(io.err, &format!("find: unimplemented file type '{value}'"));
-                    return 2;
-                }
-                typ = value.chars().next();
-                i += 2;
-            }
-            "-name" => {
-                let Some(value) = args.get(i + 1) else {
-                    ewln(io.err, "find: missing argument to '-name'");
-                    return 2;
-                };
-                name_pat = Some(value.clone());
-                i += 2;
-            }
-            "-path" => {
-                let Some(value) = args.get(i + 1) else {
-                    ewln(io.err, "find: missing argument to '-path'");
-                    return 2;
-                };
-                path_pat = Some(value.clone());
-                i += 2;
-            }
-            "-maxdepth" => {
-                let Some(value) = args.get(i + 1).and_then(|s| s.parse().ok()) else {
-                    ewln(io.err, "find: invalid argument to '-maxdepth'");
-                    return 2;
-                };
-                maxdepth = Some(value);
-                i += 2;
-            }
-            "-print" => {
-                i += 1;
-            }
-            "-print0" => {
-                print0 = true;
-                i += 1;
-            }
-            s if s.starts_with('-') => {
-                ewln(io.err, &format!("find: unimplemented predicate '{s}'"));
-                return 2;
-            }
-            s => {
-                paths.push(s.to_string());
-                i += 1;
-            }
-        }
-    }
-    if paths.is_empty() {
-        paths.push(".".to_string());
-    }
-    for start in &paths {
-        let abs = crate::vfs::resolve_against(&interp.cwd, start);
-        let base_depth = abs.matches('/').count();
-        let mut all = match interp.fs_walk("/", &abs) {
-            Ok(paths) => paths,
-            Err(error) => {
-                ewln(io.err, &format!("find: {error}"));
-                return 1;
-            }
-        };
-        all.sort();
-        for p in all {
-            if let Some(md) = maxdepth {
-                let depth = p.matches('/').count().saturating_sub(base_depth);
-                if depth > md {
-                    continue;
-                }
-            }
-            let is_dir = matches!(
-                interp.fs_metadata("/", &p, false).map(|n| n.kind),
-                Ok(crate::vfs::NodeKind::Dir)
-            );
-            if let Some(t) = typ {
-                let ok = match t {
-                    'd' => is_dir,
-                    'f' => matches!(
-                        interp.fs_metadata("/", &p, false).map(|n| n.kind),
-                        Ok(crate::vfs::NodeKind::File(_))
-                    ),
-                    'l' => matches!(
-                        interp.fs_metadata("/", &p, false).map(|n| n.kind),
-                        Ok(crate::vfs::NodeKind::Symlink(_))
-                    ),
-                    _ => false,
-                };
-                if !ok {
-                    continue;
-                }
-            }
-            if let Some(pat) = &name_pat {
-                if !glob_eq(pat, crate::vfs::basename(&p)) {
-                    continue;
-                }
-            }
-            if let Some(pat) = &path_pat {
-                if !glob_eq(pat, &p) {
-                    continue;
-                }
-            }
-            // print relative to the start path the way find does
-            let display = if start == "." {
-                if p == abs {
-                    ".".to_string()
-                } else {
-                    format!(".{}", &p[abs.len()..])
-                }
-            } else {
-                let prefix = format!("{}/", interp.cwd.trim_end_matches('/'));
-                if !start.starts_with('/') {
-                    p.strip_prefix(&prefix)
-                        .map(|s| s.to_string())
-                        .unwrap_or(p.clone())
-                } else {
-                    p.clone()
-                }
-            };
-            if print0 {
-                io.out.extend_from_slice(display.as_bytes());
-                io.out.push(0);
-            } else {
-                wln(io.out, &display);
             }
         }
     }

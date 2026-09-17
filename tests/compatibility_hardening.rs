@@ -41,6 +41,26 @@ fn unavailable_binaries_fail_and_remain_queryable() {
 }
 
 #[test]
+fn workload_observed_unavailable_binaries_share_the_same_contract() {
+    for command in ["openssl", "setfacl", "netstat", "redis-cli"] {
+        let mut environment = Environment::new();
+        let (outcome, stdout, stderr) = environment.run_script_capture(command);
+
+        assert_eq!(outcome.exit_status, 127, "{command}");
+        assert!(stdout.is_empty(), "{command}");
+        assert_eq!(
+            stderr,
+            format!("{command}: not implemented in shellsim\n").as_bytes()
+        );
+        assert_eq!(environment.unsupported.values(), [command]);
+        assert_eq!(
+            environment.invocations.events()[0].trust,
+            CommandTrust::Unsupported
+        );
+    }
+}
+
+#[test]
 fn pseudo_filesystem_is_visible_to_general_filesystem_commands() {
     assert_eq!(
         text("cd /proc; test -e cpuinfo; printf '%s\n' \"$PWD\"; find . -maxdepth 1 -name cpuinfo; realpath self"),

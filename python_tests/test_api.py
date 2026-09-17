@@ -22,6 +22,79 @@ def test_fresh_run_returns_bytes_and_structured_usage() -> None:
     assert result.cost_model_version == 1
 
 
+def test_direct_python_source_avoids_shell_quoting_and_preserves_argv_stdin() -> None:
+    result = shellsim.python.run(
+        'import sys\nprint(sys.argv)\nprint(input())\nprint(sys.stdin.read())\nprint("\'\\"$()")',
+        argv=["one", "two words"],
+        stdin=b"input\nrest",
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == b"['-c', 'one', 'two words']\ninput\nrest\n'\"$()\n"
+    assert result.commands == ("python3.14",)
+    assert result.partial_commands == ("python3.14",)
+    assert result.invocations[0].argv[:2] == ("python3.14", "-c")
+
+
+def test_environment_direct_python_reuses_vfs_and_cumulative_resources() -> None:
+    environment = shellsim.Environment()
+    environment.write_file("/work/helper.py", "answer = 42\n")
+    environment.run("cd /work")
+
+    first = environment.run_python("from helper import answer\nprint(answer)")
+    second = environment.run_python("print('again')")
+
+    assert first.stdout == b"42\n"
+    assert second.stdout == b"again\n"
+    assert second.usage.cpu_used > first.usage.cpu_used
+
+
+def test_direct_python_uses_the_modeled_process_scheduler() -> None:
+    result = shellsim.python.run(
+        'import subprocess\nprint(subprocess.run(["printf", "child"], capture_output=True).stdout)'
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == b"b'child'\n"
+    assert [invocation.argv[0] for invocation in result.invocations] == ["python3.14", "printf"]
+
+
+def test_direct_python_input_raises_catchable_eof() -> None:
+    result = shellsim.python.run('try:\n    input()\nexcept EOFError:\n    print("caught")')
+
+    assert result.returncode == 0
+    assert result.stdout == b"caught\n"
+
+
+def test_direct_python_stdin_is_utf8_text_and_iterable() -> None:
+    source = "import sys\nprint(sys.stdin.read(1))\nfor line in sys.stdin:\n    print(repr(line))"
+    result = shellsim.python.run(source, stdin="éa\nb\n".encode())
+
+    assert result.returncode == 0
+    assert result.stdout == "é\n'a\\n'\n'b\\n'\n".encode()
+
+
+def test_direct_python_rejects_binary_stdin_and_obeys_resource_limits() -> None:
+    invalid = shellsim.python.run("import sys\nsys.stdin.read()", stdin=b"\xff")
+    exhausted = shellsim.python.run("while True:\n    pass", cpu=100)
+
+    assert invalid.returncode != 0
+    assert b"standard input is not valid UTF-8" in invalid.stderr
+    assert exhausted.returncode == 137
+    assert exhausted.stop_reason == "cpu_exhausted"
+
+
+def test_direct_python_validates_arguments() -> None:
+    environment = shellsim.Environment()
+
+    with pytest.raises(TypeError, match="source must be str"):
+        environment.run_python(b"print(1)")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="argv must be a sequence of str"):
+        environment.run_python("print(1)", "not-an-argv")
+    with pytest.raises(TypeError, match="argv must be a sequence of str"):
+        environment.run_python("print(1)", ["ok", 1])  # type: ignore[list-item]
+
+
 def test_environment_preserves_state_and_vfs_bytes() -> None:
     environment = shellsim.Environment()
     environment.mkdir("/work/package")

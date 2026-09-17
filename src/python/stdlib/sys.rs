@@ -8,11 +8,33 @@ use super::super::native::{
 
 pub(crate) static STREAM_TYPE: NativeTypeDef = NativeTypeDef {
     name: "shellsim.stream",
-    methods: &[MethodDef {
-        type_name: "shellsim.stream",
-        name: "write",
-        call: write,
-    }],
+    methods: &[
+        MethodDef {
+            type_name: "shellsim.stream",
+            name: "write",
+            call: write,
+        },
+        MethodDef {
+            type_name: "shellsim.stream",
+            name: "read",
+            call: read,
+        },
+        MethodDef {
+            type_name: "shellsim.stream",
+            name: "readline",
+            call: readline,
+        },
+        MethodDef {
+            type_name: "shellsim.stream",
+            name: "__iter__",
+            call: iter,
+        },
+        MethodDef {
+            type_name: "shellsim.stream",
+            name: "__next__",
+            call: next,
+        },
+    ],
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
@@ -44,6 +66,10 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             get: argv,
         },
         ValueDef::Factory {
+            name: "stdin",
+            get: stdin,
+        },
+        ValueDef::Factory {
             name: "stdout",
             get: stdout,
         },
@@ -72,6 +98,10 @@ fn argv(runtime: &mut dyn PyRuntime) -> PyResult {
     runtime.new_argv()
 }
 
+fn stdin(runtime: &mut dyn PyRuntime) -> PyResult {
+    Ok(runtime.marker(PyMarker::Stdin))
+}
+
 fn stdout(runtime: &mut dyn PyRuntime) -> PyResult {
     Ok(runtime.marker(PyMarker::Stdout))
 }
@@ -86,4 +116,60 @@ fn write(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResu
     let text = runtime.display(&args.positional()[0])?;
     let written = runtime.write_stream(&receiver, &text)?;
     Ok(Value::Int(i64::try_from(written).unwrap_or(i64::MAX)))
+}
+
+fn read(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    read_inner(runtime, receiver, args, false)
+}
+
+fn readline(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    read_inner(runtime, receiver, args, true)
+}
+
+fn iter(_runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    args.expect_positional("stream.__iter__", 0, 0)?;
+    args.reject_keywords("stream.__iter__")?;
+    Ok(slot_iter(_runtime, receiver)?.expect("stream iteration always returns itself"))
+}
+
+fn next(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    args.expect_positional("stream.__next__", 0, 0)?;
+    args.reject_keywords("stream.__next__")?;
+    slot_next(runtime, receiver)?.ok_or_else(|| PyError::exception("StopIteration", ""))
+}
+
+pub(crate) fn slot_iter(_runtime: &mut dyn PyRuntime, receiver: Value) -> PyResult<Option<Value>> {
+    Ok(Some(receiver))
+}
+
+pub(crate) fn slot_next(runtime: &mut dyn PyRuntime, receiver: Value) -> PyResult<Option<Value>> {
+    let text = runtime.read_stream(&receiver, None, true)?;
+    if text.is_empty() {
+        Err(PyError::exception("StopIteration", ""))
+    } else {
+        runtime.new_string(text).map(Some)
+    }
+}
+
+fn read_inner(
+    runtime: &mut dyn PyRuntime,
+    receiver: Value,
+    args: CallArgs,
+    line: bool,
+) -> PyResult {
+    args.expect_positional("stream.read", 0, 1)?;
+    args.reject_keywords("stream.read")?;
+    let size = match args.positional().first() {
+        None => None,
+        Some(value) => match runtime.int_value(value) {
+            Some(value) if value < 0 => None,
+            Some(value) => Some(
+                usize::try_from(value)
+                    .map_err(|_| PyError::value_error("stream size is too large"))?,
+            ),
+            None => return Err(PyError::type_error("stream size must be an integer")),
+        },
+    };
+    let text = runtime.read_stream(&receiver, size, line)?;
+    runtime.new_string(text)
 }

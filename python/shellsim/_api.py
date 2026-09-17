@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple, Union
 
@@ -157,6 +157,32 @@ class Environment:
         if not isinstance(source, str):
             raise TypeError("source must be str")
         metadata, stdout, stderr = self._native.run(source, _as_bytes("stdin", stdin))
+        return _decode_result(metadata, stdout, stderr)
+
+    def run_python(
+        self,
+        source: str,
+        argv: Sequence[str] = (),
+        stdin: Union[bytes, bytearray, memoryview] = b"",
+    ) -> RunResult:
+        """Execute Python source directly in this environment.
+
+        The Python interpreter is fresh for each call. The simulated filesystem, cwd, resource
+        usage, and terminal exhaustion state belong to the persistent environment.
+        """
+
+        if not isinstance(source, str):
+            raise TypeError("source must be str")
+        if isinstance(argv, (str, bytes, bytearray, memoryview)) or not isinstance(argv, Sequence):
+            raise TypeError("argv must be a sequence of str")
+        arguments = list(argv)
+        if not all(isinstance(argument, str) for argument in arguments):
+            raise TypeError("argv must be a sequence of str")
+        metadata, stdout, stderr = self._native.run_python(
+            source,
+            arguments,
+            _as_bytes("stdin", stdin),
+        )
         return _decode_result(metadata, stdout, stderr)
 
     def write_file(
