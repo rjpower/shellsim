@@ -1,278 +1,68 @@
 # Python in shellsim
 
-Shellsim implements a deterministic, resource-bounded Python 3.14 subset in Rust. Its purpose is
-to run ordinary Python embedded in agent tasks without granting access to host Python, native
-extensions, the host filesystem, processes, network, environment, locale, or clock. Compatibility
-is defined by accepted source behavior and differential tests. Unsupported syntax and APIs fail
-explicitly.
+Shellsim implements Python source directly in its deterministic, resource-bounded environment.
+The goal is to run ordinary Python used in agent tasks without granting access to host Python,
+native extensions, files, processes, networking, environment variables, locale, or time.
 
-The interpreter is intentionally not CPython-compatible at the ABI or bytecode level. It consumes
-Python source and uses shellsim-owned data structures throughout.
+The language runtime is intended to be mostly complete. Library compatibility follows a harder
+boundary: a module is included when shellsim can provide a coherent, useful implementation of its
+ordinary behavior. Missing modules and APIs fail at import or attribute lookup instead of exposing
+plausible but inconsistent stubs.
 
-## Execution pipeline
+## Run Python
 
-`python`, `python3`, and `python3.14` all enter `src/python/mod.rs`. The supported entrypoints are
-`-c`, stdin, VFS script files and shebangs, the persistent shell-owned REPL, and the bounded
-`pytest` and `unittest` runners.
+The `python`, `python3`, and `python3.14` commands run source from `-c`, stdin, or a VFS file:
 
-For host-side experiments, `shellsim-python PATH` creates a fresh environment, imports a file's
-containing project into `/work`, and runs the file. A directory discovers `test_*.py` files by
-default; `--entry`, `--pytest`, `--root`, resource-limit flags, and `--json` select other modes.
-Host ingestion rejects symlinks and is complete before the interpreter starts, so it does not give
-simulated code ambient filesystem access.
+```sh
+shellsim -c 'python3 -c "print(sum(x*x for x in range(5)))"'
+shellsim --root ./project -c 'python3.14 /work/main.py'
+shellsim-python ./project/main.py -- arg1
+shellsim-python ./project/tests --pytest
+```
+
+`shellsim-python` imports the selected trusted project into `/work` before execution. It supports
+`--entry`, `--pytest`, `--root`, resource limits, and `--json`. Simulated imports remain confined
+to frozen modules and the virtual filesystem.
+
+The runtime supports functions and closures, classes and descriptors, exceptions and context
+managers, comprehensions and generators, arbitrary-precision integers, mutable containers,
+f-strings, VFS imports, and the common language protocols needed by real scripts. `pytest` and
+`unittest` provide bounded runners for straightforward test files. Unsupported syntax and runner
+features produce an error rather than a false passing result.
+
+## Runtime model
 
 ```text
-source -> lexer -> AST parser -> semantic bytecode compiler -> metered stack VM
-                                                            |
-                                                            +-> native modules
-                                                            +-> modeled capability traits
+source -> UTF-8 lexer -> AST parser -> bytecode compiler -> metered stack VM
+                                                        -> native modules
+                                                        -> modeled capabilities
 ```
 
-The lexer and parser are UTF-8 and indentation aware. The compiler emits a typed internal
-instruction enum rather than CPython opcodes. The VM charges CPU per instruction and bounds
-source size, nesting, calls, allocation, iteration, and output. Product code never delegates
-unsupported input to a host interpreter.
+The bytecode is shellsim's internal semantic format, not CPython bytecode. Values are immediate
+scalars or typed objects in an interpreter-owned arena. User-visible identity, mutation, type
+lookup, descriptors, and operator slots are modeled explicitly. CPU is charged per instruction
+and native loop; source, recursion, calls, allocation, iteration, and output are bounded.
 
-Ordinary invocations receive fresh Python globals, modules, and heap state. Intended machine
-effects, such as VFS writes and resource consumption, persist in the surrounding `Environment`.
-The REPL is the explicit exception and retains its `ReplState` between shell actions.
+Native modules exchange a type-erased `PyValue` and recover checked views such as `PyNumber`,
+`PyString`, `PyList`, or `PyArray`. They receive only the capabilities declared by `PyRuntime`.
+A pure algorithm cannot acquire VFS, process, clock, or network access accidentally.
 
-## Values and identity
+## Adding a module
 
-Every Python value crosses runtime and native-module boundaries as a 16-byte `PyValue`:
+Use a frozen Python module when the behavior composes naturally from supported Python. Use a Rust
+native module for compact algorithms, interpreter-owned objects, or an explicit modeled
+capability. Native definitions use declarative function, method, type, and value tables.
 
-```text
-PyValue { payload: u64, aux: [u8; 7], tag: ValueTag }
+For either form:
 
-ValueTag
-  None | Bool | Int | Float | SmallString
-  Object(ObjectId) | Native(closed interpreter handle)
-```
+1. define the useful supported surface and the explicit unsupported frontier;
+2. validate arguments and reject unknown keywords;
+3. meter loops and reserve result storage before allocation;
+4. keep mutable interpreter layouts behind checked runtime views;
+5. add differential tests against the matching CPython behavior where deterministic.
 
-`None`, booleans, bounded integers, floats, and UTF-8 strings up to fifteen bytes are immediate.
-Long strings, immutable bytes, mutable byte arrays, arbitrary-precision integers, mutable values,
-exceptions, classes, and other values requiring distinct identity live in the invocation arena.
-Each arena entry has a semantic `TypeId`, optional attributes, and a typed payload. Byte sequences
-are never routed through UTF-8 storage: `PyBytes` exposes an owned, checked octet snapshot and
-`PyByteArray` provides snapshot-and-commit mutation.
+Do not add an importable placeholder for a module whose central contract is absent. For example,
+an empty `sqlite3` namespace is less useful than a clear import failure because callers otherwise
+cannot tell which database semantics are real.
 
-Physical tags do not define Python types. `type_id(value)` maps immediate storage to canonical
-builtin types and arena values to the type in their object header. `PyKind` exists only to obtain a
-checked native view such as `PyNumber`, `PyString`, `PyBytes`, `PyList`, or `PyDict`.
-
-There is no separate identity field. Arena values use `ObjectId`; immediate values are canonical
-by representation, with floats compared by exact bits for identity. Container equality and
-membership check identity before equality, preserving reflexive behavior for a stored NaN.
-
-## Types, descriptors, and operators
-
-The runtime bootstraps canonical `object`, `type`, and builtin type objects. User types carry direct
-bases, a metered C3 MRO, a metaclass, attributes, layout, and cached protocol slots. Supported
-class construction includes metaclass selection, `__prepare__`, `type.__new__`, `__set_name__`,
-`__init_subclass__`, and metaclass `__init__` and `__call__`.
-
-Attribute lookup follows Python's descriptor order:
-
-1. data descriptors through the MRO;
-2. the instance dictionary;
-3. ordinary attributes and non-data descriptors through the MRO;
-4. descriptor binding through `__get__`;
-5. a missing-attribute result.
-
-Python functions, native methods, `property`, `staticmethod`, and `classmethod` use this path.
-Zero-argument `super()` uses the function's captured defining class and the receiver's C3 MRO.
-`int` subclasses have an integer instance layout while preserving their user-defined type.
-
-Important dunder methods populate cached slots for calls, construction, attributes, display,
-truth, iteration, arithmetic, comparison, and containment. Bytecode arithmetic asks the operand
-types for the appropriate slot. Numeric slots cast both erased operands to `PyNumber`, covering
-immediate integers, heap big integers, floats, booleans, and `int` subclass payloads without VM
-tag-specific arithmetic branches. This includes reflected operations, floor division, remainder,
-bitwise operations, and unary positive, negative, and invert. `sum()` uses the same addition
-dispatch instead of a private numeric fast path.
-
-## Native Python APIs
-
-Native functions and methods use one erased ABI:
-
-```rust
-fn(&mut dyn PyRuntime, CallArgs) -> PyResult<PyValue>
-fn(&mut dyn PyRuntime, PyValue, CallArgs) -> PyResult<PyValue>
-```
-
-Implementations immediately cast values to checked views and return structured `PyError` values.
-Mutable views take metered snapshots and commit only after an operation succeeds. They never hold
-arena borrows across allocation or Python calls.
-
-`ModuleDef`, `FunctionDef`, `ValueDef`, `NativeTypeDef`, and `MethodDef` provide declarative module
-and type tables. Most modules receive only `PyRuntime`. Narrow traits expose modeled state where
-required: `time` receives the virtual clock, `os` receives the simulated environment, and the
-private subprocess core receives a logical-process runner. A module
-must not inspect VM stacks, heap payload variants, or `Environment` directly.
-
-Filesystem access is split into two explicit boundaries in `python/filesystem.rs`. `PyFilesystem`
-provides separate bounded text and byte I/O, predicates, directory mutation, renaming, and globbing
-to the private frozen-module facade. `PyModuleLoader` performs VFS-only source discovery for
-imports. Both own path policy, resource charging, quota translation, and mutation-time
-synchronization; `vm.rs` contains no VFS operations and neither boundary can reach the host
-filesystem.
-
-The registry contains bounded native slices of modules such as `argparse`, `bisect`, `dataclasses`,
-`enum`, `functools`, `heapq`, `itertools`, `math`, `pytest`, `re`, `string`, `subprocess`, `sys`,
-`time`, `typing`, and `unittest`. A separate closed frozen-source registry bundles Python
-implementations with `include_str!` and executes them through the ordinary compiler and module
-namespace. `abc`, `base64`, `codecs`, `collections`, `csv`, `datetime`, `glob`, `hashlib`, `io`,
-`json`, `logging`, `os`, `pathlib`, `struct`, `subprocess`, `tempfile`, `uuid`, and `zlib` use this
-path. Source modules may import small private native
-cores for algorithms or modeled capabilities that Python cannot implement directly. Filesystem
-modules share `_shellsim_vfs`; `collections` imports only native `defaultdict`; `json`, `hashlib`,
-and `zlib` delegate their bounded codec, digest, or checksum primitives. `subprocess` delegates
-only logical child creation, scheduling, descriptor I/O, status, and signals to
-`_shellsim_subprocess`. Its Python source defines `Popen`, `run`, `call`, `check_call`, and
-`check_output`. Children are live scheduler tasks, so independent sleeps overlap and bounded
-stdin/stdout/stderr pipes apply backpressure. Binary and text stream objects, duplex
-`communicate`, retry after timeout, cwd, replacement environments, return codes, checks, and
-virtual deadlines are modeled. `shell=True` invokes shellsim's own shell and cannot select a host
-shell. Host process setup, native file descriptors, and session manipulation are rejected.
-
-Prefer frozen Python for module policy, composition, and ordinary object behavior. Add a private
-native primitive only for a modeled capability, an algorithm that must meter host allocation
-before it occurs, or representation-level behavior such as byte codecs. This keeps module APIs
-expressed in the same object protocols as user programs and keeps the VM independent of stdlib
-names.
-
-## Resumable call and native-frame design
-
-The remaining scheduler boundary is not specific to sorting. Native compound operations and VM
-helpers currently invoke Python callables synchronously in several places: keyed `sorted` and
-`list.sort`, `map`, `filter`, `functools.reduce`, `defaultdict` factories, descriptors, protocol
-slots, context managers, class construction, and metaclass hooks. A callback can therefore consume
-an unbounded nested Rust call and cannot suspend on virtual time, a child, or a descriptor.
-
-The complete design replaces immediate inner calls with one explicit VM frame stack:
-
-```text
-VmState
-  frames: Vec<VmFrame>
-
-VmFrame
-  Bytecode(BytecodeFrame)
-  Native(Box<dyn PyNativeFrame>)
-
-FrameStep
-  Continue
-  Call { callable: PyValue, arguments: CallArgs }
-  Return(PyValue)
-  Block(WaitReason)
-  Raise(PyError)
-  Exit(status)
-```
-
-The dispatcher alone resolves and invokes callables. A `Call` pushes a new bytecode, leaf-native,
-or stateful-native frame with an explicit return target. `Return` feeds one value to that target;
-`Raise` unwinds frames until a bytecode exception region accepts it; and `Block` leaves the entire
-stack owned by `VmState` until the logical process wakes. No frame runs a nested VM loop.
-
-Native module definitions retain the erased-value convention. A callable entry is one of:
-
-```text
-Leaf(fn(&mut dyn PyRuntime, CallArgs) -> PyResult<PyValue>)
-Stateful(fn(&mut dyn PyRuntime, CallArgs) -> PyResult<Box<dyn PyNativeFrame>>)
-```
-
-Leaf entries cover JSON codecs, numeric functions, hashing, and similar operations that do bounded
-work without invoking Python or blocking. A stateful entry creates a cloneable, type-erased frame.
-Its `step(runtime, returned_value)` method may request a Python call, block, or return. Concrete
-frames such as `SortFrame` and `ReduceFrame` live beside their module implementation, not in
-`vm.rs`. Function and bound-method descriptors use the same callable entry after receiver binding.
-Small `leaf(...)` and `stateful(...)` const constructors keep module tables declarative.
-
-`PyRuntime::call_value` is removed. Native code that needs a callback must return `FrameStep::Call`,
-which makes suspension and exception propagation mandatory rather than optional. Native leaf
-functions also cannot return the internal suspension error. Operations that may block, including
-`time.sleep` and subprocess stream methods, become stateful frames and retain their own absolute
-deadline, cursor, and partial progress. This subsumes the current retry-only
-`PendingNativeCall` path.
-
-VM semantic operations that can invoke user code use the same mechanism. Attribute access emits a
-call for `__get__`; protocol operations emit calls for slots; class construction is a frame that
-sequences `__new__` and `__init__`; and `with` bytecodes sequence `__enter__`/`__exit__` through
-explicit continuation state. Pure immediate-tag and native-slot fast paths may return directly,
-but they must produce the same `FrameStep` contract and may not invoke another callable.
-
-Every retained frame is cloneable because complete `HarnessSession` forks copy live Python state.
-Each frame reports conservative modeled bytes, is charged before installation, and releases that
-ownership on return or unwind. Each `step` performs bounded work and charges CPU before loops or
-host allocation. Compound mutations use snapshot-and-commit: for example, `SortFrame` gathers
-keys and orders a private vector before replacing list contents, so callback failure or resource
-exhaustion leaves the receiver unchanged.
-
-Migration is complete only when all of the following are true:
-
-1. Introduce the unified frame dispatcher and return targets while preserving ordinary bytecode
-   call behavior.
-2. Move current retryable sleeps, subprocess operations, and descriptor I/O to stateful native
-   frames; remove `PendingNativeCall` and `native_suspend_allowed`.
-3. Move `sorted` and `list.sort` to one shared sort frame, then migrate `reduce`, `map`, `filter`,
-   and `defaultdict` factories.
-4. Reify descriptor, slot, context-manager, constructor, and metaclass sequences as frames.
-5. Remove `CallMode::Immediate`, `invoke_call`, nested `execute_code` callback paths, and
-   `PyRuntime::call_value`. There is no synchronous compatibility executor left in scheduled
-   Python execution.
-6. Cover callback sleep and subprocess waits, descriptor and constructor callbacks, callback
-   exceptions, transactional mutation, frame/memory exhaustion, session cloning while blocked,
-   and deterministic interleaving between Python processes.
-
-The synchronous library embedding API drives this same frame dispatcher to completion. If it
-encounters a modeled block without a scheduler-owned process, it advances only through the
-existing virtual scheduler adapter; it does not regain a separate recursive evaluator.
-
-## Supported behavior and frontiers
-
-The useful current language surface includes containers, arbitrary-precision integer arithmetic,
-control flow, functions, closures, defaults and `*args`, comprehensions, classes, inheritance,
-descriptors, constrained metaclasses, exceptions, context managers, decorators, f-strings,
-suspended generators, VFS imports, and common builtins. Basic string/list/dict/set APIs and
-`map`, `filter`, `reversed`, `getattr`, and `hasattr` use native descriptors or erased runtime
-protocols.
-
-Iterators are deliberately bounded. Some APIs that are lazy in CPython materialize a metered
-snapshot before returning an iterator. Generator expressions are currently eager, and generators
-cannot suspend across cleanup regions. These choices are deterministic and fail on resource
-limits, but their side-effect timing can differ from CPython.
-
-Other explicit frontiers include:
-
-- async functions, async iterators, async fixtures, and structural pattern matching;
-- generator `send`, `throw`, `close`, and `yield from`;
-- custom exception subclasses and complete attribute interception;
-- the complete buffer protocol, multidimensional slicing, attribute deletion, hashing slots, and
-  dict-view semantics;
-- `exec`, `eval`, `compile`, code objects, pickle, weak references, and garbage collection;
-- native extensions, arbitrary import hooks, host-backed modules, and full pytest/unittest.
-
-The checked stdlib probe set covers 19 named APIs, not entire modules. The TaskTrove mini corpus
-currently supports 99 of 100 checked cases, with async behavior as the recorded frontier. A
-portable CPython-basic sample passes 61 of 64 isolated behaviors; the remaining probes cover the
-three deeper object/generator items named above. Raw CPython `Lib/test` files are not a useful
-file-level target because they depend heavily on CPython's private test harness and internals.
-
-## Extending Python support
-
-For a native function or method:
-
-1. Add a `FunctionDef` or `MethodDef` in the relevant `src/python/stdlib` module.
-2. Accept and return only erased `PyValue` values at the boundary.
-3. Cast locally to checked views and call `PyRuntime` protocols for comparison, iteration,
-   attributes, calls, allocation, and mutation.
-4. Add the narrowest runtime operation only when several implementations need a semantic protocol;
-   do not expose heap representations.
-5. Charge work and reserve worst-case growth before host allocation or mutation.
-6. Return a structured Python error for invalid input and a resource error for exhaustion.
-7. Add a Python-source compatibility test that also runs on CPython, plus Rust tests for resource
-   stops or simulator-only state.
-
-For language behavior, keep parsing, compilation, and execution separate. Add syntax tests at the
-parser/compiler layer, semantic behavior through source fixtures, and an explicit rejection test
-for the unsupported edge. Any filesystem, process, clock, environment, or network requirement
-must be implemented against a narrow modeled capability before Python code can observe it.
+The minimal NumPy design follows these rules in [numpy.md](numpy.md).

@@ -17,6 +17,7 @@ pub mod heapq;
 pub mod itertools;
 pub mod json;
 pub mod math;
+pub mod numpy;
 pub mod os;
 pub mod pytest;
 pub mod re;
@@ -30,7 +31,16 @@ pub mod unittest;
 mod vfs;
 mod zlib;
 
-use super::native::ModuleDef;
+use super::native::{ModuleDef, ValueKindDef};
+
+/// Collect inline value registrations without teaching the VM about module-owned types.
+pub(super) fn value_kinds() -> [&'static ValueKindDef; 3] {
+    [
+        &numpy::BOOL.definition,
+        &numpy::INT64.definition,
+        &numpy::FLOAT64.definition,
+    ]
+}
 
 /// Resolve a capability-free stdlib module implemented in ordinary Python source.
 pub(super) fn frozen_module(name: &str) -> Option<&'static str> {
@@ -62,6 +72,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "functools" => Some(&functools::MODULE),
         "itertools" => Some(&itertools::MODULE),
         "math" => Some(&math::MODULE),
+        "numpy" => Some(&numpy::MODULE),
         "_os" => Some(&os::MODULE),
         "pytest" => Some(&pytest::MODULE),
         "re" => Some(&re::MODULE),

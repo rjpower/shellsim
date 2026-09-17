@@ -1,308 +1,95 @@
 # shellsim
 
-`shellsim` is a deterministic, resource-constrained BusyBox-like environment for evaluating
-agents. Shell programs and Unix-style commands run in-process against an in-memory filesystem;
-they never execute host programs or use the host filesystem as their working environment.
+Shellsim is a BusyBox for containers: one small, deterministic process that provides a useful
+Unix-shaped environment without starting a VM, container runtime, or host subprocess. It is built
+for experimentation and testing with reinforcement-learning rollouts and agentic environments,
+where fast startup, reproducibility, isolation, and explicit resource limits matter more than
+cycle-accurate emulation.
 
-The resource model is deliberately approximate. Commands use ordinary Rust data structures while
-reserving modeled memory and charging stable abstract CPU units. This keeps the model predictable,
-cheap, and easy to tune.
+Shell programs, common command-line tools, logical processes, and Python run in-process against an
+in-memory filesystem. Simulated code cannot access the host filesystem, processes, network,
+environment, or clock. A trusted harness may copy a selected project into the virtual filesystem
+before execution; changes never write back to the host.
 
-See [docs/agent-environment.md](docs/agent-environment.md) for the reviewed gap between the current
-simulator and a useful Unix-shaped coding-agent harness, plus the ordered implementation roadmap.
+## Compatibility
 
-## Resource model
+Shellsim aims for broad compatibility inside clear boundaries. A supported facility should handle
+almost all ordinary uses, even when obscure flags or legacy behavior remain out of scope. A module
+or command with no coherent useful subset is omitted instead of being exposed as a misleading
+stub. Unsupported syntax, options, executable formats, and capabilities fail visibly and are
+included in structured results.
 
-- **CPU** is monotonic fuel. Parsing, executor nodes, dispatch, input, output, and algorithms
-  consume units. Exhaustion stops the evaluation.
-- **Memory** is modeled concurrent working set. Command reservations are released on return;
-  nested invocations contribute to the same peak.
-- **Disk** is logical in-memory filesystem size. Content and a fixed 256-byte non-root node overhead count.
-  Mutations that exceed quota roll back atomically, and deletion releases capacity.
-- **Output** caps materialized stdout and stderr as a safety guardrail.
+The current environment includes:
 
-Defaults are 10,000,000 CPU units, 64 MiB memory, 64 MiB disk, and 4 MiB output. Costs are
-deterministic rather than cycle-accurate. Results include a cost-model version.
+- a Bash-like shell with pipelines, redirections, functions, common expansions, control flow,
+  background jobs, signals, and job control;
+- common filesystem, text, archive, Git, Make, process, and system commands;
+- deterministic virtual time, network fixtures, `/proc`, `/dev`, processes, descriptors, and
+  bounded pipes;
+- a mostly complete Python language runtime with a deliberately selected standard-library and
+  third-party module surface.
 
-## Build and use
+Python is source-compatible where supported, not ABI-compatible with CPython. Native extensions,
+package installation, compilers, and arbitrary machine code are outside the simulation boundary.
+See [Python in shellsim](docs/python.md) for the current contract.
+
+## Install and run
+
+Install the Python package and console command:
+
+```sh
+python -m pip install shellsim
+shellsim -c 'printf "b\na\n" | sort'
+shellsim --root ./project -c 'python3.14 test.py'
+```
+
+`--root` copies the selected host tree into a disposable `/work` snapshot. With no `-c` and a
+terminal attached, `shellsim` starts a persistent interactive session.
+
+To build the Rust binaries from source:
 
 ```sh
 cargo build --release
+./target/release/shellsim -c 'echo hello'
+./target/release/shellsim eval --cpu 100k --memory 8m -c 'make test'
+./target/release/shellsim-python ./project/main.py -- arg1
+```
 
-# Ordinary output
-./target/release/shellsim -c 'printf "b\na\n" | sort'
+Limits accept `k`, `m`, and `g` binary suffixes. `eval` emits a structured result containing the
+exit status, stdout and stderr, resource use, command trace, and unsupported behavior.
 
-# Host file used only as script source; execution occurs in a fresh simulated environment
-./target/release/shellsim run script.sh arg1 arg2
+The Python API exposes fresh and persistent environments:
 
-# Persistent interactive session; state and resource usage accumulate until exit/exhaustion
-./target/release/shellsim shell --cpu 100k --memory 8m --disk 2m --output 64k
-
-# Structured evaluation report
-./target/release/shellsim eval \
-  --cpu 100k --memory 8m --disk 2m --output 64k \
-  -c 'printf "b\na\n" | sort > result.txt; cat result.txt'
-
-# Persistent NDJSON harness session
-printf '%s\n' \
-  '{"id":1,"op":"execute","source":"printf hello > result"}' \
-  '{"id":2,"op":"workspace_diff"}' \
-  | ./target/release/shellsim serve --root ./project
-
-# Retain an action, observe its timer wait, then permit virtual-time advancement
-printf '%s\n' \
-  '{"id":1,"op":"start_execute","source":"printf one; sleep 2; printf two"}' \
-  '{"id":2,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":false}' \
-  '{"id":3,"op":"read_action_output","action_id":0}' \
-  '{"id":4,"op":"poll_action","action_id":0,"work_quanta":100,"advance_time":true}' \
-  | ./target/release/shellsim serve
-
-# Cancel a blocked foreground action while keeping the session reusable
-printf '%s\n' \
-  '{"id":1,"op":"start_execute","source":"sleep 60"}' \
-  '{"id":2,"op":"cancel_action","action_id":0}' \
-  '{"id":3,"op":"execute","source":"printf reused"}' \
-  | ./target/release/shellsim serve
-
-# Running background jobs can return to the modeled terminal foreground
-./target/release/shellsim -c 'sleep 2 & fg %1; echo complete'
-
-# Fork session zero and route an independent action to the branch
-printf '%s\n' \
-  '{"id":1,"op":"fork_session","source":0}' \
-  '{"id":2,"session_id":1,"op":"execute","source":"printf branch"}' \
-  | ./target/release/shellsim serve
-
-# Replay a bounded scenario and emit paired request/response transcript records
-./target/release/shellsim replay scenario.ndjson --root ./project > transcript.ndjson
-
-# Enable format checks, strict trust, and final assertions with a metadata line
-printf '%s\n' '{"scenario":{"version":1,"strict":true,"final_expectation":{"active_action_count":0}}}' \
-  '{"op":"execute","source":"make test"}' > strict-scenario.ndjson
-./target/release/shellsim replay strict-scenario.ndjson
-
-# Import a host Python project into a fresh VFS and run it in shellsim
-./target/release/shellsim-python project/main.py -- arg1
-./target/release/shellsim-python project/tests --pytest
-./target/release/shellsim-python --json --root project project/main.py
-
-# Embed a persistent simulated environment from Python
-python -m pip install shellsim
-python - <<'PY'
+```python
 import shellsim
 
 environment = shellsim.Environment(cpu=100_000)
 environment.write_file("/work/main.py", "print(6 * 7)\n")
 result = environment.run("python3.14 /work/main.py")
+assert result.returncode == 0
 assert result.stdout == b"42\n"
-PY
-
-# Run the PyPI package as an ephemeral tool
-uvx shellsim -c 'printf "b\na\n" | sort'
-
-# Copy a trusted host project into /work, then modify only the disposable VFS snapshot
-uvx shellsim --root ./project -c 'pwd; find . -type f; make test'
-
-# Open a persistent interactive simulator rooted at a host-project snapshot
-uvx shellsim --root ./project
 ```
 
-Limit values accept `k`, `m`, and `g` binary suffixes. Arguments after `--` in `eval` mode become
-shell positional parameters.
+## Agent harness
 
-`serve` retains one environment across requests. `--root` performs one trusted, bounded import
-before request processing. The protocol supports shell actions, base64 file reads and writes
-confined to `/work`, stable path-level workspace diffs, checkpoints, VFS reset, listings, and
-process/resource inspection. One JSON response is emitted for each input line, which makes the
-request/response stream directly replayable. See [docs/implementation.md](docs/implementation.md)
-for the protocol boundary and current limitations.
+`shellsim serve --root ./project` runs a persistent newline-delimited JSON session. It supports
+bounded execution, streaming actions, VFS operations, checkpoints, workspace diffs, process and
+resource inspection, and deterministic session forks. `shellsim mcp` exposes the same environment
+as a stdio MCP server. `shellsim replay scenario.ndjson` reruns checked action transcripts.
 
-For development, `make format`, `make lint`, and `make test` are the canonical local commands and
-the exact entrypoints used by CI. See [CONTRIBUTING.md](CONTRIBUTING.md) for code, testing, review,
-and optional pre-commit-hook guidelines.
-
-The JSON report contains the exit status, typed stop reason, limits, aggregate usage, per-command
-CPU/disk deltas, stdout, stderr, command trace, and unsupported capabilities.
-
-`shellsim-python` and `serve --root` share one transactional importer. They treat the host path as
-trusted harness input, reject symlinks, preserve permission bits, copy the project into `/work`,
-then close that boundary before simulated execution starts. A Python directory automatically
-discovers `test_*.py` files; `--entry FILE` selects a script within a directory. Use `--root` to
-control which project tree is imported and the standard limit flags to constrain the run.
-
-The PyPI package exposes `shellsim.run` for one fresh action and `shellsim.Environment` for a
-persistent VFS, variables, processes, and cumulative resource budget. Results preserve stdout and
-stderr as bytes and include resource, unsupported-capability, no-op, partial-command, and invocation
-telemetry. `Environment.mount` is an explicit trusted-host operation with the same symlink rejection
-and rollback behavior as the CLI importer. The extension never installs the standalone binaries'
-process-wide seccomp filter, so importing or using it does not restrict the embedding Python
-process. Simulated programs still execute through the capability-free Rust library and cannot
-reach ambient host resources.
-
-The installed `shellsim` console command uses the same facade. With a terminal it opens a
-persistent simulated shell; with piped input it executes that input as shell source, and `-c`
-executes one action. `--root DIR` performs a bounded, symlink-rejecting snapshot copy into `/work`.
-Changes made by simulated commands are never written back to the host directory.
-
-## Virtual time
-
-An environment owns deterministic monotonic, wall, and process-CPU clocks. Sleeps and deadlines
-advance the event queue without blocking a host thread; VFS timestamps and Python observe the same
-timeline. Runnable work has zero virtual duration and is bounded by CPU fuel. Background jobs,
-pipelines, and nested shells run through the deterministic cooperative scheduler, so independent
-sleeps overlap in virtual time. See
-[docs/implementation.md](docs/implementation.md) for the state, scheduler, and replay contracts.
-
-## Persistent shell sessions
-
-An `Environment` is a session, not a single command. Reusing it across `run_script_capture` calls
-preserves the VFS, working directory, variables, arrays, functions, package state, clock/network
-state, command history, and cumulative resource usage. CPU and output are cumulative fuel, disk
-tracks current persistent usage, and temporary command memory is released while its peak remains.
-
-`exit N`, `set -e` termination, CPU exhaustion, memory exhaustion, and output exhaustion make the
-session terminal. Later calls return the same terminal outcome without executing or charging more
-work. Disk-full errors are recoverable: a command can remove files and retry.
-
-The `shell` subcommand drives one such environment line by line. It shows a prompt on a terminal,
-preserves state between lines, exits normally on EOF or `exit`, and prints a reason before exiting
-with status 137 when a resource is exhausted. It is an action console rather than a resumable
-terminal: each completed action has closed stdin. Use a pipe or heredoc for command input. The
-console collects a heredoc through its terminating delimiter before executing the action.
-
-Invoking `python` without arguments transfers the foreground session to a deliberately-minimal
-Python REPL. Simple assignments and expressions persist across actions; `exit()` or `quit()`
-returns to the shell. This is a modeled process mode, not access to host CPython.
-
-## Bash-ish compatibility
-
-The shell intentionally targets common agent-written Bash rather than the full Bash grammar. It
-supports functions, indexed and associative arrays, `if`/`case`/`for`/`while`/`until`, C-style
-`for ((...))` loops, `((...))`, pipelines, `&&`/`||`, background jobs, groups and subshells,
-heredocs and here-strings, command/arithmetic substitution, brace expansion, parameter expansion,
-globbing, `[[...]]`, and frequently used `set` options including `pipefail`.
-
-Standard paths such as `/bin/sh` and `/usr/bin/env` resolve to their simulated commands. More
-specialized Bash behavior, including process substitution, trap pseudo-events, coprocesses,
-arbitrary process-group mutation, and some descriptor forms, remains outside the faithful subset. Logical children provide
-isolated shell state, stable PIDs, overlapping virtual-time jobs, bounded pipes, `jobs`/`wait`,
-default and caught signal delivery, `fg`/`bg` with STOP/CONT, dynamic `ps`, and generated `/proc`
-views without creating host processes.
-
-## Command implementations
-
-Commands receive a uniform environment context:
-
-```rust
-fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
+```sh
+printf '%s\n' \
+  '{"id":1,"op":"execute","source":"printf hello > result"}' \
+  '{"id":2,"op":"workspace_diff"}' \
+  | shellsim serve --root ./project
 ```
 
-The dispatcher applies each command's coarse base CPU and memory cost. Commands add dynamic costs
-when useful:
+## Resource model
 
-```rust
-if !env.reserve_memory(input.len() as u64 * 2) {
-    return 137;
-}
-if !env.charge_cpu(input.len() as u64) {
-    return 137;
-}
-```
+CPU is deterministic fuel, memory is modeled working set, disk is current virtual-filesystem
+usage, and output bounds materialized stdout and stderr. The defaults are 10,000,000 CPU units,
+64 MiB memory, 64 MiB disk, and 4 MiB output. Costs are stable and intentionally approximate.
+Exhaustion is observable and never falls back to an ambient host implementation.
 
-New commands should live in a focused module and use only the modeled command context. See
-[docs/implementation.md](docs/implementation.md) for the integration checklist, trust levels,
-resource rules, and the reason native compilers remain outside the simulation.
-
-The current command set includes filesystem and text coreutils, streaming `/dev/null`, `/dev/zero`,
-deterministic `/dev/random` and `/dev/urandom`, `grep`, `sed`, a useful partial `awk`, hashes and
-encoders, bounded tar and gzip tools, virtual `curl`/`wget`, deterministic Git and
-Make subsets, shell builtins, minimal package/Python launchers, and simulated system queries such
-as `env`, `printenv`, `uname`, `id`, `nproc`, `df`, `free`, and `ps`. Partial commands are surfaced
-in evaluation reports instead of being presented as fully faithful implementations.
-
-Disk enforcement lives inside `Vfs`, so direct command mutations cannot bypass capacity checks.
-Commands should still surface `VfsError::NoSpace` with a non-zero status.
-
-## Python 3.14 compatibility
-
-`python`, `python3`, and `python3.14` route to shellsim's safe in-process interpreter. Source goes
-through a UTF-8/indentation-aware lexer, owned AST, semantic bytecode compiler, and metered stack
-VM; host CPython is never invoked. The current language slice covers scalar and mutable containers,
-comparisons and control flow, functions/closures/defaults/`*args`, classes and bound methods,
-user inheritance with C3 lookup, `int` subclasses, constrained metaclasses, comprehensions,
-suspended generators, exceptions and context managers, `assert`, decorators,
-starred assignment/calls, f-strings, VFS-only imports, common iterator/container builtins, and the
-modeled REPL/script/stdin/shebang entrypoints. Unsupported syntax and APIs fail loudly with a
-diagnostic.
-
-Native Python modules use an erased value ABI, checked object views, declarative type/module tables,
-and narrow modeled capabilities. See [docs/python.md](docs/python.md) for the goals, value and
-object model, extension workflow, compatibility evidence, and explicit frontiers.
-
-The requested stdlib gate is 21/21 exact CPython 3.14 probes for these APIs: `sys.executable`,
-`os.getenv`, `collections.defaultdict`, `itertools.count`/`islice`, `heapq.heapify`/`heappop`,
-`bisect.bisect_left`, `math.sqrt`/`ceil`, `string.digits`, `json.dumps(sort_keys=...)`, `re.sub`,
-`functools.reduce`, `dataclasses.dataclass`, `typing.List[...]`, `enum.Enum`,
-`argparse.ArgumentParser.prog`, `csv.reader`/`writer`, source-backed `Counter`, `deque`, `json`,
-`os.path`, `datetime`, byte-preserving `base64`, `hashlib`, `struct`, and `zlib`,
-`import subprocess`, and the
-`pytest`/`unittest.TestCase` entry points. These are intentionally partial module slices, not
-claims of complete stdlib support.
-
-`pytest` and `unittest` are VFS-only first runner slices: explicit files, stable definition-order
-collection, plain zero-argument pytest tests, direct `unittest.TestCase` classes, tested assertions/
-skip/raises controls, and bounded wrappers. Fixtures, decorated tests, plugins, rich
-parametrization, async fixtures, directory/package discovery, and unlisted flags are rejected
-explicitly. The 100-row TaskTrove mini corpus is differential-tested with per-row provenance (99
-supported, one async frontier), and one complete `build-system-task-ordering` solution matches
-CPython 3.14. CPU fuel, modeled memory, output, source/wrapper size, and nesting limits keep this
-general-purpose slice safe and deliberately slow.
-
-## Library API
-
-```rust
-use shellsim::{Environment, Limits};
-
-let mut env = Environment::with_limits(Limits {
-    cpu: 100_000,
-    memory: 8 * 1024 * 1024,
-    disk: 2 * 1024 * 1024,
-    output: 64 * 1024,
-});
-
-let (outcome, stdout, stderr) = env.run_script_capture("echo hello");
-
-// Harness actions may attach stdin without giving the simulated command host-terminal access.
-let (outcome, stdout, stderr) =
-    env.run_script_capture_with_stdin("cat > input.txt", b"hello\n");
-```
-
-An `Environment` preserves its VFS, working directory, variables, functions, options, and resource
-usage across actions. Each action receives its own explicit stdin byte stream; an input redirect in
-the action takes precedence. New environments include `/root`, `/tmp`, and `/work`.
-
-`Interp` remains as an alias for `Environment` for source compatibility.
-
-## Layout
-
-```text
-src/resources.rs       limits, accounting, outcomes, command usage
-src/interp.rs          machine Environment and shell-local ProcessState
-src/process.rs         bounded logical process identities and lifecycle
-src/pseudo_fs.rs       generated read-only /proc and finite /dev views
-src/vfs.rs             quota-enforced in-memory filesystem
-src/shell.rs           lexer, parser, capture API
-src/expand.rs          shell expansion
-src/exec.rs            metered executor, pipelines, redirects, control flow
-src/commands/          registry, command context, implementations
-src/commands/awk.rs    partial record-oriented awk
-src/commands/system.rs simulated environment/system queries
-src/python/            Python 3.14 lexer, parser, bytecode compiler, and metered VM
-src/clock.rs           virtual clock
-src/net.rs             virtual route-table network
-docs/implementation.md architecture and command integration guide
-docs/python.md         Python goals, runtime model, and extension guide
-docs/agent-environment.md reviewed agent-harness gaps and roadmap
-```
-
-Run the unit and resource-invariant tests with `cargo test`.
+For internals and contribution workflow, see [implementation](docs/implementation.md),
+[Python](docs/python.md), and [CONTRIBUTING.md](CONTRIBUTING.md).

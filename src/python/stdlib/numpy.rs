@@ -1,0 +1,3254 @@
+//! Small NumPy-compatible array operations over one opaque shape/stride contract.
+//!
+//! Kernels deliberately use logical index iteration and runtime scalar operations. This keeps
+//! arrays type-erased, deterministic, and easy to meter; no host BLAS, native pointer, or dtype
+//! implementation crosses the interpreter boundary.
+
+use std::cmp::Ordering;
+
+use super::super::native::{
+    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyArray, PyArrayDtype,
+    PyArrayLayout, PyBinaryOp, PyError, PyIndex, PyKind, PyMarker, PyResult, PyRuntime, PySequence,
+    PyString, PyValue, PyValueCast, ValueDef, ValueKind, ValueKindDef, ValueKindSlots,
+};
+use super::super::number::{PyNumber, PyNumber as Number};
+use super::super::Value;
+
+pub(super) static BOOL: ValueKind<bool> = ValueKind::new(
+    ValueKindDef {
+        name: "numpy.bool_",
+        construct: construct_bool,
+        slots: scalar_slots(),
+    },
+    |value| value as u64,
+    |payload| payload != 0,
+);
+
+pub(super) static INT64: ValueKind<i64> = ValueKind::new(
+    ValueKindDef {
+        name: "numpy.int64",
+        construct: construct_int64,
+        slots: scalar_slots(),
+    },
+    |value| value as u64,
+    |payload| payload as i64,
+);
+
+pub(super) static FLOAT64: ValueKind<f64> = ValueKind::new(
+    ValueKindDef {
+        name: "numpy.float64",
+        construct: construct_float64,
+        slots: scalar_slots(),
+    },
+    f64::to_bits,
+    f64::from_bits,
+);
+
+const fn scalar_slots() -> ValueKindSlots {
+    ValueKindSlots {
+        repr: Some(slot_scalar_repr),
+        bool_: Some(slot_scalar_bool),
+        add: Some(slot_scalar_add),
+        reflected_add: Some(slot_scalar_add),
+        subtract: Some(slot_scalar_subtract),
+        reflected_subtract: Some(slot_scalar_reflected_subtract),
+        multiply: Some(slot_scalar_multiply),
+        reflected_multiply: Some(slot_scalar_multiply),
+        divide: Some(slot_scalar_divide),
+        reflected_divide: Some(slot_scalar_reflected_divide),
+        equal: Some(slot_scalar_equal),
+        not_equal: Some(slot_scalar_not_equal),
+        less_than: Some(slot_scalar_less_than),
+        less_equal: Some(slot_scalar_less_equal),
+        greater_than: Some(slot_scalar_greater_than),
+        greater_equal: Some(slot_scalar_greater_equal),
+    }
+}
+
+pub(super) static MODULE: ModuleDef = ModuleDef {
+    name: "numpy",
+    functions: &[
+        function("array", array),
+        function("asarray", asarray),
+        function("zeros", zeros),
+        function("ones", ones),
+        function("full", full),
+        function("zeros_like", zeros_like),
+        function("ones_like", ones_like),
+        function("full_like", full_like),
+        function("arange", arange),
+        function("linspace", linspace),
+        function("eye", eye),
+        function("identity", identity),
+        function("reshape", module_reshape),
+        function("transpose", module_transpose),
+        function("squeeze", module_squeeze),
+        function("expand_dims", expand_dims),
+        function("swapaxes", module_swapaxes),
+        function("broadcast_to", broadcast_to),
+        function("concatenate", concatenate),
+        function("stack", stack),
+        function("vstack", vstack),
+        function("hstack", hstack),
+        function("where", where_),
+        function("minimum", minimum),
+        function("maximum", maximum),
+        function("clip", clip),
+        function("negative", negative),
+        function("absolute", absolute),
+        function("abs", absolute),
+        function("sqrt", sqrt),
+        function("exp", exp),
+        function("log", log),
+        function("sin", sin),
+        function("cos", cos),
+        function("tan", tan),
+        function("floor", floor),
+        function("ceil", ceil),
+        function("sum", module_sum),
+        function("prod", module_prod),
+        function("mean", module_mean),
+        function("min", module_min),
+        function("max", module_max),
+        function("var", module_var),
+        function("std", module_std),
+        function("median", module_median),
+        function("all", module_all),
+        function("any", module_any),
+        function("argmin", module_argmin),
+        function("argmax", module_argmax),
+        function("cumsum", module_cumsum),
+        function("cumprod", module_cumprod),
+        function("dot", dot),
+        function("inner", inner),
+        function("outer", outer),
+        function("matmul", matmul),
+    ],
+    values: &[
+        ValueDef::Factory {
+            name: "ndarray",
+            get: array_type,
+        },
+        ValueDef::Factory {
+            name: "bool_",
+            get: bool_type,
+        },
+        ValueDef::Factory {
+            name: "int64",
+            get: int64_type,
+        },
+        ValueDef::Factory {
+            name: "float64",
+            get: float64_type,
+        },
+    ],
+};
+
+fn array_type(runtime: &mut dyn PyRuntime) -> PyResult {
+    Ok(runtime.marker(PyMarker::ArrayType))
+}
+
+fn bool_type(runtime: &mut dyn PyRuntime) -> PyResult {
+    runtime.value_kind_type(&BOOL.definition)
+}
+
+fn int64_type(runtime: &mut dyn PyRuntime) -> PyResult {
+    runtime.value_kind_type(&INT64.definition)
+}
+
+fn float64_type(runtime: &mut dyn PyRuntime) -> PyResult {
+    runtime.value_kind_type(&FLOAT64.definition)
+}
+
+const fn function(
+    name: &'static str,
+    call: fn(&mut dyn PyRuntime, CallArgs) -> PyResult,
+) -> FunctionDef {
+    FunctionDef {
+        module: "numpy",
+        name,
+        call,
+    }
+}
+
+pub(crate) static ARRAY_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "numpy.ndarray",
+    methods: &[
+        method("tolist", method_tolist),
+        method("copy", method_copy),
+        method("astype", method_astype),
+        method("reshape", method_reshape),
+        method("transpose", method_transpose),
+        method("flatten", method_flatten),
+        method("ravel", method_ravel),
+        method("squeeze", method_squeeze),
+        method("swapaxes", method_swapaxes),
+        method("sum", method_sum),
+        method("prod", method_prod),
+        method("mean", method_mean),
+        method("min", method_min),
+        method("max", method_max),
+        method("var", method_var),
+        method("std", method_std),
+        method("all", method_all),
+        method("any", method_any),
+        method("argmin", method_argmin),
+        method("argmax", method_argmax),
+        method("cumsum", method_cumsum),
+        method("cumprod", method_cumprod),
+    ],
+};
+
+const fn method(
+    name: &'static str,
+    call: fn(&mut dyn PyRuntime, PyValue, CallArgs) -> PyResult,
+) -> MethodDef {
+    MethodDef {
+        type_name: "numpy.ndarray",
+        name,
+        call,
+    }
+}
+
+fn array(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.array", 1, 1)?;
+    args.reject_unknown_keywords("numpy.array", &["dtype"])?;
+    let dtype = dtype_keyword(runtime, &args, "numpy.array")?;
+    construct(runtime, args.positional()[0], dtype, true)
+}
+
+fn asarray(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.asarray", 1, 1)?;
+    args.reject_unknown_keywords("numpy.asarray", &["dtype"])?;
+    let dtype = dtype_keyword(runtime, &args, "numpy.asarray")?;
+    if dtype.is_none() && runtime.kind(&args.positional()[0])? == PyKind::Array {
+        return Ok(args.positional()[0]);
+    }
+    construct(runtime, args.positional()[0], dtype, true)
+}
+
+fn construct(
+    runtime: &mut dyn PyRuntime,
+    source: PyValue,
+    requested_dtype: Option<PyArrayDtype>,
+    copy_array: bool,
+) -> PyResult {
+    if runtime.kind(&source)? == PyKind::Array {
+        let array = source.cast::<PyArray>(runtime)?;
+        let (layout, source_dtype) = runtime.array_layout(array)?;
+        if !copy_array && requested_dtype.is_none() {
+            return Ok(source);
+        }
+        let dtype = requested_dtype.unwrap_or(source_dtype);
+        let count = element_count(&layout.shape)?;
+        reserve_values(runtime, count)?;
+        let mut values = Vec::with_capacity(count);
+        for_each_index(&layout.shape, |index| {
+            let value = runtime.array_get(array, index)?;
+            values.push(convert(runtime, value, dtype)?);
+            Ok(())
+        })?;
+        return runtime.new_array(values, layout.shape, dtype);
+    }
+    let mut values = Vec::new();
+    let shape = flatten(runtime, source, &mut values)?;
+    let inferred = infer_dtype(runtime, &values)?;
+    let dtype = requested_dtype.unwrap_or(inferred);
+    reserve_values(runtime, values.len())?;
+    let mut converted = Vec::with_capacity(values.len());
+    for value in values {
+        runtime.charge_cpu(1)?;
+        converted.push(convert(runtime, value, dtype)?);
+    }
+    runtime.new_array(converted, shape, dtype)
+}
+
+fn flatten(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+    output: &mut Vec<PyValue>,
+) -> PyResult<Vec<usize>> {
+    if registered_scalar(runtime, &value).is_some() {
+        push_value(runtime, output, value)?;
+        return Ok(Vec::new());
+    }
+    match runtime.kind(&value)? {
+        PyKind::List | PyKind::Tuple => {
+            let items = value.cast::<PySequence>(runtime)?.items(runtime)?;
+            let mut child_shape = None;
+            for item in items.iter().copied() {
+                runtime.charge_cpu(1)?;
+                let shape = flatten(runtime, item, output)?;
+                if child_shape
+                    .as_ref()
+                    .is_some_and(|expected| expected != &shape)
+                {
+                    return Err(PyError::value_error(
+                        "setting an array element with a sequence",
+                    ));
+                }
+                child_shape = Some(shape);
+            }
+            let mut shape = vec![items.len()];
+            shape.extend(child_shape.unwrap_or_default());
+            Ok(shape)
+        }
+        PyKind::Array => {
+            let array = value.cast::<PyArray>(runtime)?;
+            let (layout, _) = runtime.array_layout(array)?;
+            for_each_index(&layout.shape, |index| {
+                let value = runtime.array_get(array, index)?;
+                push_value(runtime, output, value)?;
+                Ok(())
+            })?;
+            Ok(layout.shape)
+        }
+        PyKind::Bool | PyKind::Int | PyKind::Float => {
+            push_value(runtime, output, value)?;
+            Ok(Vec::new())
+        }
+        _ => Err(PyError::type_error(
+            "numpy arrays require numeric scalar values",
+        )),
+    }
+}
+
+fn infer_dtype(runtime: &dyn PyRuntime, values: &[PyValue]) -> PyResult<PyArrayDtype> {
+    let mut dtype = PyArrayDtype::Bool;
+    for value in values {
+        if let Some(value) = registered_scalar(runtime, value) {
+            dtype = promote_scalar_dtype(dtype, value);
+            continue;
+        }
+        dtype = match runtime.kind(value)? {
+            PyKind::Bool => dtype,
+            PyKind::Int if dtype == PyArrayDtype::Bool => PyArrayDtype::Int,
+            PyKind::Int => dtype,
+            PyKind::Float => PyArrayDtype::Float,
+            _ => {
+                return Err(PyError::type_error(
+                    "numpy arrays require numeric scalar values",
+                ))
+            }
+        };
+    }
+    Ok(dtype)
+}
+
+fn promote_scalar_dtype(current: PyArrayDtype, value: Scalar) -> PyArrayDtype {
+    match value {
+        Scalar::Bool(_) => current,
+        Scalar::Int(_) if current == PyArrayDtype::Bool => PyArrayDtype::Int,
+        Scalar::Int(_) => current,
+        Scalar::Float(_) => PyArrayDtype::Float,
+    }
+}
+
+fn dtype_keyword(
+    runtime: &mut dyn PyRuntime,
+    args: &CallArgs,
+    function: &str,
+) -> PyResult<Option<PyArrayDtype>> {
+    args.keyword(function, "dtype")?
+        .copied()
+        .map(|value| parse_dtype(runtime, value))
+        .transpose()
+}
+
+fn parse_dtype(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<PyArrayDtype> {
+    let name = if runtime.kind(&value)? == PyKind::String {
+        value.cast::<PyString>(runtime)?.0
+    } else {
+        runtime.repr(&value)?
+    };
+    match name.as_str() {
+        "bool" | "<class 'bool'>" | "<class 'numpy.bool_'>" => Ok(PyArrayDtype::Bool),
+        "int" | "int64" | "<class 'int'>" | "<class 'numpy.int64'>" => Ok(PyArrayDtype::Int),
+        "float" | "float64" | "<class 'float'>" | "<class 'numpy.float64'>" => {
+            Ok(PyArrayDtype::Float)
+        }
+        _ => Err(PyError::type_error(format!(
+            "unsupported numpy dtype {name:?}"
+        ))),
+    }
+}
+
+fn construct_bool(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.bool_", 0, 1)?;
+    args.reject_keywords("numpy.bool_")?;
+    convert(
+        runtime,
+        args.positional()
+            .first()
+            .copied()
+            .unwrap_or(Value::Bool(false)),
+        PyArrayDtype::Bool,
+    )
+}
+
+fn construct_int64(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.int64", 0, 1)?;
+    args.reject_keywords("numpy.int64")?;
+    convert(
+        runtime,
+        args.positional().first().copied().unwrap_or(Value::Int(0)),
+        PyArrayDtype::Int,
+    )
+}
+
+fn construct_float64(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.float64", 0, 1)?;
+    args.reject_keywords("numpy.float64")?;
+    convert(
+        runtime,
+        args.positional()
+            .first()
+            .copied()
+            .unwrap_or(Value::Float(0.0)),
+        PyArrayDtype::Float,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum Scalar {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+}
+
+impl Scalar {
+    fn as_f64(self) -> f64 {
+        match self {
+            Self::Bool(value) => i64::from(value) as f64,
+            Self::Int(value) => value as f64,
+            Self::Float(value) => value,
+        }
+    }
+
+    fn truth(self) -> bool {
+        match self {
+            Self::Bool(value) => value,
+            Self::Int(value) => value != 0,
+            Self::Float(value) => value != 0.0,
+        }
+    }
+}
+
+fn registered_scalar(runtime: &dyn PyRuntime, value: &PyValue) -> Option<Scalar> {
+    BOOL.unpack(runtime, value)
+        .map(Scalar::Bool)
+        .or_else(|| INT64.unpack(runtime, value).map(Scalar::Int))
+        .or_else(|| FLOAT64.unpack(runtime, value).map(Scalar::Float))
+}
+
+fn scalar(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Scalar> {
+    if let Some(value) = registered_scalar(runtime, &value) {
+        return Ok(value);
+    }
+    match value.cast::<Number>(runtime)? {
+        Number::Int(value) => Ok(Scalar::Int(value)),
+        Number::BigInt(value) => value
+            .parse::<i64>()
+            .map(Scalar::Int)
+            .map_err(|_| PyError::overflow_error("integer does not fit in numpy.int64")),
+        Number::Float(value) => Ok(Scalar::Float(value)),
+    }
+}
+
+fn convert(runtime: &mut dyn PyRuntime, value: PyValue, dtype: PyArrayDtype) -> PyResult<PyValue> {
+    match dtype {
+        PyArrayDtype::Bool => {
+            let value = match registered_scalar(runtime, &value) {
+                Some(value) => value.truth(),
+                None => runtime.truth(&value)?,
+            };
+            BOOL.pack(runtime, value)
+        }
+        PyArrayDtype::Float => FLOAT64.pack(runtime, scalar(runtime, value)?.as_f64()),
+        PyArrayDtype::Int => match scalar(runtime, value)? {
+            Scalar::Bool(value) => INT64.pack(runtime, i64::from(value)),
+            Scalar::Int(value) => INT64.pack(runtime, value),
+            Scalar::Float(value) if value.is_finite() => {
+                let truncated = value.trunc();
+                if truncated < i64::MIN as f64 || truncated >= 9_223_372_036_854_775_808.0 {
+                    Err(PyError::overflow_error(
+                        "integer does not fit in numpy.int64",
+                    ))
+                } else {
+                    INT64.pack(runtime, truncated as i64)
+                }
+            }
+            Scalar::Float(_) => Err(PyError::overflow_error(
+                "cannot convert float infinity to integer",
+            )),
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScalarOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+fn scalar_binary(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+    operation: ScalarOp,
+) -> PyResult<Option<PyValue>> {
+    let left = scalar(runtime, left)?;
+    let right = scalar(runtime, right)?;
+    if matches!(operation, ScalarOp::Divide)
+        || matches!(left, Scalar::Float(_))
+        || matches!(right, Scalar::Float(_))
+    {
+        let left = left.as_f64();
+        let right = right.as_f64();
+        if matches!(operation, ScalarOp::Divide) && right == 0.0 {
+            return Err(PyError::zero_division_error("division by zero"));
+        }
+        let value = match operation {
+            ScalarOp::Add => left + right,
+            ScalarOp::Subtract => left - right,
+            ScalarOp::Multiply => left * right,
+            ScalarOp::Divide => left / right,
+        };
+        return FLOAT64.pack(runtime, value).map(Some);
+    }
+    if let (Scalar::Bool(left), Scalar::Bool(right)) = (left, right) {
+        let value = match operation {
+            ScalarOp::Add => left || right,
+            ScalarOp::Multiply => left && right,
+            ScalarOp::Subtract => {
+                return Err(PyError::type_error(
+                    "numpy boolean subtract is not supported",
+                ))
+            }
+            ScalarOp::Divide => unreachable!(),
+        };
+        return BOOL.pack(runtime, value).map(Some);
+    }
+    let integer = |value| match value {
+        Scalar::Bool(value) => i64::from(value),
+        Scalar::Int(value) => value,
+        Scalar::Float(_) => unreachable!(),
+    };
+    let left = integer(left);
+    let right = integer(right);
+    let value = match operation {
+        ScalarOp::Add => left.wrapping_add(right),
+        ScalarOp::Subtract => left.wrapping_sub(right),
+        ScalarOp::Multiply => left.wrapping_mul(right),
+        ScalarOp::Divide => unreachable!(),
+    };
+    INT64.pack(runtime, value).map(Some)
+}
+
+pub(crate) fn slot_scalar_add(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    scalar_binary(runtime, left, right, ScalarOp::Add)
+}
+
+pub(crate) fn slot_scalar_subtract(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    scalar_binary(runtime, left, right, ScalarOp::Subtract)
+}
+
+pub(crate) fn slot_scalar_reflected_subtract(
+    runtime: &mut dyn PyRuntime,
+    right: PyValue,
+    left: PyValue,
+) -> PyResult<Option<PyValue>> {
+    scalar_binary(runtime, left, right, ScalarOp::Subtract)
+}
+
+pub(crate) fn slot_scalar_multiply(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    scalar_binary(runtime, left, right, ScalarOp::Multiply)
+}
+
+pub(crate) fn slot_scalar_divide(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    scalar_binary(runtime, left, right, ScalarOp::Divide)
+}
+
+pub(crate) fn slot_scalar_reflected_divide(
+    runtime: &mut dyn PyRuntime,
+    right: PyValue,
+    left: PyValue,
+) -> PyResult<Option<PyValue>> {
+    scalar_binary(runtime, left, right, ScalarOp::Divide)
+}
+
+fn slot_scalar_repr(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+    let text = match scalar(runtime, value)? {
+        Scalar::Bool(value) => if value { "True" } else { "False" }.into(),
+        Scalar::Int(value) => value.to_string(),
+        Scalar::Float(value) => {
+            let text = value.to_string();
+            if text.contains(['.', 'e', 'E']) {
+                text
+            } else {
+                format!("{text}.0")
+            }
+        }
+    };
+    runtime.new_string(text).map(Some)
+}
+
+fn slot_scalar_bool(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+    Ok(Some(Value::Bool(scalar(runtime, value)?.truth())))
+}
+
+fn slot_scalar_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let left = scalar(runtime, left)?.as_f64();
+    let right = scalar(runtime, right)?.as_f64();
+    Ok(Some(Value::Bool(left == right)))
+}
+
+fn slot_scalar_less_than(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let left = scalar(runtime, left)?.as_f64();
+    let right = scalar(runtime, right)?.as_f64();
+    Ok(Some(Value::Bool(left < right)))
+}
+
+fn slot_scalar_not_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_scalar_equal(runtime, left, right).map(|value| {
+        value.map(|value| Value::Bool(!value.bool_value().expect("comparison returns bool")))
+    })
+}
+
+fn slot_scalar_less_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(Some(Value::Bool(
+        scalar(runtime, left)?.as_f64() <= scalar(runtime, right)?.as_f64(),
+    )))
+}
+
+fn slot_scalar_greater_than(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(Some(Value::Bool(
+        scalar(runtime, left)?.as_f64() > scalar(runtime, right)?.as_f64(),
+    )))
+}
+
+fn slot_scalar_greater_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(Some(Value::Bool(
+        scalar(runtime, left)?.as_f64() >= scalar(runtime, right)?.as_f64(),
+    )))
+}
+
+fn zeros(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    filled(runtime, args, "numpy.zeros", Value::Int(0))
+}
+
+fn ones(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    filled(runtime, args, "numpy.ones", Value::Int(1))
+}
+
+fn full(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.full", 2, 2)?;
+    args.reject_unknown_keywords("numpy.full", &["dtype"])?;
+    let shape = parse_shape(runtime, args.positional()[0])?;
+    let requested = dtype_keyword(runtime, &args, "numpy.full")?;
+    let dtype = requested.unwrap_or(infer_dtype(runtime, &args.positional()[1..])?);
+    let value = convert(runtime, args.positional()[1], dtype)?;
+    allocate_filled(runtime, shape, value, dtype)
+}
+
+fn filled(runtime: &mut dyn PyRuntime, args: CallArgs, name: &str, value: PyValue) -> PyResult {
+    args.expect_positional(name, 1, 1)?;
+    args.reject_unknown_keywords(name, &["dtype"])?;
+    let shape = parse_shape(runtime, args.positional()[0])?;
+    let dtype = dtype_keyword(runtime, &args, name)?.unwrap_or(PyArrayDtype::Float);
+    let value = convert(runtime, value, dtype)?;
+    allocate_filled(runtime, shape, value, dtype)
+}
+
+fn allocate_filled(
+    runtime: &mut dyn PyRuntime,
+    shape: Vec<usize>,
+    value: PyValue,
+    dtype: PyArrayDtype,
+) -> PyResult {
+    let count = element_count(&shape)?;
+    reserve_values(runtime, count)?;
+    runtime.charge_cpu(u64::try_from(count).unwrap_or(u64::MAX))?;
+    runtime.new_array(vec![value; count], shape, dtype)
+}
+
+fn zeros_like(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    like_filled(runtime, args, "numpy.zeros_like", Value::Int(0))
+}
+
+fn ones_like(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    like_filled(runtime, args, "numpy.ones_like", Value::Int(1))
+}
+
+fn like_filled(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
+    name: &str,
+    value: PyValue,
+) -> PyResult {
+    args.expect_positional(name, 1, 1)?;
+    args.reject_unknown_keywords(name, &["dtype"])?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let (layout, source_dtype) = runtime.array_layout(array)?;
+    let dtype = dtype_keyword(runtime, &args, name)?.unwrap_or(source_dtype);
+    let value = convert(runtime, value, dtype)?;
+    allocate_filled(runtime, layout.shape, value, dtype)
+}
+
+fn full_like(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.full_like", 2, 2)?;
+    args.reject_unknown_keywords("numpy.full_like", &["dtype"])?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let (layout, source_dtype) = runtime.array_layout(array)?;
+    let dtype = dtype_keyword(runtime, &args, "numpy.full_like")?.unwrap_or(source_dtype);
+    let value = convert(runtime, args.positional()[1], dtype)?;
+    allocate_filled(runtime, layout.shape, value, dtype)
+}
+
+fn parse_shape(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<usize>> {
+    if let Some(value) = runtime.int_value(&value) {
+        return Ok(vec![dimension(value)?]);
+    }
+    let items = value.cast::<PySequence>(runtime)?.items(runtime)?;
+    items
+        .into_iter()
+        .map(|item| {
+            let PyIndex(value) = item.cast(runtime)?;
+            dimension(value)
+        })
+        .collect()
+}
+
+fn dimension(value: i64) -> PyResult<usize> {
+    usize::try_from(value).map_err(|_| PyError::value_error("negative dimensions are not allowed"))
+}
+
+fn element_count(shape: &[usize]) -> PyResult<usize> {
+    shape.iter().try_fold(1usize, |count, dimension| {
+        count
+            .checked_mul(*dimension)
+            .ok_or_else(|| PyError::value_error("array is too large"))
+    })
+}
+
+fn reserve_values(runtime: &mut dyn PyRuntime, count: usize) -> PyResult<()> {
+    let bytes = count
+        .checked_mul(std::mem::size_of::<PyValue>())
+        .ok_or_else(|| PyError::value_error("array is too large"))?;
+    runtime.reserve_memory(bytes)
+}
+
+fn push_value(
+    runtime: &mut dyn PyRuntime,
+    values: &mut Vec<PyValue>,
+    value: PyValue,
+) -> PyResult<()> {
+    reserve_values(runtime, 1)?;
+    values.push(value);
+    Ok(())
+}
+
+fn arange(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.arange", 1, 3)?;
+    args.reject_unknown_keywords("numpy.arange", &["dtype"])?;
+    let numbers = args
+        .positional()
+        .iter()
+        .copied()
+        .map(|value| value.cast::<PyNumber>(runtime))
+        .collect::<PyResult<Vec<_>>>()?;
+    let float_input = numbers
+        .iter()
+        .any(|value| matches!(value, Number::Float(_)));
+    let converted = numbers
+        .into_iter()
+        .map(Number::into_f64)
+        .collect::<PyResult<Vec<_>>>()?;
+    let (start, stop, step) = match converted.as_slice() {
+        [stop] => (0.0, *stop, 1.0),
+        [start, stop] => (*start, *stop, 1.0),
+        [start, stop, step] => (*start, *stop, *step),
+        _ => unreachable!(),
+    };
+    if step == 0.0 || !start.is_finite() || !stop.is_finite() || !step.is_finite() {
+        return Err(PyError::value_error(
+            "arange arguments must be finite and step must be nonzero",
+        ));
+    }
+    let raw_count = ((stop - start) / step).ceil().max(0.0);
+    if raw_count > usize::MAX as f64 {
+        return Err(PyError::value_error("array is too large"));
+    }
+    let count = raw_count as usize;
+    reserve_values(runtime, count)?;
+    runtime.charge_cpu(u64::try_from(count).unwrap_or(u64::MAX))?;
+    let requested = dtype_keyword(runtime, &args, "numpy.arange")?;
+    let dtype = requested.unwrap_or(if float_input {
+        PyArrayDtype::Float
+    } else {
+        PyArrayDtype::Int
+    });
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let value = start + step * index as f64;
+        values.push(convert(runtime, Value::Float(value), dtype)?);
+    }
+    runtime.new_array(values, vec![count], dtype)
+}
+
+fn linspace(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.linspace", 2, 3)?;
+    args.reject_unknown_keywords("numpy.linspace", &["num", "endpoint", "dtype"])?;
+    let start = scalar(runtime, args.positional()[0])?.as_f64();
+    let stop = scalar(runtime, args.positional()[1])?.as_f64();
+    let num_value = args
+        .positional()
+        .get(2)
+        .copied()
+        .or(args.keyword("numpy.linspace", "num")?.copied())
+        .unwrap_or(Value::Int(50));
+    let PyIndex(num) = num_value.cast(runtime)?;
+    let num = dimension(num)?;
+    let endpoint = match args.keyword("numpy.linspace", "endpoint")? {
+        Some(value) => runtime.truth(value)?,
+        None => true,
+    };
+    let dtype = dtype_keyword(runtime, &args, "numpy.linspace")?.unwrap_or(PyArrayDtype::Float);
+    reserve_values(runtime, num)?;
+    let mut values = Vec::with_capacity(num);
+    let denominator = if endpoint { num.saturating_sub(1) } else { num };
+    for index in 0..num {
+        runtime.charge_cpu(1)?;
+        let value = if denominator == 0 {
+            start
+        } else {
+            start + (stop - start) * index as f64 / denominator as f64
+        };
+        values.push(convert(runtime, Value::Float(value), dtype)?);
+    }
+    runtime.new_array(values, vec![num], dtype)
+}
+
+fn eye(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.eye", 1, 3)?;
+    args.reject_unknown_keywords("numpy.eye", &["M", "k", "dtype"])?;
+    let PyIndex(rows) = args.positional()[0].cast(runtime)?;
+    let rows = dimension(rows)?;
+    let columns = args
+        .positional()
+        .get(1)
+        .copied()
+        .or(args.keyword("numpy.eye", "M")?.copied())
+        .map(|value| {
+            value
+                .cast::<PyIndex>(runtime)
+                .and_then(|value| dimension(value.0))
+        })
+        .transpose()?
+        .unwrap_or(rows);
+    let diagonal = args
+        .positional()
+        .get(2)
+        .copied()
+        .or(args.keyword("numpy.eye", "k")?.copied())
+        .map(|value| value.cast::<PyIndex>(runtime).map(|value| value.0))
+        .transpose()?
+        .unwrap_or(0);
+    let dtype = dtype_keyword(runtime, &args, "numpy.eye")?.unwrap_or(PyArrayDtype::Float);
+    let count = rows
+        .checked_mul(columns)
+        .ok_or_else(|| PyError::value_error("array is too large"))?;
+    reserve_values(runtime, count)?;
+    let zero = convert(runtime, Value::Int(0), dtype)?;
+    let one = convert(runtime, Value::Int(1), dtype)?;
+    let mut values = vec![zero; count];
+    for row in 0..rows {
+        runtime.charge_cpu(1)?;
+        let column = i64::try_from(row)
+            .ok()
+            .and_then(|row| row.checked_add(diagonal))
+            .and_then(|column| usize::try_from(column).ok());
+        if let Some(column) = column.filter(|column| *column < columns) {
+            values[row * columns + column] = one;
+        }
+    }
+    runtime.new_array(values, vec![rows, columns], dtype)
+}
+
+fn identity(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.identity", 1, 1)?;
+    args.reject_unknown_keywords("numpy.identity", &["dtype"])?;
+    let forwarded = CallArgs::new(args.positional().to_vec(), args.keywords().to_vec());
+    eye(runtime, forwarded)
+}
+
+fn coerce_array(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<PyArray> {
+    if runtime.kind(&value)? == PyKind::Array {
+        value.cast(runtime)
+    } else {
+        construct(runtime, value, None, true)?.cast(runtime)
+    }
+}
+
+pub(crate) fn slot_length(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let array = value.cast::<PyArray>(runtime)?;
+    let (layout, _) = runtime.array_layout(array)?;
+    let Some(length) = layout.shape.first() else {
+        return Err(PyError::type_error("len() of unsized object"));
+    };
+    Ok(Some(Value::Int(i64::try_from(*length).map_err(|_| {
+        PyError::overflow_error("array length overflow")
+    })?)))
+}
+
+pub(crate) fn slot_bool(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+    let array = value.cast::<PyArray>(runtime)?;
+    let (layout, _) = runtime.array_layout(array)?;
+    if element_count(&layout.shape)? != 1 {
+        return Err(PyError::value_error(
+            "the truth value of an array with other than one element is ambiguous",
+        ));
+    }
+    let index = vec![0; layout.shape.len()];
+    let value = runtime.array_get(array, &index)?;
+    Ok(Some(Value::Bool(runtime.truth(&value)?)))
+}
+
+pub(crate) fn slot_repr(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+    let array = value.cast::<PyArray>(runtime)?;
+    let (layout, _) = runtime.array_layout(array)?;
+    let values = tolist_axis(runtime, array, &layout.shape, &mut Vec::new())?;
+    let rendered = runtime.repr(&values)?;
+    runtime.new_string(format!("array({rendered})")).map(Some)
+}
+
+pub(crate) fn slot_iter(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+    let array = value.cast::<PyArray>(runtime)?;
+    let (layout, _) = runtime.array_layout(array)?;
+    let Some(length) = layout.shape.first() else {
+        return Err(PyError::type_error("iteration over a 0-d array"));
+    };
+    reserve_values(runtime, *length)?;
+    let mut values = Vec::with_capacity(*length);
+    for index in 0..*length {
+        values.push(get_item(runtime, array, Value::Int(index as i64))?);
+    }
+    runtime.new_iterator(values).map(Some)
+}
+
+pub(crate) fn slot_get_item(
+    runtime: &mut dyn PyRuntime,
+    array: PyValue,
+    index: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let array = array.cast::<PyArray>(runtime)?;
+    Ok(Some(get_item(runtime, array, index)?))
+}
+
+pub(crate) fn slot_slice(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+    start: Option<i64>,
+    stop: Option<i64>,
+    step: Option<i64>,
+) -> PyResult<Option<PyValue>> {
+    let array = value.cast::<PyArray>(runtime)?;
+    let (mut layout, _) = runtime.array_layout(array)?;
+    let Some(&length) = layout.shape.first() else {
+        return Err(PyError::value_error("cannot slice a 0-d array"));
+    };
+    let (first, count, step) = slice_plan(length, start, stop, step)?;
+    if count != 0 {
+        layout.offset = layout
+            .offset
+            .checked_add(
+                layout.strides[0]
+                    .checked_mul(first)
+                    .ok_or_else(|| PyError::value_error("array offset overflow"))?,
+            )
+            .ok_or_else(|| PyError::value_error("array offset overflow"))?;
+    }
+    layout.shape[0] = count;
+    layout.strides[0] = layout.strides[0]
+        .checked_mul(step)
+        .ok_or_else(|| PyError::value_error("array stride overflow"))?;
+    runtime.new_array_view(array, layout).map(Some)
+}
+
+fn slice_plan(
+    length: usize,
+    start: Option<i64>,
+    stop: Option<i64>,
+    step: Option<i64>,
+) -> PyResult<(isize, usize, isize)> {
+    let length =
+        i64::try_from(length).map_err(|_| PyError::overflow_error("array dimension overflow"))?;
+    let step = step.unwrap_or(1);
+    if step == 0 {
+        return Err(PyError::value_error("slice step cannot be zero"));
+    }
+    let normalize = |value: i64, minimum: i64, maximum: i64| {
+        let value = if value < 0 {
+            value.saturating_add(length)
+        } else {
+            value
+        };
+        value.clamp(minimum, maximum)
+    };
+    let (first, stop) = if step > 0 {
+        (
+            start.map_or(0, |value| normalize(value, 0, length)),
+            stop.map_or(length, |value| normalize(value, 0, length)),
+        )
+    } else {
+        (
+            start.map_or(length - 1, |value| normalize(value, -1, length - 1)),
+            stop.map_or(-1, |value| normalize(value, -1, length - 1)),
+        )
+    };
+    let count = if (step > 0 && first < stop) || (step < 0 && first > stop) {
+        usize::try_from((stop - first - step.signum()) / step + 1)
+            .map_err(|_| PyError::value_error("slice length overflow"))?
+    } else {
+        0
+    };
+    Ok((
+        isize::try_from(first).map_err(|_| PyError::value_error("slice offset overflow"))?,
+        count,
+        isize::try_from(step).map_err(|_| PyError::value_error("slice stride overflow"))?,
+    ))
+}
+
+fn get_item(runtime: &mut dyn PyRuntime, array: PyArray, index: PyValue) -> PyResult<PyValue> {
+    let (layout, _) = runtime.array_layout(array)?;
+    if matches!(runtime.kind(&index)?, PyKind::List | PyKind::Array) {
+        let selection = advanced_selection(runtime, &layout.shape, index)?;
+        reserve_values(runtime, selection.coordinates.len())?;
+        let mut values = Vec::with_capacity(selection.coordinates.len());
+        for coordinate in selection.coordinates {
+            values.push(runtime.array_get(array, &coordinate)?);
+        }
+        let dtype = runtime.array_layout(array)?.1;
+        return runtime.new_array(values, selection.shape, dtype);
+    }
+    let indices = parse_indices(runtime, index, &layout.shape)?;
+    if indices.len() == layout.shape.len() {
+        return runtime.array_get(array, &indices);
+    }
+    let mut offset = layout.offset;
+    for (axis, index) in indices.iter().enumerate() {
+        offset = offset
+            .checked_add(
+                layout.strides[axis]
+                    .checked_mul(*index as isize)
+                    .ok_or_else(|| PyError::value_error("array offset overflow"))?,
+            )
+            .ok_or_else(|| PyError::value_error("array offset overflow"))?;
+    }
+    runtime.new_array_view(
+        array,
+        PyArrayLayout {
+            shape: layout.shape[indices.len()..].to_vec(),
+            strides: layout.strides[indices.len()..].to_vec(),
+            offset,
+        },
+    )
+}
+
+fn parse_indices(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+    shape: &[usize],
+) -> PyResult<Vec<usize>> {
+    let raw = if runtime.int_value(&value).is_some() {
+        vec![value]
+    } else {
+        value.cast::<PySequence>(runtime)?.items(runtime)?
+    };
+    if raw.len() > shape.len() {
+        return Err(PyError::value_error("too many indices for array"));
+    }
+    raw.into_iter()
+        .enumerate()
+        .map(|(axis, value)| {
+            let PyIndex(value) = value.cast(runtime)?;
+            normalize_index(value, shape[axis])
+        })
+        .collect()
+}
+
+fn normalize_index(index: i64, length: usize) -> PyResult<usize> {
+    let length_i64 =
+        i64::try_from(length).map_err(|_| PyError::overflow_error("array dimension overflow"))?;
+    let index = if index < 0 {
+        length_i64.checked_add(index)
+    } else {
+        Some(index)
+    }
+    .ok_or_else(|| PyError::value_error("index out of bounds"))?;
+    let index = usize::try_from(index).map_err(|_| PyError::value_error("index out of bounds"))?;
+    if index >= length {
+        Err(PyError::value_error("index out of bounds"))
+    } else {
+        Ok(index)
+    }
+}
+
+pub(crate) fn slot_set_item(
+    runtime: &mut dyn PyRuntime,
+    array: PyValue,
+    index: PyValue,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let array = array.cast::<PyArray>(runtime)?;
+    let (layout, dtype) = runtime.array_layout(array)?;
+    if matches!(runtime.kind(&index)?, PyKind::List | PyKind::Array) {
+        let selection = advanced_selection(runtime, &layout.shape, index)?;
+        let mut source = value;
+        if matches!(runtime.kind(&source)?, PyKind::List | PyKind::Tuple) {
+            source = construct(runtime, source, None, true)?;
+        }
+        let source_layout = if runtime.kind(&source)? == PyKind::Array {
+            Some(runtime.array_layout(source.cast(runtime)?)?.0)
+        } else {
+            None
+        };
+        let mut position = 0usize;
+        for_each_index(&selection.shape, |output_index| {
+            let selected = selection.coordinates[position].clone();
+            position += 1;
+            let value = broadcast_get(
+                runtime,
+                source,
+                source_layout.as_ref(),
+                output_index,
+                &selection.shape,
+            )?;
+            let value = convert(runtime, value, dtype)?;
+            runtime.array_set(array, &selected, value)
+        })?;
+        return Ok(Some(Value::None));
+    }
+    let indices = parse_indices(runtime, index, &layout.shape)?;
+    if indices.len() != layout.shape.len() {
+        return Err(PyError::type_error(
+            "assignment to array views is not implemented",
+        ));
+    }
+    let value = convert(runtime, value, dtype)?;
+    runtime.array_set(array, &indices, value)?;
+    Ok(Some(Value::None))
+}
+
+struct AdvancedSelection {
+    coordinates: Vec<Vec<usize>>,
+    shape: Vec<usize>,
+}
+
+fn advanced_selection(
+    runtime: &mut dyn PyRuntime,
+    shape: &[usize],
+    index: PyValue,
+) -> PyResult<AdvancedSelection> {
+    if shape.is_empty() {
+        return Err(PyError::value_error("cannot index a 0-d array"));
+    }
+    let index = if runtime.kind(&index)? == PyKind::List {
+        let empty = index
+            .cast::<PySequence>(runtime)?
+            .items(runtime)?
+            .is_empty();
+        construct(runtime, index, empty.then_some(PyArrayDtype::Int), true)?
+    } else {
+        index
+    };
+    let indices = index.cast::<PyArray>(runtime)?;
+    let (index_layout, index_dtype) = runtime.array_layout(indices)?;
+    let mut coordinates = Vec::new();
+    let result_shape = match index_dtype {
+        PyArrayDtype::Bool if index_layout.shape == shape => {
+            for_each_index(shape, |coordinate| {
+                let selected = runtime.array_get(indices, coordinate)?;
+                if BOOL.unpack(runtime, &selected).unwrap_or(false) {
+                    push_coordinate(runtime, &mut coordinates, coordinate.to_vec())?;
+                }
+                Ok(())
+            })?;
+            vec![coordinates.len()]
+        }
+        PyArrayDtype::Bool
+            if index_layout.shape.len() == 1 && index_layout.shape[0] == shape[0] =>
+        {
+            let mut selected_rows = 0usize;
+            for row in 0..shape[0] {
+                let selected = runtime.array_get(indices, &[row])?;
+                if !BOOL.unpack(runtime, &selected).unwrap_or(false) {
+                    continue;
+                }
+                selected_rows += 1;
+                for_each_index(&shape[1..], |tail| {
+                    let mut coordinate = vec![row];
+                    coordinate.extend_from_slice(tail);
+                    push_coordinate(runtime, &mut coordinates, coordinate)
+                })?;
+            }
+            let mut result = vec![selected_rows];
+            result.extend_from_slice(&shape[1..]);
+            result
+        }
+        PyArrayDtype::Bool => {
+            return Err(PyError::value_error(
+                "boolean index must match the array or its first axis",
+            ))
+        }
+        PyArrayDtype::Int => {
+            for_each_index(&index_layout.shape, |index_coordinate| {
+                let selected = runtime.array_get(indices, index_coordinate)?;
+                let selected = INT64.unpack(runtime, &selected).ok_or_else(|| {
+                    PyError::runtime_error("integer index array contains another scalar kind")
+                })?;
+                let row = normalize_index(selected, shape[0])?;
+                for_each_index(&shape[1..], |tail| {
+                    let mut coordinate = vec![row];
+                    coordinate.extend_from_slice(tail);
+                    push_coordinate(runtime, &mut coordinates, coordinate)
+                })
+            })?;
+            let mut result = index_layout.shape;
+            result.extend_from_slice(&shape[1..]);
+            result
+        }
+        PyArrayDtype::Float => {
+            return Err(PyError::type_error(
+                "arrays used as indices must be of integer or boolean type",
+            ))
+        }
+    };
+    Ok(AdvancedSelection {
+        coordinates,
+        shape: result_shape,
+    })
+}
+
+fn push_coordinate(
+    runtime: &mut dyn PyRuntime,
+    coordinates: &mut Vec<Vec<usize>>,
+    coordinate: Vec<usize>,
+) -> PyResult<()> {
+    runtime.reserve_memory(
+        coordinate
+            .len()
+            .checked_mul(std::mem::size_of::<usize>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<usize>>()))
+            .ok_or_else(|| PyError::value_error("index selection is too large"))?,
+    )?;
+    coordinates.push(coordinate);
+    Ok(())
+}
+
+fn binary(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+    operation: PyBinaryOp,
+    reflected: bool,
+) -> PyResult<Option<PyValue>> {
+    let (mut left, mut right) = if reflected {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    if matches!(runtime.kind(&left)?, PyKind::List | PyKind::Tuple) {
+        left = construct(runtime, left, None, true)?;
+    }
+    if matches!(runtime.kind(&right)?, PyKind::List | PyKind::Tuple) {
+        right = construct(runtime, right, None, true)?;
+    }
+    if runtime.kind(&left)? != PyKind::Array && runtime.kind(&right)? != PyKind::Array {
+        return Ok(None);
+    }
+    let left_array = if runtime.kind(&left)? == PyKind::Array {
+        Some(runtime.array_layout(left.cast(runtime)?)?)
+    } else {
+        None
+    };
+    let right_array = if runtime.kind(&right)? == PyKind::Array {
+        Some(runtime.array_layout(right.cast(runtime)?)?)
+    } else {
+        None
+    };
+    let shape = broadcast_shape(
+        left_array
+            .as_ref()
+            .map(|value| value.0.shape.as_slice())
+            .unwrap_or(&[]),
+        right_array
+            .as_ref()
+            .map(|value| value.0.shape.as_slice())
+            .unwrap_or(&[]),
+    )?;
+    let left_dtype = operand_dtype(runtime, left, left_array.as_ref().map(|value| value.1))?;
+    let right_dtype = operand_dtype(runtime, right, right_array.as_ref().map(|value| value.1))?;
+    let dtype = if operation == PyBinaryOp::Divide
+        || left_dtype == PyArrayDtype::Float
+        || right_dtype == PyArrayDtype::Float
+    {
+        PyArrayDtype::Float
+    } else if left_dtype == PyArrayDtype::Int || right_dtype == PyArrayDtype::Int {
+        PyArrayDtype::Int
+    } else {
+        PyArrayDtype::Bool
+    };
+    let count = element_count(&shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&shape, |index| {
+        let left_value = broadcast_get(
+            runtime,
+            left,
+            left_array.as_ref().map(|value| &value.0),
+            index,
+            &shape,
+        )?;
+        let right_value = broadcast_get(
+            runtime,
+            right,
+            right_array.as_ref().map(|value| &value.0),
+            index,
+            &shape,
+        )?;
+        let left_value = convert(runtime, left_value, dtype)?;
+        let right_value = convert(runtime, right_value, dtype)?;
+        let value = runtime.binary_op(operation, left_value, right_value)?;
+        values.push(value);
+        Ok(())
+    })?;
+    runtime.new_array(values, shape, dtype).map(Some)
+}
+
+fn operand_dtype(
+    runtime: &dyn PyRuntime,
+    value: PyValue,
+    array_dtype: Option<PyArrayDtype>,
+) -> PyResult<PyArrayDtype> {
+    if let Some(dtype) = array_dtype {
+        return Ok(dtype);
+    }
+    if let Some(value) = registered_scalar(runtime, &value) {
+        return Ok(promote_scalar_dtype(PyArrayDtype::Bool, value));
+    }
+    match runtime.kind(&value)? {
+        PyKind::Bool => Ok(PyArrayDtype::Bool),
+        PyKind::Int => Ok(PyArrayDtype::Int),
+        PyKind::Float => Ok(PyArrayDtype::Float),
+        _ => Err(PyError::type_error("numpy operand is not numeric")),
+    }
+}
+
+fn broadcast_shape(left: &[usize], right: &[usize]) -> PyResult<Vec<usize>> {
+    let rank = left.len().max(right.len());
+    let mut shape = vec![1; rank];
+    for offset in 0..rank {
+        let a = left
+            .get(left.len().wrapping_sub(1 + offset))
+            .copied()
+            .unwrap_or(1);
+        let b = right
+            .get(right.len().wrapping_sub(1 + offset))
+            .copied()
+            .unwrap_or(1);
+        if a != b && a != 1 && b != 1 {
+            return Err(PyError::value_error(
+                "operands could not be broadcast together",
+            ));
+        }
+        shape[rank - 1 - offset] = a.max(b);
+    }
+    Ok(shape)
+}
+
+fn broadcast_get(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+    layout: Option<&PyArrayLayout>,
+    output_index: &[usize],
+    output_shape: &[usize],
+) -> PyResult<PyValue> {
+    let Some(layout) = layout else {
+        return Ok(value);
+    };
+    let leading = output_shape.len() - layout.shape.len();
+    let index = layout
+        .shape
+        .iter()
+        .enumerate()
+        .map(|(axis, length)| {
+            if *length == 1 {
+                0
+            } else {
+                output_index[leading + axis]
+            }
+        })
+        .collect::<Vec<_>>();
+    runtime.array_get(value.cast(runtime)?, &index)
+}
+
+macro_rules! binary_slots {
+    ($normal:ident, $reflected:ident, $operation:expr) => {
+        pub(crate) fn $normal(
+            runtime: &mut dyn PyRuntime,
+            left: PyValue,
+            right: PyValue,
+        ) -> PyResult<Option<PyValue>> {
+            binary(runtime, left, right, $operation, false)
+        }
+        pub(crate) fn $reflected(
+            runtime: &mut dyn PyRuntime,
+            left: PyValue,
+            right: PyValue,
+        ) -> PyResult<Option<PyValue>> {
+            binary(runtime, left, right, $operation, true)
+        }
+    };
+}
+
+binary_slots!(slot_add, slot_reflected_add, PyBinaryOp::Add);
+binary_slots!(slot_subtract, slot_reflected_subtract, PyBinaryOp::Subtract);
+binary_slots!(slot_multiply, slot_reflected_multiply, PyBinaryOp::Multiply);
+binary_slots!(slot_divide, slot_reflected_divide, PyBinaryOp::Divide);
+
+#[derive(Clone, Copy)]
+enum CompareMap {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+fn comparison(
+    runtime: &mut dyn PyRuntime,
+    mut left: PyValue,
+    mut right: PyValue,
+    operation: CompareMap,
+) -> PyResult<Option<PyValue>> {
+    if matches!(runtime.kind(&left)?, PyKind::List | PyKind::Tuple) {
+        left = construct(runtime, left, None, true)?;
+    }
+    if matches!(runtime.kind(&right)?, PyKind::List | PyKind::Tuple) {
+        right = construct(runtime, right, None, true)?;
+    }
+    if runtime.kind(&left)? != PyKind::Array && runtime.kind(&right)? != PyKind::Array {
+        return Ok(None);
+    }
+    let left_layout = if runtime.kind(&left)? == PyKind::Array {
+        Some(runtime.array_layout(left.cast(runtime)?)?.0)
+    } else {
+        None
+    };
+    let right_layout = if runtime.kind(&right)? == PyKind::Array {
+        Some(runtime.array_layout(right.cast(runtime)?)?.0)
+    } else {
+        None
+    };
+    let shape = broadcast_shape(
+        left_layout
+            .as_ref()
+            .map_or(&[], |value| value.shape.as_slice()),
+        right_layout
+            .as_ref()
+            .map_or(&[], |value| value.shape.as_slice()),
+    )?;
+    let count = element_count(&shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&shape, |index| {
+        let left = broadcast_get(runtime, left, left_layout.as_ref(), index, &shape)?;
+        let right = broadcast_get(runtime, right, right_layout.as_ref(), index, &shape)?;
+        let left = scalar(runtime, left)?.as_f64();
+        let right = scalar(runtime, right)?.as_f64();
+        let result = match operation {
+            CompareMap::Equal => left == right,
+            CompareMap::NotEqual => left != right,
+            CompareMap::Less => left < right,
+            CompareMap::LessEqual => left <= right,
+            CompareMap::Greater => left > right,
+            CompareMap::GreaterEqual => left >= right,
+        };
+        values.push(BOOL.pack(runtime, result)?);
+        Ok(())
+    })?;
+    runtime
+        .new_array(values, shape, PyArrayDtype::Bool)
+        .map(Some)
+}
+
+macro_rules! comparison_slots {
+    ($(($name:ident, $operation:expr)),+ $(,)?) => {
+        $(pub(crate) fn $name(
+            runtime: &mut dyn PyRuntime,
+            left: PyValue,
+            right: PyValue,
+        ) -> PyResult<Option<PyValue>> {
+            comparison(runtime, left, right, $operation)
+        })+
+    };
+}
+
+comparison_slots!(
+    (slot_equal, CompareMap::Equal),
+    (slot_not_equal, CompareMap::NotEqual),
+    (slot_less_than, CompareMap::Less),
+    (slot_less_equal, CompareMap::LessEqual),
+    (slot_greater_than, CompareMap::Greater),
+    (slot_greater_equal, CompareMap::GreaterEqual),
+);
+
+#[derive(Clone, Copy)]
+enum UnaryMap {
+    Positive,
+    Negative,
+    Invert,
+    Absolute,
+    Sqrt,
+    Exp,
+    Log,
+    Sin,
+    Cos,
+    Tan,
+    Floor,
+    Ceil,
+}
+
+fn unary_function(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
+    name: &str,
+    operation: UnaryMap,
+) -> PyResult {
+    args.expect_positional(name, 1, 1)?;
+    args.reject_keywords(name)?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    unary_array(runtime, array, operation)
+}
+
+fn unary_array(runtime: &mut dyn PyRuntime, array: PyArray, operation: UnaryMap) -> PyResult {
+    let (layout, input_dtype) = runtime.array_layout(array)?;
+    let float_output = matches!(
+        operation,
+        UnaryMap::Sqrt
+            | UnaryMap::Exp
+            | UnaryMap::Log
+            | UnaryMap::Sin
+            | UnaryMap::Cos
+            | UnaryMap::Tan
+            | UnaryMap::Floor
+            | UnaryMap::Ceil
+    );
+    if input_dtype == PyArrayDtype::Bool && matches!(operation, UnaryMap::Negative) {
+        return Err(PyError::type_error(
+            "this unary operation is not defined for boolean arrays",
+        ));
+    }
+    let dtype = if float_output {
+        PyArrayDtype::Float
+    } else {
+        input_dtype
+    };
+    let count = element_count(&layout.shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&layout.shape, |index| {
+        let raw = runtime.array_get(array, index)?;
+        let value = scalar(runtime, raw)?;
+        let mapped = match operation {
+            UnaryMap::Positive => value,
+            UnaryMap::Negative => match value {
+                Scalar::Int(value) => Scalar::Int(value.wrapping_neg()),
+                Scalar::Float(value) => Scalar::Float(-value),
+                Scalar::Bool(_) => unreachable!(),
+            },
+            UnaryMap::Invert => match value {
+                Scalar::Bool(value) => Scalar::Bool(!value),
+                Scalar::Int(value) => Scalar::Int(!value),
+                Scalar::Float(_) => {
+                    return Err(PyError::type_error(
+                        "bitwise invert is not defined for floating arrays",
+                    ))
+                }
+            },
+            UnaryMap::Absolute => match value {
+                Scalar::Int(value) => Scalar::Int(value.wrapping_abs()),
+                Scalar::Float(value) => Scalar::Float(value.abs()),
+                Scalar::Bool(_) => unreachable!(),
+            },
+            UnaryMap::Sqrt => Scalar::Float(value.as_f64().sqrt()),
+            UnaryMap::Exp => Scalar::Float(value.as_f64().exp()),
+            UnaryMap::Log => Scalar::Float(value.as_f64().ln()),
+            UnaryMap::Sin => Scalar::Float(value.as_f64().sin()),
+            UnaryMap::Cos => Scalar::Float(value.as_f64().cos()),
+            UnaryMap::Tan => Scalar::Float(value.as_f64().tan()),
+            UnaryMap::Floor => Scalar::Float(value.as_f64().floor()),
+            UnaryMap::Ceil => Scalar::Float(value.as_f64().ceil()),
+        };
+        values.push(pack_scalar(runtime, mapped, dtype)?);
+        Ok(())
+    })?;
+    runtime.new_array(values, layout.shape, dtype)
+}
+
+pub(crate) fn slot_positive(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let array = value.cast(runtime)?;
+    unary_array(runtime, array, UnaryMap::Positive).map(Some)
+}
+
+pub(crate) fn slot_negative(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let array = value.cast(runtime)?;
+    unary_array(runtime, array, UnaryMap::Negative).map(Some)
+}
+
+pub(crate) fn slot_invert(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let array = value.cast(runtime)?;
+    unary_array(runtime, array, UnaryMap::Invert).map(Some)
+}
+
+pub(crate) fn slot_absolute(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let array = value.cast(runtime)?;
+    unary_array(runtime, array, UnaryMap::Absolute).map(Some)
+}
+
+fn pack_scalar(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult<PyValue> {
+    match (dtype, value) {
+        (PyArrayDtype::Bool, value) => BOOL.pack(runtime, value.truth()),
+        (PyArrayDtype::Int, Scalar::Int(value)) => INT64.pack(runtime, value),
+        (PyArrayDtype::Int, Scalar::Bool(value)) => INT64.pack(runtime, i64::from(value)),
+        (PyArrayDtype::Int, Scalar::Float(value)) => INT64.pack(runtime, value as i64),
+        (PyArrayDtype::Float, value) => FLOAT64.pack(runtime, value.as_f64()),
+    }
+}
+
+macro_rules! unary_functions {
+    ($(($name:ident, $operation:expr)),+ $(,)?) => {
+        $(fn $name(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+            unary_function(runtime, args, concat!("numpy.", stringify!($name)), $operation)
+        })+
+    };
+}
+
+unary_functions!(
+    (negative, UnaryMap::Negative),
+    (absolute, UnaryMap::Absolute),
+    (sqrt, UnaryMap::Sqrt),
+    (exp, UnaryMap::Exp),
+    (log, UnaryMap::Log),
+    (sin, UnaryMap::Sin),
+    (cos, UnaryMap::Cos),
+    (tan, UnaryMap::Tan),
+    (floor, UnaryMap::Floor),
+    (ceil, UnaryMap::Ceil),
+);
+
+fn minimum(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    extreme(runtime, args, "numpy.minimum", false)
+}
+
+fn maximum(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    extreme(runtime, args, "numpy.maximum", true)
+}
+
+fn extreme(runtime: &mut dyn PyRuntime, args: CallArgs, name: &str, maximum: bool) -> PyResult {
+    args.expect_positional(name, 2, 2)?;
+    args.reject_keywords(name)?;
+    elementwise_extreme(runtime, args.positional()[0], args.positional()[1], maximum)
+}
+
+fn elementwise_extreme(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+    maximum: bool,
+) -> PyResult {
+    let left_array = (runtime.kind(&left)? == PyKind::Array)
+        .then(|| left.cast::<PyArray>(runtime))
+        .transpose()?;
+    let right_array = (runtime.kind(&right)? == PyKind::Array)
+        .then(|| right.cast::<PyArray>(runtime))
+        .transpose()?;
+    let left_info = left_array
+        .map(|array| runtime.array_layout(array))
+        .transpose()?;
+    let right_info = right_array
+        .map(|array| runtime.array_layout(array))
+        .transpose()?;
+    let shape = broadcast_shape(
+        left_info
+            .as_ref()
+            .map_or(&[], |value| value.0.shape.as_slice()),
+        right_info
+            .as_ref()
+            .map_or(&[], |value| value.0.shape.as_slice()),
+    )?;
+    let left_dtype = operand_dtype(runtime, left, left_info.as_ref().map(|value| value.1))?;
+    let right_dtype = operand_dtype(runtime, right, right_info.as_ref().map(|value| value.1))?;
+    let dtype = product_dtype(left_dtype, right_dtype);
+    let dtype = if left_dtype == PyArrayDtype::Bool && right_dtype == PyArrayDtype::Bool {
+        PyArrayDtype::Bool
+    } else {
+        dtype
+    };
+    let count = element_count(&shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&shape, |index| {
+        let left = broadcast_get(
+            runtime,
+            left,
+            left_info.as_ref().map(|value| &value.0),
+            index,
+            &shape,
+        )?;
+        let right = broadcast_get(
+            runtime,
+            right,
+            right_info.as_ref().map(|value| &value.0),
+            index,
+            &shape,
+        )?;
+        let ordering = scalar(runtime, left)?
+            .as_f64()
+            .total_cmp(&scalar(runtime, right)?.as_f64());
+        let selected = if (ordering == Ordering::Greater) == maximum {
+            left
+        } else {
+            right
+        };
+        values.push(convert(runtime, selected, dtype)?);
+        Ok(())
+    })?;
+    runtime.new_array(values, shape, dtype)
+}
+
+fn clip(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.clip", 3, 3)?;
+    args.reject_keywords("numpy.clip")?;
+    let lower = elementwise_extreme(runtime, args.positional()[0], args.positional()[1], true)?;
+    elementwise_extreme(runtime, lower, args.positional()[2], false)
+}
+
+fn where_(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.where", 3, 3)?;
+    args.reject_keywords("numpy.where")?;
+    let condition = coerce_array(runtime, args.positional()[0])?;
+    let condition_layout = runtime.array_layout(condition)?.0;
+    let left = args.positional()[1];
+    let right = args.positional()[2];
+    let left_info = if runtime.kind(&left)? == PyKind::Array {
+        Some(runtime.array_layout(left.cast(runtime)?)?)
+    } else {
+        None
+    };
+    let right_info = if runtime.kind(&right)? == PyKind::Array {
+        Some(runtime.array_layout(right.cast(runtime)?)?)
+    } else {
+        None
+    };
+    let shape = broadcast_shape(
+        &condition_layout.shape,
+        &broadcast_shape(
+            left_info
+                .as_ref()
+                .map_or(&[], |value| value.0.shape.as_slice()),
+            right_info
+                .as_ref()
+                .map_or(&[], |value| value.0.shape.as_slice()),
+        )?,
+    )?;
+    let left_dtype = operand_dtype(runtime, left, left_info.as_ref().map(|value| value.1))?;
+    let right_dtype = operand_dtype(runtime, right, right_info.as_ref().map(|value| value.1))?;
+    let dtype = if left_dtype == PyArrayDtype::Float || right_dtype == PyArrayDtype::Float {
+        PyArrayDtype::Float
+    } else if left_dtype == PyArrayDtype::Int || right_dtype == PyArrayDtype::Int {
+        PyArrayDtype::Int
+    } else {
+        PyArrayDtype::Bool
+    };
+    let count = element_count(&shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&shape, |index| {
+        let condition_value = broadcast_get(
+            runtime,
+            Value::Object(condition.object_id()),
+            Some(&condition_layout),
+            index,
+            &shape,
+        )?;
+        let (value, layout) = if scalar(runtime, condition_value)?.truth() {
+            (left, left_info.as_ref().map(|value| &value.0))
+        } else {
+            (right, right_info.as_ref().map(|value| &value.0))
+        };
+        let value = broadcast_get(runtime, value, layout, index, &shape)?;
+        values.push(convert(runtime, value, dtype)?);
+        Ok(())
+    })?;
+    runtime.new_array(values, shape, dtype)
+}
+
+fn method_tolist(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("ndarray.tolist", 0, 0)?;
+    args.reject_keywords("ndarray.tolist")?;
+    let array = receiver.cast::<PyArray>(runtime)?;
+    let (layout, _) = runtime.array_layout(array)?;
+    tolist_axis(runtime, array, &layout.shape, &mut Vec::new())
+}
+
+fn tolist_axis(
+    runtime: &mut dyn PyRuntime,
+    array: PyArray,
+    shape: &[usize],
+    prefix: &mut Vec<usize>,
+) -> PyResult {
+    if prefix.len() == shape.len() {
+        let value = runtime.array_get(array, prefix)?;
+        return Ok(match registered_scalar(runtime, &value) {
+            Some(Scalar::Bool(value)) => Value::Bool(value),
+            Some(Scalar::Int(value)) => Value::Int(value),
+            Some(Scalar::Float(value)) => Value::Float(value),
+            None => value,
+        });
+    }
+    let axis = prefix.len();
+    reserve_values(runtime, shape[axis])?;
+    let mut values = Vec::with_capacity(shape[axis]);
+    for index in 0..shape[axis] {
+        runtime.charge_cpu(1)?;
+        prefix.push(index);
+        values.push(tolist_axis(runtime, array, shape, prefix)?);
+        prefix.pop();
+    }
+    runtime.new_list(values)
+}
+
+fn method_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("ndarray.copy", 0, 0)?;
+    args.reject_keywords("ndarray.copy")?;
+    let array = receiver.cast(runtime)?;
+    copy_array(runtime, array)
+}
+
+fn method_astype(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("ndarray.astype", 1, 1)?;
+    args.reject_keywords("ndarray.astype")?;
+    let array = receiver.cast::<PyArray>(runtime)?;
+    let dtype = parse_dtype(runtime, args.positional()[0])?;
+    let (layout, _) = runtime.array_layout(array)?;
+    let count = element_count(&layout.shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&layout.shape, |index| {
+        let value = runtime.array_get(array, index)?;
+        values.push(convert(runtime, value, dtype)?);
+        Ok(())
+    })?;
+    runtime.new_array(values, layout.shape, dtype)
+}
+
+fn copy_array(runtime: &mut dyn PyRuntime, array: PyArray) -> PyResult {
+    let (layout, dtype) = runtime.array_layout(array)?;
+    let count = element_count(&layout.shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&layout.shape, |index| {
+        values.push(runtime.array_get(array, index)?);
+        Ok(())
+    })?;
+    runtime.new_array(values, layout.shape, dtype)
+}
+
+fn method_reshape(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("ndarray.reshape", 1, usize::MAX)?;
+    args.reject_keywords("ndarray.reshape")?;
+    let array = receiver.cast::<PyArray>(runtime)?;
+    let total = element_count(&runtime.array_layout(array)?.0.shape)?;
+    let requested = if args.positional().len() == 1 {
+        parse_signed_shape(runtime, args.positional()[0])?
+    } else {
+        args.positional()
+            .iter()
+            .map(|value| {
+                let PyIndex(value) = (*value).cast(runtime)?;
+                Ok(value)
+            })
+            .collect::<PyResult<Vec<_>>>()?
+    };
+    let shape = resolve_reshape_shape(requested, total)?;
+    reshape(runtime, array, shape)
+}
+
+fn parse_signed_shape(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<i64>> {
+    if let Some(value) = runtime.int_value(&value) {
+        return Ok(vec![value]);
+    }
+    value
+        .cast::<PySequence>(runtime)?
+        .items(runtime)?
+        .into_iter()
+        .map(|item| item.cast::<PyIndex>(runtime).map(|value| value.0))
+        .collect()
+}
+
+fn resolve_reshape_shape(requested: Vec<i64>, total: usize) -> PyResult<Vec<usize>> {
+    let mut inferred = None;
+    let mut known = 1usize;
+    let mut shape = Vec::with_capacity(requested.len());
+    for value in requested {
+        if value == -1 {
+            if inferred.replace(shape.len()).is_some() {
+                return Err(PyError::value_error(
+                    "can only specify one unknown dimension",
+                ));
+            }
+            shape.push(1);
+        } else {
+            let value = dimension(value)?;
+            known = known
+                .checked_mul(value)
+                .ok_or_else(|| PyError::value_error("array is too large"))?;
+            shape.push(value);
+        }
+    }
+    if let Some(axis) = inferred {
+        if known == 0 || !total.is_multiple_of(known) {
+            return Err(PyError::value_error("cannot infer reshape dimension"));
+        }
+        shape[axis] = total / known;
+    }
+    Ok(shape)
+}
+
+fn reshape(runtime: &mut dyn PyRuntime, array: PyArray, shape: Vec<usize>) -> PyResult {
+    let (layout, _) = runtime.array_layout(array)?;
+    if element_count(&shape)? != element_count(&layout.shape)? {
+        return Err(PyError::value_error(
+            "cannot reshape array to requested shape",
+        ));
+    }
+    if contiguous_strides(&layout.shape)? == layout.strides {
+        return runtime.new_array_view(
+            array,
+            PyArrayLayout {
+                strides: contiguous_strides(&shape)?,
+                shape,
+                offset: layout.offset,
+            },
+        );
+    }
+    let copied = copy_array(runtime, array)?.cast(runtime)?;
+    let (copied_layout, _) = runtime.array_layout(copied)?;
+    runtime.new_array_view(
+        copied,
+        PyArrayLayout {
+            strides: contiguous_strides(&shape)?,
+            shape,
+            offset: copied_layout.offset,
+        },
+    )
+}
+
+fn module_reshape(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.reshape", 2, 2)?;
+    args.reject_keywords("numpy.reshape")?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let total = element_count(&runtime.array_layout(array)?.0.shape)?;
+    let shape = resolve_reshape_shape(parse_signed_shape(runtime, args.positional()[1])?, total)?;
+    reshape(runtime, array, shape)
+}
+
+fn method_transpose(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("ndarray.transpose")?;
+    let axes = if args.positional().is_empty() {
+        None
+    } else {
+        Some(
+            if args.positional().len() == 1
+                && matches!(
+                    runtime.kind(&args.positional()[0])?,
+                    PyKind::List | PyKind::Tuple
+                )
+            {
+                parse_shape(runtime, args.positional()[0])?
+            } else {
+                args.positional()
+                    .iter()
+                    .map(|value| {
+                        let PyIndex(value) = (*value).cast(runtime)?;
+                        dimension(value)
+                    })
+                    .collect::<PyResult<Vec<_>>>()?
+            },
+        )
+    };
+    let array = receiver.cast(runtime)?;
+    transpose(runtime, array, axes)
+}
+
+pub(in crate::python) fn transpose(
+    runtime: &mut dyn PyRuntime,
+    array: PyArray,
+    axes: Option<Vec<usize>>,
+) -> PyResult {
+    let (layout, _) = runtime.array_layout(array)?;
+    let axes = axes.unwrap_or_else(|| (0..layout.shape.len()).rev().collect());
+    if axes.len() != layout.shape.len() {
+        return Err(PyError::value_error("axes don't match array"));
+    }
+    let mut seen = vec![false; axes.len()];
+    for axis in &axes {
+        if *axis >= axes.len() || seen[*axis] {
+            return Err(PyError::value_error("invalid transpose axes"));
+        }
+        seen[*axis] = true;
+    }
+    runtime.new_array_view(
+        array,
+        PyArrayLayout {
+            shape: axes.iter().map(|axis| layout.shape[*axis]).collect(),
+            strides: axes.iter().map(|axis| layout.strides[*axis]).collect(),
+            offset: layout.offset,
+        },
+    )
+}
+
+fn module_transpose(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.transpose", 1, 2)?;
+    args.reject_keywords("numpy.transpose")?;
+    let axes = args
+        .positional()
+        .get(1)
+        .copied()
+        .map(|value| parse_shape(runtime, value))
+        .transpose()?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    transpose(runtime, array, axes)
+}
+
+fn method_flatten(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("ndarray.flatten", 0, 0)?;
+    args.reject_keywords("ndarray.flatten")?;
+    let array = receiver.cast::<PyArray>(runtime)?;
+    let count = element_count(&runtime.array_layout(array)?.0.shape)?;
+    let copied = copy_array(runtime, array)?.cast(runtime)?;
+    reshape(runtime, copied, vec![count])
+}
+
+fn method_ravel(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("ndarray.ravel", 0, 0)?;
+    args.reject_keywords("ndarray.ravel")?;
+    let array = receiver.cast::<PyArray>(runtime)?;
+    let layout = runtime.array_layout(array)?.0;
+    let count = element_count(&layout.shape)?;
+    reshape(runtime, array, vec![count])
+}
+
+fn method_squeeze(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    squeeze(runtime, array, args, "ndarray.squeeze")
+}
+
+fn module_squeeze(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.squeeze", 1, 2)?;
+    args.reject_unknown_keywords("numpy.squeeze", &["axis"])?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let forwarded = CallArgs::new(args.positional()[1..].to_vec(), args.keywords().to_vec());
+    squeeze(runtime, array, forwarded, "numpy.squeeze")
+}
+
+fn squeeze(runtime: &mut dyn PyRuntime, array: PyArray, args: CallArgs, name: &str) -> PyResult {
+    args.expect_positional(name, 0, 1)?;
+    args.reject_unknown_keywords(name, &["axis"])?;
+    let (layout, _) = runtime.array_layout(array)?;
+    let selected = args
+        .positional()
+        .first()
+        .copied()
+        .or(args.keyword(name, "axis")?.copied())
+        .map(|value| {
+            let PyIndex(axis) = value.cast(runtime)?;
+            normalize_axis(axis, layout.shape.len()).map(Some)
+        })
+        .transpose()?
+        .flatten();
+    if let Some(axis) = selected {
+        if layout.shape[axis] != 1 {
+            return Err(PyError::value_error(
+                "cannot squeeze an axis whose size is not one",
+            ));
+        }
+    }
+    let retained = (0..layout.shape.len())
+        .filter(|axis| selected.map_or(layout.shape[*axis] != 1, |selected| selected != *axis))
+        .collect::<Vec<_>>();
+    runtime.new_array_view(
+        array,
+        PyArrayLayout {
+            shape: retained.iter().map(|axis| layout.shape[*axis]).collect(),
+            strides: retained.iter().map(|axis| layout.strides[*axis]).collect(),
+            offset: layout.offset,
+        },
+    )
+}
+
+fn expand_dims(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.expand_dims", 2, 2)?;
+    args.reject_keywords("numpy.expand_dims")?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let (mut layout, _) = runtime.array_layout(array)?;
+    let PyIndex(axis) = args.positional()[1].cast(runtime)?;
+    let rank = i64::try_from(layout.shape.len() + 1)
+        .map_err(|_| PyError::overflow_error("array rank overflow"))?;
+    let axis = if axis < 0 { rank + axis } else { axis };
+    let axis = usize::try_from(axis)
+        .ok()
+        .filter(|axis| *axis < rank as usize)
+        .ok_or_else(|| PyError::value_error("axis is out of bounds for array"))?;
+    let stride = layout
+        .strides
+        .get(axis)
+        .copied()
+        .unwrap_or(1)
+        .checked_mul(
+            isize::try_from(layout.shape.get(axis).copied().unwrap_or(1))
+                .map_err(|_| PyError::value_error("array stride overflow"))?,
+        )
+        .ok_or_else(|| PyError::value_error("array stride overflow"))?;
+    layout.shape.insert(axis, 1);
+    layout.strides.insert(axis, stride);
+    runtime.new_array_view(array, layout)
+}
+
+fn method_swapaxes(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("ndarray.swapaxes", 2, 2)?;
+    args.reject_keywords("ndarray.swapaxes")?;
+    let array = receiver.cast(runtime)?;
+    swapaxes(runtime, array, args.positional()[0], args.positional()[1])
+}
+
+fn module_swapaxes(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.swapaxes", 3, 3)?;
+    args.reject_keywords("numpy.swapaxes")?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    swapaxes(runtime, array, args.positional()[1], args.positional()[2])
+}
+
+fn swapaxes(
+    runtime: &mut dyn PyRuntime,
+    array: PyArray,
+    first: PyValue,
+    second: PyValue,
+) -> PyResult {
+    let (layout, _) = runtime.array_layout(array)?;
+    let PyIndex(first) = first.cast(runtime)?;
+    let PyIndex(second) = second.cast(runtime)?;
+    let first = normalize_axis(first, layout.shape.len())?;
+    let second = normalize_axis(second, layout.shape.len())?;
+    let mut axes = (0..layout.shape.len()).collect::<Vec<_>>();
+    axes.swap(first, second);
+    transpose(runtime, array, Some(axes))
+}
+
+fn broadcast_to(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.broadcast_to", 2, 2)?;
+    args.reject_keywords("numpy.broadcast_to")?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let target = parse_shape(runtime, args.positional()[1])?;
+    let (layout, _) = runtime.array_layout(array)?;
+    if target.len() < layout.shape.len() {
+        return Err(PyError::value_error("cannot broadcast to fewer dimensions"));
+    }
+    let leading = target.len() - layout.shape.len();
+    let mut strides = vec![0; leading];
+    for (source, destination) in layout.shape.iter().zip(&target[leading..]) {
+        if source != destination && *source != 1 {
+            return Err(PyError::value_error(
+                "operands could not be broadcast together",
+            ));
+        }
+    }
+    strides.extend(
+        layout
+            .shape
+            .iter()
+            .zip(&layout.strides)
+            .map(|(length, stride)| if *length == 1 { 0 } else { *stride }),
+    );
+    runtime.new_array_view(
+        array,
+        PyArrayLayout {
+            shape: target,
+            strides,
+            offset: layout.offset,
+        },
+    )
+}
+
+fn array_sequence(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<PyArray>> {
+    let items = value.cast::<PySequence>(runtime)?.items(runtime)?;
+    if items.is_empty() {
+        return Err(PyError::value_error("need at least one array to join"));
+    }
+    items
+        .into_iter()
+        .map(|value| coerce_array(runtime, value))
+        .collect()
+}
+
+fn concatenate(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.concatenate", 1, 2)?;
+    args.reject_unknown_keywords("numpy.concatenate", &["axis"])?;
+    let arrays = array_sequence(runtime, args.positional()[0])?;
+    let axis = args
+        .positional()
+        .get(1)
+        .copied()
+        .or(args.keyword("numpy.concatenate", "axis")?.copied())
+        .unwrap_or(Value::Int(0));
+    concatenate_arrays(runtime, &arrays, axis)
+}
+
+fn concatenate_arrays(
+    runtime: &mut dyn PyRuntime,
+    arrays: &[PyArray],
+    axis_value: PyValue,
+) -> PyResult {
+    let layouts = arrays
+        .iter()
+        .map(|array| runtime.array_layout(*array))
+        .collect::<PyResult<Vec<_>>>()?;
+    let rank = layouts[0].0.shape.len();
+    let PyIndex(axis) = axis_value.cast(runtime)?;
+    let axis = normalize_axis(axis, rank)?;
+    let dtype = layouts.iter().fold(PyArrayDtype::Bool, |dtype, value| {
+        if dtype == PyArrayDtype::Float || value.1 == PyArrayDtype::Float {
+            PyArrayDtype::Float
+        } else if dtype == PyArrayDtype::Int || value.1 == PyArrayDtype::Int {
+            PyArrayDtype::Int
+        } else {
+            PyArrayDtype::Bool
+        }
+    });
+    let mut shape = layouts[0].0.shape.clone();
+    shape[axis] = 0;
+    for (layout, _) in &layouts {
+        if layout.shape.len() != rank
+            || layout
+                .shape
+                .iter()
+                .enumerate()
+                .any(|(candidate, length)| candidate != axis && *length != shape[candidate])
+        {
+            return Err(PyError::value_error(
+                "all input arrays must have matching dimensions",
+            ));
+        }
+        shape[axis] = shape[axis]
+            .checked_add(layout.shape[axis])
+            .ok_or_else(|| PyError::value_error("array is too large"))?;
+    }
+    let count = element_count(&shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&shape, |output_index| {
+        let mut selected = output_index[axis];
+        for (array, (layout, _)) in arrays.iter().zip(&layouts) {
+            if selected < layout.shape[axis] {
+                let mut input_index = output_index.to_vec();
+                input_index[axis] = selected;
+                let value = runtime.array_get(*array, &input_index)?;
+                values.push(convert(runtime, value, dtype)?);
+                return Ok(());
+            }
+            selected -= layout.shape[axis];
+        }
+        Err(PyError::runtime_error("concatenate index escaped inputs"))
+    })?;
+    runtime.new_array(values, shape, dtype)
+}
+
+fn stack(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.stack", 1, 2)?;
+    args.reject_unknown_keywords("numpy.stack", &["axis"])?;
+    let arrays = array_sequence(runtime, args.positional()[0])?;
+    let first_shape = runtime.array_layout(arrays[0])?.0.shape;
+    if arrays.iter().skip(1).any(|array| {
+        runtime
+            .array_layout(*array)
+            .map(|value| value.0.shape != first_shape)
+            .unwrap_or(true)
+    }) {
+        return Err(PyError::value_error(
+            "all input arrays must have the same shape",
+        ));
+    }
+    let axis_value = args
+        .positional()
+        .get(1)
+        .copied()
+        .or(args.keyword("numpy.stack", "axis")?.copied())
+        .unwrap_or(Value::Int(0));
+    let PyIndex(axis) = axis_value.cast(runtime)?;
+    let rank = i64::try_from(first_shape.len() + 1)
+        .map_err(|_| PyError::overflow_error("array rank overflow"))?;
+    let axis = if axis < 0 { rank + axis } else { axis };
+    let axis = usize::try_from(axis)
+        .ok()
+        .filter(|axis| *axis < rank as usize)
+        .ok_or_else(|| PyError::value_error("axis is out of bounds for array"))?;
+    let mut expanded = Vec::with_capacity(arrays.len());
+    for array in arrays {
+        let (mut layout, _) = runtime.array_layout(array)?;
+        layout.shape.insert(axis, 1);
+        layout.strides.insert(axis, 0);
+        expanded.push(runtime.new_array_view(array, layout)?.cast(runtime)?);
+    }
+    concatenate_arrays(runtime, &expanded, Value::Int(axis as i64))
+}
+
+fn vstack(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.vstack", 1, 1)?;
+    args.reject_keywords("numpy.vstack")?;
+    let arrays = array_sequence(runtime, args.positional()[0])?;
+    let mut promoted = Vec::with_capacity(arrays.len());
+    for array in arrays {
+        let layout = runtime.array_layout(array)?.0;
+        promoted.push(if layout.shape.len() == 1 {
+            reshape(runtime, array, vec![1, layout.shape[0]])?.cast(runtime)?
+        } else {
+            array
+        });
+    }
+    concatenate_arrays(runtime, &promoted, Value::Int(0))
+}
+
+fn hstack(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.hstack", 1, 1)?;
+    args.reject_keywords("numpy.hstack")?;
+    let arrays = array_sequence(runtime, args.positional()[0])?;
+    let axis = if runtime.array_layout(arrays[0])?.0.shape.len() == 1 {
+        0
+    } else {
+        1
+    };
+    concatenate_arrays(runtime, &arrays, Value::Int(axis))
+}
+
+fn method_sum(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    reduce(runtime, array, args, Reduction::Sum, "ndarray.sum")
+}
+fn method_prod(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    reduce(runtime, array, args, Reduction::Product, "ndarray.prod")
+}
+fn method_mean(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    reduce(runtime, array, args, Reduction::Mean, "ndarray.mean")
+}
+fn method_min(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    reduce(runtime, array, args, Reduction::Min, "ndarray.min")
+}
+fn method_max(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    reduce(runtime, array, args, Reduction::Max, "ndarray.max")
+}
+
+fn module_sum(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_reduce(runtime, args, Reduction::Sum, "numpy.sum")
+}
+fn module_prod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_reduce(runtime, args, Reduction::Product, "numpy.prod")
+}
+fn module_mean(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_reduce(runtime, args, Reduction::Mean, "numpy.mean")
+}
+fn module_min(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_reduce(runtime, args, Reduction::Min, "numpy.min")
+}
+fn module_max(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_reduce(runtime, args, Reduction::Max, "numpy.max")
+}
+
+fn method_var(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    statistic(runtime, array, args, Statistic::Variance, "ndarray.var")
+}
+
+fn method_std(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    statistic(runtime, array, args, Statistic::StdDev, "ndarray.std")
+}
+
+fn method_all(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    statistic(runtime, array, args, Statistic::All, "ndarray.all")
+}
+
+fn method_any(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    statistic(runtime, array, args, Statistic::Any, "ndarray.any")
+}
+
+fn method_argmin(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    arg_reduce(runtime, array, args, false, "ndarray.argmin")
+}
+
+fn method_argmax(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    arg_reduce(runtime, array, args, true, "ndarray.argmax")
+}
+
+fn method_cumsum(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    cumulative(runtime, array, args, false, "ndarray.cumsum")
+}
+
+fn method_cumprod(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    cumulative(runtime, array, args, true, "ndarray.cumprod")
+}
+
+fn module_var(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_statistic(runtime, args, Statistic::Variance, "numpy.var")
+}
+
+fn module_std(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_statistic(runtime, args, Statistic::StdDev, "numpy.std")
+}
+
+fn module_median(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_statistic(runtime, args, Statistic::Median, "numpy.median")
+}
+
+fn module_all(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_statistic(runtime, args, Statistic::All, "numpy.all")
+}
+
+fn module_any(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_statistic(runtime, args, Statistic::Any, "numpy.any")
+}
+
+fn module_argmin(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_arg_reduce(runtime, args, false, "numpy.argmin")
+}
+
+fn module_argmax(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_arg_reduce(runtime, args, true, "numpy.argmax")
+}
+
+fn module_cumsum(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_cumulative(runtime, args, false, "numpy.cumsum")
+}
+
+fn module_cumprod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    module_cumulative(runtime, args, true, "numpy.cumprod")
+}
+
+fn module_arg_reduce(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
+    maximum: bool,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 1, 2)?;
+    args.reject_unknown_keywords(name, &["axis"])?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let forwarded = CallArgs::new(args.positional()[1..].to_vec(), args.keywords().to_vec());
+    arg_reduce(runtime, array, forwarded, maximum, name)
+}
+
+fn arg_reduce(
+    runtime: &mut dyn PyRuntime,
+    array: PyArray,
+    args: CallArgs,
+    maximum: bool,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 0, 1)?;
+    args.reject_unknown_keywords(name, &["axis"])?;
+    let shape = runtime.array_layout(array)?.0.shape;
+    let axis_value = args
+        .positional()
+        .first()
+        .copied()
+        .or(args.keyword(name, "axis")?.copied());
+    if let Some(axis_value) = axis_value {
+        let PyIndex(axis) = axis_value.cast(runtime)?;
+        let axis = normalize_axis(axis, shape.len())?;
+        let axis_length = shape[axis];
+        if axis_length == 0 {
+            return Err(PyError::value_error("arg reduction of an empty sequence"));
+        }
+        let mut output_shape = shape.clone();
+        output_shape.remove(axis);
+        let count = element_count(&output_shape)?;
+        reserve_values(runtime, count)?;
+        let mut values = Vec::with_capacity(count);
+        for_each_index(&output_shape, |output_index| {
+            let mut winner = 0usize;
+            let mut index = output_index.to_vec();
+            index.insert(axis, 0);
+            let first = runtime.array_get(array, &index)?;
+            let mut best = scalar(runtime, first)?.as_f64();
+            for selected in 1..axis_length {
+                index[axis] = selected;
+                let raw = runtime.array_get(array, &index)?;
+                let candidate = scalar(runtime, raw)?.as_f64();
+                if (maximum && candidate > best) || (!maximum && candidate < best) {
+                    best = candidate;
+                    winner = selected;
+                }
+            }
+            values.push(INT64.pack(runtime, winner as i64)?);
+            Ok(())
+        })?;
+        return runtime.new_array(values, output_shape, PyArrayDtype::Int);
+    }
+    let mut winner = None;
+    let mut best = 0.0;
+    let mut position = 0usize;
+    for_each_index(&shape, |index| {
+        let raw = runtime.array_get(array, index)?;
+        let candidate = scalar(runtime, raw)?.as_f64();
+        if winner.is_none() || (maximum && candidate > best) || (!maximum && candidate < best) {
+            winner = Some(position);
+            best = candidate;
+        }
+        position += 1;
+        Ok(())
+    })?;
+    INT64.pack(
+        runtime,
+        i64::try_from(
+            winner.ok_or_else(|| PyError::value_error("arg reduction of an empty sequence"))?,
+        )
+        .map_err(|_| PyError::overflow_error("array index overflow"))?,
+    )
+}
+
+fn module_cumulative(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
+    product: bool,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 1, 2)?;
+    args.reject_unknown_keywords(name, &["axis"])?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let forwarded = CallArgs::new(args.positional()[1..].to_vec(), args.keywords().to_vec());
+    cumulative(runtime, array, forwarded, product, name)
+}
+
+fn cumulative(
+    runtime: &mut dyn PyRuntime,
+    array: PyArray,
+    args: CallArgs,
+    product: bool,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 0, 1)?;
+    args.reject_unknown_keywords(name, &["axis"])?;
+    let (layout, dtype) = runtime.array_layout(array)?;
+    let axis_value = args
+        .positional()
+        .first()
+        .copied()
+        .or(args.keyword(name, "axis")?.copied());
+    let (source, shape, axis) = if let Some(axis) = axis_value {
+        let PyIndex(axis) = axis.cast(runtime)?;
+        let rank = layout.shape.len();
+        (array, layout.shape, normalize_axis(axis, rank)?)
+    } else {
+        let count = element_count(&layout.shape)?;
+        let flattened = copy_array(runtime, array)?.cast(runtime)?;
+        let flattened = reshape(runtime, flattened, vec![count])?.cast(runtime)?;
+        (flattened, vec![count], 0)
+    };
+    let output_dtype = if dtype == PyArrayDtype::Bool {
+        PyArrayDtype::Int
+    } else {
+        dtype
+    };
+    let count = element_count(&shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&shape, |index| {
+        let reduction = if product {
+            Reduction::Product
+        } else {
+            Reduction::Sum
+        };
+        let mut total = reduction_identity(runtime, output_dtype, reduction)?;
+        for selected in 0..=index[axis] {
+            let mut source_index = index.to_vec();
+            source_index[axis] = selected;
+            let value = runtime.array_get(source, &source_index)?;
+            total = runtime.binary_op(
+                if product {
+                    PyBinaryOp::Multiply
+                } else {
+                    PyBinaryOp::Add
+                },
+                total,
+                value,
+            )?;
+        }
+        values.push(total);
+        Ok(())
+    })?;
+    runtime.new_array(values, shape, output_dtype)
+}
+
+#[derive(Clone, Copy)]
+enum Statistic {
+    Variance,
+    StdDev,
+    Median,
+    All,
+    Any,
+}
+
+fn module_statistic(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
+    statistic_kind: Statistic,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 1, 2)?;
+    args.reject_unknown_keywords(name, &["axis"])?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let forwarded = CallArgs::new(args.positional()[1..].to_vec(), args.keywords().to_vec());
+    statistic(runtime, array, forwarded, statistic_kind, name)
+}
+
+fn statistic(
+    runtime: &mut dyn PyRuntime,
+    array: PyArray,
+    args: CallArgs,
+    statistic_kind: Statistic,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 0, 1)?;
+    args.reject_unknown_keywords(name, &["axis"])?;
+    let axis_value = args
+        .positional()
+        .first()
+        .copied()
+        .or(args.keyword(name, "axis")?.copied());
+    let shape = runtime.array_layout(array)?.0.shape;
+    if let Some(axis) = axis_value {
+        let PyIndex(axis) = axis.cast(runtime)?;
+        return statistic_axis(
+            runtime,
+            array,
+            &shape,
+            normalize_axis(axis, shape.len())?,
+            statistic_kind,
+        );
+    }
+    let mut state = StatisticState::new(runtime, statistic_kind, element_count(&shape)?)?;
+    for_each_index(&shape, |index| {
+        let value = runtime.array_get(array, index)?;
+        state.observe(runtime, value)
+    })?;
+    state.finish(runtime, statistic_kind)
+}
+
+fn statistic_axis(
+    runtime: &mut dyn PyRuntime,
+    array: PyArray,
+    shape: &[usize],
+    axis: usize,
+    statistic_kind: Statistic,
+) -> PyResult {
+    let mut output_shape = shape.to_vec();
+    let axis_length = output_shape.remove(axis);
+    let count = element_count(&output_shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&output_shape, |output_index| {
+        let mut state = StatisticState::new(runtime, statistic_kind, axis_length)?;
+        for selected in 0..axis_length {
+            let mut index = output_index.to_vec();
+            index.insert(axis, selected);
+            let value = runtime.array_get(array, &index)?;
+            state.observe(runtime, value)?;
+        }
+        values.push(state.finish(runtime, statistic_kind)?);
+        Ok(())
+    })?;
+    let dtype = if matches!(statistic_kind, Statistic::All | Statistic::Any) {
+        PyArrayDtype::Bool
+    } else {
+        PyArrayDtype::Float
+    };
+    runtime.new_array(values, output_shape, dtype)
+}
+
+struct StatisticState {
+    count: usize,
+    mean: f64,
+    squared_deviation: f64,
+    ordered: Option<Vec<f64>>,
+    all: bool,
+    any: bool,
+}
+
+impl StatisticState {
+    fn new(
+        runtime: &mut dyn PyRuntime,
+        statistic_kind: Statistic,
+        capacity: usize,
+    ) -> PyResult<Self> {
+        let ordered = if matches!(statistic_kind, Statistic::Median) {
+            runtime.reserve_memory(
+                capacity
+                    .checked_mul(std::mem::size_of::<f64>())
+                    .ok_or_else(|| PyError::value_error("statistic input is too large"))?,
+            )?;
+            Some(Vec::with_capacity(capacity))
+        } else {
+            None
+        };
+        Ok(Self {
+            count: 0,
+            mean: 0.0,
+            squared_deviation: 0.0,
+            ordered,
+            all: true,
+            any: false,
+        })
+    }
+
+    fn observe(&mut self, runtime: &dyn PyRuntime, value: PyValue) -> PyResult<()> {
+        let value = scalar(runtime, value)?;
+        let numeric = value.as_f64();
+        self.count += 1;
+        let delta = numeric - self.mean;
+        self.mean += delta / self.count as f64;
+        self.squared_deviation += delta * (numeric - self.mean);
+        if let Some(ordered) = &mut self.ordered {
+            ordered.push(numeric);
+        }
+        self.all &= value.truth();
+        self.any |= value.truth();
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        runtime: &mut dyn PyRuntime,
+        statistic_kind: Statistic,
+    ) -> PyResult<PyValue> {
+        match statistic_kind {
+            Statistic::All => BOOL.pack(runtime, self.all),
+            Statistic::Any => BOOL.pack(runtime, self.any),
+            Statistic::Variance | Statistic::StdDev => {
+                let variance = if self.count == 0 {
+                    f64::NAN
+                } else {
+                    self.squared_deviation / self.count as f64
+                };
+                FLOAT64.pack(
+                    runtime,
+                    if matches!(statistic_kind, Statistic::StdDev) {
+                        variance.sqrt()
+                    } else {
+                        variance
+                    },
+                )
+            }
+            Statistic::Median => {
+                let ordered = self.ordered.as_mut().expect("median collects values");
+                let comparisons = ordered
+                    .len()
+                    .saturating_mul(ordered.len().max(1).ilog2() as usize);
+                runtime.charge_cpu(u64::try_from(comparisons).unwrap_or(u64::MAX))?;
+                ordered.sort_by(f64::total_cmp);
+                let middle = ordered.len() / 2;
+                let value = if ordered.is_empty() {
+                    f64::NAN
+                } else if ordered.len().is_multiple_of(2) {
+                    (ordered[middle - 1] + ordered[middle]) / 2.0
+                } else {
+                    ordered[middle]
+                };
+                FLOAT64.pack(runtime, value)
+            }
+        }
+    }
+}
+
+fn module_reduce(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
+    reduction: Reduction,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 1, 2)?;
+    args.reject_unknown_keywords(name, &["axis"])?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let forwarded = CallArgs::new(args.positional()[1..].to_vec(), args.keywords().to_vec());
+    reduce(runtime, array, forwarded, reduction, name)
+}
+
+#[derive(Clone, Copy)]
+enum Reduction {
+    Sum,
+    Product,
+    Mean,
+    Min,
+    Max,
+}
+
+fn reduce(
+    runtime: &mut dyn PyRuntime,
+    array: PyArray,
+    args: CallArgs,
+    reduction: Reduction,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 0, 1)?;
+    args.reject_unknown_keywords(name, &["axis"])?;
+    let axis_value = if let Some(value) = args.positional().first() {
+        Some(*value)
+    } else {
+        args.keyword(name, "axis")?.copied()
+    };
+    let (layout, dtype) = runtime.array_layout(array)?;
+    if let Some(axis_value) = axis_value {
+        let PyIndex(axis) = axis_value.cast(runtime)?;
+        let axis = normalize_axis(axis, layout.shape.len())?;
+        return reduce_axis(runtime, array, &layout.shape, dtype, axis, reduction);
+    }
+    reduce_values(runtime, array, &layout.shape, dtype, reduction)
+}
+
+fn normalize_axis(axis: i64, rank: usize) -> PyResult<usize> {
+    let rank = i64::try_from(rank).map_err(|_| PyError::overflow_error("array rank overflow"))?;
+    let axis = if axis < 0 { rank + axis } else { axis };
+    usize::try_from(axis)
+        .ok()
+        .filter(|axis| *axis < rank as usize)
+        .ok_or_else(|| PyError::value_error("axis is out of bounds for array"))
+}
+
+fn reduce_values(
+    runtime: &mut dyn PyRuntime,
+    array: PyArray,
+    shape: &[usize],
+    dtype: PyArrayDtype,
+    reduction: Reduction,
+) -> PyResult {
+    let mut accumulator = match reduction {
+        Reduction::Sum | Reduction::Product | Reduction::Mean => {
+            Some(reduction_identity(runtime, dtype, reduction)?)
+        }
+        Reduction::Min | Reduction::Max => None,
+    };
+    let mut count = 0usize;
+    for_each_index(shape, |index| {
+        let value = runtime.array_get(array, index)?;
+        accumulator = Some(match (reduction, accumulator) {
+            (Reduction::Sum | Reduction::Mean, Some(current)) => {
+                runtime.binary_op(PyBinaryOp::Add, current, value)?
+            }
+            (Reduction::Product, Some(current)) => {
+                runtime.binary_op(PyBinaryOp::Multiply, current, value)?
+            }
+            (Reduction::Min, Some(current)) => {
+                if runtime.compare(&value, &current)? == Ordering::Less {
+                    value
+                } else {
+                    current
+                }
+            }
+            (Reduction::Max, Some(current)) => {
+                if runtime.compare(&value, &current)? == Ordering::Greater {
+                    value
+                } else {
+                    current
+                }
+            }
+            (Reduction::Min | Reduction::Max, None) => value,
+            _ => unreachable!(),
+        });
+        count += 1;
+        Ok(())
+    })?;
+    let value = accumulator
+        .ok_or_else(|| PyError::value_error("zero-size array reduction has no identity"))?;
+    if matches!(reduction, Reduction::Mean) {
+        if count == 0 {
+            return Err(PyError::value_error("mean of empty array"));
+        }
+        runtime.binary_op(PyBinaryOp::Divide, value, Value::Int(count as i64))
+    } else {
+        Ok(value)
+    }
+}
+
+fn reduce_axis(
+    runtime: &mut dyn PyRuntime,
+    array: PyArray,
+    shape: &[usize],
+    dtype: PyArrayDtype,
+    axis: usize,
+    reduction: Reduction,
+) -> PyResult {
+    let mut output_shape = shape.to_vec();
+    let axis_length = output_shape.remove(axis);
+    let count = element_count(&output_shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    let output_dtype = reduction_dtype(dtype, reduction);
+    for_each_index(&output_shape, |output_index| {
+        let mut accumulator = match reduction {
+            Reduction::Sum | Reduction::Product | Reduction::Mean => {
+                Some(reduction_identity(runtime, dtype, reduction)?)
+            }
+            _ => None,
+        };
+        for selected in 0..axis_length {
+            let mut index = output_index.to_vec();
+            index.insert(axis, selected);
+            let value = runtime.array_get(array, &index)?;
+            accumulator = Some(match (reduction, accumulator) {
+                (Reduction::Sum | Reduction::Mean, Some(current)) => {
+                    runtime.binary_op(PyBinaryOp::Add, current, value)?
+                }
+                (Reduction::Product, Some(current)) => {
+                    runtime.binary_op(PyBinaryOp::Multiply, current, value)?
+                }
+                (Reduction::Min, Some(current)) => {
+                    if runtime.compare(&value, &current)? == Ordering::Less {
+                        value
+                    } else {
+                        current
+                    }
+                }
+                (Reduction::Max, Some(current)) => {
+                    if runtime.compare(&value, &current)? == Ordering::Greater {
+                        value
+                    } else {
+                        current
+                    }
+                }
+                (_, None) => value,
+            });
+        }
+        let mut value = accumulator
+            .ok_or_else(|| PyError::value_error("zero-size array reduction has no identity"))?;
+        if matches!(reduction, Reduction::Mean) {
+            if axis_length == 0 {
+                return Err(PyError::value_error("mean of empty array"));
+            }
+            value = runtime.binary_op(PyBinaryOp::Divide, value, Value::Int(axis_length as i64))?;
+        }
+        values.push(value);
+        Ok(())
+    })?;
+    runtime.new_array(values, output_shape, output_dtype)
+}
+
+fn reduction_dtype(dtype: PyArrayDtype, reduction: Reduction) -> PyArrayDtype {
+    match reduction {
+        Reduction::Mean => PyArrayDtype::Float,
+        Reduction::Sum | Reduction::Product if dtype == PyArrayDtype::Bool => PyArrayDtype::Int,
+        _ => dtype,
+    }
+}
+
+fn reduction_identity(
+    runtime: &dyn PyRuntime,
+    dtype: PyArrayDtype,
+    reduction: Reduction,
+) -> PyResult<PyValue> {
+    let one = matches!(reduction, Reduction::Product);
+    match reduction_dtype(dtype, reduction) {
+        PyArrayDtype::Bool => BOOL.pack(runtime, one),
+        PyArrayDtype::Int => INT64.pack(runtime, i64::from(one)),
+        PyArrayDtype::Float => FLOAT64.pack(runtime, f64::from(one)),
+    }
+}
+
+fn dot(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.dot", 2, 2)?;
+    args.reject_keywords("numpy.dot")?;
+    let left = coerce_array(runtime, args.positional()[0])?;
+    let right = coerce_array(runtime, args.positional()[1])?;
+    let (left_layout, left_dtype) = runtime.array_layout(left)?;
+    let (right_layout, right_dtype) = runtime.array_layout(right)?;
+    let left_shape = left_layout.shape;
+    let right_shape = right_layout.shape;
+    let dtype = product_dtype(left_dtype, right_dtype);
+    if left_shape.len() == 1 && right_shape.len() == 1 {
+        if left_shape[0] != right_shape[0] {
+            return Err(PyError::value_error("shapes are not aligned"));
+        }
+        let mut total = reduction_identity(runtime, dtype, Reduction::Sum)?;
+        for inner in 0..left_shape[0] {
+            let left_value = runtime.array_get(left, &[inner])?;
+            let right_value = runtime.array_get(right, &[inner])?;
+            let product = runtime.binary_op(PyBinaryOp::Multiply, left_value, right_value)?;
+            total = runtime.binary_op(PyBinaryOp::Add, total, product)?;
+        }
+        Ok(total)
+    } else {
+        matmul_arrays(runtime, left, right)
+    }
+}
+
+fn inner(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.inner", 2, 2)?;
+    args.reject_keywords("numpy.inner")?;
+    let left = coerce_array(runtime, args.positional()[0])?;
+    let right = coerce_array(runtime, args.positional()[1])?;
+    let (left_layout, left_dtype) = runtime.array_layout(left)?;
+    let (right_layout, right_dtype) = runtime.array_layout(right)?;
+    if left_layout.shape.is_empty() || right_layout.shape.is_empty() {
+        return binary(
+            runtime,
+            Value::Object(left.object_id()),
+            Value::Object(right.object_id()),
+            PyBinaryOp::Multiply,
+            false,
+        )?
+        .ok_or_else(|| PyError::runtime_error("inner product rejected array operands"));
+    }
+    let inner = *left_layout.shape.last().expect("nonempty shape checked");
+    if right_layout.shape.last() != Some(&inner) {
+        return Err(PyError::value_error("shapes are not aligned"));
+    }
+    let mut shape = left_layout.shape[..left_layout.shape.len() - 1].to_vec();
+    shape.extend_from_slice(&right_layout.shape[..right_layout.shape.len() - 1]);
+    let dtype = product_dtype(left_dtype, right_dtype);
+    let count = element_count(&shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    let left_outer_rank = left_layout.shape.len() - 1;
+    for_each_index(&shape, |output| {
+        let mut total = reduction_identity(runtime, dtype, Reduction::Sum)?;
+        for contracted in 0..inner {
+            let mut left_index = output[..left_outer_rank].to_vec();
+            left_index.push(contracted);
+            let mut right_index = output[left_outer_rank..].to_vec();
+            right_index.push(contracted);
+            let left_value = runtime.array_get(left, &left_index)?;
+            let right_value = runtime.array_get(right, &right_index)?;
+            let product = runtime.binary_op(PyBinaryOp::Multiply, left_value, right_value)?;
+            total = runtime.binary_op(PyBinaryOp::Add, total, product)?;
+        }
+        values.push(total);
+        Ok(())
+    })?;
+    if shape.is_empty() {
+        Ok(values[0])
+    } else {
+        runtime.new_array(values, shape, dtype)
+    }
+}
+
+fn outer(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.outer", 2, 2)?;
+    args.reject_keywords("numpy.outer")?;
+    let left = coerce_array(runtime, args.positional()[0])?;
+    let right = coerce_array(runtime, args.positional()[1])?;
+    let left_count = element_count(&runtime.array_layout(left)?.0.shape)?;
+    let right_count = element_count(&runtime.array_layout(right)?.0.shape)?;
+    let left_copy = copy_array(runtime, left)?;
+    let left_copy = left_copy.cast(runtime)?;
+    let left = reshape(runtime, left_copy, vec![left_count])?.cast::<PyArray>(runtime)?;
+    let right_copy = copy_array(runtime, right)?;
+    let right_copy = right_copy.cast(runtime)?;
+    let right = reshape(runtime, right_copy, vec![right_count])?.cast::<PyArray>(runtime)?;
+    let left_dtype = runtime.array_layout(left)?.1;
+    let right_dtype = runtime.array_layout(right)?.1;
+    let dtype = product_dtype(left_dtype, right_dtype);
+    let count = left_count
+        .checked_mul(right_count)
+        .ok_or_else(|| PyError::value_error("array is too large"))?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for row in 0..left_count {
+        for column in 0..right_count {
+            let left_value = runtime.array_get(left, &[row])?;
+            let right_value = runtime.array_get(right, &[column])?;
+            values.push(runtime.binary_op(PyBinaryOp::Multiply, left_value, right_value)?);
+        }
+    }
+    runtime.new_array(values, vec![left_count, right_count], dtype)
+}
+
+fn matmul(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.matmul", 2, 2)?;
+    args.reject_keywords("numpy.matmul")?;
+    let left = coerce_array(runtime, args.positional()[0])?;
+    let right = coerce_array(runtime, args.positional()[1])?;
+    matmul_arrays(runtime, left, right)
+}
+
+fn matmul_arrays(runtime: &mut dyn PyRuntime, left: PyArray, right: PyArray) -> PyResult {
+    let (left_layout, left_dtype) = runtime.array_layout(left)?;
+    let (right_layout, right_dtype) = runtime.array_layout(right)?;
+    let left_shape = left_layout.shape;
+    let right_shape = right_layout.shape;
+    if left_shape.len() != 2 || right_shape.len() != 2 || left_shape[1] != right_shape[0] {
+        return Err(PyError::value_error(
+            "matmul requires aligned two-dimensional arrays",
+        ));
+    }
+    let shape = vec![left_shape[0], right_shape[1]];
+    let count = element_count(&shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    let dtype = product_dtype(left_dtype, right_dtype);
+    for row in 0..shape[0] {
+        for column in 0..shape[1] {
+            let mut total = reduction_identity(runtime, dtype, Reduction::Sum)?;
+            for inner in 0..left_shape[1] {
+                runtime.charge_cpu(1)?;
+                let left_value = runtime.array_get(left, &[row, inner])?;
+                let right_value = runtime.array_get(right, &[inner, column])?;
+                let product = runtime.binary_op(PyBinaryOp::Multiply, left_value, right_value)?;
+                total = runtime.binary_op(PyBinaryOp::Add, total, product)?;
+            }
+            values.push(total);
+        }
+    }
+    runtime.new_array(values, shape, dtype)
+}
+
+fn product_dtype(left: PyArrayDtype, right: PyArrayDtype) -> PyArrayDtype {
+    if left == PyArrayDtype::Float || right == PyArrayDtype::Float {
+        PyArrayDtype::Float
+    } else {
+        PyArrayDtype::Int
+    }
+}
+
+pub(in crate::python) fn contiguous_strides(shape: &[usize]) -> PyResult<Vec<isize>> {
+    let mut stride = 1usize;
+    let mut result = vec![0isize; shape.len()];
+    for axis in (0..shape.len()).rev() {
+        result[axis] =
+            isize::try_from(stride).map_err(|_| PyError::value_error("array stride overflow"))?;
+        stride = stride
+            .checked_mul(shape[axis])
+            .ok_or_else(|| PyError::value_error("array stride overflow"))?;
+    }
+    Ok(result)
+}
+
+fn for_each_index(
+    shape: &[usize],
+    mut operation: impl FnMut(&[usize]) -> PyResult<()>,
+) -> PyResult<()> {
+    if shape.contains(&0) {
+        return Ok(());
+    }
+    if shape.is_empty() {
+        return operation(&[]);
+    }
+    let mut index = vec![0; shape.len()];
+    loop {
+        operation(&index)?;
+        let mut axis = shape.len();
+        loop {
+            if axis == 0 {
+                return Ok(());
+            }
+            axis -= 1;
+            index[axis] += 1;
+            if index[axis] < shape[axis] {
+                break;
+            }
+            index[axis] = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcasting_aligns_dimensions_from_the_right() {
+        assert_eq!(broadcast_shape(&[2, 1, 3], &[4, 3]).unwrap(), vec![2, 4, 3]);
+        assert!(broadcast_shape(&[2, 3], &[4]).is_err());
+    }
+
+    #[test]
+    fn contiguous_layout_is_row_major() {
+        assert_eq!(contiguous_strides(&[2, 3, 4]).unwrap(), vec![12, 4, 1]);
+    }
+}

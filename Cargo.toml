@@ -2,7 +2,7 @@
 name = "shellsim"
 version = "0.1.2"
 edition = "2021"
-description = "Deterministic, resource-constrained BusyBox-like environment for evaluating agents"
+description = "In-process BusyBox-like environment for RL rollouts and agent tests"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/rjpower/shellsim"

@@ -33,6 +33,89 @@ pub(super) type TernarySlotFn =
 /// Native implementation stored directly in a unary protocol slot.
 pub(super) type UnarySlotFn = fn(&mut dyn PyRuntime, PyValue) -> PyResult<Option<PyValue>>;
 
+/// Native implementation for the parser's compact slice operation.
+pub(super) type SliceSlotFn = fn(
+    &mut dyn PyRuntime,
+    PyValue,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+) -> PyResult<Option<PyValue>>;
+
+/// Protocol functions attached to one opaque inline value kind.
+///
+/// The runtime only dispatches these functions. It does not interpret the value payload.
+#[derive(Clone, Copy, Default)]
+pub(super) struct ValueKindSlots {
+    pub repr: Option<UnarySlotFn>,
+    pub bool_: Option<UnarySlotFn>,
+    pub add: Option<BinarySlotFn>,
+    pub reflected_add: Option<BinarySlotFn>,
+    pub subtract: Option<BinarySlotFn>,
+    pub reflected_subtract: Option<BinarySlotFn>,
+    pub multiply: Option<BinarySlotFn>,
+    pub reflected_multiply: Option<BinarySlotFn>,
+    pub divide: Option<BinarySlotFn>,
+    pub reflected_divide: Option<BinarySlotFn>,
+    pub equal: Option<BinarySlotFn>,
+    pub not_equal: Option<BinarySlotFn>,
+    pub less_than: Option<BinarySlotFn>,
+    pub less_equal: Option<BinarySlotFn>,
+    pub greater_than: Option<BinarySlotFn>,
+    pub greater_equal: Option<BinarySlotFn>,
+}
+
+/// Static registration for a type-erased, inline Python value.
+pub(super) struct ValueKindDef {
+    pub name: &'static str,
+    pub construct: NativeFn,
+    pub slots: ValueKindSlots,
+}
+
+impl PartialEq for ValueKindDef {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for ValueKindDef {}
+
+impl fmt::Debug for ValueKindDef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ValueKindDef")
+            .field(&self.name)
+            .finish()
+    }
+}
+
+/// A typed module-local handle for packing and unpacking one registered inline kind.
+pub(super) struct ValueKind<T> {
+    pub definition: ValueKindDef,
+    encode: fn(T) -> u64,
+    decode: fn(u64) -> T,
+}
+
+impl<T: Copy> ValueKind<T> {
+    pub const fn new(definition: ValueKindDef, encode: fn(T) -> u64, decode: fn(u64) -> T) -> Self {
+        Self {
+            definition,
+            encode,
+            decode,
+        }
+    }
+
+    pub fn pack(&'static self, runtime: &dyn PyRuntime, value: T) -> PyResult<PyValue> {
+        runtime.new_value_kind(&self.definition, (self.encode)(value))
+    }
+
+    pub fn unpack(&'static self, runtime: &dyn PyRuntime, value: &PyValue) -> Option<T> {
+        runtime
+            .value_kind_payload(value, &self.definition)
+            .map(self.decode)
+    }
+}
+
 /// Stable error categories produced by native Python operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PyErrorKind {
@@ -128,6 +211,7 @@ pub(super) enum PyKind {
     Iterator,
     Generator,
     Module,
+    Array,
     Native,
 }
 
@@ -139,6 +223,42 @@ pub(super) enum PyNativeKind {
     ArgumentParser,
     RaisesContext,
     Property,
+    Array,
+}
+
+/// Logical scalar family carried by a type-erased array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PyArrayDtype {
+    Bool,
+    Int,
+    Float,
+}
+
+impl PyArrayDtype {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::Int => "int64",
+            Self::Float => "float64",
+        }
+    }
+}
+
+/// Shape and storage mapping for an opaque array view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PyArrayLayout {
+    pub shape: Vec<usize>,
+    pub strides: Vec<isize>,
+    pub offset: isize,
+}
+
+/// Scalar operation used by generic array kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PyBinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
 }
 
 /// Interpreter-owned marker values exported by compatibility modules.
@@ -150,6 +270,7 @@ pub(super) enum PyMarker {
     Environment,
     Stdout,
     Stderr,
+    ArrayType,
 }
 
 /// Explicit access to shellsim's virtual clock and CPU-time counters.
@@ -305,6 +426,25 @@ pub(super) trait PyRuntime {
     fn new_tuple(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
     fn new_dict(&mut self, items: Vec<(PyValue, PyValue)>) -> PyResult<PyValue>;
     fn new_set(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
+    fn new_value_kind(&self, kind: &'static ValueKindDef, payload: u64) -> PyResult<PyValue>;
+    fn value_kind_payload(&self, value: &PyValue, kind: &'static ValueKindDef) -> Option<u64>;
+    fn value_kind_type(&self, kind: &'static ValueKindDef) -> PyResult<PyValue>;
+    fn new_array(
+        &mut self,
+        items: Vec<PyValue>,
+        shape: Vec<usize>,
+        dtype: PyArrayDtype,
+    ) -> PyResult<PyValue>;
+    fn new_array_view(&mut self, array: PyArray, layout: PyArrayLayout) -> PyResult<PyValue>;
+    fn array_layout(&self, array: PyArray) -> PyResult<(PyArrayLayout, PyArrayDtype)>;
+    fn array_get(&mut self, array: PyArray, index: &[usize]) -> PyResult<PyValue>;
+    fn array_set(&mut self, array: PyArray, index: &[usize], value: PyValue) -> PyResult<()>;
+    fn binary_op(
+        &mut self,
+        operation: PyBinaryOp,
+        left: PyValue,
+        right: PyValue,
+    ) -> PyResult<PyValue>;
     fn new_string(&mut self, value: String) -> PyResult<PyValue>;
     fn new_bytes(&mut self, value: Vec<u8>) -> PyResult<PyValue>;
     fn new_bytearray(&mut self, value: Vec<u8>) -> PyResult<PyValue>;
@@ -375,8 +515,32 @@ pub(super) trait PyRuntime {
             PyKind::Iterator => "iterator",
             PyKind::Generator => "generator",
             PyKind::Module => "module",
+            PyKind::Array => "numpy.ndarray",
             PyKind::Native => "object",
         })
+    }
+}
+
+/// Checked handle to an interpreter-owned array view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PyArray(ObjectId);
+
+impl FromPyValue for PyArray {
+    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
+        let Some(id) = value.object_id() else {
+            return Err(PyError::type_error("expected numpy.ndarray"));
+        };
+        if runtime.native_kind(&Value::Object(id))? == Some(PyNativeKind::Array) {
+            Ok(Self(id))
+        } else {
+            Err(PyError::type_error("expected numpy.ndarray"))
+        }
+    }
+}
+
+impl PyArray {
+    pub(super) fn object_id(self) -> ObjectId {
+        self.0
     }
 }
 

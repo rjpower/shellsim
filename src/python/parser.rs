@@ -1187,11 +1187,29 @@ impl Parser {
                     };
                     continue;
                 }
-                let index = start_or_index.ok_or_else(|| self.error("expected subscript index"))?;
+                let first = start_or_index.ok_or_else(|| self.error("expected subscript index"))?;
+                let first_span = first.span;
+                let mut indices = vec![first];
+                let mut saw_comma = false;
+                while self.take(|kind| matches!(kind, TokenKind::Comma)).is_some() {
+                    saw_comma = true;
+                    if self.at(|kind| matches!(kind, TokenKind::RightBracket)) {
+                        break;
+                    }
+                    indices.push(self.expression()?);
+                }
                 let end = self.expect(
                     |kind| matches!(kind, TokenKind::RightBracket),
                     "expected ']' after subscript",
                 )?;
+                let index = if saw_comma {
+                    Expression {
+                        kind: ExpressionKind::Tuple(indices),
+                        span: first_span.through(end.span),
+                    }
+                } else {
+                    indices.pop().expect("first subscript index was pushed")
+                };
                 let span = value.span.through(end.span);
                 value = Expression {
                     kind: ExpressionKind::Subscript {

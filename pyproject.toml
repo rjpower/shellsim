@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "shellsim"
 dynamic = ["version"]
-description = "Deterministic, resource-constrained shell and Python execution for tests"
+description = "In-process BusyBox-like environment for RL rollouts and agent tests"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Software Development :: Testing",
     "Typing :: Typed",
 ]
-keywords = ["sandbox", "shell", "simulation", "testing"]
+keywords = ["agents", "containers", "reinforcement-learning", "sandbox", "simulation", "testing"]
 
 [project.urls]
 Homepage = "https://github.com/rjpower/shellsim"

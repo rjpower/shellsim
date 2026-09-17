@@ -1,292 +1,93 @@
 # Shellsim implementation
 
-Shellsim is a deterministic in-process operating environment for evaluating agent-written shell
-and Python programs. It models useful behavior with Rust implementations and explicit state. It
-does not execute host commands or use the host filesystem as the simulated working environment.
+Shellsim models a small deterministic Unix machine in one Rust process. Simulated input reaches
+only typed state owned by an `Environment`; it never reaches host processes, files, descriptors,
+networking, environment variables, or clocks.
 
-## Architecture
-
-An `Environment` owns all machine and session state:
+## Machine model
 
 ```text
 Environment
-  ProcessState     active variables, arrays, functions, cwd, options, jobs, Python REPL
-  ProcessTable     bounded PID/PPID records and child lifecycle status
-  Vfs              files, directories, symlinks, metadata, disk quota
-  PseudoFs         generated read-only /proc and finite /dev views
-  Timeline         monotonic/wall/process clocks and scheduled events
-  VirtualNet       deterministic route table and responses
-  Resources        CPU, memory, disk/output accounting and stop reason
+  ProcessTable      logical PIDs, sessions, groups, signals, continuations
+  Descriptors       VFS files, bounded pipes, captures, and finite /dev devices
+  Vfs               quota-enforced files, directories, links, and metadata
+  Timeline          monotonic, wall, and process-CPU clocks plus scheduled events
+  VirtualNet        deterministic routes and request records
+  Resources         CPU, memory, disk, output, and stop reason
 ```
 
-Shell source flows through `src/shell.rs`, expansion in `src/expand.rs`, and the executor in
-`src/exec.rs`. The executor dispatches commands through `src/commands/mod.rs`. Commands receive a
-`CommandContext` plus explicit `Io`; unknown commands resolve through the modeled process `PATH`
-to executable VFS scripts and otherwise become recorded compatibility gaps. The native `rg`
-implementation performs bounded, metered VFS-only recursive search. Python uses its own source
-pipeline described in [python.md](python.md) and shares only modeled environment capabilities.
+The shell parser and expander produce owned syntax consumed by a cooperative executor. Logical
+processes retain their complete state across typed waits. A single-threaded FIFO scheduler runs
+runnable work and advances virtual time only when all work is blocked. Equal-time events use
+stable insertion order.
 
-Logical processes retain forked `ProcessState` values by PID. Shell continuations, background
-jobs, sleeps, waits, subshells, and pipeline stages suspend and resume through the deterministic
-scheduler. Pipeline bytes flow through bounded descriptor-backed pipes. VFS, clocks, virtual
-network, resources, package markers, and telemetry remain machine-wide, so local process mutation
-does not leak while filesystem effects remain visible. Exited background records remain until
-`wait` reaps them. Background jobs lead modeled process groups, ordinary descendants inherit group
-identity, and group signals are delivered at scheduler boundaries. Command substitutions, nested
-shells and scripts, Make recipes, `env`, `xargs`,
-`timeout`, and the `command` builtin all use retained continuations or scheduled argv children.
-Python commands retain compiled code, VM state, output, and top-level bytecode frames in command
-continuations and yield after bounded instruction quanta. Ordinary bytecode user-function calls
-use explicit return frames as well. Python calls made from within compound native operations still
-need instruction-level continuations. Native bytecode calls can now retain normalized arguments
-and retry after a typed wake: direct `time.sleep` uses the timer path and unbounded
-`Popen.wait()` uses the child path, and unbounded `communicate()` retries on child-tree activity
-while retaining partial duplex progress. Direct stream reads and writes wait on exact descriptor
-readiness and retain partial write cursors. Timeout-bearing subprocess operations combine those
-resource keys with virtual deadline events. The nested scheduler helper is now confined to the
-explicitly synchronous `run_python` embedding API.
+Pipes, file descriptions, PIDs, queued events, process state, output, and other input-driven
+growth are bounded. VFS mutations enforce disk capacity atomically. Resource accounting uses
+checked or saturating arithmetic at untrusted boundaries.
 
-Reusing an `Environment` preserves the VFS, cwd, variables, functions, arrays, package markers,
-virtual time/network state, command history, Python REPL, and cumulative resource usage. `exit`,
-`set -e` termination, and CPU/memory/output exhaustion make the session terminal. Disk-full errors
-remain recoverable.
+## Compatibility boundary
 
-## Persistent harness protocol
-
-`shellsim serve` owns one `HarnessSession` and reads bounded newline-delimited JSON requests. The
-closed operation set includes one-shot `execute`; retained `start_execute`, `poll_action`,
-`write_stdin`, `close_stdin`, `read_action_output`, `signal_process`, `signal_foreground`,
-`set_foreground_process_group`, `cancel_action`, and `drop_action`; plus
-`read_file`, `write_file`, `stat_path`, `make_directory`, `create_symlink`, `apply_patch`,
-`remove_path`, `list_paths`, `checkpoint`, `workspace_diff`, `reset_workspace`, and `inspect`. Each
-request may carry an arbitrary JSON `id`, which is echoed in
-its one-line response. Stream and file bytes are base64; the protocol never performs lossy text
-conversion.
-
-`cancel_action` is distinct from both signaling and dropping. It sends an uncatchable modeled
-signal to the action's foreground process group, closes its input, drives only bounded scheduler
-work without advancing virtual time, restores the persistent shell descriptors, and retains a
-completed status-137 action record. The cancellation-induced shell exit is cleared so the session
-can execute another action. Separately grouped background jobs are not silently destroyed;
-`signal_process` remains the explicit mechanism for them. `drop_action` only releases an already
-completed record.
-
-Process records distinguish process-group and session identities. The synthetic controlling
-terminal owns one session and one foreground group. Harness clients can transfer that foreground
-ownership only to a live group in the terminal session and can send supported signals to the
-selected group. When its last process exits, ownership deterministically returns to the root shell
-group. `fg` uses the ordinary resumable child wait after transferring a running job. Inspection and
-`/proc/PID/status` report the same terminal/session model.
-
-A retained action installs a shell continuation and isolated standard descriptors without driving
-the machine. Polls execute a bounded number of ordinary scheduler quanta. With `advance_time`
-disabled, an all-blocked action returns its typed wait reason without moving the virtual clock;
-with it enabled, the scheduler may fire the next modeled event. Streaming stdin is a bounded input
-description with explicit append and EOF operations. Output reads use independent delivery cursors
-and return only newly available bytes. At most one foreground action is active in a session, up to
-64 completed action records may be retained, and an active action survives a complete-state session
-fork. The legacy `execute` operation drives this same retained path to completion.
-
-`serve` routes requests through a bounded `HarnessManager`. Omitting `session_id` selects session
-zero. `fork_session` creates a new monotonically identified session through the same bounded
-complete-state clone used by the library, including an active action; `drop_session` releases the
-whole independent machine. A connection retains at most eight sessions, and every source session
-must satisfy the 96 MiB modeled fork bound before cloning. Session state is never shared mutably.
-
-File operations are confined to the simulated `/work` tree. `execute` still sees the full modeled
-filesystem and all normal shellsim capabilities, never host state. Requests are capped at 20 MiB,
-individual binary transfers and diffs at 6 MiB, and byte decoding is charged before allocation.
-Workspace changes are typed, path-sorted added/modified/deleted records containing before/after
-file bytes, modes, directories, or symlink targets. A checkpoint clones only a bounded VFS;
-`reset_workspace` restores that VFS checkpoint but deliberately does not rewind CPU fuel, virtual
-time, process history, shell variables, or terminal resource exhaustion.
-
-Typed metadata reports node kind, mode, ownership, virtual mtime, byte size, and an optional
-unfollowed symlink target. Directory creation has explicit parent and mode behavior. Harness patch
-application is fixed at `/work` and calls the same metered, atomic VFS patch engine as the simulated
-commands; invalid context, unsafe paths, oversized input, or resource exhaustion leave no partial
-file changes.
-
-Action results include ordered command occurrences and the bounded per-action virtual-network
-request delta with method, URL, and
-whether a route matched. Inspection returns the retained request log and a dropped-record count;
-once the fixed log capacity is reached, later attempts increment that count without growing host
-memory.
-
-The auxiliary command-name and unsupported-diagnostic logs are likewise bounded by entry count
-and retained string bytes. They keep their first window so action-start indices remain stable,
-then increment explicit `dropped_commands` and `dropped_unsupported` counters. Action, execute,
-inspection, evaluation, and Python-adapter reports expose those counters. The ordered invocation
-log remains the canonical command record and retains its rolling occurrence window.
-
-`serve --root PATH` and `shellsim-python` share `host_ingest.rs`. This trusted startup-only adapter
-canonicalizes the selected root, rejects symlinks, special files, and non-UTF-8 names, skips common
-dependency/build trees, preserves basic modes, applies file-count and VFS disk limits, and rolls
-back the entire import on failure. No request can reopen that host boundary.
-
-`shellsim replay SCENARIO.ndjson` runs the same requests through a fresh session and emits one
-typed transcript record per action containing its zero-based sequence number, original request,
-and response. A line may instead wrap a request as `{"request": {...}, "expect": {...}}` and
-assert exact success, exit status, base64 streams, unsupported, no-op, and partial commands,
-workspace change count, or an error substring. Assertion results are embedded in the transcript and
-any mismatch makes the replay exit with status 1 after all actions run. Scenario lines remain
-subject to the 20 MiB request bound; a replay is capped at 4,096 actions and 64 MiB each of scenario
-and emitted transcript data.
-`--root` and resource limits have the same meaning as in `serve`, so a checked-in action stream can
-be rerun against a bounded host snapshot without changing the protocol. `--transcript PATH` also
-persists the emitted NDJSON after a complete replay. Publication is atomic and refuses to replace
-an existing path; malformed or incomplete scenarios leave no requested transcript file.
-
-A scenario may start with a versioned metadata record:
-
-```json
-{"scenario":{"version":1,"strict":true,"final_expectation":{"workspace_change_count":1,"active_action_count":0,"cpu_used_at_most":100000}}}
-```
-
-Versioned replays copy this metadata into the transcript and finish with a typed `final` assertion
-record. Version 1 can assert the selected session's final status, workspace change count, active
-action and live process counts, and upper bounds for CPU, peak memory, current disk use, and output.
-Strict mode additionally fails on any request error, partial or no-op command, unsupported
-behavior, unmatched virtual-network request, dropped observability record, or unfinished retained
-action. Unknown versions and metadata fields fail before executing an action. Action-only legacy
-NDJSON remains accepted and retains its existing transcript shape.
-
-The `shellsim mcp` command is a thin stdio Model Context Protocol adapter over the same
-`HarnessManager`. It provides shell execution, text-oriented workspace operations, typed
-inspection and diffs, checkpoint/reset, and bounded session forks. Its JSON-RPC transport owns no
-machine state and translates each call to a closed `HarnessOperation`; execution, confinement,
-metering, persistence, and errors therefore have the same behavior as `serve`. MCP messages are
-newline-delimited and capped at 20 MiB. Notifications receive no response, malformed requests do
-not end the connection, and tool failures use MCP's `isError` result while preserving the typed
-harness response in `structuredContent`.
-
-The external model client still runs outside shellsim. For example, after building a release
-binary, Codex can launch a session over stdio with:
-
-```sh
-codex mcp add shellsim -- /absolute/path/to/shellsim mcp --root /absolute/project/path
-```
-
-The configured `--root` is read exactly once by the trusted startup importer into simulated
-`/work`. Subsequent agent reads, writes, patches, commands, subprocesses, `/proc` access, clocks,
-and network requests operate only on modeled state; changes are not exported back to the host.
-Other MCP clients can launch the same command using their stdio server configuration.
-
-The library can fork a bounded `HarnessSession`, including scheduler, descriptor, process, Python,
-clock, network, resource, and checkpoint state, for deterministic branching evaluation. Replay is
-still the canonical way to turn a tool-call sequence into a checked deterministic fixture.
-
-## Simulation boundaries
-
-The VFS and generated pseudo-filesystem facade are the only filesystems visible to simulated code.
-VFS mutations are quota-atomic, deletion releases capacity, and the environment supplies virtual
-wall timestamps. `/proc` nodes and descriptor-backed `/dev` devices are generated from modeled
-state, consume no disk, and reject mutation. Commands and Python code must never fall through to
-`std::fs`, `std::process`, host environment variables, host networking, or host time.
-
-Time has three domains:
-
-| Domain | Source | Use |
-|---|---|---|
-| Monotonic | nanoseconds since environment creation | sleeps, deadlines, causal ordering |
-| Wall | fixed UTC epoch + monotonic + explicit adjustment | `date`, Python time, VFS timestamps |
-| Process CPU | deterministic CPU fuel at 1 microsecond per unit | accounting APIs |
-
-Wall adjustments cannot move monotonic deadlines. CPU work consumes no virtual wall time unless an
-operation explicitly models latency. Blocking suspends the current logical process; the scheduler
-runs other work and advances to the next event only when its runnable queue is empty. It never
-sleeps a host thread. Equal-time events use insertion order.
-
-Native compilation is outside the model. Compiler commands are recorded as `NoOp`: pretending to
-compile can keep a setup script moving, but no executable artifact is produced. Running arbitrary
-emitted machine code would bypass every modeled capability and resource boundary. The partial
-`make` implementation parses a bounded Makefile graph and executes shell-only recipes through the
-existing interpreter; it never invokes a host build tool.
-
-## Resource accounting
-
-The resource model is deterministic and approximate:
-
-- CPU is monotonic fuel charged for parsing, dispatch, bytecode, input/output, and algorithms.
-- Memory is a modeled working set; command-frame reservations are released when the frame returns.
-- Disk is current logical VFS content plus fixed node overhead and is enforced inside `Vfs`.
-- Output is a hard cap on materialized stdout and stderr.
-
-Use checked or saturating arithmetic for sizes derived from simulated input. Reserve a conservative
-result bound before constructing or mutating large host data structures, and charge loops before
-unbounded work. Resource exhaustion returns status 137 with a typed `StopReason`; it must not leave
-partially committed VFS or collection state.
-
-Every registered command has coarse base CPU and memory costs. Dynamic implementations add charges
-for their actual input and algorithms. Nested dispatch tracks output already charged by children so
-the parent does not double-count it.
-
-## Commands and trust
-
-Commands have the uniform signature:
+Commands are Rust implementations over a narrow `CommandContext` and explicit `Io`:
 
 ```rust
 fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
 ```
 
-`args` excludes `argv[0]`; stdin is owned input and stdout/stderr are explicit buffers. The central
-registry assigns each name a function, base costs, and a trust level:
+Each command is registered as `Real`, `Partial`, or `NoOp`. Partial and no-op invocations remain
+visible in evaluation telemetry. Unknown options and unsupported behavior must fail explicitly;
+they must never invoke a host binary. Native compilation and arbitrary executable formats remain
+outside the model because running emitted machine code would bypass every capability boundary.
 
-- `Real`: the supported behavior is intended to be faithful;
-- `Partial`: a documented subset such as `sed`, `jq`, or a package facade;
-- `NoOp`: pretend-success compatibility with no claimed effect, recorded as unsupported.
+The standard for a supported command is ordinary usefulness, not exhaustive historical
+compatibility. Implement the common behavior as a coherent whole, reject the remaining frontier,
+and avoid module-shaped stubs whose successful behavior cannot be explained simply.
 
-Trust is observable telemetry. The environment retains a bounded occurrence log with PID, argv,
-trust, completion status, and inclusive CPU/disk deltas; suspended commands remain visible with a
-null status. Per-action no-op and partial summaries are derived from that log, so invoking the same
-partial command in separate actions remains observable. Do not mark a partial tool `Real`, silently
-ignore unsupported options, or invoke a host binary to fill a gap.
+## Harness boundary
 
-## Adding or extending a tool
+`serve`, `mcp`, and `replay` all use the same bounded harness operations. The harness owns
+persistent environments and exposes execution, stdin and output streaming, VFS operations,
+workspace checkpoints and diffs, inspection, cancellation, and deterministic forks. Binary data
+is byte preserving. Requests cannot reopen a host path after startup.
 
-1. Read the closest command module and its integration tests. Choose an existing behavioral module
-   or create a focused file under `src/commands/` with a `//!` overview.
-2. Implement the `CmdFn` using only `CommandContext`, `Io`, VFS operations, virtual time/network,
-   and nested shellsim dispatch. Never use ambient host capabilities.
-3. Register all supported names in the module's `register` function with an honest `Trust` level.
-   Add the module to `src/commands/mod.rs` when it is new.
-4. Validate options and operands explicitly. Unsupported behavior should return a useful status and
-   record the gap rather than producing a plausible but incorrect result.
-5. Charge dynamic CPU and reserve memory before reading, expanding, sorting, parsing, or producing
-   unbounded data. Let VFS primitives enforce disk capacity atomically.
-6. Put small parsing/algorithm invariants beside the implementation. Add integration tests for
-   stdout, stderr, status, persistent state, malformed input, exhaustion, and the unsupported edge.
-   Use a reference differential when the behavior is deterministic.
+`--root` is an explicit trusted harness operation. The importer rejects links and special files,
+copies a bounded tree into `/work`, and closes the host boundary before simulated execution. The
+copy has no write-back path.
 
-When a tool needs a new machine capability, add it to `Environment` as modeled state with a narrow
-interface and deterministic tests first. A convenience abstraction is not authorization to expose
-the corresponding host facility.
+## Adding behavior
+
+1. Read the closest module and its tests.
+2. Implement against modeled state and narrow capabilities only.
+3. Validate syntax, options, and operands before doing work.
+4. Meter loops and reserve input-driven allocation before growth.
+5. Return a useful error for the unsupported frontier.
+6. Add a unit test for tricky logic and an integration or differential test for observable
+   compatibility.
+
+New commands live under `src/commands/`. Machine capabilities belong on `Environment` behind a
+small typed interface. Python runtime and module changes follow [python.md](python.md).
 
 ## Repository map
 
 ```text
-src/interp.rs          Environment and persistent ProcessState
-src/process.rs         bounded logical PID and lifecycle records
-src/pseudo_fs.rs       generated read-only /proc and finite /dev views
-src/resources.rs       limits, accounting, outcomes, command telemetry
-src/vfs.rs             quota-enforced in-memory filesystem
-src/clock.rs           virtual clocks and bounded event queue
-src/net.rs             virtual route-table network
-src/harness.rs         persistent typed agent-session boundary
-src/host_ingest.rs     trusted transactional host-to-VFS startup import
-src/shell.rs           shell lexer/parser and capture API
-src/expand.rs          shell word and parameter expansion
-src/exec.rs            metered shell executor and control flow
-src/commands/          command registry and native implementations
-src/python/            Python lexer, parser, compiler, object model, VM, and stdlib
-tests/                 cross-module, differential, resource, and acceptance behavior
-tests/fixtures/        checked shell/Python inputs and expected outputs
-research/              inventories and historical design evidence
+src/interp.rs          Environment and persistent shell state
+src/process.rs         logical processes and signals
+src/scheduler.rs       deterministic runnable and blocked work
+src/descriptors.rs     open descriptions and bounded pipes
+src/vfs.rs             in-memory filesystem and disk quota
+src/resources.rs       limits, accounting, outcomes, and telemetry
+src/shell.rs           shell lexer and parser
+src/expand.rs          shell expansion
+src/exec.rs            cooperative shell execution
+src/commands/          modeled command implementations
+src/python/            Python source runtime and selected modules
+src/harness.rs         persistent agent-session protocol
+src/host_ingest.rs     trusted startup-only project import
+tests/                 integration, differential, and resource tests
 ```
 
 ## Validation
 
-Use a narrow test while iterating. Before committing, run:
+Run a narrow test while editing. Before handing off a change, run:
 
 ```sh
 ./infra/pre-commit.py --all-files --fix
@@ -294,7 +95,5 @@ Use a narrow test while iterating. Before committing, run:
 ./infra/ci/run_tests.py
 ```
 
-Tests must not depend on host elapsed time, locale, network, filesystem contents, or unordered map
-iteration. Compatibility tests should prefer semantic assertions; exact checked output is
-appropriate when formatting is the contract. Never weaken a lint, skip a test, or rewrite a
-differential fixture merely to make a gate pass.
+Tests must not depend on host elapsed time, locale, network, filesystem contents, or unordered
+collection output.

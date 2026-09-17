@@ -79,7 +79,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
     if let Some(value) = string_value(heap, value)? {
         return Ok(quote_string(&value));
     }
-    if value.tag() == super::ValueTag::Int {
+    if matches!(value.tag(), super::ValueTag::Int) {
         return Ok(value.immediate_int().expect("tag checked").to_string());
     }
     if let Some(value) = value.float_value() {
@@ -136,6 +136,8 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::CountIterator { .. } => "<iterator ...>",
                 Object::Generator { .. } => "<generator ...>",
                 Object::Module { .. } => "<module ...>",
+                Object::ArrayStorage(_) => "<array storage ...>",
+                Object::Array { .. } => "array(...)",
                 Object::Regex { .. } => "re.compile(...) ",
                 Object::Match { .. } => "<re.Match ...>",
                 Object::ArgumentParser { .. } => "<argparse.ArgumentParser ...>",
@@ -201,6 +203,10 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::CountIterator { .. } => "<iterator>".into(),
             Object::Generator { .. } => "<generator>".into(),
             Object::Module { name, .. } => format!("<module '{name}'>"),
+            Object::ArrayStorage(_) => "<array storage>".into(),
+            Object::Array { layout, dtype, .. } => {
+                format!("array(shape={:?}, dtype={})", layout.shape, dtype.name())
+            }
             Object::Regex { pattern, .. } => format!("re.compile({})", quote_string(pattern)),
             Object::Match {
                 text, start, end, ..
@@ -252,7 +258,7 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
     if let Some(value) = value.bool_value() {
         return Ok(value);
     }
-    if value.tag() == super::ValueTag::Int {
+    if matches!(value.tag(), super::ValueTag::Int) {
         return Ok(value.immediate_int().expect("tag checked") != 0);
     }
     if let Some(value) = value.float_value() {
@@ -290,6 +296,8 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         | Object::CountIterator { .. }
         | Object::Generator { .. }
         | Object::Module { .. }
+        | Object::ArrayStorage(_)
+        | Object::Array { .. }
         | Object::Regex { .. }
         | Object::Match { .. }
         | Object::ArgumentParser { .. }
@@ -618,6 +626,8 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::CountIterator { .. }
             | Object::Generator { .. }
             | Object::Module { .. }
+            | Object::ArrayStorage(_)
+            | Object::Array { .. }
             | Object::Regex { .. }
             | Object::Match { .. }
             | Object::ArgumentParser { .. }
