@@ -76,7 +76,7 @@ struct EvalReport {
     dropped_unsupported: u64,
     commands: Vec<String>,
     dropped_commands: u64,
-    noop_commands: Vec<String>,
+    unsupported_commands: Vec<String>,
     partial_commands: Vec<String>,
     invocations: Vec<shellsim::InvocationEvent>,
     dropped_invocations: u64,
@@ -118,7 +118,7 @@ fn evaluate(args: &[String]) -> ! {
     let (outcome, stdout, stderr) = env.run_script_capture_with_stdin(&source, &stdin);
     let status = outcome.exit_status;
     let invocations = env.invocations.events();
-    let noop_commands = invocation_names(&invocations, shellsim::CommandTrust::NoOp);
+    let unsupported_commands = invocation_names(&invocations, shellsim::CommandTrust::Unsupported);
     let partial_commands = invocation_names(&invocations, shellsim::CommandTrust::Partial);
     let report = EvalReport {
         outcome,
@@ -128,7 +128,7 @@ fn evaluate(args: &[String]) -> ! {
         dropped_unsupported: env.unsupported.dropped(),
         commands: env.cmd_trace.values(),
         dropped_commands: env.cmd_trace.dropped(),
-        noop_commands,
+        unsupported_commands,
         partial_commands,
         invocations,
         dropped_invocations: env.invocations.dropped(),

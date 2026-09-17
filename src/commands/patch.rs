@@ -129,7 +129,10 @@ pub(crate) fn apply_harness_patch(
         out: &mut stdout,
         err: &mut stderr,
     };
-    let mut context = CommandContext { env: interp };
+    let mut context = CommandContext {
+        env: interp,
+        command_name: "patch",
+    };
     let status = run_patch(
         &mut context,
         &[format!("-p{strip}")],

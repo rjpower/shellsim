@@ -36,6 +36,11 @@ const MAX_RUNNER_FILE_BYTES: usize = 256 * 1024;
 const MAX_RUNNER_SOURCE_BYTES: usize = 512 * 1024;
 const MAX_RUNNER_WRAPPER_BYTES: usize = 1024 * 1024;
 
+/// Return whether an offline package command can supply this third-party distribution.
+pub(crate) fn is_bundled_distribution(name: &str) -> bool {
+    matches!(name, "numpy" | "pytest")
+}
+
 /// Physical storage discriminator kept separate from Python's semantic [`object_model::TypeId`].
 ///
 /// Tags describe storage only. Python semantics come from the value's registered `TypeId`, so a
@@ -587,10 +592,12 @@ fn execute_source(
 fn run_module(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
     match args.first().map(String::as_str) {
         Some("pip") => {
-            if args.get(1).map(String::as_str) == Some("install") {
-                crate::commands::pkg::register_install_args(interp, &args[1..]);
-            }
-            0
+            let mut io = crate::commands::Io {
+                stdin: Vec::new(),
+                out,
+                err,
+            };
+            crate::commands::pkg::run_pip(interp, &args[1..], &mut io)
         }
         Some("venv") => {
             let Some(dir) = args.iter().skip(1).find(|arg| !arg.starts_with('-')) else {

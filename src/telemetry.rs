@@ -86,8 +86,8 @@ pub enum CommandTrust {
     Real,
     /// The implementation deliberately supports only a documented subset.
     Partial,
-    /// The command is a compatibility no-op or is unavailable.
-    NoOp,
+    /// The command is unavailable, including unknown names and recognized capability boundaries.
+    Unsupported,
 }
 
 /// One ordered command occurrence.

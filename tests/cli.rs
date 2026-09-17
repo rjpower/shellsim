@@ -705,7 +705,7 @@ fn scenario_replay_checks_typed_expectations() {
     std::fs::write(
         &passing,
         concat!(
-            "{\"request\":{\"id\":\"run\",\"op\":\"execute\",\"source\":\"printf ok > note; printf done\"},\"expect\":{\"ok\":true,\"exit_status\":0,\"stdout_base64\":\"ZG9uZQ==\",\"stderr_base64\":\"\",\"unsupported\":[],\"noop_commands\":[],\"partial_commands\":[]}}\n",
+            "{\"request\":{\"id\":\"run\",\"op\":\"execute\",\"source\":\"printf ok > note; printf done\"},\"expect\":{\"ok\":true,\"exit_status\":0,\"stdout_base64\":\"ZG9uZQ==\",\"stderr_base64\":\"\",\"unsupported\":[],\"unsupported_commands\":[],\"partial_commands\":[]}}\n",
             "{\"request\":{\"id\":\"diff\",\"op\":\"workspace_diff\"},\"expect\":{\"workspace_change_count\":1}}\n"
         ),
     )
@@ -814,7 +814,7 @@ fn versioned_scenario_enforces_strict_trust_and_final_resources() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|failure| failure.as_str().unwrap().contains("partial or no-op")));
+        .any(|failure| failure.as_str().unwrap().contains("partial or unsupported")));
 }
 
 #[test]

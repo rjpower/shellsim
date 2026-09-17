@@ -1,25 +1,23 @@
 //! Package managers and build tools.
 //!
-//! Installers (`pip`/`pip3`/`conda`/`pipx`) don't fetch anything, but they DO record the
-//! installed package names into [`Interp::packages`] so bootstrap probes such as `pip list`
-//! remain deterministic. Package contents are absent, so installers remain [`Trust::NoOp`].
-//!
-//! Build tools / compilers (`gcc`/`make`/`cargo`/…) stay pure no-ops: see
-//! `docs/implementation.md` for why shellsim deliberately does not simulate native compilation.
+//! pip, pip3, and the bounded uv paths can activate the bundled numpy and pytest distributions
+//! without network access. Other package managers, packages, native toolchains, and external
+//! runtimes are explicit unsupported boundaries.
 
 use std::collections::HashMap;
 
+use crate::commands::options::{parse_options, OptionSpec};
 use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 
-pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
-    // Real-ish: installers that update package state (still NoOp-trust: contents are absent).
-    reg(m, &["pip", "pip3", "conda", "pipx"], Trust::NoOp, cmd_pip);
-    // Pure no-ops: build tools, compilers, daemons, runtimes we don't simulate.
-    reg(
-        m,
+pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
+    use super::{reg, reg_unsupported};
+    reg(commands, &["pip", "pip3"], Trust::Partial, cmd_pip);
+    reg_unsupported(
+        commands,
         &[
+            "conda",
+            "pipx",
             "apt",
             "apt-get",
             "npm",
@@ -45,179 +43,208 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
             "rustc",
             "go",
         ],
-        Trust::NoOp,
-        cmd_noop,
     );
 }
 
-/// Pretend success; the dispatcher already recorded the command as unsupported.
-fn cmd_noop(_interp: &mut CommandContext<'_>, _args: &[String], _io: &mut Io) -> i32 {
-    0
+/// Implement the bounded pip surface used to activate bundled packages.
+fn cmd_pip(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    run_pip(interp, args, io)
 }
 
-/// `pip install [flags] pkg[==ver] ...` / `pip install -r req.txt` / `conda install ...`.
-/// Records package names so the embedded libraries become importable. Other subcommands
-/// (`list`, `show`, `freeze`, `uninstall`, …) are handled enough to be plausible.
-fn cmd_pip(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    // find the subcommand (first non-flag token)
-    let sub = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(|s| s.as_str())
-        .unwrap_or("");
-    match sub {
-        "install" => {
-            register_install_args(interp, args);
-            0
-        }
+/// Run the shared offline pip surface for both the command and `python -m pip` entry points.
+pub(crate) fn run_pip(interp: &mut Interp, args: &[String], io: &mut Io) -> i32 {
+    let mut sub_index = 0;
+    while args.get(sub_index).is_some_and(|argument| {
+        matches!(
+            argument.as_str(),
+            "-q" | "--quiet" | "--disable-pip-version-check"
+        )
+    }) {
+        sub_index += 1;
+    }
+    let subcommand = args.get(sub_index).map(String::as_str).unwrap_or("");
+    match subcommand {
+        "install" => match install_args(interp, &args[sub_index + 1..]) {
+            Ok(()) => 0,
+            Err(error) => {
+                interp.note_unsupported(&format!("pip:{error}"));
+                crate::commands::util::ewln(io.err, &format!("pip: {error}"));
+                1
+            }
+        },
         "list" | "freeze" => {
+            if args.len() != sub_index + 1 {
+                crate::commands::util::ewln(io.err, "pip: unsupported option");
+                return 2;
+            }
             let mut names: Vec<&String> = interp.packages.iter().collect();
             names.sort();
-            for n in names {
-                if sub == "freeze" {
-                    crate::commands::util::wln(io.out, &format!("{n}==0.0.0"));
+            for name in names {
+                if subcommand == "freeze" {
+                    crate::commands::util::wln(io.out, &format!("{name}==0.0.0"));
                 } else {
-                    crate::commands::util::wln(io.out, &format!("{n} 0.0.0"));
+                    crate::commands::util::wln(io.out, &format!("{name} 0.0.0"));
                 }
             }
             0
         }
         "show" => {
-            // `pip show NAME` → minimal metadata if "installed"
-            if let Some(name) = args
-                .iter()
-                .rfind(|a| !a.starts_with('-'))
-                .filter(|a| a.as_str() != "show")
-            {
-                let key = normalize_pkg(name);
-                if interp.packages.contains(&key) || interp.packages.contains(name.as_str()) {
-                    crate::commands::util::wln(io.out, &format!("Name: {name}"));
-                    crate::commands::util::wln(io.out, "Version: 0.0.0");
-                }
+            let Some(name) = args
+                .get(sub_index + 1)
+                .filter(|_| args.len() == sub_index + 2)
+            else {
+                crate::commands::util::ewln(io.err, "pip: show requires one package name");
+                return 2;
+            };
+            let key = normalize_package(name);
+            if interp.packages.contains(&key) || interp.packages.contains(name.as_str()) {
+                crate::commands::util::wln(io.out, &format!("Name: {name}"));
+                crate::commands::util::wln(io.out, "Version: 0.0.0");
+                0
+            } else {
+                crate::commands::util::ewln(
+                    io.err,
+                    &format!("WARNING: Package(s) not found: {name}"),
+                );
+                1
             }
+        }
+        "--help" | "-h" | "" => {
+            crate::commands::util::wln(io.out, "usage: pip {install,list,freeze,show} [OPTIONS]");
             0
         }
-        _ => 0, // uninstall / download / config / wheel / cache → benign success
+        _ => {
+            interp.note_unsupported(&format!("pip:{subcommand}"));
+            crate::commands::util::ewln(
+                io.err,
+                &format!("pip: unsupported command '{subcommand}'"),
+            );
+            2
+        }
     }
 }
 
-/// Parse the token stream after `install` and register each concrete package. Handles version
-/// specifiers (`pkg==1.2`, `"pkg>=1"`), extras (`pkg[all]`), `-r requirements.txt`, and the
-/// common flags (skipping the values of value-taking ones). Shared by pip/conda/uv.
-pub fn register_install_args(interp: &mut Interp, args: &[String]) {
-    // flags that consume the following token as a value (and aren't packages)
-    const VALUE_FLAGS: &[&str] = &[
-        "-i",
-        "--index-url",
-        "--extra-index-url",
-        "-f",
-        "--find-links",
-        "-c",
-        "--constraint",
-        "-t",
-        "--target",
-        "-p",
-        "--python",
-        "--prefix",
-        "--root",
-        "--platform",
-        "--abi",
-        "--implementation",
-        "--cache-dir",
-        "--no-binary",
-        "--only-binary",
+/// Validate package arguments completely, then activate every requested bundled package.
+pub(crate) fn install_args(interp: &mut Interp, args: &[String]) -> Result<(), String> {
+    let request = resolve_install_args(interp, args)?;
+    install_packages(interp, &request.packages);
+    Ok(())
+}
+
+/// A validated offline install request, including raw direct specs for uv project metadata.
+pub(crate) struct InstallRequest {
+    pub packages: Vec<String>,
+    pub direct_specs: Vec<String>,
+}
+
+/// Resolve package arguments without changing interpreter state.
+pub(crate) fn resolve_install_args(
+    interp: &Interp,
+    args: &[String],
+) -> Result<InstallRequest, String> {
+    #[derive(Clone, Copy)]
+    enum Key {
+        Requirement,
+        Quiet,
+        NoDeps,
+        DisableVersionCheck,
+    }
+    const OPTIONS: &[OptionSpec<Key>] = &[
+        OptionSpec::required(Key::Requirement, Some('r'), Some("requirement")),
+        OptionSpec::flag(Key::Quiet, Some('q'), Some("quiet")),
+        OptionSpec::flag(Key::NoDeps, None, Some("no-deps")),
+        OptionSpec::flag(
+            Key::DisableVersionCheck,
+            None,
+            Some("disable-pip-version-check"),
+        ),
     ];
-    let mut i = 0;
-    let mut seen_sub = false;
-    while i < args.len() {
-        let a = &args[i];
-        if a == "install" || a == "add" {
-            seen_sub = true;
-            i += 1;
+    let parsed = parse_options(args, OPTIONS)?;
+    let mut packages = resolve_package_specs(&parsed.operands)?;
+    for option in parsed.options {
+        match option.key {
+            Key::Requirement => packages.extend(resolve_requirements_file(
+                interp,
+                &option.value.expect("required option value"),
+            )?),
+            Key::Quiet | Key::NoDeps | Key::DisableVersionCheck => {}
+        }
+    }
+    if packages.is_empty() {
+        return Err("no packages specified".to_string());
+    }
+    Ok(InstallRequest {
+        packages,
+        direct_specs: parsed.operands,
+    })
+}
+
+/// Resolve a requirements file without changing interpreter state.
+pub(crate) fn resolve_requirements_file(
+    interp: &Interp,
+    file: &str,
+) -> Result<Vec<String>, String> {
+    let source = interp
+        .vfs
+        .read_string(&interp.cwd, file)
+        .map_err(|error| format!("cannot read requirements file '{file}': {error}"))?;
+    let mut packages = Vec::new();
+    for line in source.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
             continue;
         }
-        if a == "-r" || a == "--requirement" {
-            if let Some(file) = args.get(i + 1) {
-                register_requirements_file(interp, file);
-            }
-            i += 2;
-            continue;
+        if line.starts_with('-') {
+            return Err(format!("unsupported requirement option '{line}'"));
         }
-        if VALUE_FLAGS.contains(&a.as_str()) {
-            i += 2;
-            continue;
-        }
-        if a.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        if !seen_sub {
-            // token before the subcommand (e.g. a `pip`-as-arg) — skip until we see install/add
-            i += 1;
-            continue;
-        }
-        // a package spec (or a local path / VCS URL we can't model — skip those)
-        if a.starts_with("git+")
-            || a.contains("://")
-            || a.starts_with('.')
-            || a.ends_with(".whl")
-            || a.ends_with(".tar.gz")
+        packages.extend(resolve_package_specs(&[line.to_string()])?);
+    }
+    Ok(packages)
+}
+
+/// Resolve distribution specifications against the Python runtime's bundled distribution table.
+pub(crate) fn resolve_package_specs(specs: &[String]) -> Result<Vec<String>, String> {
+    let mut packages = Vec::with_capacity(specs.len());
+    for spec in specs {
+        if spec.starts_with("git+")
+            || spec.contains("://")
+            || spec.starts_with('.')
+            || spec.ends_with(".whl")
+            || spec.ends_with(".tar.gz")
         {
-            i += 1;
-            continue;
+            return Err(format!("unsupported package source '{spec}'"));
         }
-        if let Some(name) = package_name_of(a) {
-            interp.install_package(&name);
+        let Some(name) = package_name_of(spec) else {
+            return Err(format!("invalid package specification '{spec}'"));
+        };
+        if !crate::python::is_bundled_distribution(&name) {
+            return Err(format!("package '{name}' is not bundled"));
         }
-        i += 1;
+        packages.push(name);
+    }
+    Ok(packages)
+}
+
+/// Activate package names that have already passed bundled-distribution validation.
+pub(crate) fn install_packages(interp: &mut Interp, packages: &[String]) {
+    for name in packages {
+        interp.install_package(name);
     }
 }
 
-/// Read a requirements file from the VFS and register each requirement line.
-pub fn register_requirements_file(interp: &mut Interp, file: &str) {
-    if let Ok(src) = interp.vfs.read_string(&interp.cwd, file) {
-        for line in src.lines() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() || line.starts_with('-') {
-                continue;
-            }
-            if let Some(name) = package_name_of(line) {
-                interp.install_package(&name);
-            }
-        }
-    }
-}
-
-/// Strip a requirement spec down to the *import* name we register. Returns None for things we
-/// can't map to an importable module (URLs, empties).
-pub fn package_name_of(spec: &str) -> Option<String> {
-    let s = spec.trim().trim_matches('"').trim_matches('\'');
-    if s.is_empty() || s.contains("://") {
+/// Strip a requirement spec down to the import name registered by shellsim.
+fn package_name_of(spec: &str) -> Option<String> {
+    let spec = spec.trim().trim_matches('"').trim_matches('\'');
+    if spec.is_empty() || spec.contains("://") {
         return None;
     }
-    // cut at the first version operator / extras bracket / whitespace / semicolon (markers)
-    let end = s
+    let end = spec
         .find(['=', '<', '>', '!', '~', '[', ' ', ';', '@'])
-        .unwrap_or(s.len());
-    let dist = &s[..end];
-    if dist.is_empty() {
-        return None;
-    }
-    Some(normalize_pkg(dist))
+        .unwrap_or(spec.len());
+    let distribution = &spec[..end];
+    (!distribution.is_empty()).then(|| normalize_package(distribution))
 }
 
-/// Map a PyPI *distribution* name to the *import* name our libraries register under, lowercased.
-fn normalize_pkg(dist: &str) -> String {
-    let d = dist.trim().to_lowercase().replace('_', "-");
-    match d.as_str() {
-        "scikit-learn" => "sklearn",
-        "pyyaml" => "yaml",
-        "pillow" => "PIL",
-        "beautifulsoup4" => "bs4",
-        "opencv-python" | "opencv-python-headless" => "cv2",
-        "python-dateutil" => "dateutil",
-        "msgpack-python" => "msgpack",
-        _ => return d.replace('-', "_"),
-    }
-    .to_string()
+fn normalize_package(distribution: &str) -> String {
+    distribution.trim().to_lowercase().replace('-', "_")
 }

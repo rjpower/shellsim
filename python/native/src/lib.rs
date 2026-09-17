@@ -35,7 +35,7 @@ struct RunMetadata {
     dropped_unsupported: u64,
     commands: Vec<String>,
     dropped_commands: u64,
-    noop_commands: Vec<String>,
+    unsupported_commands: Vec<String>,
     partial_commands: Vec<String>,
     invocations: Vec<InvocationEvent>,
     dropped_invocations: u64,
@@ -208,7 +208,7 @@ fn run_action(
             .cmd_trace
             .dropped()
             .saturating_sub(dropped_commands_start),
-        noop_commands: invocation_names(&invocations, CommandTrust::NoOp),
+        unsupported_commands: invocation_names(&invocations, CommandTrust::Unsupported),
         partial_commands: invocation_names(&invocations, CommandTrust::Partial),
         invocations,
         dropped_invocations: environment

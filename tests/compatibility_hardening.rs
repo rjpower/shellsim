@@ -3,7 +3,7 @@
 //! These tests favor short agent-shaped shell snippets. They cover both the supported common
 //! path and the explicit failure frontier so unsupported syntax cannot silently look successful.
 
-use shellsim::Environment;
+use shellsim::{CommandTrust, Environment};
 
 fn run(source: &str) -> (i32, Vec<u8>, Vec<u8>) {
     let mut environment = Environment::new();
@@ -18,6 +18,26 @@ fn text(source: &str) -> (i32, String, String) {
         String::from_utf8_lossy(&stdout).into_owned(),
         String::from_utf8_lossy(&stderr).into_owned(),
     )
+}
+
+#[test]
+fn unavailable_binaries_fail_and_remain_queryable() {
+    let mut environment = Environment::new();
+    let (outcome, stdout, stderr) = environment.run_script_capture("npm install package");
+
+    assert_eq!(outcome.exit_status, 127);
+    assert!(stdout.is_empty());
+    assert_eq!(stderr, b"npm: not implemented in shellsim\n");
+    assert_eq!(environment.unsupported.values(), ["npm"]);
+
+    let invocation = environment.invocations.events().pop().unwrap();
+    assert_eq!(invocation.argv, ["npm", "install", "package"]);
+    assert_eq!(invocation.trust, CommandTrust::Unsupported);
+    assert_eq!(invocation.status, Some(127));
+    assert_eq!(
+        invocation.unsupported_reason.as_deref(),
+        Some("not implemented in shellsim")
+    );
 }
 
 #[test]
@@ -89,10 +109,126 @@ fn common_text_options_are_exact_or_explicitly_unsupported() {
     );
     let (status, _, stderr) = text("printf 'a\nb\n' | grep -A1 a");
     assert_eq!(status, 2);
-    assert!(stderr.contains("unimplemented"), "{stderr}");
+    assert!(stderr.contains("unsupported"), "{stderr}");
     let (status, _, stderr) = text("printf data | fold");
+    assert_eq!(status, 127);
+    assert!(stderr.contains("not implemented"), "{stderr}");
+}
+
+#[test]
+fn text_tools_share_option_boundaries_and_cover_common_forms() {
+    for command in ["grep", "sed", "sort", "jq"] {
+        let (status, stdout, stderr) = text(&format!("{command} --help"));
+        assert_eq!(status, 0, "{command}: {stderr}");
+        assert!(stdout.starts_with("usage:"), "{command}: {stdout}");
+        assert!(stderr.is_empty(), "{command}: {stderr}");
+    }
+    assert_eq!(
+        text("printf 'a+\\naa\\n' | grep '^a+$'; printf 'a+\\naa\\n' | grep -E '^a+$'"),
+        (0, "a+\naa\n".into(), String::new())
+    );
+    assert_eq!(
+        text("printf 'a+\\naa\\n' | sed 's/a+/basic/'; printf 'aa\\n' | sed -E 's/a+/extended/'"),
+        (0, "basic\naa\nextended\n".into(), String::new())
+    );
+    assert_eq!(
+        text("printf 'x:10\\ny:2\\n' | sort -t: -k2n"),
+        (0, "y:2\nx:10\n".into(), String::new())
+    );
+    assert_eq!(
+        text("printf 'aa\\naa extra\\naa\\n' | grep -xm1 aa"),
+        (0, "aa\n".into(), String::new())
+    );
+    assert_eq!(
+        text("printf 'aa\\n' | grep -m0 aa"),
+        (1, String::new(), String::new())
+    );
+    let (status, _, stderr) = text("grep -m nope value");
     assert_eq!(status, 2);
-    assert!(stderr.contains("unimplemented"), "{stderr}");
+    assert!(stderr.contains("invalid max count"), "{stderr}");
+    for source in ["grep --wat", "sed --wat", "sort --wat", "jq -S ."] {
+        let (status, _, stderr) = text(source);
+        assert_eq!(status, 2, "{source}: {stderr}");
+        assert!(stderr.contains("unsupported option"), "{source}: {stderr}");
+    }
+    for source in ["sed 's/a'", "sed 's/a/b/z'"] {
+        let (status, _, stderr) = text(source);
+        assert_eq!(status, 2, "{source}: {stderr}");
+        assert!(
+            stderr.contains("invalid substitution"),
+            "{source}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn package_tools_only_succeed_for_effects_shellsim_can_supply() {
+    assert_eq!(
+        text("pip install numpy; pip list"),
+        (0, "numpy 0.0.0\n".into(), String::new())
+    );
+    assert_eq!(
+        text("python -m pip install numpy; python -m pip freeze"),
+        (0, "numpy==0.0.0\n".into(), String::new())
+    );
+
+    let mut environment = Environment::new();
+    let (outcome, _, stderr) = environment.run_script_capture("pip install requests");
+    assert_eq!(outcome.exit_status, 1);
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("not bundled"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(environment
+        .unsupported
+        .values()
+        .iter()
+        .any(|feature| feature.contains("requests")));
+
+    let (status, _, stderr) = text("uv remove numpy");
+    assert_eq!(status, 2);
+    assert!(stderr.contains("unsupported command"), "{stderr}");
+
+    let (status, stdout, stderr) =
+        text("uv run --with numpy python -c 'print(\"should not run\")'");
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("unsupported launcher option"), "{stderr}");
+
+    let (status, _, stderr) = text("pip install --target /tmp/site numpy");
+    assert_eq!(status, 1);
+    assert!(stderr.contains("unsupported option"), "{stderr}");
+}
+
+#[test]
+fn uv_sync_validates_all_dependencies_before_mutating_package_state() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write(
+            "/work",
+            "pyproject.toml",
+            b"[project]\ndependencies = [\"numpy\"]\n",
+            0o644,
+        )
+        .unwrap();
+    environment
+        .vfs
+        .write("/work", "requirements.txt", b"requests\n", 0o644)
+        .unwrap();
+
+    let (outcome, _, stderr) = environment.run_script_capture("cd /work; uv sync");
+    assert_eq!(outcome.exit_status, 1);
+    assert!(String::from_utf8_lossy(&stderr).contains("not bundled"));
+    assert!(!environment.packages.contains("numpy"));
+}
+
+#[test]
+fn uv_sync_requires_project_metadata() {
+    let (status, _, stderr) = text("uv sync");
+    assert_eq!(status, 1);
+    assert!(stderr.contains("no pyproject.toml or requirements.txt found"));
 }
 
 #[test]
@@ -137,9 +273,14 @@ fn system_queries_compose_options_and_reject_unknown_ones() {
             String::new()
         )
     );
-    for source in ["uname -Q", "df -Q", "yes", "readonly value=one"] {
+    for source in ["uname -Q", "df -Q"] {
         let (status, _, stderr) = text(source);
         assert_eq!(status, 2, "{source}: {stderr}");
         assert!(stderr.contains("unimplemented"), "{source}: {stderr}");
+    }
+    for source in ["yes", "readonly value=one"] {
+        let (status, _, stderr) = text(source);
+        assert_eq!(status, 127, "{source}: {stderr}");
+        assert!(stderr.contains("not implemented"), "{source}: {stderr}");
     }
 }

@@ -30,8 +30,16 @@ The current environment includes:
   third-party module surface.
 
 Python is source-compatible where supported, not ABI-compatible with CPython. Native extensions,
-package installation, compilers, and arbitrary machine code are outside the simulation boundary.
-See [Python in shellsim](docs/python.md) for the current contract.
+network package installation, compilers, and arbitrary machine code are outside the simulation
+boundary. The simulated `pip` and `uv` paths can activate packages already bundled with
+shellsim; they reject other packages instead of fetching them. See
+[Python in shellsim](docs/python.md) for the current contract.
+
+Common utilities accept clustered short options, long options, option values, and `--` through a
+shared parser. Each utility declares its supported options. For example, `grep` supports ordinary
+basic and extended regular expressions, recursive search, fixed strings, word and whole-line
+matching, counts, line numbers, match limits, and common output controls. Unsupported options exit
+nonzero with a direct diagnostic.
 
 ## Install and run
 
@@ -57,6 +65,8 @@ cargo build --release
 
 Limits accept `k`, `m`, and `g` binary suffixes. `eval` emits a structured result containing the
 exit status, stdout and stderr, resource use, command trace, and unsupported behavior.
+`unsupported_commands` lists recognized or attempted commands that crossed the capability
+boundary; invocation records include trust, status, and the unsupported reason.
 
 The Python API exposes fresh and persistent environments:
 

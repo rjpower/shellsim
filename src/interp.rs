@@ -1248,15 +1248,6 @@ impl Environment {
             return;
         }
         self.packages.insert(name.to_string());
-        let deps: &[&str] = match name {
-            "pandas" => &["numpy"],
-            "scipy" => &["numpy"],
-            "sklearn" => &["numpy", "scipy"],
-            _ => &[],
-        };
-        for d in deps {
-            self.packages.insert((*d).to_string());
-        }
     }
 
     /// Make the wall-clock/VFS boundary explicit immediately before a filesystem effect.

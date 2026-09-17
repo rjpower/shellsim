@@ -31,7 +31,7 @@ pub struct Expectation {
     #[serde(default)]
     pub unsupported: Option<Vec<String>>,
     #[serde(default)]
-    pub noop_commands: Option<Vec<String>>,
+    pub unsupported_commands: Option<Vec<String>>,
     #[serde(default)]
     pub partial_commands: Option<Vec<String>>,
     #[serde(default)]
@@ -213,9 +213,9 @@ pub fn check_expectation(expected: &Expectation, response: &HarnessResponse) -> 
             execute.map(|result| &result.unsupported),
         ),
         (
-            "noop_commands",
-            expected.noop_commands.as_ref(),
-            execute.map(|result| &result.noop_commands),
+            "unsupported_commands",
+            expected.unsupported_commands.as_ref(),
+            execute.map(|result| &result.unsupported_commands),
         ),
         (
             "partial_commands",
@@ -304,7 +304,7 @@ pub fn strict_response_failures(sequence: usize, response: &HarnessResponse) -> 
         .iter()
         .any(|event| event.trust != CommandTrust::Real)
     {
-        failures.push(format!("{prefix} used a partial or no-op command"));
+        failures.push(format!("{prefix} used a partial or unsupported command"));
     }
     if network.iter().any(|request| !request.matched) {
         failures.push(format!("{prefix} made an unmatched network request"));

@@ -213,7 +213,7 @@ pub struct ExecuteResult {
     pub dropped_commands: u64,
     pub unsupported: Vec<String>,
     pub dropped_unsupported: u64,
-    pub noop_commands: Vec<String>,
+    pub unsupported_commands: Vec<String>,
     pub partial_commands: Vec<String>,
     pub invocations: Vec<InvocationEvent>,
     pub dropped_invocations: u64,
@@ -790,7 +790,7 @@ impl HarnessSession {
             .outcome
             .clone()
             .ok_or_else(|| format!("action {action_id} completed without an outcome"))?;
-        let noop_commands = invocation_names(&action.invocations, CommandTrust::NoOp);
+        let unsupported_commands = invocation_names(&action.invocations, CommandTrust::Unsupported);
         let partial_commands = invocation_names(&action.invocations, CommandTrust::Partial);
         Ok(HarnessResult::Execute(ExecuteResult {
             outcome,
@@ -800,7 +800,7 @@ impl HarnessSession {
             dropped_commands: action.dropped_commands,
             unsupported: action.unsupported,
             dropped_unsupported: action.dropped_unsupported,
-            noop_commands,
+            unsupported_commands,
             partial_commands,
             invocations: action.invocations,
             dropped_invocations: action.dropped_invocations,

@@ -33,10 +33,17 @@ Commands are Rust implementations over a narrow `CommandContext` and explicit `I
 fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
 ```
 
-Each command is registered as `Real`, `Partial`, or `NoOp`. Partial and no-op invocations remain
-visible in evaluation telemetry. Unknown options and unsupported behavior must fail explicitly;
-they must never invoke a host binary. Native compilation and arbitrary executable formats remain
-outside the model because running emitted machine code would bypass every capability boundary.
+Each command is registered as `Real`, `Partial`, or `Unsupported`. Partial and unsupported
+invocations remain visible in evaluation telemetry. Registered unavailable commands share one
+implementation: they exit 127, write `<command>: not implemented in shellsim`, and appear in
+`unsupported`, `unsupported_commands`, and the invocation trace. Unknown options and unsupported
+behavior must fail explicitly; they must never invoke a host binary. Native compilation and
+arbitrary executable formats remain outside the model because running emitted machine code would
+bypass every capability boundary.
+
+Text utilities use a shared option scanner for short clusters, long options, values, and the `--`
+operand boundary. The scanner only recognizes command-local option tables. It has no permissive
+fallback, so an accepted option always has an implementation in that command.
 
 The standard for a supported command is ordinary usefulness, not exhaustive historical
 compatibility. Implement the common behavior as a coherent whole, reject the remaining frontier,
