@@ -34,17 +34,70 @@ pub fn int_value(heap: &Heap, value: &Value) -> Option<i64> {
     }
 }
 
-pub fn string_value(heap: &Heap, value: &Value) -> Result<Option<String>, String> {
+/// A Python string exposed without cloning an arena-backed payload.
+///
+/// Short inline strings own their decoded storage because their bytes live inside [`Value`]. Long
+/// strings borrow the arena allocation and retain its cached ASCII property.
+#[derive(Debug)]
+pub struct StringRef<'a> {
+    storage: StringStorage<'a>,
+    is_ascii: bool,
+}
+
+#[derive(Debug)]
+enum StringStorage<'a> {
+    Inline(String),
+    Heap(&'a str),
+}
+
+impl StringRef<'_> {
+    /// Return the UTF-8 contents.
+    pub fn as_str(&self) -> &str {
+        match &self.storage {
+            StringStorage::Inline(value) => value,
+            StringStorage::Heap(value) => value,
+        }
+    }
+
+    /// Return the UTF-8 storage size used for resource accounting.
+    pub fn byte_len(&self) -> usize {
+        self.as_str().len()
+    }
+
+    /// Return whether every code point occupies one byte.
+    pub fn is_ascii(&self) -> bool {
+        self.is_ascii
+    }
+}
+
+/// Borrow a Python string when it is arena-backed.
+///
+/// Consumers that only inspect a string should prefer this interface over [`string_value`], which
+/// returns an owned copy for APIs that must outlive the heap borrow.
+pub fn string_ref<'a>(heap: &'a Heap, value: &Value) -> Result<Option<StringRef<'a>>, String> {
     if let Some(value) = value.inline_string_value() {
-        return Ok(Some(value));
+        let is_ascii = value.is_ascii();
+        return Ok(Some(StringRef {
+            storage: StringStorage::Inline(value),
+            is_ascii,
+        }));
     }
     let Some(id) = value.object_id() else {
         return Ok(None);
     };
     Ok(match heap.get(id)? {
-        Object::String(value) => Some(value.clone()),
+        Object::String(value) => Some(StringRef {
+            storage: StringStorage::Heap(value),
+            is_ascii: heap
+                .string_is_ascii(id)?
+                .expect("string payloads cache their ASCII property"),
+        }),
         _ => None,
     })
+}
+
+pub fn string_value(heap: &Heap, value: &Value) -> Result<Option<String>, String> {
+    Ok(string_ref(heap, value)?.map(|value| value.as_str().to_owned()))
 }
 
 /// Return one Python string code point without materializing the complete string as characters.
@@ -52,53 +105,25 @@ pub fn string_value(heap: &Heap, value: &Value) -> Result<Option<String>, String
 /// ASCII strings, including the large text buffers used by the frozen I/O layer, support direct
 /// byte indexing. Non-ASCII strings still index by Unicode code point to match Python semantics.
 pub fn string_index(heap: &Heap, owner: &Value, index: &Value) -> Result<Option<char>, String> {
-    let character = |text: &str| {
-        let index = index.as_int().ok_or("string index must be an integer")?;
-        indexed_char(text, index, text.is_ascii())
-            .ok_or_else(|| "string index out of range".to_string())
-    };
-
-    if let Some(text) = owner.inline_string_value() {
-        return character(&text).map(Some);
-    }
-    let Some(id) = owner.object_id() else {
+    let Some(text) = string_ref(heap, owner)? else {
         return Ok(None);
     };
-    match heap.get(id)? {
-        Object::String(text) => {
-            let index = index.as_int().ok_or("string index must be an integer")?;
-            let is_ascii = heap
-                .string_is_ascii(id)?
-                .expect("string payloads cache their ASCII property");
-            indexed_char(text, index, is_ascii)
-                .ok_or_else(|| "string index out of range".to_string())
-                .map(Some)
-        }
-        _ => Ok(None),
-    }
+    let index = index.as_int().ok_or("string index must be an integer")?;
+    indexed_char(text.as_str(), index, text.is_ascii())
+        .ok_or_else(|| "string index out of range".to_string())
+        .map(Some)
 }
 
 /// Return a string's Python length without cloning its arena payload.
 pub fn string_length(heap: &Heap, value: &Value) -> Result<Option<usize>, String> {
-    if let Some(text) = value.inline_string_value() {
-        return Ok(Some(text.chars().count()));
-    }
-    let Some(id) = value.object_id() else {
+    let Some(text) = string_ref(heap, value)? else {
         return Ok(None);
     };
-    match heap.get(id)? {
-        Object::String(text) => Ok(Some(
-            if heap
-                .string_is_ascii(id)?
-                .expect("string payloads cache their ASCII property")
-            {
-                text.len()
-            } else {
-                text.chars().count()
-            },
-        )),
-        _ => Ok(None),
-    }
+    Ok(Some(if text.is_ascii() {
+        text.byte_len()
+    } else {
+        text.as_str().chars().count()
+    }))
 }
 
 fn indexed_char(value: &str, index: i64, is_ascii: bool) -> Option<char> {
@@ -802,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn string_index_handles_inline_heap_ascii_and_unicode_values() {
+    fn string_protocols_handle_inline_heap_ascii_and_unicode_values() {
         let mut heap = Heap::default();
         let mut resources = Resources::new(Limits::unlimited());
         let inline = Value::inline_string("café").unwrap();
@@ -813,6 +838,12 @@ mod tests {
             .allocate(Object::String("☃ snow".into()), &mut resources)
             .unwrap();
 
+        let inline_ref = string_ref(&heap, &inline).unwrap().unwrap();
+        assert_eq!(inline_ref.as_str(), "café");
+        assert!(!inline_ref.is_ascii());
+        let ascii_ref = string_ref(&heap, &ascii).unwrap().unwrap();
+        assert_eq!(ascii_ref.as_str(), "a long ASCII string");
+        assert!(ascii_ref.is_ascii());
         assert_eq!(
             string_index(&heap, &inline, &Value::Int(3)).unwrap(),
             Some('é')

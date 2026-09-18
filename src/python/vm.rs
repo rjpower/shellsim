@@ -2018,11 +2018,12 @@ impl<'a> Vm<'a> {
             self.stack.push(value);
             return Ok(());
         }
-        let value = if let Some(text) = protocol::string_value(&self.state.heap, &owner)? {
-            let characters = text.chars().collect::<Vec<_>>();
-            let indices = slice_indices(characters.len(), start, stop, step)?;
-            self.charge_cpu(u64::try_from(indices.len()).unwrap_or(u64::MAX))?;
-            self.allocate_string(indices.into_iter().map(|index| characters[index]).collect())?
+        let string_slice = protocol::string_ref(&self.state.heap, &owner)?
+            .map(|text| select_string_slice(text.as_str(), text.is_ascii(), start, stop, step))
+            .transpose()?;
+        let value = if let Some((selected, units)) = string_slice {
+            self.charge_cpu(units)?;
+            self.allocate_string(selected)?
         } else if let Some(bytes) = protocol::bytes_value(&self.state.heap, &owner)? {
             let indices = slice_indices(bytes.len(), start, stop, step)?;
             self.charge_cpu(u64::try_from(indices.len()).unwrap_or(u64::MAX))?;
@@ -5332,8 +5333,8 @@ impl<'a> Vm<'a> {
         // A host Vec has allocator/capacity overhead that is not represented in the Python heap.
         // Reserve a deliberately generous per-item amount before every push, including string
         // payloads, so repeated materialization cannot grow outside the memory budget.
-        let payload = protocol::string_value(&self.state.heap, &value)?
-            .map_or(0, |text| text.len().saturating_mul(2));
+        let payload = protocol::string_ref(&self.state.heap, &value)?
+            .map_or(0, |text| text.byte_len().saturating_mul(2));
         self.reserve_result(64usize.saturating_add(payload))?;
         self.charge_cpu(1)?;
         values.push(value);
@@ -7116,6 +7117,38 @@ fn slice_indices(
             .ok_or("slice index arithmetic overflow")?;
     }
     Ok(indices)
+}
+
+fn select_string_slice(
+    value: &str,
+    is_ascii: bool,
+    start: Option<i64>,
+    stop: Option<i64>,
+    step: Option<i64>,
+) -> Result<(String, u64), String> {
+    debug_assert_eq!(value.is_ascii(), is_ascii);
+    let characters = (!is_ascii).then(|| value.chars().collect::<Vec<_>>());
+    let length = characters.as_ref().map_or(value.len(), Vec::len);
+    let indices = slice_indices(length, start, stop, step)?;
+    let units = u64::try_from(indices.len()).unwrap_or(u64::MAX);
+    let selected = if is_ascii && step.unwrap_or(1) == 1 {
+        match (indices.first(), indices.last()) {
+            (Some(first), Some(last)) => value
+                .get(*first..last.saturating_add(1))
+                .expect("ASCII slice indices are byte boundaries")
+                .to_owned(),
+            _ => String::new(),
+        }
+    } else if is_ascii {
+        indices
+            .into_iter()
+            .map(|index| char::from(value.as_bytes()[index]))
+            .collect()
+    } else {
+        let characters = characters.expect("non-ASCII slices materialize code points");
+        indices.into_iter().map(|index| characters[index]).collect()
+    };
+    Ok((selected, units))
 }
 
 fn expect_arity(arguments: &[Value], minimum: usize, maximum: usize) -> Result<(), String> {
