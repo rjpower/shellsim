@@ -1909,3 +1909,65 @@ fn a_conflict_can_be_settled_by_taking_one_side() {
     assert_eq!(run(&mut env, "git add f; git commit -qm merged").0, 0);
     assert_eq!(run(&mut env, "git status --short").1, "");
 }
+
+#[test]
+fn a_replay_leaves_other_staged_work_alone() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a", b"a\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    assert_eq!(run(&mut env, "git switch -qc side").0, 0);
+    env.vfs.put_file("/s", b"s\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm side").0, 0);
+    assert_eq!(run(&mut env, "git switch -q main").0, 0);
+    env.vfs
+        .put_file("/keep", b"keep\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add keep").0, 0);
+
+    // Committing the replay would fold the staged file into it, so Git refuses.
+    let refused = run(&mut env, "git cherry-pick side");
+    assert_eq!(refused.0, 128);
+    assert!(refused.2.contains("would be overwritten"), "{}", refused.2);
+    assert_eq!(run(&mut env, "git status --short").1, "A  keep\n");
+
+    // `-n` commits nothing, so it goes ahead and leaves the staged file staged.
+    assert_eq!(run(&mut env, "git cherry-pick -n side").0, 0);
+    assert_eq!(run(&mut env, "git status --short").1, "A  keep\nA  s\n");
+    // Nothing is recorded as in progress, so there is nothing to abort.
+    assert_eq!(run(&mut env, "git cherry-pick --abort").0, 128);
+    assert_eq!(run(&mut env, "git status --short").1, "A  keep\nA  s\n");
+}
+
+#[test]
+fn a_merge_commit_names_both_parents_in_the_log() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/f", b"a\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    assert_eq!(run(&mut env, "git switch -qc side").0, 0);
+    env.vfs.put_file("/s", b"s\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm side").0, 0);
+    assert_eq!(run(&mut env, "git switch -q main").0, 0);
+    env.vfs.put_file("/m", b"m\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm main").0, 0);
+    let first = run(&mut env, "git rev-parse --short HEAD")
+        .1
+        .trim()
+        .to_string();
+    let second = run(&mut env, "git rev-parse --short side")
+        .1
+        .trim()
+        .to_string();
+    assert_eq!(run(&mut env, "git merge -m merged side").0, 0);
+
+    assert!(
+        run(&mut env, "git log -1")
+            .1
+            .contains(&format!("Merge: {first} {second}\n")),
+        "{}",
+        run(&mut env, "git log -1").1
+    );
+    // An ordinary commit has no such line.
+    assert!(!run(&mut env, "git log -1 HEAD~1").1.contains("Merge:"));
+}

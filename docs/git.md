@@ -87,8 +87,10 @@ markers show up in a review and `--diff-filter=U` names the path.
 
 `git cherry-pick` and `git revert` run the same three-way merge with different corners: a
 cherry-pick uses the commit's parent as the base and the commit as the incoming side, and a
-revert swaps those two. Both stop at a conflict, both take `--continue` and `--abort`, and
-`-n` leaves the result staged. A cherry-pick keeps the original author; a revert does not.
+revert swaps those two. Both stop at a conflict, both take `--continue` and `--abort`, and both
+want a settled index first because the commit they make would otherwise fold in whatever was
+already staged. `-n` makes no commit, so it goes ahead and leaves other staged work alone. A
+cherry-pick keeps the original author; a revert does not.
 
 `git stash pop` and `git stash apply` merge the entry back the same way, against the commit it was
 taken from, so work committed or edited in the meantime survives. A plain reapplication restores

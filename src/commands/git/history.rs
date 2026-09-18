@@ -484,26 +484,33 @@ fn render_commit_header(
     now: i64,
 ) -> String {
     let identity = format!("{} <{}>", commit.author_name, commit.author_email);
+    // A commit with more than one parent names them, which is how a merge is recognised.
+    let merge = if commit.parents.len() > 1 {
+        let parents: Vec<&str> = commit.parents.iter().map(|id| repo::short(id)).collect();
+        format!("Merge: {}\n", parents.join(" "))
+    } else {
+        String::new()
+    };
     match pretty {
         Pretty::OneLine => format!("{id}{decoration} {}\n", commit.subject()),
         Pretty::AbbreviatedOneLine => {
             format!("{}{decoration} {}\n", repo::short(id), commit.subject())
         }
         Pretty::Short => format!(
-            "commit {id}{decoration}\nAuthor: {identity}\n\n{}",
+            "commit {id}{decoration}\n{merge}Author: {identity}\n\n{}",
             indent(commit.subject())
         ),
         Pretty::Medium => format!(
-            "commit {id}{decoration}\nAuthor: {identity}\nDate:   {}\n\n{}",
+            "commit {id}{decoration}\n{merge}Author: {identity}\nDate:   {}\n\n{}",
             format_date(commit.timestamp),
             indent(&commit.message)
         ),
         Pretty::Full => format!(
-            "commit {id}{decoration}\nAuthor: {identity}\nCommit: {identity}\n\n{}",
+            "commit {id}{decoration}\n{merge}Author: {identity}\nCommit: {identity}\n\n{}",
             indent(&commit.message)
         ),
         Pretty::Fuller => format!(
-            "commit {id}{decoration}\nAuthor:     {identity}\nAuthorDate: {}\nCommit:     {identity}\nCommitDate: {}\n\n{}",
+            "commit {id}{decoration}\n{merge}Author:     {identity}\nAuthorDate: {}\nCommit:     {identity}\nCommitDate: {}\n\n{}",
             format_date(commit.timestamp),
             format_date(commit.timestamp),
             indent(&commit.message)
@@ -2832,11 +2839,18 @@ fn replay_one(
     } else {
         (&parent_tree, &commit_tree)
     };
-    if !blocking_changes(ctx, root, theirs).is_empty() {
+    // Committing the replay would fold anything already staged into it, which is why Git wants
+    // a settled index first. `-n` leaves the commit to the user, so it can go ahead.
+    let staged = repo::load_index(ctx, root).unwrap_or_default();
+    let dirty = !no_commit && staged != head_tree;
+    if dirty || !blocking_changes(ctx, root, theirs).is_empty() {
         io.err.extend_from_slice(
-            format!("error: your local changes would be overwritten by {name}.\n").as_bytes(),
+            format!(
+                "error: your local changes would be overwritten by {name}.\nhint: commit your changes or stash them to proceed.\nfatal: {name} failed\n"
+            )
+            .as_bytes(),
         );
-        return 1;
+        return 128;
     }
     let message = if revert {
         format!(
@@ -2854,7 +2868,18 @@ fn replay_one(
             .extend_from_slice(format!("git {name}: {error}\n").as_bytes());
         return 1;
     }
-    if repo::store_index(ctx, root, &applied).is_err() {
+    // Only the paths the replay touched move in the index; anything else staged is left alone.
+    let mut index = staged;
+    for path in head_tree.keys().chain(applied.keys()) {
+        if head_tree.get(path) == applied.get(path) {
+            continue;
+        }
+        match applied.get(path) {
+            Some(entry) => index.insert(path.clone(), entry.clone()),
+            None => index.remove(path),
+        };
+    }
+    if repo::store_index(ctx, root, &index).is_err() {
         return 1;
     }
     let kind = if revert {
@@ -2881,8 +2906,7 @@ fn replay_one(
         );
     }
     if no_commit {
-        // `-n` leaves the change staged for the user to commit, as Git does.
-        conflict::begin(ctx, root, kind, &id, &message);
+        // `-n` leaves the change staged for the user to commit; Git records nothing in progress.
         return 0;
     }
     if applied == head_tree {
