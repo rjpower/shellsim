@@ -46,14 +46,22 @@ request = Request('https://api.test/items', headers={'X-Test': 'yes'})
 with urlopen(request) as response:
     print(response.status, response.getcode(), response.geturl())
     print(response.headers['content-type'], response.getheader('CONTENT-TYPE'))
-    print(response.read(5), response.readline(), response.read())
+    print(response.read(5), response.readline())
+    buffer = bytearray(b'........')
+    print(response.readinto(buffer), bytes(buffer))
+    print(response.readinto(buffer), bytes(buffer))
+    print(response.readinto(buffer), bytes(buffer))
+    try:
+        response.readinto(b'')
+    except TypeError as error:
+        print(error)
 "#;
 
     assert_eq!(
         run_in(&mut environment, source),
         (
             0,
-            "200 200 https://api.test/items\napplication/json application/json\nb'line ' b'one\\n' b'line two\\n'\n".into(),
+            "200 200 https://api.test/items\napplication/json application/json\nb'line ' b'one\\n'\n8 b'line two'\n1 b'\\nine two'\n0 b'\\nine two'\nreadinto() requires a bytearray\n".into(),
             String::new(),
         )
     );

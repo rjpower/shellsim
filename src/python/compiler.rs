@@ -951,34 +951,6 @@ impl Compiler {
                 self.expression(*index);
                 self.emit(Operation::LoadSubscript, span);
             }
-            ExpressionKind::Slice {
-                value,
-                start,
-                stop,
-                step,
-            } => {
-                self.expression(*value);
-                let has_start = start.is_some();
-                let has_stop = stop.is_some();
-                let has_step = step.is_some();
-                if let Some(start) = start {
-                    self.expression(*start);
-                }
-                if let Some(stop) = stop {
-                    self.expression(*stop);
-                }
-                if let Some(step) = step {
-                    self.expression(*step);
-                }
-                self.emit(
-                    Operation::LoadSlice {
-                        has_start,
-                        has_stop,
-                        has_step,
-                    },
-                    span,
-                );
-            }
             ExpressionKind::SliceValue { start, stop, step } => {
                 let has_start = start.is_some();
                 let has_stop = stop.is_some();

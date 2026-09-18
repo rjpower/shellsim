@@ -12,6 +12,7 @@ use super::super::native::{
     PySequence, PyString, PyValue, PyValueCast, ValueDef, ValueKindDef, ValueKindSlots,
 };
 use super::super::number::{PyNumber, PyNumber as Number};
+use super::super::slice::SlicePlan;
 use super::super::Value;
 
 const MAX_ARRAY_RANK: usize = 64;
@@ -1942,82 +1943,12 @@ pub(crate) fn slot_get_item(
     Ok(Some(get_item(runtime, array, index)?))
 }
 
-pub(crate) fn slot_slice(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-    start: Option<i64>,
-    stop: Option<i64>,
-    step: Option<i64>,
-) -> PyResult<Option<PyValue>> {
-    let array = value.cast::<PyArray>(runtime)?;
-    let (mut layout, _) = runtime.array_layout(array)?;
-    let Some(&length) = layout.shape.first() else {
-        return Err(PyError::value_error("cannot slice a 0-d array"));
-    };
-    let (first, count, step) = slice_plan(length, start, stop, step)?;
-    if count != 0 {
-        layout.offset = layout
-            .offset
-            .checked_add(
-                layout.strides[0]
-                    .checked_mul(first)
-                    .ok_or_else(|| PyError::value_error("array offset overflow"))?,
-            )
-            .ok_or_else(|| PyError::value_error("array offset overflow"))?;
-    }
-    layout.shape[0] = count;
-    layout.strides[0] = layout.strides[0]
-        .checked_mul(step)
-        .ok_or_else(|| PyError::value_error("array stride overflow"))?;
-    runtime.new_array_view(array, layout).map(Some)
-}
-
-fn slice_plan(
-    length: usize,
-    start: Option<i64>,
-    stop: Option<i64>,
-    step: Option<i64>,
-) -> PyResult<(isize, usize, isize)> {
-    let length =
-        i64::try_from(length).map_err(|_| PyError::overflow_error("array dimension overflow"))?;
-    let step = step.unwrap_or(1);
-    if step == 0 {
-        return Err(PyError::value_error("slice step cannot be zero"));
-    }
-    let normalize = |value: i64, minimum: i64, maximum: i64| {
-        let value = if value < 0 {
-            value.saturating_add(length)
-        } else {
-            value
-        };
-        value.clamp(minimum, maximum)
-    };
-    let (first, stop) = if step > 0 {
-        (
-            start.map_or(0, |value| normalize(value, 0, length)),
-            stop.map_or(length, |value| normalize(value, 0, length)),
-        )
-    } else {
-        (
-            start.map_or(length - 1, |value| normalize(value, -1, length - 1)),
-            stop.map_or(-1, |value| normalize(value, -1, length - 1)),
-        )
-    };
-    let count = if (step > 0 && first < stop) || (step < 0 && first > stop) {
-        usize::try_from((stop - first - step.signum()) / step + 1)
-            .map_err(|_| PyError::value_error("slice length overflow"))?
-    } else {
-        0
-    };
-    Ok((
-        isize::try_from(first).map_err(|_| PyError::value_error("slice offset overflow"))?,
-        count,
-        isize::try_from(step).map_err(|_| PyError::value_error("slice stride overflow"))?,
-    ))
-}
-
 fn get_item(runtime: &mut dyn PyRuntime, array: PyArray, index: PyValue) -> PyResult<PyValue> {
     let (layout, _) = runtime.array_layout(array)?;
+    if runtime.slice_parts(&index).is_some() {
+        let layout = basic_slice_layout(runtime, &layout, &[index])?;
+        return runtime.new_array_view(array, layout);
+    }
     if runtime.kind(&index)? == PyKind::Tuple {
         let raw = index.cast::<PySequence>(runtime)?.items(runtime)?;
         if raw.iter().any(|value| runtime.slice_parts(value).is_some()) {
@@ -2231,20 +2162,21 @@ fn basic_slice_layout(
     let mut strides = Vec::with_capacity(layout.strides.len());
     for (axis, component) in components.iter().enumerate() {
         if let Some((start, stop, step)) = runtime.slice_parts(component) {
-            let (first, count, step) = slice_plan(layout.shape[axis], start, stop, step)?;
-            if count != 0 {
+            let plan = SlicePlan::new(layout.shape[axis], start, stop, step)
+                .map_err(PyError::value_error)?;
+            if plan.len() != 0 {
                 offset = offset
                     .checked_add(
                         layout.strides[axis]
-                            .checked_mul(first)
+                            .checked_mul(plan.first())
                             .ok_or_else(|| PyError::value_error("array offset overflow"))?,
                     )
                     .ok_or_else(|| PyError::value_error("array offset overflow"))?;
             }
-            shape.push(count);
+            shape.push(plan.len());
             strides.push(
                 layout.strides[axis]
-                    .checked_mul(step)
+                    .checked_mul(plan.step())
                     .ok_or_else(|| PyError::value_error("array stride overflow"))?,
             );
         } else {

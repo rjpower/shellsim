@@ -16,6 +16,7 @@ use super::super::native::{
     PyValueCast,
 };
 use super::super::number::PyNumber;
+use super::super::slice::SlicePlan;
 
 static BUILTINS: &[FunctionDef] = &[
     builtin("map", builtin_map),
@@ -470,16 +471,7 @@ fn bytearray_extend(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallAr
     args.expect_positional("bytearray.extend", 1, 1)?;
     args.reject_keywords("bytearray.extend")?;
     let array = receiver.cast::<PyByteArray>(runtime)?;
-    let iterator = runtime.iterator(args.positional()[0])?;
-    let mut additions = Vec::new();
-    while let Some(value) = runtime.iterator_next(iterator)? {
-        additions.push(
-            runtime
-                .int_value(&value)
-                .and_then(|value| u8::try_from(value).ok())
-                .ok_or_else(|| PyError::value_error("byte must be in range(0, 256)"))?,
-        );
-    }
+    let additions = collect_bytes(runtime, args.positional()[0])?;
     let mut items = runtime.bytearray_items(array)?;
     let length = items
         .len()
@@ -489,6 +481,32 @@ fn bytearray_extend(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallAr
     items.extend(additions);
     runtime.replace_bytearray_items(array, items)?;
     Ok(PyValue::None)
+}
+
+fn collect_bytes(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<u8>> {
+    let iterator = runtime.iterator(value)?;
+    let mut bytes = Vec::new();
+    while let Some(value) = runtime.iterator_next(iterator)? {
+        let byte = runtime
+            .int_value(&value)
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or_else(|| PyError::value_error("byte must be in range(0, 256)"))?;
+        runtime.reserve_memory(1)?;
+        runtime.charge_cpu(1)?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
+fn collect_values(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<PyValue>> {
+    let iterator = runtime.iterator(value)?;
+    let mut values = Vec::new();
+    while let Some(value) = runtime.iterator_next(iterator)? {
+        runtime.reserve_memory(std::mem::size_of::<PyValue>())?;
+        runtime.charge_cpu(1)?;
+        values.push(value);
+    }
+    Ok(values)
 }
 
 enum StripKind {
@@ -1845,16 +1863,41 @@ pub(crate) fn slot_bytearray_set_item(
     value: PyValue,
 ) -> PyResult<Option<PyValue>> {
     let array = owner.cast::<PyByteArray>(runtime)?;
-    let Some(index) = runtime.int_value(&index) else {
-        return Ok(None);
-    };
-    let value = runtime
-        .int_value(&value)
-        .and_then(|value| u8::try_from(value).ok())
-        .ok_or_else(|| PyError::value_error("byte must be in range(0, 256)"))?;
     let mut items = runtime.bytearray_items(array)?;
-    let index = byte_index(index, items.len())?;
-    items[index] = value;
+    if let Some(index) = runtime.int_value(&index) {
+        let value = runtime
+            .int_value(&value)
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or_else(|| PyError::value_error("byte must be in range(0, 256)"))?;
+        let index = byte_index(index, items.len())?;
+        items[index] = value;
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+        let replacement = collect_bytes(runtime, value)?;
+        let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
+        assign_slice(runtime, &mut items, plan, replacement)?;
+    } else {
+        return Ok(None);
+    }
+    runtime.replace_bytearray_items(array, items)?;
+    Ok(Some(PyValue::None))
+}
+
+pub(crate) fn slot_bytearray_delete_item(
+    runtime: &mut dyn PyRuntime,
+    owner: PyValue,
+    index: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let array = owner.cast::<PyByteArray>(runtime)?;
+    let mut items = runtime.bytearray_items(array)?;
+    if let Some(index) = runtime.int_value(&index) {
+        let index = byte_index(index, items.len())?;
+        items.remove(index);
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+        let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
+        delete_slice(runtime, &mut items, plan)?;
+    } else {
+        return Ok(None);
+    }
     runtime.replace_bytearray_items(array, items)?;
     Ok(Some(PyValue::None))
 }
@@ -1938,22 +1981,114 @@ pub(crate) fn slot_list_delete_item(
     index: PyValue,
 ) -> PyResult<Option<PyValue>> {
     let list = owner.cast::<PyList>(runtime)?;
-    let Some(index) = runtime.int_value(&index) else {
-        return Ok(None);
-    };
     let mut items = runtime.list_items(list)?;
-    let length = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    if let Some(index) = runtime.int_value(&index) {
+        let index = normalized_list_index(index, items.len())?;
+        items.remove(index);
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+        let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
+        delete_slice(runtime, &mut items, plan)?;
+    } else {
+        return Ok(None);
+    }
+    runtime.replace_list_items(list, items)?;
+    Ok(Some(PyValue::None))
+}
+
+pub(crate) fn slot_list_set_item(
+    runtime: &mut dyn PyRuntime,
+    owner: PyValue,
+    index: PyValue,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let list = owner.cast::<PyList>(runtime)?;
+    let mut items = runtime.list_items(list)?;
+    if let Some(index) = runtime.int_value(&index) {
+        let index = normalized_list_index(index, items.len())?;
+        items[index] = value;
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+        let replacement = collect_values(runtime, value)?;
+        let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
+        assign_slice(runtime, &mut items, plan, replacement)?;
+    } else {
+        return Ok(None);
+    }
+    runtime.replace_list_items(list, items)?;
+    Ok(Some(PyValue::None))
+}
+
+fn normalized_list_index(index: i64, length: usize) -> PyResult<usize> {
+    let length = i64::try_from(length).unwrap_or(i64::MAX);
     let index = if index < 0 {
         index.checked_add(length)
     } else {
         Some(index)
     }
     .and_then(|index| usize::try_from(index).ok())
-    .filter(|index| *index < items.len())
+    .filter(|index| *index < usize::try_from(length).unwrap_or(usize::MAX))
     .ok_or_else(|| PyError::exception("IndexError", "list assignment index out of range"))?;
-    items.remove(index);
-    runtime.replace_list_items(list, items)?;
-    Ok(Some(PyValue::None))
+    Ok(index)
+}
+
+fn assign_slice<T>(
+    runtime: &mut dyn PyRuntime,
+    items: &mut Vec<T>,
+    plan: SlicePlan,
+    replacement: Vec<T>,
+) -> PyResult<()> {
+    if let Some(range) = plan.contiguous_range() {
+        let final_length = items
+            .len()
+            .checked_sub(range.len())
+            .and_then(|length| length.checked_add(replacement.len()))
+            .ok_or_else(|| PyError::resource_error("slice result is too large"))?;
+        let growth = final_length
+            .saturating_sub(items.len())
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| PyError::resource_error("slice result is too large"))?;
+        runtime.reserve_memory(growth)?;
+        runtime.charge_cpu(
+            u64::try_from(items.len().saturating_add(replacement.len())).unwrap_or(u64::MAX),
+        )?;
+        items.splice(range, replacement);
+        return Ok(());
+    }
+    if replacement.len() != plan.len() {
+        return Err(PyError::value_error(format!(
+            "attempt to assign sequence of size {} to extended slice of size {}",
+            replacement.len(),
+            plan.len()
+        )));
+    }
+    runtime.charge_cpu(u64::try_from(plan.len()).unwrap_or(u64::MAX))?;
+    for (index, value) in plan.indices().zip(replacement) {
+        items[index] = value;
+    }
+    Ok(())
+}
+
+fn delete_slice<T>(
+    runtime: &mut dyn PyRuntime,
+    items: &mut Vec<T>,
+    plan: SlicePlan,
+) -> PyResult<()> {
+    runtime.charge_cpu(u64::try_from(items.len()).unwrap_or(u64::MAX))?;
+    if let Some(range) = plan.contiguous_range() {
+        items.drain(range);
+        return Ok(());
+    }
+    runtime.reserve_memory(items.len())?;
+    let mut deleted = vec![false; items.len()];
+    for index in plan.indices() {
+        deleted[index] = true;
+    }
+    let mut index = 0;
+    items.retain(|_| {
+        let keep = !deleted[index];
+        index += 1;
+        keep
+    });
+    Ok(())
 }
 
 pub(crate) fn slot_dict_delete_item(

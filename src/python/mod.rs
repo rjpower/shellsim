@@ -17,6 +17,7 @@ mod object_model;
 mod parser;
 mod process;
 mod protocol;
+mod slice;
 mod source;
 mod stdlib;
 mod token;

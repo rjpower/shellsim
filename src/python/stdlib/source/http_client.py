@@ -117,6 +117,13 @@ class HTTPResponse:
             self._position += len(value)
         return value
 
+    def readinto(self, buffer):
+        if not isinstance(buffer, bytearray):
+            raise TypeError("readinto() requires a bytearray")
+        value = self.read(len(buffer))
+        buffer[:len(value)] = value
+        return len(value)
+
     def readline(self, limit=-1):
         if self.closed or self._position >= len(self._body):
             return b""

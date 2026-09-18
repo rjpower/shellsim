@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::native::{BinarySlotFn, SliceSlotFn, TernarySlotFn, UnarySlotFn};
+use super::native::{BinarySlotFn, TernarySlotFn, UnarySlotFn};
 use super::Value;
 
 // Builtins and native value kinds are immutable process metadata. A fixed charge keeps their
@@ -148,7 +148,6 @@ pub struct TypeSlots {
     pub length: Option<SlotValue>,
     pub get_item: Option<SlotValue>,
     pub set_item: Option<SlotValue>,
-    pub slice: Option<SlotValue>,
     pub positive: Option<SlotValue>,
     pub negative: Option<SlotValue>,
     pub invert: Option<SlotValue>,
@@ -196,7 +195,6 @@ pub enum SlotValue {
     NativeBinary(BinarySlotFn),
     NativeTernary(TernarySlotFn),
     NativeUnary(UnarySlotFn),
-    NativeSlice(SliceSlotFn),
 }
 
 /// Protocol operations cached on each type after MRO resolution.
@@ -216,7 +214,6 @@ pub enum Slot {
     Length,
     GetItem,
     SetItem,
-    Slice,
     Positive,
     Negative,
     Invert,
@@ -258,7 +255,7 @@ pub enum Slot {
 }
 
 impl Slot {
-    const ALL: [Self; 53] = [
+    const ALL: [Self; 52] = [
         Self::Call,
         Self::New,
         Self::Init,
@@ -273,7 +270,6 @@ impl Slot {
         Self::Length,
         Self::GetItem,
         Self::SetItem,
-        Self::Slice,
         Self::Positive,
         Self::Negative,
         Self::Invert,
@@ -333,7 +329,6 @@ impl TypeSlots {
             length: get("__len__"),
             get_item: get("__getitem__"),
             set_item: get("__setitem__"),
-            slice: None,
             positive: get("__pos__"),
             negative: get("__neg__"),
             invert: get("__invert__"),
@@ -391,7 +386,6 @@ impl TypeSlots {
             &self.length,
             &self.get_item,
             &self.set_item,
-            &self.slice,
             &self.positive,
             &self.negative,
             &self.invert,
@@ -452,7 +446,6 @@ impl TypeSlots {
             Slot::Length => self.length.as_ref(),
             Slot::GetItem => self.get_item.as_ref(),
             Slot::SetItem => self.set_item.as_ref(),
-            Slot::Slice => self.slice.as_ref(),
             Slot::Positive => self.positive.as_ref(),
             Slot::Negative => self.negative.as_ref(),
             Slot::Invert => self.invert.as_ref(),
@@ -510,7 +503,6 @@ impl TypeSlots {
             Slot::Length => &mut self.length,
             Slot::GetItem => &mut self.get_item,
             Slot::SetItem => &mut self.set_item,
-            Slot::Slice => &mut self.slice,
             Slot::Positive => &mut self.positive,
             Slot::Negative => &mut self.negative,
             Slot::Invert => &mut self.invert,
@@ -908,11 +900,15 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.set_item = Some(SlotValue::NativeTernary(
         super::stdlib::core::slot_bytearray_set_item,
     ));
+    slots.delete_item = Some(intrinsic(super::stdlib::core::slot_bytearray_delete_item));
 
     let slots = &mut types[BuiltinType::List as usize].slots;
     slots.add = Some(intrinsic(super::stdlib::core::slot_list_add));
     slots.multiply = Some(intrinsic(super::stdlib::core::slot_list_multiply));
     slots.reflected_multiply = Some(intrinsic(super::stdlib::core::slot_list_multiply));
+    slots.set_item = Some(SlotValue::NativeTernary(
+        super::stdlib::core::slot_list_set_item,
+    ));
     slots.delete_item = Some(intrinsic(super::stdlib::core::slot_list_delete_item));
 
     types[BuiltinType::Dict as usize].slots.delete_item =
@@ -949,7 +945,6 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.set_item = Some(SlotValue::NativeTernary(
         super::stdlib::numpy::slot_set_item,
     ));
-    slots.slice = Some(SlotValue::NativeSlice(super::stdlib::numpy::slot_slice));
     slots.add = Some(intrinsic(super::stdlib::numpy::slot_add));
     slots.reflected_add = Some(intrinsic(super::stdlib::numpy::slot_reflected_add));
     slots.subtract = Some(intrinsic(super::stdlib::numpy::slot_subtract));
