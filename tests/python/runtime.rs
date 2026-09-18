@@ -119,6 +119,42 @@ fn python_loops_consume_fuel_per_bytecode_instruction() {
 }
 
 #[test]
+fn dispatch_cursor_preserves_frames_handlers_and_quantum_boundaries() {
+    let source = r#"def increment(value):
+    return value + 1
+
+def run(count):
+    total = 0
+    for index in range(count):
+        try:
+            total = increment(total)
+            if index == count - 1:
+                raise ValueError(total)
+        except ValueError:
+            total = total + 7
+    return total
+
+print(run(128))
+"#;
+    let argv = vec!["python3.14".into(), "-c".into(), source.into()];
+    let mut environment = Environment::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let status = shellsim::python::run_python(
+        &mut environment,
+        &argv,
+        Vec::new(),
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"135\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn executes_python_scripts_from_the_virtual_filesystem() {
     assert_eq!(
         run_shell(
