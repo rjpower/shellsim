@@ -1094,10 +1094,48 @@ fn stash_reapply_keeps_work_committed_in_the_meantime() {
         .unwrap();
     assert_eq!(run(&mut env, "git commit -qam later").0, 0);
 
+    // The two changes touch with no unchanged line between them, which Git treats as a conflict
+    // rather than picking an order for them.
+    assert_eq!(run(&mut env, "git stash pop").0, 1);
+    assert_eq!(
+        env.vfs.read("/", "/f.txt").unwrap(),
+        b"one\n<<<<<<< Updated upstream\ntwo\nCOMMITTED\n=======\nSTASHED\nthree\n>>>>>>> Stashed changes\n"
+    );
+    assert_eq!(run(&mut env, "git status --short").1, "UU f.txt\n");
+    // The entry stays on the list so the conflict can be settled and the pop tried again.
+    assert!(run(&mut env, "git stash list").1.contains("saved"));
+}
+
+#[test]
+fn a_stash_that_touches_a_different_part_of_a_file_reapplies_cleanly() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"one\ntwo\nthree\nfour\nfive\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    env.vfs
+        .put_file(
+            "/f.txt",
+            b"one\nSTASHED\nthree\nfour\nfive\n".to_vec(),
+            0o644,
+        )
+        .unwrap();
+    assert_eq!(run(&mut env, "git stash push -q -m saved").0, 0);
+
+    env.vfs
+        .put_file(
+            "/f.txt",
+            b"one\ntwo\nthree\nfour\nCOMMITTED\n".to_vec(),
+            0o644,
+        )
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -qam later").0, 0);
+
     assert_eq!(run(&mut env, "git stash pop").0, 0);
     assert_eq!(
         env.vfs.read("/", "/f.txt").unwrap(),
-        b"one\nSTASHED\nCOMMITTED\n"
+        b"one\nSTASHED\nthree\nfour\nCOMMITTED\n"
     );
     // Git restores the working tree only, leaving the user to stage again.
     assert_eq!(run(&mut env, "git status --short").1, " M f.txt\n");
@@ -2500,4 +2538,90 @@ fn short_status_lists_tracked_paths_in_path_order() {
         run(&mut env, "git status --short").1,
         " M f.txt\nUU g.txt\n?? a.txt\n"
     );
+}
+
+#[test]
+fn moving_between_commits_keeps_untracked_files_and_staged_work() {
+    let mut env = Environment::new();
+    let setup = "git init -q; echo base > b.txt; git add -A; git commit -qm c1; \
+                 git switch -qc side; echo 'FROM SIDE' > n.txt; git add -A; git commit -qm s1; \
+                 git switch -q main";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    // An untracked file is recorded nowhere, so nothing may write over it.
+    for command in [
+        "git checkout side",
+        "git switch side",
+        "git merge side",
+        "git rebase side",
+    ] {
+        assert_eq!(run(&mut env, "echo PRECIOUS > n.txt").0, 0);
+        let attempt = run(&mut env, command);
+        assert_eq!(attempt.0, 1, "{command}: {}", attempt.2);
+        assert!(
+            attempt.2.starts_with(
+                "error: The following untracked working tree files would be overwritten by"
+            ),
+            "{command}: {}",
+            attempt.2
+        );
+        assert_eq!(run(&mut env, "cat n.txt").1, "PRECIOUS\n");
+        assert_eq!(run(&mut env, "rm n.txt").0, 0);
+    }
+
+    // Staged work the move does not touch stays staged.
+    assert_eq!(run(&mut env, "echo staged > s.txt; git add s.txt").0, 0);
+    assert_eq!(run(&mut env, "git switch side").0, 0);
+    assert_eq!(run(&mut env, "git status --short").1, "A  s.txt\n");
+    assert_eq!(
+        run(&mut env, "git diff --cached --name-status").1,
+        "A\ts.txt\n"
+    );
+}
+
+#[test]
+fn a_hard_reset_ends_a_conflicted_merge() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'a\\nb\\nc\\n' > f.txt; git add -A; git commit -qm c1; \
+                 git switch -qc side; printf 'S\\nb\\nc\\n' > f.txt; git commit -qam s; \
+                 git switch -q main; printf 'M\\nb\\nc\\n' > f.txt; git commit -qam m";
+    assert_eq!(run(&mut env, setup).0, 0);
+    assert_eq!(run(&mut env, "git merge side").0, 1);
+
+    assert_eq!(run(&mut env, "git reset --hard").0, 0);
+    assert_eq!(run(&mut env, "git status --short").1, "");
+    assert_eq!(run(&mut env, "git ls-files -u").1, "");
+    // The merge is over, so the next commit has one parent rather than being wedged.
+    assert_eq!(
+        run(
+            &mut env,
+            "echo later > later.txt; git add -A; git commit -qm after"
+        )
+        .0,
+        0
+    );
+    assert_eq!(
+        run(&mut env, "git log --format=%p -1")
+            .1
+            .split_whitespace()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn an_untracked_file_set_aside_comes_back_untracked() {
+    let mut env = Environment::new();
+    let setup = "git init -q; echo a > a.txt; git add -A; git commit -qm c1; \
+                 echo junk > scratch.log; mkdir -p untr/nested; echo u > untr/nested/u.txt";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    assert_eq!(run(&mut env, "git stash push -u -m w").0, 0);
+    assert_eq!(run(&mut env, "git stash pop").0, 0);
+    assert_eq!(
+        run(&mut env, "git status --short").1,
+        "?? scratch.log\n?? untr/\n"
+    );
+    // Nothing was staged, so a sweeping commit does not pick the scratch files up.
+    assert_eq!(run(&mut env, "git commit -qam next").0, 1);
 }

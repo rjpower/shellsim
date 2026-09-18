@@ -181,12 +181,26 @@ pub(crate) fn git_rebase(
         && repo::merge_base(ctx, &root, &head, &upstream_id).as_deref()
             == Some(upstream_id.as_str());
     let todo = commits_to_replay(ctx, &root, &head, &upstream_id);
-    if settled || todo.is_empty() {
+    if settled || (todo.is_empty() && head == onto_id) {
         io.out
             .extend_from_slice(format!("Current branch {branch} is up to date.\n").as_bytes());
         return 0;
     }
     repo::record_orig_head(ctx, &root);
+    if todo.is_empty() {
+        // The branch has nothing the new base lacks, so moving it there is all the rebase is.
+        if let Err(status) = lay_down(ctx, &root, &onto_id, io) {
+            return status;
+        }
+        if repo::update_head(ctx, &root, &onto_id, &format!("rebase finished: {onto_id}")).is_err()
+        {
+            return 1;
+        }
+        io.out.extend_from_slice(
+            format!("Successfully rebased and updated refs/heads/{branch}.\n").as_bytes(),
+        );
+        return 0;
+    }
     // The branch moves to the new base first, and each commit is replayed on top of it.
     if let Err(status) = lay_down(ctx, &root, &onto_id, io) {
         return status;
@@ -236,6 +250,9 @@ fn lay_down(
 ) -> Result<(), i32> {
     let current = repo::head_tree(ctx, root);
     let target = repo::commit_tree(ctx, root, commit).unwrap_or_default();
+    if history::refuse_untracked_overwrite(ctx, root, &target, "checkout", "switch branches", io) {
+        return Err(1);
+    }
     if let Err(error) = repo::replace_work_tree(ctx, root, &current, &target) {
         io.err
             .extend_from_slice(format!("git rebase: {error}\n").as_bytes());

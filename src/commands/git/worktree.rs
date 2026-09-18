@@ -1219,6 +1219,8 @@ fn restore_paths(
         if repo::store_index(ctx, root, &index_tree).is_err() {
             return 1;
         }
+        // Putting a path back the way HEAD has it settles it: there is one side left, not three.
+        conflict::resolve(ctx, root, &selected);
         if !worktree {
             return 0;
         }
@@ -1301,6 +1303,9 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         return restore_paths(ctx, &root, Some(&revision), &paths, true, false, io);
     }
     repo::record_orig_head(ctx, &root);
+    // A whole-tree reset is how a merge, cherry-pick or revert is walked away from, so it drops
+    // the recorded conflict sides along with the operation itself. Git clears them here too.
+    conflict::clear(ctx, &root);
     if mode == "--hard" {
         // A hard reset removes paths known by either HEAD or the index while preserving untracked
         // files, matching the boundary agents rely on when discarding staged additions.

@@ -2217,6 +2217,58 @@ pub(crate) fn blocking_changes(
         .collect()
 }
 
+/// Untracked working files that moving to `target` would write over.
+///
+/// An untracked file is recorded nowhere, so overwriting one destroys it for good. Git refuses to
+/// move rather than do that, and names the files it would have replaced.
+pub(crate) fn untracked_collisions(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    target: &repo::Tree,
+) -> Vec<String> {
+    let index = repo::load_index(ctx, root).unwrap_or_default();
+    let head = repo::head_tree(ctx, root);
+    let Ok(work) = repo::collect_working_tree(ctx, root) else {
+        return Vec::new();
+    };
+    let files = work.release(ctx);
+    target
+        .keys()
+        .filter(|path| {
+            files.contains_key(*path) && !index.contains_key(*path) && !head.contains_key(*path)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Report the untracked files `target` would overwrite, the way Git reports them.
+pub(crate) fn refuse_untracked_overwrite(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    target: &repo::Tree,
+    verb: &str,
+    advice: &str,
+    io: &mut Io,
+) -> bool {
+    let doomed = untracked_collisions(ctx, root, target);
+    if doomed.is_empty() {
+        return false;
+    }
+    io.err.extend_from_slice(
+        format!(
+            "error: The following untracked working tree files would be overwritten by {verb}:\n"
+        )
+        .as_bytes(),
+    );
+    for path in doomed {
+        io.err.extend_from_slice(format!("\t{path}\n").as_bytes());
+    }
+    io.err.extend_from_slice(
+        format!("Please move or remove them before you {advice}.\nAborting\n").as_bytes(),
+    );
+    true
+}
+
 /// Where a tracked path is not the same in HEAD, the index and the working tree.
 ///
 /// A command that rewrites the whole tree, such as `git rebase`, has nowhere to put these, so it
@@ -2287,15 +2339,42 @@ fn checkout_commit(
         );
         return Err(1);
     }
+    if refuse_untracked_overwrite(ctx, root, &new, "checkout", "switch branches", io) {
+        return Err(1);
+    }
     if let Err(error) = repo::update_work_tree(ctx, root, &old, &new) {
         io.err
             .extend_from_slice(format!("git switch: {error}\n").as_bytes());
         return Err(1);
     }
-    if repo::store_index(ctx, root, &new).is_err() {
+    let index = carried_index(ctx, root, &new);
+    if repo::store_index(ctx, root, &index).is_err() {
         return Err(1);
     }
     Ok(())
+}
+
+/// The index after moving to `target`, keeping whatever was staged and not committed.
+///
+/// A move is only allowed when every path that differs between HEAD and the index is the same in
+/// both commits, so carrying those entries across cannot contradict the new commit. Git keeps
+/// them; replacing the index with the target tree would silently unstage the lot.
+fn carried_index(ctx: &mut CommandContext<'_>, root: &str, target: &Tree) -> Tree {
+    let index = repo::load_index(ctx, root).unwrap_or_default();
+    let head = repo::head_tree(ctx, root);
+    let mut carried = target.clone();
+    for (path, entry) in &index {
+        if head.get(path) != Some(entry) {
+            carried.insert(path.clone(), entry.clone());
+        }
+    }
+    // A path staged for deletion stays deleted on the other side of the move.
+    for path in head.keys() {
+        if !index.contains_key(path) {
+            carried.remove(path);
+        }
+    }
+    carried
 }
 
 /// Why moving the working tree to another commit has to wait, if it does.
@@ -2698,6 +2777,9 @@ pub(crate) fn git_merge(
     if !blocking_changes(ctx, &root, &incoming).is_empty() {
         io.err
             .extend_from_slice(b"error: Your local changes would be overwritten by merge.\n");
+        return 1;
+    }
+    if refuse_untracked_overwrite(ctx, &root, &incoming, "merge", "merge", io) {
         return 1;
     }
     repo::record_orig_head(ctx, &root);

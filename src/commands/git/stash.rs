@@ -340,14 +340,14 @@ fn apply(
     }
     // A plain apply restores the working tree only, leaving what was staged for the user to stage
     // again; that is what Git does without `--index`.
-    let _ = index_tree;
     // A file the entry brings back that nothing tracks yet cannot be left "unstaged", so Git
-    // records it as a new file. Paths already tracked keep whatever the index says.
+    // records it as a new file. Paths already tracked keep whatever the index says, and a file
+    // that was untracked when the entry was pushed stays untracked.
     let mut index = repo::load_index(ctx, root).unwrap_or_default();
     let restored: Vec<(String, repo::Entry)> = combined
         .tree
         .iter()
-        .filter(|(path, _)| !index.contains_key(*path))
+        .filter(|(path, _)| !index.contains_key(*path) && index_tree.contains_key(*path))
         .map(|(path, entry)| (path.clone(), entry.clone()))
         .collect();
     if !restored.is_empty() {
