@@ -4,10 +4,9 @@ use super::ast::{
     AssignmentTarget, BooleanOperator, ComprehensionClause, Constant, DictEntry, Expression,
     ExpressionKind, FStringPart, Program, Statement, StatementKind,
 };
-use super::bytecode::{ClassField, Code, CodeRef, Instruction, Operation, Parameter};
+use super::bytecode::{ClassField, CodeBuilder, CodeRef, Instruction, Operation, Parameter};
 use super::source::Span;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 pub fn compile(program: Program) -> CodeRef {
     let mut compiler = Compiler {
@@ -28,7 +27,7 @@ pub fn compile(program: Program) -> CodeRef {
 }
 
 struct Compiler {
-    instructions: Vec<Instruction>,
+    instructions: Vec<PendingInstruction>,
     loops: Vec<LoopContext>,
     /// Lexically active ``finally`` bodies.  Abrupt control flow is lowered by
     /// running these bodies before the control-flow operation, which keeps the
@@ -44,6 +43,11 @@ struct Compiler {
     named_expression: NamedExpressionContext,
     is_class_scope: bool,
     structural_depth: usize,
+}
+
+struct PendingInstruction {
+    operation: Operation,
+    span: Span,
 }
 
 #[derive(Clone)]
@@ -131,12 +135,27 @@ impl Compiler {
                     instruction.operation = operation;
                 }
             }
+        } else if !self.is_class_scope {
+            for instruction in &mut instructions {
+                instruction.operation =
+                    match std::mem::replace(&mut instruction.operation, Operation::Halt) {
+                        Operation::LoadName(name) => Operation::LoadGlobal(name),
+                        Operation::StoreName(name) => Operation::StoreGlobal(name),
+                        Operation::DeleteName(name) => Operation::DeleteGlobal(name),
+                        operation => operation,
+                    };
+            }
         }
-        Arc::new(Code {
-            instructions: instructions.into(),
-            parameters: parameters.into(),
-            local_names: local_names.into(),
-        })
+        let mut builder = CodeBuilder::default();
+        let mut bytecode = Vec::with_capacity(instructions.len());
+        let mut spans = Vec::with_capacity(instructions.len());
+        for instruction in instructions {
+            bytecode.push(Instruction {
+                opcode: builder.lower(instruction.operation),
+            });
+            spans.push(instruction.span);
+        }
+        builder.finish(bytecode, spans, parameters, local_names)
     }
 
     fn statements(&mut self, statements: Vec<Statement>) {
@@ -1113,7 +1132,8 @@ impl Compiler {
 
     fn emit(&mut self, operation: Operation, span: Span) -> usize {
         let index = self.instructions.len();
-        self.instructions.push(Instruction { operation, span });
+        self.instructions
+            .push(PendingInstruction { operation, span });
         index
     }
 
@@ -1347,21 +1367,35 @@ enum ComprehensionKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::python::bytecode::{NameId, Opcode};
     use crate::python::lexer::lex;
     use crate::python::parser::parse;
 
     #[test]
     fn assignment_has_an_explicit_stack_contract() {
         let code = compile(parse(lex("x = 40 + 2").unwrap()).unwrap());
-        assert!(matches!(
-            code.instructions[2].operation,
-            Operation::Binary(_)
-        ));
+        assert!(matches!(code.instructions[2].opcode, Opcode::Binary(_)));
+        let Opcode::StoreGlobal(name) = code.instructions[3].opcode else {
+            panic!("module assignment must end in a global store")
+        };
+        assert_eq!(code.name(name), "x");
+        assert_eq!(code.instructions.last().unwrap().opcode, Opcode::Halt);
+    }
+
+    #[test]
+    fn executable_bytecode_is_compact_and_deduplicates_names() {
+        let code = compile(parse(lex("x = x + 1\nprint(x)\n").unwrap()).unwrap());
+        assert!(std::mem::size_of::<Opcode>() <= 24);
         assert_eq!(
-            code.instructions[3].operation,
-            Operation::StoreName("x".into())
+            std::mem::size_of::<Instruction>(),
+            std::mem::size_of::<Opcode>()
         );
-        assert_eq!(code.instructions.last().unwrap().operation, Operation::Halt);
+        assert_eq!(
+            (0..code.name_count())
+                .filter(|index| code.name(NameId::new(*index)) == "x")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1372,18 +1406,19 @@ mod tests {
             )
             .unwrap(),
         );
-        let Operation::MakeFunction { code, .. } = &code.instructions[0].operation else {
+        let Opcode::MakeFunction(function) = code.instructions[0].opcode else {
             panic!("function definition must create a code object")
         };
+        let code = &code.function(function).code;
         assert_eq!(&*code.local_names, ["left", "right", "total"]);
         assert!(code
             .instructions
             .iter()
-            .any(|instruction| matches!(instruction.operation, Operation::LoadLocal(0))));
+            .any(|instruction| matches!(instruction.opcode, Opcode::LoadLocal(0))));
         assert!(code
             .instructions
             .iter()
-            .any(|instruction| matches!(instruction.operation, Operation::StoreLocal(2))));
+            .any(|instruction| matches!(instruction.opcode, Opcode::StoreLocal(2))));
     }
 
     #[test]
@@ -1408,9 +1443,9 @@ mod tests {
         let code = compile(Program { statements: body });
         assert!(code.instructions.iter().any(|instruction| {
             matches!(
-                &instruction.operation,
-                Operation::RuntimeError(message)
-                    if message.contains("compiler structural nesting limit")
+                instruction.opcode,
+                Opcode::RuntimeError(error)
+                    if code.error(error).contains("compiler structural nesting limit")
             )
         }));
     }

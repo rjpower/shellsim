@@ -20,6 +20,7 @@ mod protocol;
 mod slice;
 mod source;
 mod stdlib;
+mod string;
 mod token;
 mod vm;
 
@@ -175,15 +176,15 @@ impl Value {
     }
 
     fn inline_string_value(&self) -> Option<String> {
+        Some(self.inline_string_ref()?.as_str().to_owned())
+    }
+
+    fn inline_string_ref(&self) -> Option<string::InlineString> {
         let length = self.inline_string_len()?;
         let mut bytes = [0; 15];
         bytes[..8].copy_from_slice(&self.payload.to_ne_bytes());
         bytes[8..].copy_from_slice(&self.aux);
-        Some(
-            std::str::from_utf8(&bytes[..length])
-                .expect("inline strings originate from UTF-8")
-                .to_string(),
-        )
+        Some(string::InlineString::from_parts(bytes, length))
     }
 
     const fn inline_string_len(&self) -> Option<usize> {
@@ -331,7 +332,7 @@ mod value_layout_tests {
 /// Persistent locals for the deliberately-small foreground Python REPL.
 #[derive(Clone, Default, Debug)]
 pub struct ReplState {
-    locals: HashMap<String, Value>,
+    globals: GlobalBindings,
     heap: heap::Heap,
     types: object_model::TypeRegistry,
     modules: HashMap<String, Value>,
@@ -340,6 +341,73 @@ pub struct ReplState {
     temporary_import_paths: Vec<String>,
     original_cwd: Option<String>,
     type_memory: u64,
+}
+
+#[derive(Clone, Default, Debug)]
+struct GlobalBindings {
+    values: Vec<Option<Value>>,
+    modeled_bytes: u64,
+}
+
+impl GlobalBindings {
+    #[inline(always)]
+    fn get(&self, symbol: heap::SymbolId) -> Option<Value> {
+        self.values.get(symbol.index()).copied().flatten()
+    }
+
+    #[inline(always)]
+    fn insert(
+        &mut self,
+        symbol: heap::SymbolId,
+        value: Value,
+        resources: &mut crate::resources::Resources,
+    ) -> Result<(), String> {
+        if self.values.len() <= symbol.index() {
+            self.grow(symbol, resources)?;
+        }
+        self.values[symbol.index()] = Some(value);
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(
+        &mut self,
+        symbol: heap::SymbolId,
+        resources: &mut crate::resources::Resources,
+    ) -> Result<(), String> {
+        let required_len = symbol
+            .index()
+            .checked_add(1)
+            .ok_or("global binding count overflow")?;
+        let added = required_len - self.values.len();
+        let bytes = u64::try_from(added)
+            .unwrap_or(u64::MAX)
+            .checked_mul(std::mem::size_of::<Value>() as u64)
+            .ok_or("global binding size overflow")?;
+        let modeled_bytes = self
+            .modeled_bytes
+            .checked_add(bytes)
+            .ok_or("modeled global binding size overflow")?;
+        if !resources.reserve_memory(bytes) {
+            return Err("memory limit exceeded".into());
+        }
+        self.values.resize(required_len, None);
+        self.modeled_bytes = modeled_bytes;
+        Ok(())
+    }
+
+    fn remove(&mut self, symbol: heap::SymbolId) -> Option<Value> {
+        self.values.get_mut(symbol.index()).and_then(Option::take)
+    }
+
+    fn values(&self) -> impl Iterator<Item = Value> + '_ {
+        self.values.iter().flatten().copied()
+    }
+
+    fn take_modeled_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.modeled_bytes)
+    }
 }
 
 impl ReplState {
@@ -359,7 +427,10 @@ impl ReplState {
 
     fn release_owned_memory(&mut self, resources: &mut crate::resources::Resources) {
         let heap = self.heap.take_modeled_bytes();
-        resources.release_memory(heap.saturating_add(std::mem::take(&mut self.type_memory)));
+        resources.release_memory(
+            heap.saturating_add(self.globals.take_modeled_bytes())
+                .saturating_add(std::mem::take(&mut self.type_memory)),
+        );
     }
 }
 
@@ -561,24 +632,46 @@ pub(crate) fn start_python(
         }
     };
     state.import_paths.push(import_root);
-    state
-        .locals
-        .insert("__name__".into(), Value::inline_string("__main__").unwrap());
+    let name_symbol = match state.heap.intern_symbol("__name__", &mut interp.resources) {
+        Ok(symbol) => symbol,
+        Err(_) => return PythonCommandStart::Ready(137),
+    };
+    if state
+        .globals
+        .insert(
+            name_symbol,
+            Value::inline_string("__main__").expect("short builtin string"),
+            &mut interp.resources,
+        )
+        .is_err()
+    {
+        return PythonCommandStart::Ready(137);
+    }
     if let Some(script) = py_argv
         .first()
         .filter(|script| !matches!(script.as_str(), "-c" | "-" | ""))
     {
         let file = match Value::inline_string(script) {
             Some(value) => value,
-            None => match state
-                .heap
-                .allocate(heap::Object::String(script.clone()), &mut interp.resources)
-            {
+            None => match state.heap.allocate(
+                heap::Object::String(script.clone().into()),
+                &mut interp.resources,
+            ) {
                 Ok(value) => value,
                 Err(_) => return PythonCommandStart::Ready(137),
             },
         };
-        state.locals.insert("__file__".into(), file);
+        let file_symbol = match state.heap.intern_symbol("__file__", &mut interp.resources) {
+            Ok(symbol) => symbol,
+            Err(_) => return PythonCommandStart::Ready(137),
+        };
+        if state
+            .globals
+            .insert(file_symbol, file, &mut interp.resources)
+            .is_err()
+        {
+            return PythonCommandStart::Ready(137);
+        }
     }
     PythonCommandStart::Running(Box::new(PythonContinuation {
         argv: py_argv,
@@ -1176,6 +1269,7 @@ fn unsupported(interp: &mut Interp, feature: &str, err: Out) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::{Limits, Resources};
 
     fn run(source: &str) -> (i32, String, String) {
         let mut env = Interp::new();
@@ -1243,5 +1337,24 @@ mod tests {
             run("name = 'Ada'\nvalue = 7\nprint(f'Hello, {name}: {{{value}}}')"),
             (0, "Hello, Ada: {7}\n".into(), String::new())
         );
+    }
+
+    #[test]
+    fn global_binding_growth_is_charged_before_mutation() {
+        let mut resources = Resources::new(Limits {
+            memory: 32,
+            ..Limits::unlimited()
+        });
+        let mut heap = heap::Heap::default();
+        let symbol = heap.intern_symbol("x", &mut resources).unwrap();
+        let mut globals = GlobalBindings::default();
+
+        assert_eq!(
+            globals
+                .insert(symbol, Value::Int(1), &mut resources)
+                .unwrap_err(),
+            "memory limit exceeded"
+        );
+        assert_eq!(globals.get(symbol), None);
     }
 }

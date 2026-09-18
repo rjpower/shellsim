@@ -12,13 +12,14 @@ use std::sync::Arc;
 use super::bytecode::CodeRef;
 use super::native::{PyArgumentSpec, PyArrayDtype, PyArrayLayout};
 use super::object_model::{BuiltinType, TypeId};
+use super::string::PyString;
 use super::Value;
 
 const MAX_SHAPED_ATTRIBUTES: usize = 32;
 const INSTANCE_SLOT_BYTES: u64 = 16;
 const INSTANCE_DICT_ENTRY_BYTES: u64 = 48;
 const SHAPE_BYTES: u64 = 24;
-const ATTRIBUTE_NAME_BYTES: u64 = 24;
+const SYMBOL_NAME_BYTES: u64 = 24;
 
 /// Storage layout inherited by user-defined classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,9 +36,15 @@ pub enum InstancePayload {
     Int(i64),
 }
 
-/// Runtime-local identity for an interned instance-attribute name.
+/// Runtime-local identity for an interned Python identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct AttributeId(u32);
+pub struct SymbolId(u32);
+
+impl SymbolId {
+    pub(super) const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 /// Runtime-local identity for one append-only instance storage layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -54,7 +61,7 @@ pub struct InstanceAttributeSlot {
 #[derive(Clone, Debug)]
 pub enum InstanceAttributes {
     Shaped { shape: ShapeId, values: Vec<Value> },
-    Dictionary(HashMap<String, Value>),
+    Dictionary(HashMap<SymbolId, Value>),
 }
 
 impl Default for InstanceAttributes {
@@ -69,7 +76,7 @@ impl Default for InstanceAttributes {
 #[derive(Clone, Debug)]
 struct Shape {
     parent: Option<ShapeId>,
-    added: Option<AttributeId>,
+    added: Option<SymbolId>,
     slots: u32,
 }
 
@@ -91,7 +98,7 @@ pub struct ScopeId(usize);
 
 #[derive(Clone, Debug)]
 pub enum Object {
-    String(String),
+    String(PyString),
     Bytes(Vec<u8>),
     ByteArray(Vec<u8>),
     Exception {
@@ -261,10 +268,10 @@ pub struct Heap {
     free_objects: Vec<usize>,
     scopes: Vec<Option<Scope>>,
     free_scopes: Vec<usize>,
-    attribute_ids: HashMap<String, AttributeId>,
-    attribute_names: Vec<String>,
+    symbol_ids: HashMap<Arc<str>, SymbolId>,
+    symbol_names: Vec<Arc<str>>,
     shapes: Vec<Shape>,
-    shape_transitions: HashMap<(ShapeId, AttributeId), ShapeId>,
+    shape_transitions: HashMap<(ShapeId, SymbolId), ShapeId>,
     modeled_bytes: u64,
     bytes_since_collection: u64,
 }
@@ -276,8 +283,8 @@ impl Default for Heap {
             free_objects: Vec::new(),
             scopes: Vec::new(),
             free_scopes: Vec::new(),
-            attribute_ids: HashMap::new(),
-            attribute_names: Vec::new(),
+            symbol_ids: HashMap::new(),
+            symbol_names: Vec::new(),
             shapes: vec![Shape {
                 parent: None,
                 added: None,
@@ -295,7 +302,6 @@ impl Default for Heap {
 struct HeapObject {
     type_id: TypeId,
     payload: Object,
-    string_is_ascii: Option<bool>,
     modeled_bytes: u64,
 }
 
@@ -326,15 +332,6 @@ impl Heap {
             .ok_or_else(|| "invalid object reference".into())
     }
 
-    /// Return the cached ASCII property of an immutable string payload.
-    pub fn string_is_ascii(&self, id: ObjectId) -> Result<Option<bool>, String> {
-        self.objects
-            .get(id.0)
-            .and_then(Option::as_ref)
-            .map(|object| object.string_is_ascii)
-            .ok_or_else(|| "invalid object reference".into())
-    }
-
     /// Replace an object payload while charging growth before installing it and releasing shrink
     /// after the old payload is no longer live. The object's identity is preserved.
     pub fn replace_payload(
@@ -356,10 +353,6 @@ impl Heap {
         if next_bytes > current_bytes {
             self.reserve_object_growth(id, next_bytes - current_bytes, resources)?;
         }
-        let string_is_ascii = match &payload {
-            Object::String(value) => Some(value.is_ascii()),
-            _ => None,
-        };
         let object = self
             .objects
             .get_mut(id.0)
@@ -367,7 +360,6 @@ impl Heap {
             .ok_or("invalid object reference")?;
         object.type_id = next_type;
         object.payload = payload;
-        object.string_is_ascii = string_is_ascii;
         if current_bytes > next_bytes {
             let released = current_bytes - next_bytes;
             object.modeled_bytes = object.modeled_bytes.saturating_sub(released);
@@ -385,7 +377,54 @@ impl Heap {
             .ok_or_else(|| "invalid object reference".into())
     }
 
+    /// Return the runtime identity of an identifier already known to this heap.
+    pub fn symbol_id(&self, name: &str) -> Option<SymbolId> {
+        self.symbol_ids.get(name).copied()
+    }
+
+    /// Intern one identifier, charging its process-lifetime storage before mutation.
+    pub fn intern_symbol(
+        &mut self,
+        name: &str,
+        resources: &mut Resources,
+    ) -> Result<SymbolId, String> {
+        if let Some(symbol) = self.symbol_id(name) {
+            return Ok(symbol);
+        }
+        let symbol = SymbolId(
+            u32::try_from(self.symbol_names.len()).map_err(|_| "too many Python identifiers")?,
+        );
+        let bytes = SYMBOL_NAME_BYTES
+            .checked_add(u64::try_from(name.len()).unwrap_or(u64::MAX))
+            .ok_or("identifier storage size overflow")?;
+        let modeled_bytes = self
+            .modeled_bytes
+            .checked_add(bytes)
+            .ok_or("modeled heap size overflow")?;
+        if !resources.reserve_memory(bytes) {
+            return Err("memory limit exceeded".into());
+        }
+        self.modeled_bytes = modeled_bytes;
+        self.bytes_since_collection = self.bytes_since_collection.saturating_add(bytes);
+        let name: Arc<str> = name.into();
+        self.symbol_ids.insert(name.clone(), symbol);
+        self.symbol_names.push(name);
+        Ok(symbol)
+    }
+
+    #[cfg(test)]
     pub fn attribute(&self, id: ObjectId, name: &str) -> Result<Option<&Value>, String> {
+        let Some(symbol) = self.symbol_id(name) else {
+            return Ok(None);
+        };
+        self.attribute_by_symbol(id, symbol)
+    }
+
+    pub fn attribute_by_symbol(
+        &self,
+        id: ObjectId,
+        symbol: SymbolId,
+    ) -> Result<Option<&Value>, String> {
         let object = self
             .objects
             .get(id.0)
@@ -395,22 +434,17 @@ impl Heap {
             return Err("object does not have instance attributes".into());
         };
         match attributes {
-            InstanceAttributes::Dictionary(values) => Ok(values.get(name)),
-            InstanceAttributes::Shaped { shape, values } => {
-                let Some(attribute) = self.attribute_ids.get(name).copied() else {
-                    return Ok(None);
-                };
-                Ok(self
-                    .shape_slot(*shape, attribute)
-                    .and_then(|slot| values.get(slot)))
-            }
+            InstanceAttributes::Dictionary(values) => Ok(values.get(&symbol)),
+            InstanceAttributes::Shaped { shape, values } => Ok(self
+                .shape_slot(*shape, symbol)
+                .and_then(|slot| values.get(slot))),
         }
     }
 
-    pub fn instance_attribute_slot(
+    pub fn instance_attribute_slot_by_symbol(
         &self,
         id: ObjectId,
-        name: &str,
+        symbol: SymbolId,
     ) -> Result<Option<InstanceAttributeSlot>, String> {
         let object = self
             .objects
@@ -423,11 +457,8 @@ impl Heap {
         let InstanceAttributes::Shaped { shape, values } = attributes else {
             return Ok(None);
         };
-        let Some(attribute) = self.attribute_ids.get(name).copied() else {
-            return Ok(None);
-        };
         Ok(self
-            .shape_slot(*shape, attribute)
+            .shape_slot(*shape, symbol)
             .filter(|slot| *slot < values.len())
             .map(|slot| InstanceAttributeSlot {
                 shape: *shape,
@@ -473,6 +504,27 @@ impl Heap {
         value: Value,
         resources: &mut Resources,
     ) -> Result<(), String> {
+        match &self
+            .objects
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .ok_or("invalid object reference")?
+            .payload
+        {
+            Object::Instance { .. } => {}
+            _ => return Err("object does not have instance attributes".into()),
+        }
+        let symbol = self.intern_symbol(&name, resources)?;
+        self.insert_attribute_by_symbol(id, symbol, value, resources)
+    }
+
+    pub fn insert_attribute_by_symbol(
+        &mut self,
+        id: ObjectId,
+        symbol: SymbolId,
+        value: Value,
+        resources: &mut Resources,
+    ) -> Result<(), String> {
         let storage = match &self
             .objects
             .get(id.0)
@@ -485,7 +537,7 @@ impl Heap {
         };
         match storage {
             InstanceAttributes::Dictionary(values) => {
-                let growth = if values.contains_key(&name) {
+                let growth = if values.contains_key(&symbol) {
                     0
                 } else {
                     INSTANCE_DICT_ENTRY_BYTES
@@ -503,33 +555,31 @@ impl Heap {
                 let InstanceAttributes::Dictionary(values) = attributes else {
                     unreachable!("instance representation changed without yielding")
                 };
-                values.insert(name, value);
+                values.insert(symbol, value);
                 Ok(())
             }
             InstanceAttributes::Shaped { shape, values } => {
                 let shape = *shape;
-                if let Some(attribute) = self.attribute_ids.get(&name).copied() {
-                    if let Some(slot) = self.shape_slot(shape, attribute) {
-                        let Object::Instance { attributes, .. } = &mut self
-                            .objects
-                            .get_mut(id.0)
-                            .and_then(Option::as_mut)
-                            .expect("instance was validated before update")
-                            .payload
-                        else {
-                            unreachable!("instance was validated before update")
-                        };
-                        let InstanceAttributes::Shaped { values, .. } = attributes else {
-                            unreachable!("instance representation changed without yielding")
-                        };
-                        values[slot] = value;
-                        return Ok(());
-                    }
+                if let Some(slot) = self.shape_slot(shape, symbol) {
+                    let Object::Instance { attributes, .. } = &mut self
+                        .objects
+                        .get_mut(id.0)
+                        .and_then(Option::as_mut)
+                        .expect("instance was validated before update")
+                        .payload
+                    else {
+                        unreachable!("instance was validated before update")
+                    };
+                    let InstanceAttributes::Shaped { values, .. } = attributes else {
+                        unreachable!("instance representation changed without yielding")
+                    };
+                    values[slot] = value;
+                    return Ok(());
                 }
                 if values.len() >= MAX_SHAPED_ATTRIBUTES {
-                    return self.insert_dictionary_attribute(id, name, value, resources);
+                    return self.insert_dictionary_attribute(id, symbol, value, resources);
                 }
-                self.append_shaped_attribute(id, shape, name, value, resources)
+                self.append_shaped_attribute(id, shape, symbol, value, resources)
             }
         }
     }
@@ -550,43 +600,22 @@ impl Heap {
         &mut self,
         id: ObjectId,
         shape: ShapeId,
-        name: String,
+        symbol: SymbolId,
         value: Value,
         resources: &mut Resources,
     ) -> Result<(), String> {
-        let existing_attribute = self.attribute_ids.get(&name).copied();
-        let attribute = existing_attribute.unwrap_or_else(|| {
-            AttributeId(u32::try_from(self.attribute_names.len()).unwrap_or(u32::MAX))
-        });
-        if attribute.0 == u32::MAX {
-            return Err("too many instance attribute names".into());
-        }
-        let existing_transition = self.shape_transitions.get(&(shape, attribute)).copied();
+        let existing_transition = self.shape_transitions.get(&(shape, symbol)).copied();
         let next_shape = existing_transition
             .unwrap_or_else(|| ShapeId(u32::try_from(self.shapes.len()).unwrap_or(u32::MAX)));
         if next_shape.0 == u32::MAX {
             return Err("too many instance shapes".into());
         }
-        let name_bytes = if existing_attribute.is_none() {
-            ATTRIBUTE_NAME_BYTES.saturating_add(u64::try_from(name.len()).unwrap_or(u64::MAX))
-        } else {
-            0
-        };
         let shape_bytes = if existing_transition.is_none() {
             SHAPE_BYTES
         } else {
             0
         };
-        self.reserve_instance_growth(
-            id,
-            INSTANCE_SLOT_BYTES,
-            name_bytes.saturating_add(shape_bytes),
-            resources,
-        )?;
-        if existing_attribute.is_none() {
-            self.attribute_ids.insert(name.clone(), attribute);
-            self.attribute_names.push(name);
-        }
+        self.reserve_instance_growth(id, INSTANCE_SLOT_BYTES, shape_bytes, resources)?;
         if existing_transition.is_none() {
             let slots = self
                 .shapes
@@ -597,11 +626,10 @@ impl Heap {
                 .ok_or("too many shaped instance attributes")?;
             self.shapes.push(Shape {
                 parent: Some(shape),
-                added: Some(attribute),
+                added: Some(symbol),
                 slots,
             });
-            self.shape_transitions
-                .insert((shape, attribute), next_shape);
+            self.shape_transitions.insert((shape, symbol), next_shape);
         }
         let Object::Instance { attributes, .. } = &mut self
             .objects
@@ -623,7 +651,7 @@ impl Heap {
     fn insert_dictionary_attribute(
         &mut self,
         id: ObjectId,
-        name: String,
+        symbol: SymbolId,
         value: Value,
         resources: &mut Resources,
     ) -> Result<(), String> {
@@ -641,7 +669,7 @@ impl Heap {
             Object::Instance {
                 attributes: InstanceAttributes::Dictionary(_),
                 ..
-            } => return self.insert_attribute(id, name, value, resources),
+            } => return self.insert_attribute_by_symbol(id, symbol, value, resources),
             _ => return Err("object does not have instance attributes".into()),
         };
         let existing = u64::try_from(shaped_len)
@@ -670,14 +698,9 @@ impl Heap {
             let attribute = self
                 .shape_attribute_at(shape, slot)
                 .ok_or("invalid instance shape slot")?;
-            let attribute_name = self
-                .attribute_names
-                .get(attribute.0 as usize)
-                .ok_or("invalid instance attribute name")?
-                .clone();
-            values.insert(attribute_name, value);
+            values.insert(attribute, value);
         }
-        values.insert(name, value);
+        values.insert(symbol, value);
         let Object::Instance { attributes, .. } = &mut self
             .objects
             .get_mut(id.0)
@@ -691,7 +714,7 @@ impl Heap {
         Ok(())
     }
 
-    fn shape_slot(&self, mut shape: ShapeId, attribute: AttributeId) -> Option<usize> {
+    fn shape_slot(&self, mut shape: ShapeId, attribute: SymbolId) -> Option<usize> {
         while shape.0 != 0 {
             let current = self.shapes.get(shape.0 as usize)?;
             if current.added == Some(attribute) {
@@ -702,7 +725,7 @@ impl Heap {
         None
     }
 
-    fn shape_attribute_at(&self, mut shape: ShapeId, slot: usize) -> Option<AttributeId> {
+    fn shape_attribute_at(&self, mut shape: ShapeId, slot: usize) -> Option<SymbolId> {
         while shape.0 != 0 {
             let current = self.shapes.get(shape.0 as usize)?;
             if usize::try_from(current.slots.checked_sub(1)?).ok()? == slot {
@@ -989,14 +1012,9 @@ impl Heap {
             .ok_or("modeled heap size overflow")?;
         self.bytes_since_collection = self.bytes_since_collection.saturating_add(bytes);
         let type_id = self.infer_type_id(&object)?;
-        let string_is_ascii = match &object {
-            Object::String(value) => Some(value.is_ascii()),
-            _ => None,
-        };
         let object = HeapObject {
             type_id,
             payload: object,
-            string_is_ascii,
             modeled_bytes: bytes,
         };
         let id = if let Some(index) = self.free_objects.pop() {
@@ -1758,14 +1776,14 @@ mod tests {
         let instance = allocate_instance(&mut heap, &mut resources);
         let id = instance.object_id().unwrap();
         let shapes_before = heap.shapes.len();
-        let names_before = heap.attribute_names.len();
+        let names_before = heap.symbol_names.len();
 
         let error = heap
             .insert_attribute(id, "x".repeat(8 * 1024), Value::Int(1), &mut resources)
             .unwrap_err();
         assert_eq!(error, "memory limit exceeded");
         assert_eq!(heap.shapes.len(), shapes_before);
-        assert_eq!(heap.attribute_names.len(), names_before);
+        assert_eq!(heap.symbol_names.len(), names_before);
         assert!(matches!(
             heap.get(id).unwrap(),
             Object::Instance {

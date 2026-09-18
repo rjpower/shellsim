@@ -424,7 +424,6 @@ pub(super) trait PyRuntime {
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(PyValue, PyValue)>) -> PyResult<()>;
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<PyValue>>;
     fn replace_set_items(&mut self, set: PySet, items: Vec<PyValue>) -> PyResult<()>;
-    fn instance_attribute(&self, instance: PyInstance, name: &str) -> PyResult<Option<PyValue>>;
     fn replace_list_items(&mut self, list: PyList, items: Vec<PyValue>) -> PyResult<()>;
     fn call_value(&mut self, callable: PyValue, args: CallArgs) -> PyResult<PyValue>;
     fn is_callable(&self, value: &PyValue) -> PyResult<bool>;
@@ -1065,40 +1064,6 @@ impl FromPyValue for PyProperty {
 impl PyProperty {
     pub(super) fn object_id(self) -> ObjectId {
         self.0
-    }
-}
-
-/// Checked handle to an arena-backed Python instance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PyInstance(ObjectId);
-
-impl FromPyValue for PyInstance {
-    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
-            let actual = runtime.type_name(&value)?;
-            return Err(PyError::type_error(format!(
-                "expected instance, got {actual}"
-            )));
-        };
-        if runtime.kind(&Value::Object(id))? == PyKind::Instance {
-            Ok(Self(id))
-        } else {
-            let actual = runtime.type_name(&Value::Object(id))?;
-            Err(PyError::type_error(format!(
-                "expected instance, got {actual}"
-            )))
-        }
-    }
-}
-
-impl PyInstance {
-    pub(super) fn object_id(self) -> ObjectId {
-        self.0
-    }
-
-    /// Read an instance attribute without exposing the arena representation.
-    pub fn attribute(self, runtime: &dyn PyRuntime, name: &str) -> PyResult<Option<PyValue>> {
-        runtime.instance_attribute(self, name)
     }
 }
 

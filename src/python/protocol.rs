@@ -10,6 +10,7 @@ use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Zero};
 
 use super::heap::{Heap, InstancePayload, Object, ObjectId};
+pub use super::string::{string_ref, string_value};
 use super::Value;
 
 pub fn display(heap: &Heap, value: &Value) -> Result<String, String> {
@@ -32,72 +33,6 @@ pub fn int_value(heap: &Heap, value: &Value) -> Option<i64> {
         super::number::NumberRef::Int(value) => Some(value),
         super::number::NumberRef::BigInt(_) | super::number::NumberRef::Float(_) => None,
     }
-}
-
-/// A Python string exposed without cloning an arena-backed payload.
-///
-/// Short inline strings own their decoded storage because their bytes live inside [`Value`]. Long
-/// strings borrow the arena allocation and retain its cached ASCII property.
-#[derive(Debug)]
-pub struct StringRef<'a> {
-    storage: StringStorage<'a>,
-    is_ascii: bool,
-}
-
-#[derive(Debug)]
-enum StringStorage<'a> {
-    Inline(String),
-    Heap(&'a str),
-}
-
-impl StringRef<'_> {
-    /// Return the UTF-8 contents.
-    pub fn as_str(&self) -> &str {
-        match &self.storage {
-            StringStorage::Inline(value) => value,
-            StringStorage::Heap(value) => value,
-        }
-    }
-
-    /// Return the UTF-8 storage size used for resource accounting.
-    pub fn byte_len(&self) -> usize {
-        self.as_str().len()
-    }
-
-    /// Return whether every code point occupies one byte.
-    pub fn is_ascii(&self) -> bool {
-        self.is_ascii
-    }
-}
-
-/// Borrow a Python string when it is arena-backed.
-///
-/// Consumers that only inspect a string should prefer this interface over [`string_value`], which
-/// returns an owned copy for APIs that must outlive the heap borrow.
-pub fn string_ref<'a>(heap: &'a Heap, value: &Value) -> Result<Option<StringRef<'a>>, String> {
-    if let Some(value) = value.inline_string_value() {
-        let is_ascii = value.is_ascii();
-        return Ok(Some(StringRef {
-            storage: StringStorage::Inline(value),
-            is_ascii,
-        }));
-    }
-    let Some(id) = value.object_id() else {
-        return Ok(None);
-    };
-    Ok(match heap.get(id)? {
-        Object::String(value) => Some(StringRef {
-            storage: StringStorage::Heap(value),
-            is_ascii: heap
-                .string_is_ascii(id)?
-                .expect("string payloads cache their ASCII property"),
-        }),
-        _ => None,
-    })
-}
-
-pub fn string_value(heap: &Heap, value: &Value) -> Result<Option<String>, String> {
-    Ok(string_ref(heap, value)?.map(|value| value.as_str().to_owned()))
 }
 
 /// Return one Python string code point without materializing the complete string as characters.
