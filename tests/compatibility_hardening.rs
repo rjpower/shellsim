@@ -344,3 +344,20 @@ fn system_queries_compose_options_and_reject_unknown_ones() {
         assert!(stderr.contains("not implemented"), "{source}: {stderr}");
     }
 }
+
+#[test]
+fn a_long_listing_describes_a_named_file_as_well_as_a_directory() {
+    let (status, stdout, stderr) = text("touch f && chmod +x f && ls -l f");
+    assert_eq!((status, stderr.as_str()), (0, ""));
+    assert!(stdout.starts_with("-rwxr-xr-x "), "{stdout}");
+    assert!(stdout.trim_end().ends_with(" f"), "{stdout}");
+}
+
+#[test]
+fn printf_reads_hex_and_the_remaining_control_escapes() {
+    assert_eq!(text(r"printf 'A=\x41 %s\n' ok").1, "A=A ok\n");
+    assert_eq!(text(r"printf 'tab=\x09|'").1, "tab=\t|");
+    // Two digits at most, so what follows is ordinary text.
+    assert_eq!(text(r"printf '\x41BC'").1, "ABC");
+    assert_eq!(text(r"printf '\e[0m' | wc -c").1, "4\n");
+}

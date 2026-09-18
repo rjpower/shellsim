@@ -186,6 +186,26 @@ pub fn unescape(s: &str) -> String {
                 }
                 Some('a') => out.push('\u{7}'),
                 Some('b') => out.push('\u{8}'),
+                Some('f') => out.push('\u{c}'),
+                Some('v') => out.push('\u{b}'),
+                Some('e') => out.push('\u{1b}'),
+                Some('x') => {
+                    // Up to two hexadecimal digits, as `printf` and `echo -e` read them.
+                    let mut hex = String::new();
+                    while hex.len() < 2 {
+                        let Some(next) = chars.peek().filter(|next| next.is_ascii_hexdigit())
+                        else {
+                            break;
+                        };
+                        hex.push(*next);
+                        chars.next();
+                    }
+                    match u8::from_str_radix(&hex, 16) {
+                        Ok(value) => out.push(char::from(value)),
+                        // A bare `\x` is not an escape at all.
+                        Err(_) => out.push_str("\\x"),
+                    }
+                }
                 Some(o) => {
                     out.push('\\');
                     out.push(o);

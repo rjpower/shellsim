@@ -35,6 +35,11 @@ boundary. The simulated `pip` and `uv` paths can activate packages already bundl
 shellsim; they reject other packages instead of fetching them. See
 [Python in shellsim](docs/python.md) for the current contract.
 
+`git` provides a porcelain subset backed by the virtual filesystem: staging, commits, history,
+diffs, branches, tags, merges, stashes, and search, with output that matches real Git where an
+agent is likely to parse it. Networked subcommands and content conflicts are refused rather than
+approximated. See [Git in shellsim](docs/git.md) for the supported surface and its boundaries.
+
 Common utilities accept clustered short options, long options, option values, and `--` through a
 shared parser. Each utility declares its supported options. For example, `grep` supports ordinary
 basic and extended regular expressions, recursive search, fixed strings, word and whole-line

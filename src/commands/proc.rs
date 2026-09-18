@@ -374,7 +374,7 @@ fn cmd_date(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     }
 }
 
-fn format_date(unix_ns: i128, fmt: &str) -> Result<String, String> {
+pub(crate) fn format_date(unix_ns: i128, fmt: &str) -> Result<String, String> {
     // convert unix secs to UTC fields (proleptic Gregorian)
     let secs = unix_ns.div_euclid(i128::from(NANOS_PER_SECOND));
     let subsecond_ns = unix_ns.rem_euclid(i128::from(NANOS_PER_SECOND));
@@ -396,7 +396,28 @@ fn format_date(unix_ns: i128, fmt: &str) -> Result<String, String> {
             output.push(character);
             continue;
         }
-        match chars.next() {
+        // `%-X` suppresses the usual zero padding, as GNU date allows.
+        let (unpadded, specifier) = match chars.next() {
+            Some('-') => (true, chars.next()),
+            other => (false, other),
+        };
+        if unpadded {
+            match specifier {
+                Some('Y') => output.push_str(&y.to_string()),
+                Some('m') => output.push_str(&mo.to_string()),
+                Some('d') | Some('e') => output.push_str(&d.to_string()),
+                Some('H') => output.push_str(&h.to_string()),
+                Some('M') => output.push_str(&mi.to_string()),
+                Some('S') => output.push_str(&s.to_string()),
+                Some(other) => {
+                    output.push_str("%-");
+                    output.push(other);
+                }
+                None => output.push_str("%-"),
+            }
+            continue;
+        }
+        match specifier {
             Some('%') => output.push('%'),
             Some('Y') => output.push_str(&format!("{y:04}")),
             Some('m') => output.push_str(&format!("{mo:02}")),

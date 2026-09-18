@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use crate::commands::util::{ewln, split_flags, wln};
 use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
+use crate::vfs::resolve_against;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     use super::reg;
@@ -56,7 +57,6 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     let long = flags.contains(&'l');
     let all = flags.contains(&'a');
     let almost_all = flags.contains(&'A');
-    let one = flags.contains(&'1') || long;
     let recursive = flags.contains(&'R');
     let directory_as_file = flags.contains(&'d');
     let paths: Vec<String> = if ops.is_empty() {
@@ -68,7 +68,7 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     for p in &paths {
         if directory_as_file {
             if interp.fs_metadata(&interp.cwd, p, false).is_ok() {
-                emit_listing(interp, ".", std::slice::from_ref(p), long, one, io.out);
+                emit_listing(interp, ".", std::slice::from_ref(p), long, io.out);
             } else {
                 ewln(
                     io.err,
@@ -99,11 +99,12 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                 entries.insert(0, "..".into());
                 entries.insert(0, ".".into());
             }
-            if paths.len() > 1 {
+            if paths.len() > 1 || recursive {
                 wln(io.out, &format!("{p}:"));
             }
-            emit_listing(interp, p, &entries, long, one, io.out);
+            emit_listing(interp, p, &entries, long, io.out);
             if recursive {
+                let base = resolve_against(&interp.cwd, p);
                 let Ok(all_paths) = interp.fs_walk(&interp.cwd, p) else {
                     status = 2;
                     continue;
@@ -117,6 +118,17 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                         })
                     )
                 }) {
+                    // Headers name the directory the way the operand did, and a hidden directory
+                    // is not descended into unless hidden entries were asked for.
+                    let relative = sub
+                        .strip_prefix(&base)
+                        .unwrap_or(&sub)
+                        .trim_start_matches('/');
+                    if !all && !almost_all && relative.split('/').any(|part| part.starts_with('.'))
+                    {
+                        continue;
+                    }
+                    let label = format!("{}/{relative}", p.trim_end_matches('/'));
                     let mut sub_entries = interp.fs_list_dir("/", &sub).unwrap_or_default();
                     if !all && !almost_all {
                         sub_entries.retain(|entry| !entry.starts_with('.'));
@@ -125,12 +137,13 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                         sub_entries.insert(0, ".".into());
                     }
                     wln(io.out, "");
-                    wln(io.out, &format!("{sub}:"));
-                    emit_listing(interp, &sub, &sub_entries, long, one, io.out);
+                    wln(io.out, &format!("{label}:"));
+                    emit_listing(interp, &sub, &sub_entries, long, io.out);
                 }
             }
         } else if interp.fs_metadata(&interp.cwd, p, false).is_ok() {
-            wln(io.out, p);
+            // A file operand is listed the same way an entry of a directory is.
+            emit_listing(interp, ".", std::slice::from_ref(p), long, io.out);
         } else {
             ewln(
                 io.err,
@@ -142,14 +155,7 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     status
 }
 
-fn emit_listing(
-    interp: &Interp,
-    dir: &str,
-    entries: &[String],
-    long: bool,
-    one: bool,
-    out: &mut Vec<u8>,
-) {
+fn emit_listing(interp: &Interp, dir: &str, entries: &[String], long: bool, out: &mut Vec<u8>) {
     if long {
         for e in entries {
             let full = if e == "." {
@@ -160,7 +166,7 @@ fn emit_listing(
             } else {
                 format!("{}/{}", dir.trim_end_matches('/'), e)
             };
-            let (typ, mode, size) = match interp.fs_metadata(&interp.cwd, &full, false) {
+            let (typ, mode, size, target) = match interp.fs_metadata(&interp.cwd, &full, false) {
                 Ok(n) => {
                     let t = match n.kind {
                         crate::vfs::NodeKind::Dir => 'd',
@@ -169,29 +175,36 @@ fn emit_listing(
                     };
                     let sz = match &n.kind {
                         crate::vfs::NodeKind::File(d) => d.len(),
-                        _ => 0,
+                        crate::vfs::NodeKind::Symlink(target) => target.len(),
+                        crate::vfs::NodeKind::Dir => 0,
                     };
-                    (t, n.mode, sz)
+                    // A long listing names what a link points at rather than following it.
+                    let target = match &n.kind {
+                        crate::vfs::NodeKind::Symlink(target) => format!(" -> {target}"),
+                        _ => String::new(),
+                    };
+                    (t, n.mode, sz, target)
                 }
-                Err(_) => ('-', 0o644, 0),
+                Err(_) => ('-', 0o644, 0, String::new()),
             };
             wln(
                 out,
                 &format!(
-                    "{}{} 1 root root {:>6} Jan  1 00:00 {}",
+                    "{}{} 1 root root {:>6} Jan  1 00:00 {}{}",
                     typ,
                     mode_str(mode),
                     size,
-                    e
+                    e,
+                    target
                 ),
             );
         }
-    } else if one {
+    } else {
+        // Nothing here writes to a terminal, and `ls` writing to a pipe emits one name per line,
+        // so `-1` is the only short form and needs no separate handling.
         for e in entries {
             wln(out, e);
         }
-    } else {
-        wln(out, &entries.join("  "));
     }
 }
 
