@@ -22,7 +22,7 @@ use super::native::{
     PyProcessOutput, PyProcessRunner, PyProcessStartRequest, PyProperty, PyRaisesContext, PyRegex,
     PyResult, PyRuntime, PySet, PySubcommandSpec, PySubparsersSpec, PyTuple, PyValueCast,
 };
-use super::object_model::{BuiltinType, PyLayout, Slot, SlotValue, TypeId};
+use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
 
 const VM_POLL_QUANTUM: usize = 64;
@@ -2682,22 +2682,12 @@ impl<'a> Vm<'a> {
         if !type_mro.contains(&BuiltinType::Object.id()) {
             type_mro.push(BuiltinType::Object.id());
         }
-        let metaclass_type = self
-            .class_type_id(&metaclass)?
+        self.class_type_id(&metaclass)?
             .ok_or("metaclass must be a type")?;
-        let python_layout = match layout {
-            ClassLayout::Object => PyLayout::Object,
-            ClassLayout::Int => PyLayout::Int,
-            ClassLayout::Type => PyLayout::Type,
-        };
-        let instance_type = self.state.types.register(
-            name.clone(),
-            type_bases,
-            type_mro,
-            metaclass_type,
-            attributes.clone(),
-            python_layout,
-        )?;
+        let instance_type =
+            self.state
+                .types
+                .register(name.clone(), type_bases, type_mro, attributes.clone())?;
         let descriptors = attributes
             .iter()
             .map(|(name, value)| (name.clone(), *value))
