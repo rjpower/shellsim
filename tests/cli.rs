@@ -48,6 +48,19 @@ fn run_with_stdin(args: &[&str], stdin: &[u8]) -> Output {
     child.wait_with_output().expect("wait for shellsim CLI")
 }
 
+fn git(repository: &Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(repository)
+        .output()
+        .expect("run reference Git");
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn command_action_receives_host_stdin_and_has_a_tmp_directory() {
     let output = run_with_stdin(
@@ -601,6 +614,48 @@ fn persistent_protocol_can_checkpoint_a_trusted_host_snapshot() {
         "c25hcHNob3QAYnl0ZXM="
     );
     assert_eq!(responses[1]["result"]["changes"], serde_json::json!([]));
+}
+
+#[test]
+fn persistent_protocol_imports_git_history_from_its_root_directory() {
+    let project = TestDirectory::new();
+    git(project.path(), &["init", "-b", "main"]);
+    git(project.path(), &["config", "user.name", "CLI Test"]);
+    git(project.path(), &["config", "user.email", "cli@example.com"]);
+    std::fs::write(project.path().join("note.txt"), "tracked\n").unwrap();
+    git(project.path(), &["add", "note.txt"]);
+    git(project.path(), &["commit", "-m", "seed"]);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shellsim"))
+        .args(["serve", "--root"])
+        .arg(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"id\":1,\"op\":\"execute\",\"source\":\"git log --format=%s; git status --porcelain\"}\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(
+        output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .find(|line| !line.is_empty())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["stdout_base64"], "c2VlZAo=");
 }
 
 #[test]

@@ -26,7 +26,7 @@ mod dd;
 mod echo;
 mod find;
 mod fs;
-mod git;
+pub(crate) mod git;
 mod hashing;
 mod makecmd;
 mod net;

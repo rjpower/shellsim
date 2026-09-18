@@ -21,6 +21,7 @@ mod config;
 mod conflict;
 mod diff;
 mod ignore;
+pub(crate) mod import;
 mod log;
 mod merge;
 mod plumbing;

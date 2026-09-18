@@ -37,7 +37,6 @@ struct Report {
 }
 
 fn main() {
-    shellsim::sandbox::apply();
     let options = parse_options(std::env::args().skip(1).collect());
     let status = run(options).unwrap_or_else(|error| {
         eprintln!("shellsim-python: {error}");
@@ -112,6 +111,7 @@ fn run(options: Options) -> Result<i32, String> {
     };
 
     let stdin = read_stdin();
+    shellsim::sandbox::apply();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let status = python::run_python(&mut environment, &command, stdin, &mut stdout, &mut stderr);

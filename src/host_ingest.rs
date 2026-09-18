@@ -30,6 +30,21 @@ pub const DEFAULT_SKIPPED_DIRECTORIES: &[&str] = &[
 pub struct MountReport {
     pub files: usize,
     pub skipped_directories: Vec<String>,
+    pub git: Option<GitImportReport>,
+}
+
+/// Observable result of translating recent HEAD history from a host Git working tree.
+///
+/// `source_head` is the native Git object ID. `imported_head` differs because Shellsim rewrites
+/// commits into its private format; blob IDs remain unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitImportReport {
+    pub commits: usize,
+    pub blobs: usize,
+    pub tree_entries: usize,
+    pub truncated_history: bool,
+    pub source_head: String,
+    pub imported_head: String,
 }
 
 /// Import a canonicalized host directory at one absolute VFS destination.
@@ -41,10 +56,11 @@ pub fn mount_host_tree(
     mount_host_tree_report(environment, host_root, destination_root).map(|report| report.files)
 }
 
-/// Import a canonicalized host directory and report intentional directory omissions.
+/// Import a canonicalized host directory and report intentional omissions and Git history.
 ///
 /// The host directory is trusted harness input. The complete VFS mutation is rolled back when
-/// traversal, decoding, file-count enforcement, or disk accounting fails.
+/// traversal, decoding, Git translation, file-count enforcement, or disk accounting fails. A
+/// root `.git` file or directory triggers bounded history translation automatically.
 pub fn mount_host_tree_report(
     environment: &mut Environment,
     host_root: &Path,
@@ -63,13 +79,53 @@ pub fn mount_host_tree_report(
         return Err("VFS destination root must be an absolute safe path".to_string());
     }
     let destination_root = crate::vfs::normalize(destination_root);
+    let import_git = has_git_metadata(&host_root)?;
     let before = environment.vfs.clone();
-    match mount_inner(environment, &host_root, &destination_root) {
+    let result = (|| {
+        let mut report = mount_inner(environment, &host_root, &destination_root)?;
+        if import_git {
+            let history = crate::commands::git::import::import_head_history(
+                environment,
+                &host_root,
+                &destination_root,
+            )?;
+            report.git = Some(GitImportReport {
+                commits: history.commits,
+                blobs: history.blobs,
+                tree_entries: history.tree_entries,
+                truncated_history: history.truncated_history,
+                source_head: history.source_head,
+                imported_head: history.imported_head,
+            });
+        }
+        Ok(report)
+    })();
+    match result {
         Ok(report) => Ok(report),
         Err(error) => {
             environment.vfs = before;
             Err(error)
         }
+    }
+}
+
+fn has_git_metadata(host_root: &Path) -> Result<bool, String> {
+    let marker = host_root.join(".git");
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "refusing host symlink during Git discovery: {}",
+            marker.display()
+        )),
+        Ok(metadata) if metadata.is_dir() || metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "Git metadata marker is not a file or directory: {}",
+            marker.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "cannot inspect Git metadata marker {}: {error}",
+            marker.display()
+        )),
     }
 }
 
@@ -105,9 +161,8 @@ fn mount_inner(
                 let name = name
                     .to_str()
                     .ok_or_else(|| format!("non-UTF-8 host path below {}", host.display()))?;
-                if DEFAULT_SKIPPED_DIRECTORIES.contains(&name)
-                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
-                {
+                let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+                if name == ".git" || (DEFAULT_SKIPPED_DIRECTORIES.contains(&name) && is_directory) {
                     skipped_directories.insert(name.to_string());
                     continue;
                 }
@@ -141,6 +196,7 @@ fn mount_inner(
     Ok(MountReport {
         files,
         skipped_directories: skipped_directories.into_iter().collect(),
+        git: None,
     })
 }
 
