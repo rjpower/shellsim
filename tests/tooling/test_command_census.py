@@ -23,7 +23,7 @@ def run_census(tmp_path: Path, source: str) -> dict[str, object]:
             for command in ("awk", "dd", "grep", "jq", "sed")
         )
     )
-    script = Path(__file__).parents[1] / "tools" / "tasktrove_command_census.py"
+    script = Path(__file__).parents[2] / "tools" / "tasktrove_command_census.py"
     completed = subprocess.run(
         [sys.executable, str(script), str(corpus), "--repository", str(repository)],
         check=True,

@@ -1,3 +1,5 @@
+//! Unittest entrypoint, lifecycle, assertion, and unsupported-discovery behavior.
+
 use shellsim::Environment;
 
 fn run_unittest(source: &str, command: &str) -> (i32, Vec<u8>, Vec<u8>) {

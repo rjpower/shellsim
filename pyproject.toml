@@ -44,7 +44,7 @@ locked = true
 strip = true
 
 [tool.pytest.ini_options]
-testpaths = ["python_tests"]
+testpaths = ["tests/python_package", "tests/tooling"]
 
 [tool.marin-style]
 checks = ["ruff-check", "ruff-format"]
@@ -52,8 +52,9 @@ include = [
     "infra/*.py",
     "infra/**/*.py",
     "python/**/*.py",
-    "python_tests/*.py",
-    "python_tests/**/*.py",
+    "tests/python/test_*.py",
+    "tests/python_package/**/*.py",
+    "tests/tooling/**/*.py",
     "tools/*.py",
     "tools/**/*.py",
 ]

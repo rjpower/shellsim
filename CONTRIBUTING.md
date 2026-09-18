@@ -40,8 +40,8 @@ make lint
 
 It checks Rust and Python formatting, runs clippy over every target and feature with warnings
 denied, builds rustdoc with warnings denied, and rejects staged or unstaged whitespace errors.
-The Python checks cover repository tooling and the PyPI package, not simulated stdlib sources or
-compatibility fixtures. Apply safe formatting fixes with:
+The Python checks cover repository tooling, the PyPI package, and portable Python source suites,
+but not corpus inputs or simulated stdlib sources. Apply safe formatting fixes with:
 
 ```sh
 make format
@@ -68,7 +68,7 @@ use another headless agent. Raw prompts and results are written below `/tmp/mari
 Run the narrowest useful test while editing:
 
 ```sh
-cargo test --test python_stdlib_differential
+cargo test --test python stdlib_differential
 ```
 
 Before requesting review, run all safe tests through the same entrypoint as CI:
@@ -84,7 +84,7 @@ from the source tree:
 uv build
 uv venv /tmp/shellsim-wheel-test
 uv pip install --python /tmp/shellsim-wheel-test/bin/python dist/*.whl pytest
-/tmp/shellsim-wheel-test/bin/python -m pytest python_tests
+/tmp/shellsim-wheel-test/bin/python -m pytest tests/python_package
 ```
 
 The safe suite is the full shellsim suite because it is local, deterministic, and does not require
@@ -93,17 +93,22 @@ comparison when the named reference binary is unavailable, while checked fixture
 
 Use the following testing layers for new behavior:
 
-1. Put small algorithm and invariant tests beside the implementation.
+1. Put private algorithm and invariant tests beside the implementation. Keep a few tests inline;
+   use a module-local `tests.rs` when private unit coverage becomes substantial.
 2. Put command behavior in the plainly named module under `tests/commands/`. These modules share
    one integration-test crate to avoid compiling and linking one harness per command. Put
    cross-command shell behavior in the relevant top-level integration suite.
-3. Compare compatibility surfaces with CPython or coreutils where practical.
-4. Add a reduced real-task fixture when a TaskTrove case exposes the gap.
-5. Test malformed input, limits, and unsupported behavior as well as the success path.
+3. Put Python behavior that needs Rust-side setup or observations in the plainly named module
+   under `tests/python/`. These modules share the `tests/python.rs` integration-test crate.
+4. Put portable Python semantics in a `tests/python/test_*.py` source suite. Register each suite
+   explicitly in `tests/python/source_suites.rs` so shellsim always runs it and CPython 3.14 checks
+   it when available.
+5. Put large differential and reduced real-task inputs under `tests/python/corpus/`.
+6. Test malformed input, limits, and unsupported behavior as well as the success path. Compare
+   compatibility surfaces with CPython or coreutils where practical.
 
-Keep Python tests grouped by compatibility layer because they share one runtime harness. Put
-source snippets directly in the focused `python_*.rs` suite, or in `tests/fixtures/python/` when a
-snippet is large enough that an inline string obscures the behavior under test.
+Tests for the installed Python package live under `tests/python_package/`. Tests for repository
+Python tools live under `tests/tooling/`; neither belongs in the simulated Python source suites.
 
 Never make a test depend on host wall time, locale, network state, filesystem contents, or hash-map
 iteration order.

@@ -3,24 +3,9 @@
 //! These tests use only registered commands and VFS scripts. They intentionally probe captured
 //! and inherited streams plus process-local cwd/environment state at the public Python API.
 
-use shellsim::{process::MAX_PROCESSES, python, Environment};
+use shellsim::{process::MAX_PROCESSES, Environment};
 
-fn run(environment: &mut Environment, source: &str) -> (i32, String, String) {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let status = python::run_python(
-        environment,
-        &["python3.14".into(), "-c".into(), source.into()],
-        Vec::new(),
-        &mut stdout,
-        &mut stderr,
-    );
-    (
-        status,
-        String::from_utf8_lossy(&stdout).into_owned(),
-        String::from_utf8_lossy(&stderr).into_owned(),
-    )
-}
+use super::support::run_python_text_in as run;
 
 #[test]
 fn run_captures_bytes_and_text_and_can_inherit_output() {

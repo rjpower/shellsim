@@ -9,7 +9,7 @@ use std::process::Command;
 
 use shellsim::Environment;
 
-const CORPUS: &str = "tests/fixtures/python/tasktrove_100";
+const CORPUS: &str = "tests/python/corpus/tasktrove";
 
 fn cpython_314_available() -> bool {
     let probe = "import sys; print(sys.implementation.name); print(*sys.version_info[:2])";

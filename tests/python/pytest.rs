@@ -1,3 +1,5 @@
+//! Pytest entrypoint, collection, reporting, and explicit unsupported-frontier behavior.
+
 use std::process::Command;
 
 use shellsim::Environment;

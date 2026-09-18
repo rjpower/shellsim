@@ -1,24 +1,10 @@
+//! Standard-library behavior requiring VFS setup, exact diagnostics, or CPython comparison.
+
 use std::process::Command;
 
 use shellsim::Environment;
 
-fn run(source: &str) -> (i32, Vec<u8>, Vec<u8>) {
-    let mut environment = Environment::new();
-    run_in(&mut environment, source)
-}
-
-fn run_in(environment: &mut Environment, source: &str) -> (i32, Vec<u8>, Vec<u8>) {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let status = shellsim::python::run_python(
-        environment,
-        &["python3.14".into(), "-c".into(), source.into()],
-        Vec::new(),
-        &mut stdout,
-        &mut stderr,
-    );
-    (status, stdout, stderr)
-}
+use super::support::{run_python as run, run_python_in as run_in};
 
 #[test]
 fn os_chdir_changes_only_the_simulated_process_directory() {

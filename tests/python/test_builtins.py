@@ -53,7 +53,7 @@ def test_getattr_and_hasattr_share_attribute_lookup():
     class Item:
         value = 3
 
-    assert getattr(Item, "value") == 3
+    assert getattr(Item, "value") == 3  # noqa: B009 - exercise the getattr builtin
     assert getattr(Item(), "missing", 4) == 4
     assert hasattr(Item, "value")
     assert not hasattr(Item, "missing")
@@ -68,24 +68,24 @@ def test_reversed_returns_an_iterator():
 def test_invalid_inputs_raise_python_exceptions():
     try:
         int("10", 1)
-        assert False
+        raise AssertionError("int() accepted an invalid base")
     except ValueError:
         pass
 
     try:
         "".join([1])
-        assert False
+        raise AssertionError("str.join() accepted a non-string item")
     except TypeError:
         pass
 
     try:
         [1].index(2)
-        assert False
+        raise AssertionError("list.index() found a missing item")
     except ValueError:
         pass
 
     try:
         {}.pop("missing")
-        assert False
+        raise AssertionError("dict.pop() accepted a missing key")
     except KeyError:
         pass
