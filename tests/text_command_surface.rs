@@ -279,7 +279,7 @@ fn recursive_listing_labels_directories_relatively_and_skips_hidden_ones() {
         "mkdir -p pkg/.cache pkg/sub && touch pkg/top pkg/.cache/junk pkg/sub/leaf && ls -R pkg",
     );
     assert_eq!((status, stderr.as_str()), (0, ""));
-    assert_eq!(stdout, "pkg:\nsub  top\n\npkg/sub:\nleaf\n");
+    assert_eq!(stdout, "pkg:\nsub\ntop\n\npkg/sub:\nleaf\n");
 
     let (status, stdout, _) = run(
         "mkdir -p pkg/.cache pkg/sub && touch pkg/top pkg/.cache/junk pkg/sub/leaf && ls -R -A pkg",
@@ -287,6 +287,18 @@ fn recursive_listing_labels_directories_relatively_and_skips_hidden_ones() {
     assert_eq!(status, 0);
     assert_eq!(
         stdout,
-        "pkg:\n.cache  sub  top\n\npkg/.cache:\njunk\n\npkg/sub:\nleaf\n"
+        "pkg:\n.cache\nsub\ntop\n\npkg/.cache:\njunk\n\npkg/sub:\nleaf\n"
+    );
+}
+
+#[test]
+fn listing_writes_one_name_per_line() {
+    // Simulated output is never a terminal, so `ls` uses the format real `ls` uses for a pipe.
+    let (status, stdout, stderr) = run("mkdir -p d/b && touch d/a d/c && ls d");
+    assert_eq!((status, stderr.as_str()), (0, ""));
+    assert_eq!(stdout, "a\nb\nc\n");
+    assert_eq!(
+        run("mkdir -p d/b && touch d/a d/c && ls d | wc -l").1,
+        "3\n"
     );
 }
