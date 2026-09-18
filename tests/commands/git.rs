@@ -2884,3 +2884,41 @@ fn a_one_line_log_entry_is_not_separated_from_its_diff() {
     let medium = run(&mut env, "git log --stat").1;
     assert!(medium.contains("    one\n\n f | 1 +\n"), "{medium}");
 }
+
+#[test]
+fn a_corrupt_index_stops_the_commands_that_would_write_over_it() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs.put_file("/f", b"one\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add f; git commit -qm one").0, 0);
+    env.vfs
+        .put_file("/.git/index", b"not an index\n".to_vec(), 0o644)
+        .unwrap();
+
+    // An unreadable index used to read as "nothing is staged", which to `git clean` means every
+    // tracked file is untracked and can be deleted.
+    let cleaned = run(&mut env, "git clean -f");
+    assert_eq!(cleaned.0, 128, "{}", cleaned.2);
+    assert!(cleaned.2.contains("index file corrupt"), "{}", cleaned.2);
+    assert!(env.vfs.exists("/", "/f"));
+
+    for command in ["git add f", "git status", "git commit -m two", "git stash"] {
+        let refused = run(&mut env, command);
+        assert_eq!(refused.0, 128, "{command}: {}", refused.2);
+    }
+}
+
+#[test]
+fn a_missing_index_is_nothing_staged_rather_than_an_error() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs.put_file("/f", b"one\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add f; git commit -qm one").0, 0);
+    env.vfs.remove_file("/", "/.git/index").unwrap();
+
+    // Git reads an absent index file as an empty one, so the tracked file reads as staged for
+    // deletion and untracked at once, which is what real Git prints here.
+    let status = run(&mut env, "git status --short");
+    assert_eq!(status.0, 0, "{}", status.2);
+    assert_eq!(status.1, "D  f\n?? f\n");
+}

@@ -694,7 +694,7 @@ pub(crate) fn tracked_working_tree(
     root: &str,
     index: &Tree,
 ) -> Option<Tree> {
-    let mut work = repo::collect_working_tree(ctx, root).ok()?.release(ctx);
+    let mut work = repo::collect_working_tree(ctx, root).ok()?;
     work.retain(|path, _| index.contains_key(path));
     Some(work)
 }

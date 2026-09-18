@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::commands::CommandContext;
 use crate::interp::Interp;
+use crate::vfs::VfsError;
 
 use super::diff::{self, Op};
 use super::repo::{self, Tree};
@@ -166,6 +167,12 @@ pub(crate) fn clear(ctx: &mut CommandContext<'_>, root: &str) {
 }
 
 /// The outcome of combining two trees against their base.
+/// A merged file that could not be stored, which leaves the whole merge unusable.
+pub(crate) struct Unwritable {
+    pub path: String,
+    pub error: VfsError,
+}
+
 pub(crate) struct Combined {
     /// The resolved tree, holding the conflict-marked content for conflicted paths.
     pub tree: Tree,
@@ -182,7 +189,7 @@ pub(crate) fn combine(
     theirs: &Tree,
     ours_label: &str,
     theirs_label: &str,
-) -> Combined {
+) -> Result<Combined, Unwritable> {
     // A file one side renamed is still the same file, so the other side's change to it belongs
     // under the new name. Renaming the base and the other side first turns "deleted here,
     // changed there" back into an ordinary change to one path.
@@ -256,8 +263,11 @@ pub(crate) fn combine(
             ours_label,
             theirs_label,
         );
-        let Ok(hash) = repo::write_blob(ctx, root, &merged) else {
-            continue;
+        let hash = match repo::write_blob(ctx, root, &merged) {
+            Ok(hash) => hash,
+            // Dropping the path here would leave it out of the merged tree, and the caller would
+            // then take that as "delete it".
+            Err(error) => return Err(Unwritable { path, error }),
         };
         if conflicted {
             stages.insert(path.clone(), sides(original, mine, yours));
@@ -274,7 +284,7 @@ pub(crate) fn combine(
             },
         );
     }
-    Combined { tree, stages }
+    Ok(Combined { tree, stages })
 }
 
 /// Paths `side` moved without changing, as `(old name, new name)`.

@@ -14,7 +14,7 @@ use super::compare;
 use super::conflict;
 use super::ignore;
 use super::repo::{self, Tree};
-use super::{fatal, repo_error, usage, Arg, Flags};
+use super::{cannot_write, fatal, repo_error, require_index, usage, Arg, Flags};
 
 /// The state of one path relative to HEAD, the index, and the working tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,16 +218,11 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         .iter()
         .map(|value| super::pathspec(&cwd, &root, value))
         .collect();
-    let Some(index) = repo::load_index(ctx, &root) else {
-        io.err
-            .extend_from_slice(b"fatal: invalid simulated index\n");
-        return 128;
-    };
-    let work = match repo::collect_working_tree(ctx, &root) {
-        Ok(snapshot) => snapshot.release(ctx),
-        Err(status) => return status,
-    };
-    let head = repo::head_tree(ctx, &root);
+    let super::history::Snapshot { head, index, work } =
+        match super::history::snapshot(ctx, &root, io) {
+            Ok(snapshot) => snapshot,
+            Err(status) => return status,
+        };
     let rules = ignore::load(ctx, &root);
     // A path with recorded conflict stages is unmerged and is reported on its own.
     let unmerged = conflict::load_stages(ctx, &root);
@@ -728,9 +723,12 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     let Some(root) = repo::find_repo_root(ctx) else {
         return repo_error(io);
     };
-    let mut index = repo::load_index(ctx, &root).unwrap_or_default();
+    let mut index = match require_index(ctx, &root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     let work = match repo::collect_working_tree(ctx, &root) {
-        Ok(snapshot) => snapshot.release(ctx),
+        Ok(work) => work,
         Err(status) => return status,
     };
     let cwd = ctx.cwd.clone();
@@ -909,7 +907,10 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     let Some(root) = repo::find_repo_root(ctx) else {
         return repo_error(io);
     };
-    let mut index = repo::load_index(ctx, &root).unwrap_or_default();
+    let mut index = match require_index(ctx, &root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     let head = repo::head_tree(ctx, &root);
     // Removing an unmerged path is how a modify/delete conflict is settled, so it needs no force.
     let unmerged = conflict::load_stages(ctx, &root);
@@ -1050,7 +1051,10 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
             "destination must be a directory when moving several sources",
         );
     }
-    let mut index = repo::load_index(ctx, &root).unwrap_or_default();
+    let mut index = match require_index(ctx, &root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     let mut moves: Vec<(String, String, String, String)> = Vec::new();
     for source in sources {
         let (source_absolute, source_relative) = match repo_operand(&ctx.cwd, &root, source) {
@@ -1215,7 +1219,10 @@ fn restore_paths(
     worktree: bool,
     io: &mut Io,
 ) -> i32 {
-    let mut index_tree = repo::load_index(ctx, root).unwrap_or_default();
+    let mut index_tree = match require_index(ctx, root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     let source_tree = match source {
         Some(revision) => {
             let Some(commit) = repo::resolve_revision(ctx, root, revision) else {
@@ -1245,8 +1252,8 @@ fn restore_paths(
                 }
             }
         }
-        if repo::store_index(ctx, root, &index_tree).is_err() {
-            return 1;
+        if let Err(error) = repo::store_index(ctx, root, &index_tree) {
+            return cannot_write(io, "the index", &error);
         }
         // Putting a path back the way HEAD has it settles it: there is one side left, not three.
         conflict::resolve(ctx, root, &selected);
@@ -1255,7 +1262,7 @@ fn restore_paths(
         }
     }
     let work = match repo::collect_working_tree(ctx, root) {
-        Ok(snapshot) => snapshot.release(ctx),
+        Ok(work) => work,
         Err(status) => return status,
     };
     let cwd = ctx.cwd.clone();
@@ -1345,19 +1352,25 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         // A hard reset removes paths known by either HEAD or the index while preserving untracked
         // files, matching the boundary agents rely on when discarding staged additions.
         let mut old = repo::head_tree(ctx, &root);
-        old.extend(repo::load_index(ctx, &root).unwrap_or_default());
+        match require_index(ctx, &root, io) {
+            Ok(index) => old.extend(index),
+            Err(status) => return status,
+        }
         if let Err(error) = repo::replace_work_tree(ctx, &root, &old, &tree) {
             io.err
                 .extend_from_slice(format!("git reset: {error}\n").as_bytes());
             return 1;
         }
     }
-    if mode != "--soft" && repo::store_index(ctx, &root, &tree).is_err() {
-        return 1;
+    if mode != "--soft" {
+        if let Err(error) = repo::store_index(ctx, &root, &tree) {
+            return cannot_write(io, "the index", &error);
+        }
     }
     let target = revision.clone();
-    if repo::update_head(ctx, &root, &commit, &format!("reset: moving to {target}")).is_err() {
-        return 1;
+    let action = format!("reset: moving to {target}");
+    if let Err(error) = repo::update_head(ctx, &root, &commit, &action) {
+        return cannot_write(io, "HEAD", &error);
     }
     if mode == "--mixed" {
         emit_unstaged_after_reset(ctx, &root, &tree, io);
@@ -1375,10 +1388,9 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
 
 /// List the paths that differ from the new index after a mixed reset, as Git does.
 fn emit_unstaged_after_reset(ctx: &mut CommandContext<'_>, root: &str, tree: &Tree, io: &mut Io) {
-    let Ok(snapshot) = repo::collect_working_tree(ctx, root) else {
+    let Ok(work) = repo::collect_working_tree(ctx, root) else {
         return;
     };
-    let work = snapshot.release(ctx);
     let changed: Vec<&String> = tree
         .keys()
         .filter(|path| work.get(*path) != tree.get(*path))
@@ -1424,9 +1436,12 @@ pub(crate) fn git_clean(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         );
         return 128;
     }
-    let index = repo::load_index(ctx, &root).unwrap_or_default();
+    let index = match require_index(ctx, &root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     let work = match repo::collect_working_tree(ctx, &root) {
-        Ok(snapshot) => snapshot.release(ctx),
+        Ok(work) => work,
         Err(status) => return status,
     };
     let rules = ignore::load(ctx, &root);
@@ -1533,7 +1548,7 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let needs_work = modified || deleted || others;
     let work = if needs_work {
         match repo::collect_working_tree(ctx, &root) {
-            Ok(snapshot) => snapshot.release(ctx),
+            Ok(work) => work,
             Err(status) => return status,
         }
     } else {
@@ -1613,8 +1628,8 @@ pub(crate) fn stage_tracked_changes(
     root: &str,
     io: &mut Io,
 ) -> Result<(), i32> {
-    let mut index = repo::load_index(ctx, root).unwrap_or_default();
-    let work = repo::collect_working_tree(ctx, root)?.release(ctx);
+    let mut index = require_index(ctx, root, io)?;
+    let work = repo::collect_working_tree(ctx, root)?;
     let selected: BTreeSet<String> = index.keys().cloned().collect();
     let status = stage_paths(ctx, root, &mut index, &work, &selected, Staging::Silent, io);
     if status == 0 {

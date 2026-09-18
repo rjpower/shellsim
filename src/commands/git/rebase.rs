@@ -10,7 +10,7 @@ use crate::commands::{CommandContext, Io};
 use super::conflict;
 use super::history;
 use super::repo::{self, Commit};
-use super::{repo_error, usage, Arg, Flags, Globals};
+use super::{cannot_write, repo_error, require_index, usage, Arg, Flags, Globals};
 
 const STATE: &str = "REBASE_STATE";
 
@@ -150,7 +150,7 @@ pub(crate) fn git_rebase(
         None => upstream_id.clone(),
     };
     // A rebase rewrites the whole tree, so anything not committed has nowhere to go.
-    let snapshot = match history::snapshot(ctx, &root) {
+    let snapshot = match history::snapshot(ctx, &root, io) {
         Ok(snapshot) => snapshot,
         Err(status) => return status,
     };
@@ -201,8 +201,8 @@ pub(crate) fn git_rebase(
             return status;
         }
         let action = format!("rebase (finish): returning to refs/heads/{branch}");
-        if repo::update_head(ctx, &root, &onto_id, &action).is_err() {
-            return 1;
+        if let Err(error) = repo::update_head(ctx, &root, &onto_id, &action) {
+            return cannot_write(io, "HEAD", &error);
         }
         io.out.extend_from_slice(
             format!("Successfully rebased and updated refs/heads/{branch}.\n").as_bytes(),
@@ -215,15 +215,9 @@ pub(crate) fn git_rebase(
     }
     // Git detaches HEAD for the duration, so the branch keeps naming its old tip until the
     // replay succeeds and nothing that reads the branch sees a half-finished history.
-    if repo::set_head_detached(
-        ctx,
-        &root,
-        &onto_id,
-        &format!("rebase (start): checkout {base_name}"),
-    )
-    .is_err()
-    {
-        return 1;
+    let action = format!("rebase (start): checkout {base_name}");
+    if let Err(error) = repo::set_head_detached(ctx, &root, &onto_id, &action) {
+        return cannot_write(io, "HEAD", &error);
     }
     let state = State {
         branch,
@@ -262,7 +256,7 @@ fn lay_down(
     io: &mut Io,
 ) -> Result<(), i32> {
     let target = super::require_tree(ctx, root, commit, io)?;
-    let snapshot = history::snapshot(ctx, root)?;
+    let snapshot = history::snapshot(ctx, root, io)?;
     if history::refuse_untracked_overwrite(&snapshot, &target, "checkout", "switch branches", io) {
         return Err(1);
     }
@@ -271,8 +265,8 @@ fn lay_down(
             .extend_from_slice(format!("git rebase: {error}\n").as_bytes());
         return Err(1);
     }
-    if repo::store_index(ctx, root, &target).is_err() {
-        return Err(1);
+    if let Err(error) = repo::store_index(ctx, root, &target) {
+        return Err(cannot_write(io, "the index", &error));
     }
     Ok(())
 }
@@ -294,11 +288,10 @@ fn replay(
         let Some(head) = repo::head_commit(ctx, root) else {
             return 1;
         };
-        let base = original
-            .parents
-            .first()
-            .and_then(|parent| repo::commit_tree(ctx, root, parent))
-            .unwrap_or_default();
+        let base = match super::parent_tree(ctx, root, original.parents.first(), io) {
+            Ok(tree) => tree,
+            Err(status) => return status,
+        };
         let (theirs, ours) = match (
             super::require_tree(ctx, root, &id, io),
             super::require_tree(ctx, root, &head, io),
@@ -307,14 +300,17 @@ fn replay(
             (Err(status), _) | (_, Err(status)) => return status,
         };
         let label = format!("{} ({})", repo::short(&id), original.subject());
-        let combined = conflict::combine(ctx, root, &base, &ours, &theirs, "HEAD", &label);
+        let combined = match conflict::combine(ctx, root, &base, &ours, &theirs, "HEAD", &label) {
+            Ok(combined) => combined,
+            Err(failed) => return cannot_write(io, &failed.path, &failed.error),
+        };
         if let Err(error) = repo::update_work_tree(ctx, root, &ours, &combined.tree) {
             io.err
                 .extend_from_slice(format!("git rebase: {error}\n").as_bytes());
             return 1;
         }
-        if repo::store_index(ctx, root, &combined.tree).is_err() {
-            return 1;
+        if let Err(error) = repo::store_index(ctx, root, &combined.tree) {
+            return cannot_write(io, "the index", &error);
         }
         if !combined.stages.is_empty() {
             if !store(ctx, root, &state) || !conflict::store_stages(ctx, root, &combined.stages) {
@@ -376,8 +372,8 @@ fn land(ctx: &mut CommandContext<'_>, root: &str, state: &State, io: &mut Io) ->
         return Err(1);
     }
     let action = format!("rebase (finish): returning to {reference}");
-    if repo::set_head_to_branch(ctx, root, &state.branch, &action).is_err() {
-        return Err(1);
+    if let Err(error) = repo::set_head_to_branch(ctx, root, &state.branch, &action) {
+        return Err(cannot_write(io, "HEAD", &error));
     }
     Ok(())
 }
@@ -401,14 +397,13 @@ fn record(
         timestamp: original.timestamp,
         message: original.message.clone(),
     };
-    let Ok(id) = repo::store_commit(ctx, root, &replayed, tree) else {
-        io.err
-            .extend_from_slice(b"git rebase: cannot record commit\n");
-        return Err(1);
+    let id = match repo::store_commit(ctx, root, &replayed, tree) {
+        Ok(id) => id,
+        Err(error) => return Err(cannot_write(io, "the commit", &error)),
     };
     let action = format!("rebase ({verb}): {}", replayed.subject());
-    if repo::update_head(ctx, root, &id, &action).is_err() {
-        return Err(1);
+    if let Err(error) = repo::update_head(ctx, root, &id, &action) {
+        return Err(cannot_write(io, "HEAD", &error));
     }
     Ok(id)
 }
@@ -432,7 +427,10 @@ fn resume(ctx: &mut CommandContext<'_>, root: &str, globals: &Globals, io: &mut 
     let Some(original) = repo::load_commit(ctx, root, &id) else {
         return 128;
     };
-    let staged = repo::load_index(ctx, root).unwrap_or_default();
+    let staged = match require_index(ctx, root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     let head_tree = repo::head_tree(ctx, root);
     if staged != head_tree {
         // Git reports the commit the user just settled, which is the only one it names by hand.
@@ -491,16 +489,12 @@ fn abort(ctx: &mut CommandContext<'_>, root: &str, io: &mut Io) -> i32 {
     }
     // HEAD is detached mid-rebase, so putting it back means naming the branch again.
     let reference = format!("refs/heads/{}", state.branch);
-    if repo::write_reference(ctx, root, &reference, &state.original).is_err()
-        || repo::set_head_to_branch(
-            ctx,
-            root,
-            &state.branch,
-            &format!("rebase (abort): returning to {reference}"),
-        )
-        .is_err()
-    {
-        return 1;
+    if let Err(error) = repo::write_reference(ctx, root, &reference, &state.original) {
+        return cannot_write(io, &reference, &error);
+    }
+    let action = format!("rebase (abort): returning to {reference}");
+    if let Err(error) = repo::set_head_to_branch(ctx, root, &state.branch, &action) {
+        return cannot_write(io, "HEAD", &error);
     }
     clear(ctx, root);
     0

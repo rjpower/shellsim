@@ -29,7 +29,7 @@ mod worktree;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::commands::{reg_costed, CommandContext, CommandSpec, Io, Trust};
-use crate::vfs::resolve_against;
+use crate::vfs::{resolve_against, VfsError};
 
 /// Version string reported by `git --version`. The suffix keeps the simulation identifiable
 /// while leaving the usual `git version X.Y.Z` prefix parseable.
@@ -155,6 +155,45 @@ pub(crate) fn fatal(io: &mut Io, message: &str) -> i32 {
     io.err
         .extend_from_slice(format!("fatal: {message}\n").as_bytes());
     128
+}
+
+/// Report a repository write that could not be made, and the status to exit with.
+///
+/// These writes fail when the simulated disk fills. Returning a bare status for one leaves an
+/// agent with a non-zero exit, nothing on standard error, and a repository it cannot reason
+/// about, so every caller names what it was trying to write.
+pub(crate) fn cannot_write(io: &mut Io, what: &str, error: &VfsError) -> i32 {
+    fatal(io, &format!("unable to write {what}: {error}"))
+}
+
+/// The tree of a commit that may not be there: empty when there is none, fatal when there is one
+/// and it cannot be read.
+///
+/// A root commit has no parent, and its change is measured against nothing. That is not the same
+/// as a parent whose tree is missing, which must not be read as "every file was added".
+pub(crate) fn parent_tree(
+    ctx: &CommandContext<'_>,
+    root: &str,
+    parent: Option<&String>,
+    io: &mut Io,
+) -> Result<repo::Tree, i32> {
+    match parent {
+        Some(parent) => require_tree(ctx, root, parent, io),
+        None => Ok(repo::Tree::new()),
+    }
+}
+
+/// The staged tree, or a fatal error when the index cannot be read.
+///
+/// `repo::load_index` reads a *missing* index as nothing staged, which is what a fresh repository
+/// has. What it cannot read is a *corrupt* one, and to a command that writes the index or the
+/// working tree "nothing is staged" reads as "delete everything", so those ask for it this way.
+pub(crate) fn require_index(
+    ctx: &CommandContext<'_>,
+    root: &str,
+    io: &mut Io,
+) -> Result<repo::Tree, i32> {
+    repo::load_index(ctx, root).ok_or_else(|| fatal(io, "index file corrupt"))
 }
 
 /// One argument, as the command that asked for it sees it.

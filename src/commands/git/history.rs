@@ -177,27 +177,27 @@ pub(crate) fn git_commit(
     if dry_run {
         // Git reports what a commit would record, stops before asking for a message, and fails
         // when there is nothing staged to record.
-        let staged =
-            repo::load_index(ctx, &root).unwrap_or_default() != repo::head_tree(ctx, &root);
+        let staged = match super::require_index(ctx, &root, io) {
+            Ok(index) => index != repo::head_tree(ctx, &root),
+            Err(status) => return status,
+        };
         let status = super::worktree::git_status(ctx, &[], io);
         return if status == 0 && !staged { 1 } else { status };
     }
     if message.is_empty() && !allow_empty {
         return usage(io, "a non-empty -m MESSAGE is required");
     }
-    let Some(index_tree) = repo::load_index(ctx, &root) else {
-        io.err
-            .extend_from_slice(b"fatal: invalid simulated index\n");
-        return 128;
+    let index_tree = match super::require_index(ctx, &root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
     };
     // Amending replaces the previous commit, so the comparison tree is its parent's.
     let (parents, baseline) = match (amend, &previous) {
         (true, Some((_, commit))) => {
-            let baseline = commit
-                .parents
-                .first()
-                .and_then(|parent| repo::commit_tree(ctx, &root, parent))
-                .unwrap_or_default();
+            let baseline = match super::parent_tree(ctx, &root, commit.parents.first(), io) {
+                Ok(tree) => tree,
+                Err(status) => return status,
+            };
             (commit.parents.clone(), baseline)
         }
         (_, Some((id, _))) => {
@@ -206,10 +206,11 @@ pub(crate) fn git_commit(
             if let Some((conflict::MERGE_HEAD, other)) = pending.as_ref().map(|(k, c)| (*k, c)) {
                 parents.push(other.clone());
             }
-            (
-                parents,
-                repo::commit_tree(ctx, &root, id).unwrap_or_default(),
-            )
+            let baseline = match super::require_tree(ctx, &root, id, io) {
+                Ok(tree) => tree,
+                Err(status) => return status,
+            };
+            (parents, baseline)
         }
         _ => (Vec::new(), Tree::new()),
     };
@@ -274,8 +275,9 @@ pub(crate) fn git_commit(
         (false, true) => "commit (amend)",
         (false, false) => "commit",
     };
-    if repo::update_head(ctx, &root, &id, &format!("{what}: {}", commit.subject())).is_err() {
-        return 1;
+    let action = format!("{what}: {}", commit.subject());
+    if let Err(error) = repo::update_head(ctx, &root, &id, &action) {
+        return super::cannot_write(io, "HEAD", &error);
     }
     if pending.is_some() {
         conflict::clear(ctx, &root);
@@ -1952,15 +1954,17 @@ fn rename_branch(
             .extend_from_slice(format!("fatal: a branch named '{to}' already exists\n").as_bytes());
         return 128;
     }
-    if repo::write_reference(ctx, root, &format!("refs/heads/{to}"), &commit).is_err()
-        || repo::delete_reference(ctx, root, &format!("refs/heads/{from}")).is_err()
-    {
-        return 1;
+    if let Err(error) = repo::write_reference(ctx, root, &format!("refs/heads/{to}"), &commit) {
+        return super::cannot_write(io, &format!("refs/heads/{to}"), &error);
     }
-    if repo::current_branch(ctx, root).as_deref() == Some(from)
-        && repo::set_head_to_branch(ctx, root, to, &format!("branch: renamed to {to}")).is_err()
-    {
-        return 1;
+    if let Err(error) = repo::delete_reference(ctx, root, &format!("refs/heads/{from}")) {
+        return super::cannot_write(io, &format!("refs/heads/{from}"), &error);
+    }
+    if repo::current_branch(ctx, root).as_deref() == Some(from) {
+        let action = format!("branch: renamed to {to}");
+        if let Err(error) = repo::set_head_to_branch(ctx, root, to, &action) {
+            return super::cannot_write(io, "HEAD", &error);
+        }
     }
     0
 }
@@ -2093,8 +2097,8 @@ pub(crate) fn git_tag(
             .extend_from_slice(format!("fatal: tag '{name}' already exists\n").as_bytes());
         return 128;
     }
-    if repo::write_reference(ctx, &root, &reference, &commit).is_err() {
-        return 1;
+    if let Err(error) = repo::write_reference(ctx, &root, &reference, &commit) {
+        return super::cannot_write(io, &reference, &error);
     }
     if let Some(message) = message {
         // The annotation is stored beside the ref; the ref itself stays lightweight.
@@ -2106,8 +2110,8 @@ pub(crate) fn git_tag(
             timestamp: now_seconds(ctx),
             message,
         };
-        if repo::write_annotation(ctx, &root, name, &annotation).is_err() {
-            return 1;
+        if let Err(error) = repo::write_annotation(ctx, &root, name, &annotation) {
+            return super::cannot_write(io, "the tag annotation", &error);
         }
     }
     0
@@ -2129,10 +2133,14 @@ pub(crate) struct Snapshot {
     pub work: Tree,
 }
 
-pub(crate) fn snapshot(ctx: &mut CommandContext<'_>, root: &str) -> Result<Snapshot, i32> {
+pub(crate) fn snapshot(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    io: &mut Io,
+) -> Result<Snapshot, i32> {
     let head = repo::head_tree(ctx, root);
-    let index = repo::load_index(ctx, root).unwrap_or_default();
-    let work = repo::collect_working_tree(ctx, root)?.release(ctx);
+    let index = super::require_index(ctx, root, io)?;
+    let work = repo::collect_working_tree(ctx, root)?;
     Ok(Snapshot { head, index, work })
 }
 
@@ -2233,7 +2241,7 @@ fn checkout_commit(
         );
     }
     let new = super::require_tree(ctx, root, commit, io)?;
-    let snapshot = snapshot(ctx, root)?;
+    let snapshot = snapshot(ctx, root, io)?;
     let old = &snapshot.head;
     let blocked = blocking_changes(&snapshot, &new);
     if !blocked.is_empty() {
@@ -2257,8 +2265,8 @@ fn checkout_commit(
         return Err(1);
     }
     let index = carried_index(&snapshot, &new);
-    if repo::store_index(ctx, root, &index).is_err() {
-        return Err(1);
+    if let Err(error) = repo::store_index(ctx, root, &index) {
+        return Err(super::cannot_write(io, "the index", &error));
     }
     Ok(())
 }
@@ -2329,8 +2337,8 @@ pub(crate) fn switch_to_branch(
     }
     let from = repo::current_branch(ctx, root).unwrap_or_else(|| "HEAD".to_string());
     let action = format!("checkout: moving from {from} to {branch}");
-    if repo::set_head_to_branch(ctx, root, branch, &action).is_err() {
-        return 1;
+    if let Err(error) = repo::set_head_to_branch(ctx, root, branch, &action) {
+        return super::cannot_write(io, "HEAD", &error);
     }
     if announce {
         io.err
@@ -2348,15 +2356,9 @@ fn switch_detached(ctx: &mut CommandContext<'_>, root: &str, revision: &str, io:
     if let Err(status) = checkout_commit(ctx, root, &commit, io) {
         return status;
     }
-    if repo::set_head_detached(
-        ctx,
-        root,
-        &commit,
-        &format!("checkout: moving to {revision}"),
-    )
-    .is_err()
-    {
-        return 1;
+    let action = format!("checkout: moving to {revision}");
+    if let Err(error) = repo::set_head_detached(ctx, root, &commit, &action) {
+        return super::cannot_write(io, "HEAD", &error);
     }
     io.err.extend_from_slice(
         format!(
@@ -2695,7 +2697,7 @@ pub(crate) fn git_merge(
         Ok(tree) => tree,
         Err(status) => return status,
     };
-    let snapshot = match snapshot(ctx, &root) {
+    let snapshot = match snapshot(ctx, &root, io) {
         Ok(snapshot) => snapshot,
         Err(status) => return status,
     };
@@ -2714,9 +2716,9 @@ pub(crate) fn git_merge(
         if let Err(status) = checkout_commit(ctx, &root, &other, io) {
             return status;
         }
-        if repo::update_head(ctx, &root, &other, &format!("merge {target}: Fast-forward")).is_err()
-        {
-            return 1;
+        let action = format!("merge {target}: Fast-forward");
+        if let Err(error) = repo::update_head(ctx, &root, &other, &action) {
+            return super::cannot_write(io, "HEAD", &error);
         }
         io.out.extend_from_slice(
             format!(
@@ -2741,10 +2743,10 @@ pub(crate) fn git_merge(
             .extend_from_slice(b"fatal: Not possible to fast-forward, aborting.\n");
         return 128;
     }
-    let base_tree = base
-        .as_deref()
-        .and_then(|base| repo::commit_tree(ctx, &root, base))
-        .unwrap_or_default();
+    let base_tree = match super::parent_tree(ctx, &root, base.as_ref(), io) {
+        Ok(tree) => tree,
+        Err(status) => return status,
+    };
     let head_tree = match super::require_tree(ctx, &root, &head, io) {
         Ok(tree) => tree,
         Err(status) => return status,
@@ -2766,14 +2768,18 @@ pub(crate) fn git_merge(
         "HEAD",
         target,
     );
+    let combined = match combined {
+        Ok(combined) => combined,
+        Err(failed) => return super::cannot_write(io, &failed.path, &failed.error),
+    };
     let merged = combined.tree;
     if let Err(error) = repo::update_work_tree(ctx, &root, &head_tree, &merged) {
         io.err
             .extend_from_slice(format!("git merge: {error}\n").as_bytes());
         return 1;
     }
-    if repo::store_index(ctx, &root, &merged).is_err() {
-        return 1;
+    if let Err(error) = repo::store_index(ctx, &root, &merged) {
+        return super::cannot_write(io, "the index", &error);
     }
     if !combined.stages.is_empty() {
         return pause_for_conflicts(
@@ -2798,11 +2804,12 @@ pub(crate) fn git_merge(
         timestamp: now_seconds(ctx),
         message: subject,
     };
-    let Ok(id) = repo::store_commit(ctx, &root, &commit, &merged) else {
-        return 1;
+    let id = match repo::store_commit(ctx, &root, &commit, &merged) {
+        Ok(id) => id,
+        Err(error) => return super::cannot_write(io, "the merge commit", &error),
     };
-    if repo::update_head(ctx, &root, &id, &format!("merge {target}")).is_err() {
-        return 1;
+    if let Err(error) = repo::update_head(ctx, &root, &id, &format!("merge {target}")) {
+        return super::cannot_write(io, "HEAD", &error);
     }
     io.out
         .extend_from_slice(b"Merge made by the 'ort' strategy.\n");
@@ -3025,7 +3032,10 @@ fn abort_sequence(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut
         Ok(tree) => tree,
         Err(status) => return status,
     };
-    let mut previous = repo::load_index(ctx, root).unwrap_or_default();
+    let mut previous = match super::require_index(ctx, root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     for (path, entry) in &head {
         previous
             .entry(path.clone())
@@ -3036,10 +3046,12 @@ fn abort_sequence(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut
             .extend_from_slice(format!("git {name}: {error}\n").as_bytes());
         return 1;
     }
-    if repo::store_index(ctx, root, &target).is_err()
-        || repo::update_head(ctx, root, &sequence.original, &format!("{name}: aborted")).is_err()
-    {
-        return 1;
+    if let Err(error) = repo::store_index(ctx, root, &target) {
+        return super::cannot_write(io, "the index", &error);
+    }
+    let action = format!("{name}: aborted");
+    if let Err(error) = repo::update_head(ctx, root, &sequence.original, &action) {
+        return super::cannot_write(io, "HEAD", &error);
     }
     conflict::clear(ctx, root);
     clear_sequence(ctx, root);
@@ -3116,11 +3128,10 @@ fn replay_one(
         Ok(tree) => tree,
         Err(status) => return status,
     };
-    let parent_tree = commit
-        .parents
-        .get(against - 1)
-        .and_then(|parent| repo::commit_tree(ctx, root, parent))
-        .unwrap_or_default();
+    let parent_tree = match super::parent_tree(ctx, root, commit.parents.get(against - 1), io) {
+        Ok(tree) => tree,
+        Err(status) => return status,
+    };
     let head_tree = match super::require_tree(ctx, root, &head, io) {
         Ok(tree) => tree,
         Err(status) => return status,
@@ -3132,7 +3143,7 @@ fn replay_one(
     };
     // Committing the replay would fold anything already staged into it, which is why Git wants
     // a settled index first. `-n` leaves the commit to the user, so it can go ahead.
-    let snapshot = match snapshot(ctx, root) {
+    let snapshot = match snapshot(ctx, root, io) {
         Ok(snapshot) => snapshot,
         Err(status) => return status,
     };
@@ -3156,6 +3167,10 @@ fn replay_one(
     };
     let label = format!("{} ({})", repo::short(&id), commit.subject());
     let combined = conflict::combine(ctx, root, base, &head_tree, theirs, "HEAD", &label);
+    let combined = match combined {
+        Ok(combined) => combined,
+        Err(failed) => return super::cannot_write(io, &failed.path, &failed.error),
+    };
     let applied = combined.tree;
     if let Err(error) = repo::update_work_tree(ctx, root, &head_tree, &applied) {
         io.err
@@ -3173,8 +3188,8 @@ fn replay_one(
             None => index.remove(path),
         };
     }
-    if repo::store_index(ctx, root, &index).is_err() {
-        return 1;
+    if let Err(error) = repo::store_index(ctx, root, &index) {
+        return super::cannot_write(io, "the index", &error);
     }
     let kind = if revert {
         conflict::REVERT_HEAD
@@ -3230,18 +3245,13 @@ fn replay_one(
         timestamp: now_seconds(ctx),
         message,
     };
-    let Ok(new_id) = repo::store_commit(ctx, root, &replayed, &applied) else {
-        return 1;
+    let new_id = match repo::store_commit(ctx, root, &replayed, &applied) {
+        Ok(id) => id,
+        Err(error) => return super::cannot_write(io, "the commit", &error),
     };
-    if repo::update_head(
-        ctx,
-        root,
-        &new_id,
-        &format!("{name}: {}", replayed.subject()),
-    )
-    .is_err()
-    {
-        return 1;
+    let action = format!("{name}: {}", replayed.subject());
+    if let Err(error) = repo::update_head(ctx, root, &new_id, &action) {
+        return super::cannot_write(io, "HEAD", &error);
     }
     let branch = repo::current_branch(ctx, root).unwrap_or_else(|| "detached HEAD".to_string());
     io.out.extend_from_slice(
@@ -3335,7 +3345,10 @@ fn abort_pending(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut 
     }
     let head = repo::head_tree(ctx, root);
     // Only paths the merge could have touched are restored; untracked files are left alone.
-    let mut previous = repo::load_index(ctx, root).unwrap_or_default();
+    let mut previous = match super::require_index(ctx, root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     for (path, hash) in &head {
         previous.entry(path.clone()).or_insert_with(|| hash.clone());
     }
@@ -3344,8 +3357,8 @@ fn abort_pending(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut 
             .extend_from_slice(format!("git {name}: {error}\n").as_bytes());
         return 1;
     }
-    if repo::store_index(ctx, root, &head).is_err() {
-        return 1;
+    if let Err(error) = repo::store_index(ctx, root, &head) {
+        return super::cannot_write(io, "the index", &error);
     }
     conflict::clear(ctx, root);
     0

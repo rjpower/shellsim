@@ -9,7 +9,7 @@ use crate::commands::{CommandContext, Io};
 
 use super::conflict;
 use super::repo::{self, Tree};
-use super::{repo_error, usage, Arg, Flags};
+use super::{cannot_write, repo_error, require_index, usage, Arg, Flags};
 
 /// One saved entry.
 struct Entry {
@@ -163,10 +163,13 @@ fn push(
         io.err.extend_from_slice(b"error: could not write index\n");
         return 1;
     }
-    let index_tree = repo::load_index(ctx, root).unwrap_or_default();
+    let index_tree = match require_index(ctx, root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     let head_tree = repo::head_tree(ctx, root);
     let mut work = match repo::collect_working_tree(ctx, root) {
-        Ok(snapshot) => snapshot.release(ctx),
+        Ok(work) => work,
         Err(status) => return status,
     };
     if !include_untracked {
@@ -181,8 +184,8 @@ fn push(
         let Some(data) = repo::read_work_file(ctx, root, path) else {
             continue;
         };
-        if repo::write_blob(ctx, root, &data).is_err() {
-            return 1;
+        if let Err(error) = repo::write_blob(ctx, root, &data) {
+            return cannot_write(io, "the object", &error);
         }
     }
     let branch = repo::current_branch(ctx, root).unwrap_or_else(|| "HEAD".to_string());
@@ -196,20 +199,12 @@ fn push(
         || format!("WIP on {branch}: {} {subject}", repo::short(&base)),
         |text| format!("On {branch}: {text}"),
     );
-    if repo::write_vfs(
-        ctx,
-        &tree_path(root, id, "work"),
-        &repo::serialize_tree(&work),
-    )
-    .is_err()
-        || repo::write_vfs(
-            ctx,
-            &tree_path(root, id, "index"),
-            &repo::serialize_tree(&index_tree),
-        )
-        .is_err()
-    {
-        return 1;
+    for (kind, tree) in [("work", &work), ("index", &index_tree)] {
+        if let Err(error) =
+            repo::write_vfs(ctx, &tree_path(root, id, kind), &repo::serialize_tree(tree))
+        {
+            return cannot_write(io, "the stash entry", &error);
+        }
     }
     entries.insert(
         0,
@@ -232,8 +227,8 @@ fn push(
             .extend_from_slice(format!("git stash: {error}\n").as_bytes());
         return 1;
     }
-    if repo::store_index(ctx, root, &head_tree).is_err() {
-        return 1;
+    if let Err(error) = repo::store_index(ctx, root, &head_tree) {
+        return cannot_write(io, "the index", &error);
     }
     io.out.extend_from_slice(
         format!("Saved working directory and index state {message}\n").as_bytes(),
@@ -315,7 +310,7 @@ fn apply(
         Err(status) => return status,
     };
     let mine = match repo::collect_working_tree(ctx, root) {
-        Ok(snapshot) => snapshot.release(ctx),
+        Ok(work) => work,
         Err(status) => return status,
     };
     // The merge reads both sides from the object store, and a working-tree file that was never
@@ -335,7 +330,10 @@ fn apply(
     }
     // A file the entry would change that the working tree has already moved away from has two
     // unrecorded versions and room for one. Git refuses rather than choose, and so does this.
-    let index = repo::load_index(ctx, root).unwrap_or_default();
+    let index = match require_index(ctx, root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     let doomed: Vec<String> = work
         .keys()
         .chain(base.keys())
@@ -366,6 +364,10 @@ fn apply(
         "Updated upstream",
         "Stashed changes",
     );
+    let combined = match combined {
+        Ok(combined) => combined,
+        Err(failed) => return cannot_write(io, &failed.path, &failed.error),
+    };
     if let Err(error) = repo::update_work_tree(ctx, root, &mine, &combined.tree) {
         io.err
             .extend_from_slice(format!("git stash: {error}\n").as_bytes());
@@ -376,7 +378,10 @@ fn apply(
     // A file the entry brings back that nothing tracks yet cannot be left "unstaged", so Git
     // records it as a new file. Paths already tracked keep whatever the index says, and a file
     // that was untracked when the entry was pushed stays untracked.
-    let mut index = repo::load_index(ctx, root).unwrap_or_default();
+    let mut index = match require_index(ctx, root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     let restored: Vec<(String, repo::Entry)> = combined
         .tree
         .iter()
@@ -385,8 +390,8 @@ fn apply(
         .collect();
     if !restored.is_empty() {
         index.extend(restored);
-        if repo::store_index(ctx, root, &index).is_err() {
-            return 1;
+        if let Err(error) = repo::store_index(ctx, root, &index) {
+            return cannot_write(io, "the index", &error);
         }
     }
     if !combined.stages.is_empty() {

@@ -245,8 +245,15 @@ fn write_work_file(interp: &mut Interp, path: &str, bytes: &[u8], entry: &Entry)
     interp.vfs.chmod("/", path, mode)
 }
 
+/// The staged tree, or `None` when the index cannot be read.
+///
+/// A repository with no index file has nothing staged, which is what Git makes of one; `None`
+/// means the file is there and unreadable, which is worth saying out loud.
 pub(crate) fn load_index(interp: &Interp, root: &str) -> Option<Tree> {
-    read_tree(interp, &git_path(root, INDEX))
+    match interp.vfs.read("/", &git_path(root, INDEX)) {
+        Ok(bytes) => parse_tree(&bytes),
+        Err(_) => Some(Tree::new()),
+    }
 }
 
 pub(crate) fn store_index(ctx: &mut CommandContext<'_>, root: &str, index: &Tree) -> VfsResult<()> {
@@ -975,25 +982,11 @@ pub(crate) fn write_config(
 
 // -- working tree -------------------------------------------------------------------------------
 
-/// A hashed snapshot of every file in the working tree, with the memory it reserved.
-pub(crate) struct WorkingTree {
-    pub files: Tree,
-    reserved_memory: u64,
-}
-
-impl WorkingTree {
-    /// Release the memory the snapshot reserved. Call once the snapshot is no longer needed.
-    pub fn release(self, ctx: &mut CommandContext<'_>) -> Tree {
-        ctx.resources.release_memory(self.reserved_memory);
-        self.files
-    }
-}
-
 /// Hash every file in the working tree, metering the work against the caller's limits.
-pub(crate) fn collect_working_tree(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-) -> Result<WorkingTree, i32> {
+///
+/// The memory the walk reserves is given back before returning, because every caller wants the
+/// tree and nothing else.
+pub(crate) fn collect_working_tree(ctx: &mut CommandContext<'_>, root: &str) -> Result<Tree, i32> {
     let mut file_count = 0_u64;
     let mut path_bytes = 0_u64;
     let mut content_bytes = 0_u64;
@@ -1049,10 +1042,8 @@ pub(crate) fn collect_working_tree(
             }
         }
     }
-    Ok(WorkingTree {
-        files,
-        reserved_memory,
-    })
+    ctx.resources.release_memory(reserved_memory);
+    Ok(files)
 }
 
 /// Hash one working-tree file, charging the read against the caller's limits.

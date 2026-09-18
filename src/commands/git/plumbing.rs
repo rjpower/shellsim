@@ -12,7 +12,7 @@ use crate::vfs::resolve_against;
 use super::diff;
 use super::ignore;
 use super::repo;
-use super::{fatal, repo_error, usage, Arg, Flags};
+use super::{cannot_write, fatal, repo_error, usage, Arg, Flags};
 
 /// The most files `git grep` will search in one invocation.
 const MAX_GREP_FILES: usize = 10_000;
@@ -162,8 +162,8 @@ pub(crate) fn git_hash_object(ctx: &mut CommandContext<'_>, args: &[String], io:
             let Some(root) = root.as_deref() else {
                 return repo_error(io);
             };
-            if repo::write_blob(ctx, root, &data).is_err() {
-                return 1;
+            if let Err(error) = repo::write_blob(ctx, root, &data) {
+                return cannot_write(io, "the object", &error);
             }
         }
         io.out.extend_from_slice(format!("{hash}\n").as_bytes());

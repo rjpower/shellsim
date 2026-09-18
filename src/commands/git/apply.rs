@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use crate::commands::{CommandContext, Io};
 
 use super::repo;
-use super::repo_error;
+use super::{cannot_write, repo_error, require_index};
 
 pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut stage = false;
@@ -49,14 +49,17 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         return repo_error(io);
     };
     let work = match repo::collect_working_tree(ctx, &root) {
-        Ok(snapshot) => snapshot.release(ctx),
+        Ok(work) => work,
         Err(status) => return status,
     };
     let unpatched = ctx.vfs.clone();
     // `--cached` patches what is staged, so the index content is laid down to be worked on and
     // the working tree is put back afterwards.
     let before = if cached {
-        let staged = repo::load_index(ctx, &root).unwrap_or_default();
+        let staged = match require_index(ctx, &root, io) {
+            Ok(index) => index,
+            Err(status) => return status,
+        };
         // Only tracked paths are laid down; an untracked file, the patch itself included, stays.
         let mut tracked = repo::head_tree(ctx, &root);
         tracked.extend(staged.clone());
@@ -79,7 +82,7 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         return status;
     }
     let after = match repo::collect_working_tree(ctx, &root) {
-        Ok(snapshot) => snapshot.release(ctx),
+        Ok(work) => work,
         Err(status) => return status,
     };
     // The patched content has to be read before `--cached` puts the working tree back.
@@ -98,7 +101,10 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     if cached {
         ctx.vfs = unpatched;
     }
-    let mut index = repo::load_index(ctx, &root).unwrap_or_default();
+    let mut index = match require_index(ctx, &root, io) {
+        Ok(index) => index,
+        Err(status) => return status,
+    };
     for (path, content) in changed {
         match content {
             Some(data) => match repo::write_blob(ctx, &root, &data) {
@@ -118,8 +124,8 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
             }
         }
     }
-    if repo::store_index(ctx, &root, &index).is_err() {
-        return 1;
+    if let Err(error) = repo::store_index(ctx, &root, &index) {
+        return cannot_write(io, "the index", &error);
     }
     0
 }
