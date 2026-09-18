@@ -71,9 +71,9 @@ impl Default for Options {
 /// Whether a repository-relative path is covered by the given pathspec prefixes.
 pub(crate) fn selected(paths: &[String], path: &str) -> bool {
     paths.is_empty()
-        || paths.iter().any(|prefix| {
-            prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"))
-        })
+        || paths
+            .iter()
+            .any(|spec| super::ignore::matches_pathspec(spec, path))
 }
 
 fn content(

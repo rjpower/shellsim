@@ -284,7 +284,7 @@ fn git_rm_refuses_modified_files_without_force() {
     let refused = run(&mut env, "git rm file");
     assert_eq!(refused.0, 1);
     assert!(
-        refused.2.contains("staged or local changes"),
+        refused.2.contains("has local modifications"),
         "{}",
         refused.2
     );
@@ -808,4 +808,283 @@ fn clean_removes_untracked_directories_only_with_d() {
     assert!(!env.vfs.exists("/", "/junk"));
     assert!(!env.vfs.exists("/", "/loose.txt"));
     assert_eq!(env.vfs.read("/", "/tracked.txt").unwrap(), b"keep\n");
+}
+
+#[test]
+fn glob_pathspecs_select_files_at_any_depth() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/src/main.py", b"one\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/src/notes.md", b"one\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m base").0, 0);
+    env.vfs
+        .put_file("/src/main.py", b"two\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/src/notes.md", b"two\n".to_vec(), 0o644)
+        .unwrap();
+
+    assert_eq!(
+        run(&mut env, "git status --porcelain -- '*.py'").1,
+        " M src/main.py\n"
+    );
+    assert_eq!(
+        run(&mut env, "git diff --name-only -- '*.md'").1,
+        "src/notes.md\n"
+    );
+    assert_eq!(run(&mut env, "git ls-files '*.py'").1, "src/main.py\n");
+}
+
+#[test]
+fn adding_an_ignored_file_by_name_is_refused() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/.gitignore", b"*.log\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/debug.log", b"noise\n".to_vec(), 0o644)
+        .unwrap();
+
+    let refused = run(&mut env, "git add debug.log");
+    assert_eq!(refused.0, 1);
+    assert!(
+        refused.2.contains("ignored by one of your"),
+        "{}",
+        refused.2
+    );
+    assert_eq!(run(&mut env, "git status --short").1, "?? .gitignore\n");
+
+    // `-v` names the rule that decided the path, and `-f` overrides it.
+    assert_eq!(
+        run(&mut env, "git check-ignore -v debug.log").1,
+        ".gitignore:1:*.log\tdebug.log\n"
+    );
+    assert_eq!(run(&mut env, "git add -f debug.log").0, 0);
+    assert!(run(&mut env, "git status --short")
+        .1
+        .contains("A  debug.log"));
+}
+
+#[test]
+fn repository_excludes_and_character_classes_are_honoured() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/.git/info/exclude", b"scratch/\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/.gitignore", b"page[0-9].txt\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/scratch/tmp.bin", b"x\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/page1.txt", b"x\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/pages.txt", b"x\n".to_vec(), 0o644)
+        .unwrap();
+
+    assert_eq!(
+        run(&mut env, "git status --short").1,
+        "?? .gitignore\n?? pages.txt\n"
+    );
+    assert_eq!(run(&mut env, "git check-ignore scratch/tmp.bin").0, 0);
+}
+
+#[test]
+fn checkout_keeps_edits_to_files_the_move_does_not_touch() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    env.vfs.put_file("/b.txt", b"b\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    assert_eq!(run(&mut env, "git branch side").0, 0);
+    env.vfs
+        .put_file("/b.txt", b"changed\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -a -m two").0, 0);
+
+    // a.txt is identical on both branches, so the local edit survives the switch.
+    env.vfs
+        .put_file("/a.txt", b"local\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git switch side").0, 0);
+    assert_eq!(env.vfs.read("/", "/a.txt").unwrap(), b"local\n");
+    assert_eq!(env.vfs.read("/", "/b.txt").unwrap(), b"b\n");
+
+    // A tracked file deleted from the working tree is restored even when its content is unchanged.
+    assert_eq!(run(&mut env, "rm a.txt; git checkout HEAD -- .").0, 0);
+    assert_eq!(env.vfs.read("/", "/a.txt").unwrap(), b"a\n");
+}
+
+#[test]
+fn stash_reapply_refuses_to_overwrite_local_changes() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    env.vfs
+        .put_file("/a.txt", b"stashed\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git stash push -q -m saved").0, 0);
+    assert_eq!(run(&mut env, "git stash push -q -m saved").1, "");
+
+    env.vfs
+        .put_file("/a.txt", b"conflict\n".to_vec(), 0o644)
+        .unwrap();
+    let refused = run(&mut env, "git stash pop");
+    assert_eq!(refused.0, 1);
+    assert!(refused.2.contains("would be overwritten"), "{}", refused.2);
+    assert_eq!(env.vfs.read("/", "/a.txt").unwrap(), b"conflict\n");
+    // The entry survives a refused reapplication.
+    assert!(run(&mut env, "git stash list").1.contains("saved"));
+}
+
+#[test]
+fn committing_a_pathspec_records_only_those_files() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    env.vfs.put_file("/b.txt", b"b\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    env.vfs
+        .put_file("/a.txt", b"edited\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/b.txt", b"edited\n".to_vec(), 0o644)
+        .unwrap();
+
+    assert_eq!(run(&mut env, "git commit -m two b.txt").0, 0);
+    assert_eq!(run(&mut env, "git status --porcelain").1, " M a.txt\n");
+    assert_eq!(
+        run(&mut env, "git show --name-only --format=%s HEAD").1,
+        "two\n\nb.txt\n"
+    );
+
+    // A dry run reports the long status and fails when nothing is staged.
+    let dry = run(&mut env, "git commit --dry-run");
+    assert_eq!(dry.0, 1);
+    assert!(dry.1.contains("Changes not staged for commit"), "{}", dry.1);
+}
+
+#[test]
+fn removing_the_last_file_removes_its_directory() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/pkg/mod/unit.txt", b"x\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/keep.txt", b"k\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+
+    assert_eq!(run(&mut env, "git rm -r -q pkg").0, 0);
+    assert!(!env.vfs.exists("/", "/pkg"));
+    assert!(env.vfs.exists("/", "/keep.txt"));
+}
+
+#[test]
+fn inspection_commands_name_trees_and_revisions() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/src/main.py", b"print(1)\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/README.md", b"docs\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+
+    let body = run(&mut env, "git cat-file -p HEAD").1;
+    assert!(body.starts_with("tree "), "{body}");
+    assert!(
+        body.contains("\ncommitter shellsim <shellsim@localhost>"),
+        "{body}"
+    );
+    // `-s` reports the size of exactly those bytes.
+    assert_eq!(
+        run(&mut env, "git cat-file -s HEAD")
+            .1
+            .trim()
+            .parse::<usize>(),
+        Ok(body.len())
+    );
+
+    // A tree id is shared by `ls-tree`, `cat-file`, and `rev-parse`.
+    let listed = run(&mut env, "git ls-tree -d HEAD").1;
+    assert!(listed.starts_with("040000 tree "), "{listed}");
+    assert!(listed.ends_with("\tsrc\n"), "{listed}");
+    assert_eq!(
+        run(&mut env, "git rev-parse 'HEAD^{tree}'").1,
+        body.lines().next().unwrap()["tree ".len()..].to_string() + "\n"
+    );
+
+    assert_eq!(
+        run(&mut env, "git rev-parse HEAD:README.md").1,
+        run(&mut env, "git hash-object README.md").1
+    );
+    assert_eq!(
+        run(&mut env, "git rev-parse --symbolic-full-name HEAD").1,
+        "refs/heads/main\n"
+    );
+    assert_eq!(
+        run(&mut env, "git rev-parse 'HEAD^{commit}'").1,
+        run(&mut env, "git rev-parse HEAD").1
+    );
+}
+
+#[test]
+fn grep_reports_paths_relative_to_the_working_directory() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/src/a.txt", b"hello world\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/docs/b.txt", b"hello docs\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+
+    assert_eq!(
+        run(&mut env, "git grep -n hello").1,
+        "docs/b.txt:1:hello docs\nsrc/a.txt:1:hello world\n"
+    );
+    assert_eq!(
+        run(&mut env, "(cd src && git grep -n hello)").1,
+        "a.txt:1:hello world\n"
+    );
+    // A revision operand searches that commit and prefixes each match with it.
+    env.vfs
+        .put_file("/src/a.txt", b"goodbye\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(
+        run(&mut env, "git grep -n hello HEAD").1,
+        "HEAD:docs/b.txt:1:hello docs\nHEAD:src/a.txt:1:hello world\n"
+    );
+}
+
+#[test]
+fn unknown_subcommands_are_reported_the_way_git_reports_them() {
+    let mut env = Environment::new();
+    let unknown = run(&mut env, "git frobnicate");
+    assert_eq!(unknown.0, 1);
+    assert_eq!(
+        unknown.2,
+        "git: 'frobnicate' is not a git command. See 'git --help'.\n"
+    );
+    // A real Git subcommand this subset leaves out says so instead.
+    let omitted = run(&mut env, "git rebase main");
+    assert_eq!(omitted.0, 2);
+    assert!(
+        omitted.2.contains("unsupported subcommand"),
+        "{}",
+        omitted.2
+    );
 }

@@ -71,6 +71,24 @@ Supported commands:
 ";
 
 /// Subcommands that would need a network. They are refused rather than approximated.
+/// Real Git subcommands this subset deliberately leaves out; anything else is simply not a
+/// command, and is reported the way Git reports a typo.
+const UNSUPPORTED_COMMANDS: &[&str] = &[
+    "am",
+    "bisect",
+    "blame",
+    "bundle",
+    "cherry-pick",
+    "filter-branch",
+    "gc",
+    "notes",
+    "rebase",
+    "reflog",
+    "replace",
+    "revert",
+    "worktree",
+];
+
 const NETWORK_COMMANDS: &[&str] = &["clone", "fetch", "pull", "push", "submodule", "ls-remote"];
 
 /// Settings `git init` records, matching the defaults a real repository starts with.
@@ -326,9 +344,16 @@ fn dispatch(
             );
             128
         }
-        other => {
+        other if UNSUPPORTED_COMMANDS.contains(&other) => {
             ctx.note_unsupported(&format!("git:{other}"));
             usage(io, &format!("unsupported subcommand: {other}"))
+        }
+        other => {
+            ctx.note_unsupported(&format!("git:{other}"));
+            io.err.extend_from_slice(
+                format!("git: '{other}' is not a git command. See 'git --help'.\n").as_bytes(),
+            );
+            1
         }
     }
 }

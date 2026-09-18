@@ -72,25 +72,25 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             .extend_from_slice(format!("fatal: Not a valid object name {object}\n").as_bytes());
         return 128;
     };
+    let tree = repo::commit_tree(ctx, &root, &id).unwrap_or_default();
+    let mut body = format!("tree {}\n", repo::tree_hash(&tree));
+    for parent in &commit.parents {
+        body.push_str(&format!("parent {parent}\n"));
+    }
+    let identity = format!(
+        "{} <{}> {} +0000",
+        commit.author_name, commit.author_email, commit.timestamp
+    );
+    body.push_str(&format!("author {identity}\ncommitter {identity}\n\n"));
+    body.push_str(&commit.message);
+    body.push('\n');
     match mode.as_str() {
         "-t" => io.out.extend_from_slice(b"commit\n"),
         "-e" => {}
         "-s" => io
             .out
-            .extend_from_slice(format!("{}\n", commit.message.len()).as_bytes()),
-        _ => {
-            for parent in &commit.parents {
-                io.out
-                    .extend_from_slice(format!("parent {parent}\n").as_bytes());
-            }
-            io.out.extend_from_slice(
-                format!(
-                    "author {} <{}> {} +0000\n\n{}\n",
-                    commit.author_name, commit.author_email, commit.timestamp, commit.message
-                )
-                .as_bytes(),
-            );
-        }
+            .extend_from_slice(format!("{}\n", body.len()).as_bytes()),
+        _ => io.out.extend_from_slice(body.as_bytes()),
     }
     0
 }
@@ -151,12 +151,14 @@ pub(crate) fn git_ls_tree(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
     };
     let mut name_only = false;
     let mut recursive = false;
+    let mut directories_only = false;
     let mut operands = Vec::new();
     for argument in super::expand_clusters(args, "rd") {
         match argument.as_str() {
             "--name-only" | "--name-status" => name_only = true,
             "-r" => recursive = true,
-            "-d" | "--full-name" => {}
+            "-d" => directories_only = true,
+            "--full-name" => {}
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported ls-tree option: {value}"))
             }
@@ -203,17 +205,30 @@ pub(crate) fn git_ls_tree(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
         }
     }
     for (name, hash) in listed {
+        if directories_only && hash.is_some() {
+            continue;
+        }
         if name_only {
             io.out.extend_from_slice(format!("{name}\n").as_bytes());
             continue;
         }
         let line = match hash {
             Some(hash) => format!("100644 blob {hash}\t{name}\n"),
-            None => format!("040000 tree {}\t{name}\n", "0".repeat(40)),
+            None => format!("040000 tree {}\t{name}\n", subtree_hash(&tree, &name)),
         };
         io.out.extend_from_slice(line.as_bytes());
     }
     0
+}
+
+/// The identifier of the subtree rooted at `directory`.
+fn subtree_hash(tree: &repo::Tree, directory: &str) -> String {
+    let prefix = format!("{directory}/");
+    let subtree: repo::Tree = tree
+        .iter()
+        .filter_map(|(path, hash)| Some((path.strip_prefix(&prefix)?.to_string(), hash.clone())))
+        .collect();
+    repo::tree_hash(&subtree)
 }
 
 pub(crate) fn git_check_ignore(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -221,26 +236,56 @@ pub(crate) fn git_check_ignore(ctx: &mut CommandContext<'_>, args: &[String], io
         return repo_error(io);
     };
     let mut paths = Vec::new();
-    for argument in args {
+    let mut verbose = false;
+    let mut quiet = false;
+    let mut non_matching = false;
+    let mut from_stdin = false;
+    let args = super::expand_clusters(args, "vqn");
+    for argument in &args {
         match argument.as_str() {
-            "-v" | "--verbose" | "-q" | "--quiet" | "--no-index" => {}
+            "-v" | "--verbose" => verbose = true,
+            "-q" | "--quiet" => quiet = true,
+            "-n" | "--non-matching" => non_matching = true,
+            "--stdin" => from_stdin = true,
+            "--no-index" => {}
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported check-ignore option: {value}"))
             }
             value => paths.push(value.to_string()),
         }
     }
+    if from_stdin {
+        paths.extend(
+            String::from_utf8_lossy(&io.stdin)
+                .lines()
+                .map(str::to_string),
+        );
+    }
     if paths.is_empty() {
         return usage(io, "usage: git check-ignore PATH...");
+    }
+    if non_matching && !verbose {
+        return usage(io, "check-ignore: -n requires -v");
     }
     let rules = ignore::load(ctx, &root);
     let cwd = ctx.cwd.clone();
     let mut any = false;
     for path in &paths {
         let relative = super::pathspec(&cwd, &root, path);
-        if rules.is_ignored(&relative) {
-            any = true;
-            io.out.extend_from_slice(format!("{path}\n").as_bytes());
+        let rule = rules.describe(&relative);
+        any |= rule.is_some();
+        if quiet {
+            continue;
+        }
+        match (&rule, non_matching) {
+            (Some(rule), _) if verbose => {
+                io.out
+                    .extend_from_slice(format!("{rule}\t{path}\n").as_bytes());
+            }
+            (Some(_), _) => io.out.extend_from_slice(format!("{path}\n").as_bytes()),
+            // `-n` reports the paths no pattern covers, with empty source fields.
+            (None, true) => io.out.extend_from_slice(format!("::\t{path}\n").as_bytes()),
+            (None, false) => {}
         }
     }
     i32::from(!any)
@@ -346,21 +391,44 @@ pub(crate) fn git_shortlog(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     };
     let mut summary = false;
     let mut numbered = false;
+    let mut with_email = false;
+    let mut revisions: Vec<String> = Vec::new();
     for argument in super::expand_clusters(args, "sne") {
         match argument.as_str() {
             "-s" | "--summary" => summary = true,
             "-n" | "--numbered" => numbered = true,
-            "-e" | "--email" => {}
-            value => return usage(io, &format!("unsupported shortlog option: {value}")),
+            "-e" | "--email" => with_email = true,
+            "--no-merges" => {}
+            value if value.starts_with('-') => {
+                return usage(io, &format!("unsupported shortlog option: {value}"))
+            }
+            value => revisions.push(value.to_string()),
         }
     }
-    let Some(head) = repo::head_commit(ctx, &root) else {
-        return 0;
+    let starts: Vec<String> = if revisions.is_empty() {
+        repo::head_commit(ctx, &root).into_iter().collect()
+    } else {
+        let mut resolved = Vec::new();
+        for revision in &revisions {
+            let Some(commit) = repo::resolve_revision(ctx, &root, revision) else {
+                return super::ambiguous_argument(io, revision);
+            };
+            resolved.push(commit);
+        }
+        resolved
     };
+    if starts.is_empty() {
+        return 0;
+    }
     let mut counts: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (_, commit) in repo::first_parent_history(ctx, &root, &head, 10_000) {
+    for (_, commit) in repo::reachable_history(ctx, &root, &starts, 10_000) {
+        let author = if with_email {
+            format!("{} <{}>", commit.author_name, commit.author_email)
+        } else {
+            commit.author_name.clone()
+        };
         counts
-            .entry(commit.author_name.clone())
+            .entry(author)
             .or_default()
             .push(commit.subject().to_string());
     }
@@ -399,6 +467,7 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
     let mut pattern = None;
     let mut paths: Vec<String> = Vec::new();
     let mut operands_only = false;
+    let mut before_separator = usize::MAX;
     let mut index = 0;
     let args = super::expand_clusters(args, "niIlcEFv");
     while index < args.len() {
@@ -409,7 +478,10 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             continue;
         }
         match argument {
-            "--" => operands_only = true,
+            "--" => {
+                before_separator = paths.len();
+                operands_only = true;
+            }
             "-n" | "--line-number" => line_numbers = true,
             "-i" | "--ignore-case" => ignore_case = true,
             "-l" | "--files-with-matches" | "--name-only" => names_only = true,
@@ -446,20 +518,53 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
         return 128;
     };
     let cwd = ctx.cwd.clone();
+    // An operand before `--` that names no file but does resolve is a revision to search.
+    let revision = paths
+        .first()
+        .filter(|_| before_separator.min(paths.len()) > 0)
+        .filter(|candidate| !super::names_a_path(ctx, &root, candidate))
+        .and_then(|candidate| {
+            repo::resolve_revision(ctx, &root, candidate).map(|commit| (candidate.clone(), commit))
+        });
+    if revision.is_some() {
+        paths.remove(0);
+    }
     let paths: Vec<String> = paths
         .iter()
         .map(|path| super::pathspec(&cwd, &root, path))
         .collect();
-    let index_tree = repo::load_index(ctx, &root).unwrap_or_default();
+    // Git searches only below the working directory and reports paths relative to it.
+    let scope = repo::relative_path(&root, &cwd)
+        .filter(|prefix| !prefix.is_empty())
+        .map(|prefix| format!("{prefix}/"));
+    let tree = match &revision {
+        Some((_, commit)) => repo::commit_tree(ctx, &root, commit).unwrap_or_default(),
+        None => repo::load_index(ctx, &root).unwrap_or_default(),
+    };
     let mut found = false;
-    for (searched, path) in index_tree.keys().enumerate() {
+    for (searched, (path, blob)) in tree.iter().enumerate() {
         if searched >= MAX_GREP_FILES {
             break;
         }
         if !super::compare::selected(&paths, path) {
             continue;
         }
-        let Some(data) = repo::read_work_file(ctx, &root, path) else {
+        let displayed = match &scope {
+            Some(prefix) => match path.strip_prefix(prefix.as_str()) {
+                Some(relative) => relative,
+                None => continue,
+            },
+            None => path.as_str(),
+        };
+        let displayed = match &revision {
+            Some((name, _)) => format!("{name}:{displayed}"),
+            None => displayed.to_string(),
+        };
+        let data = match &revision {
+            Some(_) => repo::read_blob(ctx, &root, blob),
+            None => repo::read_work_file(ctx, &root, path),
+        };
+        let Some(data) = data else {
             continue;
         };
         if !ctx.charge_cpu(data.len() as u64) {
@@ -480,15 +585,16 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
                 break;
             }
             let location = if line_numbers {
-                format!("{path}:{}:", number + 1)
+                format!("{displayed}:{}:", number + 1)
             } else {
-                format!("{path}:")
+                format!("{displayed}:")
             };
             io.out
                 .extend_from_slice(format!("{location}{line}\n").as_bytes());
         }
         if names_only && matches != 0 {
-            io.out.extend_from_slice(format!("{path}\n").as_bytes());
+            io.out
+                .extend_from_slice(format!("{displayed}\n").as_bytes());
         }
         if count_only {
             let total = if matches == 0 {
@@ -500,7 +606,7 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             };
             if total != 0 {
                 io.out
-                    .extend_from_slice(format!("{path}:{total}\n").as_bytes());
+                    .extend_from_slice(format!("{displayed}:{total}\n").as_bytes());
             }
         }
     }

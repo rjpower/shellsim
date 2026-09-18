@@ -23,6 +23,10 @@ struct Pattern {
     negated: bool,
     directory_only: bool,
     anchored: bool,
+    /// Where the line came from, as `git check-ignore -v` reports it.
+    source: String,
+    line: usize,
+    original: String,
 }
 
 /// All ignore patterns that apply inside one repository.
@@ -38,26 +42,38 @@ impl IgnoreRules {
     /// matches a directory pattern. The last matching pattern wins, so a later `!` line
     /// re-includes a path an earlier line excluded.
     pub fn is_ignored(&self, relative: &str) -> bool {
-        if self.patterns.is_empty() {
-            return false;
-        }
-        let mut ignored = false;
+        self.decide(relative)
+            .is_some_and(|pattern| !pattern.negated)
+    }
+
+    /// The `source:line:pattern` description `git check-ignore -v` prints for an ignored path.
+    pub fn describe(&self, relative: &str) -> Option<String> {
+        let pattern = self.decide(relative).filter(|pattern| !pattern.negated)?;
+        Some(format!(
+            "{}:{}:{}",
+            pattern.source, pattern.line, pattern.original
+        ))
+    }
+
+    /// The pattern that settles `relative`, which is the last one to match it.
+    fn decide(&self, relative: &str) -> Option<&Pattern> {
+        let mut decision: Option<&Pattern> = None;
         for (candidate, is_directory) in ancestor_candidates(relative) {
             for pattern in &self.patterns {
                 if pattern.directory_only && !is_directory {
                     continue;
                 }
                 if pattern.matches(&candidate) {
-                    ignored = !pattern.negated;
+                    decision = Some(pattern);
                 }
             }
-            if ignored && is_directory {
-                // Git does not descend into an ignored directory, so nothing below it can be
-                // re-included by a later pattern.
-                return true;
+            // Git does not descend into an ignored directory, so nothing below it can be
+            // re-included by a later pattern.
+            if is_directory && decision.is_some_and(|pattern| !pattern.negated) {
+                return decision;
             }
         }
-        ignored
+        decision
     }
 }
 
@@ -94,9 +110,9 @@ impl Pattern {
 
 /// Match one `.gitignore` pattern against a path fragment.
 ///
-/// `*` and `?` stop at a `/`; `**` crosses separators. Backtracking is linear in the text
-/// length per wildcard, which is bounded by the pattern and path limits the caller enforces.
-fn glob_match(pattern: &str, text: &str) -> bool {
+/// `*`, `?`, and `[abc]` stop at a `/`; `**` crosses separators. Backtracking is linear in the
+/// text length per wildcard, which is bounded by the pattern and path limits the caller enforces.
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();
     matches_from(&pattern, &text)
@@ -128,6 +144,14 @@ fn matches_from(pattern: &[char], text: &[char]) -> bool {
                     p += 1;
                     continue;
                 }
+                '[' if text[t] != '/' && class_end(pattern, p).is_some() => {
+                    let end = class_end(pattern, p).unwrap_or(p);
+                    if class_contains(pattern, p, end, text[t]) {
+                        p = end + 1;
+                        t += 1;
+                        continue;
+                    }
+                }
                 '?' if text[t] != '/' => {
                     p += 1;
                     t += 1;
@@ -153,10 +177,93 @@ fn matches_from(pattern: &[char], text: &[char]) -> bool {
     pattern[p..].iter().all(|character| *character == '*')
 }
 
-/// Read every `.gitignore` file in the working tree below `root`.
+/// Locate the `]` that closes a class opened at `start`, if the class is terminated.
+fn class_end(pattern: &[char], start: usize) -> Option<usize> {
+    let mut index = start + 1;
+    if matches!(pattern.get(index), Some('!' | '^')) {
+        index += 1;
+    }
+    // A `]` immediately after the opening bracket is a literal member, not the terminator.
+    if pattern.get(index) == Some(&']') {
+        index += 1;
+    }
+    while index < pattern.len() {
+        if pattern[index] == ']' {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Whether `candidate` belongs to the class spanning `start..=end`.
+fn class_contains(pattern: &[char], start: usize, end: usize, candidate: char) -> bool {
+    let mut index = start + 1;
+    let negated = matches!(pattern.get(index), Some('!' | '^'));
+    if negated {
+        index += 1;
+    }
+    let mut found = false;
+    while index < end {
+        if index + 2 < end && pattern[index + 1] == '-' {
+            found |= pattern[index] <= candidate && candidate <= pattern[index + 2];
+            index += 3;
+        } else {
+            found |= pattern[index] == candidate;
+            index += 1;
+        }
+    }
+    found != negated
+}
+
+/// Whether a repository-relative `path` is named by one pathspec.
+///
+/// A plain pathspec names a file or a directory prefix. One holding a wildcard is matched against
+/// the whole path, and, as in Git, its wildcards cross `/`: `*.py` matches `src/main.py`.
+pub(crate) fn matches_pathspec(spec: &str, path: &str) -> bool {
+    if spec.is_empty() {
+        return true;
+    }
+    if !spec.contains(['*', '?', '[']) {
+        return path == spec || path.starts_with(&format!("{spec}/"));
+    }
+    glob_match(&widen(spec), path)
+}
+
+/// Turn every run of `*` into `**` so pathspec wildcards cross directory separators.
+fn widen(spec: &str) -> String {
+    let mut out = String::new();
+    let mut characters = spec.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '*' {
+            out.push(character);
+            continue;
+        }
+        while characters.peek() == Some(&'*') {
+            characters.next();
+        }
+        out.push_str("**");
+    }
+    out
+}
+
+/// Read `.git/info/exclude` and every `.gitignore` file in the working tree below `root`.
 pub(crate) fn load(interp: &Interp, root: &str) -> IgnoreRules {
     let mut rules = IgnoreRules::default();
     let mut files = 0;
+    // Repository-local excludes rank below every `.gitignore`, so they are read first.
+    if let Ok(data) = interp
+        .vfs
+        .read("/", &super::repo::git_path(root, "info/exclude"))
+    {
+        files += 1;
+        add_patterns(
+            &mut rules,
+            "",
+            ".git/info/exclude",
+            &String::from_utf8_lossy(&data),
+        );
+    }
     for (path, node) in interp.vfs.all_paths() {
         if files >= MAX_FILES || rules.patterns.len() >= MAX_PATTERNS {
             break;
@@ -181,17 +288,18 @@ pub(crate) fn load(interp: &Interp, root: &str) -> IgnoreRules {
             continue;
         }
         files += 1;
-        add_patterns(&mut rules, &base, &String::from_utf8_lossy(data));
+        add_patterns(&mut rules, &base, &relative, &String::from_utf8_lossy(data));
     }
     rules
 }
 
-fn add_patterns(rules: &mut IgnoreRules, base: &str, text: &str) {
-    for line in text.lines() {
+fn add_patterns(rules: &mut IgnoreRules, base: &str, source: &str, text: &str) {
+    for (number, line) in text.lines().enumerate() {
         if rules.patterns.len() >= MAX_PATTERNS {
             return;
         }
-        let line = line.trim_end();
+        let original = line.trim_end().to_string();
+        let line = original.as_str();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -214,6 +322,9 @@ fn add_patterns(rules: &mut IgnoreRules, base: &str, text: &str) {
             negated,
             directory_only,
             anchored,
+            source: source.to_string(),
+            line: number + 1,
+            original,
         });
     }
 }
@@ -224,7 +335,7 @@ mod tests {
 
     fn rules(base: &str, text: &str) -> IgnoreRules {
         let mut rules = IgnoreRules::default();
-        add_patterns(&mut rules, base, text);
+        add_patterns(&mut rules, base, "test", text);
         rules
     }
 
@@ -256,7 +367,7 @@ mod tests {
     #[test]
     fn applies_nested_pattern_files_only_below_their_directory() {
         let mut rules = rules("docs/", "draft.md\n");
-        add_patterns(&mut rules, "", "top.md\n");
+        add_patterns(&mut rules, "", "test", "top.md\n");
         assert!(rules.is_ignored("docs/draft.md"));
         assert!(!rules.is_ignored("draft.md"));
         assert!(rules.is_ignored("top.md"));

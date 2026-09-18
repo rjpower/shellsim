@@ -56,11 +56,19 @@ pub(crate) fn git_commit(
     let mut dry_run = false;
     let mut signoff = false;
     let mut author = None;
+    let mut paths: Vec<String> = Vec::new();
+    let mut operands_only = false;
     let args = super::expand_clusters(args, "amqvns");
     let mut index = 0;
     while index < args.len() {
         let argument = args[index].as_str();
+        if operands_only {
+            paths.push(argument.to_string());
+            index += 1;
+            continue;
+        }
         match argument {
+            "--" => operands_only = true,
             "-m" | "--message" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -98,15 +106,29 @@ pub(crate) fn git_commit(
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported commit option: {value}"))
             }
-            _ => return usage(io, "committing a pathspec is not supported; stage it first"),
+            value => paths.push(value.to_string()),
         }
         index += 1;
     }
     let Some(root) = repo::find_repo_root(ctx) else {
         return repo_error(io);
     };
+    if stage_tracked && !paths.is_empty() {
+        return usage(io, "-a cannot be combined with paths");
+    }
     if stage_tracked {
         if let Err(status) = worktree::stage_tracked_changes(ctx, &root, io) {
+            return status;
+        }
+    }
+    // `git commit MESSAGE PATH...` commits the working-tree state of those paths and leaves the
+    // rest of the index alone, so the named paths are refreshed before the index is read.
+    if !paths.is_empty() {
+        let operands: Vec<String> = std::iter::once("--".to_string())
+            .chain(paths.iter().cloned())
+            .collect();
+        let status = worktree::git_add(ctx, &operands, io);
+        if status != 0 {
             return status;
         }
     }
@@ -145,6 +167,14 @@ pub(crate) fn git_commit(
             message = commit.message.clone();
         }
     }
+    if dry_run {
+        // Git reports what a commit would record, stops before asking for a message, and fails
+        // when there is nothing staged to record.
+        let staged =
+            repo::load_index(ctx, &root).unwrap_or_default() != repo::head_tree(ctx, &root);
+        let status = super::worktree::git_status(ctx, &[], io);
+        return if status == 0 && !staged { 1 } else { status };
+    }
     if message.is_empty() && !allow_empty {
         return usage(io, "a non-empty -m MESSAGE is required");
     }
@@ -169,6 +199,29 @@ pub(crate) fn git_commit(
         ),
         _ => (Vec::new(), Tree::new()),
     };
+    // With pathspecs the commit records HEAD plus those paths; anything else stays staged.
+    let index_tree = if paths.is_empty() {
+        index_tree
+    } else {
+        let cwd = ctx.cwd.clone();
+        let specs: Vec<String> = paths
+            .iter()
+            .map(|path| super::pathspec(&cwd, &root, path))
+            .collect();
+        let named = |path: &str| {
+            specs
+                .iter()
+                .any(|spec| super::ignore::matches_pathspec(spec, path))
+        };
+        let mut tree = baseline.clone();
+        tree.retain(|path, _| !named(path));
+        for (path, hash) in &index_tree {
+            if named(path) {
+                tree.insert(path.clone(), hash.clone());
+            }
+        }
+        tree
+    };
     if index_tree == baseline && !allow_empty {
         emit_nothing_to_commit(ctx, io);
         return 1;
@@ -176,9 +229,6 @@ pub(crate) fn git_commit(
     if signoff {
         let (name, email) = author_identity(ctx, &root, globals);
         message.push_str(&format!("\n\nSigned-off-by: {name} <{email}>"));
-    }
-    if dry_run {
-        return super::worktree::git_status(ctx, &["--short".to_string()], io);
     }
     let (default_name, default_email) = author_identity(ctx, &root, globals);
     let (author_name, author_email) = match author.as_deref().and_then(parse_author) {
@@ -370,7 +420,13 @@ fn decorations(ctx: &CommandContext<'_>, root: &str, id: &str) -> String {
     }
 }
 
-fn render_commit_header(id: &str, commit: &Commit, pretty: &Pretty, decoration: &str) -> String {
+fn render_commit_header(
+    id: &str,
+    commit: &Commit,
+    pretty: &Pretty,
+    decoration: &str,
+    now: i64,
+) -> String {
     let identity = format!("{} <{}>", commit.author_name, commit.author_email);
     match pretty {
         Pretty::OneLine => format!("{id}{decoration} {}\n", commit.subject()),
@@ -396,7 +452,7 @@ fn render_commit_header(id: &str, commit: &Commit, pretty: &Pretty, decoration: 
             format_date(commit.timestamp),
             indent(&commit.message)
         ),
-        Pretty::Custom { format, .. } => expand_format(format, id, commit, decoration),
+        Pretty::Custom { format, .. } => expand_format(format, id, commit, decoration, now),
     }
 }
 
@@ -422,9 +478,10 @@ fn expand_format_checked(
     id: &str,
     commit: &Commit,
     decoration: &str,
+    now: i64,
 ) -> Option<String> {
     let mut out = String::new();
-    let mut characters = format.chars();
+    let mut characters = format.chars().peekable();
     while let Some(character) = characters.next() {
         if character != '%' {
             out.push(character);
@@ -433,6 +490,31 @@ fn expand_format_checked(
         let first = characters.next()?;
         let name = match first {
             'a' | 'c' => format!("{first}{}", characters.next()?),
+            // Colour placeholders expand to nothing: this subset never writes escape sequences.
+            'C' => {
+                if characters.peek() == Some(&'(') {
+                    for character in characters.by_ref() {
+                        if character == ')' {
+                            break;
+                        }
+                    }
+                } else {
+                    while characters
+                        .peek()
+                        .is_some_and(|character| character.is_ascii_alphabetic())
+                    {
+                        characters.next();
+                    }
+                }
+                continue;
+            }
+            'x' => {
+                // `%xNN` inserts one byte written in hexadecimal.
+                let digits: String = characters.by_ref().take(2).collect();
+                let byte = u8::from_str_radix(&digits, 16).ok()?;
+                out.push(byte as char);
+                continue;
+            }
             other => other.to_string(),
         };
         // Author and committer identities are the same in this subset.
@@ -464,18 +546,23 @@ fn expand_format_checked(
                 .map(|parent| repo::short(parent).to_string())
                 .collect::<Vec<_>>()
                 .join(" "),
-            "d" => decoration.trim_start().to_string(),
+            "d" => decoration.to_string(),
             "D" => decoration
                 .trim_start()
                 .trim_start_matches('(')
                 .trim_end_matches(')')
                 .to_string(),
-            "an" | "cn" => commit.author_name.clone(),
-            "ae" | "ce" => commit.author_email.clone(),
+            "an" | "cn" | "aN" | "cN" => commit.author_name.clone(),
+            "ae" | "ce" | "aE" | "cE" => commit.author_email.clone(),
             "ad" | "cd" => format_date(commit.timestamp),
             "at" | "ct" => commit.timestamp.to_string(),
             "ai" | "ci" => stamp(commit.timestamp, "%Y-%m-%d %H:%M:%S +0000"),
             "aI" | "cI" => stamp(commit.timestamp, "%Y-%m-%dT%H:%M:%S+00:00"),
+            "as" | "cs" => stamp(commit.timestamp, "%Y-%m-%d"),
+            "aD" | "cD" => stamp(commit.timestamp, "%a, %-d %b %Y %H:%M:%S +0000"),
+            "ar" | "cr" => relative_date(commit.timestamp, now),
+            // Notes, boundary marks, and encodings have no counterpart in this subset.
+            "N" | "m" | "e" => String::new(),
             "n" => "\n".to_string(),
             "%" => "%".to_string(),
             _ => return None,
@@ -485,12 +572,43 @@ fn expand_format_checked(
     Some(out)
 }
 
-fn expand_format(format: &str, id: &str, commit: &Commit, decoration: &str) -> String {
-    expand_format_checked(format, id, commit, decoration).unwrap_or_default()
+fn expand_format(format: &str, id: &str, commit: &Commit, decoration: &str, now: i64) -> String {
+    expand_format_checked(format, id, commit, decoration, now).unwrap_or_default()
+}
+
+/// Whether every placeholder in `format` is one this subset can render.
+fn format_is_supported(format: &str) -> bool {
+    expand_format_checked(format, &"0".repeat(40), &Commit::default(), "", 0).is_some()
+}
+
+/// Render an age the way `%ar` does.
+fn relative_date(timestamp: i64, now: i64) -> String {
+    let seconds = now.saturating_sub(timestamp).max(0);
+    for (unit, size) in [
+        ("year", 31_556_952),
+        ("month", 2_629_746),
+        ("week", 604_800),
+        ("day", 86_400),
+        ("hour", 3_600),
+        ("minute", 60),
+    ] {
+        let count = seconds / size;
+        if count > 0 {
+            let plural = if count == 1 { "" } else { "s" };
+            return format!("{count} {unit}{plural} ago");
+        }
+    }
+    format!("{seconds} seconds ago")
 }
 
 /// Split `a..b` or `a...b` into its endpoints.
-fn split_range(revision: &str) -> Option<(&str, &str, bool)> {
+///
+/// A path such as `../src` is never a range, so arguments that start with a path component are
+/// left alone.
+pub(crate) fn split_range(revision: &str) -> Option<(&str, &str, bool)> {
+    if revision.starts_with('.') || revision.starts_with('/') {
+        return None;
+    }
     if let Some((left, right)) = revision.split_once("...") {
         return Some((left, right, true));
     }
@@ -499,15 +617,19 @@ fn split_range(revision: &str) -> Option<(&str, &str, bool)> {
         .map(|(left, right)| (left, right, false))
 }
 
-/// The commits reachable from `revision`, honoring `a..b` exclusion ranges.
-fn history_for(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    revision: &str,
-) -> Option<Vec<(String, Commit)>> {
+/// One revision argument resolved into the commits it includes and the commits it excludes.
+struct Selection {
+    included: Vec<String>,
+    excluded: BTreeSet<String>,
+}
+
+/// Resolve one revision argument, which may be a plain revision or an `a..b` range.
+fn select_revision(ctx: &mut CommandContext<'_>, root: &str, revision: &str) -> Option<Selection> {
     let Some((left, right, merge_base)) = split_range(revision) else {
-        let start = repo::resolve_revision(ctx, root, revision)?;
-        return Some(repo::first_parent_history(ctx, root, &start, 10_000));
+        return Some(Selection {
+            included: vec![repo::resolve_revision(ctx, root, revision)?],
+            excluded: BTreeSet::new(),
+        });
     };
     let right = if right.is_empty() { "HEAD" } else { right };
     let left = if left.is_empty() { "HEAD" } else { left };
@@ -521,12 +643,56 @@ fn history_for(
     } else {
         repo::ancestors(ctx, root, &left_commit)
     };
+    Some(Selection {
+        included: vec![right_commit],
+        excluded,
+    })
+}
+
+/// The commits listed by a set of revision arguments, newest first.
+fn history_for(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    revisions: &[String],
+    first_parent: bool,
+) -> Option<Vec<(String, Commit)>> {
+    let mut included = Vec::new();
+    let mut excluded = BTreeSet::new();
+    for revision in revisions {
+        let selection = select_revision(ctx, root, revision)?;
+        included.extend(selection.included);
+        excluded.extend(selection.excluded);
+    }
+    let listed = if first_parent {
+        included
+            .first()
+            .map(|start| repo::first_parent_history(ctx, root, start, 10_000))
+            .unwrap_or_default()
+    } else {
+        repo::reachable_history(ctx, root, &included, 10_000)
+    };
     Some(
-        repo::first_parent_history(ctx, root, &right_commit, 10_000)
+        listed
             .into_iter()
             .filter(|(id, _)| !excluded.contains(id))
             .collect(),
     )
+}
+
+/// Every branch and tag tip, for `--all`.
+fn all_reference_tips(ctx: &CommandContext<'_>, root: &str) -> Vec<String> {
+    let mut tips = Vec::new();
+    for (kind, names) in [
+        ("heads", repo::branch_names(ctx, root)),
+        ("tags", repo::reference_names(ctx, root, "tags")),
+    ] {
+        for name in names {
+            if let Some(commit) = repo::read_reference(ctx, root, &format!("refs/{kind}/{name}")) {
+                tips.push(commit);
+            }
+        }
+    }
+    tips
 }
 
 pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -536,9 +702,13 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     let mut pretty = Pretty::Medium;
     let mut limit = 10_000_usize;
     let mut skip = 0_usize;
-    let mut revision = "HEAD".to_string();
+    let mut revisions: Vec<String> = Vec::new();
+    let mut all_references = false;
+    let mut first_parent = false;
     let mut reverse = false;
     let mut decorate = false;
+    let mut no_merges = false;
+    let mut abbreviate = false;
     let mut author_filter: Option<String> = None;
     let mut patch = None;
     let mut stat = None;
@@ -558,8 +728,11 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             "--oneline" => pretty = Pretty::AbbreviatedOneLine,
             "--reverse" => reverse = true,
             "--decorate" | "--decorate=short" => decorate = true,
-            "--no-decorate" | "--decorate=no" | "--no-merges" | "--first-parent" | "--no-color"
-            | "--abbrev-commit" | "--all" => {}
+            "--no-decorate" | "--decorate=no" | "--no-color" => {}
+            "--no-merges" => no_merges = true,
+            "--abbrev-commit" => abbreviate = true,
+            "--first-parent" => first_parent = true,
+            "--all" => all_references = true,
             "-n" | "--max-count" => {
                 index += 1;
                 let Some(value) = args.get(index).and_then(|value| value.parse().ok()) else {
@@ -591,7 +764,11 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
                 let Some(parsed) = parse_pretty(
                     value.split_once('=').map_or("", |parts| parts.1),
                     terminated,
-                ) else {
+                )
+                .filter(|parsed| match parsed {
+                    Pretty::Custom { format, .. } => format_is_supported(format),
+                    _ => true,
+                }) else {
                     return usage(io, &format!("unsupported log format: {value}"));
                 };
                 pretty = parsed;
@@ -615,7 +792,9 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported log option: {value}"))
             }
-            value if history_for(ctx, &root, value).is_some() => revision = value.to_string(),
+            value if select_revision(ctx, &root, value).is_some() => {
+                revisions.push(value.to_string())
+            }
             value => {
                 if !super::names_a_path(ctx, &root, value) {
                     return super::ambiguous_argument(io, value);
@@ -625,7 +804,13 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         }
         index += 1;
     }
-    let Some(mut history) = history_for(ctx, &root, &revision) else {
+    if all_references {
+        revisions.extend(all_reference_tips(ctx, &root));
+    }
+    if revisions.is_empty() {
+        revisions.push("HEAD".to_string());
+    }
+    let Some(mut history) = history_for(ctx, &root, &revisions, first_parent) else {
         if repo::head_commit(ctx, &root).is_none() {
             let branch = repo::current_branch(ctx, &root).unwrap_or_else(|| "HEAD".to_string());
             io.err.extend_from_slice(
@@ -634,8 +819,11 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             );
             return 128;
         }
-        return super::ambiguous_argument(io, &revision);
+        return super::ambiguous_argument(io, &revisions.join(" "));
     };
+    if no_merges {
+        history.retain(|(_, commit)| commit.parents.len() < 2);
+    }
     if let Some(author) = &author_filter {
         history.retain(|(_, commit)| {
             commit.author_name.contains(author) || commit.author_email.contains(author)
@@ -653,6 +841,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     if reverse {
         history.reverse();
     }
+    let now = now_seconds(ctx);
     // Multi-line formats are separated by a blank line; one-line formats are not.
     let separated = matches!(
         pretty,
@@ -668,13 +857,20 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         if separated && position != 0 {
             io.out.push(b'\n');
         }
-        let decoration = if decorate {
+        // `%d` and `%D` always expand, so decorations are computed whenever a format may use them.
+        let decoration = if decorate || matches!(pretty, Pretty::Custom { .. }) {
             decorations(ctx, &root, id)
         } else {
             String::new()
         };
-        io.out
-            .extend_from_slice(render_commit_header(id, commit, &pretty, &decoration).as_bytes());
+        let displayed = if abbreviate {
+            repo::short(id)
+        } else {
+            id.as_str()
+        };
+        io.out.extend_from_slice(
+            render_commit_header(displayed, commit, &pretty, &decoration, now).as_bytes(),
+        );
         if matches!(
             pretty,
             Pretty::Custom {
@@ -756,7 +952,11 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
                 let Some(parsed) = parse_pretty(
                     value.split_once('=').map_or("", |parts| parts.1),
                     value.starts_with("--format="),
-                ) else {
+                )
+                .filter(|parsed| match parsed {
+                    Pretty::Custom { format, .. } => format_is_supported(format),
+                    _ => true,
+                }) else {
                     return usage(io, &format!("unsupported show format: {value}"));
                 };
                 pretty = parsed;
@@ -807,8 +1007,15 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
                 .as_bytes(),
             );
         }
-        io.out
-            .extend_from_slice(render_commit_header(&id, &commit, &pretty, "").as_bytes());
+        let decoration = if matches!(pretty, Pretty::Custom { .. }) {
+            decorations(ctx, &root, &id)
+        } else {
+            String::new()
+        };
+        let now = now_seconds(ctx);
+        io.out.extend_from_slice(
+            render_commit_header(&id, &commit, &pretty, &decoration, now).as_bytes(),
+        );
         if matches!(
             pretty,
             Pretty::Custom {
@@ -839,6 +1046,7 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
     };
     let mut abbreviate: Option<usize> = None;
     let mut abbrev_ref = false;
+    let mut full_name = false;
     let mut quiet = false;
     let mut revisions: Vec<String> = Vec::new();
     for argument in args {
@@ -895,6 +1103,7 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
             }
             "--short" => abbreviate = Some(7),
             "--abbrev-ref" => abbrev_ref = true,
+            "--symbolic-full-name" => full_name = true,
             "--verify" => {}
             "-q" | "--quiet" => quiet = true,
             value if value.starts_with("--short=") => {
@@ -913,6 +1122,24 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
         revisions.push("HEAD".to_string());
     }
     for revision in &revisions {
+        if full_name {
+            let name = if revision == "HEAD" {
+                repo::current_branch(ctx, &root).map_or_else(
+                    || "HEAD".to_string(),
+                    |branch| format!("refs/heads/{branch}"),
+                )
+            } else if revision.starts_with("refs/") {
+                revision.clone()
+            } else if repo::branch_names(ctx, &root).contains(revision) {
+                format!("refs/heads/{revision}")
+            } else if repo::reference_names(ctx, &root, "tags").contains(revision) {
+                format!("refs/tags/{revision}")
+            } else {
+                String::new()
+            };
+            io.out.extend_from_slice(format!("{name}\n").as_bytes());
+            continue;
+        }
         if abbrev_ref {
             let name = if revision == "HEAD" {
                 repo::current_branch(ctx, &root).unwrap_or_else(|| "HEAD".to_string())
@@ -922,7 +1149,7 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
             io.out.extend_from_slice(format!("{name}\n").as_bytes());
             continue;
         }
-        let Some(commit) = repo::resolve_revision(ctx, &root, revision) else {
+        let Some(commit) = rev_parse_object(ctx, &root, revision) else {
             if quiet {
                 // `--quiet --verify` is the usual "does this reference exist?" probe.
                 return 1;
@@ -938,18 +1165,41 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
     0
 }
 
+/// Resolve one `rev-parse` operand, which may name a commit, a tree, or a blob.
+fn rev_parse_object(ctx: &mut CommandContext<'_>, root: &str, revision: &str) -> Option<String> {
+    if let Some((base, path)) = revision.split_once(':') {
+        let commit = repo::resolve_revision(ctx, root, base)?;
+        let tree = repo::commit_tree(ctx, root, &commit)?;
+        if path.is_empty() {
+            return Some(repo::tree_hash(&tree));
+        }
+        return tree.get(path).cloned();
+    }
+    if let Some(base) = revision.strip_suffix("^{tree}") {
+        let commit = repo::resolve_revision(ctx, root, base)?;
+        return Some(repo::tree_hash(&repo::commit_tree(ctx, root, &commit)?));
+    }
+    // `^{commit}` and `^{}` peel a tag to the commit it points at, which this subset already does.
+    let revision = revision
+        .strip_suffix("^{commit}")
+        .or_else(|| revision.strip_suffix("^{}"))
+        .unwrap_or(revision);
+    repo::resolve_revision(ctx, root, revision)
+}
+
 pub(crate) fn git_rev_list(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let Some(root) = repo::find_repo_root(ctx) else {
         return repo_error(io);
     };
     let mut count = false;
     let mut limit = 10_000_usize;
-    let mut revision = "HEAD".to_string();
+    let mut revisions: Vec<String> = Vec::new();
+    let mut all_references = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--count" => count = true,
-            "--all" => {}
+            "--all" => all_references = true,
             "-n" | "--max-count" => {
                 index += 1;
                 let Some(value) = args.get(index).and_then(|value| value.parse().ok()) else {
@@ -966,14 +1216,19 @@ pub(crate) fn git_rev_list(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported rev-list option: {value}"))
             }
-            value => revision = value.to_string(),
+            value => revisions.push(value.to_string()),
         }
         index += 1;
     }
-    let Some(start) = repo::resolve_revision(ctx, &root, &revision) else {
-        return usage(io, "unknown revision");
+    if all_references {
+        revisions.extend(all_reference_tips(ctx, &root));
+    }
+    if revisions.is_empty() {
+        revisions.push("HEAD".to_string());
+    }
+    let Some(mut history) = history_for(ctx, &root, &revisions, false) else {
+        return super::ambiguous_argument(io, &revisions.join(" "));
     };
-    let mut history = repo::first_parent_history(ctx, &root, &start, 10_000);
     history.truncate(limit);
     if count {
         io.out
@@ -1056,6 +1311,7 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
                 return 0;
             }
             "-a" | "--all" | "--no-color" | "--no-column" => list = true,
+            "-q" | "--quiet" => {}
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported branch option: {value}"))
             }
@@ -1283,6 +1539,7 @@ pub(crate) fn git_tag(
                 index += 1;
                 message = args.get(index).cloned();
             }
+            "-q" | "--quiet" => {}
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported tag option: {value}"))
             }
@@ -1356,20 +1613,36 @@ pub(crate) fn git_tag(
 
 // -- switching branches -----------------------------------------------------------------------
 
-fn working_tree_clean(ctx: &mut CommandContext<'_>, root: &str) -> bool {
+/// The tracked paths that differ from HEAD, which is what blocks a branch switch.
+///
+/// Untracked files never block a switch, so they are not considered here.
+pub(crate) fn blocking_changes(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    target: &repo::Tree,
+) -> Vec<String> {
     let index = repo::load_index(ctx, root).unwrap_or_default();
     let Ok(work) = repo::collect_working_tree(ctx, root) else {
-        return false;
+        return vec!["<unreadable working tree>".to_string()];
     };
     let files = work.release(ctx);
     let head = repo::head_tree(ctx, root);
-    // Untracked files never block a switch.
-    files
-        .iter()
-        .filter(|(path, _)| index.contains_key(*path))
-        .all(|(path, hash)| index.get(path) == Some(hash))
-        && index.keys().all(|path| files.contains_key(path))
-        && index == head
+    let mut blocked: BTreeSet<String> = BTreeSet::new();
+    for (path, hash) in &index {
+        if files.get(path) != Some(hash) || head.get(path) != Some(hash) {
+            blocked.insert(path.clone());
+        }
+    }
+    for path in head.keys() {
+        if !index.contains_key(path) {
+            blocked.insert(path.clone());
+        }
+    }
+    // Only the paths the move would actually rewrite can lose work.
+    blocked
+        .into_iter()
+        .filter(|path| target.get(path) != head.get(path))
+        .collect()
 }
 
 /// Move HEAD and the working tree to `commit`.
@@ -1386,17 +1659,24 @@ fn checkout_commit(
             format!("{previous}\n").as_bytes(),
         );
     }
-    if !working_tree_clean(ctx, root) {
-        io.err.extend_from_slice(
-            b"error: local changes would be overwritten; commit or restore them first\n",
-        );
-        return Err(1);
-    }
     let old = repo::head_tree(ctx, root);
     let Some(new) = repo::commit_tree(ctx, root, commit) else {
         return Err(usage(io, "target revision has an invalid commit"));
     };
-    if let Err(error) = repo::replace_work_tree(ctx, root, &old, &new) {
+    let blocked = blocking_changes(ctx, root, &new);
+    if !blocked.is_empty() {
+        io.err.extend_from_slice(
+            b"error: Your local changes to the following files would be overwritten by checkout:\n",
+        );
+        for path in blocked {
+            io.err.extend_from_slice(format!("\t{path}\n").as_bytes());
+        }
+        io.err.extend_from_slice(
+            b"Please commit your changes or stash them before you switch branches.\nAborting\n",
+        );
+        return Err(1);
+    }
+    if let Err(error) = repo::update_work_tree(ctx, root, &old, &new) {
         io.err
             .extend_from_slice(format!("git switch: {error}\n").as_bytes());
         return Err(1);
@@ -1509,6 +1789,7 @@ pub(crate) fn git_switch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             }
             "-d" | "--detach" => detach = true,
             "-f" | "--force" | "--discard-changes" => force = true,
+            "-q" | "--quiet" | "--no-guess" | "--no-track" => {}
             // A lone `-` names the previously checked-out branch.
             value if value.starts_with('-') && value != "-" => {
                 return usage(io, &format!("unsupported switch option: {value}"))
@@ -1682,9 +1963,10 @@ pub(crate) fn git_merge(
         io.out.extend_from_slice(b"Already up to date.\n");
         return 0;
     }
-    if !working_tree_clean(ctx, &root) {
+    let incoming = repo::commit_tree(ctx, &root, &other).unwrap_or_default();
+    if !blocking_changes(ctx, &root, &incoming).is_empty() {
         io.err
-            .extend_from_slice(b"error: your local changes would be overwritten by merge\n");
+            .extend_from_slice(b"error: Your local changes would be overwritten by merge.\n");
         return 1;
     }
     let base = repo::merge_base(ctx, &root, &head, &other);
@@ -1739,7 +2021,7 @@ pub(crate) fn git_merge(
             return 1;
         }
     };
-    if let Err(error) = repo::replace_work_tree(ctx, &root, &head_tree, &merged) {
+    if let Err(error) = repo::update_work_tree(ctx, &root, &head_tree, &merged) {
         io.err
             .extend_from_slice(format!("git merge: {error}\n").as_bytes());
         return 1;

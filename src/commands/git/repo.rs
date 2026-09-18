@@ -268,6 +268,15 @@ pub(crate) fn load_commit(interp: &Interp, root: &str, id: &str) -> Option<Commi
     Commit::parse(&interp.vfs.read("/", &commit_file(root, id)).ok()?)
 }
 
+/// A stable identifier for a tree.
+///
+/// Real Git hashes a packed tree object; this subset hashes its own serialization, so the value
+/// is self-consistent across `cat-file`, `ls-tree`, and `rev-parse` but differs from Git's.
+pub(crate) fn tree_hash(tree: &Tree) -> String {
+    let body = serialize_tree(tree);
+    sha1(&[format!("tree {}\0", body.len()).as_bytes(), &body].concat())
+}
+
 pub(crate) fn commit_tree(interp: &Interp, root: &str, id: &str) -> Option<Tree> {
     read_tree(interp, &tree_file(root, id))
 }
@@ -326,6 +335,72 @@ pub(crate) fn first_parent_history(
         };
         current = commit.parents.first().cloned();
         out.push((id, commit));
+    }
+    out
+}
+
+/// Commits reachable from any of `starts`, newest first.
+///
+/// The order is topological: a commit is listed only after every commit that reaches it, with
+/// ties broken by author timestamp and then by discovery order. Merge commits contribute both
+/// parents, so nothing merged into the history disappears from `git log`.
+pub(crate) fn reachable_history(
+    interp: &Interp,
+    root: &str,
+    starts: &[String],
+    limit: usize,
+) -> Vec<(String, Commit)> {
+    let mut commits: BTreeMap<String, (usize, Commit)> = BTreeMap::new();
+    let mut queue: std::collections::VecDeque<String> = starts.iter().cloned().collect();
+    let mut discovered = 0;
+    while let Some(id) = queue.pop_front() {
+        if commits.len() >= limit || commits.contains_key(&id) {
+            continue;
+        }
+        let Some(commit) = load_commit(interp, root, &id) else {
+            continue;
+        };
+        queue.extend(commit.parents.iter().cloned());
+        commits.insert(id, (discovered, commit));
+        discovered += 1;
+    }
+    // Count how many listed commits reach each commit directly.
+    let mut pending: BTreeMap<&String, usize> = commits.keys().map(|id| (id, 0)).collect();
+    for (_, commit) in commits.values() {
+        for parent in &commit.parents {
+            if let Some(count) = pending.get_mut(parent) {
+                *count += 1;
+            }
+        }
+    }
+    let mut ready: std::collections::BinaryHeap<(i64, std::cmp::Reverse<usize>, String)> = commits
+        .iter()
+        .filter(|(id, _)| pending.get(id).copied() == Some(0))
+        .map(|(id, (discovered, commit))| {
+            (commit.timestamp, std::cmp::Reverse(*discovered), id.clone())
+        })
+        .collect();
+    let mut out = Vec::with_capacity(commits.len());
+    while let Some((_, _, id)) = ready.pop() {
+        let Some((_, commit)) = commits.get(&id) else {
+            continue;
+        };
+        for parent in commit.parents.clone() {
+            let Some(count) = pending.get_mut(&parent) else {
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                if let Some((discovered, parent_commit)) = commits.get(&parent) {
+                    ready.push((
+                        parent_commit.timestamp,
+                        std::cmp::Reverse(*discovered),
+                        parent.clone(),
+                    ));
+                }
+            }
+        }
+        out.push((id.clone(), commit.clone()));
     }
     out
 }
@@ -778,11 +853,58 @@ pub(crate) fn resource_error(ctx: &CommandContext<'_>) -> i32 {
 ///
 /// The whole update is applied to a VFS copy so that a failure part-way through leaves the
 /// working tree untouched.
+/// Move the working tree from `old` to `new`, rewriting every path `new` names.
+///
+/// This discards uncommitted edits, which is what `git restore` and `git reset --hard` are for.
+/// Remove the directories a deletion left empty, stopping at the repository root.
+///
+/// Git tracks files rather than directories, so removing the last file in a directory removes the
+/// directory too.
+pub(crate) fn prune_empty_parents(ctx: &mut CommandContext<'_>, root: &str, absolute: &str) {
+    let mut current = parent_of(absolute);
+    while let Some(directory) = current {
+        if directory == root || !within(root, &directory) || is_git_path(root, &directory) {
+            return;
+        }
+        match ctx.vfs.list_dir("/", &directory) {
+            Ok(entries) if entries.is_empty() => {}
+            _ => return,
+        }
+        if ctx.vfs.remove_all("/", &directory).is_err() {
+            return;
+        }
+        current = parent_of(&directory);
+    }
+}
+
 pub(crate) fn replace_work_tree(
     ctx: &mut CommandContext<'_>,
     root: &str,
     old: &Tree,
     new: &Tree,
+) -> Result<(), String> {
+    write_work_tree(ctx, root, old, new, true)
+}
+
+/// Move the working tree from `old` to `new`, leaving unchanged paths alone.
+///
+/// Checkout, merge, and stash reapplication go through here so that an uncommitted edit to a file
+/// the move does not touch survives, as it does in Git.
+pub(crate) fn update_work_tree(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    old: &Tree,
+    new: &Tree,
+) -> Result<(), String> {
+    write_work_tree(ctx, root, old, new, false)
+}
+
+fn write_work_tree(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    old: &Tree,
+    new: &Tree,
+    force: bool,
 ) -> Result<(), String> {
     let reserved = ctx.vfs.disk_used().saturating_add(4 * 1024);
     if !ctx.reserve_memory(reserved) {
@@ -796,9 +918,16 @@ pub(crate) fn replace_work_tree(
                 ctx.vfs
                     .remove_file("/", &absolute)
                     .map_err(|error| error.to_string())?;
+                prune_empty_parents(ctx, root, &absolute);
             }
         }
         for (path, hash) in new {
+            // A path the move does not change keeps whatever the working tree holds, but a
+            // missing file is still restored.
+            if !force && old.get(path) == Some(hash) && ctx.vfs.is_file("/", &path_join(root, path))
+            {
+                continue;
+            }
             let data = read_blob(ctx, root, hash)
                 .ok_or_else(|| format!("missing blob {hash} for {path}"))?;
             write_vfs(ctx, &path_join(root, path), &data).map_err(|error| error.to_string())?;

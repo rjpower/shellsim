@@ -21,12 +21,25 @@ Output follows real Git byte for byte wherever an agent is likely to parse it: `
 and `--porcelain` formats including untracked-directory collapsing and exact rename detection,
 unified diffs with hunk headers, function context, `\ No newline at end of file`, and index lines
 carrying real Git blob ids, `git log` author and date headers, `--format` placeholders, and the
-`N files changed, N insertions(+)` summaries. `.gitignore` is honored by `status`, `add`, `clean`,
-`ls-files --others --exclude-standard`, and `check-ignore`, including negation, anchoring,
-directory-only patterns, `**`, and nested pattern files.
+`N files changed, N insertions(+)` summaries. `.gitignore` and `.git/info/exclude` are honored by
+`status`, `add`, `clean`, `ls-files --others --exclude-standard`, and `check-ignore`, including
+negation, anchoring, directory-only patterns, character classes, `**`, and nested pattern files.
+Naming an ignored file outright to `git add` is an error, as it is in Git.
+
+Pathspecs accept globs, and their wildcards cross directory separators the way Git's do, so
+`git status -- '*.py'` reports a change to `src/main.py`. `git grep` searches only below the
+working directory, reports paths relative to it, and accepts a revision to search instead of the
+working tree.
 
 Revisions accept `HEAD`, `@`, branch and tag names, full and abbreviated commit ids, the `~N` and
-`^N` ancestry suffixes, and the `a..b` and `a...b` ranges used by `log` and `diff`.
+`^N` ancestry suffixes, the `a..b` and `a...b` ranges used by `log` and `diff`, and the
+`<rev>:<path>`, `<rev>^{tree}`, and `<rev>^{commit}` forms `rev-parse` and `cat-file` resolve.
+`git log` walks every parent of a merge unless `--first-parent` is given.
+
+Moving between commits preserves uncommitted work: `checkout`, `switch`, `merge`, and
+`stash pop` rewrite only the paths the move changes, and refuse outright when a path they must
+rewrite holds uncommitted changes. `git restore` and `git reset --hard` still overwrite, which is
+what they are for.
 
 Configuration is stored in Git's INI format in `.git/config`, so a block appended by hand or by
 another tool reads back correctly. There are two scopes: the repository and a per-user
@@ -43,7 +56,8 @@ Content conflicts are refused rather than written as markers. `git merge` fast-f
 can and otherwise takes whichever side changed each path; when both sides changed one file it
 reports the conflicting paths, leaves the working tree untouched, and exits nonzero. There is no
 `rebase`, `cherry-pick`, `revert`, `reflog`, `bisect`, `blame`, or `worktree`, and no interactive
-mode for any command.
+mode for any command. Those report `unsupported subcommand` and exit 2; a name that is not a Git
+subcommand at all is reported the way Git reports a typo and exits 1.
 
 File modes, symbolic links, submodules, and rename detection based on similarity are outside the
 model: every tracked path is a regular file, and renames are recognized only when the content is
@@ -69,8 +83,9 @@ by real Git is not readable, and a repository created here is not meant to be ha
 
 Trees are flat path maps rather than nested tree objects, and commits are stored uncompressed.
 Blob ids match real Git's (`sha1("blob <len>\0" + content)`), so `git hash-object` and the `index`
-lines in diffs agree with a real repository; commit ids do not, because commits do not serialize
-real tree objects.
+lines in diffs agree with a real repository; commit and tree ids do not, because neither
+serializes a real tree object. Tree ids are still self-consistent: `ls-tree`, `cat-file`, and
+`rev-parse <rev>^{tree}` all report the same value for the same tree.
 
 ## Limits
 

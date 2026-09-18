@@ -294,8 +294,7 @@ fn emit_short_status(
         let label = match (branch, repo::head_commit(ctx, root)) {
             (Some(branch), None) => format!("No commits yet on {branch}"),
             (Some(branch), Some(_)) => branch.to_string(),
-            (None, Some(id)) => format!("HEAD (no branch) {}", repo::short(&id)),
-            (None, None) => "HEAD (no branch)".to_string(),
+            (None, _) => "HEAD (no branch)".to_string(),
         };
         io.out.extend_from_slice(format!("## {label}").as_bytes());
         io.out.push(terminator);
@@ -445,10 +444,9 @@ fn selected_paths(
             selected.extend(work.keys().cloned());
             continue;
         }
-        let prefix = format!("{relative}/");
         let mut found = false;
         for key in index.keys().chain(work.keys()) {
-            if key == &relative || key.starts_with(&prefix) {
+            if super::ignore::matches_pathspec(&relative, key) {
                 selected.insert(key.clone());
                 found = true;
             }
@@ -522,6 +520,26 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     }
     if !force {
         let rules = ignore::load(ctx, &root);
+        // Naming an ignored file outright is an error; sweeping one up by directory or glob is not.
+        let named: Vec<String> = operands
+            .iter()
+            .map(|operand| super::pathspec(&cwd, &root, operand))
+            .filter(|path| {
+                work.contains_key(path) && !index.contains_key(path) && rules.is_ignored(path)
+            })
+            .collect();
+        if !named.is_empty() {
+            io.err.extend_from_slice(
+                b"The following paths are ignored by one of your .gitignore files:\n",
+            );
+            for path in &named {
+                io.err.extend_from_slice(format!("{path}\n").as_bytes());
+            }
+            io.err
+                .extend_from_slice(b"hint: Use -f if you really want to add them.\n");
+            io.err.extend_from_slice(b"fatal: no files added\n");
+            return 1;
+        }
         selected.retain(|path| index.contains_key(path) || !rules.is_ignored(path));
     }
     if selected.len() > 100_000 {
@@ -687,8 +705,11 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
                 };
                 if !safe {
                     io.err.extend_from_slice(
-                        format!("error: the following file has staged or local changes: {path}\n")
-                            .as_bytes(),
+                        format!(
+                            "error: the following file has local modifications:\n    {path}\n\
+                             (use --cached to keep the file, or -f to force removal)\n"
+                        )
+                        .as_bytes(),
                     );
                     return 1;
                 }
@@ -707,6 +728,7 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
                 ctx.vfs
                     .remove_file("/", absolute)
                     .map_err(|error| error.to_string())?;
+                repo::prune_empty_parents(ctx, &root, absolute);
             }
             index.remove(relative);
         }
@@ -858,6 +880,7 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
             ctx.vfs
                 .rename("/", source_absolute, target_absolute)
                 .map_err(|error| error.to_string())?;
+            repo::prune_empty_parents(ctx, &root, source_absolute);
         }
         repo::store_index(ctx, &root, &index).map_err(|error| error.to_string())
     })();
@@ -898,6 +921,7 @@ pub(crate) fn git_restore(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
                 paths.extend_from_slice(&args[index + 1..]);
                 break;
             }
+            "-q" | "--quiet" => {}
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported restore option: {value}"))
             }
@@ -1250,9 +1274,9 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             continue;
         }
         if !paths.is_empty()
-            && !paths.iter().any(|selected| {
-                displayed == selected || displayed.starts_with(&format!("{selected}/"))
-            })
+            && !paths
+                .iter()
+                .any(|selected| super::ignore::matches_pathspec(selected, displayed))
         {
             continue;
         }

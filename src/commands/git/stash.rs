@@ -75,13 +75,15 @@ pub(crate) fn git_stash(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         return repo_error(io);
     };
     let mut include_untracked = false;
+    let mut quiet = false;
     let mut message = None;
     let mut operands: Vec<String> = Vec::new();
     let mut index = 0;
     for argument in super::expand_clusters(args, "um") {
         match argument.as_str() {
             "-u" | "--include-untracked" => include_untracked = true,
-            "-q" | "--quiet" | "--no-keep-index" => {}
+            "-q" | "--quiet" => quiet = true,
+            "--no-keep-index" => {}
             "-m" | "--message" => index = usize::MAX,
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported stash option: {value}"))
@@ -94,7 +96,9 @@ pub(crate) fn git_stash(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         }
     }
     let command = operands.first().map(String::as_str).unwrap_or("push");
-    match command {
+    // `-q` only silences the progress report; diagnostics still reach standard error.
+    let before = io.out.len();
+    let status = match command {
         "push" | "save" => push(ctx, &root, message, include_untracked, io),
         "list" => list(ctx, &root, io),
         "pop" | "apply" => {
@@ -114,7 +118,11 @@ pub(crate) fn git_stash(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
             i32::from(!store_entries(ctx, &root, &entries))
         }
         other => usage(io, &format!("unsupported stash command: {other}")),
+    };
+    if quiet {
+        io.out.truncate(before);
     }
+    status
 }
 
 fn push(
@@ -239,7 +247,21 @@ fn apply(
         return 128;
     };
     let current = repo::head_tree(ctx, root);
-    if let Err(error) = repo::replace_work_tree(ctx, root, &current, &work) {
+    // Reapplying overwrites whole files, so refuse when that would discard uncommitted work.
+    let touched = super::history::blocking_changes(ctx, root, &work);
+    if !touched.is_empty() {
+        io.err.extend_from_slice(
+            b"error: Your local changes to the following files would be overwritten by merge:\n",
+        );
+        for path in touched {
+            io.err.extend_from_slice(format!("\t{path}\n").as_bytes());
+        }
+        io.err.extend_from_slice(
+            b"Please commit your changes or stash them before you merge.\nAborting\n",
+        );
+        return 1;
+    }
+    if let Err(error) = repo::update_work_tree(ctx, root, &current, &work) {
         io.err
             .extend_from_slice(format!("git stash: {error}\n").as_bytes());
         return 1;
@@ -263,11 +285,28 @@ fn drop_entry(ctx: &mut CommandContext<'_>, root: &str, position: usize, io: &mu
         return 128;
     }
     let entry = entries.remove(position);
+    // Git names the dropped stash commit; this subset has no such commit, so it derives a stable
+    // identifier from the trees the entry saved.
+    let identifier = repo::sha1(
+        format!(
+            "stash {} {} {}",
+            entry.base,
+            read_tree(ctx, &tree_path(root, entry.id, "work"))
+                .as_ref()
+                .map(repo::tree_hash)
+                .unwrap_or_default(),
+            read_tree(ctx, &tree_path(root, entry.id, "index"))
+                .as_ref()
+                .map(repo::tree_hash)
+                .unwrap_or_default(),
+        )
+        .as_bytes(),
+    );
     if !store_entries(ctx, root, &entries) {
         return 1;
     }
     io.out.extend_from_slice(
-        format!("Dropped stash@{{{position}}} ({})\n", entry.message).as_bytes(),
+        format!("Dropped refs/stash@{{{position}}} ({identifier})\n").as_bytes(),
     );
     0
 }
