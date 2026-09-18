@@ -15,6 +15,9 @@ merge-base
 describe  shortlog  show-ref  symbolic-ref  for-each-ref
 ```
 
+`git log --graph` draws the branch rail, with connectors on lines of their own rather than folded
+into the commit header the way Git does it.
+
 Aliases recorded in configuration are expanded, so `git config alias.st "status --short"`
 makes `git st` work. A `!shell command` alias is not, because it would need host execution.
 

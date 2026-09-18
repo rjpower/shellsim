@@ -787,6 +787,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     let mut changed_lines: Option<String> = None;
     let mut patch = None;
     let mut stat = None;
+    let mut graph: Option<Rail> = None;
     let mut paths: Vec<String> = Vec::new();
     let mut operands_only = false;
     let mut index = 0;
@@ -857,6 +858,8 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
                     changed_lines = Some(value.clone());
                 }
             }
+            "--graph" => graph = Some(Rail::default()),
+            "--no-graph" => graph = None,
             "--stat" => stat = Some(Format::Stat),
             "--name-only" => stat = Some(Format::NameOnly),
             "--name-status" => stat = Some(Format::NameStatus),
@@ -1017,6 +1020,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         history.reverse();
     }
     let now = now_seconds(ctx);
+    let outer = io;
     // Multi-line formats are separated by a blank line; one-line formats are not.
     let separated = matches!(
         pretty,
@@ -1029,7 +1033,15 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         }
     );
     for (position, (id, commit)) in history.iter().enumerate() {
-        if separated && position != 0 {
+        // One commit's output is built up on its own so that `--graph` can prefix every line.
+        let mut block = Vec::new();
+        let io = &mut Io {
+            stdin: Vec::new(),
+            out: &mut block,
+            err: outer.err,
+        };
+        let head = usize::from(separated && position != 0);
+        if head == 1 {
             io.out.push(b'\n');
         }
         // `%d` and `%D` always expand, so decorations are computed whenever a format may use them.
@@ -1059,8 +1071,108 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             io.out.push(b'\n');
             emit_commit_diff(ctx, &root, id, commit, format, &paths, io);
         }
+        match graph.as_mut() {
+            Some(rail) => {
+                let rung = rail.advance(id, &commit.parents);
+                draw_on_rail(&block, &rung, head, outer);
+            }
+            None => outer.out.extend_from_slice(&block),
+        }
     }
     0
+}
+
+/// The rail `git log --graph` draws down the left of the output.
+///
+/// One column per commit whose line has not been drawn yet. A commit is marked in its own column
+/// and its parents take that column's place, which is what makes a branch fan out and a merge fold
+/// back in. The drawing is simpler than Git's: connectors always occupy a line of their own.
+#[derive(Default)]
+struct Rail {
+    columns: Vec<String>,
+}
+
+/// Where one commit's lines sit on the rail.
+struct Rung {
+    /// The prefix for the commit's first line.
+    first: String,
+    /// The prefix for its remaining lines, and for the blank line between commits.
+    rest: String,
+    /// Connector lines drawn after the commit, each already terminated.
+    connectors: String,
+}
+
+impl Rail {
+    /// Draw `id` and move the rail on to its parents.
+    fn advance(&mut self, id: &str, parents: &[String]) -> Rung {
+        let column = match self.columns.iter().position(|open| open == id) {
+            Some(column) => column,
+            None => {
+                self.columns.push(id.to_string());
+                self.columns.len() - 1
+            }
+        };
+        let width = self.columns.len();
+        let mut first: String = (0..width)
+            .map(|at| if at == column { "* " } else { "| " })
+            .collect();
+        // A merge widens the rail, and Git pads the commit line to the width that follows.
+        let extra = parents.len().saturating_sub(1);
+        first.push_str(&"  ".repeat(extra));
+        let rest: String = "| ".repeat(width);
+        let mut connectors = String::new();
+        self.columns
+            .splice(column..=column, parents.iter().cloned());
+        if extra > 0 {
+            connectors.push_str(&"| ".repeat(column));
+            connectors.push_str("|\\\n");
+        }
+        // Two columns waiting for the same commit fold into the leftmost of them.
+        while let Some((at, keep)) = self.duplicate() {
+            self.columns.remove(at);
+            connectors.push_str(&"| ".repeat(keep));
+            connectors.push_str("|/\n");
+        }
+        Rung {
+            first,
+            rest,
+            connectors,
+        }
+    }
+
+    /// The first column that repeats an earlier one, as `(duplicate, original)`.
+    fn duplicate(&self) -> Option<(usize, usize)> {
+        for (at, open) in self.columns.iter().enumerate() {
+            if let Some(first) = self.columns[..at].iter().position(|other| other == open) {
+                return Some((at, first));
+            }
+        }
+        None
+    }
+}
+
+/// Prefix every line of one commit's output with its place on the rail.
+///
+/// `head` is the index of the line the commit itself starts on; anything before it is the blank
+/// line that separates two commits, which rides the rail like a continuation line.
+fn draw_on_rail(block: &[u8], rung: &Rung, head: usize, io: &mut Io) {
+    let lines: Vec<&[u8]> = block.split(|byte| *byte == b'\n').collect();
+    // `split` yields a trailing empty piece for the final newline, which is not a line.
+    let lines = match lines.split_last() {
+        Some((&[], rest)) => rest,
+        _ => &lines[..],
+    };
+    for (position, line) in lines.iter().enumerate() {
+        let prefix = if position == head {
+            &rung.first
+        } else {
+            &rung.rest
+        };
+        io.out.extend_from_slice(prefix.as_bytes());
+        io.out.extend_from_slice(line);
+        io.out.push(b'\n');
+    }
+    io.out.extend_from_slice(rung.connectors.as_bytes());
 }
 
 fn commit_touches(

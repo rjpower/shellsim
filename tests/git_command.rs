@@ -1742,3 +1742,33 @@ fn the_executable_bit_is_tracked_through_a_commit_and_a_checkout() {
     assert_eq!(run(&mut env, "git switch -q other").0, 0);
     assert_eq!(run(&mut env, "test -x s.sh").0, 0);
 }
+
+#[test]
+fn log_graph_draws_a_branch_and_the_merge_that_closes_it() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/f", b"a\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    assert_eq!(run(&mut env, "git switch -qc side").0, 0);
+    env.vfs.put_file("/side", b"s\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm side").0, 0);
+    assert_eq!(run(&mut env, "git switch -q main").0, 0);
+    env.vfs.put_file("/main", b"m\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm main").0, 0);
+    assert_eq!(run(&mut env, "git merge -m merged side").0, 0);
+
+    let shape: Vec<String> = run(&mut env, "git log --graph --oneline")
+        .1
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(shape, vec!["*", "|\\", "*", "|", "|/", "*"]);
+    assert!(run(&mut env, "git log --graph --oneline")
+        .1
+        .contains("| * "));
+}
