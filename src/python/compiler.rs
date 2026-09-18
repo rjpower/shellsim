@@ -4,11 +4,12 @@ use super::ast::{
     AssignmentTarget, BooleanOperator, ComprehensionClause, Constant, DictEntry, Expression,
     ExpressionKind, FStringPart, Program, Statement, StatementKind,
 };
-use super::bytecode::{ClassField, Code, Instruction, Operation};
+use super::bytecode::{ClassField, Code, CodeRef, Instruction, Operation, Parameter};
 use super::source::Span;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-pub fn compile(program: Program) -> Code {
+pub fn compile(program: Program) -> CodeRef {
     let mut compiler = Compiler {
         instructions: Vec::new(),
         loops: Vec::new(),
@@ -23,10 +24,7 @@ pub fn compile(program: Program) -> Code {
     };
     compiler.statements(program.statements);
     compiler.emit(Operation::Halt, Span::default());
-    Code {
-        instructions: compiler.instructions,
-        parameters: Vec::new(),
-    }
+    compiler.finish(Vec::new())
 }
 
 struct Compiler {
@@ -96,6 +94,51 @@ fn contains_star(target: &AssignmentTarget) -> bool {
 }
 
 impl Compiler {
+    fn finish(self, parameters: Vec<Parameter>) -> CodeRef {
+        let mut instructions = self.instructions;
+        let mut local_names = parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<Vec<_>>();
+        if self.in_function && !self.is_class_scope {
+            for instruction in &instructions {
+                if let Operation::StoreName(name) = &instruction.operation {
+                    if !self.globals.contains(name)
+                        && !self.nonlocals.contains(name)
+                        && !local_names.contains(name)
+                    {
+                        local_names.push(name.clone());
+                    }
+                }
+            }
+            for instruction in &mut instructions {
+                let replacement = match &instruction.operation {
+                    Operation::LoadName(name) => local_names
+                        .iter()
+                        .position(|local| local == name)
+                        .map(Operation::LoadLocal),
+                    Operation::StoreName(name) => local_names
+                        .iter()
+                        .position(|local| local == name)
+                        .map(Operation::StoreLocal),
+                    Operation::DeleteName(name) => local_names
+                        .iter()
+                        .position(|local| local == name)
+                        .map(Operation::DeleteLocal),
+                    _ => None,
+                };
+                if let Some(operation) = replacement {
+                    instruction.operation = operation;
+                }
+            }
+        }
+        Arc::new(Code {
+            instructions: instructions.into(),
+            parameters: parameters.into(),
+            local_names: local_names.into(),
+        })
+    }
+
     fn statements(&mut self, statements: Vec<Statement>) {
         for statement in statements {
             self.statement(statement);
@@ -285,9 +328,8 @@ impl Compiler {
                 nested.statements(body);
                 nested.emit(Operation::LoadConstant(Constant::None), span);
                 nested.emit(Operation::Return, span);
-                let code = Code {
-                    instructions: nested.instructions,
-                    parameters: parameters
+                let code = nested.finish(
+                    parameters
                         .iter()
                         .map(|parameter| super::bytecode::Parameter {
                             name: parameter.name.clone(),
@@ -296,11 +338,11 @@ impl Compiler {
                             keyword_only: parameter.keyword_only,
                         })
                         .collect(),
-                };
+                );
                 self.emit(
                     Operation::MakeFunction {
                         name: name.clone(),
-                        code: Box::new(code),
+                        code,
                         defaults: defaults.len(),
                     },
                     span,
@@ -348,10 +390,7 @@ impl Compiler {
                 self.emit(
                     Operation::MakeClass {
                         name: name.clone(),
-                        code: Box::new(Code {
-                            instructions: nested.instructions,
-                            parameters: Vec::new(),
-                        }),
+                        code: nested.finish(Vec::new()),
                         bases: base_count,
                         has_metaclass,
                         fields,
@@ -1013,9 +1052,8 @@ impl Compiler {
                 self.emit(
                     Operation::MakeFunction {
                         name: "<lambda>".into(),
-                        code: Box::new(Code {
-                            instructions: nested.instructions,
-                            parameters: parameters
+                        code: nested.finish(
+                            parameters
                                 .iter()
                                 .map(|parameter| super::bytecode::Parameter {
                                     name: parameter.name.clone(),
@@ -1024,7 +1062,7 @@ impl Compiler {
                                     keyword_only: parameter.keyword_only,
                                 })
                                 .collect(),
-                        }),
+                        ),
                         defaults: defaults.len(),
                     },
                     span,
@@ -1171,10 +1209,7 @@ impl Compiler {
         self.emit(
             Operation::MakeFunction {
                 name: "<comprehension>".into(),
-                code: Box::new(Code {
-                    instructions: nested.instructions,
-                    parameters: Vec::new(),
-                }),
+                code: nested.finish(Vec::new()),
                 defaults: 0,
             },
             span,
@@ -1218,10 +1253,7 @@ impl Compiler {
         self.emit(
             Operation::MakeFunction {
                 name: "<dictcomp>".into(),
-                code: Box::new(Code {
-                    instructions: nested.instructions,
-                    parameters: Vec::new(),
-                }),
+                code: nested.finish(Vec::new()),
                 defaults: 0,
             },
             span,
@@ -1358,6 +1390,28 @@ mod tests {
             Operation::StoreName("x".into())
         );
         assert_eq!(code.instructions.last().unwrap().operation, Operation::Halt);
+    }
+
+    #[test]
+    fn function_locals_are_lowered_to_stable_slots() {
+        let code = compile(
+            parse(
+                lex("def add(left, right):\n    total = left + right\n    return total\n").unwrap(),
+            )
+            .unwrap(),
+        );
+        let Operation::MakeFunction { code, .. } = &code.instructions[0].operation else {
+            panic!("function definition must create a code object")
+        };
+        assert_eq!(&*code.local_names, ["left", "right", "total"]);
+        assert!(code
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction.operation, Operation::LoadLocal(0))));
+        assert!(code
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction.operation, Operation::StoreLocal(2))));
     }
 
     #[test]

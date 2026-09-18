@@ -227,11 +227,14 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::Slice { .. } => "slice(...)",
                 Object::Dict(_) | Object::DefaultDict { .. } => "{...}",
                 Object::Set(_) => "set(...)",
+                Object::Range { .. } => "range(...)",
                 Object::Function { .. } => "<function ...>",
                 Object::Class { .. } => "<class ...>",
                 Object::Instance { .. } => "<instance ...>",
                 Object::DescriptorBoundMethod { .. } => "<bound method ...>",
-                Object::Iterator { .. } => "<iterator ...>",
+                Object::Iterator { .. }
+                | Object::SequenceIterator { .. }
+                | Object::RangeIterator { .. } => "<iterator ...>",
                 Object::CountIterator { .. } => "<iterator ...>",
                 Object::CallableIterator { .. } => "<callable_iterator ...>",
                 Object::Generator { .. } => "<generator ...>",
@@ -292,6 +295,15 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::Set(values) => {
                 format!("{{{}}}", render_values(heap, values, active)?.join(", "))
             }
+            Object::Range { start, stop, step } => {
+                if *step == 1 && *start == 0 {
+                    format!("range({stop})")
+                } else if *step == 1 {
+                    format!("range({start}, {stop})")
+                } else {
+                    format!("range({start}, {stop}, {step})")
+                }
+            }
             Object::Function { name, .. } => format!("<function {name}>"),
             Object::Class { name, .. } => format!("<class '{name}'>"),
             Object::Instance { class, payload, .. } => match payload {
@@ -302,7 +314,9 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 },
             },
             Object::DescriptorBoundMethod { .. } => "<bound method>".into(),
-            Object::Iterator { .. } => "<iterator>".into(),
+            Object::Iterator { .. }
+            | Object::SequenceIterator { .. }
+            | Object::RangeIterator { .. } => "<iterator>".into(),
             Object::CountIterator { .. } => "<iterator>".into(),
             Object::CallableIterator { .. } => "<callable_iterator>".into(),
             Object::Generator { .. } => "<generator>".into(),
@@ -386,6 +400,9 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         Object::Slice { .. } => true,
         Object::Dict(entries) | Object::DefaultDict { entries, .. } => !entries.is_empty(),
         Object::BigInt(value) => !value.is_zero(),
+        Object::Range { start, stop, step } => {
+            (*step > 0 && *start < *stop) || (*step < 0 && *start > *stop)
+        }
         Object::Instance {
             payload: InstancePayload::Int(value),
             ..
@@ -398,6 +415,8 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         }
         | Object::DescriptorBoundMethod { .. }
         | Object::Iterator { .. }
+        | Object::SequenceIterator { .. }
+        | Object::RangeIterator { .. }
         | Object::CountIterator { .. }
         | Object::CallableIterator { .. }
         | Object::Generator { .. }
@@ -511,6 +530,37 @@ fn equals_inner(
                 (Object::List(left), Object::List(right))
                 | (Object::Tuple(left), Object::Tuple(right)) => {
                     sequence_equal(heap, left, right, active)?
+                }
+                (
+                    Object::Range {
+                        start: left_start,
+                        stop: left_stop,
+                        step: left_step,
+                    },
+                    Object::Range {
+                        start: right_start,
+                        stop: right_stop,
+                        step: right_step,
+                    },
+                ) => {
+                    let count = |start: i64, stop: i64, step: i64| {
+                        let start = i128::from(start);
+                        let stop = i128::from(stop);
+                        let step = i128::from(step);
+                        if step > 0 && start < stop {
+                            (stop - start - 1) / step + 1
+                        } else if step < 0 && start > stop {
+                            (start - stop - 1) / -step + 1
+                        } else {
+                            0
+                        }
+                    };
+                    let left_count = count(*left_start, *left_stop, *left_step);
+                    let right_count = count(*right_start, *right_stop, *right_step);
+                    left_count == right_count
+                        && (left_count == 0
+                            || (left_start == right_start
+                                && (left_count == 1 || left_step == right_step)))
                 }
                 (Object::Dict(left), Object::Dict(right))
                 | (Object::Dict(left), Object::DefaultDict { entries: right, .. })
@@ -719,6 +769,13 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
                 }
                 Ok(false)
             }
+            Object::Range { start, stop, step } => {
+                let value =
+                    int_value(heap, needle).ok_or("range containment requires an integer")?;
+                let within = (*step > 0 && value >= *start && value < *stop)
+                    || (*step < 0 && value <= *start && value > *stop);
+                Ok(within && (i128::from(value) - i128::from(*start)) % i128::from(*step) == 0)
+            }
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 for (key, _) in entries {
                     if identical(key, needle) || equals(heap, key, needle)? {
@@ -732,6 +789,8 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::Instance { .. }
             | Object::DescriptorBoundMethod { .. }
             | Object::Iterator { .. }
+            | Object::SequenceIterator { .. }
+            | Object::RangeIterator { .. }
             | Object::CountIterator { .. }
             | Object::CallableIterator { .. }
             | Object::Generator { .. }

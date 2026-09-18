@@ -36,6 +36,7 @@ pub(super) enum BuiltinType {
     Tuple,
     Dict,
     Set,
+    Range,
     Function,
     Module,
     Iterator,
@@ -53,7 +54,7 @@ pub(super) enum BuiltinType {
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 27] = [
+    pub(super) const ALL: [Self; 28] = [
         Self::Object,
         Self::Type,
         Self::None,
@@ -67,6 +68,7 @@ impl BuiltinType {
         Self::Tuple,
         Self::Dict,
         Self::Set,
+        Self::Range,
         Self::Function,
         Self::Module,
         Self::Iterator,
@@ -102,6 +104,7 @@ impl BuiltinType {
             Self::Tuple => "tuple",
             Self::Dict => "dict",
             Self::Set => "set",
+            Self::Range => "range",
             Self::Function => "function",
             Self::Module => "module",
             Self::Iterator => "iterator",
