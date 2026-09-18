@@ -669,8 +669,8 @@ impl TypeRegistry {
 
     /// Heap values retained by semantic type metadata.
     ///
-    /// User type attributes and completed class values participate in the same arena graph as
-    /// ordinary globals, so the VM includes these values in every safe-point collection.
+    /// Completed user class objects own their Python-visible namespace. The registry roots those
+    /// class objects, builtin attributes, and cached protocol descriptors at every safe point.
     pub fn heap_roots(&self) -> Vec<Value> {
         let mut roots = Vec::new();
         for ty in &self.types {
@@ -702,10 +702,10 @@ impl TypeRegistry {
         name: String,
         bases: Vec<TypeId>,
         mro: Vec<TypeId>,
-        attributes: HashMap<String, Value>,
+        attributes: &HashMap<String, Value>,
     ) -> Result<TypeId, String> {
         let index = u32::try_from(self.types.len()).map_err(|_| "too many Python types")?;
-        let mut slots = TypeSlots::from_attributes(&attributes);
+        let mut slots = TypeSlots::from_attributes(attributes);
         for slot in Slot::ALL {
             if slots.get(slot).is_some() {
                 continue;
@@ -721,7 +721,7 @@ impl TypeRegistry {
             name,
             bases,
             mro,
-            attributes,
+            attributes: HashMap::new(),
             slots,
             value: None,
         };
@@ -1005,10 +1005,11 @@ mod tests {
                 "Example".into(),
                 vec![BuiltinType::Object.id()],
                 vec![BuiltinType::Object.id()],
-                HashMap::from([("value".into(), Value::Int(1))]),
+                &HashMap::from([("value".into(), Value::Int(1))]),
             )
             .unwrap();
         let registered_bytes = modeled_type_bytes(registry.get(id).unwrap());
+        assert_eq!(registry.attribute(id, "value").unwrap(), None);
         assert_eq!(
             registry.modeled_bytes(),
             before.saturating_add(registered_bytes)
