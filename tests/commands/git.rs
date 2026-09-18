@@ -2476,3 +2476,28 @@ fn blame_follows_a_file_that_was_renamed() {
     assert_eq!(old.0, 0, "{}", old.2);
     assert!(old.1.ends_with(" TWO\n"), "{}", old.1);
 }
+
+#[test]
+fn short_status_lists_tracked_paths_in_path_order() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'a\\n' > f.txt; printf 'k\\n' > g.txt; git add -A; \
+                 git commit -qm base; git switch -qc topic; printf 'T\\n' > g.txt; \
+                 git commit -qam t1; git switch -q main; printf 'M\\n' > g.txt; \
+                 git commit -qam m1";
+    assert_eq!(run(&mut env, setup).0, 0);
+    assert_eq!(run(&mut env, "git merge topic").0, 1);
+    assert_eq!(
+        run(
+            &mut env,
+            "printf 'edited\\n' > f.txt; printf 'new\\n' > a.txt"
+        )
+        .0,
+        0
+    );
+
+    // The unmerged path sorts among the others rather than being listed ahead of them.
+    assert_eq!(
+        run(&mut env, "git status --short").1,
+        " M f.txt\nUU g.txt\n?? a.txt\n"
+    );
+}

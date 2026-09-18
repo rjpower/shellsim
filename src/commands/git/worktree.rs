@@ -493,16 +493,19 @@ fn emit_short_status(
         io.out.extend_from_slice(format!("## {label}").as_bytes());
         io.out.push(terminator);
     }
-    for (path, entry) in unmerged {
-        io.out
-            .extend_from_slice(format!("{} {path}", entry.porcelain()).as_bytes());
-        io.out.push(terminator);
-    }
-    for entry in entries {
+    // Tracked paths are listed in path order whether or not they are unmerged, as Git lists them.
+    let mut tracked: Vec<(&str, String)> = unmerged
+        .iter()
+        .map(|(path, entry)| (path.as_str(), format!("{} {path}", entry.porcelain())))
+        .collect();
+    tracked.extend(entries.iter().map(|entry| {
         let x = entry.staged.map_or(' ', Change::porcelain);
         let y = entry.unstaged.map_or(' ', Change::porcelain);
-        io.out
-            .extend_from_slice(format!("{x}{y} {}", entry.display()).as_bytes());
+        (entry.path.as_str(), format!("{x}{y} {}", entry.display()))
+    }));
+    tracked.sort_by(|left, right| left.0.cmp(right.0));
+    for (_, line) in tracked {
+        io.out.extend_from_slice(line.as_bytes());
         io.out.push(terminator);
     }
     for path in untracked {

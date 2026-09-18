@@ -16,12 +16,16 @@ check-ignore  merge-base  describe  shortlog  show-ref  symbolic-ref  for-each-r
 
 Every move of HEAD is recorded, so `git reflog` lists where it has been and `HEAD@{N}` names the
 commit it was on N moves ago. That is what makes a mistaken `git reset --hard` recoverable. Only
-HEAD is logged, not individual branches, and the last thousand moves are kept.
+HEAD is logged, not individual branches, and the last thousand moves are kept. A reset, merge or
+rebase also writes `ORIG_HEAD`, so `git reset --hard ORIG_HEAD` undoes one.
 
 `git blame` walks first parents, carrying each line back until the version that introduced it,
-and marks lines the working tree has not committed with a zero hash. `git log --graph` draws the
-branch rail, with connectors on lines of their own rather than folded
-into the commit header the way Git does it.
+and marks lines the working tree has not committed with a zero hash. It follows a file back
+through a commit that only renamed it; a rename that also edited the file stops the walk there.
+`git log --graph` draws the branch rail, with connectors on lines of their own rather than folded
+into the commit header the way Git does it. The rail is right for one line of development and the
+merges that close into it; `--all` over branches that never merged can put a collapse in the
+wrong column.
 
 `git apply` holds a patch to the anchors Git holds it to: a hunk with no trailing context has to
 reach the end of the file, and one that starts at the first line has to start there. A hunk that
@@ -97,13 +101,21 @@ cherry-pick keeps the original author; a revert does not.
 
 `git stash pop` and `git stash apply` merge the entry back the same way, against the commit it was
 taken from, so work committed or edited in the meantime survives. A plain reapplication restores
-the working tree only, as Git's does; an entry that conflicts stays on the list.
+the working tree only, as Git's does, except that a file nothing tracks yet is staged, because
+there is no way to leave it unstaged. An entry that conflicts stays on the list. `git stash push`
+refuses while a path is unmerged, since one saved tree cannot hold three sides.
 
-`git rebase [--onto NEWBASE] UPSTREAM` replays the commits the branch has and the upstream does
-not, one at a time, as a run of cherry-picks. It stops at the first conflict and takes
-`--continue`, `--skip`, and `--abort`; `--abort` puts the branch back exactly where it was. A
-commit whose change is already in the new base is dropped. Interactive rebase needs an editor and
-is refused.
+`git rebase [--onto NEWBASE] UPSTREAM [BRANCH]` replays the commits the branch has and the
+upstream does not, one at a time, as a run of cherry-picks; naming BRANCH checks it out first. It
+refuses to start on a working tree or index that has moved away from HEAD, because the replay
+would overwrite that work. HEAD is detached for the replay, as Git detaches it, so the branch
+keeps naming its old tip until the rebase succeeds, and `git switch` is refused until it ends. It
+stops at the first conflict and takes `--continue`, `--skip`, and `--abort`; `--abort` puts the
+branch back exactly where it was. A commit whose change is already in the new base is dropped.
+Interactive rebase needs an editor and is refused.
+
+While a merge, cherry-pick, revert or rebase is unfinished, `git status` names the operation and
+the `--continue`, `--skip`, and `--abort` forms that belong to it.
 
 Binary files and a path one side deleted while the other changed it are recorded as conflicts
 without markers, leaving the surviving content in the working tree, as Git does.
@@ -141,7 +153,8 @@ by real Git is not readable, and a repository created here is not meant to be ha
 .git/config            repository configuration in Git's INI format
 .git/stash-list        saved stash entries, newest first
 .git/logs/HEAD         every move of HEAD, oldest first, as `before<TAB>after<TAB>action`
-.git/REBASE_STATE      the branch, its original tip, and the commits a rebase has left to apply
+.git/REBASE_STATE      the branch, its original tip, what it replays onto, and what is left
+.git/ORIG_HEAD         where HEAD was before the last reset, merge, or rebase
 .git/MERGE_HEAD        the commit an unfinished merge is bringing in
 .git/CHERRY_PICK_HEAD  the commit an unfinished cherry-pick is replaying
 .git/REVERT_HEAD       the commit an unfinished revert is undoing
