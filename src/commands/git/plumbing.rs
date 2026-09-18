@@ -864,6 +864,7 @@ pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         return repo_error(io);
     };
     let mut suppress = false;
+    let mut long = false;
     let mut range: Option<String> = None;
     let mut operands: Vec<String> = Vec::new();
     // Where `--` fell, so `git blame REV -- PATH` names a path that the working tree lost.
@@ -882,8 +883,9 @@ pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         };
         match name.as_str() {
             "-s" => suppress = true,
+            "-l" => long = true,
             // Blame here has no similarity detection or whitespace modes to turn on.
-            "-l" | "-w" | "-e" | "--show-email" | "--root" => {}
+            "-w" | "-e" | "--show-email" | "--root" => {}
             "-L" => {
                 let Some(value) = flags.value(attached) else {
                     return usage(io, "-L requires a line range");
@@ -941,7 +943,12 @@ pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     else {
         return repo::resource_error(ctx);
     };
-    emit_blame(ctx, &root, &lines, &origins, range.as_deref(), suppress, io)
+    let format = BlameFormat {
+        range: range.as_deref(),
+        suppress,
+        long,
+    };
+    emit_blame(ctx, &root, &lines, &origins, &format, io)
 }
 
 /// The name blame gives lines that are only in the working tree.
@@ -1079,15 +1086,29 @@ fn trace_lines(
     )
 }
 
+/// How `git blame` was asked to print its lines.
+struct BlameFormat<'a> {
+    /// `-L`: the lines to show, out of the whole file.
+    range: Option<&'a str>,
+    /// `-s`: the hash and line number alone, with no author or date.
+    suppress: bool,
+    /// `-l`: the whole commit id rather than its abbreviation.
+    long: bool,
+}
+
 fn emit_blame(
     ctx: &mut CommandContext<'_>,
     root: &str,
     lines: &[String],
     origins: &[Origin],
-    range: Option<&str>,
-    suppress: bool,
+    format: &BlameFormat<'_>,
     io: &mut Io,
 ) -> i32 {
+    let BlameFormat {
+        range,
+        suppress,
+        long,
+    } = *format;
     let (from, to) = match range {
         Some(range) => match parse_line_range(range, lines.len()) {
             Some(bounds) => bounds,
@@ -1108,10 +1129,11 @@ fn emit_blame(
         };
         let origin = &origins[number - 1];
         // A boundary commit is marked with `^`, which takes the place of a hash digit.
+        let digits = if long { origin.commit.len() } else { 8 };
         let name = if origin.boundary {
-            format!("^{}", &origin.commit[..7])
+            format!("^{}", &origin.commit[..digits - 1])
         } else {
-            origin.commit[..8].to_string()
+            origin.commit[..digits].to_string()
         };
         let described = if suppress {
             String::new()

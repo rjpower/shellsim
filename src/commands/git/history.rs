@@ -268,7 +268,13 @@ pub(crate) fn git_commit(
             return 1;
         }
     };
-    if repo::update_head(ctx, &root, &id, &format!("commit: {}", commit.subject())).is_err() {
+    // Git words the reflog by what the commit was: the first on a branch, an amend, or neither.
+    let what = match (commit.parents.is_empty(), amend) {
+        (true, _) => "commit (initial)",
+        (false, true) => "commit (amend)",
+        (false, false) => "commit",
+    };
+    if repo::update_head(ctx, &root, &id, &format!("{what}: {}", commit.subject())).is_err() {
         return 1;
     }
     if pending.is_some() {
@@ -309,7 +315,7 @@ fn parse_author(value: &str) -> Option<(String, String)> {
 }
 
 /// Print the ` N files changed ...` line and the per-file mode lines Git shows after a commit.
-fn emit_commit_summary(
+pub(crate) fn emit_commit_summary(
     ctx: &mut CommandContext<'_>,
     root: &str,
     old: &Tree,
@@ -3081,7 +3087,9 @@ fn replay_one(
         return 128;
     }
     let against = mainline.unwrap_or(1);
-    if against > commit.parents.len() {
+    // A root commit has no parent, and Git measures it against the empty tree rather than
+    // refusing: replaying the first commit of a history is an ordinary thing to ask for.
+    if against > commit.parents.len() && !commit.parents.is_empty() {
         io.err.extend_from_slice(
             format!("error: commit {id} does not have parent {against}\nfatal: {name} failed\n")
                 .as_bytes(),
@@ -3163,10 +3171,15 @@ fn replay_one(
         conflict::CHERRY_PICK_HEAD
     };
     if !combined.stages.is_empty() {
+        // The escape hatches are named because an agent that reads only this line still needs
+        // to know it can skip the commit or give the whole thing up.
         let advice = format!(
             "error: could not apply {label}\n\
              hint: After resolving the conflicts, mark them with\n\
-             hint: \"git add/rm <pathspec>\", then run \"git {name} --continue\"."
+             hint: \"git add/rm <pathspec>\", then run \"git {name} --continue\".\n\
+             hint: You can instead skip this commit with \"git {name} --skip\".\n\
+             hint: To abort and get back to the state before \"git {name}\",\n\
+             hint: run \"git {name} --abort\"."
         );
         return pause_for_conflicts(
             ctx,
@@ -3228,11 +3241,7 @@ fn replay_one(
         )
         .as_bytes(),
     );
-    let stat = compare::Options {
-        format: Format::Stat,
-        ..Default::default()
-    };
-    compare::emit(ctx, root, &head_tree, &applied, &stat, io);
+    emit_commit_summary(ctx, root, &head_tree, &applied, io);
     0
 }
 

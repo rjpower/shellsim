@@ -135,6 +135,8 @@ pub(crate) fn git_rebase(
             .extend_from_slice(format!("fatal: invalid upstream '{upstream}'\n").as_bytes());
         return 128;
     };
+    // Git names the new base in the reflog as the user wrote it, which is what makes it readable.
+    let base_name = onto.clone().unwrap_or_else(|| upstream.clone());
     let onto_id = match onto {
         Some(revision) => match repo::resolve_revision(ctx, &root, &revision) {
             Some(id) => id,
@@ -198,8 +200,8 @@ pub(crate) fn git_rebase(
         if let Err(status) = lay_down(ctx, &root, &onto_id, io) {
             return status;
         }
-        if repo::update_head(ctx, &root, &onto_id, &format!("rebase finished: {onto_id}")).is_err()
-        {
+        let action = format!("rebase (finish): returning to refs/heads/{branch}");
+        if repo::update_head(ctx, &root, &onto_id, &action).is_err() {
             return 1;
         }
         io.out.extend_from_slice(
@@ -213,8 +215,13 @@ pub(crate) fn git_rebase(
     }
     // Git detaches HEAD for the duration, so the branch keeps naming its old tip until the
     // replay succeeds and nothing that reads the branch sees a half-finished history.
-    if repo::set_head_detached(ctx, &root, &onto_id, &format!("rebase: checkout {onto_id}"))
-        .is_err()
+    if repo::set_head_detached(
+        ctx,
+        &root,
+        &onto_id,
+        &format!("rebase (start): checkout {base_name}"),
+    )
+    .is_err()
     {
         return 1;
     }
@@ -333,7 +340,7 @@ fn replay(
         }
         // A commit whose change is already in the new base is dropped, as Git drops it.
         if combined.tree != ours {
-            if let Err(status) = record(ctx, root, &original, &combined.tree, io) {
+            if let Err(status) = record(ctx, root, &original, &combined.tree, "pick", io) {
                 return status;
             }
         }
@@ -368,7 +375,7 @@ fn land(ctx: &mut CommandContext<'_>, root: &str, state: &State, io: &mut Io) ->
             .extend_from_slice(format!("git rebase: cannot update {reference}\n").as_bytes());
         return Err(1);
     }
-    let action = format!("rebase finished: returning to {reference}");
+    let action = format!("rebase (finish): returning to {reference}");
     if repo::set_head_to_branch(ctx, root, &state.branch, &action).is_err() {
         return Err(1);
     }
@@ -381,8 +388,9 @@ fn record(
     root: &str,
     original: &Commit,
     tree: &repo::Tree,
+    verb: &str,
     io: &mut Io,
-) -> Result<(), i32> {
+) -> Result<String, i32> {
     let Some(head) = repo::head_commit(ctx, root) else {
         return Err(1);
     };
@@ -398,11 +406,11 @@ fn record(
             .extend_from_slice(b"git rebase: cannot record commit\n");
         return Err(1);
     };
-    let action = format!("rebase: {}", replayed.subject());
+    let action = format!("rebase ({verb}): {}", replayed.subject());
     if repo::update_head(ctx, root, &id, &action).is_err() {
         return Err(1);
     }
-    Ok(())
+    Ok(id)
 }
 
 /// Finish the commit the user has settled, then carry on.
@@ -427,9 +435,20 @@ fn resume(ctx: &mut CommandContext<'_>, root: &str, globals: &Globals, io: &mut 
     let staged = repo::load_index(ctx, root).unwrap_or_default();
     let head_tree = repo::head_tree(ctx, root);
     if staged != head_tree {
-        if let Err(status) = record(ctx, root, &original, &staged, io) {
-            return status;
-        }
+        // Git reports the commit the user just settled, which is the only one it names by hand.
+        let id = match record(ctx, root, &original, &staged, "continue", io) {
+            Ok(id) => id,
+            Err(status) => return status,
+        };
+        io.out.extend_from_slice(
+            format!(
+                "[detached HEAD {}] {}\n",
+                repo::short(&id),
+                original.subject()
+            )
+            .as_bytes(),
+        );
+        history::emit_commit_summary(ctx, root, &head_tree, &staged, io);
     }
     state.todo.remove(0);
     conflict::clear(ctx, root);
@@ -473,7 +492,13 @@ fn abort(ctx: &mut CommandContext<'_>, root: &str, io: &mut Io) -> i32 {
     // HEAD is detached mid-rebase, so putting it back means naming the branch again.
     let reference = format!("refs/heads/{}", state.branch);
     if repo::write_reference(ctx, root, &reference, &state.original).is_err()
-        || repo::set_head_to_branch(ctx, root, &state.branch, "rebase: aborted").is_err()
+        || repo::set_head_to_branch(
+            ctx,
+            root,
+            &state.branch,
+            &format!("rebase (abort): returning to {reference}"),
+        )
+        .is_err()
     {
         return 1;
     }

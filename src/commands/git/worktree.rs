@@ -583,7 +583,7 @@ fn emit_long_status(report: &Report, pending: Option<&str>, io: &mut Io) {
     }
     if !unmerged.is_empty() {
         io.out.extend_from_slice(
-            b"Unmerged paths:\n  (use \"git add <file>...\" to mark resolution)\n",
+            b"Unmerged paths:\n  (use \"git restore --staged <file>...\" to unstage)\n  (use \"git add <file>...\" to mark resolution)\n",
         );
         for (path, entry) in unmerged {
             io.out.extend_from_slice(

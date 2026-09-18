@@ -2121,7 +2121,7 @@ fn the_reflog_records_where_head_has_been_and_brings_a_reset_back() {
             "checkout: moving from side to main",
             "checkout: moving from main to side",
             "commit: two",
-            "commit: one",
+            "commit (initial): one",
         ]
     );
     assert_eq!(run(&mut env, "git reflog -n 2").1.lines().count(), 2);
@@ -2796,4 +2796,76 @@ fn a_mistyped_option_and_a_failed_operation_exit_differently() {
     let nothing = run(&mut env, "git add");
     assert_eq!(nothing.0, 0, "{}", nothing.2);
     assert!(nothing.2.contains("Nothing specified"), "{}", nothing.2);
+}
+
+#[test]
+fn the_first_commit_of_a_history_can_be_reverted() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs.put_file("/f", b"one\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add f; git commit -qm one").0, 0);
+
+    // A root commit has no parent, so it is measured against the empty tree rather than refused.
+    let reverted = run(&mut env, "git revert --no-edit HEAD");
+    assert_eq!(reverted.0, 0, "{}", reverted.2);
+    assert!(
+        reverted.1.contains("delete mode 100644 f"),
+        "{}",
+        reverted.1
+    );
+    assert!(!env.vfs.exists("/", "/f"));
+}
+
+#[test]
+fn a_rebase_names_what_it_did_in_the_reflog_and_reports_the_commit_it_settled() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs
+        .put_file("/f", b"a\nb\nc\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add f; git commit -qm base").0, 0);
+    assert_eq!(run(&mut env, "git switch -qc side").0, 0);
+    env.vfs
+        .put_file("/f", b"a\nB\nc\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -qam side").0, 0);
+    assert_eq!(run(&mut env, "git switch -q main").0, 0);
+    env.vfs
+        .put_file("/f", b"A\nb\nc\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -qam main").0, 0);
+
+    let stopped = run(&mut env, "git rebase side");
+    assert_eq!(stopped.0, 1, "{}", stopped.2);
+    env.vfs
+        .put_file("/f", b"A\nB\nc\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add f").0, 0);
+    let finished = run(&mut env, "git rebase --continue");
+    assert_eq!(finished.0, 0, "{}", finished.2);
+    // Git names the commit the user settled by hand, and only that one.
+    assert!(finished.1.contains("[detached HEAD"), "{}", finished.1);
+    assert!(finished.1.contains("1 file changed"), "{}", finished.1);
+
+    let reflog = run(&mut env, "git reflog -n 3").1;
+    assert!(
+        reflog.contains("rebase (finish): returning to refs/heads/main"),
+        "{reflog}"
+    );
+    assert!(reflog.contains("rebase (continue): main"), "{reflog}");
+    assert!(reflog.contains("rebase (start): checkout side"), "{reflog}");
+}
+
+#[test]
+fn blame_can_print_the_whole_commit_id() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs.put_file("/f", b"one\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add f; git commit -qm one").0, 0);
+
+    let short = run(&mut env, "git blame f").1;
+    let long = run(&mut env, "git blame -l f").1;
+    let id = run(&mut env, "git rev-parse HEAD").1.trim().to_string();
+    assert!(short.starts_with(&format!("^{}", &id[..7])), "{short}");
+    assert!(long.starts_with(&format!("^{}", &id[..39])), "{long}");
 }
