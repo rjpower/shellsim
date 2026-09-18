@@ -11,17 +11,17 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
-use super::bytecode::{ClassField, CodeRef, Operation};
+use super::bytecode::{ClassField, CodeRef, NameId, Opcode};
 use super::filesystem::PyModuleLoader;
 use super::heap::{
     ClassLayout, InstanceAttributeSlot, InstanceAttributes, InstancePayload, Object, ObjectId,
-    ScopeId,
+    ScopeId, SymbolId,
 };
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
     PyArray, PyArrayDtype, PyArrayLayout, PyBinaryOp, PyByteArray, PyCallable, PyClass, PyClock,
     PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity,
-    PyInstance, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
+    PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
     PyProcessHandle, PyProcessOutput, PyProcessRunner, PyProcessStartRequest, PyProperty,
     PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PySubcommandSpec, PySubparsersSpec,
     PyTuple, PyValueCast,
@@ -265,10 +265,22 @@ pub(super) fn execute(
     out: Out,
     err: Out,
 ) -> ExecResult {
-    state
-        .locals
-        .entry("__name__".into())
-        .or_insert_with(|| Value::inline_string("__main__").expect("short builtin string"));
+    let name_symbol = match state.heap.intern_symbol("__name__", &mut interp.resources) {
+        Ok(symbol) => symbol,
+        Err(_) => return ExecResult::Exit(137),
+    };
+    if state.globals.get(name_symbol).is_none()
+        && state
+            .globals
+            .insert(
+                name_symbol,
+                Value::inline_string("__main__").expect("short builtin string"),
+                &mut interp.resources,
+            )
+            .is_err()
+    {
+        return ExecResult::Exit(137);
+    }
     let mut program = match VmProgram::compile(source) {
         Ok(program) => program,
         Err(result) => return result,
@@ -434,7 +446,7 @@ struct VmState {
     exception_stack: Vec<RaisedException>,
     with_contexts: Vec<Value>,
     method_frames: Vec<(super::heap::ObjectId, Value)>,
-    attribute_caches: Vec<CodeAttributeCaches>,
+    code_caches: Vec<CodeCaches>,
     stdin_position: usize,
     stdin_text: Option<String>,
     transient_memory: u64,
@@ -442,9 +454,10 @@ struct VmState {
 }
 
 #[derive(Clone)]
-struct CodeAttributeCaches {
+struct CodeCaches {
     code: CodeRef,
-    entries: Vec<Option<LoadAttributeCache>>,
+    names: Vec<Option<SymbolId>>,
+    attributes: Option<Vec<Option<LoadAttributeCache>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -526,7 +539,7 @@ impl<'a> Vm<'a> {
     }
 
     fn collect_heap(&mut self) -> Result<(), String> {
-        let mut values = self.state.locals.values().copied().collect::<Vec<_>>();
+        let mut values = self.state.globals.values().collect::<Vec<_>>();
         values.extend(self.state.modules.values().copied());
         values.extend(self.state.sys_path);
         values.extend(self.state.types.heap_roots());
@@ -663,14 +676,25 @@ impl<'a> Vm<'a> {
         &mut self,
         budget: usize,
     ) -> Result<Execution, (String, super::source::Span)> {
+        // The VM runs synchronously for one bounded quantum. Interrupt state can change only when
+        // control returns to the scheduler, so one check defines the quantum's safe-point edge.
+        if self.interp.deadline_interrupt.is_some() {
+            return Ok(Execution::Exit(124));
+        }
+        let mut code = self
+            .bytecode_frames
+            .last()
+            .expect("bytecode execution requires an active frame")
+            .code
+            .clone();
+        let mut code_cache = self
+            .ensure_code_cache(&code)
+            .map_err(|error| (error, super::source::Span::default()))?;
         'execution: for _ in 0..budget.max(1) {
             // Native helper snapshots live for one semantic instruction. Releasing the previous
             // instruction's scratch here avoids double-counting a materialized result after it
             // has moved into an arena object.
             self.release_transient_memory();
-            if self.interp.deadline_interrupt.is_some() {
-                return Ok(Execution::Exit(124));
-            }
             if let Some(pending) = self.active_frame_mut().pending_native_call.take() {
                 let span = pending.call_span;
                 match self.resume_native_call(pending) {
@@ -698,20 +722,24 @@ impl<'a> Vm<'a> {
                     }
                 }
             }
-            let instruction_pointer = self
-                .bytecode_frames
-                .last()
-                .expect("bytecode execution requires an active frame")
-                .instruction_pointer;
-            // Retain the immutable code independently from the mutable frame stack. This keeps
-            // dispatch borrowed from one shared instruction stream while operations mutate VM
-            // state or install another frame.
-            let code = self
-                .bytecode_frames
-                .last()
-                .expect("bytecode execution requires an active frame")
-                .code
-                .clone();
+            let (code_changed, instruction_pointer) = {
+                let frame = self
+                    .bytecode_frames
+                    .last()
+                    .expect("bytecode execution requires an active frame");
+                (!Arc::ptr_eq(&code, &frame.code), frame.instruction_pointer)
+            };
+            if code_changed {
+                code = self
+                    .bytecode_frames
+                    .last()
+                    .expect("bytecode execution requires an active frame")
+                    .code
+                    .clone();
+                code_cache = self
+                    .ensure_code_cache(&code)
+                    .map_err(|error| (error, super::source::Span::default()))?;
+            }
             let Some(instruction) = code.instructions.get(instruction_pointer) else {
                 return Err((
                     "instruction pointer left the code object".into(),
@@ -721,170 +749,216 @@ impl<'a> Vm<'a> {
             if !self.interp.resources.charge_cpu(1) {
                 return Ok(Execution::Exit(137));
             }
-            let result = match &instruction.operation {
-                Operation::LoadConstant(constant) => {
-                    self.value_from_constant(constant).map(|value| {
+            let opcode = instruction.opcode;
+            let span = code.spans[instruction_pointer];
+            let mut next_instruction = instruction_pointer + 1;
+            let result = match opcode {
+                Opcode::LoadConstant(constant) => self
+                    .value_from_constant(code.constant(constant))
+                    .map(|value| {
                         self.stack.push(value);
-                    })
+                    }),
+                Opcode::LoadName(name) => {
+                    let symbol = self
+                        .symbol_for(&code, code_cache, name)
+                        .map_err(|error| (error, span))?;
+                    self.load_name(symbol, code.name(name))
                 }
-                Operation::LoadName(name) => self.load_name(name),
-                Operation::StoreName(name) => self.store_name(name),
-                Operation::LoadLocal(slot) => self.load_local(*slot),
-                Operation::StoreLocal(slot) => self.store_local(*slot),
-                Operation::StoreEnclosing { name, scope_hops } => {
-                    self.store_enclosing(name, *scope_hops)
+                Opcode::LoadGlobal(name) => {
+                    let symbol = self
+                        .symbol_for(&code, code_cache, name)
+                        .map_err(|error| (error, span))?;
+                    self.load_global(symbol, &code, name)
                 }
-                Operation::StoreNonlocal(name) => self.store_nonlocal(name),
-                Operation::StoreGlobal(name) => {
-                    let value = self.pop().map_err(|error| (error, instruction.span))?;
-                    self.store_global(name, value)
+                Opcode::StoreName(name) => {
+                    let symbol = self
+                        .symbol_for(&code, code_cache, name)
+                        .map_err(|error| (error, span))?;
+                    self.store_name(symbol, code.name(name))
                 }
-                Operation::StoreAttribute(name) => {
-                    let owner = self.pop().map_err(|error| (error, instruction.span))?;
-                    let value = self.pop().map_err(|error| (error, instruction.span))?;
-                    self.store_attribute(owner, name, value)
+                Opcode::LoadLocal(slot) => self.load_local(slot),
+                Opcode::StoreLocal(slot) => self.store_local(slot),
+                Opcode::StoreEnclosing { name, scope_hops } => {
+                    let symbol = self
+                        .symbol_for(&code, code_cache, name)
+                        .map_err(|error| (error, span))?;
+                    self.store_enclosing(symbol, code.name(name), scope_hops)
                 }
-                Operation::StoreSubscript => self.store_subscript(),
-                Operation::DeleteName(name) => {
+                Opcode::StoreNonlocal(name) => self.store_nonlocal(code.name(name)),
+                Opcode::StoreGlobal(name) => {
+                    let symbol = self
+                        .symbol_for(&code, code_cache, name)
+                        .map_err(|error| (error, span))?;
+                    let value = self.pop().map_err(|error| (error, span))?;
+                    self.store_global(symbol, &code, name, value)
+                }
+                Opcode::StoreAttribute(name) => {
+                    let symbol = self
+                        .symbol_for(&code, code_cache, name)
+                        .map_err(|error| (error, span))?;
+                    let owner = self.pop().map_err(|error| (error, span))?;
+                    let value = self.pop().map_err(|error| (error, span))?;
+                    self.store_attribute_by_symbol(owner, symbol, code.name(name), value)
+                }
+                Opcode::StoreSubscript => self.store_subscript(),
+                Opcode::DeleteName(name) => {
+                    let symbol = self
+                        .symbol_for(&code, code_cache, name)
+                        .map_err(|error| (error, span))?;
+                    let name = code.name(name);
                     if let Some(scope) = self.local_scopes.last().copied() {
                         self.state.heap.scope_remove(scope, name).map(|_| ())
                     } else {
-                        self.state.locals.remove(name);
+                        self.state.globals.remove(symbol);
                         Ok(())
                     }
                 }
-                Operation::DeleteLocal(slot) => self.delete_local(*slot),
-                Operation::DeleteGlobal(name) => self.delete_global(name),
-                Operation::DeleteSubscript => self.delete_subscript(),
-                Operation::Import { name, bind_root } => self.import(name, *bind_root),
-                Operation::LoadAttribute(name) => {
-                    self.load_attribute_at(&code, instruction_pointer, name)
+                Opcode::DeleteLocal(slot) => self.delete_local(slot),
+                Opcode::DeleteGlobal(name) => {
+                    let symbol = self
+                        .symbol_for(&code, code_cache, name)
+                        .map_err(|error| (error, span))?;
+                    self.delete_global(symbol, &code, name)
                 }
-                Operation::LoadSubscript => self.load_subscript(),
-                Operation::BuildSlice {
+                Opcode::DeleteSubscript => self.delete_subscript(),
+                Opcode::Import { name, bind_root } => self.import(code.name(name), bind_root),
+                Opcode::LoadAttribute(name) => {
+                    let symbol = self
+                        .symbol_for(&code, code_cache, name)
+                        .map_err(|error| (error, span))?;
+                    self.load_attribute_at(&code, instruction_pointer, symbol, code.name(name))
+                }
+                Opcode::LoadSubscript => self.load_subscript(),
+                Opcode::BuildSlice {
                     has_start,
                     has_stop,
                     has_step,
-                } => self.build_slice(*has_start, *has_stop, *has_step),
-                Operation::BuildList(count) => self.build_sequence(*count, SequenceKind::List),
-                Operation::BuildTuple(count) => self.build_sequence(*count, SequenceKind::Tuple),
-                Operation::BuildDict(unpacked) => self.build_dict(unpacked),
-                Operation::BuildSet(count) => self.build_set(*count),
-                Operation::UnpackSequence { count, star_index } => {
-                    self.unpack_sequence(*count, *star_index)
+                } => self.build_slice(has_start, has_stop, has_step),
+                Opcode::BuildList(count) => self.build_sequence(count, SequenceKind::List),
+                Opcode::BuildTuple(count) => self.build_sequence(count, SequenceKind::Tuple),
+                Opcode::BuildDict(dict) => self.build_dict(code.dict_entries(dict)),
+                Opcode::BuildSet(count) => self.build_set(count),
+                Opcode::UnpackSequence { count, star_index } => {
+                    self.unpack_sequence(count, star_index)
                 }
-                Operation::MakeFunction {
-                    name,
-                    code,
-                    defaults,
-                } => self.make_function(name.clone(), code.clone(), *defaults),
-                Operation::MakeClass {
-                    name,
-                    code,
-                    bases,
-                    has_metaclass,
-                    fields,
-                } => self.make_class(name.clone(), code, *bases, *has_metaclass, fields),
-                Operation::GetIterator => self.get_iterator(),
-                Operation::ForIterator(target) => match self.for_iterator() {
+                Opcode::MakeFunction(function) => {
+                    let function = code.function(function);
+                    self.make_function(
+                        code.name(function.name).to_owned(),
+                        function.code.clone(),
+                        function.defaults,
+                    )
+                }
+                Opcode::MakeClass(class) => {
+                    let class = code.class(class);
+                    self.make_class(
+                        code.name(class.name).to_owned(),
+                        &class.code,
+                        class.bases,
+                        class.has_metaclass,
+                        &class.fields,
+                    )
+                }
+                Opcode::GetIterator => self.get_iterator(),
+                Opcode::ForIterator(target) => match self.for_iterator() {
                     Ok(true) => Ok(()),
                     Ok(false) => {
-                        self.active_frame_mut().instruction_pointer = *target;
-                        continue;
-                    }
-                    Err(error) => Err(error),
-                },
-                Operation::Unary(operator) => self.unary(*operator),
-                Operation::Binary(operator) => self.binary(*operator),
-                Operation::FormatValue {
-                    conversion,
-                    format_spec,
-                } => self.format_value(*conversion, format_spec),
-                Operation::Compare(operator) => self.compare(*operator),
-                Operation::Call {
-                    positional,
-                    keywords,
-                    starred,
-                } => match self.call(
-                    *positional,
-                    keywords,
-                    starred,
-                    CallMode::Deferred(instruction.span),
-                ) {
-                    Ok(CallResult::Value(value)) => {
-                        self.stack.push(value);
+                        next_instruction = target;
                         Ok(())
                     }
-                    Ok(CallResult::EnteredFrame) => {
-                        let caller = self.bytecode_frames.len() - 2;
-                        self.bytecode_frames[caller].instruction_pointer += 1;
-                        continue;
-                    }
-                    Ok(CallResult::Blocked(reason, value)) => {
-                        self.stack.push(value);
-                        self.active_frame_mut().instruction_pointer += 1;
-                        return Ok(Execution::Blocked(reason));
-                    }
-                    Ok(CallResult::Retry(reason, pending)) => {
-                        self.active_frame_mut().instruction_pointer += 1;
-                        self.active_frame_mut().pending_native_call = Some(pending);
-                        return Ok(Execution::Blocked(reason));
-                    }
-                    Ok(CallResult::Exit(status)) => return Ok(Execution::Exit(status)),
                     Err(error) => Err(error),
                 },
-                Operation::Copy(depth) => self.copy(*depth),
-                Operation::Swap(depth) => self.swap(*depth),
-                Operation::PopTop => self.pop().map(|_| ()),
-                Operation::Jump(target) => {
-                    self.active_frame_mut().instruction_pointer = *target;
-                    continue;
+                Opcode::Unary(operator) => self.unary(operator),
+                Opcode::Binary(operator) => self.binary(operator),
+                Opcode::FormatValue(format) => {
+                    let format = code.format(format);
+                    self.format_value(format.conversion, &format.format_spec)
                 }
-                Operation::JumpIfFalseOrPop(target) => match self.jump_if_or_pop(false) {
+                Opcode::Compare(operator) => self.compare(operator),
+                Opcode::Call(call) => {
+                    let call = code.call(call);
+                    let keywords = call
+                        .keywords
+                        .iter()
+                        .map(|name| code.name(*name).to_owned())
+                        .collect::<Vec<_>>();
+                    match self.call(
+                        call.positional,
+                        &keywords,
+                        &call.starred,
+                        CallMode::Deferred(span),
+                    ) {
+                        Ok(CallResult::Value(value)) => {
+                            self.stack.push(value);
+                            Ok(())
+                        }
+                        Ok(CallResult::EnteredFrame) => {
+                            let caller = self.bytecode_frames.len() - 2;
+                            self.bytecode_frames[caller].instruction_pointer = next_instruction;
+                            continue;
+                        }
+                        Ok(CallResult::Blocked(reason, value)) => {
+                            self.stack.push(value);
+                            self.active_frame_mut().instruction_pointer = next_instruction;
+                            return Ok(Execution::Blocked(reason));
+                        }
+                        Ok(CallResult::Retry(reason, pending)) => {
+                            self.active_frame_mut().instruction_pointer = next_instruction;
+                            self.active_frame_mut().pending_native_call = Some(pending);
+                            return Ok(Execution::Blocked(reason));
+                        }
+                        Ok(CallResult::Exit(status)) => return Ok(Execution::Exit(status)),
+                        Err(error) => Err(error),
+                    }
+                }
+                Opcode::Copy(depth) => self.copy(depth),
+                Opcode::Swap(depth) => self.swap(depth),
+                Opcode::PopTop => self.pop().map(|_| ()),
+                Opcode::Jump(target) => {
+                    next_instruction = target;
+                    Ok(())
+                }
+                Opcode::JumpIfFalseOrPop(target) => match self.jump_if_or_pop(false) {
                     Ok(true) => {
-                        self.active_frame_mut().instruction_pointer = *target;
-                        continue;
+                        next_instruction = target;
+                        Ok(())
                     }
                     Ok(false) => Ok(()),
                     Err(error) => Err(error),
                 },
-                Operation::JumpIfTrueOrPop(target) => match self.jump_if_or_pop(true) {
+                Opcode::JumpIfTrueOrPop(target) => match self.jump_if_or_pop(true) {
                     Ok(true) => {
-                        self.active_frame_mut().instruction_pointer = *target;
-                        continue;
+                        next_instruction = target;
+                        Ok(())
                     }
                     Ok(false) => Ok(()),
                     Err(error) => Err(error),
                 },
-                Operation::PopJumpIfFalse(target) => {
-                    let value = self.pop().map_err(|error| (error, instruction.span))?;
-                    if !self
-                        .truth_value(&value)
-                        .map_err(|error| (error, instruction.span))?
-                    {
-                        self.active_frame_mut().instruction_pointer = *target;
-                        continue;
+                Opcode::PopJumpIfFalse(target) => {
+                    let value = self.pop().map_err(|error| (error, span))?;
+                    if !self.truth_value(&value).map_err(|error| (error, span))? {
+                        next_instruction = target;
                     }
                     Ok(())
                 }
-                Operation::Return => {
-                    let value = self.pop().map_err(|error| (error, instruction.span))?;
+                Opcode::Return => {
+                    let value = self.pop().map_err(|error| (error, span))?;
                     if self.finish_deferred_frame(value) {
                         continue;
                     }
                     return Ok(Execution::Return(value));
                 }
-                Operation::Yield => {
-                    let value = self.pop().map_err(|error| (error, instruction.span))?;
+                Opcode::Yield => {
+                    let value = self.pop().map_err(|error| (error, span))?;
                     return Ok(Execution::Yield(value, instruction_pointer + 1));
                 }
-                Operation::RuntimeError(error) => Err(error.clone()),
-                Operation::Assert => {
-                    let message = self.pop().map_err(|error| (error, instruction.span))?;
-                    let condition = self.pop().map_err(|error| (error, instruction.span))?;
+                Opcode::RuntimeError(error) => Err(code.error(error).to_owned()),
+                Opcode::Assert => {
+                    let message = self.pop().map_err(|error| (error, span))?;
+                    let condition = self.pop().map_err(|error| (error, span))?;
                     if self
                         .truth_value(&condition)
-                        .map_err(|error| (error, instruction.span))?
+                        .map_err(|error| (error, span))?
                     {
                         Ok(())
                     } else {
@@ -892,11 +966,11 @@ impl<'a> Vm<'a> {
                             String::new()
                         } else {
                             protocol::display(&self.state.heap, &message)
-                                .map_err(|error| (error, instruction.span))?
+                                .map_err(|error| (error, span))?
                         };
                         let value = self
                             .allocate_exception("AssertionError".into(), message)
-                            .map_err(|error| (error, instruction.span))?;
+                            .map_err(|error| (error, span))?;
                         self.pending_exception = Some(RaisedException {
                             kind: "AssertionError".into(),
                             value,
@@ -904,63 +978,63 @@ impl<'a> Vm<'a> {
                         Err("assertion failed".into())
                     }
                 }
-                Operation::TryBegin(target) => {
+                Opcode::TryBegin(target) => {
                     let depth = self.stack.len();
-                    self.active_frame_mut().handlers.push((*target, depth));
+                    self.active_frame_mut().handlers.push((target, depth));
                     Ok(())
                 }
-                Operation::TryEnd => {
+                Opcode::TryEnd => {
                     self.active_frame_mut()
                         .handlers
                         .pop()
                         .ok_or("invalid bytecode exception handler")
-                        .map_err(|e| (e.to_string(), instruction.span))?;
+                        .map_err(|e| (e.to_string(), span))?;
                     Ok(())
                 }
-                Operation::MatchException { typed } => {
+                Opcode::MatchException { typed } => {
                     let actual = self
                         .exception_stack
                         .last()
                         .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), instruction.span))?
+                        .map_err(|e| (e.to_string(), span))?
                         .clone();
-                    let matches = if *typed {
-                        let expected = self.pop().map_err(|error| (error, instruction.span))?;
+                    let matches = if typed {
+                        let expected = self.pop().map_err(|error| (error, span))?;
                         self.exception_type_matches(expected, &actual)
-                            .map_err(|error| (error, instruction.span))?
+                            .map_err(|error| (error, span))?
                     } else {
                         true
                     };
                     self.stack.push(Value::Bool(matches));
                     Ok(())
                 }
-                Operation::ClearException => {
+                Opcode::ClearException => {
                     self.exception_stack
                         .pop()
                         .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), instruction.span))?;
+                        .map_err(|e| (e.to_string(), span))?;
                     Ok(())
                 }
-                Operation::Reraise => {
+                Opcode::Reraise => {
                     let exception = self
                         .exception_stack
                         .last()
                         .cloned()
                         .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), instruction.span))?;
+                        .map_err(|e| (e.to_string(), span))?;
                     self.pending_exception = Some(exception);
                     Err("exception raised".into())
                 }
-                Operation::Raise(has_value) => {
-                    let exception = if *has_value {
-                        let value = self.pop().map_err(|e| (e, instruction.span))?;
+                Opcode::Raise(has_value) => {
+                    let exception = if has_value {
+                        let value = self.pop().map_err(|e| (e, span))?;
                         if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, &value)
-                            .map_err(|error| (error, instruction.span))?
+                            .map_err(|error| (error, span))?
                         {
                             RaisedException { kind, value }
                         } else if let Some(kind) = self
                             .user_exception_kind(&value)
-                            .map_err(|error| (error, instruction.span))?
+                            .map_err(|error| (error, span))?
                         {
                             RaisedException { kind, value }
                         } else if let Some(NativeValue::ExceptionType(ExceptionType(kind))) =
@@ -968,36 +1042,32 @@ impl<'a> Vm<'a> {
                         {
                             let value = self
                                 .allocate_exception(kind.to_string(), String::new())
-                                .map_err(|error| (error, instruction.span))?;
+                                .map_err(|error| (error, span))?;
                             RaisedException {
                                 kind: kind.to_string(),
                                 value,
                             }
                         } else {
-                            return Err((
-                                "exceptions must derive from BaseException".into(),
-                                instruction.span,
-                            ));
+                            return Err(("exceptions must derive from BaseException".into(), span));
                         }
                     } else {
                         self.exception_stack
                             .last()
                             .cloned()
                             .ok_or("No active exception to reraise")
-                            .map_err(|e| (e.to_string(), instruction.span))?
+                            .map_err(|e| (e.to_string(), span))?
                     };
                     self.pending_exception = Some(exception);
                     Err("exception raised".into())
                 }
-                Operation::WithEnter => {
-                    let context = self.pop().map_err(|e| (e, instruction.span))?;
+                Opcode::WithEnter => {
+                    let context = self.pop().map_err(|e| (e, span))?;
                     self.stack.push(context);
                     self.with_contexts.push(context);
-                    self.load_attribute("__enter__")
-                        .map_err(|e| (e, instruction.span))?;
+                    self.load_attribute("__enter__").map_err(|e| (e, span))?;
                     match self
                         .call(0, &[], &[], CallMode::Immediate)
-                        .map_err(|e| (e, instruction.span))?
+                        .map_err(|e| (e, span))?
                     {
                         CallResult::Value(value) => self.stack.push(value),
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
@@ -1008,19 +1078,18 @@ impl<'a> Vm<'a> {
                     }
                     Ok(())
                 }
-                Operation::WithExit => {
+                Opcode::WithExit => {
                     let context = self
                         .with_contexts
                         .pop()
                         .ok_or("with stack underflow")
-                        .map_err(|e| (e.to_string(), instruction.span))?;
+                        .map_err(|e| (e.to_string(), span))?;
                     self.stack.push(context);
-                    self.load_attribute("__exit__")
-                        .map_err(|e| (e, instruction.span))?;
+                    self.load_attribute("__exit__").map_err(|e| (e, span))?;
                     self.stack.extend([Value::None, Value::None, Value::None]);
                     match self
                         .call(3, &[], &[false, false, false], CallMode::Immediate)
-                        .map_err(|e| (e, instruction.span))?
+                        .map_err(|e| (e, span))?
                     {
                         CallResult::Value(_) => Ok(()),
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
@@ -1030,29 +1099,28 @@ impl<'a> Vm<'a> {
                         }
                     }
                 }
-                Operation::WithExitException => {
+                Opcode::WithExitException => {
                     let context = self
                         .with_contexts
                         .pop()
                         .ok_or("with stack underflow")
-                        .map_err(|e| (e.to_string(), instruction.span))?;
+                        .map_err(|e| (e.to_string(), span))?;
                     let exception = self
                         .exception_stack
                         .last()
                         .cloned()
                         .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), instruction.span))?;
+                        .map_err(|e| (e.to_string(), span))?;
                     self.stack.push(context);
-                    self.load_attribute("__exit__")
-                        .map_err(|e| (e, instruction.span))?;
+                    self.load_attribute("__exit__").map_err(|e| (e, span))?;
                     let exception_kind = self
                         .allocate_string(exception.kind.clone())
-                        .map_err(|error| (error, instruction.span))?;
+                        .map_err(|error| (error, span))?;
                     self.stack
                         .extend([exception_kind, exception.value, Value::None]);
                     let result = match self
                         .call(3, &[], &[false, false, false], CallMode::Immediate)
-                        .map_err(|e| (e, instruction.span))?
+                        .map_err(|e| (e, span))?
                     {
                         CallResult::Value(value) => value,
                         CallResult::Exit(status) => return Ok(Execution::Exit(status)),
@@ -1061,10 +1129,7 @@ impl<'a> Vm<'a> {
                             unreachable!("immediate call cannot suspend")
                         }
                     };
-                    if self
-                        .truth_value(&result)
-                        .map_err(|e| (e, instruction.span))?
-                    {
+                    if self.truth_value(&result).map_err(|e| (e, span))? {
                         self.pending_exception = None;
                         self.exception_stack.pop();
                         Ok(())
@@ -1073,12 +1138,12 @@ impl<'a> Vm<'a> {
                         Err("exception raised".into())
                     }
                 }
-                Operation::PopExpression => match self.pop() {
+                Opcode::PopExpression => match self.pop() {
                     Ok(value) => {
                         if self.mode.interactive && !matches!(value, Value::None) {
                             let rendered = match protocol::repr(&self.state.heap, &value) {
                                 Ok(rendered) => rendered,
-                                Err(error) => return Err((error, instruction.span)),
+                                Err(error) => return Err((error, span)),
                             };
                             self.out.extend_from_slice(rendered.as_bytes());
                             self.out.push(b'\n');
@@ -1087,7 +1152,7 @@ impl<'a> Vm<'a> {
                     }
                     Err(error) => Err(error),
                 },
-                Operation::Halt => {
+                Opcode::Halt => {
                     if self.finish_deferred_frame(Value::None) {
                         continue;
                     }
@@ -1095,12 +1160,12 @@ impl<'a> Vm<'a> {
                 }
             };
             if let Err(error) = result {
-                if self.propagate_error(error, instruction.span)? {
+                if self.propagate_error(error, span)? {
                     continue 'execution;
                 }
                 unreachable!("propagate_error either enters a handler or returns an error")
             }
-            self.active_frame_mut().instruction_pointer += 1;
+            self.active_frame_mut().instruction_pointer = next_instruction;
         }
         Ok(Execution::Pending)
     }
@@ -1184,7 +1249,7 @@ impl<'a> Vm<'a> {
         true
     }
 
-    fn load_name(&mut self, name: &str) -> Result<(), String> {
+    fn load_name(&mut self, symbol: SymbolId, name: &str) -> Result<(), String> {
         if name == "__class__" {
             let class = self
                 .method_frames
@@ -1202,13 +1267,56 @@ impl<'a> Vm<'a> {
             .unwrap_or(true);
         let value = scoped.or_else(|| {
             can_use_globals
-                .then(|| self.state.locals.get(name).cloned())
+                .then(|| self.state.globals.get(symbol))
                 .flatten()
         });
         if let Some(value) = value {
             self.stack.push(value);
             return Ok(());
         }
+        self.load_builtin(name)
+    }
+
+    #[inline(always)]
+    fn load_global(
+        &mut self,
+        symbol: SymbolId,
+        code: &CodeRef,
+        name: NameId,
+    ) -> Result<(), String> {
+        if self.local_scopes.is_empty() {
+            if let Some(value) = self.state.globals.get(symbol) {
+                self.stack.push(value);
+                return Ok(());
+            }
+            return self.load_builtin(code.name(name));
+        }
+        self.load_scoped_global(symbol, code, name)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn load_scoped_global(
+        &mut self,
+        symbol: SymbolId,
+        code: &CodeRef,
+        name: NameId,
+    ) -> Result<(), String> {
+        let scope = *self.local_scopes.last().expect("checked by load_global");
+        let root = self.state.heap.scope_root(scope)?;
+        let value = if self.state.heap.scope_uses_repl_globals(root)? {
+            self.state.globals.get(symbol)
+        } else {
+            self.state.heap.scope_get(root, code.name(name)).copied()
+        };
+        if let Some(value) = value {
+            self.stack.push(value);
+            return Ok(());
+        }
+        self.load_builtin(code.name(name))
+    }
+
+    fn load_builtin(&mut self, name: &str) -> Result<(), String> {
         if let Some((module_name, attribute)) = super::stdlib::frozen_builtin(name) {
             self.import(module_name, false)?;
             let module = self.pop()?;
@@ -1398,7 +1506,7 @@ impl<'a> Vm<'a> {
         self.state.heap.scope_remove_local(scope, slot).map(|_| ())
     }
 
-    fn store_name(&mut self, name: &str) -> Result<(), String> {
+    fn store_name(&mut self, symbol: SymbolId, name: &str) -> Result<(), String> {
         let value = self.pop()?;
         if let Some(scope) = self.local_scopes.last().copied() {
             if self.class_scopes.last().copied() == Some(scope)
@@ -1419,12 +1527,19 @@ impl<'a> Vm<'a> {
                 &mut self.interp.resources,
             )?;
         } else {
-            self.state.locals.insert(name.to_string(), value);
+            self.state
+                .globals
+                .insert(symbol, value, &mut self.interp.resources)?;
         }
         Ok(())
     }
 
-    fn store_enclosing(&mut self, name: &str, scope_hops: usize) -> Result<(), String> {
+    fn store_enclosing(
+        &mut self,
+        symbol: SymbolId,
+        name: &str,
+        scope_hops: usize,
+    ) -> Result<(), String> {
         let value = self.pop()?;
         let mut target = self.local_scopes.last().copied();
         for _ in 0..scope_hops {
@@ -1438,7 +1553,9 @@ impl<'a> Vm<'a> {
                 .heap
                 .scope_insert(scope, name.to_string(), value, &mut self.interp.resources)
         } else {
-            self.state.locals.insert(name.to_string(), value);
+            self.state
+                .globals
+                .insert(symbol, value, &mut self.interp.resources)?;
             Ok(())
         }
     }
@@ -1539,32 +1656,64 @@ impl<'a> Vm<'a> {
         Ok(exception_base.map(|_| name.clone()))
     }
 
-    fn store_global(&mut self, name: &str, value: Value) -> Result<(), String> {
+    #[inline(always)]
+    fn store_global(
+        &mut self,
+        symbol: SymbolId,
+        code: &CodeRef,
+        name: NameId,
+        value: Value,
+    ) -> Result<(), String> {
         let Some(scope) = self.local_scopes.last().copied() else {
-            self.state.locals.insert(name.to_string(), value);
+            self.state
+                .globals
+                .insert(symbol, value, &mut self.interp.resources)?;
             return Ok(());
         };
+        self.store_scoped_global(scope, symbol, code, name, value)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn store_scoped_global(
+        &mut self,
+        scope: ScopeId,
+        symbol: SymbolId,
+        code: &CodeRef,
+        name: NameId,
+        value: Value,
+    ) -> Result<(), String> {
         let root = self.state.heap.scope_root(scope)?;
         if self.state.heap.scope_uses_repl_globals(root)? {
-            self.state.locals.insert(name.to_string(), value);
+            self.state
+                .globals
+                .insert(symbol, value, &mut self.interp.resources)?;
             Ok(())
         } else {
-            self.state
-                .heap
-                .scope_insert(root, name.to_string(), value, &mut self.interp.resources)
+            self.state.heap.scope_insert(
+                root,
+                code.name(name).to_owned(),
+                value,
+                &mut self.interp.resources,
+            )
         }
     }
 
-    fn delete_global(&mut self, name: &str) -> Result<(), String> {
+    fn delete_global(
+        &mut self,
+        symbol: SymbolId,
+        code: &CodeRef,
+        name: NameId,
+    ) -> Result<(), String> {
         let Some(scope) = self.local_scopes.last().copied() else {
-            self.state.locals.remove(name);
+            self.state.globals.remove(symbol);
             return Ok(());
         };
         let root = self.state.heap.scope_root(scope)?;
         if self.state.heap.scope_uses_repl_globals(root)? {
-            self.state.locals.remove(name);
+            self.state.globals.remove(symbol);
         } else {
-            self.state.heap.scope_remove(root, name)?;
+            self.state.heap.scope_remove(root, code.name(name))?;
         }
         Ok(())
     }
@@ -1755,7 +1904,13 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
-    fn load_attribute_at(&mut self, code: &CodeRef, site: usize, name: &str) -> Result<(), String> {
+    fn load_attribute_at(
+        &mut self,
+        code: &CodeRef,
+        site: usize,
+        symbol: SymbolId,
+        name: &str,
+    ) -> Result<(), String> {
         let owner = self.pop()?;
         if let (Some(id), Some(cache)) = (owner.object_id(), self.attribute_cache(code, site)) {
             if let Some(value) =
@@ -1768,9 +1923,9 @@ impl<'a> Vm<'a> {
             }
         }
         let value = self
-            .resolve_attribute(owner, name)?
+            .resolve_attribute_by_symbol(owner, symbol, name)?
             .ok_or_else(|| format!("attribute {name:?} is not implemented"))?;
-        if let Some(cache) = self.cacheable_instance_attribute(owner, name)? {
+        if let Some(cache) = self.cacheable_instance_attribute(owner, symbol, name)? {
             self.remember_attribute_cache(code, site, cache)?;
         }
         self.stack.push(value);
@@ -1779,10 +1934,11 @@ impl<'a> Vm<'a> {
 
     fn attribute_cache(&self, code: &CodeRef, site: usize) -> Option<LoadAttributeCache> {
         self.execution
-            .attribute_caches
+            .code_caches
             .iter()
             .find(|cache| Arc::ptr_eq(&cache.code, code))?
-            .entries
+            .attributes
+            .as_ref()?
             .get(site)
             .copied()
             .flatten()
@@ -1794,37 +1950,83 @@ impl<'a> Vm<'a> {
         site: usize,
         cache: LoadAttributeCache,
     ) -> Result<(), String> {
-        if let Some(caches) = self
-            .execution
-            .attribute_caches
-            .iter_mut()
-            .find(|caches| Arc::ptr_eq(&caches.code, code))
-        {
-            caches.entries[site] = Some(cache);
+        let index = self.ensure_code_cache(code)?;
+        if let Some(attributes) = &mut self.execution.code_caches[index].attributes {
+            attributes[site] = Some(cache);
             return Ok(());
         }
         let bytes = code
             .instructions
             .len()
             .checked_mul(std::mem::size_of::<Option<LoadAttributeCache>>())
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CodeAttributeCaches>()))
             .ok_or("attribute cache size overflow")?;
         if u64::try_from(bytes).unwrap_or(u64::MAX) > self.interp.resources.memory_remaining() {
             return Ok(());
         }
         self.reserve_retained_memory(bytes)?;
-        let mut entries = vec![None; code.instructions.len()];
-        entries[site] = Some(cache);
-        self.execution.attribute_caches.push(CodeAttributeCaches {
-            code: code.clone(),
-            entries,
-        });
+        let mut attributes = vec![None; code.instructions.len()];
+        attributes[site] = Some(cache);
+        self.execution.code_caches[index].attributes = Some(attributes);
         Ok(())
+    }
+
+    #[inline(always)]
+    fn symbol_for(
+        &mut self,
+        code: &CodeRef,
+        cache: usize,
+        name: NameId,
+    ) -> Result<SymbolId, String> {
+        if let Some(symbol) = self.execution.code_caches[cache].names[name.index()] {
+            return Ok(symbol);
+        }
+        self.resolve_symbol(code, cache, name)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn resolve_symbol(
+        &mut self,
+        code: &CodeRef,
+        cache: usize,
+        name: NameId,
+    ) -> Result<SymbolId, String> {
+        let symbol = self
+            .state
+            .heap
+            .intern_symbol(code.name(name), &mut self.interp.resources)?;
+        self.execution.code_caches[cache].names[name.index()] = Some(symbol);
+        Ok(symbol)
+    }
+
+    fn ensure_code_cache(&mut self, code: &CodeRef) -> Result<usize, String> {
+        if let Some(index) = self
+            .execution
+            .code_caches
+            .iter()
+            .position(|cache| Arc::ptr_eq(&cache.code, code))
+        {
+            return Ok(index);
+        }
+        let bytes = code
+            .name_count()
+            .checked_mul(std::mem::size_of::<Option<SymbolId>>())
+            .and_then(|names| names.checked_add(std::mem::size_of::<CodeCaches>()))
+            .ok_or("code cache size overflow")?;
+        self.reserve_retained_memory(bytes)?;
+        let index = self.execution.code_caches.len();
+        self.execution.code_caches.push(CodeCaches {
+            code: code.clone(),
+            names: vec![None; code.name_count()],
+            attributes: None,
+        });
+        Ok(index)
     }
 
     fn cacheable_instance_attribute(
         &mut self,
         owner: Value,
+        symbol: SymbolId,
         name: &str,
     ) -> Result<Option<LoadAttributeCache>, String> {
         let Some(id) = owner.object_id() else {
@@ -1842,7 +2044,7 @@ impl<'a> Vm<'a> {
         Ok(self
             .state
             .heap
-            .instance_attribute_slot(id, name)?
+            .instance_attribute_slot_by_symbol(id, symbol)?
             .map(|location| LoadAttributeCache { class, location }))
     }
 
@@ -1851,6 +2053,25 @@ impl<'a> Vm<'a> {
     /// Missing attributes return `None`; errors raised while invoking descriptors remain errors.
     /// This distinction lets `getattr` and `hasattr` share the bytecode lookup path.
     fn resolve_attribute(&mut self, owner: Value, name: &str) -> Result<Option<Value>, String> {
+        let symbol = self.state.heap.symbol_id(name);
+        self.resolve_attribute_inner(owner, symbol, name)
+    }
+
+    fn resolve_attribute_by_symbol(
+        &mut self,
+        owner: Value,
+        symbol: SymbolId,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        self.resolve_attribute_inner(owner, Some(symbol), name)
+    }
+
+    fn resolve_attribute_inner(
+        &mut self,
+        owner: Value,
+        symbol: Option<SymbolId>,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
         if let Some(NativeValue::Module(module)) = owner.native_value() {
             if let Some(function) = module.function(name) {
                 return Ok(Some(Value::Native(NativeValue::NativeFunction(function))));
@@ -1926,13 +2147,11 @@ impl<'a> Vm<'a> {
                             return Ok(Some(value));
                         }
                     }
-                    let instance = owner
-                        .cast::<PyInstance>(self)
-                        .map_err(|error| error.to_string())?;
-                    if let Some(value) = instance
-                        .attribute(self, name)
-                        .map_err(|error| error.to_string())?
-                    {
+                    let instance_value = match symbol {
+                        Some(symbol) => self.state.heap.attribute_by_symbol(id, symbol)?.copied(),
+                        None => None,
+                    };
+                    if let Some(value) = instance_value {
                         return Ok(Some(value));
                     }
                     let Some((defining_class, descriptor)) = class_entry else {
@@ -2025,7 +2244,13 @@ impl<'a> Vm<'a> {
         Ok(value)
     }
 
-    fn store_attribute(&mut self, owner: Value, name: &str, value: Value) -> Result<(), String> {
+    fn store_attribute_by_symbol(
+        &mut self,
+        owner: Value,
+        symbol: SymbolId,
+        name: &str,
+        value: Value,
+    ) -> Result<(), String> {
         let Some(id) = owner.object_id() else {
             return Err("object does not support attribute assignment".into());
         };
@@ -2067,9 +2292,9 @@ impl<'a> Vm<'a> {
                 }
             }
         }
-        self.state.heap.insert_attribute(
+        self.state.heap.insert_attribute_by_symbol(
             id,
-            name.to_string(),
+            symbol,
             value,
             &mut self.interp.resources,
         )?;
@@ -3825,12 +4050,15 @@ impl<'a> Vm<'a> {
         else {
             return Err("for-loop stack does not contain an iterator".into());
         };
-        if let Object::CallableIterator {
-            callable,
-            sentinel,
-            exhausted,
-        } = self.state.heap.get(id)?.clone()
-        {
+        let callable_iterator = match self.state.heap.get(id)? {
+            Object::CallableIterator {
+                callable,
+                sentinel,
+                exhausted,
+            } => Some((*callable, *sentinel, *exhausted)),
+            _ => None,
+        };
+        if let Some((callable, sentinel, exhausted)) = callable_iterator {
             if exhausted {
                 self.stack.pop();
                 return Ok(false);
@@ -4173,9 +4401,29 @@ impl<'a> Vm<'a> {
     }
 
     fn binary(&mut self, operator: BinaryOperator) -> Result<(), String> {
-        let right = self.pop()?;
-        let left = self.pop()?;
-        let value = self.binary_value(operator, left, right)?;
+        let result_slot = self
+            .stack
+            .len()
+            .checked_sub(2)
+            .ok_or("invalid bytecode stack effect")?;
+        let left = self.stack[result_slot];
+        let right = self.stack[result_slot + 1];
+        match number::exact_binary(self, operator, left, right)
+            .map_err(|error| self.record_native_error(error))
+        {
+            Ok(Some(value)) => {
+                self.stack.truncate(result_slot + 1);
+                self.stack[result_slot] = value;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.stack.truncate(result_slot);
+                return Err(error);
+            }
+        }
+        self.stack.truncate(result_slot);
+        let value = self.binary_protocol(operator, left, right)?;
         self.stack.push(value);
         Ok(())
     }
@@ -4191,6 +4439,17 @@ impl<'a> Vm<'a> {
         {
             return Ok(value);
         }
+        self.binary_protocol(operator, left, right)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn binary_protocol(
+        &mut self,
+        operator: BinaryOperator,
+        left: Value,
+        right: Value,
+    ) -> Result<Value, String> {
         let (slot, name, reflected_slot, reflected_name) = match operator {
             BinaryOperator::Add => (Slot::Add, "__add__", Slot::ReflectedAdd, "__radd__"),
             BinaryOperator::Subtract => (
@@ -5275,7 +5534,7 @@ impl<'a> Vm<'a> {
         if code
             .instructions
             .iter()
-            .any(|instruction| matches!(&instruction.operation, Operation::Yield))
+            .any(|instruction| matches!(&instruction.opcode, Opcode::Yield))
         {
             return self.create_generator(
                 name,
@@ -5591,7 +5850,7 @@ impl<'a> Vm<'a> {
         if let Some(value) = Value::inline_string(&value) {
             Ok(value)
         } else {
-            self.allocate_object(Object::String(value))
+            self.allocate_object(Object::String(value.into()))
         }
     }
 
@@ -6363,25 +6622,6 @@ impl PyRuntime for Vm<'_> {
             enum_members: Vec::new(),
         })
         .map_err(PyError::runtime_error)
-    }
-
-    fn instance_attribute(&self, instance: PyInstance, name: &str) -> PyResult<Option<Value>> {
-        if !matches!(
-            self.state
-                .heap
-                .get(instance.object_id())
-                .map_err(PyError::runtime_error)?,
-            Object::Instance { .. }
-        ) {
-            return Err(PyError::runtime_error(
-                "instance handle changed object kind",
-            ));
-        }
-        self.state
-            .heap
-            .attribute(instance.object_id(), name)
-            .map(|value| value.cloned())
-            .map_err(PyError::runtime_error)
     }
 
     fn replace_list_items(&mut self, list: PyList, items: Vec<Value>) -> PyResult<()> {
