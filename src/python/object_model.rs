@@ -945,6 +945,16 @@ fn install_builtin_slots(types: &mut [PyType]) {
 
     let slots = &mut types[BuiltinType::Set as usize].slots;
     slots.subtract = Some(intrinsic(super::stdlib::core::slot_set_subtract));
+    slots.bitwise_and = Some(intrinsic(super::stdlib::core::slot_set_intersection));
+    slots.reflected_bitwise_and = Some(intrinsic(super::stdlib::core::slot_set_intersection));
+    slots.bitwise_xor = Some(intrinsic(
+        super::stdlib::core::slot_set_symmetric_difference,
+    ));
+    slots.reflected_bitwise_xor = Some(intrinsic(
+        super::stdlib::core::slot_set_symmetric_difference,
+    ));
+    slots.bitwise_or = Some(intrinsic(super::stdlib::core::slot_set_union));
+    slots.reflected_bitwise_or = Some(intrinsic(super::stdlib::core::slot_set_union));
     slots.less_than = Some(intrinsic(super::stdlib::core::slot_set_less));
     slots.less_equal = Some(intrinsic(super::stdlib::core::slot_set_less_equal));
     slots.greater_than = Some(intrinsic(super::stdlib::core::slot_set_greater));

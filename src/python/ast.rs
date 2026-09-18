@@ -152,6 +152,10 @@ pub enum ExpressionKind {
     FString(Vec<FStringPart>),
     Starred(Box<Expression>),
     Name(String),
+    NamedExpression {
+        name: String,
+        value: Box<Expression>,
+    },
     List(Vec<Expression>),
     Tuple(Vec<Expression>),
     Dict(Vec<DictEntry>),

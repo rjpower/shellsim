@@ -610,10 +610,34 @@ impl Parser {
         {
             self.lambda_expression()
         } else {
-            self.conditional_expression()
+            self.named_expression()
         };
         self.expression_depth -= 1;
         result
+    }
+
+    fn named_expression(&mut self) -> Result<Expression, ParseError> {
+        let target = self.conditional_expression()?;
+        if self
+            .take(|kind| matches!(kind, TokenKind::ColonEqual))
+            .is_none()
+        {
+            return Ok(target);
+        }
+        let ExpressionKind::Name(name) = target.kind else {
+            return Err(ParseError {
+                message: "assignment expression target must be a name".into(),
+                span: target.span,
+            });
+        };
+        let value = self.expression()?;
+        Ok(Expression {
+            span: target.span.through(value.span),
+            kind: ExpressionKind::NamedExpression {
+                name,
+                value: Box::new(value),
+            },
+        })
     }
 
     fn expression_item(&mut self) -> Result<Expression, ParseError> {

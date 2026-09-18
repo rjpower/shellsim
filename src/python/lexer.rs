@@ -173,7 +173,15 @@ impl<'a> Lexer<'a> {
                 '.' => self.single(TokenKind::Dot),
                 '@' => self.single(TokenKind::At),
                 ',' => self.single(TokenKind::Comma),
-                ':' => self.single(TokenKind::Colon),
+                ':' => {
+                    self.bump();
+                    if self.peek() == Some('=') {
+                        self.bump();
+                        TokenKind::ColonEqual
+                    } else {
+                        TokenKind::Colon
+                    }
+                }
                 '(' => self.open(TokenKind::LeftParen),
                 ')' => self.close(start, TokenKind::RightParen)?,
                 '[' => self.open(TokenKind::LeftBracket),
