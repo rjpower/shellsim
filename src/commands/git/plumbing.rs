@@ -38,7 +38,7 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let blob = match object.split_once(':') {
         Some((revision, path)) => repo::resolve_revision(ctx, &root, revision)
             .and_then(|commit| repo::commit_tree(ctx, &root, &commit))
-            .and_then(|tree| tree.get(path).cloned()),
+            .and_then(|tree| tree.get(path).map(|entry| entry.hash.clone())),
         None => Some(object.clone()),
     };
     if let Some(data) = blob
@@ -188,8 +188,8 @@ pub(crate) fn git_ls_tree(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
         .map(|path| path.trim_end_matches('/').to_string())
         .unwrap_or_default();
     // Without -r, entries below the listed directory collapse into that directory.
-    let mut listed: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for (path, hash) in &tree {
+    let mut listed: BTreeMap<String, Option<repo::Entry>> = BTreeMap::new();
+    for (path, entry) in &tree {
         let relative = if prefix.is_empty() {
             Some(path.as_str())
         } else {
@@ -208,20 +208,20 @@ pub(crate) fn git_ls_tree(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
                 listed.insert(name, None);
             }
             _ => {
-                listed.insert(path.clone(), Some(hash.clone()));
+                listed.insert(path.clone(), Some(entry.clone()));
             }
         }
     }
-    for (name, hash) in listed {
-        if directories_only && hash.is_some() {
+    for (name, entry) in listed {
+        if directories_only && entry.is_some() {
             continue;
         }
         if name_only {
             io.out.extend_from_slice(format!("{name}\n").as_bytes());
             continue;
         }
-        let line = match hash {
-            Some(hash) => format!("100644 blob {hash}\t{name}\n"),
+        let line = match entry {
+            Some(entry) => format!("{} blob {}\t{name}\n", entry.mode(), entry.hash),
             None => format!("040000 tree {}\t{name}\n", subtree_hash(&tree, &name)),
         };
         io.out.extend_from_slice(line.as_bytes());
@@ -234,7 +234,7 @@ fn subtree_hash(tree: &repo::Tree, directory: &str) -> String {
     let prefix = format!("{directory}/");
     let subtree: repo::Tree = tree
         .iter()
-        .filter_map(|(path, hash)| Some((path.strip_prefix(&prefix)?.to_string(), hash.clone())))
+        .filter_map(|(path, entry)| Some((path.strip_prefix(&prefix)?.to_string(), entry.clone())))
         .collect();
     repo::tree_hash(&subtree)
 }
@@ -584,7 +584,7 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             None => displayed.to_string(),
         };
         let data = match &revision {
-            Some(_) => repo::read_blob(ctx, &root, blob),
+            Some(_) => repo::read_blob(ctx, &root, &blob.hash),
             None => repo::read_work_file(ctx, &root, path),
         };
         let Some(data) = data else {

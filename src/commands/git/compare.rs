@@ -89,7 +89,7 @@ fn content(
     match side {
         RightSide::Stored => tree
             .get(path)
-            .and_then(|hash| repo::read_blob(ctx, root, hash)),
+            .and_then(|entry| repo::read_blob(ctx, root, &entry.hash)),
         RightSide::WorkingTree => {
             tree.get(path)?;
             repo::read_work_file(ctx, root, path)
@@ -173,13 +173,23 @@ pub(crate) fn emit(
                 .extend_from_slice(format!(" rename {from} => {to} (100%)\n").as_bytes());
         }
         for path in &changed {
-            match (old.contains_key(path), new.contains_key(path)) {
-                (false, true) => io
-                    .out
-                    .extend_from_slice(format!(" create mode 100644 {path}\n").as_bytes()),
-                (true, false) => io
-                    .out
-                    .extend_from_slice(format!(" delete mode 100644 {path}\n").as_bytes()),
+            match (old.get(path), new.get(path)) {
+                (None, Some(entry)) => io.out.extend_from_slice(
+                    format!(" create mode {} {path}\n", entry.mode()).as_bytes(),
+                ),
+                (Some(entry), None) => io.out.extend_from_slice(
+                    format!(" delete mode {} {path}\n", entry.mode()).as_bytes(),
+                ),
+                (Some(before), Some(after)) if before.executable != after.executable => {
+                    io.out.extend_from_slice(
+                        format!(
+                            " mode change {} => {} {path}\n",
+                            before.mode(),
+                            after.mode()
+                        )
+                        .as_bytes(),
+                    )
+                }
                 _ => {}
             }
         }
@@ -224,6 +234,7 @@ pub(crate) fn emit(
                     path,
                     before.as_deref(),
                     after.as_deref(),
+                    modes(old, new, path),
                     options.context,
                     options.prefixes,
                     options.whitespace,
@@ -242,6 +253,12 @@ pub(crate) fn emit(
         emit_stats(&stats, options.format, io);
     }
     check_failed
+}
+
+/// The modes a patch reports for one path, defaulting to the non-executable mode.
+fn modes(old: &Tree, new: &Tree, path: &str) -> diff::Modes {
+    let mode = |tree: &Tree| tree.get(path).map_or("100644", repo::Entry::mode);
+    (mode(old), mode(new))
 }
 
 /// Pair a deletion with an addition of byte-identical content.
@@ -491,6 +508,7 @@ fn diff_no_index(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
         left,
         Some(&before),
         Some(&after),
+        diff::PLAIN,
         options.context,
         options.prefixes,
         options.whitespace,

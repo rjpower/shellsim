@@ -344,10 +344,10 @@ fn emit_commit_summary(
     for path in &changed {
         let before = old
             .get(*path)
-            .and_then(|hash| repo::read_blob(ctx, root, hash));
+            .and_then(|entry| repo::read_blob(ctx, root, &entry.hash));
         let after = new
             .get(*path)
-            .and_then(|hash| repo::read_blob(ctx, root, hash));
+            .and_then(|entry| repo::read_blob(ctx, root, &entry.hash));
         let (added, removed) = super::diff::change_counts(
             before.as_deref(),
             after.as_deref(),
@@ -369,13 +369,23 @@ fn emit_mode_lines(old: &Tree, new: &Tree, io: &mut Io) {
         .filter(|path| old.get(*path) != new.get(*path))
         .collect();
     for path in changed {
-        match (old.contains_key(path), new.contains_key(path)) {
-            (false, true) => io
+        match (old.get(path), new.get(path)) {
+            (None, Some(entry)) => io
                 .out
-                .extend_from_slice(format!(" create mode 100644 {path}\n").as_bytes()),
-            (true, false) => io
+                .extend_from_slice(format!(" create mode {} {path}\n", entry.mode()).as_bytes()),
+            (Some(entry), None) => io
                 .out
-                .extend_from_slice(format!(" delete mode 100644 {path}\n").as_bytes()),
+                .extend_from_slice(format!(" delete mode {} {path}\n", entry.mode()).as_bytes()),
+            (Some(before), Some(after)) if before.executable != after.executable => {
+                io.out.extend_from_slice(
+                    format!(
+                        " mode change {} => {} {path}\n",
+                        before.mode(),
+                        after.mode()
+                    )
+                    .as_bytes(),
+                )
+            }
             _ => {}
         }
     }
@@ -1164,7 +1174,10 @@ fn changed_blobs(
     names
         .into_iter()
         .filter(|path| tree.get(path) != parent.get(path))
-        .map(|path| (parent.get(&path).cloned(), tree.get(&path).cloned()))
+        .map(|path| {
+            let hash = |tree: &repo::Tree| tree.get(&path).map(|entry| entry.hash.clone());
+            (hash(&parent), hash(&tree))
+        })
         .collect()
 }
 
@@ -1284,7 +1297,7 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             let tree = repo::commit_tree(ctx, &root, &commit).unwrap_or_default();
             let Some(data) = tree
                 .get(path)
-                .and_then(|hash| repo::read_blob(ctx, &root, hash))
+                .and_then(|entry| repo::read_blob(ctx, &root, &entry.hash))
             else {
                 io.err.extend_from_slice(
                     format!("fatal: path '{path}' does not exist in '{prefix}'\n").as_bytes(),
@@ -1478,7 +1491,7 @@ fn rev_parse_object(ctx: &mut CommandContext<'_>, root: &str, revision: &str) ->
         if path.is_empty() {
             return Some(repo::tree_hash(&tree));
         }
-        return tree.get(path).cloned();
+        return tree.get(path).map(|entry| entry.hash.clone());
     }
     if let Some(base) = revision.strip_suffix("^{tree}") {
         let commit = repo::resolve_revision(ctx, root, base)?;
@@ -2195,7 +2208,8 @@ pub(crate) fn git_switch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     let mut force = false;
     let mut detach = false;
     let mut operands: Vec<String> = Vec::new();
-    for argument in args {
+    let args = super::expand_clusters(args, "qcCdf");
+    for argument in &args {
         match argument.as_str() {
             "-c" | "--create" => create = true,
             "-C" | "--force-create" => {

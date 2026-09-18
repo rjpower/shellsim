@@ -26,8 +26,40 @@ pub(crate) const INDEX: &str = "index";
 pub(crate) const CONFIG: &str = "config";
 pub(crate) const DEFAULT_BRANCH: &str = "main";
 
-/// A staged or committed tree: repository-relative path to blob hash.
-pub(crate) type Tree = BTreeMap<String, String>;
+/// One tracked file: the blob it holds and the only permission bit Git records.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Entry {
+    pub hash: String,
+    pub executable: bool,
+}
+
+impl Entry {
+    /// The mode Git prints for this entry.
+    pub fn mode(&self) -> &'static str {
+        if self.executable {
+            "100755"
+        } else {
+            "100644"
+        }
+    }
+}
+
+/// Whether a working-tree permission set makes the file executable, as Git decides it.
+pub(crate) fn is_executable(mode: u32) -> bool {
+    mode & 0o111 != 0
+}
+
+/// The permissions a checkout gives a file of this mode.
+pub(crate) fn work_mode(executable: bool) -> u32 {
+    if executable {
+        0o755
+    } else {
+        0o644
+    }
+}
+
+/// A staged or committed tree: repository-relative path to the file recorded there.
+pub(crate) type Tree = BTreeMap<String, Entry>;
 
 /// Configuration: dotted lowercase key to every value recorded for it, in file order.
 pub(crate) type Config = BTreeMap<String, Vec<String>>;
@@ -141,10 +173,16 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
 
 pub(crate) fn serialize_tree(tree: &Tree) -> Vec<u8> {
     let mut out = Vec::new();
-    for (path, hash) in tree {
+    for (path, entry) in tree {
         out.extend_from_slice(encode_hex(path.as_bytes()).as_bytes());
         out.push(b'\t');
-        out.extend_from_slice(hash.as_bytes());
+        out.extend_from_slice(entry.hash.as_bytes());
+        // The mode is written only when it is not the default, so an ordinary tree serializes
+        // exactly as it did before modes were recorded.
+        if entry.executable {
+            out.push(b'\t');
+            out.extend_from_slice(entry.mode().as_bytes());
+        }
         out.push(b'\n');
     }
     out
@@ -153,12 +191,22 @@ pub(crate) fn serialize_tree(tree: &Tree) -> Vec<u8> {
 pub(crate) fn parse_tree(bytes: &[u8]) -> Option<Tree> {
     let mut tree = Tree::new();
     for line in String::from_utf8_lossy(bytes).lines() {
-        let (path_hex, hash) = line.split_once('\t')?;
+        let (path_hex, rest) = line.split_once('\t')?;
         let path = String::from_utf8(decode_hex(path_hex)?).ok()?;
+        let (hash, mode) = match rest.split_once('\t') {
+            Some((hash, mode)) => (hash, mode),
+            None => (rest, "100644"),
+        };
         if path.is_empty() || hash.len() != 40 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
-        tree.insert(path, hash.to_string());
+        tree.insert(
+            path,
+            Entry {
+                hash: hash.to_string(),
+                executable: mode == "100755",
+            },
+        );
     }
     Some(tree)
 }
@@ -174,6 +222,21 @@ pub(crate) fn write_vfs(interp: &mut Interp, path: &str, bytes: &[u8]) -> VfsRes
         interp.vfs.mkdir_all("/", &parent)?;
     }
     interp.vfs.write("/", path, bytes, 0o644)
+}
+
+/// Write a checked-out file, giving it the permissions its recorded mode calls for.
+fn write_work_file(
+    interp: &mut Interp,
+    path: &str,
+    bytes: &[u8],
+    executable: bool,
+) -> VfsResult<()> {
+    interp.sync_vfs_time();
+    if let Some(parent) = parent_of(path) {
+        interp.vfs.mkdir_all("/", &parent)?;
+    }
+    interp.vfs.write("/", path, bytes, work_mode(executable))?;
+    interp.vfs.chmod("/", path, work_mode(executable))
 }
 
 pub(crate) fn load_index(interp: &Interp, root: &str) -> Option<Tree> {
@@ -833,7 +896,13 @@ pub(crate) fn collect_working_tree(
         }
         if let NodeKind::File(data) = &node.kind {
             if let Some(relative) = relative_path(root, path) {
-                files.insert(relative, blob_hash(data));
+                files.insert(
+                    relative,
+                    Entry {
+                        hash: blob_hash(data),
+                        executable: is_executable(node.mode),
+                    },
+                );
             }
         }
     }
@@ -943,16 +1012,20 @@ fn write_work_tree(
                 prune_empty_parents(ctx, root, &absolute);
             }
         }
-        for (path, hash) in new {
+        for (path, entry) in new {
             // A path the move does not change keeps whatever the working tree holds, but a
             // missing file is still restored.
-            if !force && old.get(path) == Some(hash) && ctx.vfs.is_file("/", &path_join(root, path))
+            if !force
+                && old.get(path) == Some(entry)
+                && ctx.vfs.is_file("/", &path_join(root, path))
             {
                 continue;
             }
+            let hash = &entry.hash;
             let data = read_blob(ctx, root, hash)
                 .ok_or_else(|| format!("missing blob {hash} for {path}"))?;
-            write_vfs(ctx, &path_join(root, path), &data).map_err(|error| error.to_string())?;
+            write_work_file(ctx, &path_join(root, path), &data, entry.executable)
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     })();

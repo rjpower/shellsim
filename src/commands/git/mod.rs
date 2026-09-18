@@ -170,6 +170,17 @@ pub(crate) fn expand_clusters(args: &[String], clusterable: &str) -> Vec<String>
     out
 }
 
+/// Whether a short option or cluster of them carries `-q`, as in `git switch -qc`.
+fn is_short_quiet(argument: &str) -> bool {
+    let Some(flags) = argument.strip_prefix('-') else {
+        return false;
+    };
+    !flags.is_empty()
+        && !flags.starts_with('-')
+        && flags.chars().all(|flag| flag.is_ascii_alphabetic())
+        && flags.contains('q')
+}
+
 /// Convert a command-line pathspec into a repository-relative prefix.
 ///
 /// An empty result means the repository root, which matches every path.
@@ -302,7 +313,7 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         && args[1..]
             .iter()
             .take_while(|argument| *argument != "--")
-            .any(|argument| argument == "-q" || argument == "--quiet");
+            .any(|argument| argument == "--quiet" || is_short_quiet(argument));
     let before = (io.out.len(), io.err.len());
     let status = dispatch(ctx, &globals, subcommand, &args[1..], io);
     if silence {

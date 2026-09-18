@@ -142,7 +142,8 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                 }
             }
         } else if interp.fs_metadata(&interp.cwd, p, false).is_ok() {
-            wln(io.out, p);
+            // A file operand is listed the same way an entry of a directory is.
+            emit_listing(interp, ".", std::slice::from_ref(p), long, io.out);
         } else {
             ewln(
                 io.err,

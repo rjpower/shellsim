@@ -198,30 +198,24 @@ pub(crate) fn combine(
         } else {
             None
         };
-        if let Some(hash) = resolved {
-            if let Some(hash) = hash {
-                tree.insert(path, hash.clone());
+        if let Some(entry) = resolved {
+            if let Some(entry) = entry {
+                tree.insert(path, entry.clone());
             }
             continue;
         }
         if mine.is_none() || yours.is_none() {
             // One side deleted what the other changed; Git leaves the surviving content in place
             // and the decision to the user.
-            if let Some(hash) = mine.or(yours) {
-                tree.insert(path.clone(), hash.clone());
+            if let Some(entry) = mine.or(yours) {
+                tree.insert(path.clone(), entry.clone());
             }
-            stages.insert(
-                path,
-                Unmerged {
-                    base: original.cloned(),
-                    ours: mine.cloned(),
-                    theirs: yours.cloned(),
-                },
-            );
+            stages.insert(path, sides(original, mine, yours));
             continue;
         }
-        let read = |hash: Option<&String>| {
-            hash.and_then(|hash| repo::read_blob(ctx, root, hash))
+        let read = |entry: Option<&repo::Entry>| {
+            entry
+                .and_then(|entry| repo::read_blob(ctx, root, &entry.hash))
                 .unwrap_or_default()
         };
         let (original_text, mine_text, yours_text) = (read(original), read(mine), read(yours));
@@ -230,17 +224,10 @@ pub(crate) fn combine(
             .any(|data| diff::is_binary(data))
         {
             // Binary files cannot be merged line by line, so our side stays in the work tree.
-            if let Some(hash) = mine.or(yours) {
-                tree.insert(path.clone(), hash.clone());
+            if let Some(entry) = mine.or(yours) {
+                tree.insert(path.clone(), entry.clone());
             }
-            stages.insert(
-                path,
-                Unmerged {
-                    base: original.cloned(),
-                    ours: mine.cloned(),
-                    theirs: yours.cloned(),
-                },
-            );
+            stages.insert(path, sides(original, mine, yours));
             continue;
         }
         let (merged, conflicted) = merge_content(
@@ -254,18 +241,28 @@ pub(crate) fn combine(
             continue;
         };
         if conflicted {
-            stages.insert(
-                path.clone(),
-                Unmerged {
-                    base: original.cloned(),
-                    ours: mine.cloned(),
-                    theirs: yours.cloned(),
-                },
-            );
+            stages.insert(path.clone(), sides(original, mine, yours));
         }
-        tree.insert(path, hash);
+        // A mode set on either side carries into the merged file.
+        let executable = mine.is_some_and(|entry| entry.executable)
+            || yours.is_some_and(|entry| entry.executable);
+        tree.insert(path, repo::Entry { hash, executable });
     }
     Combined { tree, stages }
+}
+
+/// Record the three sides of a path the merge could not settle.
+fn sides(
+    base: Option<&repo::Entry>,
+    ours: Option<&repo::Entry>,
+    theirs: Option<&repo::Entry>,
+) -> Unmerged {
+    let hash = |entry: Option<&repo::Entry>| entry.map(|entry| entry.hash.clone());
+    Unmerged {
+        base: hash(base),
+        ours: hash(ours),
+        theirs: hash(theirs),
+    }
 }
 
 /// One region of the base that a side replaced.

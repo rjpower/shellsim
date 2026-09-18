@@ -360,19 +360,27 @@ fn emit_porcelain_v2(
             format!("# branch.oid {commit}\n# branch.head {branch}\n").as_bytes(),
         );
     }
-    let mode = |present: bool| if present { "100644" } else { "000000" };
+    let mode = |recorded: Option<&repo::Entry>| recorded.map_or("000000", repo::Entry::mode);
     for (entry, path) in entries.iter().zip(tracked) {
         let x = entry.staged.map_or('.', Change::porcelain);
         let y = entry.unstaged.map_or('.', Change::porcelain);
-        let head_hash = head.get(path).map_or(MISSING, String::as_str);
-        let index_hash = index.get(path).map_or(MISSING, String::as_str);
+        let staged = index.get(path);
+        fn hash(recorded: Option<&repo::Entry>) -> &str {
+            recorded.map_or(MISSING, |recorded| recorded.hash.as_str())
+        }
         io.out.extend_from_slice(
             format!(
-                "1 {x}{y} N... {} {} {} {head_hash} {index_hash} {}\n",
-                mode(head.contains_key(path)),
-                mode(index.contains_key(path)),
+                "1 {x}{y} N... {} {} {} {} {} {}\n",
+                mode(head.get(path)),
+                mode(staged),
                 // A path the index no longer tracks has no working-tree mode to report.
-                mode(index.contains_key(path) && work.contains_key(path)),
+                if staged.is_some() {
+                    mode(work.get(path))
+                } else {
+                    "000000"
+                },
+                hash(head.get(path)),
+                hash(staged),
                 entry.display(),
             )
             .as_bytes(),
@@ -741,13 +749,13 @@ fn stage_paths(
         if dry_run {
             continue;
         }
-        if let Some(hash) = work.get(path) {
+        if let Some(recorded) = work.get(path) {
             let Some(data) = repo::read_work_file(ctx, root, path) else {
                 io.err
                     .extend_from_slice(format!("git add: unable to read '{path}'\n").as_bytes());
                 return 1;
             };
-            if repo::blob_hash(&data) != *hash {
+            if repo::blob_hash(&data) != recorded.hash {
                 io.err.extend_from_slice(
                     format!("git add: '{path}' changed while building the index\n").as_bytes(),
                 );
@@ -758,7 +766,7 @@ fn stage_paths(
                     .extend_from_slice(format!("git add: {error}\n").as_bytes());
                 return 1;
             }
-            index.insert(path.clone(), hash.clone());
+            index.insert(path.clone(), recorded.clone());
         } else {
             index.remove(path);
         }
@@ -854,13 +862,17 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
         for path in tracked {
             let absolute = repo::path_join(&root, &path);
             if !force && !unmerged.contains_key(&path) {
-                let index_hash = index.get(&path).cloned().unwrap_or_default();
+                let index_hash = index
+                    .get(&path)
+                    .map(|entry| entry.hash.clone())
+                    .unwrap_or_default();
                 let work_hash = match repo::metered_file_hash(ctx, &absolute) {
                     Ok(hash) => hash,
                     Err(status) => return status,
                 };
                 let matches_work = work_hash.as_deref() == Some(index_hash.as_str());
-                let matches_head = head.get(&path) == Some(&index_hash);
+                let matches_head =
+                    head.get(&path).map(|entry| entry.hash.as_str()) == Some(index_hash.as_str());
                 let safe = if cached {
                     matches_work || matches_head
                 } else {
@@ -1028,8 +1040,12 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
                 .fs_read_limited("/", source_absolute, length)
                 .map_err(|error| error.to_string())?;
             let hash = repo::write_blob(ctx, &root, &data).map_err(|error| error.to_string())?;
+            // A move keeps the file's mode along with its content.
+            let executable = index
+                .get(source_relative)
+                .is_some_and(|entry| entry.executable);
             index.remove(source_relative);
-            index.insert(target_relative.clone(), hash);
+            index.insert(target_relative.clone(), repo::Entry { hash, executable });
             if ctx.vfs.exists("/", target_absolute) {
                 ctx.vfs
                     .remove_file("/", target_absolute)
@@ -1468,9 +1484,9 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         }
         matched = true;
         if stage {
-            let hash = index.get(&path).cloned().unwrap_or_default();
+            let recorded = index.get(&path).cloned().unwrap_or_default();
             io.out
-                .extend_from_slice(format!("100644 {hash} 0\t").as_bytes());
+                .extend_from_slice(format!("{} {} 0\t", recorded.mode(), recorded.hash).as_bytes());
         }
         io.out.extend_from_slice(displayed.as_bytes());
         io.out.push(if nul { 0 } else { b'\n' });

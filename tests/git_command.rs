@@ -1701,3 +1701,44 @@ fn stat_output_stays_within_the_column_budget() {
          2 files changed, 21 insertions(+)\n"
     );
 }
+
+#[test]
+fn the_executable_bit_is_tracked_through_a_commit_and_a_checkout() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/s.sh", b"#!/bin/sh\necho ok\n".to_vec(), 0o755)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add s.sh").0, 0);
+    assert!(run(&mut env, "git ls-files -s").1.starts_with("100755 "));
+    let committed = run(&mut env, "git commit -m script");
+    assert!(
+        committed.1.contains(" create mode 100755 s.sh\n"),
+        "{}",
+        committed.1
+    );
+
+    // Dropping the bit is a change in its own right, with no content to index.
+    assert_eq!(run(&mut env, "chmod -x s.sh").0, 0);
+    assert_eq!(run(&mut env, "git status --short").1, " M s.sh\n");
+    assert_eq!(
+        run(&mut env, "git diff").1,
+        "diff --git a/s.sh b/s.sh\nold mode 100755\nnew mode 100644\n"
+    );
+
+    // A checkout puts the recorded mode back, so the script runs again.
+    assert_eq!(run(&mut env, "git checkout -- s.sh").0, 0);
+    assert_eq!(run(&mut env, "test -x s.sh").0, 0);
+    assert_eq!(run(&mut env, "git status --short").1, "");
+
+    // The bit survives moving between branches.
+    assert_eq!(run(&mut env, "git switch -qc other").0, 0);
+    env.vfs
+        .put_file("/s.sh", b"#!/bin/sh\necho other\n".to_vec(), 0o755)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -qam other").0, 0);
+    assert_eq!(run(&mut env, "git switch -q main").0, 0);
+    assert_eq!(run(&mut env, "test -x s.sh").0, 0);
+    assert_eq!(run(&mut env, "git switch -q other").0, 0);
+    assert_eq!(run(&mut env, "test -x s.sh").0, 0);
+}

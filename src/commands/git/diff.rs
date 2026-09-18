@@ -214,7 +214,13 @@ pub(crate) fn change_counts(
 }
 
 /// The `diff --git` header Git prints before each file's hunks.
-fn header(path: &str, old: Option<&[u8]>, new: Option<&[u8]>, prefixes: bool) -> String {
+fn header(
+    path: &str,
+    old: Option<&[u8]>,
+    new: Option<&[u8]>,
+    prefixes: bool,
+    modes: Modes,
+) -> String {
     let (left, right) = labels(prefixes);
     let blank = "0000000";
     let hash = |data: Option<&[u8]>| {
@@ -224,13 +230,20 @@ fn header(path: &str, old: Option<&[u8]>, new: Option<&[u8]>, prefixes: bool) ->
     };
     let mut text = format!("diff --git {left}{path} {right}{path}\n");
     match (old.is_some(), new.is_some()) {
-        (false, true) => text.push_str("new file mode 100644\n"),
-        (true, false) => text.push_str("deleted file mode 100644\n"),
+        (false, true) => text.push_str(&format!("new file mode {}\n", modes.1)),
+        (true, false) => text.push_str(&format!("deleted file mode {}\n", modes.0)),
+        _ if modes.0 != modes.1 => {
+            text.push_str(&format!("old mode {}\nnew mode {}\n", modes.0, modes.1));
+        }
         _ => {}
+    }
+    if old == new {
+        // A change of mode alone has no content to index.
+        return text;
     }
     text.push_str(&format!("index {}..{}", hash(old), hash(new)));
     if old.is_some() && new.is_some() {
-        text.push_str(" 100644");
+        text.push_str(&format!(" {}", modes.1));
     }
     text.push('\n');
     text
@@ -248,19 +261,30 @@ fn labels(prefixes: bool) -> (&'static str, &'static str) {
 /// Render one file's unified diff, including the `diff --git` header.
 ///
 /// Returns an empty string when the contents are identical.
+/// The `100644` or `100755` each side of a patch reports.
+pub(crate) type Modes = (&'static str, &'static str);
+
+/// The modes of a file neither side marks executable.
+pub(crate) const PLAIN: Modes = ("100644", "100644");
+
 pub(crate) fn render(
     path: &str,
     old: Option<&[u8]>,
     new: Option<&[u8]>,
+    modes: Modes,
     context: usize,
     prefixes: bool,
     whitespace: Whitespace,
 ) -> String {
-    if old == new {
+    if old == new && modes.0 == modes.1 {
         return String::new();
     }
     let (left, right) = labels(prefixes);
-    let mut out = header(path, old, new, prefixes);
+    let mut out = header(path, old, new, prefixes, modes);
+    if old == new {
+        // Only the mode changed, so the header says everything.
+        return out;
+    }
     if old.is_some_and(is_binary) || new.is_some_and(is_binary) {
         out.push_str(&format!(
             "Binary files {} and {} differ\n",
@@ -411,7 +435,7 @@ pub(crate) fn whitespace_errors(path: &str, old: Option<&[u8]>, new: Option<&[u8
 
 #[cfg(test)]
 mod tests {
-    use super::{change_counts, render, Whitespace, DEFAULT_CONTEXT};
+    use super::{change_counts, render, Whitespace, DEFAULT_CONTEXT, PLAIN};
 
     #[test]
     fn renders_a_hunk_with_context_rather_than_the_whole_file() {
@@ -421,6 +445,7 @@ mod tests {
             "f.txt",
             Some(old),
             Some(new),
+            PLAIN,
             DEFAULT_CONTEXT,
             true,
             Whitespace::Significant,
@@ -436,6 +461,7 @@ mod tests {
             "f.txt",
             None,
             Some(b"hello\n"),
+            PLAIN,
             DEFAULT_CONTEXT,
             true,
             Whitespace::Significant,
@@ -446,6 +472,7 @@ mod tests {
             "f.txt",
             Some(b"hello\n"),
             None,
+            PLAIN,
             DEFAULT_CONTEXT,
             true,
             Whitespace::Significant,
@@ -460,6 +487,7 @@ mod tests {
             "f.txt",
             Some(b"a\n"),
             Some(b"a\nb"),
+            PLAIN,
             DEFAULT_CONTEXT,
             true,
             Whitespace::Significant,
@@ -476,6 +504,7 @@ mod tests {
             "f.txt",
             Some(b"a\nb\n"),
             Some(b"a\nb"),
+            PLAIN,
             DEFAULT_CONTEXT,
             true,
             Whitespace::Significant,
@@ -517,6 +546,7 @@ mod tests {
             "f.txt",
             None,
             Some(b"a\nb\n"),
+            PLAIN,
             DEFAULT_CONTEXT,
             true,
             Whitespace::Significant,
@@ -530,6 +560,7 @@ mod tests {
             "f.bin",
             Some(b"\x00\x01"),
             Some(b"\x00\x02"),
+            PLAIN,
             DEFAULT_CONTEXT,
             true,
             Whitespace::Significant,
@@ -549,6 +580,7 @@ mod tests {
                 "f.rs",
                 Some(old),
                 Some(new),
+                PLAIN,
                 DEFAULT_CONTEXT,
                 true,
                 Whitespace::IgnoreAll
@@ -565,6 +597,7 @@ mod tests {
             "f.rs",
             Some(old),
             Some(edited),
+            PLAIN,
             DEFAULT_CONTEXT,
             true,
             Whitespace::IgnoreAll,

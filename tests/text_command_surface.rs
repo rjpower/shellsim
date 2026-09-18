@@ -302,3 +302,11 @@ fn listing_writes_one_name_per_line() {
         "3\n"
     );
 }
+
+#[test]
+fn a_long_listing_describes_a_named_file_as_well_as_a_directory() {
+    let (status, stdout, stderr) = run("touch f && chmod +x f && ls -l f");
+    assert_eq!((status, stderr.as_str()), (0, ""));
+    assert!(stdout.starts_with("-rwxr-xr-x "), "{stdout}");
+    assert!(stdout.trim_end().ends_with(" f"), "{stdout}");
+}

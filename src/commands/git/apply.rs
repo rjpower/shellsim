@@ -103,7 +103,9 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         match content {
             Some(data) => match repo::write_blob(ctx, &root, &data) {
                 Ok(hash) => {
-                    index.insert(path, hash);
+                    // A patch changes content, never the mode the index already records.
+                    let executable = index.get(&path).is_some_and(|entry| entry.executable);
+                    index.insert(path, repo::Entry { hash, executable });
                 }
                 Err(error) => {
                     io.err
