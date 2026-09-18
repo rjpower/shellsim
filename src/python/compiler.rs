@@ -17,6 +17,8 @@ pub fn compile(program: Program) -> Code {
         in_function: false,
         globals: HashSet::new(),
         nonlocals: HashSet::new(),
+        named_expression: NamedExpressionContext::local(),
+        is_class_scope: false,
         structural_depth: 0,
     };
     compiler.statements(program.statements);
@@ -41,7 +43,33 @@ struct Compiler {
     in_function: bool,
     globals: HashSet<String>,
     nonlocals: HashSet<String>,
+    named_expression: NamedExpressionContext,
+    is_class_scope: bool,
     structural_depth: usize,
+}
+
+#[derive(Clone)]
+struct NamedExpressionContext {
+    target: NamedExpressionTarget,
+    globals: HashSet<String>,
+    nonlocals: HashSet<String>,
+}
+
+impl NamedExpressionContext {
+    fn local() -> Self {
+        Self {
+            target: NamedExpressionTarget::Local,
+            globals: HashSet::new(),
+            nonlocals: HashSet::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NamedExpressionTarget {
+    Local,
+    Enclosing(usize),
+    ForbiddenClassComprehension,
 }
 
 struct LoopContext {
@@ -250,6 +278,8 @@ impl Compiler {
                     in_function: true,
                     globals: HashSet::new(),
                     nonlocals: HashSet::new(),
+                    named_expression: NamedExpressionContext::local(),
+                    is_class_scope: false,
                     structural_depth: self.structural_depth,
                 };
                 nested.statements(body);
@@ -302,6 +332,8 @@ impl Compiler {
                     in_function: false,
                     globals: HashSet::new(),
                     nonlocals: HashSet::new(),
+                    named_expression: NamedExpressionContext::local(),
+                    is_class_scope: true,
                     structural_depth: self.structural_depth,
                 };
                 nested.statements(body);
@@ -769,6 +801,31 @@ impl Compiler {
             ExpressionKind::Name(name) => {
                 self.emit(Operation::LoadName(name), span);
             }
+            ExpressionKind::NamedExpression { name, value } => {
+                self.expression(*value);
+                self.emit(Operation::Copy(1), span);
+                match self.named_expression.target {
+                    NamedExpressionTarget::Local => self.store_name(name, span),
+                    NamedExpressionTarget::Enclosing(scope_hops) => {
+                        if self.named_expression.globals.contains(&name) {
+                            self.emit(Operation::StoreGlobal(name), span);
+                        } else if self.named_expression.nonlocals.contains(&name) {
+                            self.emit(Operation::StoreNonlocal(name), span);
+                        } else {
+                            self.emit(Operation::StoreEnclosing { name, scope_hops }, span);
+                        }
+                    }
+                    NamedExpressionTarget::ForbiddenClassComprehension => {
+                        self.emit(
+                            Operation::RuntimeError(
+                                "assignment expression within a comprehension cannot be used in a class body"
+                                    .into(),
+                            ),
+                            span,
+                        );
+                    }
+                }
+            }
             ExpressionKind::List(values) => {
                 let count = values.len();
                 for value in values {
@@ -947,6 +1004,8 @@ impl Compiler {
                     in_function: true,
                     globals: HashSet::new(),
                     nonlocals: HashSet::new(),
+                    named_expression: NamedExpressionContext::local(),
+                    is_class_scope: false,
                     structural_depth: self.structural_depth,
                 };
                 nested.expression(*body);
@@ -1048,6 +1107,35 @@ impl Compiler {
         index
     }
 
+    fn comprehension_named_expression_context(&self) -> NamedExpressionContext {
+        let target = if self.is_class_scope
+            || matches!(
+                self.named_expression.target,
+                NamedExpressionTarget::ForbiddenClassComprehension
+            ) {
+            NamedExpressionTarget::ForbiddenClassComprehension
+        } else {
+            NamedExpressionTarget::Enclosing(match self.named_expression.target {
+                NamedExpressionTarget::Local => 1,
+                NamedExpressionTarget::Enclosing(scope_hops) => scope_hops.saturating_add(1),
+                NamedExpressionTarget::ForbiddenClassComprehension => unreachable!(),
+            })
+        };
+        let (globals, nonlocals) = match self.named_expression.target {
+            NamedExpressionTarget::Local => (self.globals.clone(), self.nonlocals.clone()),
+            NamedExpressionTarget::Enclosing(_) => (
+                self.named_expression.globals.clone(),
+                self.named_expression.nonlocals.clone(),
+            ),
+            NamedExpressionTarget::ForbiddenClassComprehension => (HashSet::new(), HashSet::new()),
+        };
+        NamedExpressionContext {
+            target,
+            globals,
+            nonlocals,
+        }
+    }
+
     fn emit_comprehension(
         &mut self,
         kind: ComprehensionKind,
@@ -1055,6 +1143,7 @@ impl Compiler {
         clauses: Vec<ComprehensionClause>,
         span: Span,
     ) {
+        let named_expression = self.comprehension_named_expression_context();
         let mut nested = Compiler {
             instructions: Vec::new(),
             loops: Vec::new(),
@@ -1063,6 +1152,8 @@ impl Compiler {
             in_function: true,
             globals: HashSet::new(),
             nonlocals: HashSet::new(),
+            named_expression,
+            is_class_scope: false,
             structural_depth: self.structural_depth,
         };
         let result_name = "$__shellsim_comprehension_result".to_string();
@@ -1105,6 +1196,7 @@ impl Compiler {
         clauses: Vec<ComprehensionClause>,
         span: Span,
     ) {
+        let named_expression = self.comprehension_named_expression_context();
         let mut nested = Compiler {
             instructions: Vec::new(),
             loops: Vec::new(),
@@ -1113,6 +1205,8 @@ impl Compiler {
             in_function: true,
             globals: HashSet::new(),
             nonlocals: HashSet::new(),
+            named_expression,
+            is_class_scope: false,
             structural_depth: self.structural_depth,
         };
         let result_name = "$__shellsim_comprehension_result".to_string();

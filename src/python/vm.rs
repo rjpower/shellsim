@@ -701,6 +701,9 @@ impl<'a> Vm<'a> {
                 }
                 Operation::LoadName(name) => self.load_name(name),
                 Operation::StoreName(name) => self.store_name(name),
+                Operation::StoreEnclosing { name, scope_hops } => {
+                    self.store_enclosing(name, *scope_hops)
+                }
                 Operation::StoreNonlocal(name) => self.store_nonlocal(name),
                 Operation::StoreGlobal(name) => {
                     let value = self.pop().map_err(|error| (error, instruction.span))?;
@@ -1352,6 +1355,25 @@ impl<'a> Vm<'a> {
             self.state.locals.insert(name.to_string(), value);
         }
         Ok(())
+    }
+
+    fn store_enclosing(&mut self, name: &str, scope_hops: usize) -> Result<(), String> {
+        let value = self.pop()?;
+        let mut target = self.local_scopes.last().copied();
+        for _ in 0..scope_hops {
+            target = target
+                .map(|scope| self.state.heap.scope_parent(scope))
+                .transpose()?
+                .flatten();
+        }
+        if let Some(scope) = target {
+            self.state
+                .heap
+                .scope_insert(scope, name.to_string(), value, &mut self.interp.resources)
+        } else {
+            self.state.locals.insert(name.to_string(), value);
+            Ok(())
+        }
     }
 
     fn store_nonlocal(&mut self, name: &str) -> Result<(), String> {

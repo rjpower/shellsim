@@ -70,6 +70,7 @@ pub enum TokenKind {
     LeftBrace,
     RightBrace,
     Colon,
+    ColonEqual,
     Semicolon,
     Newline,
     Indent,

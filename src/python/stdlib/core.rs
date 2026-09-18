@@ -6,12 +6,16 @@
 
 use std::cmp::Ordering;
 
+use num_bigint::{BigInt, Sign};
+use num_traits::{Signed, Zero};
+
 use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, MethodDef, NativeTypeDef, PyByteArray, PyBytes, PyCallable, PyDict,
     PyError, PyKind, PyList, PyProperty, PyResult, PyRuntime, PySequence, PySet, PyString, PyValue,
     PyValueCast,
 };
+use super::super::number::PyNumber;
 
 static BUILTINS: &[FunctionDef] = &[
     builtin("map", builtin_map),
@@ -19,6 +23,7 @@ static BUILTINS: &[FunctionDef] = &[
     builtin("reversed", builtin_reversed),
     builtin("getattr", builtin_getattr),
     builtin("hasattr", builtin_hasattr),
+    builtin("round", builtin_round),
 ];
 
 /// Resolve capability-free builtins implemented through the erased runtime API.
@@ -1331,26 +1336,93 @@ pub(crate) fn slot_set_subtract(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
+    set_binary(runtime, left, right, SetBinaryOperation::Difference)
+}
+
+pub(crate) fn slot_set_intersection(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    set_binary(runtime, left, right, SetBinaryOperation::Intersection)
+}
+
+pub(crate) fn slot_set_symmetric_difference(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    set_binary(
+        runtime,
+        left,
+        right,
+        SetBinaryOperation::SymmetricDifference,
+    )
+}
+
+pub(crate) fn slot_set_union(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    set_binary(runtime, left, right, SetBinaryOperation::Union)
+}
+
+#[derive(Clone, Copy)]
+enum SetBinaryOperation {
+    Difference,
+    Intersection,
+    SymmetricDifference,
+    Union,
+}
+
+fn set_binary(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+    operation: SetBinaryOperation,
+) -> PyResult<Option<PyValue>> {
     let left = left.cast::<PySet>(runtime)?.items(runtime)?;
     let Ok(right) = right.cast::<PySet>(runtime) else {
         return Ok(None);
     };
     let right = right.items(runtime)?;
-    let mut difference = Vec::new();
-    for value in left {
-        let mut present = false;
-        for candidate in &right {
-            runtime.charge_cpu(1)?;
-            if runtime.equals(&value, candidate)? {
-                present = true;
-                break;
-            }
-        }
-        if !present {
-            difference.push(value);
+    let mut result = Vec::new();
+    for value in &left {
+        let present = set_contains(runtime, &right, value)?;
+        if matches!(operation, SetBinaryOperation::Union)
+            || present == matches!(operation, SetBinaryOperation::Intersection)
+        {
+            runtime.reserve_memory(64)?;
+            result.push(*value);
         }
     }
-    runtime.new_set(difference).map(Some)
+    if matches!(
+        operation,
+        SetBinaryOperation::Union | SetBinaryOperation::SymmetricDifference
+    ) {
+        for value in &right {
+            if !set_contains(runtime, &left, value)? {
+                runtime.reserve_memory(64)?;
+                result.push(*value);
+            }
+        }
+    }
+    runtime.new_set(result).map(Some)
+}
+
+fn set_contains(
+    runtime: &mut dyn PyRuntime,
+    values: &[PyValue],
+    expected: &PyValue,
+) -> PyResult<bool> {
+    for candidate in values {
+        runtime.charge_cpu(1)?;
+        if runtime.equals(expected, candidate)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn builtin_map(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -1440,6 +1512,128 @@ fn builtin_hasattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
             .get_attribute(args.positional()[0], &name)?
             .is_some(),
     ))
+}
+
+fn builtin_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("round", 1, 2)?;
+    args.reject_unknown_keywords("round", &["ndigits"])?;
+    let keyword_digits = args.keyword("round", "ndigits")?;
+    if args.positional().len() == 2 && keyword_digits.is_some() {
+        return Err(PyError::type_error(
+            "round() got multiple values for argument 'ndigits'",
+        ));
+    }
+    let digits = match args.positional().get(1).or(keyword_digits) {
+        Some(value) if runtime.kind(value)? != PyKind::None => Some(integer_argument(
+            runtime,
+            value,
+            "ndigits must be an integer",
+        )?),
+        Some(_) | None => None,
+    };
+    match args.positional()[0].cast::<PyNumber>(runtime)? {
+        PyNumber::Int(value) => round_integer(runtime, BigInt::from(value), digits),
+        PyNumber::BigInt(value) => {
+            let value = value
+                .parse::<BigInt>()
+                .expect("PyNumber bigint originates from a decimal integer");
+            round_integer(runtime, value, digits)
+        }
+        PyNumber::Float(value) => round_float(runtime, value, digits),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IntegerArgument {
+    Finite(i64),
+    TooPositive,
+    TooNegative,
+}
+
+fn integer_argument(
+    runtime: &dyn PyRuntime,
+    value: &PyValue,
+    message: &str,
+) -> PyResult<IntegerArgument> {
+    let text = runtime
+        .integer_text(value)?
+        .ok_or_else(|| PyError::type_error(message))?;
+    Ok(match text.parse::<i64>() {
+        Ok(value) => IntegerArgument::Finite(value),
+        Err(_) if text.starts_with('-') => IntegerArgument::TooNegative,
+        Err(_) => IntegerArgument::TooPositive,
+    })
+}
+
+fn round_integer(
+    runtime: &mut dyn PyRuntime,
+    value: BigInt,
+    digits: Option<IntegerArgument>,
+) -> PyResult {
+    let negative_digits = match digits {
+        None | Some(IntegerArgument::TooPositive | IntegerArgument::Finite(0..)) => {
+            return runtime.new_integer(&value.to_string());
+        }
+        Some(IntegerArgument::TooNegative) => return runtime.new_integer("0"),
+        Some(IntegerArgument::Finite(value)) => value.unsigned_abs(),
+    };
+    let decimal_digits = value.abs().to_string().len() as u64;
+    if negative_digits > decimal_digits {
+        return runtime.new_integer("0");
+    }
+    let exponent = u32::try_from(negative_digits)
+        .map_err(|_| PyError::resource_error("rounding precision is too large"))?;
+    runtime.charge_cpu(negative_digits)?;
+    let divisor = BigInt::from(10_u8).pow(exponent);
+    let mut quotient = &value / &divisor;
+    let remainder = (&value % &divisor).abs();
+    let twice_remainder = remainder * 2_u8;
+    if twice_remainder > divisor
+        || (twice_remainder == divisor && (&quotient % 2_u8) != BigInt::zero())
+    {
+        quotient += if value.sign() == Sign::Minus { -1 } else { 1 };
+    }
+    runtime.new_integer(&(quotient * divisor).to_string())
+}
+
+fn round_float(
+    runtime: &mut dyn PyRuntime,
+    value: f64,
+    digits: Option<IntegerArgument>,
+) -> PyResult {
+    let Some(digits) = digits else {
+        if value.is_nan() {
+            return Err(PyError::value_error("cannot convert float NaN to integer"));
+        }
+        if value.is_infinite() {
+            return Err(PyError::overflow_error(
+                "cannot convert float infinity to integer",
+            ));
+        }
+        return runtime.new_integer(&format!("{:.0}", value.round_ties_even()));
+    };
+    if !value.is_finite() {
+        return Ok(Value::Float(value));
+    }
+    let rounded = match digits {
+        IntegerArgument::TooPositive => value,
+        IntegerArgument::TooNegative => value.signum() * 0.0,
+        IntegerArgument::Finite(digits) if digits > 308 => value,
+        IntegerArgument::Finite(digits) if digits < -308 => value.signum() * 0.0,
+        IntegerArgument::Finite(digits) if digits >= 0 => {
+            let precision = usize::try_from(digits).expect("nonnegative precision is bounded");
+            runtime.reserve_memory(precision.saturating_add(320))?;
+            runtime.charge_cpu(u64::try_from(precision).unwrap_or(u64::MAX))?;
+            format!("{value:.precision$}")
+                .parse::<f64>()
+                .expect("formatted finite float remains a float")
+        }
+        IntegerArgument::Finite(digits) => {
+            let scale = 10_f64.powi(i32::try_from(-digits).expect("precision is bounded"));
+            (value / scale).round_ties_even() * scale
+        }
+    };
+    Ok(Value::Float(rounded))
 }
 
 fn property_setter(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

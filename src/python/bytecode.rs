@@ -33,6 +33,11 @@ pub enum Operation {
     LoadConstant(Constant),
     LoadName(String),
     StoreName(String),
+    /// Store a named-expression result outside synthetic comprehension scopes.
+    StoreEnclosing {
+        name: String,
+        scope_hops: usize,
+    },
     StoreNonlocal(String),
     StoreGlobal(String),
     StoreAttribute(String),

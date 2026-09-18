@@ -63,6 +63,87 @@ print("yes" if values[:2] == [0, 1] else "no")
 }
 
 #[test]
+fn set_bitwise_operators_match_set_algebra() {
+    let left = "{1, 2, 3}";
+    let right = "{3, 4}";
+    let source = format!(
+        "print(sorted({left} & {right}))\nprint(sorted({left} | {right}))\nprint(sorted({left} ^ {right}))\nprint(sorted({left} - {right}))"
+    );
+    assert_eq!(
+        run(&source),
+        (
+            0,
+            "[3]\n[1, 2, 3, 4]\n[1, 2, 4]\n[1, 2]\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn round_preserves_python_numeric_types_and_ties_to_even() {
+    let source = r#"
+print(round(2.5), round(3.5), round(-2.5))
+print(round(2.675, 2), round(1.25, ndigits=1), round(-1.25, 1))
+print(round(2500, -3), round(3500, -3), round(123456789012345678901, -4))
+print(isinstance(round(3.5), int), isinstance(round(3.5, 0), float))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "2 4 -2\n2.67 1.2 -1.2\n2000 4000 123456789012345680000\nTrue True\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn named_expressions_escape_only_synthetic_comprehension_scopes() {
+    let source = r#"
+module_values = [(module_last := value) for value in [1, 2]]
+print(module_values, module_last)
+
+def collect(values):
+    selected = [(last := value * 2) for value in values if (seen := value) > 0]
+    nested = [[(product := left * right) for right in [2]] for left in [3]]
+    return selected, last, seen, nested, product
+
+print(collect([-1, 2, 3]))
+
+global_value = 0
+def set_global():
+    global global_value
+    return [(global_value := value) for value in [4, 5]]
+set_global()
+print(global_value)
+
+def outer():
+    captured = 0
+    def inner():
+        nonlocal captured
+        return [(captured := value) for value in [6, 7]]
+    inner()
+    return captured
+print(outer())
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "[1, 2] 2\n([4, 6], 6, 3, [[6]], 6)\n5\n7\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn named_expressions_in_class_comprehensions_are_rejected() {
+    let (_, _, stderr) = run("class Invalid:\n    values = [(bound := value) for value in [1]]\n");
+    assert!(stderr
+        .contains("assignment expression within a comprehension cannot be used in a class body"));
+}
+
+#[test]
 fn tuple_subscripts_work_for_ordinary_mapping_keys() {
     let source = r#"
 values = {(1, 2): "pair", (1,): "single"}
