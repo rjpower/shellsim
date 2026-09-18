@@ -13,6 +13,7 @@
 //! supported subset fails visibly rather than approximating Git's behavior, and anything that
 //! would need a network is refused and recorded as unsupported.
 
+mod apply;
 mod compare;
 mod config;
 mod diff;
@@ -71,6 +72,12 @@ Supported commands:
 ";
 
 /// Subcommands that would need a network. They are refused rather than approximated.
+/// Subcommands whose `-q` suppresses the report they would otherwise print.
+const QUIET_COMMANDS: &[&str] = &[
+    "add", "branch", "checkout", "clean", "commit", "merge", "mv", "reset", "restore", "rm",
+    "stash", "switch", "tag",
+];
+
 /// Real Git subcommands this subset deliberately leaves out; anything else is simply not a
 /// command, and is reported the way Git reports a typo.
 const UNSUPPORTED_COMMANDS: &[&str] = &[
@@ -289,7 +296,22 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         }
         None => None,
     };
+    // `-q` silences the progress report these commands print; diagnostics still reach stderr.
+    let silence = QUIET_COMMANDS.contains(&subcommand)
+        && args[1..]
+            .iter()
+            .take_while(|argument| *argument != "--")
+            .any(|argument| argument == "-q" || argument == "--quiet");
+    let before = (io.out.len(), io.err.len());
     let status = dispatch(ctx, &globals, subcommand, &args[1..], io);
+    if silence {
+        io.out.truncate(before.0);
+        // Progress notes such as `Switched to branch` go to standard error, as they do in Git;
+        // a failure's diagnostics are kept.
+        if status == 0 {
+            io.err.truncate(before.1);
+        }
+    }
     if let Some(previous) = restore_cwd {
         ctx.cwd = previous;
     }
@@ -327,7 +349,7 @@ fn dispatch(
         "config" => config::git_config(ctx, globals, args, io),
         "remote" => config::git_remote(ctx, globals, args, io),
         "stash" => stash::git_stash(ctx, args, io),
-        "apply" => crate::commands::patch::apply_unified_diff(ctx, args, io),
+        "apply" => apply::git_apply(ctx, args, io),
         "grep" => plumbing::git_grep(ctx, args, io),
         "cat-file" => plumbing::git_cat_file(ctx, args, io),
         "hash-object" => plumbing::git_hash_object(ctx, args, io),
@@ -349,6 +371,14 @@ fn dispatch(
             usage(io, &format!("unsupported subcommand: {other}"))
         }
         other => {
+            // An alias expands to another subcommand; one that names itself is not followed.
+            if let Some(mut expansion) = config::alias(ctx, globals, other) {
+                let name = expansion.remove(0);
+                if name != other {
+                    expansion.extend_from_slice(args);
+                    return dispatch(ctx, globals, &name, &expansion, io);
+                }
+            }
             ctx.note_unsupported(&format!("git:{other}"));
             io.err.extend_from_slice(
                 format!("git: '{other}' is not a git command. See 'git --help'.\n").as_bytes(),
@@ -422,7 +452,7 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                 repo::serialize_config(
                     &DEFAULT_CONFIG
                         .iter()
-                        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                        .map(|(key, value)| ((*key).to_string(), vec![(*value).to_string()]))
                         .collect(),
                 ),
             ),

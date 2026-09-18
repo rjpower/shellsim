@@ -249,6 +249,19 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     if !show_ignored {
         ignored_paths.clear();
     }
+    // Git names paths relative to the working directory, reaching upwards with `../` when needed.
+    let prefix = repo::relative_path(&root, &cwd).map_or_else(String::new, |p| format!("{p}/"));
+    let mut entries = entries;
+    for entry in &mut entries {
+        entry.path = displayed_path(&prefix, &entry.path);
+        entry.origin = entry
+            .origin
+            .as_deref()
+            .map(|origin| displayed_path(&prefix, origin));
+    }
+    for path in untracked_paths.iter_mut().chain(ignored_paths.iter_mut()) {
+        *path = displayed_path(&prefix, path);
+    }
     let branch = repo::current_branch(ctx, &root);
     let head_commit = repo::head_commit(ctx, &root);
     if short {
@@ -275,6 +288,17 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         io,
     );
     0
+}
+
+/// Render a repository-relative path relative to the working directory, as Git reports it.
+fn displayed_path(prefix: &str, path: &str) -> String {
+    if prefix.is_empty() {
+        return path.to_string();
+    }
+    match path.strip_prefix(prefix) {
+        Some(rest) => rest.to_string(),
+        None => format!("{}{path}", "../".repeat(prefix.matches('/').count())),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

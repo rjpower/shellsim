@@ -5,11 +5,9 @@
 //! by another tool is read back correctly. There is no system scope and no network, so remotes
 //! are recorded but never contacted.
 
-use std::collections::BTreeMap;
-
 use crate::commands::{CommandContext, Io};
 
-use super::repo;
+use super::repo::{self, Config};
 use super::{repo_error, usage, Globals};
 
 /// Which configuration file a command reads and writes.
@@ -25,16 +23,21 @@ pub(crate) fn effective_config(
     ctx: &mut CommandContext<'_>,
     root: &str,
     globals: &Globals,
-) -> BTreeMap<String, String> {
+) -> Config {
     let mut config = repo::load_global_config(ctx);
     config.extend(repo::load_config(ctx, root));
     config.extend(
         globals
             .overrides
             .iter()
-            .map(|(key, value)| (key.clone(), value.clone())),
+            .map(|(key, value)| (key.clone(), vec![value.clone()])),
     );
     config
+}
+
+/// The single value a read of `key` yields, which is the last one recorded.
+fn value_of(config: &Config, key: &str) -> Option<String> {
+    repo::config_value(config, &key.to_ascii_lowercase()).map(str::to_string)
 }
 
 /// Identity for new commits, preferring the environment as Git does.
@@ -47,7 +50,7 @@ pub(crate) fn identity(
     let pick = |variable: &str, key: &str, fallback: &str| {
         ctx.get_var(variable)
             .filter(|value| !value.is_empty())
-            .or_else(|| config.get(key).cloned())
+            .or_else(|| value_of(&config, key))
             .unwrap_or_else(|| fallback.to_string())
     };
     (
@@ -64,6 +67,8 @@ pub(crate) fn git_config(
 ) -> i32 {
     let mut scope = Scope::Local;
     let mut explicit_scope = false;
+    let mut show_origin = false;
+    let mut as_boolean = false;
     let mut operands: Vec<String> = Vec::new();
     for argument in args {
         match argument.as_str() {
@@ -73,6 +78,9 @@ pub(crate) fn git_config(
                 explicit_scope = true;
             }
             "--system" => return usage(io, "the system configuration scope is not available"),
+            "--show-origin" => show_origin = true,
+            "--bool" | "--type=bool" => as_boolean = true,
+            "--type=string" | "--null" | "-z" if false => {}
             value => operands.push(value.to_string()),
         }
     }
@@ -97,11 +105,19 @@ pub(crate) fn git_config(
         effective_config(ctx, &root, globals)
     };
     let operands: Vec<&str> = operands.iter().map(String::as_str).collect();
+    // `--show-origin` prefixes each line with the file the value came from.
+    let origin = if show_origin {
+        format!("file:{file}\t")
+    } else {
+        String::new()
+    };
     match operands.as_slice() {
         ["--list" | "-l"] => {
-            for (key, value) in &readable {
-                io.out
-                    .extend_from_slice(format!("{key}={value}\n").as_bytes());
+            for (key, values) in &readable {
+                for value in values {
+                    io.out
+                        .extend_from_slice(format!("{origin}{key}={value}\n").as_bytes());
+                }
             }
             0
         }
@@ -110,24 +126,44 @@ pub(crate) fn git_config(
                 return usage(io, "invalid --get-regexp pattern");
             };
             let mut matched = false;
-            for (key, value) in &readable {
-                if regex.is_match(key) {
-                    matched = true;
+            for (key, values) in &readable {
+                if !regex.is_match(key) {
+                    continue;
+                }
+                matched = true;
+                for value in values {
                     io.out
-                        .extend_from_slice(format!("{key} {value}\n").as_bytes());
+                        .extend_from_slice(format!("{origin}{key} {value}\n").as_bytes());
                 }
             }
             i32::from(!matched)
         }
-        ["--get" | "--get-all", key] => emit_value(&readable, key, io),
-        ["--unset", key] => {
+        ["--get-all", key] => {
+            let Some(values) = readable.get(&key.to_ascii_lowercase()) else {
+                return 1;
+            };
+            for value in values {
+                emit_one(&origin, value, as_boolean, io);
+            }
+            0
+        }
+        ["--get", key] | [key] if !key.starts_with('-') => {
+            match repo::config_value(&readable, &key.to_ascii_lowercase()) {
+                Some(value) => {
+                    emit_one(&origin, value, as_boolean, io);
+                    0
+                }
+                None => 1,
+            }
+        }
+        ["--unset" | "--unset-all", key] => {
             if stored.remove(&key.to_ascii_lowercase()).is_none() {
                 return 5;
             }
             repo::write_config(ctx, &file, &stored).map_or(1, |()| 0)
         }
-        [key] if !key.starts_with('-') => emit_value(&readable, key, io),
         ["--add", key, value] | [key, value] if !key.starts_with('-') => {
+            let adding = operands[0] == "--add";
             let key = key.to_ascii_lowercase();
             if !repo::valid_config_key(&key)
                 || value.len() > 4096
@@ -138,7 +174,11 @@ pub(crate) fn git_config(
             if stored.len() == 256 && !stored.contains_key(&key) {
                 return usage(io, "too many config entries");
             }
-            stored.insert(key, (*value).to_string());
+            let entry = stored.entry(key).or_default();
+            if !adding {
+                entry.clear();
+            }
+            entry.push((*value).to_string());
             repo::write_config(ctx, &file, &stored).map_or(1, |()| 0)
         }
         _ => usage(
@@ -148,11 +188,41 @@ pub(crate) fn git_config(
     }
 }
 
-fn emit_value(config: &BTreeMap<String, String>, key: &str, io: &mut Io) -> i32 {
-    config.get(&key.to_ascii_lowercase()).map_or(1, |value| {
-        io.out.extend_from_slice(format!("{value}\n").as_bytes());
-        0
-    })
+fn emit_one(origin: &str, value: &str, as_boolean: bool, io: &mut Io) {
+    let rendered = if as_boolean {
+        // Git's boolean reading: these spellings are true, everything else is false.
+        let truthy = matches!(
+            value.to_ascii_lowercase().as_str(),
+            "true" | "yes" | "on" | "1"
+        ) || value.is_empty();
+        truthy.to_string()
+    } else {
+        value.to_string()
+    };
+    io.out
+        .extend_from_slice(format!("{origin}{rendered}\n").as_bytes());
+}
+
+/// The command an alias expands to, split into words.
+pub(crate) fn alias(
+    ctx: &mut CommandContext<'_>,
+    globals: &Globals,
+    name: &str,
+) -> Option<Vec<String>> {
+    let root = repo::find_repo_root(ctx).unwrap_or_default();
+    let config = effective_config(ctx, &root, globals);
+    let expansion = repo::config_value(&config, &format!("alias.{}", name.to_ascii_lowercase()))?;
+    // Shell aliases (`!cmd`) would need host execution, which this simulation does not provide.
+    if expansion.starts_with('!') {
+        return None;
+    }
+    Some(
+        expansion
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+    )
+    .filter(|words: &Vec<String>| !words.is_empty())
 }
 
 /// Record and report remotes. Nothing here contacts a network.
@@ -192,7 +262,7 @@ pub(crate) fn git_remote(
             if !repo::valid_config_key(&key) {
                 return usage(io, &format!("invalid remote name: {name}"));
             }
-            config.insert(key, (*url).to_string());
+            config.insert(key, vec![(*url).to_string()]);
             repo::write_config(ctx, &file, &config).map_or(1, |()| 0)
         }
         ["remove" | "rm", name] => {
@@ -204,8 +274,10 @@ pub(crate) fn git_remote(
             }
             repo::write_config(ctx, &file, &config).map_or(1, |()| 0)
         }
-        ["get-url", name] => match config.get(&format!("remote.{}.url", name.to_ascii_lowercase()))
-        {
+        ["get-url", name] => match repo::config_value(
+            &config,
+            &format!("remote.{}.url", name.to_ascii_lowercase()),
+        ) {
             Some(url) => {
                 io.out.extend_from_slice(format!("{url}\n").as_bytes());
                 0
@@ -223,7 +295,7 @@ pub(crate) fn git_remote(
                     .extend_from_slice(format!("error: No such remote '{name}'\n").as_bytes());
                 return 2;
             }
-            config.insert(key, (*url).to_string());
+            config.insert(key, vec![(*url).to_string()]);
             repo::write_config(ctx, &file, &config).map_or(1, |()| 0)
         }
         _ => usage(
@@ -233,27 +305,27 @@ pub(crate) fn git_remote(
     }
 }
 
-fn remotes(config: &BTreeMap<String, String>) -> Vec<(String, String)> {
+fn remotes(config: &Config) -> Vec<(String, String)> {
     config
         .iter()
-        .filter_map(|(key, value)| {
+        .filter_map(|(key, values)| {
             let name = key.strip_prefix("remote.")?.strip_suffix(".url")?;
-            Some((name.to_string(), value.clone()))
+            Some((name.to_string(), values.last()?.clone()))
         })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::commands::git::repo::{parse_config, serialize_config};
+    use crate::commands::git::repo::{config_value, parse_config, serialize_config};
 
     #[test]
     fn reads_and_writes_git_ini_format() {
         let text = "[user]\n\tname = Ada\n\temail = ada@example.com\n[remote \"origin\"]\n\turl = https://example.com/r.git\n";
         let config = parse_config(text);
-        assert_eq!(config.get("user.name").map(String::as_str), Some("Ada"));
+        assert_eq!(config_value(&config, "user.name"), Some("Ada"));
         assert_eq!(
-            config.get("remote.origin.url").map(String::as_str),
+            config_value(&config, "remote.origin.url"),
             Some("https://example.com/r.git")
         );
         // Serialization groups by section in sorted order, which keeps output deterministic.
@@ -270,6 +342,6 @@ mod tests {
     #[test]
     fn accepts_comments_and_bare_boolean_keys() {
         let config = parse_config("# a comment\n[core]\n\tbare\n; another\n");
-        assert_eq!(config.get("core.bare").map(String::as_str), Some("true"));
+        assert_eq!(config_value(&config, "core.bare"), Some("true"));
     }
 }

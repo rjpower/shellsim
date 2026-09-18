@@ -31,7 +31,7 @@ pub(crate) struct Edit<'a> {
 }
 
 /// Split content into lines that keep their trailing newline.
-fn split_lines(data: &[u8]) -> Vec<&str> {
+pub(crate) fn split_lines(data: &[u8]) -> Vec<&str> {
     let text = std::str::from_utf8(data).unwrap_or("");
     text.split_inclusive('\n').collect()
 }

@@ -29,6 +29,14 @@ pub(crate) const DEFAULT_BRANCH: &str = "main";
 /// A staged or committed tree: repository-relative path to blob hash.
 pub(crate) type Tree = BTreeMap<String, String>;
 
+/// Configuration: dotted lowercase key to every value recorded for it, in file order.
+pub(crate) type Config = BTreeMap<String, Vec<String>>;
+
+/// The value a plain `git config <key>` read returns, which is the last one recorded.
+pub(crate) fn config_value<'a>(config: &'a Config, key: &str) -> Option<&'a str> {
+    config.get(key)?.last().map(String::as_str)
+}
+
 /// The most files one command will examine in a working tree.
 const MAX_WORKING_FILES: u64 = 100_000;
 
@@ -632,10 +640,11 @@ fn resolve_base_revision(interp: &Interp, root: &str, revision: &str) -> Option<
 /// Read one configuration file in Git's INI format.
 ///
 /// Keys are normalized to the lowercase dotted form Git uses on the command line, so
-/// `[remote "origin"] url = X` becomes `remote.origin.url`. Includes, conditional includes,
-/// multi-valued keys, and value continuations are out of scope.
-pub(crate) fn parse_config(text: &str) -> BTreeMap<String, String> {
-    let mut config = BTreeMap::new();
+/// `[remote "origin"] url = X` becomes `remote.origin.url`. A key may appear more than once, and
+/// its values are kept in file order; the last one is what a plain read returns. Includes,
+/// conditional includes, and value continuations are out of scope.
+pub(crate) fn parse_config(text: &str) -> Config {
+    let mut config = Config::new();
     let mut prefix = String::new();
     for line in text.lines() {
         let line = line.trim();
@@ -658,10 +667,10 @@ pub(crate) fn parse_config(text: &str) -> BTreeMap<String, String> {
         }
         let Some((key, value)) = line.split_once('=') else {
             // A bare key is Git's shorthand for a true boolean.
-            config.insert(
-                format!("{prefix}{}", line.to_ascii_lowercase()),
-                "true".to_string(),
-            );
+            config
+                .entry(format!("{prefix}{}", line.to_ascii_lowercase()))
+                .or_default()
+                .push("true".to_string());
             continue;
         };
         if config.len() >= 256 {
@@ -672,25 +681,27 @@ pub(crate) fn parse_config(text: &str) -> BTreeMap<String, String> {
             .strip_prefix('"')
             .and_then(|rest| rest.strip_suffix('"'))
             .unwrap_or(value);
-        config.insert(
-            format!("{prefix}{}", key.trim().to_ascii_lowercase()),
-            value.to_string(),
-        );
+        config
+            .entry(format!("{prefix}{}", key.trim().to_ascii_lowercase()))
+            .or_default()
+            .push(value.to_string());
     }
     config
 }
 
 /// Render configuration back to Git's INI format.
-pub(crate) fn serialize_config(config: &BTreeMap<String, String>) -> Vec<u8> {
+pub(crate) fn serialize_config(config: &Config) -> Vec<u8> {
     let mut out = String::new();
     let mut current = String::new();
-    for (key, value) in config {
+    for (key, values) in config {
         let (heading, name) = split_config_key(key);
         if heading != current {
             out.push_str(&format!("[{heading}]\n"));
             current = heading;
         }
-        out.push_str(&format!("\t{name} = {value}\n"));
+        for value in values {
+            out.push_str(&format!("\t{name} = {value}\n"));
+        }
     }
     out.into_bytes()
 }
@@ -711,7 +722,7 @@ pub(crate) fn global_config_path(interp: &Interp) -> String {
     path_join(&home, ".gitconfig")
 }
 
-fn read_config_file(ctx: &mut CommandContext<'_>, path: &str) -> BTreeMap<String, String> {
+fn read_config_file(ctx: &mut CommandContext<'_>, path: &str) -> Config {
     ctx.fs_read_limited("/", path, 256 * 1024)
         .ok()
         .map(|bytes| parse_config(&String::from_utf8_lossy(&bytes)))
@@ -719,12 +730,12 @@ fn read_config_file(ctx: &mut CommandContext<'_>, path: &str) -> BTreeMap<String
 }
 
 /// Repository-local configuration.
-pub(crate) fn load_config(ctx: &mut CommandContext<'_>, root: &str) -> BTreeMap<String, String> {
+pub(crate) fn load_config(ctx: &mut CommandContext<'_>, root: &str) -> Config {
     read_config_file(ctx, &git_path(root, CONFIG))
 }
 
 /// Per-user configuration, which the repository's own settings override.
-pub(crate) fn load_global_config(ctx: &mut CommandContext<'_>) -> BTreeMap<String, String> {
+pub(crate) fn load_global_config(ctx: &mut CommandContext<'_>) -> Config {
     let path = global_config_path(ctx);
     read_config_file(ctx, &path)
 }
@@ -742,7 +753,7 @@ pub(crate) fn valid_config_key(key: &str) -> bool {
 pub(crate) fn write_config(
     ctx: &mut CommandContext<'_>,
     path: &str,
-    config: &BTreeMap<String, String>,
+    config: &Config,
 ) -> VfsResult<()> {
     write_vfs(ctx, path, &serialize_config(config))
 }

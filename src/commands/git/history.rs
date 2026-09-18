@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use crate::commands::{CommandContext, Io};
 
 use super::compare::{self, Format, Options, RightSide};
+use super::diff;
 use super::repo::{self, Commit, Tree};
 use super::worktree;
 use super::{repo_error, usage, Globals};
@@ -710,6 +711,11 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     let mut no_merges = false;
     let mut abbreviate = false;
     let mut author_filter: Option<String> = None;
+    let mut message_filter: Option<String> = None;
+    let mut ignore_case = false;
+    // `-S` counts occurrences of a literal string; `-G` matches the changed lines as a regex.
+    let mut pickaxe: Option<String> = None;
+    let mut changed_lines: Option<String> = None;
     let mut patch = None;
     let mut stat = None;
     let mut paths: Vec<String> = Vec::new();
@@ -740,6 +746,33 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
                 };
                 limit = value;
             }
+            "-i" | "--regexp-ignore-case" => ignore_case = true,
+            "--grep" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return usage(io, "--grep requires a pattern");
+                };
+                message_filter = Some(value.clone());
+            }
+            "--author" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return usage(io, "--author requires a pattern");
+                };
+                author_filter = Some(value.clone());
+            }
+            "-S" | "-G" => {
+                let option = argument.to_string();
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return usage(io, &format!("{option} requires a string"));
+                };
+                if option == "-S" {
+                    pickaxe = Some(value.clone());
+                } else {
+                    changed_lines = Some(value.clone());
+                }
+            }
             "--stat" => stat = Some(Format::Stat),
             "--name-only" => stat = Some(Format::NameOnly),
             "--name-status" => stat = Some(Format::NameStatus),
@@ -752,6 +785,15 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             }
             value if value.starts_with("--author=") => {
                 author_filter = Some(value["--author=".len()..].to_string());
+            }
+            value if value.starts_with("--grep=") => {
+                message_filter = Some(value["--grep=".len()..].to_string());
+            }
+            value if value.starts_with("-S") && value.len() > 2 => {
+                pickaxe = Some(value[2..].to_string());
+            }
+            value if value.starts_with("-G") && value.len() > 2 => {
+                changed_lines = Some(value[2..].to_string());
             }
             value if value.starts_with("--max-count=") => {
                 let Ok(value) = value["--max-count=".len()..].parse() else {
@@ -824,10 +866,37 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     if no_merges {
         history.retain(|(_, commit)| commit.parents.len() < 2);
     }
-    if let Some(author) = &author_filter {
+    for (pattern, over_author) in [(&author_filter, true), (&message_filter, false)] {
+        let Some(pattern) = pattern else { continue };
+        let Ok(regex) = regex::RegexBuilder::new(pattern)
+            .case_insensitive(ignore_case)
+            .build()
+        else {
+            io.err
+                .extend_from_slice(format!("fatal: invalid pattern: {pattern}\n").as_bytes());
+            return 128;
+        };
         history.retain(|(_, commit)| {
-            commit.author_name.contains(author) || commit.author_email.contains(author)
+            if over_author {
+                regex.is_match(&commit.author_name) || regex.is_match(&commit.author_email)
+            } else {
+                regex.is_match(&commit.message)
+            }
         });
+    }
+    if let Some(needle) = &pickaxe {
+        history.retain(|(id, commit)| changes_occurrence_count(ctx, &root, id, commit, needle));
+    }
+    if let Some(pattern) = &changed_lines {
+        let Ok(regex) = regex::RegexBuilder::new(pattern)
+            .case_insensitive(ignore_case)
+            .build()
+        else {
+            io.err
+                .extend_from_slice(format!("fatal: invalid pattern: {pattern}\n").as_bytes());
+            return 128;
+        };
+        history.retain(|(id, commit)| matches_changed_lines(ctx, &root, id, commit, &regex));
     }
     if !paths.is_empty() {
         history.retain(|(id, commit)| commit_touches(ctx, &root, id, commit, &paths));
@@ -906,6 +975,73 @@ fn commit_touches(
     names
         .iter()
         .any(|path| tree.get(path) != parent.get(path) && compare::selected(paths, path))
+}
+
+/// The blob pair a commit changed for each path, against its first parent.
+fn changed_blobs(
+    ctx: &CommandContext<'_>,
+    root: &str,
+    id: &str,
+    commit: &Commit,
+) -> Vec<(Option<String>, Option<String>)> {
+    let tree = repo::commit_tree(ctx, root, id).unwrap_or_default();
+    let parent = commit
+        .parents
+        .first()
+        .and_then(|parent| repo::commit_tree(ctx, root, parent))
+        .unwrap_or_default();
+    let mut names: BTreeSet<String> = tree.keys().cloned().collect();
+    names.extend(parent.keys().cloned());
+    names
+        .into_iter()
+        .filter(|path| tree.get(path) != parent.get(path))
+        .map(|path| (parent.get(&path).cloned(), tree.get(&path).cloned()))
+        .collect()
+}
+
+/// Whether a commit changed how many times `needle` appears, which is what `git log -S` selects.
+fn changes_occurrence_count(
+    ctx: &CommandContext<'_>,
+    root: &str,
+    id: &str,
+    commit: &Commit,
+    needle: &str,
+) -> bool {
+    let occurrences = |hash: Option<String>| -> usize {
+        let Some(data) = hash.and_then(|hash| repo::read_blob(ctx, root, &hash)) else {
+            return 0;
+        };
+        if needle.is_empty() {
+            return 0;
+        }
+        String::from_utf8_lossy(&data).matches(needle).count()
+    };
+    changed_blobs(ctx, root, id, commit)
+        .into_iter()
+        .any(|(before, after)| occurrences(before) != occurrences(after))
+}
+
+/// Whether any line a commit added or removed matches `regex`, which is what `git log -G` selects.
+fn matches_changed_lines(
+    ctx: &CommandContext<'_>,
+    root: &str,
+    id: &str,
+    commit: &Commit,
+    regex: &regex::Regex,
+) -> bool {
+    changed_blobs(ctx, root, id, commit)
+        .into_iter()
+        .any(|(before, after)| {
+            let read = |hash: Option<String>| {
+                hash.and_then(|hash| repo::read_blob(ctx, root, &hash))
+                    .unwrap_or_default()
+            };
+            let before = read(before);
+            let after = read(after);
+            diff::edit_script(&diff::split_lines(&before), &diff::split_lines(&after))
+                .iter()
+                .any(|edit| !matches!(edit.op, diff::Op::Keep) && regex.is_match(edit.text))
+        })
 }
 
 /// Render one commit's difference against its first parent.
@@ -1382,8 +1518,33 @@ fn list_branches(
         Some(repo::ancestors(ctx, root, &commit))
     });
     let current = repo::current_branch(ctx, root);
+    // A detached HEAD is listed first, as the checked-out "branch" it stands in for.
+    let detached = match (&current, repo::head_commit(ctx, root)) {
+        (None, Some(commit)) => Some(format!("(HEAD detached at {})", repo::short(&commit))),
+        _ => None,
+    };
     let branches = repo::branch_names(ctx, root);
-    let width = branches.iter().map(String::len).max().unwrap_or(0);
+    let width = branches
+        .iter()
+        .map(String::len)
+        .chain(detached.iter().map(String::len))
+        .max()
+        .unwrap_or(0);
+    if let Some(label) = &detached {
+        if pattern.is_none() {
+            if verbose {
+                let commit = repo::head_commit(ctx, root).unwrap_or_default();
+                let subject = repo::load_commit(ctx, root, &commit)
+                    .map(|commit| commit.subject().to_string())
+                    .unwrap_or_default();
+                io.out.extend_from_slice(
+                    format!("* {label:width$} {} {subject}\n", repo::short(&commit)).as_bytes(),
+                );
+            } else {
+                io.out.extend_from_slice(format!("* {label}\n").as_bytes());
+            }
+        }
+    }
     for branch in branches {
         if let Some(pattern) = pattern {
             if !crate::commands::util::glob_eq(pattern, &branch) {

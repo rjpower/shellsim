@@ -129,7 +129,7 @@ pub(crate) fn apply_unified_diff(
     for argument in args {
         match argument.as_str() {
             "--check" | "--summary" | "--stat" => check = true,
-            "-v" | "--verbose" | "--index" | "--cached" | "--3way" | "--whitespace=nowarn" => {}
+            "-v" | "--verbose" | "--3way" | "--whitespace=nowarn" => {}
             value if value.starts_with("-p") || value.starts_with("--unsafe-paths") => {
                 forwarded.insert(0, value.to_string());
             }
@@ -144,10 +144,31 @@ pub(crate) fn apply_unified_diff(
     }
     let cwd = ctx.cwd.clone();
     let before = check.then(|| ctx.vfs.clone());
-    let status = run_patch(ctx, &forwarded, io, false, &cwd);
+    // A failure is reported in Git's words, since that is what callers match on.
+    let mut errors = Vec::new();
+    let status = {
+        let mut inner = Io {
+            stdin: std::mem::take(&mut io.stdin),
+            out: io.out,
+            err: &mut errors,
+        };
+        let status = run_patch(ctx, &forwarded, &mut inner, false, &cwd);
+        io.stdin = std::mem::take(&mut inner.stdin);
+        status
+    };
     if let Some(before) = before {
         ctx.vfs = before;
     }
+    if status == 0 {
+        io.err.extend_from_slice(&errors);
+        return 0;
+    }
+    for line in String::from_utf8_lossy(&errors).lines() {
+        let message = line.strip_prefix("patch: ").unwrap_or(line);
+        io.err
+            .extend_from_slice(format!("error: {message}\n").as_bytes());
+    }
+    io.err.extend_from_slice(b"error: patch does not apply\n");
     status
 }
 

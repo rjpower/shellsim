@@ -1088,3 +1088,182 @@ fn unknown_subcommands_are_reported_the_way_git_reports_them() {
         omitted.2
     );
 }
+
+#[test]
+fn log_filters_by_message_author_and_content() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/a.txt", b"alpha\nbeta\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m 'add alpha'").0, 0);
+    env.vfs
+        .put_file("/a.txt", b"alpha\ngamma\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m 'swap beta'").0, 0);
+    env.vfs
+        .put_file("/a.txt", b"delta\ngamma\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m 'drop alpha'").0, 0);
+
+    assert_eq!(
+        run(&mut env, "git log --grep=alpha --format=%s").1,
+        "drop alpha\nadd alpha\n"
+    );
+    assert_eq!(
+        run(&mut env, "git log -i --grep=ALPHA --format=%s").1,
+        "drop alpha\nadd alpha\n"
+    );
+    // `-S` selects commits that changed how often the string occurs.
+    assert_eq!(
+        run(&mut env, "git log -S alpha --format=%s").1,
+        "drop alpha\nadd alpha\n"
+    );
+    // `-G` selects commits with a matching changed line.
+    assert_eq!(
+        run(&mut env, "git log -G 'beta|gamma' --format=%s").1,
+        "swap beta\nadd alpha\n"
+    );
+    assert_eq!(run(&mut env, "git log --author nobody --format=%s").1, "");
+}
+
+#[test]
+fn configuration_keeps_every_value_and_expands_aliases() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+
+    assert_eq!(run(&mut env, "git config --add fetch.refspec one").0, 0);
+    assert_eq!(run(&mut env, "git config --add fetch.refspec two").0, 0);
+    assert_eq!(
+        run(&mut env, "git config --get-all fetch.refspec").1,
+        "one\ntwo\n"
+    );
+    // A plain read returns the last value, and a plain write replaces every value.
+    assert_eq!(run(&mut env, "git config fetch.refspec").1, "two\n");
+    assert_eq!(run(&mut env, "git config fetch.refspec only").0, 0);
+    assert_eq!(
+        run(&mut env, "git config --get-all fetch.refspec").1,
+        "only\n"
+    );
+
+    assert_eq!(run(&mut env, "git config core.bare").1, "false\n");
+    assert_eq!(
+        run(&mut env, "git config --type=bool core.bare").1,
+        "false\n"
+    );
+    assert!(run(&mut env, "git config --show-origin core.bare")
+        .1
+        .starts_with("file:"));
+
+    env.vfs
+        .put_file("/note.txt", b"one\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git config alias.st 'status --short'").0, 0);
+    assert_eq!(run(&mut env, "git st").1, "?? note.txt\n");
+}
+
+#[test]
+fn apply_can_record_a_patch_in_the_index() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"a\nb\nc\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"a\nB\nc\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(
+        run(&mut env, "git diff > /p.diff; git checkout -- f.txt").0,
+        0
+    );
+
+    // `--cached` patches the index and leaves the working tree alone.
+    assert_eq!(run(&mut env, "git apply --cached /p.diff").0, 0);
+    assert_eq!(
+        run(&mut env, "git status --short").1,
+        "MM f.txt\n?? p.diff\n"
+    );
+    assert_eq!(env.vfs.read("/", "/f.txt").unwrap(), b"a\nb\nc\n");
+
+    assert_eq!(run(&mut env, "git reset -q").0, 0);
+    // `--index` patches both.
+    assert_eq!(run(&mut env, "git apply --index /p.diff").0, 0);
+    assert_eq!(
+        run(&mut env, "git status --short").1,
+        "M  f.txt\n?? p.diff\n"
+    );
+    assert_eq!(env.vfs.read("/", "/f.txt").unwrap(), b"a\nB\nc\n");
+
+    // A patch that no longer applies says so in Git's words and changes nothing.
+    let refused = run(&mut env, "git apply /p.diff");
+    assert_eq!(refused.0, 1);
+    assert!(refused.2.contains("patch does not apply"), "{}", refused.2);
+}
+
+#[test]
+fn status_names_paths_relative_to_the_working_directory() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    env.vfs
+        .put_file("/sub/b.txt", b"b\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    env.vfs
+        .put_file("/a.txt", b"edited\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/sub/b.txt", b"edited\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/new.txt", b"n\n".to_vec(), 0o644)
+        .unwrap();
+
+    assert_eq!(
+        run(&mut env, "(cd sub && git status --short)").1,
+        " M ../a.txt\n M b.txt\n?? ../new.txt\n"
+    );
+}
+
+#[test]
+fn branch_listing_shows_a_detached_head() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    env.vfs.put_file("/a.txt", b"b\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git commit -a -m two").0, 0);
+    let head = run(&mut env, "git rev-parse HEAD~1").1.trim().to_string();
+
+    assert_eq!(run(&mut env, "git checkout -q HEAD~1").0, 0);
+    assert_eq!(
+        run(&mut env, "git branch").1,
+        format!("* (HEAD detached at {})\n  main\n", &head[..7])
+    );
+}
+
+#[test]
+fn quiet_suppresses_the_report_but_not_the_diagnostic() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -q -m one").0, 0);
+    assert_eq!(run(&mut env, "git branch side").0, 0);
+
+    let switched = run(&mut env, "git checkout -q side");
+    assert_eq!(
+        (switched.0, switched.1.as_str(), switched.2.as_str()),
+        (0, "", "")
+    );
+    let created = run(&mut env, "git switch -q -c other");
+    assert_eq!(
+        (created.0, created.1.as_str(), created.2.as_str()),
+        (0, "", "")
+    );
+
+    // A failure still explains itself.
+    let missing = run(&mut env, "git checkout -q nonexistent");
+    assert_eq!(missing.0, 1);
+    assert!(missing.2.contains("did not match"), "{}", missing.2);
+}
