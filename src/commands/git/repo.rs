@@ -611,6 +611,24 @@ pub(crate) fn update_head(
 ///
 /// Git writes `ORIG_HEAD` for reset, merge, rebase and the like, which is what makes
 /// `git reset --hard ORIG_HEAD` the usual way to undo one.
+/// Split a `REVISION:PATH` operand into the tree it names and the path within it.
+///
+/// An empty revision names the index, so `:file` and `:0:file` read what is staged rather than
+/// what is committed, as they do in Git.
+pub(crate) fn tree_and_path(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    operand: &str,
+) -> Option<(Tree, String)> {
+    let (revision, path) = operand.split_once(':')?;
+    if revision.is_empty() {
+        let path = path.strip_prefix("0:").unwrap_or(path);
+        return Some((load_index(ctx, root).unwrap_or_default(), path.to_string()));
+    }
+    let commit = resolve_revision(ctx, root, revision)?;
+    Some((commit_tree(ctx, root, &commit)?, path.to_string()))
+}
+
 pub(crate) fn record_orig_head(ctx: &mut CommandContext<'_>, root: &str) {
     if let Some(commit) = head_commit(ctx, root) {
         let _ = write_reference(ctx, root, "ORIG_HEAD", &commit);

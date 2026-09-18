@@ -1049,7 +1049,7 @@ fn checkout_keeps_edits_to_files_the_move_does_not_touch() {
 }
 
 #[test]
-fn stash_reapply_merges_and_marks_what_it_cannot_settle() {
+fn stash_reapply_refuses_to_write_over_an_uncommitted_edit() {
     let mut env = Environment::new();
     assert_eq!(run(&mut env, "git init -q").0, 0);
     env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
@@ -1060,18 +1060,22 @@ fn stash_reapply_merges_and_marks_what_it_cannot_settle() {
     assert_eq!(run(&mut env, "git stash push -q -m saved").0, 0);
     assert_eq!(run(&mut env, "git stash push -q -m saved").1, "");
 
+    // The entry and the working file are two versions that nothing has recorded, and the file can
+    // only hold one. Git refuses rather than pick, and leaves the working file alone.
     env.vfs
         .put_file("/a.txt", b"conflict\n".to_vec(), 0o644)
         .unwrap();
-    let marked = run(&mut env, "git stash pop");
-    assert_eq!(marked.0, 1);
-    assert!(marked.2.contains("Merge conflict in a.txt"), "{}", marked.2);
-    assert_eq!(
-        String::from_utf8(env.vfs.read("/", "/a.txt").unwrap()).unwrap(),
-        "<<<<<<< Updated upstream\nconflict\n=======\nstashed\n>>>>>>> Stashed changes\n"
+    let refused = run(&mut env, "git stash pop");
+    assert_eq!(refused.0, 1);
+    assert!(
+        refused.2.starts_with(
+            "error: Your local changes to the following files would be overwritten by merge:\n\ta.txt\n"
+        ),
+        "{}",
+        refused.2
     );
-    assert_eq!(run(&mut env, "git status --short").1, "UU a.txt\n");
-    // The entry survives a reapplication that did not finish.
+    assert_eq!(env.vfs.read("/", "/a.txt").unwrap(), b"conflict\n");
+    // The entry survives a reapplication that did not happen.
     assert!(run(&mut env, "git stash list").1.contains("saved"));
 }
 
@@ -2624,4 +2628,68 @@ fn an_untracked_file_set_aside_comes_back_untracked() {
     );
     // Nothing was staged, so a sweeping commit does not pick the scratch files up.
     assert_eq!(run(&mut env, "git commit -qam next").0, 1);
+}
+
+#[test]
+fn a_replay_of_several_commits_carries_on_past_a_conflict() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'a\\n' > f.txt; git add -A; git commit -qm c1; \
+                 git switch -qc feat; printf 'FEAT\\n' > f.txt; git add -A; git commit -qm p1; \
+                 echo second > second.txt; git add -A; git commit -qm p2; \
+                 git switch -q main; printf 'MAIN\\n' > f.txt; git add -A; git commit -qm m1";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    assert_eq!(run(&mut env, "git cherry-pick feat~1 feat").0, 1);
+    assert_eq!(run(&mut env, "printf 'RES\\n' > f.txt; git add f.txt").0, 0);
+    let finished = run(&mut env, "git cherry-pick --continue");
+    assert_eq!(finished.0, 0, "{}", finished.2);
+    // The second commit of the list is applied rather than silently dropped.
+    assert_eq!(
+        run(&mut env, "git log --format=%s | tr '\\n' ' '").1,
+        "p2 p1 m1 c1 "
+    );
+    assert_eq!(run(&mut env, "cat second.txt").1, "second\n");
+    assert_eq!(run(&mut env, "git status --short").1, "");
+}
+
+#[test]
+fn abandoning_a_replay_undoes_the_commits_it_already_made() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'a\\n' > f.txt; git add -A; git commit -qm c1; \
+                 git switch -qc feat; echo first > one.txt; git add -A; git commit -qm p1; \
+                 printf 'FEAT\\n' > f.txt; git add -A; git commit -qm p2; \
+                 git switch -q main; printf 'MAIN\\n' > f.txt; git add -A; git commit -qm m1";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    assert_eq!(run(&mut env, "git cherry-pick feat~1 feat").0, 1);
+    assert_eq!(
+        run(&mut env, "git log --format=%s | tr '\\n' ' '").1,
+        "p1 m1 c1 "
+    );
+
+    assert_eq!(run(&mut env, "git cherry-pick --abort").0, 0);
+    assert_eq!(
+        run(&mut env, "git log --format=%s | tr '\\n' ' '").1,
+        "m1 c1 "
+    );
+    assert_eq!(run(&mut env, "git status --short").1, "");
+    assert_eq!(run(&mut env, "test -e one.txt; echo $?").1, "1\n");
+}
+
+#[test]
+fn an_empty_revision_names_what_is_staged() {
+    let mut env = Environment::new();
+    let setup = "git init -q; echo V1 > a.txt; git add -A; git commit -qm c1; \
+                 echo V2 > a.txt; git add a.txt; echo V3 > a.txt";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    assert_eq!(run(&mut env, "git show :a.txt").1, "V2\n");
+    assert_eq!(run(&mut env, "git show :0:a.txt").1, "V2\n");
+    assert_eq!(run(&mut env, "git cat-file -p :a.txt").1, "V2\n");
+    assert_eq!(run(&mut env, "git show HEAD:a.txt").1, "V1\n");
+    assert_eq!(run(&mut env, "cat a.txt").1, "V3\n");
+    assert_ne!(
+        run(&mut env, "git rev-parse :a.txt").1,
+        run(&mut env, "git rev-parse HEAD:a.txt").1
+    );
 }

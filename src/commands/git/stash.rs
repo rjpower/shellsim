@@ -324,6 +324,30 @@ fn apply(
             return 1;
         }
     }
+    // A file the entry would change that the working tree has already moved away from has two
+    // unrecorded versions and room for one. Git refuses rather than choose, and so does this.
+    let index = repo::load_index(ctx, root).unwrap_or_default();
+    let doomed: Vec<String> = work
+        .keys()
+        .chain(base.keys())
+        .filter(|path| work.get(*path) != base.get(*path) && mine.get(*path) != index.get(*path))
+        .cloned()
+        .collect::<std::collections::BTreeSet<String>>()
+        .into_iter()
+        .collect();
+    if !doomed.is_empty() {
+        io.err.extend_from_slice(
+            b"error: Your local changes to the following files would be overwritten by merge:\n",
+        );
+        for path in doomed {
+            io.err.extend_from_slice(format!("\t{path}\n").as_bytes());
+        }
+        io.err.extend_from_slice(
+            b"Please commit your changes or stash them before you merge.\nAborting\n\
+              The stash entry is kept in case you need it again.\n",
+        );
+        return 1;
+    }
     let combined = conflict::combine(
         ctx,
         root,

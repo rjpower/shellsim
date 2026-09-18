@@ -1415,13 +1415,13 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
     }
     for revision in &revisions {
         // `REVISION:PATH` prints one file's contents at that revision.
-        if let Some((prefix, path)) = revision.split_once(':') {
-            let Some(commit) = repo::resolve_revision(ctx, &root, prefix) else {
+        if revision.contains(':') {
+            let prefix = revision.split(':').next().unwrap_or_default().to_string();
+            let Some((tree, path)) = repo::tree_and_path(ctx, &root, revision) else {
                 return super::ambiguous_argument(io, revision);
             };
-            let tree = repo::commit_tree(ctx, &root, &commit).unwrap_or_default();
             let Some(data) = tree
-                .get(path)
+                .get(&path)
                 .and_then(|entry| repo::read_blob(ctx, &root, &entry.hash))
             else {
                 io.err.extend_from_slice(
@@ -1610,13 +1610,12 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
 
 /// Resolve one `rev-parse` operand, which may name a commit, a tree, or a blob.
 fn rev_parse_object(ctx: &mut CommandContext<'_>, root: &str, revision: &str) -> Option<String> {
-    if let Some((base, path)) = revision.split_once(':') {
-        let commit = repo::resolve_revision(ctx, root, base)?;
-        let tree = repo::commit_tree(ctx, root, &commit)?;
+    if revision.contains(':') {
+        let (tree, path) = repo::tree_and_path(ctx, root, revision)?;
         if path.is_empty() {
             return Some(repo::tree_hash(&tree));
         }
-        return tree.get(path).map(|entry| entry.hash.clone());
+        return tree.get(&path).map(|entry| entry.hash.clone());
     }
     if let Some(base) = revision.strip_suffix("^{tree}") {
         let commit = repo::resolve_revision(ctx, root, base)?;
@@ -2910,10 +2909,24 @@ pub(crate) fn git_replay(
         match argument.as_str() {
             "-n" | "--no-commit" => no_commit = true,
             "-e" | "--edit" | "--no-edit" | "-q" | "--quiet" => {}
-            // With one commit in flight there is nothing left to resume after skipping it, so
-            // skipping and abandoning come to the same thing here.
-            "--abort" | "--quit" | "--skip" => return abort_pending(ctx, &root, name, io),
-            "--continue" => return continue_pending(ctx, &root, globals, name, io),
+            "--abort" | "--quit" => return abort_sequence(ctx, &root, name, io),
+            // Skipping abandons the commit in flight, then the rest of the list carries on.
+            "--skip" => {
+                let status = abort_pending(ctx, &root, name, io);
+                return if status == 0 {
+                    resume_sequence(ctx, globals, &root, name, io)
+                } else {
+                    status
+                };
+            }
+            "--continue" => {
+                let status = continue_pending(ctx, &root, globals, name, io);
+                return if status == 0 {
+                    resume_sequence(ctx, globals, &root, name, io)
+                } else {
+                    status
+                };
+            }
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported {name} option: {value}"))
             }
@@ -2923,12 +2936,157 @@ pub(crate) fn git_replay(
     if operands.is_empty() {
         return usage(io, &format!("usage: git {name} [-n] COMMIT..."));
     }
+    let Some(original) = repo::head_commit(ctx, &root) else {
+        io.err
+            .extend_from_slice(format!("fatal: {name} needs a commit to apply onto\n").as_bytes());
+        return 128;
+    };
+    let mut todo = Vec::new();
     for revision in &operands {
-        let status = replay_one(ctx, globals, &root, name, revert, no_commit, revision, io);
+        let Some(id) = repo::resolve_revision(ctx, &root, revision) else {
+            io.err
+                .extend_from_slice(format!("fatal: bad revision '{revision}'\n").as_bytes());
+            return 128;
+        };
+        todo.push(id);
+    }
+    run_sequence(
+        ctx,
+        globals,
+        &root,
+        name,
+        Sequence {
+            revert,
+            no_commit,
+            original,
+            todo,
+        },
+        io,
+    )
+}
+
+/// What a `git cherry-pick A B C` still has to replay, so a conflict does not lose the rest.
+struct Sequence {
+    revert: bool,
+    no_commit: bool,
+    /// Where HEAD was before the first commit was replayed, which `--abort` returns to.
+    original: String,
+    /// The commits left to apply, oldest first.
+    todo: Vec<String>,
+}
+
+const SEQUENCER: &str = "SEQUENCER";
+
+fn load_sequence(interp: &crate::interp::Interp, root: &str) -> Option<Sequence> {
+    let bytes = interp
+        .vfs
+        .read("/", &repo::git_path(root, SEQUENCER))
+        .ok()?;
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let mut sequence = Sequence {
+        revert: false,
+        no_commit: false,
+        original: String::new(),
+        todo: Vec::new(),
+    };
+    for line in text.lines() {
+        match line.split_once(' ') {
+            Some(("revert", value)) => sequence.revert = value == "1",
+            Some(("nocommit", value)) => sequence.no_commit = value == "1",
+            Some(("orig", value)) => sequence.original = value.to_string(),
+            Some(("todo", value)) => sequence.todo.push(value.to_string()),
+            _ => {}
+        }
+    }
+    (!sequence.original.is_empty()).then_some(sequence)
+}
+
+fn store_sequence(ctx: &mut CommandContext<'_>, root: &str, sequence: &Sequence) -> bool {
+    let mut text = format!(
+        "revert {}\nnocommit {}\norig {}\n",
+        u8::from(sequence.revert),
+        u8::from(sequence.no_commit),
+        sequence.original
+    );
+    for id in &sequence.todo {
+        text.push_str(&format!("todo {id}\n"));
+    }
+    repo::write_vfs(ctx, &repo::git_path(root, SEQUENCER), text.as_bytes()).is_ok()
+}
+
+fn clear_sequence(ctx: &mut CommandContext<'_>, root: &str) {
+    let _ = ctx.vfs.remove_file("/", &repo::git_path(root, SEQUENCER));
+}
+
+/// Replay each commit in turn, remembering what is left if one of them stops.
+fn run_sequence(
+    ctx: &mut CommandContext<'_>,
+    globals: &Globals,
+    root: &str,
+    name: &str,
+    mut sequence: Sequence,
+    io: &mut Io,
+) -> i32 {
+    while !sequence.todo.is_empty() {
+        let id = sequence.todo.remove(0);
+        let status = replay_one(
+            ctx,
+            globals,
+            root,
+            name,
+            sequence.revert,
+            sequence.no_commit,
+            &id,
+            io,
+        );
         if status != 0 {
+            store_sequence(ctx, root, &sequence);
             return status;
         }
     }
+    clear_sequence(ctx, root);
+    0
+}
+
+/// Carry on with the commits a stopped cherry-pick or revert had left.
+fn resume_sequence(
+    ctx: &mut CommandContext<'_>,
+    globals: &Globals,
+    root: &str,
+    name: &str,
+    io: &mut Io,
+) -> i32 {
+    match load_sequence(ctx, root) {
+        Some(sequence) => run_sequence(ctx, globals, root, name, sequence, io),
+        None => 0,
+    }
+}
+
+/// Abandon the whole sequence, putting the branch back where it started.
+fn abort_sequence(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut Io) -> i32 {
+    let Some(sequence) = load_sequence(ctx, root) else {
+        return abort_pending(ctx, root, name, io);
+    };
+    let head = repo::head_tree(ctx, root);
+    let target = repo::commit_tree(ctx, root, &sequence.original).unwrap_or_default();
+    let mut previous = repo::load_index(ctx, root).unwrap_or_default();
+    for (path, entry) in &head {
+        previous
+            .entry(path.clone())
+            .or_insert_with(|| entry.clone());
+    }
+    if let Err(error) = repo::replace_work_tree(ctx, root, &previous, &target) {
+        io.err
+            .extend_from_slice(format!("git {name}: {error}\n").as_bytes());
+        return 1;
+    }
+    if repo::store_index(ctx, root, &target).is_err()
+        || repo::update_head(ctx, root, &sequence.original, &format!("{name}: aborted")).is_err()
+    {
+        return 1;
+    }
+    conflict::clear(ctx, root);
+    clear_sequence(ctx, root);
     0
 }
 

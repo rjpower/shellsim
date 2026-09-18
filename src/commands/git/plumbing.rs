@@ -36,11 +36,10 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         return usage(io, "usage: git cat-file (-p|-t|-s|-e) OBJECT");
     };
     // An object is either a blob hash or a revision, optionally with a `:PATH` suffix.
-    let blob = match object.split_once(':') {
-        Some((revision, path)) => repo::resolve_revision(ctx, &root, revision)
-            .and_then(|commit| repo::commit_tree(ctx, &root, &commit))
-            .and_then(|tree| tree.get(path).map(|entry| entry.hash.clone())),
-        None => Some(object.clone()),
+    let blob = match object.contains(':') {
+        true => repo::tree_and_path(ctx, &root, &object)
+            .and_then(|(tree, path)| tree.get(&path).map(|entry| entry.hash.clone())),
+        false => Some(object.clone()),
     };
     if let Some(data) = blob
         .as_deref()
