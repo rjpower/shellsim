@@ -2101,16 +2101,30 @@ pub(crate) fn git_tag(
 /// The tracked paths that differ from HEAD, which is what blocks a branch switch.
 ///
 /// Untracked files never block a switch, so they are not considered here.
-pub(crate) fn blocking_changes(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    target: &repo::Tree,
-) -> Vec<String> {
+/// HEAD, the index and the working tree, read once.
+///
+/// Every question a move has to answer — what would be overwritten, what is only staged, which
+/// untracked files are in the way — compares these three trees, and walking and re-hashing the
+/// working tree for each question costs the same again.
+pub(crate) struct Snapshot {
+    pub head: Tree,
+    pub index: Tree,
+    pub work: Tree,
+}
+
+pub(crate) fn snapshot(ctx: &mut CommandContext<'_>, root: &str) -> Result<Snapshot, i32> {
     let head = repo::head_tree(ctx, root);
+    let index = repo::load_index(ctx, root).unwrap_or_default();
+    let work = repo::collect_working_tree(ctx, root)?.release(ctx);
+    Ok(Snapshot { head, index, work })
+}
+
+/// Tracked paths that moving to `target` would overwrite work in.
+pub(crate) fn blocking_changes(snapshot: &Snapshot, target: &Tree) -> Vec<String> {
     // Only the paths the move would actually rewrite can lose work.
-    dirty_paths(ctx, root)
+    dirty_paths(snapshot)
         .into_iter()
-        .filter(|path| target.get(path) != head.get(path))
+        .filter(|path| target.get(path) != snapshot.head.get(path))
         .collect()
 }
 
@@ -2118,21 +2132,13 @@ pub(crate) fn blocking_changes(
 ///
 /// An untracked file is recorded nowhere, so overwriting one destroys it for good. Git refuses to
 /// move rather than do that, and names the files it would have replaced.
-pub(crate) fn untracked_collisions(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    target: &repo::Tree,
-) -> Vec<String> {
-    let index = repo::load_index(ctx, root).unwrap_or_default();
-    let head = repo::head_tree(ctx, root);
-    let Ok(work) = repo::collect_working_tree(ctx, root) else {
-        return Vec::new();
-    };
-    let files = work.release(ctx);
+pub(crate) fn untracked_collisions(snapshot: &Snapshot, target: &Tree) -> Vec<String> {
     target
         .keys()
         .filter(|path| {
-            files.contains_key(*path) && !index.contains_key(*path) && !head.contains_key(*path)
+            snapshot.work.contains_key(*path)
+                && !snapshot.index.contains_key(*path)
+                && !snapshot.head.contains_key(*path)
         })
         .cloned()
         .collect()
@@ -2140,14 +2146,13 @@ pub(crate) fn untracked_collisions(
 
 /// Report the untracked files `target` would overwrite, the way Git reports them.
 pub(crate) fn refuse_untracked_overwrite(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    target: &repo::Tree,
+    snapshot: &Snapshot,
+    target: &Tree,
     verb: &str,
     advice: &str,
     io: &mut Io,
 ) -> bool {
-    let doomed = untracked_collisions(ctx, root, target);
+    let doomed = untracked_collisions(snapshot, target);
     if doomed.is_empty() {
         return false;
     }
@@ -2170,21 +2175,15 @@ pub(crate) fn refuse_untracked_overwrite(
 ///
 /// A command that rewrites the whole tree, such as `git rebase`, has nowhere to put these, so it
 /// refuses to start rather than overwrite them.
-pub(crate) fn dirty_paths(ctx: &mut CommandContext<'_>, root: &str) -> Vec<String> {
-    let index = repo::load_index(ctx, root).unwrap_or_default();
-    let Ok(work) = repo::collect_working_tree(ctx, root) else {
-        return vec!["<unreadable working tree>".to_string()];
-    };
-    let files = work.release(ctx);
-    let head = repo::head_tree(ctx, root);
+pub(crate) fn dirty_paths(snapshot: &Snapshot) -> Vec<String> {
     let mut blocked: BTreeSet<String> = BTreeSet::new();
-    for (path, hash) in &index {
-        if files.get(path) != Some(hash) || head.get(path) != Some(hash) {
+    for (path, hash) in &snapshot.index {
+        if snapshot.work.get(path) != Some(hash) || snapshot.head.get(path) != Some(hash) {
             blocked.insert(path.clone());
         }
     }
-    for path in head.keys() {
-        if !index.contains_key(path) {
+    for path in snapshot.head.keys() {
+        if !snapshot.index.contains_key(path) {
             blocked.insert(path.clone());
         }
     }
@@ -2192,13 +2191,10 @@ pub(crate) fn dirty_paths(ctx: &mut CommandContext<'_>, root: &str) -> Vec<Strin
 }
 
 /// Whether the difference is only staged, which Git words differently.
-pub(crate) fn only_staged(ctx: &mut CommandContext<'_>, root: &str, paths: &[String]) -> bool {
-    let index = repo::load_index(ctx, root).unwrap_or_default();
-    let Ok(work) = repo::collect_working_tree(ctx, root) else {
-        return false;
-    };
-    let files = work.release(ctx);
-    paths.iter().all(|path| files.get(path) == index.get(path))
+pub(crate) fn only_staged(snapshot: &Snapshot, paths: &[String]) -> bool {
+    paths
+        .iter()
+        .all(|path| snapshot.work.get(path) == snapshot.index.get(path))
 }
 
 /// Move HEAD and the working tree to `commit`.
@@ -2219,11 +2215,10 @@ fn checkout_commit(
             format!("{previous}\n").as_bytes(),
         );
     }
-    let old = repo::head_tree(ctx, root);
-    let Some(new) = repo::commit_tree(ctx, root, commit) else {
-        return Err(fatal(io, "target revision has an invalid commit"));
-    };
-    let blocked = blocking_changes(ctx, root, &new);
+    let new = super::require_tree(ctx, root, commit, io)?;
+    let snapshot = snapshot(ctx, root)?;
+    let old = &snapshot.head;
+    let blocked = blocking_changes(&snapshot, &new);
     if !blocked.is_empty() {
         io.err.extend_from_slice(
             b"error: Your local changes to the following files would be overwritten by checkout:\n",
@@ -2236,15 +2231,15 @@ fn checkout_commit(
         );
         return Err(1);
     }
-    if refuse_untracked_overwrite(ctx, root, &new, "checkout", "switch branches", io) {
+    if refuse_untracked_overwrite(&snapshot, &new, "checkout", "switch branches", io) {
         return Err(1);
     }
-    if let Err(error) = repo::update_work_tree(ctx, root, &old, &new) {
+    if let Err(error) = repo::update_work_tree(ctx, root, old, &new) {
         io.err
             .extend_from_slice(format!("git switch: {error}\n").as_bytes());
         return Err(1);
     }
-    let index = carried_index(ctx, root, &new);
+    let index = carried_index(&snapshot, &new);
     if repo::store_index(ctx, root, &index).is_err() {
         return Err(1);
     }
@@ -2256,18 +2251,16 @@ fn checkout_commit(
 /// A move is only allowed when every path that differs between HEAD and the index is the same in
 /// both commits, so carrying those entries across cannot contradict the new commit. Git keeps
 /// them; replacing the index with the target tree would silently unstage the lot.
-fn carried_index(ctx: &mut CommandContext<'_>, root: &str, target: &Tree) -> Tree {
-    let index = repo::load_index(ctx, root).unwrap_or_default();
-    let head = repo::head_tree(ctx, root);
+fn carried_index(snapshot: &Snapshot, target: &Tree) -> Tree {
     let mut carried = target.clone();
-    for (path, entry) in &index {
-        if head.get(path) != Some(entry) {
+    for (path, entry) in &snapshot.index {
+        if snapshot.head.get(path) != Some(entry) {
             carried.insert(path.clone(), entry.clone());
         }
     }
     // A path staged for deletion stays deleted on the other side of the move.
-    for path in head.keys() {
-        if !index.contains_key(path) {
+    for path in snapshot.head.keys() {
+        if !snapshot.index.contains_key(path) {
             carried.remove(path);
         }
     }
@@ -2685,12 +2678,16 @@ pub(crate) fn git_merge(
         Ok(tree) => tree,
         Err(status) => return status,
     };
-    if !blocking_changes(ctx, &root, &incoming).is_empty() {
+    let snapshot = match snapshot(ctx, &root) {
+        Ok(snapshot) => snapshot,
+        Err(status) => return status,
+    };
+    if !blocking_changes(&snapshot, &incoming).is_empty() {
         io.err
             .extend_from_slice(b"error: Your local changes would be overwritten by merge.\n");
         return 1;
     }
-    if refuse_untracked_overwrite(ctx, &root, &incoming, "merge", "merge", io) {
+    if refuse_untracked_overwrite(&snapshot, &incoming, "merge", "merge", io) {
         return 1;
     }
     repo::record_orig_head(ctx, &root);
@@ -2765,12 +2762,14 @@ pub(crate) fn git_merge(
         return pause_for_conflicts(
             ctx,
             &root,
-            conflict::MERGE_HEAD,
-            &other,
-            &subject,
-            target,
+            &Paused {
+                kind: conflict::MERGE_HEAD,
+                commit: &other,
+                message: &subject,
+                theirs_label: target,
+                advice: "Automatic merge failed; fix conflicts and then commit the result.",
+            },
             &combined.stages,
-            "Automatic merge failed; fix conflicts and then commit the result.",
             io,
         );
     }
@@ -2848,7 +2847,7 @@ pub(crate) fn git_replay(
             "--skip" => {
                 let status = abort_pending(ctx, &root, name, io);
                 return if status == 0 {
-                    resume_sequence(ctx, globals, &root, name, io)
+                    resume_sequence(ctx, globals, &root, io)
                 } else {
                     status
                 };
@@ -2856,7 +2855,7 @@ pub(crate) fn git_replay(
             "--continue" => {
                 let status = continue_pending(ctx, &root, globals, name, io);
                 return if status == 0 {
-                    resume_sequence(ctx, globals, &root, name, io)
+                    resume_sequence(ctx, globals, &root, io)
                 } else {
                     status
                 };
@@ -2885,7 +2884,6 @@ pub(crate) fn git_replay(
         ctx,
         globals,
         &root,
-        name,
         Sequence {
             revert,
             no_commit,
@@ -2907,6 +2905,15 @@ struct Sequence {
     original: String,
     /// The commits left to apply, oldest first.
     todo: Vec<String>,
+}
+
+/// How Git words its messages about a replay, which is also the command's name.
+fn replay_name(revert: bool) -> &'static str {
+    if revert {
+        "revert"
+    } else {
+        "cherry-pick"
+    }
 }
 
 const SEQUENCER: &str = "SEQUENCER";
@@ -2963,23 +2970,12 @@ fn run_sequence(
     ctx: &mut CommandContext<'_>,
     globals: &Globals,
     root: &str,
-    name: &str,
     mut sequence: Sequence,
     io: &mut Io,
 ) -> i32 {
     while !sequence.todo.is_empty() {
         let id = sequence.todo.remove(0);
-        let status = replay_one(
-            ctx,
-            globals,
-            root,
-            name,
-            sequence.revert,
-            sequence.no_commit,
-            sequence.mainline,
-            &id,
-            io,
-        );
+        let status = replay_one(ctx, globals, root, &sequence, &id, io);
         if status != 0 {
             store_sequence(ctx, root, &sequence);
             return status;
@@ -2994,11 +2990,10 @@ fn resume_sequence(
     ctx: &mut CommandContext<'_>,
     globals: &Globals,
     root: &str,
-    name: &str,
     io: &mut Io,
 ) -> i32 {
     match load_sequence(ctx, root) {
-        Some(sequence) => run_sequence(ctx, globals, root, name, sequence, io),
+        Some(sequence) => run_sequence(ctx, globals, root, sequence, io),
         None => 0,
     }
 }
@@ -3034,18 +3029,21 @@ fn abort_sequence(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut
     0
 }
 
-#[allow(clippy::too_many_arguments)]
 fn replay_one(
     ctx: &mut CommandContext<'_>,
     globals: &Globals,
     root: &str,
-    name: &str,
-    revert: bool,
-    no_commit: bool,
-    mainline: Option<usize>,
+    sequence: &Sequence,
     revision: &str,
     io: &mut Io,
 ) -> i32 {
+    let Sequence {
+        revert,
+        no_commit,
+        mainline,
+        ..
+    } = *sequence;
+    let name = replay_name(revert);
     if pending_operation(ctx, root).is_some() {
         io.err.extend_from_slice(
             format!(
@@ -3115,9 +3113,12 @@ fn replay_one(
     };
     // Committing the replay would fold anything already staged into it, which is why Git wants
     // a settled index first. `-n` leaves the commit to the user, so it can go ahead.
-    let staged = repo::load_index(ctx, root).unwrap_or_default();
-    let dirty = !no_commit && staged != head_tree;
-    if dirty || !blocking_changes(ctx, root, theirs).is_empty() {
+    let snapshot = match snapshot(ctx, root) {
+        Ok(snapshot) => snapshot,
+        Err(status) => return status,
+    };
+    let dirty = !no_commit && snapshot.index != head_tree;
+    if dirty || !blocking_changes(&snapshot, theirs).is_empty() {
         io.err.extend_from_slice(
             format!(
                 "error: your local changes would be overwritten by {name}.\nhint: commit your changes or stash them to proceed.\nfatal: {name} failed\n"
@@ -3143,7 +3144,7 @@ fn replay_one(
         return 1;
     }
     // Only the paths the replay touched move in the index; anything else staged is left alone.
-    let mut index = staged;
+    let mut index = snapshot.index.clone();
     for path in head_tree.keys().chain(applied.keys()) {
         if head_tree.get(path) == applied.get(path) {
             continue;
@@ -3170,12 +3171,14 @@ fn replay_one(
         return pause_for_conflicts(
             ctx,
             root,
-            kind,
-            &id,
-            &message,
-            &label,
+            &Paused {
+                kind,
+                commit: &id,
+                message: &message,
+                theirs_label: &label,
+                advice: &advice,
+            },
             &combined.stages,
-            &advice,
             io,
         );
     }
@@ -3234,18 +3237,34 @@ fn replay_one(
 }
 
 /// Record an unfinished merge, cherry-pick, or revert and report the paths left to the user.
-#[allow(clippy::too_many_arguments)]
+/// The operation that stopped, as its messages and its record of what is in progress need it.
+struct Paused<'a> {
+    /// `MERGE_HEAD`, `CHERRY_PICK_HEAD` or `REVERT_HEAD`: the file that records the operation.
+    kind: &'a str,
+    /// The commit being brought in.
+    commit: &'a str,
+    /// The message the finished commit will carry.
+    message: &'a str,
+    /// What the incoming side is called in a conflict marker.
+    theirs_label: &'a str,
+    /// The closing line, which tells the user how to carry on.
+    advice: &'a str,
+}
+
 fn pause_for_conflicts(
     ctx: &mut CommandContext<'_>,
     root: &str,
-    kind: &str,
-    commit: &str,
-    message: &str,
-    theirs_label: &str,
+    paused: &Paused<'_>,
     stages: &Stages,
-    advice: &str,
     io: &mut Io,
 ) -> i32 {
+    let Paused {
+        kind,
+        commit,
+        message,
+        theirs_label,
+        advice,
+    } = *paused;
     for (path, entry) in stages {
         // A delete on one side needs the longer sentence, because the file left in the working
         // tree is not the one the user was last looking at.

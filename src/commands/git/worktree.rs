@@ -286,53 +286,56 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         .filter(|(path, _)| compare::selected(&paths, path))
         .map(|(path, entry)| (displayed_path(&prefix, &path), entry))
         .collect();
-    let branch = repo::current_branch(ctx, &root);
-    let head_commit = repo::head_commit(ctx, &root);
+    let report = Report {
+        branch: repo::current_branch(ctx, &root),
+        head: repo::head_commit(ctx, &root),
+        entries,
+        tracked,
+        untracked: untracked_paths,
+        ignored: ignored_paths,
+        unmerged,
+        head_tree: head,
+        index,
+        work,
+        hide_untracked: untracked == Untracked::No,
+        branch_header,
+        nul,
+    };
     if version_two {
-        emit_porcelain_v2(
-            ctx,
-            &root,
-            &entries,
-            &tracked,
-            &untracked_paths,
-            &ignored_paths,
-            &head,
-            &index,
-            &work,
-            &unmerged,
-            branch_header,
-            io,
-        );
+        emit_porcelain_v2(&report, io);
         return 0;
     }
     if short {
-        emit_short_status(
-            ctx,
-            &root,
-            branch.as_deref(),
-            branch_header,
-            nul,
-            &unmerged,
-            &entries,
-            &untracked_paths,
-            &ignored_paths,
-            io,
-        );
+        emit_short_status(&report, io);
         return 0;
     }
-    let pending = unfinished_operation(ctx, &root, !unmerged.is_empty());
-    emit_long_status(
-        branch.as_deref(),
-        head_commit.as_deref(),
-        pending.as_deref(),
-        &unmerged,
-        &entries,
-        &untracked_paths,
-        &ignored_paths,
-        untracked == Untracked::No,
-        io,
-    );
+    let pending = unfinished_operation(ctx, &root, !report.unmerged.is_empty());
+    emit_long_status(&report, pending.as_deref(), io);
     0
+}
+
+/// Everything the three status formats print, worked out once.
+///
+/// The formats differ in layout rather than in what they report, so they read the same struct.
+/// `head_tree`, `index` and `work` are the three trees a `v2` record reports object ids from, and
+/// `tracked` holds each entry's repository-relative name, because the entry's own path has been
+/// made relative to the working directory for display.
+struct Report {
+    branch: Option<String>,
+    head: Option<String>,
+    entries: Vec<Entry>,
+    tracked: Vec<String>,
+    untracked: Vec<String>,
+    ignored: Vec<String>,
+    unmerged: Vec<(String, conflict::Unmerged)>,
+    head_tree: Tree,
+    index: Tree,
+    work: Tree,
+    /// Set by `-u no`, which prints a line saying the list was left out.
+    hide_untracked: bool,
+    branch_header: bool,
+    /// Set by `-z`, which separates records with NUL rather than a newline.
+    nul: bool,
 }
 
 /// What Git prints above the file lists while a merge, replay or rebase is unfinished.
@@ -404,25 +407,28 @@ fn displayed_path(prefix: &str, path: &str) -> String {
 ///
 /// Every tracked entry is a `1` record; this subset never records a submodule or a file mode other
 /// than `100644`, so those columns are constant.
-#[allow(clippy::too_many_arguments)]
-fn emit_porcelain_v2(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    entries: &[Entry],
-    tracked: &[String],
-    untracked: &[String],
-    ignored: &[String],
-    head: &Tree,
-    index: &Tree,
-    work: &Tree,
-    unmerged: &[(String, conflict::Unmerged)],
-    branch_header: bool,
-    io: &mut Io,
-) {
+fn emit_porcelain_v2(report: &Report, io: &mut Io) {
     const MISSING: &str = "0000000000000000000000000000000000000000";
-    if branch_header {
-        let commit = repo::head_commit(ctx, root).unwrap_or_else(|| "(initial)".to_string());
-        let branch = repo::current_branch(ctx, root).unwrap_or_else(|| "(detached)".to_string());
+    let Report {
+        entries,
+        tracked,
+        untracked,
+        ignored,
+        unmerged,
+        head_tree: head,
+        index,
+        work,
+        ..
+    } = report;
+    if report.branch_header {
+        let commit = report
+            .head
+            .clone()
+            .unwrap_or_else(|| "(initial)".to_string());
+        let branch = report
+            .branch
+            .clone()
+            .unwrap_or_else(|| "(detached)".to_string());
         io.out.extend_from_slice(
             format!("# branch.oid {commit}\n# branch.head {branch}\n").as_bytes(),
         );
@@ -481,22 +487,17 @@ fn emit_porcelain_v2(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_short_status(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    branch: Option<&str>,
-    branch_header: bool,
-    nul: bool,
-    unmerged: &[(String, conflict::Unmerged)],
-    entries: &[Entry],
-    untracked: &[String],
-    ignored: &[String],
-    io: &mut Io,
-) {
-    let terminator = if nul { 0 } else { b'\n' };
-    if branch_header {
-        let label = match (branch, repo::head_commit(ctx, root)) {
+fn emit_short_status(report: &Report, io: &mut Io) {
+    let Report {
+        entries,
+        untracked,
+        ignored,
+        unmerged,
+        ..
+    } = report;
+    let terminator = if report.nul { 0 } else { b'\n' };
+    if report.branch_header {
+        let label = match (report.branch.as_deref(), report.head.as_deref()) {
             (Some(branch), None) => format!("No commits yet on {branch}"),
             (Some(branch), Some(_)) => branch.to_string(),
             (None, _) => "HEAD (no branch)".to_string(),
@@ -529,19 +530,17 @@ fn emit_short_status(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_long_status(
-    branch: Option<&str>,
-    head: Option<&str>,
-    pending: Option<&str>,
-    unmerged: &[(String, conflict::Unmerged)],
-    entries: &[Entry],
-    untracked: &[String],
-    ignored: &[String],
-    hide_untracked: bool,
-    io: &mut Io,
-) {
-    match branch {
+fn emit_long_status(report: &Report, pending: Option<&str>, io: &mut Io) {
+    let Report {
+        entries,
+        untracked,
+        ignored,
+        unmerged,
+        hide_untracked,
+        ..
+    } = report;
+    let head = report.head.as_deref();
+    match report.branch.as_deref() {
         Some(branch) => io
             .out
             .extend_from_slice(format!("On branch {branch}\n").as_bytes()),
@@ -624,7 +623,7 @@ fn emit_long_status(
         }
         io.out.push(b'\n');
     }
-    if hide_untracked {
+    if *hide_untracked {
         io.out.extend_from_slice(
             b"Untracked files not listed (use -u option to show untracked files)\n",
         );
@@ -788,9 +787,12 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     if !ctx.reserve_memory(reserved) {
         return repo::resource_error(ctx);
     }
-    let status = stage_paths(
-        ctx, &root, &mut index, &work, &selected, dry_run, verbose, io,
-    );
+    let staging = match (dry_run, verbose) {
+        (true, _) => Staging::DryRun,
+        (false, true) => Staging::Verbose,
+        (false, false) => Staging::Silent,
+    };
+    let status = stage_paths(ctx, &root, &mut index, &work, &selected, staging, io);
     ctx.resources.release_memory(reserved);
     // Staging a conflicted path is how the user says the conflict is settled.
     if status == 0 && !dry_run {
@@ -799,24 +801,34 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     status
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What `git add` says about each path, and whether it stages it.
+#[derive(Clone, Copy, PartialEq)]
+enum Staging {
+    /// The ordinary case: stage the path and say nothing.
+    Silent,
+    /// `-v`: stage the path and name it.
+    Verbose,
+    /// `-n`: name the path that would be staged, and stage nothing.
+    DryRun,
+}
+
 fn stage_paths(
     ctx: &mut CommandContext<'_>,
     root: &str,
     index: &mut Tree,
     work: &Tree,
     selected: &BTreeSet<String>,
-    dry_run: bool,
-    verbose: bool,
+    staging: Staging,
     io: &mut Io,
 ) -> i32 {
+    let dry_run = staging == Staging::DryRun;
     for path in selected {
         let action = if work.contains_key(path) {
             "add"
         } else {
             "remove"
         };
-        if verbose || dry_run {
+        if staging != Staging::Silent {
             io.out
                 .extend_from_slice(format!("{action} '{path}'\n").as_bytes());
         }
@@ -1194,7 +1206,6 @@ pub(crate) fn git_restore(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
     restore_paths(ctx, &root, source.as_deref(), &paths, staged, worktree, io)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn restore_paths(
     ctx: &mut CommandContext<'_>,
     root: &str,
@@ -1605,7 +1616,7 @@ pub(crate) fn stage_tracked_changes(
     let mut index = repo::load_index(ctx, root).unwrap_or_default();
     let work = repo::collect_working_tree(ctx, root)?.release(ctx);
     let selected: BTreeSet<String> = index.keys().cloned().collect();
-    let status = stage_paths(ctx, root, &mut index, &work, &selected, false, false, io);
+    let status = stage_paths(ctx, root, &mut index, &work, &selected, Staging::Silent, io);
     if status == 0 {
         Ok(())
     } else {

@@ -148,9 +148,13 @@ pub(crate) fn git_rebase(
         None => upstream_id.clone(),
     };
     // A rebase rewrites the whole tree, so anything not committed has nowhere to go.
-    let dirty = history::dirty_paths(ctx, &root);
+    let snapshot = match history::snapshot(ctx, &root) {
+        Ok(snapshot) => snapshot,
+        Err(status) => return status,
+    };
+    let dirty = history::dirty_paths(&snapshot);
     if !dirty.is_empty() {
-        let what = if history::only_staged(ctx, &root, &dirty) {
+        let what = if history::only_staged(&snapshot, &dirty) {
             "Your index contains uncommitted changes."
         } else {
             "You have unstaged changes."
@@ -250,12 +254,12 @@ fn lay_down(
     commit: &str,
     io: &mut Io,
 ) -> Result<(), i32> {
-    let current = repo::head_tree(ctx, root);
     let target = super::require_tree(ctx, root, commit, io)?;
-    if history::refuse_untracked_overwrite(ctx, root, &target, "checkout", "switch branches", io) {
+    let snapshot = history::snapshot(ctx, root)?;
+    if history::refuse_untracked_overwrite(&snapshot, &target, "checkout", "switch branches", io) {
         return Err(1);
     }
-    if let Err(error) = repo::replace_work_tree(ctx, root, &current, &target) {
+    if let Err(error) = repo::replace_work_tree(ctx, root, &snapshot.head, &target) {
         io.err
             .extend_from_slice(format!("git rebase: {error}\n").as_bytes());
         return Err(1);
