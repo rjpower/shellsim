@@ -93,6 +93,8 @@ pub enum Object {
         /// The callable type object responsible for this class.
         metaclass: Value,
         layout: ClassLayout,
+        /// Closest native exception ancestor, when instances may be raised.
+        exception_base: Option<&'static str>,
         attributes: HashMap<String, Value>,
         is_dataclass: bool,
         dataclass_fields: Vec<(String, Option<Value>)>,
@@ -1044,6 +1046,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             mro,
             metaclass: _,
             layout: _,
+            exception_base,
             attributes,
             is_dataclass,
             dataclass_fields,
@@ -1053,6 +1056,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .checked_add(bases.len())
             .and_then(|size| size.checked_add(mro.len()))
             .and_then(|size| size.checked_add(1))
+            .and_then(|size| size.checked_add(usize::from(exception_base.is_some())))
             .and_then(|size| size.checked_add(attributes.len()))
             .and_then(|size| size.checked_add(usize::from(*is_dataclass)))
             .and_then(|size| size.checked_add(dataclass_fields.len()))

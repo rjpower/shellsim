@@ -89,6 +89,26 @@ assert result.returncode == 0
 assert result.stdout == b"42\n"
 ```
 
+Static HTTP fixtures use the same isolated environment. They do not enable sockets, DNS, TLS, or
+host-network access:
+
+```python
+environment = shellsim.Environment(http={
+    "https://api.test/items/*": shellsim.HttpResponse(
+        status=200,
+        headers={"Content-Type": "application/json"},
+        body='{"items": []}',
+    ),
+})
+result = environment.run("curl -s https://api.test/items/1")
+
+result = environment.run_python("""
+from urllib.request import urlopen
+print(urlopen('https://api.test/items/1').read())
+""")
+assert result.network_requests[0].matched
+```
+
 Python source can bypass shell parsing and quoting while using the same isolated runtime:
 
 ```python

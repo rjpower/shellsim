@@ -42,14 +42,24 @@ fn cmd_net(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             } else {
                 String::new()
             };
-            interp.net.route_static(pattern, status, body.into_bytes());
-            0
+            match interp.net.route_static(pattern, status, body.into_bytes()) {
+                Ok(()) => 0,
+                Err(error) => {
+                    ewln(io.err, &format!("net route: {error}"));
+                    2
+                }
+            }
         }
         Some("route-file") => match (args.get(1), args.get(2)) {
             (Some(pattern), Some(path)) => {
                 let abs = crate::vfs::resolve_against(&interp.cwd, path);
-                interp.net.route_vfs(pattern, &abs);
-                0
+                match interp.net.route_vfs(pattern, &abs) {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        ewln(io.err, &format!("net route-file: {error}"));
+                        2
+                    }
+                }
             }
             _ => {
                 ewln(

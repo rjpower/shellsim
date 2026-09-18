@@ -4,6 +4,8 @@ from . import python as python
 from ._api import (
     CommandUsage,
     Environment,
+    HttpRequest,
+    HttpResponse,
     Invocation,
     Limits,
     MountResult,
@@ -16,6 +18,8 @@ from ._api import (
 __all__ = [
     "CommandUsage",
     "Environment",
+    "HttpRequest",
+    "HttpResponse",
     "Invocation",
     "Limits",
     "MountResult",

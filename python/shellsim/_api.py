@@ -65,11 +65,33 @@ class Invocation:
 
 
 @dataclass(frozen=True)
+class HttpRequest:
+    """One bounded request record emitted by the simulated HTTP broker."""
+
+    method: str
+    url: str
+    headers: Tuple[Tuple[str, str], ...]
+    dropped_headers: int
+    body_bytes: int
+    matched: bool
+    response_status: Optional[int]
+
+
+@dataclass(frozen=True)
 class MountResult:
     """Result of copying an explicitly trusted host tree into the VFS."""
 
     files: int
     skipped_directories: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    """One static response returned by the simulated HTTP broker."""
+
+    status: int = 200
+    headers: Union[Mapping[str, str], Sequence[Tuple[str, str]]] = ()
+    body: Union[bytes, bytearray, memoryview, str] = b""
 
 
 @dataclass(frozen=True)
@@ -92,6 +114,8 @@ class RunResult:
     partial_commands: Tuple[str, ...]
     invocations: Tuple[Invocation, ...]
     dropped_invocations: int
+    network_requests: Tuple[HttpRequest, ...]
+    dropped_network_requests: int
 
     @property
     def stdout_text(self) -> str:
@@ -129,6 +153,7 @@ class Environment:
         memory: Optional[int] = None,
         disk: Optional[int] = None,
         output: Optional[int] = None,
+        http: Optional[Mapping[str, HttpResponse]] = None,
     ) -> None:
         overrides = {"cpu": cpu, "memory": memory, "disk": disk, "output": output}
         if limits is not None and any(value is not None for value in overrides.values()):
@@ -144,6 +169,11 @@ class Environment:
             resolved.disk,
             resolved.output,
         )
+        if http is not None:
+            if not isinstance(http, Mapping):
+                raise TypeError("http must be a mapping from URL patterns to shellsim.HttpResponse")
+            for pattern, response in http.items():
+                self.route_http(pattern, response)
 
     @property
     def terminated(self) -> bool:
@@ -222,6 +252,34 @@ class Environment:
             raise TypeError("parents must be bool")
         self._native.mkdir(path, parents)
 
+    def route_http(
+        self,
+        pattern: str,
+        response: HttpResponse,
+        *,
+        method: Optional[str] = None,
+    ) -> None:
+        """Register a static HTTP response for an exact URL or ``*`` glob.
+
+        Requests are handled inside the simulator. This does not grant the environment DNS,
+        sockets, TLS, or access to the host network. When ``method`` is omitted, the route matches
+        every HTTP method.
+        """
+
+        if not isinstance(pattern, str):
+            raise TypeError("pattern must be str")
+        if not isinstance(response, HttpResponse):
+            raise TypeError("response must be a shellsim.HttpResponse instance")
+        if method is not None and not isinstance(method, str):
+            raise TypeError("method must be str or None")
+        if isinstance(response.status, bool) or not isinstance(response.status, int):
+            raise TypeError("response status must be int")
+        if not 0 <= response.status <= 0xFFFF:
+            raise ValueError("response status must fit in an unsigned 16-bit integer")
+        headers = _http_headers(response.headers)
+        body = response.body.encode() if isinstance(response.body, str) else _as_bytes("response body", response.body)
+        self._native.route_http(pattern, method, response.status, headers, body)
+
     def mount(self, host_root: Union[str, os.PathLike[str]], destination: str = "/work") -> MountResult:
         """Copy an explicitly trusted host directory into the bounded VFS.
 
@@ -251,6 +309,7 @@ def run(
     memory: Optional[int] = None,
     disk: Optional[int] = None,
     output: Optional[int] = None,
+    http: Optional[Mapping[str, HttpResponse]] = None,
 ) -> RunResult:
     """Execute one action in a fresh environment."""
 
@@ -260,6 +319,7 @@ def run(
         memory=memory,
         disk=disk,
         output=output,
+        http=http,
     ).run(source, stdin)
 
 
@@ -275,6 +335,24 @@ def _as_bytes(name: str, value: Any) -> bytes:
     if not isinstance(value, (bytes, bytearray, memoryview)):
         raise TypeError(f"{name} must be bytes-like")
     return bytes(value)
+
+
+def _http_headers(value: Any) -> list[Tuple[str, str]]:
+    if isinstance(value, Mapping):
+        headers = list(value.items())
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, memoryview)):
+        headers = list(value)
+    else:
+        raise TypeError("response headers must be a mapping or sequence of name/value pairs")
+    normalized = []
+    for header in headers:
+        if not isinstance(header, Sequence) or isinstance(header, (str, bytes)) or len(header) != 2:
+            raise TypeError("response headers must contain name/value pairs")
+        name, item = header
+        if not isinstance(name, str) or not isinstance(item, str):
+            raise TypeError("response header names and values must be str")
+        normalized.append((name, item))
+    return normalized
 
 
 def _decode_result(metadata_json: str, stdout: bytes, stderr: bytes) -> RunResult:
@@ -296,6 +374,18 @@ def _decode_result(metadata_json: str, stdout: bytes, stderr: bytes) -> RunResul
         )
         for item in metadata["invocations"]
     )
+    network_requests = tuple(
+        HttpRequest(
+            method=item["method"],
+            url=item["url"],
+            headers=tuple(tuple(header) for header in item["headers"]),
+            dropped_headers=item["dropped_headers"],
+            body_bytes=item["body_bytes"],
+            matched=item["matched"],
+            response_status=item["response_status"],
+        )
+        for item in metadata["network_requests"]
+    )
     return RunResult(
         returncode=outcome["exit_status"],
         stdout=stdout,
@@ -313,4 +403,6 @@ def _decode_result(metadata_json: str, stdout: bytes, stderr: bytes) -> RunResul
         partial_commands=tuple(metadata["partial_commands"]),
         invocations=invocations,
         dropped_invocations=metadata["dropped_invocations"],
+        network_requests=network_requests,
+        dropped_network_requests=metadata["dropped_network_requests"],
     )

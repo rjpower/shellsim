@@ -2,12 +2,11 @@
 
 use shellsim::{python, Environment, Limits};
 
-fn run(source: &str) -> (i32, String, String) {
-    let mut environment = Environment::default();
+fn run_in(environment: &mut Environment, source: &str) -> (i32, String, String) {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let status = python::run_python(
-        &mut environment,
+        environment,
         &["python3.14".into(), "-c".into(), source.into()],
         Vec::new(),
         &mut stdout,
@@ -18,6 +17,183 @@ fn run(source: &str) -> (i32, String, String) {
         String::from_utf8(stdout).expect("UTF-8 stdout"),
         String::from_utf8(stderr).expect("UTF-8 stderr"),
     )
+}
+
+fn run(source: &str) -> (i32, String, String) {
+    let mut environment = Environment::default();
+    run_in(&mut environment, source)
+}
+
+#[test]
+fn urllib_request_uses_typed_routes_and_file_like_responses() {
+    let mut environment = Environment::new();
+    environment
+        .net
+        .route(
+            "https://api.test/items",
+            Some("GET"),
+            shellsim::net::HttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".into(), "application/json".into())],
+                body: b"line one\nline two\n".to_vec(),
+            },
+        )
+        .unwrap();
+    let source = r#"
+from urllib.request import Request, urlopen
+
+request = Request('https://api.test/items', headers={'X-Test': 'yes'})
+with urlopen(request) as response:
+    print(response.status, response.getcode(), response.geturl())
+    print(response.headers['content-type'], response.getheader('CONTENT-TYPE'))
+    print(response.read(5), response.readline(), response.read())
+"#;
+
+    assert_eq!(
+        run_in(&mut environment, source),
+        (
+            0,
+            "200 200 https://api.test/items\napplication/json application/json\nb'line ' b'one\\n' b'line two\\n'\n".into(),
+            String::new(),
+        )
+    );
+    assert_eq!(environment.net.log.len(), 1);
+    assert_eq!(environment.net.log[0].method, "GET");
+    assert_eq!(
+        environment.net.log[0].headers,
+        [("X-Test".into(), "yes".into())]
+    );
+}
+
+#[test]
+fn urllib_post_redirects_and_errors_preserve_http_semantics() {
+    let mut environment = Environment::new();
+    environment
+        .net
+        .route(
+            "https://api.test/start",
+            Some("POST"),
+            shellsim::net::HttpResponse {
+                status: 302,
+                headers: vec![("Location".into(), "/done".into())],
+                body: Vec::new(),
+            },
+        )
+        .unwrap();
+    environment
+        .net
+        .route_static("https://api.test/done", 200, b"finished")
+        .unwrap();
+    environment
+        .net
+        .route_static("https://api.test/missing", 404, b"missing body")
+        .unwrap();
+    let source = r#"
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+print(urlopen(Request('https://api.test/start', data=b'name=test')).read())
+try:
+    urlopen('https://api.test/missing')
+except URLError as error:
+    print(isinstance(error, HTTPError), error.code, error.reason, error.read())
+try:
+    urlopen('https://unmatched.test/')
+except OSError as error:
+    print(error.reason)
+"#;
+
+    assert_eq!(
+        run_in(&mut environment, source),
+        (
+            0,
+            "b'finished'\nTrue 404 Not Found b'missing body'\nno matching virtual HTTP route for https://unmatched.test/\n".into(),
+            String::new(),
+        )
+    );
+    assert_eq!(
+        environment
+            .net
+            .log
+            .iter()
+            .map(|request| (request.method.as_str(), request.body_bytes, request.matched))
+            .collect::<Vec<_>>(),
+        [
+            ("POST", 9, true),
+            ("GET", 0, true),
+            ("GET", 0, true),
+            ("GET", 0, false),
+        ]
+    );
+    assert!(environment.net.log[0].headers.contains(&(
+        "Content-Type".into(),
+        "application/x-www-form-urlencoded".into()
+    )));
+    assert!(environment.net.log[0]
+        .headers
+        .contains(&("Content-Length".into(), "9".into())));
+}
+
+#[test]
+fn http_client_builds_urls_and_rejects_unmodeled_connection_features() {
+    let mut environment = Environment::new();
+    environment
+        .net
+        .route_static("http://service.test/ping", 200, b"pong")
+        .unwrap();
+    environment
+        .net
+        .route_static("https://secure.test:8443/data", 201, b"created")
+        .unwrap();
+    let source = r#"
+from http.client import HTTPConnection, HTTPSConnection
+
+connection = HTTPConnection('service.test')
+connection.request('GET', '/ping', headers={'X-Test': 'one'})
+response = connection.getresponse()
+print(response.status, response.reason, response.read())
+
+secure = HTTPSConnection('secure.test', 8443)
+secure.request('POST', 'data', body='value')
+print(secure.getresponse().status, secure.getresponse().read())
+try:
+    connection.set_tunnel('proxy.test')
+except ValueError as error:
+    print(error)
+"#;
+
+    assert_eq!(
+        run_in(&mut environment, source),
+        (
+            0,
+            "200 OK b'pong'\n201 b'created'\nHTTP CONNECT tunnels are not supported by shellsim\n"
+                .into(),
+            String::new(),
+        )
+    );
+    assert_eq!(environment.net.log[1].method, "POST");
+    assert_eq!(environment.net.log[1].body_bytes, 5);
+}
+
+#[test]
+fn urllib_rejects_non_http_urls_and_custom_handlers_explicitly() {
+    let source = r#"
+from urllib.request import build_opener, urlopen
+
+for operation in [lambda: urlopen('file:///etc/passwd'), lambda: build_opener(1)]:
+    try:
+        operation()
+    except ValueError as error:
+        print(error)
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "only http:// and https:// URLs are supported\ncustom urllib handlers are not supported by shellsim\n".into(),
+            String::new(),
+        )
+    );
 }
 
 #[test]

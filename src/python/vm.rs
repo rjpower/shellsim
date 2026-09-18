@@ -17,10 +17,11 @@ use super::heap::{ClassLayout, InstancePayload, Object, ScopeId};
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
     PyArray, PyArrayDtype, PyArrayLayout, PyBinaryOp, PyByteArray, PyCallable, PyClass, PyClock,
-    PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyIdentity, PyInstance, PyIterator,
-    PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind, PyProcessHandle,
-    PyProcessOutput, PyProcessRunner, PyProcessStartRequest, PyProperty, PyRaisesContext, PyRegex,
-    PyResult, PyRuntime, PySet, PySubcommandSpec, PySubparsersSpec, PyTuple, PyValueCast,
+    PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity,
+    PyInstance, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
+    PyProcessHandle, PyProcessOutput, PyProcessRunner, PyProcessStartRequest, PyProperty,
+    PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PySubcommandSpec, PySubparsersSpec,
+    PyTuple, PyValueCast,
 };
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
@@ -907,7 +908,6 @@ impl<'a> Vm<'a> {
                         .last()
                         .ok_or("no active exception")
                         .map_err(|e| (e.to_string(), instruction.span))?
-                        .kind
                         .clone();
                     let matches = if *typed {
                         let expected = self.pop().map_err(|error| (error, instruction.span))?;
@@ -940,6 +940,11 @@ impl<'a> Vm<'a> {
                     let exception = if *has_value {
                         let value = self.pop().map_err(|e| (e, instruction.span))?;
                         if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, &value)
+                            .map_err(|error| (error, instruction.span))?
+                        {
+                            RaisedException { kind, value }
+                        } else if let Some(kind) = self
+                            .user_exception_kind(&value)
                             .map_err(|error| (error, instruction.span))?
                         {
                             RaisedException { kind, value }
@@ -1433,10 +1438,31 @@ impl<'a> Vm<'a> {
         self.state.heap.scope_store_nonlocal(scope, name, value)
     }
 
-    fn exception_type_matches(&mut self, expected: Value, actual: &str) -> Result<bool, String> {
+    fn exception_type_matches(
+        &mut self,
+        expected: Value,
+        actual: &RaisedException,
+    ) -> Result<bool, String> {
         if let Some(NativeValue::ExceptionType(ExceptionType(name))) = expected.native_value() {
+            let custom_base = actual.value.object_id().and_then(|id| {
+                let Object::Instance { class, .. } = self.state.heap.get(id).ok()? else {
+                    return None;
+                };
+                let Object::Class { exception_base, .. } = self.state.heap.get(*class).ok()? else {
+                    return None;
+                };
+                *exception_base
+            });
+            if let Some(custom_base) = custom_base {
+                return Ok(name == "BaseException"
+                    || (name == "Exception"
+                        && custom_base != "BaseException"
+                        && custom_base != "SystemExit")
+                    || name == custom_base
+                    || (name == "OSError" && is_os_error(custom_base)));
+            }
             let os_error = matches!(
-                actual,
+                actual.kind.as_str(),
                 "OSError"
                     | "FileNotFoundError"
                     | "FileExistsError"
@@ -1445,8 +1471,10 @@ impl<'a> Vm<'a> {
                     | "PermissionError"
             );
             return Ok(name == "BaseException"
-                || (name == "Exception" && actual != "SystemExit")
-                || name == actual
+                || (name == "Exception"
+                    && actual.kind != "BaseException"
+                    && actual.kind != "SystemExit")
+                || name == actual.kind
                 || (name == "OSError" && os_error));
         }
         let Some(id) = expected.object_id() else {
@@ -1454,19 +1482,46 @@ impl<'a> Vm<'a> {
                 "catching classes that do not inherit from BaseException is not allowed".into(),
             );
         };
-        let Object::Tuple(types) = self.state.heap.get(id)? else {
-            return Err(
-                "catching classes that do not inherit from BaseException is not allowed".into(),
-            );
-        };
-        let types = types.clone();
-        for expected in types {
-            self.charge_cpu(1)?;
-            if self.exception_type_matches(expected, actual)? {
-                return Ok(true);
+        match self.state.heap.get(id)?.clone() {
+            Object::Class {
+                instance_type,
+                exception_base: Some(_),
+                ..
+            } => {
+                let actual_type = self.type_id(&actual.value)?;
+                self.state.types.is_subclass(actual_type, instance_type)
+            }
+            Object::Tuple(types) => {
+                for expected in types {
+                    self.charge_cpu(1)?;
+                    if self.exception_type_matches(expected, actual)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => {
+                Err("catching classes that do not inherit from BaseException is not allowed".into())
             }
         }
-        Ok(false)
+    }
+
+    fn user_exception_kind(&self, value: &Value) -> Result<Option<String>, String> {
+        let Some(id) = value.object_id() else {
+            return Ok(None);
+        };
+        let Object::Instance { class, .. } = self.state.heap.get(id)? else {
+            return Ok(None);
+        };
+        let Object::Class {
+            name,
+            exception_base,
+            ..
+        } = self.state.heap.get(*class)?
+        else {
+            return Ok(None);
+        };
+        Ok(exception_base.map(|_| name.clone()))
     }
 
     fn store_global(&mut self, name: &str, value: Value) -> Result<(), String> {
@@ -2345,6 +2400,13 @@ impl<'a> Vm<'a> {
                 Some(NativeValue::BuiltinType(BuiltinType::Type))
             )
         });
+        let direct_exception_bases = bases
+            .iter()
+            .filter_map(|base| match base.native_value() {
+                Some(NativeValue::ExceptionType(ExceptionType(name))) => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let user_bases = if is_enum || is_unittest {
             Vec::new()
         } else {
@@ -2361,7 +2423,7 @@ impl<'a> Vm<'a> {
                         base.native_value(),
                         Some(NativeValue::BuiltinType(
                             BuiltinType::Int | BuiltinType::Object | BuiltinType::Type
-                        ))
+                        )) | Some(NativeValue::ExceptionType(_))
                     ) {
                         None
                     } else {
@@ -2370,6 +2432,24 @@ impl<'a> Vm<'a> {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
+        let inherited_exception_bases = user_bases
+            .iter()
+            .filter_map(|base| match self.state.heap.get(*base) {
+                Ok(Object::Class { exception_base, .. }) => *exception_base,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let exception_base = direct_exception_bases
+            .iter()
+            .chain(inherited_exception_bases.iter())
+            .copied()
+            .next();
+        if direct_exception_bases.len() + inherited_exception_bases.len() > 1 {
+            return Err("multiple exception bases are unsupported".into());
+        }
+        if exception_base.is_some() && (has_int_base || has_type_base || is_enum || is_unittest) {
+            return Err("exception classes cannot use another instance layout".into());
+        }
         if has_int_base && (bases.len() != 1 || is_enum || is_unittest) {
             return Err("int inheritance with another direct base is unsupported".into());
         }
@@ -2579,6 +2659,7 @@ impl<'a> Vm<'a> {
                     mro,
                     metaclass,
                     layout,
+                    exception_base,
                     attributes,
                     dataclass_fields,
                     enum_members,
@@ -2592,6 +2673,7 @@ impl<'a> Vm<'a> {
                 mro,
                 metaclass,
                 layout,
+                exception_base,
                 attributes,
                 dataclass_fields,
                 enum_members,
@@ -2649,13 +2731,18 @@ impl<'a> Vm<'a> {
             mro,
             metaclass,
             layout,
+            exception_base,
             attributes,
             dataclass_fields,
             enum_members,
         } = definition;
         let mut type_bases = Vec::new();
         for base in &bases {
-            if let Some(base) = self.class_type_id(base)? {
+            let base = match base.native_value() {
+                Some(NativeValue::ExceptionType(_)) => Some(BuiltinType::Exception.id()),
+                _ => self.class_type_id(base)?,
+            };
+            if let Some(base) = base {
                 type_bases.push(base);
             }
         }
@@ -2669,6 +2756,9 @@ impl<'a> Vm<'a> {
                 _ => Err("class MRO contains a non-class object".into()),
             })
             .collect::<Result<Vec<_>, String>>()?;
+        if exception_base.is_some() && !type_mro.contains(&BuiltinType::Exception.id()) {
+            type_mro.push(BuiltinType::Exception.id());
+        }
         let builtin_ancestor = match layout {
             ClassLayout::Object => None,
             ClassLayout::Int => Some(BuiltinType::Int.id()),
@@ -2699,6 +2789,7 @@ impl<'a> Vm<'a> {
             mro,
             metaclass,
             layout,
+            exception_base,
             attributes,
             is_dataclass: false,
             dataclass_fields,
@@ -6113,10 +6204,12 @@ impl PyRuntime for Vm<'_> {
         }
         let mut user_bases = Vec::new();
         let mut layout = ClassLayout::Object;
+        let mut exception_base = None;
         for base in &bases {
             if let Some(id) = base.object_id() {
                 let Object::Class {
                     layout: base_layout,
+                    exception_base: base_exception,
                     ..
                 } = self.state.heap.get(id).map_err(PyError::runtime_error)?
                 else {
@@ -6133,6 +6226,13 @@ impl PyRuntime for Vm<'_> {
                 if *base_layout != ClassLayout::Object {
                     layout = *base_layout;
                 }
+                if let Some(base_exception) = base_exception {
+                    if exception_base.replace(*base_exception).is_some() {
+                        return Err(PyError::type_error(
+                            "multiple exception bases are unsupported",
+                        ));
+                    }
+                }
                 user_bases.push(id);
             } else {
                 match base.native_value() {
@@ -6146,6 +6246,11 @@ impl PyRuntime for Vm<'_> {
                         if layout == ClassLayout::Object =>
                     {
                         layout = ClassLayout::Type;
+                    }
+                    Some(NativeValue::ExceptionType(ExceptionType(name)))
+                        if layout == ClassLayout::Object && exception_base.is_none() =>
+                    {
+                        exception_base = Some(name);
                     }
                     _ => return Err(PyError::type_error("type.__new__() bases must be classes")),
                 }
@@ -6161,6 +6266,7 @@ impl PyRuntime for Vm<'_> {
             mro,
             metaclass,
             layout,
+            exception_base,
             attributes,
             dataclass_fields: Vec::new(),
             enum_members: Vec::new(),
@@ -7032,6 +7138,10 @@ impl PyRuntime for Vm<'_> {
         self.interp
     }
 
+    fn http(&mut self) -> &mut dyn PyHttpClient {
+        self.interp
+    }
+
     fn processes(&mut self) -> &mut dyn PyProcessRunner {
         self
     }
@@ -7288,9 +7398,22 @@ struct ClassDefinition {
     mro: Vec<super::heap::ObjectId>,
     metaclass: Value,
     layout: ClassLayout,
+    exception_base: Option<&'static str>,
     attributes: HashMap<String, Value>,
     dataclass_fields: Vec<(String, Option<Value>)>,
     enum_members: Vec<Value>,
+}
+
+fn is_os_error(name: &str) -> bool {
+    matches!(
+        name,
+        "OSError"
+            | "FileNotFoundError"
+            | "FileExistsError"
+            | "IsADirectoryError"
+            | "NotADirectoryError"
+            | "PermissionError"
+    )
 }
 
 fn format_float(value: f64, spec: &str) -> Result<String, String> {

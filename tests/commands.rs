@@ -19,6 +19,8 @@ mod grep;
 mod jq;
 #[path = "commands/make.rs"]
 mod make;
+#[path = "commands/network.rs"]
+mod network;
 #[path = "commands/patch.rs"]
 mod patch;
 #[path = "commands/rg.rs"]

@@ -1,135 +1,357 @@
-//! `curl` / `wget` against the virtual network. No real egress.
+//! `curl` and `wget` clients for the typed virtual HTTP broker.
+//!
+//! Both clients use the shared option scanner, submit typed requests to [`crate::net::VirtualNet`],
+//! and never acquire host networking. Their supported option tables are closed: unknown flags
+//! fail instead of silently changing the request.
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+
+use crate::commands::options::{parse_options_or_report, OptionSpec};
 use crate::interp::Interp;
-use crate::net::RouteBody;
+use crate::net::{HttpRequest, HttpResponse, RequestError};
 
 type Out<'a> = &'a mut Vec<u8>;
 
 pub fn curl(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
-    let mut method = "GET".to_string();
-    let mut url = None;
-    let mut output_file: Option<String> = None;
+    #[derive(Clone, Copy, PartialEq)]
+    enum Key {
+        Request,
+        Url,
+        Output,
+        RemoteName,
+        Silent,
+        ShowError,
+        Include,
+        Fail,
+        Head,
+        Data,
+        Header,
+        UserAgent,
+        Referer,
+        Cookie,
+        User,
+        Help,
+    }
+    const OPTIONS: &[OptionSpec<Key>] = &[
+        OptionSpec::required(Key::Request, Some('X'), Some("request")),
+        OptionSpec::required(Key::Url, None, Some("url")),
+        OptionSpec::required(Key::Output, Some('o'), Some("output")),
+        OptionSpec::flag(Key::RemoteName, Some('O'), Some("remote-name")),
+        OptionSpec::flag(Key::Silent, Some('s'), Some("silent")),
+        OptionSpec::flag(Key::ShowError, Some('S'), Some("show-error")),
+        OptionSpec::flag(Key::Include, Some('i'), Some("include")),
+        OptionSpec::flag(Key::Fail, Some('f'), Some("fail")),
+        OptionSpec::flag(Key::Head, Some('I'), Some("head")),
+        OptionSpec::required(Key::Data, Some('d'), Some("data")),
+        OptionSpec::required(Key::Data, None, Some("data-raw")),
+        OptionSpec::required(Key::Data, None, Some("data-binary")),
+        OptionSpec::required(Key::Header, Some('H'), Some("header")),
+        OptionSpec::required(Key::UserAgent, Some('A'), Some("user-agent")),
+        OptionSpec::required(Key::Referer, Some('e'), Some("referer")),
+        OptionSpec::required(Key::Cookie, Some('b'), Some("cookie")),
+        OptionSpec::required(Key::User, Some('u'), Some("user")),
+        OptionSpec::flag(Key::Help, None, Some("help")),
+    ];
+    let parsed = match parse_options_or_report(
+        "curl",
+        args,
+        OPTIONS,
+        (
+            Key::Help,
+            "usage: curl [OPTIONS] URL\nsupported: -X --url -o -O -sSifI -d -H -A -e -b -u\n",
+        ),
+        out,
+        err,
+    ) {
+        Ok(parsed) => parsed,
+        Err(status) => return status,
+    };
+    if parsed.operands.len() > 1 {
+        ewln(err, "curl: multiple URLs are not supported");
+        return 2;
+    }
+
+    let mut request = HttpRequest::new("GET", parsed.operands.first().cloned().unwrap_or_default());
+    let mut output_file = None;
+    let mut remote_name = false;
     let mut silent = false;
+    let mut show_error = false;
     let mut include_headers = false;
     let mut fail = false;
-    let mut data: Option<String> = None;
     let mut head_only = false;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "-X" | "--request" => method = it.next().cloned().unwrap_or(method),
-            "-o" | "--output" => output_file = it.next().cloned(),
-            "-O" | "--remote-name" => output_file = Some(String::new()),
-            "-s" | "--silent" => silent = true,
-            "-i" | "--include" => include_headers = true,
-            "-f" | "--fail" => fail = true,
-            "-I" | "--head" => {
+    for option in parsed.options {
+        let value = || option.value.clone().expect("required option value");
+        match option.key {
+            Key::Request => request.method = value(),
+            Key::Url => request.url = value(),
+            Key::Output => output_file = Some(value()),
+            Key::RemoteName => remote_name = true,
+            Key::Silent => silent = true,
+            Key::ShowError => show_error = true,
+            Key::Include => include_headers = true,
+            Key::Fail => fail = true,
+            Key::Head => {
                 head_only = true;
-                method = "HEAD".into();
+                request.method = "HEAD".into();
             }
-            "-d" | "--data" | "--data-raw" => {
-                data = it.next().cloned();
-                if method == "GET" {
-                    method = "POST".into();
+            Key::Data => {
+                if !request.body.is_empty() {
+                    request.body.push(b'&');
+                }
+                request.body.extend_from_slice(value().as_bytes());
+                if request.method == "GET" {
+                    request.method = "POST".into();
                 }
             }
-            "-H" | "--header" | "-A" | "-e" | "-b" | "--connect-timeout" | "-m" | "--max-time"
-            | "--retry" | "-u" => {
-                it.next();
+            Key::Header => {
+                let Some(header) = parse_header(&value()) else {
+                    ewln(err, "curl: malformed header; expected 'Name: value'");
+                    return 2;
+                };
+                request.headers.push(header);
             }
-            "-L" | "--location" | "-k" | "--insecure" | "-g" => {}
-            s if s.starts_with('-') => {}
-            s => url = Some(s.to_string()),
+            Key::UserAgent => request.headers.push(("User-Agent".into(), value())),
+            Key::Referer => request.headers.push(("Referer".into(), value())),
+            Key::Cookie => request.headers.push(("Cookie".into(), value())),
+            Key::User => request.headers.push((
+                "Authorization".into(),
+                format!("Basic {}", STANDARD.encode(value())),
+            )),
+            Key::Help => unreachable!("help is handled by the shared option parser"),
         }
     }
-    let _ = (include_headers, head_only, data);
-    let Some(url) = url else {
+    if request.url.is_empty() {
         ewln(err, "curl: no URL specified");
         return 2;
-    };
-    match interp.net.resolve(&method, &url) {
-        Some(route) => {
-            let body = match &route.body {
-                RouteBody::Static(b) => b.clone(),
-                RouteBody::VfsFile(p) => interp.vfs.read("/", p).unwrap_or_default(),
-            };
-            if route.status >= 400 && fail {
-                ewln(err, &format!("curl: ({}) HTTP error", route.status));
-                return 22;
-            }
-            if let Some(of) = output_file {
-                let name = if of.is_empty() {
-                    url.rsplit('/').next().unwrap_or("index.html").to_string()
-                } else {
-                    of
-                };
-                let cwd = interp.cwd.clone();
-                let _ = interp.vfs.write(&cwd, &name, &body, 0o644);
-            } else {
-                out.extend_from_slice(&body);
-            }
-            0
-        }
-        None => {
-            if !silent {
+    }
+    let url = request.url.clone();
+    let report_errors = !silent || show_error;
+    let response = match interp.net.request(request, &interp.vfs) {
+        Ok(response) => response,
+        Err(RequestError::NoRoute) => {
+            if report_errors {
                 ewln(
                     err,
-                    &format!("curl: (7) Failed to connect: no virtual route for {url}"),
+                    "curl: (7) Failed to connect: no matching virtual HTTP route",
                 );
             }
-            7
+            return 7;
         }
+        Err(error) => {
+            if report_errors {
+                ewln(err, &format!("curl: (23) {error}"));
+            }
+            return 23;
+        }
+    };
+    if response.status >= 400 && fail {
+        if report_errors {
+            ewln(
+                err,
+                &format!("curl: (22) HTTP response status {}", response.status),
+            );
+        }
+        return 22;
     }
+
+    let payload = response_payload(&response, include_headers || head_only, head_only);
+    if output_file.is_some() || remote_name {
+        let name = output_file.unwrap_or_else(|| request_filename(&response, &url));
+        let cwd = interp.cwd.clone();
+        if let Err(error) = interp.vfs.write(&cwd, &name, &payload, 0o644) {
+            ewln(err, &format!("curl: (23) {error}"));
+            return 23;
+        }
+    } else {
+        out.extend_from_slice(&payload);
+    }
+    0
 }
 
 pub fn wget(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
-    let mut url = None;
-    let mut output_file: Option<String> = None;
+    #[derive(Clone, Copy, PartialEq)]
+    enum Key {
+        Output,
+        Quiet,
+        Directory,
+        Method,
+        Header,
+        Body,
+        Help,
+    }
+    const OPTIONS: &[OptionSpec<Key>] = &[
+        OptionSpec::required(Key::Output, Some('O'), Some("output-document")),
+        OptionSpec::flag(Key::Quiet, Some('q'), Some("quiet")),
+        OptionSpec::required(Key::Directory, Some('P'), Some("directory-prefix")),
+        OptionSpec::required(Key::Method, None, Some("method")),
+        OptionSpec::required(Key::Header, None, Some("header")),
+        OptionSpec::required(Key::Body, None, Some("body-data")),
+        OptionSpec::required(Key::Body, None, Some("post-data")),
+        OptionSpec::flag(Key::Help, None, Some("help")),
+    ];
+    let parsed = match parse_options_or_report(
+        "wget",
+        args,
+        OPTIONS,
+        (
+            Key::Help,
+            "usage: wget [OPTIONS] URL\nsupported: -O -q -P --method --header --body-data --post-data\n",
+        ),
+        out,
+        err,
+    ) {
+        Ok(parsed) => parsed,
+        Err(status) => return status,
+    };
+    if parsed.operands.len() != 1 {
+        ewln(err, "wget: exactly one URL is required");
+        return 2;
+    }
+
+    let mut request = HttpRequest::new("GET", &parsed.operands[0]);
+    let mut output_file = None;
+    let mut directory = None;
     let mut quiet = false;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "-O" | "--output-document" => output_file = it.next().cloned(),
-            "-q" | "--quiet" => quiet = true,
-            "-P" => {
-                it.next();
+    for option in parsed.options {
+        let value = || option.value.clone().expect("required option value");
+        match option.key {
+            Key::Output => output_file = Some(value()),
+            Key::Quiet => quiet = true,
+            Key::Directory => directory = Some(value()),
+            Key::Method => request.method = value(),
+            Key::Header => {
+                let Some(header) = parse_header(&value()) else {
+                    ewln(err, "wget: malformed header; expected 'Name: value'");
+                    return 2;
+                };
+                request.headers.push(header);
             }
-            s if s.starts_with('-') => {}
-            s => url = Some(s.to_string()),
+            Key::Body => {
+                request.body = value().into_bytes();
+                if request.method == "GET" {
+                    request.method = "POST".into();
+                }
+            }
+            Key::Help => unreachable!("help is handled by the shared option parser"),
         }
     }
-    let Some(url) = url else {
-        ewln(err, "wget: missing URL");
-        return 1;
-    };
-    match interp.net.resolve("GET", &url) {
-        Some(route) => {
-            let body = match &route.body {
-                RouteBody::Static(b) => b.clone(),
-                RouteBody::VfsFile(p) => interp.vfs.read("/", p).unwrap_or_default(),
-            };
-            let name = output_file
-                .unwrap_or_else(|| url.rsplit('/').next().unwrap_or("index.html").to_string());
-            if name == "-" {
-                out.extend_from_slice(&body);
-            } else {
-                let cwd = interp.cwd.clone();
-                let _ = interp.vfs.write(&cwd, &name, &body, 0o644);
+    let url = request.url.clone();
+    let response = match interp.net.request(request, &interp.vfs) {
+        Ok(response) => response,
+        Err(RequestError::NoRoute) => {
+            if !quiet {
+                ewln(
+                    err,
+                    "wget: unable to resolve request: no matching virtual HTTP route",
+                );
             }
-            let _ = quiet;
-            0
+            return 4;
         }
-        None => {
+        Err(error) => {
+            if !quiet {
+                ewln(err, &format!("wget: {error}"));
+            }
+            return 4;
+        }
+    };
+    if response.status >= 400 {
+        if !quiet {
             ewln(
                 err,
-                &format!("wget: unable to resolve host (no virtual route): {url}"),
+                &format!("wget: server returned status {}", response.status),
             );
-            4
         }
+        return 8;
+    }
+
+    let mut name = output_file.unwrap_or_else(|| request_filename(&response, &url));
+    if let Some(directory) = directory {
+        name = format!("{}/{}", directory.trim_end_matches('/'), name);
+    }
+    if name == "-" {
+        out.extend_from_slice(&response.body);
+    } else {
+        let cwd = interp.cwd.clone();
+        if let Err(error) = interp.vfs.write(&cwd, &name, &response.body, 0o644) {
+            ewln(err, &format!("wget: {error}"));
+            return 3;
+        }
+    }
+    0
+}
+
+fn parse_header(value: &str) -> Option<(String, String)> {
+    let (name, value) = value.split_once(':')?;
+    let name = name.trim();
+    if name.is_empty() || name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+        return None;
+    }
+    Some((name.to_string(), value.trim().to_string()))
+}
+
+fn response_payload(response: &HttpResponse, include_headers: bool, head_only: bool) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if include_headers {
+        bytes.extend_from_slice(
+            format!(
+                "HTTP/1.1 {} {}\r\n",
+                response.status,
+                reason_phrase(response.status)
+            )
+            .as_bytes(),
+        );
+        for (name, value) in &response.headers {
+            bytes.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"\r\n");
+    }
+    if !head_only {
+        bytes.extend_from_slice(&response.body);
+    }
+    bytes
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        409 => "Conflict",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "",
     }
 }
 
-fn ewln(err: Out, s: &str) {
-    err.extend_from_slice(s.as_bytes());
+fn request_filename(response: &HttpResponse, url: &str) -> String {
+    response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-disposition"))
+        .and_then(|(_, value)| value.split("filename=").nth(1))
+        .map(|value| value.trim_matches([' ', '"']).to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            url.split('?')
+                .next()
+                .and_then(|url| url.rsplit('/').next())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "index.html".to_string())
+}
+
+fn ewln(err: Out, message: &str) {
+    err.extend_from_slice(message.as_bytes());
     err.push(b'\n');
 }
