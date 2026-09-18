@@ -74,6 +74,14 @@ fn pseudo_filesystem_is_visible_to_general_filesystem_commands() {
 }
 
 #[test]
+fn realpath_missing_mode_resolves_symlinks_and_normalizes_absent_suffixes() {
+    assert_eq!(
+        text("mkdir -p /work/actual; ln -s actual /work/link; realpath -m /work/link/../link/missing/../file"),
+        (0, "/work/actual/file\n".into(), String::new())
+    );
+}
+
+#[test]
 fn find_rejects_unsupported_and_malformed_predicates() {
     for source in [
         "find /proc -delete",

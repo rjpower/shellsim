@@ -97,6 +97,14 @@ fn common_bash_guard_idioms() {
 }
 
 #[test]
+fn test_negates_unary_file_predicates() {
+    assert_eq!(
+        run("[ ! -f /missing ] && echo absent; touch /present; test ! -d /present && echo file"),
+        (0, "absent\nfile\n".into(), String::new())
+    );
+}
+
+#[test]
 fn malformed_compound_syntax_never_executes_a_partial_ast() {
     for source in [
         "echo partial; if true; then echo no",

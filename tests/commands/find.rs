@@ -1,4 +1,4 @@
-//! Compatibility strategy: exercise ordinary find predicate composition and explicit frontiers.
+//! Compatibility strategy for `find`: ordinary predicate composition and explicit frontiers.
 
 use shellsim::interp::{Environment, Interp};
 use shellsim::{Limits, StopReason};

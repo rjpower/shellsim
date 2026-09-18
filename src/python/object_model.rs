@@ -171,6 +171,10 @@ pub struct TypeSlots {
     pub reflected_floor_divide: Option<SlotValue>,
     pub remainder: Option<SlotValue>,
     pub reflected_remainder: Option<SlotValue>,
+    pub left_shift: Option<SlotValue>,
+    pub reflected_left_shift: Option<SlotValue>,
+    pub right_shift: Option<SlotValue>,
+    pub reflected_right_shift: Option<SlotValue>,
     pub bitwise_and: Option<SlotValue>,
     pub reflected_bitwise_and: Option<SlotValue>,
     pub bitwise_xor: Option<SlotValue>,
@@ -235,6 +239,10 @@ pub enum Slot {
     ReflectedFloorDivide,
     Remainder,
     ReflectedRemainder,
+    LeftShift,
+    ReflectedLeftShift,
+    RightShift,
+    ReflectedRightShift,
     BitwiseAnd,
     ReflectedBitwiseAnd,
     BitwiseXor,
@@ -252,7 +260,7 @@ pub enum Slot {
 }
 
 impl Slot {
-    const ALL: [Self; 49] = [
+    const ALL: [Self; 53] = [
         Self::Call,
         Self::New,
         Self::Init,
@@ -288,6 +296,10 @@ impl Slot {
         Self::ReflectedFloorDivide,
         Self::Remainder,
         Self::ReflectedRemainder,
+        Self::LeftShift,
+        Self::ReflectedLeftShift,
+        Self::RightShift,
+        Self::ReflectedRightShift,
         Self::BitwiseAnd,
         Self::ReflectedBitwiseAnd,
         Self::BitwiseXor,
@@ -344,6 +356,10 @@ impl TypeSlots {
             reflected_floor_divide: get("__rfloordiv__"),
             remainder: get("__mod__"),
             reflected_remainder: get("__rmod__"),
+            left_shift: get("__lshift__"),
+            reflected_left_shift: get("__rlshift__"),
+            right_shift: get("__rshift__"),
+            reflected_right_shift: get("__rrshift__"),
             bitwise_and: get("__and__"),
             reflected_bitwise_and: get("__rand__"),
             bitwise_xor: get("__xor__"),
@@ -398,6 +414,10 @@ impl TypeSlots {
             &self.reflected_floor_divide,
             &self.remainder,
             &self.reflected_remainder,
+            &self.left_shift,
+            &self.reflected_left_shift,
+            &self.right_shift,
+            &self.reflected_right_shift,
             &self.bitwise_and,
             &self.reflected_bitwise_and,
             &self.bitwise_xor,
@@ -455,6 +475,10 @@ impl TypeSlots {
             Slot::ReflectedFloorDivide => self.reflected_floor_divide.as_ref(),
             Slot::Remainder => self.remainder.as_ref(),
             Slot::ReflectedRemainder => self.reflected_remainder.as_ref(),
+            Slot::LeftShift => self.left_shift.as_ref(),
+            Slot::ReflectedLeftShift => self.reflected_left_shift.as_ref(),
+            Slot::RightShift => self.right_shift.as_ref(),
+            Slot::ReflectedRightShift => self.reflected_right_shift.as_ref(),
             Slot::BitwiseAnd => self.bitwise_and.as_ref(),
             Slot::ReflectedBitwiseAnd => self.reflected_bitwise_and.as_ref(),
             Slot::BitwiseXor => self.bitwise_xor.as_ref(),
@@ -509,6 +533,10 @@ impl TypeSlots {
             Slot::ReflectedFloorDivide => &mut self.reflected_floor_divide,
             Slot::Remainder => &mut self.remainder,
             Slot::ReflectedRemainder => &mut self.reflected_remainder,
+            Slot::LeftShift => &mut self.left_shift,
+            Slot::ReflectedLeftShift => &mut self.reflected_left_shift,
+            Slot::RightShift => &mut self.right_shift,
+            Slot::ReflectedRightShift => &mut self.reflected_right_shift,
             Slot::BitwiseAnd => &mut self.bitwise_and,
             Slot::ReflectedBitwiseAnd => &mut self.reflected_bitwise_and,
             Slot::BitwiseXor => &mut self.bitwise_xor,
@@ -855,6 +883,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
         slots.reflected_floor_divide = Some(intrinsic(super::number::slot_reflected_floor_divide));
         slots.remainder = Some(intrinsic(super::number::slot_remainder));
         slots.reflected_remainder = Some(intrinsic(super::number::slot_reflected_remainder));
+        slots.left_shift = Some(intrinsic(super::number::slot_left_shift));
+        slots.reflected_left_shift = Some(intrinsic(super::number::slot_left_shift));
+        slots.right_shift = Some(intrinsic(super::number::slot_right_shift));
+        slots.reflected_right_shift = Some(intrinsic(super::number::slot_right_shift));
         slots.bitwise_and = Some(intrinsic(super::number::slot_bitwise_and));
         slots.reflected_bitwise_and = Some(intrinsic(super::number::slot_bitwise_and));
         slots.bitwise_xor = Some(intrinsic(super::number::slot_bitwise_xor));
@@ -894,6 +926,7 @@ fn install_builtin_slots(types: &mut [PyType]) {
         Some(intrinsic(super::stdlib::core::slot_dict_delete_item));
 
     let slots = &mut types[BuiltinType::Set as usize].slots;
+    slots.subtract = Some(intrinsic(super::stdlib::core::slot_set_subtract));
     slots.less_than = Some(intrinsic(super::stdlib::core::slot_set_less));
     slots.less_equal = Some(intrinsic(super::stdlib::core::slot_set_less_equal));
     slots.greater_than = Some(intrinsic(super::stdlib::core::slot_set_greater));

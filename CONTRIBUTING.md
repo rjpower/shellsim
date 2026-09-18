@@ -94,10 +94,16 @@ comparison when the named reference binary is unavailable, while checked fixture
 Use the following testing layers for new behavior:
 
 1. Put small algorithm and invariant tests beside the implementation.
-2. Put cross-module and command behavior in `tests/`.
+2. Put command behavior in the plainly named module under `tests/commands/`. These modules share
+   one integration-test crate to avoid compiling and linking one harness per command. Put
+   cross-command shell behavior in the relevant top-level integration suite.
 3. Compare compatibility surfaces with CPython or coreutils where practical.
 4. Add a reduced real-task fixture when a TaskTrove case exposes the gap.
 5. Test malformed input, limits, and unsupported behavior as well as the success path.
+
+Keep Python tests grouped by compatibility layer because they share one runtime harness. Put
+source snippets directly in the focused `python_*.rs` suite, or in `tests/fixtures/python/` when a
+snippet is large enough that an inline string obscures the behavior under test.
 
 Never make a test depend on host wall time, locale, network state, filesystem contents, or hash-map
 iteration order.

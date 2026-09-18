@@ -32,6 +32,9 @@ class Path:
     def __repr__(self):
         return "PosixPath('" + self._path + "')"
 
+    def __fspath__(self):
+        return self._path
+
     def __truediv__(self, other):
         return Path(_join(self._path, str(other)))
 

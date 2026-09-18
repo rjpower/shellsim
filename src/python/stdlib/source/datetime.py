@@ -44,6 +44,7 @@ class _UTCZone:
 
 
 UTC = _UTCZone()
+_MISSING = []
 
 
 class timezone:
@@ -185,6 +186,20 @@ class datetime:
 
     def astimezone(self, tz=None):
         return datetime(self.year, self.month, self.day, self.hour, self.minute, self.second, self.microsecond, tz)
+
+    def replace(self, year=None, month=None, day=None, hour=None, minute=None, second=None, microsecond=None, tzinfo=_MISSING):
+        if tzinfo is _MISSING:
+            tzinfo = self.tzinfo
+        return datetime(
+            self.year if year is None else year,
+            self.month if month is None else month,
+            self.day if day is None else day,
+            self.hour if hour is None else hour,
+            self.minute if minute is None else minute,
+            self.second if second is None else second,
+            self.microsecond if microsecond is None else microsecond,
+            tzinfo,
+        )
 
     def __add__(self, other):
         if not isinstance(other, timedelta):

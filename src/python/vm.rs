@@ -159,6 +159,7 @@ fn exception_type_code(name: &str) -> u64 {
         "IsADirectoryError" => 19,
         "NotADirectoryError" => 20,
         "PermissionError" => 21,
+        "SystemExit" => 22,
         _ => unreachable!("exception type must come from the closed builtin table"),
     }
 }
@@ -187,6 +188,7 @@ fn exception_type_name(code: u64) -> &'static str {
         19 => "IsADirectoryError",
         20 => "NotADirectoryError",
         21 => "PermissionError",
+        22 => "SystemExit",
         _ => unreachable!("invalid private exception-type handle"),
     }
 }
@@ -505,6 +507,20 @@ impl<'a> Vm<'a> {
             Err((error, span)) => {
                 if let Some(reason) = self.interp.resources.stop_reason() {
                     ExecResult::Exit(reason.exit_status())
+                } else if self
+                    .pending_exception
+                    .as_ref()
+                    .is_some_and(|exception| exception.kind == "SystemExit")
+                {
+                    let exception = self
+                        .pending_exception
+                        .as_ref()
+                        .expect("SystemExit exception checked above");
+                    let status = protocol::display(&self.state.heap, &exception.value)
+                        .ok()
+                        .and_then(|value| value.parse::<i32>().ok())
+                        .unwrap_or(1);
+                    ExecResult::Exit(status)
                 } else if let Some(exception) = &self.pending_exception {
                     let rendered = protocol::display(&self.state.heap, &exception.value)
                         .unwrap_or_else(|_| exception.kind.clone());
@@ -1219,6 +1235,11 @@ impl<'a> Vm<'a> {
                         "PermissionError",
                     ))))
                 }
+                "SystemExit" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "SystemExit",
+                    ))))
+                }
                 "AssertionError" => {
                     return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
                         "AssertionError",
@@ -1286,7 +1307,7 @@ impl<'a> Vm<'a> {
                     | "PermissionError"
             );
             return Ok(name == "BaseException"
-                || name == "Exception"
+                || (name == "Exception" && actual != "SystemExit")
                 || name == actual
                 || (name == "OSError" && os_error));
         }
@@ -1340,6 +1361,32 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
+    fn import_roots(&mut self) -> Result<Vec<String>, String> {
+        let mut roots = self.state.temporary_import_paths.clone();
+        if let Some(path) = self.state.sys_path {
+            let Object::List(values) = self
+                .state
+                .heap
+                .get(path.object_id().ok_or("sys.path lost list identity")?)?
+            else {
+                return Err("sys.path must remain a list".into());
+            };
+            for value in values.clone() {
+                let path = self
+                    .string_value(&value)
+                    .map_err(|error| self.record_native_error(error))?
+                    .ok_or("sys.path entries must be strings")?;
+                roots.push(path);
+            }
+        } else {
+            roots.extend(self.state.import_paths.clone());
+        }
+        if roots.is_empty() {
+            roots.push(self.interp.cwd.clone());
+        }
+        Ok(roots)
+    }
+
     fn import(&mut self, name: &str, bind_root: bool) -> Result<(), String> {
         if let Some(module) = super::stdlib::native_module(name) {
             return self.finish_import(name, Value::Native(NativeValue::Module(module)), bind_root);
@@ -1352,11 +1399,7 @@ impl<'a> Vm<'a> {
         let source = if let Some(source) = super::stdlib::frozen_module(relative_name) {
             Some((format!("<frozen {name}>"), source.to_string()))
         } else {
-            let roots = if self.state.import_paths.is_empty() {
-                vec![self.interp.cwd.clone()]
-            } else {
-                self.state.import_paths.clone()
-            };
+            let roots = self.import_roots()?;
             self.interp
                 .load_module_source(&roots, relative_name)
                 .map_err(|error| self.record_native_error(error))?
@@ -1407,13 +1450,13 @@ impl<'a> Vm<'a> {
                 .map_or_else(|| "/".to_string(), |(parent, _)| parent.to_string())
         });
         if let Some(path) = &temporary_import_path {
-            self.state.import_paths.insert(0, path.clone());
+            self.state.temporary_import_paths.insert(0, path.clone());
         }
         self.local_scopes.push(scope);
         let execution = self.execute_code(&code);
         self.local_scopes.pop();
         if temporary_import_path.is_some() {
-            self.state.import_paths.remove(0);
+            self.state.temporary_import_paths.remove(0);
         }
         self.stack = outer_stack;
         match execution {
@@ -2809,6 +2852,14 @@ impl<'a> Vm<'a> {
                 .bool_value()
                 .ok_or_else(|| "__bool__ should return bool".into());
         }
+        if let Some(result) = self.invoke_slot(value, Slot::Length, "__len__", Vec::new())? {
+            let length = protocol::int_value(&self.state.heap, &result)
+                .ok_or_else(|| "__len__ should return int".to_string())?;
+            if length < 0 {
+                return Err("__len__ should return >= 0".into());
+            }
+            return Ok(length != 0);
+        }
         protocol::truth(&self.state.heap, value)
     }
 
@@ -3739,6 +3790,18 @@ impl<'a> Vm<'a> {
                 "__mod__",
                 Slot::ReflectedRemainder,
                 "__rmod__",
+            ),
+            BinaryOperator::LeftShift => (
+                Slot::LeftShift,
+                "__lshift__",
+                Slot::ReflectedLeftShift,
+                "__rlshift__",
+            ),
+            BinaryOperator::RightShift => (
+                Slot::RightShift,
+                "__rshift__",
+                Slot::ReflectedRightShift,
+                "__rrshift__",
             ),
             BinaryOperator::BitwiseAnd => (
                 Slot::BitwiseAnd,
@@ -5968,6 +6031,22 @@ impl PyRuntime for Vm<'_> {
         Vm::allocate_object(self, Object::List(items)).map_err(PyError::resource_error)
     }
 
+    fn new_import_path(&mut self) -> PyResult<Value> {
+        if let Some(path) = self.state.sys_path {
+            return Ok(path);
+        }
+        let mut values = Vec::with_capacity(self.state.import_paths.len());
+        for path in self.state.import_paths.clone() {
+            values.push(
+                self.allocate_string(path)
+                    .map_err(PyError::resource_error)?,
+            );
+        }
+        let path = self.new_list(values)?;
+        self.state.sys_path = Some(path);
+        Ok(path)
+    }
+
     fn new_tuple(&mut self, items: Vec<Value>) -> PyResult<Value> {
         Vm::allocate_object(self, Object::Tuple(items)).map_err(PyError::resource_error)
     }
@@ -6514,11 +6593,11 @@ impl PyRuntime for Vm<'_> {
         let import_root = path
             .rsplit_once('/')
             .map_or_else(|| "/".to_string(), |(parent, _)| parent.to_string());
-        self.state.import_paths.insert(0, import_root);
+        self.state.temporary_import_paths.insert(0, import_root);
         self.local_scopes.push(scope);
         let execution = self.execute_code(&code);
         self.local_scopes.pop();
-        self.state.import_paths.remove(0);
+        self.state.temporary_import_paths.remove(0);
         self.stack = outer_stack;
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),

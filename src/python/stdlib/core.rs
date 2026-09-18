@@ -87,6 +87,7 @@ pub(crate) static LIST_TYPE: NativeTypeDef = NativeTypeDef {
     name: "list",
     methods: &[
         method("list", "append", list_append),
+        method("list", "insert", list_insert),
         method("list", "extend", list_extend),
         method("list", "pop", list_pop),
         method("list", "remove", list_remove),
@@ -796,6 +797,26 @@ fn list_append(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     Ok(Value::None)
 }
 
+fn list_insert(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("list.insert", 2, 2)?;
+    args.reject_keywords("list.insert")?;
+    let list = receiver.cast::<PyList>(runtime)?;
+    let mut values = list.items(runtime)?;
+    let raw = runtime
+        .int_value(&args.positional()[0])
+        .ok_or_else(|| PyError::type_error("list index must be an integer"))?;
+    let len = i64::try_from(values.len()).map_err(|_| PyError::overflow_error("list too large"))?;
+    let index = if raw < 0 {
+        usize::try_from(len.saturating_add(raw).max(0)).unwrap_or(0)
+    } else {
+        usize::try_from(raw).unwrap_or(usize::MAX).min(values.len())
+    };
+    runtime.reserve_memory(64)?;
+    values.insert(index, args.positional()[1]);
+    runtime.replace_list_items(list, values)?;
+    Ok(Value::None)
+}
+
 fn list_extend(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("list.extend", 1, 1)?;
     args.reject_keywords("list.extend")?;
@@ -1269,6 +1290,33 @@ pub(crate) fn slot_set_greater_equal(
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
     slot_set_less_equal(runtime, right, left)
+}
+
+pub(crate) fn slot_set_subtract(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let left = left.cast::<PySet>(runtime)?.items(runtime)?;
+    let Ok(right) = right.cast::<PySet>(runtime) else {
+        return Ok(None);
+    };
+    let right = right.items(runtime)?;
+    let mut difference = Vec::new();
+    for value in left {
+        let mut present = false;
+        for candidate in &right {
+            runtime.charge_cpu(1)?;
+            if runtime.equals(&value, candidate)? {
+                present = true;
+                break;
+            }
+        }
+        if !present {
+            difference.push(value);
+        }
+    }
+    runtime.new_set(difference).map(Some)
 }
 
 fn builtin_map(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
