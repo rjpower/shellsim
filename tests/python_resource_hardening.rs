@@ -160,6 +160,27 @@ fn string_join_reserves_its_result_before_host_growth() {
 }
 
 #[test]
+fn repeated_large_ascii_string_indexing_stays_within_cpu_budget() {
+    let source =
+        "value = 'x' * 10000\nfor _ in range(1000):\n    assert value[9999] == 'x'\nprint('ok')";
+    let (status, stdout, stderr, usage) = run_with_limits(
+        source,
+        Limits {
+            cpu: 500_000,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(
+        status,
+        0,
+        "stderr={} usage={usage:?}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"ok\n");
+    assert!(usage.cpu_used <= 500_000);
+}
+
+#[test]
 fn bytes_repetition_reserves_before_allocating() {
     let (status, stdout, stderr, usage) = run_with_limits(
         "b'x' * 1000000",

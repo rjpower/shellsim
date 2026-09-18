@@ -198,6 +198,7 @@ struct HeapObject {
     type_id: TypeId,
     attributes: HashMap<String, Value>,
     payload: Object,
+    string_is_ascii: Option<bool>,
     modeled_bytes: u64,
 }
 
@@ -226,6 +227,15 @@ impl Heap {
             .ok_or_else(|| "invalid object reference".into())
     }
 
+    /// Return the cached ASCII property of an immutable string payload.
+    pub fn string_is_ascii(&self, id: ObjectId) -> Result<Option<bool>, String> {
+        self.objects
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|object| object.string_is_ascii)
+            .ok_or_else(|| "invalid object reference".into())
+    }
+
     /// Replace an object payload while charging growth before installing it and releasing shrink
     /// after the old payload is no longer live. The object's identity and instance attributes are
     /// preserved.
@@ -248,6 +258,10 @@ impl Heap {
         if next_bytes > current_bytes {
             self.reserve_object_growth(id, next_bytes - current_bytes, resources)?;
         }
+        let string_is_ascii = match &payload {
+            Object::String(value) => Some(value.is_ascii()),
+            _ => None,
+        };
         let object = self
             .objects
             .get_mut(id.0)
@@ -255,6 +269,7 @@ impl Heap {
             .ok_or("invalid object reference")?;
         object.type_id = next_type;
         object.payload = payload;
+        object.string_is_ascii = string_is_ascii;
         if current_bytes > next_bytes {
             let released = current_bytes - next_bytes;
             object.modeled_bytes = object.modeled_bytes.saturating_sub(released);
@@ -534,10 +549,15 @@ impl Heap {
             .ok_or("modeled heap size overflow")?;
         self.bytes_since_collection = self.bytes_since_collection.saturating_add(bytes);
         let type_id = self.infer_type_id(&object)?;
+        let string_is_ascii = match &object {
+            Object::String(value) => Some(value.is_ascii()),
+            _ => None,
+        };
         let object = HeapObject {
             type_id,
             attributes: HashMap::new(),
             payload: object,
+            string_is_ascii,
             modeled_bytes: bytes,
         };
         let id = if let Some(index) = self.free_objects.pop() {
