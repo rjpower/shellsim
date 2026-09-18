@@ -1258,7 +1258,8 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     if mode != "--soft" && repo::store_index(ctx, &root, &tree).is_err() {
         return 1;
     }
-    if repo::update_head(ctx, &root, &commit).is_err() {
+    let target = revision.clone();
+    if repo::update_head(ctx, &root, &commit, &format!("reset: moving to {target}")).is_err() {
         return 1;
     }
     if mode == "--mixed" {

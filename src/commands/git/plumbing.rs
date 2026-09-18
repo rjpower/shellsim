@@ -741,7 +741,7 @@ pub(crate) fn git_symbolic_ref(ctx: &mut CommandContext<'_>, args: &[String], io
             let Some(branch) = target.strip_prefix("refs/heads/") else {
                 return usage(io, "only refs/heads/* can be pointed at by HEAD");
             };
-            repo::set_head_to_branch(ctx, &root, branch).map_or(1, |()| 0)
+            repo::set_head_to_branch(ctx, &root, branch, "symbolic-ref: update").map_or(1, |()| 0)
         }
         _ => usage(io, "usage: git symbolic-ref [--short] HEAD [REF]"),
     }
@@ -1100,4 +1100,58 @@ fn parse_line_range(range: &str, total: usize) -> Option<(usize, usize)> {
         end.parse().ok()?
     };
     (start >= 1 && start <= end).then_some((start, end.min(total)))
+}
+
+// -- reflog --------------------------------------------------------------------------------------
+
+/// List where HEAD has been, which is what makes a bad reset recoverable.
+pub(crate) fn git_reflog(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(ctx) else {
+        return repo_error(io);
+    };
+    let mut limit = usize::MAX;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        match argument {
+            // `show` is the only subcommand offered, and HEAD the only reference logged.
+            "show" | "HEAD" | "--oneline" | "--no-abbrev" | "--" => {}
+            "-n" | "--max-count" => {
+                index += 1;
+                let Some(value) = args.get(index).and_then(|value| value.parse().ok()) else {
+                    return usage(io, "-n requires a count");
+                };
+                limit = value;
+            }
+            value if value.starts_with("--max-count=") => {
+                let Ok(value) = value["--max-count=".len()..].parse() else {
+                    return usage(io, "--max-count requires a count");
+                };
+                limit = value;
+            }
+            value if value.starts_with('-') && value[1..].chars().all(|c| c.is_ascii_digit()) => {
+                limit = value[1..].parse().unwrap_or(usize::MAX);
+            }
+            value if value.starts_with('-') => {
+                return usage(io, &format!("unsupported reflog option: {value}"))
+            }
+            value => return usage(io, &format!("only HEAD is logged, not {value}")),
+        }
+        index += 1;
+    }
+    for (position, entry) in repo::read_head_log(ctx, &root)
+        .iter()
+        .enumerate()
+        .take(limit)
+    {
+        io.out.extend_from_slice(
+            format!(
+                "{} HEAD@{{{position}}}: {}\n",
+                repo::short(&entry.after),
+                entry.action
+            )
+            .as_bytes(),
+        );
+    }
+    0
 }

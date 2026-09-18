@@ -282,7 +282,7 @@ pub(crate) fn git_commit(
             return 1;
         }
     };
-    if repo::update_head(ctx, &root, &id).is_err() {
+    if repo::update_head(ctx, &root, &id, &format!("commit: {}", commit.subject())).is_err() {
         return 1;
     }
     if pending.is_some() {
@@ -2037,7 +2037,7 @@ fn rename_branch(
         return 1;
     }
     if repo::current_branch(ctx, root).as_deref() == Some(from)
-        && repo::set_head_to_branch(ctx, root, to).is_err()
+        && repo::set_head_to_branch(ctx, root, to, &format!("branch: renamed to {to}")).is_err()
     {
         return 1;
     }
@@ -2288,7 +2288,9 @@ fn switch_to_branch(ctx: &mut CommandContext<'_>, root: &str, branch: &str, io: 
     if let Err(status) = checkout_commit(ctx, root, &commit, io) {
         return status;
     }
-    if repo::set_head_to_branch(ctx, root, branch).is_err() {
+    let from = repo::current_branch(ctx, root).unwrap_or_else(|| "HEAD".to_string());
+    let action = format!("checkout: moving from {from} to {branch}");
+    if repo::set_head_to_branch(ctx, root, branch, &action).is_err() {
         return 1;
     }
     io.err
@@ -2305,7 +2307,14 @@ fn switch_detached(ctx: &mut CommandContext<'_>, root: &str, revision: &str, io:
     if let Err(status) = checkout_commit(ctx, root, &commit, io) {
         return status;
     }
-    if repo::set_head_detached(ctx, root, &commit).is_err() {
+    if repo::set_head_detached(
+        ctx,
+        root,
+        &commit,
+        &format!("checkout: moving to {revision}"),
+    )
+    .is_err()
+    {
         return 1;
     }
     io.err.extend_from_slice(
@@ -2648,7 +2657,8 @@ pub(crate) fn git_merge(
         if let Err(status) = checkout_commit(ctx, &root, &other, io) {
             return status;
         }
-        if repo::update_head(ctx, &root, &other).is_err() {
+        if repo::update_head(ctx, &root, &other, &format!("merge {target}: Fast-forward")).is_err()
+        {
             return 1;
         }
         io.out.extend_from_slice(
@@ -2729,7 +2739,7 @@ pub(crate) fn git_merge(
     let Ok(id) = repo::store_commit(ctx, &root, &commit, &merged) else {
         return 1;
     };
-    if repo::update_head(ctx, &root, &id).is_err() {
+    if repo::update_head(ctx, &root, &id, &format!("merge {target}")).is_err() {
         return 1;
     }
     io.out
@@ -2937,7 +2947,14 @@ fn replay_one(
     let Ok(new_id) = repo::store_commit(ctx, root, &replayed, &applied) else {
         return 1;
     };
-    if repo::update_head(ctx, root, &new_id).is_err() {
+    if repo::update_head(
+        ctx,
+        root,
+        &new_id,
+        &format!("{name}: {}", replayed.subject()),
+    )
+    .is_err()
+    {
         return 1;
     }
     let branch = repo::current_branch(ctx, root).unwrap_or_else(|| "detached HEAD".to_string());

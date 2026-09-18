@@ -89,7 +89,6 @@ const UNSUPPORTED_COMMANDS: &[&str] = &[
     "gc",
     "notes",
     "rebase",
-    "reflog",
     "replace",
     "worktree",
 ];
@@ -357,6 +356,7 @@ fn dispatch(
         "switch" => history::git_switch(ctx, args, io),
         "checkout" => history::git_checkout(ctx, args, io),
         "blame" => plumbing::git_blame(ctx, args, io),
+        "reflog" => plumbing::git_reflog(ctx, args, io),
         "merge" => history::git_merge(ctx, globals, args, io),
         "cherry-pick" => history::git_replay(ctx, globals, false, args, io),
         "revert" => history::git_replay(ctx, globals, true, args, io),

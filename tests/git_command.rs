@@ -2054,3 +2054,38 @@ fn diff_and_log_accept_the_flags_agents_pass_by_habit() {
     let patch = run(&mut env, "git diff -w").1;
     assert!(patch.contains("\n b\n"), "{patch:?}");
 }
+
+#[test]
+fn the_reflog_records_where_head_has_been_and_brings_a_reset_back() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/f", b"one\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm one").0, 0);
+    env.vfs.put_file("/f", b"two\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git commit -qam two").0, 0);
+    assert_eq!(run(&mut env, "git switch -qc side").0, 0);
+    assert_eq!(run(&mut env, "git switch -q main").0, 0);
+    assert_eq!(run(&mut env, "git reset -q --hard HEAD~1").0, 0);
+
+    let log = run(&mut env, "git reflog").1;
+    let actions: Vec<&str> = log
+        .lines()
+        .map(|line| line.split_once(": ").map(|parts| parts.1).unwrap_or(line))
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            "reset: moving to HEAD~1",
+            "checkout: moving from side to main",
+            "checkout: moving from main to side",
+            "commit: two",
+            "commit: one",
+        ]
+    );
+    assert_eq!(run(&mut env, "git reflog -n 2").1.lines().count(), 2);
+
+    // The commit the reset threw away is still reachable through the log.
+    assert_eq!(env.vfs.read("/", "/f").unwrap(), b"one\n");
+    assert_eq!(run(&mut env, "git reset -q --hard HEAD@{1}").0, 0);
+    assert_eq!(env.vfs.read("/", "/f").unwrap(), b"two\n");
+}

@@ -594,29 +594,107 @@ pub(crate) fn delete_reference(
 }
 
 /// Point HEAD at `commit`, following the current branch when HEAD is not detached.
-pub(crate) fn update_head(ctx: &mut CommandContext<'_>, root: &str, commit: &str) -> VfsResult<()> {
+pub(crate) fn update_head(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    commit: &str,
+    action: &str,
+) -> VfsResult<()> {
+    let before = head_commit(ctx, root);
     let destination = head_reference(ctx, root).unwrap_or_else(|| HEAD.to_string());
-    write_reference(ctx, root, &destination, commit)
+    write_reference(ctx, root, &destination, commit)?;
+    log_head_move(ctx, root, before.as_deref(), commit, action);
+    Ok(())
 }
 
 pub(crate) fn set_head_to_branch(
     ctx: &mut CommandContext<'_>,
     root: &str,
     branch: &str,
+    action: &str,
 ) -> VfsResult<()> {
+    let before = head_commit(ctx, root);
     write_vfs(
         ctx,
         &git_path(root, HEAD),
         format!("ref: refs/heads/{branch}\n").as_bytes(),
-    )
+    )?;
+    if let Some(commit) = head_commit(ctx, root) {
+        log_head_move(ctx, root, before.as_deref(), &commit, action);
+    }
+    Ok(())
 }
 
 pub(crate) fn set_head_detached(
     ctx: &mut CommandContext<'_>,
     root: &str,
     commit: &str,
+    action: &str,
 ) -> VfsResult<()> {
-    write_vfs(ctx, &git_path(root, HEAD), format!("{commit}\n").as_bytes())
+    let before = head_commit(ctx, root);
+    write_vfs(ctx, &git_path(root, HEAD), format!("{commit}\n").as_bytes())?;
+    log_head_move(ctx, root, before.as_deref(), commit, action);
+    Ok(())
+}
+
+/// The most moves of HEAD the log keeps; older ones are forgotten.
+const MAX_REFLOG_ENTRIES: usize = 1000;
+
+/// One recorded move of HEAD.
+pub(crate) struct HeadMove {
+    pub before: String,
+    pub after: String,
+    pub action: String,
+}
+
+/// Record a move of HEAD, which is what `git reflog` reads and `HEAD@{N}` names.
+fn log_head_move(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    before: Option<&str>,
+    after: &str,
+    action: &str,
+) {
+    const MISSING: &str = "0000000000000000000000000000000000000000";
+    // Git logs every move, including one that leaves HEAD where it was, so the numbering of
+    // `HEAD@{N}` counts moves rather than distinct commits.
+    let before = before.unwrap_or(MISSING);
+    let mut moves = read_head_log(ctx, root);
+    // Oldest first in the file, as Git writes it.
+    moves.reverse();
+    moves.push(HeadMove {
+        before: before.to_string(),
+        after: after.to_string(),
+        action: action.replace(['\t', '\n'], " "),
+    });
+    if moves.len() > MAX_REFLOG_ENTRIES {
+        moves.drain(..moves.len() - MAX_REFLOG_ENTRIES);
+    }
+    let text: String = moves
+        .iter()
+        .map(|entry| format!("{}\t{}\t{}\n", entry.before, entry.after, entry.action))
+        .collect();
+    let _ = write_vfs(ctx, &git_path(root, "logs/HEAD"), text.as_bytes());
+}
+
+/// Every recorded move of HEAD, newest first, which is the order `git reflog` prints.
+pub(crate) fn read_head_log(interp: &Interp, root: &str) -> Vec<HeadMove> {
+    let Ok(bytes) = interp.vfs.read("/", &git_path(root, "logs/HEAD")) else {
+        return Vec::new();
+    };
+    let mut moves: Vec<HeadMove> = String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            Some(HeadMove {
+                before: fields.next()?.to_string(),
+                after: fields.next()?.to_string(),
+                action: fields.next().unwrap_or_default().to_string(),
+            })
+        })
+        .collect();
+    moves.reverse();
+    moves
 }
 
 /// Sorted names of the references below `.git/refs/<kind>`.
@@ -700,6 +778,19 @@ pub(crate) fn resolve_revision(interp: &Interp, root: &str, revision: &str) -> O
 fn resolve_base_revision(interp: &Interp, root: &str, revision: &str) -> Option<String> {
     if revision.is_empty() || revision == "HEAD" || revision == "@" {
         return head_commit(interp, root);
+    }
+    if let Some(position) = revision
+        .strip_prefix("HEAD@{")
+        .or_else(|| revision.strip_prefix("@{"))
+        .and_then(|rest| rest.strip_suffix('}'))
+        .and_then(|digits| digits.parse::<usize>().ok())
+    {
+        // `HEAD@{0}` is where HEAD is now; each step back is the state before one recorded move.
+        let moves = read_head_log(interp, root);
+        return match position {
+            0 => head_commit(interp, root),
+            _ => moves.get(position - 1).map(|entry| entry.before.clone()),
+        };
     }
     if revision == "@{-1}" {
         let previous = previous_branch(interp, root)?;

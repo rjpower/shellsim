@@ -12,8 +12,12 @@ init  status  add  rm  mv  restore  reset  clean  ls-files
 commit  log  show  diff  apply  rev-parse  rev-list  branch  tag  switch  checkout  merge
 cherry-pick  revert  config  remote  stash  grep  cat-file  hash-object  ls-tree  check-ignore
 merge-base
-describe  shortlog  show-ref  symbolic-ref  for-each-ref  blame
+describe  shortlog  show-ref  symbolic-ref  for-each-ref  blame  reflog
 ```
+
+Every move of HEAD is recorded, so `git reflog` lists where it has been and `HEAD@{N}` names the
+commit it was on N moves ago. That is what makes a mistaken `git reset --hard` recoverable. Only
+HEAD is logged, not individual branches, and the last thousand moves are kept.
 
 `git blame` walks first parents, carrying each line back until the version that introduced it,
 and marks lines the working tree has not committed with a zero hash. `git log --graph` draws the
@@ -104,7 +108,7 @@ without markers, leaving the surviving content in the working tree, as Git does.
 Anything needing a network is refused and recorded as unsupported: `clone`, `fetch`, `pull`,
 `push`, `ls-remote`, and `submodule`. `git remote` records remote names but never contacts one.
 
-There is no `rebase`, `reflog`, `bisect`, or `worktree`, and no interactive mode for any
+There is no `rebase`, `bisect`, or `worktree`, and no interactive mode for any
 command. Those report `unsupported subcommand` and exit 2; a name that is not a Git
 subcommand at all is reported the way Git reports a typo and exits 1.
 
@@ -131,6 +135,7 @@ by real Git is not readable, and a repository created here is not meant to be ha
 .git/commits/<id>.commit   a commit's parents, author, timestamp, and message
 .git/config            repository configuration in Git's INI format
 .git/stash-list        saved stash entries, newest first
+.git/logs/HEAD         every move of HEAD, oldest first, as `before<TAB>after<TAB>action`
 .git/MERGE_HEAD        the commit an unfinished merge is bringing in
 .git/CHERRY_PICK_HEAD  the commit an unfinished cherry-pick is replaying
 .git/REVERT_HEAD       the commit an unfinished revert is undoing
