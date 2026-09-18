@@ -337,6 +337,28 @@ pub struct ReplState {
     sys_path: Option<Value>,
     temporary_import_paths: Vec<String>,
     original_cwd: Option<String>,
+    type_memory: u64,
+}
+
+impl ReplState {
+    fn sync_type_memory(&mut self, resources: &mut crate::resources::Resources) -> bool {
+        let current = self.types.modeled_bytes();
+        if current > self.type_memory {
+            let growth = current - self.type_memory;
+            if !resources.reserve_memory(growth) {
+                return false;
+            }
+        } else {
+            resources.release_memory(self.type_memory - current);
+        }
+        self.type_memory = current;
+        true
+    }
+
+    fn release_owned_memory(&mut self, resources: &mut crate::resources::Resources) {
+        let heap = self.heap.take_modeled_bytes();
+        resources.release_memory(heap.saturating_add(std::mem::take(&mut self.type_memory)));
+    }
 }
 
 enum ExecResult {
@@ -399,11 +421,13 @@ impl PythonContinuation {
         if interp.cwd != self.original_cwd {
             interp.set_var("PWD", self.original_cwd.clone());
         }
-        PythonPoll::Ready(match result {
+        let status = match result {
             ExecResult::Continue => 0,
             ExecResult::Exit(status) => status,
             ExecResult::Unsupported(feature) => unsupported(interp, &feature, &mut self.stderr),
-        })
+        };
+        self.state.release_owned_memory(&mut interp.resources);
+        PythonPoll::Ready(status)
     }
 
     pub(crate) fn into_output(self) -> (Vec<u8>, Vec<u8>) {
@@ -498,11 +522,24 @@ pub(crate) fn start_python(
     };
 
     let scratch = 10 * 1024 + source.len() as u64;
-    if !interp.resources.reserve_memory(scratch)
-        || !interp.resources.charge_cpu(100 + source.len() as u64)
-    {
+    if !interp.resources.reserve_memory(scratch) {
         return PythonCommandStart::Ready(137);
     }
+    if !interp.resources.charge_cpu(100 + source.len() as u64) {
+        interp.resources.release_memory(scratch);
+        return PythonCommandStart::Ready(137);
+    }
+
+    let program = vm::VmProgram::compile(&source);
+    interp.resources.release_memory(scratch);
+    let program = match program {
+        Ok(program) => program,
+        Err(ExecResult::Unsupported(feature)) => {
+            return PythonCommandStart::Ready(unsupported(interp, &feature, err))
+        }
+        Err(ExecResult::Exit(status)) => return PythonCommandStart::Ready(status),
+        Err(ExecResult::Continue) => unreachable!("compilation cannot complete execution"),
+    };
 
     let mut state = ReplState::default();
     let import_root = match py_argv.first().map(String::as_str) {
@@ -541,14 +578,6 @@ pub(crate) fn start_python(
         };
         state.locals.insert("__file__".into(), file);
     }
-    let program = match vm::VmProgram::compile(&source) {
-        Ok(program) => program,
-        Err(ExecResult::Unsupported(feature)) => {
-            return PythonCommandStart::Ready(unsupported(interp, &feature, err))
-        }
-        Err(ExecResult::Exit(status)) => return PythonCommandStart::Ready(status),
-        Err(ExecResult::Continue) => unreachable!("compilation cannot complete execution"),
-    };
     PythonCommandStart::Running(Box::new(PythonContinuation {
         argv: py_argv,
         stdin: execution_stdin,
@@ -601,8 +630,11 @@ pub fn run_repl_line(
     interp.resources.release_memory(scratch);
     if stay {
         out.extend_from_slice(b">>> ");
-    } else if let Some(original_cwd) = state.original_cwd.take() {
-        interp.set_var("PWD", original_cwd);
+    } else {
+        if let Some(original_cwd) = state.original_cwd.take() {
+            interp.set_var("PWD", original_cwd);
+        }
+        state.release_owned_memory(&mut interp.resources);
     }
     (status, stay)
 }

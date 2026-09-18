@@ -67,6 +67,11 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="modeled memory limit per replay (default: 256)",
     )
+    parser.add_argument(
+        "--solution-only",
+        action="store_true",
+        help="skip verifier phases when diagnosing golden solution behavior",
+    )
     parser.add_argument("--quiet", action="store_true", help="do not print task progress")
     return parser.parse_args()
 
@@ -210,7 +215,14 @@ def reward(environment: Any) -> Optional[str]:
     return None
 
 
-def replay(task: Path, environment_type: Any, limits_type: Any, memory_mib: int = 256) -> dict[str, Any]:
+def replay(
+    task: Path,
+    environment_type: Any,
+    limits_type: Any,
+    memory_mib: int = 256,
+    *,
+    include_verifier: bool = True,
+) -> dict[str, Any]:
     environment = environment_type(
         limits_type(
             cpu=100_000_000,
@@ -250,7 +262,7 @@ def replay(task: Path, environment_type: Any, limits_type: Any, memory_mib: int 
     verifier_result = None
     verifier_source = None
     tests = task / "tests"
-    if not environment.terminated and tests.is_dir():
+    if include_verifier and not environment.terminated and tests.is_dir():
         try:
             environment.mount(tests, "/tests")
             wrapper = tests / "test.sh"
@@ -344,12 +356,24 @@ def main() -> int:
     for index, task in enumerate(tasks, 1):
         if not options.quiet:
             print(f"[{index}/{len(tasks)}] {task.name}", file=sys.stderr)
-        results.append(replay(task, Environment, Limits, options.memory_mib))
+        results.append(
+            replay(
+                task,
+                Environment,
+                Limits,
+                options.memory_mib,
+                include_verifier=not options.solution_only,
+            )
+        )
     print(
         json.dumps(
             {
                 "schema_version": 3,
-                "method": "approximate task mount; golden solution; verifier wrapper with Python fallback",
+                "method": (
+                    "approximate task mount; golden solution only"
+                    if options.solution_only
+                    else "approximate task mount; golden solution; verifier wrapper with Python fallback"
+                ),
                 "source": str(source),
                 "tasks": len(results),
                 "summary": summarize(results),

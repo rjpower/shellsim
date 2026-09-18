@@ -349,13 +349,9 @@ impl VmProgram {
         err: Out,
     ) -> VmPoll {
         let mut vm = Vm::new(interp, input, state, &mut self.execution, mode, out, err);
+        vm.release_transient_memory();
         if !self.started {
-            let retained_heap = vm
-                .state
-                .heap
-                .modeled_bytes()
-                .saturating_add(vm.state.types.modeled_bytes());
-            if retained_heap != 0 && !vm.interp.resources.reserve_memory(retained_heap) {
+            if !vm.state.sync_type_memory(&mut vm.interp.resources) {
                 return VmPoll::Ready(ExecResult::Exit(137));
             }
             vm.bytecode_frames.push(BytecodeFrame {
@@ -367,7 +363,19 @@ impl VmProgram {
             });
             self.started = true;
         }
+        if vm.state.heap.should_collect(
+            vm.interp.resources.limits().memory,
+            vm.interp.resources.memory_remaining(),
+        ) {
+            if let Err(error) = vm.collect_heap() {
+                return VmPoll::Ready(ExecResult::Unsupported(error));
+            }
+        }
         let execution = vm.execute_active_frame(VM_POLL_QUANTUM);
+        vm.release_transient_memory();
+        if !vm.state.sync_type_memory(&mut vm.interp.resources) {
+            return VmPoll::Ready(ExecResult::Exit(137));
+        }
         match &execution {
             Ok(Execution::Pending) => return VmPoll::Runnable,
             Ok(Execution::Blocked(reason)) => return VmPoll::Blocked(*reason),
@@ -376,6 +384,7 @@ impl VmProgram {
         vm.bytecode_frames
             .pop()
             .expect("completed program must retain its root frame");
+        vm.release_retained_memory();
         VmPoll::Ready(vm.render_execution(execution))
     }
 }
@@ -419,6 +428,8 @@ struct VmState {
     method_frames: Vec<(super::heap::ObjectId, Value)>,
     stdin_position: usize,
     stdin_text: Option<String>,
+    transient_memory: u64,
+    retained_memory: u64,
 }
 
 /// An executing code object's resumable control state.
@@ -491,6 +502,60 @@ impl<'a> Vm<'a> {
             out,
             err,
         }
+    }
+
+    fn collect_heap(&mut self) -> Result<(), String> {
+        let mut values = self.state.locals.values().copied().collect::<Vec<_>>();
+        values.extend(self.state.modules.values().copied());
+        values.extend(self.state.sys_path);
+        values.extend(self.state.types.heap_roots());
+        values.extend(self.stack.iter().copied());
+        values.extend(self.with_contexts.iter().copied());
+        if let Some(exception) = &self.pending_exception {
+            values.push(exception.value);
+        }
+        values.extend(self.exception_stack.iter().map(|exception| exception.value));
+        for (owner, value) in &self.method_frames {
+            values.extend([Value::Object(*owner), *value]);
+        }
+        for frame in &self.bytecode_frames {
+            if let Some(function_return) = &frame.function_return {
+                values.extend(function_return.outer_stack.iter().copied());
+            }
+            if let Some(pending) = &frame.pending_native_call {
+                values.extend(pending.arguments.positional().iter().copied());
+                values.extend(pending.arguments.keywords().iter().map(|(_, value)| *value));
+            }
+        }
+        let mut scopes = self.local_scopes.clone();
+        scopes.extend(self.class_scopes.iter().copied());
+        self.state
+            .heap
+            .collect(&values, &scopes, &mut self.interp.resources)?;
+        Ok(())
+    }
+
+    fn release_transient_memory(&mut self) {
+        let bytes = std::mem::take(&mut self.transient_memory);
+        self.interp.resources.release_memory(bytes);
+    }
+
+    fn release_retained_memory(&mut self) {
+        let bytes = std::mem::take(&mut self.retained_memory);
+        self.interp.resources.release_memory(bytes);
+    }
+
+    fn reserve_retained_memory(&mut self, bytes: usize) -> Result<(), String> {
+        let bytes = u64::try_from(bytes).map_err(|_| "Python allocation is too large")?;
+        let next = self
+            .retained_memory
+            .checked_add(bytes)
+            .ok_or("modeled Python memory overflow")?;
+        if !self.interp.resources.reserve_memory(bytes) {
+            return Err("memory limit exceeded".into());
+        }
+        self.retained_memory = next;
+        Ok(())
     }
 
     fn render_execution(
@@ -575,6 +640,10 @@ impl<'a> Vm<'a> {
         budget: usize,
     ) -> Result<Execution, (String, super::source::Span)> {
         'execution: for _ in 0..budget.max(1) {
+            // Native helper snapshots live for one semantic instruction. Releasing the previous
+            // instruction's scratch here avoids double-counting a materialized result after it
+            // has moved into an arena object.
+            self.release_transient_memory();
             if self.interp.deadline_interrupt.is_some() {
                 return Ok(Execution::Exit(124));
             }
@@ -1761,7 +1830,7 @@ impl<'a> Vm<'a> {
         if is_new {
             self.state
                 .heap
-                .reserve_growth(48, &mut self.interp.resources)?;
+                .reserve_object_growth(id, 48, &mut self.interp.resources)?;
         }
         self.state
             .heap
@@ -1845,9 +1914,11 @@ impl<'a> Vm<'a> {
                                 unreachable!("immediate call cannot suspend")
                             }
                         };
-                        self.state
-                            .heap
-                            .reserve_growth(48, &mut self.interp.resources)?;
+                        self.state.heap.reserve_object_growth(
+                            id,
+                            48,
+                            &mut self.interp.resources,
+                        )?;
                         let Object::DefaultDict { entries, .. } = self.state.heap.get_mut(id)?
                         else {
                             unreachable!()
@@ -2055,7 +2126,7 @@ impl<'a> Vm<'a> {
                 } else {
                     self.state
                         .heap
-                        .reserve_growth(48, &mut self.interp.resources)?;
+                        .reserve_object_growth(id, 48, &mut self.interp.resources)?;
                     let entries = match self.state.heap.get_mut(id)? {
                         Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
                         _ => unreachable!(),
@@ -4236,6 +4307,7 @@ impl<'a> Vm<'a> {
                         self.state.heap.extend_attributes(
                             instance.object_id().expect("instances are heap objects"),
                             values,
+                            &mut self.interp.resources,
                         )?;
                     } else if let Some(initializer) = self.class_attribute(id, "__init__")? {
                         let Some(function) = initializer.object_id() else {
@@ -5316,11 +5388,15 @@ impl<'a> Vm<'a> {
 
     fn reserve_result(&mut self, bytes: usize) -> Result<(), String> {
         let bytes = u64::try_from(bytes).map_err(|_| "string result is too large")?;
-        if self.interp.resources.reserve_memory(bytes) {
-            Ok(())
-        } else {
-            Err("memory limit exceeded".into())
+        let next = self
+            .transient_memory
+            .checked_add(bytes)
+            .ok_or("modeled Python memory overflow")?;
+        if !self.interp.resources.reserve_memory(bytes) {
+            return Err("memory limit exceeded".into());
         }
+        self.transient_memory = next;
+        Ok(())
     }
 
     /// Append at most the output budget's remaining bytes. Charging happens before touching the
@@ -5502,7 +5578,8 @@ impl PyRuntime for Vm<'_> {
                 .map_err(PyError::runtime_error)?;
             std::str::from_utf8(self.stdin)
                 .map_err(|_| PyError::value_error("standard input is not valid UTF-8"))?;
-            self.reserve_memory(self.stdin.len())?;
+            self.reserve_retained_memory(self.stdin.len())
+                .map_err(PyError::resource_error)?;
             self.stdin_text = Some(
                 String::from_utf8(self.stdin.to_vec())
                     .expect("stdin was validated as UTF-8 immediately above"),
@@ -5607,37 +5684,18 @@ impl PyRuntime for Vm<'_> {
 
     fn replace_bytearray_items(&mut self, value: PyByteArray, items: Vec<u8>) -> PyResult<()> {
         let id = value.object_id();
-        let current = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
-            Object::ByteArray(items) => items.len(),
-            _ => {
-                return Err(PyError::runtime_error(
-                    "bytearray handle changed object kind",
-                ))
-            }
-        };
-        if items.len() > current {
-            self.state
-                .heap
-                .reserve_growth(
-                    u64::try_from(items.len() - current).unwrap_or(u64::MAX),
-                    &mut self.interp.resources,
-                )
-                .map_err(PyError::resource_error)?;
-        }
-        match self
-            .state
-            .heap
-            .get_mut(id)
-            .map_err(PyError::runtime_error)?
-        {
-            Object::ByteArray(current) => {
-                *current = items;
-                Ok(())
-            }
-            _ => Err(PyError::runtime_error(
+        if !matches!(
+            self.state.heap.get(id).map_err(PyError::runtime_error)?,
+            Object::ByteArray(_)
+        ) {
+            return Err(PyError::runtime_error(
                 "bytearray handle changed object kind",
-            )),
+            ));
         }
+        self.state
+            .heap
+            .replace_payload(id, Object::ByteArray(items), &mut self.interp.resources)
+            .map_err(PyError::resource_error)
     }
 
     fn tuple_items(&mut self, tuple: PyTuple) -> PyResult<Vec<Value>> {
@@ -5681,22 +5739,19 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(Value, Value)>) -> PyResult<()> {
-        match self
-            .state
+        let id = dict.object_id();
+        let replacement = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::Dict(_) => Object::Dict(items),
+            Object::DefaultDict { factory, .. } => Object::DefaultDict {
+                factory: *factory,
+                entries: items,
+            },
+            _ => return Err(PyError::runtime_error("dict handle changed object kind")),
+        };
+        self.state
             .heap
-            .get_mut(dict.object_id())
-            .map_err(PyError::runtime_error)?
-        {
-            Object::Dict(destination)
-            | Object::DefaultDict {
-                entries: destination,
-                ..
-            } => {
-                *destination = items;
-                Ok(())
-            }
-            _ => Err(PyError::runtime_error("dict handle changed object kind")),
-        }
+            .replace_payload(id, replacement, &mut self.interp.resources)
+            .map_err(PyError::resource_error)
     }
 
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<Value>> {
@@ -5726,16 +5781,17 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn replace_set_items(&mut self, set: PySet, items: Vec<Value>) -> PyResult<()> {
-        let Object::Set(destination) = self
-            .state
-            .heap
-            .get_mut(set.object_id())
-            .map_err(PyError::runtime_error)?
-        else {
+        let id = set.object_id();
+        if !matches!(
+            self.state.heap.get(id).map_err(PyError::runtime_error)?,
+            Object::Set(_)
+        ) {
             return Err(PyError::runtime_error("set handle changed object kind"));
-        };
-        *destination = items;
-        Ok(())
+        }
+        self.state
+            .heap
+            .replace_payload(id, Object::Set(items), &mut self.interp.resources)
+            .map_err(PyError::resource_error)
     }
 
     fn property_getter(&self, property: PyProperty) -> PyResult<Value> {
@@ -5866,16 +5922,17 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn replace_list_items(&mut self, list: PyList, items: Vec<Value>) -> PyResult<()> {
-        let Object::List(destination) = self
-            .state
-            .heap
-            .get_mut(list.object_id())
-            .map_err(PyError::runtime_error)?
-        else {
+        let id = list.object_id();
+        if !matches!(
+            self.state.heap.get(id).map_err(PyError::runtime_error)?,
+            Object::List(_)
+        ) {
             return Err(PyError::runtime_error("list handle changed object kind"));
-        };
-        *destination = items;
-        Ok(())
+        }
+        self.state
+            .heap
+            .replace_payload(id, Object::List(items), &mut self.interp.resources)
+            .map_err(PyError::resource_error)
     }
 
     fn call_value(&mut self, callable: Value, args: CallArgs) -> PyResult<Value> {
@@ -6433,7 +6490,7 @@ impl PyRuntime for Vm<'_> {
     ) -> PyResult<()> {
         self.state
             .heap
-            .reserve_growth(96, &mut self.interp.resources)
+            .reserve_object_growth(parser.object_id(), 96, &mut self.interp.resources)
             .map_err(PyError::resource_error)?;
         let Object::ArgumentParser { arguments, .. } = self
             .state
@@ -6483,7 +6540,7 @@ impl PyRuntime for Vm<'_> {
     ) -> PyResult<()> {
         self.state
             .heap
-            .reserve_growth(96, &mut self.interp.resources)
+            .reserve_object_growth(parser.object_id(), 96, &mut self.interp.resources)
             .map_err(PyError::resource_error)?;
         let Object::ArgumentParser { subparsers, .. } = self
             .state

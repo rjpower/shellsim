@@ -19,6 +19,8 @@ def _record_complete(text, quotechar):
 
 
 def _parse_record(text, delimiter, quotechar, skipinitialspace):
+    if text == "":
+        return []
     fields = []
     field = ""
     quoted = False
@@ -122,6 +124,8 @@ class DictReader:
 
     def __next__(self):
         row = next(self._reader)
+        while row == []:
+            row = next(self._reader)
         result = {}
         for index in range(min(len(self.fieldnames), len(row))):
             result[self.fieldnames[index]] = row[index]

@@ -682,6 +682,24 @@ impl TypeRegistry {
         })
     }
 
+    /// Heap values retained by semantic type metadata.
+    ///
+    /// User type attributes and completed class values participate in the same arena graph as
+    /// ordinary globals, so the VM includes these values in every safe-point collection.
+    pub fn heap_roots(&self) -> Vec<Value> {
+        let mut roots = Vec::new();
+        for ty in &self.types {
+            roots.extend(ty.attributes.values().copied());
+            roots.extend(ty.value);
+            for slot in Slot::ALL {
+                if let Some(SlotValue::Descriptor(value)) = ty.slots.get(slot) {
+                    roots.push(*value);
+                }
+            }
+        }
+        roots
+    }
+
     pub fn get(&self, id: TypeId) -> Result<&PyType, String> {
         self.types
             .get(id.0 as usize)
