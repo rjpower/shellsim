@@ -607,6 +607,16 @@ pub(crate) fn update_head(
     Ok(())
 }
 
+/// Remember where HEAD was before an operation that moves it a long way.
+///
+/// Git writes `ORIG_HEAD` for reset, merge, rebase and the like, which is what makes
+/// `git reset --hard ORIG_HEAD` the usual way to undo one.
+pub(crate) fn record_orig_head(ctx: &mut CommandContext<'_>, root: &str) {
+    if let Some(commit) = head_commit(ctx, root) {
+        let _ = write_reference(ctx, root, "ORIG_HEAD", &commit);
+    }
+}
+
 pub(crate) fn set_head_to_branch(
     ctx: &mut CommandContext<'_>,
     root: &str,

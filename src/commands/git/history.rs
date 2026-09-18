@@ -2313,7 +2313,15 @@ fn unfinished_operation(ctx: &mut CommandContext<'_>, root: &str) -> Option<Stri
         .then(|| "error: you need to resolve your current index first\n".to_string())
 }
 
-fn switch_to_branch(ctx: &mut CommandContext<'_>, root: &str, branch: &str, io: &mut Io) -> i32 {
+/// Move HEAD to `branch`, saying so unless the caller is only passing through on its way
+/// somewhere else, as `git rebase UPSTREAM BRANCH` does.
+pub(crate) fn switch_to_branch(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    branch: &str,
+    announce: bool,
+    io: &mut Io,
+) -> i32 {
     let Some(commit) = repo::read_reference(ctx, root, &format!("refs/heads/{branch}")) else {
         io.err
             .extend_from_slice(format!("fatal: invalid reference: {branch}\n").as_bytes());
@@ -2332,8 +2340,10 @@ fn switch_to_branch(ctx: &mut CommandContext<'_>, root: &str, branch: &str, io: 
     if repo::set_head_to_branch(ctx, root, branch, &action).is_err() {
         return 1;
     }
-    io.err
-        .extend_from_slice(format!("Switched to branch '{branch}'\n").as_bytes());
+    if announce {
+        io.err
+            .extend_from_slice(format!("Switched to branch '{branch}'\n").as_bytes());
+    }
     0
 }
 
@@ -2390,7 +2400,7 @@ fn create_and_switch(
     if status != 0 {
         return status;
     }
-    let status = switch_to_branch(ctx, root, branch, io);
+    let status = switch_to_branch(ctx, root, branch, true, io);
     if status == 0 {
         // Git reports creation rather than a plain switch.
         let switched = format!("Switched to branch '{branch}'\n");
@@ -2440,7 +2450,7 @@ pub(crate) fn git_switch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         [branch] => {
             let branch = resolve_previous(ctx, &root, branch);
             match branch {
-                Some(branch) => switch_to_branch(ctx, &root, &branch, io),
+                Some(branch) => switch_to_branch(ctx, &root, &branch, true, io),
                 None => {
                     io.err
                         .extend_from_slice(b"fatal: no previous branch to switch to\n");
@@ -2511,7 +2521,7 @@ pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         [target] => {
             if let Some(branch) = resolve_previous(ctx, &root, target) {
                 if repo::read_reference(ctx, &root, &format!("refs/heads/{branch}")).is_some() {
-                    return switch_to_branch(ctx, &root, &branch, io);
+                    return switch_to_branch(ctx, &root, &branch, true, io);
                 }
             }
             if repo::resolve_revision(ctx, &root, target).is_some() {
@@ -2690,6 +2700,7 @@ pub(crate) fn git_merge(
             .extend_from_slice(b"error: Your local changes would be overwritten by merge.\n");
         return 1;
     }
+    repo::record_orig_head(ctx, &root);
     let base = repo::merge_base(ctx, &root, &head, &other);
     let fast_forward = base.as_deref() == Some(head.as_str());
     if fast_forward && !no_fast_forward {
@@ -2817,7 +2828,9 @@ pub(crate) fn git_replay(
         match argument.as_str() {
             "-n" | "--no-commit" => no_commit = true,
             "-e" | "--edit" | "--no-edit" | "-q" | "--quiet" => {}
-            "--abort" | "--quit" => return abort_pending(ctx, &root, name, io),
+            // With one commit in flight there is nothing left to resume after skipping it, so
+            // skipping and abandoning come to the same thing here.
+            "--abort" | "--quit" | "--skip" => return abort_pending(ctx, &root, name, io),
             "--continue" => return continue_pending(ctx, &root, globals, name, io),
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported {name} option: {value}"))

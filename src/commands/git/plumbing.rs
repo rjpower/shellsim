@@ -829,12 +829,17 @@ pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     let mut range: Option<String> = None;
     let mut operands: Vec<String> = Vec::new();
     let mut options = true;
+    // Where `--` fell, so `git blame REV -- PATH` names a path that the working tree lost.
+    let mut after_separator = None;
     let expanded = super::expand_clusters(args, "slwe");
     let mut index = 0;
     while index < expanded.len() {
         let argument = expanded[index].as_str();
         match argument {
-            "--" if options => options = false,
+            "--" if options => {
+                options = false;
+                after_separator = Some(operands.len());
+            }
             "-s" if options => suppress = true,
             // Blame here has no similarity detection or whitespace modes to turn on.
             "-l" | "-w" | "-e" | "--show-email" | "--root" if options => {}
@@ -855,11 +860,16 @@ pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         }
         index += 1;
     }
-    // The file is the operand that names one; anything else is the revision to start from.
-    let Some(position) = operands
-        .iter()
-        .rposition(|operand| super::names_a_path(ctx, &root, operand))
-    else {
+    // The file is whatever followed `--`, or else the operand that names one; anything left over
+    // is the revision to start from.
+    let found = after_separator
+        .filter(|position| *position < operands.len())
+        .or_else(|| {
+            operands
+                .iter()
+                .rposition(|operand| super::names_a_path(ctx, &root, operand))
+        });
+    let Some(position) = found else {
         return usage(io, "usage: git blame [-s] [-L RANGE] [REVISION] FILE");
     };
     let file = operands.remove(position);
@@ -962,6 +972,8 @@ fn trace_lines(
     let mut mapping: Vec<Option<usize>> = (0..count).map(Some).collect();
     let mut current = start.to_string();
     let mut current_content = content.to_vec();
+    // The name the file had in the version being examined, which a rename moves.
+    let mut path = path.to_string();
     if let Some(hash) = stored {
         let committed = repo::read_blob(ctx, root, &hash)?;
         mapping = carry_lines(
@@ -975,12 +987,23 @@ fn trace_lines(
     }
     for _ in 0..MAX_BLAME_COMMITS {
         let commit = repo::load_commit(ctx, root, &current)?;
-        let parent_content = commit
+        let parent_tree = commit
             .parents
             .first()
-            .and_then(|parent| repo::commit_tree(ctx, root, parent))
-            .and_then(|tree| tree.get(path).cloned())
-            .and_then(|entry| repo::read_blob(ctx, root, &entry.hash));
+            .and_then(|parent| repo::commit_tree(ctx, root, parent));
+        let entry = parent_tree.as_ref().and_then(|parent| {
+            parent.get(&path).cloned().or_else(|| {
+                // The file was renamed here, so look for the same blob under its old name.
+                let here = repo::commit_tree(ctx, root, &current)?;
+                let moved = here.get(&path)?;
+                let (was, before) = parent
+                    .iter()
+                    .find(|(name, entry)| entry.hash == moved.hash && !here.contains_key(*name))?;
+                path = was.clone();
+                Some(before.clone())
+            })
+        });
+        let parent_content = entry.and_then(|entry| repo::read_blob(ctx, root, &entry.hash));
         let Some(parent_content) = parent_content else {
             // The file starts here, so every line still unclaimed is this commit's.
             for slot in mapping.into_iter().flatten() {

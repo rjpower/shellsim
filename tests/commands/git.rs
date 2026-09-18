@@ -2347,3 +2347,132 @@ fn stashing_is_refused_mid_conflict_and_restores_new_files_staged() {
     assert_eq!(run(&mut env, "git stash pop").0, 0);
     assert_eq!(run(&mut env, "git status --short").1, "A  new.txt\n");
 }
+
+#[test]
+fn status_names_the_operation_that_is_unfinished() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'a\\n' > f; git add -A; git commit -qm base; \
+                 git switch -qc topic; printf 'T\\n' > f; git commit -qam t1; \
+                 git switch -q main; printf 'M\\n' > f; git commit -qam m1";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    assert_eq!(run(&mut env, "git cherry-pick topic").0, 1);
+    let picking = run(&mut env, "git status").1;
+    assert!(
+        picking.contains("You are currently cherry-picking commit"),
+        "{picking}"
+    );
+    assert!(
+        picking.contains("  (fix conflicts and run \"git cherry-pick --continue\")\n"),
+        "{picking}"
+    );
+    assert!(
+        picking
+            .contains("  (use \"git cherry-pick --abort\" to cancel the cherry-pick operation)\n"),
+        "{picking}"
+    );
+
+    assert_eq!(run(&mut env, "printf 'R\\n' > f; git add f").0, 0);
+    let settled = run(&mut env, "git status").1;
+    assert!(
+        settled.contains("  (all conflicts fixed: run \"git cherry-pick --continue\")\n"),
+        "{settled}"
+    );
+
+    assert_eq!(run(&mut env, "git cherry-pick --abort").0, 0);
+    assert_eq!(run(&mut env, "git rebase topic").0, 1);
+    let rebasing = run(&mut env, "git status").1;
+    assert!(
+        rebasing.contains("You are currently rebasing branch 'main' on '"),
+        "{rebasing}"
+    );
+    assert!(
+        rebasing.contains("  (use \"git rebase --abort\" to check out the original branch)\n"),
+        "{rebasing}"
+    );
+}
+
+#[test]
+fn orig_head_names_where_a_reset_came_from() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'a\\n' > f; git add -A; git commit -qm c1; \
+                 printf 'b\\n' > f; git commit -qam c2; printf 'c\\n' > f; git commit -qam c3";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    assert_eq!(run(&mut env, "git reset --hard HEAD~2").0, 0);
+    assert_eq!(run(&mut env, "git log --oneline | wc -l").1, "1\n");
+
+    let back = run(&mut env, "git reset --hard ORIG_HEAD");
+    assert_eq!(back.0, 0, "{}", back.2);
+    assert_eq!(run(&mut env, "git log --oneline | wc -l").1, "3\n");
+    assert_eq!(run(&mut env, "cat f").1, "c\n");
+}
+
+#[test]
+fn a_rebase_can_name_the_branch_to_move_and_a_replay_can_be_skipped() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'a\\n' > f; git add -A; git commit -qm base; \
+                 git switch -qc topic; printf 't\\n' > g; git add -A; git commit -qm t1; \
+                 git switch -q main; printf 'm\\n' > h; git add -A; git commit -qm m1";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    // The branch to move need not be the one checked out.
+    let rebased = run(&mut env, "git rebase main topic");
+    assert_eq!(rebased.0, 0, "{}", rebased.2);
+    assert_eq!(
+        run(&mut env, "git rev-parse --abbrev-ref HEAD").1,
+        "topic\n"
+    );
+    assert_eq!(
+        run(&mut env, "git log --format=%s | tr '\\n' ' '").1,
+        "t1 m1 base "
+    );
+
+    assert_eq!(
+        run(&mut env, "printf 'Y\\n' > f; git commit -qam other").0,
+        0
+    );
+    assert_eq!(
+        run(
+            &mut env,
+            "git switch -q main; printf 'X\\n' > f; git commit -qam clash"
+        )
+        .0,
+        0
+    );
+    assert_eq!(
+        run(&mut env, "git switch -q topic; git cherry-pick main").0,
+        1
+    );
+    let skipped = run(&mut env, "git cherry-pick --skip");
+    assert_eq!(skipped.0, 0, "{}", skipped.2);
+    assert_eq!(run(&mut env, "git status --short").1, "");
+    assert_eq!(run(&mut env, "cat f").1, "Y\n");
+}
+
+#[test]
+fn blame_follows_a_file_that_was_renamed() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'one\\ntwo\\n' > a.txt; git add -A; git commit -qm c1; \
+                 printf 'one\\nTWO\\n' > a.txt; git commit -qam c2; \
+                 git mv a.txt b.txt; git commit -qm rename";
+    assert_eq!(run(&mut env, setup).0, 0);
+    let ids = run(&mut env, "git log --format=%H --reverse").1;
+    let mut lines = ids.lines();
+    let c1 = lines.next().unwrap().to_string();
+    let c2 = lines.next().unwrap().to_string();
+
+    let blame = run(&mut env, "git blame b.txt");
+    assert_eq!(blame.0, 0, "{}", blame.2);
+    let attributed: Vec<&str> = blame
+        .1
+        .lines()
+        .map(|line| line.split_whitespace().next().unwrap_or_default())
+        .collect();
+    assert_eq!(attributed, [format!("^{}", &c1[..7]), c2[..8].to_string()]);
+
+    // A path the working tree no longer has is still blamable when `--` names it.
+    let old = run(&mut env, "git blame HEAD~1 -- a.txt");
+    assert_eq!(old.0, 0, "{}", old.2);
+    assert!(old.1.ends_with(" TWO\n"), "{}", old.1);
+}

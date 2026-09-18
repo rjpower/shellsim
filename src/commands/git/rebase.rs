@@ -20,6 +20,8 @@ struct State {
     branch: String,
     /// Where that branch pointed before the rebase, for `--abort`.
     original: String,
+    /// The commit the branch is being replayed onto, which `git status` names.
+    onto: String,
     /// The commits still to apply, oldest first; the first is the one in progress.
     todo: Vec<String>,
 }
@@ -29,11 +31,13 @@ fn load(interp: &crate::interp::Interp, root: &str) -> Option<State> {
     let text = String::from_utf8_lossy(&bytes).to_string();
     let mut branch = String::new();
     let mut original = String::new();
+    let mut onto = String::new();
     let mut todo = Vec::new();
     for line in text.lines() {
         match line.split_once(' ') {
             Some(("branch", value)) => branch = value.to_string(),
             Some(("orig", value)) => original = value.to_string(),
+            Some(("onto", value)) => onto = value.to_string(),
             Some(("todo", value)) => todo.push(value.to_string()),
             _ => {}
         }
@@ -41,12 +45,16 @@ fn load(interp: &crate::interp::Interp, root: &str) -> Option<State> {
     (!branch.is_empty() && !original.is_empty()).then_some(State {
         branch,
         original,
+        onto,
         todo,
     })
 }
 
 fn store(ctx: &mut CommandContext<'_>, root: &str, state: &State) -> bool {
-    let mut text = format!("branch {}\norig {}\n", state.branch, state.original);
+    let mut text = format!(
+        "branch {}\norig {}\nonto {}\n",
+        state.branch, state.original, state.onto
+    );
     for id in &state.todo {
         text.push_str(&format!("todo {id}\n"));
     }
@@ -56,6 +64,11 @@ fn store(ctx: &mut CommandContext<'_>, root: &str, state: &State) -> bool {
 /// Whether a rebase has started and not yet finished.
 pub(crate) fn in_progress(interp: &crate::interp::Interp, root: &str) -> bool {
     load(interp, root).is_some()
+}
+
+/// The branch a rebase is replaying and the commit it is replaying onto.
+pub(crate) fn replaying(interp: &crate::interp::Interp, root: &str) -> Option<(String, String)> {
+    load(interp, root).map(|state| (state.branch, state.onto))
 }
 
 fn clear(ctx: &mut CommandContext<'_>, root: &str) {
@@ -107,9 +120,14 @@ pub(crate) fn git_rebase(
         );
         return 128;
     }
-    let [upstream] = operands.as_slice() else {
-        return usage(io, "usage: git rebase [--onto NEWBASE] UPSTREAM");
+    // `git rebase UPSTREAM BRANCH` means "check out BRANCH first", which is how a rebase is
+    // written when the branch to move is not the one currently checked out.
+    let (upstream, wanted) = match operands.as_slice() {
+        [upstream] => (upstream.clone(), None),
+        [upstream, branch] => (upstream.clone(), Some(branch.clone())),
+        _ => return usage(io, "usage: git rebase [--onto NEWBASE] UPSTREAM [BRANCH]"),
     };
+    let upstream = &upstream;
     let Some(upstream_id) = repo::resolve_revision(ctx, &root, upstream) else {
         io.err
             .extend_from_slice(format!("fatal: invalid upstream '{upstream}'\n").as_bytes());
@@ -127,16 +145,6 @@ pub(crate) fn git_rebase(
         },
         None => upstream_id.clone(),
     };
-    let Some(branch) = repo::current_branch(ctx, &root) else {
-        io.err
-            .extend_from_slice(b"fatal: rebasing a detached HEAD is not supported here\n");
-        return 128;
-    };
-    let Some(head) = repo::head_commit(ctx, &root) else {
-        io.err
-            .extend_from_slice(b"fatal: no commit on the current branch to rebase\n");
-        return 128;
-    };
     // A rebase rewrites the whole tree, so anything not committed has nowhere to go.
     let dirty = history::dirty_paths(ctx, &root);
     if !dirty.is_empty() {
@@ -151,6 +159,22 @@ pub(crate) fn git_rebase(
         );
         return 1;
     }
+    if let Some(wanted) = wanted {
+        let status = history::switch_to_branch(ctx, &root, &wanted, false, io);
+        if status != 0 {
+            return status;
+        }
+    }
+    let Some(branch) = repo::current_branch(ctx, &root) else {
+        io.err
+            .extend_from_slice(b"fatal: rebasing a detached HEAD is not supported here\n");
+        return 128;
+    };
+    let Some(head) = repo::head_commit(ctx, &root) else {
+        io.err
+            .extend_from_slice(b"fatal: no commit on the current branch to rebase\n");
+        return 128;
+    };
     // With the upstream already behind the branch there is nowhere new to put it, unless
     // `--onto` names somewhere else.
     let settled = onto_id == upstream_id
@@ -162,6 +186,7 @@ pub(crate) fn git_rebase(
             .extend_from_slice(format!("Current branch {branch} is up to date.\n").as_bytes());
         return 0;
     }
+    repo::record_orig_head(ctx, &root);
     // The branch moves to the new base first, and each commit is replayed on top of it.
     if let Err(status) = lay_down(ctx, &root, &onto_id, io) {
         return status;
@@ -176,6 +201,7 @@ pub(crate) fn git_rebase(
     let state = State {
         branch,
         original: head,
+        onto: onto_id.clone(),
         todo,
     };
     if !store(ctx, &root, &state) {

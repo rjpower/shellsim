@@ -309,9 +309,11 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         );
         return 0;
     }
+    let pending = unfinished_operation(ctx, &root, !unmerged.is_empty());
     emit_long_status(
         branch.as_deref(),
         head_commit.as_deref(),
+        pending.as_deref(),
         &unmerged,
         &entries,
         &untracked_paths,
@@ -320,6 +322,60 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         io,
     );
     0
+}
+
+/// What Git prints above the file lists while a merge, replay or rebase is unfinished.
+///
+/// Naming the operation matters more than the wording: an agent that reads "you have unmerged
+/// paths" mid-cherry-pick reaches for `git commit`, which refuses.
+fn unfinished_operation(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    conflicted: bool,
+) -> Option<String> {
+    let next = |command: &str| {
+        if conflicted {
+            format!("  (fix conflicts and run \"git {command} --continue\")\n")
+        } else {
+            format!("  (all conflicts fixed: run \"git {command} --continue\")\n")
+        }
+    };
+    if let Some((branch, onto)) = super::rebase::replaying(ctx, root) {
+        return Some(format!(
+            "You are currently rebasing branch '{branch}' on '{}'.\n{}  (use \"git rebase --skip\" to skip this patch)\n  (use \"git rebase --abort\" to check out the original branch)\n\n",
+            repo::short(&onto),
+            next("rebase"),
+        ));
+    }
+    for (kind, command, cancel) in [
+        (
+            conflict::CHERRY_PICK_HEAD,
+            "cherry-pick",
+            "to cancel the cherry-pick operation",
+        ),
+        (
+            conflict::REVERT_HEAD,
+            "revert",
+            "to cancel the revert operation",
+        ),
+    ] {
+        if let Some(commit) = conflict::in_progress(ctx, root, kind) {
+            let doing = if command == "revert" {
+                "reverting"
+            } else {
+                "cherry-picking"
+            };
+            return Some(format!(
+                "You are currently {doing} commit {}.\n{}  (use \"git {command} --skip\" to skip this patch)\n  (use \"git {command} --abort\" {cancel})\n\n",
+                repo::short(&commit),
+                next(command),
+            ));
+        }
+    }
+    conflicted.then(|| {
+        "You have unmerged paths.\n  (fix conflicts and run \"git commit\")\n  (use \"git merge --abort\" to abort the merge)\n\n"
+            .to_string()
+    })
 }
 
 /// Render a repository-relative path relative to the working directory, as Git reports it.
@@ -463,6 +519,7 @@ fn emit_short_status(
 fn emit_long_status(
     branch: Option<&str>,
     head: Option<&str>,
+    pending: Option<&str>,
     unmerged: &[(String, conflict::Unmerged)],
     entries: &[Entry],
     untracked: &[String],
@@ -483,10 +540,8 @@ fn emit_long_status(
     if head.is_none() {
         io.out.extend_from_slice(b"\nNo commits yet\n\n");
     }
-    if !unmerged.is_empty() {
-        io.out.extend_from_slice(
-            b"You have unmerged paths.\n  (fix conflicts and run \"git commit\")\n  (use \"git merge --abort\" to abort the merge)\n\n",
-        );
+    if let Some(pending) = pending {
+        io.out.extend_from_slice(pending.as_bytes());
     }
     let staged: Vec<&Entry> = entries
         .iter()
@@ -1242,6 +1297,7 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         // `git reset REVISION -- PATH` rewrites only those index entries.
         return restore_paths(ctx, &root, Some(&revision), &paths, true, false, io);
     }
+    repo::record_orig_head(ctx, &root);
     if mode == "--hard" {
         // A hard reset removes paths known by either HEAD or the index while preserving untracked
         // files, matching the boundary agents rely on when discarding staged additions.
