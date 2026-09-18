@@ -8,7 +8,7 @@
 use crate::commands::{CommandContext, Io};
 
 use super::repo::{self, Config};
-use super::{repo_error, usage, Globals};
+use super::{fatal, repo_error, usage, Globals};
 
 /// Which configuration file a command reads and writes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -140,7 +140,7 @@ pub(crate) fn git_config(
         }
         ["--get-regexp", pattern] => {
             let Ok(regex) = regex::Regex::new(pattern) else {
-                return usage(io, "invalid --get-regexp pattern");
+                return fatal(io, "invalid --get-regexp pattern");
             };
             let mut matched = false;
             for (key, values) in &readable {
@@ -186,10 +186,10 @@ pub(crate) fn git_config(
                 || value.len() > 4096
                 || value.contains(['\0', '\n', '\r'])
             {
-                return usage(io, "invalid config key or value");
+                return fatal(io, "invalid config key or value");
             }
             if stored.len() == 256 && !stored.contains_key(&key) {
-                return usage(io, "too many config entries");
+                return fatal(io, "too many config entries");
             }
             let entry = stored.entry(key).or_default();
             if !adding {
@@ -277,7 +277,7 @@ pub(crate) fn git_remote(
         ["add", name, url] => {
             let key = format!("remote.{}.url", name.to_ascii_lowercase());
             if !repo::valid_config_key(&key) {
-                return usage(io, &format!("invalid remote name: {name}"));
+                return fatal(io, &format!("invalid remote name: {name}"));
             }
             config.insert(key, vec![(*url).to_string()]);
             repo::write_config(ctx, &file, &config).map_or(1, |()| 0)

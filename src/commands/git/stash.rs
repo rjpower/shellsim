@@ -310,7 +310,10 @@ fn apply(
     };
     // The entry is merged back in against the commit it was taken from, so anything committed or
     // edited since is kept rather than overwritten.
-    let base = repo::commit_tree(ctx, root, &entry.base).unwrap_or_default();
+    let base = match super::require_tree(ctx, root, &entry.base, io) {
+        Ok(tree) => tree,
+        Err(status) => return status,
+    };
     let mine = match repo::collect_working_tree(ctx, root) {
         Ok(snapshot) => snapshot.release(ctx),
         Err(status) => return status,
@@ -392,7 +395,11 @@ fn apply(
                 format!("CONFLICT (content): Merge conflict in {path}\n").as_bytes(),
             );
         }
-        conflict::store_stages(ctx, root, &combined.stages);
+        if !conflict::store_stages(ctx, root, &combined.stages) {
+            io.err
+                .extend_from_slice(b"fatal: unable to record the conflicted state\n");
+            return 128;
+        }
         // The entry stays on the list so the user can try again after settling the conflict.
         io.err
             .extend_from_slice(b"The stash entry is kept in case you need it again.\n");

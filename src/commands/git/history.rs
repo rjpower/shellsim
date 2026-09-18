@@ -15,7 +15,7 @@ use super::diff;
 use super::rebase;
 use super::repo::{self, Commit, Tree};
 use super::worktree;
-use super::{repo_error, usage, Arg, Flags, Globals};
+use super::{fatal, repo_error, usage, Arg, Flags, Globals};
 
 fn author_identity(
     ctx: &mut CommandContext<'_>,
@@ -855,7 +855,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
                         _ => true,
                     })
                 else {
-                    return usage(io, &format!("unsupported log format: {name}"));
+                    return fatal(io, &format!("unsupported log format: {name}"));
                 };
                 pretty = parsed;
             }
@@ -1687,7 +1687,7 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             [to] => (
                 match repo::current_branch(ctx, &root) {
                     Some(branch) => branch,
-                    None => return usage(io, "cannot rename a detached HEAD"),
+                    None => return fatal(io, "cannot rename a detached HEAD"),
                 },
                 to.clone(),
             ),
@@ -1923,7 +1923,7 @@ fn rename_branch(
     io: &mut Io,
 ) -> i32 {
     if !valid_reference_name(to) {
-        return usage(io, &format!("invalid branch name: {to}"));
+        return fatal(io, &format!("invalid branch name: {to}"));
     }
     let Some(commit) = repo::read_reference(ctx, root, &format!("refs/heads/{from}")) else {
         io.err
@@ -2062,7 +2062,7 @@ pub(crate) fn git_tag(
     }
     let name = &operands[0];
     if !valid_reference_name(name) {
-        return usage(io, &format!("invalid tag name: {name}"));
+        return fatal(io, &format!("invalid tag name: {name}"));
     }
     let start = operands.get(1).map_or("HEAD", String::as_str);
     let Some(commit) = repo::resolve_revision(ctx, &root, start) else {
@@ -2221,7 +2221,7 @@ fn checkout_commit(
     }
     let old = repo::head_tree(ctx, root);
     let Some(new) = repo::commit_tree(ctx, root, commit) else {
-        return Err(usage(io, "target revision has an invalid commit"));
+        return Err(fatal(io, "target revision has an invalid commit"));
     };
     let blocked = blocking_changes(ctx, root, &new);
     if !blocked.is_empty() {
@@ -2681,7 +2681,10 @@ pub(crate) fn git_merge(
         io.out.extend_from_slice(b"Already up to date.\n");
         return 0;
     }
-    let incoming = repo::commit_tree(ctx, &root, &other).unwrap_or_default();
+    let incoming = match super::require_tree(ctx, &root, &other, io) {
+        Ok(tree) => tree,
+        Err(status) => return status,
+    };
     if !blocking_changes(ctx, &root, &incoming).is_empty() {
         io.err
             .extend_from_slice(b"error: Your local changes would be overwritten by merge.\n");
@@ -2728,8 +2731,11 @@ pub(crate) fn git_merge(
         .as_deref()
         .and_then(|base| repo::commit_tree(ctx, &root, base))
         .unwrap_or_default();
-    let head_tree = repo::commit_tree(ctx, &root, &head).unwrap_or_default();
-    let other_tree = repo::commit_tree(ctx, &root, &other).unwrap_or_default();
+    let head_tree = match super::require_tree(ctx, &root, &head, io) {
+        Ok(tree) => tree,
+        Err(status) => return status,
+    };
+    let other_tree = incoming;
     let subject = message.unwrap_or_else(|| {
         // Git names the branch merged into unless it is the repository's default.
         match repo::current_branch(ctx, &root).filter(|branch| branch != repo::DEFAULT_BRANCH) {
@@ -3003,7 +3009,10 @@ fn abort_sequence(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut
         return abort_pending(ctx, root, name, io);
     };
     let head = repo::head_tree(ctx, root);
-    let target = repo::commit_tree(ctx, root, &sequence.original).unwrap_or_default();
+    let target = match super::require_tree(ctx, root, &sequence.original, io) {
+        Ok(tree) => tree,
+        Err(status) => return status,
+    };
     let mut previous = repo::load_index(ctx, root).unwrap_or_default();
     for (path, entry) in &head {
         previous
@@ -3086,13 +3095,19 @@ fn replay_one(
             .extend_from_slice(format!("fatal: {name} needs a commit to apply onto\n").as_bytes());
         return 128;
     };
-    let commit_tree = repo::commit_tree(ctx, root, &id).unwrap_or_default();
+    let commit_tree = match super::require_tree(ctx, root, &id, io) {
+        Ok(tree) => tree,
+        Err(status) => return status,
+    };
     let parent_tree = commit
         .parents
         .get(against - 1)
         .and_then(|parent| repo::commit_tree(ctx, root, parent))
         .unwrap_or_default();
-    let head_tree = repo::commit_tree(ctx, root, &head).unwrap_or_default();
+    let head_tree = match super::require_tree(ctx, root, &head, io) {
+        Ok(tree) => tree,
+        Err(status) => return status,
+    };
     let (base, theirs) = if revert {
         (&commit_tree, &parent_tree)
     } else {
@@ -3246,9 +3261,12 @@ fn pause_for_conflicts(
         };
         io.err.extend_from_slice(line.as_bytes());
     }
-    conflict::begin(ctx, root, kind, commit, message);
-    if !conflict::store_stages(ctx, root, stages) {
-        return 1;
+    if !conflict::begin(ctx, root, kind, commit, message)
+        || !conflict::store_stages(ctx, root, stages)
+    {
+        io.err
+            .extend_from_slice(b"fatal: unable to record the conflicted state\n");
+        return 128;
     }
     io.err.extend_from_slice(format!("{advice}\n").as_bytes());
     1

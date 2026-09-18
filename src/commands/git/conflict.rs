@@ -106,19 +106,25 @@ pub(crate) fn in_progress(interp: &Interp, root: &str, kind: &str) -> Option<Str
     (!text.is_empty()).then_some(text)
 }
 
+/// Record the operation in progress, so `--continue` and `--abort` know what to finish.
+///
+/// Reports whether the record was written. A failure matters: the conflict markers are already in
+/// the working tree, and without `MERGE_HEAD` the repository looks settled, so the caller must say
+/// so rather than report an ordinary conflict.
 pub(crate) fn begin(
     ctx: &mut CommandContext<'_>,
     root: &str,
     kind: &str,
     commit: &str,
     message: &str,
-) {
-    let _ = repo::write_vfs(
+) -> bool {
+    repo::write_vfs(
         ctx,
         &repo::git_path(root, kind),
         format!("{commit}\n").as_bytes(),
-    );
-    let _ = repo::write_vfs(ctx, &repo::git_path(root, MERGE_MSG), message.as_bytes());
+    )
+    .is_ok()
+        && repo::write_vfs(ctx, &repo::git_path(root, MERGE_MSG), message.as_bytes()).is_ok()
 }
 
 /// The message recorded for the operation in progress.

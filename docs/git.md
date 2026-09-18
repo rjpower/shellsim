@@ -141,8 +141,11 @@ Anything needing a network is refused and recorded as unsupported: `clone`, `fet
 `push`, `ls-remote`, and `submodule`. `git remote` records remote names but never contacts one.
 
 There is no `bisect` or `worktree`, and no interactive mode for any
-command. Those report `unsupported subcommand` and exit 2; a name that is not a Git
-subcommand at all is reported the way Git reports a typo and exits 1.
+command. Those report `unsupported subcommand` and exit 129, which is the status Git uses for an
+argument it cannot make sense of; a name that is not a Git subcommand at all is reported the way
+Git reports a typo and exits 1. An operation that was understood but could not be carried out —
+an unresolvable revision, a pathspec matching nothing — prints `fatal:` and exits 128, again as
+Git does.
 
 Submodules and rename detection based on similarity are outside the model: `status` and `diff`
 recognize a rename only when the content is byte-identical. Modes are tracked as Git tracks them:

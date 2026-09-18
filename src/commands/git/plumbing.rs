@@ -12,7 +12,7 @@ use crate::vfs::resolve_against;
 use super::diff;
 use super::ignore;
 use super::repo;
-use super::{repo_error, usage, Arg, Flags};
+use super::{fatal, repo_error, usage, Arg, Flags};
 
 /// The most files `git grep` will search in one invocation.
 const MAX_GREP_FILES: usize = 10_000;
@@ -777,7 +777,7 @@ pub(crate) fn git_symbolic_ref(ctx: &mut CommandContext<'_>, args: &[String], io
         },
         [name, target] if name == repo::HEAD => {
             let Some(branch) = target.strip_prefix("refs/heads/") else {
-                return usage(io, "only refs/heads/* can be pointed at by HEAD");
+                return fatal(io, "only refs/heads/* can be pointed at by HEAD");
             };
             repo::set_head_to_branch(ctx, &root, branch, "symbolic-ref: update").map_or(1, |()| 0)
         }

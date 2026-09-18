@@ -136,10 +136,25 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_costed(m, &["git"], Trust::Partial, 150, 16 * 1024, cmd_git);
 }
 
+/// An argument Git cannot make sense of: an option it does not have, or one used the wrong way.
+///
+/// Git exits 129 for these, which is how a caller tells a mistyped command from one that ran and
+/// failed. Messages that already read as a synopsis are printed as they stand.
 pub(crate) fn usage(io: &mut Io, message: &str) -> i32 {
+    let line = if message.starts_with("usage:") {
+        message.to_string()
+    } else {
+        format!("error: {message}")
+    };
+    io.err.extend_from_slice(format!("{line}\n").as_bytes());
+    129
+}
+
+/// An operation that was understood but could not be carried out. Git exits 128 for these.
+pub(crate) fn fatal(io: &mut Io, message: &str) -> i32 {
     io.err
-        .extend_from_slice(format!("git: {message}\n").as_bytes());
-    2
+        .extend_from_slice(format!("fatal: {message}\n").as_bytes());
+    128
 }
 
 /// One argument, as the command that asked for it sees it.
@@ -347,6 +362,24 @@ pub(crate) fn pathspec(cwd: &str, root: &str, value: &str) -> String {
 ///
 /// Git uses this to tell a mistyped revision from a pathspec; an operand that is neither is a
 /// fatal ambiguous argument rather than a silently empty result.
+/// The tree a commit records, or a fatal error naming the commit.
+///
+/// A missing tree reads as the empty tree, and to a command that writes the working tree an empty
+/// tree means "delete every file", so the commands that write ask for a tree this way.
+pub(crate) fn require_tree(
+    ctx: &CommandContext<'_>,
+    root: &str,
+    commit: &str,
+    io: &mut Io,
+) -> Result<repo::Tree, i32> {
+    repo::commit_tree(ctx, root, commit).ok_or_else(|| {
+        io.err.extend_from_slice(
+            format!("fatal: unable to read tree of commit {commit}\n").as_bytes(),
+        );
+        128
+    })
+}
+
 pub(crate) fn names_a_path(ctx: &CommandContext<'_>, root: &str, value: &str) -> bool {
     let absolute = resolve_against(&ctx.cwd, value);
     if ctx.vfs.exists("/", &absolute) {
@@ -416,7 +449,7 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                     return usage(io, "-c requires NAME=VALUE");
                 };
                 if !repo::valid_config_key(&key) {
-                    return usage(io, &format!("invalid config key: {key}"));
+                    return fatal(io, &format!("invalid config key: {key}"));
                 }
                 globals.overrides.insert(key, value);
             }

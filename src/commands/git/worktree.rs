@@ -14,7 +14,7 @@ use super::compare;
 use super::conflict;
 use super::ignore;
 use super::repo::{self, Tree};
-use super::{repo_error, usage, Arg, Flags};
+use super::{fatal, repo_error, usage, Arg, Flags};
 
 /// The state of one path relative to HEAD, the index, and the working tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -717,10 +717,14 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         }
     }
     if !all && !update_only && operands.is_empty() {
-        return usage(io, "nothing specified, nothing added");
+        // Git treats this as a no-op with a hint rather than an error.
+        io.err.extend_from_slice(
+            b"Nothing specified, nothing added.\nhint: Maybe you wanted to say 'git add .'?\n",
+        );
+        return 0;
     }
     if operands.len() > 256 {
-        return usage(io, "too many pathspecs");
+        return fatal(io, "too many pathspecs");
     }
     let Some(root) = repo::find_repo_root(ctx) else {
         return repo_error(io);
@@ -901,7 +905,7 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     for operand in operands {
         let (absolute, relative) = match repo_operand(&ctx.cwd, &root, &operand) {
             Ok(paths) => paths,
-            Err(message) => return usage(io, &message),
+            Err(message) => return fatal(io, &message),
         };
         let directory_prefix = format!("{relative}/");
         let tracked: Vec<String> = index
@@ -1025,7 +1029,7 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     };
     let (destination_absolute, _) = match repo_operand(&ctx.cwd, &root, destination) {
         Ok(paths) => paths,
-        Err(message) => return usage(io, &message),
+        Err(message) => return fatal(io, &message),
     };
     let into_directory = ctx.vfs.is_dir("/", &destination_absolute);
     if sources.len() > 1 && !into_directory {
@@ -1039,7 +1043,7 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     for source in sources {
         let (source_absolute, source_relative) = match repo_operand(&ctx.cwd, &root, source) {
             Ok(paths) => paths,
-            Err(message) => return usage(io, &message),
+            Err(message) => return fatal(io, &message),
         };
         // A directory source moves every tracked file below it.
         let tracked: Vec<String> = if ctx.vfs.is_dir("/", &source_absolute) {
@@ -1077,7 +1081,7 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
                 (None, false) => destination_absolute.clone(),
             };
             let Some(target_relative) = repo::relative_path(&root, &target_absolute) else {
-                return usage(io, "destination is outside the working tree");
+                return fatal(io, "destination is outside the working tree");
             };
             if !force
                 && (ctx.vfs.exists("/", &target_absolute) || index.contains_key(&target_relative))
@@ -1204,9 +1208,12 @@ fn restore_paths(
     let source_tree = match source {
         Some(revision) => {
             let Some(commit) = repo::resolve_revision(ctx, root, revision) else {
-                return usage(io, "unknown restore source");
+                return fatal(io, "unknown restore source");
             };
-            repo::commit_tree(ctx, root, &commit).unwrap_or_default()
+            match super::require_tree(ctx, root, &commit, io) {
+                Ok(tree) => tree,
+                Err(status) => return status,
+            }
         }
         None if staged => repo::head_tree(ctx, root),
         None => index_tree.clone(),
@@ -1215,7 +1222,7 @@ fn restore_paths(
         let cwd = ctx.cwd.clone();
         let selected = match selected_paths(&cwd, root, paths, &index_tree, &source_tree) {
             Ok(selected) => selected,
-            Err(message) => return usage(io, &message),
+            Err(message) => return fatal(io, &message),
         };
         for path in &selected {
             match source_tree.get(path) {
@@ -1245,7 +1252,7 @@ fn restore_paths(
     let source_tree = if staged { index_tree } else { source_tree };
     let selected = match selected_paths(&cwd, root, paths, &source_tree, &work) {
         Ok(selected) => selected,
-        Err(message) => return usage(io, &message),
+        Err(message) => return fatal(io, &message),
     };
     let old: Tree = work
         .into_iter()
@@ -1308,7 +1315,10 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         }
         None => return super::ambiguous_argument(io, &revision),
     };
-    let tree = repo::commit_tree(ctx, &root, &commit).unwrap_or_default();
+    let tree = match super::require_tree(ctx, &root, &commit, io) {
+        Ok(tree) => tree,
+        Err(status) => return status,
+    };
     if !paths.is_empty() {
         if mode != "--mixed" {
             return usage(io, "a pathspec cannot be combined with --soft or --hard");

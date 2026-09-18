@@ -83,7 +83,7 @@ fn resolves_head_and_rejects_unsupported_operations() {
     );
 
     let unknown = run(&mut env, "git bisect start");
-    assert_eq!(unknown.0, 2);
+    assert_eq!(unknown.0, 129);
     assert!(
         unknown.2.contains("unsupported subcommand"),
         "{}",
@@ -531,7 +531,7 @@ fn log_supports_ranges_formats_and_rejects_unknown_placeholders() {
     assert!(default.contains("\nDate:   "), "{default}");
 
     let rejected = run(&mut env, "git log --pretty=nonsense");
-    assert_eq!(rejected.0, 2);
+    assert_eq!(rejected.0, 128);
     assert!(
         rejected.2.contains("unsupported log format"),
         "{}",
@@ -1281,7 +1281,7 @@ fn unknown_subcommands_are_reported_the_way_git_reports_them() {
     );
     // A real Git subcommand this subset leaves out says so instead.
     let omitted = run(&mut env, "git bisect start");
-    assert_eq!(omitted.0, 2);
+    assert_eq!(omitted.0, 129);
     assert!(
         omitted.2.contains("unsupported subcommand"),
         "{}",
@@ -1738,7 +1738,7 @@ fn log_filters_by_date() {
         "old\n"
     );
     // A date this subset cannot read is refused rather than guessed at.
-    assert_eq!(run(&mut env, "git log --since='last tuesday'").0, 2);
+    assert_eq!(run(&mut env, "git log --since='last tuesday'").0, 129);
     assert_eq!(
         run(&mut env, "git log -1 --format=%ad").1,
         "Sun Jun 1 00:00:00 2025 +0000\n"
@@ -2775,4 +2775,25 @@ fn a_branch_cannot_be_left_in_the_middle_of_an_operation() {
         "{}",
         picking.2
     );
+}
+
+#[test]
+fn a_mistyped_option_and_a_failed_operation_exit_differently() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs.put_file("/a", b"one\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add a; git commit -m one").0, 0);
+
+    // Git exits 129 for an option it does not have, and 128 for work it could not do.
+    let mistyped = run(&mut env, "git status --bogus");
+    assert_eq!(mistyped.0, 129, "{}", mistyped.2);
+    let missing = run(&mut env, "git add nosuch");
+    assert_eq!(missing.0, 128, "{}", missing.2);
+    let unresolvable = run(&mut env, "git restore --source=nope a");
+    assert_eq!(unresolvable.0, 128, "{}", unresolvable.2);
+
+    // Adding nothing is a no-op with a hint, not a failure.
+    let nothing = run(&mut env, "git add");
+    assert_eq!(nothing.0, 0, "{}", nothing.2);
+    assert!(nothing.2.contains("Nothing specified"), "{}", nothing.2);
 }

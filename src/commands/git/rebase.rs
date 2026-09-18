@@ -251,7 +251,7 @@ fn lay_down(
     io: &mut Io,
 ) -> Result<(), i32> {
     let current = repo::head_tree(ctx, root);
-    let target = repo::commit_tree(ctx, root, commit).unwrap_or_default();
+    let target = super::require_tree(ctx, root, commit, io)?;
     if history::refuse_untracked_overwrite(ctx, root, &target, "checkout", "switch branches", io) {
         return Err(1);
     }
@@ -288,8 +288,13 @@ fn replay(
             .first()
             .and_then(|parent| repo::commit_tree(ctx, root, parent))
             .unwrap_or_default();
-        let theirs = repo::commit_tree(ctx, root, &id).unwrap_or_default();
-        let ours = repo::commit_tree(ctx, root, &head).unwrap_or_default();
+        let (theirs, ours) = match (
+            super::require_tree(ctx, root, &id, io),
+            super::require_tree(ctx, root, &head, io),
+        ) {
+            (Ok(theirs), Ok(ours)) => (theirs, ours),
+            (Err(status), _) | (_, Err(status)) => return status,
+        };
         let label = format!("{} ({})", repo::short(&id), original.subject());
         let combined = conflict::combine(ctx, root, &base, &ours, &theirs, "HEAD", &label);
         if let Err(error) = repo::update_work_tree(ctx, root, &ours, &combined.tree) {

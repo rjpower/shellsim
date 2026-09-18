@@ -12,7 +12,7 @@ use crate::commands::{CommandContext, Io};
 use super::conflict;
 use super::diff::{self, DEFAULT_CONTEXT};
 use super::repo::{self, Tree};
-use super::{usage, Arg, Flags};
+use super::{fatal, usage, Arg, Flags};
 
 /// How a tree comparison is presented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -623,11 +623,11 @@ pub(crate) fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             repo::resolve_revision(ctx, &root, left),
             repo::resolve_revision(ctx, &root, right),
         ) else {
-            return usage(io, "unknown revision range");
+            return fatal(io, "unknown revision range");
         };
         if merge_base {
             let Some(base) = repo::merge_base(ctx, &root, &left_commit, &right_commit) else {
-                return usage(io, "the revisions have no common ancestor");
+                return fatal(io, "the revisions have no common ancestor");
             };
             left_commit = base;
         }
