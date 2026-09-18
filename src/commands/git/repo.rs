@@ -258,7 +258,7 @@ pub(crate) fn load_index(interp: &Interp, root: &str) -> Option<Tree> {
     }
 }
 
-pub(crate) fn store_index(ctx: &mut CommandContext<'_>, root: &str, index: &Tree) -> VfsResult<()> {
+pub(crate) fn store_index(ctx: &mut Interp, root: &str, index: &Tree) -> VfsResult<()> {
     write_vfs(ctx, &git_path(root, INDEX), &serialize_tree(index))
 }
 
@@ -269,11 +269,7 @@ pub(crate) fn read_blob(interp: &Interp, root: &str, hash: &str) -> Option<Vec<u
         .ok()
 }
 
-pub(crate) fn write_blob(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    data: &[u8],
-) -> VfsResult<String> {
+pub(crate) fn write_blob(ctx: &mut Interp, root: &str, data: &[u8]) -> VfsResult<String> {
     let hash = blob_hash(data);
     write_vfs(ctx, &git_path(root, &format!("objects/{hash}")), data)?;
     Ok(hash)
@@ -388,7 +384,7 @@ pub(crate) fn commit_tree(interp: &Interp, root: &str, id: &str) -> Option<Tree>
 /// The id is the SHA-1 of a Git-shaped header, so two commits differ whenever their tree,
 /// parents, author, timestamp, or message differ.
 pub(crate) fn store_commit(
-    ctx: &mut CommandContext<'_>,
+    ctx: &mut Interp,
     root: &str,
     commit: &Commit,
     tree: &Tree,
@@ -609,7 +605,7 @@ pub(crate) fn read_reference(interp: &Interp, root: &str, reference: &str) -> Op
 }
 
 pub(crate) fn write_reference(
-    ctx: &mut CommandContext<'_>,
+    ctx: &mut Interp,
     root: &str,
     reference: &str,
     commit: &str,

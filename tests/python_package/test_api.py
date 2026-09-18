@@ -209,8 +209,8 @@ def test_invalid_limits_are_rejected_before_native_conversion() -> None:
 
 
 def test_mount_reports_skips_and_runs_python_from_trusted_tree(tmp_path) -> None:
-    (tmp_path / ".git").mkdir()
-    (tmp_path / ".git" / "config").write_text("secret")
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "config").write_text("secret")
     (tmp_path / "helper.py").write_text("answer = 42\n")
     (tmp_path / "main.py").write_text("from helper import answer\nprint(answer)\n")
     environment = shellsim.Environment()
@@ -219,10 +219,10 @@ def test_mount_reports_skips_and_runs_python_from_trusted_tree(tmp_path) -> None
     result = environment.run("cd /work; python3.14 main.py")
 
     assert report.files == 2
-    assert report.skipped_directories == (".git",)
+    assert report.skipped_directories == (".venv",)
     assert result.stdout == b"42\n"
     with pytest.raises(shellsim.SimulationError, match="No such file"):
-        environment.read_file("/work/.git/config")
+        environment.read_file("/work/.venv/config")
 
 
 def test_failed_mount_rolls_back_all_files(tmp_path) -> None:

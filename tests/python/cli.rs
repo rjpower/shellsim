@@ -149,8 +149,8 @@ fn project_ingestion_obeys_the_vfs_disk_limit() {
 #[test]
 fn project_ingestion_reports_skipped_dependency_directories() {
     let project = TestDirectory::new();
-    std::fs::create_dir(project.path().join(".git")).expect("create skipped directory");
-    std::fs::write(project.path().join(".git/config"), "host-only").expect("write skipped file");
+    std::fs::create_dir(project.path().join(".venv")).expect("create skipped directory");
+    std::fs::write(project.path().join(".venv/config"), "host-only").expect("write skipped file");
     std::fs::write(project.path().join("main.py"), "print('safe')\n").expect("write script");
     let mut environment = Environment::new();
 
@@ -159,9 +159,9 @@ fn project_ingestion_reports_skipped_dependency_directories() {
             .expect("mount project");
 
     assert_eq!(report.files, 1);
-    assert_eq!(report.skipped_directories, [".git"]);
+    assert_eq!(report.skipped_directories, [".venv"]);
     assert!(environment.vfs.exists("/", "/work/main.py"));
-    assert!(!environment.vfs.exists("/", "/work/.git/config"));
+    assert!(!environment.vfs.exists("/", "/work/.venv/config"));
 }
 
 #[cfg(unix)]

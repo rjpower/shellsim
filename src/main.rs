@@ -14,7 +14,6 @@ use std::process::exit;
 use shellsim::{Environment, Limits, RunOutcome};
 
 fn main() {
-    shellsim::sandbox::apply();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         run_script(&read_stdin(), &[]);
@@ -59,6 +58,7 @@ fn run_script(source: &str, positional: &[String]) -> ! {
 }
 
 fn run_script_with_stdin(source: &str, positional: &[String], stdin: &[u8]) -> ! {
+    shellsim::sandbox::apply();
     let mut env = fresh_environment(Limits::default(), positional);
     let (outcome, out, err) = env.run_script_capture_with_stdin(source, stdin);
     use std::io::Write;
@@ -114,6 +114,7 @@ fn evaluate(args: &[String]) -> ! {
         Some(source) => (source, read_stdin_bytes()),
         None => (read_stdin(), Vec::new()),
     };
+    shellsim::sandbox::apply();
     let mut env = fresh_environment(limits, &positional);
     let (outcome, stdout, stderr) = env.run_script_capture_with_stdin(&source, &stdin);
     let status = outcome.exit_status;
@@ -171,6 +172,7 @@ fn interactive_shell(args: &[String]) -> ! {
         i += 1;
     }
 
+    shellsim::sandbox::apply();
     let mut env = fresh_environment(limits, &positional);
     let stdin = std::io::stdin();
     let show_prompt = stdin.is_terminal();
@@ -275,6 +277,7 @@ fn harness_session(options: HarnessOptions, command: &str) -> shellsim::harness:
             exit(2);
         });
     }
+    shellsim::sandbox::apply();
     session
 }
 
