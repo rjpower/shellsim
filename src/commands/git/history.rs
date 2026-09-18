@@ -994,7 +994,9 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             io.out.push(b'\n');
         }
         for format in [stat, patch].into_iter().flatten() {
-            io.out.push(b'\n');
+            if diff_needs_spacing(&pretty) {
+                io.out.push(b'\n');
+            }
             emit_commit_diff(ctx, &root, id, commit, format, &paths, io);
         }
         match graph.as_mut() {
@@ -1386,11 +1388,20 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             io.out.push(b'\n');
         }
         if let Some(format) = format {
-            io.out.push(b'\n');
+            if diff_needs_spacing(&pretty) {
+                io.out.push(b'\n');
+            }
             emit_commit_diff(ctx, &root, &id, &commit, format, &[], io);
         }
     }
     0
+}
+
+/// Whether a diff that follows the header needs a blank line before it.
+///
+/// Git separates the message from the diff, but a one-line header has no message to separate.
+fn diff_needs_spacing(pretty: &Pretty) -> bool {
+    !matches!(pretty, Pretty::OneLine | Pretty::AbbreviatedOneLine)
 }
 
 /// Read an annotated tag's message record, if `name` names one.

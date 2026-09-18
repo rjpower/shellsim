@@ -47,6 +47,10 @@ placeholders, and the
 negation, anchoring, directory-only patterns, character classes, `**`, and nested pattern files.
 Naming an ignored file outright to `git add` is an error, as it is in Git.
 
+Options are read the way Git reads them, whichever of its four spellings a caller reaches for:
+`-n5`, `-n 5`, `--max-count=5` and `--max-count 5` are one option, short options cluster as `-am`
+does, and nothing after `--` is treated as an option however it is written.
+
 Pathspecs accept globs, and their wildcards cross directory separators the way Git's do, so
 `git status -- '*.py'` reports a change to `src/main.py`. `git grep` searches only below the
 working directory, reports paths relative to it, and accepts a revision to search instead of the

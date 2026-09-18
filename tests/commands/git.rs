@@ -2869,3 +2869,18 @@ fn blame_can_print_the_whole_commit_id() {
     assert!(short.starts_with(&format!("^{}", &id[..7])), "{short}");
     assert!(long.starts_with(&format!("^{}", &id[..39])), "{long}");
 }
+
+#[test]
+fn a_one_line_log_entry_is_not_separated_from_its_diff() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    env.vfs.put_file("/f", b"one\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add f; git commit -qm one").0, 0);
+
+    // A one-line header has no message to separate from the diff, so Git runs them together.
+    let oneline = run(&mut env, "git log --oneline --stat").1;
+    assert!(oneline.contains("one\n f | 1 +\n"), "{oneline}");
+    // The default header still has its blank line.
+    let medium = run(&mut env, "git log --stat").1;
+    assert!(medium.contains("    one\n\n f | 1 +\n"), "{medium}");
+}
