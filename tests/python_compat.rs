@@ -130,6 +130,10 @@ fn system_exit_uses_process_status_and_base_exception_hierarchy() {
         ),
         (7, b"base\n".to_vec(), Vec::new())
     );
+    assert_eq!(
+        run_shell("python -c 'raise SystemExit(\"clear boundary\")'"),
+        (1, Vec::new(), b"clear boundary\n".to_vec())
+    );
 }
 
 #[test]
@@ -165,6 +169,21 @@ print(sorted(values), sorted(values_copy))"#;
             b"True True False\n['a', 'b', 'c'] ['a\\r\\n', 'b\\n']\n00042 -0042 +42\n1 2 True ['a', 'b']\n[1, 2] [1, 2, 3]\n".to_vec(),
             Vec::new(),
         )
+    );
+}
+
+#[test]
+fn chr_builds_unicode_scalars_and_rejects_out_of_range_values() {
+    assert_eq!(
+        run_shell("python -c 'print(chr(65), chr(0x1f642))'"),
+        (0, "A 🙂\n".as_bytes().to_vec(), Vec::new())
+    );
+    let (status, _, stderr) = run_shell("python -c 'chr(0x110000)' ");
+    assert_eq!(status, 2);
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("not in range"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
     );
 }
 
@@ -423,6 +442,31 @@ print(items)"#;
         b"[('a', 3), ('a', 1), ('b', 2)]\n[('a', 3), ('b', 2), ('a', 1)]\n[('a', 1), ('b', 2), ('a', 3)]\n"
     );
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn callable_sentinel_iter_is_lazy_and_stops_before_the_sentinel() {
+    let source = r#"
+from io import BytesIO
+stream = BytesIO(b'abcdef')
+chunks = iter(lambda: stream.read(2), b'')
+print(stream.tell())
+print(list(chunks))
+print(stream.tell())
+"#;
+    let mut environment = Environment::new();
+    let argv = vec!["python3.14".into(), "-c".into(), source.into()];
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = shellsim::python::run_python(
+        &mut environment,
+        &argv,
+        Vec::new(),
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"0\n[b'ab', b'cd', b'ef']\n6\n");
 }
 
 #[test]

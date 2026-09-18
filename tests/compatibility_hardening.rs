@@ -165,6 +165,10 @@ fn text_tools_share_option_boundaries_and_cover_common_forms() {
         (0, "y:2\nx:10\n".into(), String::new())
     );
     assert_eq!(
+        text("printf 'b\\na\\n' > input; sort -o output input; cat output"),
+        (0, "a\nb\n".into(), String::new())
+    );
+    assert_eq!(
         text("printf 'aa\\naa extra\\naa\\n' | grep -xm1 aa"),
         (0, "aa\n".into(), String::new())
     );

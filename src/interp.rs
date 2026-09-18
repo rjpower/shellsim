@@ -183,6 +183,8 @@ pub struct ProcessState {
     pending_signals: std::collections::BTreeSet<Signal>,
     /// Non-default signal actions installed by the shell `trap` builtin.
     pub(crate) signal_dispositions: BTreeMap<Signal, ShellSignalDisposition>,
+    /// Process-local pseudo-signal action run once when the current shell script finishes.
+    pub(crate) exit_disposition: Option<ShellSignalDisposition>,
     /// Prevent ordinary caught signals from recursively interrupting their own handler.
     handling_signal: bool,
     /// Memory reserved for this forked context and released independently at exit.
@@ -346,6 +348,11 @@ impl ProcessState {
             } else {
                 self.signal_dispositions.clone()
             },
+            exit_disposition: if new_shell {
+                None
+            } else {
+                self.exit_disposition.clone()
+            },
             handling_signal: false,
             fork_allocation_bytes,
             detached_output,
@@ -429,6 +436,14 @@ impl ProcessState {
         }
         bytes = bytes.saturating_add(self.expansion_error.as_ref().map_or(0, string));
         for disposition in self.signal_dispositions.values() {
+            bytes = bytes.saturating_add(match disposition {
+                ShellSignalDisposition::Ignore => 16,
+                ShellSignalDisposition::Handler { source, body } => {
+                    string(source).saturating_add(body.estimated_bytes())
+                }
+            });
+        }
+        if let Some(disposition) = &self.exit_disposition {
             bytes = bytes.saturating_add(match disposition {
                 ShellSignalDisposition::Ignore => 16,
                 ShellSignalDisposition::Handler { source, body } => {
@@ -557,6 +572,7 @@ impl Environment {
                 shell_continuation: None,
                 pending_signals: std::collections::BTreeSet::new(),
                 signal_dispositions: BTreeMap::new(),
+                exit_disposition: None,
                 handling_signal: false,
                 fork_allocation_bytes: 0,
                 detached_output: false,

@@ -202,6 +202,12 @@ enum ShellFrame {
         variable: String,
         previous: Option<String>,
     },
+    AwaitProcessSubstitution {
+        command: PreparedCommand,
+        pid: crate::process::ProcessId,
+        capture: crate::descriptors::DescriptionId,
+        redirect: usize,
+    },
     PrepareFor(PreparedFor),
     AwaitForSubstitution {
         state: PreparedFor,
@@ -301,6 +307,9 @@ enum ShellFrame {
         variables: Vec<(String, Option<String>)>,
     },
     FinishSignalHandler {
+        previous_status: i32,
+    },
+    FinishExitTrap {
         previous_status: i32,
     },
     ResumeCommand {
@@ -411,6 +420,7 @@ pub(crate) struct ShellContinuation {
     switched: bool,
     yielded: bool,
     blocked: Option<crate::scheduler::WaitReason>,
+    exit_trap_started: bool,
 }
 
 impl ShellContinuation {
@@ -421,6 +431,7 @@ impl ShellContinuation {
             switched: false,
             yielded: false,
             blocked: None,
+            exit_trap_started: false,
         }
     }
 
@@ -430,6 +441,20 @@ impl ShellContinuation {
         self.blocked = None;
         for _ in 0..budget.max(1) {
             let Some(frame) = self.frames.pop() else {
+                if !self.exit_trap_started {
+                    self.exit_trap_started = true;
+                    let previous_status = interp.exiting.take().unwrap_or(self.status);
+                    match interp.exit_disposition.take() {
+                        Some(crate::interp::ShellSignalDisposition::Handler { body, .. }) => {
+                            self.status = previous_status;
+                            self.frames
+                                .push(ShellFrame::FinishExitTrap { previous_status });
+                            self.frames.push(ShellFrame::Eval(body));
+                            continue;
+                        }
+                        Some(crate::interp::ShellSignalDisposition::Ignore) | None => {}
+                    }
+                }
                 return ShellPoll::Ready(self.status);
             };
             self.step(interp, frame);
@@ -444,7 +469,7 @@ impl ShellContinuation {
                 return ShellPoll::Blocked(reason);
             }
         }
-        if self.frames.is_empty() {
+        if self.frames.is_empty() && (self.exit_trap_started || interp.exit_disposition.is_none()) {
             ShellPoll::Ready(self.status)
         } else {
             ShellPoll::Pending
@@ -496,6 +521,7 @@ impl ShellContinuation {
                     restore_command_variables(interp, variables);
                 }
                 ShellFrame::FinishSignalHandler { .. } => interp.finish_signal_handler(),
+                ShellFrame::FinishExitTrap { .. } => {}
                 ShellFrame::FinishLoop => {
                     interp.loop_depth = interp.loop_depth.saturating_sub(1);
                 }
@@ -549,6 +575,40 @@ impl ShellContinuation {
     }
 
     fn prepare_command(&mut self, interp: &mut Interp, mut command: PreparedCommand) {
+        if let Some((redirect, source)) = next_process_substitution(&command) {
+            let (pid, capture) = match start_command_substitution(interp, source) {
+                Ok(child) => child,
+                Err((status, message)) => {
+                    if !message.is_empty() {
+                        write_diagnostic(interp, &message);
+                    }
+                    restore_command_variables(interp, command.temporary_variables);
+                    self.status = status;
+                    return;
+                }
+            };
+            self.frames.push(ShellFrame::AwaitProcessSubstitution {
+                command,
+                pid,
+                capture,
+                redirect,
+            });
+            self.switched = true;
+            return;
+        }
+        if command
+            .words
+            .iter()
+            .any(|word| process_substitution_source(word).is_some())
+        {
+            write_diagnostic(
+                interp,
+                "shellsim: process substitution is supported only as an input redirection\n",
+            );
+            restore_command_variables(interp, command.temporary_variables);
+            self.status = 2;
+            return;
+        }
         if let Some((location, substitution)) = next_command_substitution(&command) {
             if !self.ensure_capacity(interp, 1) {
                 restore_command_variables(interp, command.temporary_variables);
@@ -894,6 +954,17 @@ impl ShellContinuation {
                 command.substitution_status = Some(status);
                 self.push(interp, ShellFrame::PrepareCommand(command));
             }
+            ShellFrame::AwaitProcessSubstitution {
+                mut command,
+                pid,
+                capture,
+                redirect,
+            } => {
+                let (_, bytes) = finish_substitution(interp, pid, capture);
+                command.redirects[redirect].op = RedirOp::HeredocRaw;
+                command.redirects[redirect].target = String::from_utf8_lossy(&bytes).into_owned();
+                self.push(interp, ShellFrame::PrepareCommand(command));
+            }
             ShellFrame::PrepareFor(state) => self.prepare_for(interp, state),
             ShellFrame::AwaitForSubstitution {
                 mut state,
@@ -1224,6 +1295,9 @@ impl ShellContinuation {
             ShellFrame::FinishSignalHandler { previous_status } => {
                 interp.finish_signal_handler();
                 self.status = previous_status;
+            }
+            ShellFrame::FinishExitTrap { previous_status } => {
+                self.status = interp.exiting.take().unwrap_or(previous_status);
             }
             ShellFrame::ResumeCommand {
                 variables,
@@ -1935,6 +2009,23 @@ fn next_command_substitution(
     None
 }
 
+fn process_substitution_source(value: &str) -> Option<&str> {
+    value.strip_prefix("<(")?.strip_suffix(')')
+}
+
+fn next_process_substitution(command: &PreparedCommand) -> Option<(usize, &str)> {
+    command
+        .redirects
+        .iter()
+        .enumerate()
+        .find_map(|(index, redirect)| {
+            (redirect.op == RedirOp::Read)
+                .then(|| process_substitution_source(&redirect.target))
+                .flatten()
+                .map(|source| (index, source))
+        })
+}
+
 fn replace_substitution(
     command: &mut PreparedCommand,
     location: ExpansionLocation,
@@ -1972,6 +2063,18 @@ fn finish_command_substitution(
     pid: crate::process::ProcessId,
     capture: crate::descriptors::DescriptionId,
 ) -> (i32, String) {
+    let (status, mut bytes) = finish_substitution(interp, pid, capture);
+    while bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn finish_substitution(
+    interp: &mut Interp,
+    pid: crate::process::ProcessId,
+    capture: crate::descriptors::DescriptionId,
+) -> (i32, Vec<u8>) {
     let status = match interp.processes.get(pid).map(|record| record.status) {
         Some(crate::process::ProcessStatus::Exited(status)) => status,
         _ => {
@@ -1982,17 +2085,14 @@ fn finish_command_substitution(
             125
         }
     };
-    let mut bytes = interp
+    let bytes = interp
         .descriptors
         .drain_capture(capture)
         .unwrap_or_default();
     let _ = interp.descriptors.release_handle(capture);
     interp.processes.reap(pid);
     let _ = interp.scheduler.reap(pid);
-    while bytes.last() == Some(&b'\n') {
-        bytes.pop();
-    }
-    (status, String::from_utf8_lossy(&bytes).into_owned())
+    (status, bytes)
 }
 
 fn start_command_substitution(
@@ -2773,11 +2873,12 @@ fn restore_command_variables(interp: &mut Interp, saved: Vec<(String, Option<Str
 /// (`declare`/`local`/`typeset`/`readonly`) can parse them itself.
 fn expand_argv(interp: &mut Interp, words: &[String]) -> Vec<String> {
     let mut out = Vec::new();
+    let double_bracket = words.first().is_some_and(|word| word == "[[");
     for w in words {
         if is_array_assign_word(w) {
             out.push(w.clone());
         } else {
-            out.extend(expand_word(interp, w, true));
+            out.extend(expand_word(interp, w, !double_bracket));
         }
     }
     out

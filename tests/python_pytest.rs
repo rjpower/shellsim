@@ -25,6 +25,18 @@ fn collects_zero_argument_tests_in_definition_order() {
 }
 
 #[test]
+fn accepts_common_presentation_only_flags() {
+    let source = "def test_ok():\n    pass\n";
+    let (status, stdout, stderr) = run_pytest(
+        source,
+        "pytest -q --disable-warnings --tb=short /test_sample.py",
+    );
+    assert_eq!(status, 0, "{stderr:?}");
+    assert_eq!(stdout, b"/test_sample.py::test_ok PASSED\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn assert_and_pytest_controls_have_expected_statuses() {
     let source = "import pytest\ndef test_assertion():\n    assert 1 == 2, 'nope'\ndef test_skip():\n    pytest.skip('later')\ndef test_raises():\n    with pytest.raises(ValueError):\n        raise ValueError('bad')\n";
     let (status, stdout, stderr) = run_pytest(source, "python3.14 -m pytest /test_sample.py");

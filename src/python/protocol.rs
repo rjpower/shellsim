@@ -233,6 +233,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::DescriptorBoundMethod { .. } => "<bound method ...>",
                 Object::Iterator { .. } => "<iterator ...>",
                 Object::CountIterator { .. } => "<iterator ...>",
+                Object::CallableIterator { .. } => "<callable_iterator ...>",
                 Object::Generator { .. } => "<generator ...>",
                 Object::Module { .. } => "<module ...>",
                 Object::ArrayStorage(_) => "<array storage ...>",
@@ -303,6 +304,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::DescriptorBoundMethod { .. } => "<bound method>".into(),
             Object::Iterator { .. } => "<iterator>".into(),
             Object::CountIterator { .. } => "<iterator>".into(),
+            Object::CallableIterator { .. } => "<callable_iterator>".into(),
             Object::Generator { .. } => "<generator>".into(),
             Object::Module { name, .. } => format!("<module '{name}'>"),
             Object::ArrayStorage(_) => "<array storage>".into(),
@@ -397,6 +399,7 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         | Object::DescriptorBoundMethod { .. }
         | Object::Iterator { .. }
         | Object::CountIterator { .. }
+        | Object::CallableIterator { .. }
         | Object::Generator { .. }
         | Object::Module { .. }
         | Object::ArrayStorage(_)
@@ -568,6 +571,7 @@ fn equals_inner(
                 | (Object::DescriptorBoundMethod { .. }, Object::DescriptorBoundMethod { .. })
                 | (Object::Iterator { .. }, Object::Iterator { .. })
                 | (Object::CountIterator { .. }, Object::CountIterator { .. })
+                | (Object::CallableIterator { .. }, Object::CallableIterator { .. })
                 | (Object::Generator { .. }, Object::Generator { .. })
                 | (Object::Module { .. }, Object::Module { .. })
                 | (Object::Regex { .. }, Object::Regex { .. })
@@ -729,6 +733,7 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::DescriptorBoundMethod { .. }
             | Object::Iterator { .. }
             | Object::CountIterator { .. }
+            | Object::CallableIterator { .. }
             | Object::Generator { .. }
             | Object::Module { .. }
             | Object::ArrayStorage(_)

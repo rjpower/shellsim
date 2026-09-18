@@ -24,6 +24,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
         FunctionDef {
             module: "math",
+            name: "cos",
+            call: native_cos,
+        },
+        FunctionDef {
+            module: "math",
             name: "exp",
             call: native_exp,
         },
@@ -51,6 +56,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             module: "math",
             name: "sqrt",
             call: native_sqrt,
+        },
+        FunctionDef {
+            module: "math",
+            name: "tan",
+            call: native_tan,
         },
     ],
     values: &[
@@ -81,6 +91,10 @@ fn native_ceil(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "ceil")
 }
 
+fn native_cos(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "cos")
+}
+
 fn native_exp(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "exp")
 }
@@ -103,6 +117,10 @@ fn native_sin(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 
 fn native_sqrt(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "sqrt")
+}
+
+fn native_tan(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "tan")
 }
 
 fn native_call(runtime: &mut dyn PyRuntime, args: CallArgs, name: &'static str) -> PyResult {
@@ -203,6 +221,7 @@ pub fn constant(name: &str) -> Option<MathValue> {
 pub fn call(name: &str, args: &[f64]) -> MathResult {
     match name {
         "ceil" => unary("ceil", args, ceil),
+        "cos" => unary("cos", args, cos),
         "exp" => unary("exp", args, exp),
         "isinf" => unary("isinf", args, |value| Ok(MathValue::Bool(isinf(value)))),
         "isnan" => unary("isnan", args, |value| Ok(MathValue::Bool(isnan(value)))),
@@ -217,6 +236,7 @@ pub fn call(name: &str, args: &[f64]) -> MathResult {
         },
         "sin" => unary("sin", args, sin),
         "sqrt" => unary("sqrt", args, sqrt),
+        "tan" => unary("tan", args, tan),
         _ => Err(MathError::UnknownFunction(name.to_string())),
     }
 }
@@ -303,6 +323,22 @@ pub fn sin(value: f64) -> MathResult {
         return Err(MathError::ValueError("expected a finite input"));
     }
     Ok(MathValue::Float(value.sin()))
+}
+
+/// Return the cosine, rejecting infinite inputs as Python does.
+pub fn cos(value: f64) -> MathResult {
+    if value.is_infinite() {
+        return Err(MathError::ValueError("expected a finite input"));
+    }
+    Ok(MathValue::Float(value.cos()))
+}
+
+/// Return the tangent, rejecting infinite inputs as Python does.
+pub fn tan(value: f64) -> MathResult {
+    if value.is_infinite() {
+        return Err(MathError::ValueError("expected a finite input"));
+    }
+    Ok(MathValue::Float(value.tan()))
 }
 
 /// Return the non-negative square root.

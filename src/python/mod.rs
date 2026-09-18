@@ -707,7 +707,10 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
             }
             ctrf = Some(path.to_string());
         } else if arg.starts_with('-') {
-            if !matches!(arg.as_str(), "-q" | "-v" | "-rA" | "--tb=short") {
+            if !matches!(
+                arg.as_str(),
+                "-q" | "-v" | "-rA" | "--tb=short" | "--disable-warnings"
+            ) {
                 return unsupported(interp, &format!("pytest option {arg}"), err);
             }
         } else {

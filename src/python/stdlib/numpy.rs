@@ -333,8 +333,12 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         function("matmul", matmul),
         function("diag", diag),
         function("allclose", allclose),
+        function("array_equal", array_equal),
         function("argsort", argsort),
         function("percentile", percentile),
+        function("pad", pad),
+        function("save", save),
+        function("load", load),
     ],
     values: &[
         ValueDef::Constant {
@@ -356,6 +360,10 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         ValueDef::Factory {
             name: "ndarray",
             get: array_type,
+        },
+        ValueDef::Factory {
+            name: "random",
+            get: random_module,
         },
         dtype_value("bool", bool_type),
         dtype_value("bool_", bool_type),
@@ -388,6 +396,401 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
 
 fn array_type(runtime: &mut dyn PyRuntime) -> PyResult {
     Ok(runtime.marker(PyMarker::ArrayType))
+}
+
+fn random_module(runtime: &mut dyn PyRuntime) -> PyResult {
+    runtime.import_module("numpy.random")
+}
+
+fn array_equal(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.array_equal", 2, 2)?;
+    args.reject_unknown_keywords("numpy.array_equal", &["equal_nan"])?;
+    let equal_nan = args
+        .keyword("numpy.array_equal", "equal_nan")?
+        .map(|value| runtime.truth(value))
+        .transpose()?
+        .unwrap_or(false);
+    let left = coerce_array(runtime, args.positional()[0])?;
+    let right = coerce_array(runtime, args.positional()[1])?;
+    let (left_layout, _) = runtime.array_layout(left)?;
+    let (right_layout, _) = runtime.array_layout(right)?;
+    if left_layout.shape != right_layout.shape {
+        return Ok(Value::Bool(false));
+    }
+    let mut equal = true;
+    for_each_index(&left_layout.shape, |index| {
+        let left_value = runtime.array_get(left, index)?;
+        let right_value = runtime.array_get(right, index)?;
+        let left = scalar(runtime, left_value)?;
+        let right = scalar(runtime, right_value)?;
+        if !(left.compare(right) == Some(Ordering::Equal)
+            || (equal_nan && left.is_nan() && right.is_nan()))
+        {
+            equal = false;
+        }
+        Ok(())
+    })?;
+    Ok(Value::Bool(equal))
+}
+
+fn pad(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.pad", 2, 3)?;
+    args.reject_unknown_keywords("numpy.pad", &["mode", "constant_values"])?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let (layout, dtype) = runtime.array_layout(array)?;
+    let widths = pad_widths(runtime, args.positional()[1], layout.shape.len())?;
+    let mode_value = args
+        .keyword("numpy.pad", "mode")?
+        .copied()
+        .or_else(|| args.positional().get(2).copied());
+    let mode = mode_value
+        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .transpose()?
+        .unwrap_or_else(|| "constant".to_string());
+    if !matches!(mode.as_str(), "constant" | "edge") {
+        return Err(PyError::value_error(format!(
+            "numpy.pad mode {mode:?} is not supported; use 'constant' or 'edge'"
+        )));
+    }
+    if mode == "edge" && layout.shape.contains(&0) {
+        return Err(PyError::value_error(
+            "cannot extend an empty axis using mode 'edge'",
+        ));
+    }
+    let constant = args
+        .keyword("numpy.pad", "constant_values")?
+        .copied()
+        .unwrap_or(Value::Int(0));
+    let constant = convert(runtime, constant, dtype)?;
+    let shape = layout
+        .shape
+        .iter()
+        .zip(&widths)
+        .map(|(length, (before, after))| {
+            length
+                .checked_add(*before)
+                .and_then(|value| value.checked_add(*after))
+                .ok_or_else(|| PyError::value_error("padded array is too large"))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let count = element_count(&shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&shape, |output| {
+        runtime.charge_cpu(1)?;
+        let mut input = Vec::with_capacity(output.len());
+        let mut outside = false;
+        for (axis, coordinate) in output.iter().copied().enumerate() {
+            let (before, _) = widths[axis];
+            let length = layout.shape[axis];
+            if coordinate < before {
+                outside = true;
+                input.push(0);
+            } else if coordinate >= before + length {
+                outside = true;
+                input.push(length.saturating_sub(1));
+            } else {
+                input.push(coordinate - before);
+            }
+        }
+        values.push(if outside && mode == "constant" {
+            constant
+        } else {
+            runtime.array_get(array, &input)?
+        });
+        Ok(())
+    })?;
+    runtime.new_array(values, shape, dtype)
+}
+
+fn pad_widths(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+    rank: usize,
+) -> PyResult<Vec<(usize, usize)>> {
+    if let Some(width) = runtime.int_value(&value) {
+        let width = dimension(width)?;
+        return Ok(vec![(width, width); rank]);
+    }
+    let items = value.cast::<PySequence>(runtime)?.items(runtime)?;
+    if items.len() == 2 && items.iter().all(|item| runtime.int_value(item).is_some()) {
+        let before = dimension(runtime.int_value(&items[0]).expect("checked"))?;
+        let after = dimension(runtime.int_value(&items[1]).expect("checked"))?;
+        return Ok(vec![(before, after); rank]);
+    }
+    if items.len() != rank {
+        return Err(PyError::value_error(
+            "pad_width must be one width, one pair, or one entry per axis",
+        ));
+    }
+    items
+        .into_iter()
+        .map(|item| {
+            if let Some(width) = runtime.int_value(&item) {
+                let width = dimension(width)?;
+                return Ok((width, width));
+            }
+            let pair = item.cast::<PySequence>(runtime)?.items(runtime)?;
+            if pair.len() != 2 {
+                return Err(PyError::value_error(
+                    "each pad width must contain two values",
+                ));
+            }
+            let before = pair[0].cast::<PyIndex>(runtime)?.0;
+            let after = pair[1].cast::<PyIndex>(runtime)?.0;
+            Ok((dimension(before)?, dimension(after)?))
+        })
+        .collect()
+}
+
+fn save(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.save", 2, 2)?;
+    args.reject_unknown_keywords("numpy.save", &["allow_pickle", "fix_imports"])?;
+    let mut path = runtime.display(&args.positional()[0])?;
+    if !path.ends_with(".npy") {
+        path.push_str(".npy");
+    }
+    let array = coerce_array(runtime, args.positional()[1])?;
+    let (layout, dtype) = runtime.array_layout(array)?;
+    let shape = match layout.shape.as_slice() {
+        [] => "()".to_string(),
+        [value] => format!("({value},)"),
+        values => format!(
+            "({})",
+            values
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let base = format!(
+        "{{'descr': '{}', 'fortran_order': False, 'shape': {shape}, }}",
+        dtype_descriptor(dtype)
+    );
+    let padding = (16 - ((10 + base.len() + 1) % 16)) % 16;
+    let header = format!("{base}{}\n", " ".repeat(padding));
+    let header_len = u16::try_from(header.len())
+        .map_err(|_| PyError::value_error("numpy header is too large"))?;
+    let count = element_count(&layout.shape)?;
+    let item_size = usize::from(dtype_kind(dtype).bits.max(8) / 8);
+    let capacity = 10usize
+        .checked_add(header.len())
+        .and_then(|value| value.checked_add(count.checked_mul(item_size)?))
+        .ok_or_else(|| PyError::resource_error("numpy file is too large"))?;
+    runtime.reserve_memory(capacity)?;
+    let mut output = Vec::with_capacity(capacity);
+    output.extend_from_slice(b"\x93NUMPY\x01\x00");
+    output.extend_from_slice(&header_len.to_le_bytes());
+    output.extend_from_slice(header.as_bytes());
+    for_each_index(&layout.shape, |index| {
+        runtime.charge_cpu(1)?;
+        let raw = runtime.array_get(array, index)?;
+        let value = scalar(runtime, raw)?;
+        append_scalar_bytes(&mut output, value, dtype);
+        Ok(())
+    })?;
+    runtime.filesystem().write_bytes(&path, &output)?;
+    Ok(Value::None)
+}
+
+fn load(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.load", 1, 1)?;
+    args.reject_unknown_keywords(
+        "numpy.load",
+        &["mmap_mode", "allow_pickle", "fix_imports", "encoding"],
+    )?;
+    let path = runtime.display(&args.positional()[0])?;
+    let bytes = runtime.filesystem().read_bytes(&path)?;
+    if bytes.len() < 10 || &bytes[..6] != b"\x93NUMPY" {
+        return Err(PyError::value_error("file is not a NumPy .npy array"));
+    }
+    let (header_start, header_len) = match (bytes[6], bytes[7]) {
+        (1, 0) => (
+            10usize,
+            usize::from(u16::from_le_bytes([bytes[8], bytes[9]])),
+        ),
+        (2 | 3, 0) if bytes.len() >= 12 => (
+            12usize,
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize,
+        ),
+        _ => return Err(PyError::value_error("unsupported NumPy file version")),
+    };
+    let data_start = header_start
+        .checked_add(header_len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| PyError::value_error("truncated NumPy header"))?;
+    let header = std::str::from_utf8(&bytes[header_start..data_start])
+        .map_err(|_| PyError::value_error("NumPy header is not ASCII"))?;
+    if header.contains("'fortran_order': True") {
+        return Err(PyError::value_error(
+            "Fortran-order NumPy arrays are not supported",
+        ));
+    }
+    let descriptor = npy_string_field(header, "descr")?;
+    let dtype = descriptor_dtype(descriptor)?;
+    let shape = npy_shape(header)?;
+    let count = element_count(&shape)?;
+    let item_size = usize::from(dtype_kind(dtype).bits.max(8) / 8);
+    let data_len = count
+        .checked_mul(item_size)
+        .ok_or_else(|| PyError::value_error("NumPy array is too large"))?;
+    let data = bytes
+        .get(data_start..data_start.saturating_add(data_len))
+        .ok_or_else(|| PyError::value_error("truncated NumPy array data"))?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for chunk in data.chunks_exact(item_size) {
+        runtime.charge_cpu(1)?;
+        values.push(pack_checked(runtime, decode_scalar(chunk, dtype), dtype)?);
+    }
+    runtime.new_array(values, shape, dtype)
+}
+
+fn dtype_descriptor(dtype: PyArrayDtype) -> &'static str {
+    match dtype_kind(dtype).class {
+        NumericClass::Bool => "|b1",
+        NumericClass::Signed => match dtype_kind(dtype).bits {
+            8 => "|i1",
+            16 => "<i2",
+            32 => "<i4",
+            _ => "<i8",
+        },
+        NumericClass::Unsigned => match dtype_kind(dtype).bits {
+            8 => "|u1",
+            16 => "<u2",
+            32 => "<u4",
+            _ => "<u8",
+        },
+        NumericClass::Float if dtype_kind(dtype).bits == 32 => "<f4",
+        NumericClass::Float => "<f8",
+    }
+}
+
+fn descriptor_dtype(descriptor: &str) -> PyResult<PyArrayDtype> {
+    match descriptor {
+        "|b1" | "?" => Ok(PyArrayDtype::Bool),
+        "|i1" | "<i1" => Ok(PyArrayDtype::Int8),
+        "<i2" => Ok(PyArrayDtype::Int16),
+        "<i4" => Ok(PyArrayDtype::Int32),
+        "<i8" => Ok(PyArrayDtype::Int64),
+        "|u1" | "<u1" => Ok(PyArrayDtype::UInt8),
+        "<u2" => Ok(PyArrayDtype::UInt16),
+        "<u4" => Ok(PyArrayDtype::UInt32),
+        "<u8" => Ok(PyArrayDtype::UInt64),
+        "<f4" => Ok(PyArrayDtype::Float32),
+        "<f8" => Ok(PyArrayDtype::Float64),
+        _ => Err(PyError::value_error(format!(
+            "unsupported NumPy file dtype {descriptor:?}"
+        ))),
+    }
+}
+
+fn append_scalar_bytes(output: &mut Vec<u8>, value: Scalar, dtype: PyArrayDtype) {
+    let kind = dtype_kind(dtype);
+    match (kind.class, kind.bits) {
+        (NumericClass::Bool, _) => output.push(u8::from(value.truth())),
+        (NumericClass::Signed, 8) => output.push(value.as_i128() as i8 as u8),
+        (NumericClass::Signed, 16) => {
+            output.extend_from_slice(&(value.as_i128() as i16).to_le_bytes())
+        }
+        (NumericClass::Signed, 32) => {
+            output.extend_from_slice(&(value.as_i128() as i32).to_le_bytes())
+        }
+        (NumericClass::Signed, _) => {
+            output.extend_from_slice(&(value.as_i128() as i64).to_le_bytes())
+        }
+        (NumericClass::Unsigned, 8) => output.push(value.as_u128() as u8),
+        (NumericClass::Unsigned, 16) => {
+            output.extend_from_slice(&(value.as_u128() as u16).to_le_bytes())
+        }
+        (NumericClass::Unsigned, 32) => {
+            output.extend_from_slice(&(value.as_u128() as u32).to_le_bytes())
+        }
+        (NumericClass::Unsigned, _) => {
+            output.extend_from_slice(&(value.as_u128() as u64).to_le_bytes())
+        }
+        (NumericClass::Float, 32) => {
+            output.extend_from_slice(&(value.as_f64() as f32).to_le_bytes())
+        }
+        (NumericClass::Float, _) => output.extend_from_slice(&value.as_f64().to_le_bytes()),
+    }
+}
+
+fn decode_scalar(bytes: &[u8], dtype: PyArrayDtype) -> Scalar {
+    let kind = dtype_kind(dtype);
+    let value = match (kind.class, kind.bits) {
+        (NumericClass::Bool, _) => ScalarValue::Bool(bytes[0] != 0),
+        (NumericClass::Signed, 8) => ScalarValue::Signed(i128::from(bytes[0] as i8)),
+        (NumericClass::Signed, 16) => {
+            ScalarValue::Signed(i128::from(i16::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        (NumericClass::Signed, 32) => {
+            ScalarValue::Signed(i128::from(i32::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        (NumericClass::Signed, _) => {
+            ScalarValue::Signed(i128::from(i64::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        (NumericClass::Unsigned, 8) => ScalarValue::Unsigned(u128::from(bytes[0])),
+        (NumericClass::Unsigned, 16) => {
+            ScalarValue::Unsigned(u128::from(u16::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        (NumericClass::Unsigned, 32) => {
+            ScalarValue::Unsigned(u128::from(u32::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        (NumericClass::Unsigned, _) => {
+            ScalarValue::Unsigned(u128::from(u64::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        (NumericClass::Float, 32) => {
+            ScalarValue::Float(f64::from(f32::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        (NumericClass::Float, _) => {
+            ScalarValue::Float(f64::from_le_bytes(bytes.try_into().unwrap()))
+        }
+    };
+    Scalar { dtype, value }
+}
+
+fn npy_string_field<'a>(header: &'a str, name: &str) -> PyResult<&'a str> {
+    let marker = format!("'{name}':");
+    let value = header
+        .split_once(&marker)
+        .map(|(_, value)| value.trim_start())
+        .ok_or_else(|| PyError::value_error(format!("NumPy header is missing {name:?}")))?;
+    let quote = value
+        .chars()
+        .next()
+        .filter(|quote| matches!(quote, '\'' | '"'))
+        .ok_or_else(|| PyError::value_error("invalid NumPy string header field"))?;
+    let rest = &value[1..];
+    let end = rest
+        .find(quote)
+        .ok_or_else(|| PyError::value_error("unterminated NumPy string header field"))?;
+    Ok(&rest[..end])
+}
+
+fn npy_shape(header: &str) -> PyResult<Vec<usize>> {
+    let value = header
+        .split_once("'shape':")
+        .map(|(_, value)| value)
+        .ok_or_else(|| PyError::value_error("NumPy header is missing 'shape'"))?;
+    let start = value
+        .find('(')
+        .ok_or_else(|| PyError::value_error("invalid NumPy shape"))?;
+    let end = value[start + 1..]
+        .find(')')
+        .map(|end| start + 1 + end)
+        .ok_or_else(|| PyError::value_error("invalid NumPy shape"))?;
+    value[start + 1..end]
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| PyError::value_error("invalid NumPy shape dimension"))
+        })
+        .collect()
 }
 
 const fn dtype_value(name: &'static str, get: fn(&mut dyn PyRuntime) -> PyResult) -> ValueDef {

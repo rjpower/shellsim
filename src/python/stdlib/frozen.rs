@@ -20,6 +20,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "io" => Some(include_str!("source/io.py")),
         "json" => Some(include_str!("source/json.py")),
         "logging" => Some(include_str!("source/logging.py")),
+        "numpy.random" => Some(include_str!("source/numpy_random.py")),
         "os" => Some(include_str!("source/os.py")),
         "pathlib" => Some(include_str!("source/pathlib.py")),
         "random" => Some(include_str!("source/random.py")),
@@ -28,6 +29,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "subprocess" => Some(include_str!("source/subprocess.py")),
         "tempfile" => Some(include_str!("source/tempfile.py")),
         "uuid" => Some(include_str!("source/uuid.py")),
+        "zipfile" => Some(include_str!("source/zipfile.py")),
         "zlib" => Some(include_str!("source/zlib.py")),
         _ => None,
     }

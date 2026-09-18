@@ -473,6 +473,8 @@ pub(super) trait PyRuntime {
     fn new_argv(&mut self) -> PyResult<PyValue>;
     /// Return the mutable list consulted for subsequent VFS module imports.
     fn new_import_path(&mut self) -> PyResult<PyValue>;
+    /// Import one module through the VM's closed native, frozen, and VFS lookup rules.
+    fn import_module(&mut self, name: &str) -> PyResult<PyValue>;
     fn new_argument_parser(
         &mut self,
         program: String,

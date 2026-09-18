@@ -113,6 +113,13 @@ pub enum Object {
         current: i64,
         step: i64,
     },
+    /// The two-argument `iter(callable, sentinel)` form. Calls remain lazy so an unbounded
+    /// producer is still governed by the VM's ordinary instruction budget.
+    CallableIterator {
+        callable: Value,
+        sentinel: Value,
+        exhausted: bool,
+    },
     /// A suspended Python generator frame. The bytecode is immutable; the instruction pointer,
     /// exception-handler stack, and lexical scope are the complete resumable state.
     Generator {
@@ -600,7 +607,9 @@ impl Heap {
                 Object::Class { instance_type, .. } => *instance_type,
                 _ => return Err("instance class is not a class".into()),
             },
-            Object::Iterator { .. } | Object::CountIterator { .. } => BuiltinType::Iterator.id(),
+            Object::Iterator { .. }
+            | Object::CountIterator { .. }
+            | Object::CallableIterator { .. } => BuiltinType::Iterator.id(),
             Object::Generator { .. } => BuiltinType::Generator.id(),
             Object::Module { .. } => BuiltinType::Module.id(),
             Object::ArrayStorage(_) => BuiltinType::Native.id(),
@@ -822,6 +831,12 @@ fn trace_object(
         Object::Iterator { values: items, .. } => {
             trace_values(items.iter().copied(), object_work);
         }
+        Object::CallableIterator {
+            callable, sentinel, ..
+        } => {
+            trace_value(*callable, object_work);
+            trace_value(*sentinel, object_work);
+        }
         Object::Generator { scope, stack, .. } => {
             scope_work.push(*scope);
             trace_values(stack.iter().copied(), object_work);
@@ -939,6 +954,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::DescriptorBoundMethod { .. } => 3,
         Object::Iterator { values, .. } => values.len(),
         Object::CountIterator { .. } => 2,
+        Object::CallableIterator { .. } => 3,
         Object::Generator {
             name,
             code,

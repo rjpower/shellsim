@@ -97,6 +97,63 @@ fn common_bash_guard_idioms() {
 }
 
 #[test]
+fn double_bracket_covers_predicates_boolean_logic_and_regex_captures() {
+    assert_eq!(
+        run(
+            "mkdir -p /work/logs; empty=; level=ERROR; line='[FATAL] Exception occurred: app.Bad'; [[ -d /work/logs && -z \"$empty\" ]] && echo ready; [[ \"$level\" == ERROR || \"$level\" == FATAL ]] && echo level; [[ $line =~ \\[(ERROR|FATAL)\\] ]] && printf '%s:%s\\n' \"${BASH_REMATCH[0]}\" \"${BASH_REMATCH[1]}\"; [[ ! ( 1 -gt 2 || x != x ) ]] && echo grouped",
+        ),
+        (
+            0,
+            "ready\nlevel\n[FATAL]:FATAL\ngrouped\n".into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
+fn input_process_substitution_preserves_bytes_and_parent_shell_mutation() {
+    assert_eq!(
+        run(
+            "mapfile -t rows < <(printf 'one\\ntwo\\n'); printf '%s:%s:%s\\n' \"${rows[0]}\" \"${rows[1]}\" \"${#rows[@]}\"; mapfile -d '' names < <(printf 'a\\0b\\0'); printf '%s:%s:%s\\n' \"${names[0]}\" \"${names[1]}\" \"${#names[@]}\"",
+        ),
+        (0, "one:two:2\na:b:2\n".into(), String::new())
+    );
+
+    let unsupported = run("cat <(printf data)");
+    assert_eq!(unsupported.0, 2);
+    assert!(
+        unsupported
+            .2
+            .contains("supported only as an input redirection"),
+        "{}",
+        unsupported.2
+    );
+}
+
+#[test]
+fn multi_digit_descriptors_support_common_flock_guards() {
+    assert_eq!(
+        run("(flock -x 200; printf locked) 200>/tmp/lock; test -f /tmp/lock"),
+        (0, "locked".into(), String::new())
+    );
+    let (status, _, stderr) = run("flock -x 200");
+    assert_eq!(status, 1);
+    assert!(stderr.contains("bad file descriptor"), "{stderr}");
+}
+
+#[test]
+fn exit_traps_run_once_at_script_completion_and_preserve_status() {
+    assert_eq!(
+        run("trap 'printf cleanup:$?' EXIT; printf body:; false"),
+        (1, "body:cleanup:1".into(), String::new())
+    );
+    assert_eq!(
+        run("trap 'printf no' EXIT; trap - EXIT; printf kept"),
+        (0, "kept".into(), String::new())
+    );
+}
+
+#[test]
 fn test_negates_unary_file_predicates() {
     assert_eq!(
         run("[ ! -f /missing ] && echo absent; touch /present; test ! -d /present && echo file"),
@@ -112,6 +169,8 @@ fn malformed_compound_syntax_never_executes_a_partial_ast() {
         "echo partial; while true; do echo no",
         "echo partial; (echo no",
         "echo partial; echo 'no",
+        "echo partial; [[ value == value",
+        "echo partial; cat < <(printf no",
     ] {
         let (status, out, err) = run(source);
         assert_eq!(status, 2, "wrong status for {source:?}");

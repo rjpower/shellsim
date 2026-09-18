@@ -107,6 +107,43 @@ print(np.asarray([0, 1, 2], dtype=bool).tolist())
 }
 
 #[test]
+fn deterministic_random_padding_and_npy_persistence_use_the_array_contract() {
+    let source = r#"import numpy as np
+from pathlib import Path
+
+first = np.random.default_rng(123).standard_normal((2, 3), dtype=np.float32)
+second = np.random.default_rng(123).standard_normal((2, 3), dtype=np.float32)
+print(first.shape, first.dtype, np.array_equal(first, second))
+values = np.random.default_rng(9).integers(2, 7, size=5, dtype=np.int16)
+print(values.dtype, len(values), bool(np.all(values >= 2)), bool(np.all(values < 7)))
+
+base = np.array([[1, 2], [3, 4]], dtype=np.int16)
+print(np.pad(base, ((1, 0), (2, 1)), constant_values=-1).tolist())
+print(np.pad(base, 1, mode='edge').tolist())
+
+np.save(Path('/work/model'), first)
+loaded = np.load('/work/model.npy')
+print(loaded.shape, loaded.dtype, np.array_equal(first, loaded))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            concat!(
+                "(2, 3) float32 True\n",
+                "int16 5 True True\n",
+                "[[-1, -1, -1, -1, -1], [-1, -1, 1, 2, -1], [-1, -1, 3, 4, -1]]\n",
+                "[[1, 1, 2, 2], [1, 1, 2, 2], [3, 3, 4, 4], [3, 3, 4, 4]]\n",
+                "(2, 3) float32 True\n",
+            )
+            .as_bytes()
+            .to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
 fn registered_scalars_keep_fixed_width_numeric_semantics() {
     let source = r#"import numpy as np
 x = np.int64(9223372036854775807)

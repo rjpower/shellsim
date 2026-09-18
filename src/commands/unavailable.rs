@@ -30,7 +30,6 @@ pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
             "rsyslog",
             "wstest",
             // Interfaces whose real semantics require host process or socket capabilities.
-            "flock",
             "netstat",
             "nohup",
             "openssl",

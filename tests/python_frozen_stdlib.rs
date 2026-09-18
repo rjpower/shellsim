@@ -225,6 +225,48 @@ except ValueError:
 }
 
 #[test]
+fn frozen_zipfile_reads_writes_and_extracts_vfs_archives() {
+    let source = r#"import io
+import zipfile
+from pathlib import Path
+
+buffer = io.BytesIO()
+with zipfile.ZipFile(buffer, 'w') as archive:
+    archive.writestr('one.txt', b'first')
+    archive.writestr('nested/two.bin', bytes([0, 1, 255]))
+
+with zipfile.ZipFile(io.BytesIO(buffer.getvalue()), 'r') as archive:
+    print(archive.namelist())
+    print(archive.read('one.txt'), archive.open('nested/two.bin').read())
+    print([(item.filename, item.file_size) for item in archive.infolist()])
+    archive.extractall('/output')
+
+print(Path('/output/one.txt').read_text(), Path('/output/nested/two.bin').read_bytes())
+with zipfile.ZipFile('/work/items.zip', 'w') as archive:
+    archive.write('/output/one.txt', 'renamed.txt')
+print(zipfile.is_zipfile('/work/items.zip'))
+with zipfile.ZipFile('/work/items.zip') as archive:
+    print(archive.read('renamed.txt'))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            concat!(
+                "['one.txt', 'nested/two.bin']\n",
+                "b'first' b'\\x00\\x01\\xff'\n",
+                "[('one.txt', 5), ('nested/two.bin', 3)]\n",
+                "first b'\\x00\\x01\\xff'\n",
+                "True\n",
+                "b'first'\n",
+            )
+            .into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
 fn frozen_statistics_path_parts_json_error_and_access_cover_common_calls() {
     let source = r#"import json
 import os
@@ -236,6 +278,7 @@ print(statistics.median([4, 1, 3, 2]), statistics.pstdev([2, 2]))
 print(statistics.multimode([1, 2, 1, 2, 3]))
 print(statistics.quantiles([0, 10, 20, 30, 40], n=4, method="inclusive"))
 print(Path("/work/item.txt").parts, Path("a/b").parts)
+print(Path("/work/item.txt").is_absolute(), Path("a/b").is_absolute())
 Path("/work/tool").write_text("x")
 print(os.access("/work/tool", os.F_OK), os.access("/work/tool", os.R_OK), os.access("/missing", os.F_OK))
 try:
@@ -247,7 +290,7 @@ except json.JSONDecodeError:
     assert_eq!(status, 0, "{stderr}");
     assert_eq!(
         stdout,
-        "3.0\n2.5 0.0\n[1, 2]\n[10.0, 20.0, 30.0]\n('/', 'work', 'item.txt') ('a', 'b')\nTrue True False\njson-error\n"
+        "3.0\n2.5 0.0\n[1, 2]\n[10.0, 20.0, 30.0]\n('/', 'work', 'item.txt') ('a', 'b')\nTrue False\nTrue True False\njson-error\n"
     );
     assert!(stderr.is_empty());
 }
