@@ -76,6 +76,22 @@ fn string_indexing_preserves_ascii_unicode_and_negative_indices() {
 }
 
 #[test]
+fn string_slicing_preserves_ascii_unicode_and_extended_slice_semantics() {
+    assert_eq!(
+        run_shell(
+            "python3.14 -c 'ascii = \"0123456789\" * 4; unicode = \"aé☃z🙂q\"; print(ascii[3:17], ascii[-12:-2], ascii[20:5:-4], ascii[4:4]); print(unicode[1:5], unicode[::-2], unicode[-5:-1:2])'"
+        ),
+        (
+            0,
+            "34567890123456 8901234567 0628 \né☃z🙂 qzé éz\n"
+                .as_bytes()
+                .to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
 fn sequence_ordering_uses_element_protocols_and_sets_use_subset_ordering() {
     let source = r#"class Key:
     def __init__(self, value):
