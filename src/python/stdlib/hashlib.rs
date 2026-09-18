@@ -3,7 +3,8 @@
 //! The ABI accepts byte-preserving values and returns exact lowercase hex.
 
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyBytes, PyError, PyResult, PyRuntime, PyString, PyValueCast,
+    CallArgs, FunctionDef, ModuleDef, OwnedPyString, PyBytes, PyError, PyResult, PyRuntime,
+    PyValueCast,
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
@@ -19,7 +20,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
 fn hexdigest(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_hashlib.hexdigest", 2, 2)?;
     args.reject_keywords("_hashlib.hexdigest")?;
-    let PyString(algorithm) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(algorithm) = args.positional()[0].cast(runtime)?;
     let PyBytes(data) = args.positional()[1].cast(runtime)?;
     runtime.charge_cpu(u64::try_from(data.len()).unwrap_or(u64::MAX))?;
     let digest = match algorithm.as_str() {

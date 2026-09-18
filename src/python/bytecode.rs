@@ -47,6 +47,8 @@ pub struct Code {
     pub instructions: Box<[Instruction]>,
     pub spans: Box<[Span]>,
     pub parameters: Box<[Parameter]>,
+    /// Call-shape facts derived once by the compiler and shared by every invocation.
+    pub call_signature: CallSignature,
     /// Stable slot names for locals owned by this code object.
     pub local_names: Arc<[String]>,
     names: Box<[Arc<str>]>,
@@ -57,6 +59,15 @@ pub struct Code {
     formats: Box<[FormatSpec]>,
     dicts: Box<[Box<[bool]>]>,
     errors: Box<[String]>,
+}
+
+/// Immutable argument-binding metadata for one code object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallSignature {
+    pub is_generator: bool,
+    pub positional_count: usize,
+    pub variadic_slot: Option<usize>,
+    pub default_slots: Box<[usize]>,
 }
 
 impl Code {
@@ -493,10 +504,28 @@ impl CodeBuilder {
         parameters: Vec<Parameter>,
         local_names: Vec<String>,
     ) -> CodeRef {
+        let positional_count = parameters
+            .iter()
+            .position(|parameter| parameter.variadic || parameter.keyword_only)
+            .unwrap_or(parameters.len());
+        let call_signature = CallSignature {
+            is_generator: instructions
+                .iter()
+                .any(|instruction| matches!(instruction.opcode, Opcode::Yield)),
+            positional_count,
+            variadic_slot: parameters.iter().position(|parameter| parameter.variadic),
+            default_slots: parameters
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, parameter)| parameter.has_default.then_some(slot))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        };
         Arc::new(Code {
             instructions: instructions.into_boxed_slice(),
             spans: spans.into_boxed_slice(),
             parameters: parameters.into_boxed_slice(),
+            call_signature,
             local_names: local_names.into(),
             names: self.names.into_boxed_slice(),
             constants: self.constants.into_boxed_slice(),

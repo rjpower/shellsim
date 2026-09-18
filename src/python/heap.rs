@@ -10,10 +10,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::bytecode::CodeRef;
+use super::mapping::OrderedMap;
 use super::native::{PyArgumentSpec, PyArrayDtype, PyArrayLayout};
 use super::object_model::{BuiltinType, TypeId};
 use super::string::PyString;
 use super::Value;
+
+pub(super) const MODELED_VALUE_BYTES: u64 = 24;
+pub(super) const MODELED_MAPPING_ENTRY_BYTES: u64 = MODELED_VALUE_BYTES * 3;
 
 const MAX_SHAPED_ATTRIBUTES: usize = 32;
 const INSTANCE_SLOT_BYTES: u64 = 16;
@@ -112,10 +116,10 @@ pub enum Object {
         stop: Option<i64>,
         step: Option<i64>,
     },
-    Dict(Vec<(Value, Value)>),
+    Dict(OrderedMap),
     DefaultDict {
         factory: Value,
-        entries: Vec<(Value, Value)>,
+        entries: OrderedMap,
     },
     Set(Vec<Value>),
     BigInt(BigInt),
@@ -764,6 +768,29 @@ impl Heap {
         for name in local_names.iter() {
             locals.push(values.remove(name));
         }
+        self.allocate_scope_slots(
+            parent,
+            uses_repl_globals,
+            local_names,
+            locals,
+            values,
+            resources,
+        )
+    }
+
+    /// Allocate a lexical scope whose compiler-assigned local slots are already populated.
+    pub fn allocate_scope_slots(
+        &mut self,
+        parent: Option<ScopeId>,
+        uses_repl_globals: bool,
+        local_names: Arc<[String]>,
+        locals: Vec<Option<Value>>,
+        values: HashMap<String, Value>,
+        resources: &mut Resources,
+    ) -> Result<ScopeId, String> {
+        if locals.len() != local_names.len() {
+            return Err("local slot metadata mismatch".into());
+        }
         let slots = u64::try_from(locals.len()).map_err(|_| "modeled scope size overflow")?;
         let dynamic = u64::try_from(values.len()).map_err(|_| "modeled scope size overflow")?;
         let bytes = 32u64
@@ -1109,6 +1136,27 @@ impl Heap {
         Ok(())
     }
 
+    /// Release modeled storage removed from one live object's payload.
+    pub fn release_object_shrink(
+        &mut self,
+        id: ObjectId,
+        bytes: u64,
+        resources: &mut Resources,
+    ) -> Result<(), String> {
+        let object = self
+            .objects
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .ok_or("invalid object reference")?;
+        if object.modeled_bytes < bytes || self.modeled_bytes < bytes {
+            return Err("modeled object size underflow".into());
+        }
+        object.modeled_bytes -= bytes;
+        self.modeled_bytes -= bytes;
+        resources.release_memory(bytes);
+        Ok(())
+    }
+
     fn reserve_instance_growth(
         &mut self,
         id: ObjectId,
@@ -1415,11 +1463,11 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::Range { .. } => 3,
         Object::Dict(entries) => entries
             .len()
-            .checked_mul(2)
+            .checked_mul(3)
             .ok_or("modeled object size overflow")?,
         Object::DefaultDict { entries, .. } => entries
             .len()
-            .checked_mul(2)
+            .checked_mul(3)
             .and_then(|slots| slots.checked_add(1))
             .ok_or("modeled object size overflow")?,
         Object::Function {

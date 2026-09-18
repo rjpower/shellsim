@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyBytes, PyDict, PyError, PyKind, PyList, PyProcessHandle,
-    PyProcessOutput, PyProcessStartRequest, PyResult, PyRuntime, PyStdio, PyString, PyTuple,
+    CallArgs, FunctionDef, ModuleDef, OwnedPyString, PyBytes, PyDict, PyError, PyKind, PyList,
+    PyProcessHandle, PyProcessOutput, PyProcessStartRequest, PyResult, PyRuntime, PyStdio, PyTuple,
     PyValue, PyValueCast, ValueDef,
 };
 use super::super::number::PyNumber;
@@ -237,7 +237,7 @@ fn string_sequence(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<
     }
     let argv = items
         .into_iter()
-        .map(|item| item.cast::<PyString>(runtime).map(|item| item.0))
+        .map(|item| item.cast::<OwnedPyString>(runtime).map(|item| item.0))
         .collect::<PyResult<Vec<_>>>()?;
     if argv.iter().any(|argument| argument.contains('\0')) {
         return Err(PyError::value_error(
@@ -264,7 +264,7 @@ fn optional_string(
         Ok(None)
     } else {
         value
-            .cast::<PyString>(runtime)
+            .cast::<OwnedPyString>(runtime)
             .map(|value| Some(value.0))
             .map_err(|_| PyError::type_error(format!("subprocess {name} must be a string")))
     }
@@ -280,8 +280,8 @@ fn optional_environment(
     let items = value.cast::<PyDict>(runtime)?.items(runtime)?;
     let mut environment = BTreeMap::new();
     for (key, value) in items {
-        let PyString(key) = key.cast(runtime)?;
-        let PyString(value) = value.cast(runtime)?;
+        let OwnedPyString(key) = key.cast(runtime)?;
+        let OwnedPyString(value) = value.cast(runtime)?;
         if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
             return Err(PyError::value_error("invalid subprocess environment entry"));
         }

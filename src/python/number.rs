@@ -631,14 +631,39 @@ fn immediate_integer_binary(operation: BinaryOperator, left: i64, right: i64) ->
         BinaryOperator::BitwiseAnd => Some(left & right),
         BinaryOperator::BitwiseXor => Some(left ^ right),
         BinaryOperator::BitwiseOr => Some(left | right),
+        BinaryOperator::FloorDivide => python_floor_div(left, right),
+        BinaryOperator::Remainder => python_remainder(left, right),
         BinaryOperator::MatrixMultiply
         | BinaryOperator::Power
         | BinaryOperator::Divide
-        | BinaryOperator::FloorDivide
-        | BinaryOperator::Remainder
         | BinaryOperator::LeftShift
         | BinaryOperator::RightShift => None,
     }
+}
+
+fn python_floor_div(left: i64, right: i64) -> Option<i64> {
+    let quotient = left.checked_div(right)?;
+    let remainder = left.checked_rem(right)?;
+    Some(if remainder != 0 && (remainder < 0) != (right < 0) {
+        quotient - 1
+    } else {
+        quotient
+    })
+}
+
+fn python_remainder(left: i64, right: i64) -> Option<i64> {
+    if right == 0 {
+        return None;
+    }
+    if left == i64::MIN && right == -1 {
+        return Some(0);
+    }
+    let remainder = left % right;
+    Some(if remainder != 0 && (remainder < 0) != (right < 0) {
+        remainder + right
+    } else {
+        remainder
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -756,7 +781,7 @@ pub(super) fn runtime_repeat_count(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_integer_text;
+    use super::{parse_integer_text, python_floor_div, python_remainder};
 
     #[test]
     fn integer_text_parsing_handles_bases_signs_and_separators() {
@@ -767,5 +792,22 @@ mod tests {
         assert!(parse_integer_text("_10", 10).is_err());
         assert!(parse_integer_text("1__0", 10).is_err());
         assert!(parse_integer_text("2", 2).is_err());
+    }
+
+    #[test]
+    fn immediate_floor_division_and_remainder_follow_python_signs() {
+        for (left, right, quotient, remainder) in [
+            (7, 3, 2, 1),
+            (-7, 3, -3, 2),
+            (7, -3, -3, -2),
+            (-7, -3, 2, -1),
+        ] {
+            assert_eq!(python_floor_div(left, right), Some(quotient));
+            assert_eq!(python_remainder(left, right), Some(remainder));
+        }
+        assert_eq!(python_floor_div(i64::MIN, -1), None);
+        assert_eq!(python_remainder(i64::MIN, -1), Some(0));
+        assert_eq!(python_floor_div(1, 0), None);
+        assert_eq!(python_remainder(1, 0), None);
     }
 }

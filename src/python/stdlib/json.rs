@@ -35,7 +35,7 @@ fn loads(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("loads", 1, 1)?;
     args.reject_keywords("loads")?;
     let source = args.positional()[0]
-        .cast::<super::super::native::PyString>(runtime)?
+        .cast::<super::super::native::OwnedPyString>(runtime)?
         .0;
     if source.len() > MAX_JSON_INPUT {
         return Err(PyError::value_error("JSON input exceeds 1 MiB"));
@@ -118,8 +118,8 @@ fn dumps(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
                         "json.dumps separators must be a pair of strings",
                     ));
                 };
-                item_separator = item.cast::<super::super::native::PyString>(runtime)?.0;
-                key_separator = key.cast::<super::super::native::PyString>(runtime)?.0;
+                item_separator = item.cast::<super::super::native::OwnedPyString>(runtime)?.0;
+                key_separator = key.cast::<super::super::native::OwnedPyString>(runtime)?.0;
                 saw_separators = true;
             }
             "sort_keys" if !saw_sort_keys => {

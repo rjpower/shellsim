@@ -372,6 +372,9 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
 }
 
 pub fn equals(heap: &Heap, left: &Value, right: &Value) -> Result<bool, String> {
+    if let Some(equal) = scalar_equality(heap, left, right)? {
+        return Ok(equal);
+    }
     equals_inner(heap, left, right, &mut BTreeSet::new())
 }
 
@@ -390,55 +393,8 @@ fn equals_inner(
     right: &Value,
     active: &mut BTreeSet<(ObjectId, ObjectId)>,
 ) -> Result<bool, String> {
-    if let Some(left) = bigint_value(heap, left) {
-        if let Some(right) = bigint_value(heap, right) {
-            return Ok(left == right);
-        }
-        if let Some(right) = int_value(heap, right) {
-            return Ok(left == &BigInt::from(right));
-        }
-        if let Some(right) = right.float_value() {
-            return Ok(right.is_finite()
-                && right.fract() == 0.0
-                && BigInt::from_f64(right).is_some_and(|right| left == &right));
-        }
-    }
-    if let Some(right) = bigint_value(heap, right) {
-        if let Some(left) = int_value(heap, left) {
-            return Ok(&BigInt::from(left) == right);
-        }
-        if let Some(left) = left.float_value() {
-            return Ok(left.is_finite()
-                && left.fract() == 0.0
-                && BigInt::from_f64(left).is_some_and(|left| &left == right));
-        }
-    }
-    if let Some(left) = int_value(heap, left) {
-        if let Some(right) = int_value(heap, right) {
-            return Ok(left == right);
-        }
-        if let Some(right) = right.float_value() {
-            return Ok(right.is_finite()
-                && right.fract() == 0.0
-                && BigInt::from_f64(right).is_some_and(|right| BigInt::from(left) == right));
-        }
-    }
-    if let (Some(left), Some(right)) = (left.float_value(), int_value(heap, right)) {
-        return Ok(left.is_finite()
-            && left.fract() == 0.0
-            && BigInt::from_f64(left).is_some_and(|left| left == BigInt::from(right)));
-    }
-    if left.is_none() || right.is_none() {
-        return Ok(left.is_none() && right.is_none());
-    }
-    if let (Some(left), Some(right)) = (left.float_value(), right.float_value()) {
-        return Ok(left == right);
-    }
-    if let (Some(left), Some(right)) = (string_value(heap, left)?, string_value(heap, right)?) {
-        return Ok(left == right);
-    }
-    if let (Some(left), Some(right)) = (left.native_value(), right.native_value()) {
-        return Ok(left == right);
+    if let Some(equal) = scalar_equality(heap, left, right)? {
+        return Ok(equal);
     }
     match (left.object_id(), right.object_id()) {
         (Some(left), Some(right)) if left == right => Ok(true),
@@ -575,6 +531,68 @@ fn equals_inner(
         }
         _ => Ok(false),
     }
+}
+
+fn scalar_equality(heap: &Heap, left: &Value, right: &Value) -> Result<Option<bool>, String> {
+    if let Some(left) = bigint_value(heap, left) {
+        if let Some(right) = bigint_value(heap, right) {
+            return Ok(Some(left == right));
+        }
+        if let Some(right) = int_value(heap, right) {
+            return Ok(Some(left == &BigInt::from(right)));
+        }
+        if let Some(right) = right.float_value() {
+            return Ok(Some(
+                right.is_finite()
+                    && right.fract() == 0.0
+                    && BigInt::from_f64(right).is_some_and(|right| left == &right),
+            ));
+        }
+    }
+    if let Some(right) = bigint_value(heap, right) {
+        if let Some(left) = int_value(heap, left) {
+            return Ok(Some(&BigInt::from(left) == right));
+        }
+        if let Some(left) = left.float_value() {
+            return Ok(Some(
+                left.is_finite()
+                    && left.fract() == 0.0
+                    && BigInt::from_f64(left).is_some_and(|left| &left == right),
+            ));
+        }
+    }
+    if let Some(left) = int_value(heap, left) {
+        if let Some(right) = int_value(heap, right) {
+            return Ok(Some(left == right));
+        }
+        if let Some(right) = right.float_value() {
+            return Ok(Some(
+                right.is_finite()
+                    && right.fract() == 0.0
+                    && BigInt::from_f64(right).is_some_and(|right| BigInt::from(left) == right),
+            ));
+        }
+    }
+    if let (Some(left), Some(right)) = (left.float_value(), int_value(heap, right)) {
+        return Ok(Some(
+            left.is_finite()
+                && left.fract() == 0.0
+                && BigInt::from_f64(left).is_some_and(|left| left == BigInt::from(right)),
+        ));
+    }
+    if left.is_none() || right.is_none() {
+        return Ok(Some(left.is_none() && right.is_none()));
+    }
+    if let (Some(left), Some(right)) = (left.float_value(), right.float_value()) {
+        return Ok(Some(left == right));
+    }
+    if let (Some(left), Some(right)) = (string_value(heap, left)?, string_value(heap, right)?) {
+        return Ok(Some(left == right));
+    }
+    if let (Some(left), Some(right)) = (left.native_value(), right.native_value()) {
+        return Ok(Some(left == right));
+    }
+    Ok(None)
 }
 
 fn sequence_equal(
@@ -788,19 +806,25 @@ mod tests {
         let mut resources = Resources::new(Limits::unlimited());
         let first = heap
             .allocate(
-                Object::Dict(vec![
-                    (Value::inline_string("a").unwrap(), Value::Int(1)),
-                    (Value::inline_string("b").unwrap(), Value::Int(2)),
-                ]),
+                Object::Dict(
+                    vec![
+                        (Value::inline_string("a").unwrap(), Value::Int(1)),
+                        (Value::inline_string("b").unwrap(), Value::Int(2)),
+                    ]
+                    .into(),
+                ),
                 &mut resources,
             )
             .unwrap();
         let second = heap
             .allocate(
-                Object::Dict(vec![
-                    (Value::inline_string("b").unwrap(), Value::Int(2)),
-                    (Value::inline_string("a").unwrap(), Value::Int(1)),
-                ]),
+                Object::Dict(
+                    vec![
+                        (Value::inline_string("b").unwrap(), Value::Int(2)),
+                        (Value::inline_string("a").unwrap(), Value::Int(1)),
+                    ]
+                    .into(),
+                ),
                 &mut resources,
             )
             .unwrap();

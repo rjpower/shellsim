@@ -417,13 +417,31 @@ pub(super) trait PyRuntime {
     fn compare(&mut self, left: &PyValue, right: &PyValue) -> PyResult<Ordering>;
     /// Resolve an attribute through the runtime's descriptor and MRO protocol.
     fn get_attribute(&mut self, value: PyValue, name: &str) -> PyResult<Option<PyValue>>;
+    fn list_len(&self, list: PyList) -> PyResult<usize>;
     fn list_items(&mut self, list: PyList) -> PyResult<Vec<PyValue>>;
+    fn list_append(&mut self, list: PyList, value: PyValue) -> PyResult<()>;
+    fn list_insert(&mut self, list: PyList, index: usize, value: PyValue) -> PyResult<()>;
+    fn list_extend(&mut self, list: PyList, values: Vec<PyValue>) -> PyResult<()>;
+    fn list_pop(&mut self, list: PyList, index: usize) -> PyResult<PyValue>;
+    fn list_position(
+        &mut self,
+        list: PyList,
+        needle: &PyValue,
+        start: usize,
+        stop: usize,
+    ) -> PyResult<Option<usize>>;
+    fn list_reverse(&mut self, list: PyList) -> PyResult<()>;
+    fn list_clear(&mut self, list: PyList) -> PyResult<()>;
     fn tuple_items(&mut self, tuple: PyTuple) -> PyResult<Vec<PyValue>>;
     fn slice_parts(&self, value: &PyValue) -> Option<(Option<i64>, Option<i64>, Option<i64>)>;
     fn dict_items(&mut self, dict: PyDict) -> PyResult<Vec<(PyValue, PyValue)>>;
+    fn dict_get(&mut self, dict: PyDict, key: &PyValue) -> PyResult<Option<PyValue>>;
+    fn dict_insert(&mut self, dict: PyDict, key: PyValue, value: PyValue) -> PyResult<()>;
+    fn dict_remove(&mut self, dict: PyDict, key: &PyValue) -> PyResult<Option<PyValue>>;
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(PyValue, PyValue)>) -> PyResult<()>;
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<PyValue>>;
-    fn replace_set_items(&mut self, set: PySet, items: Vec<PyValue>) -> PyResult<()>;
+    fn set_insert(&mut self, set: PySet, value: PyValue) -> PyResult<bool>;
+    fn set_remove(&mut self, set: PySet, value: &PyValue) -> PyResult<bool>;
     fn replace_list_items(&mut self, list: PyList, items: Vec<PyValue>) -> PyResult<()>;
     fn call_value(&mut self, callable: PyValue, args: CallArgs) -> PyResult<PyValue>;
     fn is_callable(&self, value: &PyValue) -> PyResult<bool>;
@@ -600,9 +618,9 @@ impl PyValueCast for PyValue {
 
 /// Owned string extracted from an erased value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct PyString(pub String);
+pub(super) struct OwnedPyString(pub String);
 
-impl FromPyValue for PyString {
+impl FromPyValue for OwnedPyString {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
         if let Some(value) = runtime.string_value(&value)? {
             Ok(Self(value))

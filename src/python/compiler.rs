@@ -1422,6 +1422,26 @@ mod tests {
     }
 
     #[test]
+    fn call_shape_is_compiled_once_with_the_function() {
+        let code = compile(
+            parse(lex("def generate(first, second, *rest):\n    yield first\n").unwrap()).unwrap(),
+        );
+        let function = code
+            .instructions
+            .iter()
+            .find_map(|instruction| match instruction.opcode {
+                Opcode::MakeFunction(function) => Some(function),
+                _ => None,
+            })
+            .expect("function definition must create a code object");
+        let signature = &code.function(function).code.call_signature;
+        assert!(signature.is_generator);
+        assert_eq!(signature.positional_count, 2);
+        assert_eq!(signature.variadic_slot, Some(2));
+        assert!(signature.default_slots.is_empty());
+    }
+
+    #[test]
     fn caps_structural_nesting_without_recursing_forever() {
         let mut body = vec![Statement {
             kind: StatementKind::Pass,

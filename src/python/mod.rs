@@ -11,6 +11,7 @@ mod filesystem;
 mod heap;
 mod http;
 mod lexer;
+mod mapping;
 mod native;
 mod number;
 mod object_model;
@@ -48,7 +49,7 @@ pub(crate) fn is_bundled_distribution(name: &str) -> bool {
 ///
 /// Tags describe storage only. Python semantics come from the value's registered `TypeId`, so a
 /// short string and a heap string have the same Python type despite different physical tags.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 enum ValueTag {
     SmallString0,
@@ -77,7 +78,7 @@ enum ValueTag {
 }
 
 /// Compact, copyable Python value used by the VM and native-module ABI.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 struct Value {
     payload: u64,

@@ -11,9 +11,9 @@ use num_traits::{Signed, Zero};
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, MethodDef, NativeTypeDef, PyByteArray, PyBytes, PyCallable, PyDict,
-    PyError, PyKind, PyList, PyProperty, PyResult, PyRuntime, PySequence, PySet, PyString, PyValue,
-    PyValueCast,
+    CallArgs, FunctionDef, MethodDef, NativeTypeDef, OwnedPyString, PyByteArray, PyBytes,
+    PyCallable, PyDict, PyError, PyKind, PyList, PyProperty, PyResult, PyRuntime, PySequence,
+    PySet, PyValue, PyValueCast,
 };
 use super::super::number::PyNumber;
 use super::super::slice::SlicePlan;
@@ -170,11 +170,11 @@ fn string_rstrip(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
 fn string_encode(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.encode", 0, 2)?;
     args.reject_keywords("str.encode")?;
-    let PyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
     let encoding = args
         .positional()
         .first()
-        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
         .transpose()?
         .unwrap_or_else(|| "utf-8".into())
         .to_ascii_lowercase()
@@ -182,7 +182,7 @@ fn string_encode(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
     let errors = args
         .positional()
         .get(1)
-        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
         .transpose()?
         .unwrap_or_else(|| "strict".into());
     if errors != "strict" {
@@ -247,7 +247,7 @@ fn string_transform(
 ) -> PyResult {
     args.expect_positional(name, 0, 0)?;
     args.reject_keywords(name)?;
-    let PyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
     runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
     runtime.new_string(transform(&value))
 }
@@ -287,7 +287,7 @@ fn string_case_predicate(
 ) -> PyResult {
     args.expect_positional(name, 0, 0)?;
     args.reject_keywords(name)?;
-    let PyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
     runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
     let mut cased = false;
     for character in value.chars() {
@@ -310,7 +310,7 @@ fn string_predicate(
 ) -> PyResult {
     args.expect_positional(name, 0, 0)?;
     args.reject_keywords(name)?;
-    let PyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
     runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
     Ok(PyValue::Bool(
         !value.is_empty() && value.chars().all(predicate),
@@ -323,13 +323,13 @@ fn bytes_decode(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     let encoding = args
         .positional()
         .first()
-        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
         .transpose()?
         .unwrap_or_else(|| "utf-8".into());
     let errors = args
         .positional()
         .get(1)
-        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
         .transpose()?
         .unwrap_or_else(|| "strict".into());
     if errors != "strict" {
@@ -523,11 +523,11 @@ fn strip(
 ) -> PyResult {
     args.expect_positional("str.strip", 0, 1)?;
     args.reject_keywords("str.strip")?;
-    let PyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
     let characters = match args.positional().first() {
         None => None,
         Some(value) if runtime.kind(value)? == super::super::native::PyKind::None => None,
-        Some(value) => Some((*value).cast::<PyString>(runtime)?.0),
+        Some(value) => Some((*value).cast::<OwnedPyString>(runtime)?.0),
     };
     let result = match (kind, characters.as_deref()) {
         (StripKind::Both, None) => value.trim().to_string(),
@@ -555,7 +555,7 @@ fn string_endswith(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArg
 fn string_zfill(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.zfill", 1, 1)?;
     args.reject_keywords("str.zfill")?;
-    let PyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
     let width = runtime
         .int_value(&args.positional()[0])
         .ok_or_else(|| PyError::type_error("width must be an integer"))?;
@@ -593,8 +593,8 @@ fn string_affix(
 ) -> PyResult {
     args.expect_positional("str prefix test", 1, 1)?;
     args.reject_keywords("str prefix test")?;
-    let PyString(value) = receiver.cast(runtime)?;
-    let PyString(needle) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(needle) = args.positional()[0].cast(runtime)?;
     Ok(Value::Bool(if prefix {
         value.starts_with(&needle)
     } else {
@@ -605,12 +605,12 @@ fn string_affix(
 fn string_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.split", 0, 2)?;
     args.reject_keywords("str.split")?;
-    let PyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
     let separator = match args.positional().first() {
         None => None,
         Some(value) if runtime.kind(value)? == super::super::native::PyKind::None => None,
         Some(value) => {
-            let PyString(value) = (*value).cast(runtime)?;
+            let OwnedPyString(value) = (*value).cast(runtime)?;
             if value.is_empty() {
                 return Err(PyError::value_error("empty separator"));
             }
@@ -643,7 +643,7 @@ fn string_splitlines(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallA
         .map(|value| runtime.truth(value))
         .transpose()?
         .unwrap_or(false);
-    let PyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
     runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
     let mut lines = Vec::new();
     let mut start = 0;
@@ -681,13 +681,13 @@ fn string_splitlines(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallA
 fn string_join(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.join", 1, 1)?;
     args.reject_keywords("str.join")?;
-    let PyString(separator) = receiver.cast(runtime)?;
+    let OwnedPyString(separator) = receiver.cast(runtime)?;
     let iterator = runtime.iterator(args.positional()[0])?;
     let mut parts = Vec::new();
     let mut bytes = 0usize;
     while let Some(value) = runtime.iterator_next(iterator)? {
         runtime.charge_cpu(1)?;
-        let PyString(value) = value.cast(runtime)?;
+        let OwnedPyString(value) = value.cast(runtime)?;
         bytes = bytes
             .checked_add(value.len())
             .ok_or_else(|| PyError::resource_error("joined string is too large"))?;
@@ -708,9 +708,9 @@ fn string_join(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
 fn string_replace(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.replace", 2, 3)?;
     args.reject_keywords("str.replace")?;
-    let PyString(value) = receiver.cast(runtime)?;
-    let PyString(old) = args.positional()[0].cast(runtime)?;
-    let PyString(new) = args.positional()[1].cast(runtime)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(old) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(new) = args.positional()[1].cast(runtime)?;
     let count = args.positional().get(2).map_or(Ok(None), |value| {
         runtime
             .int_value(value)
@@ -738,7 +738,7 @@ fn string_replace(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
 }
 
 fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    let PyString(template) = receiver.cast(runtime)?;
+    let OwnedPyString(template) = receiver.cast(runtime)?;
     let mut result = String::new();
     let mut characters = template.chars().peekable();
     let mut automatic = 0usize;
@@ -847,10 +847,7 @@ fn list_append(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     args.expect_positional("list.append", 1, 1)?;
     args.reject_keywords("list.append")?;
     let list = receiver.cast::<PyList>(runtime)?;
-    let mut values = list.items(runtime)?;
-    runtime.reserve_memory(64)?;
-    values.push(args.positional()[0]);
-    runtime.replace_list_items(list, values)?;
+    runtime.list_append(list, args.positional()[0])?;
     Ok(Value::None)
 }
 
@@ -858,19 +855,17 @@ fn list_insert(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     args.expect_positional("list.insert", 2, 2)?;
     args.reject_keywords("list.insert")?;
     let list = receiver.cast::<PyList>(runtime)?;
-    let mut values = list.items(runtime)?;
     let raw = runtime
         .int_value(&args.positional()[0])
         .ok_or_else(|| PyError::type_error("list index must be an integer"))?;
-    let len = i64::try_from(values.len()).map_err(|_| PyError::overflow_error("list too large"))?;
+    let len = i64::try_from(runtime.list_len(list)?)
+        .map_err(|_| PyError::overflow_error("list too large"))?;
     let index = if raw < 0 {
         usize::try_from(len.saturating_add(raw).max(0)).unwrap_or(0)
     } else {
-        usize::try_from(raw).unwrap_or(usize::MAX).min(values.len())
+        usize::try_from(raw).unwrap_or(usize::MAX).min(len as usize)
     };
-    runtime.reserve_memory(64)?;
-    values.insert(index, args.positional()[1]);
-    runtime.replace_list_items(list, values)?;
+    runtime.list_insert(list, index, args.positional()[1])?;
     Ok(Value::None)
 }
 
@@ -878,13 +873,13 @@ fn list_extend(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     args.expect_positional("list.extend", 1, 1)?;
     args.reject_keywords("list.extend")?;
     let list = receiver.cast::<PyList>(runtime)?;
-    let mut values = list.items(runtime)?;
     let iterator = runtime.iterator(args.positional()[0])?;
+    let mut values = Vec::new();
     while let Some(value) = runtime.iterator_next(iterator)? {
-        runtime.reserve_memory(64)?;
+        runtime.reserve_memory(std::mem::size_of::<PyValue>())?;
         values.push(value);
     }
-    runtime.replace_list_items(list, values)?;
+    runtime.list_extend(list, values)?;
     Ok(Value::None)
 }
 
@@ -892,8 +887,8 @@ fn list_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     args.expect_positional("list.pop", 0, 1)?;
     args.reject_keywords("list.pop")?;
     let list = receiver.cast::<PyList>(runtime)?;
-    let mut values = list.items(runtime)?;
-    if values.is_empty() {
+    let length = runtime.list_len(list)?;
+    if length == 0 {
         return Err(PyError::value_error("pop from empty list"));
     }
     let raw = args.positional().first().map_or(Ok(-1), |value| {
@@ -901,37 +896,27 @@ fn list_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
             .int_value(value)
             .ok_or_else(|| PyError::type_error("list index must be an integer"))
     })?;
-    let len = i64::try_from(values.len()).map_err(|_| PyError::overflow_error("list too large"))?;
+    let len = i64::try_from(length).map_err(|_| PyError::overflow_error("list too large"))?;
     let raw = if raw < 0 {
         len.saturating_add(raw)
     } else {
         raw
     };
     let index = usize::try_from(raw).map_err(|_| PyError::value_error("pop index out of range"))?;
-    if index >= values.len() {
+    if index >= length {
         return Err(PyError::value_error("pop index out of range"));
     }
-    let value = values.remove(index);
-    runtime.replace_list_items(list, values)?;
-    Ok(value)
+    runtime.list_pop(list, index)
 }
 
 fn list_remove(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("list.remove", 1, 1)?;
     args.reject_keywords("list.remove")?;
     let list = receiver.cast::<PyList>(runtime)?;
-    let mut values = list.items(runtime)?;
-    let mut position = None;
-    for (index, value) in values.iter().enumerate() {
-        runtime.charge_cpu(1)?;
-        if runtime.equals(value, &args.positional()[0])? {
-            position = Some(index);
-            break;
-        }
-    }
-    let position = position.ok_or_else(|| PyError::value_error("list.remove(x): x not in list"))?;
-    values.remove(position);
-    runtime.replace_list_items(list, values)?;
+    let position = runtime
+        .list_position(list, &args.positional()[0], 0, usize::MAX)?
+        .ok_or_else(|| PyError::value_error("list.remove(x): x not in list"))?;
+    runtime.list_pop(list, position)?;
     Ok(Value::None)
 }
 
@@ -939,10 +924,7 @@ fn list_reverse(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     args.expect_positional("list.reverse", 0, 0)?;
     args.reject_keywords("list.reverse")?;
     let list = receiver.cast::<PyList>(runtime)?;
-    let mut values = list.items(runtime)?;
-    runtime.charge_cpu(u64::try_from(values.len()).unwrap_or(u64::MAX))?;
-    values.reverse();
-    runtime.replace_list_items(list, values)?;
+    runtime.list_reverse(list)?;
     Ok(Value::None)
 }
 
@@ -950,7 +932,7 @@ fn list_clear(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
     args.expect_positional("list.clear", 0, 0)?;
     args.reject_keywords("list.clear")?;
     let list = receiver.cast::<PyList>(runtime)?;
-    runtime.replace_list_items(list, Vec::new())?;
+    runtime.list_clear(list)?;
     Ok(PyValue::None)
 }
 
@@ -1055,20 +1037,6 @@ fn list_sort(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
     Ok(Value::None)
 }
 
-fn find_entry(
-    runtime: &mut dyn PyRuntime,
-    entries: &[(PyValue, PyValue)],
-    key: &PyValue,
-) -> PyResult<Option<usize>> {
-    for (index, (candidate, _)) in entries.iter().enumerate() {
-        runtime.charge_cpu(1)?;
-        if runtime.equals(candidate, key)? {
-            return Ok(Some(index));
-        }
-    }
-    Ok(None)
-}
-
 fn dict_get(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     dict_lookup(runtime, receiver, args, false)
 }
@@ -1086,15 +1054,12 @@ fn dict_lookup(
     args.expect_positional("dict lookup", 1, 2)?;
     args.reject_keywords("dict lookup")?;
     let dict = receiver.cast::<PyDict>(runtime)?;
-    let mut entries = dict.items(runtime)?;
-    if let Some(position) = find_entry(runtime, &entries, &args.positional()[0])? {
-        return Ok(entries[position].1);
+    if let Some(value) = runtime.dict_get(dict, &args.positional()[0])? {
+        return Ok(value);
     }
     let default = args.positional().get(1).copied().unwrap_or(Value::None);
     if insert {
-        runtime.reserve_memory(96)?;
-        entries.push((args.positional()[0], default));
-        runtime.replace_dict_items(dict, entries)?;
+        runtime.dict_insert(dict, args.positional()[0], default)?;
     }
     Ok(default)
 }
@@ -1135,7 +1100,6 @@ fn dict_projection(
 fn dict_update(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("dict.update", 0, 1)?;
     let dict = receiver.cast::<PyDict>(runtime)?;
-    let mut entries = dict.items(runtime)?;
     let mut additions = Vec::new();
     if let Some(source) = args.positional().first() {
         if runtime.kind(source)? == PyKind::Dict {
@@ -1157,14 +1121,8 @@ fn dict_update(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
         additions.push((runtime.new_string(name.clone())?, *value));
     }
     for (key, value) in additions {
-        if let Some(position) = find_entry(runtime, &entries, &key)? {
-            entries[position].1 = value;
-        } else {
-            runtime.reserve_memory(96)?;
-            entries.push((key, value));
-        }
+        runtime.dict_insert(dict, key, value)?;
     }
-    runtime.replace_dict_items(dict, entries)?;
     Ok(Value::None)
 }
 
@@ -1172,10 +1130,7 @@ fn dict_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     args.expect_positional("dict.pop", 1, 2)?;
     args.reject_keywords("dict.pop")?;
     let dict = receiver.cast::<PyDict>(runtime)?;
-    let mut entries = dict.items(runtime)?;
-    if let Some(position) = find_entry(runtime, &entries, &args.positional()[0])? {
-        let (_, value) = entries.remove(position);
-        runtime.replace_dict_items(dict, entries)?;
+    if let Some(value) = runtime.dict_remove(dict, &args.positional()[0])? {
         return Ok(value);
     }
     if let Some(default) = args.positional().get(1) {
@@ -1223,7 +1178,6 @@ fn set_modify(
     args.expect_positional("set method", 1, 1)?;
     args.reject_keywords("set method")?;
     let set = receiver.cast::<PySet>(runtime)?;
-    let mut values = set.items(runtime)?;
     let additions = if matches!(operation, SetOperation::Update) {
         let iterator = runtime.iterator(args.positional()[0])?;
         let mut items = Vec::new();
@@ -1235,29 +1189,20 @@ fn set_modify(
         vec![args.positional()[0]]
     };
     for value in additions {
-        let mut position = None;
-        for (index, candidate) in values.iter().enumerate() {
-            runtime.charge_cpu(1)?;
-            if runtime.equals(candidate, &value)? {
-                position = Some(index);
-                break;
-            }
-        }
         match operation {
-            SetOperation::Add | SetOperation::Update if position.is_none() => {
-                runtime.reserve_memory(64)?;
-                values.push(value);
+            SetOperation::Add | SetOperation::Update => {
+                runtime.set_insert(set, value)?;
             }
-            SetOperation::Remove if position.is_none() => {
-                return Err(PyError::value_error("set element not found"))
+            SetOperation::Remove => {
+                if !runtime.set_remove(set, &value)? {
+                    return Err(PyError::value_error("set element not found"));
+                }
             }
-            SetOperation::Remove | SetOperation::Discard if position.is_some() => {
-                values.remove(position.unwrap());
+            SetOperation::Discard => {
+                runtime.set_remove(set, &value)?;
             }
-            _ => {}
         }
     }
-    runtime.replace_set_items(set, values)?;
     Ok(Value::None)
 }
 
@@ -1512,7 +1457,7 @@ fn builtin_reversed(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 fn builtin_getattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("getattr", 2, 3)?;
     args.reject_keywords("getattr")?;
-    let PyString(name) = args.positional()[1].cast(runtime)?;
+    let OwnedPyString(name) = args.positional()[1].cast(runtime)?;
     match runtime.get_attribute(args.positional()[0], &name)? {
         Some(value) => Ok(value),
         None => args.positional().get(2).copied().ok_or_else(|| {
@@ -1524,7 +1469,7 @@ fn builtin_getattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 fn builtin_hasattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("hasattr", 2, 2)?;
     args.reject_keywords("hasattr")?;
-    let PyString(name) = args.positional()[1].cast(runtime)?;
+    let OwnedPyString(name) = args.positional()[1].cast(runtime)?;
     Ok(Value::Bool(
         runtime
             .get_attribute(args.positional()[0], &name)?
@@ -1665,7 +1610,7 @@ fn property_setter(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArg
 fn type_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("type.__new__", 3, 3)?;
     args.reject_keywords("type.__new__")?;
-    let PyString(name) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
     runtime.new_type(receiver, name, args.positional()[1], args.positional()[2])
 }
 
