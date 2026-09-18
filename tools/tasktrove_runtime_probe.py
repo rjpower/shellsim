@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         help="modeled memory limit per replay (default: 256)",
     )
     parser.add_argument(
+        "--cpu",
+        type=int,
+        default=100_000_000,
+        help="modeled instruction limit per replay (default: 100000000)",
+    )
+    parser.add_argument(
         "--solution-only",
         action="store_true",
         help="skip verifier phases when diagnosing golden solution behavior",
@@ -220,12 +226,13 @@ def replay(
     environment_type: Any,
     limits_type: Any,
     memory_mib: int = 256,
+    cpu: int = 100_000_000,
     *,
     include_verifier: bool = True,
 ) -> dict[str, Any]:
     environment = environment_type(
         limits_type(
-            cpu=100_000_000,
+            cpu=cpu,
             memory=memory_mib << 20,
             disk=256 << 20,
             output=8 << 20,
@@ -341,6 +348,8 @@ def main() -> int:
         raise SystemExit("--offset must not be negative")
     if options.memory_mib <= 0:
         raise SystemExit("--memory-mib must be positive")
+    if options.cpu <= 0:
+        raise SystemExit("--cpu must be positive")
     tasks = tasks[options.offset :]
     if options.limit is not None:
         tasks = tasks[: options.limit]
@@ -362,6 +371,7 @@ def main() -> int:
                 Environment,
                 Limits,
                 options.memory_mib,
+                options.cpu,
                 include_verifier=not options.solution_only,
             )
         )

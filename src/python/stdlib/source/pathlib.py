@@ -93,6 +93,9 @@ class Path:
     def is_dir(self):
         return _shellsim_vfs.is_dir(self._path)
 
+    def is_absolute(self):
+        return self._path.startswith("/")
+
     def mkdir(self, parents=False, exist_ok=False):
         _shellsim_vfs.mkdir(self._path, parents, exist_ok)
 

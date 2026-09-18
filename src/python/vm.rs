@@ -226,6 +226,7 @@ pub(super) enum Builtin {
     Print,
     Input,
     Exit,
+    Character,
     Repr,
     IsInstance,
     IsSubclass,
@@ -581,10 +582,13 @@ impl<'a> Vm<'a> {
                         .pending_exception
                         .as_ref()
                         .expect("SystemExit exception checked above");
-                    let status = protocol::display(&self.state.heap, &exception.value)
-                        .ok()
-                        .and_then(|value| value.parse::<i32>().ok())
-                        .unwrap_or(1);
+                    let rendered = protocol::display(&self.state.heap, &exception.value)
+                        .unwrap_or_else(|_| "SystemExit".to_string());
+                    let status = rendered.parse::<i32>().unwrap_or_else(|_| {
+                        self.err.extend_from_slice(rendered.as_bytes());
+                        self.err.push(b'\n');
+                        1
+                    });
                     ExecResult::Exit(status)
                 } else if let Some(exception) = &self.pending_exception {
                     let rendered = protocol::display(&self.state.heap, &exception.value)
@@ -1212,6 +1216,7 @@ impl<'a> Vm<'a> {
                 "print" => Builtin::Print,
                 "input" => Builtin::Input,
                 "exit" | "quit" => Builtin::Exit,
+                "chr" => Builtin::Character,
                 "repr" => Builtin::Repr,
                 "isinstance" => Builtin::IsInstance,
                 "issubclass" => Builtin::IsSubclass,
@@ -1953,6 +1958,7 @@ impl<'a> Vm<'a> {
                 | Object::DescriptorBoundMethod { .. }
                 | Object::Iterator { .. }
                 | Object::CountIterator { .. }
+                | Object::CallableIterator { .. }
                 | Object::Generator { .. }
                 | Object::Module { .. }
                 | Object::ArrayStorage(_)
@@ -2161,6 +2167,7 @@ impl<'a> Vm<'a> {
             | Object::DescriptorBoundMethod { .. }
             | Object::Iterator { .. }
             | Object::CountIterator { .. }
+            | Object::CallableIterator { .. }
             | Object::Generator { .. }
             | Object::Module { .. }
             | Object::ArrayStorage(_)
@@ -3414,7 +3421,9 @@ impl<'a> Vm<'a> {
         let iterable = self.pop()?;
         if let Some(id) = iterable.object_id() {
             match self.state.heap.get(id)? {
-                Object::CountIterator { .. } | Object::Generator { .. } => {
+                Object::CountIterator { .. }
+                | Object::CallableIterator { .. }
+                | Object::Generator { .. } => {
                     // These iterators remain lazy; materializing either one here would permit an
                     // unbounded host allocation before the caller's loop can meter each item.
                     self.stack.push(Value::Object(id));
@@ -3497,6 +3506,33 @@ impl<'a> Vm<'a> {
         else {
             return Err("for-loop stack does not contain an iterator".into());
         };
+        if let Object::CallableIterator {
+            callable,
+            sentinel,
+            exhausted,
+        } = self.state.heap.get(id)?.clone()
+        {
+            if exhausted {
+                self.stack.pop();
+                return Ok(false);
+            }
+            self.charge_cpu(1)?;
+            let value = <Self as PyRuntime>::call_value(
+                self,
+                callable,
+                CallArgs::new(Vec::new(), Vec::new()),
+            )
+            .map_err(|error| error.to_string())?;
+            if protocol::equals(&self.state.heap, &value, &sentinel)? {
+                if let Object::CallableIterator { exhausted, .. } = self.state.heap.get_mut(id)? {
+                    *exhausted = true;
+                }
+                self.stack.pop();
+                return Ok(false);
+            }
+            self.stack.push(value);
+            return Ok(true);
+        }
         let next = match self.state.heap.get_mut(id)? {
             Object::Iterator { values, position } => {
                 let next = values.get(*position).cloned();
@@ -4488,6 +4524,18 @@ impl<'a> Vm<'a> {
                     .unwrap_or_default();
                 Ok(CallResult::Exit(status as i32))
             }
+            Builtin::Character => {
+                expect_arity(&arguments, 1, 1)?;
+                let value = protocol::int_value(&self.state.heap, &arguments[0])
+                    .ok_or("an integer is required for chr()")?;
+                let codepoint = u32::try_from(value)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .ok_or("chr() arg not in range(0x110000)")?;
+                Ok(CallResult::Value(
+                    self.allocate_string(codepoint.to_string())?,
+                ))
+            }
             Builtin::Repr => {
                 expect_arity(&arguments, 1, 1)?;
                 let value = self.repr_value(&arguments[0])?;
@@ -4540,6 +4588,7 @@ impl<'a> Vm<'a> {
                         | Object::DescriptorBoundMethod { .. }
                         | Object::Iterator { .. }
                         | Object::CountIterator { .. }
+                        | Object::CallableIterator { .. }
                         | Object::Generator { .. }
                         | Object::Module { .. }
                         | Object::ArrayStorage(_)
@@ -4668,7 +4717,21 @@ impl<'a> Vm<'a> {
                 Ok(CallResult::Value(value))
             }
             Builtin::Iter => {
-                expect_arity(&arguments, 1, 1)?;
+                expect_arity(&arguments, 1, 2)?;
+                if arguments.len() == 2 {
+                    if !<Self as PyRuntime>::is_callable(self, &arguments[0])
+                        .map_err(|error| error.to_string())?
+                    {
+                        return Err("iter(v, w): v must be callable".into());
+                    }
+                    return Ok(CallResult::Value(self.allocate_object(
+                        Object::CallableIterator {
+                            callable: arguments[0],
+                            sentinel: arguments[1],
+                            exhausted: false,
+                        },
+                    )?));
+                }
                 let values = self.iterable_values(&arguments[0])?;
                 Ok(CallResult::Value(self.allocate_object(
                     Object::Iterator {
@@ -4683,6 +4746,33 @@ impl<'a> Vm<'a> {
                     return Err("next() argument is not an iterator".into());
                 };
                 let value = match self.state.heap.get(id)?.clone() {
+                    Object::CallableIterator {
+                        callable,
+                        sentinel,
+                        exhausted,
+                    } => {
+                        if exhausted {
+                            None
+                        } else {
+                            self.charge_cpu(1)?;
+                            let value = <Self as PyRuntime>::call_value(
+                                self,
+                                callable,
+                                CallArgs::new(Vec::new(), Vec::new()),
+                            )
+                            .map_err(|error| error.to_string())?;
+                            if protocol::equals(&self.state.heap, &value, &sentinel)? {
+                                if let Object::CallableIterator { exhausted, .. } =
+                                    self.state.heap.get_mut(id)?
+                                {
+                                    *exhausted = true;
+                                }
+                                None
+                            } else {
+                                Some(value)
+                            }
+                        }
+                    }
                     Object::CountIterator { current, step } => {
                         let next = super::stdlib::itertools::count_next(current, step)
                             .map_err(str::to_string)?;
@@ -5309,6 +5399,32 @@ impl<'a> Vm<'a> {
                         "cannot materialize infinite itertools.count without a bound".into(),
                     )
                 }
+                Object::CallableIterator {
+                    callable,
+                    sentinel,
+                    exhausted,
+                } => {
+                    if !exhausted {
+                        loop {
+                            self.charge_cpu(1)?;
+                            let item = <Self as PyRuntime>::call_value(
+                                self,
+                                callable,
+                                CallArgs::new(Vec::new(), Vec::new()),
+                            )
+                            .map_err(|error| error.to_string())?;
+                            if protocol::equals(&self.state.heap, &item, &sentinel)? {
+                                if let Object::CallableIterator { exhausted, .. } =
+                                    self.state.heap.get_mut(id)?
+                                {
+                                    *exhausted = true;
+                                }
+                                break;
+                            }
+                            self.push_materialized(&mut result, item)?;
+                        }
+                    }
+                }
                 Object::Generator { .. } => {
                     while let Some(value) = self.resume_generator(id)? {
                         self.push_materialized(&mut result, value)?;
@@ -5484,7 +5600,9 @@ impl PyRuntime for Vm<'_> {
                 Object::Function { .. } | Object::DescriptorBoundMethod { .. } => PyKind::Function,
                 Object::Class { .. } => PyKind::Class,
                 Object::Instance { .. } | Object::EnumMember { .. } => PyKind::Instance,
-                Object::Iterator { .. } | Object::CountIterator { .. } => PyKind::Iterator,
+                Object::Iterator { .. }
+                | Object::CountIterator { .. }
+                | Object::CallableIterator { .. } => PyKind::Iterator,
                 Object::Generator { .. } => PyKind::Generator,
                 Object::Module { .. } => PyKind::Module,
                 Object::Array { .. } => PyKind::Array,
@@ -6011,7 +6129,10 @@ impl PyRuntime for Vm<'_> {
         if let Some(id) = value.object_id() {
             if matches!(
                 self.state.heap.get(id).map_err(PyError::runtime_error)?,
-                Object::Iterator { .. } | Object::CountIterator { .. } | Object::Generator { .. }
+                Object::Iterator { .. }
+                    | Object::CountIterator { .. }
+                    | Object::CallableIterator { .. }
+                    | Object::Generator { .. }
             ) {
                 return Value::Object(id).cast(self);
             }
@@ -6058,6 +6179,33 @@ impl PyRuntime for Vm<'_> {
                 };
                 *current = next;
                 Ok(Some(Value::Int(value)))
+            }
+            Object::CallableIterator {
+                callable,
+                sentinel,
+                exhausted,
+            } => {
+                if exhausted {
+                    return Ok(None);
+                }
+                self.charge_cpu(1).map_err(PyError::resource_error)?;
+                let value = self.call_value(callable, CallArgs::new(Vec::new(), Vec::new()))?;
+                if protocol::equals(&self.state.heap, &value, &sentinel)
+                    .map_err(PyError::runtime_error)?
+                {
+                    let Object::CallableIterator { exhausted, .. } = self
+                        .state
+                        .heap
+                        .get_mut(id)
+                        .map_err(PyError::runtime_error)?
+                    else {
+                        return Err(PyError::runtime_error("iterator changed object kind"));
+                    };
+                    *exhausted = true;
+                    Ok(None)
+                } else {
+                    Ok(Some(value))
+                }
             }
             Object::Generator { .. } => self.resume_generator(id).map_err(PyError::runtime_error),
             _ => Err(PyError::type_error("expected an iterator")),
@@ -6582,6 +6730,17 @@ impl PyRuntime for Vm<'_> {
 
     fn command_arguments(&self) -> Vec<String> {
         self.argv.iter().skip(1).cloned().collect()
+    }
+
+    fn import_module(&mut self, name: &str) -> PyResult<Value> {
+        let stack_len = self.stack.len();
+        self.import(name, false).map_err(PyError::runtime_error)?;
+        let module = self
+            .stack
+            .pop()
+            .ok_or_else(|| PyError::runtime_error("module import produced no value"))?;
+        debug_assert_eq!(self.stack.len(), stack_len);
+        Ok(module)
     }
 
     fn new_module(

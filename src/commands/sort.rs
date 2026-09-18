@@ -23,6 +23,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         Stable,
         Fields,
         Separator,
+        Output,
         Help,
     }
     const OPTIONS: &[OptionSpec<Key>] = &[
@@ -33,6 +34,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         OptionSpec::flag(Key::Stable, Some('s'), Some("stable")),
         OptionSpec::required(Key::Fields, Some('k'), Some("key")),
         OptionSpec::required(Key::Separator, Some('t'), Some("field-separator")),
+        OptionSpec::required(Key::Output, Some('o'), Some("output")),
         OptionSpec::flag(Key::Help, None, Some("help")),
     ];
     let parsed = match parse_options_or_report(
@@ -41,7 +43,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         OPTIONS,
         (
             Key::Help,
-            "usage: sort [OPTIONS] [FILE...]\nsupported: -n -r -u -f -s -k KEY -t CHAR\n",
+            "usage: sort [OPTIONS] [FILE...]\nsupported: -n -r -u -f -s -k KEY -t CHAR -o FILE\n",
         ),
         io.out,
         io.err,
@@ -55,6 +57,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut fold_case = false;
     let mut key = None;
     let mut separator = None;
+    let mut output = None;
     for option in parsed.options {
         match option.key {
             Key::Numeric => numeric = true,
@@ -86,6 +89,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                     }
                 };
             }
+            Key::Output => output = option.value,
             Key::Help => unreachable!("help is handled by the shared option parser"),
         }
     }
@@ -162,11 +166,22 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     if unique {
         lines.dedup_by(|a, b| compare(a, b).is_eq());
     }
-    for line in lines {
-        io.out.extend_from_slice(&line);
-    }
+    let sorted = lines.into_iter().flatten().collect::<Vec<_>>();
+    let status = if let Some(path) = output {
+        let cwd = env.cwd.clone();
+        match env.vfs.write(&cwd, &path, &sorted, 0o644) {
+            Ok(()) => 0,
+            Err(error) => {
+                ewln(io.err, &format!("sort: {path}: {error}"));
+                1
+            }
+        }
+    } else {
+        io.out.extend_from_slice(&sorted);
+        0
+    };
     env.resources.release_memory(scratch);
-    0
+    status
 }
 
 #[derive(Clone, Copy)]

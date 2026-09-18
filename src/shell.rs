@@ -228,6 +228,7 @@ struct Lexer {
     chars: Vec<char>,
     i: usize,
     toks: Vec<Tok>,
+    in_double_bracket: bool,
     heredocs_complete: bool,
     error: Option<ShellError>,
 }
@@ -238,6 +239,7 @@ impl Lexer {
             chars: src.chars().collect(),
             i: 0,
             toks: Vec::new(),
+            in_double_bracket: false,
             heredocs_complete: true,
             error: None,
         }
@@ -250,10 +252,31 @@ impl Lexer {
         self.chars.get(self.i + o).copied()
     }
 
+    fn fd_redirect_len(&self) -> Option<usize> {
+        let digits = self.chars[self.i..]
+            .iter()
+            .take_while(|character| character.is_ascii_digit())
+            .count();
+        (digits > 0 && matches!(self.at(digits), Some('<' | '>'))).then_some(digits)
+    }
+
     fn tokenize(mut self) -> (Vec<Tok>, bool, Option<ShellError>) {
         // pending heredocs: (delim, quoted, token-index placeholder)
         let mut pending: Vec<(String, bool, usize)> = Vec::new();
         while let Some(c) = self.peek() {
+            if self.in_double_bracket
+                && matches!(self.toks.last(), Some(Tok::Word(operator)) if operator == "=~")
+                && !matches!(c, ' ' | '\t' | '\n')
+            {
+                let pattern = self.read_double_bracket_regex();
+                let pattern = if matches!(pattern.as_bytes().first(), Some(b'\'' | b'"')) {
+                    pattern
+                } else {
+                    format!("\"{pattern}\"")
+                };
+                self.toks.push(Tok::Word(pattern));
+                continue;
+            }
             match c {
                 ' ' | '\t' => {
                     self.i += 1;
@@ -291,7 +314,11 @@ impl Lexer {
                     }
                 }
                 '&' => {
-                    if self.at(1) == Some('&') {
+                    if self.in_double_bracket {
+                        let word = if self.at(1) == Some('&') { "&&" } else { "&" };
+                        self.i += word.len();
+                        self.toks.push(Tok::Word(word.into()));
+                    } else if self.at(1) == Some('&') {
                         self.toks.push(Tok::Op("&&".into()));
                         self.i += 2;
                     } else if self.at(1) == Some('>') {
@@ -304,7 +331,11 @@ impl Lexer {
                     }
                 }
                 '|' => {
-                    if self.at(1) == Some('|') {
+                    if self.in_double_bracket {
+                        let word = if self.at(1) == Some('|') { "||" } else { "|" };
+                        self.i += word.len();
+                        self.toks.push(Tok::Word(word.into()));
+                    } else if self.at(1) == Some('|') {
                         self.toks.push(Tok::Op("||".into()));
                         self.i += 2;
                     } else {
@@ -313,7 +344,10 @@ impl Lexer {
                     }
                 }
                 '(' => {
-                    if self.at(1) == Some('(') {
+                    if self.in_double_bracket {
+                        self.toks.push(Tok::Word("(".into()));
+                        self.i += 1;
+                    } else if self.at(1) == Some('(') {
                         let expression = self.read_arithmetic_command();
                         self.toks.push(Tok::Arithmetic(expression));
                     } else {
@@ -322,11 +356,22 @@ impl Lexer {
                     }
                 }
                 ')' => {
-                    self.toks.push(Tok::Op(")".into()));
+                    self.toks.push(if self.in_double_bracket {
+                        Tok::Word(")".into())
+                    } else {
+                        Tok::Op(")".into())
+                    });
                     self.i += 1;
                 }
                 '<' => {
-                    if self.at(1) == Some('<') && self.at(2) == Some('<') {
+                    if self.in_double_bracket {
+                        self.toks.push(Tok::Word("<".into()));
+                        self.i += 1;
+                    } else if self.at(1) == Some('(') {
+                        self.i += 1;
+                        let group = self.read_balanced_paren();
+                        self.toks.push(Tok::Word(format!("<{group}")));
+                    } else if self.at(1) == Some('<') && self.at(2) == Some('<') {
                         self.i += 3;
                         while matches!(self.peek(), Some(' ' | '\t')) {
                             self.i += 1;
@@ -358,7 +403,10 @@ impl Lexer {
                     }
                 }
                 '>' => {
-                    if self.at(1) == Some('>') {
+                    if self.in_double_bracket {
+                        self.toks.push(Tok::Word(">".into()));
+                        self.i += 1;
+                    } else if self.at(1) == Some('>') {
                         self.toks.push(Tok::DGreat);
                         self.i += 2;
                     } else if self.at(1) == Some('&') {
@@ -384,10 +432,15 @@ impl Lexer {
                         self.i += 1;
                     }
                 }
-                c if c.is_ascii_digit() && (self.at(1) == Some('>') || self.at(1) == Some('<')) => {
-                    // fd-prefixed redirect like 2> 2>> 1> 2>&1
-                    let fd = c.to_digit(10).unwrap() as i32;
-                    self.i += 1;
+                c if c.is_ascii_digit() && self.fd_redirect_len().is_some() => {
+                    // fd-prefixed redirect like 2>, 200>>, or 10>&1
+                    let digits = self.fd_redirect_len().expect("guard checked redirect");
+                    let fd = self.chars[self.i..self.i + digits]
+                        .iter()
+                        .collect::<String>()
+                        .parse::<i32>()
+                        .unwrap_or(-1);
+                    self.i += digits;
                     if self.peek() == Some('>') {
                         if self.at(1) == Some('>') {
                             self.i += 2;
@@ -421,6 +474,11 @@ impl Lexer {
                 }
                 _ => {
                     let w = self.read_word();
+                    if w == "[[" {
+                        self.in_double_bracket = true;
+                    } else if w == "]]" && self.in_double_bracket {
+                        self.in_double_bracket = false;
+                    }
                     self.toks.push(Tok::Word(w));
                 }
             }
@@ -432,6 +490,11 @@ impl Lexer {
                 let body = self.read_heredoc_body(&delim);
                 self.toks[idx] = Tok::Heredoc(body, quoted);
             }
+        }
+        if self.in_double_bracket {
+            self.error.get_or_insert(ShellError::UnexpectedEof {
+                expected: "`]]`".to_string(),
+            });
         }
         self.toks.push(Tok::Eof);
         (self.toks, self.heredocs_complete, self.error)
@@ -642,6 +705,30 @@ impl Lexer {
             }
         }
         w
+    }
+
+    /// Read the unquoted right-hand side of `[[ value =~ regex ]]` as one expression token.
+    /// Shell metacharacters such as `(` and `|` are regex syntax here, while escaped whitespace
+    /// remains part of the pattern.
+    fn read_double_bracket_regex(&mut self) -> String {
+        let mut word = String::new();
+        while let Some(c) = self.peek() {
+            if matches!(c, ' ' | '\t' | '\n') {
+                break;
+            }
+            if c == ']' && self.at(1) == Some(']') {
+                break;
+            }
+            word.push(c);
+            self.i += 1;
+            if c == '\\' {
+                if let Some(next) = self.peek() {
+                    word.push(next);
+                    self.i += 1;
+                }
+            }
+        }
+        word
     }
 
     /// If the word at the cursor is an array-assignment literal `name=( … )` or `name+=( … )`,
@@ -1166,8 +1253,7 @@ impl Parser {
     }
 
     fn attach_redirects(&mut self, node: Node) -> Node {
-        // optionally consume redirects after compound commands; we ignore for now except
-        // for groups feeding pipelines (rare in corpus). Return as-is.
+        // Compound commands accept the same ordinary descriptor redirects as simple commands.
         let mut redirs = Vec::new();
         loop {
             match self.peek().clone() {
@@ -1194,6 +1280,50 @@ impl Parser {
                         op: RedirOp::Read,
                         target: self.take_word(),
                     });
+                }
+                Tok::GreatAmp(source) => {
+                    self.i += 1;
+                    redirs.push(Redirect {
+                        fd: 1,
+                        op: RedirOp::DupOut,
+                        target: format!("&{source}"),
+                    });
+                }
+                Tok::CloseOut => {
+                    self.i += 1;
+                    redirs.push(Redirect {
+                        fd: 1,
+                        op: RedirOp::Close,
+                        target: "-".into(),
+                    });
+                }
+                Tok::RedirFd(fd, op) => {
+                    self.i += 1;
+                    let (op, target) = match op.as_str() {
+                        "&>" => {
+                            let target = self.take_word();
+                            redirs.push(Redirect {
+                                fd: 1,
+                                op: RedirOp::Write,
+                                target,
+                            });
+                            redirs.push(Redirect {
+                                fd: 2,
+                                op: RedirOp::DupOut,
+                                target: "&1".into(),
+                            });
+                            continue;
+                        }
+                        ">" => (RedirOp::Write, self.take_word()),
+                        ">>" => (RedirOp::Append, self.take_word()),
+                        "<" => (RedirOp::Read, self.take_word()),
+                        ">&-" => (RedirOp::Close, "-".into()),
+                        value if value.starts_with(">&") => {
+                            (RedirOp::DupOut, format!("&{}", &value[2..]))
+                        }
+                        _ => unreachable!("lexer emitted an unknown descriptor redirect"),
+                    };
+                    redirs.push(Redirect { fd, op, target });
                 }
                 _ => break,
             }

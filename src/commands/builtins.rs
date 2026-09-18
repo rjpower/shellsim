@@ -36,6 +36,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_resumable(m, &["fg"], Trust::Real, cmd_fg, start_fg);
     reg(m, &["bg"], Trust::Real, cmd_bg);
     reg(m, &["trap"], Trust::Real, cmd_trap);
+    reg(m, &["flock"], Trust::Partial, cmd_flock);
     reg_unsupported(
         m,
         &[
@@ -59,9 +60,46 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
 
 const MAX_TRAP_STATE_BYTES: u64 = 1024 * 1024;
 
+/// Validate the common descriptor-lock form. A shellsim process has no ambient competing host
+/// processes, so acquiring or releasing an advisory lock on one of its own open descriptors is
+/// deterministic and immediate. Path-and-command forms are a separate process-control surface.
+fn cmd_flock(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut operand = None;
+    for argument in args {
+        match argument.as_str() {
+            "-x" | "--exclusive" | "-s" | "--shared" | "-u" | "--unlock" | "-n" | "--nonblock" => {}
+            "--" if operand.is_none() => {}
+            value if operand.is_none() => operand = Some(value),
+            _ => {
+                ewln(
+                    io.err,
+                    "flock: path-and-command locking is not supported; use an open file descriptor",
+                );
+                return 2;
+            }
+        }
+    }
+    let Some(operand) = operand else {
+        ewln(io.err, "flock: missing file descriptor");
+        return 2;
+    };
+    let Ok(fd) = operand.parse::<i32>() else {
+        ewln(
+            io.err,
+            "flock: path-and-command locking is not supported; use an open file descriptor",
+        );
+        return 2;
+    };
+    if interp.fds.get(fd).is_err() {
+        ewln(io.err, &format!("flock: {fd}: bad file descriptor"));
+        return 1;
+    }
+    0
+}
+
 fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     if args.is_empty() {
-        print_traps(interp, &[], io);
+        print_traps(interp, &[], true, io);
         return 0;
     }
     if args[0] == "-l" {
@@ -72,14 +110,14 @@ fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         return list_signal(None, io);
     }
     if args[0] == "-p" {
-        let signals = match parse_trap_signals(&args[1..]) {
-            Ok(signals) => signals,
+        let (include_exit, signals) = match parse_trap_targets(&args[1..]) {
+            Ok(targets) => targets,
             Err(error) => {
                 ewln(io.err, &format!("trap: {error}"));
                 return 2;
             }
         };
-        print_traps(interp, &signals, io);
+        print_traps(interp, &signals, include_exit, io);
         return 0;
     }
 
@@ -93,8 +131,8 @@ fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         ewln(io.err, "trap: missing signal operand");
         return 2;
     }
-    let signals = match parse_trap_signals(signal_args) {
-        Ok(signals) => signals,
+    let (has_exit, signals) = match parse_trap_targets(signal_args) {
+        Ok(targets) => targets,
         Err(error) => {
             ewln(io.err, &format!("trap: {error}"));
             return 2;
@@ -139,28 +177,46 @@ fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             updated.remove(&signal);
         }
     }
-    let state_bytes = updated.values().fold(0_u64, |total, disposition| {
-        total.saturating_add(match disposition {
-            crate::interp::ShellSignalDisposition::Ignore => 16,
-            crate::interp::ShellSignalDisposition::Handler { source, body } => (source.len()
-                as u64)
-                .saturating_add(body.estimated_bytes())
-                .saturating_add(32),
+    let mut updated_exit = interp.exit_disposition.clone();
+    if has_exit {
+        updated_exit = disposition.clone();
+    }
+    let state_bytes = updated
+        .values()
+        .fold(0_u64, |total, disposition| {
+            total.saturating_add(match disposition {
+                crate::interp::ShellSignalDisposition::Ignore => 16,
+                crate::interp::ShellSignalDisposition::Handler { source, body } => (source.len()
+                    as u64)
+                    .saturating_add(body.estimated_bytes())
+                    .saturating_add(32),
+            })
         })
-    });
+        .saturating_add(updated_exit.as_ref().map_or(0, |disposition| {
+            match disposition {
+                crate::interp::ShellSignalDisposition::Ignore => 16,
+                crate::interp::ShellSignalDisposition::Handler { source, body } => (source.len()
+                    as u64)
+                    .saturating_add(body.estimated_bytes())
+                    .saturating_add(32),
+            }
+        }));
     if state_bytes > MAX_TRAP_STATE_BYTES {
         ewln(io.err, "trap: signal handler state exceeds the 1 MiB limit");
         return 2;
     }
     interp.signal_dispositions = updated;
+    interp.exit_disposition = updated_exit;
     0
 }
 
-fn parse_trap_signals(values: &[String]) -> Result<Vec<crate::process::Signal>, String> {
+fn parse_trap_targets(values: &[String]) -> Result<(bool, Vec<crate::process::Signal>), String> {
+    let mut has_exit = values.is_empty();
     let mut signals = Vec::with_capacity(values.len());
     for value in values {
         if value == "0" || value.eq_ignore_ascii_case("EXIT") {
-            return Err("EXIT traps are not supported".to_string());
+            has_exit = true;
+            continue;
         }
         let signal = crate::process::Signal::parse(value)
             .ok_or_else(|| format!("invalid signal: {value}"))?;
@@ -168,10 +224,27 @@ fn parse_trap_signals(values: &[String]) -> Result<Vec<crate::process::Signal>, 
             signals.push(signal);
         }
     }
-    Ok(signals)
+    Ok((has_exit, signals))
 }
 
-fn print_traps(interp: &CommandContext<'_>, selected: &[crate::process::Signal], io: &mut Io) {
+fn print_traps(
+    interp: &CommandContext<'_>,
+    selected: &[crate::process::Signal],
+    include_exit: bool,
+    io: &mut Io,
+) {
+    if include_exit {
+        if let Some(disposition) = &interp.exit_disposition {
+            let action = match disposition {
+                crate::interp::ShellSignalDisposition::Ignore => String::new(),
+                crate::interp::ShellSignalDisposition::Handler { source, .. } => source.clone(),
+            };
+            wln(
+                io.out,
+                &format!("trap -- '{}' EXIT", action.replace('\'', "'\\''")),
+            );
+        }
+    }
     for (signal, disposition) in &interp.signal_dispositions {
         if !selected.is_empty() && !selected.contains(signal) {
             continue;
@@ -1222,7 +1295,14 @@ fn eval_test_cmd(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -
     }
 }
 
-fn eval_test(interp: &Interp, a: &[&str]) -> bool {
+fn eval_test(interp: &mut Interp, a: &[&str]) -> bool {
+    let a = strip_test_parens(a);
+    if let Some(pos) = top_level_test_operator(a, &["-o", "||"]) {
+        return eval_test(interp, &a[..pos]) || eval_test(interp, &a[pos + 1..]);
+    }
+    if let Some(pos) = top_level_test_operator(a, &["-a", "&&"]) {
+        return eval_test(interp, &a[..pos]) && eval_test(interp, &a[pos + 1..]);
+    }
     if a.first() == Some(&"!") {
         return !eval_test(interp, &a[1..]);
     }
@@ -1283,9 +1363,20 @@ fn eval_test(interp: &Interp, a: &[&str]) -> bool {
                 "-ge" => num(x) >= num(y),
                 "<" => x < y,
                 ">" => x > y,
-                "=~" => regex::Regex::new(y)
-                    .map(|regex| regex.is_match(x))
-                    .unwrap_or(false),
+                "=~" => regex::Regex::new(y).is_ok_and(|regex| {
+                    let Some(captures) = regex.captures(x) else {
+                        interp.set_array("BASH_REMATCH", Vec::new());
+                        return false;
+                    };
+                    interp.set_array(
+                        "BASH_REMATCH",
+                        captures
+                            .iter()
+                            .map(|capture| capture.map_or("", |value| value.as_str()).to_string())
+                            .collect(),
+                    );
+                    true
+                }),
                 "-nt" => {
                     let left = interp.fs_metadata(&interp.cwd, x, true).ok();
                     let right = interp.fs_metadata(&interp.cwd, y, true).ok();
@@ -1303,17 +1394,40 @@ fn eval_test(interp: &Interp, a: &[&str]) -> bool {
                 _ => false,
             }
         }
-        _ => {
-            // handle && || and ! and parens minimally: split on -a/-o
-            if let Some(pos) = a.iter().position(|s| *s == "-a" || *s == "&&") {
-                return eval_test(interp, &a[..pos]) && eval_test(interp, &a[pos + 1..]);
+        _ => false,
+    }
+}
+
+fn strip_test_parens<'a>(mut args: &'a [&'a str]) -> &'a [&'a str] {
+    while args.first() == Some(&"(") && args.last() == Some(&")") {
+        let mut depth = 0_i32;
+        let wraps_all = args.iter().enumerate().all(|(index, token)| {
+            match *token {
+                "(" => depth += 1,
+                ")" => depth -= 1,
+                _ => {}
             }
-            if let Some(pos) = a.iter().position(|s| *s == "-o" || *s == "||") {
-                return eval_test(interp, &a[..pos]) || eval_test(interp, &a[pos + 1..]);
-            }
-            false
+            depth > 0 || index + 1 == args.len()
+        });
+        if !wraps_all {
+            break;
+        }
+        args = &args[1..args.len() - 1];
+    }
+    args
+}
+
+fn top_level_test_operator(args: &[&str], operators: &[&str]) -> Option<usize> {
+    let mut depth = 0_i32;
+    for (index, token) in args.iter().enumerate() {
+        match *token {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            _ if depth == 0 && operators.contains(token) => return Some(index),
+            _ => {}
         }
     }
+    None
 }
 
 fn num(s: &str) -> i64 {
@@ -1471,7 +1585,9 @@ fn cmd_mapfile(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
                 return 1;
             }
             let mut record = &io.stdin[cursor..end];
-            if trim_delimiter && record.last() == Some(&delimiter) {
+            // Bash variables cannot contain NUL, so `mapfile -d ''` necessarily drops it even
+            // without `-t`.
+            if (trim_delimiter || delimiter == 0) && record.last() == Some(&delimiter) {
                 record = &record[..record.len() - 1];
             }
             interp.array_set(
