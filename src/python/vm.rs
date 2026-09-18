@@ -5,12 +5,13 @@ use crate::interp::Interp;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
-use super::bytecode::{ClassField, Code, Operation};
+use super::bytecode::{ClassField, CodeRef, Operation};
 use super::filesystem::PyModuleLoader;
 use super::heap::{ClassLayout, InstancePayload, Object, ScopeId};
 use super::native::{
@@ -285,7 +286,7 @@ pub(super) fn execute(
 /// Compiled Python and the transient bytecode state retained between bounded VM polls.
 #[derive(Clone)]
 pub(super) struct VmProgram {
-    code: Code,
+    code: CodeRef,
     execution: VmState,
     started: bool,
 }
@@ -436,7 +437,7 @@ struct VmState {
 /// An executing code object's resumable control state.
 #[derive(Clone)]
 struct BytecodeFrame {
-    code: Code,
+    code: CodeRef,
     instruction_pointer: usize,
     handlers: Vec<(usize, usize)>,
     function_return: Option<FunctionReturn>,
@@ -607,14 +608,14 @@ impl<'a> Vm<'a> {
         }
     }
 
-    fn execute_code(&mut self, code: &Code) -> Result<Execution, (String, super::source::Span)> {
+    fn execute_code(&mut self, code: &CodeRef) -> Result<Execution, (String, super::source::Span)> {
         let mut handlers: Vec<(usize, usize)> = Vec::new();
         self.execute_code_from(code, 0, &mut handlers)
     }
 
     fn execute_code_from(
         &mut self,
-        code: &Code,
+        code: &CodeRef,
         instruction_pointer: usize,
         handlers: &mut Vec<(usize, usize)>,
     ) -> Result<Execution, (String, super::source::Span)> {
@@ -683,12 +684,16 @@ impl<'a> Vm<'a> {
                 .last()
                 .expect("bytecode execution requires an active frame")
                 .instruction_pointer;
-            let Some(instruction) = self
+            // Retain the immutable code independently from the mutable frame stack. This keeps
+            // dispatch borrowed from one shared instruction stream while operations mutate VM
+            // state or install another frame.
+            let code = self
                 .bytecode_frames
                 .last()
-                .and_then(|frame| frame.code.instructions.get(instruction_pointer))
-                .cloned()
-            else {
+                .expect("bytecode execution requires an active frame")
+                .code
+                .clone();
+            let Some(instruction) = code.instructions.get(instruction_pointer) else {
                 return Err((
                     "instruction pointer left the code object".into(),
                     super::source::Span::default(),
@@ -705,6 +710,8 @@ impl<'a> Vm<'a> {
                 }
                 Operation::LoadName(name) => self.load_name(name),
                 Operation::StoreName(name) => self.store_name(name),
+                Operation::LoadLocal(slot) => self.load_local(*slot),
+                Operation::StoreLocal(slot) => self.store_local(*slot),
                 Operation::StoreEnclosing { name, scope_hops } => {
                     self.store_enclosing(name, *scope_hops)
                 }
@@ -727,6 +734,7 @@ impl<'a> Vm<'a> {
                         Ok(())
                     }
                 }
+                Operation::DeleteLocal(slot) => self.delete_local(*slot),
                 Operation::DeleteGlobal(name) => self.delete_global(name),
                 Operation::DeleteSubscript => self.delete_subscript(),
                 Operation::Import { name, bind_root } => self.import(name, *bind_root),
@@ -753,7 +761,7 @@ impl<'a> Vm<'a> {
                     name,
                     code,
                     defaults,
-                } => self.make_function(name.clone(), (**code).clone(), *defaults),
+                } => self.make_function(name.clone(), code.clone(), *defaults),
                 Operation::MakeClass {
                     name,
                     code,
@@ -1336,6 +1344,40 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
+    fn load_local(&mut self, slot: usize) -> Result<(), String> {
+        let scope = self
+            .local_scopes
+            .last()
+            .copied()
+            .ok_or("local bytecode requires a lexical scope")?;
+        let value = self
+            .state
+            .heap
+            .scope_get_local(scope, slot)?
+            .ok_or_else(|| "local variable referenced before assignment".to_string())?;
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn store_local(&mut self, slot: usize) -> Result<(), String> {
+        let value = self.pop()?;
+        let scope = self
+            .local_scopes
+            .last()
+            .copied()
+            .ok_or("local bytecode requires a lexical scope")?;
+        self.state.heap.scope_store_local(scope, slot, value)
+    }
+
+    fn delete_local(&mut self, slot: usize) -> Result<(), String> {
+        let scope = self
+            .local_scopes
+            .last()
+            .copied()
+            .ok_or("local bytecode requires a lexical scope")?;
+        self.state.heap.scope_remove_local(scope, slot).map(|_| ())
+    }
+
     fn store_name(&mut self, name: &str) -> Result<(), String> {
         let value = self.pop()?;
         if let Some(scope) = self.local_scopes.last().copied() {
@@ -1531,6 +1573,7 @@ impl<'a> Vm<'a> {
         let scope = self.state.heap.allocate_scope(
             None,
             false,
+            Arc::from([]),
             HashMap::from([("__name__".into(), module_name)]),
             &mut self.interp.resources,
         )?;
@@ -1613,6 +1656,7 @@ impl<'a> Vm<'a> {
                 let scope = self.state.heap.allocate_scope(
                     None,
                     false,
+                    Arc::from([]),
                     HashMap::from([
                         ("__name__".into(), module_name),
                         (child_name.to_string(), child),
@@ -1892,6 +1936,30 @@ impl<'a> Vm<'a> {
                         .cloned()
                         .ok_or("index out of range")?
                 }
+                Object::Range { start, stop, step } => {
+                    let length = range_length(start, stop, step)?;
+                    let index = index.as_int().ok_or("range index must be an integer")?;
+                    let index = if index < 0 {
+                        i128::try_from(length).map_err(|_| "range is too large")?
+                            + i128::from(index)
+                    } else {
+                        i128::from(index)
+                    };
+                    if index < 0 || index >= i128::try_from(length).unwrap_or(i128::MAX) {
+                        return Err("range index out of range".into());
+                    }
+                    let value = i128::from(start)
+                        .checked_add(
+                            i128::from(step)
+                                .checked_mul(index)
+                                .ok_or("range value overflow")?,
+                        )
+                        .ok_or("range value overflow")?;
+                    Value::Int(
+                        i64::try_from(value)
+                            .map_err(|_| "range value exceeds bounded integer range")?,
+                    )
+                }
                 Object::Dict(entries) => {
                     let mut found = None;
                     for (key, value) in &entries {
@@ -1957,6 +2025,8 @@ impl<'a> Vm<'a> {
                 | Object::Instance { .. }
                 | Object::DescriptorBoundMethod { .. }
                 | Object::Iterator { .. }
+                | Object::SequenceIterator { .. }
+                | Object::RangeIterator { .. }
                 | Object::CountIterator { .. }
                 | Object::CallableIterator { .. }
                 | Object::Generator { .. }
@@ -2162,11 +2232,14 @@ impl<'a> Vm<'a> {
             | Object::Exception { .. }
             | Object::Set(_)
             | Object::BigInt(_)
+            | Object::Range { .. }
             | Object::Function { .. }
             | Object::Class { .. }
             | Object::Instance { .. }
             | Object::DescriptorBoundMethod { .. }
             | Object::Iterator { .. }
+            | Object::SequenceIterator { .. }
+            | Object::RangeIterator { .. }
             | Object::CountIterator { .. }
             | Object::CallableIterator { .. }
             | Object::Generator { .. }
@@ -2204,7 +2277,7 @@ impl<'a> Vm<'a> {
     fn make_function(
         &mut self,
         name: String,
-        code: Code,
+        code: CodeRef,
         default_count: usize,
     ) -> Result<(), String> {
         if self.stack.len() < default_count {
@@ -2236,7 +2309,7 @@ impl<'a> Vm<'a> {
     fn make_class(
         &mut self,
         name: String,
-        code: &Code,
+        code: &CodeRef,
         base_count: usize,
         has_metaclass: bool,
         fields: &[ClassField],
@@ -2412,6 +2485,7 @@ impl<'a> Vm<'a> {
         let scope = self.state.heap.allocate_scope(
             parent,
             uses_repl_globals,
+            Arc::from([]),
             prepared_namespace,
             &mut self.interp.resources,
         )?;
@@ -3292,6 +3366,7 @@ impl<'a> Vm<'a> {
                 self.allocate_object(Object::Dict(entries))?
             }
             BuiltinType::Function
+            | BuiltinType::Range
             | BuiltinType::Module
             | BuiltinType::Iterator
             | BuiltinType::Generator
@@ -3420,15 +3495,38 @@ impl<'a> Vm<'a> {
 
     fn get_iterator(&mut self) -> Result<(), String> {
         let iterable = self.pop()?;
+        let iterator = self.make_iterator(iterable)?;
+        self.stack.push(iterator);
+        Ok(())
+    }
+
+    fn make_iterator(&mut self, iterable: Value) -> Result<Value, String> {
         if let Some(id) = iterable.object_id() {
             match self.state.heap.get(id)? {
-                Object::CountIterator { .. }
+                Object::List(_) | Object::Tuple(_) => {
+                    return self.allocate_object(Object::SequenceIterator {
+                        owner: id,
+                        position: 0,
+                    });
+                }
+                Object::Range { start, stop, step } => {
+                    let (current, stop, step) = (*start, *stop, *step);
+                    return self.allocate_object(Object::RangeIterator {
+                        current,
+                        stop,
+                        step,
+                        exhausted: false,
+                    });
+                }
+                Object::Iterator { .. }
+                | Object::SequenceIterator { .. }
+                | Object::RangeIterator { .. }
+                | Object::CountIterator { .. }
                 | Object::CallableIterator { .. }
                 | Object::Generator { .. } => {
                     // These iterators remain lazy; materializing either one here would permit an
                     // unbounded host allocation before the caller's loop can meter each item.
-                    self.stack.push(Value::Object(id));
-                    return Ok(());
+                    return Ok(Value::Object(id));
                 }
                 _ => {}
             }
@@ -3441,8 +3539,69 @@ impl<'a> Vm<'a> {
             },
             &mut self.interp.resources,
         )?;
-        self.stack.push(iterator);
-        Ok(())
+        Ok(iterator)
+    }
+
+    fn next_stored_iterator(
+        &mut self,
+        iterator: super::heap::ObjectId,
+    ) -> Result<Option<Value>, String> {
+        let sequence = match self.state.heap.get(iterator)? {
+            Object::SequenceIterator { owner, position } => Some((*owner, *position)),
+            _ => None,
+        };
+        if let Some((owner, position)) = sequence {
+            let value = match self.state.heap.get(owner)? {
+                Object::List(values) | Object::Tuple(values) => values.get(position).copied(),
+                _ => return Err("iterator source changed object kind".into()),
+            };
+            if value.is_some() {
+                let Object::SequenceIterator { position, .. } =
+                    self.state.heap.get_mut(iterator)?
+                else {
+                    unreachable!("iterator kind was checked above")
+                };
+                *position += 1;
+            }
+            return Ok(value);
+        }
+        match self.state.heap.get_mut(iterator)? {
+            Object::Iterator { values, position } => {
+                let value = values.get(*position).copied();
+                if value.is_some() {
+                    *position += 1;
+                }
+                Ok(value)
+            }
+            Object::RangeIterator {
+                current,
+                stop,
+                step,
+                exhausted,
+            } => {
+                if *exhausted
+                    || (*step > 0 && *current >= *stop)
+                    || (*step < 0 && *current <= *stop)
+                {
+                    *exhausted = true;
+                    return Ok(None);
+                }
+                let value = *current;
+                if let Some(next) = current.checked_add(*step) {
+                    *current = next;
+                } else {
+                    *exhausted = true;
+                }
+                Ok(Some(Value::Int(value)))
+            }
+            Object::CountIterator { current, step } => {
+                let value = *current;
+                *current =
+                    super::stdlib::itertools::count_next(value, *step).map_err(str::to_string)?;
+                Ok(Some(Value::Int(value)))
+            }
+            _ => Err("object is not a stored iterator".into()),
+        }
     }
 
     fn unpack_sequence(
@@ -3534,20 +3693,7 @@ impl<'a> Vm<'a> {
             self.stack.push(value);
             return Ok(true);
         }
-        let next = match self.state.heap.get_mut(id)? {
-            Object::Iterator { values, position } => {
-                let next = values.get(*position).cloned();
-                if next.is_some() {
-                    *position += 1;
-                }
-                next
-            }
-            Object::CountIterator { current, step } => {
-                let value = *current;
-                *current =
-                    super::stdlib::itertools::count_next(value, *step).map_err(str::to_string)?;
-                Some(Value::Int(value))
-            }
+        let next = match self.state.heap.get(id)? {
             Object::Generator { .. } => match self.resume_generator(id)? {
                 Some(value) => {
                     self.stack.push(value);
@@ -3558,6 +3704,10 @@ impl<'a> Vm<'a> {
                     return Ok(false);
                 }
             },
+            Object::Iterator { .. }
+            | Object::SequenceIterator { .. }
+            | Object::RangeIterator { .. }
+            | Object::CountIterator { .. } => self.next_stored_iterator(id)?,
             _ => return Err("for-loop stack does not contain an iterator".into()),
         };
         if let Some(value) = next {
@@ -4574,6 +4724,7 @@ impl<'a> Vm<'a> {
                         Object::List(values) | Object::Tuple(values) | Object::Set(values) => {
                             values.len()
                         }
+                        Object::Range { start, stop, step } => range_length(*start, *stop, *step)?,
                         Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                             entries.len()
                         }
@@ -4588,6 +4739,8 @@ impl<'a> Vm<'a> {
                         | Object::Instance { .. }
                         | Object::DescriptorBoundMethod { .. }
                         | Object::Iterator { .. }
+                        | Object::SequenceIterator { .. }
+                        | Object::RangeIterator { .. }
                         | Object::CountIterator { .. }
                         | Object::CallableIterator { .. }
                         | Object::Generator { .. }
@@ -4733,13 +4886,7 @@ impl<'a> Vm<'a> {
                         },
                     )?));
                 }
-                let values = self.iterable_values(&arguments[0])?;
-                Ok(CallResult::Value(self.allocate_object(
-                    Object::Iterator {
-                        values,
-                        position: 0,
-                    },
-                )?))
+                Ok(CallResult::Value(self.make_iterator(arguments[0])?))
             }
             Builtin::Next => {
                 expect_arity(&arguments, 1, 2)?;
@@ -4785,17 +4932,9 @@ impl<'a> Vm<'a> {
                         Some(Value::Int(current))
                     }
                     Object::Generator { .. } => self.resume_generator(id)?,
-                    Object::Iterator { values, position } => {
-                        let value = values.get(position).cloned();
-                        if value.is_some() {
-                            if let Object::Iterator { position, .. } =
-                                self.state.heap.get_mut(id)?
-                            {
-                                *position += 1;
-                            }
-                        }
-                        value
-                    }
+                    Object::Iterator { .. }
+                    | Object::SequenceIterator { .. }
+                    | Object::RangeIterator { .. } => self.next_stored_iterator(id)?,
                     _ => {
                         match self.invoke_slot(&arguments[0], Slot::Next, "__next__", Vec::new()) {
                             Ok(Some(value)) => Some(value),
@@ -4832,10 +4971,14 @@ impl<'a> Vm<'a> {
                     [start, stop, step] => (*start, *stop, *step),
                     _ => unreachable!(),
                 };
-                let values = self.range_values(start, stop, step)?;
-                Ok(CallResult::Value(
-                    self.allocate_object(Object::List(values))?,
-                ))
+                if step == 0 {
+                    return Err("range() arg 3 must not be zero".into());
+                }
+                Ok(CallResult::Value(self.allocate_object(Object::Range {
+                    start,
+                    stop,
+                    step,
+                })?))
             }
             Builtin::Enumerate => {
                 expect_arity(&arguments, 1, 2)?;
@@ -4946,7 +5089,7 @@ impl<'a> Vm<'a> {
     fn call_python_function(
         &mut self,
         name: &str,
-        code: &Code,
+        code: &CodeRef,
         closure: Option<ScopeId>,
         defaults: &[Value],
         invocation: FunctionInvocation,
@@ -5061,6 +5204,7 @@ impl<'a> Vm<'a> {
         let scope = self.state.heap.allocate_scope(
             closure,
             uses_repl_globals,
+            code.local_names.clone(),
             locals,
             &mut self.interp.resources,
         )?;
@@ -5105,7 +5249,7 @@ impl<'a> Vm<'a> {
     fn create_generator(
         &mut self,
         name: &str,
-        code: &Code,
+        code: &CodeRef,
         closure: Option<ScopeId>,
         defaults: &[Value],
         arguments: Vec<Value>,
@@ -5199,6 +5343,7 @@ impl<'a> Vm<'a> {
         let scope = self.state.heap.allocate_scope(
             closure,
             uses_repl_globals,
+            code.local_names.clone(),
             locals,
             &mut self.interp.resources,
         )?;
@@ -5310,20 +5455,9 @@ impl<'a> Vm<'a> {
     }
 
     fn range_values(&mut self, start: i64, stop: i64, step: i64) -> Result<Vec<Value>, String> {
-        if step == 0 {
-            return Err("range() arg 3 must not be zero".into());
-        }
+        let count = range_length(start, stop, step)?;
         let start = i128::from(start);
-        let stop = i128::from(stop);
         let step = i128::from(step);
-        let count = if step > 0 && start < stop {
-            (stop - start - 1) / step + 1
-        } else if step < 0 && start > stop {
-            (start - stop - 1) / -step + 1
-        } else {
-            0
-        };
-        let count = usize::try_from(count).map_err(|_| "range is too large")?;
         let bytes = count.checked_mul(24).ok_or("range result is too large")?;
         self.reserve_result(bytes)?;
         if !self
@@ -5390,8 +5524,15 @@ impl<'a> Vm<'a> {
                         self.push_materialized(&mut result, key)?;
                     }
                 }
-                Object::Iterator { values, position } => {
-                    for value in values.into_iter().skip(position) {
+                Object::Range { start, stop, step } => {
+                    for value in self.range_values(start, stop, step)? {
+                        self.push_materialized(&mut result, value)?;
+                    }
+                }
+                Object::Iterator { .. }
+                | Object::SequenceIterator { .. }
+                | Object::RangeIterator { .. } => {
+                    while let Some(value) = self.next_stored_iterator(id)? {
                         self.push_materialized(&mut result, value)?;
                     }
                 }
@@ -5598,10 +5739,13 @@ impl PyRuntime for Vm<'_> {
                 Object::Slice { .. } => PyKind::Native,
                 Object::Dict(_) | Object::DefaultDict { .. } => PyKind::Dict,
                 Object::Set(_) => PyKind::Set,
+                Object::Range { .. } => PyKind::Native,
                 Object::Function { .. } | Object::DescriptorBoundMethod { .. } => PyKind::Function,
                 Object::Class { .. } => PyKind::Class,
                 Object::Instance { .. } | Object::EnumMember { .. } => PyKind::Instance,
                 Object::Iterator { .. }
+                | Object::SequenceIterator { .. }
+                | Object::RangeIterator { .. }
                 | Object::CountIterator { .. }
                 | Object::CallableIterator { .. } => PyKind::Iterator,
                 Object::Generator { .. } => PyKind::Generator,
@@ -6131,6 +6275,8 @@ impl PyRuntime for Vm<'_> {
             if matches!(
                 self.state.heap.get(id).map_err(PyError::runtime_error)?,
                 Object::Iterator { .. }
+                    | Object::SequenceIterator { .. }
+                    | Object::RangeIterator { .. }
                     | Object::CountIterator { .. }
                     | Object::CallableIterator { .. }
                     | Object::Generator { .. }
@@ -6138,8 +6284,9 @@ impl PyRuntime for Vm<'_> {
                 return Value::Object(id).cast(self);
             }
         }
-        let values = self.iterable_values(&value).map_err(PyError::type_error)?;
-        self.new_iterator(values)?.cast(self)
+        self.make_iterator(value)
+            .map_err(PyError::type_error)?
+            .cast(self)
     }
 
     fn iterator_next(&mut self, iterator: PyIterator) -> PyResult<Option<Value>> {
@@ -6166,6 +6313,9 @@ impl PyRuntime for Vm<'_> {
                 }
                 Ok(value)
             }
+            Object::SequenceIterator { .. } | Object::RangeIterator { .. } => self
+                .next_stored_iterator(id)
+                .map_err(PyError::runtime_error),
             Object::CountIterator { current, step } => {
                 let value = current;
                 let next = super::stdlib::itertools::count_next(current, step)
@@ -6770,6 +6920,7 @@ impl PyRuntime for Vm<'_> {
             .allocate_scope(
                 None,
                 false,
+                Arc::from([]),
                 HashMap::from([
                     ("__name__".into(), module_name),
                     ("__file__".into(), module_path),
@@ -7308,6 +7459,23 @@ fn select_string_slice(
         indices.into_iter().map(|index| characters[index]).collect()
     };
     Ok((selected, units))
+}
+
+fn range_length(start: i64, stop: i64, step: i64) -> Result<usize, String> {
+    if step == 0 {
+        return Err("range() arg 3 must not be zero".into());
+    }
+    let start = i128::from(start);
+    let stop = i128::from(stop);
+    let step = i128::from(step);
+    let count = if step > 0 && start < stop {
+        (stop - start - 1) / step + 1
+    } else if step < 0 && start > stop {
+        (start - stop - 1) / -step + 1
+    } else {
+        0
+    };
+    usize::try_from(count).map_err(|_| "range is too large".into())
 }
 
 fn expect_arity(arguments: &[Value], minimum: usize, maximum: usize) -> Result<(), String> {

@@ -7,8 +7,9 @@
 use crate::resources::Resources;
 use num_bigint::BigInt;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use super::bytecode::Code;
+use super::bytecode::CodeRef;
 use super::native::{PyArgumentSpec, PyArrayDtype, PyArrayLayout};
 use super::object_model::{BuiltinType, TypeId};
 use super::Value;
@@ -67,9 +68,15 @@ pub enum Object {
     },
     Set(Vec<Value>),
     BigInt(BigInt),
+    /// Reusable arithmetic sequence. Iteration state lives in a separate iterator object.
+    Range {
+        start: i64,
+        stop: i64,
+        step: i64,
+    },
     Function {
         name: String,
-        code: Code,
+        code: CodeRef,
         closure: Option<ScopeId>,
         defaults: Vec<Value>,
         /// Class captured when this function is installed by a class body.
@@ -108,6 +115,18 @@ pub enum Object {
         values: Vec<Value>,
         position: usize,
     },
+    /// Cursor over an arena sequence. Keeping the owner preserves mutation and lifetime semantics
+    /// without copying every item when a loop starts.
+    SequenceIterator {
+        owner: ObjectId,
+        position: usize,
+    },
+    RangeIterator {
+        current: i64,
+        stop: i64,
+        step: i64,
+        exhausted: bool,
+    },
     /// An infinite arithmetic iterator kept lazy so it cannot allocate without a caller bound.
     CountIterator {
         current: i64,
@@ -124,7 +143,7 @@ pub enum Object {
     /// exception-handler stack, and lexical scope are the complete resumable state.
     Generator {
         name: String,
-        code: Code,
+        code: CodeRef,
         scope: ScopeId,
         instruction_pointer: usize,
         handlers: Vec<(usize, usize)>,
@@ -213,6 +232,8 @@ struct HeapObject {
 struct Scope {
     parent: Option<ScopeId>,
     uses_repl_globals: bool,
+    local_names: Arc<[String]>,
+    locals: Vec<Option<Value>>,
     values: HashMap<String, Value>,
     modeled_bytes: u64,
 }
@@ -379,17 +400,26 @@ impl Heap {
         &mut self,
         parent: Option<ScopeId>,
         uses_repl_globals: bool,
-        values: HashMap<String, Value>,
+        local_names: Arc<[String]>,
+        mut values: HashMap<String, Value>,
         resources: &mut Resources,
     ) -> Result<ScopeId, String> {
-        let slots = u64::try_from(values.len()).map_err(|_| "modeled scope size overflow")?;
+        let mut locals = Vec::with_capacity(local_names.len());
+        for name in local_names.iter() {
+            locals.push(values.remove(name));
+        }
+        let slots = u64::try_from(locals.len()).map_err(|_| "modeled scope size overflow")?;
+        let dynamic = u64::try_from(values.len()).map_err(|_| "modeled scope size overflow")?;
         let bytes = 32u64
-            .checked_add(slots.checked_mul(48).ok_or("modeled scope size overflow")?)
+            .checked_add(slots.checked_mul(16).ok_or("modeled scope size overflow")?)
+            .and_then(|bytes| bytes.checked_add(dynamic.checked_mul(48)?))
             .ok_or("modeled scope size overflow")?;
         self.reserve_growth(bytes, resources)?;
         let scope = Scope {
             parent,
             uses_repl_globals,
+            local_names,
+            locals,
             values,
             modeled_bytes: bytes,
         };
@@ -407,6 +437,11 @@ impl Heap {
     pub fn scope_get(&self, mut scope: ScopeId, name: &str) -> Option<&Value> {
         loop {
             let current = self.scopes.get(scope.0)?.as_ref()?;
+            if let Some(index) = current.local_names.iter().position(|local| local == name) {
+                if let Some(value) = current.locals.get(index)?.as_ref() {
+                    return Some(value);
+                }
+            }
             if let Some(value) = current.values.get(name) {
                 return Some(value);
             }
@@ -454,13 +489,64 @@ impl Heap {
     }
 
     pub fn scope_values(&self, scope: ScopeId) -> Result<HashMap<String, Value>, String> {
-        Ok(self
+        let scope = self
             .scopes
             .get(scope.0)
             .and_then(Option::as_ref)
+            .ok_or("invalid scope reference")?;
+        let mut values = scope.values.clone();
+        values.extend(
+            scope
+                .local_names
+                .iter()
+                .zip(&scope.locals)
+                .filter_map(|(name, value)| value.map(|value| (name.clone(), value))),
+        );
+        Ok(values)
+    }
+
+    pub fn scope_get_local(&self, scope: ScopeId, slot: usize) -> Result<Option<Value>, String> {
+        self.scopes
+            .get(scope.0)
+            .and_then(Option::as_ref)
             .ok_or("invalid scope reference")?
-            .values
-            .clone())
+            .locals
+            .get(slot)
+            .copied()
+            .ok_or_else(|| "invalid local slot".into())
+    }
+
+    pub fn scope_store_local(
+        &mut self,
+        scope: ScopeId,
+        slot: usize,
+        value: Value,
+    ) -> Result<(), String> {
+        *self
+            .scopes
+            .get_mut(scope.0)
+            .and_then(Option::as_mut)
+            .ok_or("invalid scope reference")?
+            .locals
+            .get_mut(slot)
+            .ok_or("invalid local slot")? = Some(value);
+        Ok(())
+    }
+
+    pub fn scope_remove_local(
+        &mut self,
+        scope: ScopeId,
+        slot: usize,
+    ) -> Result<Option<Value>, String> {
+        Ok(self
+            .scopes
+            .get_mut(scope.0)
+            .and_then(Option::as_mut)
+            .ok_or("invalid scope reference")?
+            .locals
+            .get_mut(slot)
+            .ok_or("invalid local slot")?
+            .take())
     }
 
     pub fn scope_insert(
@@ -470,6 +556,17 @@ impl Heap {
         value: Value,
         resources: &mut Resources,
     ) -> Result<(), String> {
+        if let Some(slot) = self
+            .scopes
+            .get(scope.0)
+            .and_then(Option::as_ref)
+            .ok_or("invalid scope reference")?
+            .local_names
+            .iter()
+            .position(|local| local == &name)
+        {
+            return self.scope_store_local(scope, slot, value);
+        }
         let is_new = !self
             .scopes
             .get(scope.0)
@@ -512,18 +609,19 @@ impl Heap {
             .parent
             .ok_or_else(|| format!("no binding for nonlocal {name:?} found"))?;
         loop {
-            let parent = self
+            let candidate = self
                 .scopes
                 .get(current.0)
                 .and_then(Option::as_ref)
-                .ok_or("invalid scope reference")?
-                .parent;
-            if self.scopes[current.0]
-                .as_ref()
-                .expect("validated scope")
-                .values
-                .contains_key(name)
-            {
+                .ok_or("invalid scope reference")?;
+            let parent = candidate.parent;
+            if let Some(slot) = candidate.local_names.iter().position(|local| local == name) {
+                if candidate.locals[slot].is_some() {
+                    self.scope_store_local(current, slot, value)?;
+                    return Ok(());
+                }
+            }
+            if candidate.values.contains_key(name) {
                 self.scopes[current.0]
                     .as_mut()
                     .expect("validated scope")
@@ -536,13 +634,15 @@ impl Heap {
     }
 
     pub fn scope_remove(&mut self, scope: ScopeId, name: &str) -> Result<Option<Value>, String> {
-        Ok(self
+        let current = self
             .scopes
             .get_mut(scope.0)
             .and_then(Option::as_mut)
-            .ok_or("invalid scope reference")?
-            .values
-            .remove(name))
+            .ok_or("invalid scope reference")?;
+        if let Some(slot) = current.local_names.iter().position(|local| local == name) {
+            return Ok(current.locals[slot].take());
+        }
+        Ok(current.values.remove(name))
     }
 
     pub fn allocate(&mut self, object: Object, resources: &mut Resources) -> Result<Value, String> {
@@ -590,6 +690,7 @@ impl Heap {
             Object::Dict(_) | Object::DefaultDict { .. } => BuiltinType::Dict.id(),
             Object::Set(_) => BuiltinType::Set.id(),
             Object::BigInt(_) => BuiltinType::Int.id(),
+            Object::Range { .. } => BuiltinType::Range.id(),
             Object::Function { .. } | Object::DescriptorBoundMethod { .. } => {
                 BuiltinType::Function.id()
             }
@@ -608,6 +709,8 @@ impl Heap {
                 _ => return Err("instance class is not a class".into()),
             },
             Object::Iterator { .. }
+            | Object::SequenceIterator { .. }
+            | Object::RangeIterator { .. }
             | Object::CountIterator { .. }
             | Object::CallableIterator { .. } => BuiltinType::Iterator.id(),
             Object::Generator { .. } => BuiltinType::Generator.id(),
@@ -728,6 +831,11 @@ impl Heap {
                         object_work.push(id);
                     }
                 }
+                for value in scope.locals.iter().flatten() {
+                    if let Some(id) = value.object_id() {
+                        object_work.push(id);
+                    }
+                }
             }
         }
 
@@ -831,6 +939,7 @@ fn trace_object(
         Object::Iterator { values: items, .. } => {
             trace_values(items.iter().copied(), object_work);
         }
+        Object::SequenceIterator { owner, .. } => object_work.push(*owner),
         Object::CallableIterator {
             callable, sentinel, ..
         } => {
@@ -884,6 +993,8 @@ fn trace_object(
         | Object::Exception { .. }
         | Object::Slice { .. }
         | Object::BigInt(_)
+        | Object::Range { .. }
+        | Object::RangeIterator { .. }
         | Object::CountIterator { .. }
         | Object::Regex { .. }
         | Object::Match { .. }
@@ -906,6 +1017,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::Slice { .. } => 3,
         Object::BigInt(value) => usize::try_from(value.bits().saturating_add(7) / 8)
             .map_err(|_| "modeled big integer size overflow")?,
+        Object::Range { .. } => 3,
         Object::Dict(entries) => entries
             .len()
             .checked_mul(2)
@@ -953,6 +1065,8 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .ok_or("modeled object size overflow")?,
         Object::DescriptorBoundMethod { .. } => 3,
         Object::Iterator { values, .. } => values.len(),
+        Object::SequenceIterator { .. } => 2,
+        Object::RangeIterator { .. } => 4,
         Object::CountIterator { .. } => 2,
         Object::CallableIterator { .. } => 3,
         Object::Generator {
@@ -1025,6 +1139,7 @@ mod tests {
     use crate::python::Value;
     use crate::resources::{Limits, Resources};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn traced_roots_keep_aliases_and_unreachable_cycles_are_reclaimed() {
@@ -1063,6 +1178,7 @@ mod tests {
             .allocate_scope(
                 None,
                 false,
+                Arc::from([]),
                 HashMap::from([("value".into(), value)]),
                 &mut resources,
             )

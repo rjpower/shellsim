@@ -2,11 +2,18 @@
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
 use super::source::Span;
+use std::sync::Arc;
+
+/// Shared executable code. Functions, generators, and active frames retain this handle instead of
+/// copying an immutable instruction stream.
+pub type CodeRef = Arc<Code>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Code {
-    pub instructions: Vec<Instruction>,
-    pub parameters: Vec<Parameter>,
+    pub instructions: Arc<[Instruction]>,
+    pub parameters: Arc<[Parameter]>,
+    /// Stable slot names for locals owned by this code object.
+    pub local_names: Arc<[String]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,6 +40,8 @@ pub enum Operation {
     LoadConstant(Constant),
     LoadName(String),
     StoreName(String),
+    LoadLocal(usize),
+    StoreLocal(usize),
     /// Store a named-expression result outside synthetic comprehension scopes.
     StoreEnclosing {
         name: String,
@@ -43,6 +52,7 @@ pub enum Operation {
     StoreAttribute(String),
     StoreSubscript,
     DeleteName(String),
+    DeleteLocal(usize),
     DeleteGlobal(String),
     DeleteSubscript,
     Import {
@@ -73,12 +83,12 @@ pub enum Operation {
     },
     MakeFunction {
         name: String,
-        code: Box<Code>,
+        code: CodeRef,
         defaults: usize,
     },
     MakeClass {
         name: String,
-        code: Box<Code>,
+        code: CodeRef,
         bases: usize,
         has_metaclass: bool,
         fields: Vec<ClassField>,
