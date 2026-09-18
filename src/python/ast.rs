@@ -189,12 +189,6 @@ pub enum ExpressionKind {
         value: Box<Expression>,
         index: Box<Expression>,
     },
-    Slice {
-        value: Box<Expression>,
-        start: Option<Box<Expression>>,
-        stop: Option<Box<Expression>>,
-        step: Option<Box<Expression>>,
-    },
     SliceValue {
         start: Option<Box<Expression>>,
         stop: Option<Box<Expression>>,

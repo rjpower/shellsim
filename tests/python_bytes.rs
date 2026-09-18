@@ -97,3 +97,76 @@ print(bytearray(b'ab') + b'cd', 2 * bytearray(b'x'))
         )
     );
 }
+
+#[test]
+fn mutable_sequence_slices_replace_delete_and_validate_atomically() {
+    let source = r#"
+value = bytearray(b'abcdef')
+value[2:4] = b'Q'
+value[1:2] = b'WXYZ'
+del value[2:6]
+print(value)
+
+value = bytearray(b'abcdef')
+value[::-2] = b'XYZ'
+print(value)
+del value[1::2]
+print(value)
+
+value = bytearray(b'abcd')
+value[1:3] = value
+print(value)
+for replacement in (b'xy', [1, 300]):
+    before = bytes(value)
+    try:
+        value[::2] = replacement
+    except ValueError:
+        print('ValueError', bytes(value) == before)
+
+values = [0, 1, 2, 3, 4]
+values[1:4] = [8, 9]
+values[::2] = [5, 6]
+before = values.copy()
+try:
+    values[::2] = [1]
+except ValueError:
+    print('ValueError', values == before)
+del values[1::2]
+print(values)
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "bytearray(b'aWef')\nbytearray(b'aZcYeX')\nbytearray(b'ace')\nbytearray(b'aabcdd')\nValueError True\nValueError True\nValueError True\n[5, 6]\n".into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
+fn user_subscript_methods_receive_ordinary_slice_values() {
+    let source = r#"
+class Capture:
+    def __getitem__(self, key):
+        print('get', key.start, key.stop, key.step)
+        return 7
+    def __setitem__(self, key, value):
+        print('set', key.start, key.stop, key.step, value)
+    def __delitem__(self, key):
+        print('del', key.start, key.stop, key.step)
+
+capture = Capture()
+print(capture[1:5:2])
+capture[:3] = 9
+del capture[::-1]
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "get 1 5 2\n7\nset None 3 None 9\ndel None None -1\n".into(),
+            String::new(),
+        )
+    );
+}

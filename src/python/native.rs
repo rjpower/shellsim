@@ -33,15 +33,6 @@ pub(super) type TernarySlotFn =
 /// Native implementation stored directly in a unary protocol slot.
 pub(super) type UnarySlotFn = fn(&mut dyn PyRuntime, PyValue) -> PyResult<Option<PyValue>>;
 
-/// Native implementation for the parser's compact slice operation.
-pub(super) type SliceSlotFn = fn(
-    &mut dyn PyRuntime,
-    PyValue,
-    Option<i64>,
-    Option<i64>,
-    Option<i64>,
-) -> PyResult<Option<PyValue>>;
-
 /// Protocol functions attached to one opaque inline value kind.
 ///
 /// The runtime only dispatches these functions. It does not interpret the value payload.

@@ -61,11 +61,6 @@ pub enum Operation {
     },
     LoadAttribute(String),
     LoadSubscript,
-    LoadSlice {
-        has_start: bool,
-        has_stop: bool,
-        has_step: bool,
-    },
     BuildSlice {
         has_start: bool,
         has_stop: bool,

@@ -1275,21 +1275,10 @@ impl Parser {
                 )?;
                 let span = value.span.through(end.span);
                 value = match components.pop() {
-                    Some(ParsedSubscript::Slice { start, stop, step }) if !saw_comma => {
-                        Expression {
-                            kind: ExpressionKind::Slice {
-                                value: Box::new(value),
-                                start: start.map(Box::new),
-                                stop: stop.map(Box::new),
-                                step: step.map(Box::new),
-                            },
-                            span,
-                        }
-                    }
-                    Some(ParsedSubscript::Index(index)) if !saw_comma => Expression {
+                    Some(component) if !saw_comma => Expression {
                         kind: ExpressionKind::Subscript {
                             value: Box::new(value),
-                            index: Box::new(index),
+                            index: Box::new(component.into_expression(opening.through(end.span))),
                         },
                         span,
                     },

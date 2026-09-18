@@ -24,6 +24,7 @@ use super::native::{
     PyTuple, PyValueCast,
 };
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
+use super::slice::SlicePlan;
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
 
 const VM_POLL_QUANTUM: usize = 64;
@@ -741,11 +742,6 @@ impl<'a> Vm<'a> {
                 Operation::Import { name, bind_root } => self.import(name, *bind_root),
                 Operation::LoadAttribute(name) => self.load_attribute(name),
                 Operation::LoadSubscript => self.load_subscript(),
-                Operation::LoadSlice {
-                    has_start,
-                    has_stop,
-                    has_step,
-                } => self.load_slice(*has_start, *has_stop, *has_step),
                 Operation::BuildSlice {
                     has_start,
                     has_stop,
@@ -1864,6 +1860,15 @@ impl<'a> Vm<'a> {
                         .map(|(_, value)| *value);
                     return Ok(value);
                 }
+                Object::Slice { start, stop, step } => {
+                    let component = match name {
+                        "start" => start,
+                        "stop" => stop,
+                        "step" => step,
+                        _ => return Ok(None),
+                    };
+                    return Ok(Some(component.map_or(Value::None, Value::Int)));
+                }
                 Object::Array { layout, dtype, .. } => {
                     let value = match name {
                         "shape" => Some(
@@ -1968,6 +1973,11 @@ impl<'a> Vm<'a> {
         let index = self.pop()?;
         let owner = self.pop()?;
         if let Some(value) = self.invoke_slot(&owner, Slot::GetItem, "__getitem__", vec![index])? {
+            self.stack.push(value);
+            return Ok(());
+        }
+        if let Some((start, stop, step)) = self.slice_parts(&index) {
+            let value = self.load_builtin_slice(owner, start, stop, step)?;
             self.stack.push(value);
             return Ok(());
         }
@@ -2106,83 +2116,47 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
-    fn load_slice(
+    fn load_builtin_slice(
         &mut self,
-        has_start: bool,
-        has_stop: bool,
-        has_step: bool,
-    ) -> Result<(), String> {
-        let step = if has_step {
-            Some(
-                self.pop()?
-                    .as_int()
-                    .ok_or("slice step must be an integer")?,
-            )
-        } else {
-            None
-        };
-        let stop = if has_stop {
-            Some(
-                self.pop()?
-                    .as_int()
-                    .ok_or("slice stop must be an integer")?,
-            )
-        } else {
-            None
-        };
-        let start = if has_start {
-            Some(
-                self.pop()?
-                    .as_int()
-                    .ok_or("slice start must be an integer")?,
-            )
-        } else {
-            None
-        };
-        let owner = self.pop()?;
-        if let Some(SlotValue::NativeSlice(call)) =
-            self.state.types.slot(self.type_id(&owner)?, Slot::Slice)?
-        {
-            let value = call(self, owner, start, stop, step)
-                .map_err(|error| self.record_native_error(error))?
-                .ok_or("slice operation declined by its registered type")?;
-            self.stack.push(value);
-            return Ok(());
-        }
+        owner: Value,
+        start: Option<i64>,
+        stop: Option<i64>,
+        step: Option<i64>,
+    ) -> Result<Value, String> {
         let string_slice = protocol::string_ref(&self.state.heap, &owner)?
             .map(|text| select_string_slice(text.as_str(), text.is_ascii(), start, stop, step))
             .transpose()?;
-        let value = if let Some((selected, units)) = string_slice {
+        if let Some((selected, units)) = string_slice {
             self.charge_cpu(units)?;
-            self.allocate_string(selected)?
-        } else if let Some(bytes) = protocol::bytes_value(&self.state.heap, &owner)? {
-            let indices = slice_indices(bytes.len(), start, stop, step)?;
-            self.charge_cpu(u64::try_from(indices.len()).unwrap_or(u64::MAX))?;
-            let selected = indices.into_iter().map(|index| bytes[index]).collect();
-            if self.type_id(&owner)? == BuiltinType::ByteArray.id() {
+            return self.allocate_string(selected);
+        }
+        if let Some(bytes) = protocol::bytes_value(&self.state.heap, &owner)? {
+            let plan = SlicePlan::new(bytes.len(), start, stop, step)?;
+            self.charge_cpu(u64::try_from(plan.len()).unwrap_or(u64::MAX))?;
+            let selected = plan.indices().map(|index| bytes[index]).collect();
+            let selected = if self.type_id(&owner)? == BuiltinType::ByteArray.id() {
                 self.allocate_bytearray(selected)?
             } else {
                 self.allocate_bytes(selected)?
-            }
-        } else if let Some(id) = owner.object_id() {
+            };
+            return Ok(selected);
+        }
+        if let Some(id) = owner.object_id() {
             let (values, tuple) = match self.state.heap.get(id)?.clone() {
                 Object::List(values) => (values, false),
                 Object::Tuple(values) => (values, true),
                 _ => return Err("object is not sliceable".into()),
             };
-            let indices = slice_indices(values.len(), start, stop, step)?;
-            self.charge_cpu(u64::try_from(indices.len()).unwrap_or(u64::MAX))?;
-            let selected = indices.into_iter().map(|index| values[index]).collect();
-            self.allocate_object(if tuple {
+            let plan = SlicePlan::new(values.len(), start, stop, step)?;
+            self.charge_cpu(u64::try_from(plan.len()).unwrap_or(u64::MAX))?;
+            let selected = plan.indices().map(|index| values[index]).collect();
+            return self.allocate_object(if tuple {
                 Object::Tuple(selected)
             } else {
                 Object::List(selected)
-            })?
-        } else {
-            return Err("object is not sliceable".into());
-        };
-        self.stack.push(value);
-        Ok(())
+            });
+        }
+        Err("object is not sliceable".into())
     }
 
     fn build_slice(
@@ -3072,9 +3046,6 @@ impl<'a> Vm<'a> {
                     return Err("unary protocol slot received arguments".into());
                 }
                 return call(self, *receiver).map_err(|error| self.record_native_error(error));
-            }
-            SlotValue::NativeSlice(_) => {
-                return Err("slice protocol invoked through the wrong operation".into())
             }
             SlotValue::Descriptor(descriptor) => descriptor,
         };
@@ -7498,50 +7469,6 @@ fn format_text(value: &str, spec: &str) -> Result<String, String> {
     ))
 }
 
-fn slice_indices(
-    length: usize,
-    start: Option<i64>,
-    stop: Option<i64>,
-    step: Option<i64>,
-) -> Result<Vec<usize>, String> {
-    let length = i64::try_from(length).map_err(|_| "sequence is too large to slice")?;
-    let step = step.unwrap_or(1);
-    if step == 0 {
-        return Err("slice step cannot be zero".into());
-    }
-    let normalize = |value: i64, minimum: i64, maximum: i64| {
-        let value = if value < 0 {
-            value.saturating_add(length)
-        } else {
-            value
-        };
-        value.clamp(minimum, maximum)
-    };
-    let (mut current, stop) = if step > 0 {
-        (
-            start.map_or(0, |value| normalize(value, 0, length)),
-            stop.map_or(length, |value| normalize(value, 0, length)),
-        )
-    } else {
-        (
-            start.map_or(length - 1, |value| normalize(value, -1, length - 1)),
-            stop.map_or(-1, |value| normalize(value, -1, length - 1)),
-        )
-    };
-    let mut indices = Vec::new();
-    while if step > 0 {
-        current < stop
-    } else {
-        current > stop
-    } {
-        indices.push(usize::try_from(current).map_err(|_| "slice index out of range")?);
-        current = current
-            .checked_add(step)
-            .ok_or("slice index arithmetic overflow")?;
-    }
-    Ok(indices)
-}
-
 fn select_string_slice(
     value: &str,
     is_ascii: bool,
@@ -7552,24 +7479,23 @@ fn select_string_slice(
     debug_assert_eq!(value.is_ascii(), is_ascii);
     let characters = (!is_ascii).then(|| value.chars().collect::<Vec<_>>());
     let length = characters.as_ref().map_or(value.len(), Vec::len);
-    let indices = slice_indices(length, start, stop, step)?;
-    let units = u64::try_from(indices.len()).unwrap_or(u64::MAX);
-    let selected = if is_ascii && step.unwrap_or(1) == 1 {
-        match (indices.first(), indices.last()) {
-            (Some(first), Some(last)) => value
-                .get(*first..last.saturating_add(1))
-                .expect("ASCII slice indices are byte boundaries")
-                .to_owned(),
-            _ => String::new(),
-        }
+    let plan = SlicePlan::new(length, start, stop, step)?;
+    let units = u64::try_from(plan.len()).unwrap_or(u64::MAX);
+    let selected = if is_ascii && plan.step() == 1 {
+        let range = plan
+            .contiguous_range()
+            .expect("unit-step slices are contiguous");
+        value
+            .get(range)
+            .expect("ASCII slice indices are byte boundaries")
+            .to_owned()
     } else if is_ascii {
-        indices
-            .into_iter()
+        plan.indices()
             .map(|index| char::from(value.as_bytes()[index]))
             .collect()
     } else {
         let characters = characters.expect("non-ASCII slices materialize code points");
-        indices.into_iter().map(|index| characters[index]).collect()
+        plan.indices().map(|index| characters[index]).collect()
     };
     Ok((selected, units))
 }
