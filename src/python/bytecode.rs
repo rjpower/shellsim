@@ -40,7 +40,10 @@ pub enum Operation {
     DeleteName(String),
     DeleteGlobal(String),
     DeleteSubscript,
-    Import(String),
+    Import {
+        name: String,
+        bind_root: bool,
+    },
     LoadAttribute(String),
     LoadSubscript,
     LoadSlice {

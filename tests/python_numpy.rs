@@ -383,6 +383,31 @@ print(np.inner([1, 2], [3, 4]), np.outer([1, 2], [3, 4]).tolist())
 }
 
 #[test]
+fn workload_driven_numeric_helpers_use_the_generic_array_contract() {
+    let source = r#"import numpy as np
+print(np.pi > 3.14, np.inf > 1e300, np.__version__)
+print(np.log2([1, 8]).tolist(), np.rint([1.5, 2.5, -1.5]).tolist())
+print(np.sign([-3, 0, 4]).tolist())
+print(np.isnan([0.0, np.nan]).tolist(), np.isinf([np.inf, 1.0]).tolist())
+print(np.diag([1, 2, 3]).tolist())
+print(np.diag([1, 2, 3], k=1).tolist())
+print(np.diag([[1, 2, 3], [4, 5, 6]], k=1).tolist())
+print(np.argsort([3, 1, 2], kind="stable").tolist())
+print(np.argsort([[3, 1], [2, 0]]).tolist())
+print(np.allclose([[1.0], [2.0]], [1.0, 2.0]))
+print(np.percentile([0, 10, 20, 30], 25))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"True True 2.0.0-shellsim\n[0.0, 3.0] [2.0, 2.0, -2.0]\n[-1, 0, 1]\n[False, True] [True, False]\n[[1, 0, 0], [0, 2, 0], [0, 0, 3]]\n[[0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 3], [0, 0, 0, 0]]\n[2, 6]\n[1, 2, 0]\n[[1, 0], [1, 0]]\nFalse\n7.5\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
 fn unsupported_or_invalid_array_operations_fail_explicitly() {
     for (source, expected) in [
         (

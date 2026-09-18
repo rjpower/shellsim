@@ -28,6 +28,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             name: "getcwd",
             call: getcwd,
         },
+        FunctionDef {
+            module: "_os",
+            name: "chdir",
+            call: chdir,
+        },
     ],
     values: &[ValueDef::Factory {
         name: "environ",
@@ -38,12 +43,16 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
 fn getcwd(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("os.getcwd", 0, 0)?;
     args.reject_keywords("os.getcwd")?;
-    runtime.new_string(
-        runtime
-            .environment()
-            .get("PWD")
-            .unwrap_or_else(|| "/".into()),
-    )
+    let directory = runtime.filesystem().current_dir();
+    runtime.new_string(directory)
+}
+
+fn chdir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("os.chdir", 1, 1)?;
+    args.reject_keywords("os.chdir")?;
+    let PyString(path) = args.positional()[0].cast(runtime)?;
+    runtime.filesystem().change_dir(&path)?;
+    Ok(Value::None)
 }
 
 fn getenv(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {

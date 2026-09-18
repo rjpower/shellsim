@@ -342,6 +342,10 @@ pub(super) trait PyProcessRunner {
 /// this capability explicitly so neither the bytecode VM nor stdlib facades need to know VFS
 /// path, quota, or mutation-time policy.
 pub(super) trait PyFilesystem {
+    /// Return the current directory of the simulated Python process.
+    fn current_dir(&self) -> String;
+    /// Change only the simulated process directory after validating it in the VFS.
+    fn change_dir(&mut self, path: &str) -> PyResult<()>;
     fn read_text(&mut self, path: &str) -> PyResult<String>;
     fn write_text(&mut self, path: &str, contents: &str) -> PyResult<()>;
     fn append_text(&mut self, path: &str, contents: &str) -> PyResult<usize>;
@@ -378,6 +382,7 @@ pub(super) trait PyRuntime {
     fn bytearray_items(&mut self, value: PyByteArray) -> PyResult<Vec<u8>>;
     fn replace_bytearray_items(&mut self, value: PyByteArray, items: Vec<u8>) -> PyResult<()>;
     fn is_integer_type(&self, value: &PyValue) -> bool;
+    fn is_string_type(&self, value: &PyValue) -> bool;
     /// Return an exact decimal rendering for any Python integer representation.
     fn integer_text(&self, value: &PyValue) -> PyResult<Option<String>>;
     /// Write only to an interpreter-owned simulated stream marker.
@@ -464,17 +469,41 @@ pub(super) trait PyRuntime {
     fn mark_dataclass(&mut self, class: PyClass) -> PyResult<()>;
     fn argv0(&self) -> String;
     fn new_argv(&mut self) -> PyResult<PyValue>;
-    fn new_argument_parser(&mut self, program: String) -> PyResult<PyValue>;
-    fn argument_parser_parts(
+    fn new_argument_parser(
         &mut self,
-        parser: PyArgumentParser,
-    ) -> PyResult<(String, Vec<PyArgumentSpec>)>;
+        program: String,
+        description: Option<String>,
+        add_help: bool,
+        is_subcommand: bool,
+    ) -> PyResult<PyValue>;
+    fn argument_parser_parts(&mut self, parser: PyArgumentParser)
+        -> PyResult<PyArgumentParserData>;
     fn append_argument(
         &mut self,
         parser: PyArgumentParser,
         argument: PyArgumentSpec,
     ) -> PyResult<()>;
+    fn configure_subparsers(
+        &mut self,
+        parser: PyArgumentParser,
+        subparsers: PySubparsersSpec,
+    ) -> PyResult<()>;
+    fn append_subcommand(
+        &mut self,
+        parser: PyArgumentParser,
+        command: PySubcommandSpec,
+    ) -> PyResult<()>;
     fn command_arguments(&self) -> Vec<String>;
+    /// Allocate an empty VM module whose globals are isolated from the caller.
+    fn new_module(
+        &mut self,
+        name: String,
+        path: String,
+        spec: PyValue,
+        loader: PyValue,
+    ) -> PyResult<PyValue>;
+    /// Execute one bounded VFS source file in an existing VM module namespace.
+    fn exec_module(&mut self, module: PyModule, path: &str) -> PyResult<()>;
     fn new_namespace(&mut self, values: Vec<(String, PyValue)>) -> PyResult<PyValue>;
     fn new_raises_context(&mut self, expected: String) -> PyResult<PyValue>;
     fn raises_expected(&self, context: PyRaisesContext) -> PyResult<String>;
@@ -680,8 +709,37 @@ pub(super) struct PyArgumentSpec {
     pub required: bool,
     pub default: PyValue,
     pub store_true: bool,
+    pub store_false: bool,
     pub integer: bool,
     pub choices: Vec<PyValue>,
+    pub help: Option<String>,
+}
+
+/// One command registered on an ``argparse`` subparser collection.
+#[derive(Clone, Debug)]
+pub(super) struct PySubcommandSpec {
+    pub name: String,
+    pub help: Option<String>,
+    pub parser: PyArgumentParser,
+}
+
+/// Owned definition of the deliberately one-level subparser surface.
+#[derive(Clone, Debug)]
+pub(super) struct PySubparsersSpec {
+    pub dest: Option<String>,
+    pub required: bool,
+    pub help: Option<String>,
+    pub commands: Vec<PySubcommandSpec>,
+}
+
+/// Metered snapshot of an interpreter-owned argument parser.
+#[derive(Clone, Debug)]
+pub(super) struct PyArgumentParserData {
+    pub prog: String,
+    pub description: Option<String>,
+    pub add_help: bool,
+    pub arguments: Vec<PyArgumentSpec>,
+    pub subparsers: Option<PySubparsersSpec>,
 }
 
 /// Checked handle to an interpreter-owned argument parser.
@@ -703,6 +761,29 @@ impl FromPyValue for PyArgumentParser {
             Ok(Self(id))
         } else {
             Err(PyError::type_error("expected ArgumentParser"))
+        }
+    }
+}
+
+/// Checked handle to an interpreter-owned Python module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PyModule(ObjectId);
+
+impl PyModule {
+    pub(super) fn object_id(self) -> ObjectId {
+        self.0
+    }
+}
+
+impl FromPyValue for PyModule {
+    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
+        let Some(id) = value.object_id() else {
+            return Err(PyError::type_error("expected module"));
+        };
+        if runtime.kind(&Value::Object(id))? == PyKind::Module {
+            Ok(Self(id))
+        } else {
+            Err(PyError::type_error("expected module"))
         }
     }
 }

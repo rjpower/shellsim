@@ -154,7 +154,11 @@ pub enum Object {
     },
     ArgumentParser {
         prog: String,
+        description: Option<String>,
+        add_help: bool,
+        is_subcommand: bool,
         arguments: Vec<PyArgumentSpec>,
+        subparsers: Option<super::native::PySubparsersSpec>,
     },
     Namespace {
         values: Vec<(String, Value)>,
@@ -572,9 +576,23 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
                     .sum(),
             )
             .ok_or("modeled object size overflow")?,
-        Object::ArgumentParser { prog, arguments } => prog
+        Object::ArgumentParser {
+            prog,
+            description,
+            arguments,
+            subparsers,
+            ..
+        } => prog
             .len()
-            .checked_add(arguments.len())
+            .checked_add(description.as_ref().map_or(0, String::len))
+            .and_then(|size| size.checked_add(arguments.len()))
+            .and_then(|size| {
+                size.checked_add(
+                    subparsers
+                        .as_ref()
+                        .map_or(0, |subparsers| subparsers.commands.len()),
+                )
+            })
             .ok_or("modeled object size overflow")?,
         Object::Namespace { values } => values.len(),
         Object::RaisesContext { expected } => expected.len(),

@@ -334,6 +334,7 @@ pub struct ReplState {
     types: object_model::TypeRegistry,
     modules: HashMap<String, Value>,
     import_paths: Vec<String>,
+    original_cwd: Option<String>,
 }
 
 enum ExecResult {
@@ -351,6 +352,7 @@ pub(crate) struct PythonContinuation {
     program: vm::VmProgram,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    original_cwd: String,
 }
 
 /// Result of parsing and starting a Python command.
@@ -392,6 +394,9 @@ impl PythonContinuation {
             vm::VmPoll::Blocked(reason) => return PythonPoll::Blocked(reason),
             vm::VmPoll::Ready(result) => result,
         };
+        if interp.cwd != self.original_cwd {
+            interp.set_var("PWD", self.original_cwd.clone());
+        }
         PythonPoll::Ready(match result {
             ExecResult::Continue => 0,
             ExecResult::Exit(status) => status,
@@ -462,7 +467,10 @@ pub(crate) fn start_python(
             Vec::new(),
         )
     } else if args.is_empty() {
-        let mut state = ReplState::default();
+        let mut state = ReplState {
+            original_cwd: Some(interp.cwd.clone()),
+            ..ReplState::default()
+        };
         state.import_paths.push(interp.cwd.clone());
         interp.python_repl = Some(state);
         out.extend_from_slice(
@@ -530,6 +538,7 @@ pub(crate) fn start_python(
         program,
         stdout: Vec::new(),
         stderr: Vec::new(),
+        original_cwd: interp.cwd.clone(),
     }))
 }
 
@@ -574,6 +583,8 @@ pub fn run_repl_line(
     interp.resources.release_memory(scratch);
     if stay {
         out.extend_from_slice(b">>> ");
+    } else if let Some(original_cwd) = state.original_cwd.take() {
+        interp.set_var("PWD", original_cwd);
     }
     (status, stay)
 }

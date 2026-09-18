@@ -14,6 +14,23 @@ use super::native::{PyError, PyFileMetadata, PyFilesystem, PyResult};
 const MAX_TEXT_FILE: usize = 4 * 1024 * 1024;
 const MODELED_GLOB_RESULT_BYTES: usize = 64;
 
+/// Preserve ordinary Python filesystem exception boundaries while keeping resource exhaustion
+/// distinct for the shellsim harness.
+fn map_vfs_error(error: VfsError) -> PyError {
+    let message = error.to_string();
+    match error {
+        VfsError::NotFound(_) => PyError::exception("FileNotFoundError", message),
+        VfsError::NotADir(_) => PyError::exception("NotADirectoryError", message),
+        VfsError::IsADir(_) => PyError::exception("IsADirectoryError", message),
+        VfsError::Exists(_) => PyError::exception("FileExistsError", message),
+        VfsError::ReadOnly(_) => PyError::exception("PermissionError", message),
+        VfsError::NoSpace | VfsError::TooLarge { .. } => PyError::resource_error(message),
+        VfsError::NotEmpty(_) | VfsError::Loop(_) | VfsError::Invalid(_) => {
+            PyError::exception("OSError", message)
+        }
+    }
+}
+
 /// Capability used by the VM to discover Python source without learning VFS layout policy.
 pub(super) trait PyModuleLoader {
     fn load_module_source(
@@ -42,10 +59,28 @@ fn reserve_memory(interp: &mut Interp, bytes: usize) -> PyResult<()> {
 }
 
 impl PyFilesystem for Interp {
+    fn current_dir(&self) -> String {
+        self.cwd.clone()
+    }
+
+    fn change_dir(&mut self, path: &str) -> PyResult<()> {
+        let absolute = resolve_against(&self.cwd, path);
+        let resolved = self.vfs.realpath(&absolute, true).map_err(map_vfs_error)?;
+        let node = self
+            .fs_metadata("/", &resolved, true)
+            .map_err(map_vfs_error)?;
+        if !matches!(node.kind, crate::vfs::NodeKind::Dir) {
+            return Err(PyError::exception(
+                "NotADirectoryError",
+                format!("Not a directory: {path}"),
+            ));
+        }
+        self.set_var("PWD", resolved);
+        Ok(())
+    }
+
     fn read_text(&mut self, path: &str) -> PyResult<String> {
-        let length = self
-            .fs_file_len(&self.cwd, path)
-            .map_err(|error| PyError::runtime_error(error.to_string()))?;
+        let length = self.fs_file_len(&self.cwd, path).map_err(map_vfs_error)?;
         if length > MAX_TEXT_FILE {
             return Err(PyError::resource_error("text file exceeds the 4 MiB limit"));
         }
@@ -53,7 +88,7 @@ impl PyFilesystem for Interp {
         charge_cpu(self, length)?;
         let bytes = self
             .fs_read_limited(&self.cwd, path, MAX_TEXT_FILE)
-            .map_err(|error| PyError::runtime_error(error.to_string()))?;
+            .map_err(map_vfs_error)?;
         String::from_utf8(bytes)
             .map_err(|_| PyError::runtime_error(format!("file is not UTF-8: {path}")))
     }
@@ -65,10 +100,7 @@ impl PyFilesystem for Interp {
         self.sync_vfs_time();
         self.vfs
             .put_file(&path, contents.as_bytes().to_vec(), 0o644)
-            .map_err(|error| match error {
-                VfsError::NoSpace => PyError::resource_error(error.to_string()),
-                _ => PyError::runtime_error(error.to_string()),
-            })
+            .map_err(map_vfs_error)
     }
 
     fn append_text(&mut self, path: &str, contents: &str) -> PyResult<usize> {
@@ -76,9 +108,7 @@ impl PyFilesystem for Interp {
     }
 
     fn read_bytes(&mut self, path: &str) -> PyResult<Vec<u8>> {
-        let length = self
-            .fs_file_len(&self.cwd, path)
-            .map_err(|error| PyError::runtime_error(error.to_string()))?;
+        let length = self.fs_file_len(&self.cwd, path).map_err(map_vfs_error)?;
         if length > MAX_TEXT_FILE {
             return Err(PyError::resource_error(
                 "binary file exceeds the 4 MiB limit",
@@ -87,7 +117,7 @@ impl PyFilesystem for Interp {
         reserve_memory(self, length)?;
         charge_cpu(self, length)?;
         self.fs_read_limited(&self.cwd, path, MAX_TEXT_FILE)
-            .map_err(|error| PyError::runtime_error(error.to_string()))
+            .map_err(map_vfs_error)
     }
 
     fn write_bytes(&mut self, path: &str, contents: &[u8]) -> PyResult<()> {
@@ -97,10 +127,7 @@ impl PyFilesystem for Interp {
         self.sync_vfs_time();
         self.vfs
             .put_file(&path, contents.to_vec(), 0o644)
-            .map_err(|error| match error {
-                VfsError::NoSpace => PyError::resource_error(error.to_string()),
-                _ => PyError::runtime_error(error.to_string()),
-            })
+            .map_err(map_vfs_error)
     }
 
     fn append_bytes(&mut self, path: &str, contents: &[u8]) -> PyResult<usize> {
@@ -110,17 +137,13 @@ impl PyFilesystem for Interp {
     fn remove_file(&mut self, path: &str) -> PyResult<()> {
         self.sync_vfs_time();
         let cwd = self.cwd.clone();
-        self.vfs
-            .remove_file(&cwd, path)
-            .map_err(|error| PyError::runtime_error(error.to_string()))
+        self.vfs.remove_file(&cwd, path).map_err(map_vfs_error)
     }
 
     fn remove_tree(&mut self, path: &str) -> PyResult<()> {
         self.sync_vfs_time();
         let cwd = self.cwd.clone();
-        self.vfs
-            .remove_all(&cwd, path)
-            .map_err(|error| PyError::runtime_error(error.to_string()))
+        self.vfs.remove_all(&cwd, path).map_err(map_vfs_error)
     }
 
     fn rename(&mut self, source: &str, destination: &str) -> PyResult<()> {
@@ -128,7 +151,7 @@ impl PyFilesystem for Interp {
         let cwd = self.cwd.clone();
         self.vfs
             .rename(&cwd, source, destination)
-            .map_err(|error| PyError::runtime_error(error.to_string()))
+            .map_err(map_vfs_error)
     }
 
     fn exists(&self, path: &str) -> bool {
@@ -146,7 +169,7 @@ impl PyFilesystem for Interp {
     fn metadata(&self, path: &str) -> PyResult<PyFileMetadata> {
         let node = self
             .fs_metadata(&self.cwd, path, true)
-            .map_err(|error| PyError::runtime_error(error.to_string()))?;
+            .map_err(map_vfs_error)?;
         let size = match &node.kind {
             crate::vfs::NodeKind::File(data) => data.len(),
             crate::vfs::NodeKind::Symlink(target) => target.len(),
@@ -169,7 +192,7 @@ impl PyFilesystem for Interp {
         } else {
             self.vfs.mkdir(&cwd, path)
         };
-        result.map_err(|error| PyError::runtime_error(error.to_string()))
+        result.map_err(map_vfs_error)
     }
 
     fn glob(&mut self, pattern: &str) -> PyResult<Vec<String>> {
@@ -215,13 +238,8 @@ impl Interp {
         self.sync_vfs_time();
         self.vfs
             .append("/", &path, contents, 0o644)
-            .map_err(|error| match error {
-                VfsError::NoSpace => PyError::resource_error(error.to_string()),
-                _ => PyError::runtime_error(error.to_string()),
-            })?;
-        self.vfs
-            .file_len("/", &path)
-            .map_err(|error| PyError::runtime_error(error.to_string()))
+            .map_err(map_vfs_error)?;
+        self.vfs.file_len("/", &path).map_err(map_vfs_error)
     }
 }
 

@@ -92,12 +92,25 @@ impl Compiler {
         let span = statement.span;
         match statement.kind {
             StatementKind::Import { module, binding } => {
-                self.emit(Operation::Import(module), span);
+                let bind_root = module.split('.').next().is_some_and(|root| root == binding);
+                self.emit(
+                    Operation::Import {
+                        name: module,
+                        bind_root,
+                    },
+                    span,
+                );
                 self.emit(Operation::StoreName(binding), span);
             }
             StatementKind::ImportFrom { module, names: _ } if module == "__future__" => {}
             StatementKind::ImportFrom { module, names } => {
-                self.emit(Operation::Import(module), span);
+                self.emit(
+                    Operation::Import {
+                        name: module,
+                        bind_root: false,
+                    },
+                    span,
+                );
                 for (imported, binding) in names {
                     self.emit(Operation::Copy(1), span);
                     self.emit(Operation::LoadAttribute(imported), span);

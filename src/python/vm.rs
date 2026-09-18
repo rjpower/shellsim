@@ -14,12 +14,12 @@ use super::bytecode::{ClassField, Code, Operation};
 use super::filesystem::PyModuleLoader;
 use super::heap::{ClassLayout, InstancePayload, Object, ScopeId};
 use super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentSpec, PyArray, PyArrayDtype,
-    PyArrayLayout, PyBinaryOp, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment,
-    PyError, PyErrorKind, PyFilesystem, PyIdentity, PyInstance, PyIterator, PyKind, PyList,
-    PyMarker, PyMatch, PyMatchData, PyNativeKind, PyProcessHandle, PyProcessOutput,
-    PyProcessRunner, PyProcessStartRequest, PyProperty, PyRaisesContext, PyRegex, PyResult,
-    PyRuntime, PySet, PyTuple, PyValueCast,
+    CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
+    PyArray, PyArrayDtype, PyArrayLayout, PyBinaryOp, PyByteArray, PyCallable, PyClass, PyClock,
+    PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyIdentity, PyInstance, PyIterator,
+    PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind, PyProcessHandle,
+    PyProcessOutput, PyProcessRunner, PyProcessStartRequest, PyProperty, PyRaisesContext, PyRegex,
+    PyResult, PyRuntime, PySet, PySubcommandSpec, PySubparsersSpec, PyTuple, PyValueCast,
 };
 use super::object_model::{BuiltinType, PyLayout, Slot, SlotValue, TypeId};
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
@@ -153,6 +153,12 @@ fn exception_type_code(name: &str) -> u64 {
         "CalledProcessError" => 13,
         "TimeoutExpired" => 14,
         "EOFError" => 15,
+        "OSError" => 16,
+        "FileNotFoundError" => 17,
+        "FileExistsError" => 18,
+        "IsADirectoryError" => 19,
+        "NotADirectoryError" => 20,
+        "PermissionError" => 21,
         _ => unreachable!("exception type must come from the closed builtin table"),
     }
 }
@@ -175,6 +181,12 @@ fn exception_type_name(code: u64) -> &'static str {
         13 => "CalledProcessError",
         14 => "TimeoutExpired",
         15 => "EOFError",
+        16 => "OSError",
+        17 => "FileNotFoundError",
+        18 => "FileExistsError",
+        19 => "IsADirectoryError",
+        20 => "NotADirectoryError",
+        21 => "PermissionError",
         _ => unreachable!("invalid private exception-type handle"),
     }
 }
@@ -625,7 +637,7 @@ impl<'a> Vm<'a> {
                 }
                 Operation::DeleteGlobal(name) => self.delete_global(name),
                 Operation::DeleteSubscript => self.delete_subscript(),
-                Operation::Import(name) => self.import(name),
+                Operation::Import { name, bind_root } => self.import(name, *bind_root),
                 Operation::LoadAttribute(name) => self.load_attribute(name),
                 Operation::LoadSubscript => self.load_subscript(),
                 Operation::LoadSlice {
@@ -1078,7 +1090,7 @@ impl<'a> Vm<'a> {
             return Ok(());
         }
         if let Some((module_name, attribute)) = super::stdlib::frozen_builtin(name) {
-            self.import(module_name)?;
+            self.import(module_name, false)?;
             let module = self.pop()?;
             let callable = self.resolve_attribute(module, attribute)?.ok_or_else(|| {
                 format!("frozen module {module_name:?} does not define {attribute:?}")
@@ -1177,6 +1189,36 @@ impl<'a> Vm<'a> {
                         "EOFError",
                     ))))
                 }
+                "OSError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "OSError",
+                    ))))
+                }
+                "FileNotFoundError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "FileNotFoundError",
+                    ))))
+                }
+                "FileExistsError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "FileExistsError",
+                    ))))
+                }
+                "IsADirectoryError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "IsADirectoryError",
+                    ))))
+                }
+                "NotADirectoryError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "NotADirectoryError",
+                    ))))
+                }
+                "PermissionError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "PermissionError",
+                    ))))
+                }
                 "AssertionError" => {
                     return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
                         "AssertionError",
@@ -1234,7 +1276,19 @@ impl<'a> Vm<'a> {
 
     fn exception_type_matches(&mut self, expected: Value, actual: &str) -> Result<bool, String> {
         if let Some(NativeValue::ExceptionType(ExceptionType(name))) = expected.native_value() {
-            return Ok(name == "BaseException" || name == "Exception" || name == actual);
+            let os_error = matches!(
+                actual,
+                "OSError"
+                    | "FileNotFoundError"
+                    | "FileExistsError"
+                    | "IsADirectoryError"
+                    | "NotADirectoryError"
+                    | "PermissionError"
+            );
+            return Ok(name == "BaseException"
+                || name == "Exception"
+                || name == actual
+                || (name == "OSError" && os_error));
         }
         let Some(id) = expected.object_id() else {
             return Err(
@@ -1286,14 +1340,12 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
-    fn import(&mut self, name: &str) -> Result<(), String> {
+    fn import(&mut self, name: &str, bind_root: bool) -> Result<(), String> {
         if let Some(module) = super::stdlib::native_module(name) {
-            self.stack.push(Value::Native(NativeValue::Module(module)));
-            return Ok(());
+            return self.finish_import(name, Value::Native(NativeValue::Module(module)), bind_root);
         }
         if let Some(module) = self.state.modules.get(name).cloned() {
-            self.stack.push(module);
-            return Ok(());
+            return self.finish_import(name, module, bind_root);
         }
 
         let relative_name = name.trim_start_matches('.');
@@ -1367,10 +1419,7 @@ impl<'a> Vm<'a> {
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
-            Ok(Execution::Halt) => {
-                self.stack.push(module);
-                Ok(())
-            }
+            Ok(Execution::Halt) => self.finish_import(name, module, bind_root),
             Ok(Execution::Return(_)) => {
                 self.state.modules.remove(name);
                 Err(format!("'return' outside function in module {name:?}"))
@@ -1391,6 +1440,57 @@ impl<'a> Vm<'a> {
                 ))
             }
         }
+    }
+
+    /// Install synthetic package parents for a dotted import and push the value selected by
+    /// Python's ordinary import binding rule. Package objects contain only VM module references.
+    fn finish_import(&mut self, name: &str, leaf: Value, bind_root: bool) -> Result<(), String> {
+        if !bind_root || !name.contains('.') {
+            self.stack.push(leaf);
+            return Ok(());
+        }
+        let parts = name.split('.').collect::<Vec<_>>();
+        let mut child = leaf;
+        for parent_end in (1..parts.len()).rev() {
+            let parent_name = parts[..parent_end].join(".");
+            let child_name = parts[parent_end];
+            let parent = if let Some(parent) = self.state.modules.get(&parent_name).copied() {
+                let Some(parent_id) = parent.object_id() else {
+                    return Err(format!("module {parent_name:?} cannot contain submodules"));
+                };
+                let Object::Module { scope, .. } = self.state.heap.get(parent_id)? else {
+                    return Err(format!("module {parent_name:?} changed object kind"));
+                };
+                let scope = *scope;
+                self.state.heap.scope_insert(
+                    scope,
+                    child_name.to_string(),
+                    child,
+                    &mut self.interp.resources,
+                )?;
+                parent
+            } else {
+                let module_name = self.allocate_string(parent_name.clone())?;
+                let scope = self.state.heap.allocate_scope(
+                    None,
+                    false,
+                    HashMap::from([
+                        ("__name__".into(), module_name),
+                        (child_name.to_string(), child),
+                    ]),
+                    &mut self.interp.resources,
+                )?;
+                let parent = self.allocate_object(Object::Module {
+                    name: parent_name.clone(),
+                    scope,
+                })?;
+                self.state.modules.insert(parent_name, parent);
+                parent
+            };
+            child = parent;
+        }
+        self.stack.push(child);
+        Ok(())
     }
 
     fn load_attribute(&mut self, name: &str) -> Result<(), String> {
@@ -3134,14 +3234,38 @@ impl<'a> Vm<'a> {
         self.state.types.value(self.type_id(value)?)
     }
 
-    fn is_instance(&self, value: &Value, class: &Value) -> Result<bool, String> {
+    fn is_instance(&mut self, value: &Value, class: &Value) -> Result<bool, String> {
+        if let Some(class_id) = class.object_id() {
+            if let Object::Tuple(classes) = self.state.heap.get(class_id)? {
+                let classes = classes.clone();
+                for class in classes {
+                    self.charge_cpu(1)?;
+                    if self.is_instance(value, &class)? {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+        }
         let class = self
             .class_type_id(class)?
             .ok_or("isinstance() requires a class argument")?;
         self.state.types.is_subclass(self.type_id(value)?, class)
     }
 
-    fn is_subclass(&self, class: &Value, base: &Value) -> Result<bool, String> {
+    fn is_subclass(&mut self, class: &Value, base: &Value) -> Result<bool, String> {
+        if let Some(base_id) = base.object_id() {
+            if let Object::Tuple(bases) = self.state.heap.get(base_id)? {
+                let bases = bases.clone();
+                for base in bases {
+                    self.charge_cpu(1)?;
+                    if self.is_subclass(class, &base)? {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+        }
         let class = self
             .class_type_id(class)?
             .ok_or("issubclass() requires a class argument")?;
@@ -5280,6 +5404,13 @@ impl PyRuntime for Vm<'_> {
         )
     }
 
+    fn is_string_type(&self, value: &Value) -> bool {
+        matches!(
+            value.native_value(),
+            Some(NativeValue::BuiltinType(BuiltinType::String))
+        )
+    }
+
     fn integer_text(&self, value: &Value) -> PyResult<Option<String>> {
         Ok(match super::number::view(&self.state.heap, value) {
             Some(super::number::NumberRef::Int(value)) => Some(value.to_string()),
@@ -6156,12 +6287,22 @@ impl PyRuntime for Vm<'_> {
         self.new_list(values)
     }
 
-    fn new_argument_parser(&mut self, program: String) -> PyResult<Value> {
+    fn new_argument_parser(
+        &mut self,
+        program: String,
+        description: Option<String>,
+        add_help: bool,
+        is_subcommand: bool,
+    ) -> PyResult<Value> {
         Vm::allocate_object(
             self,
             Object::ArgumentParser {
                 prog: program,
+                description,
+                add_help,
+                is_subcommand,
                 arguments: Vec::new(),
+                subparsers: None,
             },
         )
         .map_err(PyError::resource_error)
@@ -6170,8 +6311,15 @@ impl PyRuntime for Vm<'_> {
     fn argument_parser_parts(
         &mut self,
         parser: PyArgumentParser,
-    ) -> PyResult<(String, Vec<PyArgumentSpec>)> {
-        let Object::ArgumentParser { prog, arguments } = self
+    ) -> PyResult<PyArgumentParserData> {
+        let Object::ArgumentParser {
+            prog,
+            description,
+            add_help,
+            arguments,
+            subparsers,
+            ..
+        } = self
             .state
             .heap
             .get(parser.object_id())
@@ -6181,8 +6329,20 @@ impl PyRuntime for Vm<'_> {
         };
         let bytes = prog
             .len()
-            .saturating_add(arguments.len().saturating_mul(96));
-        let result = (prog.clone(), arguments.clone());
+            .saturating_add(description.as_ref().map_or(0, String::len))
+            .saturating_add(arguments.len().saturating_mul(128))
+            .saturating_add(
+                subparsers
+                    .as_ref()
+                    .map_or(0, |value| value.commands.len().saturating_mul(96)),
+            );
+        let result = PyArgumentParserData {
+            prog: prog.clone(),
+            description: description.clone(),
+            add_help: *add_help,
+            arguments: arguments.clone(),
+            subparsers: subparsers.clone(),
+        };
         self.reserve_memory(bytes)?;
         Ok(result)
     }
@@ -6208,8 +6368,174 @@ impl PyRuntime for Vm<'_> {
         Ok(())
     }
 
+    fn configure_subparsers(
+        &mut self,
+        parser: PyArgumentParser,
+        subparsers: PySubparsersSpec,
+    ) -> PyResult<()> {
+        let Object::ArgumentParser {
+            is_subcommand,
+            subparsers: current,
+            ..
+        } = self
+            .state
+            .heap
+            .get_mut(parser.object_id())
+            .map_err(PyError::runtime_error)?
+        else {
+            return Err(PyError::runtime_error("parser handle changed object kind"));
+        };
+        if *is_subcommand {
+            return Err(PyError::value_error(
+                "nested argparse subparsers are not supported",
+            ));
+        }
+        if current.is_some() {
+            return Err(PyError::value_error("parser already has subparsers"));
+        }
+        *current = Some(subparsers);
+        Ok(())
+    }
+
+    fn append_subcommand(
+        &mut self,
+        parser: PyArgumentParser,
+        command: PySubcommandSpec,
+    ) -> PyResult<()> {
+        self.state
+            .heap
+            .reserve_growth(96, &mut self.interp.resources)
+            .map_err(PyError::resource_error)?;
+        let Object::ArgumentParser { subparsers, .. } = self
+            .state
+            .heap
+            .get_mut(parser.object_id())
+            .map_err(PyError::runtime_error)?
+        else {
+            return Err(PyError::runtime_error("parser handle changed object kind"));
+        };
+        let subparsers = subparsers
+            .as_mut()
+            .ok_or_else(|| PyError::value_error("add_subparsers() must be called first"))?;
+        if subparsers
+            .commands
+            .iter()
+            .any(|candidate| candidate.name == command.name)
+        {
+            return Err(PyError::value_error(format!(
+                "conflicting subparser: {}",
+                command.name
+            )));
+        }
+        subparsers.commands.push(command);
+        Ok(())
+    }
+
     fn command_arguments(&self) -> Vec<String> {
         self.argv.iter().skip(1).cloned().collect()
+    }
+
+    fn new_module(
+        &mut self,
+        name: String,
+        path: String,
+        spec: Value,
+        loader: Value,
+    ) -> PyResult<Value> {
+        let module_name = self
+            .allocate_string(name.clone())
+            .map_err(PyError::resource_error)?;
+        let module_path = self
+            .allocate_string(path)
+            .map_err(PyError::resource_error)?;
+        let package = name
+            .rsplit_once('.')
+            .map_or("", |(package, _)| package)
+            .to_string();
+        let package = self
+            .allocate_string(package)
+            .map_err(PyError::resource_error)?;
+        let scope = self
+            .state
+            .heap
+            .allocate_scope(
+                None,
+                false,
+                HashMap::from([
+                    ("__name__".into(), module_name),
+                    ("__file__".into(), module_path),
+                    ("__package__".into(), package),
+                    ("__spec__".into(), spec),
+                    ("__loader__".into(), loader),
+                ]),
+                &mut self.interp.resources,
+            )
+            .map_err(PyError::resource_error)?;
+        self.allocate_object(Object::Module { name, scope })
+            .map_err(PyError::resource_error)
+    }
+
+    fn exec_module(&mut self, module: PyModule, path: &str) -> PyResult<()> {
+        let source = self.interp.read_text(path)?;
+        let parse_memory = u64::try_from(source.len())
+            .ok()
+            .and_then(|bytes| bytes.checked_mul(4))
+            .ok_or_else(|| PyError::resource_error("module source is too large"))?;
+        if !self.interp.resources.reserve_memory(parse_memory)
+            || !self.interp.resources.charge_cpu(source.len() as u64)
+        {
+            return Err(PyError::resource_error(
+                "resource limit exceeded while loading module",
+            ));
+        }
+        let tokens = super::lexer::lex(&source).map_err(|error| {
+            PyError::runtime_error(format!(
+                "{} in {path} at line {}, column {}",
+                error.message, error.span.line, error.span.column
+            ))
+        })?;
+        let program = super::parser::parse(tokens).map_err(|error| {
+            PyError::runtime_error(format!(
+                "{} in {path} at line {}, column {}",
+                error.message, error.span.line, error.span.column
+            ))
+        })?;
+        let code = super::compiler::compile(program);
+        let Object::Module { scope, .. } = self
+            .state
+            .heap
+            .get(module.object_id())
+            .map_err(PyError::runtime_error)?
+        else {
+            return Err(PyError::runtime_error("module handle changed object kind"));
+        };
+        let scope = *scope;
+        let outer_stack = std::mem::take(&mut self.stack);
+        let import_root = path
+            .rsplit_once('/')
+            .map_or_else(|| "/".to_string(), |(parent, _)| parent.to_string());
+        self.state.import_paths.insert(0, import_root);
+        self.local_scopes.push(scope);
+        let execution = self.execute_code(&code);
+        self.local_scopes.pop();
+        self.state.import_paths.remove(0);
+        self.stack = outer_stack;
+        match execution {
+            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
+            Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
+            Ok(Execution::Halt) => Ok(()),
+            Ok(Execution::Return(_)) => Err(PyError::runtime_error(format!(
+                "'return' outside function in module loaded from {path:?}"
+            ))),
+            Ok(Execution::Yield(_, _)) => Err(PyError::runtime_error(format!(
+                "'yield' outside function in module loaded from {path:?}"
+            ))),
+            Ok(Execution::Exit(status)) => Err(PyError::exit(status)),
+            Err((error, span)) => Err(PyError::runtime_error(format!(
+                "{error} in {path} at line {}, column {}",
+                span.line, span.column
+            ))),
+        }
     }
 
     fn new_namespace(&mut self, values: Vec<(String, Value)>) -> PyResult<Value> {
