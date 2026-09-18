@@ -24,15 +24,15 @@ fn run(source: &str) -> (i32, String, String) {
 fn csv_reader_and_dict_reader_handle_quoted_records() {
     let source = r#"
 import csv
-rows = list(csv.reader(['name,note\n', 'Ada,"one, two"\n', 'Lin,"line 1\n', 'line 2"\n']))
+rows = list(csv.reader(['name,note\n', 'Ada,"one, two"\n', 'Lin,"line 1\n', 'line 2"\n', '\n']))
 print(rows)
-print(list(csv.DictReader(['name,value\n', 'a,1\n'])))
+print(list(csv.DictReader(['name,value\n', 'a,1\n', '\n'])))
 "#;
     assert_eq!(
         run(source),
         (
             0,
-            "[['name', 'note'], ['Ada', 'one, two'], ['Lin', 'line 1\\nline 2']]\n[{'name': 'a', 'value': '1'}]\n".into(),
+            "[['name', 'note'], ['Ada', 'one, two'], ['Lin', 'line 1\\nline 2'], []]\n[{'name': 'a', 'value': '1'}]\n".into(),
             String::new(),
         )
     );

@@ -53,6 +53,7 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "encode", string_encode),
         method("str", "lower", string_lower),
         method("str", "upper", string_upper),
+        method("str", "zfill", string_zfill),
         method("str", "isalnum", string_isalnum),
         method("str", "isalpha", string_isalpha),
         method("str", "isdigit", string_isdigit),
@@ -526,6 +527,39 @@ fn string_startswith(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallA
 
 fn string_endswith(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     string_affix(runtime, receiver, args, false)
+}
+
+fn string_zfill(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.zfill", 1, 1)?;
+    args.reject_keywords("str.zfill")?;
+    let PyString(value) = receiver.cast(runtime)?;
+    let width = runtime
+        .int_value(&args.positional()[0])
+        .ok_or_else(|| PyError::type_error("width must be an integer"))?;
+    let width = usize::try_from(width).unwrap_or(0);
+    let length = value.chars().count();
+    if width <= length {
+        return runtime.new_string(value);
+    }
+    let padding = width - length;
+    let capacity = value
+        .len()
+        .checked_add(padding)
+        .ok_or_else(|| PyError::resource_error("filled string is too large"))?;
+    runtime.reserve_memory(capacity)?;
+    runtime.charge_cpu(u64::try_from(capacity).unwrap_or(u64::MAX))?;
+    let mut result = String::with_capacity(capacity);
+    let (sign, digits) = value
+        .strip_prefix(['+', '-'])
+        .map_or((None, value.as_str()), |digits| {
+            (value.chars().next(), digits)
+        });
+    if let Some(sign) = sign {
+        result.push(sign);
+    }
+    result.extend(std::iter::repeat_n('0', padding));
+    result.push_str(digits);
+    runtime.new_string(result)
 }
 
 fn string_affix(

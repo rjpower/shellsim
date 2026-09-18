@@ -169,6 +169,11 @@ impl Resources {
         self.memory_current
     }
 
+    /// Modeled working-set capacity still available to independently owned allocations.
+    pub fn memory_remaining(&self) -> u64 {
+        self.limits.memory.saturating_sub(self.memory_current)
+    }
+
     pub fn restore_memory(&mut self, mark: u64) {
         self.memory_current = mark.min(self.memory_current);
     }

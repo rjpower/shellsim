@@ -120,6 +120,7 @@ fn venv_exposes_offline_python_and_pip_entrypoints() {
 fn common_text_predicates_lines_and_collection_copies_match_python() {
     let source = r#"print('ABC 12'.isupper(), 'abc 12'.islower(), ''.isupper())
 print('a\r\nb\nc\r'.splitlines(), 'a\r\nb\n'.splitlines(True))
+print('42'.zfill(5), '-42'.zfill(5), '+42'.zfill(2))
 items = [[1]]
 items_copy = items.copy()
 items_copy.append([2])
@@ -135,7 +136,7 @@ print(sorted(values), sorted(values_copy))"#;
         run_shell(&format!("python3.14 <<'PY'\n{source}\nPY")),
         (
             0,
-            b"True True False\n['a', 'b', 'c'] ['a\\r\\n', 'b\\n']\n1 2 True ['a', 'b']\n[1, 2] [1, 2, 3]\n".to_vec(),
+            b"True True False\n['a', 'b', 'c'] ['a\\r\\n', 'b\\n']\n00042 -0042 +42\n1 2 True ['a', 'b']\n[1, 2] [1, 2, 3]\n".to_vec(),
             Vec::new(),
         )
     );

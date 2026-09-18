@@ -196,3 +196,46 @@ fn zlib_rejects_expansion_before_materializing_the_result() {
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn temporary_objects_and_cycles_use_a_bounded_working_set() {
+    let source = "index = 0\nwhile index < 5000:\n    value = 'x' * 1024\n    cycle = []\n    cycle.append(cycle)\n    index += 1\nprint(len(value))";
+    let (status, stdout, stderr, usage) = run_with_limits(
+        source,
+        Limits {
+            cpu: 20_000_000,
+            memory: 512 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(
+        status,
+        0,
+        "stderr={} usage={usage:?}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"1024\n");
+    assert_eq!(usage.memory_current, 0);
+    assert!(usage.memory_peak <= 512 * 1024);
+}
+
+#[test]
+fn completed_python_processes_release_owned_memory() {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 2_000_000,
+        memory: 256 * 1024,
+        ..Limits::unlimited()
+    });
+    for _ in 0..20 {
+        let (outcome, stdout, stderr) =
+            environment.run_script_capture("python3.14 -c 'print(\"x\" * 4096)' >/dev/null");
+        assert_eq!(
+            outcome.exit_status,
+            0,
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(stdout.is_empty());
+        assert_eq!(outcome.usage.memory_current, 0);
+    }
+}
