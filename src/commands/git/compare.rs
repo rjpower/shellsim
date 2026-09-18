@@ -464,6 +464,9 @@ pub(crate) fn apply_shared_option(options: &mut Options, argument: &str) -> Opti
         "--check" => options.format = Format::Check,
         "-p" | "-u" | "--patch" => options.format = Format::Patch,
         "--no-color" | "--color=never" | "--no-ext-diff" | "--no-renames" => {}
+        // Renames are always detected here, so asking for them changes nothing.
+        "-M" | "--find-renames" | "--find-copies-harder" => {}
+        value if value.starts_with("-M") || value.starts_with("--find-renames=") => {}
         "-w" | "--ignore-all-space" => options.whitespace = diff::Whitespace::IgnoreAll,
         "-b" | "--ignore-space-change" => options.whitespace = diff::Whitespace::IgnoreChange,
         value if value.starts_with("--diff-filter=") => {

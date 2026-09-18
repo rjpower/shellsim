@@ -101,7 +101,8 @@ pub(crate) fn edit_script_ignoring<'a>(
                 Op::Keep => {
                     old_index += 1;
                     new_index += 1;
-                    old[old_index - 1]
+                    // The two lines differ only in whitespace here, and Git shows the new one.
+                    new[new_index - 1]
                 }
             };
             Edit { op: edit.op, text }

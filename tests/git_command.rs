@@ -2012,3 +2012,45 @@ fn symbolic_links_are_tracked_as_their_targets() {
     assert!(patch.contains("-t.txt"), "{patch}");
     assert!(patch.contains("+other.txt"), "{patch}");
 }
+
+#[test]
+fn diff_and_log_accept_the_flags_agents_pass_by_habit() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f", b"a\nb  \nc\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    assert_eq!(run(&mut env, "git switch -qc side").0, 0);
+    env.vfs.put_file("/s", b"s\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm side").0, 0);
+    assert_eq!(run(&mut env, "git switch -q main").0, 0);
+    env.vfs.put_file("/m", b"m\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm main").0, 0);
+    assert_eq!(run(&mut env, "git merge -m merged side").0, 0);
+
+    assert_eq!(
+        run(&mut env, "git log --merges --oneline")
+            .1
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        run(&mut env, "git log --no-merges --oneline")
+            .1
+            .lines()
+            .count(),
+        3
+    );
+    // Renames are always detected, so asking for them is accepted and changes nothing.
+    assert_eq!(run(&mut env, "git diff -M HEAD~1 --name-only").0, 0);
+    assert_eq!(run(&mut env, "git diff -M50% HEAD~1 --name-only").0, 0);
+
+    // Under -w a context line is shown as it reads now, not as it read before.
+    env.vfs
+        .put_file("/f", b"a\nb\nCHANGED\n".to_vec(), 0o644)
+        .unwrap();
+    let patch = run(&mut env, "git diff -w").1;
+    assert!(patch.contains("\n b\n"), "{patch:?}");
+}

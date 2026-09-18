@@ -783,6 +783,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     let mut reverse = false;
     let mut decorate = false;
     let mut no_merges = false;
+    let mut merges_only = false;
     let mut abbreviate = false;
     let mut author_filter: Option<String> = None;
     let mut message_filter: Option<String> = None;
@@ -813,6 +814,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             "--decorate" | "--decorate=short" => decorate = true,
             "--no-decorate" | "--decorate=no" | "--no-color" => {}
             "--no-merges" => no_merges = true,
+            "--merges" => merges_only = true,
             "--abbrev-commit" => abbreviate = true,
             "--first-parent" => first_parent = true,
             "--all" => all_references = true,
@@ -975,6 +977,9 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     };
     if no_merges {
         history.retain(|(_, commit)| commit.parents.len() < 2);
+    }
+    if merges_only {
+        history.retain(|(_, commit)| commit.parents.len() > 1);
     }
     for (pattern, over_author) in [(&author_filter, true), (&message_filter, false)] {
         let Some(pattern) = pattern else { continue };
