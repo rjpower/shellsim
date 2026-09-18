@@ -53,6 +53,11 @@ fn store(ctx: &mut CommandContext<'_>, root: &str, state: &State) -> bool {
     repo::write_vfs(ctx, &repo::git_path(root, STATE), text.as_bytes()).is_ok()
 }
 
+/// Whether a rebase has started and not yet finished.
+pub(crate) fn in_progress(interp: &crate::interp::Interp, root: &str) -> bool {
+    load(interp, root).is_some()
+}
+
 fn clear(ctx: &mut CommandContext<'_>, root: &str) {
     let _ = ctx.vfs.remove_file("/", &repo::git_path(root, STATE));
     conflict::clear(ctx, root);
@@ -132,9 +137,17 @@ pub(crate) fn git_rebase(
             .extend_from_slice(b"fatal: no commit on the current branch to rebase\n");
         return 128;
     };
-    if !history::blocking_changes(ctx, &root, &repo::head_tree(ctx, &root)).is_empty() {
+    // A rebase rewrites the whole tree, so anything not committed has nowhere to go.
+    let dirty = history::dirty_paths(ctx, &root);
+    if !dirty.is_empty() {
+        let what = if history::only_staged(ctx, &root, &dirty) {
+            "Your index contains uncommitted changes."
+        } else {
+            "You have unstaged changes."
+        };
         io.err.extend_from_slice(
-            b"error: cannot rebase: You have unstaged changes.\nerror: Please commit or stash them.\n",
+            format!("error: cannot rebase: {what}\nerror: Please commit or stash them.\n")
+                .as_bytes(),
         );
         return 1;
     }
@@ -153,7 +166,11 @@ pub(crate) fn git_rebase(
     if let Err(status) = lay_down(ctx, &root, &onto_id, io) {
         return status;
     }
-    if repo::update_head(ctx, &root, &onto_id, &format!("rebase: checkout {onto_id}")).is_err() {
+    // Git detaches HEAD for the duration, so the branch keeps naming its old tip until the
+    // replay succeeds and nothing that reads the branch sees a half-finished history.
+    if repo::set_head_detached(ctx, &root, &onto_id, &format!("rebase: checkout {onto_id}"))
+        .is_err()
+    {
         return 1;
     }
     let state = State {
@@ -272,6 +289,9 @@ fn replay(
         }
     }
     let _ = globals;
+    if let Err(status) = land(ctx, root, &state, io) {
+        return status;
+    }
     clear(ctx, root);
     io.out.extend_from_slice(
         format!(
@@ -281,6 +301,24 @@ fn replay(
         .as_bytes(),
     );
     0
+}
+
+/// Move the rebased branch to the commit the replay ended on and put HEAD back on it.
+fn land(ctx: &mut CommandContext<'_>, root: &str, state: &State, io: &mut Io) -> Result<(), i32> {
+    let Some(tip) = repo::head_commit(ctx, root) else {
+        return Err(1);
+    };
+    let reference = format!("refs/heads/{}", state.branch);
+    if repo::write_reference(ctx, root, &reference, &tip).is_err() {
+        io.err
+            .extend_from_slice(format!("git rebase: cannot update {reference}\n").as_bytes());
+        return Err(1);
+    }
+    let action = format!("rebase finished: returning to {reference}");
+    if repo::set_head_to_branch(ctx, root, &state.branch, &action).is_err() {
+        return Err(1);
+    }
+    Ok(())
 }
 
 /// Write one replayed commit, keeping the author and message of the original.
@@ -378,7 +416,11 @@ fn abort(ctx: &mut CommandContext<'_>, root: &str, io: &mut Io) -> i32 {
     if let Err(status) = lay_down(ctx, root, &state.original, io) {
         return status;
     }
-    if repo::update_head(ctx, root, &state.original, "rebase: aborted").is_err() {
+    // HEAD is detached mid-rebase, so putting it back means naming the branch again.
+    let reference = format!("refs/heads/{}", state.branch);
+    if repo::write_reference(ctx, root, &reference, &state.original).is_err()
+        || repo::set_head_to_branch(ctx, root, &state.branch, "rebase: aborted").is_err()
+    {
         return 1;
     }
     clear(ctx, root);

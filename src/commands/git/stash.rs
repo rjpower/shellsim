@@ -146,6 +146,17 @@ fn push(
             .extend_from_slice(b"fatal: You do not have the initial commit yet\n");
         return 128;
     };
+    // An unresolved conflict has three sides, and a stash entry records only one tree, so the
+    // merge result would be silently thrown away. Git refuses for the same reason.
+    let unmerged = conflict::load_stages(ctx, root);
+    if !unmerged.is_empty() {
+        for path in unmerged.keys() {
+            io.err
+                .extend_from_slice(format!("{path}: needs merge\n").as_bytes());
+        }
+        io.err.extend_from_slice(b"error: could not write index\n");
+        return 1;
+    }
     let index_tree = repo::load_index(ctx, root).unwrap_or_default();
     let head_tree = repo::head_tree(ctx, root);
     let mut work = match repo::collect_working_tree(ctx, root) {
@@ -330,6 +341,21 @@ fn apply(
     // A plain apply restores the working tree only, leaving what was staged for the user to stage
     // again; that is what Git does without `--index`.
     let _ = index_tree;
+    // A file the entry brings back that nothing tracks yet cannot be left "unstaged", so Git
+    // records it as a new file. Paths already tracked keep whatever the index says.
+    let mut index = repo::load_index(ctx, root).unwrap_or_default();
+    let restored: Vec<(String, repo::Entry)> = combined
+        .tree
+        .iter()
+        .filter(|(path, _)| !index.contains_key(*path))
+        .map(|(path, entry)| (path.clone(), entry.clone()))
+        .collect();
+    if !restored.is_empty() {
+        index.extend(restored);
+        if repo::store_index(ctx, root, &index).is_err() {
+            return 1;
+        }
+    }
     if !combined.stages.is_empty() {
         for path in combined.stages.keys() {
             io.err.extend_from_slice(

@@ -1030,15 +1030,13 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     let before = ctx.vfs.clone();
     let result = (|| -> Result<(), String> {
         for (source_absolute, source_relative, target_absolute, target_relative) in &moves {
-            let length = ctx
-                .fs_file_len("/", source_absolute)
-                .map_err(|error| error.to_string())?;
-            if !ctx.charge_cpu(length as u64) {
+            // Read the link itself rather than what it points at, so moving a symbolic link
+            // stages its target text and not the contents of the file at the end of it.
+            let data = repo::read_work_file(ctx, &root, source_relative)
+                .ok_or_else(|| format!("cannot read '{source_relative}'"))?;
+            if !ctx.charge_cpu(data.len() as u64) {
                 return Err("cpu limit exceeded".to_string());
             }
-            let data = ctx
-                .fs_read_limited("/", source_absolute, length)
-                .map_err(|error| error.to_string())?;
             let hash = repo::write_blob(ctx, &root, &data).map_err(|error| error.to_string())?;
             // A move keeps the file's mode along with its content.
             let recorded = index.get(source_relative).cloned().unwrap_or_default();

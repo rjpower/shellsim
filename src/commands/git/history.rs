@@ -12,6 +12,7 @@ use crate::commands::{CommandContext, Io};
 use super::compare::{self, Format, Options, RightSide};
 use super::conflict::{self, Stages};
 use super::diff;
+use super::rebase;
 use super::repo::{self, Commit, Tree};
 use super::worktree;
 use super::{repo_error, usage, Globals};
@@ -2208,6 +2209,19 @@ pub(crate) fn blocking_changes(
     root: &str,
     target: &repo::Tree,
 ) -> Vec<String> {
+    let head = repo::head_tree(ctx, root);
+    // Only the paths the move would actually rewrite can lose work.
+    dirty_paths(ctx, root)
+        .into_iter()
+        .filter(|path| target.get(path) != head.get(path))
+        .collect()
+}
+
+/// Where a tracked path is not the same in HEAD, the index and the working tree.
+///
+/// A command that rewrites the whole tree, such as `git rebase`, has nowhere to put these, so it
+/// refuses to start rather than overwrite them.
+pub(crate) fn dirty_paths(ctx: &mut CommandContext<'_>, root: &str) -> Vec<String> {
     let index = repo::load_index(ctx, root).unwrap_or_default();
     let Ok(work) = repo::collect_working_tree(ctx, root) else {
         return vec!["<unreadable working tree>".to_string()];
@@ -2225,11 +2239,17 @@ pub(crate) fn blocking_changes(
             blocked.insert(path.clone());
         }
     }
-    // Only the paths the move would actually rewrite can lose work.
-    blocked
-        .into_iter()
-        .filter(|path| target.get(path) != head.get(path))
-        .collect()
+    blocked.into_iter().collect()
+}
+
+/// Whether the difference is only staged, which Git words differently.
+pub(crate) fn only_staged(ctx: &mut CommandContext<'_>, root: &str, paths: &[String]) -> bool {
+    let index = repo::load_index(ctx, root).unwrap_or_default();
+    let Ok(work) = repo::collect_working_tree(ctx, root) else {
+        return false;
+    };
+    let files = work.release(ctx);
+    paths.iter().all(|path| files.get(path) == index.get(path))
 }
 
 /// Move HEAD and the working tree to `commit`.
@@ -2239,6 +2259,10 @@ fn checkout_commit(
     commit: &str,
     io: &mut Io,
 ) -> Result<(), i32> {
+    if let Some(reason) = unfinished_operation(ctx, root) {
+        io.err.extend_from_slice(reason.as_bytes());
+        return Err(if reason.starts_with("fatal") { 128 } else { 1 });
+    }
     if let Some(previous) = repo::current_branch(ctx, root) {
         let _ = repo::write_vfs(
             ctx,
@@ -2272,6 +2296,21 @@ fn checkout_commit(
         return Err(1);
     }
     Ok(())
+}
+
+/// Why moving the working tree to another commit has to wait, if it does.
+///
+/// A rebase holds HEAD detached and a half-replayed history, and unresolved conflicts have
+/// nowhere to go, so Git refuses to move in both cases rather than lose either.
+fn unfinished_operation(ctx: &mut CommandContext<'_>, root: &str) -> Option<String> {
+    if rebase::in_progress(ctx, root) {
+        return Some(
+            "fatal: cannot switch branch while rebasing\nConsider \"git rebase --abort\" or \"git rebase --continue\".\n"
+                .to_string(),
+        );
+    }
+    (!conflict::load_stages(ctx, root).is_empty())
+        .then(|| "error: you need to resolve your current index first\n".to_string())
 }
 
 fn switch_to_branch(ctx: &mut CommandContext<'_>, root: &str, branch: &str, io: &mut Io) -> i32 {

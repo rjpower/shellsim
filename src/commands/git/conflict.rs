@@ -394,7 +394,9 @@ pub(crate) fn merge_content(
         // Both sides changed an overlapping region; grow it until neither side reaches further.
         let mut start = our_hunks[mine].start.min(their_hunks[yours].start);
         let mut end = our_hunks[mine].end.max(their_hunks[yours].end);
-        let (mut last_mine, mut last_yours) = (mine, yours);
+        // Both hunks are already inside the region, so start past them: a pair of insertions at
+        // the same point spans nothing, and growing from `mine`/`yours` would never advance.
+        let (mut last_mine, mut last_yours) = (mine + 1, yours + 1);
         loop {
             let before = (last_mine, last_yours);
             while last_mine < our_hunks.len() && our_hunks[last_mine].start < end {

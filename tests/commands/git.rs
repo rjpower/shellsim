@@ -2171,3 +2171,179 @@ fn a_conflicting_rebase_stops_and_can_be_continued_or_abandoned() {
     assert_eq!(run(&mut env, "git status --short").1, "");
     assert_eq!(run(&mut env, "git rebase --continue").0, 128);
 }
+
+#[test]
+fn two_branches_that_both_append_conflict_instead_of_looping() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'a\\n' > f.txt; git add -A; git commit -q -m base; \
+                 git switch -qc topic; printf 'a\\nTOPIC\\n' > f.txt; git commit -qam t1; \
+                 git switch -q main; printf 'a\\nMAIN\\n' > f.txt; git commit -qam m1";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    let merge = run(&mut env, "git merge topic");
+    assert_eq!(merge.0, 1, "{}", merge.2);
+    assert!(
+        merge
+            .2
+            .contains("CONFLICT (content): Merge conflict in f.txt"),
+        "{}",
+        merge.2
+    );
+    assert_eq!(
+        run(&mut env, "cat f.txt").1,
+        "a\n<<<<<<< HEAD\nMAIN\n=======\nTOPIC\n>>>>>>> topic\n"
+    );
+    assert_eq!(run(&mut env, "git status --short").1, "UU f.txt\n");
+}
+
+#[test]
+fn blame_survives_a_file_that_grew_and_then_changed() {
+    let mut env = Environment::new();
+    let setup =
+        "git init -q; printf 'one\\ntwo\\nthree\\n' > f.txt; git add -A; git commit -q -m c1; \
+                 printf 'one\\ntwo\\nthree\\nfour\\n' > f.txt; git commit -qam c2; \
+                 printf 'one\\ntwo\\nTHREE\\nfour\\n' > f.txt; git commit -qam c3";
+    assert_eq!(run(&mut env, setup).0, 0);
+    let first = run(&mut env, "git log --format=%H --reverse | head -1").1;
+    let (c1, c2, c3) = {
+        let ids = run(&mut env, "git log --format=%H --reverse").1;
+        let mut lines = ids.lines();
+        (
+            lines.next().unwrap().to_string(),
+            lines.next().unwrap().to_string(),
+            lines.next().unwrap().to_string(),
+        )
+    };
+    assert_eq!(first.trim(), c1);
+
+    let blame = run(&mut env, "git blame f.txt");
+    assert_eq!(blame.0, 0, "{}", blame.2);
+    let attributed: Vec<&str> = blame
+        .1
+        .lines()
+        .map(|line| line.split_whitespace().next().unwrap_or_default())
+        .collect();
+    // The two untouched lines came from the first commit, "four" from the append, "THREE" from
+    // the edit that followed it.
+    assert_eq!(
+        attributed,
+        [
+            format!("^{}", &c1[..7]),
+            format!("^{}", &c1[..7]),
+            c3[..8].to_string(),
+            c2[..8].to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_rebase_refuses_to_start_on_work_that_is_not_committed() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'base\\n' > a; printf 'original\\n' > d; git add -A; \
+                 git commit -q -m base; git switch -qc topic; printf 'topic\\n' > a; \
+                 git commit -qam t1; git switch -q main; printf 'main\\n' > m; git add -A; \
+                 git commit -qm m1; git switch -q topic; echo precious > d";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    let unstaged = run(&mut env, "git rebase main");
+    assert_eq!(unstaged.0, 1, "{}", unstaged.2);
+    assert!(
+        unstaged
+            .2
+            .starts_with("error: cannot rebase: You have unstaged changes."),
+        "{}",
+        unstaged.2
+    );
+    assert_eq!(run(&mut env, "cat d").1, "precious\n");
+
+    assert_eq!(run(&mut env, "git add d").0, 0);
+    let staged = run(&mut env, "git rebase main");
+    assert_eq!(staged.0, 1, "{}", staged.2);
+    assert!(
+        staged
+            .2
+            .starts_with("error: cannot rebase: Your index contains uncommitted changes."),
+        "{}",
+        staged.2
+    );
+    assert_eq!(run(&mut env, "cat d").1, "precious\n");
+}
+
+#[test]
+fn a_stopped_rebase_leaves_every_branch_where_it_was() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'base\\n' > f; git add -A; git commit -q -m base; \
+                 git switch -qc topic; printf 't1\\n' > f; git commit -qam t1; \
+                 printf 't2\\n' > f; git commit -qam t2; git switch -q main; \
+                 printf 'm1\\n' > f; git commit -qam m1; git switch -q topic";
+    assert_eq!(run(&mut env, setup).0, 0);
+    let topic_tip = run(&mut env, "git rev-parse topic").1;
+    let main_tip = run(&mut env, "git rev-parse main").1;
+
+    assert_eq!(run(&mut env, "git rebase main").0, 1);
+    // Git detaches HEAD for the replay, so both branches still name what they named before.
+    assert_eq!(run(&mut env, "git rev-parse topic").1, topic_tip);
+    assert_eq!(run(&mut env, "git rev-parse main").1, main_tip);
+
+    let switched = run(&mut env, "git switch main");
+    assert_eq!(switched.0, 128, "{}", switched.2);
+    assert!(
+        switched.2.contains("cannot switch branch while rebasing"),
+        "{}",
+        switched.2
+    );
+
+    assert_eq!(run(&mut env, "git rebase --abort").0, 0);
+    assert_eq!(run(&mut env, "git rev-parse topic").1, topic_tip);
+    assert_eq!(run(&mut env, "git rev-parse main").1, main_tip);
+    assert_eq!(
+        run(&mut env, "git rev-parse --abbrev-ref HEAD").1,
+        "topic\n"
+    );
+}
+
+#[test]
+fn moving_a_symbolic_link_stages_the_link_and_not_what_it_points_at() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'TARGET-CONTENT\\n' > t.txt; ln -s t.txt link; \
+                 git add -A; git commit -q -m base";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    let moved = run(&mut env, "git mv link link2");
+    assert_eq!(moved.0, 0, "{}", moved.2);
+    // The blob is the link target text, which is what real Git stores for mode 120000.
+    assert_eq!(
+        run(&mut env, "git ls-files -s link2").1,
+        "120000 3eddab3ca20c14aaf1b71e59b3c4633f167afcc1 0\tlink2\n"
+    );
+    assert_eq!(run(&mut env, "git status --short").1, "R  link -> link2\n");
+    assert_eq!(run(&mut env, "git commit -qm mv").0, 0);
+    assert_eq!(run(&mut env, "rm link2; git checkout -- link2").0, 0);
+    assert_eq!(run(&mut env, "readlink link2").1, "t.txt\n");
+}
+
+#[test]
+fn stashing_is_refused_mid_conflict_and_restores_new_files_staged() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'base\\n' > f.txt; printf 'keep\\n' > g.txt; git add -A; \
+                 git commit -q -m base; git switch -qc topic; printf 'TOPIC\\n' > f.txt; \
+                 printf 'TOPIC-IMPORTANT\\n' > g.txt; git commit -qam t1; git switch -q main; \
+                 printf 'MAIN\\n' > f.txt; git commit -qam m1";
+    assert_eq!(run(&mut env, setup).0, 0);
+    assert_eq!(run(&mut env, "git merge topic").0, 1);
+
+    let refused = run(&mut env, "git stash push -m mid");
+    assert_eq!(refused.0, 1, "{}", refused.2);
+    assert!(refused.2.contains("f.txt: needs merge"), "{}", refused.2);
+    // The merged side of the other file is still there, so the merge commit will carry it.
+    assert_eq!(run(&mut env, "cat g.txt").1, "TOPIC-IMPORTANT\n");
+
+    assert_eq!(run(&mut env, "git merge --abort").0, 0);
+    assert_eq!(
+        run(&mut env, "echo brandnew > new.txt; git add new.txt").0,
+        0
+    );
+    assert_eq!(run(&mut env, "git stash push -m s").0, 0);
+    assert_eq!(run(&mut env, "git stash pop").0, 0);
+    assert_eq!(run(&mut env, "git status --short").1, "A  new.txt\n");
+}

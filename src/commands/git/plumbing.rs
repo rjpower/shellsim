@@ -906,14 +906,15 @@ const UNCOMMITTED: &str = "0000000000000000000000000000000000000000";
 
 /// Carry each line of `new` back to `old`, claiming for `commit` the lines `old` does not have.
 ///
-/// Returns the mapping for `old`: the line of the file as it is now that each of its lines became.
+/// Returns the mapping for `old`: the line of the file as it is now that each of its lines became,
+/// or `None` for a line that `new` dropped and so survives nowhere.
 fn carry_lines(
     old: &[u8],
     new: &[u8],
-    mapping: &[usize],
+    mapping: &[Option<usize>],
     commit: &str,
     origins: &mut [Option<Origin>],
-) -> Vec<usize> {
+) -> Vec<Option<usize>> {
     let old_lines = diff::split_lines(old);
     let new_lines = diff::split_lines(new);
     let mut carried = Vec::with_capacity(old_lines.len());
@@ -925,13 +926,16 @@ fn carry_lines(
                 at += 1;
             }
             diff::Op::Insert => {
-                origins[mapping[at]].get_or_insert(Origin {
-                    commit: commit.to_string(),
-                    boundary: false,
-                });
+                if let Some(line) = mapping[at] {
+                    origins[line].get_or_insert(Origin {
+                        commit: commit.to_string(),
+                        boundary: false,
+                    });
+                }
                 at += 1;
             }
-            diff::Op::Delete => {}
+            // `old` had this line and `new` does not, so it reaches nothing in the file today.
+            diff::Op::Delete => carried.push(None),
         }
     }
     carried
@@ -955,7 +959,7 @@ fn trace_lines(
 ) -> Option<Vec<Origin>> {
     let mut origins: Vec<Option<Origin>> = (0..count).map(|_| None).collect();
     // Which line of the file as it is now each line of the version being examined became.
-    let mut mapping: Vec<usize> = (0..count).collect();
+    let mut mapping: Vec<Option<usize>> = (0..count).map(Some).collect();
     let mut current = start.to_string();
     let mut current_content = content.to_vec();
     if let Some(hash) = stored {
@@ -979,7 +983,7 @@ fn trace_lines(
             .and_then(|entry| repo::read_blob(ctx, root, &entry.hash));
         let Some(parent_content) = parent_content else {
             // The file starts here, so every line still unclaimed is this commit's.
-            for slot in mapping {
+            for slot in mapping.into_iter().flatten() {
                 origins[slot].get_or_insert(Origin {
                     commit: current.clone(),
                     boundary: true,
@@ -997,7 +1001,8 @@ fn trace_lines(
             &current,
             &mut origins,
         );
-        if carried.is_empty() {
+        // Nothing the parent holds reaches the file as it is now, so there is nothing left to ask.
+        if carried.iter().all(Option::is_none) {
             break;
         }
         current = commit.parents.first().cloned()?;
