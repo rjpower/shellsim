@@ -1870,3 +1870,42 @@ fn apply_refuses_a_patch_whose_file_has_moved_on() {
     assert_eq!(run(&mut env, "git apply p.patch").0, 0);
     assert_eq!(env.vfs.read("/", "/f").unwrap(), b"a\nB\nc\nd\n");
 }
+
+#[test]
+fn a_conflict_can_be_settled_by_taking_one_side() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f", b"l1\nl2\nl3\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    assert_eq!(run(&mut env, "git switch -qc side").0, 0);
+    env.vfs
+        .put_file("/f", b"l1\nSIDE\nl3\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -qam side").0, 0);
+    assert_eq!(run(&mut env, "git switch -q main").0, 0);
+    env.vfs
+        .put_file("/f", b"l1\nMAIN\nl3\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -qam main").0, 0);
+    assert_eq!(run(&mut env, "git merge side").0, 1);
+
+    // The conflict is visible to the usual review commands.
+    assert_eq!(run(&mut env, "git diff --name-status").1, "U\tf\n");
+    assert_eq!(
+        run(&mut env, "git diff --diff-filter=U --name-only").1,
+        "f\n"
+    );
+    assert!(run(&mut env, "git diff").1.contains("+<<<<<<< HEAD"));
+
+    assert_eq!(run(&mut env, "git checkout --theirs f").0, 0);
+    assert_eq!(env.vfs.read("/", "/f").unwrap(), b"l1\nSIDE\nl3\n");
+    // Taking a side does not by itself mark the path resolved.
+    assert_eq!(run(&mut env, "git status --short").1, "UU f\n");
+
+    assert_eq!(run(&mut env, "git restore --ours f").0, 0);
+    assert_eq!(env.vfs.read("/", "/f").unwrap(), b"l1\nMAIN\nl3\n");
+    assert_eq!(run(&mut env, "git add f; git commit -qm merged").0, 0);
+    assert_eq!(run(&mut env, "git status --short").1, "");
+}

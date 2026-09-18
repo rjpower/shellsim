@@ -80,6 +80,11 @@ and `>>>>>>>` markers, and the three sides are recorded so the rest of the workf
 restores the pre-merge state without touching untracked files, and `git merge --continue` is the
 same as committing.
 
+`git checkout --ours`/`--theirs` and `git restore --ours`/`--theirs` put one recorded side back in
+the working tree, leaving the path unmerged until it is staged. While a path is unmerged `git
+diff` compares the working file against the side that was ours going into the merge, so the
+markers show up in a review and `--diff-filter=U` names the path.
+
 `git cherry-pick` and `git revert` run the same three-way merge with different corners: a
 cherry-pick uses the commit's parent as the base and the commit as the incoming side, and a
 revert swaps those two. Both stop at a conflict, both take `--continue` and `--abort`, and

@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 
 use crate::commands::{CommandContext, Io};
 
+use super::conflict;
 use super::diff::{self, DEFAULT_CONTEXT};
 use super::repo::{self, Tree};
 use super::usage;
@@ -53,6 +54,8 @@ pub(crate) struct Options {
     pub filter: Option<String>,
     /// How whitespace differences are treated, as `-w` and `-b` set it.
     pub whitespace: diff::Whitespace,
+    /// Paths a merge left unmerged, which are reported with `U` rather than `M`.
+    pub unmerged: BTreeSet<String>,
 }
 
 impl Default for Options {
@@ -67,6 +70,7 @@ impl Default for Options {
             reverse: false,
             filter: None,
             whitespace: diff::Whitespace::Significant,
+            unmerged: BTreeSet::new(),
         }
     }
 }
@@ -124,6 +128,7 @@ pub(crate) fn emit(
             letters.contains(status_letter(
                 old.contains_key(path),
                 new.contains_key(path),
+                options.unmerged.contains(path),
             ))
         });
         renames.retain(|_| letters.contains('R'));
@@ -161,7 +166,11 @@ pub(crate) fn emit(
                 .extend_from_slice(format!("R100\t{from}\t{to}\n").as_bytes());
         }
         for path in &changed {
-            let status = status_letter(old.contains_key(path), new.contains_key(path));
+            let status = status_letter(
+                old.contains_key(path),
+                new.contains_key(path),
+                options.unmerged.contains(path),
+            );
             io.out
                 .extend_from_slice(format!("{status}\t{path}\n").as_bytes());
         }
@@ -301,8 +310,9 @@ fn rename_header(from: &str, to: &str, prefixes: bool) -> String {
 }
 
 /// The letter `--name-status` and `--diff-filter` use for one path.
-fn status_letter(in_old: bool, in_new: bool) -> char {
+fn status_letter(in_old: bool, in_new: bool, unmerged: bool) -> char {
     match (in_old, in_new) {
+        _ if unmerged => 'U',
         (false, true) => 'A',
         (true, false) => 'D',
         _ => 'M',
@@ -642,6 +652,23 @@ pub(crate) fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             let Some(work) = tracked_working_tree(ctx, &root, &index) else {
                 return repo::resource_error(ctx);
             };
+            // An unmerged path has no settled index entry to compare against, so the side that
+            // was ours going into the merge stands in for it; otherwise the conflict markers the
+            // merge wrote would compare equal and the tree would look clean.
+            let mut index = index;
+            for (path, entry) in conflict::load_stages(ctx, &root) {
+                options.unmerged.insert(path.clone());
+                match entry.ours {
+                    Some(hash) => {
+                        let executable =
+                            index.get(&path).is_some_and(|recorded| recorded.executable);
+                        index.insert(path, repo::Entry { hash, executable });
+                    }
+                    None => {
+                        index.remove(&path);
+                    }
+                }
+            }
             finish(ctx, &root, &index, &work, &options, exit_code, io)
         }
     }

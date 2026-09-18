@@ -2410,6 +2410,7 @@ pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let mut operands: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
     let mut operands_only = false;
+    let mut side = None;
     let args = super::expand_clusters(args, "qbBf");
     for argument in &args {
         if operands_only {
@@ -2426,11 +2427,17 @@ pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             "--detach" => detach = true,
             "-f" | "--force" => force = true,
             "-q" | "--quiet" => {}
+            "--ours" => side = Some(Side::Ours),
+            "--theirs" => side = Some(Side::Theirs),
             value if value.starts_with('-') && value != "-" => {
                 return usage(io, &format!("unsupported checkout option: {value}"))
             }
             value => operands.push(value.to_string()),
         }
+    }
+    if let Some(side) = side {
+        let named = if paths.is_empty() { &operands } else { &paths };
+        return checkout_side(ctx, &root, side, named, io);
     }
     if !paths.is_empty() {
         // `git checkout [REVISION] -- PATH...` restores files without moving HEAD.
@@ -2469,6 +2476,83 @@ pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             "usage: git checkout [-b] BRANCH | [REVISION] -- PATH...",
         ),
     }
+}
+
+/// Take one side of a conflict for the named paths, as `git checkout --ours` does.
+pub(crate) fn restore_side(
+    ctx: &mut CommandContext<'_>,
+    theirs: bool,
+    named: &[String],
+    io: &mut Io,
+) -> i32 {
+    let Some(root) = repo::find_repo_root(ctx) else {
+        return repo_error(io);
+    };
+    let side = if theirs { Side::Theirs } else { Side::Ours };
+    checkout_side(ctx, &root, side, named, io)
+}
+
+/// Which recorded side of a conflict `git checkout --ours` and `--theirs` take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Ours,
+    Theirs,
+}
+
+/// Resolve a conflict by taking one side's recorded content for the named paths.
+///
+/// As in Git the path stays unmerged until it is staged, so the user can look before committing.
+fn checkout_side(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    side: Side,
+    named: &[String],
+    io: &mut Io,
+) -> i32 {
+    let stages = conflict::load_stages(ctx, root);
+    if named.is_empty() {
+        return usage(io, "usage: git checkout --ours|--theirs PATH...");
+    }
+    let cwd = ctx.cwd.clone();
+    let mut chosen: Vec<(String, String)> = Vec::new();
+    for operand in named {
+        let path = super::pathspec(&cwd, root, operand);
+        let Some(entry) = stages.get(&path) else {
+            io.err.extend_from_slice(
+                format!("error: path '{operand}' does not have their version\n").as_bytes(),
+            );
+            return 1;
+        };
+        let hash = match side {
+            Side::Ours => entry.ours.clone(),
+            Side::Theirs => entry.theirs.clone(),
+        };
+        // A side that deleted the file has nothing to check out, which Git reports the same way.
+        let Some(hash) = hash else {
+            io.err.extend_from_slice(
+                format!("error: path '{operand}' does not have their version\n").as_bytes(),
+            );
+            return 1;
+        };
+        chosen.push((path, hash));
+    }
+    let count = chosen.len();
+    for (path, hash) in chosen {
+        let Some(data) = repo::read_blob(ctx, root, &hash) else {
+            io.err
+                .extend_from_slice(format!("error: missing blob for '{path}'\n").as_bytes());
+            return 1;
+        };
+        if repo::write_vfs(ctx, &repo::path_join(root, &path), &data).is_err() {
+            io.err
+                .extend_from_slice(format!("error: cannot write '{path}'\n").as_bytes());
+            return 1;
+        }
+    }
+    let plural = if count == 1 { "" } else { "s" };
+    io.out
+        .extend_from_slice(format!("Updated {count} path{plural} from the index\n").as_bytes());
+    0
 }
 
 /// Translate a `git checkout [REVISION] -- PATH...` invocation into `git restore` arguments.

@@ -1081,6 +1081,7 @@ pub(crate) fn git_restore(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
     let mut staged = false;
     let mut worktree = false;
     let mut source = None;
+    let mut side = None;
     let mut paths = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -1102,12 +1103,16 @@ pub(crate) fn git_restore(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
                 break;
             }
             "-q" | "--quiet" => {}
+            "--ours" | "--theirs" => side = Some(args[index] == "--theirs"),
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported restore option: {value}"))
             }
             value => paths.push(value.to_string()),
         }
         index += 1;
+    }
+    if let Some(theirs) = side {
+        return super::history::restore_side(ctx, theirs, &paths, io);
     }
     if paths.is_empty() {
         io.err
