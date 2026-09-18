@@ -271,3 +271,22 @@ fn generated_text_and_field_growth_obey_resource_limits() {
     assert_eq!(outcome.exit_status, 137);
     assert_eq!(outcome.stop_reason, Some(StopReason::MemoryExhausted));
 }
+
+#[test]
+fn recursive_listing_labels_directories_relatively_and_skips_hidden_ones() {
+    // An agent running `ls -R` inside a repository must not be handed the contents of `.git`.
+    let (status, stdout, stderr) = run(
+        "mkdir -p pkg/.cache pkg/sub && touch pkg/top pkg/.cache/junk pkg/sub/leaf && ls -R pkg",
+    );
+    assert_eq!((status, stderr.as_str()), (0, ""));
+    assert_eq!(stdout, "pkg:\nsub  top\n\npkg/sub:\nleaf\n");
+
+    let (status, stdout, _) = run(
+        "mkdir -p pkg/.cache pkg/sub && touch pkg/top pkg/.cache/junk pkg/sub/leaf && ls -R -A pkg",
+    );
+    assert_eq!(status, 0);
+    assert_eq!(
+        stdout,
+        "pkg:\n.cache  sub  top\n\npkg/.cache:\njunk\n\npkg/sub:\nleaf\n"
+    );
+}

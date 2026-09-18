@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use crate::commands::util::{ewln, split_flags, wln};
 use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
+use crate::vfs::resolve_against;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     use super::reg;
@@ -99,11 +100,12 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                 entries.insert(0, "..".into());
                 entries.insert(0, ".".into());
             }
-            if paths.len() > 1 {
+            if paths.len() > 1 || recursive {
                 wln(io.out, &format!("{p}:"));
             }
             emit_listing(interp, p, &entries, long, one, io.out);
             if recursive {
+                let base = resolve_against(&interp.cwd, p);
                 let Ok(all_paths) = interp.fs_walk(&interp.cwd, p) else {
                     status = 2;
                     continue;
@@ -117,6 +119,17 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                         })
                     )
                 }) {
+                    // Headers name the directory the way the operand did, and a hidden directory
+                    // is not descended into unless hidden entries were asked for.
+                    let relative = sub
+                        .strip_prefix(&base)
+                        .unwrap_or(&sub)
+                        .trim_start_matches('/');
+                    if !all && !almost_all && relative.split('/').any(|part| part.starts_with('.'))
+                    {
+                        continue;
+                    }
+                    let label = format!("{}/{relative}", p.trim_end_matches('/'));
                     let mut sub_entries = interp.fs_list_dir("/", &sub).unwrap_or_default();
                     if !all && !almost_all {
                         sub_entries.retain(|entry| !entry.starts_with('.'));
@@ -125,7 +138,7 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                         sub_entries.insert(0, ".".into());
                     }
                     wln(io.out, "");
-                    wln(io.out, &format!("{sub}:"));
+                    wln(io.out, &format!("{label}:"));
                     emit_listing(interp, &sub, &sub_entries, long, one, io.out);
                 }
             }
