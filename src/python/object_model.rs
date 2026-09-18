@@ -9,6 +9,10 @@ use std::collections::HashMap;
 use super::native::{BinarySlotFn, SliceSlotFn, TernarySlotFn, UnarySlotFn};
 use super::Value;
 
+// Builtins and native value kinds are immutable process metadata. A fixed charge keeps their
+// accounting out of the VM hot path; user-defined types are charged when registered below.
+const BUILTIN_TYPE_MEMORY_BYTES: u64 = 16 * 1024;
+
 /// Stable identity of a Python type within a [`ReplState`](super::ReplState).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeId(u32);
@@ -121,15 +125,6 @@ impl BuiltinType {
             Self::Array => "numpy.ndarray",
         }
     }
-}
-
-/// Storage layout required by instances of a type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PyLayout {
-    Object,
-    Int,
-    Type,
-    Native,
 }
 
 /// Cached protocol methods resolved from a type dictionary.
@@ -564,9 +559,7 @@ pub struct PyType {
     pub name: String,
     pub bases: Vec<TypeId>,
     pub mro: Vec<TypeId>,
-    pub metaclass: TypeId,
     pub attributes: HashMap<String, Value>,
-    pub layout: PyLayout,
     pub slots: TypeSlots,
     value: Option<Value>,
 }
@@ -576,20 +569,29 @@ pub struct PyType {
 pub struct TypeRegistry {
     types: Vec<PyType>,
     value_kinds: Vec<&'static super::native::ValueKindDef>,
+    modeled_bytes: u64,
+}
+
+fn modeled_type_bytes(ty: &PyType) -> u64 {
+    let bytes = 64usize
+        .saturating_add(ty.name.len())
+        .saturating_add(ty.bases.len().saturating_mul(4))
+        .saturating_add(ty.mro.len().saturating_mul(4))
+        .saturating_add(ty.attributes.len().saturating_mul(48))
+        .saturating_add(ty.slots.populated_count().saturating_mul(24));
+    u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 impl Default for TypeRegistry {
     fn default() -> Self {
         let mut types = Vec::with_capacity(BuiltinType::ALL.len());
         for builtin in BuiltinType::ALL {
-            let (bases, mro, metaclass, layout) = builtin_metadata(builtin);
+            let (bases, mro) = builtin_metadata(builtin);
             types.push(PyType {
                 name: builtin.name().into(),
                 bases,
                 mro,
-                metaclass,
                 attributes: HashMap::new(),
-                layout,
                 slots: TypeSlots::default(),
                 value: Some(Value::Native(super::vm::NativeValue::BuiltinType(builtin))),
             });
@@ -658,6 +660,7 @@ impl Default for TypeRegistry {
         let mut registry = Self {
             types,
             value_kinds: Vec::new(),
+            modeled_bytes: BUILTIN_TYPE_MEMORY_BYTES,
         };
         for kind in super::stdlib::value_kinds() {
             registry.register_value_kind(kind);
@@ -669,20 +672,7 @@ impl Default for TypeRegistry {
 impl TypeRegistry {
     /// Conservative modeled size of registry metadata retained between executions.
     pub fn modeled_bytes(&self) -> u64 {
-        self.types.iter().fold(0u64, |total, ty| {
-            let variable = ty
-                .name
-                .len()
-                .saturating_add(ty.bases.len().saturating_mul(4))
-                .saturating_add(ty.mro.len().saturating_mul(4))
-                .saturating_add(ty.attributes.len().saturating_mul(48))
-                .saturating_add(ty.slots.populated_count().saturating_mul(24));
-            let fixed = match ty.layout {
-                PyLayout::Object | PyLayout::Int | PyLayout::Type | PyLayout::Native => 64usize,
-            };
-            let _metaclass = ty.metaclass;
-            total.saturating_add(u64::try_from(variable.saturating_add(fixed)).unwrap_or(u64::MAX))
-        })
+        self.modeled_bytes
     }
 
     /// Heap values retained by semantic type metadata.
@@ -720,9 +710,7 @@ impl TypeRegistry {
         name: String,
         bases: Vec<TypeId>,
         mro: Vec<TypeId>,
-        metaclass: TypeId,
         attributes: HashMap<String, Value>,
-        layout: PyLayout,
     ) -> Result<TypeId, String> {
         let index = u32::try_from(self.types.len()).map_err(|_| "too many Python types")?;
         let mut slots = TypeSlots::from_attributes(&attributes);
@@ -737,16 +725,16 @@ impl TypeRegistry {
                 slots.set(slot, value);
             }
         }
-        self.types.push(PyType {
+        let ty = PyType {
             name,
             bases,
             mro,
-            metaclass,
             attributes,
-            layout,
             slots,
             value: None,
-        });
+        };
+        self.modeled_bytes = self.modeled_bytes.saturating_add(modeled_type_bytes(&ty));
+        self.types.push(ty);
         Ok(TypeId(index))
     }
 
@@ -781,9 +769,7 @@ impl TypeRegistry {
             name: kind.name.into(),
             bases: vec![object],
             mro: vec![object],
-            metaclass: BuiltinType::Type.id(),
             attributes: HashMap::new(),
-            layout: PyLayout::Native,
             slots: value_kind_slots(kind.slots),
             value: Some(Value::Native(super::vm::NativeValue::ValueKind(kind))),
         });
@@ -844,29 +830,15 @@ fn value_kind_slots(slots: super::native::ValueKindSlots) -> TypeSlots {
     }
 }
 
-fn builtin_metadata(builtin: BuiltinType) -> (Vec<TypeId>, Vec<TypeId>, TypeId, PyLayout) {
+fn builtin_metadata(builtin: BuiltinType) -> (Vec<TypeId>, Vec<TypeId>) {
     let object = BuiltinType::Object.id();
-    let type_ = BuiltinType::Type.id();
     match builtin {
-        BuiltinType::Object => (Vec::new(), Vec::new(), type_, PyLayout::Object),
-        BuiltinType::Type => (vec![object], vec![object], type_, PyLayout::Type),
+        BuiltinType::Object => (Vec::new(), Vec::new()),
         BuiltinType::Bool => (
             vec![BuiltinType::Int.id()],
             vec![BuiltinType::Int.id(), object],
-            type_,
-            PyLayout::Int,
         ),
-        BuiltinType::Int => (vec![object], vec![object], type_, PyLayout::Int),
-        BuiltinType::Native
-        | BuiltinType::Regex
-        | BuiltinType::Match
-        | BuiltinType::Stream
-        | BuiltinType::Environment
-        | BuiltinType::ArgumentParser
-        | BuiltinType::RaisesContext => (vec![object], vec![object], type_, PyLayout::Native),
-        BuiltinType::Array => (vec![object], vec![object], type_, PyLayout::Native),
-        BuiltinType::Property => (vec![object], vec![object], type_, PyLayout::Object),
-        _ => (vec![object], vec![object], type_, PyLayout::Object),
+        _ => (vec![object], vec![object]),
     }
 }
 
@@ -1011,16 +983,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bootstrap_closes_object_type_cycle_and_bool_int_hierarchy() {
+    fn bootstrap_builds_bool_int_hierarchy_and_slots() {
         let registry = TypeRegistry::default();
-        assert_eq!(
-            registry.get(BuiltinType::Object.id()).unwrap().metaclass,
-            BuiltinType::Type.id()
-        );
-        assert_eq!(
-            registry.get(BuiltinType::Type.id()).unwrap().metaclass,
-            BuiltinType::Type.id()
-        );
         assert!(registry
             .is_subclass(BuiltinType::Bool.id(), BuiltinType::Int.id())
             .unwrap());
@@ -1033,5 +997,32 @@ mod tests {
                 .unwrap(),
             Some(SlotValue::NativeBinary(_))
         ));
+    }
+
+    #[test]
+    fn modeled_memory_uses_a_fixed_builtin_charge_and_tracks_registered_types() {
+        let mut registry = TypeRegistry::default();
+        assert_eq!(registry.modeled_bytes(), BUILTIN_TYPE_MEMORY_BYTES);
+
+        let before = registry.modeled_bytes();
+        let id = registry
+            .register(
+                "Example".into(),
+                vec![BuiltinType::Object.id()],
+                vec![BuiltinType::Object.id()],
+                HashMap::from([("value".into(), Value::Int(1))]),
+            )
+            .unwrap();
+        let registered_bytes = modeled_type_bytes(registry.get(id).unwrap());
+        assert_eq!(
+            registry.modeled_bytes(),
+            before.saturating_add(registered_bytes)
+        );
+
+        registry.finish(id, Value::None).unwrap();
+        assert_eq!(
+            registry.modeled_bytes(),
+            before.saturating_add(registered_bytes)
+        );
     }
 }
