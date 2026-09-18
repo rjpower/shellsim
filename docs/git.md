@@ -81,6 +81,10 @@ cherry-pick uses the commit's parent as the base and the commit as the incoming 
 revert swaps those two. Both stop at a conflict, both take `--continue` and `--abort`, and
 `-n` leaves the result staged. A cherry-pick keeps the original author; a revert does not.
 
+`git stash pop` and `git stash apply` merge the entry back the same way, against the commit it was
+taken from, so work committed or edited in the meantime survives. A plain reapplication restores
+the working tree only, as Git's does; an entry that conflicts stays on the list.
+
 Binary files and a path one side deleted while the other changed it are recorded as conflicts
 without markers, leaving the surviving content in the working tree, as Git does.
 

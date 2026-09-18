@@ -265,6 +265,16 @@ fn sides(
     }
 }
 
+/// Whether two replaced regions collide, so that neither side's change can simply be taken.
+///
+/// The regions are half-open, so a change ending where the other begins does not collide. Two
+/// insertions at the very same point do, because there is no way to order them.
+fn overlap(left: &Hunk, right: &Hunk) -> bool {
+    let inserts_at_the_same_point =
+        left.start == left.end && right.start == right.end && left.start == right.start;
+    left.start.max(right.start) < left.end.min(right.end) || inserts_at_the_same_point
+}
+
 /// One region of the base that a side replaced.
 struct Hunk {
     start: usize,
@@ -353,7 +363,7 @@ pub(crate) fn merge_content(
         let next_mine = our_hunks.get(mine);
         let next_yours = their_hunks.get(yours);
         let touching = match (next_mine, next_yours) {
-            (Some(left), Some(right)) => left.start <= right.end && right.start <= left.end,
+            (Some(left), Some(right)) => overlap(left, right),
             _ => false,
         };
         if !touching {
@@ -380,12 +390,12 @@ pub(crate) fn merge_content(
         let (mut last_mine, mut last_yours) = (mine, yours);
         loop {
             let before = (last_mine, last_yours);
-            while last_mine < our_hunks.len() && our_hunks[last_mine].start <= end {
+            while last_mine < our_hunks.len() && our_hunks[last_mine].start < end {
                 start = start.min(our_hunks[last_mine].start);
                 end = end.max(our_hunks[last_mine].end);
                 last_mine += 1;
             }
-            while last_yours < their_hunks.len() && their_hunks[last_yours].start <= end {
+            while last_yours < their_hunks.len() && their_hunks[last_yours].start < end {
                 start = start.min(their_hunks[last_yours].start);
                 end = end.max(their_hunks[last_yours].end);
                 last_yours += 1;

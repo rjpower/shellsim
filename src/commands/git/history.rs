@@ -1690,7 +1690,7 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     let mut rename = false;
     let mut force = false;
     let mut list = false;
-    let mut contains: Option<String> = None;
+    let mut contains: Option<(BranchFilter, String)> = None;
     let mut format: Option<String> = None;
     let mut operands: Vec<String> = Vec::new();
     let mut index = 0;
@@ -1717,24 +1717,25 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             }
             "-f" | "--force" => force = true,
             "-l" | "--list" => list = true,
-            value if value.starts_with("--contains=") || value.starts_with("--merged=") => {
-                contains = Some(
-                    value
-                        .split_once('=')
-                        .map_or("", |parts| parts.1)
-                        .to_string(),
-                );
+            value
+                if value.starts_with("--contains=")
+                    || value.starts_with("--merged=")
+                    || value.starts_with("--no-merged=") =>
+            {
+                let (name, revision) = value.split_once('=').unwrap_or((value, "HEAD"));
+                contains = Some((branch_filter(name), revision.to_string()));
                 list = true;
             }
-            "--contains" | "--merged" => {
+            "--contains" | "--merged" | "--no-merged" => {
                 // The revision is optional and defaults to HEAD.
-                contains = Some(match args.get(index) {
+                let revision = match args.get(index) {
                     Some(value) if !value.starts_with('-') => {
                         index += 1;
                         value.clone()
                     }
                     _ => "HEAD".to_string(),
-                });
+                };
+                contains = Some((branch_filter(argument), revision));
                 list = true;
             }
             "-r" | "--remotes" => {
@@ -1784,7 +1785,7 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         if let Some(format) = &format {
             return list_formatted_branches(ctx, &root, pattern, format, io);
         }
-        return list_branches(ctx, &root, pattern, contains.as_deref(), verbose, io);
+        return list_branches(ctx, &root, pattern, contains.as_ref(), verbose, io);
     }
     if operands.len() > 2 || !valid_reference_name(&operands[0]) {
         return usage(io, "usage: git branch NAME [START_POINT]");
@@ -1812,19 +1813,56 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     )
 }
 
+/// Which branches `--merged`, `--no-merged`, and `--contains` keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BranchFilter {
+    /// The branch's tip is an ancestor of the named revision.
+    Merged,
+    /// It is not.
+    NotMerged,
+    /// The branch's own history includes the named revision, which is the other direction.
+    Contains,
+}
+
+fn branch_filter(option: &str) -> BranchFilter {
+    match option {
+        "--contains" => BranchFilter::Contains,
+        "--no-merged" => BranchFilter::NotMerged,
+        _ => BranchFilter::Merged,
+    }
+}
+
+/// Whether a branch survives `--merged`, `--no-merged`, or `--contains`.
+fn branch_selected(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    branch: &str,
+    filter: Option<&(BranchFilter, String)>,
+) -> bool {
+    let Some((filter, revision)) = filter else {
+        return true;
+    };
+    let Some(target) = repo::resolve_revision(ctx, root, revision) else {
+        return false;
+    };
+    let Some(tip) = repo::read_reference(ctx, root, &format!("refs/heads/{branch}")) else {
+        return false;
+    };
+    match filter {
+        BranchFilter::Merged => repo::ancestors(ctx, root, &target).contains(&tip),
+        BranchFilter::NotMerged => !repo::ancestors(ctx, root, &target).contains(&tip),
+        BranchFilter::Contains => repo::ancestors(ctx, root, &tip).contains(&target),
+    }
+}
+
 fn list_branches(
     ctx: &mut CommandContext<'_>,
     root: &str,
     pattern: Option<&str>,
-    contains: Option<&str>,
+    contains: Option<&(BranchFilter, String)>,
     verbose: bool,
     io: &mut Io,
 ) -> i32 {
-    // `--contains`/`--merged` keep only branches whose tip is reachable from the named revision.
-    let reachable = contains.and_then(|revision| {
-        let commit = repo::resolve_revision(ctx, root, revision)?;
-        Some(repo::ancestors(ctx, root, &commit))
-    });
     let current = repo::current_branch(ctx, root);
     // A detached HEAD is listed first, as the checked-out "branch" it stands in for.
     let detached = match (&current, repo::head_commit(ctx, root)) {
@@ -1859,11 +1897,8 @@ fn list_branches(
                 continue;
             }
         }
-        if let Some(reachable) = &reachable {
-            let tip = repo::read_reference(ctx, root, &format!("refs/heads/{branch}"));
-            if !tip.is_some_and(|tip| reachable.contains(&tip)) {
-                continue;
-            }
+        if !branch_selected(ctx, root, &branch, contains) {
+            continue;
         }
         let marker = if current.as_deref() == Some(branch.as_str()) {
             '*'

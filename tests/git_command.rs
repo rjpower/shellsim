@@ -1049,7 +1049,7 @@ fn checkout_keeps_edits_to_files_the_move_does_not_touch() {
 }
 
 #[test]
-fn stash_reapply_refuses_to_overwrite_local_changes() {
+fn stash_reapply_merges_and_marks_what_it_cannot_settle() {
     let mut env = Environment::new();
     assert_eq!(run(&mut env, "git init -q").0, 0);
     env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
@@ -1063,12 +1063,45 @@ fn stash_reapply_refuses_to_overwrite_local_changes() {
     env.vfs
         .put_file("/a.txt", b"conflict\n".to_vec(), 0o644)
         .unwrap();
-    let refused = run(&mut env, "git stash pop");
-    assert_eq!(refused.0, 1);
-    assert!(refused.2.contains("would be overwritten"), "{}", refused.2);
-    assert_eq!(env.vfs.read("/", "/a.txt").unwrap(), b"conflict\n");
-    // The entry survives a refused reapplication.
+    let marked = run(&mut env, "git stash pop");
+    assert_eq!(marked.0, 1);
+    assert!(marked.2.contains("Merge conflict in a.txt"), "{}", marked.2);
+    assert_eq!(
+        String::from_utf8(env.vfs.read("/", "/a.txt").unwrap()).unwrap(),
+        "<<<<<<< Updated upstream\nconflict\n=======\nstashed\n>>>>>>> Stashed changes\n"
+    );
+    assert_eq!(run(&mut env, "git status --short").1, "UU a.txt\n");
+    // The entry survives a reapplication that did not finish.
     assert!(run(&mut env, "git stash list").1.contains("saved"));
+}
+
+#[test]
+fn stash_reapply_keeps_work_committed_in_the_meantime() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"one\ntwo\nthree\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"one\nSTASHED\nthree\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git stash push -q -m saved").0, 0);
+
+    // A change to a different part of the same file is committed while the work is set aside.
+    env.vfs
+        .put_file("/f.txt", b"one\ntwo\nCOMMITTED\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -qam later").0, 0);
+
+    assert_eq!(run(&mut env, "git stash pop").0, 0);
+    assert_eq!(
+        env.vfs.read("/", "/f.txt").unwrap(),
+        b"one\nSTASHED\nCOMMITTED\n"
+    );
+    // Git restores the working tree only, leaving the user to stage again.
+    assert_eq!(run(&mut env, "git status --short").1, " M f.txt\n");
+    assert_eq!(run(&mut env, "git stash list").1, "");
 }
 
 #[test]

@@ -2,11 +2,12 @@
 //!
 //! A stash entry records two trees, the index and the working tree, plus the commit and branch
 //! they were built on. Entries live in `.git/stash/` and are listed newest first in
-//! `.git/stash-list`. Conflicting reapplication is refused rather than producing markers, which
-//! matches how the merge subset behaves.
+//! `.git/stash-list`. Reapplying an entry is a three-way merge against the commit it was built
+//! on, so work committed in the meantime survives; a conflict leaves markers and keeps the entry.
 
 use crate::commands::{CommandContext, Io};
 
+use super::conflict;
 use super::repo::{self, Tree};
 use super::{repo_error, usage};
 
@@ -79,7 +80,7 @@ pub(crate) fn git_stash(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     let mut message = None;
     let mut operands: Vec<String> = Vec::new();
     let mut index = 0;
-    for argument in super::expand_clusters(args, "um") {
+    for argument in super::expand_clusters(args, "qum") {
         match argument.as_str() {
             "-u" | "--include-untracked" => include_untracked = true,
             "-q" | "--quiet" => quiet = true,
@@ -290,27 +291,55 @@ fn apply(
             .extend_from_slice(b"fatal: the stash entry is unreadable\n");
         return 128;
     };
-    let current = repo::head_tree(ctx, root);
-    // Reapplying overwrites whole files, so refuse when that would discard uncommitted work.
-    let touched = super::history::blocking_changes(ctx, root, &work);
-    if !touched.is_empty() {
-        io.err.extend_from_slice(
-            b"error: Your local changes to the following files would be overwritten by merge:\n",
-        );
-        for path in touched {
-            io.err.extend_from_slice(format!("\t{path}\n").as_bytes());
+    // The entry is merged back in against the commit it was taken from, so anything committed or
+    // edited since is kept rather than overwritten.
+    let base = repo::commit_tree(ctx, root, &entry.base).unwrap_or_default();
+    let mine = match repo::collect_working_tree(ctx, root) {
+        Ok(snapshot) => snapshot.release(ctx),
+        Err(status) => return status,
+    };
+    // The merge reads both sides from the object store, and a working-tree file that was never
+    // staged has nothing there yet.
+    for (path, recorded) in &mine {
+        if base.get(path) == Some(recorded) || work.get(path) == Some(recorded) {
+            continue;
         }
-        io.err.extend_from_slice(
-            b"Please commit your changes or stash them before you merge.\nAborting\n",
-        );
-        return 1;
+        let Some(data) = repo::read_work_file(ctx, root, path) else {
+            continue;
+        };
+        if repo::write_blob(ctx, root, &data).is_err() {
+            io.err
+                .extend_from_slice(format!("git stash: cannot record '{path}'\n").as_bytes());
+            return 1;
+        }
     }
-    if let Err(error) = repo::update_work_tree(ctx, root, &current, &work) {
+    let combined = conflict::combine(
+        ctx,
+        root,
+        &base,
+        &mine,
+        &work,
+        "Updated upstream",
+        "Stashed changes",
+    );
+    if let Err(error) = repo::update_work_tree(ctx, root, &mine, &combined.tree) {
         io.err
             .extend_from_slice(format!("git stash: {error}\n").as_bytes());
         return 1;
     }
-    if repo::store_index(ctx, root, &index_tree).is_err() {
+    // A plain apply restores the working tree only, leaving what was staged for the user to stage
+    // again; that is what Git does without `--index`.
+    let _ = index_tree;
+    if !combined.stages.is_empty() {
+        for path in combined.stages.keys() {
+            io.err.extend_from_slice(
+                format!("CONFLICT (content): Merge conflict in {path}\n").as_bytes(),
+            );
+        }
+        conflict::store_stages(ctx, root, &combined.stages);
+        // The entry stays on the list so the user can try again after settling the conflict.
+        io.err
+            .extend_from_slice(b"The stash entry is kept in case you need it again.\n");
         return 1;
     }
     super::worktree::git_status(ctx, &[], io);
