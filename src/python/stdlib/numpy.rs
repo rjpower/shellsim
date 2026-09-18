@@ -8,8 +8,8 @@ use std::cmp::Ordering;
 
 use super::super::native::{
     CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyArray, PyArrayDtype,
-    PyArrayLayout, PyBinaryOp, PyError, PyIndex, PyKind, PyMarker, PyResult, PyRuntime, PySequence,
-    PyString, PyValue, PyValueCast, ValueDef, ValueKindDef, ValueKindSlots,
+    PyArrayLayout, PyBinaryOp, PyConstant, PyError, PyIndex, PyKind, PyMarker, PyResult, PyRuntime,
+    PySequence, PyString, PyValue, PyValueCast, ValueDef, ValueKindDef, ValueKindSlots,
 };
 use super::super::number::{PyNumber, PyNumber as Number};
 use super::super::Value;
@@ -303,11 +303,16 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         function("sqrt", sqrt),
         function("exp", exp),
         function("log", log),
+        function("log2", log2),
         function("sin", sin),
         function("cos", cos),
         function("tan", tan),
         function("floor", floor),
         function("ceil", ceil),
+        function("rint", rint),
+        function("sign", sign),
+        function("isnan", isnan),
+        function("isinf", isinf),
         function("sum", module_sum),
         function("prod", module_prod),
         function("mean", module_mean),
@@ -326,8 +331,28 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         function("inner", inner),
         function("outer", outer),
         function("matmul", matmul),
+        function("diag", diag),
+        function("allclose", allclose),
+        function("argsort", argsort),
+        function("percentile", percentile),
     ],
     values: &[
+        ValueDef::Constant {
+            name: "pi",
+            value: PyConstant::Float(std::f64::consts::PI),
+        },
+        ValueDef::Constant {
+            name: "inf",
+            value: PyConstant::Float(f64::INFINITY),
+        },
+        ValueDef::Constant {
+            name: "nan",
+            value: PyConstant::Float(f64::NAN),
+        },
+        ValueDef::Constant {
+            name: "__version__",
+            value: PyConstant::String("2.0.0-shellsim"),
+        },
         ValueDef::Factory {
             name: "ndarray",
             get: array_type,
@@ -2242,11 +2267,16 @@ enum UnaryMap {
     Sqrt,
     Exp,
     Log,
+    Log2,
     Sin,
     Cos,
     Tan,
     Floor,
     Ceil,
+    Rint,
+    Sign,
+    IsNan,
+    IsInf,
 }
 
 fn unary_function(
@@ -2268,18 +2298,22 @@ fn unary_array(runtime: &mut dyn PyRuntime, array: PyArray, operation: UnaryMap)
         UnaryMap::Sqrt
             | UnaryMap::Exp
             | UnaryMap::Log
+            | UnaryMap::Log2
             | UnaryMap::Sin
             | UnaryMap::Cos
             | UnaryMap::Tan
             | UnaryMap::Floor
             | UnaryMap::Ceil
+            | UnaryMap::Rint
     );
     if input_dtype == PyArrayDtype::Bool && matches!(operation, UnaryMap::Negative) {
         return Err(PyError::type_error(
             "this unary operation is not defined for boolean arrays",
         ));
     }
-    let dtype = if float_output {
+    let dtype = if matches!(operation, UnaryMap::IsNan | UnaryMap::IsInf) {
+        PyArrayDtype::Bool
+    } else if float_output {
         if input_dtype == PyArrayDtype::Float32 {
             PyArrayDtype::Float32
         } else {
@@ -2344,11 +2378,34 @@ fn unary_array(runtime: &mut dyn PyRuntime, array: PyArray, operation: UnaryMap)
             UnaryMap::Sqrt => float_scalar(dtype, value.as_f64().sqrt()),
             UnaryMap::Exp => float_scalar(dtype, value.as_f64().exp()),
             UnaryMap::Log => float_scalar(dtype, value.as_f64().ln()),
+            UnaryMap::Log2 => float_scalar(dtype, value.as_f64().log2()),
             UnaryMap::Sin => float_scalar(dtype, value.as_f64().sin()),
             UnaryMap::Cos => float_scalar(dtype, value.as_f64().cos()),
             UnaryMap::Tan => float_scalar(dtype, value.as_f64().tan()),
             UnaryMap::Floor => float_scalar(dtype, value.as_f64().floor()),
             UnaryMap::Ceil => float_scalar(dtype, value.as_f64().ceil()),
+            UnaryMap::Rint => float_scalar(dtype, value.as_f64().round_ties_even()),
+            UnaryMap::Sign => {
+                let signed = value.as_f64();
+                let sign = if signed.is_nan() {
+                    f64::NAN
+                } else if signed > 0.0 {
+                    1.0
+                } else if signed < 0.0 {
+                    -1.0
+                } else {
+                    signed
+                };
+                cast_scalar(runtime, float_scalar(PyArrayDtype::Float64, sign), dtype)?
+            }
+            UnaryMap::IsNan => Scalar {
+                dtype,
+                value: ScalarValue::Bool(value.as_f64().is_nan()),
+            },
+            UnaryMap::IsInf => Scalar {
+                dtype,
+                value: ScalarValue::Bool(value.as_f64().is_infinite()),
+            },
         };
         values.push(pack_scalar(runtime, mapped_value, dtype)?);
         Ok(())
@@ -2413,11 +2470,16 @@ unary_functions!(
     (sqrt, UnaryMap::Sqrt),
     (exp, UnaryMap::Exp),
     (log, UnaryMap::Log),
+    (log2, UnaryMap::Log2),
     (sin, UnaryMap::Sin),
     (cos, UnaryMap::Cos),
     (tan, UnaryMap::Tan),
     (floor, UnaryMap::Floor),
     (ceil, UnaryMap::Ceil),
+    (rint, UnaryMap::Rint),
+    (sign, UnaryMap::Sign),
+    (isnan, UnaryMap::IsNan),
+    (isinf, UnaryMap::IsInf),
 );
 
 fn minimum(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -3941,6 +4003,269 @@ fn matmul_arrays(runtime: &mut dyn PyRuntime, left: PyArray, right: PyArray) -> 
         }
     }
     runtime.new_array(values, shape, dtype)
+}
+
+fn diag(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.diag", 1, 2)?;
+    args.reject_unknown_keywords("numpy.diag", &["k"])?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let (layout, dtype) = runtime.array_layout(array)?;
+    let offset = args
+        .positional()
+        .get(1)
+        .copied()
+        .or(args.keyword("numpy.diag", "k")?.copied())
+        .unwrap_or(Value::Int(0));
+    let PyIndex(offset) = offset.cast(runtime)?;
+    match layout.shape.as_slice() {
+        [length] => {
+            let padding = usize::try_from(offset.unsigned_abs())
+                .map_err(|_| PyError::value_error("diagonal offset is too large"))?;
+            let size = length
+                .checked_add(padding)
+                .ok_or_else(|| PyError::value_error("diagonal shape overflow"))?;
+            let count = element_count(&[size, size])?;
+            reserve_values(runtime, count)?;
+            let zero = numeric_identity(runtime, dtype, false)?;
+            let mut values = Vec::with_capacity(count);
+            for row in 0..size {
+                for column in 0..size {
+                    let source = if offset >= 0 && column == row.saturating_add(padding) {
+                        Some(row)
+                    } else if offset < 0 && row == column.saturating_add(padding) {
+                        Some(column)
+                    } else {
+                        None
+                    };
+                    values.push(
+                        if let Some(index) = source.filter(|index| *index < *length) {
+                            runtime.array_get(array, &[index])?
+                        } else {
+                            zero
+                        },
+                    );
+                }
+            }
+            runtime.new_array(values, vec![size, size], dtype)
+        }
+        [rows, columns] => {
+            let (row, column) = if offset >= 0 {
+                (0usize, usize::try_from(offset).unwrap_or(usize::MAX))
+            } else {
+                (
+                    usize::try_from(offset.unsigned_abs()).unwrap_or(usize::MAX),
+                    0usize,
+                )
+            };
+            let length = rows.saturating_sub(row).min(columns.saturating_sub(column));
+            reserve_values(runtime, length)?;
+            let mut values = Vec::with_capacity(length);
+            for index in 0..length {
+                values.push(runtime.array_get(array, &[row + index, column + index])?);
+            }
+            runtime.new_array(values, vec![length], dtype)
+        }
+        _ => Err(PyError::value_error(
+            "numpy.diag requires a 1-D or 2-D array",
+        )),
+    }
+}
+
+fn allclose(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.allclose", 2, 4)?;
+    args.reject_unknown_keywords("numpy.allclose", &["rtol", "atol", "equal_nan"])?;
+    let left = coerce_array(runtime, args.positional()[0])?;
+    let right = coerce_array(runtime, args.positional()[1])?;
+    let rtol = args
+        .positional()
+        .get(2)
+        .copied()
+        .or(args.keyword("numpy.allclose", "rtol")?.copied())
+        .map(|value| scalar(runtime, value).map(|value| value.as_f64()))
+        .transpose()?
+        .unwrap_or(1e-5);
+    let atol = args
+        .positional()
+        .get(3)
+        .copied()
+        .or(args.keyword("numpy.allclose", "atol")?.copied())
+        .map(|value| scalar(runtime, value).map(|value| value.as_f64()))
+        .transpose()?
+        .unwrap_or(1e-8);
+    let equal_nan = args
+        .keyword("numpy.allclose", "equal_nan")?
+        .map(|value| runtime.truth(value))
+        .transpose()?
+        .unwrap_or(false);
+    let (left_layout, _) = runtime.array_layout(left)?;
+    let (right_layout, _) = runtime.array_layout(right)?;
+    let shape = broadcast_shape(&left_layout.shape, &right_layout.shape)?;
+    let mut close = true;
+    for_each_index(&shape, |index| {
+        let left = broadcast_get(
+            runtime,
+            Value::Object(left.object_id()),
+            Some(&left_layout),
+            index,
+            &shape,
+        )?;
+        let right = broadcast_get(
+            runtime,
+            Value::Object(right.object_id()),
+            Some(&right_layout),
+            index,
+            &shape,
+        )?;
+        let left = scalar(runtime, left)?.as_f64();
+        let right = scalar(runtime, right)?.as_f64();
+        close &= if left.is_nan() || right.is_nan() {
+            equal_nan && left.is_nan() && right.is_nan()
+        } else {
+            left == right || (left - right).abs() <= atol + rtol * right.abs()
+        };
+        Ok(())
+    })?;
+    Ok(Value::Bool(close))
+}
+
+fn argsort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.argsort", 1, 1)?;
+    args.reject_unknown_keywords("numpy.argsort", &["axis", "kind"])?;
+    if let Some(kind) = args.keyword("numpy.argsort", "kind")? {
+        let PyString(kind) = (*kind).cast(runtime)?;
+        if !matches!(
+            kind.as_str(),
+            "quicksort" | "mergesort" | "heapsort" | "stable"
+        ) {
+            return Err(PyError::value_error(format!(
+                "unsupported numpy.argsort kind {kind:?}"
+            )));
+        }
+    }
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let (layout, _) = runtime.array_layout(array)?;
+    let axis_value = args.keyword("numpy.argsort", "axis")?.copied();
+    if axis_value.is_some_and(|value| value.is_none()) {
+        let count = element_count(&layout.shape)?;
+        reserve_values(runtime, count)?;
+        let mut indexed = Vec::with_capacity(count);
+        let mut ordinal = 0usize;
+        for_each_index(&layout.shape, |index| {
+            let value = runtime.array_get(array, index)?;
+            indexed.push((scalar(runtime, value)?, ordinal));
+            ordinal += 1;
+            Ok(())
+        })?;
+        sort_indexed(runtime, &mut indexed)?;
+        let values = indexed
+            .into_iter()
+            .map(|(_, index)| pack_index(runtime, index))
+            .collect::<PyResult<Vec<_>>>()?;
+        return runtime.new_array(values, vec![count], PyArrayDtype::Int64);
+    }
+    let axis = match axis_value {
+        Some(value) => {
+            let PyIndex(axis) = value.cast(runtime)?;
+            normalize_axis(axis, layout.shape.len())?
+        }
+        None => layout
+            .shape
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| PyError::value_error("cannot argsort a 0-D array"))?,
+    };
+    let count = element_count(&layout.shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = vec![Value::Int(0); count];
+    let strides = contiguous_strides(&layout.shape)?;
+    let mut outer_shape = layout.shape.clone();
+    let axis_length = outer_shape.remove(axis);
+    for_each_index(&outer_shape, |outer| {
+        let mut indexed = Vec::with_capacity(axis_length);
+        for selected in 0..axis_length {
+            let mut index = outer.to_vec();
+            index.insert(axis, selected);
+            let value = runtime.array_get(array, &index)?;
+            indexed.push((scalar(runtime, value)?, selected));
+        }
+        sort_indexed(runtime, &mut indexed)?;
+        for (position, (_, source)) in indexed.into_iter().enumerate() {
+            let mut output_index = outer.to_vec();
+            output_index.insert(axis, position);
+            let flat = output_index
+                .iter()
+                .zip(&strides)
+                .try_fold(0usize, |total, (index, stride)| {
+                    total.checked_add(index.saturating_mul(*stride as usize))
+                })
+                .ok_or_else(|| PyError::value_error("array offset overflow"))?;
+            values[flat] = pack_index(runtime, source)?;
+        }
+        Ok(())
+    })?;
+    runtime.new_array(values, layout.shape, PyArrayDtype::Int64)
+}
+
+fn sort_indexed(runtime: &mut dyn PyRuntime, values: &mut [(Scalar, usize)]) -> PyResult<()> {
+    let comparisons = values
+        .len()
+        .saturating_mul(values.len().max(1).ilog2() as usize);
+    runtime.charge_cpu(u64::try_from(comparisons).unwrap_or(u64::MAX))?;
+    values.sort_by(|(left, _), (right, _)| {
+        left.compare(*right).unwrap_or_else(|| {
+            match (left.as_f64().is_nan(), right.as_f64().is_nan()) {
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                _ => Ordering::Equal,
+            }
+        })
+    });
+    Ok(())
+}
+
+fn percentile(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.percentile", 2, 2)?;
+    args.reject_unknown_keywords("numpy.percentile", &["axis"])?;
+    if args
+        .keyword("numpy.percentile", "axis")?
+        .is_some_and(|axis| !axis.is_none())
+    {
+        return Err(PyError::value_error(
+            "numpy.percentile axis is not supported",
+        ));
+    }
+    let array = coerce_array(runtime, args.positional()[0])?;
+    let quantile = scalar(runtime, args.positional()[1])?.as_f64();
+    if !(0.0..=100.0).contains(&quantile) {
+        return Err(PyError::value_error(
+            "percentile must be in the range [0, 100]",
+        ));
+    }
+    let (layout, _) = runtime.array_layout(array)?;
+    let count = element_count(&layout.shape)?;
+    runtime.reserve_memory(
+        count
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| PyError::value_error("percentile input is too large"))?,
+    )?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&layout.shape, |index| {
+        let value = runtime.array_get(array, index)?;
+        values.push(scalar(runtime, value)?.as_f64());
+        Ok(())
+    })?;
+    let comparisons = count.saturating_mul(count.max(1).ilog2() as usize);
+    runtime.charge_cpu(u64::try_from(comparisons).unwrap_or(u64::MAX))?;
+    values.sort_by(f64::total_cmp);
+    let value = if values.is_empty() {
+        f64::NAN
+    } else {
+        let position = quantile / 100.0 * (values.len() - 1) as f64;
+        let lower = position.floor() as usize;
+        let upper = position.ceil() as usize;
+        values[lower] + (values[upper] - values[lower]) * (position - lower as f64)
+    };
+    pack_float(runtime, value, PyArrayDtype::Float64)
 }
 
 fn product_dtype(left: PyArrayDtype, right: PyArrayDtype) -> PyArrayDtype {

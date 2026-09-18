@@ -37,6 +37,20 @@ fn bytecode_vm_covers_arithmetic_argv_and_environment() {
 }
 
 #[test]
+fn python_chdir_is_process_local_to_the_python_command() {
+    assert_eq!(
+        run_shell(
+            "mkdir -p /work/project; cd /work; pwd; python3.14 -c 'import os; os.chdir(\"project\"); print(os.getcwd())'; pwd"
+        ),
+        (
+            0,
+            b"/work\n/work/project\n/work\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
 fn containers_comparisons_and_short_circuiting_use_python_protocols() {
     assert_eq!(
         run_shell(
@@ -472,11 +486,11 @@ fn int_subclasses_preserve_identity_and_use_numeric_protocols() {
 fn type_predicates_follow_user_mro_and_builtin_layouts() {
     assert_eq!(
         run_shell(
-            "python3.14 -c 'class Root(object):\n    pass\nclass UserId(int):\n    pass\nclass Child(UserId):\n    pass\nvalue = Child(4)\nprint(type(value) is Child, type(Child) is type)\nprint(isinstance(value, Child), isinstance(value, UserId), isinstance(value, int), isinstance(value, object))\nprint(issubclass(Child, UserId), issubclass(Child, int), issubclass(Child, object), issubclass(bool, int))\nprint(isinstance(Root(), Root))'"
+            "python3.14 -c 'class Root(object):\n    pass\nclass UserId(int):\n    pass\nclass Child(UserId):\n    pass\nvalue = Child(4)\nprint(type(value) is Child, type(Child) is type)\nprint(isinstance(value, Child), isinstance(value, UserId), isinstance(value, int), isinstance(value, object))\nprint(issubclass(Child, UserId), issubclass(Child, int), issubclass(Child, object), issubclass(bool, int))\nprint(isinstance(Root(), Root))\nprint(isinstance(value, (str, int)), isinstance(value, (str, bytes)))\nprint(issubclass(Child, (str, int)), issubclass(Child, (str, bytes)))'"
         ),
         (
             0,
-            b"True True\nTrue True True True\nTrue True True True\nTrue\n".to_vec(),
+            b"True True\nTrue True True True\nTrue True True True\nTrue\nTrue False\nTrue False\n".to_vec(),
             Vec::new()
         )
     );

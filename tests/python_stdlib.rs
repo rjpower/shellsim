@@ -4,16 +4,80 @@ use shellsim::Environment;
 
 fn run(source: &str) -> (i32, Vec<u8>, Vec<u8>) {
     let mut environment = Environment::new();
+    run_in(&mut environment, source)
+}
+
+fn run_in(environment: &mut Environment, source: &str) -> (i32, Vec<u8>, Vec<u8>) {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let status = shellsim::python::run_python(
-        &mut environment,
+        environment,
         &["python3.14".into(), "-c".into(), source.into()],
         Vec::new(),
         &mut stdout,
         &mut stderr,
     );
     (status, stdout, stderr)
+}
+
+#[test]
+fn os_chdir_changes_only_the_simulated_process_directory() {
+    let mut environment = Environment::new();
+    environment.set_var("PWD", "/work");
+    environment.vfs.mkdir_all("/", "/work/project").unwrap();
+    environment
+        .vfs
+        .put_file("/work/project/value.txt", b"inside\n".to_vec(), 0o644)
+        .unwrap();
+    let source = r#"import os
+print(os.getcwd())
+os.chdir("project")
+print(os.getcwd())
+print(open("value.txt").read().strip())
+"#;
+    assert_eq!(
+        run_in(&mut environment, source),
+        (0, b"/work\n/work/project\ninside\n".to_vec(), Vec::new())
+    );
+    assert_eq!(environment.cwd, "/work");
+}
+
+#[test]
+fn vfs_operations_raise_the_python_os_exception_family() {
+    let mut environment = Environment::new();
+    environment.set_var("PWD", "/work");
+    environment.vfs.put_dir("/work/folder", 0o755).unwrap();
+    environment
+        .vfs
+        .put_file("/work/file", b"value".to_vec(), 0o644)
+        .unwrap();
+    let source = r#"import os
+for operation in [
+    lambda: open("missing").read(),
+    lambda: open("folder").read(),
+    lambda: os.chdir("file"),
+]:
+    try:
+        operation()
+    except FileNotFoundError:
+        print("missing")
+    except IsADirectoryError:
+        print("directory")
+    except NotADirectoryError:
+        print("not-directory")
+try:
+    open("missing").read()
+except OSError:
+    print("os-base")
+"#;
+    assert_eq!(
+        run_in(&mut environment, source),
+        (
+            0,
+            b"missing\ndirectory\nnot-directory\nos-base\n".to_vec(),
+            Vec::new()
+        )
+    );
 }
 
 #[test]
@@ -144,6 +208,86 @@ print(parser.prog, args.count, args.verbose, args.mode)
         .2
         .windows(14)
         .any(|window| window == b"invalid choice"));
+}
+
+#[test]
+fn argparse_help_known_args_and_subcommands_cover_common_cli_shapes() {
+    let subcommands = run(r#"import argparse
+parser = argparse.ArgumentParser(prog="tool", description="example tool")
+commands = parser.add_subparsers(dest="command", required=True, help="available commands")
+run_parser = commands.add_parser("run", help="run the job")
+run_parser.add_argument("path", help="input path")
+run_parser.add_argument("--count", type=int, default=2, help="repeat count")
+run_parser.add_argument("--enabled", action="store_false")
+args = parser.parse_args(["run", "input.txt", "--count", "4", "--enabled"])
+print(args.command, args.path, args.count, args.enabled)
+"#);
+    assert_eq!(
+        subcommands,
+        (0, b"run input.txt 4 False\n".to_vec(), Vec::new())
+    );
+
+    let known = run(r#"import argparse
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--seed", type=int, default=1)
+args, rest = parser.parse_known_args(["--seed", "7", "--foreign", "value"])
+print(args.seed, rest)
+"#);
+    assert_eq!(
+        known,
+        (0, b"7 ['--foreign', 'value']\n".to_vec(), Vec::new())
+    );
+
+    let help = run(r#"import argparse
+parser = argparse.ArgumentParser(prog="tool", description="example tool")
+parser.add_argument("--count", type=int, help="repeat count")
+parser.parse_args(["--help"])
+"#);
+    assert_eq!(help.0, 0);
+    let help = String::from_utf8(help.1).unwrap();
+    assert!(help.contains("usage: tool [-h] [--count COUNT]"));
+    assert!(help.contains("example tool"));
+    assert!(help.contains("-h, --help"));
+    assert!(help.contains("--count COUNT"));
+    assert!(help.contains("repeat count"));
+}
+
+#[test]
+fn importlib_util_executes_vfs_source_in_an_isolated_module() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/work/pkg").unwrap();
+    environment
+        .vfs
+        .put_file(
+            "/work/pkg/helper.py",
+            b"def double(value):\n    return value * 2\n".to_vec(),
+            0o644,
+        )
+        .unwrap();
+    environment
+        .vfs
+        .put_file(
+            "/work/pkg/plugin.py",
+            b"from helper import double\nvalue = double(21)\n".to_vec(),
+            0o644,
+        )
+        .unwrap();
+    let source = r#"import importlib.util
+spec = importlib.util.spec_from_file_location("plugin_name", "/work/pkg/plugin.py")
+module = importlib.util.module_from_spec(spec)
+print(importlib.__name__, importlib.util.__name__)
+print(spec.name, spec.origin, spec.loader is not None)
+spec.loader.exec_module(module)
+print(module.__name__, module.__file__, module.__package__, module.__spec__ is spec, module.value)
+"#;
+    assert_eq!(
+        run_in(&mut environment, source),
+        (
+            0,
+            b"importlib importlib.util\nplugin_name /work/pkg/plugin.py True\nplugin_name /work/pkg/plugin.py  True 42\n".to_vec(),
+            Vec::new()
+        )
+    );
 }
 
 #[test]

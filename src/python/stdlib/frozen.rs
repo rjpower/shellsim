@@ -15,6 +15,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "collections" => Some(include_str!("source/collections.py")),
         "glob" => Some(include_str!("source/glob.py")),
         "hashlib" => Some(include_str!("source/hashlib.py")),
+        "importlib" | "importlib.util" => Some(include_str!("source/importlib.py")),
         "_io" => Some(include_str!("source/io.py")),
         "io" => Some(include_str!("source/io.py")),
         "json" => Some(include_str!("source/json.py")),
