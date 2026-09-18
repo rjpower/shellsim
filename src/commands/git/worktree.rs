@@ -271,6 +271,7 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         &entries,
         &untracked_paths,
         &ignored_paths,
+        untracked == Untracked::No,
         io,
     );
     0
@@ -322,6 +323,7 @@ fn emit_long_status(
     entries: &[Entry],
     untracked: &[String],
     ignored: &[String],
+    hide_untracked: bool,
     io: &mut Io,
 ) {
     match branch {
@@ -392,6 +394,11 @@ fn emit_long_status(
             io.out.extend_from_slice(format!("\t{path}\n").as_bytes());
         }
         io.out.push(b'\n');
+    }
+    if hide_untracked {
+        io.out.extend_from_slice(
+            b"Untracked files not listed (use -u option to show untracked files)\n",
+        );
     }
     if entries.is_empty() && untracked.is_empty() {
         io.out
@@ -899,7 +906,9 @@ pub(crate) fn git_restore(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
         index += 1;
     }
     if paths.is_empty() {
-        return usage(io, "restore requires a pathspec");
+        io.err
+            .extend_from_slice(b"fatal: you must specify path(s) to restore\n");
+        return 128;
     }
     if !staged {
         worktree = true;
@@ -1162,16 +1171,18 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let mut modified = false;
     let mut deleted = false;
     let mut others = false;
+    let mut stage = false;
     let mut exclude_standard = false;
     let mut paths = Vec::new();
     let mut options = true;
-    for argument in super::expand_clusters(args, "cmdoz") {
+    for argument in super::expand_clusters(args, "cmdosz") {
         match argument.as_str() {
             "--" if options => options = false,
             "-c" | "--cached" if options => cached = true,
             "-m" | "--modified" if options => modified = true,
             "-d" | "--deleted" if options => deleted = true,
             "-o" | "--others" if options => others = true,
+            "-s" | "--stage" if options => stage = true,
             "--exclude-standard" if options => exclude_standard = true,
             "--error-unmatch" if options => error_unmatch = true,
             "-z" if options => nul = true,
@@ -1246,6 +1257,11 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             continue;
         }
         matched = true;
+        if stage {
+            let hash = index.get(&path).cloned().unwrap_or_default();
+            io.out
+                .extend_from_slice(format!("100644 {hash} 0\t").as_bytes());
+        }
         io.out.extend_from_slice(displayed.as_bytes());
         io.out.push(if nul { 0 } else { b'\n' });
     }

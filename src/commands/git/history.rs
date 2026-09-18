@@ -1005,8 +1005,12 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     let mut rename = false;
     let mut force = false;
     let mut list = false;
+    let mut contains: Option<String> = None;
     let mut operands: Vec<String> = Vec::new();
-    for argument in args {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        index += 1;
         match argument.as_str() {
             "--show-current" => {
                 if let Some(branch) = repo::current_branch(ctx, &root) {
@@ -1027,6 +1031,26 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             }
             "-f" | "--force" => force = true,
             "-l" | "--list" => list = true,
+            value if value.starts_with("--contains=") || value.starts_with("--merged=") => {
+                contains = Some(
+                    value
+                        .split_once('=')
+                        .map_or("", |parts| parts.1)
+                        .to_string(),
+                );
+                list = true;
+            }
+            "--contains" | "--merged" => {
+                // The revision is optional and defaults to HEAD.
+                contains = Some(match args.get(index) {
+                    Some(value) if !value.starts_with('-') => {
+                        index += 1;
+                        value.clone()
+                    }
+                    _ => "HEAD".to_string(),
+                });
+                list = true;
+            }
             "-r" | "--remotes" => {
                 // The simulation has no remotes, so there are no remote-tracking branches.
                 return 0;
@@ -1059,13 +1083,8 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         return rename_branch(ctx, &root, &from, &to, force, io);
     }
     if operands.is_empty() || list {
-        return list_branches(
-            ctx,
-            &root,
-            operands.first().map(String::as_str),
-            verbose,
-            io,
-        );
+        let pattern = operands.first().map(String::as_str);
+        return list_branches(ctx, &root, pattern, contains.as_deref(), verbose, io);
     }
     if operands.len() > 2 || !valid_reference_name(&operands[0]) {
         return usage(io, "usage: git branch NAME [START_POINT]");
@@ -1097,15 +1116,27 @@ fn list_branches(
     ctx: &mut CommandContext<'_>,
     root: &str,
     pattern: Option<&str>,
+    contains: Option<&str>,
     verbose: bool,
     io: &mut Io,
 ) -> i32 {
+    // `--contains`/`--merged` keep only branches whose tip is reachable from the named revision.
+    let reachable = contains.and_then(|revision| {
+        let commit = repo::resolve_revision(ctx, root, revision)?;
+        Some(repo::ancestors(ctx, root, &commit))
+    });
     let current = repo::current_branch(ctx, root);
     let branches = repo::branch_names(ctx, root);
     let width = branches.iter().map(String::len).max().unwrap_or(0);
     for branch in branches {
         if let Some(pattern) = pattern {
             if !crate::commands::util::glob_eq(pattern, &branch) {
+                continue;
+            }
+        }
+        if let Some(reachable) = &reachable {
+            let tip = repo::read_reference(ctx, root, &format!("refs/heads/{branch}"));
+            if !tip.is_some_and(|tip| reachable.contains(&tip)) {
                 continue;
             }
         }

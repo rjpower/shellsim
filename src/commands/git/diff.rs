@@ -146,14 +146,15 @@ pub(crate) fn change_counts(old: Option<&[u8]>, new: Option<&[u8]>) -> (usize, u
 }
 
 /// The `diff --git` header Git prints before each file's hunks.
-fn header(path: &str, old: Option<&[u8]>, new: Option<&[u8]>) -> String {
+fn header(path: &str, old: Option<&[u8]>, new: Option<&[u8]>, prefixes: bool) -> String {
+    let (left, right) = labels(prefixes);
     let blank = "0000000";
     let hash = |data: Option<&[u8]>| {
         data.map_or(blank.to_string(), |data| {
             super::repo::short(&super::repo::blob_hash(data)).to_string()
         })
     };
-    let mut text = format!("diff --git a/{path} b/{path}\n");
+    let mut text = format!("diff --git {left}{path} {right}{path}\n");
     match (old.is_some(), new.is_some()) {
         (false, true) => text.push_str("new file mode 100644\n"),
         (true, false) => text.push_str("deleted file mode 100644\n"),
@@ -167,28 +168,44 @@ fn header(path: &str, old: Option<&[u8]>, new: Option<&[u8]>) -> String {
     text
 }
 
+/// The `a/` and `b/` path prefixes, which `git diff --no-prefix` drops.
+fn labels(prefixes: bool) -> (&'static str, &'static str) {
+    if prefixes {
+        ("a/", "b/")
+    } else {
+        ("", "")
+    }
+}
+
 /// Render one file's unified diff, including the `diff --git` header.
 ///
 /// Returns an empty string when the contents are identical.
-pub(crate) fn render(path: &str, old: Option<&[u8]>, new: Option<&[u8]>, context: usize) -> String {
+pub(crate) fn render(
+    path: &str,
+    old: Option<&[u8]>,
+    new: Option<&[u8]>,
+    context: usize,
+    prefixes: bool,
+) -> String {
     if old == new {
         return String::new();
     }
-    let mut out = header(path, old, new);
+    let (left, right) = labels(prefixes);
+    let mut out = header(path, old, new, prefixes);
     if old.is_some_and(is_binary) || new.is_some_and(is_binary) {
         out.push_str(&format!(
             "Binary files {} and {} differ\n",
-            old.map_or("/dev/null".to_string(), |_| format!("a/{path}")),
-            new.map_or("/dev/null".to_string(), |_| format!("b/{path}"))
+            old.map_or("/dev/null".to_string(), |_| format!("{left}{path}")),
+            new.map_or("/dev/null".to_string(), |_| format!("{right}{path}"))
         ));
         return out;
     }
     out.push_str(&match old {
-        Some(_) => format!("--- a/{path}\n"),
+        Some(_) => format!("--- {left}{path}\n"),
         None => "--- /dev/null\n".to_string(),
     });
     out.push_str(&match new {
-        Some(_) => format!("+++ b/{path}\n"),
+        Some(_) => format!("+++ {right}{path}\n"),
         None => "+++ /dev/null\n".to_string(),
     });
     let old_lines = split_lines(old.unwrap_or_default());
@@ -326,7 +343,7 @@ mod tests {
     fn renders_a_hunk_with_context_rather_than_the_whole_file() {
         let old = b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
         let new = b"one\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nnine\nten\n";
-        let patch = render("f.txt", Some(old), Some(new), DEFAULT_CONTEXT);
+        let patch = render("f.txt", Some(old), Some(new), DEFAULT_CONTEXT, true);
         assert!(patch.contains("@@ -2,7 +2,7 @@ one\n"), "{patch}");
         assert!(patch.contains("-five\n+FIVE\n"), "{patch}");
         assert!(!patch.contains("-one"), "{patch}");
@@ -334,17 +351,17 @@ mod tests {
 
     #[test]
     fn marks_new_and_deleted_files() {
-        let created = render("f.txt", None, Some(b"hello\n"), DEFAULT_CONTEXT);
+        let created = render("f.txt", None, Some(b"hello\n"), DEFAULT_CONTEXT, true);
         assert!(created.contains("new file mode 100644\n"), "{created}");
         assert!(created.contains("@@ -0,0 +1 @@\n+hello\n"), "{created}");
-        let removed = render("f.txt", Some(b"hello\n"), None, DEFAULT_CONTEXT);
+        let removed = render("f.txt", Some(b"hello\n"), None, DEFAULT_CONTEXT, true);
         assert!(removed.contains("deleted file mode 100644\n"), "{removed}");
         assert!(removed.contains("@@ -1 +0,0 @@\n-hello\n"), "{removed}");
     }
 
     #[test]
     fn reports_a_missing_final_newline() {
-        let patch = render("f.txt", Some(b"a\n"), Some(b"a\nb"), DEFAULT_CONTEXT);
+        let patch = render("f.txt", Some(b"a\n"), Some(b"a\nb"), DEFAULT_CONTEXT, true);
         assert!(
             patch.contains("+b\n\\ No newline at end of file\n"),
             "{patch}"
@@ -353,7 +370,13 @@ mod tests {
 
     #[test]
     fn treats_removing_the_final_newline_as_a_change() {
-        let patch = render("f.txt", Some(b"a\nb\n"), Some(b"a\nb"), DEFAULT_CONTEXT);
+        let patch = render(
+            "f.txt",
+            Some(b"a\nb\n"),
+            Some(b"a\nb"),
+            DEFAULT_CONTEXT,
+            true,
+        );
         assert!(patch.contains("@@ -1,2 +1,2 @@\n"), "{patch}");
         assert!(
             patch.contains("-b\n+b\n\\ No newline at end of file\n"),
@@ -374,7 +397,7 @@ mod tests {
 
     #[test]
     fn uses_git_blob_hashes_in_index_lines() {
-        let patch = render("f.txt", None, Some(b"a\nb\n"), DEFAULT_CONTEXT);
+        let patch = render("f.txt", None, Some(b"a\nb\n"), DEFAULT_CONTEXT, true);
         assert!(patch.contains("index 0000000..422c2b7\n"), "{patch}");
     }
 
@@ -385,6 +408,7 @@ mod tests {
             Some(b"\x00\x01"),
             Some(b"\x00\x02"),
             DEFAULT_CONTEXT,
+            true,
         );
         assert!(
             patch.contains("Binary files a/f.bin and b/f.bin differ\n"),

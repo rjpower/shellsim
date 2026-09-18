@@ -22,6 +22,7 @@ pub(crate) enum Format {
     Stat,
     NumStat,
     ShortStat,
+    Summary,
     Check,
 }
 
@@ -44,6 +45,12 @@ pub(crate) struct Options {
     pub paths: Vec<String>,
     /// Report only whether anything differs, printing nothing.
     pub quiet: bool,
+    /// Whether patch paths carry the usual `a/` and `b/` prefixes.
+    pub prefixes: bool,
+    /// Swap the two sides, as `git diff -R` does.
+    pub reverse: bool,
+    /// Limit the report to these change letters, as `--diff-filter` does.
+    pub filter: Option<String>,
 }
 
 impl Default for Options {
@@ -54,6 +61,9 @@ impl Default for Options {
             right: RightSide::Stored,
             paths: Vec::new(),
             quiet: false,
+            prefixes: true,
+            reverse: false,
+            filter: None,
         }
     }
 }
@@ -93,12 +103,25 @@ pub(crate) fn emit(
     options: &Options,
     io: &mut Io,
 ) -> bool {
+    let (old, new) = if options.reverse {
+        (new, old)
+    } else {
+        (old, new)
+    };
     let mut names = BTreeSet::new();
     names.extend(old.keys().cloned());
     names.extend(new.keys().cloned());
     let changed: Vec<String> = names
         .into_iter()
         .filter(|path| selected(&options.paths, path) && old.get(path) != new.get(path))
+        .filter(|path| {
+            options.filter.as_ref().is_none_or(|letters| {
+                letters.contains(status_letter(
+                    old.contains_key(path),
+                    new.contains_key(path),
+                ))
+            })
+        })
         .collect();
     if changed.is_empty() {
         return false;
@@ -111,13 +134,23 @@ pub(crate) fn emit(
     }
     if options.format == Format::NameStatus {
         for path in &changed {
-            let status = match (old.contains_key(path), new.contains_key(path)) {
-                (false, true) => 'A',
-                (true, false) => 'D',
-                _ => 'M',
-            };
+            let status = status_letter(old.contains_key(path), new.contains_key(path));
             io.out
                 .extend_from_slice(format!("{status}\t{path}\n").as_bytes());
+        }
+        return false;
+    }
+    if options.format == Format::Summary {
+        for path in &changed {
+            match (old.contains_key(path), new.contains_key(path)) {
+                (false, true) => io
+                    .out
+                    .extend_from_slice(format!(" create mode 100644 {path}\n").as_bytes()),
+                (true, false) => io
+                    .out
+                    .extend_from_slice(format!(" delete mode 100644 {path}\n").as_bytes()),
+                _ => {}
+            }
         }
         return false;
     }
@@ -144,11 +177,18 @@ pub(crate) fn emit(
                 stats.push((path.clone(), insertions, deletions, binary));
             }
             Format::Patch => {
-                let patch =
-                    diff::render(path, before.as_deref(), after.as_deref(), options.context);
+                let patch = diff::render(
+                    path,
+                    before.as_deref(),
+                    after.as_deref(),
+                    options.context,
+                    options.prefixes,
+                );
                 io.out.extend_from_slice(patch.as_bytes());
             }
-            Format::NameOnly | Format::NameStatus => unreachable!("handled above"),
+            Format::NameOnly | Format::NameStatus | Format::Summary => {
+                unreachable!("handled above")
+            }
         }
     }
     if matches!(
@@ -158,6 +198,15 @@ pub(crate) fn emit(
         emit_stats(&stats, options.format, io);
     }
     check_failed
+}
+
+/// The letter `--name-status` and `--diff-filter` use for one path.
+fn status_letter(in_old: bool, in_new: bool) -> char {
+    match (in_old, in_new) {
+        (false, true) => 'A',
+        (true, false) => 'D',
+        _ => 'M',
+    }
 }
 
 /// The trailing ` N files changed, ... ` line shared by `--stat`, `--shortstat`, and `git commit`.
@@ -249,11 +298,17 @@ pub(crate) fn apply_shared_option(options: &mut Options, argument: &str) -> Opti
         "--name-only" => options.format = Format::NameOnly,
         "--name-status" => options.format = Format::NameStatus,
         "--stat" => options.format = Format::Stat,
+        "--summary" => options.format = Format::Summary,
+        "--no-prefix" => options.prefixes = false,
+        "-R" => options.reverse = true,
         "--numstat" => options.format = Format::NumStat,
         "--shortstat" => options.format = Format::ShortStat,
         "--check" => options.format = Format::Check,
         "-p" | "-u" | "--patch" => options.format = Format::Patch,
         "--no-color" | "--color=never" | "--no-ext-diff" | "--no-renames" => {}
+        value if value.starts_with("--diff-filter=") => {
+            options.filter = Some(value["--diff-filter=".len()..].to_ascii_uppercase());
+        }
         value => {
             let context = value
                 .strip_prefix("-U")

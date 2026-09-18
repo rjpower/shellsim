@@ -115,6 +115,42 @@ fn run_patch(
     status
 }
 
+/// Apply a unified diff on behalf of `git apply`.
+///
+/// Git strips one leading path component by default, and `--check` verifies the patch without
+/// keeping the result, which is done here by restoring the filesystem snapshot afterwards.
+pub(crate) fn apply_unified_diff(
+    ctx: &mut CommandContext<'_>,
+    args: &[String],
+    io: &mut Io,
+) -> i32 {
+    let mut check = false;
+    let mut forwarded = vec!["-p1".to_string()];
+    for argument in args {
+        match argument.as_str() {
+            "--check" | "--summary" | "--stat" => check = true,
+            "-v" | "--verbose" | "--index" | "--cached" | "--3way" | "--whitespace=nowarn" => {}
+            value if value.starts_with("-p") || value.starts_with("--unsafe-paths") => {
+                forwarded.insert(0, value.to_string());
+            }
+            value if value.starts_with('-') => {
+                io.err.extend_from_slice(
+                    format!("git: unsupported apply option: {value}\n").as_bytes(),
+                );
+                return 2;
+            }
+            value => forwarded.push(value.to_string()),
+        }
+    }
+    let cwd = ctx.cwd.clone();
+    let before = check.then(|| ctx.vfs.clone());
+    let status = run_patch(ctx, &forwarded, io, false, &cwd);
+    if let Some(before) = before {
+        ctx.vfs = before;
+    }
+    status
+}
+
 /// Apply one trusted harness patch atomically beneath `/work` using the command's parser and
 /// resource model.
 pub(crate) fn apply_harness_patch(

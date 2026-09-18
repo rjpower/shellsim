@@ -37,6 +37,7 @@ usage: git [-C DIRECTORY] [-c NAME=VALUE] COMMAND [ARGUMENTS]
 
 Supported commands:
    add         stage working-tree contents
+   apply       apply a unified diff to the working tree
    branch      list, create, rename, or delete branches
    cat-file    show an object's type, size, or contents
    check-ignore report which paths .gitignore excludes
@@ -92,6 +93,10 @@ pub(crate) struct Globals {
 /// Only `commit -F -` and `hash-object --stdin` do, so every other subcommand leaves a
 /// redirected loop's input alone.
 pub(crate) fn reads_standard_input(args: &[String]) -> bool {
+    // `git apply` with no file operand reads the patch from standard input.
+    if args.first().is_some_and(|subcommand| subcommand == "apply") {
+        return !args[1..].iter().any(|argument| !argument.starts_with('-'));
+    }
     let mut previous = "";
     for argument in args {
         if argument == "--stdin" || argument == "--file=-" {
@@ -304,6 +309,7 @@ fn dispatch(
         "config" => config::git_config(ctx, globals, args, io),
         "remote" => config::git_remote(ctx, globals, args, io),
         "stash" => stash::git_stash(ctx, args, io),
+        "apply" => crate::commands::patch::apply_unified_diff(ctx, args, io),
         "grep" => plumbing::git_grep(ctx, args, io),
         "cat-file" => plumbing::git_cat_file(ctx, args, io),
         "hash-object" => plumbing::git_hash_object(ctx, args, io),
