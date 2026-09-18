@@ -73,3 +73,58 @@ print(total)"#;
     assert_eq!(stdout, b"6\n");
     assert!(usage.memory_peak <= 64 * 1024);
 }
+
+#[test]
+fn instance_shapes_preserve_late_attributes_and_dictionary_fallback() {
+    let mut source = String::from(
+        "class Item:\n    pass\ndef read_left(item):\n    return item.left\nfirst = Item()\nsecond = Item()\nfirst.left = 1\nfirst.right = 2\nsecond.right = 3\nsecond.left = 4\nprint(read_left(first))\nfirst.extra = 6\nprint(read_left(first))\nfirst.right = 5\n",
+    );
+    for index in 0..40 {
+        source.push_str(&format!("first.field_{index} = {index}\n"));
+    }
+    source.push_str("print(read_left(first))\nprint(first.left, first.right, second.left, second.right, first.field_0, first.field_39)\n");
+
+    let (status, stdout, stderr, _) = run(&source, Limits::unlimited());
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"1\n1\n1\n1 5 4 3 0 39\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn divergent_instance_attributes_remain_memory_bounded() {
+    let mut source = String::from("class Item:\n    pass\nitem = Item()\n");
+    for index in 0..2_000 {
+        source.push_str(&format!("item.field_{index} = {index}\n"));
+    }
+    let (status, stdout, stderr, usage) = run(
+        &source,
+        Limits {
+            memory: 32 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 32 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn attribute_lookaside_preserves_non_data_descriptor_precedence() {
+    let source = r#"class Item:
+    def label(self):
+        return "class"
+
+def read_label(item):
+    return item.label
+
+item = Item()
+item.label = "instance"
+print(read_label(item), read_label(item))
+item.extra = 1
+print(read_label(item))"#;
+    let (status, stdout, stderr, _) = run(source, Limits::unlimited());
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"instance instance\ninstance\n");
+    assert!(stderr.is_empty());
+}

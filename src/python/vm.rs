@@ -13,7 +13,10 @@ use num_traits::ToPrimitive;
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
 use super::bytecode::{ClassField, CodeRef, Operation};
 use super::filesystem::PyModuleLoader;
-use super::heap::{ClassLayout, InstancePayload, Object, ScopeId};
+use super::heap::{
+    ClassLayout, InstanceAttributeSlot, InstanceAttributes, InstancePayload, Object, ObjectId,
+    ScopeId,
+};
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
     PyArray, PyArrayDtype, PyArrayLayout, PyBinaryOp, PyByteArray, PyCallable, PyClass, PyClock,
@@ -430,10 +433,23 @@ struct VmState {
     exception_stack: Vec<RaisedException>,
     with_contexts: Vec<Value>,
     method_frames: Vec<(super::heap::ObjectId, Value)>,
+    attribute_caches: Vec<CodeAttributeCaches>,
     stdin_position: usize,
     stdin_text: Option<String>,
     transient_memory: u64,
     retained_memory: u64,
+}
+
+#[derive(Clone)]
+struct CodeAttributeCaches {
+    code: CodeRef,
+    entries: Vec<Option<LoadAttributeCache>>,
+}
+
+#[derive(Clone, Copy)]
+struct LoadAttributeCache {
+    class: ObjectId,
+    location: InstanceAttributeSlot,
 }
 
 /// An executing code object's resumable control state.
@@ -740,7 +756,9 @@ impl<'a> Vm<'a> {
                 Operation::DeleteGlobal(name) => self.delete_global(name),
                 Operation::DeleteSubscript => self.delete_subscript(),
                 Operation::Import { name, bind_root } => self.import(name, *bind_root),
-                Operation::LoadAttribute(name) => self.load_attribute(name),
+                Operation::LoadAttribute(name) => {
+                    self.load_attribute_at(&code, instruction_pointer, name)
+                }
                 Operation::LoadSubscript => self.load_subscript(),
                 Operation::BuildSlice {
                     has_start,
@@ -1736,6 +1754,97 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
+    fn load_attribute_at(&mut self, code: &CodeRef, site: usize, name: &str) -> Result<(), String> {
+        let owner = self.pop()?;
+        if let (Some(id), Some(cache)) = (owner.object_id(), self.attribute_cache(code, site)) {
+            if let Some(value) =
+                self.state
+                    .heap
+                    .cached_instance_attribute(id, cache.class, cache.location)?
+            {
+                self.stack.push(value);
+                return Ok(());
+            }
+        }
+        let value = self
+            .resolve_attribute(owner, name)?
+            .ok_or_else(|| format!("attribute {name:?} is not implemented"))?;
+        if let Some(cache) = self.cacheable_instance_attribute(owner, name)? {
+            self.remember_attribute_cache(code, site, cache)?;
+        }
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn attribute_cache(&self, code: &CodeRef, site: usize) -> Option<LoadAttributeCache> {
+        self.execution
+            .attribute_caches
+            .iter()
+            .find(|cache| Arc::ptr_eq(&cache.code, code))?
+            .entries
+            .get(site)
+            .copied()
+            .flatten()
+    }
+
+    fn remember_attribute_cache(
+        &mut self,
+        code: &CodeRef,
+        site: usize,
+        cache: LoadAttributeCache,
+    ) -> Result<(), String> {
+        if let Some(caches) = self
+            .execution
+            .attribute_caches
+            .iter_mut()
+            .find(|caches| Arc::ptr_eq(&caches.code, code))
+        {
+            caches.entries[site] = Some(cache);
+            return Ok(());
+        }
+        let bytes = code
+            .instructions
+            .len()
+            .checked_mul(std::mem::size_of::<Option<LoadAttributeCache>>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CodeAttributeCaches>()))
+            .ok_or("attribute cache size overflow")?;
+        if u64::try_from(bytes).unwrap_or(u64::MAX) > self.interp.resources.memory_remaining() {
+            return Ok(());
+        }
+        self.reserve_retained_memory(bytes)?;
+        let mut entries = vec![None; code.instructions.len()];
+        entries[site] = Some(cache);
+        self.execution.attribute_caches.push(CodeAttributeCaches {
+            code: code.clone(),
+            entries,
+        });
+        Ok(())
+    }
+
+    fn cacheable_instance_attribute(
+        &mut self,
+        owner: Value,
+        name: &str,
+    ) -> Result<Option<LoadAttributeCache>, String> {
+        let Some(id) = owner.object_id() else {
+            return Ok(None);
+        };
+        let Object::Instance { class, .. } = self.state.heap.get(id)? else {
+            return Ok(None);
+        };
+        let class = *class;
+        if let Some((_, descriptor)) = self.class_attribute_entry(class, name)? {
+            if self.is_data_descriptor(&descriptor)? {
+                return Ok(None);
+            }
+        }
+        Ok(self
+            .state
+            .heap
+            .instance_attribute_slot(id, name)?
+            .map(|location| LoadAttributeCache { class, location }))
+    }
+
     /// Resolve one attribute without involving the operand stack.
     ///
     /// Missing attributes return `None`; errors raised while invoking descriptors remain errors.
@@ -1957,15 +2066,12 @@ impl<'a> Vm<'a> {
                 }
             }
         }
-        let is_new = !self.state.heap.has_attribute(id, name)?;
-        if is_new {
-            self.state
-                .heap
-                .reserve_object_growth(id, 48, &mut self.interp.resources)?;
-        }
-        self.state
-            .heap
-            .insert_attribute(id, name.to_string(), value)?;
+        self.state.heap.insert_attribute(
+            id,
+            name.to_string(),
+            value,
+            &mut self.interp.resources,
+        )?;
         Ok(())
     }
 
@@ -2751,7 +2857,7 @@ impl<'a> Vm<'a> {
         let instance_type =
             self.state
                 .types
-                .register(name.clone(), type_bases, type_mro, attributes.clone())?;
+                .register(name.clone(), type_bases, type_mro, &attributes)?;
         let descriptors = attributes
             .iter()
             .map(|(name, value)| (name.clone(), *value))
@@ -4510,7 +4616,11 @@ impl<'a> Vm<'a> {
                             return Ok(CallResult::Value(created));
                         }
                     };
-                    let instance = self.allocate_object(Object::Instance { class: id, payload })?;
+                    let instance = self.allocate_object(Object::Instance {
+                        class: id,
+                        payload,
+                        attributes: InstanceAttributes::default(),
+                    })?;
                     if is_dataclass {
                         let mut values = Vec::new();
                         for (index, (field, default)) in dataclass_fields.iter().enumerate() {
