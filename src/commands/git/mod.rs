@@ -358,6 +358,9 @@ fn dispatch(
         "merge-base" => plumbing::git_merge_base(ctx, args, io),
         "describe" => plumbing::git_describe(ctx, args, io),
         "shortlog" => plumbing::git_shortlog(ctx, args, io),
+        "show-ref" => plumbing::git_show_ref(ctx, args, io),
+        "symbolic-ref" => plumbing::git_symbolic_ref(ctx, args, io),
+        "for-each-ref" => plumbing::git_for_each_ref(ctx, args, io),
         other if NETWORK_COMMANDS.contains(&other) => {
             ctx.note_unsupported(&format!("git:{other}"));
             io.err.extend_from_slice(

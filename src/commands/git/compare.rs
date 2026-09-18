@@ -51,6 +51,8 @@ pub(crate) struct Options {
     pub reverse: bool,
     /// Limit the report to these change letters, as `--diff-filter` does.
     pub filter: Option<String>,
+    /// How whitespace differences are treated, as `-w` and `-b` set it.
+    pub whitespace: diff::Whitespace,
 }
 
 impl Default for Options {
@@ -64,6 +66,7 @@ impl Default for Options {
             prefixes: true,
             reverse: false,
             filter: None,
+            whitespace: diff::Whitespace::Significant,
         }
     }
 }
@@ -111,28 +114,52 @@ pub(crate) fn emit(
     let mut names = BTreeSet::new();
     names.extend(old.keys().cloned());
     names.extend(new.keys().cloned());
-    let changed: Vec<String> = names
+    let mut changed: Vec<String> = names
         .into_iter()
         .filter(|path| selected(&options.paths, path) && old.get(path) != new.get(path))
-        .filter(|path| {
-            options.filter.as_ref().is_none_or(|letters| {
-                letters.contains(status_letter(
-                    old.contains_key(path),
-                    new.contains_key(path),
-                ))
-            })
-        })
         .collect();
-    if changed.is_empty() {
+    let mut renames = detect_renames(old, new, &mut changed);
+    if let Some(letters) = &options.filter {
+        changed.retain(|path| {
+            letters.contains(status_letter(
+                old.contains_key(path),
+                new.contains_key(path),
+            ))
+        });
+        renames.retain(|_| letters.contains('R'));
+    }
+    if options.whitespace != diff::Whitespace::Significant {
+        // Under `-w` or `-b` a file whose only difference is whitespace is not a change at all.
+        let context = &*ctx;
+        changed.retain(|path| {
+            match (
+                content(context, root, old, path, RightSide::Stored),
+                content(context, root, new, path, options.right),
+            ) {
+                (Some(before), Some(after)) => {
+                    diff::change_counts(Some(&before), Some(&after), options.whitespace) != (0, 0)
+                }
+                _ => true,
+            }
+        });
+    }
+    if changed.is_empty() && renames.is_empty() {
         return false;
     }
     if options.format == Format::NameOnly {
+        for (_, to) in &renames {
+            io.out.extend_from_slice(format!("{to}\n").as_bytes());
+        }
         for path in &changed {
             io.out.extend_from_slice(format!("{path}\n").as_bytes());
         }
         return false;
     }
     if options.format == Format::NameStatus {
+        for (from, to) in &renames {
+            io.out
+                .extend_from_slice(format!("R100\t{from}\t{to}\n").as_bytes());
+        }
         for path in &changed {
             let status = status_letter(old.contains_key(path), new.contains_key(path));
             io.out
@@ -141,6 +168,10 @@ pub(crate) fn emit(
         return false;
     }
     if options.format == Format::Summary {
+        for (from, to) in &renames {
+            io.out
+                .extend_from_slice(format!(" rename {from} => {to} (100%)\n").as_bytes());
+        }
         for path in &changed {
             match (old.contains_key(path), new.contains_key(path)) {
                 (false, true) => io
@@ -157,6 +188,18 @@ pub(crate) fn emit(
 
     let mut check_failed = false;
     let mut stats: Vec<(String, usize, usize, bool)> = Vec::new();
+    for (from, to) in &renames {
+        match options.format {
+            Format::Stat | Format::NumStat | Format::ShortStat => {
+                stats.push((format!("{from} => {to}"), 0, 0, false));
+            }
+            Format::Patch => {
+                io.out
+                    .extend_from_slice(rename_header(from, to, options.prefixes).as_bytes());
+            }
+            _ => {}
+        }
+    }
     for path in &changed {
         let before = content(ctx, root, old, path, RightSide::Stored);
         let after = content(ctx, root, new, path, options.right);
@@ -172,7 +215,7 @@ pub(crate) fn emit(
                 let (insertions, deletions) = if binary {
                     (0, 0)
                 } else {
-                    diff::change_counts(before.as_deref(), after.as_deref())
+                    diff::change_counts(before.as_deref(), after.as_deref(), options.whitespace)
                 };
                 stats.push((path.clone(), insertions, deletions, binary));
             }
@@ -183,6 +226,7 @@ pub(crate) fn emit(
                     after.as_deref(),
                     options.context,
                     options.prefixes,
+                    options.whitespace,
                 );
                 io.out.extend_from_slice(patch.as_bytes());
             }
@@ -200,6 +244,45 @@ pub(crate) fn emit(
     check_failed
 }
 
+/// Pair a deletion with an addition of byte-identical content.
+///
+/// Similarity-based detection is outside this model, so only an exact move is a rename; the paired
+/// paths are removed from `changed`.
+fn detect_renames(old: &Tree, new: &Tree, changed: &mut Vec<String>) -> Vec<(String, String)> {
+    let removed: Vec<String> = changed
+        .iter()
+        .filter(|path| !new.contains_key(*path))
+        .cloned()
+        .collect();
+    let added: Vec<String> = changed
+        .iter()
+        .filter(|path| !old.contains_key(*path))
+        .cloned()
+        .collect();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for source in removed {
+        let Some(hash) = old.get(&source) else {
+            continue;
+        };
+        let target = added.iter().find(|candidate| {
+            new.get(*candidate) == Some(hash) && !pairs.iter().any(|(_, taken)| taken == *candidate)
+        });
+        if let Some(target) = target {
+            pairs.push((source, target.clone()));
+        }
+    }
+    changed.retain(|path| !pairs.iter().any(|(from, to)| path == from || path == to));
+    pairs
+}
+
+/// The header Git prints for a rename, which carries no hunks when the content is unchanged.
+fn rename_header(from: &str, to: &str, prefixes: bool) -> String {
+    let (a, b) = if prefixes { ("a/", "b/") } else { ("", "") };
+    format!(
+        "diff --git {a}{from} {b}{to}\nsimilarity index 100%\nrename from {from}\nrename to {to}\n"
+    )
+}
+
 /// The letter `--name-status` and `--diff-filter` use for one path.
 fn status_letter(in_old: bool, in_new: bool) -> char {
     match (in_old, in_new) {
@@ -212,6 +295,11 @@ fn status_letter(in_old: bool, in_new: bool) -> char {
 /// The trailing ` N files changed, ... ` line shared by `--stat`, `--shortstat`, and `git commit`.
 pub(crate) fn summary_line(files: usize, insertions: usize, deletions: usize) -> String {
     let mut text = format!(" {files} file{} changed", plural(files));
+    // A change with no line movement still reports both counts, as Git does for a pure rename.
+    if insertions == 0 && deletions == 0 {
+        text.push_str(", 0 insertions(+), 0 deletions(-)\n");
+        return text;
+    }
     if insertions != 0 {
         text.push_str(&format!(
             ", {insertions} insertion{}(+)",
@@ -264,13 +352,11 @@ fn emit_stats(stats: &[(String, usize, usize, bool)], format: Format, io: &mut I
             let total = insertions + deletions;
             // Git scales the graph to at most 40 columns while keeping at least one mark per side.
             let (plus, minus) = scale_graph(*insertions, *deletions);
+            let graph = format!("{}{}", "+".repeat(plus), "-".repeat(minus));
+            let separator = if graph.is_empty() { "" } else { " " };
             io.out.extend_from_slice(
-                format!(
-                    " {path:name_width$} | {total:>count_width$} {}{}\n",
-                    "+".repeat(plus),
-                    "-".repeat(minus)
-                )
-                .as_bytes(),
+                format!(" {path:name_width$} | {total:>count_width$}{separator}{graph}\n")
+                    .as_bytes(),
             );
         }
     }
@@ -306,6 +392,8 @@ pub(crate) fn apply_shared_option(options: &mut Options, argument: &str) -> Opti
         "--check" => options.format = Format::Check,
         "-p" | "-u" | "--patch" => options.format = Format::Patch,
         "--no-color" | "--color=never" | "--no-ext-diff" | "--no-renames" => {}
+        "-w" | "--ignore-all-space" => options.whitespace = diff::Whitespace::IgnoreAll,
+        "-b" | "--ignore-space-change" => options.whitespace = diff::Whitespace::IgnoreChange,
         value if value.starts_with("--diff-filter=") => {
             options.filter = Some(value["--diff-filter=".len()..].to_ascii_uppercase());
         }
@@ -317,6 +405,63 @@ pub(crate) fn apply_shared_option(options: &mut Options, argument: &str) -> Opti
         }
     }
     Some(true)
+}
+
+/// Compare two files directly, as `git diff --no-index` does.
+///
+/// Exits 1 when the files differ, which is how the command is usually used as a plain differ.
+fn diff_no_index(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut options = Options::default();
+    let mut operands: Vec<String> = Vec::new();
+    for argument in args {
+        match argument.as_str() {
+            "--no-index" => {}
+            value if value.starts_with('-') => {
+                if apply_shared_option(&mut options, value).is_none() {
+                    return super::usage(io, &format!("unsupported diff option: {value}"));
+                }
+            }
+            value => operands.push(value.to_string()),
+        }
+    }
+    let [left, right] = operands.as_slice() else {
+        return super::usage(io, "usage: git diff --no-index PATH PATH");
+    };
+    let read = |path: &str| -> Option<Vec<u8>> {
+        let absolute = crate::vfs::resolve_against(&ctx.cwd, path);
+        ctx.fs_read_limited("/", &absolute, 16 * 1024 * 1024).ok()
+    };
+    let (Some(before), Some(after)) = (read(left), read(right)) else {
+        io.err.extend_from_slice(
+            format!("fatal: cannot read '{left}' or '{right}': No such file or directory\n")
+                .as_bytes(),
+        );
+        return 128;
+    };
+    if before == after {
+        return 0;
+    }
+    // Git labels the two sides with the operands themselves rather than a repository path.
+    let patch = diff::render(
+        left,
+        Some(&before),
+        Some(&after),
+        options.context,
+        options.prefixes,
+        options.whitespace,
+    );
+    let patch = patch.replacen(
+        &format!("diff --git a/{left} b/{left}"),
+        &format!("diff --git a/{left} b/{right}"),
+        1,
+    );
+    let patch = patch.replacen(&format!("+++ b/{left}"), &format!("+++ b/{right}"), 1);
+    if patch.is_empty() {
+        // `-w` or `-b` can make files that differ in bytes compare equal.
+        return 0;
+    }
+    io.out.extend_from_slice(patch.as_bytes());
+    1
 }
 
 /// Split a revision argument that may use range syntax into its two endpoints.
@@ -332,6 +477,10 @@ fn split_range(revision: &str) -> Option<(&str, &str, bool)> {
 }
 
 pub(crate) fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    // `--no-index` compares two files on their own and needs no repository.
+    if args.iter().any(|argument| argument == "--no-index") {
+        return diff_no_index(ctx, args, io);
+    }
     let Some(root) = repo::find_repo_root(ctx) else {
         return super::repo_error(io);
     };
@@ -467,7 +616,22 @@ fn finish(
     let differs = old
         .keys()
         .chain(new.keys())
-        .any(|path| selected(&options.paths, path) && old.get(path) != new.get(path));
+        .filter(|path| selected(&options.paths, path) && old.get(*path) != new.get(*path))
+        .any(|path| {
+            // Under `-w` or `-b` a whitespace-only difference does not count as a difference.
+            if options.whitespace == diff::Whitespace::Significant {
+                return true;
+            }
+            match (
+                content(ctx, root, old, path, RightSide::Stored),
+                content(ctx, root, new, path, options.right),
+            ) {
+                (Some(before), Some(after)) => {
+                    diff::change_counts(Some(&before), Some(&after), options.whitespace) != (0, 0)
+                }
+                _ => true,
+            }
+        });
     if options.quiet {
         return i32::from(differs);
     }

@@ -300,6 +300,10 @@ fn emit_commit_summary(
         .chain(old.keys())
         .filter(|path| old.get(*path) != new.get(*path))
         .collect();
+    // An empty commit records nothing, so Git prints no summary at all.
+    if changed.is_empty() {
+        return;
+    }
     for path in &changed {
         let before = old
             .get(*path)
@@ -307,7 +311,11 @@ fn emit_commit_summary(
         let after = new
             .get(*path)
             .and_then(|hash| repo::read_blob(ctx, root, hash));
-        let (added, removed) = super::diff::change_counts(before.as_deref(), after.as_deref());
+        let (added, removed) = super::diff::change_counts(
+            before.as_deref(),
+            after.as_deref(),
+            super::diff::Whitespace::Significant,
+        );
         insertions += added;
         deletions += removed;
     }
@@ -626,6 +634,14 @@ struct Selection {
 
 /// Resolve one revision argument, which may be a plain revision or an `a..b` range.
 fn select_revision(ctx: &mut CommandContext<'_>, root: &str, revision: &str) -> Option<Selection> {
+    // `^rev` excludes everything reachable from `rev` and includes nothing.
+    if let Some(excluded) = revision.strip_prefix('^') {
+        let commit = repo::resolve_revision(ctx, root, excluded)?;
+        return Some(Selection {
+            included: Vec::new(),
+            excluded: repo::ancestors(ctx, root, &commit),
+        });
+    }
     let Some((left, right, merge_base)) = split_range(revision) else {
         return Some(Selection {
             included: vec![repo::resolve_revision(ctx, root, revision)?],
@@ -1397,6 +1413,7 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     let mut force = false;
     let mut list = false;
     let mut contains: Option<String> = None;
+    let mut format: Option<String> = None;
     let mut operands: Vec<String> = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -1448,6 +1465,16 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             }
             "-a" | "--all" | "--no-color" | "--no-column" => list = true,
             "-q" | "--quiet" => {}
+            "--format" => {
+                index += 1;
+                format = args.get(index).cloned();
+                list = true;
+            }
+            value if value.starts_with("--format=") => {
+                format = Some(value["--format=".len()..].to_string());
+                list = true;
+            }
+            value if value.starts_with("--sort=") => list = true,
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported branch option: {value}"))
             }
@@ -1476,6 +1503,9 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     }
     if operands.is_empty() || list {
         let pattern = operands.first().map(String::as_str);
+        if let Some(format) = &format {
+            return list_formatted_branches(ctx, &root, pattern, format, io);
+        }
         return list_branches(ctx, &root, pattern, contains.as_deref(), verbose, io);
     }
     if operands.len() > 2 || !valid_reference_name(&operands[0]) {
@@ -1581,6 +1611,32 @@ fn list_branches(
     0
 }
 
+/// List branches through a `--format` template.
+fn list_formatted_branches(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    pattern: Option<&str>,
+    format: &str,
+    io: &mut Io,
+) -> i32 {
+    for branch in repo::branch_names(ctx, root) {
+        if let Some(pattern) = pattern {
+            if !crate::commands::util::glob_eq(pattern, &branch) {
+                continue;
+            }
+        }
+        let name = format!("refs/heads/{branch}");
+        let Some(commit) = repo::read_reference(ctx, root, &name) else {
+            continue;
+        };
+        let Some(line) = super::plumbing::expand_ref_format(format, &name, &commit) else {
+            return usage(io, &format!("unsupported branch format: {format}"));
+        };
+        io.out.extend_from_slice(format!("{line}\n").as_bytes());
+    }
+    0
+}
+
 fn delete_branches(
     ctx: &mut CommandContext<'_>,
     root: &str,
@@ -1677,6 +1733,8 @@ pub(crate) fn git_tag(
     let mut force = false;
     let mut annotations = false;
     let mut message: Option<String> = None;
+    let mut format: Option<String> = None;
+    let mut points_at: Option<String> = None;
     let mut operands: Vec<String> = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -1701,6 +1759,25 @@ pub(crate) fn git_tag(
                 message = args.get(index).cloned();
             }
             "-q" | "--quiet" => {}
+            "--format" => {
+                index += 1;
+                format = args.get(index).cloned();
+                list = true;
+            }
+            "--points-at" => {
+                index += 1;
+                points_at = args.get(index).cloned();
+                list = true;
+            }
+            value if value.starts_with("--format=") => {
+                format = Some(value["--format=".len()..].to_string());
+                list = true;
+            }
+            value if value.starts_with("--points-at=") => {
+                points_at = Some(value["--points-at=".len()..].to_string());
+                list = true;
+            }
+            value if value.starts_with("--sort=") => list = true,
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported tag option: {value}"))
             }
@@ -1710,22 +1787,46 @@ pub(crate) fn git_tag(
     }
     if delete {
         for name in &operands {
+            let was =
+                repo::read_reference(ctx, &root, &format!("refs/tags/{name}")).unwrap_or_default();
             if repo::delete_reference(ctx, &root, &format!("refs/tags/{name}")).is_err() {
                 io.err
                     .extend_from_slice(format!("error: tag '{name}' not found.\n").as_bytes());
                 return 1;
             }
-            io.out
-                .extend_from_slice(format!("Deleted tag '{name}'\n").as_bytes());
+            io.out.extend_from_slice(
+                format!("Deleted tag '{name}' (was {})\n", repo::short(&was)).as_bytes(),
+            );
         }
         return 0;
     }
     if operands.is_empty() || list {
+        // `--points-at` keeps only the tags on one commit.
+        let target = match points_at {
+            Some(revision) => match repo::resolve_revision(ctx, &root, &revision) {
+                Some(commit) => Some(commit),
+                None => return super::ambiguous_argument(io, &revision),
+            },
+            None => None,
+        };
         for name in repo::reference_names(ctx, &root, "tags") {
             if let Some(pattern) = operands.first() {
                 if !crate::commands::util::glob_eq(pattern, &name) {
                     continue;
                 }
+            }
+            let reference = format!("refs/tags/{name}");
+            let commit = repo::read_reference(ctx, &root, &reference).unwrap_or_default();
+            if target.as_ref().is_some_and(|target| *target != commit) {
+                continue;
+            }
+            if let Some(format) = &format {
+                let Some(line) = super::plumbing::expand_ref_format(format, &reference, &commit)
+                else {
+                    return usage(io, &format!("unsupported tag format: {format}"));
+                };
+                io.out.extend_from_slice(format!("{line}\n").as_bytes());
+                continue;
             }
             match repo::read_annotation(ctx, &root, &name).filter(|_| annotations) {
                 Some(annotation) => io

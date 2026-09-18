@@ -1267,3 +1267,160 @@ fn quiet_suppresses_the_report_but_not_the_diagnostic() {
     assert_eq!(missing.0, 1);
     assert!(missing.2.contains("did not match"), "{}", missing.2);
 }
+
+#[test]
+fn diff_reports_a_move_as_a_rename() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/old.txt", b"aaa\nbbb\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    assert_eq!(run(&mut env, "git mv old.txt new.txt").0, 0);
+
+    assert_eq!(
+        run(&mut env, "git diff --cached").1,
+        "diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt\n"
+    );
+    assert_eq!(
+        run(&mut env, "git diff --cached --name-status").1,
+        "R100\told.txt\tnew.txt\n"
+    );
+    assert_eq!(
+        run(&mut env, "git diff --cached --stat").1,
+        " old.txt => new.txt | 0\n 1 file changed, 0 insertions(+), 0 deletions(-)\n"
+    );
+    assert_eq!(
+        run(&mut env, "git diff --cached --numstat").1,
+        "0\t0\told.txt => new.txt\n"
+    );
+    assert_eq!(
+        run(&mut env, "git diff --cached --summary").1,
+        " rename old.txt => new.txt (100%)\n"
+    );
+}
+
+#[test]
+fn diff_can_ignore_whitespace_and_work_outside_a_repository() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/a.rs", b"fn main() {\nlet x = 1;\n}\n".to_vec(), 0o644)
+        .unwrap();
+    env.vfs
+        .put_file("/b.txt", b"keep\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    env.vfs
+        .put_file("/a.rs", b"fn main() {\n    let x = 1;\n}\n".to_vec(), 0o644)
+        .unwrap();
+
+    // Reindentation alone is not a change under `-w`.
+    assert_eq!(run(&mut env, "git diff -w").1, "");
+    assert_eq!(run(&mut env, "git diff -w --stat").1, "");
+    assert_eq!(run(&mut env, "git diff -w --quiet").0, 0);
+    // A real edit still shows, and the whitespace-only file stays out of it.
+    env.vfs
+        .put_file("/b.txt", b"changed\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git diff -w --name-only").1, "b.txt\n");
+
+    // `--no-index` needs no repository and exits 1 when the files differ.
+    let differing = run(&mut env, "git diff --no-index a.rs b.txt");
+    assert_eq!(differing.0, 1);
+    assert!(
+        differing.1.starts_with("diff --git a/a.rs b/b.txt\n"),
+        "{}",
+        differing.1
+    );
+    assert_eq!(run(&mut env, "git diff --no-index a.rs a.rs").0, 0);
+}
+
+#[test]
+fn reference_plumbing_reads_the_ref_store() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    assert_eq!(run(&mut env, "git tag v1; git branch side").0, 0);
+    let head = run(&mut env, "git rev-parse HEAD").1.trim().to_string();
+
+    assert_eq!(
+        run(&mut env, "git show-ref").1,
+        format!("{head} refs/heads/main\n{head} refs/heads/side\n{head} refs/tags/v1\n")
+    );
+    assert_eq!(
+        run(&mut env, "git show-ref --heads").1,
+        format!("{head} refs/heads/main\n{head} refs/heads/side\n")
+    );
+    assert_eq!(
+        run(&mut env, "git symbolic-ref HEAD").1,
+        "refs/heads/main\n"
+    );
+    assert_eq!(run(&mut env, "git symbolic-ref --short HEAD").1, "main\n");
+    assert_eq!(
+        run(
+            &mut env,
+            "git for-each-ref --format='%(refname:short)' refs/heads/"
+        )
+        .1,
+        "main\nside\n"
+    );
+    assert_eq!(
+        run(&mut env, "git branch --format='%(refname:short)'").1,
+        "main\nside\n"
+    );
+    assert_eq!(run(&mut env, "git tag --points-at HEAD").1, "v1\n");
+    assert_eq!(
+        run(&mut env, "git tag -d v1").1,
+        format!("Deleted tag 'v1' (was {})\n", &head[..7])
+    );
+
+    // A detached HEAD is not a symbolic reference.
+    assert_eq!(run(&mut env, "git checkout -q HEAD").0, 0);
+    assert_eq!(run(&mut env, "git symbolic-ref HEAD").0, 1);
+}
+
+#[test]
+fn stash_labels_entries_and_can_show_them() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"a\nb\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"a\nB\n".to_vec(), 0o644)
+        .unwrap();
+
+    assert_eq!(run(&mut env, "git stash push -q -m wip").0, 0);
+    assert_eq!(
+        run(&mut env, "git stash list").1,
+        "stash@{0}: On main: wip\n"
+    );
+    assert_eq!(
+        run(&mut env, "git stash show").1,
+        " f.txt | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n"
+    );
+    assert!(run(&mut env, "git stash show -p").1.contains("-b\n+B\n"));
+    assert!(run(&mut env, "git stash pop").0 == 0);
+}
+
+#[test]
+fn caret_excludes_a_revision_from_the_history() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    assert_eq!(run(&mut env, "git branch base").0, 0);
+    env.vfs.put_file("/a.txt", b"b\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git commit -a -m two").0, 0);
+    env.vfs.put_file("/a.txt", b"c\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git commit -a -m three").0, 0);
+
+    assert_eq!(
+        run(&mut env, "git log --format=%s HEAD ^base").1,
+        "three\ntwo\n"
+    );
+    assert_eq!(run(&mut env, "git rev-list --count HEAD ^base").1, "2\n");
+}

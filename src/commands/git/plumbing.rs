@@ -464,6 +464,8 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
     let mut count_only = false;
     let mut fixed = false;
     let mut invert = false;
+    let mut word = false;
+    let mut without_match = false;
     let mut pattern = None;
     let mut paths: Vec<String> = Vec::new();
     let mut operands_only = false;
@@ -487,6 +489,11 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             "-l" | "--files-with-matches" | "--name-only" => names_only = true,
             "-c" | "--count" => count_only = true,
             "-F" | "--fixed-strings" => fixed = true,
+            "-w" | "--word-regexp" => word = true,
+            "-L" | "--files-without-match" => {
+                names_only = true;
+                without_match = true;
+            }
             "-v" | "--invert-match" => invert = true,
             "-E" | "--extended-regexp" | "-I" | "--no-color" | "--cached" => {}
             "-e" => {
@@ -504,11 +511,14 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
     let Some(pattern) = pattern else {
         return usage(io, "usage: git grep [-n] [-i] [-l] PATTERN [-- PATH...]");
     };
-    let expression = if fixed {
+    let mut expression = if fixed {
         regex::escape(&pattern)
     } else {
         pattern.clone()
     };
+    if word {
+        expression = format!(r"\b(?:{expression})\b");
+    }
     let Ok(regex) = regex::RegexBuilder::new(&expression)
         .case_insensitive(ignore_case)
         .build()
@@ -592,7 +602,8 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             io.out
                 .extend_from_slice(format!("{location}{line}\n").as_bytes());
         }
-        if names_only && matches != 0 {
+        if names_only && (matches != 0) != without_match {
+            found = true;
             io.out
                 .extend_from_slice(format!("{displayed}\n").as_bytes());
         }
@@ -611,4 +622,176 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
         }
     }
     i32::from(!found)
+}
+
+/// Every reference in the repository, as `refs/...` names paired with the commit they point at.
+fn all_references(ctx: &CommandContext<'_>, root: &str) -> Vec<(String, String)> {
+    let mut references = Vec::new();
+    for kind in ["heads", "tags"] {
+        for name in repo::reference_names(ctx, root, kind) {
+            let full = format!("refs/{kind}/{name}");
+            if let Some(commit) = repo::read_reference(ctx, root, &full) {
+                references.push((full, commit));
+            }
+        }
+    }
+    references.sort();
+    references
+}
+
+pub(crate) fn git_show_ref(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(ctx) else {
+        return repo_error(io);
+    };
+    let mut heads_only = false;
+    let mut tags_only = false;
+    let mut verify = false;
+    let mut patterns: Vec<String> = Vec::new();
+    for argument in args {
+        match argument.as_str() {
+            "--heads" => heads_only = true,
+            "--tags" => tags_only = true,
+            "--verify" => verify = true,
+            "-q" | "--quiet" | "--hash" | "-d" | "--dereference" => {}
+            value if value.starts_with('-') => {
+                return usage(io, &format!("unsupported show-ref option: {value}"))
+            }
+            value => patterns.push(value.to_string()),
+        }
+    }
+    let mut matched = false;
+    for (name, commit) in all_references(ctx, &root) {
+        if heads_only && !name.starts_with("refs/heads/") {
+            continue;
+        }
+        if tags_only && !name.starts_with("refs/tags/") {
+            continue;
+        }
+        // `--verify` needs the full name; otherwise any trailing component may be given.
+        let selected = patterns.is_empty()
+            || patterns.iter().any(|pattern| {
+                if verify {
+                    name == *pattern
+                } else {
+                    name == *pattern || name.ends_with(&format!("/{pattern}"))
+                }
+            });
+        if !selected {
+            continue;
+        }
+        matched = true;
+        io.out
+            .extend_from_slice(format!("{commit} {name}\n").as_bytes());
+    }
+    i32::from(!matched)
+}
+
+pub(crate) fn git_symbolic_ref(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(ctx) else {
+        return repo_error(io);
+    };
+    let mut short = false;
+    let mut operands: Vec<String> = Vec::new();
+    for argument in args {
+        match argument.as_str() {
+            "--short" => short = true,
+            "-q" | "--quiet" => {}
+            value if value.starts_with('-') => {
+                return usage(io, &format!("unsupported symbolic-ref option: {value}"))
+            }
+            value => operands.push(value.to_string()),
+        }
+    }
+    match operands.as_slice() {
+        [name] if name == repo::HEAD => match repo::head_reference(ctx, &root) {
+            Some(reference) => {
+                let rendered = if short {
+                    reference
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&reference)
+                        .to_string()
+                } else {
+                    reference
+                };
+                io.out.extend_from_slice(format!("{rendered}\n").as_bytes());
+                0
+            }
+            None => {
+                io.err
+                    .extend_from_slice(b"fatal: ref HEAD is not a symbolic ref\n");
+                1
+            }
+        },
+        [name, target] if name == repo::HEAD => {
+            let Some(branch) = target.strip_prefix("refs/heads/") else {
+                return usage(io, "only refs/heads/* can be pointed at by HEAD");
+            };
+            repo::set_head_to_branch(ctx, &root, branch).map_or(1, |()| 0)
+        }
+        _ => usage(io, "usage: git symbolic-ref [--short] HEAD [REF]"),
+    }
+}
+
+pub(crate) fn git_for_each_ref(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(ctx) else {
+        return repo_error(io);
+    };
+    let mut format = None;
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--format" => {
+                index += 1;
+                format = args.get(index).cloned();
+            }
+            value if value.starts_with("--format=") => {
+                format = Some(value["--format=".len()..].to_string());
+            }
+            value if value.starts_with("--count=") || value.starts_with("--sort=") => {}
+            value if value.starts_with('-') => {
+                return usage(io, &format!("unsupported for-each-ref option: {value}"))
+            }
+            value => prefixes.push(value.trim_end_matches('*').to_string()),
+        }
+        index += 1;
+    }
+    let format = format.unwrap_or_else(|| "%(objectname) %(objecttype)\t%(refname)".to_string());
+    for (name, commit) in all_references(ctx, &root) {
+        if !prefixes.is_empty() && !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            continue;
+        }
+        let Some(line) = expand_ref_format(&format, &name, &commit) else {
+            return usage(io, &format!("unsupported for-each-ref format: {format}"));
+        };
+        io.out.extend_from_slice(format!("{line}\n").as_bytes());
+    }
+    0
+}
+
+/// Expand the `%(field)` placeholders `for-each-ref` and `--format` accept.
+pub(crate) fn expand_ref_format(format: &str, name: &str, commit: &str) -> Option<String> {
+    let short = name
+        .strip_prefix("refs/heads/")
+        .or_else(|| name.strip_prefix("refs/tags/"))
+        .unwrap_or(name);
+    let mut out = String::new();
+    let mut rest = format;
+    while let Some(start) = rest.find("%(") {
+        out.push_str(&rest[..start]);
+        let end = rest[start..].find(')')? + start;
+        let value = match &rest[start + 2..end] {
+            "refname" => name.to_string(),
+            "refname:short" | "refname:lstrip=2" => short.to_string(),
+            "objectname" => commit.to_string(),
+            "objectname:short" => repo::short(commit).to_string(),
+            "objecttype" => "commit".to_string(),
+            _ => return None,
+        };
+        out.push_str(&value);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
 }

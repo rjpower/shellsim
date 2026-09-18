@@ -83,7 +83,7 @@ pub(crate) fn git_stash(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         match argument.as_str() {
             "-u" | "--include-untracked" => include_untracked = true,
             "-q" | "--quiet" => quiet = true,
-            "--no-keep-index" => {}
+            "-p" | "--patch" | "--no-keep-index" => {}
             "-m" | "--message" => index = usize::MAX,
             value if value.starts_with('-') => {
                 return usage(io, &format!("unsupported stash option: {value}"))
@@ -101,6 +101,14 @@ pub(crate) fn git_stash(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     let status = match command {
         "push" | "save" => push(ctx, &root, message, include_untracked, io),
         "list" => list(ctx, &root, io),
+        "show" => {
+            let Some(position) = selector(operands.get(1).filter(|value| !value.starts_with('-')))
+            else {
+                return usage(io, "usage: git stash show [-p] [stash@{N}]");
+            };
+            let patch = args.iter().any(|value| value == "-p" || value == "--patch");
+            show(ctx, &root, position, patch, io)
+        }
         "pop" | "apply" => {
             let Some(position) = selector(operands.get(1)) else {
                 return usage(io, "usage: git stash pop [stash@{N}]");
@@ -165,8 +173,11 @@ fn push(
         .unwrap_or_default();
     let mut entries = load_entries(ctx, root);
     let id = entries.iter().map(|entry| entry.id).max().unwrap_or(0) + 1;
-    let message =
-        message.unwrap_or_else(|| format!("WIP on {branch}: {} {subject}", repo::short(&base)));
+    // Git labels an explicit message `On <branch>:` and a default one `WIP on <branch>:`.
+    let message = message.map_or_else(
+        || format!("WIP on {branch}: {} {subject}", repo::short(&base)),
+        |text| format!("On {branch}: {text}"),
+    );
     if repo::write_vfs(
         ctx,
         &tree_path(root, id, "work"),
@@ -217,6 +228,39 @@ fn list(ctx: &mut CommandContext<'_>, root: &str, io: &mut Io) -> i32 {
         io.out
             .extend_from_slice(format!("stash@{{{position}}}: {}\n", entry.message).as_bytes());
     }
+    0
+}
+
+/// Report what an entry would reapply, as `git stash show` does.
+fn show(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    position: usize,
+    patch: bool,
+    io: &mut Io,
+) -> i32 {
+    let entries = load_entries(ctx, root);
+    let Some(entry) = entries.get(position) else {
+        io.err.extend_from_slice(
+            format!("fatal: stash@{{{position}}} is not a valid reference\n").as_bytes(),
+        );
+        return 128;
+    };
+    let Some(work) = read_tree(ctx, &tree_path(root, entry.id, "work")) else {
+        io.err
+            .extend_from_slice(b"fatal: the stash entry is unreadable\n");
+        return 128;
+    };
+    let base = repo::commit_tree(ctx, root, &entry.base).unwrap_or_default();
+    let options = super::compare::Options {
+        format: if patch {
+            super::compare::Format::Patch
+        } else {
+            super::compare::Format::Stat
+        },
+        ..Default::default()
+    };
+    super::compare::emit(ctx, root, &base, &work, &options, io);
     0
 }
 

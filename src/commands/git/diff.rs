@@ -45,6 +45,70 @@ pub(crate) fn is_binary(data: &[u8]) -> bool {
     data.iter().take(8_000).any(|byte| *byte == 0) || std::str::from_utf8(data).is_err()
 }
 
+/// How whitespace is treated when two lines are compared.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) enum Whitespace {
+    #[default]
+    Significant,
+    /// `-b`: runs of whitespace compare equal and trailing whitespace is ignored.
+    IgnoreChange,
+    /// `-w`: whitespace is ignored entirely.
+    IgnoreAll,
+}
+
+/// The form of a line used for comparison under `whitespace`.
+fn compare_key(line: &str, whitespace: Whitespace) -> String {
+    match whitespace {
+        Whitespace::Significant => line.to_string(),
+        Whitespace::IgnoreAll => line.split_whitespace().collect(),
+        Whitespace::IgnoreChange => line.split_whitespace().collect::<Vec<_>>().join(" "),
+    }
+}
+
+/// Build an edit script that compares under `whitespace` but reports the original lines.
+pub(crate) fn edit_script_ignoring<'a>(
+    old: &[&'a str],
+    new: &[&'a str],
+    whitespace: Whitespace,
+) -> Vec<Edit<'a>> {
+    if whitespace == Whitespace::Significant {
+        return edit_script(old, new);
+    }
+    let old_keys: Vec<String> = old
+        .iter()
+        .map(|line| compare_key(line, whitespace))
+        .collect();
+    let new_keys: Vec<String> = new
+        .iter()
+        .map(|line| compare_key(line, whitespace))
+        .collect();
+    let old_refs: Vec<&str> = old_keys.iter().map(String::as_str).collect();
+    let new_refs: Vec<&str> = new_keys.iter().map(String::as_str).collect();
+    let mut old_index = 0;
+    let mut new_index = 0;
+    edit_script(&old_refs, &new_refs)
+        .into_iter()
+        .map(|edit| {
+            let text = match edit.op {
+                Op::Insert => {
+                    new_index += 1;
+                    new[new_index - 1]
+                }
+                Op::Delete => {
+                    old_index += 1;
+                    old[old_index - 1]
+                }
+                Op::Keep => {
+                    old_index += 1;
+                    new_index += 1;
+                    old[old_index - 1]
+                }
+            };
+            Edit { op: edit.op, text }
+        })
+        .collect()
+}
+
 /// Build an edit script turning `old` into `new`.
 pub(crate) fn edit_script<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<Edit<'a>> {
     let prefix = old
@@ -135,10 +199,14 @@ fn align<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<Edit<'a>> {
 }
 
 /// Inserted and deleted line counts, as `git diff --stat` reports them.
-pub(crate) fn change_counts(old: Option<&[u8]>, new: Option<&[u8]>) -> (usize, usize) {
+pub(crate) fn change_counts(
+    old: Option<&[u8]>,
+    new: Option<&[u8]>,
+    whitespace: Whitespace,
+) -> (usize, usize) {
     let old_lines = split_lines(old.unwrap_or_default());
     let new_lines = split_lines(new.unwrap_or_default());
-    let edits = edit_script(&old_lines, &new_lines);
+    let edits = edit_script_ignoring(&old_lines, &new_lines, whitespace);
     (
         edits.iter().filter(|edit| edit.op == Op::Insert).count(),
         edits.iter().filter(|edit| edit.op == Op::Delete).count(),
@@ -186,6 +254,7 @@ pub(crate) fn render(
     new: Option<&[u8]>,
     context: usize,
     prefixes: bool,
+    whitespace: Whitespace,
 ) -> String {
     if old == new {
         return String::new();
@@ -210,8 +279,13 @@ pub(crate) fn render(
     });
     let old_lines = split_lines(old.unwrap_or_default());
     let new_lines = split_lines(new.unwrap_or_default());
-    let edits = edit_script(&old_lines, &new_lines);
-    out.push_str(&render_hunks(&edits, context));
+    let edits = edit_script_ignoring(&old_lines, &new_lines, whitespace);
+    let hunks = render_hunks(&edits, context);
+    if hunks.is_empty() {
+        // Under `-w` or `-b` the files may compare equal, and Git then prints nothing at all.
+        return String::new();
+    }
+    out.push_str(&hunks);
     out
 }
 
@@ -337,13 +411,20 @@ pub(crate) fn whitespace_errors(path: &str, old: Option<&[u8]>, new: Option<&[u8
 
 #[cfg(test)]
 mod tests {
-    use super::{change_counts, render, DEFAULT_CONTEXT};
+    use super::{change_counts, render, Whitespace, DEFAULT_CONTEXT};
 
     #[test]
     fn renders_a_hunk_with_context_rather_than_the_whole_file() {
         let old = b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
         let new = b"one\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nnine\nten\n";
-        let patch = render("f.txt", Some(old), Some(new), DEFAULT_CONTEXT, true);
+        let patch = render(
+            "f.txt",
+            Some(old),
+            Some(new),
+            DEFAULT_CONTEXT,
+            true,
+            Whitespace::Significant,
+        );
         assert!(patch.contains("@@ -2,7 +2,7 @@ one\n"), "{patch}");
         assert!(patch.contains("-five\n+FIVE\n"), "{patch}");
         assert!(!patch.contains("-one"), "{patch}");
@@ -351,17 +432,38 @@ mod tests {
 
     #[test]
     fn marks_new_and_deleted_files() {
-        let created = render("f.txt", None, Some(b"hello\n"), DEFAULT_CONTEXT, true);
+        let created = render(
+            "f.txt",
+            None,
+            Some(b"hello\n"),
+            DEFAULT_CONTEXT,
+            true,
+            Whitespace::Significant,
+        );
         assert!(created.contains("new file mode 100644\n"), "{created}");
         assert!(created.contains("@@ -0,0 +1 @@\n+hello\n"), "{created}");
-        let removed = render("f.txt", Some(b"hello\n"), None, DEFAULT_CONTEXT, true);
+        let removed = render(
+            "f.txt",
+            Some(b"hello\n"),
+            None,
+            DEFAULT_CONTEXT,
+            true,
+            Whitespace::Significant,
+        );
         assert!(removed.contains("deleted file mode 100644\n"), "{removed}");
         assert!(removed.contains("@@ -1 +0,0 @@\n-hello\n"), "{removed}");
     }
 
     #[test]
     fn reports_a_missing_final_newline() {
-        let patch = render("f.txt", Some(b"a\n"), Some(b"a\nb"), DEFAULT_CONTEXT, true);
+        let patch = render(
+            "f.txt",
+            Some(b"a\n"),
+            Some(b"a\nb"),
+            DEFAULT_CONTEXT,
+            true,
+            Whitespace::Significant,
+        );
         assert!(
             patch.contains("+b\n\\ No newline at end of file\n"),
             "{patch}"
@@ -376,28 +478,49 @@ mod tests {
             Some(b"a\nb"),
             DEFAULT_CONTEXT,
             true,
+            Whitespace::Significant,
         );
         assert!(patch.contains("@@ -1,2 +1,2 @@\n"), "{patch}");
         assert!(
             patch.contains("-b\n+b\n\\ No newline at end of file\n"),
             "{patch}"
         );
-        assert_eq!(change_counts(Some(b"a\nb\n"), Some(b"a\nb")), (1, 1));
+        assert_eq!(
+            change_counts(Some(b"a\nb\n"), Some(b"a\nb"), Whitespace::Significant),
+            (1, 1)
+        );
     }
 
     #[test]
     fn counts_changed_lines_by_alignment() {
         assert_eq!(
-            change_counts(Some(b"a\nb\nc\n"), Some(b"a\nx\nc\n")),
+            change_counts(
+                Some(b"a\nb\nc\n"),
+                Some(b"a\nx\nc\n"),
+                Whitespace::Significant
+            ),
             (1, 1)
         );
-        assert_eq!(change_counts(None, Some(b"a\nb\n")), (2, 0));
-        assert_eq!(change_counts(Some(b"a\nb\n"), None), (0, 2));
+        assert_eq!(
+            change_counts(None, Some(b"a\nb\n"), Whitespace::Significant),
+            (2, 0)
+        );
+        assert_eq!(
+            change_counts(Some(b"a\nb\n"), None, Whitespace::Significant),
+            (0, 2)
+        );
     }
 
     #[test]
     fn uses_git_blob_hashes_in_index_lines() {
-        let patch = render("f.txt", None, Some(b"a\nb\n"), DEFAULT_CONTEXT, true);
+        let patch = render(
+            "f.txt",
+            None,
+            Some(b"a\nb\n"),
+            DEFAULT_CONTEXT,
+            true,
+            Whitespace::Significant,
+        );
         assert!(patch.contains("index 0000000..422c2b7\n"), "{patch}");
     }
 
@@ -409,10 +532,44 @@ mod tests {
             Some(b"\x00\x02"),
             DEFAULT_CONTEXT,
             true,
+            Whitespace::Significant,
         );
         assert!(
             patch.contains("Binary files a/f.bin and b/f.bin differ\n"),
             "{patch}"
         );
+    }
+
+    #[test]
+    fn ignoring_whitespace_hides_reindentation_but_not_real_edits() {
+        let old = b"fn main() {\nlet x = 1;\n}\n";
+        let new = b"fn main() {\n    let x = 1;\n}\n";
+        assert_eq!(
+            render(
+                "f.rs",
+                Some(old),
+                Some(new),
+                DEFAULT_CONTEXT,
+                true,
+                Whitespace::IgnoreAll
+            ),
+            ""
+        );
+        assert_eq!(
+            change_counts(Some(old), Some(new), Whitespace::IgnoreAll),
+            (0, 0)
+        );
+        // A real change still shows, carrying the original text.
+        let edited = b"fn main() {\n    let x = 2;\n}\n";
+        let patch = render(
+            "f.rs",
+            Some(old),
+            Some(edited),
+            DEFAULT_CONTEXT,
+            true,
+            Whitespace::IgnoreAll,
+        );
+        assert!(patch.contains("-let x = 1;\n"), "{patch}");
+        assert!(patch.contains("+    let x = 2;\n"), "{patch}");
     }
 }
