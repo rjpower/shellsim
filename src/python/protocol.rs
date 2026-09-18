@@ -47,6 +47,79 @@ pub fn string_value(heap: &Heap, value: &Value) -> Result<Option<String>, String
     })
 }
 
+/// Return one Python string code point without materializing the complete string as characters.
+///
+/// ASCII strings, including the large text buffers used by the frozen I/O layer, support direct
+/// byte indexing. Non-ASCII strings still index by Unicode code point to match Python semantics.
+pub fn string_index(heap: &Heap, owner: &Value, index: &Value) -> Result<Option<char>, String> {
+    let character = |text: &str| {
+        let index = index.as_int().ok_or("string index must be an integer")?;
+        indexed_char(text, index, text.is_ascii())
+            .ok_or_else(|| "string index out of range".to_string())
+    };
+
+    if let Some(text) = owner.inline_string_value() {
+        return character(&text).map(Some);
+    }
+    let Some(id) = owner.object_id() else {
+        return Ok(None);
+    };
+    match heap.get(id)? {
+        Object::String(text) => {
+            let index = index.as_int().ok_or("string index must be an integer")?;
+            let is_ascii = heap
+                .string_is_ascii(id)?
+                .expect("string payloads cache their ASCII property");
+            indexed_char(text, index, is_ascii)
+                .ok_or_else(|| "string index out of range".to_string())
+                .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Return a string's Python length without cloning its arena payload.
+pub fn string_length(heap: &Heap, value: &Value) -> Result<Option<usize>, String> {
+    if let Some(text) = value.inline_string_value() {
+        return Ok(Some(text.chars().count()));
+    }
+    let Some(id) = value.object_id() else {
+        return Ok(None);
+    };
+    match heap.get(id)? {
+        Object::String(text) => Ok(Some(
+            if heap
+                .string_is_ascii(id)?
+                .expect("string payloads cache their ASCII property")
+            {
+                text.len()
+            } else {
+                text.chars().count()
+            },
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn indexed_char(value: &str, index: i64, is_ascii: bool) -> Option<char> {
+    if is_ascii {
+        let index = normalize_index(value.len(), index)?;
+        return value.as_bytes().get(index).copied().map(char::from);
+    }
+
+    let index = normalize_index(value.chars().count(), index)?;
+    value.chars().nth(index)
+}
+
+fn normalize_index(length: usize, index: i64) -> Option<usize> {
+    let index = if index < 0 {
+        length.checked_sub(usize::try_from(index.unsigned_abs()).ok()?)?
+    } else {
+        usize::try_from(index).ok()?
+    };
+    (index < length).then_some(index)
+}
+
 pub fn bytes_value(heap: &Heap, value: &Value) -> Result<Option<Vec<u8>>, String> {
     let Some(id) = value.object_id() else {
         return Ok(None);
@@ -726,5 +799,50 @@ mod tests {
         assert!(!equals(&heap, &nan, &nan).unwrap());
         assert!(contains(&heap, &first, &nan).unwrap());
         assert!(equals(&heap, &first, &second).unwrap());
+    }
+
+    #[test]
+    fn string_index_handles_inline_heap_ascii_and_unicode_values() {
+        let mut heap = Heap::default();
+        let mut resources = Resources::new(Limits::unlimited());
+        let inline = Value::inline_string("café").unwrap();
+        let ascii = heap
+            .allocate(Object::String("a long ASCII string".into()), &mut resources)
+            .unwrap();
+        let unicode = heap
+            .allocate(Object::String("☃ snow".into()), &mut resources)
+            .unwrap();
+
+        assert_eq!(
+            string_index(&heap, &inline, &Value::Int(3)).unwrap(),
+            Some('é')
+        );
+        assert_eq!(
+            string_index(&heap, &inline, &Value::Int(-4)).unwrap(),
+            Some('c')
+        );
+        assert_eq!(
+            string_index(&heap, &ascii, &Value::Int(7)).unwrap(),
+            Some('A')
+        );
+        assert_eq!(
+            string_index(&heap, &unicode, &Value::Int(-6)).unwrap(),
+            Some('☃')
+        );
+        assert_eq!(string_length(&heap, &inline).unwrap(), Some(4));
+        assert_eq!(string_length(&heap, &ascii).unwrap(), Some(19));
+        assert_eq!(string_length(&heap, &unicode).unwrap(), Some(6));
+        assert_eq!(
+            string_index(&heap, &Value::Int(1), &Value::Int(0)).unwrap(),
+            None
+        );
+        assert_eq!(
+            string_index(&heap, &ascii, &Value::Int(99)).unwrap_err(),
+            "string index out of range"
+        );
+        assert_eq!(
+            string_index(&heap, &ascii, &Value::None).unwrap_err(),
+            "string index must be an integer"
+        );
     }
 }

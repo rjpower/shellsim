@@ -66,6 +66,16 @@ fn containers_comparisons_and_short_circuiting_use_python_protocols() {
 }
 
 #[test]
+fn string_indexing_preserves_ascii_unicode_and_negative_indices() {
+    assert_eq!(
+        run_shell(
+            "python3.14 -c 'value = \"aé☃z\"; print(value[0], value[1], value[-2], value[-1])'"
+        ),
+        (0, "a é ☃ z\n".as_bytes().to_vec(), Vec::new())
+    );
+}
+
+#[test]
 fn sequence_ordering_uses_element_protocols_and_sets_use_subset_ordering() {
     let source = r#"class Key:
     def __init__(self, value):

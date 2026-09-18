@@ -1874,17 +1874,8 @@ impl<'a> Vm<'a> {
                 _ => protocol::repr(&self.state.heap, &index)?,
             };
             self.allocate_string(format!("typing.List[{parameter}]"))?
-        } else if let Some(value) = protocol::string_value(&self.state.heap, &owner)? {
-            let index = index.as_int().ok_or("string index must be an integer")?;
-            let chars: Vec<char> = value.chars().collect();
-            let len = chars.len() as i64;
-            let index = if index < 0 { len + index } else { index };
-            self.allocate_string(
-                chars
-                    .get(usize::try_from(index).map_err(|_| "string index out of range")?)
-                    .ok_or("string index out of range")?
-                    .to_string(),
-            )?
+        } else if let Some(character) = protocol::string_index(&self.state.heap, &owner, &index)? {
+            self.allocate_string(character.to_string())?
         } else if let Some(id) = owner.object_id() {
             match self.state.heap.get(id)?.clone() {
                 Object::List(values) | Object::Tuple(values) => {
@@ -4525,10 +4516,10 @@ impl<'a> Vm<'a> {
                     }
                     return Ok(CallResult::Value(Value::Int(length)));
                 }
-                let length = if let Some(value) =
-                    protocol::string_value(&self.state.heap, &arguments[0])?
+                let length = if let Some(length) =
+                    protocol::string_length(&self.state.heap, &arguments[0])?
                 {
-                    value.chars().count()
+                    length
                 } else if let Some(id) = arguments[0].object_id() {
                     match self.state.heap.get(id)? {
                         Object::List(values) | Object::Tuple(values) | Object::Set(values) => {
