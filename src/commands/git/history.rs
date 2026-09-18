@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use crate::commands::{CommandContext, Io};
 
 use super::compare::{self, Format, Options, RightSide};
+use super::conflict::{self, Stages};
 use super::diff;
 use super::repo::{self, Commit, Tree};
 use super::worktree;
@@ -133,6 +134,17 @@ pub(crate) fn git_commit(
             return status;
         }
     }
+    // A merge, cherry-pick, or revert waiting on the user supplies the message and the parents.
+    let pending = pending_operation(ctx, &root);
+    if !conflict::load_stages(ctx, &root).is_empty() {
+        io.err.extend_from_slice(
+            b"error: Committing is not possible because you have unmerged files.\n\
+              hint: Fix them up in the work tree, and then use 'git add/rm <file>'\n\
+              hint: as appropriate to mark resolution and make a commit.\n\
+              fatal: Exiting because of an unresolved conflict.\n",
+        );
+        return 1;
+    }
     let previous = repo::head_commit(ctx, &root)
         .and_then(|id| repo::load_commit(ctx, &root, &id).map(|commit| (id, commit)));
     if amend && previous.is_none() {
@@ -168,6 +180,14 @@ pub(crate) fn git_commit(
             message = commit.message.clone();
         }
     }
+    if message.is_empty() {
+        if let Some(recorded) = pending
+            .as_ref()
+            .and_then(|_| conflict::pending_message(ctx, &root))
+        {
+            message = recorded;
+        }
+    }
     if dry_run {
         // Git reports what a commit would record, stops before asking for a message, and fails
         // when there is nothing staged to record.
@@ -194,10 +214,17 @@ pub(crate) fn git_commit(
                 .unwrap_or_default();
             (commit.parents.clone(), baseline)
         }
-        (_, Some((id, _))) => (
-            vec![id.clone()],
-            repo::commit_tree(ctx, &root, id).unwrap_or_default(),
-        ),
+        (_, Some((id, _))) => {
+            let mut parents = vec![id.clone()];
+            // Finishing a merge records the commit that was being merged as the second parent.
+            if let Some((conflict::MERGE_HEAD, other)) = pending.as_ref().map(|(k, c)| (*k, c)) {
+                parents.push(other.clone());
+            }
+            (
+                parents,
+                repo::commit_tree(ctx, &root, id).unwrap_or_default(),
+            )
+        }
         _ => (Vec::new(), Tree::new()),
     };
     // With pathspecs the commit records HEAD plus those paths; anything else stays staged.
@@ -223,7 +250,8 @@ pub(crate) fn git_commit(
         }
         tree
     };
-    if index_tree == baseline && !allow_empty {
+    // Finishing a merge records a commit even when the merge changed nothing.
+    if index_tree == baseline && !allow_empty && pending.is_none() {
         emit_nothing_to_commit(ctx, io);
         return 1;
     }
@@ -256,6 +284,9 @@ pub(crate) fn git_commit(
     };
     if repo::update_head(ctx, &root, &id).is_err() {
         return 1;
+    }
+    if pending.is_some() {
+        conflict::clear(ctx, &root);
     }
     if quiet {
         return 0;
@@ -2205,9 +2236,7 @@ fn resolve_previous(ctx: &CommandContext<'_>, root: &str, branch: &str) -> Optio
     if branch != "-" {
         return Some(branch.to_string());
     }
-    let bytes = ctx.vfs.read("/", &repo::git_path(root, "PREV_HEAD")).ok()?;
-    let previous = String::from_utf8_lossy(&bytes).trim().to_string();
-    (!previous.is_empty()).then_some(previous)
+    repo::previous_branch(ctx, root)
 }
 
 pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -2220,7 +2249,8 @@ pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let mut operands: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
     let mut operands_only = false;
-    for argument in args {
+    let args = super::expand_clusters(args, "qbBf");
+    for argument in &args {
         if operands_only {
             paths.push(argument.clone());
             continue;
@@ -2318,6 +2348,8 @@ pub(crate) fn git_merge(
             "--no-ff" => no_fast_forward = true,
             "--ff-only" => fast_forward_only = true,
             "--ff" | "--no-edit" | "-q" | "--quiet" => {}
+            "--abort" => return abort_pending(ctx, &root, "merge", io),
+            "--continue" => return continue_pending(ctx, &root, globals, "merge", io),
             "-m" => {
                 index += 1;
                 message = args.get(index).cloned();
@@ -2391,20 +2423,23 @@ pub(crate) fn git_merge(
         .unwrap_or_default();
     let head_tree = repo::commit_tree(ctx, &root, &head).unwrap_or_default();
     let other_tree = repo::commit_tree(ctx, &root, &other).unwrap_or_default();
-    let merged = match merge_trees(&base_tree, &head_tree, &other_tree) {
-        Ok(tree) => tree,
-        Err(conflicts) => {
-            for path in &conflicts {
-                io.err.extend_from_slice(
-                    format!("CONFLICT (content): Merge conflict in {path}\n").as_bytes(),
-                );
-            }
-            io.err.extend_from_slice(
-                b"fatal: simulated git cannot resolve content conflicts; merge manually\n",
-            );
-            return 1;
+    let subject = message.unwrap_or_else(|| {
+        // Git names the branch merged into unless it is the repository's default.
+        match repo::current_branch(ctx, &root).filter(|branch| branch != repo::DEFAULT_BRANCH) {
+            Some(branch) => format!("Merge branch '{target}' into {branch}"),
+            None => format!("Merge branch '{target}'"),
         }
-    };
+    });
+    let combined = conflict::combine(
+        ctx,
+        &root,
+        &base_tree,
+        &head_tree,
+        &other_tree,
+        "HEAD",
+        target,
+    );
+    let merged = combined.tree;
     if let Err(error) = repo::update_work_tree(ctx, &root, &head_tree, &merged) {
         io.err
             .extend_from_slice(format!("git merge: {error}\n").as_bytes());
@@ -2413,19 +2448,26 @@ pub(crate) fn git_merge(
     if repo::store_index(ctx, &root, &merged).is_err() {
         return 1;
     }
+    if !combined.stages.is_empty() {
+        return pause_for_conflicts(
+            ctx,
+            &root,
+            conflict::MERGE_HEAD,
+            &other,
+            &subject,
+            target,
+            &combined.stages,
+            "Automatic merge failed; fix conflicts and then commit the result.",
+            io,
+        );
+    }
     let (author_name, author_email) = author_identity(ctx, &root, globals);
     let commit = Commit {
         parents: vec![head.clone(), other.clone()],
         author_name,
         author_email,
         timestamp: now_seconds(ctx),
-        // Git names the branch merged into unless it is the repository's default.
-        message: message.unwrap_or_else(|| {
-            match repo::current_branch(ctx, &root).filter(|branch| branch != repo::DEFAULT_BRANCH) {
-                Some(branch) => format!("Merge branch '{target}' into {branch}"),
-                None => format!("Merge branch '{target}'"),
-            }
-        }),
+        message: subject,
     };
     let Ok(id) = repo::store_commit(ctx, &root, &commit, &merged) else {
         return 1;
@@ -2445,78 +2487,297 @@ pub(crate) fn git_merge(
     0
 }
 
-/// Combine two trees against their base, taking whichever side changed each path.
+// -- replaying single commits -----------------------------------------------------------------
+
+/// Apply one commit's change to the current branch, or undo it.
 ///
-/// Returns the conflicting paths when both sides changed the same path differently.
-fn merge_trees(base: &Tree, left: &Tree, right: &Tree) -> Result<Tree, Vec<String>> {
-    let mut names: BTreeSet<&String> = base.keys().collect();
-    names.extend(left.keys());
-    names.extend(right.keys());
-    let mut merged = Tree::new();
-    let mut conflicts = Vec::new();
-    for path in names {
-        let original = base.get(path);
-        let ours = left.get(path);
-        let theirs = right.get(path);
-        let resolved = match (ours == original, theirs == original) {
-            (true, true) => ours,
-            (false, true) => ours,
-            (true, false) => theirs,
-            (false, false) if ours == theirs => ours,
-            (false, false) => {
-                conflicts.push(path.clone());
-                continue;
+/// Both commands are the same three-way merge with different corners: a cherry-pick treats the
+/// commit's parent as the base and the commit as the incoming side, and a revert swaps those two,
+/// which turns replaying a change into undoing it.
+pub(crate) fn git_replay(
+    ctx: &mut CommandContext<'_>,
+    globals: &Globals,
+    revert: bool,
+    args: &[String],
+    io: &mut Io,
+) -> i32 {
+    let name = if revert { "revert" } else { "cherry-pick" };
+    let Some(root) = repo::find_repo_root(ctx) else {
+        return repo_error(io);
+    };
+    let mut no_commit = false;
+    let mut operands: Vec<String> = Vec::new();
+    for argument in super::expand_clusters(args, "ne") {
+        match argument.as_str() {
+            "-n" | "--no-commit" => no_commit = true,
+            "-e" | "--edit" | "--no-edit" | "-q" | "--quiet" => {}
+            "--abort" | "--quit" => return abort_pending(ctx, &root, name, io),
+            "--continue" => return continue_pending(ctx, &root, globals, name, io),
+            value if value.starts_with('-') => {
+                return usage(io, &format!("unsupported {name} option: {value}"))
             }
-        };
-        if let Some(hash) = resolved {
-            merged.insert(path.clone(), hash.clone());
+            value => operands.push(value.to_string()),
         }
     }
-    if conflicts.is_empty() {
-        Ok(merged)
-    } else {
-        Err(conflicts)
+    if operands.is_empty() {
+        return usage(io, &format!("usage: git {name} [-n] COMMIT..."));
     }
+    for revision in &operands {
+        let status = replay_one(ctx, globals, &root, name, revert, no_commit, revision, io);
+        if status != 0 {
+            return status;
+        }
+    }
+    0
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{merge_trees, Tree};
-
-    fn tree(entries: &[(&str, &str)]) -> Tree {
-        entries
-            .iter()
-            .map(|(path, hash)| ((*path).to_string(), (*hash).to_string()))
-            .collect()
+#[allow(clippy::too_many_arguments)]
+fn replay_one(
+    ctx: &mut CommandContext<'_>,
+    globals: &Globals,
+    root: &str,
+    name: &str,
+    revert: bool,
+    no_commit: bool,
+    revision: &str,
+    io: &mut Io,
+) -> i32 {
+    if pending_operation(ctx, root).is_some() {
+        io.err.extend_from_slice(
+            format!(
+                "error: a {name} is already in progress\nhint: try \"git {name} --continue\" or \"git {name} --abort\"\n"
+            )
+            .as_bytes(),
+        );
+        return 128;
     }
-
-    #[test]
-    fn takes_the_changed_side_of_each_path() {
-        let base = tree(&[("a", "1"), ("b", "1")]);
-        let left = tree(&[("a", "2"), ("b", "1")]);
-        let right = tree(&[("a", "1"), ("b", "3")]);
-        assert_eq!(
-            merge_trees(&base, &left, &right),
-            Ok(tree(&[("a", "2"), ("b", "3")]))
+    let Some(id) = repo::resolve_revision(ctx, root, revision) else {
+        io.err
+            .extend_from_slice(format!("fatal: bad revision '{revision}'\n").as_bytes());
+        return 128;
+    };
+    let Some(commit) = repo::load_commit(ctx, root, &id) else {
+        io.err
+            .extend_from_slice(format!("fatal: bad object {revision}\n").as_bytes());
+        return 128;
+    };
+    if commit.parents.len() > 1 {
+        io.err.extend_from_slice(
+            format!(
+                "error: commit {id} is a merge but no -m option was given.\nfatal: {name} failed\n"
+            )
+            .as_bytes(),
+        );
+        return 128;
+    }
+    let Some(head) = repo::head_commit(ctx, root) else {
+        io.err
+            .extend_from_slice(format!("fatal: {name} needs a commit to apply onto\n").as_bytes());
+        return 128;
+    };
+    let commit_tree = repo::commit_tree(ctx, root, &id).unwrap_or_default();
+    let parent_tree = commit
+        .parents
+        .first()
+        .and_then(|parent| repo::commit_tree(ctx, root, parent))
+        .unwrap_or_default();
+    let head_tree = repo::commit_tree(ctx, root, &head).unwrap_or_default();
+    let (base, theirs) = if revert {
+        (&commit_tree, &parent_tree)
+    } else {
+        (&parent_tree, &commit_tree)
+    };
+    if !blocking_changes(ctx, root, theirs).is_empty() {
+        io.err.extend_from_slice(
+            format!("error: your local changes would be overwritten by {name}.\n").as_bytes(),
+        );
+        return 1;
+    }
+    let message = if revert {
+        format!(
+            "Revert \"{}\"\n\nThis reverts commit {id}.",
+            commit.subject()
+        )
+    } else {
+        commit.message.clone()
+    };
+    let label = format!("{} ({})", repo::short(&id), commit.subject());
+    let combined = conflict::combine(ctx, root, base, &head_tree, theirs, "HEAD", &label);
+    let applied = combined.tree;
+    if let Err(error) = repo::update_work_tree(ctx, root, &head_tree, &applied) {
+        io.err
+            .extend_from_slice(format!("git {name}: {error}\n").as_bytes());
+        return 1;
+    }
+    if repo::store_index(ctx, root, &applied).is_err() {
+        return 1;
+    }
+    let kind = if revert {
+        conflict::REVERT_HEAD
+    } else {
+        conflict::CHERRY_PICK_HEAD
+    };
+    if !combined.stages.is_empty() {
+        let advice = format!(
+            "error: could not apply {label}\n\
+             hint: After resolving the conflicts, mark them with\n\
+             hint: \"git add/rm <pathspec>\", then run \"git {name} --continue\"."
+        );
+        return pause_for_conflicts(
+            ctx,
+            root,
+            kind,
+            &id,
+            &message,
+            &label,
+            &combined.stages,
+            &advice,
+            io,
         );
     }
-
-    #[test]
-    fn reports_paths_changed_on_both_sides() {
-        let base = tree(&[("a", "1")]);
-        let left = tree(&[("a", "2")]);
-        let right = tree(&[("a", "3")]);
-        assert_eq!(
-            merge_trees(&base, &left, &right),
-            Err(vec!["a".to_string()])
+    if no_commit {
+        // `-n` leaves the change staged for the user to commit, as Git does.
+        conflict::begin(ctx, root, kind, &id, &message);
+        return 0;
+    }
+    if applied == head_tree {
+        io.err.extend_from_slice(
+            format!("The previous cherry-pick is now empty, possibly due to conflict resolution.\nfatal: {name} failed\n")
+                .as_bytes(),
         );
+        return 1;
     }
+    // A cherry-pick keeps the original author; a revert is the work of whoever ran it.
+    let (author_name, author_email) = if revert {
+        author_identity(ctx, root, globals)
+    } else {
+        (commit.author_name.clone(), commit.author_email.clone())
+    };
+    let replayed = Commit {
+        parents: vec![head.clone()],
+        author_name,
+        author_email,
+        timestamp: now_seconds(ctx),
+        message,
+    };
+    let Ok(new_id) = repo::store_commit(ctx, root, &replayed, &applied) else {
+        return 1;
+    };
+    if repo::update_head(ctx, root, &new_id).is_err() {
+        return 1;
+    }
+    let branch = repo::current_branch(ctx, root).unwrap_or_else(|| "detached HEAD".to_string());
+    io.out.extend_from_slice(
+        format!(
+            "[{branch} {}] {}\n",
+            repo::short(&new_id),
+            replayed.subject()
+        )
+        .as_bytes(),
+    );
+    let stat = compare::Options {
+        format: Format::Stat,
+        ..Default::default()
+    };
+    compare::emit(ctx, root, &head_tree, &applied, &stat, io);
+    0
+}
 
-    #[test]
-    fn honors_deletions_from_one_side() {
-        let base = tree(&[("a", "1"), ("b", "1")]);
-        let left = tree(&[("a", "1")]);
-        let right = tree(&[("a", "1"), ("b", "1")]);
-        assert_eq!(merge_trees(&base, &left, &right), Ok(tree(&[("a", "1")])));
+/// Record an unfinished merge, cherry-pick, or revert and report the paths left to the user.
+#[allow(clippy::too_many_arguments)]
+fn pause_for_conflicts(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    kind: &str,
+    commit: &str,
+    message: &str,
+    theirs_label: &str,
+    stages: &Stages,
+    advice: &str,
+    io: &mut Io,
+) -> i32 {
+    for (path, entry) in stages {
+        // A delete on one side needs the longer sentence, because the file left in the working
+        // tree is not the one the user was last looking at.
+        let line = match entry.porcelain() {
+            "UD" => format!(
+                "CONFLICT (modify/delete): {path} deleted in {theirs_label} and modified in HEAD.  Version HEAD of {path} left in tree.\n"
+            ),
+            "DU" => format!(
+                "CONFLICT (modify/delete): {path} deleted in HEAD and modified in {theirs_label}.  Version {theirs_label} of {path} left in tree.\n"
+            ),
+            "AA" => format!("CONFLICT (add/add): Merge conflict in {path}\n"),
+            _ => format!("CONFLICT (content): Merge conflict in {path}\n"),
+        };
+        io.err.extend_from_slice(line.as_bytes());
     }
+    conflict::begin(ctx, root, kind, commit, message);
+    if !conflict::store_stages(ctx, root, stages) {
+        return 1;
+    }
+    io.err.extend_from_slice(format!("{advice}\n").as_bytes());
+    1
+}
+
+/// The operation waiting to be finished, if any.
+fn pending_operation(ctx: &CommandContext<'_>, root: &str) -> Option<(&'static str, String)> {
+    for kind in [
+        conflict::MERGE_HEAD,
+        conflict::CHERRY_PICK_HEAD,
+        conflict::REVERT_HEAD,
+    ] {
+        if let Some(commit) = conflict::in_progress(ctx, root, kind) {
+            return Some((kind, commit));
+        }
+    }
+    None
+}
+
+/// Throw away an unfinished merge, cherry-pick, or revert.
+fn abort_pending(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut Io) -> i32 {
+    if pending_operation(ctx, root).is_none() {
+        io.err.extend_from_slice(
+            format!("fatal: There is no {name} in progress ({name} --abort).\n").as_bytes(),
+        );
+        return 128;
+    }
+    let head = repo::head_tree(ctx, root);
+    // Only paths the merge could have touched are restored; untracked files are left alone.
+    let mut previous = repo::load_index(ctx, root).unwrap_or_default();
+    for (path, hash) in &head {
+        previous.entry(path.clone()).or_insert_with(|| hash.clone());
+    }
+    if let Err(error) = repo::replace_work_tree(ctx, root, &previous, &head) {
+        io.err
+            .extend_from_slice(format!("git {name}: {error}\n").as_bytes());
+        return 1;
+    }
+    if repo::store_index(ctx, root, &head).is_err() {
+        return 1;
+    }
+    conflict::clear(ctx, root);
+    0
+}
+
+/// Finish an operation whose conflicts the user has resolved.
+fn continue_pending(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    globals: &Globals,
+    name: &str,
+    io: &mut Io,
+) -> i32 {
+    if pending_operation(ctx, root).is_none() {
+        io.err.extend_from_slice(
+            format!("fatal: There is no {name} in progress ({name} --continue).\n").as_bytes(),
+        );
+        return 128;
+    }
+    if !conflict::load_stages(ctx, root).is_empty() {
+        io.err.extend_from_slice(
+            b"error: Committing is not possible because you have unmerged files.\n",
+        );
+        return 1;
+    }
+    git_commit(ctx, globals, &["--no-edit".to_string()], io)
 }

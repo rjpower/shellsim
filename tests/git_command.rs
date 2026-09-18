@@ -687,7 +687,7 @@ fn stash_saves_and_restores_uncommitted_work() {
 }
 
 #[test]
-fn merge_fast_forwards_and_refuses_content_conflicts() {
+fn merge_fast_forwards_and_marks_content_conflicts() {
     let mut env = Environment::new();
     assert_eq!(run(&mut env, "git init -q").0, 0);
     env.vfs
@@ -717,7 +717,7 @@ fn merge_fast_forwards_and_refuses_content_conflicts() {
         .1
         .contains("Already up to date."));
 
-    // Diverging edits to one file are refused rather than written as conflict markers.
+    // Diverging edits to one file are written as conflict markers for the user to settle.
     assert_eq!(
         run(&mut env, "git switch -c other HEAD~1; git switch other").0,
         0
@@ -739,7 +739,132 @@ fn merge_fast_forwards_and_refuses_content_conflicts() {
         "{}",
         conflicted.2
     );
+    let marked = String::from_utf8(env.vfs.read("/", "/shared.txt").unwrap()).unwrap();
+    assert_eq!(
+        marked,
+        "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> other\n"
+    );
+    assert_eq!(run(&mut env, "git status --short").1, "UU shared.txt\n");
+    assert!(run(&mut env, "git status").1.contains("both modified:"));
+    assert_eq!(
+        run(&mut env, "git ls-files -u").1,
+        "100644 df967b96a579e45a18b8251732d16804b2e56a55 1\tshared.txt\n\
+         100644 b19a1e93bec1317dc6097229e12afaffbfa74dc2 2\tshared.txt\n\
+         100644 950b81b7eee953d050aa05a641f8e056c85dd1bd 3\tshared.txt\n"
+    );
+
+    // Committing is refused until the path is staged, which is how resolution is recorded.
+    assert_eq!(run(&mut env, "git commit -m merged").0, 1);
+    env.vfs
+        .put_file("/shared.txt", b"settled\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add shared.txt").0, 0);
+    assert_eq!(run(&mut env, "git status --short").1, "M  shared.txt\n");
+    assert_eq!(run(&mut env, "git commit -m merged").0, 0);
+    assert_eq!(
+        run(&mut env, "git log -1 --format=%P").1.split(' ').count(),
+        2
+    );
+    assert_eq!(run(&mut env, "git status --short").1, "");
+}
+
+#[test]
+fn a_merge_conflict_can_be_abandoned_without_losing_other_work() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/shared.txt", b"base\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m base").0, 0);
+    assert_eq!(run(&mut env, "git switch -c other").0, 0);
+    env.vfs
+        .put_file("/shared.txt", b"theirs\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -am theirs").0, 0);
+    assert_eq!(run(&mut env, "git switch main").0, 0);
+    env.vfs
+        .put_file("/shared.txt", b"ours\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -am ours").0, 0);
+    env.vfs
+        .put_file("/scratch.txt", b"not git's business\n".to_vec(), 0o644)
+        .unwrap();
+
+    assert_eq!(run(&mut env, "git merge other").0, 1);
+    assert_eq!(run(&mut env, "git merge --abort").0, 0);
     assert_eq!(env.vfs.read("/", "/shared.txt").unwrap(), b"ours\n");
+    assert_eq!(
+        env.vfs.read("/", "/scratch.txt").unwrap(),
+        b"not git's business\n"
+    );
+    assert_eq!(run(&mut env, "git status --short").1, "?? scratch.txt\n");
+    assert_eq!(run(&mut env, "git merge --abort").0, 128);
+}
+
+#[test]
+fn cherry_pick_and_revert_replay_one_commit() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"one\ntwo\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m base").0, 0);
+    assert_eq!(run(&mut env, "git switch -c feature").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"one\ntwo\nthree\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -am three").0, 0);
+    assert_eq!(run(&mut env, "git switch main").0, 0);
+
+    assert_eq!(run(&mut env, "git cherry-pick feature").0, 0);
+    assert_eq!(env.vfs.read("/", "/f.txt").unwrap(), b"one\ntwo\nthree\n");
+    assert_eq!(run(&mut env, "git log --oneline").1.lines().count(), 2);
+
+    assert_eq!(run(&mut env, "git revert --no-edit HEAD").0, 0);
+    assert_eq!(env.vfs.read("/", "/f.txt").unwrap(), b"one\ntwo\n");
+    assert!(run(&mut env, "git log -1 --format=%s")
+        .1
+        .starts_with("Revert \"three\""));
+    assert_eq!(run(&mut env, "git status --short").1, "");
+}
+
+#[test]
+fn a_conflicting_cherry_pick_stops_and_can_be_continued() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"one\ntwo\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m base").0, 0);
+    assert_eq!(run(&mut env, "git switch -c feature").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"feature\ntwo\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -am feature").0, 0);
+    assert_eq!(run(&mut env, "git switch main").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"main\ntwo\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -am main").0, 0);
+
+    let stopped = run(&mut env, "git cherry-pick feature");
+    assert_eq!(stopped.0, 1);
+    assert!(stopped.2.contains("could not apply"), "{}", stopped.2);
+    assert_eq!(run(&mut env, "git status --short").1, "UU f.txt\n");
+    assert_eq!(run(&mut env, "git cherry-pick --continue").0, 1);
+
+    env.vfs
+        .put_file("/f.txt", b"settled\ntwo\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add f.txt").0, 0);
+    assert_eq!(run(&mut env, "git cherry-pick --continue").0, 0);
+    // A cherry-pick keeps one parent, unlike a merge.
+    assert_eq!(
+        run(&mut env, "git log -1 --format=%P").1.split(' ').count(),
+        1
+    );
+    assert_eq!(run(&mut env, "git log -1 --format=%s").1, "feature\n");
+    assert_eq!(run(&mut env, "git status --short").1, "");
 }
 
 #[test]

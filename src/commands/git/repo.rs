@@ -565,6 +565,13 @@ pub(crate) fn head_tree(interp: &Interp, root: &str) -> Tree {
 /// Supported forms are `HEAD`, `@`, a branch or tag name, a full ref path, a full or abbreviated
 /// commit id, and the `~N` and `^N` ancestry suffixes. Ranges and reflog selectors are not
 /// supported; callers split ranges before calling.
+/// The branch the last branch switch moved away from, which `-` and `@{-1}` both name.
+pub(crate) fn previous_branch(interp: &Interp, root: &str) -> Option<String> {
+    let bytes = interp.vfs.read("/", &git_path(root, "PREV_HEAD")).ok()?;
+    let previous = String::from_utf8_lossy(&bytes).trim().to_string();
+    (!previous.is_empty()).then_some(previous)
+}
+
 pub(crate) fn resolve_revision(interp: &Interp, root: &str, revision: &str) -> Option<String> {
     let boundary = revision.find(['~', '^']).unwrap_or(revision.len());
     let (base, suffix) = revision.split_at(boundary);
@@ -608,6 +615,10 @@ pub(crate) fn resolve_revision(interp: &Interp, root: &str, revision: &str) -> O
 fn resolve_base_revision(interp: &Interp, root: &str, revision: &str) -> Option<String> {
     if revision.is_empty() || revision == "HEAD" || revision == "@" {
         return head_commit(interp, root);
+    }
+    if revision == "@{-1}" {
+        let previous = previous_branch(interp, root)?;
+        return read_reference(interp, root, &format!("refs/heads/{previous}"));
     }
     for candidate in [
         format!("refs/heads/{revision}"),

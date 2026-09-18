@@ -16,6 +16,7 @@
 mod apply;
 mod compare;
 mod config;
+mod conflict;
 mod diff;
 mod history;
 mod ignore;
@@ -85,14 +86,12 @@ const UNSUPPORTED_COMMANDS: &[&str] = &[
     "bisect",
     "blame",
     "bundle",
-    "cherry-pick",
     "filter-branch",
     "gc",
     "notes",
     "rebase",
     "reflog",
     "replace",
-    "revert",
     "worktree",
 ];
 
@@ -348,6 +347,8 @@ fn dispatch(
         "switch" => history::git_switch(ctx, args, io),
         "checkout" => history::git_checkout(ctx, args, io),
         "merge" => history::git_merge(ctx, globals, args, io),
+        "cherry-pick" => history::git_replay(ctx, globals, false, args, io),
+        "revert" => history::git_replay(ctx, globals, true, args, io),
         "config" => config::git_config(ctx, globals, args, io),
         "remote" => config::git_remote(ctx, globals, args, io),
         "stash" => stash::git_stash(ctx, args, io),

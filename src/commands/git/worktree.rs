@@ -11,6 +11,7 @@ use crate::commands::{CommandContext, Io};
 use crate::vfs::resolve_against;
 
 use super::compare;
+use super::conflict;
 use super::ignore;
 use super::repo::{self, Tree};
 use super::{repo_error, usage};
@@ -217,8 +218,11 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     };
     let head = repo::head_tree(ctx, &root);
     let rules = ignore::load(ctx, &root);
+    // A path with recorded conflict stages is unmerged and is reported on its own.
+    let unmerged = conflict::load_stages(ctx, &root);
     let entries: Vec<Entry> = classify(&head, &index, &work)
         .into_iter()
+        .filter(|entry| !unmerged.contains_key(&entry.path))
         .filter(|entry| {
             compare::selected(&paths, &entry.path)
                 || entry
@@ -266,6 +270,11 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     for path in untracked_paths.iter_mut().chain(ignored_paths.iter_mut()) {
         *path = displayed_path(&prefix, path);
     }
+    let unmerged: Vec<(String, conflict::Unmerged)> = unmerged
+        .into_iter()
+        .filter(|(path, _)| compare::selected(&paths, path))
+        .map(|(path, entry)| (displayed_path(&prefix, &path), entry))
+        .collect();
     let branch = repo::current_branch(ctx, &root);
     let head_commit = repo::head_commit(ctx, &root);
     if version_two {
@@ -279,6 +288,7 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             &head,
             &index,
             &work,
+            &unmerged,
             branch_header,
             io,
         );
@@ -291,6 +301,7 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             branch.as_deref(),
             branch_header,
             nul,
+            &unmerged,
             &entries,
             &untracked_paths,
             &ignored_paths,
@@ -301,6 +312,7 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     emit_long_status(
         branch.as_deref(),
         head_commit.as_deref(),
+        &unmerged,
         &entries,
         &untracked_paths,
         &ignored_paths,
@@ -336,6 +348,7 @@ fn emit_porcelain_v2(
     head: &Tree,
     index: &Tree,
     work: &Tree,
+    unmerged: &[(String, conflict::Unmerged)],
     branch_header: bool,
     io: &mut Io,
 ) {
@@ -365,6 +378,26 @@ fn emit_porcelain_v2(
             .as_bytes(),
         );
     }
+    for (path, entry) in unmerged {
+        // Every conflict this subset produces comes from a plain two-parent merge.
+        let stage = |hash: &Option<String>| match hash {
+            Some(_) => "100644",
+            None => "000000",
+        };
+        io.out.extend_from_slice(
+            format!(
+                "u {} N... {} {} {} 100644 {} {} {} {path}\n",
+                entry.porcelain(),
+                stage(&entry.base),
+                stage(&entry.ours),
+                stage(&entry.theirs),
+                entry.base.as_deref().unwrap_or(MISSING),
+                entry.ours.as_deref().unwrap_or(MISSING),
+                entry.theirs.as_deref().unwrap_or(MISSING),
+            )
+            .as_bytes(),
+        );
+    }
     for path in untracked {
         io.out.extend_from_slice(format!("? {path}\n").as_bytes());
     }
@@ -380,6 +413,7 @@ fn emit_short_status(
     branch: Option<&str>,
     branch_header: bool,
     nul: bool,
+    unmerged: &[(String, conflict::Unmerged)],
     entries: &[Entry],
     untracked: &[String],
     ignored: &[String],
@@ -393,6 +427,11 @@ fn emit_short_status(
             (None, _) => "HEAD (no branch)".to_string(),
         };
         io.out.extend_from_slice(format!("## {label}").as_bytes());
+        io.out.push(terminator);
+    }
+    for (path, entry) in unmerged {
+        io.out
+            .extend_from_slice(format!("{} {path}", entry.porcelain()).as_bytes());
         io.out.push(terminator);
     }
     for entry in entries {
@@ -412,9 +451,11 @@ fn emit_short_status(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_long_status(
     branch: Option<&str>,
     head: Option<&str>,
+    unmerged: &[(String, conflict::Unmerged)],
     entries: &[Entry],
     untracked: &[String],
     ignored: &[String],
@@ -433,6 +474,11 @@ fn emit_long_status(
     }
     if head.is_none() {
         io.out.extend_from_slice(b"\nNo commits yet\n\n");
+    }
+    if !unmerged.is_empty() {
+        io.out.extend_from_slice(
+            b"You have unmerged paths.\n  (fix conflicts and run \"git commit\")\n  (use \"git merge --abort\" to abort the merge)\n\n",
+        );
     }
     let staged: Vec<&Entry> = entries
         .iter()
@@ -455,6 +501,17 @@ fn emit_long_status(
                 io,
                 entry.staged.unwrap_or(Change::Modified),
                 &entry.display(),
+            );
+        }
+        io.out.push(b'\n');
+    }
+    if !unmerged.is_empty() {
+        io.out.extend_from_slice(
+            b"Unmerged paths:\n  (use \"git add <file>...\" to mark resolution)\n",
+        );
+        for (path, entry) in unmerged {
+            io.out.extend_from_slice(
+                format!("\t{:<14}   {path}\n", format!("{}:", entry.label())).as_bytes(),
             );
         }
         io.out.push(b'\n');
@@ -495,7 +552,11 @@ fn emit_long_status(
             b"Untracked files not listed (use -u option to show untracked files)\n",
         );
     }
-    if entries.is_empty() && untracked.is_empty() {
+    if !unmerged.is_empty() {
+        io.out.extend_from_slice(
+            b"no changes added to commit (use \"git add\" and/or \"git commit -a\")\n",
+        );
+    } else if entries.is_empty() && untracked.is_empty() {
         io.out
             .extend_from_slice(b"nothing to commit, working tree clean\n");
     } else if staged.is_empty() && unstaged.is_empty() && !untracked.is_empty() {
@@ -649,6 +710,10 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         ctx, &root, &mut index, &work, &selected, dry_run, verbose, io,
     );
     ctx.resources.release_memory(reserved);
+    // Staging a conflicted path is how the user says the conflict is settled.
+    if status == 0 && !dry_run {
+        conflict::resolve(ctx, &root, &selected);
+    }
     status
 }
 
@@ -751,6 +816,8 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     };
     let mut index = repo::load_index(ctx, &root).unwrap_or_default();
     let head = repo::head_tree(ctx, &root);
+    // Removing an unmerged path is how a modify/delete conflict is settled, so it needs no force.
+    let unmerged = conflict::load_stages(ctx, &root);
     let mut selected: Vec<(String, String)> = Vec::new();
     for operand in operands {
         let (absolute, relative) = match repo_operand(&ctx.cwd, &root, &operand) {
@@ -786,7 +853,7 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
         }
         for path in tracked {
             let absolute = repo::path_join(&root, &path);
-            if !force {
+            if !force && !unmerged.contains_key(&path) {
                 let index_hash = index.get(&path).cloned().unwrap_or_default();
                 let work_hash = match repo::metered_file_hash(ctx, &absolute) {
                     Ok(hash) => hash,
@@ -837,6 +904,7 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
             .extend_from_slice(format!("git rm: {error}\n").as_bytes());
         return 1;
     }
+    conflict::resolve(ctx, &root, selected.iter().map(|(_, path)| path));
     if !quiet {
         for (_, relative) in &selected {
             io.out
@@ -1292,10 +1360,11 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let mut deleted = false;
     let mut others = false;
     let mut stage = false;
+    let mut unmerged = false;
     let mut exclude_standard = false;
     let mut paths = Vec::new();
     let mut options = true;
-    for argument in super::expand_clusters(args, "cmdosz") {
+    for argument in super::expand_clusters(args, "cmdosuz") {
         match argument.as_str() {
             "--" if options => options = false,
             "-c" | "--cached" if options => cached = true,
@@ -1303,6 +1372,7 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             "-d" | "--deleted" if options => deleted = true,
             "-o" | "--others" if options => others = true,
             "-s" | "--stage" if options => stage = true,
+            "-u" | "--unmerged" if options => unmerged = true,
             "--exclude-standard" if options => exclude_standard = true,
             "--error-unmatch" if options => error_unmatch = true,
             "-z" if options => nul = true,
@@ -1311,6 +1381,26 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             }
             value => paths.push(value.to_string()),
         }
+    }
+    if unmerged {
+        // The three sides of each conflicted path, in the stage order Git prints.
+        for (path, entry) in conflict::load_stages(ctx, &root) {
+            if !paths.is_empty()
+                && !paths
+                    .iter()
+                    .any(|selected| super::ignore::matches_pathspec(selected, &path))
+            {
+                continue;
+            }
+            for (stage, hash) in [(1, &entry.base), (2, &entry.ours), (3, &entry.theirs)] {
+                if let Some(hash) = hash {
+                    io.out
+                        .extend_from_slice(format!("100644 {hash} {stage}\t{path}").as_bytes());
+                    io.out.push(if nul { 0 } else { b'\n' });
+                }
+            }
+        }
+        return 0;
     }
     if !cached && !modified && !deleted && !others {
         cached = true;

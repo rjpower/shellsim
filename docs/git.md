@@ -10,7 +10,8 @@ history, branch, and merge without noticing it is not talking to Git.
 ```text
 init  status  add  rm  mv  restore  reset  clean  ls-files
 commit  log  show  diff  apply  rev-parse  rev-list  branch  tag  switch  checkout  merge
-config  remote  stash  grep  cat-file  hash-object  ls-tree  check-ignore  merge-base
+cherry-pick  revert  config  remote  stash  grep  cat-file  hash-object  ls-tree  check-ignore
+merge-base
 describe  shortlog  show-ref  symbolic-ref  for-each-ref
 ```
 
@@ -59,16 +60,32 @@ another tool reads back correctly. There are two scopes: the repository and a pe
 `GIT_AUTHOR_EMAIL`, then `user.name` and `user.email`, then a `shellsim <shellsim@localhost>`
 default.
 
+## Conflicts
+
+`git merge` fast-forwards when it can, and otherwise merges each file three ways against the
+merge base. A file both sides changed in the same region is written with `<<<<<<<`, `=======`,
+and `>>>>>>>` markers, and the three sides are recorded so the rest of the workflow behaves:
+`git status` reports the path as `UU`, `AA`, `UD`, or `DU` and lists it under "Unmerged paths",
+`git ls-files -u` prints the stages, `git commit` refuses until the path is staged, `git add` or
+`git rm` marks it resolved, and the finished commit carries both parents. `git merge --abort`
+restores the pre-merge state without touching untracked files, and `git merge --continue` is the
+same as committing.
+
+`git cherry-pick` and `git revert` run the same three-way merge with different corners: a
+cherry-pick uses the commit's parent as the base and the commit as the incoming side, and a
+revert swaps those two. Both stop at a conflict, both take `--continue` and `--abort`, and
+`-n` leaves the result staged. A cherry-pick keeps the original author; a revert does not.
+
+Binary files and a path one side deleted while the other changed it are recorded as conflicts
+without markers, leaving the surviving content in the working tree, as Git does.
+
 ## What is not supported
 
 Anything needing a network is refused and recorded as unsupported: `clone`, `fetch`, `pull`,
 `push`, `ls-remote`, and `submodule`. `git remote` records remote names but never contacts one.
 
-Content conflicts are refused rather than written as markers. `git merge` fast-forwards when it
-can and otherwise takes whichever side changed each path; when both sides changed one file it
-reports the conflicting paths, leaves the working tree untouched, and exits nonzero. There is no
-`rebase`, `cherry-pick`, `revert`, `reflog`, `bisect`, `blame`, or `worktree`, and no interactive
-mode for any command. Those report `unsupported subcommand` and exit 2; a name that is not a Git
+There is no `rebase`, `reflog`, `bisect`, `blame`, or `worktree`, and no interactive mode for any
+command. Those report `unsupported subcommand` and exit 2; a name that is not a Git
 subcommand at all is reported the way Git reports a typo and exits 1.
 
 File modes, symbolic links, submodules, and rename detection based on similarity are outside the
@@ -93,6 +110,11 @@ by real Git is not readable, and a repository created here is not meant to be ha
 .git/commits/<id>.commit   a commit's parents, author, timestamp, and message
 .git/config            repository configuration in Git's INI format
 .git/stash-list        saved stash entries, newest first
+.git/MERGE_HEAD        the commit an unfinished merge is bringing in
+.git/CHERRY_PICK_HEAD  the commit an unfinished cherry-pick is replaying
+.git/REVERT_HEAD       the commit an unfinished revert is undoing
+.git/MERGE_MSG         the message that operation will commit
+.git/MERGE_STAGES      the three sides of each unmerged path, as `stage<TAB>hash<TAB>path`
 ```
 
 Trees are flat path maps rather than nested tree objects, and commits are stored uncompressed.
