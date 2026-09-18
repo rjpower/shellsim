@@ -17,6 +17,7 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde::Serialize;
+use shellsim::net::NetworkRequest;
 use shellsim::{CommandTrust, InvocationEvent, Limits, RunOutcome};
 
 const ACTION_STACK_BYTES: usize = 8 * 1024 * 1024;
@@ -39,6 +40,8 @@ struct RunMetadata {
     partial_commands: Vec<String>,
     invocations: Vec<InvocationEvent>,
     dropped_invocations: u64,
+    network_requests: Vec<NetworkRequest>,
+    dropped_network_requests: u64,
 }
 
 #[derive(Serialize)]
@@ -54,6 +57,8 @@ struct MetadataStart {
     dropped_unsupported: u64,
     invocation: u64,
     dropped_invocations: u64,
+    network: usize,
+    dropped_network: u64,
 }
 
 /// One persistent simulated machine owned by Python.
@@ -173,6 +178,36 @@ impl NativeEnvironment {
         .map_err(SimulationError::new_err)
     }
 
+    /// Register one static response in the simulated HTTP broker.
+    fn route_http(
+        &self,
+        py: Python<'_>,
+        pattern: String,
+        method: Option<String>,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            let mut environment = self.lock_environment()?;
+            on_worker(&mut environment, move |environment| {
+                environment
+                    .net
+                    .route(
+                        &pattern,
+                        method.as_deref(),
+                        shellsim::net::HttpResponse {
+                            status,
+                            headers,
+                            body,
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .map_err(SimulationError::new_err)
+    }
+
     /// Import one explicitly selected trusted host tree into the simulated filesystem.
     fn mount(
         &self,
@@ -257,6 +292,8 @@ fn metadata_start(environment: &shellsim::Environment) -> MetadataStart {
         dropped_unsupported: environment.unsupported.dropped(),
         invocation: environment.invocations.next_sequence(),
         dropped_invocations: environment.invocations.dropped(),
+        network: environment.net.log.len(),
+        dropped_network: environment.net.dropped_requests,
     }
 }
 
@@ -285,6 +322,11 @@ fn metadata_finish(
             .invocations
             .dropped()
             .saturating_sub(start.dropped_invocations),
+        network_requests: environment.net.log[start.network..].to_vec(),
+        dropped_network_requests: environment
+            .net
+            .dropped_requests
+            .saturating_sub(start.dropped_network),
     }
 }
 

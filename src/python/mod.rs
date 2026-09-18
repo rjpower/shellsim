@@ -9,6 +9,7 @@ mod bytecode;
 mod compiler;
 mod filesystem;
 mod heap;
+mod http;
 mod lexer;
 mod native;
 mod number;

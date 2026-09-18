@@ -264,6 +264,29 @@ pub(super) trait PyEnvironment {
     fn get(&self, name: &str) -> Option<String>;
 }
 
+/// Fully-owned request passed across Python's single virtual-HTTP capability boundary.
+pub(super) struct PyHttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Fully-owned response returned by the virtual-HTTP capability.
+pub(super) struct PyHttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Explicit HTTP-only capability backed by shellsim's route table.
+///
+/// `None` means no route matched. Implementations must never attempt DNS, sockets, TLS, or host
+/// network fallback.
+pub(super) trait PyHttpClient {
+    fn request(&mut self, request: PyHttpRequest) -> PyResult<Option<PyHttpResponse>>;
+}
+
 /// Standard-stream disposition for one simulated child process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PyStdio {
@@ -519,6 +542,7 @@ pub(super) trait PyRuntime {
     fn clock(&mut self) -> &mut dyn PyClock;
     fn environment(&self) -> &dyn PyEnvironment;
     fn filesystem(&mut self) -> &mut dyn PyFilesystem;
+    fn http(&mut self) -> &mut dyn PyHttpClient;
     fn processes(&mut self) -> &mut dyn PyProcessRunner;
 
     fn type_name(&self, value: &PyValue) -> PyResult<&'static str> {

@@ -14,6 +14,7 @@ mod frozen;
 pub mod functools;
 mod hashlib;
 pub mod heapq;
+mod http;
 mod importlib;
 pub mod itertools;
 pub mod json;
@@ -64,6 +65,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "enum" => Some(&r#enum::MODULE),
         "heapq" => Some(&heapq::MODULE),
         "_hashlib" => Some(&hashlib::MODULE),
+        "_shellsim_http" => Some(&http::MODULE),
         "_importlib" => Some(&importlib::MODULE),
         "_shellsim_vfs" => Some(&vfs::MODULE),
         "_zlib" => Some(&zlib::MODULE),

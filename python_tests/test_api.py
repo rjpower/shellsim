@@ -108,6 +108,71 @@ def test_environment_preserves_state_and_vfs_bytes() -> None:
     assert environment.read_file("data") == b"\x00\xffvalue"
 
 
+def test_environment_configures_static_http_routes() -> None:
+    environment = shellsim.Environment(
+        http={
+            "https://api.test/items": shellsim.HttpResponse(
+                status=201,
+                headers={"Content-Type": "application/json"},
+                body='{"id":7}',
+            )
+        }
+    )
+
+    result = environment.run("curl -i -X POST https://api.test/items")
+
+    assert result.returncode == 0
+    assert result.stdout == b'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n{"id":7}'
+    assert result.network_requests == (
+        shellsim.HttpRequest(
+            method="POST",
+            url="https://api.test/items",
+            headers=(),
+            dropped_headers=0,
+            body_bytes=0,
+            matched=True,
+            response_status=201,
+        ),
+    )
+
+
+def test_static_http_routes_back_python_urllib() -> None:
+    environment = shellsim.Environment(
+        http={
+            "https://api.test/items": shellsim.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                body='{"items":[]}',
+            )
+        }
+    )
+
+    result = environment.run_python(
+        "from urllib.request import urlopen\n"
+        "with urlopen('https://api.test/items') as response:\n"
+        "    print(response.status, response.getheader('content-type'), response.read())\n"
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == b"200 application/json b'{\"items\":[]}'\n"
+    assert result.network_requests[0].matched
+
+
+def test_http_routes_support_methods_globs_and_validation() -> None:
+    environment = shellsim.Environment()
+    environment.route_http(
+        "https://api.test/items/*",
+        shellsim.HttpResponse(body=b"created"),
+        method="POST",
+    )
+
+    assert environment.run("curl -d value https://api.test/items/1").stdout == b"created"
+    assert environment.run("curl https://api.test/items/1").returncode == 7
+    with pytest.raises(TypeError, match="shellsim.HttpResponse"):
+        environment.route_http("https://api.test", {"body": "wrong"})  # type: ignore[arg-type]
+    with pytest.raises(shellsim.SimulationError, match="invalid HTTP status"):
+        environment.route_http("https://api.test", shellsim.HttpResponse(status=99))
+
+
 def test_stdin_is_explicit_and_byte_preserving() -> None:
     assert shellsim.run("cat", b"\x00\xff\n").stdout == b"\x00\xff\n"
 
