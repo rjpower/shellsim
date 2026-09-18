@@ -10,7 +10,7 @@ use crate::commands::{CommandContext, Io};
 use super::conflict;
 use super::history;
 use super::repo::{self, Commit};
-use super::{repo_error, usage, Globals};
+use super::{repo_error, usage, Arg, Flags, Globals};
 
 const STATE: &str = "REBASE_STATE";
 
@@ -87,19 +87,25 @@ pub(crate) fn git_rebase(
     };
     let mut onto = None;
     let mut operands: Vec<String> = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
+    let mut flags = Flags::new(args);
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "--continue" => return resume(ctx, &root, globals, io),
             "--abort" => return abort(ctx, &root, io),
             "--skip" => return skip(ctx, &root, globals, io),
             "-q" | "--quiet" | "--no-verify" | "--no-autostash" => {}
             "--onto" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
+                let Some(value) = flags.value(attached) else {
                     return usage(io, "--onto requires a revision");
                 };
-                onto = Some(value.clone());
+                onto = Some(value);
             }
             // Editing a rebase needs an editor, which the simulation does not have.
             "-i" | "--interactive" => {
@@ -107,12 +113,8 @@ pub(crate) fn git_rebase(
                     .extend_from_slice(b"fatal: interactive rebase is not supported here\n");
                 return 128;
             }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported rebase option: {value}"))
-            }
-            value => operands.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported rebase option: {name}")),
         }
-        index += 1;
     }
     if load(ctx, &root).is_some() {
         io.err.extend_from_slice(

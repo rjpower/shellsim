@@ -12,7 +12,7 @@ use crate::vfs::resolve_against;
 use super::diff;
 use super::ignore;
 use super::repo;
-use super::{repo_error, usage};
+use super::{repo_error, usage, Arg, Flags};
 
 /// The most files `git grep` will search in one invocation.
 const MAX_GREP_FILES: usize = 10_000;
@@ -23,13 +23,17 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     };
     let mut mode = None;
     let mut object = None;
-    for argument in args {
-        match argument.as_str() {
-            "-p" | "-t" | "-s" | "-e" => mode = Some(argument.clone()),
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported cat-file option: {value}"))
+    for argument in Flags::new(args) {
+        let name = match argument {
+            Arg::Operand(value) => {
+                object = Some(value);
+                continue;
             }
-            value => object = Some(value.to_string()),
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
+            "-p" | "-t" | "-s" | "-e" => mode = Some(name),
+            _ => return usage(io, &format!("unsupported cat-file option: {name}")),
         }
     }
     let (Some(mode), Some(object)) = (mode, object) else {
@@ -107,15 +111,29 @@ pub(crate) fn git_hash_object(ctx: &mut CommandContext<'_>, args: &[String], io:
     let mut write = false;
     let mut stdin = false;
     let mut files = Vec::new();
-    for argument in args {
-        match argument.as_str() {
+    let mut flags = Flags::new(args).valued("t");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                files.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "-w" => write = true,
             "--stdin" => stdin = true,
-            "-t" => {}
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported hash-object option: {value}"))
-            }
-            value => files.push(value.to_string()),
+            // Blobs are the only object this computes an id for.
+            "-t" | "--type" => match flags.value(attached).as_deref() {
+                Some("blob") => {}
+                other => {
+                    return usage(
+                        io,
+                        &format!("unsupported object type: {}", other.unwrap_or("")),
+                    )
+                }
+            },
+            _ => return usage(io, &format!("unsupported hash-object option: {name}")),
         }
     }
     let mut contents: Vec<Vec<u8>> = Vec::new();
@@ -161,16 +179,20 @@ pub(crate) fn git_ls_tree(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
     let mut recursive = false;
     let mut directories_only = false;
     let mut operands = Vec::new();
-    for argument in super::expand_clusters(args, "rd") {
-        match argument.as_str() {
+    for argument in Flags::new(args).clustered("rd") {
+        let name = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
+            }
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
             "--name-only" | "--name-status" => name_only = true,
             "-r" => recursive = true,
             "-d" => directories_only = true,
             "--full-name" => {}
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported ls-tree option: {value}"))
-            }
-            value => operands.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported ls-tree option: {name}")),
         }
     }
     let Some((revision, paths)) = operands.split_first() else {
@@ -248,18 +270,21 @@ pub(crate) fn git_check_ignore(ctx: &mut CommandContext<'_>, args: &[String], io
     let mut quiet = false;
     let mut non_matching = false;
     let mut from_stdin = false;
-    let args = super::expand_clusters(args, "vqn");
-    for argument in &args {
-        match argument.as_str() {
+    for argument in Flags::new(args).clustered("vqn") {
+        let name = match argument {
+            Arg::Operand(value) => {
+                paths.push(value);
+                continue;
+            }
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
             "-v" | "--verbose" => verbose = true,
             "-q" | "--quiet" => quiet = true,
             "-n" | "--non-matching" => non_matching = true,
             "--stdin" => from_stdin = true,
             "--no-index" => {}
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported check-ignore option: {value}"))
-            }
-            value => paths.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported check-ignore option: {name}")),
         }
     }
     if from_stdin {
@@ -305,13 +330,17 @@ pub(crate) fn git_merge_base(ctx: &mut CommandContext<'_>, args: &[String], io: 
     };
     let mut is_ancestor = false;
     let mut revisions = Vec::new();
-    for argument in args {
-        match argument.as_str() {
-            "--is-ancestor" => is_ancestor = true,
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported merge-base option: {value}"))
+    for argument in Flags::new(args) {
+        let name = match argument {
+            Arg::Operand(value) => {
+                revisions.push(value);
+                continue;
             }
-            value => revisions.push(value.to_string()),
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
+            "--is-ancestor" => is_ancestor = true,
+            _ => return usage(io, &format!("unsupported merge-base option: {name}")),
         }
     }
     let [left, right] = revisions.as_slice() else {
@@ -345,15 +374,19 @@ pub(crate) fn git_describe(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let mut always = false;
     let mut lightweight = false;
     let mut revision = "HEAD".to_string();
-    for argument in args {
-        match argument.as_str() {
-            "--tags" => lightweight = true,
-            "--abbrev=0" | "--long" => {}
-            "--always" => always = true,
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported describe option: {value}"))
+    for argument in Flags::new(args) {
+        let name = match argument {
+            Arg::Operand(value) => {
+                revision = value;
+                continue;
             }
-            value => revision = value.to_string(),
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
+            "--tags" => lightweight = true,
+            "--abbrev" | "--long" => {}
+            "--always" => always = true,
+            _ => return usage(io, &format!("unsupported describe option: {name}")),
         }
     }
     let Some(start) = repo::resolve_revision(ctx, &root, &revision) else {
@@ -406,16 +439,20 @@ pub(crate) fn git_shortlog(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let mut numbered = false;
     let mut with_email = false;
     let mut revisions: Vec<String> = Vec::new();
-    for argument in super::expand_clusters(args, "sne") {
-        match argument.as_str() {
+    for argument in Flags::new(args).clustered("sne") {
+        let name = match argument {
+            Arg::Operand(value) => {
+                revisions.push(value);
+                continue;
+            }
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
             "-s" | "--summary" => summary = true,
             "-n" | "--numbered" => numbered = true,
             "-e" | "--email" => with_email = true,
             "--no-merges" => {}
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported shortlog option: {value}"))
-            }
-            value => revisions.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported shortlog option: {name}")),
         }
     }
     let starts: Vec<String> = if revisions.is_empty() {
@@ -481,22 +518,24 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
     let mut without_match = false;
     let mut pattern = None;
     let mut paths: Vec<String> = Vec::new();
-    let mut operands_only = false;
     let mut before_separator = usize::MAX;
-    let mut index = 0;
-    let args = super::expand_clusters(args, "niIlcEFv");
-    while index < args.len() {
-        let argument = args[index].as_str();
-        if operands_only {
-            paths.push(argument.to_string());
-            index += 1;
-            continue;
-        }
-        match argument {
-            "--" => {
-                before_separator = paths.len();
-                operands_only = true;
+    let mut flags = Flags::new(args).clustered("niIlcEFv").valued("e");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                if flags.separated() && before_separator == usize::MAX {
+                    before_separator = paths.len();
+                }
+                if pattern.is_none() && !flags.separated() {
+                    pattern = Some(value);
+                } else {
+                    paths.push(value);
+                }
+                continue;
             }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "-n" | "--line-number" => line_numbers = true,
             "-i" | "--ignore-case" => ignore_case = true,
             "-l" | "--files-with-matches" | "--name-only" => names_only = true,
@@ -509,17 +548,9 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             }
             "-v" | "--invert-match" => invert = true,
             "-E" | "--extended-regexp" | "-I" | "--no-color" | "--cached" => {}
-            "-e" => {
-                index += 1;
-                pattern = args.get(index).cloned();
-            }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported grep option: {value}"))
-            }
-            value if pattern.is_none() => pattern = Some(value.to_string()),
-            value => paths.push(value.to_string()),
+            "-e" => pattern = flags.value(attached),
+            _ => return usage(io, &format!("unsupported grep option: {name}")),
         }
-        index += 1;
     }
     let Some(pattern) = pattern else {
         return usage(io, "usage: git grep [-n] [-i] [-l] PATTERN [-- PATH...]");
@@ -660,16 +691,20 @@ pub(crate) fn git_show_ref(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let mut tags_only = false;
     let mut verify = false;
     let mut patterns: Vec<String> = Vec::new();
-    for argument in args {
-        match argument.as_str() {
+    for argument in Flags::new(args) {
+        let name = match argument {
+            Arg::Operand(value) => {
+                patterns.push(value);
+                continue;
+            }
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
             "--heads" => heads_only = true,
             "--tags" => tags_only = true,
             "--verify" => verify = true,
             "-q" | "--quiet" | "--hash" | "-d" | "--dereference" => {}
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported show-ref option: {value}"))
-            }
-            value => patterns.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported show-ref option: {name}")),
         }
     }
     let mut matched = false;
@@ -705,14 +740,18 @@ pub(crate) fn git_symbolic_ref(ctx: &mut CommandContext<'_>, args: &[String], io
     };
     let mut short = false;
     let mut operands: Vec<String> = Vec::new();
-    for argument in args {
-        match argument.as_str() {
+    for argument in Flags::new(args) {
+        let name = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
+            }
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
             "--short" => short = true,
             "-q" | "--quiet" => {}
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported symbolic-ref option: {value}"))
-            }
-            value => operands.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported symbolic-ref option: {name}")),
         }
     }
     match operands.as_slice() {
@@ -752,23 +791,23 @@ pub(crate) fn git_for_each_ref(ctx: &mut CommandContext<'_>, args: &[String], io
     };
     let mut format = None;
     let mut prefixes: Vec<String> = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--format" => {
-                index += 1;
-                format = args.get(index).cloned();
+    let mut flags = Flags::new(args);
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                prefixes.push(value.trim_end_matches('*').to_string());
+                continue;
             }
-            value if value.starts_with("--format=") => {
-                format = Some(value["--format=".len()..].to_string());
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
+            "--format" => format = flags.value(attached),
+            // Every reference is listed, in name order, so neither of these changes anything.
+            "--count" | "--sort" => {
+                flags.value(attached);
             }
-            value if value.starts_with("--count=") || value.starts_with("--sort=") => {}
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported for-each-ref option: {value}"))
-            }
-            value => prefixes.push(value.trim_end_matches('*').to_string()),
+            _ => return usage(io, &format!("unsupported for-each-ref option: {name}")),
         }
-        index += 1;
     }
     let format = format.unwrap_or_else(|| "%(objectname) %(objecttype)\t%(refname)".to_string());
     for (name, commit) in all_references(ctx, &root) {
@@ -827,37 +866,32 @@ pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     let mut suppress = false;
     let mut range: Option<String> = None;
     let mut operands: Vec<String> = Vec::new();
-    let mut options = true;
     // Where `--` fell, so `git blame REV -- PATH` names a path that the working tree lost.
     let mut after_separator = None;
-    let expanded = super::expand_clusters(args, "slwe");
-    let mut index = 0;
-    while index < expanded.len() {
-        let argument = expanded[index].as_str();
-        match argument {
-            "--" if options => {
-                options = false;
-                after_separator = Some(operands.len());
+    let mut flags = Flags::new(args).clustered("slwe").valued("L");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                if flags.separated() && after_separator.is_none() {
+                    after_separator = Some(operands.len());
+                }
+                operands.push(value);
+                continue;
             }
-            "-s" if options => suppress = true,
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
+            "-s" => suppress = true,
             // Blame here has no similarity detection or whitespace modes to turn on.
-            "-l" | "-w" | "-e" | "--show-email" | "--root" if options => {}
-            "-L" if options => {
-                index += 1;
-                let Some(value) = expanded.get(index) else {
+            "-l" | "-w" | "-e" | "--show-email" | "--root" => {}
+            "-L" => {
+                let Some(value) = flags.value(attached) else {
                     return usage(io, "-L requires a line range");
                 };
-                range = Some(value.clone());
+                range = Some(value);
             }
-            value if options && value.starts_with("-L") && value.len() > 2 => {
-                range = Some(value[2..].to_string());
-            }
-            value if options && value.starts_with('-') => {
-                return usage(io, &format!("unsupported blame option: {value}"))
-            }
-            value => operands.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported blame option: {name}")),
         }
-        index += 1;
     }
     // The file is whatever followed `--`, or else the operand that names one; anything left over
     // is the revision to start from.
@@ -1131,40 +1165,40 @@ fn parse_line_range(range: &str, total: usize) -> Option<(usize, usize)> {
 
 // -- reflog --------------------------------------------------------------------------------------
 
+/// The count in a bare `-5`, which Git accepts wherever it accepts `--max-count`.
+pub(crate) fn count_option(name: &str) -> Option<usize> {
+    let digits = name.strip_prefix('-')?;
+    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
 /// List where HEAD has been, which is what makes a bad reset recoverable.
 pub(crate) fn git_reflog(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let Some(root) = repo::find_repo_root(ctx) else {
         return repo_error(io);
     };
     let mut limit = usize::MAX;
-    let mut index = 0;
-    while index < args.len() {
-        let argument = args[index].as_str();
-        match argument {
+    let mut flags = Flags::new(args).valued("n");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
             // `show` is the only subcommand offered, and HEAD the only reference logged.
-            "show" | "HEAD" | "--oneline" | "--no-abbrev" | "--" => {}
+            Arg::Operand(value) if value == "show" || value == repo::HEAD => continue,
+            Arg::Operand(value) => return usage(io, &format!("only HEAD is logged, not {value}")),
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
+            "--oneline" | "--no-abbrev" => {}
             "-n" | "--max-count" => {
-                index += 1;
-                let Some(value) = args.get(index).and_then(|value| value.parse().ok()) else {
+                let Some(value) = flags.value(attached).and_then(|value| value.parse().ok()) else {
                     return usage(io, "-n requires a count");
                 };
                 limit = value;
             }
-            value if value.starts_with("--max-count=") => {
-                let Ok(value) = value["--max-count=".len()..].parse() else {
-                    return usage(io, "--max-count requires a count");
-                };
-                limit = value;
-            }
-            value if value.starts_with('-') && value[1..].chars().all(|c| c.is_ascii_digit()) => {
-                limit = value[1..].parse().unwrap_or(usize::MAX);
-            }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported reflog option: {value}"))
-            }
-            value => return usage(io, &format!("only HEAD is logged, not {value}")),
+            // `git reflog -5` is the count written on its own, as `git log -5` is.
+            _ if count_option(&name).is_some() => limit = count_option(&name).unwrap_or(usize::MAX),
+            _ => return usage(io, &format!("unsupported reflog option: {name}")),
         }
-        index += 1;
     }
     for (position, entry) in repo::read_head_log(ctx, &root)
         .iter()

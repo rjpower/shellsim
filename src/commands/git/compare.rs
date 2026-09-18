@@ -12,7 +12,7 @@ use crate::commands::{CommandContext, Io};
 use super::conflict;
 use super::diff::{self, DEFAULT_CONTEXT};
 use super::repo::{self, Tree};
-use super::usage;
+use super::{usage, Arg, Flags};
 
 /// How a tree comparison is presented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -451,8 +451,13 @@ fn shorten_name(name: &str, width: usize) -> String {
 /// Parse the options `git diff` shares with `git log` and `git show`.
 ///
 /// Returns `None` when the argument is not a recognized diff option.
-pub(crate) fn apply_shared_option(options: &mut Options, argument: &str) -> Option<bool> {
-    match argument {
+pub(crate) fn apply_shared_option(
+    options: &mut Options,
+    flags: &mut Flags,
+    name: &str,
+    attached: Option<String>,
+) -> Option<bool> {
+    match name {
         "--name-only" => options.format = Format::NameOnly,
         "--name-status" => options.format = Format::NameStatus,
         "--stat" => options.format = Format::Stat,
@@ -463,24 +468,21 @@ pub(crate) fn apply_shared_option(options: &mut Options, argument: &str) -> Opti
         "--shortstat" => options.format = Format::ShortStat,
         "--check" => options.format = Format::Check,
         "-p" | "-u" | "--patch" => options.format = Format::Patch,
-        "--no-color" | "--color=never" | "--no-ext-diff" | "--no-renames" => {}
-        // Renames are always detected here, so asking for them changes nothing.
+        "--no-color" | "--color" | "--no-ext-diff" | "--no-renames" => {}
+        // Exact renames are always detected here, so asking for them changes nothing, and the
+        // similarity threshold a number would set has nothing to tune.
         "-M" | "--find-renames" | "--find-copies-harder" => {}
-        value if value.starts_with("-M") || value.starts_with("--find-renames=") => {}
         "-w" | "--ignore-all-space" => options.whitespace = diff::Whitespace::IgnoreAll,
         "-b" | "--ignore-space-change" => options.whitespace = diff::Whitespace::IgnoreChange,
-        value if value.starts_with("--diff-filter=") => {
-            options.filter = Some(value["--diff-filter=".len()..].to_ascii_uppercase());
-        }
-        value => {
-            let context = value
-                .strip_prefix("-U")
-                .or_else(|| value.strip_prefix("--unified="))?;
-            options.context = context.parse().ok()?;
-        }
+        "--diff-filter" => options.filter = Some(flags.value(attached)?.to_ascii_uppercase()),
+        "-U" | "--unified" => options.context = flags.value(attached)?.parse().ok()?,
+        _ => return None,
     }
     Some(true)
 }
+
+/// The short options `git diff` lets a value be written against, as `-U3` and `-M50%` are.
+pub(crate) const DIFF_VALUED: &str = "UM";
 
 /// Compare two files directly, as `git diff --no-index` does.
 ///
@@ -488,15 +490,20 @@ pub(crate) fn apply_shared_option(options: &mut Options, argument: &str) -> Opti
 fn diff_no_index(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut options = Options::default();
     let mut operands: Vec<String> = Vec::new();
-    for argument in args {
-        match argument.as_str() {
-            "--no-index" => {}
-            value if value.starts_with('-') => {
-                if apply_shared_option(&mut options, value).is_none() {
-                    return super::usage(io, &format!("unsupported diff option: {value}"));
-                }
+    let mut flags = Flags::new(args).valued(DIFF_VALUED);
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
             }
-            value => operands.push(value.to_string()),
+            Arg::Option { name, attached } => (name, attached),
+        };
+        if name == "--no-index" {
+            continue;
+        }
+        if apply_shared_option(&mut options, &mut flags, &name, attached).is_none() {
+            return super::usage(io, &format!("unsupported diff option: {name}"));
         }
     }
     let [left, right] = operands.as_slice() else {
@@ -564,40 +571,42 @@ pub(crate) fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
     let mut cached = false;
     let mut exit_code = false;
     let mut revisions: Vec<String> = Vec::new();
-    let mut operands_only = false;
     let cwd = ctx.cwd.clone();
-    for argument in args {
-        if operands_only {
-            options.paths.push(super::pathspec(&cwd, &root, argument));
-            continue;
-        }
-        match argument.as_str() {
-            "--" => operands_only = true,
+    let mut flags = Flags::new(args).valued(DIFF_VALUED);
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) if flags.separated() => {
+                options.paths.push(super::pathspec(&cwd, &root, &value));
+                continue;
+            }
+            Arg::Operand(value) => {
+                let revision = revisions.len() < 2
+                    && (repo::resolve_revision(ctx, &root, &value).is_some()
+                        || (revisions.is_empty()
+                            && split_range(&value).is_some_and(|(left, right, _)| {
+                                repo::resolve_revision(ctx, &root, left).is_some()
+                                    && repo::resolve_revision(ctx, &root, right).is_some()
+                            })));
+                if revision {
+                    revisions.push(value);
+                    continue;
+                }
+                if !super::names_a_path(ctx, &root, &value) {
+                    return super::ambiguous_argument(io, &value);
+                }
+                options.paths.push(super::pathspec(&cwd, &root, &value));
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "--cached" | "--staged" => cached = true,
             "--quiet" => options.quiet = true,
             "--exit-code" => exit_code = true,
-            value if value.starts_with('-') => {
-                if apply_shared_option(&mut options, value).is_none() {
-                    return usage(io, &format!("unsupported diff option: {value}"));
+            _ => {
+                if apply_shared_option(&mut options, &mut flags, &name, attached).is_none() {
+                    return usage(io, &format!("unsupported diff option: {name}"));
                 }
-            }
-            value if revisions.len() < 2 && repo::resolve_revision(ctx, &root, value).is_some() => {
-                revisions.push(value.to_string());
-            }
-            value
-                if revisions.is_empty()
-                    && split_range(value).is_some_and(|(left, right, _)| {
-                        repo::resolve_revision(ctx, &root, left).is_some()
-                            && repo::resolve_revision(ctx, &root, right).is_some()
-                    }) =>
-            {
-                revisions.push(value.to_string());
-            }
-            value => {
-                if !super::names_a_path(ctx, &root, value) {
-                    return super::ambiguous_argument(io, value);
-                }
-                options.paths.push(super::pathspec(&cwd, &root, value));
             }
         }
     }

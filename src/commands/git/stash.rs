@@ -9,7 +9,7 @@ use crate::commands::{CommandContext, Io};
 
 use super::conflict;
 use super::repo::{self, Tree};
-use super::{repo_error, usage};
+use super::{repo_error, usage, Arg, Flags};
 
 /// One saved entry.
 struct Entry {
@@ -77,23 +77,30 @@ pub(crate) fn git_stash(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     };
     let mut include_untracked = false;
     let mut quiet = false;
+    let mut patch = false;
     let mut message = None;
     let mut operands: Vec<String> = Vec::new();
-    let mut index = 0;
-    for argument in super::expand_clusters(args, "qum") {
-        match argument.as_str() {
+    let mut flags = Flags::new(args).clustered("qum").valued("m");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "-u" | "--include-untracked" => include_untracked = true,
             "-q" | "--quiet" => quiet = true,
-            "-p" | "--patch" | "--no-keep-index" => {}
-            "-m" | "--message" => index = usize::MAX,
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported stash option: {value}"))
+            "-p" | "--patch" => patch = true,
+            "--no-keep-index" => {}
+            "-m" | "--message" => {
+                let Some(value) = flags.value(attached) else {
+                    return usage(io, "-m requires a message");
+                };
+                message = Some(value);
             }
-            value if index == usize::MAX => {
-                message = Some(value.to_string());
-                index = 0;
-            }
-            value => operands.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported stash option: {name}")),
         }
     }
     let command = operands.first().map(String::as_str).unwrap_or("push");
@@ -107,7 +114,6 @@ pub(crate) fn git_stash(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
             else {
                 return usage(io, "usage: git stash show [-p] [stash@{N}]");
             };
-            let patch = args.iter().any(|value| value == "-p" || value == "--patch");
             show(ctx, &root, position, patch, io)
         }
         "pop" | "apply" => {

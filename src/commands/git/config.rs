@@ -65,6 +65,17 @@ pub(crate) fn git_config(
     args: &[String],
     io: &mut Io,
 ) -> i32 {
+    // `git config` writes its verbs as options, so these reach the match on operands below.
+    const ACTIONS: &[&str] = &[
+        "--list",
+        "-l",
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--unset",
+        "--unset-all",
+        "--add",
+    ];
     let mut scope = Scope::Local;
     let mut explicit_scope = false;
     let mut show_origin = false;
@@ -80,7 +91,13 @@ pub(crate) fn git_config(
             "--system" => return usage(io, "the system configuration scope is not available"),
             "--show-origin" => show_origin = true,
             "--bool" | "--type=bool" => as_boolean = true,
-            "--type=string" | "--null" | "-z" if false => {}
+            // The default type, so asking for it changes nothing.
+            "--type=string" => {}
+            // What is left is either one of the actions below, which read as operands because
+            // `git config` spells them like options, or something this subset does not have.
+            value if value.starts_with('-') && !ACTIONS.contains(&value) => {
+                return usage(io, &format!("unsupported config option: {value}"))
+            }
             value => operands.push(value.to_string()),
         }
     }

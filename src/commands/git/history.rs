@@ -15,7 +15,7 @@ use super::diff;
 use super::rebase;
 use super::repo::{self, Commit, Tree};
 use super::worktree;
-use super::{repo_error, usage, Globals};
+use super::{repo_error, usage, Arg, Flags, Globals};
 
 fn author_identity(
     ctx: &mut CommandContext<'_>,
@@ -60,31 +60,33 @@ pub(crate) fn git_commit(
     let mut signoff = false;
     let mut author = None;
     let mut paths: Vec<String> = Vec::new();
-    let mut operands_only = false;
-    let args = super::expand_clusters(args, "amqvns");
-    let mut index = 0;
-    while index < args.len() {
-        let argument = args[index].as_str();
-        if operands_only {
-            paths.push(argument.to_string());
-            index += 1;
-            continue;
-        }
-        match argument {
-            "--" => operands_only = true,
+    let mut flags = Flags::new(args).clustered("amqvns").valued("mF");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                paths.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "-m" | "--message" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
+                let Some(value) = flags.value(attached) else {
                     return usage(io, "-m requires a message");
                 };
-                messages.push(value.clone());
+                messages.push(value);
             }
             "-F" | "--file" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
+                let Some(value) = flags.value(attached) else {
                     return usage(io, "-F requires a file");
                 };
-                message_file = Some(value.clone());
+                message_file = Some(value);
+            }
+            "--author" => {
+                let Some(value) = flags.value(attached) else {
+                    return usage(io, "--author requires a name");
+                };
+                author = Some(value);
             }
             "-a" | "--all" => stage_tracked = true,
             "--amend" => amend = true,
@@ -93,25 +95,8 @@ pub(crate) fn git_commit(
             "--dry-run" => dry_run = true,
             "-s" | "--signoff" => signoff = true,
             "-n" | "--no-verify" | "-v" | "--verbose" | "--no-edit" | "--no-gpg-sign" => {}
-            "--author" => {
-                index += 1;
-                author = args.get(index).cloned();
-            }
-            value if value.starts_with("--message=") => {
-                messages.push(value["--message=".len()..].to_string());
-            }
-            value if value.starts_with("--author=") => {
-                author = Some(value["--author=".len()..].to_string());
-            }
-            value if value.starts_with("--file=") => {
-                message_file = Some(value["--file=".len()..].to_string());
-            }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported commit option: {value}"))
-            }
-            value => paths.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported commit option: {name}")),
         }
-        index += 1;
     }
     let Some(root) = repo::find_repo_root(ctx) else {
         return repo_error(io);
@@ -776,74 +761,84 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     let mut stat = None;
     let mut graph: Option<Rail> = None;
     let mut paths: Vec<String> = Vec::new();
-    let mut operands_only = false;
-    let mut index = 0;
     let cwd = ctx.cwd.clone();
-    while index < args.len() {
-        let argument = args[index].as_str();
-        if operands_only {
-            paths.push(super::pathspec(&cwd, &root, argument));
-            index += 1;
-            continue;
-        }
-        match argument {
-            "--" => operands_only = true,
+    let mut flags = Flags::new(args).valued("nSG");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) if flags.separated() => {
+                paths.push(super::pathspec(&cwd, &root, &value));
+                continue;
+            }
+            Arg::Operand(value) => {
+                if select_revision(ctx, &root, &value).is_some() {
+                    revisions.push(value);
+                    continue;
+                }
+                if !super::names_a_path(ctx, &root, &value) {
+                    return super::ambiguous_argument(io, &value);
+                }
+                paths.push(super::pathspec(&cwd, &root, &value));
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "--oneline" => pretty = Pretty::AbbreviatedOneLine,
             "--reverse" => reverse = true,
-            "--decorate" | "--decorate=short" => decorate = true,
-            "--no-decorate" | "--decorate=no" | "--no-color" => {}
+            // Decoration is either on or off here; `full` and `short` render the same names.
+            "--decorate" => decorate = attached.as_deref() != Some("no"),
+            "--no-decorate" | "--no-color" | "--color" => {}
             "--no-merges" => no_merges = true,
             "--merges" => merges_only = true,
             "--abbrev-commit" => abbreviate = true,
             "--first-parent" => first_parent = true,
             "--all" => all_references = true,
             "-n" | "--max-count" => {
-                index += 1;
-                let Some(value) = args.get(index).and_then(|value| value.parse().ok()) else {
+                let Some(value) = flags.value(attached).and_then(|value| value.parse().ok()) else {
                     return usage(io, "log count must be a non-negative integer");
                 };
                 limit = value;
             }
+            "--skip" => {
+                let Some(value) = flags.value(attached).and_then(|value| value.parse().ok()) else {
+                    return usage(io, "--skip requires a non-negative integer");
+                };
+                skip = value;
+            }
             "-i" | "--regexp-ignore-case" => ignore_case = true,
             "--since" | "--after" | "--until" | "--before" => {
-                let after = matches!(argument, "--since" | "--after");
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return usage(io, &format!("{argument} requires a date"));
+                let Some(value) = flags.value(attached) else {
+                    return usage(io, &format!("{name} requires a date"));
                 };
-                let Some(seconds) = parse_date(value, now_seconds(ctx)) else {
+                let Some(seconds) = parse_date(&value, now_seconds(ctx)) else {
                     return usage(io, &format!("unsupported date: {value}"));
                 };
-                if after {
+                if matches!(name.as_str(), "--since" | "--after") {
                     since = Some(seconds);
                 } else {
                     until = Some(seconds);
                 }
             }
             "--grep" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
+                let Some(value) = flags.value(attached) else {
                     return usage(io, "--grep requires a pattern");
                 };
-                message_filter = Some(value.clone());
+                message_filter = Some(value);
             }
             "--author" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
+                let Some(value) = flags.value(attached) else {
                     return usage(io, "--author requires a pattern");
                 };
-                author_filter = Some(value.clone());
+                author_filter = Some(value);
             }
             "-S" | "-G" => {
-                let option = argument.to_string();
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return usage(io, &format!("{option} requires a string"));
+                let Some(value) = flags.value(attached) else {
+                    return usage(io, &format!("{name} requires a string"));
                 };
-                if option == "-S" {
-                    pickaxe = Some(value.clone());
+                if name == "-S" {
+                    pickaxe = Some(value);
                 } else {
-                    changed_lines = Some(value.clone());
+                    changed_lines = Some(value);
                 }
             }
             "--graph" => graph = Some(Rail::default()),
@@ -852,90 +847,24 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             "--name-only" => stat = Some(Format::NameOnly),
             "--name-status" => stat = Some(Format::NameStatus),
             "-p" | "-u" | "--patch" => patch = Some(Format::Patch),
-            value if value.starts_with("--skip=") => {
-                let Ok(value) = value["--skip=".len()..].parse() else {
-                    return usage(io, "--skip requires a non-negative integer");
-                };
-                skip = value;
-            }
-            value if value.starts_with("--author=") => {
-                author_filter = Some(value["--author=".len()..].to_string());
-            }
-            value if value.starts_with("--grep=") => {
-                message_filter = Some(value["--grep=".len()..].to_string());
-            }
-            value
-                if value.starts_with("--since=")
-                    || value.starts_with("--after=")
-                    || value.starts_with("--until=")
-                    || value.starts_with("--before=") =>
-            {
-                let (name, date) = value.split_once('=').unwrap_or((value, ""));
-                let Some(seconds) = parse_date(date, now_seconds(ctx)) else {
-                    return usage(io, &format!("unsupported date: {date}"));
-                };
-                if matches!(name, "--since" | "--after") {
-                    since = Some(seconds);
-                } else {
-                    until = Some(seconds);
-                }
-            }
-            value if value.starts_with("-S") && value.len() > 2 => {
-                pickaxe = Some(value[2..].to_string());
-            }
-            value if value.starts_with("-G") && value.len() > 2 => {
-                changed_lines = Some(value[2..].to_string());
-            }
-            value if value.starts_with("--max-count=") => {
-                let Ok(value) = value["--max-count=".len()..].parse() else {
-                    return usage(io, "log count must be a non-negative integer");
-                };
-                limit = value;
-            }
-            value if value.starts_with("--pretty=") || value.starts_with("--format=") => {
-                let terminated = value.starts_with("--format=");
-                let Some(parsed) = parse_pretty(
-                    value.split_once('=').map_or("", |parts| parts.1),
-                    terminated,
-                )
-                .filter(|parsed| match parsed {
-                    Pretty::Custom { format, .. } => format_is_supported(format),
-                    _ => true,
-                }) else {
-                    return usage(io, &format!("unsupported log format: {value}"));
+            "--pretty" | "--format" => {
+                let terminated = name == "--format";
+                let Some(parsed) = parse_pretty(attached.as_deref().unwrap_or(""), terminated)
+                    .filter(|parsed| match parsed {
+                        Pretty::Custom { format, .. } => format_is_supported(format),
+                        _ => true,
+                    })
+                else {
+                    return usage(io, &format!("unsupported log format: {name}"));
                 };
                 pretty = parsed;
             }
-            value if value.starts_with("-n") && value.len() > 2 => {
-                let Ok(value) = value[2..].parse() else {
-                    return usage(io, "log count must be a non-negative integer");
-                };
-                limit = value;
+            // `git log -5` is the count written on its own.
+            _ if super::plumbing::count_option(&name).is_some() => {
+                limit = super::plumbing::count_option(&name).unwrap_or(usize::MAX);
             }
-            value
-                if value.len() > 1
-                    && value.starts_with('-')
-                    && value[1..].bytes().all(|byte| byte.is_ascii_digit()) =>
-            {
-                let Ok(value) = value[1..].parse() else {
-                    return usage(io, "log count must be a non-negative integer");
-                };
-                limit = value;
-            }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported log option: {value}"))
-            }
-            value if select_revision(ctx, &root, value).is_some() => {
-                revisions.push(value.to_string())
-            }
-            value => {
-                if !super::names_a_path(ctx, &root, value) {
-                    return super::ambiguous_argument(io, value);
-                }
-                paths.push(super::pathspec(&cwd, &root, value));
-            }
+            _ => return usage(io, &format!("unsupported log option: {name}")),
         }
-        index += 1;
     }
     if all_references {
         revisions.extend(all_reference_tips(ctx, &root));
@@ -1361,31 +1290,35 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
     let mut format = Some(Format::Patch);
     let mut pretty = Pretty::Medium;
     let mut revisions: Vec<String> = Vec::new();
-    for argument in args {
-        match argument.as_str() {
+    for argument in Flags::new(args) {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                revisions.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "-s" | "--no-patch" => format = None,
             "--stat" => format = Some(Format::Stat),
             "--name-only" => format = Some(Format::NameOnly),
             "--name-status" => format = Some(Format::NameStatus),
             "--oneline" => pretty = Pretty::AbbreviatedOneLine,
             "--no-color" | "--abbrev-commit" => {}
-            value if value.starts_with("--pretty=") || value.starts_with("--format=") => {
-                let Some(parsed) = parse_pretty(
-                    value.split_once('=').map_or("", |parts| parts.1),
-                    value.starts_with("--format="),
-                )
-                .filter(|parsed| match parsed {
-                    Pretty::Custom { format, .. } => format_is_supported(format),
-                    _ => true,
-                }) else {
-                    return usage(io, &format!("unsupported show format: {value}"));
+            "--pretty" | "--format" => {
+                let Some(parsed) =
+                    parse_pretty(attached.as_deref().unwrap_or(""), name == "--format").filter(
+                        |parsed| match parsed {
+                            Pretty::Custom { format, .. } => format_is_supported(format),
+                            _ => true,
+                        },
+                    )
+                else {
+                    return usage(io, &format!("unsupported show format: {name}"));
                 };
                 pretty = parsed;
             }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported show option: {value}"))
-            }
-            value => revisions.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported show option: {name}")),
         }
     }
     if revisions.is_empty() {
@@ -1470,8 +1403,15 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
     let mut full_name = false;
     let mut quiet = false;
     let mut revisions: Vec<String> = Vec::new();
-    for argument in args {
-        match argument.as_str() {
+    for argument in Flags::new(args) {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                revisions.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "--show-toplevel" => {
                 io.out.extend_from_slice(format!("{root}\n").as_bytes());
                 return 0;
@@ -1522,21 +1462,20 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
                 }
                 return 0;
             }
-            "--short" => abbreviate = Some(7),
+            "--short" => {
+                let Some(length) = attached
+                    .map_or(Some(7), |value| value.parse::<usize>().ok())
+                    .map(|length| length.clamp(4, 40))
+                else {
+                    return usage(io, "--short requires a length");
+                };
+                abbreviate = Some(length);
+            }
             "--abbrev-ref" => abbrev_ref = true,
             "--symbolic-full-name" => full_name = true,
             "--verify" => {}
             "-q" | "--quiet" => quiet = true,
-            value if value.starts_with("--short=") => {
-                let Ok(length) = value["--short=".len()..].parse::<usize>() else {
-                    return usage(io, "--short requires a length");
-                };
-                abbreviate = Some(length.clamp(4, 40));
-            }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported rev-parse option: {value}"))
-            }
-            value => revisions.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported rev-parse option: {name}")),
         }
     }
     if revisions.is_empty() {
@@ -1615,30 +1554,29 @@ pub(crate) fn git_rev_list(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let mut limit = 10_000_usize;
     let mut revisions: Vec<String> = Vec::new();
     let mut all_references = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
+    let mut flags = Flags::new(args).valued("n");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                revisions.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "--count" => count = true,
             "--all" => all_references = true,
             "-n" | "--max-count" => {
-                index += 1;
-                let Some(value) = args.get(index).and_then(|value| value.parse().ok()) else {
+                let Some(value) = flags.value(attached).and_then(|value| value.parse().ok()) else {
                     return usage(io, "rev-list count must be a non-negative integer");
                 };
                 limit = value;
             }
-            value if value.starts_with("--max-count=") => {
-                let Ok(value) = value["--max-count=".len()..].parse() else {
-                    return usage(io, "rev-list count must be a non-negative integer");
-                };
-                limit = value;
-            }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported rev-list option: {value}"))
-            }
-            value => revisions.push(value.to_string()),
+            _ => match super::plumbing::count_option(&name) {
+                Some(value) => limit = value,
+                None => return usage(io, &format!("unsupported rev-list option: {name}")),
+            },
         }
-        index += 1;
     }
     if all_references {
         revisions.extend(all_reference_tips(ctx, &root));
@@ -1683,18 +1621,23 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     let mut contains: Option<(BranchFilter, String)> = None;
     let mut format: Option<String> = None;
     let mut operands: Vec<String> = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let argument = &args[index];
-        index += 1;
-        match argument.as_str() {
+    let mut flags = Flags::new(args).clustered("avdfqlr");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "--show-current" => {
                 if let Some(branch) = repo::current_branch(ctx, &root) {
                     io.out.extend_from_slice(format!("{branch}\n").as_bytes());
                 }
                 return 0;
             }
-            "-v" | "-vv" | "--verbose" => verbose = true,
+            "-v" | "--verbose" => verbose = true,
             "-d" | "--delete" => delete = true,
             "-D" => {
                 delete = true;
@@ -1707,25 +1650,12 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             }
             "-f" | "--force" => force = true,
             "-l" | "--list" => list = true,
-            value
-                if value.starts_with("--contains=")
-                    || value.starts_with("--merged=")
-                    || value.starts_with("--no-merged=") =>
-            {
-                let (name, revision) = value.split_once('=').unwrap_or((value, "HEAD"));
-                contains = Some((branch_filter(name), revision.to_string()));
-                list = true;
-            }
             "--contains" | "--merged" | "--no-merged" => {
                 // The revision is optional and defaults to HEAD.
-                let revision = match args.get(index) {
-                    Some(value) if !value.starts_with('-') => {
-                        index += 1;
-                        value.clone()
-                    }
-                    _ => "HEAD".to_string(),
-                };
-                contains = Some((branch_filter(argument), revision));
+                let revision = flags
+                    .optional_value(attached)
+                    .unwrap_or_else(|| "HEAD".to_string());
+                contains = Some((branch_filter(&name), revision));
                 list = true;
             }
             "-r" | "--remotes" => {
@@ -1735,19 +1665,15 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             "-a" | "--all" | "--no-color" | "--no-column" => list = true,
             "-q" | "--quiet" => {}
             "--format" => {
-                index += 1;
-                format = args.get(index).cloned();
+                format = flags.value(attached);
                 list = true;
             }
-            value if value.starts_with("--format=") => {
-                format = Some(value["--format=".len()..].to_string());
+            "--sort" => {
+                // The subset lists branches in name order, so the key is read and ignored.
+                flags.value(attached);
                 list = true;
             }
-            value if value.starts_with("--sort=") => list = true,
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported branch option: {value}"))
-            }
-            value => operands.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported branch option: {name}")),
         }
     }
     if delete {
@@ -2039,54 +1965,48 @@ pub(crate) fn git_tag(
     let mut format: Option<String> = None;
     let mut points_at: Option<String> = None;
     let mut operands: Vec<String> = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
+    let mut flags = Flags::new(args).clustered("adflqm").valued("m");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "-l" | "--list" => list = true,
             "-d" | "--delete" => delete = true,
             "-f" | "--force" => force = true,
             "-a" | "--annotate" => {}
+            "-m" | "--message" => message = flags.value(attached),
+            "-q" | "--quiet" => {}
+            "--format" => {
+                format = flags.value(attached);
+                list = true;
+            }
+            "--points-at" => {
+                points_at = flags.value(attached);
+                list = true;
+            }
+            "--sort" => {
+                // The subset lists tags in name order, so the key is read and ignored.
+                flags.value(attached);
+                list = true;
+            }
+            // `-n` and `-n<count>` both ask for the annotation; the subset prints all of it.
             "-n" | "--list-annotations" => {
                 list = true;
                 annotations = true;
             }
-            "-m" | "--message" => {
-                index += 1;
-                message = args.get(index).cloned();
-            }
-            value if value.starts_with("--message=") => {
-                message = Some(value["--message=".len()..].to_string());
-            }
-            value if value.starts_with("-am") => {
-                index += 1;
-                message = args.get(index).cloned();
-            }
-            "-q" | "--quiet" => {}
-            "--format" => {
-                index += 1;
-                format = args.get(index).cloned();
-                list = true;
-            }
-            "--points-at" => {
-                index += 1;
-                points_at = args.get(index).cloned();
-                list = true;
-            }
-            value if value.starts_with("--format=") => {
-                format = Some(value["--format=".len()..].to_string());
-                list = true;
-            }
-            value if value.starts_with("--points-at=") => {
-                points_at = Some(value["--points-at=".len()..].to_string());
-                list = true;
-            }
-            value if value.starts_with("--sort=") => list = true,
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported tag option: {value}"))
-            }
-            value => operands.push(value.to_string()),
+            _ => match super::plumbing::count_option(&name) {
+                Some(_) => {
+                    list = true;
+                    annotations = true;
+                }
+                None => return usage(io, &format!("unsupported tag option: {name}")),
+            },
         }
-        index += 1;
     }
     if delete {
         for name in &operands {
@@ -2487,9 +2407,15 @@ pub(crate) fn git_switch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     let mut force = false;
     let mut detach = false;
     let mut operands: Vec<String> = Vec::new();
-    let args = super::expand_clusters(args, "qcCdf");
-    for argument in &args {
-        match argument.as_str() {
+    for argument in Flags::new(args).clustered("qcdf") {
+        let name = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
+            }
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
             "-c" | "--create" => create = true,
             "-C" | "--force-create" => {
                 create = true;
@@ -2498,11 +2424,7 @@ pub(crate) fn git_switch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             "-d" | "--detach" => detach = true,
             "-f" | "--force" | "--discard-changes" => force = true,
             "-q" | "--quiet" | "--no-guess" | "--no-track" => {}
-            // A lone `-` names the previously checked-out branch.
-            value if value.starts_with('-') && value != "-" => {
-                return usage(io, &format!("unsupported switch option: {value}"))
-            }
-            value => operands.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported switch option: {name}")),
         }
     }
     match operands.as_slice() {
@@ -2541,16 +2463,22 @@ pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let mut detach = false;
     let mut operands: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
-    let mut operands_only = false;
     let mut side = None;
-    let args = super::expand_clusters(args, "qbBf");
-    for argument in &args {
-        if operands_only {
-            paths.push(argument.clone());
-            continue;
-        }
-        match argument.as_str() {
-            "--" => operands_only = true,
+    let mut flags = Flags::new(args).clustered("qbf");
+    while let Some(argument) = flags.next() {
+        let name = match argument {
+            Arg::Operand(value) => {
+                // Everything after `--` is a path; before it, a branch or revision.
+                if flags.separated() {
+                    paths.push(value);
+                } else {
+                    operands.push(value);
+                }
+                continue;
+            }
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
             "-b" => create = true,
             "-B" => {
                 create = true;
@@ -2561,10 +2489,7 @@ pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             "-q" | "--quiet" => {}
             "--ours" => side = Some(Side::Ours),
             "--theirs" => side = Some(Side::Theirs),
-            value if value.starts_with('-') && value != "-" => {
-                return usage(io, &format!("unsupported checkout option: {value}"))
-            }
-            value => operands.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported checkout option: {name}")),
         }
     }
     if let Some(side) = side {
@@ -2719,24 +2644,24 @@ pub(crate) fn git_merge(
     let mut fast_forward_only = false;
     let mut message = None;
     let mut operands: Vec<String> = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
+    let mut flags = Flags::new(args).clustered("q").valued("m");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "--no-ff" => no_fast_forward = true,
             "--ff-only" => fast_forward_only = true,
             "--ff" | "--no-edit" | "-q" | "--quiet" => {}
             "--abort" => return abort_pending(ctx, &root, "merge", io),
             "--continue" => return continue_pending(ctx, &root, globals, "merge", io),
-            "-m" => {
-                index += 1;
-                message = args.get(index).cloned();
-            }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported merge option: {value}"))
-            }
-            value => operands.push(value.to_string()),
+            "-m" | "--message" => message = flags.value(attached),
+            _ => return usage(io, &format!("unsupported merge option: {name}")),
         }
-        index += 1;
     }
     let [target] = operands.as_slice() else {
         return usage(io, "usage: git merge [--no-ff|--ff-only] BRANCH");
@@ -2890,26 +2815,22 @@ pub(crate) fn git_replay(
     let mut no_commit = false;
     let mut mainline: Option<usize> = None;
     let mut operands: Vec<String> = Vec::new();
-    let expanded = super::expand_clusters(args, "ne");
-    let mut arguments = expanded.iter();
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
+    let mut flags = Flags::new(args).clustered("neq").valued("m");
+    while let Some(argument) = flags.next() {
+        let (option, attached) = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match option.as_str() {
             // Replaying a merge means saying which of its parents the change is measured against.
             "-m" | "--mainline" => {
-                let parsed = arguments
-                    .next()
+                let parsed = flags
+                    .value(attached)
                     .and_then(|value| value.parse::<usize>().ok());
                 let Some(parent) = parsed.filter(|parent| *parent > 0) else {
-                    return usage(io, &format!("{name} -m wants a parent number"));
-                };
-                mainline = Some(parent);
-            }
-            value if value.starts_with("-m") && value.len() > 2 => {
-                let Some(parent) = value[2..]
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|parent| *parent > 0)
-                else {
                     return usage(io, &format!("{name} -m wants a parent number"));
                 };
                 mainline = Some(parent);
@@ -2934,10 +2855,7 @@ pub(crate) fn git_replay(
                     status
                 };
             }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported {name} option: {value}"))
-            }
-            value => operands.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported {name} option: {option}")),
         }
     }
     if operands.is_empty() {

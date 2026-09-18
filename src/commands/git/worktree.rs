@@ -14,7 +14,7 @@ use super::compare;
 use super::conflict;
 use super::ignore;
 use super::repo::{self, Tree};
-use super::{repo_error, usage};
+use super::{repo_error, usage, Arg, Flags};
 
 /// The state of one path relative to HEAD, the index, and the working tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,31 +172,42 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     let mut show_ignored = false;
     let mut nul = false;
     let mut paths: Vec<String> = Vec::new();
-    let mut operands_only = false;
-    for argument in super::expand_clusters(args, "sbz") {
-        if operands_only {
-            paths.push(argument.clone());
-            continue;
-        }
-        match argument.as_str() {
-            "--" => operands_only = true,
-            "-s" | "--short" | "--porcelain" | "--porcelain=v1" => short = true,
-            "--porcelain=v2" => version_two = true,
+    for argument in Flags::new(args).clustered("sbz").valued("u") {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                paths.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
+            "-s" | "--short" => short = true,
+            // Git takes these values only when written against the option, so what follows a
+            // bare `--porcelain` is a pathspec rather than its value.
+            "--porcelain" => match attached.as_deref() {
+                None | Some("v1") => short = true,
+                Some("v2") => version_two = true,
+                Some(other) => return usage(io, &format!("unsupported porcelain format: {other}")),
+            },
             "-b" | "--branch" => branch_header = true,
             "-z" => {
                 nul = true;
                 short = true;
             }
-            "-uno" | "--untracked-files=no" => untracked = Untracked::No,
-            "-uall" | "--untracked-files=all" => untracked = Untracked::All,
-            "-unormal" | "--untracked-files=normal" => untracked = Untracked::Normal,
-            "--ignored" | "--ignored=traditional" => show_ignored = true,
+            "-u" | "--untracked-files" => {
+                untracked = match attached.as_deref() {
+                    None | Some("normal") => Untracked::Normal,
+                    Some("no") => Untracked::No,
+                    Some("all") => Untracked::All,
+                    Some(other) => {
+                        return usage(io, &format!("unsupported untracked-files mode: {other}"))
+                    }
+                }
+            }
+            "--ignored" => show_ignored = true,
             "--long" => short = false,
             "--no-column" | "--no-renames" | "--no-color" | "--ahead-behind" => {}
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported status option: {value}"))
-            }
-            value => paths.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported status option: {name}")),
         }
     }
     let Some(root) = repo::find_repo_root(ctx) else {
@@ -688,20 +699,21 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     let mut verbose = false;
     let mut force = false;
     let mut operands = Vec::new();
-    let mut options = true;
-    let args = super::expand_clusters(args, "Auvnf");
-    for argument in &args {
-        match argument.as_str() {
-            "--" if options => options = false,
-            "-A" | "--all" | "--no-ignore-removal" if options => all = true,
-            "-u" | "--update" if options => update_only = true,
-            "-n" | "--dry-run" if options => dry_run = true,
-            "-v" | "--verbose" if options => verbose = true,
-            "-f" | "--force" if options => force = true,
-            value if options && value.starts_with('-') => {
-                return usage(io, &format!("unsupported add option: {value}"))
+    for argument in Flags::new(args).clustered("Auvnf") {
+        let name = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
             }
-            value => operands.push(value.to_string()),
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
+            "-A" | "--all" | "--no-ignore-removal" => all = true,
+            "-u" | "--update" => update_only = true,
+            "-n" | "--dry-run" => dry_run = true,
+            "-v" | "--verbose" => verbose = true,
+            "-f" | "--force" => force = true,
+            _ => return usage(io, &format!("unsupported add option: {name}")),
         }
     }
     if !all && !update_only && operands.is_empty() {
@@ -858,20 +870,21 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     let mut ignore_unmatch = false;
     let mut quiet = false;
     let mut operands = Vec::new();
-    let mut options = true;
-    let args = super::expand_clusters(args, "rfq");
-    for argument in &args {
-        match argument.as_str() {
-            "--" if options => options = false,
-            "--cached" if options => cached = true,
-            "-f" | "--force" if options => force = true,
-            "-r" if options => recursive = true,
-            "-q" | "--quiet" if options => quiet = true,
-            "--ignore-unmatch" if options => ignore_unmatch = true,
-            value if options && value.starts_with('-') => {
-                return usage(io, &format!("unsupported rm option: {value}"));
+    for argument in Flags::new(args).clustered("rfq") {
+        let name = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
             }
-            value => operands.push(value.to_string()),
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
+            "--cached" => cached = true,
+            "-f" | "--force" => force = true,
+            "-r" => recursive = true,
+            "-q" | "--quiet" => quiet = true,
+            "--ignore-unmatch" => ignore_unmatch = true,
+            _ => return usage(io, &format!("unsupported rm option: {name}")),
         }
     }
     if operands.is_empty() || operands.len() > 256 {
@@ -986,17 +999,19 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
 
 pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut operands = Vec::new();
-    let mut options = true;
     let mut force = false;
-    for argument in args {
-        match argument.as_str() {
-            "--" if options => options = false,
-            "-f" | "--force" if options => force = true,
-            "-k" | "-v" | "--verbose" if options => {}
-            value if options && value.starts_with('-') => {
-                return usage(io, &format!("unsupported mv option: {value}"))
+    for argument in Flags::new(args).clustered("fkv") {
+        let name = match argument {
+            Arg::Operand(value) => {
+                operands.push(value);
+                continue;
             }
-            value => operands.push(value.to_string()),
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
+            "-f" | "--force" => force = true,
+            "-k" | "-v" | "--verbose" => {}
+            _ => return usage(io, &format!("unsupported mv option: {name}")),
         }
     }
     let Some((destination, sources)) = operands.split_last() else {
@@ -1137,33 +1152,29 @@ pub(crate) fn git_restore(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
     let mut source = None;
     let mut side = None;
     let mut paths = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
+    let mut flags = Flags::new(args).clustered("SWq").valued("s");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(value) => {
+                paths.push(value);
+                continue;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "--staged" | "-S" => staged = true,
             "--worktree" | "-W" => worktree = true,
             "--source" | "-s" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
+                let Some(value) = flags.value(attached) else {
                     return usage(io, "--source requires a revision");
                 };
-                source = Some(value.clone());
-            }
-            value if value.starts_with("--source=") => {
-                source = Some(value["--source=".len()..].to_string());
-            }
-            "--" => {
-                paths.extend_from_slice(&args[index + 1..]);
-                break;
+                source = Some(value);
             }
             "-q" | "--quiet" => {}
-            "--ours" | "--theirs" => side = Some(args[index] == "--theirs"),
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported restore option: {value}"))
-            }
-            value => paths.push(value.to_string()),
+            "--ours" => side = Some(false),
+            "--theirs" => side = Some(true),
+            _ => return usage(io, &format!("unsupported restore option: {name}")),
         }
-        index += 1;
     }
     if let Some(theirs) = side {
         return super::history::restore_side(ctx, theirs, &paths, io);
@@ -1258,31 +1269,34 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     let Some(root) = repo::find_repo_root(ctx) else {
         return repo_error(io);
     };
-    let mut mode = "--mixed";
+    let mut mode = "--mixed".to_string();
     let mut revision = None;
     let mut paths = Vec::new();
-    let mut operands_only = false;
-    for argument in args {
-        match argument.as_str() {
-            "--" => operands_only = true,
-            "--soft" | "--mixed" | "--hard" if !operands_only => mode = argument,
-            "-q" | "--quiet" if !operands_only => {}
-            value if !operands_only && value.starts_with('-') => {
-                return usage(io, &format!("unsupported reset option: {value}"))
-            }
-            value
+    let mut flags = Flags::new(args).clustered("q");
+    while let Some(argument) = flags.next() {
+        let name = match argument {
+            Arg::Operand(value) => {
+                // Before `--`, a name that resolves is the revision to reset to; anything else
+                // has to be a path, or Git calls the argument ambiguous.
                 if revision.is_none()
-                    && !operands_only
-                    && repo::resolve_revision(ctx, &root, value).is_some() =>
-            {
-                revision = Some(value.to_string());
-            }
-            value => {
-                if !super::names_a_path(ctx, &root, value) {
-                    return super::ambiguous_argument(io, value);
+                    && !flags.separated()
+                    && repo::resolve_revision(ctx, &root, &value).is_some()
+                {
+                    revision = Some(value);
+                    continue;
                 }
-                paths.push(value.to_string());
+                if !super::names_a_path(ctx, &root, &value) {
+                    return super::ambiguous_argument(io, &value);
+                }
+                paths.push(value);
+                continue;
             }
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
+            "--soft" | "--mixed" | "--hard" => mode = name,
+            "-q" | "--quiet" => {}
+            _ => return usage(io, &format!("unsupported reset option: {name}")),
         }
     }
     let revision = revision.unwrap_or_else(|| "HEAD".to_string());
@@ -1366,17 +1380,21 @@ pub(crate) fn git_clean(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     let mut include_ignored = false;
     let mut directories = false;
     let mut paths = Vec::new();
-    for argument in super::expand_clusters(args, "fdnxq") {
-        match argument.as_str() {
+    for argument in Flags::new(args).clustered("fdnxq") {
+        let name = match argument {
+            Arg::Operand(value) => {
+                paths.push(value);
+                continue;
+            }
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
             "-f" | "--force" => force = true,
             "-n" | "--dry-run" => dry_run = true,
             "-d" => directories = true,
             "-q" | "--quiet" => {}
             "-x" => include_ignored = true,
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported clean option: {value}"))
-            }
-            value => paths.push(value.to_string()),
+            _ => return usage(io, &format!("unsupported clean option: {name}")),
         }
     }
     if !force && !dry_run {
@@ -1445,23 +1463,26 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     let mut unmerged = false;
     let mut exclude_standard = false;
     let mut paths = Vec::new();
-    let mut options = true;
-    for argument in super::expand_clusters(args, "cmdosuz") {
-        match argument.as_str() {
-            "--" if options => options = false,
-            "-c" | "--cached" if options => cached = true,
-            "-m" | "--modified" if options => modified = true,
-            "-d" | "--deleted" if options => deleted = true,
-            "-o" | "--others" if options => others = true,
-            "-s" | "--stage" if options => stage = true,
-            "-u" | "--unmerged" if options => unmerged = true,
-            "--exclude-standard" if options => exclude_standard = true,
-            "--error-unmatch" if options => error_unmatch = true,
-            "-z" if options => nul = true,
-            value if options && value.starts_with('-') => {
-                return usage(io, &format!("unsupported ls-files option: {value}"))
+    for argument in Flags::new(args).clustered("cmdosuz") {
+        let name = match argument {
+            Arg::Operand(value) => {
+                paths.push(value);
+                continue;
             }
-            value => paths.push(value.to_string()),
+            Arg::Option { name, .. } => name,
+        };
+        match name.as_str() {
+            "-c" | "--cached" => cached = true,
+            "-m" | "--modified" => modified = true,
+            "-d" | "--deleted" => deleted = true,
+            "-o" | "--others" => others = true,
+            "-s" | "--stage" => stage = true,
+            "-u" | "--unmerged" => unmerged = true,
+            "--exclude-standard" => exclude_standard = true,
+            "--error-unmatch" => error_unmatch = true,
+            "--full-name" => {}
+            "-z" => nul = true,
+            _ => return usage(io, &format!("unsupported ls-files option: {name}")),
         }
     }
     if unmerged {

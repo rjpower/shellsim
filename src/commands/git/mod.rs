@@ -142,6 +142,157 @@ pub(crate) fn usage(io: &mut Io, message: &str) -> i32 {
     2
 }
 
+/// One argument, as the command that asked for it sees it.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub(crate) enum Arg {
+    /// An option, together with any value written against it: `--name=x` or `-nx`.
+    Option {
+        name: String,
+        attached: Option<String>,
+    },
+    /// Anything else: a revision, a pathspec, a branch name.
+    Operand(String),
+}
+
+/// One pass over a Git command's arguments.
+///
+/// Git spells an option's value four ways — `-n5`, `-n 5`, `--max-count=5`, `--max-count 5` — and
+/// a command that writes its own loop tends to cover only the spellings someone needed, so which
+/// ones work varies from command to command. `Flags` reads all four, splits short clusters, and
+/// stops treating anything as an option after `--`, leaving each command a plain match on a name.
+///
+/// ```ignore
+/// let mut flags = Flags::new(args).clustered("ne").valued("n");
+/// while let Some(argument) = flags.next() {
+///     match argument {
+///         Arg::Option { name, attached } => match name.as_str() {
+///             "-n" | "--max-count" => limit = flags.value(attached)?.parse().ok()?,
+///             _ => return usage(io, &format!("unsupported log option: {name}")),
+///         },
+///         Arg::Operand(value) => operands.push(value),
+///     }
+/// }
+/// ```
+pub(crate) struct Flags {
+    args: Vec<String>,
+    at: usize,
+    /// Set once `--` is seen: everything after it is a path, whatever it looks like.
+    operands_only: bool,
+    /// Short options that may carry their value written against them, as `-n5` does.
+    valued: String,
+}
+
+impl Flags {
+    pub(crate) fn new(args: &[String]) -> Self {
+        Flags {
+            args: args.to_vec(),
+            at: 0,
+            operands_only: false,
+            valued: String::new(),
+        }
+    }
+
+    /// Declare the short options that may be written as one cluster, as `-am` is.
+    pub(crate) fn clustered(mut self, letters: &str) -> Self {
+        self.args = expand_clusters(&self.args, letters);
+        self
+    }
+
+    /// Declare the short options that may carry their value, so `-n5` reads as `-n` with `5`.
+    pub(crate) fn valued(mut self, letters: &str) -> Self {
+        self.valued = letters.to_string();
+        self
+    }
+
+    /// Whether what is being read now came after `--`, and so is a path rather than a revision.
+    pub(crate) fn separated(&self) -> bool {
+        self.operands_only
+    }
+
+    /// The value written against an option, or else the argument that follows it.
+    ///
+    /// Only for options that require a value. An option whose value is optional, such as
+    /// `--porcelain[=v2]`, must read `attached` directly: Git takes those only when they are
+    /// written against the option, and what follows a bare one is the next operand.
+    pub(crate) fn value(&mut self, attached: Option<String>) -> Option<String> {
+        if attached.is_some() {
+            return attached;
+        }
+        let value = self.args.get(self.at)?.clone();
+        self.at += 1;
+        Some(value)
+    }
+
+    /// The value written against an option, or the next argument when that is not an option.
+    ///
+    /// For options whose value may be left out, such as `git branch --contains`, which falls back
+    /// to HEAD when no revision follows it.
+    pub(crate) fn optional_value(&mut self, attached: Option<String>) -> Option<String> {
+        if attached.is_some() {
+            return attached;
+        }
+        let value = self.args.get(self.at)?;
+        if value.starts_with('-') {
+            return None;
+        }
+        let value = value.clone();
+        self.at += 1;
+        Some(value)
+    }
+
+    /// Everything left, as operands. Used by the commands that stop parsing at a given point.
+    pub(crate) fn rest(&mut self) -> Vec<String> {
+        let rest = self.args[self.at.min(self.args.len())..].to_vec();
+        self.at = self.args.len();
+        rest
+    }
+}
+
+impl Iterator for Flags {
+    type Item = Arg;
+
+    fn next(&mut self) -> Option<Arg> {
+        loop {
+            let argument = self.args.get(self.at)?.clone();
+            self.at += 1;
+            if self.operands_only {
+                return Some(Arg::Operand(argument));
+            }
+            if argument == "--" {
+                self.operands_only = true;
+                continue;
+            }
+            // A bare `-` is an operand: it is how `commit -F -` names standard input.
+            if argument == "-" || !argument.starts_with('-') {
+                return Some(Arg::Operand(argument));
+            }
+            if let Some(long) = argument.strip_prefix("--") {
+                return Some(match long.split_once('=') {
+                    Some((name, value)) => Arg::Option {
+                        name: format!("--{name}"),
+                        attached: Some(value.to_string()),
+                    },
+                    None => Arg::Option {
+                        name: argument,
+                        attached: None,
+                    },
+                });
+            }
+            let flags = &argument[1..];
+            let first = flags.chars().next()?;
+            let carries_value = flags.chars().count() > 1 && self.valued.contains(first);
+            return Some(Arg::Option {
+                name: if carries_value {
+                    format!("-{first}")
+                } else {
+                    argument.clone()
+                },
+                attached: carries_value.then(|| flags[first.len_utf8()..].to_string()),
+            });
+        }
+    }
+}
+
 /// Expand short-option clusters such as `-am` into `-a -m`.
 ///
 /// Only clusters made entirely of `clusterable` letters are split, so spellings that carry an
@@ -234,30 +385,40 @@ pub(crate) fn repo_error(io: &mut Io) -> i32 {
 fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut globals = Globals::default();
     let mut directory: Option<String> = None;
-    let mut index = 0;
-    while index < args.len() {
-        let argument = args[index].as_str();
-        match argument {
+    // The global options run out at the subcommand name, which is the first operand.
+    let mut flags = Flags::new(args).valued("Cc");
+    let mut rest = Vec::new();
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Operand(subcommand) => {
+                rest.push(subcommand);
+                rest.extend(flags.rest());
+                break;
+            }
+            Arg::Option { name, attached } => (name, attached),
+        };
+        match name.as_str() {
             "-C" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
+                let Some(value) = flags.value(attached) else {
                     return usage(io, "-C requires a directory");
                 };
                 // Repeated -C options compose, as they do in Git.
                 let base = directory.as_deref().unwrap_or(&ctx.cwd);
-                directory = Some(resolve_against(base, value));
+                directory = Some(resolve_against(base, &value));
             }
             "-c" => {
-                index += 1;
-                let Some((key, value)) = args.get(index).and_then(|pair| pair.split_once('='))
+                let Some((key, value)) = flags
+                    .value(attached)
+                    .as_deref()
+                    .and_then(|pair| pair.split_once('='))
+                    .map(|(key, value)| (key.to_ascii_lowercase(), value.to_string()))
                 else {
                     return usage(io, "-c requires NAME=VALUE");
                 };
-                let key = key.to_ascii_lowercase();
                 if !repo::valid_config_key(&key) {
                     return usage(io, &format!("invalid config key: {key}"));
                 }
-                globals.overrides.insert(key, value.to_string());
+                globals.overrides.insert(key, value);
             }
             "--no-pager"
             | "-P"
@@ -269,24 +430,24 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                 io.out.extend_from_slice(format!("{VERSION}\n").as_bytes());
                 return 0;
             }
-            "--help" | "-h" | "help" => {
+            "--help" | "-h" => {
                 io.out.extend_from_slice(HELP.as_bytes());
                 return 0;
             }
-            value if value.starts_with("--git-dir") || value.starts_with("--work-tree") => {
+            "--git-dir" | "--work-tree" => {
                 return usage(
                     io,
-                    &format!("{value} is unsupported; run git inside the tree"),
+                    &format!("{name} is unsupported; run git inside the tree"),
                 );
             }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported global option: {value}"));
-            }
-            _ => break,
+            _ => return usage(io, &format!("unsupported global option: {name}")),
         }
-        index += 1;
     }
-    let args = &args[index..];
+    let args = &rest[..];
+    if args.first().is_some_and(|value| value == "help") {
+        io.out.extend_from_slice(HELP.as_bytes());
+        return 0;
+    }
     let Some(subcommand) = args.first().map(String::as_str) else {
         io.err.extend_from_slice(HELP.as_bytes());
         return 1;
@@ -410,28 +571,27 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut branch = repo::DEFAULT_BRANCH.to_string();
     let mut quiet = false;
     let mut target = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
+    let mut flags = Flags::new(args).clustered("q").valued("b");
+    while let Some(argument) = flags.next() {
+        let (name, attached) = match argument {
+            Arg::Option { name, attached } => (name, attached),
+            Arg::Operand(value) if target.is_none() => {
+                target = Some(value);
+                continue;
+            }
+            Arg::Operand(_) => return usage(io, "usage: git init [-b BRANCH] [DIRECTORY]"),
+        };
+        match name.as_str() {
             "--bare" => return usage(io, "--bare is unsupported"),
             "-q" | "--quiet" => quiet = true,
             "-b" | "--initial-branch" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
+                let Some(value) = flags.value(attached) else {
                     return usage(io, "-b requires a branch name");
                 };
-                branch = value.clone();
+                branch = value;
             }
-            value if value.starts_with("--initial-branch=") => {
-                branch = value["--initial-branch=".len()..].to_string();
-            }
-            value if value.starts_with('-') => {
-                return usage(io, &format!("unsupported init option: {value}"))
-            }
-            value if target.is_none() => target = Some(value.to_string()),
-            _ => return usage(io, "usage: git init [-b BRANCH] [DIRECTORY]"),
+            _ => return usage(io, &format!("unsupported init option: {name}")),
         }
-        index += 1;
     }
     let target = target
         .map(|path| resolve_against(&ctx.cwd, &path))
@@ -492,4 +652,78 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             .extend_from_slice(format!("{action} Git repository in {git}/\n").as_bytes());
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arg, Flags};
+
+    fn parse(args: &[&str]) -> Vec<Arg> {
+        let args: Vec<String> = args.iter().map(|value| (*value).to_string()).collect();
+        Flags::new(&args).clustered("am").valued("n").collect()
+    }
+
+    fn option(name: &str, attached: Option<&str>) -> Arg {
+        Arg::Option {
+            name: name.to_string(),
+            attached: attached.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn all_four_spellings_of_a_value_read_the_same() {
+        let spellings = [
+            vec!["-n5"],
+            vec!["-n", "5"],
+            vec!["--max-count=5"],
+            vec!["--max-count", "5"],
+        ];
+        for spelling in spellings {
+            let args: Vec<String> = spelling.iter().map(|value| (*value).to_string()).collect();
+            let mut flags = Flags::new(&args).valued("n");
+            let Some(Arg::Option { attached, .. }) = flags.next() else {
+                panic!("{spelling:?} did not read as an option");
+            };
+            assert_eq!(flags.value(attached).as_deref(), Some("5"), "{spelling:?}");
+        }
+    }
+
+    #[test]
+    fn a_cluster_splits_into_its_letters() {
+        assert_eq!(
+            parse(&["-am"]),
+            vec![option("-a", None), option("-m", None)]
+        );
+    }
+
+    #[test]
+    fn everything_after_a_separator_is_an_operand() {
+        assert_eq!(
+            parse(&["-a", "--", "-a", "--max-count=5"]),
+            vec![
+                option("-a", None),
+                Arg::Operand("-a".to_string()),
+                Arg::Operand("--max-count=5".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_dash_is_an_operand() {
+        assert_eq!(parse(&["-"]), vec![Arg::Operand("-".to_string())]);
+    }
+
+    #[test]
+    fn an_optional_value_does_not_swallow_the_next_option() {
+        let args: Vec<String> = ["--contains", "--merged"]
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        let mut flags = Flags::new(&args);
+        let Some(Arg::Option { attached, .. }) = flags.next() else {
+            panic!("--contains did not read as an option");
+        };
+        assert_eq!(flags.optional_value(attached), None);
+        assert_eq!(flags.next(), Some(option("--merged", None)));
+    }
 }
