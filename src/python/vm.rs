@@ -11,7 +11,7 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
-use super::bytecode::{ClassField, CodeRef, NameId, Opcode};
+use super::bytecode::{CallId, ClassField, CodeRef, NameId, Opcode};
 use super::filesystem::PyModuleLoader;
 use super::heap::{
     ClassLayout, InstanceAttributeSlot, InstanceAttributes, InstancePayload, Object, ObjectId,
@@ -476,6 +476,74 @@ struct BytecodeFrame {
     pending_native_call: Option<PendingNativeCall>,
 }
 
+/// Hot dispatch state retained in registers for one scheduler quantum.
+///
+/// The resumable frame remains the source of truth at suspension and frame boundaries. Between
+/// those boundaries the cursor avoids rediscovering the active frame and rewriting its instruction
+/// pointer after every opcode.
+struct DispatchCursor {
+    code: CodeRef,
+    code_cache: usize,
+    op_index: usize,
+}
+
+/// Control-flow effect of one successfully decoded opcode.
+enum DispatchControl {
+    Next,
+    Jump(usize),
+    RefreshFrame,
+    Complete(Execution),
+}
+
+/// Result of classifying one arena-backed iterator at its mutation boundary.
+enum IteratorAdvance {
+    Yield(Value),
+    Exhausted,
+    Callable { callable: Value, sentinel: Value },
+    Generator,
+    Invalid,
+}
+
+#[inline(always)]
+fn dispatch_next(result: Result<(), String>) -> Result<DispatchControl, String> {
+    result.map(|()| DispatchControl::Next)
+}
+
+impl DispatchCursor {
+    fn for_active(vm: &mut Vm<'_>) -> Result<Self, String> {
+        let frame = vm
+            .bytecode_frames
+            .last()
+            .expect("bytecode execution requires an active frame");
+        let code = frame.code.clone();
+        let op_index = frame.instruction_pointer;
+        let code_cache = vm.ensure_code_cache(&code)?;
+        Ok(Self {
+            code,
+            code_cache,
+            op_index,
+        })
+    }
+
+    fn refresh(&mut self, vm: &mut Vm<'_>) -> Result<(), String> {
+        *self = Self::for_active(vm)?;
+        Ok(())
+    }
+
+    fn span(&self) -> super::source::Span {
+        self.code.spans[self.op_index]
+    }
+
+    fn sync(&self, vm: &mut Vm<'_>) {
+        let frame = vm
+            .bytecode_frames
+            .last_mut()
+            .expect("bytecode execution requires an active frame");
+        debug_assert!(Arc::ptr_eq(&self.code, &frame.code));
+        frame.instruction_pointer = self.op_index;
+    }
+}
+
 /// A normalized native invocation retained while its modeled resource is unavailable.
 ///
 /// Starred arguments have already been expanded and the calling instruction has advanced, so a
@@ -570,6 +638,9 @@ impl<'a> Vm<'a> {
     }
 
     fn release_transient_memory(&mut self) {
+        if self.transient_memory == 0 {
+            return;
+        }
         let bytes = std::mem::take(&mut self.transient_memory);
         self.interp.resources.release_memory(bytes);
     }
@@ -681,65 +752,20 @@ impl<'a> Vm<'a> {
         if self.interp.deadline_interrupt.is_some() {
             return Ok(Execution::Exit(124));
         }
-        let mut code = self
-            .bytecode_frames
-            .last()
-            .expect("bytecode execution requires an active frame")
-            .code
-            .clone();
-        let mut code_cache = self
-            .ensure_code_cache(&code)
+        self.release_transient_memory();
+        if let Some(execution) = self.resume_pending_native_call()? {
+            return Ok(execution);
+        }
+        let mut dispatch = DispatchCursor::for_active(self)
             .map_err(|error| (error, super::source::Span::default()))?;
         'execution: for _ in 0..budget.max(1) {
             // Native helper snapshots live for one semantic instruction. Releasing the previous
             // instruction's scratch here avoids double-counting a materialized result after it
             // has moved into an arena object.
             self.release_transient_memory();
-            if let Some(pending) = self.active_frame_mut().pending_native_call.take() {
-                let span = pending.call_span;
-                match self.resume_native_call(pending) {
-                    Ok(CallResult::Value(value)) => {
-                        self.stack.push(value);
-                        continue;
-                    }
-                    Ok(CallResult::Blocked(reason, value)) => {
-                        self.stack.push(value);
-                        return Ok(Execution::Blocked(reason));
-                    }
-                    Ok(CallResult::Retry(reason, pending)) => {
-                        self.active_frame_mut().pending_native_call = Some(pending);
-                        return Ok(Execution::Blocked(reason));
-                    }
-                    Ok(CallResult::Exit(status)) => return Ok(Execution::Exit(status)),
-                    Ok(CallResult::EnteredFrame) => {
-                        unreachable!("a retained native call cannot enter a Python frame")
-                    }
-                    Err(error) => {
-                        if self.propagate_error(error, span)? {
-                            continue 'execution;
-                        }
-                        unreachable!("propagate_error either enters a handler or returns an error")
-                    }
-                }
-            }
-            let (code_changed, instruction_pointer) = {
-                let frame = self
-                    .bytecode_frames
-                    .last()
-                    .expect("bytecode execution requires an active frame");
-                (!Arc::ptr_eq(&code, &frame.code), frame.instruction_pointer)
-            };
-            if code_changed {
-                code = self
-                    .bytecode_frames
-                    .last()
-                    .expect("bytecode execution requires an active frame")
-                    .code
-                    .clone();
-                code_cache = self
-                    .ensure_code_cache(&code)
-                    .map_err(|error| (error, super::source::Span::default()))?;
-            }
+            let instruction_pointer = dispatch.op_index;
+            let code = &dispatch.code;
+            let code_cache = dispatch.code_cache;
             let Some(instruction) = code.instructions.get(instruction_pointer) else {
                 return Err((
                     "instruction pointer left the code object".into(),
@@ -750,270 +776,225 @@ impl<'a> Vm<'a> {
                 return Ok(Execution::Exit(137));
             }
             let opcode = instruction.opcode;
-            let span = code.spans[instruction_pointer];
-            let mut next_instruction = instruction_pointer + 1;
-            let result = match opcode {
+            let result: Result<DispatchControl, String> = match opcode {
                 Opcode::LoadConstant(constant) => self
                     .value_from_constant(code.constant(constant))
                     .map(|value| {
                         self.stack.push(value);
-                    }),
+                    })
+                    .map(|()| DispatchControl::Next),
                 Opcode::LoadName(name) => {
                     let symbol = self
-                        .symbol_for(&code, code_cache, name)
-                        .map_err(|error| (error, span))?;
-                    self.load_name(symbol, code.name(name))
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.load_name(symbol, code.name(name)))
                 }
                 Opcode::LoadGlobal(name) => {
                     let symbol = self
-                        .symbol_for(&code, code_cache, name)
-                        .map_err(|error| (error, span))?;
-                    self.load_global(symbol, &code, name)
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.load_global(symbol, code, name))
                 }
                 Opcode::StoreName(name) => {
                     let symbol = self
-                        .symbol_for(&code, code_cache, name)
-                        .map_err(|error| (error, span))?;
-                    self.store_name(symbol, code.name(name))
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.store_name(symbol, code.name(name)))
                 }
-                Opcode::LoadLocal(slot) => self.load_local(slot),
-                Opcode::StoreLocal(slot) => self.store_local(slot),
+                Opcode::LoadLocal(slot) => dispatch_next(self.load_local(slot)),
+                Opcode::StoreLocal(slot) => dispatch_next(self.store_local(slot)),
                 Opcode::StoreEnclosing { name, scope_hops } => {
                     let symbol = self
-                        .symbol_for(&code, code_cache, name)
-                        .map_err(|error| (error, span))?;
-                    self.store_enclosing(symbol, code.name(name), scope_hops)
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.store_enclosing(symbol, code.name(name), scope_hops))
                 }
-                Opcode::StoreNonlocal(name) => self.store_nonlocal(code.name(name)),
+                Opcode::StoreNonlocal(name) => dispatch_next(self.store_nonlocal(code.name(name))),
                 Opcode::StoreGlobal(name) => {
                     let symbol = self
-                        .symbol_for(&code, code_cache, name)
-                        .map_err(|error| (error, span))?;
-                    let value = self.pop().map_err(|error| (error, span))?;
-                    self.store_global(symbol, &code, name, value)
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
+                    let value = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.store_global(symbol, code, name, value))
                 }
                 Opcode::StoreAttribute(name) => {
                     let symbol = self
-                        .symbol_for(&code, code_cache, name)
-                        .map_err(|error| (error, span))?;
-                    let owner = self.pop().map_err(|error| (error, span))?;
-                    let value = self.pop().map_err(|error| (error, span))?;
-                    self.store_attribute_by_symbol(owner, symbol, code.name(name), value)
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
+                    let owner = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    let value = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.store_attribute_by_symbol(
+                        owner,
+                        symbol,
+                        code.name(name),
+                        value,
+                    ))
                 }
-                Opcode::StoreSubscript => self.store_subscript(),
+                Opcode::StoreSubscript => dispatch_next(self.store_subscript()),
                 Opcode::DeleteName(name) => {
                     let symbol = self
-                        .symbol_for(&code, code_cache, name)
-                        .map_err(|error| (error, span))?;
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
                     let name = code.name(name);
-                    if let Some(scope) = self.local_scopes.last().copied() {
+                    let result = if let Some(scope) = self.local_scopes.last().copied() {
                         self.state.heap.scope_remove(scope, name).map(|_| ())
                     } else {
                         self.state.globals.remove(symbol);
                         Ok(())
-                    }
+                    };
+                    dispatch_next(result)
                 }
-                Opcode::DeleteLocal(slot) => self.delete_local(slot),
+                Opcode::DeleteLocal(slot) => dispatch_next(self.delete_local(slot)),
                 Opcode::DeleteGlobal(name) => {
                     let symbol = self
-                        .symbol_for(&code, code_cache, name)
-                        .map_err(|error| (error, span))?;
-                    self.delete_global(symbol, &code, name)
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.delete_global(symbol, code, name))
                 }
-                Opcode::DeleteSubscript => self.delete_subscript(),
-                Opcode::Import { name, bind_root } => self.import(code.name(name), bind_root),
+                Opcode::DeleteSubscript => dispatch_next(self.delete_subscript()),
+                Opcode::Import { name, bind_root } => {
+                    dispatch_next(self.import(code.name(name), bind_root))
+                }
                 Opcode::LoadAttribute(name) => {
                     let symbol = self
-                        .symbol_for(&code, code_cache, name)
-                        .map_err(|error| (error, span))?;
-                    self.load_attribute_at(&code, instruction_pointer, symbol, code.name(name))
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.load_attribute_at(
+                        code,
+                        instruction_pointer,
+                        symbol,
+                        code.name(name),
+                    ))
                 }
-                Opcode::LoadSubscript => self.load_subscript(),
+                Opcode::LoadSubscript => dispatch_next(self.load_subscript()),
                 Opcode::BuildSlice {
                     has_start,
                     has_stop,
                     has_step,
-                } => self.build_slice(has_start, has_stop, has_step),
-                Opcode::BuildList(count) => self.build_sequence(count, SequenceKind::List),
-                Opcode::BuildTuple(count) => self.build_sequence(count, SequenceKind::Tuple),
-                Opcode::BuildDict(dict) => self.build_dict(code.dict_entries(dict)),
-                Opcode::BuildSet(count) => self.build_set(count),
+                } => dispatch_next(self.build_slice(has_start, has_stop, has_step)),
+                Opcode::BuildList(count) => {
+                    dispatch_next(self.build_sequence(count, SequenceKind::List))
+                }
+                Opcode::BuildTuple(count) => {
+                    dispatch_next(self.build_sequence(count, SequenceKind::Tuple))
+                }
+                Opcode::BuildDict(dict) => dispatch_next(self.build_dict(code.dict_entries(dict))),
+                Opcode::BuildSet(count) => dispatch_next(self.build_set(count)),
                 Opcode::UnpackSequence { count, star_index } => {
-                    self.unpack_sequence(count, star_index)
+                    dispatch_next(self.unpack_sequence(count, star_index))
                 }
                 Opcode::MakeFunction(function) => {
                     let function = code.function(function);
-                    self.make_function(
+                    dispatch_next(self.make_function(
                         code.name(function.name).to_owned(),
                         function.code.clone(),
                         function.defaults,
-                    )
+                    ))
                 }
                 Opcode::MakeClass(class) => {
                     let class = code.class(class);
-                    self.make_class(
+                    dispatch_next(self.make_class(
                         code.name(class.name).to_owned(),
                         &class.code,
                         class.bases,
                         class.has_metaclass,
                         &class.fields,
-                    )
+                    ))
                 }
-                Opcode::GetIterator => self.get_iterator(),
+                Opcode::GetIterator => dispatch_next(self.get_iterator()),
                 Opcode::ForIterator(target) => match self.for_iterator() {
-                    Ok(true) => Ok(()),
-                    Ok(false) => {
-                        next_instruction = target;
-                        Ok(())
-                    }
+                    Ok(true) => Ok(DispatchControl::Next),
+                    Ok(false) => Ok(DispatchControl::Jump(target)),
                     Err(error) => Err(error),
                 },
-                Opcode::Unary(operator) => self.unary(operator),
-                Opcode::Binary(operator) => self.binary(operator),
+                Opcode::Unary(operator) => dispatch_next(self.unary(operator)),
+                Opcode::Binary(operator) => dispatch_next(self.binary(operator)),
                 Opcode::FormatValue(format) => {
                     let format = code.format(format);
-                    self.format_value(format.conversion, &format.format_spec)
+                    dispatch_next(self.format_value(format.conversion, &format.format_spec))
                 }
-                Opcode::Compare(operator) => self.compare(operator),
+                Opcode::Compare(operator) => dispatch_next(self.compare(operator)),
                 Opcode::Call(call) => {
-                    let call = code.call(call);
-                    let keywords = call
-                        .keywords
-                        .iter()
-                        .map(|name| code.name(*name).to_owned())
-                        .collect::<Vec<_>>();
-                    match self.call(
-                        call.positional,
-                        &keywords,
-                        &call.starred,
-                        CallMode::Deferred(span),
-                    ) {
-                        Ok(CallResult::Value(value)) => {
-                            self.stack.push(value);
-                            Ok(())
-                        }
-                        Ok(CallResult::EnteredFrame) => {
-                            let caller = self.bytecode_frames.len() - 2;
-                            self.bytecode_frames[caller].instruction_pointer = next_instruction;
-                            continue;
-                        }
-                        Ok(CallResult::Blocked(reason, value)) => {
-                            self.stack.push(value);
-                            self.active_frame_mut().instruction_pointer = next_instruction;
-                            return Ok(Execution::Blocked(reason));
-                        }
-                        Ok(CallResult::Retry(reason, pending)) => {
-                            self.active_frame_mut().instruction_pointer = next_instruction;
-                            self.active_frame_mut().pending_native_call = Some(pending);
-                            return Ok(Execution::Blocked(reason));
-                        }
-                        Ok(CallResult::Exit(status)) => return Ok(Execution::Exit(status)),
-                        Err(error) => Err(error),
-                    }
+                    self.dispatch_call(&dispatch.code, call, instruction_pointer, dispatch.span())
                 }
-                Opcode::Copy(depth) => self.copy(depth),
-                Opcode::Swap(depth) => self.swap(depth),
-                Opcode::PopTop => self.pop().map(|_| ()),
-                Opcode::Jump(target) => {
-                    next_instruction = target;
-                    Ok(())
-                }
+                Opcode::Copy(depth) => dispatch_next(self.copy(depth)),
+                Opcode::Swap(depth) => dispatch_next(self.swap(depth)),
+                Opcode::PopTop => self.pop().map(|_| DispatchControl::Next),
+                Opcode::Jump(target) => Ok(DispatchControl::Jump(target)),
                 Opcode::JumpIfFalseOrPop(target) => match self.jump_if_or_pop(false) {
-                    Ok(true) => {
-                        next_instruction = target;
-                        Ok(())
-                    }
-                    Ok(false) => Ok(()),
+                    Ok(true) => Ok(DispatchControl::Jump(target)),
+                    Ok(false) => Ok(DispatchControl::Next),
                     Err(error) => Err(error),
                 },
                 Opcode::JumpIfTrueOrPop(target) => match self.jump_if_or_pop(true) {
-                    Ok(true) => {
-                        next_instruction = target;
-                        Ok(())
-                    }
-                    Ok(false) => Ok(()),
+                    Ok(true) => Ok(DispatchControl::Jump(target)),
+                    Ok(false) => Ok(DispatchControl::Next),
                     Err(error) => Err(error),
                 },
                 Opcode::PopJumpIfFalse(target) => {
-                    let value = self.pop().map_err(|error| (error, span))?;
-                    if !self.truth_value(&value).map_err(|error| (error, span))? {
-                        next_instruction = target;
+                    let value = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    if !self
+                        .truth_value(&value)
+                        .map_err(|error| (error, dispatch.span()))?
+                    {
+                        Ok(DispatchControl::Jump(target))
+                    } else {
+                        Ok(DispatchControl::Next)
                     }
-                    Ok(())
                 }
                 Opcode::Return => {
-                    let value = self.pop().map_err(|error| (error, span))?;
+                    let value = self.pop().map_err(|error| (error, dispatch.span()))?;
                     if self.finish_deferred_frame(value) {
-                        continue;
+                        Ok(DispatchControl::RefreshFrame)
+                    } else {
+                        Ok(DispatchControl::Complete(Execution::Return(value)))
                     }
-                    return Ok(Execution::Return(value));
                 }
                 Opcode::Yield => {
-                    let value = self.pop().map_err(|error| (error, span))?;
-                    return Ok(Execution::Yield(value, instruction_pointer + 1));
+                    let value = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    Ok(DispatchControl::Complete(Execution::Yield(
+                        value,
+                        instruction_pointer + 1,
+                    )))
                 }
                 Opcode::RuntimeError(error) => Err(code.error(error).to_owned()),
-                Opcode::Assert => {
-                    let message = self.pop().map_err(|error| (error, span))?;
-                    let condition = self.pop().map_err(|error| (error, span))?;
-                    if self
-                        .truth_value(&condition)
-                        .map_err(|error| (error, span))?
-                    {
-                        Ok(())
-                    } else {
-                        let message = if message.is_none() {
-                            String::new()
-                        } else {
-                            protocol::display(&self.state.heap, &message)
-                                .map_err(|error| (error, span))?
-                        };
-                        let value = self
-                            .allocate_exception("AssertionError".into(), message)
-                            .map_err(|error| (error, span))?;
-                        self.pending_exception = Some(RaisedException {
-                            kind: "AssertionError".into(),
-                            value,
-                        });
-                        Err("assertion failed".into())
-                    }
-                }
+                Opcode::Assert => self.dispatch_assert(),
                 Opcode::TryBegin(target) => {
                     let depth = self.stack.len();
                     self.active_frame_mut().handlers.push((target, depth));
-                    Ok(())
+                    Ok(DispatchControl::Next)
                 }
                 Opcode::TryEnd => {
                     self.active_frame_mut()
                         .handlers
                         .pop()
                         .ok_or("invalid bytecode exception handler")
-                        .map_err(|e| (e.to_string(), span))?;
-                    Ok(())
+                        .map_err(|e| (e.to_string(), dispatch.span()))?;
+                    Ok(DispatchControl::Next)
                 }
                 Opcode::MatchException { typed } => {
                     let actual = self
                         .exception_stack
                         .last()
                         .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), span))?
+                        .map_err(|e| (e.to_string(), dispatch.span()))?
                         .clone();
                     let matches = if typed {
-                        let expected = self.pop().map_err(|error| (error, span))?;
+                        let expected = self.pop().map_err(|error| (error, dispatch.span()))?;
                         self.exception_type_matches(expected, &actual)
-                            .map_err(|error| (error, span))?
+                            .map_err(|error| (error, dispatch.span()))?
                     } else {
                         true
                     };
                     self.stack.push(Value::Bool(matches));
-                    Ok(())
+                    Ok(DispatchControl::Next)
                 }
                 Opcode::ClearException => {
                     self.exception_stack
                         .pop()
                         .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), span))?;
-                    Ok(())
+                        .map_err(|e| (e.to_string(), dispatch.span()))?;
+                    Ok(DispatchControl::Next)
                 }
                 Opcode::Reraise => {
                     let exception = self
@@ -1021,153 +1002,256 @@ impl<'a> Vm<'a> {
                         .last()
                         .cloned()
                         .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), span))?;
+                        .map_err(|e| (e.to_string(), dispatch.span()))?;
                     self.pending_exception = Some(exception);
                     Err("exception raised".into())
                 }
-                Opcode::Raise(has_value) => {
-                    let exception = if has_value {
-                        let value = self.pop().map_err(|e| (e, span))?;
-                        if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, &value)
-                            .map_err(|error| (error, span))?
-                        {
-                            RaisedException { kind, value }
-                        } else if let Some(kind) = self
-                            .user_exception_kind(&value)
-                            .map_err(|error| (error, span))?
-                        {
-                            RaisedException { kind, value }
-                        } else if let Some(NativeValue::ExceptionType(ExceptionType(kind))) =
-                            value.native_value()
-                        {
-                            let value = self
-                                .allocate_exception(kind.to_string(), String::new())
-                                .map_err(|error| (error, span))?;
-                            RaisedException {
-                                kind: kind.to_string(),
-                                value,
-                            }
-                        } else {
-                            return Err(("exceptions must derive from BaseException".into(), span));
-                        }
-                    } else {
-                        self.exception_stack
-                            .last()
-                            .cloned()
-                            .ok_or("No active exception to reraise")
-                            .map_err(|e| (e.to_string(), span))?
-                    };
-                    self.pending_exception = Some(exception);
-                    Err("exception raised".into())
-                }
-                Opcode::WithEnter => {
-                    let context = self.pop().map_err(|e| (e, span))?;
-                    self.stack.push(context);
-                    self.with_contexts.push(context);
-                    self.load_attribute("__enter__").map_err(|e| (e, span))?;
-                    match self
-                        .call(0, &[], &[], CallMode::Immediate)
-                        .map_err(|e| (e, span))?
-                    {
-                        CallResult::Value(value) => self.stack.push(value),
-                        CallResult::Exit(status) => return Ok(Execution::Exit(status)),
-                        CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-                        CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                            unreachable!("immediate call cannot suspend")
-                        }
-                    }
-                    Ok(())
-                }
-                Opcode::WithExit => {
-                    let context = self
-                        .with_contexts
-                        .pop()
-                        .ok_or("with stack underflow")
-                        .map_err(|e| (e.to_string(), span))?;
-                    self.stack.push(context);
-                    self.load_attribute("__exit__").map_err(|e| (e, span))?;
-                    self.stack.extend([Value::None, Value::None, Value::None]);
-                    match self
-                        .call(3, &[], &[false, false, false], CallMode::Immediate)
-                        .map_err(|e| (e, span))?
-                    {
-                        CallResult::Value(_) => Ok(()),
-                        CallResult::Exit(status) => return Ok(Execution::Exit(status)),
-                        CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-                        CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                            unreachable!("immediate call cannot suspend")
-                        }
-                    }
-                }
-                Opcode::WithExitException => {
-                    let context = self
-                        .with_contexts
-                        .pop()
-                        .ok_or("with stack underflow")
-                        .map_err(|e| (e.to_string(), span))?;
-                    let exception = self
-                        .exception_stack
-                        .last()
-                        .cloned()
-                        .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), span))?;
-                    self.stack.push(context);
-                    self.load_attribute("__exit__").map_err(|e| (e, span))?;
-                    let exception_kind = self
-                        .allocate_string(exception.kind.clone())
-                        .map_err(|error| (error, span))?;
-                    self.stack
-                        .extend([exception_kind, exception.value, Value::None]);
-                    let result = match self
-                        .call(3, &[], &[false, false, false], CallMode::Immediate)
-                        .map_err(|e| (e, span))?
-                    {
-                        CallResult::Value(value) => value,
-                        CallResult::Exit(status) => return Ok(Execution::Exit(status)),
-                        CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-                        CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                            unreachable!("immediate call cannot suspend")
-                        }
-                    };
-                    if self.truth_value(&result).map_err(|e| (e, span))? {
-                        self.pending_exception = None;
-                        self.exception_stack.pop();
-                        Ok(())
-                    } else {
-                        self.pending_exception = Some(exception);
-                        Err("exception raised".into())
-                    }
-                }
-                Opcode::PopExpression => match self.pop() {
-                    Ok(value) => {
-                        if self.mode.interactive && !matches!(value, Value::None) {
-                            let rendered = match protocol::repr(&self.state.heap, &value) {
-                                Ok(rendered) => rendered,
-                                Err(error) => return Err((error, span)),
-                            };
-                            self.out.extend_from_slice(rendered.as_bytes());
-                            self.out.push(b'\n');
-                        }
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                },
+                Opcode::Raise(has_value) => self.dispatch_raise(has_value),
+                Opcode::WithEnter => self.dispatch_with_enter(),
+                Opcode::WithExit => self.dispatch_with_exit(),
+                Opcode::WithExitException => self.dispatch_with_exit_exception(),
+                Opcode::PopExpression => self.dispatch_pop_expression(),
                 Opcode::Halt => {
                     if self.finish_deferred_frame(Value::None) {
-                        continue;
+                        Ok(DispatchControl::RefreshFrame)
+                    } else {
+                        Ok(DispatchControl::Complete(Execution::Halt))
                     }
-                    return Ok(Execution::Halt);
                 }
             };
-            if let Err(error) = result {
-                if self.propagate_error(error, span)? {
-                    continue 'execution;
+            match result {
+                Ok(DispatchControl::Next) => dispatch.op_index += 1,
+                Ok(DispatchControl::Jump(target)) => dispatch.op_index = target,
+                Ok(DispatchControl::RefreshFrame) => {
+                    let span = dispatch.span();
+                    dispatch.refresh(self).map_err(|error| (error, span))?;
                 }
-                unreachable!("propagate_error either enters a handler or returns an error")
+                Ok(DispatchControl::Complete(execution)) => return Ok(execution),
+                Err(error) => {
+                    dispatch.sync(self);
+                    if self.propagate_error(error, dispatch.span())? {
+                        let span = dispatch.span();
+                        dispatch.refresh(self).map_err(|error| (error, span))?;
+                        continue 'execution;
+                    }
+                    unreachable!("propagate_error either enters a handler or returns an error")
+                }
             }
-            self.active_frame_mut().instruction_pointer = next_instruction;
         }
+        dispatch.sync(self);
         Ok(Execution::Pending)
+    }
+
+    #[inline(never)]
+    fn dispatch_call(
+        &mut self,
+        code: &CodeRef,
+        call: CallId,
+        op_index: usize,
+        span: super::source::Span,
+    ) -> Result<DispatchControl, String> {
+        let call = code.call(call);
+        let keywords = call
+            .keywords
+            .iter()
+            .map(|name| code.name(*name).to_owned())
+            .collect::<Vec<_>>();
+        match self.call(
+            call.positional,
+            &keywords,
+            &call.starred,
+            CallMode::Deferred(span),
+        ) {
+            Ok(CallResult::Value(value)) => {
+                self.stack.push(value);
+                Ok(DispatchControl::Next)
+            }
+            Ok(CallResult::EnteredFrame) => {
+                let caller = self.bytecode_frames.len() - 2;
+                self.bytecode_frames[caller].instruction_pointer = op_index + 1;
+                Ok(DispatchControl::RefreshFrame)
+            }
+            Ok(CallResult::Blocked(reason, value)) => {
+                self.stack.push(value);
+                self.active_frame_mut().instruction_pointer = op_index + 1;
+                Ok(DispatchControl::Complete(Execution::Blocked(reason)))
+            }
+            Ok(CallResult::Retry(reason, pending)) => {
+                let frame = self.active_frame_mut();
+                frame.instruction_pointer = op_index + 1;
+                frame.pending_native_call = Some(pending);
+                Ok(DispatchControl::Complete(Execution::Blocked(reason)))
+            }
+            Ok(CallResult::Exit(status)) => Ok(DispatchControl::Complete(Execution::Exit(status))),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[inline(never)]
+    fn dispatch_assert(&mut self) -> Result<DispatchControl, String> {
+        let message = self.pop()?;
+        let condition = self.pop()?;
+        if self.truth_value(&condition)? {
+            return Ok(DispatchControl::Next);
+        }
+        let message = if message.is_none() {
+            String::new()
+        } else {
+            protocol::display(&self.state.heap, &message)?
+        };
+        let value = self.allocate_exception("AssertionError".into(), message)?;
+        self.pending_exception = Some(RaisedException {
+            kind: "AssertionError".into(),
+            value,
+        });
+        Err("assertion failed".into())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn dispatch_raise(&mut self, has_value: bool) -> Result<DispatchControl, String> {
+        let exception = if has_value {
+            let value = self.pop()?;
+            if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, &value)? {
+                RaisedException { kind, value }
+            } else if let Some(kind) = self.user_exception_kind(&value)? {
+                RaisedException { kind, value }
+            } else if let Some(NativeValue::ExceptionType(ExceptionType(kind))) =
+                value.native_value()
+            {
+                let value = self.allocate_exception(kind.to_string(), String::new())?;
+                RaisedException {
+                    kind: kind.to_string(),
+                    value,
+                }
+            } else {
+                return Err("exceptions must derive from BaseException".into());
+            }
+        } else {
+            self.exception_stack
+                .last()
+                .cloned()
+                .ok_or("No active exception to reraise")?
+        };
+        self.pending_exception = Some(exception);
+        Err("exception raised".into())
+    }
+
+    #[inline(never)]
+    fn dispatch_with_enter(&mut self) -> Result<DispatchControl, String> {
+        let context = self.pop()?;
+        self.stack.push(context);
+        self.with_contexts.push(context);
+        self.load_attribute("__enter__")?;
+        match self.call(0, &[], &[], CallMode::Immediate)? {
+            CallResult::Value(value) => self.stack.push(value),
+            CallResult::Exit(status) => {
+                return Ok(DispatchControl::Complete(Execution::Exit(status)))
+            }
+            CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
+            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                unreachable!("immediate call cannot suspend")
+            }
+        }
+        Ok(DispatchControl::Next)
+    }
+
+    #[inline(never)]
+    fn dispatch_with_exit(&mut self) -> Result<DispatchControl, String> {
+        let context = self.with_contexts.pop().ok_or("with stack underflow")?;
+        self.stack.push(context);
+        self.load_attribute("__exit__")?;
+        self.stack.extend([Value::None, Value::None, Value::None]);
+        match self.call(3, &[], &[false, false, false], CallMode::Immediate)? {
+            CallResult::Value(_) => Ok(DispatchControl::Next),
+            CallResult::Exit(status) => Ok(DispatchControl::Complete(Execution::Exit(status))),
+            CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
+            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                unreachable!("immediate call cannot suspend")
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn dispatch_with_exit_exception(&mut self) -> Result<DispatchControl, String> {
+        let context = self.with_contexts.pop().ok_or("with stack underflow")?;
+        let exception = self
+            .exception_stack
+            .last()
+            .cloned()
+            .ok_or("no active exception")?;
+        self.stack.push(context);
+        self.load_attribute("__exit__")?;
+        let exception_kind = self.allocate_string(exception.kind.clone())?;
+        self.stack
+            .extend([exception_kind, exception.value, Value::None]);
+        let result = match self.call(3, &[], &[false, false, false], CallMode::Immediate)? {
+            CallResult::Value(value) => value,
+            CallResult::Exit(status) => {
+                return Ok(DispatchControl::Complete(Execution::Exit(status)))
+            }
+            CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
+            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                unreachable!("immediate call cannot suspend")
+            }
+        };
+        if self.truth_value(&result)? {
+            self.pending_exception = None;
+            self.exception_stack.pop();
+            Ok(DispatchControl::Next)
+        } else {
+            self.pending_exception = Some(exception);
+            Err("exception raised".into())
+        }
+    }
+
+    #[inline(never)]
+    fn dispatch_pop_expression(&mut self) -> Result<DispatchControl, String> {
+        let value = self.pop()?;
+        if self.mode.interactive && !matches!(value, Value::None) {
+            let rendered = protocol::repr(&self.state.heap, &value)?;
+            self.out.extend_from_slice(rendered.as_bytes());
+            self.out.push(b'\n');
+        }
+        Ok(DispatchControl::Next)
+    }
+
+    /// Resume work retained by a blocking native call before entering the opcode loop.
+    ///
+    /// A pending call can only be installed while returning to the scheduler, so checking it once
+    /// at the next quantum boundary is sufficient. Ordinary opcodes never need to probe the frame.
+    fn resume_pending_native_call(
+        &mut self,
+    ) -> Result<Option<Execution>, (String, super::source::Span)> {
+        let Some(pending) = self.active_frame_mut().pending_native_call.take() else {
+            return Ok(None);
+        };
+        let span = pending.call_span;
+        match self.resume_native_call(pending) {
+            Ok(CallResult::Value(value)) => {
+                self.stack.push(value);
+                Ok(None)
+            }
+            Ok(CallResult::Blocked(reason, value)) => {
+                self.stack.push(value);
+                Ok(Some(Execution::Blocked(reason)))
+            }
+            Ok(CallResult::Retry(reason, pending)) => {
+                self.active_frame_mut().pending_native_call = Some(pending);
+                Ok(Some(Execution::Blocked(reason)))
+            }
+            Ok(CallResult::Exit(status)) => Ok(Some(Execution::Exit(status))),
+            Ok(CallResult::EnteredFrame) => {
+                unreachable!("a retained native call cannot enter a Python frame")
+            }
+            Err(error) => {
+                if self.propagate_error(error, span)? {
+                    Ok(None)
+                } else {
+                    unreachable!("propagate_error either enters a handler or returns an error")
+                }
+            }
+        }
     }
 
     fn active_frame_mut(&mut self) -> &mut BytecodeFrame {
@@ -3926,36 +4010,20 @@ impl<'a> Vm<'a> {
         Ok(iterator)
     }
 
-    fn next_stored_iterator(
+    /// Classify and, where possible, advance one iterator with a single arena lookup.
+    fn advance_iterator(
         &mut self,
         iterator: super::heap::ObjectId,
-    ) -> Result<Option<Value>, String> {
-        let sequence = match self.state.heap.get(iterator)? {
-            Object::SequenceIterator { owner, position } => Some((*owner, *position)),
-            _ => None,
-        };
-        if let Some((owner, position)) = sequence {
-            let value = match self.state.heap.get(owner)? {
-                Object::List(values) | Object::Tuple(values) => values.get(position).copied(),
-                _ => return Err("iterator source changed object kind".into()),
-            };
-            if value.is_some() {
-                let Object::SequenceIterator { position, .. } =
-                    self.state.heap.get_mut(iterator)?
-                else {
-                    unreachable!("iterator kind was checked above")
-                };
-                *position += 1;
-            }
-            return Ok(value);
-        }
-        match self.state.heap.get_mut(iterator)? {
+    ) -> Result<IteratorAdvance, String> {
+        let sequence = match self.state.heap.get_mut(iterator)? {
             Object::Iterator { values, position } => {
                 let value = values.get(*position).copied();
                 if value.is_some() {
                     *position += 1;
                 }
-                Ok(value)
+                return Ok(value
+                    .map(IteratorAdvance::Yield)
+                    .unwrap_or(IteratorAdvance::Exhausted));
             }
             Object::RangeIterator {
                 current,
@@ -3968,7 +4036,7 @@ impl<'a> Vm<'a> {
                     || (*step < 0 && *current <= *stop)
                 {
                     *exhausted = true;
-                    return Ok(None);
+                    return Ok(IteratorAdvance::Exhausted);
                 }
                 let value = *current;
                 if let Some(next) = current.checked_add(*step) {
@@ -3976,16 +4044,66 @@ impl<'a> Vm<'a> {
                 } else {
                     *exhausted = true;
                 }
-                Ok(Some(Value::Int(value)))
+                return Ok(IteratorAdvance::Yield(Value::Int(value)));
             }
             Object::CountIterator { current, step } => {
                 let value = *current;
                 *current =
                     super::stdlib::itertools::count_next(value, *step).map_err(str::to_string)?;
-                Ok(Some(Value::Int(value)))
+                return Ok(IteratorAdvance::Yield(Value::Int(value)));
             }
-            _ => Err("object is not a stored iterator".into()),
+            Object::SequenceIterator { owner, position } => Some((*owner, *position)),
+            Object::CallableIterator {
+                callable,
+                sentinel,
+                exhausted,
+            } => {
+                return Ok(if *exhausted {
+                    IteratorAdvance::Exhausted
+                } else {
+                    IteratorAdvance::Callable {
+                        callable: *callable,
+                        sentinel: *sentinel,
+                    }
+                });
+            }
+            Object::Generator { .. } => return Ok(IteratorAdvance::Generator),
+            _ => return Ok(IteratorAdvance::Invalid),
+        };
+        let (owner, position) = sequence.expect("only sequence iterators reach the slow path");
+        let value = match self.state.heap.get(owner)? {
+            Object::List(values) | Object::Tuple(values) => values.get(position).copied(),
+            _ => return Err("iterator source changed object kind".into()),
+        };
+        let Some(value) = value else {
+            return Ok(IteratorAdvance::Exhausted);
+        };
+        let Object::SequenceIterator { position, .. } = self.state.heap.get_mut(iterator)? else {
+            unreachable!("iterator kind was checked above")
+        };
+        *position += 1;
+        Ok(IteratorAdvance::Yield(value))
+    }
+
+    fn next_stored_iterator(
+        &mut self,
+        iterator: super::heap::ObjectId,
+    ) -> Result<Option<Value>, String> {
+        match self.advance_iterator(iterator)? {
+            IteratorAdvance::Yield(value) => Ok(Some(value)),
+            IteratorAdvance::Exhausted => Ok(None),
+            IteratorAdvance::Callable { .. }
+            | IteratorAdvance::Generator
+            | IteratorAdvance::Invalid => Err("object is not a stored iterator".into()),
         }
+    }
+
+    fn exhaust_callable_iterator(&mut self, iterator: super::heap::ObjectId) -> Result<(), String> {
+        let Object::CallableIterator { exhausted, .. } = self.state.heap.get_mut(iterator)? else {
+            return Err("iterator changed object kind".into());
+        };
+        *exhausted = true;
+        Ok(())
     }
 
     fn unpack_sequence(
@@ -4050,59 +4168,42 @@ impl<'a> Vm<'a> {
         else {
             return Err("for-loop stack does not contain an iterator".into());
         };
-        let callable_iterator = match self.state.heap.get(id)? {
-            Object::CallableIterator {
-                callable,
-                sentinel,
-                exhausted,
-            } => Some((*callable, *sentinel, *exhausted)),
-            _ => None,
-        };
-        if let Some((callable, sentinel, exhausted)) = callable_iterator {
-            if exhausted {
-                self.stack.pop();
-                return Ok(false);
+        match self.advance_iterator(id)? {
+            IteratorAdvance::Yield(value) => {
+                self.stack.push(value);
+                Ok(true)
             }
-            self.charge_cpu(1)?;
-            let value = <Self as PyRuntime>::call_value(
-                self,
-                callable,
-                CallArgs::new(Vec::new(), Vec::new()),
-            )
-            .map_err(|error| error.to_string())?;
-            if protocol::equals(&self.state.heap, &value, &sentinel)? {
-                if let Object::CallableIterator { exhausted, .. } = self.state.heap.get_mut(id)? {
-                    *exhausted = true;
-                }
+            IteratorAdvance::Exhausted => {
                 self.stack.pop();
-                return Ok(false);
+                Ok(false)
             }
-            self.stack.push(value);
-            return Ok(true);
-        }
-        let next = match self.state.heap.get(id)? {
-            Object::Generator { .. } => match self.resume_generator(id)? {
-                Some(value) => {
-                    self.stack.push(value);
-                    return Ok(true);
-                }
-                None => {
+            IteratorAdvance::Callable { callable, sentinel } => {
+                self.charge_cpu(1)?;
+                let value = <Self as PyRuntime>::call_value(
+                    self,
+                    callable,
+                    CallArgs::new(Vec::new(), Vec::new()),
+                )
+                .map_err(|error| error.to_string())?;
+                if protocol::equals(&self.state.heap, &value, &sentinel)? {
+                    self.exhaust_callable_iterator(id)?;
                     self.stack.pop();
                     return Ok(false);
                 }
+                self.stack.push(value);
+                Ok(true)
+            }
+            IteratorAdvance::Generator => match self.resume_generator(id)? {
+                Some(value) => {
+                    self.stack.push(value);
+                    Ok(true)
+                }
+                None => {
+                    self.stack.pop();
+                    Ok(false)
+                }
             },
-            Object::Iterator { .. }
-            | Object::SequenceIterator { .. }
-            | Object::RangeIterator { .. }
-            | Object::CountIterator { .. } => self.next_stored_iterator(id)?,
-            _ => return Err("for-loop stack does not contain an iterator".into()),
-        };
-        if let Some(value) = next {
-            self.stack.push(value);
-            Ok(true)
-        } else {
-            self.stack.pop();
-            Ok(false)
+            IteratorAdvance::Invalid => Err("for-loop stack does not contain an iterator".into()),
         }
     }
 
