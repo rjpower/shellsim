@@ -147,12 +147,14 @@ pub(crate) fn resolve_install_args(
         Requirement,
         Quiet,
         NoDeps,
+        NoCacheDir,
         DisableVersionCheck,
     }
     const OPTIONS: &[OptionSpec<Key>] = &[
         OptionSpec::required(Key::Requirement, Some('r'), Some("requirement")),
         OptionSpec::flag(Key::Quiet, Some('q'), Some("quiet")),
         OptionSpec::flag(Key::NoDeps, None, Some("no-deps")),
+        OptionSpec::flag(Key::NoCacheDir, None, Some("no-cache-dir")),
         OptionSpec::flag(
             Key::DisableVersionCheck,
             None,
@@ -167,7 +169,7 @@ pub(crate) fn resolve_install_args(
                 interp,
                 &option.value.expect("required option value"),
             )?),
-            Key::Quiet | Key::NoDeps | Key::DisableVersionCheck => {}
+            Key::Quiet | Key::NoDeps | Key::NoCacheDir | Key::DisableVersionCheck => {}
         }
     }
     if packages.is_empty() {
@@ -177,6 +179,58 @@ pub(crate) fn resolve_install_args(
         packages,
         direct_specs: parsed.operands,
     })
+}
+
+/// Materialize the small executable and activation surface shared by `uv venv` and `python -m
+/// venv`. The scripts route back through shellsim's registered Python and pip commands.
+pub(crate) fn ensure_venv(interp: &mut Interp, directory: &str, project_lock: bool) -> bool {
+    let cwd = interp.cwd.clone();
+    let root = crate::vfs::resolve_against(&cwd, directory);
+    for path in [&root, &format!("{root}/bin")] {
+        if interp.vfs.mkdir_all("/", path).is_err() {
+            return false;
+        }
+    }
+    for (name, source) in [
+        ("python", "#!shellsim-python\n"),
+        ("pip", "#!/bin/sh\npip \"$@\"\n"),
+    ] {
+        let path = format!("{root}/bin/{name}");
+        if !interp.vfs.is_file("/", &path)
+            && interp
+                .vfs
+                .put_file(&path, source.as_bytes().to_vec(), 0o755)
+                .is_err()
+        {
+            return false;
+        }
+    }
+    let activate = format!("{root}/bin/activate");
+    if !interp.vfs.is_file("/", &activate) {
+        let quoted = format!("'{}'", root.replace('\'', "'\\''"));
+        let source = format!(
+            "VIRTUAL_ENV={quoted}; export VIRTUAL_ENV; PATH=\"$VIRTUAL_ENV/bin:$PATH\"; export PATH\n"
+        );
+        if interp
+            .vfs
+            .put_file(&activate, source.into_bytes(), 0o644)
+            .is_err()
+        {
+            return false;
+        }
+    }
+    if project_lock {
+        let lock = crate::vfs::resolve_against(&cwd, "uv.lock");
+        if !interp.vfs.is_file("/", &lock)
+            && interp
+                .vfs
+                .put_file(&lock, b"# shellsim uv.lock\n".to_vec(), 0o644)
+                .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Resolve a requirements file without changing interpreter state.

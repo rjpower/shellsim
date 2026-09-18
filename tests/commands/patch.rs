@@ -1,4 +1,4 @@
-//! Integration coverage for atomic VFS-only patch application.
+//! Integration coverage for atomic, VFS-only `patch` application.
 
 use shellsim::Environment;
 

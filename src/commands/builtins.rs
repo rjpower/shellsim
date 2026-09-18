@@ -1223,6 +1223,9 @@ fn eval_test_cmd(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -
 }
 
 fn eval_test(interp: &Interp, a: &[&str]) -> bool {
+    if a.first() == Some(&"!") {
+        return !eval_test(interp, &a[1..]);
+    }
     match a.len() {
         0 => false,
         1 => !a[0].is_empty(),
@@ -1307,9 +1310,6 @@ fn eval_test(interp: &Interp, a: &[&str]) -> bool {
             }
             if let Some(pos) = a.iter().position(|s| *s == "-o" || *s == "||") {
                 return eval_test(interp, &a[..pos]) || eval_test(interp, &a[pos + 1..]);
-            }
-            if a[0] == "!" {
-                return !eval_test(interp, &a[1..]);
             }
             false
         }

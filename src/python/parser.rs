@@ -1033,10 +1033,39 @@ impl Parser {
 
     fn bitwise_and(&mut self) -> Result<Expression, ParseError> {
         self.binary_chain(
-            Self::additive,
+            Self::shift,
             TokenKind::Ampersand,
             BinaryOperator::BitwiseAnd,
         )
+    }
+
+    fn shift(&mut self) -> Result<Expression, ParseError> {
+        let mut left = self.additive()?;
+        loop {
+            let operator = if self
+                .take(|kind| matches!(kind, TokenKind::LeftShift))
+                .is_some()
+            {
+                BinaryOperator::LeftShift
+            } else if self
+                .take(|kind| matches!(kind, TokenKind::RightShift))
+                .is_some()
+            {
+                BinaryOperator::RightShift
+            } else {
+                break;
+            };
+            let right = self.additive()?;
+            left = Expression {
+                span: left.span.through(right.span),
+                kind: ExpressionKind::Binary {
+                    left: Box::new(left),
+                    operator,
+                    right: Box::new(right),
+                },
+            };
+        }
+        Ok(left)
     }
 
     fn binary_chain(
@@ -1178,6 +1207,8 @@ impl Parser {
             TokenKind::SlashEqual => BinaryOperator::Divide,
             TokenKind::DoubleSlashEqual => BinaryOperator::FloorDivide,
             TokenKind::PercentEqual => BinaryOperator::Remainder,
+            TokenKind::LeftShiftEqual => BinaryOperator::LeftShift,
+            TokenKind::RightShiftEqual => BinaryOperator::RightShift,
             TokenKind::AmpersandEqual => BinaryOperator::BitwiseAnd,
             TokenKind::CaretEqual => BinaryOperator::BitwiseXor,
             TokenKind::PipeEqual => BinaryOperator::BitwiseOr,

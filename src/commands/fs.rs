@@ -649,7 +649,7 @@ fn cmd_readlink(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
 
 fn realpath_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, long) = split_flags(args);
-    let allowed = if cmd == "readlink" { "f" } else { "" };
+    let allowed = if cmd == "readlink" { "f" } else { "m" };
     if reject_options(cmd, &flags, allowed, &long, io) {
         return 2;
     }
@@ -676,7 +676,14 @@ fn realpath_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -
             }
         } else {
             let abs = crate::vfs::resolve_against(&interp.cwd, p);
-            match interp.fs_realpath("/", &abs, true) {
+            let resolved = if flags.contains(&'m') {
+                // GNU `-m` permits missing components. The VFS resolver still follows every
+                // modeled symlink in an existing prefix and normalizes the untouched suffix.
+                interp.vfs.realpath(&abs, true)
+            } else {
+                interp.fs_realpath("/", &abs, true)
+            };
+            match resolved {
                 Ok(r) => wln(io.out, &r),
                 Err(error) => {
                     ewln(io.err, &format!("realpath: {error}"));

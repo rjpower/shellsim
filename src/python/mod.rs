@@ -334,6 +334,8 @@ pub struct ReplState {
     types: object_model::TypeRegistry,
     modules: HashMap<String, Value>,
     import_paths: Vec<String>,
+    sys_path: Option<Value>,
+    temporary_import_paths: Vec<String>,
     original_cwd: Option<String>,
 }
 
@@ -523,6 +525,22 @@ pub(crate) fn start_python(
     state
         .locals
         .insert("__name__".into(), Value::inline_string("__main__").unwrap());
+    if let Some(script) = py_argv
+        .first()
+        .filter(|script| !matches!(script.as_str(), "-c" | "-" | ""))
+    {
+        let file = match Value::inline_string(script) {
+            Some(value) => value,
+            None => match state
+                .heap
+                .allocate(heap::Object::String(script.clone()), &mut interp.resources)
+            {
+                Ok(value) => value,
+                Err(_) => return PythonCommandStart::Ready(137),
+            },
+        };
+        state.locals.insert("__file__".into(), file);
+    }
     let program = match vm::VmProgram::compile(&source) {
         Ok(program) => program,
         Err(ExecResult::Unsupported(feature)) => {
@@ -623,17 +641,7 @@ fn run_module(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
             let Some(dir) = args.iter().skip(1).find(|arg| !arg.starts_with('-')) else {
                 return 1;
             };
-            let base = crate::vfs::resolve_against(&interp.cwd, dir);
-            if interp.vfs.mkdir_all("/", &format!("{base}/bin")).is_err()
-                || interp
-                    .vfs
-                    .put_file(
-                        &format!("{base}/bin/python"),
-                        b"#!shellsim-python\n".to_vec(),
-                        0o755,
-                    )
-                    .is_err()
-            {
+            if !crate::commands::pkg::ensure_venv(interp, dir, false) {
                 err.extend_from_slice(b"python: venv: No space left on device\n");
                 return 1;
             }

@@ -43,6 +43,61 @@ print(open("value.txt").read().strip())
 }
 
 #[test]
+fn os_listdir_and_walk_traverse_only_the_modeled_vfs() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/work/tree/nested").unwrap();
+    environment
+        .vfs
+        .put_file("/work/tree/root.txt", b"root".to_vec(), 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .put_file("/work/tree/nested/leaf.txt", b"leaf".to_vec(), 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .symlink("/", "/work/tree/nested", "/work/tree/link")
+        .unwrap();
+    let source = r#"import os
+print(os.listdir("/work/tree"))
+for root, directories, files in os.walk("/work/tree"):
+    print(root, directories, files)
+"#;
+    assert_eq!(
+        run_in(&mut environment, source),
+        (
+            0,
+            b"['link', 'nested', 'root.txt']\n/work/tree ['link', 'nested'] ['root.txt']\n/work/tree/nested [] ['leaf.txt']\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
+fn os_paths_accept_the_path_like_protocol() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/work/tree").unwrap();
+    environment
+        .vfs
+        .put_file("/work/tree/value.txt", b"value".to_vec(), 0o644)
+        .unwrap();
+    let source = r#"from pathlib import Path
+import os
+root = Path("/work/tree")
+print(os.fspath(root), os.listdir(root))
+print(list(os.walk(root)))
+"#;
+    assert_eq!(
+        run_in(&mut environment, source),
+        (
+            0,
+            b"/work/tree ['value.txt']\n[('/work/tree', [], ['value.txt'])]\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
 fn vfs_operations_raise_the_python_os_exception_family() {
     let mut environment = Environment::new();
     environment.set_var("PWD", "/work");
@@ -84,6 +139,25 @@ except OSError:
 fn sys_exit_returns_the_requested_process_status() {
     assert_eq!(run("import sys\nsys.exit(4)"), (4, Vec::new(), Vec::new()));
     assert_eq!(run("import sys\nsys.exit()"), (0, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn sys_path_is_a_mutable_vfs_import_search_list() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/opt/modules").unwrap();
+    environment
+        .vfs
+        .put_file("/opt/modules/value.py", b"answer = 42\n".to_vec(), 0o644)
+        .unwrap();
+    let source = r#"import sys
+sys.path.insert(0, "/opt/modules")
+import value
+print(sys.path[0], value.answer)
+"#;
+    assert_eq!(
+        run_in(&mut environment, source),
+        (0, b"/opt/modules 42\n".to_vec(), Vec::new())
+    );
 }
 
 #[test]

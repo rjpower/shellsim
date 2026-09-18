@@ -1,4 +1,4 @@
-//! Compatibility tests for bounded ripgrep-style search over the virtual filesystem.
+//! Compatibility tests for bounded `rg`-style search over the virtual filesystem.
 
 use shellsim::{Environment, Limits, StopReason};
 

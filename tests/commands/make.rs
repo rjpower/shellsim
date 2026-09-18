@@ -1,4 +1,4 @@
-//! Integration coverage for the bounded VFS-only `make` command.
+//! Integration coverage for the bounded, VFS-only `make` command.
 //!
 //! The tests install Makefiles into the simulated VFS and invoke the command through the normal
 //! shell dispatcher. They never read or execute a host Makefile.

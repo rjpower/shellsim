@@ -295,7 +295,10 @@ pub(crate) fn try_exec_script(
     let text = String::from_utf8_lossy(&data);
     let first = text.lines().next().unwrap_or("");
     let code = if first.starts_with("#!") && first.contains("python") {
-        let mut a = vec!["python3.14".to_string(), path.to_string()];
+        let mut a = vec!["python3.14".to_string()];
+        if first != "#!shellsim-python" {
+            a.push(path.to_string());
+        }
         a.extend(args.iter().cloned());
         if resumable {
             crate::commands::start_child_sequence(

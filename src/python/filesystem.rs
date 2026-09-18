@@ -13,6 +13,7 @@ use super::native::{PyError, PyFileMetadata, PyFilesystem, PyResult};
 
 const MAX_TEXT_FILE: usize = 4 * 1024 * 1024;
 const MODELED_GLOB_RESULT_BYTES: usize = 64;
+const MODELED_DIRECTORY_ENTRY_BYTES: usize = 64;
 
 /// Preserve ordinary Python filesystem exception boundaries while keeping resource exhaustion
 /// distinct for the shellsim harness.
@@ -164,6 +165,21 @@ impl PyFilesystem for Interp {
 
     fn is_dir(&self, path: &str) -> bool {
         self.vfs.is_dir(&self.cwd, path)
+    }
+
+    fn is_symlink(&self, path: &str) -> bool {
+        self.fs_metadata(&self.cwd, path, false)
+            .is_ok_and(|node| matches!(node.kind, crate::vfs::NodeKind::Symlink(_)))
+    }
+
+    fn list_dir(&mut self, path: &str) -> PyResult<Vec<String>> {
+        let entries = self.fs_list_dir(&self.cwd, path).map_err(map_vfs_error)?;
+        charge_cpu(self, entries.len())?;
+        reserve_memory(
+            self,
+            entries.len().saturating_mul(MODELED_DIRECTORY_ENTRY_BYTES),
+        )?;
+        Ok(entries)
     }
 
     fn metadata(&self, path: &str) -> PyResult<PyFileMetadata> {

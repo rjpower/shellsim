@@ -599,7 +599,7 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         };
         crate::commands::pkg::install_packages(interp, &request.packages);
         update_pyproject(interp, &request.direct_specs);
-        ensure_venv(interp, ".venv");
+        super::pkg::ensure_venv(interp, ".venv", true);
         return 0;
     }
     if first == Some("init") {
@@ -635,7 +635,7 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         if let Err(error) = uv_sync(interp) {
             return uv_failure(interp, io, &error, &error, 1);
         }
-        ensure_venv(interp, ".venv");
+        super::pkg::ensure_venv(interp, ".venv", true);
         return 0;
     }
     if first == Some("pip") && args.get(1).map(String::as_str) == Some("install") {
@@ -647,7 +647,7 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         if let Err(error) = crate::commands::pkg::install_args(interp, &install_args) {
             return uv_failure(interp, io, &error, &error, 1);
         }
-        ensure_venv(interp, ".venv");
+        super::pkg::ensure_venv(interp, ".venv", true);
         return 0;
     }
     if first == Some("venv") {
@@ -658,7 +658,7 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         {
             return uv_failure(interp, io, "venv-arguments", "unsupported venv argument", 2);
         }
-        ensure_venv(interp, args.get(1).map_or(".venv", String::as_str));
+        super::pkg::ensure_venv(interp, args.get(1).map_or(".venv", String::as_str), true);
         return 0;
     }
     // ---- run / tool run / uvx: route the embedded interpreter ----
@@ -772,40 +772,6 @@ fn uv_failure(
     interp.note_unsupported(&format!("uv:{feature}"));
     ewln(io.err, &format!("uv: {diagnostic}"));
     status
-}
-
-/// Create the marker files a real `uv`/`venv` would leave behind, so tasks that *inspect* the
-/// environment (a `.venv`, a `uv.lock`) see plausible state.
-fn ensure_venv(interp: &mut Interp, directory: &str) {
-    let cwd = interp.cwd.clone();
-    let root = crate::vfs::resolve_against(&cwd, directory);
-    for p in [&root, &format!("{root}/bin")] {
-        let _ = interp.vfs.mkdir_all("/", p);
-    }
-    let py = format!("{root}/bin/python");
-    if !interp.vfs.is_file("/", &py) {
-        let _ = interp
-            .vfs
-            .put_file(&py, b"#!shellsim-venv\n".to_vec(), 0o755);
-    }
-    let activate = format!("{root}/bin/activate");
-    if !interp.vfs.is_file("/", &activate) {
-        let source = format!(
-            "VIRTUAL_ENV={}; export VIRTUAL_ENV; PATH=\"$VIRTUAL_ENV/bin:$PATH\"; export PATH\n",
-            shell_single_quote(&root)
-        );
-        let _ = interp.vfs.put_file(&activate, source.into_bytes(), 0o644);
-    }
-    let lock = crate::vfs::resolve_against(&cwd, "uv.lock");
-    if !interp.vfs.is_file("/", &lock) {
-        let _ = interp
-            .vfs
-            .put_file(&lock, b"# shellsim uv.lock\n".to_vec(), 0o644);
-    }
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Validate every declared project or requirements dependency, then activate all of them atomically.

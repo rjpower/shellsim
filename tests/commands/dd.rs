@@ -1,4 +1,4 @@
-//! Compatibility strategy: cover TaskTrove's sparse patching and bounded zero-file creation.
+//! Compatibility strategy for `dd`: cover sparse patching and bounded zero-file creation.
 
 use shellsim::interp::{Environment, Interp};
 use shellsim::{Limits, StopReason};

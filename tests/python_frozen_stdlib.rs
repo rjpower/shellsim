@@ -343,13 +343,14 @@ start = datetime.strptime('2024-02-28', '%Y-%m-%d')
 end = start + timedelta(days=2)
 print(end.strftime('%Y-%m-%d'), (end - start).days)
 print(datetime.fromisoformat('2024-01-02T03:04:05Z').timestamp())
+print(datetime(2024, 1, 2, 3, 4).replace(minute=9, tzinfo=UTC).isoformat())
 print(date.today())
 "#;
     assert_eq!(
         run(source),
         (
             0,
-            "2025-01-01T00:00:00+00:00\n1970-01-01 00:00:00\n2024-03-01 2\n1704164645.0\n2025-01-01\n".into(),
+            "2025-01-01T00:00:00+00:00\n1970-01-01 00:00:00\n2024-03-01 2\n1704164645.0\n2024-01-02T03:09:00+00:00\n2025-01-01\n".into(),
             String::new()
         )
     );

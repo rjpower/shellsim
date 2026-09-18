@@ -66,6 +66,10 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             get: argv,
         },
         ValueDef::Factory {
+            name: "path",
+            get: path,
+        },
+        ValueDef::Factory {
             name: "stdin",
             get: stdin,
         },
@@ -96,6 +100,10 @@ fn exit(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 
 fn argv(runtime: &mut dyn PyRuntime) -> PyResult {
     runtime.new_argv()
+}
+
+fn path(runtime: &mut dyn PyRuntime) -> PyResult {
+    runtime.new_import_path()
 }
 
 fn stdin(runtime: &mut dyn PyRuntime) -> PyResult {

@@ -315,6 +315,8 @@ pub enum BinaryOperator {
     Divide,
     FloorDivide,
     Remainder,
+    LeftShift,
+    RightShift,
     BitwiseAnd,
     BitwiseXor,
     BitwiseOr,

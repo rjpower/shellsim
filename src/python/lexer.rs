@@ -133,8 +133,40 @@ impl<'a> Lexer<'a> {
                         return Err(self.error(start, "expected '=' after '!'"));
                     }
                 }
-                '<' => self.either('=', TokenKind::LessEqual, TokenKind::Less),
-                '>' => self.either('=', TokenKind::GreaterEqual, TokenKind::Greater),
+                '<' => {
+                    self.bump();
+                    if self.peek() == Some('<') {
+                        self.bump();
+                        if self.peek() == Some('=') {
+                            self.bump();
+                            TokenKind::LeftShiftEqual
+                        } else {
+                            TokenKind::LeftShift
+                        }
+                    } else if self.peek() == Some('=') {
+                        self.bump();
+                        TokenKind::LessEqual
+                    } else {
+                        TokenKind::Less
+                    }
+                }
+                '>' => {
+                    self.bump();
+                    if self.peek() == Some('>') {
+                        self.bump();
+                        if self.peek() == Some('=') {
+                            self.bump();
+                            TokenKind::RightShiftEqual
+                        } else {
+                            TokenKind::RightShift
+                        }
+                    } else if self.peek() == Some('=') {
+                        self.bump();
+                        TokenKind::GreaterEqual
+                    } else {
+                        TokenKind::Greater
+                    }
+                }
                 '.' if matches!(self.source[self.offset..].chars().nth(1), Some('0'..='9')) => {
                     self.number(start, true)?
                 }
@@ -680,6 +712,11 @@ impl<'a> Lexer<'a> {
                 }
                 _ => break,
             }
+        }
+        // A CRLF blank line must not change indentation. The main token loop already ignores
+        // `\r`; consuming it here keeps the indentation stack untouched before the `\n` token.
+        if self.source[self.offset..].starts_with("\r\n") {
+            self.bump();
         }
         if matches!(self.peek(), None | Some('\n' | '#')) {
             return Ok(());
