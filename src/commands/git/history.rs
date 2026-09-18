@@ -243,7 +243,7 @@ pub(crate) fn git_commit(
         timestamp: previous
             .as_ref()
             .filter(|_| amend)
-            .map_or_else(|| now_seconds(ctx), |(_, commit)| commit.timestamp),
+            .map_or_else(|| author_date(ctx), |(_, commit)| commit.timestamp),
         message: message.clone(),
     };
     let id = match repo::store_commit(ctx, &root, &commit, &index_tree) {
@@ -262,7 +262,8 @@ pub(crate) fn git_commit(
     }
     let label = repo::current_branch(ctx, &root)
         .unwrap_or_else(|| format!("detached HEAD {}", repo::short(&id)));
-    let root_commit = if commit.parents.is_empty() {
+    // An amended root commit is not announced as one, since it is not a new commit.
+    let root_commit = if commit.parents.is_empty() && !amend {
         "(root-commit) "
     } else {
         ""
@@ -275,6 +276,11 @@ pub(crate) fn git_commit(
         )
         .as_bytes(),
     );
+    if amend {
+        // Amending keeps the original author date, which Git points out.
+        io.out
+            .extend_from_slice(format!(" Date: {}\n", format_date(commit.timestamp)).as_bytes());
+    }
     emit_commit_summary(ctx, &root, &baseline, &index_tree, io);
     0
 }
@@ -542,12 +548,16 @@ fn expand_format_checked(
                     }
                 })
                 .collect(),
-            "b" => commit
-                .message
-                .split_once('\n')
-                .map_or("", |rest| rest.1)
-                .to_string(),
-            "B" => commit.message.clone(),
+            // The body drops the subject and its blank separator, and both keep a final newline.
+            "b" => format!(
+                "{}\n",
+                commit
+                    .message
+                    .split_once("\n\n")
+                    .map_or("", |rest| rest.1)
+                    .trim_end()
+            ),
+            "B" => format!("{}\n", commit.message.trim_end()),
             "P" => commit.parents.join(" "),
             "p" => commit
                 .parents
@@ -728,6 +738,8 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     let mut abbreviate = false;
     let mut author_filter: Option<String> = None;
     let mut message_filter: Option<String> = None;
+    let mut since: Option<i64> = None;
+    let mut until: Option<i64> = None;
     let mut ignore_case = false;
     // `-S` counts occurrences of a literal string; `-G` matches the changed lines as a regex.
     let mut pickaxe: Option<String> = None;
@@ -763,6 +775,21 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
                 limit = value;
             }
             "-i" | "--regexp-ignore-case" => ignore_case = true,
+            "--since" | "--after" | "--until" | "--before" => {
+                let after = matches!(argument, "--since" | "--after");
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return usage(io, &format!("{argument} requires a date"));
+                };
+                let Some(seconds) = parse_date(value, now_seconds(ctx)) else {
+                    return usage(io, &format!("unsupported date: {value}"));
+                };
+                if after {
+                    since = Some(seconds);
+                } else {
+                    until = Some(seconds);
+                }
+            }
             "--grep" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -804,6 +831,22 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             }
             value if value.starts_with("--grep=") => {
                 message_filter = Some(value["--grep=".len()..].to_string());
+            }
+            value
+                if value.starts_with("--since=")
+                    || value.starts_with("--after=")
+                    || value.starts_with("--until=")
+                    || value.starts_with("--before=") =>
+            {
+                let (name, date) = value.split_once('=').unwrap_or((value, ""));
+                let Some(seconds) = parse_date(date, now_seconds(ctx)) else {
+                    return usage(io, &format!("unsupported date: {date}"));
+                };
+                if matches!(name, "--since" | "--after") {
+                    since = Some(seconds);
+                } else {
+                    until = Some(seconds);
+                }
             }
             value if value.starts_with("-S") && value.len() > 2 => {
                 pickaxe = Some(value[2..].to_string());
@@ -900,6 +943,12 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             }
         });
     }
+    if let Some(seconds) = since {
+        history.retain(|(_, commit)| commit.timestamp > seconds);
+    }
+    if let Some(seconds) = until {
+        history.retain(|(_, commit)| commit.timestamp <= seconds);
+    }
     if let Some(needle) = &pickaxe {
         history.retain(|(id, commit)| changes_occurrence_count(ctx, &root, id, commit, needle));
     }
@@ -991,6 +1040,79 @@ fn commit_touches(
     names
         .iter()
         .any(|path| tree.get(path) != parent.get(path) && compare::selected(paths, path))
+}
+
+/// The author date for a new commit, which `GIT_AUTHOR_DATE` may set as it does in Git.
+fn author_date(ctx: &mut CommandContext<'_>) -> i64 {
+    let now = now_seconds(ctx);
+    ctx.get_var("GIT_AUTHOR_DATE")
+        .and_then(|value| parse_date(&value, now))
+        .unwrap_or(now)
+}
+
+/// Parse the date forms `--since` and `--until` accept.
+///
+/// Absolute `YYYY-MM-DD[ HH:MM:SS]`, a bare epoch second count, and Git's relative `N units ago`
+/// are understood; anything else is rejected rather than guessed at.
+fn parse_date(value: &str, now: i64) -> Option<i64> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<i64>() {
+        return Some(seconds);
+    }
+    if let Some(seconds) = parse_relative_date(value, now) {
+        return Some(seconds);
+    }
+    let (date, time) = match value.split_once(['T', ' ']) {
+        Some((date, time)) => (date, Some(time)),
+        None => (value, None),
+    };
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let mut seconds = days_from_civil(year, month, day) * 86_400;
+    if let Some(time) = time {
+        let mut fields = time.trim_end_matches('Z').split(':');
+        let hours: i64 = fields.next()?.parse().ok()?;
+        let minutes: i64 = fields.next().unwrap_or("0").parse().ok()?;
+        let taken: i64 = fields.next().unwrap_or("0").parse().ok()?;
+        seconds += hours * 3_600 + minutes * 60 + taken;
+    }
+    Some(seconds)
+}
+
+fn parse_relative_date(value: &str, now: i64) -> Option<i64> {
+    let mut words = value.trim_end_matches(" ago").split_whitespace();
+    let count: i64 = words.next()?.parse().ok()?;
+    let unit = words.next()?.trim_end_matches('s');
+    if words.next().is_some() {
+        return None;
+    }
+    let size = match unit {
+        "second" => 1,
+        "minute" => 60,
+        "hour" => 3_600,
+        "day" => 86_400,
+        "week" => 604_800,
+        "month" => 2_629_746,
+        "year" => 31_556_952,
+        _ => return None,
+    };
+    Some(now - count * size)
+}
+
+/// Days since the Unix epoch for a civil date, by Howard Hinnant's algorithm.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// The blob pair a commit changed for each path, against its first parent.
@@ -2297,7 +2419,13 @@ pub(crate) fn git_merge(
         author_name,
         author_email,
         timestamp: now_seconds(ctx),
-        message: message.unwrap_or_else(|| format!("Merge branch '{target}'")),
+        // Git names the branch merged into unless it is the repository's default.
+        message: message.unwrap_or_else(|| {
+            match repo::current_branch(ctx, &root).filter(|branch| branch != repo::DEFAULT_BRANCH) {
+                Some(branch) => format!("Merge branch '{target}' into {branch}"),
+                None => format!("Merge branch '{target}'"),
+            }
+        }),
     };
     let Ok(id) = repo::store_commit(ctx, &root, &commit, &merged) else {
         return 1;
@@ -2307,7 +2435,13 @@ pub(crate) fn git_merge(
     }
     io.out
         .extend_from_slice(b"Merge made by the 'ort' strategy.\n");
-    emit_commit_summary(ctx, &root, &head_tree, &merged, io);
+    // Git shows the per-file diffstat of the merge before the summary.
+    let stat = compare::Options {
+        format: Format::Stat,
+        ..Default::default()
+    };
+    compare::emit(ctx, &root, &head_tree, &merged, &stat, io);
+    emit_mode_lines(&head_tree, &merged, io);
     0
 }
 

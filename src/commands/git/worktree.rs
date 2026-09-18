@@ -165,6 +165,7 @@ fn collapsed_form(index: &Tree, path: &str) -> String {
 
 pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut short = false;
+    let mut version_two = false;
     let mut branch_header = false;
     let mut untracked = Untracked::Normal;
     let mut show_ignored = false;
@@ -179,6 +180,7 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         match argument.as_str() {
             "--" => operands_only = true,
             "-s" | "--short" | "--porcelain" | "--porcelain=v1" => short = true,
+            "--porcelain=v2" => version_two = true,
             "-b" | "--branch" => branch_header = true,
             "-z" => {
                 nul = true;
@@ -251,6 +253,8 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     }
     // Git names paths relative to the working directory, reaching upwards with `../` when needed.
     let prefix = repo::relative_path(&root, &cwd).map_or_else(String::new, |p| format!("{p}/"));
+    // The v2 format reports object ids, so the repository-relative names are kept alongside.
+    let tracked: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
     let mut entries = entries;
     for entry in &mut entries {
         entry.path = displayed_path(&prefix, &entry.path);
@@ -264,6 +268,22 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     }
     let branch = repo::current_branch(ctx, &root);
     let head_commit = repo::head_commit(ctx, &root);
+    if version_two {
+        emit_porcelain_v2(
+            ctx,
+            &root,
+            &entries,
+            &tracked,
+            &untracked_paths,
+            &ignored_paths,
+            &head,
+            &index,
+            &work,
+            branch_header,
+            io,
+        );
+        return 0;
+    }
     if short {
         emit_short_status(
             ctx,
@@ -298,6 +318,58 @@ fn displayed_path(prefix: &str, path: &str) -> String {
     match path.strip_prefix(prefix) {
         Some(rest) => rest.to_string(),
         None => format!("{}{path}", "../".repeat(prefix.matches('/').count())),
+    }
+}
+
+/// Report status in Git's `--porcelain=v2` format.
+///
+/// Every tracked entry is a `1` record; this subset never records a submodule or a file mode other
+/// than `100644`, so those columns are constant.
+#[allow(clippy::too_many_arguments)]
+fn emit_porcelain_v2(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    entries: &[Entry],
+    tracked: &[String],
+    untracked: &[String],
+    ignored: &[String],
+    head: &Tree,
+    index: &Tree,
+    work: &Tree,
+    branch_header: bool,
+    io: &mut Io,
+) {
+    const MISSING: &str = "0000000000000000000000000000000000000000";
+    if branch_header {
+        let commit = repo::head_commit(ctx, root).unwrap_or_else(|| "(initial)".to_string());
+        let branch = repo::current_branch(ctx, root).unwrap_or_else(|| "(detached)".to_string());
+        io.out.extend_from_slice(
+            format!("# branch.oid {commit}\n# branch.head {branch}\n").as_bytes(),
+        );
+    }
+    let mode = |present: bool| if present { "100644" } else { "000000" };
+    for (entry, path) in entries.iter().zip(tracked) {
+        let x = entry.staged.map_or('.', Change::porcelain);
+        let y = entry.unstaged.map_or('.', Change::porcelain);
+        let head_hash = head.get(path).map_or(MISSING, String::as_str);
+        let index_hash = index.get(path).map_or(MISSING, String::as_str);
+        io.out.extend_from_slice(
+            format!(
+                "1 {x}{y} N... {} {} {} {head_hash} {index_hash} {}\n",
+                mode(head.contains_key(path)),
+                mode(index.contains_key(path)),
+                // A path the index no longer tracks has no working-tree mode to report.
+                mode(index.contains_key(path) && work.contains_key(path)),
+                entry.display(),
+            )
+            .as_bytes(),
+        );
+    }
+    for path in untracked {
+        io.out.extend_from_slice(format!("? {path}\n").as_bytes());
+    }
+    for path in ignored {
+        io.out.extend_from_slice(format!("! {path}\n").as_bytes());
     }
 }
 
@@ -1159,7 +1231,7 @@ pub(crate) fn git_clean(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     }
     if !force && !dry_run {
         io.err.extend_from_slice(
-            b"fatal: clean.requireForce defaults to true; refusing to clean without -f or -n\n",
+            b"fatal: clean.requireForce is true and -f not given: refusing to clean\n",
         );
         return 128;
     }

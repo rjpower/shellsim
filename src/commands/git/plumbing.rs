@@ -84,7 +84,15 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     body.push_str(&format!("author {identity}\ncommitter {identity}\n\n"));
     body.push_str(&commit.message);
     body.push('\n');
+    // An annotated tag is its own object type, even though it resolves to a commit here.
+    let annotated = object
+        .strip_prefix("refs/tags/")
+        .map(str::to_string)
+        .or_else(|| Some(object.clone()))
+        .filter(|name| repo::read_annotation(ctx, &root, name).is_some())
+        .is_some();
     match mode.as_str() {
+        "-t" if annotated => io.out.extend_from_slice(b"tag\n"),
         "-t" => io.out.extend_from_slice(b"commit\n"),
         "-e" => {}
         "-s" => io
@@ -380,8 +388,13 @@ pub(crate) fn git_describe(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             .extend_from_slice(format!("{}\n", repo::short(&start)).as_bytes());
         return 0;
     }
-    io.err
-        .extend_from_slice(b"fatal: No annotated tags can describe this commit; try --tags.\n");
+    io.err.extend_from_slice(
+        format!("fatal: No annotated tags can describe '{start}'.\n").as_bytes(),
+    );
+    if !repo::reference_names(ctx, &root, "tags").is_empty() {
+        io.err
+            .extend_from_slice(b"However, there were unannotated tags: try --tags.\n");
+    }
     128
 }
 

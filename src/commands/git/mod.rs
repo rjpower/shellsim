@@ -216,8 +216,10 @@ pub(crate) fn ambiguous_argument(io: &mut Io, value: &str) -> i32 {
 }
 
 pub(crate) fn repo_error(io: &mut Io) -> i32 {
-    io.err
-        .extend_from_slice(b"fatal: not a git repository (or any parent up to mount point)\n");
+    io.err.extend_from_slice(
+        b"fatal: not a git repository (or any parent up to mount point /)\n\
+              Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+    );
     128
 }
 

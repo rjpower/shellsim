@@ -125,14 +125,16 @@ pub(crate) fn apply_unified_diff(
     io: &mut Io,
 ) -> i32 {
     let mut check = false;
-    let mut forwarded = vec!["-p1".to_string()];
+    let mut strip = "-p1".to_string();
+    let mut forwarded: Vec<String> = Vec::new();
     for argument in args {
         match argument.as_str() {
-            "--check" | "--summary" | "--stat" => check = true,
+            "--check" => check = true,
             "-v" | "--verbose" | "--3way" | "--whitespace=nowarn" => {}
-            value if value.starts_with("-p") || value.starts_with("--unsafe-paths") => {
-                forwarded.insert(0, value.to_string());
-            }
+            // A lone `-` names standard input, which is already where an operandless patch reads.
+            "-" => {}
+            value if value.starts_with("-p") => strip = value.to_string(),
+            value if value.starts_with("--unsafe-paths") => {}
             value if value.starts_with('-') => {
                 io.err.extend_from_slice(
                     format!("git: unsupported apply option: {value}\n").as_bytes(),
@@ -142,6 +144,7 @@ pub(crate) fn apply_unified_diff(
             value => forwarded.push(value.to_string()),
         }
     }
+    forwarded.insert(0, strip);
     let cwd = ctx.cwd.clone();
     let before = check.then(|| ctx.vfs.clone());
     // A failure is reported in Git's words, since that is what callers match on.

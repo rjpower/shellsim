@@ -337,21 +337,26 @@ fn emit_stats(stats: &[(String, usize, usize, bool)], format: Format, io: &mut I
         return;
     }
     if format == Format::Stat {
-        let name_width = stats.iter().map(|entry| entry.0.len()).max().unwrap_or(0);
-        let count_width = stats
+        let max_change = stats
             .iter()
-            .map(|entry| (entry.1 + entry.2).to_string().len())
+            .map(|entry| entry.1 + entry.2)
             .max()
-            .unwrap_or(1);
+            .unwrap_or(0);
+        let count_width = max_change.to_string().len();
+        let (name_width, graph_width) = stat_widths(
+            stats.iter().map(|entry| entry.0.len()).max().unwrap_or(0),
+            max_change,
+            count_width,
+        );
         for (path, insertions, deletions, binary) in stats {
+            let path = shorten_name(path, name_width);
             if *binary {
                 io.out
                     .extend_from_slice(format!(" {path:name_width$} | Bin\n").as_bytes());
                 continue;
             }
             let total = insertions + deletions;
-            // Git scales the graph to at most 40 columns while keeping at least one mark per side.
-            let (plus, minus) = scale_graph(*insertions, *deletions);
+            let (plus, minus) = scale_graph(*insertions, *deletions, graph_width, max_change);
             let graph = format!("{}{}", "+".repeat(plus), "-".repeat(minus));
             let separator = if graph.is_empty() { "" } else { " " };
             io.out.extend_from_slice(
@@ -364,16 +369,56 @@ fn emit_stats(stats: &[(String, usize, usize, bool)], format: Format, io: &mut I
         .extend_from_slice(summary_line(stats.len(), total_insertions, total_deletions).as_bytes());
 }
 
-fn scale_graph(insertions: usize, deletions: usize) -> (usize, usize) {
-    let total = insertions + deletions;
-    if total <= 40 {
+fn scale_graph(
+    insertions: usize,
+    deletions: usize,
+    graph_width: usize,
+    max_change: usize,
+) -> (usize, usize) {
+    if max_change <= graph_width {
         return (insertions, deletions);
     }
-    let plus = (insertions * 40)
-        .div_ceil(total)
-        .max(usize::from(insertions > 0));
-    let minus = (40_usize.saturating_sub(plus)).max(usize::from(deletions > 0));
-    (plus, minus)
+    // Git's linear scale, which always keeps one mark for a side that changed at all.
+    let scale = |count: usize| {
+        if count == 0 || max_change <= 1 {
+            return usize::from(count > 0);
+        }
+        1 + (count - 1) * (graph_width - 1) / (max_change - 1)
+    };
+    (scale(insertions), scale(deletions))
+}
+
+/// The name and graph columns `--stat` gets, within Git's 80-column budget.
+fn stat_widths(max_len: usize, max_change: usize, count_width: usize) -> (usize, usize) {
+    const WIDTH: usize = 80;
+    let mut name_width = max_len;
+    let mut graph_width = max_change;
+    if name_width + count_width + 6 + graph_width <= WIDTH {
+        return (name_width, graph_width);
+    }
+    // The graph never takes more than three eighths of the line, and the name gives way first.
+    let cap = (WIDTH * 3 / 8).saturating_sub(count_width + 6).max(6);
+    graph_width = graph_width.min(cap);
+    let available = WIDTH.saturating_sub(count_width + 6 + graph_width);
+    if name_width > available {
+        name_width = available;
+    } else {
+        graph_width = WIDTH - count_width - 6 - name_width;
+    }
+    (name_width, graph_width)
+}
+
+/// Shorten a path to `width`, cutting at a directory boundary the way Git does.
+fn shorten_name(name: &str, width: usize) -> String {
+    if name.len() <= width {
+        return name.to_string();
+    }
+    let skip = name.len() - width + 3;
+    let tail = match name[skip.min(name.len())..].find('/') {
+        Some(offset) => &name[skip + offset..],
+        None => &name[skip.min(name.len())..],
+    };
+    format!("...{tail}")
 }
 
 /// Parse the options `git diff` shares with `git log` and `git show`.

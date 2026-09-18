@@ -13,6 +13,8 @@ use super::repo_error;
 pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let mut stage = false;
     let mut cached = false;
+    let mut reverse = false;
+    let mut report = None;
     let mut forwarded = Vec::new();
     for argument in args {
         match argument.as_str() {
@@ -21,8 +23,24 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
                 stage = true;
                 cached = true;
             }
+            "-R" | "--reverse" => reverse = true,
+            "--stat" | "--numstat" | "--summary" => report = Some(argument.clone()),
             value => forwarded.push(value.to_string()),
         }
+    }
+    // These read the patch and report on it without touching anything.
+    if let Some(report) = report {
+        let Some(text) = patch_text(ctx, &forwarded, io) else {
+            return 128;
+        };
+        return describe(&text, &report, io);
+    }
+    if reverse {
+        let Some(text) = patch_text(ctx, &forwarded, io) else {
+            return 128;
+        };
+        io.stdin = reverse_patch(&text).into_bytes();
+        forwarded.retain(|value| value.starts_with('-'));
     }
     if !stage {
         return crate::commands::patch::apply_unified_diff(ctx, &forwarded, io);
@@ -102,4 +120,132 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         return 1;
     }
     0
+}
+
+/// The patch text, from the first file operand or from standard input.
+fn patch_text(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> Option<String> {
+    let Some(file) = args
+        .iter()
+        .find(|value| !value.starts_with('-'))
+        .filter(|value| *value != "-")
+    else {
+        return Some(String::from_utf8_lossy(&io.stdin).into_owned());
+    };
+    let absolute = crate::vfs::resolve_against(&ctx.cwd, file);
+    match ctx.fs_read_limited("/", &absolute, 16 * 1024 * 1024) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(_) => {
+            io.err.extend_from_slice(
+                format!("error: can't open patch '{file}': No such file or directory\n").as_bytes(),
+            );
+            None
+        }
+    }
+}
+
+/// The name and line counts each file in a patch carries.
+fn patch_counts(text: &str) -> Vec<(String, usize, usize)> {
+    let mut files: Vec<(String, usize, usize)> = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let name = rest.split('\t').next().unwrap_or(rest);
+            let name = name.split_once('/').map_or(name, |(_, tail)| tail);
+            if name != "dev/null" {
+                files.push((name.to_string(), 0, 0));
+            }
+            continue;
+        }
+        let Some(entry) = files.last_mut() else {
+            continue;
+        };
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            entry.1 += 1;
+        } else if line.starts_with('-') {
+            entry.2 += 1;
+        }
+    }
+    files
+}
+
+/// Report a patch the way `--stat`, `--numstat`, and `--summary` do.
+fn describe(text: &str, report: &str, io: &mut Io) -> i32 {
+    let files = patch_counts(text);
+    if report == "--numstat" {
+        for (name, insertions, deletions) in &files {
+            io.out
+                .extend_from_slice(format!("{insertions}\t{deletions}\t{name}\n").as_bytes());
+        }
+        return 0;
+    }
+    if report == "--summary" {
+        return 0;
+    }
+    let width = files.iter().map(|entry| entry.0.len()).max().unwrap_or(0);
+    let mut insertions = 0;
+    let mut deletions = 0;
+    for (name, added, removed) in &files {
+        insertions += added;
+        deletions += removed;
+        let total = added + removed;
+        io.out.extend_from_slice(
+            format!(
+                " {name:width$} | {total:>4} {}{}\n",
+                "+".repeat(*added),
+                "-".repeat(*removed)
+            )
+            .as_bytes(),
+        );
+    }
+    io.out.extend_from_slice(
+        super::compare::summary_line(files.len(), insertions, deletions).as_bytes(),
+    );
+    0
+}
+
+/// Turn a unified diff around so that applying it undoes the original.
+fn reverse_patch(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        // The two file headers swap places as well as their markers.
+        if let (Some(from), Some(to)) = (
+            line.strip_prefix("--- "),
+            lines
+                .get(index + 1)
+                .and_then(|next| next.strip_prefix("+++ ")),
+        ) {
+            out.push_str(&format!("--- {to}\n+++ {from}\n"));
+            index += 2;
+            continue;
+        }
+        let flipped = if let Some(rest) = line.strip_prefix("@@ ") {
+            // `@@ -A,B +C,D @@` becomes `@@ -C,D +A,B @@`.
+            match rest.split_once(" @@") {
+                Some((ranges, tail)) => match ranges.split_once(' ') {
+                    Some((old, new)) => format!(
+                        "@@ -{} +{} @@{tail}",
+                        new.trim_start_matches('+'),
+                        old.trim_start_matches('-')
+                    ),
+                    None => line.to_string(),
+                },
+                None => line.to_string(),
+            }
+        } else if let Some(rest) = line.strip_prefix('+') {
+            format!("-{rest}")
+        } else if let Some(rest) = line.strip_prefix('-') {
+            format!("+{rest}")
+        } else {
+            line.to_string()
+        };
+        out.push_str(&flipped);
+        out.push('\n');
+        index += 1;
+    }
+    out
 }

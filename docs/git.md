@@ -9,10 +9,13 @@ history, branch, and merge without noticing it is not talking to Git.
 
 ```text
 init  status  add  rm  mv  restore  reset  clean  ls-files
-commit  log  show  diff  rev-parse  rev-list  branch  tag  switch  checkout  merge
+commit  log  show  diff  apply  rev-parse  rev-list  branch  tag  switch  checkout  merge
 config  remote  stash  grep  cat-file  hash-object  ls-tree  check-ignore  merge-base
-describe  shortlog
+describe  shortlog  show-ref  symbolic-ref  for-each-ref
 ```
+
+Aliases recorded in configuration are expanded, so `git config alias.st "status --short"`
+makes `git st` work. A `!shell command` alias is not, because it would need host execution.
 
 Global options `-C DIRECTORY`, `-c NAME=VALUE`, `--no-pager`, `--version`, and `git help` work
 before any subcommand. `git help` lists the supported set.
@@ -20,7 +23,8 @@ before any subcommand. `git help` lists the supported set.
 Output follows real Git byte for byte wherever an agent is likely to parse it: `git status` long
 and `--porcelain` formats including untracked-directory collapsing and exact rename detection,
 unified diffs with hunk headers, function context, `\ No newline at end of file`, and index lines
-carrying real Git blob ids, `git log` author and date headers, `--format` placeholders, and the
+carrying real Git blob ids, `git status --porcelain=v2` records, `git log` author and date headers, `--format`
+placeholders, and the
 `N files changed, N insertions(+)` summaries. `.gitignore` and `.git/info/exclude` are honored by
 `status`, `add`, `clean`, `ls-files --others --exclude-standard`, and `check-ignore`, including
 negation, anchoring, directory-only patterns, character classes, `**`, and nested pattern files.
@@ -30,6 +34,14 @@ Pathspecs accept globs, and their wildcards cross directory separators the way G
 `git status -- '*.py'` reports a change to `src/main.py`. `git grep` searches only below the
 working directory, reports paths relative to it, and accepts a revision to search instead of the
 working tree.
+
+`git log` filters with `--grep`, `--author`, `-S`, `-G`, `--since`, and `--until`; dates are read
+as `YYYY-MM-DD[ HH:MM:SS]`, a bare epoch second count, or Git's `N units ago`, and a form that is
+not one of those is refused rather than guessed at. `GIT_AUTHOR_DATE` sets a new commit's author
+date, as it does in Git.
+
+`git apply` handles `--index`, `--cached`, `--check`, `-R`, `-p<n>`, `--stat`, and `--numstat`,
+and reads the patch from a file or standard input.
 
 Revisions accept `HEAD`, `@`, branch and tag names, full and abbreviated commit ids, the `~N` and
 `^N` ancestry suffixes, the `a..b` and `a...b` ranges used by `log` and `diff`, and the
@@ -60,8 +72,10 @@ mode for any command. Those report `unsupported subcommand` and exit 2; a name t
 subcommand at all is reported the way Git reports a typo and exits 1.
 
 File modes, symbolic links, submodules, and rename detection based on similarity are outside the
-model: every tracked path is a regular file, and renames are recognized only when the content is
-byte-identical. Annotated tags store a tagger and message but are not separate objects.
+model: every tracked path is a regular file, and `status` and `diff` recognize a rename only when
+the content is byte-identical. The executable bit is neither tracked nor reported, so `chmod +x`
+on a tracked file is invisible to Git here. Annotated tags store a tagger and message but are not
+separate objects.
 
 ## Storage layout
 

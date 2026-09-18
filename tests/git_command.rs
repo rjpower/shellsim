@@ -1424,3 +1424,155 @@ fn caret_excludes_a_revision_from_the_history() {
     );
     assert_eq!(run(&mut env, "git rev-list --count HEAD ^base").1, "2\n");
 }
+
+#[test]
+fn status_reports_the_second_porcelain_format() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    env.vfs.put_file("/k.txt", b"k\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    env.vfs
+        .put_file("/a.txt", b"a\nx\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(
+        run(&mut env, "git add a.txt; git rm -q --cached k.txt").0,
+        0
+    );
+
+    let head = run(&mut env, "git rev-parse HEAD:a.txt")
+        .1
+        .trim()
+        .to_string();
+    let staged = run(&mut env, "git hash-object a.txt").1.trim().to_string();
+    let removed = run(&mut env, "git rev-parse HEAD:k.txt")
+        .1
+        .trim()
+        .to_string();
+    let missing = "0".repeat(40);
+    assert_eq!(
+        run(&mut env, "git status --porcelain=v2").1,
+        format!(
+            "1 M. N... 100644 100644 100644 {head} {staged} a.txt\n\
+             1 D. N... 100644 000000 000000 {removed} {missing} k.txt\n\
+             ? k.txt\n"
+        )
+    );
+    assert!(run(&mut env, "git status --porcelain=v2 -b")
+        .1
+        .contains("# branch.head main\n"));
+}
+
+#[test]
+fn apply_reports_and_reverses_a_patch() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"a\nb\nc\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    env.vfs
+        .put_file("/f.txt", b"a\nB\nc\nd\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(
+        run(&mut env, "git diff > /p.diff; git checkout -- f.txt").0,
+        0
+    );
+
+    assert_eq!(
+        run(&mut env, "git apply --stat /p.diff").1,
+        " f.txt |    3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-)\n"
+    );
+    assert_eq!(
+        run(&mut env, "git apply --numstat /p.diff").1,
+        "2\t1\tf.txt\n"
+    );
+
+    assert_eq!(run(&mut env, "git apply /p.diff").0, 0);
+    assert_eq!(env.vfs.read("/", "/f.txt").unwrap(), b"a\nB\nc\nd\n");
+    // `-R` undoes exactly what the patch did.
+    assert_eq!(run(&mut env, "git apply -R /p.diff").0, 0);
+    assert_eq!(env.vfs.read("/", "/f.txt").unwrap(), b"a\nb\nc\n");
+    // The patch can also arrive on standard input.
+    assert_eq!(run(&mut env, "git apply < /p.diff").0, 0);
+    assert_eq!(env.vfs.read("/", "/f.txt").unwrap(), b"a\nB\nc\nd\n");
+}
+
+#[test]
+fn log_filters_by_date() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    assert_eq!(
+        run(
+            &mut env,
+            "git add -A; GIT_AUTHOR_DATE=2024-06-01T00:00:00Z git commit -m old"
+        )
+        .0,
+        0
+    );
+    env.vfs.put_file("/a.txt", b"b\n".to_vec(), 0o644).unwrap();
+    assert_eq!(
+        run(
+            &mut env,
+            "git add -A; GIT_AUTHOR_DATE=2025-06-01T00:00:00Z git commit -m new"
+        )
+        .0,
+        0
+    );
+
+    assert_eq!(
+        run(&mut env, "git log --since=2025-01-01 --format=%s").1,
+        "new\n"
+    );
+    assert_eq!(
+        run(&mut env, "git log --until=2025-01-01 --format=%s").1,
+        "old\n"
+    );
+    assert_eq!(
+        run(
+            &mut env,
+            "git log --since 2024-01-01 --until 2024-12-31 --format=%s"
+        )
+        .1,
+        "old\n"
+    );
+    // A date this subset cannot read is refused rather than guessed at.
+    assert_eq!(run(&mut env, "git log --since='last tuesday'").0, 2);
+    assert_eq!(
+        run(&mut env, "git log -1 --format=%ad").1,
+        "Sun Jun 1 00:00:00 2025 +0000\n"
+    );
+}
+
+#[test]
+fn stat_output_stays_within_the_column_budget() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    let long = "a/very/deep/nested/path/file_with_a_rather_long_name_1.txt";
+    let body: Vec<u8> = (1..=20)
+        .map(|n| format!("line {n}\n"))
+        .collect::<String>()
+        .into();
+    env.vfs
+        .put_file(&format!("/{long}"), body.clone(), 0o644)
+        .unwrap();
+    env.vfs.put_file("/s.txt", b"s\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -m one").0, 0);
+    let more: Vec<u8> = (1..=40)
+        .map(|n| format!("line {n}\n"))
+        .collect::<String>()
+        .into();
+    env.vfs.put_file(&format!("/{long}"), more, 0o644).unwrap();
+    env.vfs
+        .put_file("/s.txt", b"s\nt\n".to_vec(), 0o644)
+        .unwrap();
+
+    // The name is elided at a directory boundary rather than widening the line.
+    assert_eq!(
+        run(&mut env, "git diff --stat").1,
+        " .../nested/path/file_with_a_rather_long_name_1.txt   | 20 ++++++++++++++++++++\n \
+         s.txt                                                |  1 +\n \
+         2 files changed, 21 insertions(+)\n"
+    );
+}
