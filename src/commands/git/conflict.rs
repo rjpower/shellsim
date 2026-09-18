@@ -246,7 +246,14 @@ pub(crate) fn combine(
         // A mode set on either side carries into the merged file.
         let executable = mine.is_some_and(|entry| entry.executable)
             || yours.is_some_and(|entry| entry.executable);
-        tree.insert(path, repo::Entry { hash, executable });
+        tree.insert(
+            path,
+            repo::Entry {
+                hash,
+                executable,
+                symlink: false,
+            },
+        );
     }
     Combined { tree, stages }
 }

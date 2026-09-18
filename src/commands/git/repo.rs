@@ -31,15 +31,17 @@ pub(crate) const DEFAULT_BRANCH: &str = "main";
 pub(crate) struct Entry {
     pub hash: String,
     pub executable: bool,
+    /// A symbolic link, whose blob holds the target rather than file content.
+    pub symlink: bool,
 }
 
 impl Entry {
     /// The mode Git prints for this entry.
     pub fn mode(&self) -> &'static str {
-        if self.executable {
-            "100755"
-        } else {
-            "100644"
+        match (self.symlink, self.executable) {
+            (true, _) => "120000",
+            (_, true) => "100755",
+            _ => "100644",
         }
     }
 }
@@ -179,7 +181,7 @@ pub(crate) fn serialize_tree(tree: &Tree) -> Vec<u8> {
         out.extend_from_slice(entry.hash.as_bytes());
         // The mode is written only when it is not the default, so an ordinary tree serializes
         // exactly as it did before modes were recorded.
-        if entry.executable {
+        if entry.executable || entry.symlink {
             out.push(b'\t');
             out.extend_from_slice(entry.mode().as_bytes());
         }
@@ -205,6 +207,7 @@ pub(crate) fn parse_tree(bytes: &[u8]) -> Option<Tree> {
             Entry {
                 hash: hash.to_string(),
                 executable: mode == "100755",
+                symlink: mode == "120000",
             },
         );
     }
@@ -225,18 +228,21 @@ pub(crate) fn write_vfs(interp: &mut Interp, path: &str, bytes: &[u8]) -> VfsRes
 }
 
 /// Write a checked-out file, giving it the permissions its recorded mode calls for.
-fn write_work_file(
-    interp: &mut Interp,
-    path: &str,
-    bytes: &[u8],
-    executable: bool,
-) -> VfsResult<()> {
+fn write_work_file(interp: &mut Interp, path: &str, bytes: &[u8], entry: &Entry) -> VfsResult<()> {
     interp.sync_vfs_time();
     if let Some(parent) = parent_of(path) {
         interp.vfs.mkdir_all("/", &parent)?;
     }
-    interp.vfs.write("/", path, bytes, work_mode(executable))?;
-    interp.vfs.chmod("/", path, work_mode(executable))
+    if entry.symlink {
+        // Writing over an existing node first, since a link cannot be created on top of one.
+        let _ = interp.vfs.remove_file("/", path);
+        return interp
+            .vfs
+            .symlink("/", &String::from_utf8_lossy(bytes), path);
+    }
+    let mode = work_mode(entry.executable);
+    interp.vfs.write("/", path, bytes, mode)?;
+    interp.vfs.chmod("/", path, mode)
 }
 
 pub(crate) fn load_index(interp: &Interp, root: &str) -> Option<Tree> {
@@ -264,9 +270,25 @@ pub(crate) fn write_blob(
     Ok(hash)
 }
 
+/// The bytes Git records for one working-tree node, or `None` for something it does not track.
+///
+/// A symbolic link is stored as a blob holding its target, which is how Git records one.
+fn tracked_content(kind: &NodeKind) -> Option<Vec<u8>> {
+    match kind {
+        NodeKind::File(data) => Some(data.clone()),
+        NodeKind::Symlink(target) => Some(target.as_bytes().to_vec()),
+        NodeKind::Dir => None,
+    }
+}
+
 /// Read a tracked file from the working tree.
 pub(crate) fn read_work_file(interp: &Interp, root: &str, path: &str) -> Option<Vec<u8>> {
-    interp.vfs.read("/", &path_join(root, path)).ok()
+    let absolute = path_join(root, path);
+    // A symbolic link is read as its target, not as whatever it points at.
+    match interp.vfs.metadata("/", &absolute, false) {
+        Ok(node) => tracked_content(&node.kind),
+        Err(_) => None,
+    }
 }
 
 // -- commits ------------------------------------------------------------------------------------
@@ -860,7 +882,7 @@ pub(crate) fn collect_working_tree(
         if is_git_path(root, path) || !within(root, path) {
             continue;
         }
-        if let NodeKind::File(data) = &node.kind {
+        if let Some(data) = tracked_content(&node.kind) {
             let Some(relative) = relative_path(root, path) else {
                 continue;
             };
@@ -894,13 +916,15 @@ pub(crate) fn collect_working_tree(
         if is_git_path(root, path) || !within(root, path) {
             continue;
         }
-        if let NodeKind::File(data) = &node.kind {
+        if let Some(data) = tracked_content(&node.kind) {
             if let Some(relative) = relative_path(root, path) {
+                let symlink = matches!(node.kind, NodeKind::Symlink(_));
                 files.insert(
                     relative,
                     Entry {
-                        hash: blob_hash(data),
-                        executable: is_executable(node.mode),
+                        hash: blob_hash(&data),
+                        executable: !symlink && is_executable(node.mode),
+                        symlink,
                     },
                 );
             }
@@ -917,6 +941,16 @@ pub(crate) fn metered_file_hash(
     ctx: &mut CommandContext<'_>,
     path: &str,
 ) -> Result<Option<String>, i32> {
+    // A symbolic link hashes to its target, so it must not be followed here.
+    if let Ok(node) = ctx.vfs.metadata("/", path, false) {
+        if let NodeKind::Symlink(target) = &node.kind {
+            let target = target.clone();
+            if !ctx.charge_cpu(target.len() as u64) {
+                return Err(resource_error(ctx));
+            }
+            return Ok(Some(blob_hash(target.as_bytes())));
+        }
+    }
     if !ctx.vfs.is_file("/", path) {
         return Ok(None);
     }
@@ -1024,7 +1058,7 @@ fn write_work_tree(
             let hash = &entry.hash;
             let data = read_blob(ctx, root, hash)
                 .ok_or_else(|| format!("missing blob {hash} for {path}"))?;
-            write_work_file(ctx, &path_join(root, path), &data, entry.executable)
+            write_work_file(ctx, &path_join(root, path), &data, entry)
                 .map_err(|error| error.to_string())?;
         }
         Ok(())

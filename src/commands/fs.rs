@@ -166,7 +166,7 @@ fn emit_listing(interp: &Interp, dir: &str, entries: &[String], long: bool, out:
             } else {
                 format!("{}/{}", dir.trim_end_matches('/'), e)
             };
-            let (typ, mode, size) = match interp.fs_metadata(&interp.cwd, &full, false) {
+            let (typ, mode, size, target) = match interp.fs_metadata(&interp.cwd, &full, false) {
                 Ok(n) => {
                     let t = match n.kind {
                         crate::vfs::NodeKind::Dir => 'd',
@@ -175,20 +175,27 @@ fn emit_listing(interp: &Interp, dir: &str, entries: &[String], long: bool, out:
                     };
                     let sz = match &n.kind {
                         crate::vfs::NodeKind::File(d) => d.len(),
-                        _ => 0,
+                        crate::vfs::NodeKind::Symlink(target) => target.len(),
+                        crate::vfs::NodeKind::Dir => 0,
                     };
-                    (t, n.mode, sz)
+                    // A long listing names what a link points at rather than following it.
+                    let target = match &n.kind {
+                        crate::vfs::NodeKind::Symlink(target) => format!(" -> {target}"),
+                        _ => String::new(),
+                    };
+                    (t, n.mode, sz, target)
                 }
-                Err(_) => ('-', 0o644, 0),
+                Err(_) => ('-', 0o644, 0, String::new()),
             };
             wln(
                 out,
                 &format!(
-                    "{}{} 1 root root {:>6} Jan  1 00:00 {}",
+                    "{}{} 1 root root {:>6} Jan  1 00:00 {}{}",
                     typ,
                     mode_str(mode),
                     size,
-                    e
+                    e,
+                    target
                 ),
             );
         }

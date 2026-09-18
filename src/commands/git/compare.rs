@@ -660,9 +660,8 @@ pub(crate) fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
                 options.unmerged.insert(path.clone());
                 match entry.ours {
                     Some(hash) => {
-                        let executable =
-                            index.get(&path).is_some_and(|recorded| recorded.executable);
-                        index.insert(path, repo::Entry { hash, executable });
+                        let recorded = index.get(&path).cloned().unwrap_or_default();
+                        index.insert(path, repo::Entry { hash, ..recorded });
                     }
                     None => {
                         index.remove(&path);

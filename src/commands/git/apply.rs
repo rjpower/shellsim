@@ -104,8 +104,8 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
             Some(data) => match repo::write_blob(ctx, &root, &data) {
                 Ok(hash) => {
                     // A patch changes content, never the mode the index already records.
-                    let executable = index.get(&path).is_some_and(|entry| entry.executable);
-                    index.insert(path, repo::Entry { hash, executable });
+                    let recorded = index.get(&path).cloned().unwrap_or_default();
+                    index.insert(path, repo::Entry { hash, ..recorded });
                 }
                 Err(error) => {
                     io.err

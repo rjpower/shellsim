@@ -1041,11 +1041,9 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
                 .map_err(|error| error.to_string())?;
             let hash = repo::write_blob(ctx, &root, &data).map_err(|error| error.to_string())?;
             // A move keeps the file's mode along with its content.
-            let executable = index
-                .get(source_relative)
-                .is_some_and(|entry| entry.executable);
+            let recorded = index.get(source_relative).cloned().unwrap_or_default();
             index.remove(source_relative);
-            index.insert(target_relative.clone(), repo::Entry { hash, executable });
+            index.insert(target_relative.clone(), repo::Entry { hash, ..recorded });
             if ctx.vfs.exists("/", target_absolute) {
                 ctx.vfs
                     .remove_file("/", target_absolute)

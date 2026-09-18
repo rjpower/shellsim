@@ -1971,3 +1971,44 @@ fn a_merge_commit_names_both_parents_in_the_log() {
     // An ordinary commit has no such line.
     assert!(!run(&mut env, "git log -1 HEAD~1").1.contains("Merge:"));
 }
+
+#[test]
+fn symbolic_links_are_tracked_as_their_targets() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    assert_eq!(run(&mut env, "echo target > t.txt; ln -s t.txt l.txt").0, 0);
+    assert_eq!(
+        run(&mut env, "git status --short").1,
+        "?? l.txt\n?? t.txt\n"
+    );
+
+    assert_eq!(run(&mut env, "git add -A").0, 0);
+    // Git stores a link as a blob holding its target, under mode 120000.
+    assert!(
+        run(&mut env, "git ls-files -s")
+            .1
+            .starts_with("120000 3eddab3ca20c14aaf1b71e59b3c4633f167afcc1 0\tl.txt\n"),
+        "{}",
+        run(&mut env, "git ls-files -s").1
+    );
+    let committed = run(&mut env, "git commit -m links");
+    assert!(
+        committed.1.contains(" create mode 120000 l.txt\n"),
+        "{}",
+        committed.1
+    );
+
+    // The link comes back as a link, not as a copy of what it points at.
+    assert_eq!(run(&mut env, "rm l.txt").0, 0);
+    assert_eq!(run(&mut env, "git status --short").1, " D l.txt\n");
+    assert_eq!(run(&mut env, "git checkout -- l.txt").0, 0);
+    assert_eq!(run(&mut env, "git status --short").1, "");
+    assert!(run(&mut env, "ls -l l.txt").1.contains("l.txt -> t.txt"));
+
+    // Retargeting it is an ordinary content change.
+    assert_eq!(run(&mut env, "rm l.txt; ln -s other.txt l.txt").0, 0);
+    assert_eq!(run(&mut env, "git status --short").1, " M l.txt\n");
+    let patch = run(&mut env, "git diff").1;
+    assert!(patch.contains("-t.txt"), "{patch}");
+    assert!(patch.contains("+other.txt"), "{patch}");
+}

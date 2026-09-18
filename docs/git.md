@@ -108,12 +108,12 @@ There is no `rebase`, `reflog`, `bisect`, or `worktree`, and no interactive mode
 command. Those report `unsupported subcommand` and exit 2; a name that is not a Git
 subcommand at all is reported the way Git reports a typo and exits 1.
 
-Symbolic links, submodules, and rename detection based on similarity are outside the model: every
-tracked path is a regular file, and `status` and `diff` recognize a rename only when the content
-is byte-identical. The executable bit is the one mode Git records and the one this subset tracks:
-`chmod +x` on a tracked file shows up in `status` and as `old mode`/`new mode` in `diff`, and a
-checkout restores it, so a committed script stays runnable. Annotated tags store a tagger and
-message but are not separate objects.
+Submodules and rename detection based on similarity are outside the model: `status` and `diff`
+recognize a rename only when the content is byte-identical. Modes are tracked as Git tracks them:
+`chmod +x` on a tracked file shows up in `status` and as `old mode`/`new mode` in `diff`, a
+checkout restores it so a committed script stays runnable, and a symbolic link is recorded under
+mode `120000` as a blob holding its target. Annotated tags store a tagger and message but are not
+separate objects.
 
 ## Storage layout
 
@@ -127,7 +127,7 @@ by real Git is not readable, and a repository created here is not meant to be ha
 .git/refs/tags/*       tags
 .git/tags/*.annotation tagger and message for annotated tags
 .git/objects/<sha1>    blob content, addressed by Git's blob hash
-.git/commits/<id>.tree     a commit's tree: path to blob hash, and mode when set
+.git/commits/<id>.tree     a commit's tree: path to blob hash, and mode when not plain
 .git/commits/<id>.commit   a commit's parents, author, timestamp, and message
 .git/config            repository configuration in Git's INI format
 .git/stash-list        saved stash entries, newest first
