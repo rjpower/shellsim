@@ -177,6 +177,19 @@ pub(crate) fn combine(
     ours_label: &str,
     theirs_label: &str,
 ) -> Combined {
+    // A file one side renamed is still the same file, so the other side's change to it belongs
+    // under the new name. Renaming the base and the other side first turns "deleted here,
+    // changed there" back into an ordinary change to one path.
+    let mut base = base.clone();
+    let mut ours = ours.clone();
+    let mut theirs = theirs.clone();
+    for (old, new) in exact_renames(&base, &ours) {
+        carry_rename(&mut base, &mut theirs, &old, &new);
+    }
+    for (old, new) in exact_renames(&base, &theirs) {
+        carry_rename(&mut base, &mut ours, &old, &new);
+    }
+    let (base, ours, theirs) = (&base, &ours, &theirs);
     let mut names: Vec<String> = base.keys().cloned().collect();
     names.extend(ours.keys().cloned());
     names.extend(theirs.keys().cloned());
@@ -256,6 +269,46 @@ pub(crate) fn combine(
         );
     }
     Combined { tree, stages }
+}
+
+/// Paths `side` moved without changing, as `(old name, new name)`.
+///
+/// Only an exact rename is recognised: a file that was also edited as it moved reads as a
+/// deletion and an addition, which is what this subset reports.
+fn exact_renames(base: &Tree, side: &Tree) -> Vec<(String, String)> {
+    let gone: Vec<&String> = base
+        .keys()
+        .filter(|path| !side.contains_key(*path))
+        .collect();
+    let mut fresh: Vec<&String> = side
+        .keys()
+        .filter(|path| !base.contains_key(*path))
+        .collect();
+    let mut found = Vec::new();
+    for old in gone {
+        let moved = fresh
+            .iter()
+            .position(|path| side[*path].hash == base[old].hash);
+        if let Some(at) = moved {
+            found.push((old.clone(), fresh.remove(at).clone()));
+        }
+    }
+    found
+}
+
+/// Follow a rename on the other side of the merge, so both sides name the file the same way.
+fn carry_rename(base: &mut Tree, other: &mut Tree, old: &str, new: &str) {
+    // Only when the other side still knows the file by its old name and has not claimed the new
+    // one; two sides that renamed the same file differently are left as they are.
+    if !other.contains_key(old) || other.contains_key(new) {
+        return;
+    }
+    if let Some(entry) = other.remove(old) {
+        other.insert(new.to_string(), entry);
+    }
+    if let Some(entry) = base.remove(old) {
+        base.insert(new.to_string(), entry);
+    }
 }
 
 /// Record the three sides of a path the merge could not settle.

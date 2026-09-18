@@ -2693,3 +2693,86 @@ fn an_empty_revision_names_what_is_staged() {
         run(&mut env, "git rev-parse HEAD:a.txt").1
     );
 }
+
+#[test]
+fn a_merge_follows_a_file_the_other_side_renamed() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'x\\ny\\nz\\n' > g.txt; echo pad > pad.txt; git add -A; \
+                 git commit -qm c1; git switch -qc side; git mv g.txt gside.txt; \
+                 git commit -qm rename; git switch -q main; printf 'x\\nMOD\\nz\\n' > g.txt; \
+                 git add -A; git commit -qm modify";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    // The edit belongs under the new name; reporting a modify/delete conflict would lose it.
+    let merged = run(&mut env, "git merge --no-edit side");
+    assert_eq!(merged.0, 0, "{}", merged.2);
+    assert_eq!(run(&mut env, "git status --short").1, "");
+    assert_eq!(run(&mut env, "cat gside.txt").1, "x\nMOD\nz\n");
+    assert_eq!(run(&mut env, "test -e g.txt; echo $?").1, "1\n");
+    assert!(
+        merged.1.contains(" rename g.txt => gside.txt (100%)\n"),
+        "{}",
+        merged.1
+    );
+}
+
+#[test]
+fn replaying_a_merge_needs_the_parent_it_is_measured_against() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'a\\n' > f.txt; git add -A; git commit -qm base; \
+                 git switch -qc side; echo s > s.txt; git add -A; git commit -qm s1; \
+                 git switch -q main; echo m > m.txt; git add -A; git commit -qm m1; \
+                 git merge --no-ff --no-edit side";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    assert_eq!(run(&mut env, "git switch -qc later main~1").0, 0);
+    let bare = run(&mut env, "git cherry-pick main");
+    assert_eq!(bare.0, 128, "{}", bare.2);
+    assert!(
+        bare.2.contains("is a merge but no -m option was given"),
+        "{}",
+        bare.2
+    );
+
+    let named = run(&mut env, "git cherry-pick -m 1 main");
+    assert_eq!(named.0, 0, "{}", named.2);
+    assert_eq!(run(&mut env, "cat s.txt").1, "s\n");
+
+    // A plain commit has no parent to choose between.
+    let wrong = run(&mut env, "git cherry-pick -m 1 side");
+    assert_eq!(wrong.0, 128, "{}", wrong.2);
+    assert!(wrong.2.contains("is not a merge"), "{}", wrong.2);
+}
+
+#[test]
+fn a_branch_cannot_be_left_in_the_middle_of_an_operation() {
+    let mut env = Environment::new();
+    let setup = "git init -q; printf 'a\\n' > f.txt; git add -A; git commit -qm base; \
+                 git switch -qc side; printf 'S\\n' > f.txt; git commit -qam s1; \
+                 git switch -q main; printf 'M\\n' > f.txt; git commit -qam m1; \
+                 git switch -qc other; git switch -q main";
+    assert_eq!(run(&mut env, setup).0, 0);
+
+    assert_eq!(run(&mut env, "git merge side").0, 1);
+    let merging = run(&mut env, "git switch other");
+    assert_eq!(merging.0, 128, "{}", merging.2);
+    assert!(
+        merging.2.contains("cannot switch branch while merging"),
+        "{}",
+        merging.2
+    );
+    assert_eq!(run(&mut env, "git merge --abort").0, 0);
+
+    // Even with the conflict settled, the operation itself is still open.
+    assert_eq!(run(&mut env, "git cherry-pick side").0, 1);
+    assert_eq!(run(&mut env, "printf 'R\\n' > f.txt; git add f.txt").0, 0);
+    let picking = run(&mut env, "git switch other");
+    assert_eq!(picking.0, 128, "{}", picking.2);
+    assert!(
+        picking
+            .2
+            .contains("cannot switch branch while cherry-picking"),
+        "{}",
+        picking.2
+    );
+}

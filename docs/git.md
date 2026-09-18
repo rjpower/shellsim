@@ -94,10 +94,15 @@ markers show up in a review and `--diff-filter=U` names the path.
 
 `git cherry-pick` and `git revert` run the same three-way merge with different corners: a
 cherry-pick uses the commit's parent as the base and the commit as the incoming side, and a
-revert swaps those two. Both stop at a conflict, both take `--continue` and `--abort`, and both
-want a settled index first because the commit they make would otherwise fold in whatever was
-already staged. `-n` makes no commit, so it goes ahead and leaves other staged work alone. A
-cherry-pick keeps the original author; a revert does not.
+revert swaps those two. Both stop at a conflict, both take `--continue`, `--skip` and `--abort`,
+and both want a settled index first because the commit they make would otherwise fold in whatever
+was already staged. `-n` makes no commit, so it goes ahead and leaves other staged work alone. A
+cherry-pick keeps the original author; a revert does not. `-m PARENT` names which parent of a
+merge commit the change is measured against, which is what lets a merge be replayed or undone.
+
+Several commits replay as a list. What is left of it is recorded in `.git/SEQUENCER`, so a
+conflict partway through does not lose the rest: `--continue` and `--skip` carry on through the
+remaining commits, and `--abort` undoes the whole run rather than leaving it half applied.
 
 `git stash pop` and `git stash apply` merge the entry back the same way, against the commit it was
 taken from, so work committed or edited in the meantime survives. A plain reapplication restores
@@ -117,8 +122,18 @@ Interactive rebase needs an editor and is refused.
 While a merge, cherry-pick, revert or rebase is unfinished, `git status` names the operation and
 the `--continue`, `--skip`, and `--abort` forms that belong to it.
 
+A file one side renamed without changing it is followed, so the other side's edit lands under
+the new name instead of reading as a deletion of one file and an addition of another. A file that
+was renamed *and* edited is not followed, and two sides that renamed the same file differently
+are left as two files rather than reported as a rename/rename conflict.
+
 Binary files and a path one side deleted while the other changed it are recorded as conflicts
 without markers, leaving the surviving content in the working tree, as Git does.
+
+`checkout`, `switch`, `merge` and `rebase` refuse to write over an untracked file, because
+nothing has recorded it and the content could not be got back. A move between commits keeps what
+was staged rather than replacing the index with the tree it moved to, and no move is allowed
+while a merge, replay or rebase is unfinished.
 
 ## What is not supported
 
@@ -160,6 +175,7 @@ by real Git is not readable, and a repository created here is not meant to be ha
 .git/REVERT_HEAD       the commit an unfinished revert is undoing
 .git/MERGE_MSG         the message that operation will commit
 .git/MERGE_STAGES      the three sides of each unmerged path, as `stage<TAB>hash<TAB>path`
+.git/SEQUENCER         the commits a multi-commit cherry-pick or revert has left to replay
 ```
 
 Trees are flat path maps rather than nested tree objects, and commits are stored uncompressed.

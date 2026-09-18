@@ -359,40 +359,18 @@ fn emit_commit_summary(
     }
     io.out
         .extend_from_slice(compare::summary_line(changed.len(), insertions, deletions).as_bytes());
-    emit_mode_lines(old, new, io);
+    emit_mode_lines(ctx, root, old, new, io);
 }
 
-/// Print the ` create mode` and ` delete mode` lines that follow a change summary.
-fn emit_mode_lines(old: &Tree, new: &Tree, io: &mut Io) {
-    let changed: BTreeSet<&String> = new
-        .keys()
-        .chain(old.keys())
-        .filter(|path| old.get(*path) != new.get(*path))
-        .collect();
-    for path in changed {
-        match (old.get(path), new.get(path)) {
-            (None, Some(entry)) => io
-                .out
-                .extend_from_slice(format!(" create mode {} {path}\n", entry.mode()).as_bytes()),
-            (Some(entry), None) => io
-                .out
-                .extend_from_slice(format!(" delete mode {} {path}\n", entry.mode()).as_bytes()),
-            (Some(before), Some(after)) if before.executable != after.executable => {
-                io.out.extend_from_slice(
-                    format!(
-                        " mode change {} => {} {path}\n",
-                        before.mode(),
-                        after.mode()
-                    )
-                    .as_bytes(),
-                )
-            }
-            _ => {}
-        }
-    }
+/// Print the ` create mode`, ` delete mode` and ` rename` lines that follow a change summary.
+fn emit_mode_lines(ctx: &mut CommandContext<'_>, root: &str, old: &Tree, new: &Tree, io: &mut Io) {
+    let summary = Options {
+        format: Format::Summary,
+        ..Options::default()
+    };
+    compare::emit(ctx, root, old, new, &summary, io);
 }
 
-/// Report that there is nothing staged, using the same wording as `git status`.
 /// Report that nothing is staged, using the same wording as `git status`.
 fn emit_nothing_to_commit(ctx: &mut CommandContext<'_>, io: &mut Io) {
     super::worktree::git_status(ctx, &[], io);
@@ -2387,8 +2365,14 @@ fn unfinished_operation(ctx: &mut CommandContext<'_>, root: &str) -> Option<Stri
                 .to_string(),
         );
     }
-    (!conflict::load_stages(ctx, root).is_empty())
-        .then(|| "error: you need to resolve your current index first\n".to_string())
+    let (kind, doing) = match pending_operation(ctx, root)? {
+        (conflict::REVERT_HEAD, _) => ("revert", "reverting"),
+        (conflict::CHERRY_PICK_HEAD, _) => ("cherry-pick", "cherry-picking"),
+        _ => ("merge", "merging"),
+    };
+    Some(format!(
+        "fatal: cannot switch branch while {doing}\nConsider \"git {kind} --abort\" to give it up.\n"
+    ))
 }
 
 /// Move HEAD to `branch`, saying so unless the caller is only passing through on its way
@@ -2807,7 +2791,7 @@ pub(crate) fn git_merge(
             ..Options::default()
         };
         compare::emit(ctx, &root, &before, &after, &options, io);
-        emit_mode_lines(&before, &after, io);
+        emit_mode_lines(ctx, &root, &before, &after, io);
         return 0;
     }
     if fast_forward_only {
@@ -2881,7 +2865,7 @@ pub(crate) fn git_merge(
         ..Default::default()
     };
     compare::emit(ctx, &root, &head_tree, &merged, &stat, io);
-    emit_mode_lines(&head_tree, &merged, io);
+    emit_mode_lines(ctx, &root, &head_tree, &merged, io);
     0
 }
 
@@ -2904,9 +2888,32 @@ pub(crate) fn git_replay(
         return repo_error(io);
     };
     let mut no_commit = false;
+    let mut mainline: Option<usize> = None;
     let mut operands: Vec<String> = Vec::new();
-    for argument in super::expand_clusters(args, "ne") {
+    let expanded = super::expand_clusters(args, "ne");
+    let mut arguments = expanded.iter();
+    while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            // Replaying a merge means saying which of its parents the change is measured against.
+            "-m" | "--mainline" => {
+                let parsed = arguments
+                    .next()
+                    .and_then(|value| value.parse::<usize>().ok());
+                let Some(parent) = parsed.filter(|parent| *parent > 0) else {
+                    return usage(io, &format!("{name} -m wants a parent number"));
+                };
+                mainline = Some(parent);
+            }
+            value if value.starts_with("-m") && value.len() > 2 => {
+                let Some(parent) = value[2..]
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|parent| *parent > 0)
+                else {
+                    return usage(io, &format!("{name} -m wants a parent number"));
+                };
+                mainline = Some(parent);
+            }
             "-n" | "--no-commit" => no_commit = true,
             "-e" | "--edit" | "--no-edit" | "-q" | "--quiet" => {}
             "--abort" | "--quit" => return abort_sequence(ctx, &root, name, io),
@@ -2934,7 +2941,7 @@ pub(crate) fn git_replay(
         }
     }
     if operands.is_empty() {
-        return usage(io, &format!("usage: git {name} [-n] COMMIT..."));
+        return usage(io, &format!("usage: git {name} [-n] [-m PARENT] COMMIT..."));
     }
     let Some(original) = repo::head_commit(ctx, &root) else {
         io.err
@@ -2958,6 +2965,7 @@ pub(crate) fn git_replay(
         Sequence {
             revert,
             no_commit,
+            mainline,
             original,
             todo,
         },
@@ -2969,6 +2977,8 @@ pub(crate) fn git_replay(
 struct Sequence {
     revert: bool,
     no_commit: bool,
+    /// Which parent of a merge commit the change is measured against, for `-m`.
+    mainline: Option<usize>,
     /// Where HEAD was before the first commit was replayed, which `--abort` returns to.
     original: String,
     /// The commits left to apply, oldest first.
@@ -2986,6 +2996,7 @@ fn load_sequence(interp: &crate::interp::Interp, root: &str) -> Option<Sequence>
     let mut sequence = Sequence {
         revert: false,
         no_commit: false,
+        mainline: None,
         original: String::new(),
         todo: Vec::new(),
     };
@@ -2993,6 +3004,10 @@ fn load_sequence(interp: &crate::interp::Interp, root: &str) -> Option<Sequence>
         match line.split_once(' ') {
             Some(("revert", value)) => sequence.revert = value == "1",
             Some(("nocommit", value)) => sequence.no_commit = value == "1",
+            // A zero means no `-m` was given; parent numbers start at one.
+            Some(("mainline", value)) => {
+                sequence.mainline = value.parse().ok().filter(|parent| *parent > 0)
+            }
             Some(("orig", value)) => sequence.original = value.to_string(),
             Some(("todo", value)) => sequence.todo.push(value.to_string()),
             _ => {}
@@ -3003,9 +3018,10 @@ fn load_sequence(interp: &crate::interp::Interp, root: &str) -> Option<Sequence>
 
 fn store_sequence(ctx: &mut CommandContext<'_>, root: &str, sequence: &Sequence) -> bool {
     let mut text = format!(
-        "revert {}\nnocommit {}\norig {}\n",
+        "revert {}\nnocommit {}\nmainline {}\norig {}\n",
         u8::from(sequence.revert),
         u8::from(sequence.no_commit),
+        sequence.mainline.unwrap_or(0),
         sequence.original
     );
     for id in &sequence.todo {
@@ -3036,6 +3052,7 @@ fn run_sequence(
             name,
             sequence.revert,
             sequence.no_commit,
+            sequence.mainline,
             &id,
             io,
         );
@@ -3098,6 +3115,7 @@ fn replay_one(
     name: &str,
     revert: bool,
     no_commit: bool,
+    mainline: Option<usize>,
     revision: &str,
     io: &mut Io,
 ) -> i32 {
@@ -3120,12 +3138,28 @@ fn replay_one(
             .extend_from_slice(format!("fatal: bad object {revision}\n").as_bytes());
         return 128;
     };
-    if commit.parents.len() > 1 {
+    if commit.parents.len() > 1 && mainline.is_none() {
         io.err.extend_from_slice(
             format!(
                 "error: commit {id} is a merge but no -m option was given.\nfatal: {name} failed\n"
             )
             .as_bytes(),
+        );
+        return 128;
+    }
+    if let Some(parent) = mainline.filter(|_| commit.parents.len() < 2) {
+        io.err.extend_from_slice(
+            format!("error: mainline was specified but commit {id} is not a merge.\nfatal: {name} failed\n")
+                .as_bytes(),
+        );
+        let _ = parent;
+        return 128;
+    }
+    let against = mainline.unwrap_or(1);
+    if against > commit.parents.len() {
+        io.err.extend_from_slice(
+            format!("error: commit {id} does not have parent {against}\nfatal: {name} failed\n")
+                .as_bytes(),
         );
         return 128;
     }
@@ -3137,7 +3171,7 @@ fn replay_one(
     let commit_tree = repo::commit_tree(ctx, root, &id).unwrap_or_default();
     let parent_tree = commit
         .parents
-        .first()
+        .get(against - 1)
         .and_then(|parent| repo::commit_tree(ctx, root, parent))
         .unwrap_or_default();
     let head_tree = repo::commit_tree(ctx, root, &head).unwrap_or_default();
