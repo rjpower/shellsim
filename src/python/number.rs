@@ -6,8 +6,10 @@
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 
+use super::ast::{BinaryOperator, ComparisonOperator};
 use super::heap::{Heap, InstancePayload, Object};
 use super::native::{FromPyValue, PyError, PyResult, PyRuntime, PyValue};
+use super::ValueTag;
 
 /// Borrowed numeric payload used by VM protocols without exposing physical value tags.
 #[derive(Clone, Copy, Debug)]
@@ -158,22 +160,6 @@ impl PyNumber {
     }
 }
 
-#[derive(Clone, Copy)]
-enum NumericOperation {
-    Add,
-    Subtract,
-    Multiply,
-    Power,
-    Divide,
-    FloorDivide,
-    Remainder,
-    LeftShift,
-    RightShift,
-    BitwiseAnd,
-    BitwiseXor,
-    BitwiseOr,
-}
-
 pub(super) fn slot_positive(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
@@ -207,7 +193,7 @@ pub(super) fn slot_add(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::Add)
+    slot_binary(runtime, left, right, BinaryOperator::Add)
 }
 
 pub(super) fn slot_subtract(
@@ -215,7 +201,7 @@ pub(super) fn slot_subtract(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::Subtract)
+    slot_binary(runtime, left, right, BinaryOperator::Subtract)
 }
 
 pub(super) fn slot_reflected_subtract(
@@ -223,7 +209,7 @@ pub(super) fn slot_reflected_subtract(
     right: PyValue,
     left: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::Subtract)
+    slot_binary(runtime, left, right, BinaryOperator::Subtract)
 }
 
 pub(super) fn slot_multiply(
@@ -231,7 +217,7 @@ pub(super) fn slot_multiply(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::Multiply)
+    slot_binary(runtime, left, right, BinaryOperator::Multiply)
 }
 
 pub(super) fn slot_power(
@@ -239,7 +225,7 @@ pub(super) fn slot_power(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::Power)
+    slot_binary(runtime, left, right, BinaryOperator::Power)
 }
 
 pub(super) fn slot_reflected_power(
@@ -247,7 +233,7 @@ pub(super) fn slot_reflected_power(
     right: PyValue,
     left: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::Power)
+    slot_binary(runtime, left, right, BinaryOperator::Power)
 }
 
 pub(super) fn slot_divide(
@@ -255,7 +241,7 @@ pub(super) fn slot_divide(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::Divide)
+    slot_binary(runtime, left, right, BinaryOperator::Divide)
 }
 
 pub(super) fn slot_reflected_divide(
@@ -263,7 +249,7 @@ pub(super) fn slot_reflected_divide(
     right: PyValue,
     left: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::Divide)
+    slot_binary(runtime, left, right, BinaryOperator::Divide)
 }
 
 pub(super) fn slot_floor_divide(
@@ -271,7 +257,7 @@ pub(super) fn slot_floor_divide(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::FloorDivide)
+    slot_binary(runtime, left, right, BinaryOperator::FloorDivide)
 }
 
 pub(super) fn slot_reflected_floor_divide(
@@ -279,7 +265,7 @@ pub(super) fn slot_reflected_floor_divide(
     right: PyValue,
     left: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::FloorDivide)
+    slot_binary(runtime, left, right, BinaryOperator::FloorDivide)
 }
 
 pub(super) fn slot_remainder(
@@ -287,7 +273,7 @@ pub(super) fn slot_remainder(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::Remainder)
+    slot_binary(runtime, left, right, BinaryOperator::Remainder)
 }
 
 pub(super) fn slot_reflected_remainder(
@@ -295,7 +281,7 @@ pub(super) fn slot_reflected_remainder(
     right: PyValue,
     left: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::Remainder)
+    slot_binary(runtime, left, right, BinaryOperator::Remainder)
 }
 
 pub(super) fn slot_bitwise_and(
@@ -303,7 +289,7 @@ pub(super) fn slot_bitwise_and(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::BitwiseAnd)
+    slot_binary(runtime, left, right, BinaryOperator::BitwiseAnd)
 }
 
 pub(super) fn slot_left_shift(
@@ -311,7 +297,7 @@ pub(super) fn slot_left_shift(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::LeftShift)
+    slot_binary(runtime, left, right, BinaryOperator::LeftShift)
 }
 
 pub(super) fn slot_right_shift(
@@ -319,7 +305,7 @@ pub(super) fn slot_right_shift(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::RightShift)
+    slot_binary(runtime, left, right, BinaryOperator::RightShift)
 }
 
 pub(super) fn slot_bitwise_xor(
@@ -327,7 +313,7 @@ pub(super) fn slot_bitwise_xor(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::BitwiseXor)
+    slot_binary(runtime, left, right, BinaryOperator::BitwiseXor)
 }
 
 pub(super) fn slot_bitwise_or(
@@ -335,14 +321,69 @@ pub(super) fn slot_bitwise_or(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    slot_binary(runtime, left, right, NumericOperation::BitwiseOr)
+    slot_binary(runtime, left, right, BinaryOperator::BitwiseOr)
+}
+
+/// Run a builtin numeric operation without consulting Python type slots.
+///
+/// Only values whose physical representation proves they are exact builtin integers, booleans,
+/// or floats enter this path. Heap-backed subclasses and registered value kinds return `None` and
+/// retain normal reflected-operation dispatch.
+#[inline]
+pub(super) fn exact_binary(
+    runtime: &mut dyn PyRuntime,
+    operation: BinaryOperator,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    if matches!(operation, BinaryOperator::MatrixMultiply) {
+        return Ok(None);
+    }
+    if let (Some(left), Some(right)) = (exact_integer(left), exact_integer(right)) {
+        if let Some(result) = immediate_integer_binary(operation, left, right) {
+            return Ok(Some(PyValue::Int(result)));
+        }
+    }
+    let Some(left) = exact_number(left) else {
+        return Ok(None);
+    };
+    let Some(right) = exact_number(right) else {
+        return Ok(None);
+    };
+    binary_numbers(runtime, left, right, operation)
+}
+
+/// Compare exact immediate integers and booleans without invoking their builtin slots.
+///
+/// Float and heap-backed integer comparison stays on the general protocol path, which owns NaN
+/// and arbitrary-precision ordering semantics.
+#[inline]
+pub(super) fn exact_integer_comparison(
+    operation: ComparisonOperator,
+    left: PyValue,
+    right: PyValue,
+) -> Option<bool> {
+    let left = exact_integer(left)?;
+    let right = exact_integer(right)?;
+    Some(match operation {
+        ComparisonOperator::Equal => left == right,
+        ComparisonOperator::NotEqual => left != right,
+        ComparisonOperator::Less => left < right,
+        ComparisonOperator::LessEqual => left <= right,
+        ComparisonOperator::Greater => left > right,
+        ComparisonOperator::GreaterEqual => left >= right,
+        ComparisonOperator::In
+        | ComparisonOperator::NotIn
+        | ComparisonOperator::Is
+        | ComparisonOperator::IsNot => return None,
+    })
 }
 
 fn slot_binary(
     runtime: &mut dyn PyRuntime,
     left: PyValue,
     right: PyValue,
-    operation: NumericOperation,
+    operation: BinaryOperator,
 ) -> PyResult<Option<PyValue>> {
     let Some(left) = try_number(runtime, left)? else {
         return Ok(None);
@@ -350,14 +391,24 @@ fn slot_binary(
     let Some(right) = try_number(runtime, right)? else {
         return Ok(None);
     };
+    binary_numbers(runtime, left, right, operation)
+}
+
+fn binary_numbers(
+    runtime: &mut dyn PyRuntime,
+    left: PyNumber,
+    right: PyNumber,
+    operation: BinaryOperator,
+) -> PyResult<Option<PyValue>> {
     if matches!(left, PyNumber::Float(_)) || matches!(right, PyNumber::Float(_)) {
         if matches!(
             operation,
-            NumericOperation::BitwiseAnd
-                | NumericOperation::BitwiseXor
-                | NumericOperation::BitwiseOr
-                | NumericOperation::LeftShift
-                | NumericOperation::RightShift
+            BinaryOperator::BitwiseAnd
+                | BinaryOperator::BitwiseXor
+                | BinaryOperator::BitwiseOr
+                | BinaryOperator::LeftShift
+                | BinaryOperator::RightShift
+                | BinaryOperator::MatrixMultiply
         ) {
             return Ok(None);
         }
@@ -365,11 +416,11 @@ fn slot_binary(
         let right = right.into_f64()?;
         if matches!(
             operation,
-            NumericOperation::Divide | NumericOperation::FloorDivide | NumericOperation::Remainder
+            BinaryOperator::Divide | BinaryOperator::FloorDivide | BinaryOperator::Remainder
         ) && right == 0.0
         {
             return Err(PyError::zero_division_error(
-                if matches!(operation, NumericOperation::Divide) {
+                if matches!(operation, BinaryOperator::Divide) {
                     "division by zero"
                 } else {
                     "float division or modulo by zero"
@@ -377,10 +428,10 @@ fn slot_binary(
             ));
         }
         return Ok(Some(PyValue::Float(match operation {
-            NumericOperation::Add => left + right,
-            NumericOperation::Subtract => left - right,
-            NumericOperation::Multiply => left * right,
-            NumericOperation::Power => {
+            BinaryOperator::Add => left + right,
+            BinaryOperator::Subtract => left - right,
+            BinaryOperator::Multiply => left * right,
+            BinaryOperator::Power => {
                 if left == 0.0 && right < 0.0 {
                     return Err(PyError::zero_division_error(
                         "0.0 cannot be raised to a negative power",
@@ -394,18 +445,21 @@ fn slot_binary(
                 }
                 value
             }
-            NumericOperation::Divide => left / right,
-            NumericOperation::FloorDivide => (left / right).floor(),
-            NumericOperation::Remainder => left - (left / right).floor() * right,
-            NumericOperation::BitwiseAnd
-            | NumericOperation::BitwiseXor
-            | NumericOperation::BitwiseOr
-            | NumericOperation::LeftShift
-            | NumericOperation::RightShift => unreachable!("integer-only operation rejected above"),
+            BinaryOperator::Divide => left / right,
+            BinaryOperator::FloorDivide => (left / right).floor(),
+            BinaryOperator::Remainder => left - (left / right).floor() * right,
+            BinaryOperator::BitwiseAnd
+            | BinaryOperator::BitwiseXor
+            | BinaryOperator::BitwiseOr
+            | BinaryOperator::LeftShift
+            | BinaryOperator::RightShift
+            | BinaryOperator::MatrixMultiply => {
+                unreachable!("integer-only operation rejected above")
+            }
         })));
     }
 
-    if matches!(operation, NumericOperation::Divide) {
+    if matches!(operation, BinaryOperator::Divide) {
         let left = left.into_f64()?;
         let right = right.into_f64()?;
         if right == 0.0 {
@@ -413,7 +467,7 @@ fn slot_binary(
         }
         return Ok(Some(PyValue::Float(left / right)));
     }
-    if matches!(operation, NumericOperation::Power) {
+    if matches!(operation, BinaryOperator::Power) {
         let exponent = integer_decimal(right)
             .parse::<BigInt>()
             .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
@@ -449,7 +503,7 @@ fn slot_binary(
     }
     if matches!(
         operation,
-        NumericOperation::LeftShift | NumericOperation::RightShift
+        BinaryOperator::LeftShift | BinaryOperator::RightShift
     ) {
         let shift = integer_decimal(right)
             .parse::<BigInt>()
@@ -471,7 +525,7 @@ fn slot_binary(
         let left = left
             .parse::<BigInt>()
             .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
-        let result = if matches!(operation, NumericOperation::LeftShift) {
+        let result = if matches!(operation, BinaryOperator::LeftShift) {
             left << shift
         } else {
             left >> shift
@@ -479,21 +533,7 @@ fn slot_binary(
         return runtime.new_integer(&result.to_string()).map(Some);
     }
     if let (PyNumber::Int(left), PyNumber::Int(right)) = (&left, &right) {
-        let result = match operation {
-            NumericOperation::Add => left.checked_add(*right),
-            NumericOperation::Subtract => left.checked_sub(*right),
-            NumericOperation::Multiply => left.checked_mul(*right),
-            NumericOperation::Power => unreachable!("power returned above"),
-            NumericOperation::Divide => unreachable!("division returned above"),
-            NumericOperation::FloorDivide | NumericOperation::Remainder => None,
-            NumericOperation::LeftShift | NumericOperation::RightShift => {
-                unreachable!("shifts returned above")
-            }
-            NumericOperation::BitwiseAnd => Some(*left & *right),
-            NumericOperation::BitwiseXor => Some(*left ^ *right),
-            NumericOperation::BitwiseOr => Some(*left | *right),
-        };
-        if let Some(result) = result {
+        if let Some(result) = immediate_integer_binary(operation, *left, *right) {
             return Ok(Some(PyValue::Int(result)));
         }
     }
@@ -506,20 +546,21 @@ fn slot_binary(
         .ok_or_else(|| PyError::resource_error("integer operation is too large"))?;
     runtime.charge_cpu(u64::try_from(work).unwrap_or(u64::MAX))?;
     let result_bound = match operation {
-        NumericOperation::Add
-        | NumericOperation::Subtract
-        | NumericOperation::BitwiseAnd
-        | NumericOperation::BitwiseXor
-        | NumericOperation::BitwiseOr => left.len().max(right.len()).saturating_add(2),
-        NumericOperation::Multiply => work.saturating_add(1),
-        NumericOperation::Power => unreachable!("power returned above"),
-        NumericOperation::LeftShift | NumericOperation::RightShift => {
+        BinaryOperator::Add
+        | BinaryOperator::Subtract
+        | BinaryOperator::BitwiseAnd
+        | BinaryOperator::BitwiseXor
+        | BinaryOperator::BitwiseOr => left.len().max(right.len()).saturating_add(2),
+        BinaryOperator::Multiply => work.saturating_add(1),
+        BinaryOperator::Power => unreachable!("power returned above"),
+        BinaryOperator::LeftShift | BinaryOperator::RightShift => {
             unreachable!("shifts returned above")
         }
-        NumericOperation::FloorDivide | NumericOperation::Remainder => {
+        BinaryOperator::FloorDivide | BinaryOperator::Remainder => {
             left.len().max(right.len()).saturating_add(2)
         }
-        NumericOperation::Divide => unreachable!("division returned above"),
+        BinaryOperator::Divide => unreachable!("division returned above"),
+        BinaryOperator::MatrixMultiply => return Ok(None),
     };
     runtime.reserve_memory(result_bound)?;
     let left = left
@@ -531,7 +572,7 @@ fn slot_binary(
     if right.is_zero()
         && matches!(
             operation,
-            NumericOperation::FloorDivide | NumericOperation::Remainder
+            BinaryOperator::FloorDivide | BinaryOperator::Remainder
         )
     {
         return Err(PyError::zero_division_error(
@@ -539,24 +580,65 @@ fn slot_binary(
         ));
     }
     let result = match operation {
-        NumericOperation::Add => left + right,
-        NumericOperation::Subtract => left - right,
-        NumericOperation::Multiply => left * right,
-        NumericOperation::Power => unreachable!("power returned above"),
-        NumericOperation::LeftShift | NumericOperation::RightShift => {
+        BinaryOperator::Add => left + right,
+        BinaryOperator::Subtract => left - right,
+        BinaryOperator::Multiply => left * right,
+        BinaryOperator::Power => unreachable!("power returned above"),
+        BinaryOperator::LeftShift | BinaryOperator::RightShift => {
             unreachable!("shifts returned above")
         }
-        NumericOperation::Divide => unreachable!("division returned above"),
-        NumericOperation::FloorDivide => bigint_floor_div(&left, &right),
-        NumericOperation::Remainder => {
+        BinaryOperator::Divide => unreachable!("division returned above"),
+        BinaryOperator::FloorDivide => bigint_floor_div(&left, &right),
+        BinaryOperator::Remainder => {
             let quotient = bigint_floor_div(&left, &right);
             left - quotient * right
         }
-        NumericOperation::BitwiseAnd => left & right,
-        NumericOperation::BitwiseXor => left ^ right,
-        NumericOperation::BitwiseOr => left | right,
+        BinaryOperator::BitwiseAnd => left & right,
+        BinaryOperator::BitwiseXor => left ^ right,
+        BinaryOperator::BitwiseOr => left | right,
+        BinaryOperator::MatrixMultiply => unreachable!("matrix multiplication returned above"),
     };
     runtime.new_integer(&result.to_string()).map(Some)
+}
+
+#[inline]
+fn exact_number(value: PyValue) -> Option<PyNumber> {
+    match value.tag() {
+        ValueTag::Int | ValueTag::Bool => Some(PyNumber::Int(
+            value.immediate_int().expect("integer tag checked"),
+        )),
+        ValueTag::Float => Some(PyNumber::Float(
+            value.float_value().expect("float tag checked"),
+        )),
+        _ => None,
+    }
+}
+
+#[inline]
+fn exact_integer(value: PyValue) -> Option<i64> {
+    match value.tag() {
+        ValueTag::Int | ValueTag::Bool => value.immediate_int(),
+        _ => None,
+    }
+}
+
+#[inline]
+fn immediate_integer_binary(operation: BinaryOperator, left: i64, right: i64) -> Option<i64> {
+    match operation {
+        BinaryOperator::Add => left.checked_add(right),
+        BinaryOperator::Subtract => left.checked_sub(right),
+        BinaryOperator::Multiply => left.checked_mul(right),
+        BinaryOperator::BitwiseAnd => Some(left & right),
+        BinaryOperator::BitwiseXor => Some(left ^ right),
+        BinaryOperator::BitwiseOr => Some(left | right),
+        BinaryOperator::MatrixMultiply
+        | BinaryOperator::Power
+        | BinaryOperator::Divide
+        | BinaryOperator::FloorDivide
+        | BinaryOperator::Remainder
+        | BinaryOperator::LeftShift
+        | BinaryOperator::RightShift => None,
+    }
 }
 
 #[derive(Clone, Copy)]

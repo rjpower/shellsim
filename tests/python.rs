@@ -23,6 +23,8 @@ mod generators;
 mod language;
 #[path = "python/numeric_literals.rs"]
 mod numeric_literals;
+#[path = "python/numeric_lookaside.rs"]
+mod numeric_lookaside;
 #[path = "python/numpy.rs"]
 mod numpy;
 #[path = "python/object_model.rs"]
