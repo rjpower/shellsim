@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use crate::commands::{CommandContext, Io};
 use crate::vfs::resolve_against;
 
+use super::diff;
 use super::ignore;
 use super::repo;
 use super::{repo_error, usage};
@@ -807,4 +808,296 @@ pub(crate) fn expand_ref_format(format: &str, name: &str, commit: &str) -> Optio
     }
     out.push_str(rest);
     Some(out)
+}
+
+// -- blame ---------------------------------------------------------------------------------------
+
+/// The most commits `git blame` will walk back through for one file.
+const MAX_BLAME_COMMITS: usize = 2000;
+
+/// Attribute each line of a file to the commit that last changed it.
+///
+/// The walk starts at the requested revision and follows first parents. At each step the parent's
+/// version of the file is diffed against the child's: a line both versions keep carries on to the
+/// parent, and a line only the child has belongs to the child. Whatever is left when the file runs
+/// out of history belongs to the commit that introduced it.
+pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(ctx) else {
+        return repo_error(io);
+    };
+    let mut suppress = false;
+    let mut range: Option<String> = None;
+    let mut operands: Vec<String> = Vec::new();
+    let mut options = true;
+    let expanded = super::expand_clusters(args, "slwe");
+    let mut index = 0;
+    while index < expanded.len() {
+        let argument = expanded[index].as_str();
+        match argument {
+            "--" if options => options = false,
+            "-s" if options => suppress = true,
+            // Blame here has no similarity detection or whitespace modes to turn on.
+            "-l" | "-w" | "-e" | "--show-email" | "--root" if options => {}
+            "-L" if options => {
+                index += 1;
+                let Some(value) = expanded.get(index) else {
+                    return usage(io, "-L requires a line range");
+                };
+                range = Some(value.clone());
+            }
+            value if options && value.starts_with("-L") && value.len() > 2 => {
+                range = Some(value[2..].to_string());
+            }
+            value if options && value.starts_with('-') => {
+                return usage(io, &format!("unsupported blame option: {value}"))
+            }
+            value => operands.push(value.to_string()),
+        }
+        index += 1;
+    }
+    // The file is the operand that names one; anything else is the revision to start from.
+    let Some(position) = operands
+        .iter()
+        .rposition(|operand| super::names_a_path(ctx, &root, operand))
+    else {
+        return usage(io, "usage: git blame [-s] [-L RANGE] [REVISION] FILE");
+    };
+    let file = operands.remove(position);
+    let revision = operands
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "HEAD".to_string());
+    let Some(start) = repo::resolve_revision(ctx, &root, &revision) else {
+        return super::ambiguous_argument(io, &revision);
+    };
+    let path = super::pathspec(&ctx.cwd, &root, &file);
+    let tip = repo::commit_tree(ctx, &root, &start).unwrap_or_default();
+    let Some(content) = tip
+        .get(&path)
+        .and_then(|entry| repo::read_blob(ctx, &root, &entry.hash))
+    else {
+        io.err
+            .extend_from_slice(format!("fatal: no such path {file} in {revision}\n").as_bytes());
+        return 128;
+    };
+    // Blaming the checked-out file, as Git does, means a local edit shows up as uncommitted work.
+    let pending = (operands.is_empty() || revision == "HEAD")
+        .then(|| repo::read_work_file(ctx, &root, &path))
+        .flatten()
+        .filter(|work| *work != content);
+    let content = pending.clone().unwrap_or(content);
+    let lines: Vec<String> = diff::split_lines(&content)
+        .into_iter()
+        .map(|line| line.trim_end_matches('\n').to_string())
+        .collect();
+    if !ctx.charge_cpu((lines.len() as u64).saturating_mul(64)) {
+        return repo::resource_error(ctx);
+    }
+    let stored = pending.map(|_| tip[&path].hash.clone());
+    let Some(origins) = trace_lines(ctx, &root, &start, &path, &content, stored, lines.len())
+    else {
+        return repo::resource_error(ctx);
+    };
+    emit_blame(ctx, &root, &lines, &origins, range.as_deref(), suppress, io)
+}
+
+/// The name blame gives lines that are only in the working tree.
+const UNCOMMITTED: &str = "0000000000000000000000000000000000000000";
+
+/// Carry each line of `new` back to `old`, claiming for `commit` the lines `old` does not have.
+///
+/// Returns the mapping for `old`: the line of the file as it is now that each of its lines became.
+fn carry_lines(
+    old: &[u8],
+    new: &[u8],
+    mapping: &[usize],
+    commit: &str,
+    origins: &mut [Option<Origin>],
+) -> Vec<usize> {
+    let old_lines = diff::split_lines(old);
+    let new_lines = diff::split_lines(new);
+    let mut carried = Vec::with_capacity(old_lines.len());
+    let mut at = 0;
+    for edit in diff::edit_script(&old_lines, &new_lines) {
+        match edit.op {
+            diff::Op::Keep => {
+                carried.push(mapping[at]);
+                at += 1;
+            }
+            diff::Op::Insert => {
+                origins[mapping[at]].get_or_insert(Origin {
+                    commit: commit.to_string(),
+                    boundary: false,
+                });
+                at += 1;
+            }
+            diff::Op::Delete => {}
+        }
+    }
+    carried
+}
+
+/// The commit each line came from, and whether that commit is where the walk stopped.
+struct Origin {
+    commit: String,
+    boundary: bool,
+}
+
+fn trace_lines(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    start: &str,
+    path: &str,
+    content: &[u8],
+    // The blob the starting commit holds, when the working tree has moved on from it.
+    stored: Option<String>,
+    count: usize,
+) -> Option<Vec<Origin>> {
+    let mut origins: Vec<Option<Origin>> = (0..count).map(|_| None).collect();
+    // Which line of the file as it is now each line of the version being examined became.
+    let mut mapping: Vec<usize> = (0..count).collect();
+    let mut current = start.to_string();
+    let mut current_content = content.to_vec();
+    if let Some(hash) = stored {
+        let committed = repo::read_blob(ctx, root, &hash)?;
+        mapping = carry_lines(
+            &committed,
+            &current_content,
+            &mapping,
+            UNCOMMITTED,
+            &mut origins,
+        );
+        current_content = committed;
+    }
+    for _ in 0..MAX_BLAME_COMMITS {
+        let commit = repo::load_commit(ctx, root, &current)?;
+        let parent_content = commit
+            .parents
+            .first()
+            .and_then(|parent| repo::commit_tree(ctx, root, parent))
+            .and_then(|tree| tree.get(path).cloned())
+            .and_then(|entry| repo::read_blob(ctx, root, &entry.hash));
+        let Some(parent_content) = parent_content else {
+            // The file starts here, so every line still unclaimed is this commit's.
+            for slot in mapping {
+                origins[slot].get_or_insert(Origin {
+                    commit: current.clone(),
+                    boundary: true,
+                });
+            }
+            break;
+        };
+        if !ctx.charge_cpu((current_content.len() + parent_content.len()) as u64) {
+            return None;
+        }
+        let carried = carry_lines(
+            &parent_content,
+            &current_content,
+            &mapping,
+            &current,
+            &mut origins,
+        );
+        if carried.is_empty() {
+            break;
+        }
+        current = commit.parents.first().cloned()?;
+        current_content = parent_content;
+        mapping = carried;
+    }
+    // A walk that ran out of room still has to name something for the lines it did not reach.
+    Some(
+        origins
+            .into_iter()
+            .map(|origin| {
+                origin.unwrap_or(Origin {
+                    commit: current.clone(),
+                    boundary: true,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn emit_blame(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    lines: &[String],
+    origins: &[Origin],
+    range: Option<&str>,
+    suppress: bool,
+    io: &mut Io,
+) -> i32 {
+    let (from, to) = match range {
+        Some(range) => match parse_line_range(range, lines.len()) {
+            Some(bounds) => bounds,
+            None => return usage(io, &format!("unsupported line range: {range}")),
+        },
+        None => (1, lines.len()),
+    };
+    let width = lines.len().to_string().len();
+    // Git lines the columns up by padding every author name to the widest one shown.
+    let author_width = (from..=to)
+        .filter_map(|number| origins.get(number - 1))
+        .map(|origin| author_of(ctx, root, origin).len())
+        .max()
+        .unwrap_or(0);
+    for number in from..=to {
+        let Some(line) = lines.get(number - 1) else {
+            break;
+        };
+        let origin = &origins[number - 1];
+        // A boundary commit is marked with `^`, which takes the place of a hash digit.
+        let name = if origin.boundary {
+            format!("^{}", &origin.commit[..7])
+        } else {
+            origin.commit[..8].to_string()
+        };
+        let described = if suppress {
+            String::new()
+        } else {
+            let author = author_of(ctx, root, origin);
+            let when = match repo::load_commit(ctx, root, &origin.commit) {
+                Some(commit) => commit.timestamp,
+                // Work that is not committed yet is dated now, as Git dates it.
+                None => super::history::now_seconds(ctx),
+            };
+            format!(
+                "({author:<author_width$} {} ",
+                super::history::stamp(when, "%Y-%m-%d %H:%M:%S +0000")
+            )
+        };
+        let close = if suppress { "" } else { ")" };
+        io.out.extend_from_slice(
+            format!(
+                "{name} {described}{number:>width$}{close}{}{line}\n",
+                if suppress { ") " } else { " " }
+            )
+            .as_bytes(),
+        );
+    }
+    0
+}
+
+/// The name shown for the commit a line came from.
+fn author_of(ctx: &CommandContext<'_>, root: &str, origin: &Origin) -> String {
+    match repo::load_commit(ctx, root, &origin.commit) {
+        Some(commit) => commit.author_name,
+        None => "Not Committed Yet".to_string(),
+    }
+}
+
+/// Parse the `START,END` forms `-L` accepts, where either side may be left out.
+fn parse_line_range(range: &str, total: usize) -> Option<(usize, usize)> {
+    let (start, end) = range.split_once(',').unwrap_or((range, range));
+    let start = if start.is_empty() {
+        1
+    } else {
+        start.parse().ok()?
+    };
+    let end = if end.is_empty() {
+        total
+    } else {
+        end.parse().ok()?
+    };
+    (start >= 1 && start <= end).then_some((start, end.min(total)))
 }

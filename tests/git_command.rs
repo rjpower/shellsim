@@ -1772,3 +1772,38 @@ fn log_graph_draws_a_branch_and_the_merge_that_closes_it() {
         .1
         .contains("| * "));
 }
+
+#[test]
+fn blame_attributes_each_line_to_the_commit_that_wrote_it() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f", b"one\ntwo\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    env.vfs
+        .put_file("/f", b"one\nTWO\nthree\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -qam next").0, 0);
+    let base = run(&mut env, "git rev-parse HEAD~1").1;
+    let next = run(&mut env, "git rev-parse HEAD").1;
+    // The first commit is a boundary, which Git marks with `^` in place of a hash digit.
+    assert_eq!(
+        run(&mut env, "git blame -s f").1,
+        format!(
+            "^{} 1) one\n{next} 2) TWO\n{next} 3) three\n",
+            &base[..7],
+            next = &next[..8]
+        )
+    );
+    assert!(run(&mut env, "git blame f").1.contains("(shellsim "));
+    assert_eq!(run(&mut env, "git blame -L3,3 f").1.lines().count(), 1);
+
+    // An edit that is not committed yet is attributed to nobody.
+    env.vfs
+        .put_file("/f", b"one\nTWO\nthree\nfour\n".to_vec(), 0o644)
+        .unwrap();
+    let pending = run(&mut env, "git blame f").1;
+    assert!(pending.contains("00000000 (Not Committed Yet"), "{pending}");
+    assert!(pending.trim_end().ends_with("four"), "{pending}");
+}

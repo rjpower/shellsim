@@ -12,10 +12,12 @@ init  status  add  rm  mv  restore  reset  clean  ls-files
 commit  log  show  diff  apply  rev-parse  rev-list  branch  tag  switch  checkout  merge
 cherry-pick  revert  config  remote  stash  grep  cat-file  hash-object  ls-tree  check-ignore
 merge-base
-describe  shortlog  show-ref  symbolic-ref  for-each-ref
+describe  shortlog  show-ref  symbolic-ref  for-each-ref  blame
 ```
 
-`git log --graph` draws the branch rail, with connectors on lines of their own rather than folded
+`git blame` walks first parents, carrying each line back until the version that introduced it,
+and marks lines the working tree has not committed with a zero hash. `git log --graph` draws the
+branch rail, with connectors on lines of their own rather than folded
 into the commit header the way Git does it.
 
 Aliases recorded in configuration are expanded, so `git config alias.st "status --short"`
@@ -87,7 +89,7 @@ without markers, leaving the surviving content in the working tree, as Git does.
 Anything needing a network is refused and recorded as unsupported: `clone`, `fetch`, `pull`,
 `push`, `ls-remote`, and `submodule`. `git remote` records remote names but never contacts one.
 
-There is no `rebase`, `reflog`, `bisect`, `blame`, or `worktree`, and no interactive mode for any
+There is no `rebase`, `reflog`, `bisect`, or `worktree`, and no interactive mode for any
 command. Those report `unsupported subcommand` and exit 2; a name that is not a Git
 subcommand at all is reported the way Git reports a typo and exits 1.
 

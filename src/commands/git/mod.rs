@@ -84,7 +84,6 @@ const QUIET_COMMANDS: &[&str] = &[
 const UNSUPPORTED_COMMANDS: &[&str] = &[
     "am",
     "bisect",
-    "blame",
     "bundle",
     "filter-branch",
     "gc",
@@ -357,6 +356,7 @@ fn dispatch(
         "tag" => history::git_tag(ctx, globals, args, io),
         "switch" => history::git_switch(ctx, args, io),
         "checkout" => history::git_checkout(ctx, args, io),
+        "blame" => plumbing::git_blame(ctx, args, io),
         "merge" => history::git_merge(ctx, globals, args, io),
         "cherry-pick" => history::git_replay(ctx, globals, false, args, io),
         "revert" => history::git_replay(ctx, globals, true, args, io),

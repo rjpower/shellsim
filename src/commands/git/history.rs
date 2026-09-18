@@ -24,7 +24,7 @@ fn author_identity(
     super::config::identity(ctx, root, globals)
 }
 
-fn now_seconds(ctx: &CommandContext<'_>) -> i64 {
+pub(crate) fn now_seconds(ctx: &CommandContext<'_>) -> i64 {
     ctx.clock
         .wall_time_seconds_floor()
         .ok()
@@ -520,7 +520,7 @@ fn indent(message: &str) -> String {
 }
 
 /// Render a timestamp in one of the formats Git's placeholders use.
-fn stamp(timestamp: i64, format: &str) -> String {
+pub(crate) fn stamp(timestamp: i64, format: &str) -> String {
     crate::commands::proc::format_date(i128::from(timestamp) * 1_000_000_000, format)
         .unwrap_or_else(|_| timestamp.to_string())
 }
