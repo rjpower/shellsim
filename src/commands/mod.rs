@@ -370,6 +370,9 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
         return false;
     };
     let command = standard_utility_name(requested).unwrap_or(requested);
+    if command == "git" {
+        return git::reads_standard_input(&argv[1..]);
+    }
     matches!(
         command,
         "apply_patch"

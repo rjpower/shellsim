@@ -92,6 +92,7 @@ src/shell.rs           shell lexer and parser
 src/expand.rs          shell expansion
 src/exec.rs            cooperative shell execution
 src/commands/          modeled command implementations
+src/commands/git/      Git porcelain subset over the VFS (see docs/git.md)
 src/python/            Python source runtime and selected modules
 src/harness.rs         persistent agent-session protocol
 src/host_ingest.rs     trusted startup-only project import
