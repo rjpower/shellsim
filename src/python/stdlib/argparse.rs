@@ -7,8 +7,8 @@
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyArgumentParser,
-    PyArgumentParserData, PyArgumentSpec, PyError, PyKind, PyMarker, PyResult, PyRuntime, PyString,
+    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, OwnedPyString, PyArgumentParser,
+    PyArgumentParserData, PyArgumentSpec, PyError, PyKind, PyMarker, PyResult, PyRuntime,
     PySubcommandSpec, PySubparsersSpec, PyValueCast,
 };
 
@@ -105,7 +105,7 @@ fn add_argument(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) ->
         .positional()
         .iter()
         .copied()
-        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
         .collect::<PyResult<Vec<_>>>()?;
     let optional = names.iter().any(|name| name.starts_with('-'));
     let dest = optional_string(runtime, &args, "add_argument", "dest")?.unwrap_or_else(|| {
@@ -198,7 +198,7 @@ fn add_parser(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> P
     args.expect_positional("add_parser", 1, 1)?;
     args.reject_unknown_keywords("add_parser", &["help", "description", "add_help"])?;
     let parent = receiver.cast::<PyArgumentParser>(runtime)?;
-    let PyString(name) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
     let help = optional_string(runtime, &args, "add_parser", "help")?;
     let description = optional_string(runtime, &args, "add_parser", "description")?;
     let add_help = boolean_keyword(runtime, &args, "add_parser", "add_help", true)?;
@@ -267,7 +267,7 @@ fn input_arguments(runtime: &mut dyn PyRuntime, args: &CallArgs) -> PyResult<Vec
     let iterator = runtime.iterator(*value)?;
     let mut input = Vec::new();
     while let Some(value) = runtime.iterator_next(iterator)? {
-        input.push(value.cast::<PyString>(runtime)?.0);
+        input.push(value.cast::<OwnedPyString>(runtime)?.0);
     }
     Ok(input)
 }
@@ -633,7 +633,7 @@ fn optional_string(
 ) -> PyResult<Option<String>> {
     args.keyword(operation, keyword)?
         .copied()
-        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
         .transpose()
 }
 

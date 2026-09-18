@@ -100,6 +100,25 @@ fn iterable_materialization_is_metered_before_host_growth() {
 }
 
 #[test]
+fn direct_list_growth_does_not_require_a_full_container_snapshot() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "items = []\nfor value in range(3000):\n    items.append(value)\nprint(len(items))",
+        Limits {
+            memory: 128 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(
+        status,
+        0,
+        "stderr={} usage={usage:?}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"3000\n");
+    assert!(usage.memory_peak <= 128 * 1024);
+}
+
+#[test]
 fn json_dumps_has_a_preallocation_bound() {
     let (status, stdout, stderr, usage) = run_with_limits(
         "import json; print(json.dumps('x' * 10000))",

@@ -2,8 +2,8 @@
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyMarker, PyResult, PyRuntime,
-    PyString, PyValueCast, ValueDef,
+    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, OwnedPyString, PyMarker, PyResult,
+    PyRuntime, PyValueCast, ValueDef,
 };
 
 pub(crate) static ENVIRONMENT_TYPE: NativeTypeDef = NativeTypeDef {
@@ -50,7 +50,7 @@ fn getcwd(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 fn chdir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("os.chdir", 1, 1)?;
     args.reject_keywords("os.chdir")?;
-    let PyString(path) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
     runtime.filesystem().change_dir(&path)?;
     Ok(Value::None)
 }
@@ -58,7 +58,7 @@ fn chdir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 fn getenv(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("os.getenv", 1, 2)?;
     args.reject_keywords("os.getenv")?;
-    let PyString(name) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
     if let Some(value) = runtime.environment().get(&name) {
         runtime.new_string(value)
     } else {
@@ -73,7 +73,7 @@ fn environ(runtime: &mut dyn PyRuntime) -> PyResult {
 fn environment_get(runtime: &mut dyn PyRuntime, _receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("environ.get", 1, 2)?;
     args.reject_keywords("environ.get")?;
-    let PyString(name) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
     if let Some(value) = runtime.environment().get(&name) {
         runtime.new_string(value)
     } else {

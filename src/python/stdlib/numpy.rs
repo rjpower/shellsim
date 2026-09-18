@@ -7,9 +7,9 @@
 use std::cmp::Ordering;
 
 use super::super::native::{
-    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyArray, PyArrayDtype,
-    PyArrayLayout, PyBinaryOp, PyConstant, PyError, PyIndex, PyKind, PyMarker, PyResult, PyRuntime,
-    PySequence, PyString, PyValue, PyValueCast, ValueDef, ValueKindDef, ValueKindSlots,
+    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, OwnedPyString, PyArray,
+    PyArrayDtype, PyArrayLayout, PyBinaryOp, PyConstant, PyError, PyIndex, PyKind, PyMarker,
+    PyResult, PyRuntime, PySequence, PyValue, PyValueCast, ValueDef, ValueKindDef, ValueKindSlots,
 };
 use super::super::number::{PyNumber, PyNumber as Number};
 use super::super::slice::SlicePlan;
@@ -445,7 +445,7 @@ fn pad(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         .copied()
         .or_else(|| args.positional().get(2).copied());
     let mode = mode_value
-        .map(|value| value.cast::<PyString>(runtime).map(|value| value.0))
+        .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
         .transpose()?
         .unwrap_or_else(|| "constant".to_string());
     if !matches!(mode.as_str(), "constant" | "edge") {
@@ -1094,7 +1094,7 @@ fn dtype_keyword(
 fn parse_dtype(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<PyArrayDtype> {
     let is_string = runtime.kind(&value)? == PyKind::String;
     let rendered = if is_string {
-        value.cast::<PyString>(runtime)?.0
+        value.cast::<OwnedPyString>(runtime)?.0
     } else {
         runtime.repr(&value)?
     };
@@ -4467,7 +4467,7 @@ fn argsort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("numpy.argsort", 1, 1)?;
     args.reject_unknown_keywords("numpy.argsort", &["axis", "kind"])?;
     if let Some(kind) = args.keyword("numpy.argsort", "kind")? {
-        let PyString(kind) = (*kind).cast(runtime)?;
+        let OwnedPyString(kind) = (*kind).cast(runtime)?;
         if !matches!(
             kind.as_str(),
             "quicksort" | "mergesort" | "heapsort" | "stable"

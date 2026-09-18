@@ -90,6 +90,35 @@ print(parts, pair, "hello".startswith("he"), "x\n".rstrip("\n"))"#;
 }
 
 #[test]
+fn ordered_mapping_index_preserves_numeric_keys_and_deletion_order() {
+    let source = r#"values = {1: "int", 2: "two", 3: "three"}
+values[True] = "bool"
+values[1.0] = "float"
+removed = values.pop(2)
+values[4] = "four"
+long_key = "key-longer-than-inline-storage"
+values[long_key] = "long"
+print(len(values), values[1], removed, values[3], values[long_key])
+print(values.keys())"#;
+    let mut environment = Environment::new();
+    let argv = vec!["python3.14".into(), "-c".into(), source.into()];
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = shellsim::python::run_python(
+        &mut environment,
+        &argv,
+        Vec::new(),
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        stdout,
+        b"4 float two three long\n[1, 3, 4, 'key-longer-than-inline-storage']\n"
+    );
+}
+
+#[test]
 fn unpacking_augmented_assignment_and_iterator_builtins_are_generic() {
     let source = r#"left, right = 1, 2
 numbers = [10, 20]

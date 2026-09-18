@@ -4,8 +4,8 @@
 //! alignment (`@`) is rejected because shellsim must not inherit the host machine ABI.
 
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyBytes, PyError, PyResult, PyRuntime, PyString, PyValue,
-    PyValueCast,
+    CallArgs, FunctionDef, ModuleDef, OwnedPyString, PyBytes, PyError, PyResult, PyRuntime,
+    PyValue, PyValueCast,
 };
 use super::super::number::PyNumber;
 
@@ -125,7 +125,7 @@ fn parse_format(text: &str) -> PyResult<Format> {
 fn calcsize(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("struct.calcsize", 1, 1)?;
     args.reject_keywords("struct.calcsize")?;
-    let PyString(format) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(format) = args.positional()[0].cast(runtime)?;
     let format = parse_format(&format)?;
     Ok(PyValue::Int(
         i64::try_from(format.size).expect("bounded size fits i64"),
@@ -137,7 +137,7 @@ fn pack(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         return Err(PyError::type_error("struct.pack requires a format"));
     }
     args.reject_keywords("struct.pack")?;
-    let PyString(format_text) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(format_text) = args.positional()[0].cast(runtime)?;
     let format = parse_format(&format_text)?;
     let values = &args.positional()[1..];
     if values.len() != format.values {
@@ -261,7 +261,7 @@ fn integer_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<i128> {
 fn unpack(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("struct.unpack", 2, 2)?;
     args.reject_keywords("struct.unpack")?;
-    let PyString(format_text) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(format_text) = args.positional()[0].cast(runtime)?;
     let PyBytes(input) = args.positional()[1].cast(runtime)?;
     let format = parse_format(&format_text)?;
     if input.len() != format.size {

@@ -4,7 +4,7 @@
 //! This module only converts checked values to and from the explicit [`PyHttpClient`] capability.
 
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyBytes, PyResult, PyRuntime, PySequence, PyString,
+    CallArgs, FunctionDef, ModuleDef, OwnedPyString, PyBytes, PyResult, PyRuntime, PySequence,
     PyValueCast,
 };
 use super::super::Value;
@@ -24,8 +24,8 @@ fn request(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_http.request", 4, 4)?;
     args.reject_keywords("_shellsim_http.request")?;
     let values = args.positional();
-    let PyString(method) = values[0].cast(runtime)?;
-    let PyString(url) = values[1].cast(runtime)?;
+    let OwnedPyString(method) = values[0].cast(runtime)?;
+    let OwnedPyString(url) = values[1].cast(runtime)?;
     let header_values: PySequence = values[2].cast(runtime)?;
     let mut headers = Vec::new();
     for header in header_values.items(runtime)? {
@@ -36,8 +36,8 @@ fn request(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
                 "HTTP headers must contain name/value pairs",
             ));
         }
-        let PyString(name) = pair[0].cast(runtime)?;
-        let PyString(value) = pair[1].cast(runtime)?;
+        let OwnedPyString(name) = pair[0].cast(runtime)?;
+        let OwnedPyString(value) = pair[1].cast(runtime)?;
         headers.push((name, value));
     }
     let PyBytes(body) = values[3].cast(runtime)?;

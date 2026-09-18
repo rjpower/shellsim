@@ -7,8 +7,8 @@ use regex::{Regex, RegexBuilder};
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyConstant, PyError, PyIndex,
-    PyMatch, PyRegex, PyResult, PyRuntime, PyString, PyValue, PyValueCast, ValueDef,
+    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, OwnedPyString, PyConstant, PyError,
+    PyIndex, PyMatch, PyRegex, PyResult, PyRuntime, PyValue, PyValueCast, ValueDef,
 };
 
 pub(super) const IGNORECASE: u32 = 2;
@@ -490,7 +490,7 @@ fn string_arg(
     label: &str,
     maximum: usize,
 ) -> PyResult<String> {
-    let PyString(value) = (*value).cast(runtime)?;
+    let OwnedPyString(value) = (*value).cast(runtime)?;
     if value.len() > maximum {
         Err(PyError::value_error(format!(
             "{label} exceeds the bounded regex input limit"

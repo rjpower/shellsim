@@ -15,7 +15,7 @@ use super::bytecode::{CallId, ClassField, CodeRef, NameId, Opcode};
 use super::filesystem::PyModuleLoader;
 use super::heap::{
     ClassLayout, InstanceAttributeSlot, InstanceAttributes, InstancePayload, Object, ObjectId,
-    ScopeId, SymbolId,
+    ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES, MODELED_VALUE_BYTES,
 };
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
@@ -377,6 +377,7 @@ impl VmProgram {
             vm.bytecode_frames.push(BytecodeFrame {
                 code: self.code.clone(),
                 instruction_pointer: 0,
+                stack_base: 0,
                 handlers: Vec::new(),
                 function_return: None,
                 pending_native_call: None,
@@ -471,6 +472,8 @@ struct LoadAttributeCache {
 struct BytecodeFrame {
     code: CodeRef,
     instruction_pointer: usize,
+    /// First operand owned by this frame in the VM's shared value stack.
+    stack_base: usize,
     handlers: Vec<(usize, usize)>,
     function_return: Option<FunctionReturn>,
     pending_native_call: Option<PendingNativeCall>,
@@ -502,6 +505,13 @@ enum IteratorAdvance {
     Callable { callable: Value, sentinel: Value },
     Generator,
     Invalid,
+}
+
+enum BuiltinSubscript {
+    Value(Value),
+    Mapping { factory: Option<Value> },
+    Set,
+    Unsupported,
 }
 
 #[inline(always)]
@@ -559,7 +569,6 @@ struct PendingNativeCall {
 struct FunctionReturn {
     name: String,
     call_span: super::source::Span,
-    outer_stack: Vec<Value>,
     pop_method_frame: bool,
 }
 
@@ -621,9 +630,6 @@ impl<'a> Vm<'a> {
             values.extend([Value::Object(*owner), *value]);
         }
         for frame in &self.bytecode_frames {
-            if let Some(function_return) = &frame.function_return {
-                values.extend(function_return.outer_stack.iter().copied());
-            }
             if let Some(pending) = &frame.pending_native_call {
                 values.extend(pending.arguments.positional().iter().copied());
                 values.extend(pending.arguments.keywords().iter().map(|(_, value)| *value));
@@ -713,7 +719,8 @@ impl<'a> Vm<'a> {
 
     fn execute_code(&mut self, code: &CodeRef) -> Result<Execution, (String, super::source::Span)> {
         let mut handlers: Vec<(usize, usize)> = Vec::new();
-        self.execute_code_from(code, 0, &mut handlers)
+        let stack_base = self.stack.len();
+        self.execute_code_from(code, 0, &mut handlers, stack_base)
     }
 
     fn execute_code_from(
@@ -721,10 +728,12 @@ impl<'a> Vm<'a> {
         code: &CodeRef,
         instruction_pointer: usize,
         handlers: &mut Vec<(usize, usize)>,
+        stack_base: usize,
     ) -> Result<Execution, (String, super::source::Span)> {
         self.bytecode_frames.push(BytecodeFrame {
             code: code.clone(),
             instruction_pointer,
+            stack_base,
             handlers: std::mem::take(handlers),
             function_return: None,
             pending_native_call: None,
@@ -739,6 +748,9 @@ impl<'a> Vm<'a> {
             .bytecode_frames
             .pop()
             .expect("active bytecode frame must remain installed");
+        if !matches!(result, Ok(Execution::Yield(_, _))) {
+            self.stack.truncate(frame.stack_base);
+        }
         *handlers = frame.handlers;
         result
     }
@@ -861,6 +873,7 @@ impl<'a> Vm<'a> {
                         .map_err(|error| (error, dispatch.span()))?;
                     dispatch_next(self.load_attribute_at(
                         code,
+                        code_cache,
                         instruction_pointer,
                         symbol,
                         code.name(name),
@@ -1302,7 +1315,7 @@ impl<'a> Vm<'a> {
             .bytecode_frames
             .pop()
             .expect("deferred function frame was checked above");
-        let mut function_return = frame
+        let function_return = frame
             .function_return
             .expect("deferred function frame must own return state");
         self.call_depth = self.call_depth.saturating_sub(1);
@@ -1314,7 +1327,7 @@ impl<'a> Vm<'a> {
                 .pop()
                 .expect("deferred method frame must remain installed");
         }
-        self.stack = std::mem::take(&mut function_return.outer_stack);
+        self.stack.truncate(frame.stack_base);
         Some(function_return)
     }
 
@@ -1886,7 +1899,6 @@ impl<'a> Vm<'a> {
         })?;
         self.state.modules.insert(name.to_string(), module);
 
-        let outer_stack = std::mem::take(&mut self.stack);
         let temporary_import_path = (!path.starts_with('<')).then(|| {
             path.rsplit_once('/')
                 .map_or_else(|| "/".to_string(), |(parent, _)| parent.to_string())
@@ -1900,7 +1912,6 @@ impl<'a> Vm<'a> {
         if temporary_import_path.is_some() {
             self.state.temporary_import_paths.remove(0);
         }
-        self.stack = outer_stack;
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
@@ -1991,12 +2002,14 @@ impl<'a> Vm<'a> {
     fn load_attribute_at(
         &mut self,
         code: &CodeRef,
+        code_cache: usize,
         site: usize,
         symbol: SymbolId,
         name: &str,
     ) -> Result<(), String> {
         let owner = self.pop()?;
-        if let (Some(id), Some(cache)) = (owner.object_id(), self.attribute_cache(code, site)) {
+        if let (Some(id), Some(cache)) = (owner.object_id(), self.attribute_cache(code_cache, site))
+        {
             if let Some(value) =
                 self.state
                     .heap
@@ -2010,17 +2023,16 @@ impl<'a> Vm<'a> {
             .resolve_attribute_by_symbol(owner, symbol, name)?
             .ok_or_else(|| format!("attribute {name:?} is not implemented"))?;
         if let Some(cache) = self.cacheable_instance_attribute(owner, symbol, name)? {
-            self.remember_attribute_cache(code, site, cache)?;
+            self.remember_attribute_cache(code, code_cache, site, cache)?;
         }
         self.stack.push(value);
         Ok(())
     }
 
-    fn attribute_cache(&self, code: &CodeRef, site: usize) -> Option<LoadAttributeCache> {
+    fn attribute_cache(&self, code_cache: usize, site: usize) -> Option<LoadAttributeCache> {
         self.execution
             .code_caches
-            .iter()
-            .find(|cache| Arc::ptr_eq(&cache.code, code))?
+            .get(code_cache)?
             .attributes
             .as_ref()?
             .get(site)
@@ -2031,11 +2043,11 @@ impl<'a> Vm<'a> {
     fn remember_attribute_cache(
         &mut self,
         code: &CodeRef,
+        code_cache: usize,
         site: usize,
         cache: LoadAttributeCache,
     ) -> Result<(), String> {
-        let index = self.ensure_code_cache(code)?;
-        if let Some(attributes) = &mut self.execution.code_caches[index].attributes {
+        if let Some(attributes) = &mut self.execution.code_caches[code_cache].attributes {
             attributes[site] = Some(cache);
             return Ok(());
         }
@@ -2050,7 +2062,7 @@ impl<'a> Vm<'a> {
         self.reserve_retained_memory(bytes)?;
         let mut attributes = vec![None; code.instructions.len()];
         attributes[site] = Some(cache);
-        self.execution.code_caches[index].attributes = Some(attributes);
+        self.execution.code_caches[code_cache].attributes = Some(attributes);
         Ok(())
     }
 
@@ -2407,18 +2419,20 @@ impl<'a> Vm<'a> {
         } else if let Some(character) = protocol::string_index(&self.state.heap, &owner, &index)? {
             self.allocate_string(character.to_string())?
         } else if let Some(id) = owner.object_id() {
-            match self.state.heap.get(id)?.clone() {
+            let target = match self.state.heap.get(id)? {
                 Object::List(values) | Object::Tuple(values) => {
                     let index = index.as_int().ok_or("sequence index must be an integer")?;
                     let len = values.len() as i64;
                     let index = if index < 0 { len + index } else { index };
-                    values
-                        .get(usize::try_from(index).map_err(|_| "index out of range")?)
-                        .cloned()
-                        .ok_or("index out of range")?
+                    BuiltinSubscript::Value(
+                        values
+                            .get(usize::try_from(index).map_err(|_| "index out of range")?)
+                            .copied()
+                            .ok_or("index out of range")?,
+                    )
                 }
                 Object::Range { start, stop, step } => {
-                    let length = range_length(start, stop, step)?;
+                    let length = range_length(*start, *stop, *step)?;
                     let index = index.as_int().ok_or("range index must be an integer")?;
                     let index = if index < 0 {
                         i128::try_from(length).map_err(|_| "range is too large")?
@@ -2429,72 +2443,23 @@ impl<'a> Vm<'a> {
                     if index < 0 || index >= i128::try_from(length).unwrap_or(i128::MAX) {
                         return Err("range index out of range".into());
                     }
-                    let value = i128::from(start)
+                    let value = i128::from(*start)
                         .checked_add(
-                            i128::from(step)
+                            i128::from(*step)
                                 .checked_mul(index)
                                 .ok_or("range value overflow")?,
                         )
                         .ok_or("range value overflow")?;
-                    Value::Int(
+                    BuiltinSubscript::Value(Value::Int(
                         i64::try_from(value)
                             .map_err(|_| "range value exceeds bounded integer range")?,
-                    )
+                    ))
                 }
-                Object::Dict(entries) => {
-                    let mut found = None;
-                    for (key, value) in &entries {
-                        self.charge_cpu(1)?;
-                        if protocol::identical(key, &index)
-                            || protocol::equals(&self.state.heap, key, &index)?
-                        {
-                            found = Some(*value);
-                            break;
-                        }
-                    }
-                    found.ok_or("key not found")?
-                }
-                Object::DefaultDict { factory, entries } => {
-                    let mut found = None;
-                    for (key, value) in &entries {
-                        self.charge_cpu(1)?;
-                        if protocol::identical(key, &index)
-                            || protocol::equals(&self.state.heap, key, &index)?
-                        {
-                            found = Some(*value);
-                            break;
-                        }
-                    }
-                    if let Some(value) = found {
-                        value
-                    } else {
-                        self.stack.push(factory);
-                        let value = match self.call(0, &[], &[], CallMode::Immediate)? {
-                            CallResult::Value(value) => value,
-                            CallResult::Exit(status) => {
-                                return Err(format!("default factory exited with status {status}"))
-                            }
-                            CallResult::EnteredFrame => {
-                                unreachable!("immediate call entered a frame")
-                            }
-                            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                                unreachable!("immediate call cannot suspend")
-                            }
-                        };
-                        self.state.heap.reserve_object_growth(
-                            id,
-                            48,
-                            &mut self.interp.resources,
-                        )?;
-                        let Object::DefaultDict { entries, .. } = self.state.heap.get_mut(id)?
-                        else {
-                            unreachable!()
-                        };
-                        entries.push((index, value));
-                        value
-                    }
-                }
-                Object::Set(_) => return Err("set object is not subscriptable".into()),
+                Object::Dict(_) => BuiltinSubscript::Mapping { factory: None },
+                Object::DefaultDict { factory, .. } => BuiltinSubscript::Mapping {
+                    factory: Some(*factory),
+                },
+                Object::Set(_) => BuiltinSubscript::Set,
                 Object::String(_)
                 | Object::Bytes(_)
                 | Object::ByteArray(_)
@@ -2517,13 +2482,55 @@ impl<'a> Vm<'a> {
                 | Object::Regex { .. }
                 | Object::Match { .. }
                 | Object::ArgumentParser { .. }
-                | Object::Namespace { .. } => return Err("object is not subscriptable".into()),
-                Object::EnumMember { .. } => return Err("object is not subscriptable".into()),
-                Object::RaisesContext { .. } => return Err("object is not subscriptable".into()),
+                | Object::Namespace { .. }
+                | Object::EnumMember { .. }
+                | Object::RaisesContext { .. } => BuiltinSubscript::Unsupported,
                 Object::Property { .. }
                 | Object::StaticMethod { .. }
                 | Object::ClassMethod { .. }
-                | Object::Super { .. } => return Err("object is not subscriptable".into()),
+                | Object::Super { .. } => BuiltinSubscript::Unsupported,
+            };
+            match target {
+                BuiltinSubscript::Value(value) => value,
+                BuiltinSubscript::Mapping { factory } => {
+                    if let Some(position) = self.find_mapping_entry(id, &index)? {
+                        match self.state.heap.get(id)? {
+                            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
+                                entries[position].1
+                            }
+                            _ => unreachable!("mapping kind was classified before lookup"),
+                        }
+                    } else if let Some(factory) = factory {
+                        self.stack.push(factory);
+                        let value = match self.call(0, &[], &[], CallMode::Immediate)? {
+                            CallResult::Value(value) => value,
+                            CallResult::Exit(status) => {
+                                return Err(format!("default factory exited with status {status}"))
+                            }
+                            CallResult::EnteredFrame => {
+                                unreachable!("immediate call entered a frame")
+                            }
+                            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                                unreachable!("immediate call cannot suspend")
+                            }
+                        };
+                        self.state.heap.reserve_object_growth(
+                            id,
+                            MODELED_MAPPING_ENTRY_BYTES,
+                            &mut self.interp.resources,
+                        )?;
+                        let Object::DefaultDict { entries, .. } = self.state.heap.get_mut(id)?
+                        else {
+                            unreachable!("defaultdict kind was classified before insertion")
+                        };
+                        entries.push((index, value));
+                        value
+                    } else {
+                        return Err("key not found".into());
+                    }
+                }
+                BuiltinSubscript::Set => return Err("set object is not subscriptable".into()),
+                BuiltinSubscript::Unsupported => return Err("object is not subscriptable".into()),
             }
         } else {
             return Err("object is not subscriptable".into());
@@ -2626,7 +2633,7 @@ impl<'a> Vm<'a> {
         let Some(id) = owner.object_id() else {
             return Err("object does not support item assignment".into());
         };
-        match self.state.heap.get(id)?.clone() {
+        match self.state.heap.get(id)? {
             Object::List(values) => {
                 let index = index.as_int().ok_or("list index must be an integer")?;
                 let len = values.len() as i64;
@@ -2641,27 +2648,19 @@ impl<'a> Vm<'a> {
                     .ok_or("list assignment index out of range")?;
                 *slot = value;
             }
-            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                let mut found = None;
-                for (position, (candidate, _)) in entries.iter().enumerate() {
-                    self.charge_cpu(1)?;
-                    if protocol::identical(candidate, &index)
-                        || protocol::equals(&self.state.heap, candidate, &index)?
-                    {
-                        found = Some(position);
-                        break;
-                    }
-                }
-                if let Some(position) = found {
+            Object::Dict(_) | Object::DefaultDict { .. } => {
+                if let Some(position) = self.find_mapping_entry(id, &index)? {
                     let entries = match self.state.heap.get_mut(id)? {
                         Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
                         _ => unreachable!(),
                     };
-                    entries[position].1 = value;
+                    entries.set_value(position, value);
                 } else {
-                    self.state
-                        .heap
-                        .reserve_object_growth(id, 48, &mut self.interp.resources)?;
+                    self.state.heap.reserve_object_growth(
+                        id,
+                        MODELED_MAPPING_ENTRY_BYTES,
+                        &mut self.interp.resources,
+                    )?;
                     let entries = match self.state.heap.get_mut(id)? {
                         Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
                         _ => unreachable!(),
@@ -2725,7 +2724,7 @@ impl<'a> Vm<'a> {
         code: CodeRef,
         default_count: usize,
     ) -> Result<(), String> {
-        if self.stack.len() < default_count {
+        if self.frame_stack_len() < default_count {
             return Err("invalid bytecode stack effect while creating function".into());
         }
         let defaults_start = self.stack.len() - default_count;
@@ -2762,7 +2761,7 @@ impl<'a> Vm<'a> {
         let stack_values = base_count
             .checked_add(usize::from(has_metaclass))
             .ok_or("too many class construction values")?;
-        if self.stack.len() < stack_values {
+        if self.frame_stack_len() < stack_values {
             return Err("invalid bytecode stack effect while creating class".into());
         }
         let explicit_metaclass = has_metaclass.then(|| self.stack.pop().expect("checked above"));
@@ -2959,7 +2958,6 @@ impl<'a> Vm<'a> {
             prepared_namespace,
             &mut self.interp.resources,
         )?;
-        let outer_stack = std::mem::take(&mut self.stack);
         self.local_scopes.push(scope);
         self.class_scopes.push(scope);
         self.class_bindings.push(Vec::new());
@@ -2970,7 +2968,6 @@ impl<'a> Vm<'a> {
             .expect("class binding stack is present");
         self.class_scopes.pop();
         self.local_scopes.pop();
-        self.stack = outer_stack;
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
@@ -3039,7 +3036,7 @@ impl<'a> Vm<'a> {
                 for (attribute_name, value) in &descriptor_candidates {
                     namespace_entries.push((self.allocate_string(attribute_name.clone())?, *value));
                 }
-                let namespace = self.allocate_object(Object::Dict(namespace_entries))?;
+                let namespace = self.allocate_object(Object::Dict(namespace_entries.into()))?;
                 self.invoke_value(constructor, vec![class_name, bases_value, namespace])?
             } else {
                 self.allocate_class(ClassDefinition {
@@ -3099,7 +3096,7 @@ impl<'a> Vm<'a> {
                 for (name, value) in descriptor_candidates {
                     entries.push((self.allocate_string(name)?, value));
                 }
-                let namespace = self.allocate_object(Object::Dict(entries))?;
+                let namespace = self.allocate_object(Object::Dict(entries.into()))?;
                 let class_name = self.allocate_string(name.clone())?;
                 let result = self.invoke_value(initializer, vec![class_name, bases, namespace])?;
                 if !result.is_none() {
@@ -3822,7 +3819,7 @@ impl<'a> Vm<'a> {
                     Some(value) if value.object_id().is_some() => {
                         match self.state.heap.get(value.object_id().unwrap())? {
                             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                                entries.clone()
+                                entries.to_vec()
                             }
                             _ => {
                                 return Err("dict() argument is not a mapping in this slice".into())
@@ -3831,7 +3828,7 @@ impl<'a> Vm<'a> {
                     }
                     Some(_) => return Err("dict() argument is not a mapping in this slice".into()),
                 };
-                self.allocate_object(Object::Dict(entries))?
+                self.allocate_object(Object::Dict(entries.into()))?
             }
             BuiltinType::Function
             | BuiltinType::Range
@@ -4159,6 +4156,9 @@ impl<'a> Vm<'a> {
     /// Advance the iterator kept at the top of the operand stack. The iterator remains below the
     /// yielded value until exhaustion, which gives `for` a small and explicit stack contract.
     fn for_iterator(&mut self) -> Result<bool, String> {
+        if self.frame_stack_len() == 0 {
+            return Err("invalid bytecode stack effect".into());
+        }
         let Some(id) = self
             .stack
             .last()
@@ -4255,7 +4255,7 @@ impl<'a> Vm<'a> {
         }
         self.local_scopes.push(scope);
         self.call_depth += 1;
-        let result = self.execute_code_from(&code, instruction_pointer, &mut handlers);
+        let result = self.execute_code_from(&code, instruction_pointer, &mut handlers, 0);
         self.call_depth -= 1;
         self.local_scopes.pop();
         let frame_result_stack = std::mem::take(&mut self.stack);
@@ -4359,7 +4359,7 @@ impl<'a> Vm<'a> {
                     .transpose()?
                 {
                     Some(Object::Dict(entries)) | Some(Object::DefaultDict { entries, .. }) => {
-                        entries.clone()
+                        entries.to_vec()
                     }
                     _ => return Err("'**' argument must be a mapping".into()),
                 }
@@ -4388,7 +4388,7 @@ impl<'a> Vm<'a> {
         let value = self
             .state
             .heap
-            .allocate(Object::Dict(entries), &mut self.interp.resources)?;
+            .allocate(Object::Dict(entries.into()), &mut self.interp.resources)?;
         self.stack.push(value);
         Ok(())
     }
@@ -4502,11 +4502,14 @@ impl<'a> Vm<'a> {
     }
 
     fn binary(&mut self, operator: BinaryOperator) -> Result<(), String> {
+        if self.frame_stack_len() < 2 {
+            return Err("invalid bytecode stack effect".into());
+        }
         let result_slot = self
             .stack
             .len()
             .checked_sub(2)
-            .ok_or("invalid bytecode stack effect")?;
+            .expect("frame operand count was checked");
         let left = self.stack[result_slot];
         let right = self.stack[result_slot + 1];
         match number::exact_binary(self, operator, left, right)
@@ -4719,7 +4722,7 @@ impl<'a> Vm<'a> {
         if starred.len() != count {
             return Err("invalid bytecode call argument metadata".into());
         }
-        if self.stack.len() < count + 1 {
+        if self.frame_stack_len() < count + 1 {
             return Err("invalid bytecode stack effect".into());
         }
         let arguments_start = self.stack.len() - count;
@@ -5632,11 +5635,7 @@ impl<'a> Vm<'a> {
             mode,
             pop_method_frame,
         } = invocation;
-        if code
-            .instructions
-            .iter()
-            .any(|instruction| matches!(&instruction.opcode, Opcode::Yield))
-        {
+        if code.call_signature.is_generator {
             return self.create_generator(
                 name,
                 code,
@@ -5650,108 +5649,20 @@ impl<'a> Vm<'a> {
         if self.call_depth == MAX_CALL_DEPTH {
             return Err("maximum recursion depth exceeded".into());
         }
-        let variadic_index = code
-            .parameters
-            .iter()
-            .position(|parameter| parameter.variadic);
-        let positional_len = code
-            .parameters
-            .iter()
-            .position(|parameter| parameter.variadic || parameter.keyword_only)
-            .unwrap_or(code.parameters.len());
-        if variadic_index.is_none() && arguments.len() > positional_len {
-            return Err(format!(
-                "{name}() takes {} positional arguments but {} were given",
-                positional_len,
-                arguments.len()
-            ));
-        }
-        let mut positional = arguments;
-        let extra_positional = if variadic_index.is_some() && positional.len() > positional_len {
-            positional.split_off(positional_len)
-        } else {
-            Vec::new()
-        };
-        let mut locals = code
-            .parameters
-            .iter()
-            .take(positional_len)
-            .map(|parameter| parameter.name.clone())
-            .zip(positional)
-            .collect::<HashMap<_, _>>();
-        if let Some(index) = variadic_index {
-            let parameter = &code.parameters[index];
-            let values = self.allocate_object(Object::Tuple(extra_positional))?;
-            locals.insert(parameter.name.clone(), values);
-        }
-        for (keyword, value) in keyword_arguments {
-            if !code
-                .parameters
-                .iter()
-                .any(|parameter| parameter.name == keyword && !parameter.variadic)
-            {
-                return Err(format!(
-                    "{name}() got an unexpected keyword argument {keyword:?}"
-                ));
-            }
-            if locals.insert(keyword.clone(), value).is_some() {
-                return Err(format!(
-                    "{name}() got multiple values for argument {keyword:?}"
-                ));
-            }
-        }
-        if let Some(missing) =
-            code.parameters.iter().enumerate().find(|(_, parameter)| {
-                !locals.contains_key(&parameter.name) && !parameter.has_default
-            })
-        {
-            return Err(format!(
-                "{name}() missing required argument {:?}",
-                missing.1.name
-            ));
-        }
-        if defaults.len()
-            != code
-                .parameters
-                .iter()
-                .filter(|parameter| parameter.has_default)
-                .count()
-        {
-            return Err(format!("{name}() has invalid default argument metadata"));
-        }
-        for (parameter, default) in code
-            .parameters
-            .iter()
-            .filter(|parameter| parameter.has_default)
-            .zip(defaults)
-        {
-            locals
-                .entry(parameter.name.clone())
-                .or_insert_with(|| *default);
-        }
-        let uses_repl_globals = closure
-            .map(|scope| self.state.heap.scope_uses_repl_globals(scope))
-            .transpose()?
-            .unwrap_or(true);
-        let scope = self.state.heap.allocate_scope(
-            closure,
-            uses_repl_globals,
-            code.local_names.clone(),
-            locals,
-            &mut self.interp.resources,
-        )?;
-        let outer_stack = std::mem::take(&mut self.stack);
+        let scope =
+            self.bind_function_scope(name, code, closure, defaults, arguments, keyword_arguments)?;
         self.local_scopes.push(scope);
         self.call_depth += 1;
         if let CallMode::Deferred(call_span) = mode {
+            let stack_base = self.stack.len();
             self.bytecode_frames.push(BytecodeFrame {
                 code: code.clone(),
                 instruction_pointer: 0,
+                stack_base,
                 handlers: Vec::new(),
                 function_return: Some(FunctionReturn {
                     name: name.to_string(),
                     call_span,
-                    outer_stack,
                     pop_method_frame,
                 }),
                 pending_native_call: None,
@@ -5761,7 +5672,6 @@ impl<'a> Vm<'a> {
         let result = self.execute_code(code);
         self.call_depth -= 1;
         self.local_scopes.pop();
-        self.stack = outer_stack;
         match result {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("immediate call cannot suspend"),
@@ -5787,98 +5697,8 @@ impl<'a> Vm<'a> {
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
     ) -> Result<CallResult, String> {
-        // Binding happens at call time, while the body itself starts only on the first next().
-        // Keeping this validation identical to ordinary functions prevents generators from being
-        // an accidental argument-checking escape hatch.
-        let variadic_index = code
-            .parameters
-            .iter()
-            .position(|parameter| parameter.variadic);
-        let positional_len = code
-            .parameters
-            .iter()
-            .position(|parameter| parameter.variadic || parameter.keyword_only)
-            .unwrap_or(code.parameters.len());
-        if variadic_index.is_none() && arguments.len() > positional_len {
-            return Err(format!(
-                "{name}() takes {} positional arguments but {} were given",
-                positional_len,
-                arguments.len()
-            ));
-        }
-        let mut positional = arguments;
-        let extra_positional = if variadic_index.is_some() && positional.len() > positional_len {
-            positional.split_off(positional_len)
-        } else {
-            Vec::new()
-        };
-        let mut locals = code
-            .parameters
-            .iter()
-            .take(positional_len)
-            .map(|parameter| parameter.name.clone())
-            .zip(positional)
-            .collect::<HashMap<_, _>>();
-        if let Some(index) = variadic_index {
-            let values = self.allocate_object(super::heap::Object::Tuple(extra_positional))?;
-            locals.insert(code.parameters[index].name.clone(), values);
-        }
-        for (keyword, value) in keyword_arguments {
-            if !code
-                .parameters
-                .iter()
-                .any(|parameter| parameter.name == keyword && !parameter.variadic)
-            {
-                return Err(format!(
-                    "{name}() got an unexpected keyword argument {keyword:?}"
-                ));
-            }
-            if locals.insert(keyword.clone(), value).is_some() {
-                return Err(format!(
-                    "{name}() got multiple values for argument {keyword:?}"
-                ));
-            }
-        }
-        if let Some(missing) = code
-            .parameters
-            .iter()
-            .find(|parameter| !locals.contains_key(&parameter.name) && !parameter.has_default)
-        {
-            return Err(format!(
-                "{name}() missing required argument {:?}",
-                missing.name
-            ));
-        }
-        if defaults.len()
-            != code
-                .parameters
-                .iter()
-                .filter(|parameter| parameter.has_default)
-                .count()
-        {
-            return Err(format!("{name}() has invalid default argument metadata"));
-        }
-        for (parameter, default) in code
-            .parameters
-            .iter()
-            .filter(|parameter| parameter.has_default)
-            .zip(defaults)
-        {
-            locals
-                .entry(parameter.name.clone())
-                .or_insert_with(|| *default);
-        }
-        let uses_repl_globals = closure
-            .map(|scope| self.state.heap.scope_uses_repl_globals(scope))
-            .transpose()?
-            .unwrap_or(true);
-        let scope = self.state.heap.allocate_scope(
-            closure,
-            uses_repl_globals,
-            code.local_names.clone(),
-            locals,
-            &mut self.interp.resources,
-        )?;
+        let scope =
+            self.bind_function_scope(name, code, closure, defaults, arguments, keyword_arguments)?;
         let generator = self.allocate_object(Object::Generator {
             name: name.to_string(),
             code: code.clone(),
@@ -5890,6 +5710,87 @@ impl<'a> Vm<'a> {
             running: false,
         })?;
         Ok(CallResult::Value(generator))
+    }
+
+    /// Bind one invocation directly into the compiler's local-slot layout.
+    fn bind_function_scope(
+        &mut self,
+        name: &str,
+        code: &CodeRef,
+        closure: Option<ScopeId>,
+        defaults: &[Value],
+        mut arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<ScopeId, String> {
+        let signature = &code.call_signature;
+        if signature.variadic_slot.is_none() && arguments.len() > signature.positional_count {
+            return Err(format!(
+                "{name}() takes {} positional arguments but {} were given",
+                signature.positional_count,
+                arguments.len()
+            ));
+        }
+        let extra_positional =
+            if signature.variadic_slot.is_some() && arguments.len() > signature.positional_count {
+                arguments.split_off(signature.positional_count)
+            } else {
+                Vec::new()
+            };
+        let mut locals = vec![None; code.local_names.len()];
+        for (slot, value) in arguments.into_iter().enumerate() {
+            locals[slot] = Some(value);
+        }
+        if let Some(slot) = signature.variadic_slot {
+            locals[slot] = Some(self.allocate_object(Object::Tuple(extra_positional))?);
+        }
+        for (keyword, value) in keyword_arguments {
+            let Some(slot) = code
+                .parameters
+                .iter()
+                .position(|parameter| parameter.name == keyword && !parameter.variadic)
+            else {
+                return Err(format!(
+                    "{name}() got an unexpected keyword argument {keyword:?}"
+                ));
+            };
+            if locals[slot].replace(value).is_some() {
+                return Err(format!(
+                    "{name}() got multiple values for argument {keyword:?}"
+                ));
+            }
+        }
+        if defaults.len() != signature.default_slots.len() {
+            return Err(format!("{name}() has invalid default argument metadata"));
+        }
+        for (&slot, default) in signature.default_slots.iter().zip(defaults) {
+            if locals[slot].is_none() {
+                locals[slot] = Some(*default);
+            }
+        }
+        if let Some((slot, parameter)) = code
+            .parameters
+            .iter()
+            .enumerate()
+            .find(|(slot, parameter)| locals[*slot].is_none() && !parameter.has_default)
+        {
+            debug_assert!(slot < locals.len());
+            return Err(format!(
+                "{name}() missing required argument {:?}",
+                parameter.name
+            ));
+        }
+        let uses_repl_globals = closure
+            .map(|scope| self.state.heap.scope_uses_repl_globals(scope))
+            .transpose()?
+            .unwrap_or(true);
+        self.state.heap.allocate_scope_slots(
+            closure,
+            uses_repl_globals,
+            code.local_names.clone(),
+            locals,
+            HashMap::new(),
+            &mut self.interp.resources,
+        )
     }
 
     fn record_native_error(&mut self, error: PyError) -> String {
@@ -6142,14 +6043,59 @@ impl<'a> Vm<'a> {
         Ok(None)
     }
 
+    fn find_mapping_entry(
+        &mut self,
+        id: ObjectId,
+        needle: &Value,
+    ) -> Result<Option<usize>, String> {
+        let heap = &self.state.heap;
+        let entries = match heap.get(id)? {
+            Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
+            _ => return Err("dict handle changed object kind".into()),
+        };
+        for position in entries.candidate_positions(needle) {
+            let candidate = entries[position].0;
+            if !self.interp.resources.charge_cpu(1) {
+                return Err("resource limit exceeded while executing Python".into());
+            }
+            if protocol::identical(&candidate, needle)
+                || protocol::equals(heap, &candidate, needle)?
+            {
+                return Ok(Some(position));
+            }
+        }
+        Ok(None)
+    }
+
+    fn find_set_entry(&mut self, id: ObjectId, needle: &Value) -> Result<Option<usize>, String> {
+        let length = match self.state.heap.get(id)? {
+            Object::Set(values) => values.len(),
+            _ => return Err("set handle changed object kind".into()),
+        };
+        for position in 0..length {
+            let candidate = match self.state.heap.get(id)? {
+                Object::Set(values) => values[position],
+                _ => return Err("set handle changed object kind".into()),
+            };
+            self.charge_cpu(1)?;
+            if protocol::identical(&candidate, needle)
+                || protocol::equals(&self.state.heap, &candidate, needle)?
+            {
+                return Ok(Some(position));
+            }
+        }
+        Ok(None)
+    }
+
     fn pop(&mut self) -> Result<Value, String> {
-        self.stack
-            .pop()
-            .ok_or_else(|| "invalid bytecode stack effect".into())
+        if self.frame_stack_len() == 0 {
+            return Err("invalid bytecode stack effect".into());
+        }
+        Ok(self.stack.pop().expect("non-empty frame stack was checked"))
     }
 
     fn take(&mut self, count: usize) -> Result<Vec<Value>, String> {
-        if self.stack.len() < count {
+        if self.frame_stack_len() < count {
             return Err("invalid bytecode stack effect".into());
         }
         let start = self.stack.len() - count;
@@ -6157,7 +6103,7 @@ impl<'a> Vm<'a> {
     }
 
     fn copy(&mut self, depth: usize) -> Result<(), String> {
-        if depth == 0 || depth > self.stack.len() {
+        if depth == 0 || depth > self.frame_stack_len() {
             return Err("invalid bytecode copy depth".into());
         }
         let value = self.stack[self.stack.len() - depth];
@@ -6166,6 +6112,9 @@ impl<'a> Vm<'a> {
     }
 
     fn jump_if_or_pop(&mut self, jump_when: bool) -> Result<bool, String> {
+        if self.frame_stack_len() == 0 {
+            return Err("invalid bytecode stack effect".into());
+        }
         let value = self
             .stack
             .last()
@@ -6180,13 +6129,21 @@ impl<'a> Vm<'a> {
     }
 
     fn swap(&mut self, depth: usize) -> Result<(), String> {
-        if depth == 0 || depth > self.stack.len() {
+        if depth == 0 || depth > self.frame_stack_len() {
             return Err("invalid bytecode swap depth".into());
         }
         let top = self.stack.len() - 1;
         let other = self.stack.len() - depth;
         self.stack.swap(top, other);
         Ok(())
+    }
+
+    fn frame_stack_len(&self) -> usize {
+        let stack_base = self
+            .bytecode_frames
+            .last()
+            .map_or(0, |frame| frame.stack_base);
+        self.stack.len().saturating_sub(stack_base)
     }
 
     fn reserve_result(&mut self, bytes: usize) -> Result<(), String> {
@@ -6455,6 +6412,18 @@ impl PyRuntime for Vm<'_> {
             .map_err(PyError::runtime_error)
     }
 
+    fn list_len(&self, list: PyList) -> PyResult<usize> {
+        match self
+            .state
+            .heap
+            .get(list.object_id())
+            .map_err(PyError::runtime_error)?
+        {
+            Object::List(items) => Ok(items.len()),
+            _ => Err(PyError::runtime_error("list handle changed object kind")),
+        }
+    }
+
     fn list_items(&mut self, list: PyList) -> PyResult<Vec<Value>> {
         let id = list.object_id();
         let length = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
@@ -6469,6 +6438,153 @@ impl PyRuntime for Vm<'_> {
             Object::List(items) => Ok(items.clone()),
             _ => Err(PyError::runtime_error("list handle changed object kind")),
         }
+    }
+
+    fn list_append(&mut self, list: PyList, value: Value) -> PyResult<()> {
+        let id = list.object_id();
+        if !matches!(self.state.heap.get(id), Ok(Object::List(_))) {
+            return Err(PyError::runtime_error("list handle changed object kind"));
+        }
+        self.state
+            .heap
+            .reserve_object_growth(id, MODELED_VALUE_BYTES, &mut self.interp.resources)
+            .map_err(PyError::resource_error)?;
+        let Object::List(items) = self
+            .state
+            .heap
+            .get_mut(id)
+            .map_err(PyError::runtime_error)?
+        else {
+            unreachable!("list kind was checked before reserving growth")
+        };
+        items.push(value);
+        Ok(())
+    }
+
+    fn list_insert(&mut self, list: PyList, index: usize, value: Value) -> PyResult<()> {
+        let id = list.object_id();
+        let length = self.list_len(list)?;
+        let index = index.min(length);
+        self.state
+            .heap
+            .reserve_object_growth(id, MODELED_VALUE_BYTES, &mut self.interp.resources)
+            .map_err(PyError::resource_error)?;
+        let Object::List(items) = self
+            .state
+            .heap
+            .get_mut(id)
+            .map_err(PyError::runtime_error)?
+        else {
+            unreachable!("list kind was checked before reserving growth")
+        };
+        items.insert(index, value);
+        Ok(())
+    }
+
+    fn list_extend(&mut self, list: PyList, values: Vec<Value>) -> PyResult<()> {
+        let id = list.object_id();
+        self.list_len(list)?;
+        let count = u64::try_from(values.len())
+            .map_err(|_| PyError::resource_error("list growth overflow"))?;
+        let bytes = count
+            .checked_mul(MODELED_VALUE_BYTES)
+            .ok_or_else(|| PyError::resource_error("list growth overflow"))?;
+        self.state
+            .heap
+            .reserve_object_growth(id, bytes, &mut self.interp.resources)
+            .map_err(PyError::resource_error)?;
+        let Object::List(items) = self
+            .state
+            .heap
+            .get_mut(id)
+            .map_err(PyError::runtime_error)?
+        else {
+            unreachable!("list kind was checked before reserving growth")
+        };
+        items.extend(values);
+        Ok(())
+    }
+
+    fn list_pop(&mut self, list: PyList, index: usize) -> PyResult<Value> {
+        let id = list.object_id();
+        let value = match self
+            .state
+            .heap
+            .get_mut(id)
+            .map_err(PyError::runtime_error)?
+        {
+            Object::List(items) if index < items.len() => items.remove(index),
+            Object::List(_) => return Err(PyError::value_error("pop index out of range")),
+            _ => return Err(PyError::runtime_error("list handle changed object kind")),
+        };
+        self.state
+            .heap
+            .release_object_shrink(id, MODELED_VALUE_BYTES, &mut self.interp.resources)
+            .map_err(PyError::runtime_error)?;
+        Ok(value)
+    }
+
+    fn list_position(
+        &mut self,
+        list: PyList,
+        needle: &Value,
+        start: usize,
+        stop: usize,
+    ) -> PyResult<Option<usize>> {
+        let id = list.object_id();
+        let length = self.list_len(list)?;
+        for position in start.min(length)..stop.min(length) {
+            let candidate = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+                Object::List(items) => items[position],
+                _ => return Err(PyError::runtime_error("list handle changed object kind")),
+            };
+            self.charge_cpu(1).map_err(PyError::resource_error)?;
+            if protocol::identical(&candidate, needle)
+                || protocol::equals(&self.state.heap, &candidate, needle)
+                    .map_err(PyError::runtime_error)?
+            {
+                return Ok(Some(position));
+            }
+        }
+        Ok(None)
+    }
+
+    fn list_reverse(&mut self, list: PyList) -> PyResult<()> {
+        let id = list.object_id();
+        let length = self.list_len(list)?;
+        self.charge_cpu(u64::try_from(length).unwrap_or(u64::MAX))
+            .map_err(PyError::resource_error)?;
+        let Object::List(items) = self
+            .state
+            .heap
+            .get_mut(id)
+            .map_err(PyError::runtime_error)?
+        else {
+            unreachable!("list kind was checked before reversal")
+        };
+        items.reverse();
+        Ok(())
+    }
+
+    fn list_clear(&mut self, list: PyList) -> PyResult<()> {
+        let id = list.object_id();
+        let length = self.list_len(list)?;
+        let Object::List(items) = self
+            .state
+            .heap
+            .get_mut(id)
+            .map_err(PyError::runtime_error)?
+        else {
+            unreachable!("list kind was checked before clearing")
+        };
+        items.clear();
+        let bytes = u64::try_from(length)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(MODELED_VALUE_BYTES);
+        self.state
+            .heap
+            .release_object_shrink(id, bytes, &mut self.interp.resources)
+            .map_err(PyError::runtime_error)
     }
 
     fn bytearray_items(&mut self, value: PyByteArray) -> PyResult<Vec<u8>> {
@@ -6541,18 +6657,95 @@ impl PyRuntime for Vm<'_> {
             .ok_or_else(|| PyError::resource_error("dict snapshot size overflow"))?;
         self.reserve_memory(bytes)?;
         match self.state.heap.get(id).map_err(PyError::runtime_error)? {
-            Object::Dict(items) | Object::DefaultDict { entries: items, .. } => Ok(items.clone()),
+            Object::Dict(items) | Object::DefaultDict { entries: items, .. } => Ok(items.to_vec()),
             _ => Err(PyError::runtime_error("dict handle changed object kind")),
         }
+    }
+
+    fn dict_get(&mut self, dict: PyDict, key: &Value) -> PyResult<Option<Value>> {
+        let id = dict.object_id();
+        let Some(position) = self
+            .find_mapping_entry(id, key)
+            .map_err(PyError::runtime_error)?
+        else {
+            return Ok(None);
+        };
+        match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
+                Ok(Some(entries[position].1))
+            }
+            _ => Err(PyError::runtime_error("dict handle changed object kind")),
+        }
+    }
+
+    fn dict_insert(&mut self, dict: PyDict, key: Value, value: Value) -> PyResult<()> {
+        let id = dict.object_id();
+        if let Some(position) = self
+            .find_mapping_entry(id, &key)
+            .map_err(PyError::runtime_error)?
+        {
+            let entries = match self
+                .state
+                .heap
+                .get_mut(id)
+                .map_err(PyError::runtime_error)?
+            {
+                Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
+                _ => return Err(PyError::runtime_error("dict handle changed object kind")),
+            };
+            entries.set_value(position, value);
+            return Ok(());
+        }
+        self.state
+            .heap
+            .reserve_object_growth(id, MODELED_MAPPING_ENTRY_BYTES, &mut self.interp.resources)
+            .map_err(PyError::resource_error)?;
+        let entries = match self
+            .state
+            .heap
+            .get_mut(id)
+            .map_err(PyError::runtime_error)?
+        {
+            Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
+            _ => unreachable!("dict kind was checked during lookup"),
+        };
+        entries.push((key, value));
+        Ok(())
+    }
+
+    fn dict_remove(&mut self, dict: PyDict, key: &Value) -> PyResult<Option<Value>> {
+        let id = dict.object_id();
+        let Some(position) = self
+            .find_mapping_entry(id, key)
+            .map_err(PyError::runtime_error)?
+        else {
+            return Ok(None);
+        };
+        let value = match self
+            .state
+            .heap
+            .get_mut(id)
+            .map_err(PyError::runtime_error)?
+        {
+            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
+                entries.remove(position).1
+            }
+            _ => return Err(PyError::runtime_error("dict handle changed object kind")),
+        };
+        self.state
+            .heap
+            .release_object_shrink(id, MODELED_MAPPING_ENTRY_BYTES, &mut self.interp.resources)
+            .map_err(PyError::runtime_error)?;
+        Ok(Some(value))
     }
 
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(Value, Value)>) -> PyResult<()> {
         let id = dict.object_id();
         let replacement = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
-            Object::Dict(_) => Object::Dict(items),
+            Object::Dict(_) => Object::Dict(items.into()),
             Object::DefaultDict { factory, .. } => Object::DefaultDict {
                 factory: *factory,
-                entries: items,
+                entries: items.into(),
             },
             _ => return Err(PyError::runtime_error("dict handle changed object kind")),
         };
@@ -6588,18 +6781,53 @@ impl PyRuntime for Vm<'_> {
         }
     }
 
-    fn replace_set_items(&mut self, set: PySet, items: Vec<Value>) -> PyResult<()> {
+    fn set_insert(&mut self, set: PySet, value: Value) -> PyResult<bool> {
         let id = set.object_id();
-        if !matches!(
-            self.state.heap.get(id).map_err(PyError::runtime_error)?,
-            Object::Set(_)
-        ) {
-            return Err(PyError::runtime_error("set handle changed object kind"));
+        if self
+            .find_set_entry(id, &value)
+            .map_err(PyError::runtime_error)?
+            .is_some()
+        {
+            return Ok(false);
         }
         self.state
             .heap
-            .replace_payload(id, Object::Set(items), &mut self.interp.resources)
-            .map_err(PyError::resource_error)
+            .reserve_object_growth(id, MODELED_VALUE_BYTES, &mut self.interp.resources)
+            .map_err(PyError::resource_error)?;
+        let Object::Set(items) = self
+            .state
+            .heap
+            .get_mut(id)
+            .map_err(PyError::runtime_error)?
+        else {
+            unreachable!("set kind was checked during lookup")
+        };
+        items.push(value);
+        Ok(true)
+    }
+
+    fn set_remove(&mut self, set: PySet, value: &Value) -> PyResult<bool> {
+        let id = set.object_id();
+        let Some(position) = self
+            .find_set_entry(id, value)
+            .map_err(PyError::runtime_error)?
+        else {
+            return Ok(false);
+        };
+        let Object::Set(items) = self
+            .state
+            .heap
+            .get_mut(id)
+            .map_err(PyError::runtime_error)?
+        else {
+            return Err(PyError::runtime_error("set handle changed object kind"));
+        };
+        items.remove(position);
+        self.state
+            .heap
+            .release_object_shrink(id, MODELED_VALUE_BYTES, &mut self.interp.resources)
+            .map_err(PyError::runtime_error)?;
+        Ok(true)
     }
 
     fn property_getter(&self, property: PyProperty) -> PyResult<Value> {
@@ -6918,7 +7146,7 @@ impl PyRuntime for Vm<'_> {
             self,
             Object::DefaultDict {
                 factory: factory.into_value(),
-                entries: Vec::new(),
+                entries: Default::default(),
             },
         )
         .map_err(PyError::resource_error)
@@ -6949,7 +7177,7 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn new_dict(&mut self, items: Vec<(Value, Value)>) -> PyResult<Value> {
-        Vm::allocate_object(self, Object::Dict(items)).map_err(PyError::resource_error)
+        Vm::allocate_object(self, Object::Dict(items.into())).map_err(PyError::resource_error)
     }
 
     fn new_set(&mut self, items: Vec<Value>) -> PyResult<Value> {
@@ -7498,7 +7726,6 @@ impl PyRuntime for Vm<'_> {
             return Err(PyError::runtime_error("module handle changed object kind"));
         };
         let scope = *scope;
-        let outer_stack = std::mem::take(&mut self.stack);
         let import_root = path
             .rsplit_once('/')
             .map_or_else(|| "/".to_string(), |(parent, _)| parent.to_string());
@@ -7507,7 +7734,6 @@ impl PyRuntime for Vm<'_> {
         let execution = self.execute_code(&code);
         self.local_scopes.pop();
         self.state.temporary_import_paths.remove(0);
-        self.stack = outer_stack;
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
