@@ -134,7 +134,7 @@ fn json_loads_reserves_parser_and_object_memory() {
 #[test]
 fn arbitrary_precision_arithmetic_is_metered_before_growth() {
     let (status, stdout, stderr, usage) = run_with_limits(
-        "value = 9223372036854775808\nfor _ in range(100):\n    value = value * value",
+        "value = 9223372036854775807\nfor _ in range(100):\n    value = value * value",
         Limits {
             memory: 64 * 1024,
             ..Limits::unlimited()

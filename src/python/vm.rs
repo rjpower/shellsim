@@ -26,6 +26,7 @@ use super::native::{
     PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PySubcommandSpec, PySubparsersSpec,
     PyTuple, PyValueCast,
 };
+use super::number;
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
 use super::slice::SlicePlan;
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
@@ -4091,6 +4092,10 @@ impl<'a> Vm<'a> {
     fn compare(&mut self, operator: ComparisonOperator) -> Result<(), String> {
         let right = self.pop()?;
         let left = self.pop()?;
+        if let Some(result) = number::exact_integer_comparison(operator, left, right) {
+            self.stack.push(Value::Bool(result));
+            return Ok(());
+        }
         let mut slot_result = match operator {
             ComparisonOperator::Equal => {
                 self.invoke_slot(&left, Slot::Equal, "__eq__", vec![right])?
@@ -4181,6 +4186,11 @@ impl<'a> Vm<'a> {
         left: Value,
         right: Value,
     ) -> Result<Value, String> {
+        if let Some(value) = number::exact_binary(self, operator, left, right)
+            .map_err(|error| self.record_native_error(error))?
+        {
+            return Ok(value);
+        }
         let (slot, name, reflected_slot, reflected_name) = match operator {
             BinaryOperator::Add => (Slot::Add, "__add__", Slot::ReflectedAdd, "__radd__"),
             BinaryOperator::Subtract => (
