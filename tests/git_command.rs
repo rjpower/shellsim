@@ -1238,7 +1238,7 @@ fn unknown_subcommands_are_reported_the_way_git_reports_them() {
         "git: 'frobnicate' is not a git command. See 'git --help'.\n"
     );
     // A real Git subcommand this subset leaves out says so instead.
-    let omitted = run(&mut env, "git rebase main");
+    let omitted = run(&mut env, "git bisect start");
     assert_eq!(omitted.0, 2);
     assert!(
         omitted.2.contains("unsupported subcommand"),
@@ -2088,4 +2088,86 @@ fn the_reflog_records_where_head_has_been_and_brings_a_reset_back() {
     assert_eq!(env.vfs.read("/", "/f").unwrap(), b"one\n");
     assert_eq!(run(&mut env, "git reset -q --hard HEAD@{1}").0, 0);
     assert_eq!(env.vfs.read("/", "/f").unwrap(), b"two\n");
+}
+
+#[test]
+fn rebase_replays_a_branch_onto_another() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/f", b"base\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    assert_eq!(run(&mut env, "git switch -qc feature").0, 0);
+    env.vfs.put_file("/a", b"a\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm f1").0, 0);
+    env.vfs.put_file("/b", b"b\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm f2").0, 0);
+    assert_eq!(run(&mut env, "git switch -q main").0, 0);
+    env.vfs.put_file("/m", b"m\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm m1").0, 0);
+    assert_eq!(run(&mut env, "git switch -q feature").0, 0);
+
+    assert_eq!(run(&mut env, "git rebase main").0, 0);
+    let subjects: Vec<String> = run(&mut env, "git log --format=%s")
+        .1
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(subjects, vec!["f2", "f1", "m1", "base"]);
+    assert_eq!(run(&mut env, "git status --short").1, "");
+    // Everything both branches wrote is present.
+    for path in ["/a", "/b", "/m", "/f"] {
+        assert!(env.vfs.exists("/", path), "{path} is missing");
+    }
+    assert!(run(&mut env, "git rebase main").1.contains("up to date"));
+}
+
+#[test]
+fn a_conflicting_rebase_stops_and_can_be_continued_or_abandoned() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f", b"l1\nl2\nl3\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    assert_eq!(run(&mut env, "git switch -qc feature").0, 0);
+    env.vfs
+        .put_file("/f", b"l1\nFEATURE\nl3\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -qam f1").0, 0);
+    env.vfs
+        .put_file("/f", b"l1\nFEATURE\nl3\nextra\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -qam f2").0, 0);
+    assert_eq!(run(&mut env, "git switch -q main").0, 0);
+    env.vfs
+        .put_file("/f", b"l1\nMAIN\nl3\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git commit -qam m1").0, 0);
+    assert_eq!(run(&mut env, "git switch -q feature").0, 0);
+
+    let stopped = run(&mut env, "git rebase main");
+    assert_eq!(stopped.0, 1);
+    assert!(stopped.2.contains("could not apply"), "{}", stopped.2);
+    assert_eq!(run(&mut env, "git status --short").1, "UU f\n");
+
+    // Abandoning it puts the branch back exactly as it was.
+    assert_eq!(run(&mut env, "git rebase --abort").0, 0);
+    assert_eq!(
+        env.vfs.read("/", "/f").unwrap(),
+        b"l1\nFEATURE\nl3\nextra\n"
+    );
+    assert_eq!(run(&mut env, "git log --format=%s").1, "f2\nf1\nbase\n");
+    assert_eq!(run(&mut env, "git status --short").1, "");
+
+    // Settling the conflict carries the rest of the branch over it.
+    assert_eq!(run(&mut env, "git rebase main").0, 1);
+    env.vfs
+        .put_file("/f", b"l1\nBOTH\nl3\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add f").0, 0);
+    assert_eq!(run(&mut env, "git rebase --continue").0, 0);
+    assert_eq!(run(&mut env, "git log --format=%s").1, "f2\nf1\nm1\nbase\n");
+    assert_eq!(env.vfs.read("/", "/f").unwrap(), b"l1\nBOTH\nl3\nextra\n");
+    assert_eq!(run(&mut env, "git status --short").1, "");
+    assert_eq!(run(&mut env, "git rebase --continue").0, 128);
 }

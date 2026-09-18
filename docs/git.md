@@ -10,9 +10,8 @@ history, branch, and merge without noticing it is not talking to Git.
 ```text
 init  status  add  rm  mv  restore  reset  clean  ls-files
 commit  log  show  diff  apply  rev-parse  rev-list  branch  tag  switch  checkout  merge
-cherry-pick  revert  config  remote  stash  grep  cat-file  hash-object  ls-tree  check-ignore
-merge-base
-describe  shortlog  show-ref  symbolic-ref  for-each-ref  blame  reflog
+cherry-pick  revert  rebase  config  remote  stash  grep  cat-file  hash-object  ls-tree
+check-ignore  merge-base  describe  shortlog  show-ref  symbolic-ref  for-each-ref  blame  reflog
 ```
 
 Every move of HEAD is recorded, so `git reflog` lists where it has been and `HEAD@{N}` names the
@@ -100,6 +99,12 @@ cherry-pick keeps the original author; a revert does not.
 taken from, so work committed or edited in the meantime survives. A plain reapplication restores
 the working tree only, as Git's does; an entry that conflicts stays on the list.
 
+`git rebase [--onto NEWBASE] UPSTREAM` replays the commits the branch has and the upstream does
+not, one at a time, as a run of cherry-picks. It stops at the first conflict and takes
+`--continue`, `--skip`, and `--abort`; `--abort` puts the branch back exactly where it was. A
+commit whose change is already in the new base is dropped. Interactive rebase needs an editor and
+is refused.
+
 Binary files and a path one side deleted while the other changed it are recorded as conflicts
 without markers, leaving the surviving content in the working tree, as Git does.
 
@@ -108,7 +113,7 @@ without markers, leaving the surviving content in the working tree, as Git does.
 Anything needing a network is refused and recorded as unsupported: `clone`, `fetch`, `pull`,
 `push`, `ls-remote`, and `submodule`. `git remote` records remote names but never contacts one.
 
-There is no `rebase`, `bisect`, or `worktree`, and no interactive mode for any
+There is no `bisect` or `worktree`, and no interactive mode for any
 command. Those report `unsupported subcommand` and exit 2; a name that is not a Git
 subcommand at all is reported the way Git reports a typo and exits 1.
 
@@ -136,6 +141,7 @@ by real Git is not readable, and a repository created here is not meant to be ha
 .git/config            repository configuration in Git's INI format
 .git/stash-list        saved stash entries, newest first
 .git/logs/HEAD         every move of HEAD, oldest first, as `before<TAB>after<TAB>action`
+.git/REBASE_STATE      the branch, its original tip, and the commits a rebase has left to apply
 .git/MERGE_HEAD        the commit an unfinished merge is bringing in
 .git/CHERRY_PICK_HEAD  the commit an unfinished cherry-pick is replaying
 .git/REVERT_HEAD       the commit an unfinished revert is undoing
