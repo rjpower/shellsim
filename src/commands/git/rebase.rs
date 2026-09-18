@@ -109,17 +109,14 @@ pub(crate) fn git_rebase(
             }
             // Editing a rebase needs an editor, which the simulation does not have.
             "-i" | "--interactive" => {
-                io.err
-                    .extend_from_slice(b"fatal: interactive rebase is not supported here\n");
+                io.print_err("fatal: interactive rebase is not supported here\n");
                 return 128;
             }
             _ => return usage(io, &format!("unsupported rebase option: {name}")),
         }
     }
     if load(ctx, &root).is_some() {
-        io.err.extend_from_slice(
-            b"fatal: a rebase is already in progress\nhint: try \"git rebase --continue\" or \"git rebase --abort\"\n",
-        );
+        io.print_err("fatal: a rebase is already in progress\nhint: try \"git rebase --continue\" or \"git rebase --abort\"\n");
         return 128;
     }
     // `git rebase UPSTREAM BRANCH` means "check out BRANCH first", which is how a rebase is
@@ -131,8 +128,7 @@ pub(crate) fn git_rebase(
     };
     let upstream = &upstream;
     let Some(upstream_id) = repo::resolve_revision(ctx, &root, upstream) else {
-        io.err
-            .extend_from_slice(format!("fatal: invalid upstream '{upstream}'\n").as_bytes());
+        io.print_err(&format!("fatal: invalid upstream '{upstream}'\n"));
         return 128;
     };
     // Git names the new base in the reflog as the user wrote it, which is what makes it readable.
@@ -141,9 +137,7 @@ pub(crate) fn git_rebase(
         Some(revision) => match repo::resolve_revision(ctx, &root, &revision) {
             Some(id) => id,
             None => {
-                io.err.extend_from_slice(
-                    format!("fatal: invalid reference '{revision}'\n").as_bytes(),
-                );
+                io.print_err(&format!("fatal: invalid reference '{revision}'\n"));
                 return 128;
             }
         },
@@ -161,10 +155,9 @@ pub(crate) fn git_rebase(
         } else {
             "You have unstaged changes."
         };
-        io.err.extend_from_slice(
-            format!("error: cannot rebase: {what}\nerror: Please commit or stash them.\n")
-                .as_bytes(),
-        );
+        io.print_err(&format!(
+            "error: cannot rebase: {what}\nerror: Please commit or stash them.\n"
+        ));
         return 1;
     }
     if let Some(wanted) = wanted {
@@ -174,13 +167,11 @@ pub(crate) fn git_rebase(
         }
     }
     let Some(branch) = repo::current_branch(ctx, &root) else {
-        io.err
-            .extend_from_slice(b"fatal: rebasing a detached HEAD is not supported here\n");
+        io.print_err("fatal: rebasing a detached HEAD is not supported here\n");
         return 128;
     };
     let Some(head) = repo::head_commit(ctx, &root) else {
-        io.err
-            .extend_from_slice(b"fatal: no commit on the current branch to rebase\n");
+        io.print_err("fatal: no commit on the current branch to rebase\n");
         return 128;
     };
     // With the upstream already behind the branch there is nowhere new to put it, unless
@@ -190,8 +181,7 @@ pub(crate) fn git_rebase(
             == Some(upstream_id.as_str());
     let todo = commits_to_replay(ctx, &root, &head, &upstream_id);
     if settled || (todo.is_empty() && head == onto_id) {
-        io.out
-            .extend_from_slice(format!("Current branch {branch} is up to date.\n").as_bytes());
+        io.print(&format!("Current branch {branch} is up to date.\n"));
         return 0;
     }
     repo::record_orig_head(ctx, &root);
@@ -204,9 +194,9 @@ pub(crate) fn git_rebase(
         if let Err(error) = repo::update_head(ctx, &root, &onto_id, &action) {
             return cannot_write(io, "HEAD", &error);
         }
-        io.out.extend_from_slice(
-            format!("Successfully rebased and updated refs/heads/{branch}.\n").as_bytes(),
-        );
+        io.print(&format!(
+            "Successfully rebased and updated refs/heads/{branch}.\n"
+        ));
         return 0;
     }
     // The branch moves to the new base first, and each commit is replayed on top of it.
@@ -261,8 +251,7 @@ fn lay_down(
         return Err(1);
     }
     if let Err(error) = repo::replace_work_tree(ctx, root, &snapshot.head, &target) {
-        io.err
-            .extend_from_slice(format!("git rebase: {error}\n").as_bytes());
+        io.print_err(&format!("git rebase: {error}\n"));
         return Err(1);
     }
     if let Err(error) = repo::store_index(ctx, root, &target) {
@@ -281,8 +270,7 @@ fn replay(
 ) -> i32 {
     while let Some(id) = state.todo.first().cloned() {
         let Some(original) = repo::load_commit(ctx, root, &id) else {
-            io.err
-                .extend_from_slice(format!("fatal: bad object {id}\n").as_bytes());
+            io.print_err(&format!("fatal: bad object {id}\n"));
             return 128;
         };
         let Some(head) = repo::head_commit(ctx, root) else {
@@ -305,8 +293,7 @@ fn replay(
             Err(failed) => return cannot_write(io, &failed.path, &failed.error),
         };
         if let Err(error) = repo::update_work_tree(ctx, root, &ours, &combined.tree) {
-            io.err
-                .extend_from_slice(format!("git rebase: {error}\n").as_bytes());
+            io.print_err(&format!("git rebase: {error}\n"));
             return 1;
         }
         if let Err(error) = repo::store_index(ctx, root, &combined.tree) {
@@ -317,21 +304,16 @@ fn replay(
                 return 1;
             }
             for path in combined.stages.keys() {
-                io.err.extend_from_slice(
-                    format!("CONFLICT (content): Merge conflict in {path}\n").as_bytes(),
-                );
+                io.print_err(&format!("CONFLICT (content): Merge conflict in {path}\n"));
             }
-            io.err.extend_from_slice(
-                format!(
-                    "error: could not apply {label}\n\
+            io.print_err(&format!(
+                "error: could not apply {label}\n\
                      hint: Resolve all conflicts manually, mark them as resolved with\n\
                      hint: \"git add/rm <pathspec>\", then run \"git rebase --continue\".\n\
                      hint: You can instead skip this commit: run \"git rebase --skip\".\n\
                      hint: To abort and get back to the state before \"git rebase\", run\n\
                      hint: \"git rebase --abort\".\n"
-                )
-                .as_bytes(),
-            );
+            ));
             return 1;
         }
         // A commit whose change is already in the new base is dropped, as Git drops it.
@@ -350,13 +332,10 @@ fn replay(
         return status;
     }
     clear(ctx, root);
-    io.out.extend_from_slice(
-        format!(
-            "Successfully rebased and updated refs/heads/{}.\n",
-            state.branch
-        )
-        .as_bytes(),
-    );
+    io.print(&format!(
+        "Successfully rebased and updated refs/heads/{}.\n",
+        state.branch
+    ));
     0
 }
 
@@ -367,8 +346,7 @@ fn land(ctx: &mut CommandContext<'_>, root: &str, state: &State, io: &mut Io) ->
     };
     let reference = format!("refs/heads/{}", state.branch);
     if repo::write_reference(ctx, root, &reference, &tip).is_err() {
-        io.err
-            .extend_from_slice(format!("git rebase: cannot update {reference}\n").as_bytes());
+        io.print_err(&format!("git rebase: cannot update {reference}\n"));
         return Err(1);
     }
     let action = format!("rebase (finish): returning to {reference}");
@@ -411,13 +389,11 @@ fn record(
 /// Finish the commit the user has settled, then carry on.
 fn resume(ctx: &mut CommandContext<'_>, root: &str, globals: &Globals, io: &mut Io) -> i32 {
     let Some(mut state) = load(ctx, root) else {
-        io.err.extend_from_slice(b"fatal: No rebase in progress?\n");
+        io.print_err("fatal: No rebase in progress?\n");
         return 128;
     };
     if !conflict::load_stages(ctx, root).is_empty() {
-        io.err.extend_from_slice(
-            b"error: you have unmerged paths\nhint: Mark them resolved with \"git add/rm <pathspec>\".\n",
-        );
+        io.print_err("error: you have unmerged paths\nhint: Mark them resolved with \"git add/rm <pathspec>\".\n");
         return 1;
     }
     let Some(id) = state.todo.first().cloned() else {
@@ -438,14 +414,11 @@ fn resume(ctx: &mut CommandContext<'_>, root: &str, globals: &Globals, io: &mut 
             Ok(id) => id,
             Err(status) => return status,
         };
-        io.out.extend_from_slice(
-            format!(
-                "[detached HEAD {}] {}\n",
-                repo::short(&id),
-                original.subject()
-            )
-            .as_bytes(),
-        );
+        io.print(&format!(
+            "[detached HEAD {}] {}\n",
+            repo::short(&id),
+            original.subject()
+        ));
         history::emit_commit_summary(ctx, root, &head_tree, &staged, io);
     }
     state.todo.remove(0);
@@ -459,7 +432,7 @@ fn resume(ctx: &mut CommandContext<'_>, root: &str, globals: &Globals, io: &mut 
 /// Drop the commit that stopped the rebase and carry on without it.
 fn skip(ctx: &mut CommandContext<'_>, root: &str, globals: &Globals, io: &mut Io) -> i32 {
     let Some(mut state) = load(ctx, root) else {
-        io.err.extend_from_slice(b"fatal: No rebase in progress?\n");
+        io.print_err("fatal: No rebase in progress?\n");
         return 128;
     };
     let Some(head) = repo::head_commit(ctx, root) else {
@@ -481,7 +454,7 @@ fn skip(ctx: &mut CommandContext<'_>, root: &str, globals: &Globals, io: &mut Io
 /// Put the branch back where it was before the rebase started.
 fn abort(ctx: &mut CommandContext<'_>, root: &str, io: &mut Io) -> i32 {
     let Some(state) = load(ctx, root) else {
-        io.err.extend_from_slice(b"fatal: No rebase in progress?\n");
+        io.print_err("fatal: No rebase in progress?\n");
         return 128;
     };
     if let Err(status) = lay_down(ctx, root, &state.original, io) {

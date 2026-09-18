@@ -151,6 +151,13 @@ Git reports a typo and exits 1. An operation that was understood but could not b
 an unresolvable revision, a pathspec matching nothing — prints `fatal:` and exits 128, again as
 Git does.
 
+A repository that cannot be read is refused rather than guessed at. An absent index file is
+nothing staged, as it is in Git, but an index that is there and unreadable stops every command
+that would write the index or the working tree, because an empty index reads as "delete
+everything". The same holds for a commit whose tree is missing: the commands that write ask for
+it in a form that fails. A write that cannot be made — the simulated disk has a size limit — says
+what it could not write rather than exiting quietly.
+
 Submodules and rename detection based on similarity are outside the model: `status` and `diff`
 recognize a rename only when the content is byte-identical. Modes are tracked as Git tracks them:
 `chmod +x` on a tracked file shows up in `status` and as `old mode`/`new mode` in `diff`, a

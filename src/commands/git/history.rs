@@ -123,8 +123,8 @@ pub(crate) fn git_commit(
     // A merge, cherry-pick, or revert waiting on the user supplies the message and the parents.
     let pending = pending_operation(ctx, &root);
     if !conflict::load_stages(ctx, &root).is_empty() {
-        io.err.extend_from_slice(
-            b"error: Committing is not possible because you have unmerged files.\n\
+        io.print_err(
+            "error: Committing is not possible because you have unmerged files.\n\
               hint: Fix them up in the work tree, and then use 'git add/rm <file>'\n\
               hint: as appropriate to mark resolution and make a commit.\n\
               fatal: Exiting because of an unresolved conflict.\n",
@@ -134,8 +134,7 @@ pub(crate) fn git_commit(
     let previous = repo::head_commit(ctx, &root)
         .and_then(|id| repo::load_commit(ctx, &root, &id).map(|commit| (id, commit)));
     if amend && previous.is_none() {
-        io.err
-            .extend_from_slice(b"fatal: You have nothing to amend.\n");
+        io.print_err("fatal: You have nothing to amend.\n");
         return 128;
     }
     let mut message = messages.join("\n\n");
@@ -148,10 +147,9 @@ pub(crate) fn git_commit(
             ctx.fs_read_limited("/", &absolute, 1024 * 1024)
         };
         let Ok(bytes) = bytes else {
-            io.err.extend_from_slice(
-                format!("fatal: could not read log file '{path}': No such file or directory\n")
-                    .as_bytes(),
-            );
+            io.print_err(&format!(
+                "fatal: could not read log file '{path}': No such file or directory\n"
+            ));
             return 128;
         };
         let text = String::from_utf8_lossy(&bytes).trim_end().to_string();
@@ -264,8 +262,7 @@ pub(crate) fn git_commit(
     let id = match repo::store_commit(ctx, &root, &commit, &index_tree) {
         Ok(id) => id,
         Err(error) => {
-            io.err
-                .extend_from_slice(format!("git commit: {error}\n").as_bytes());
+            io.print_err(&format!("git commit: {error}\n"));
             return 1;
         }
     };
@@ -293,18 +290,14 @@ pub(crate) fn git_commit(
     } else {
         ""
     };
-    io.out.extend_from_slice(
-        format!(
-            "[{label} {root_commit}{}] {}\n",
-            repo::short(&id),
-            commit.subject()
-        )
-        .as_bytes(),
-    );
+    io.print(&format!(
+        "[{label} {root_commit}{}] {}\n",
+        repo::short(&id),
+        commit.subject()
+    ));
     if amend {
         // Amending keeps the original author date, which Git points out.
-        io.out
-            .extend_from_slice(format!(" Date: {}\n", format_date(commit.timestamp)).as_bytes());
+        io.print(&format!(" Date: {}\n", format_date(commit.timestamp)));
     }
     emit_commit_summary(ctx, &root, &baseline, &index_tree, io);
     0
@@ -350,8 +343,7 @@ pub(crate) fn emit_commit_summary(
         insertions += added;
         deletions += removed;
     }
-    io.out
-        .extend_from_slice(compare::summary_line(changed.len(), insertions, deletions).as_bytes());
+    io.print(&compare::summary_line(changed.len(), insertions, deletions));
     emit_mode_lines(ctx, root, old, new, io);
 }
 
@@ -883,10 +875,9 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     let Some(mut history) = history_for(ctx, &root, &revisions, first_parent) else {
         if repo::head_commit(ctx, &root).is_none() {
             let branch = repo::current_branch(ctx, &root).unwrap_or_else(|| "HEAD".to_string());
-            io.err.extend_from_slice(
-                format!("fatal: your current branch '{branch}' does not have any commits yet\n")
-                    .as_bytes(),
-            );
+            io.print_err(&format!(
+                "fatal: your current branch '{branch}' does not have any commits yet\n"
+            ));
             return 128;
         }
         return super::ambiguous_argument(io, &revisions.join(" "));
@@ -903,8 +894,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             .case_insensitive(ignore_case)
             .build()
         else {
-            io.err
-                .extend_from_slice(format!("fatal: invalid pattern: {pattern}\n").as_bytes());
+            io.print_err(&format!("fatal: invalid pattern: {pattern}\n"));
             return 128;
         };
         history.retain(|(_, commit)| {
@@ -929,8 +919,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             .case_insensitive(ignore_case)
             .build()
         else {
-            io.err
-                .extend_from_slice(format!("fatal: invalid pattern: {pattern}\n").as_bytes());
+            io.print_err(&format!("fatal: invalid pattern: {pattern}\n"));
             return 128;
         };
         history.retain(|(id, commit)| matches_changed_lines(ctx, &root, id, commit, &regex));
@@ -983,9 +972,13 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         } else {
             id.as_str()
         };
-        io.out.extend_from_slice(
-            render_commit_header(displayed, commit, &pretty, &decoration, now).as_bytes(),
-        );
+        io.print(&render_commit_header(
+            displayed,
+            commit,
+            &pretty,
+            &decoration,
+            now,
+        ));
         if matches!(
             pretty,
             Pretty::Custom {
@@ -1098,11 +1091,11 @@ fn draw_on_rail(block: &[u8], rung: &Rung, head: usize, io: &mut Io) {
         } else {
             &rung.rest
         };
-        io.out.extend_from_slice(prefix.as_bytes());
+        io.print(prefix);
         io.out.extend_from_slice(line);
         io.out.push(b'\n');
     }
-    io.out.extend_from_slice(rung.connectors.as_bytes());
+    io.print(&rung.connectors);
 }
 
 fn commit_touches(
@@ -1345,9 +1338,9 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
                 .get(&path)
                 .and_then(|entry| repo::read_blob(ctx, &root, &entry.hash))
             else {
-                io.err.extend_from_slice(
-                    format!("fatal: path '{path}' does not exist in '{prefix}'\n").as_bytes(),
-                );
+                io.print_err(&format!(
+                    "fatal: path '{path}' does not exist in '{prefix}'\n"
+                ));
                 return 128;
             };
             io.out.extend_from_slice(&data);
@@ -1360,16 +1353,13 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             return super::ambiguous_argument(io, revision);
         };
         if let Some(annotation) = read_annotation(ctx, &root, revision) {
-            io.out.extend_from_slice(
-                format!(
-                    "tag {revision}\nTagger: {} <{}>\nDate:   {}\n\n{}\n\n",
-                    annotation.author_name,
-                    annotation.author_email,
-                    format_date(annotation.timestamp),
-                    annotation.message
-                )
-                .as_bytes(),
-            );
+            io.print(&format!(
+                "tag {revision}\nTagger: {} <{}>\nDate:   {}\n\n{}\n\n",
+                annotation.author_name,
+                annotation.author_email,
+                format_date(annotation.timestamp),
+                annotation.message
+            ));
         }
         let decoration = if matches!(pretty, Pretty::Custom { .. }) {
             decorations(ctx, &root, &id)
@@ -1377,9 +1367,13 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             String::new()
         };
         let now = now_seconds(ctx);
-        io.out.extend_from_slice(
-            render_commit_header(&id, &commit, &pretty, &decoration, now).as_bytes(),
-        );
+        io.print(&render_commit_header(
+            &id,
+            &commit,
+            &pretty,
+            &decoration,
+            now,
+        ));
         if matches!(
             pretty,
             Pretty::Custom {
@@ -1432,17 +1426,16 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
         };
         match name.as_str() {
             "--show-toplevel" => {
-                io.out.extend_from_slice(format!("{root}\n").as_bytes());
+                io.print(&format!("{root}\n"));
                 return 0;
             }
             "--is-inside-work-tree" => {
-                io.out.extend_from_slice(b"true\n");
+                io.print("true\n");
                 return 0;
             }
             "--is-inside-git-dir" => {
                 let inside = repo::is_git_path(&root, &ctx.cwd);
-                io.out
-                    .extend_from_slice(if inside { b"true\n" } else { b"false\n" });
+                io.print(if inside { "true\n" } else { "false\n" });
                 return 0;
             }
             "--git-dir" => {
@@ -1452,24 +1445,21 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
                 } else {
                     repo::path_join(&root, repo::GIT_DIR)
                 };
-                io.out.extend_from_slice(format!("{rendered}\n").as_bytes());
+                io.print(&format!("{rendered}\n"));
                 return 0;
             }
             "--absolute-git-dir" => {
-                io.out.extend_from_slice(
-                    format!("{}\n", repo::path_join(&root, repo::GIT_DIR)).as_bytes(),
-                );
+                io.print(&format!("{}\n", repo::path_join(&root, repo::GIT_DIR)));
                 return 0;
             }
             "--is-bare-repository" => {
-                io.out.extend_from_slice(b"false\n");
+                io.print("false\n");
                 return 0;
             }
             "--show-cdup" => {
                 let depth = repo::relative_path(&root, &ctx.cwd)
                     .map_or(0, |prefix| prefix.split('/').count());
-                io.out
-                    .extend_from_slice(format!("{}\n", "../".repeat(depth)).as_bytes());
+                io.print(&format!("{}\n", "../".repeat(depth)));
                 return 0;
             }
             "--show-prefix" => {
@@ -1477,7 +1467,7 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
                 if prefix.is_empty() {
                     io.out.push(b'\n');
                 } else {
-                    io.out.extend_from_slice(format!("{prefix}/\n").as_bytes());
+                    io.print(&format!("{prefix}/\n"));
                 }
                 return 0;
             }
@@ -1516,7 +1506,7 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
             } else {
                 String::new()
             };
-            io.out.extend_from_slice(format!("{name}\n").as_bytes());
+            io.print(&format!("{name}\n"));
             continue;
         }
         if abbrev_ref {
@@ -1525,7 +1515,7 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
             } else {
                 revision.rsplit('/').next().unwrap_or(revision).to_string()
             };
-            io.out.extend_from_slice(format!("{name}\n").as_bytes());
+            io.print(&format!("{name}\n"));
             continue;
         }
         let Some(commit) = rev_parse_object(ctx, &root, revision) else {
@@ -1539,7 +1529,7 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
             Some(length) => commit[..length.min(commit.len())].to_string(),
             None => commit,
         };
-        io.out.extend_from_slice(format!("{rendered}\n").as_bytes());
+        io.print(&format!("{rendered}\n"));
     }
     0
 }
@@ -1608,12 +1598,11 @@ pub(crate) fn git_rev_list(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     };
     history.truncate(limit);
     if count {
-        io.out
-            .extend_from_slice(format!("{}\n", history.len()).as_bytes());
+        io.print(&format!("{}\n", history.len()));
         return 0;
     }
     for (id, _) in history {
-        io.out.extend_from_slice(format!("{id}\n").as_bytes());
+        io.print(&format!("{id}\n"));
     }
     0
 }
@@ -1652,7 +1641,7 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         match name.as_str() {
             "--show-current" => {
                 if let Some(branch) = repo::current_branch(ctx, &root) {
-                    io.out.extend_from_slice(format!("{branch}\n").as_bytes());
+                    io.print(&format!("{branch}\n"));
                 }
                 return 0;
             }
@@ -1727,21 +1716,20 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
     }
     let start = operands.get(1).map_or("HEAD", String::as_str);
     let Some(commit) = repo::resolve_revision(ctx, &root, start) else {
-        io.err
-            .extend_from_slice(format!("fatal: not a valid object name: '{start}'\n").as_bytes());
+        io.print_err(&format!("fatal: not a valid object name: '{start}'\n"));
         return 128;
     };
     let reference = format!("refs/heads/{}", operands[0]);
     if !force && repo::read_reference(ctx, &root, &reference).is_some() {
-        io.err.extend_from_slice(
-            format!("fatal: a branch named '{}' already exists\n", operands[0]).as_bytes(),
-        );
+        io.print_err(&format!(
+            "fatal: a branch named '{}' already exists\n",
+            operands[0]
+        ));
         return 128;
     }
     repo::write_reference(ctx, &root, &reference, &commit).map_or_else(
         |error| {
-            io.err
-                .extend_from_slice(format!("git branch: {error}\n").as_bytes());
+            io.print_err(&format!("git branch: {error}\n"));
             1
         },
         |()| 0,
@@ -1818,11 +1806,12 @@ fn list_branches(
                 let subject = repo::load_commit(ctx, root, &commit)
                     .map(|commit| commit.subject().to_string())
                     .unwrap_or_default();
-                io.out.extend_from_slice(
-                    format!("* {label:width$} {} {subject}\n", repo::short(&commit)).as_bytes(),
-                );
+                io.print(&format!(
+                    "* {label:width$} {} {subject}\n",
+                    repo::short(&commit)
+                ));
             } else {
-                io.out.extend_from_slice(format!("* {label}\n").as_bytes());
+                io.print(&format!("* {label}\n"));
             }
         }
     }
@@ -1841,8 +1830,7 @@ fn list_branches(
             ' '
         };
         if !verbose {
-            io.out
-                .extend_from_slice(format!("{marker} {branch}\n").as_bytes());
+            io.print(&format!("{marker} {branch}\n"));
             continue;
         }
         let summary = repo::read_reference(ctx, root, &format!("refs/heads/{branch}"))
@@ -1853,8 +1841,7 @@ fn list_branches(
                 format!("{} {subject}", repo::short(&commit))
             })
             .unwrap_or_default();
-        io.out
-            .extend_from_slice(format!("{marker} {branch:width$} {summary}\n").as_bytes());
+        io.print(&format!("{marker} {branch:width$} {summary}\n"));
     }
     0
 }
@@ -1880,7 +1867,7 @@ fn list_formatted_branches(
         let Some(line) = super::plumbing::expand_ref_format(format, &name, &commit) else {
             return usage(io, &format!("unsupported branch format: {format}"));
         };
-        io.out.extend_from_slice(format!("{line}\n").as_bytes());
+        io.print(&format!("{line}\n"));
     }
     0
 }
@@ -1895,15 +1882,14 @@ fn delete_branches(
     let current = repo::current_branch(ctx, root);
     for name in names {
         if current.as_deref() == Some(name.as_str()) {
-            io.err.extend_from_slice(
-                format!("error: cannot delete branch '{name}' checked out\n").as_bytes(),
-            );
+            io.print_err(&format!(
+                "error: cannot delete branch '{name}' checked out\n"
+            ));
             return 1;
         }
         let reference = format!("refs/heads/{name}");
         let Some(commit) = repo::read_reference(ctx, root, &reference) else {
-            io.err
-                .extend_from_slice(format!("error: branch '{name}' not found\n").as_bytes());
+            io.print_err(&format!("error: branch '{name}' not found\n"));
             return 1;
         };
         if !force {
@@ -1912,23 +1898,20 @@ fn delete_branches(
                 .map(|head| repo::ancestors(ctx, root, &head))
                 .unwrap_or_default();
             if !reachable.contains(&commit) {
-                io.err.extend_from_slice(
-                    format!(
-                        "error: the branch '{name}' is not fully merged; use -D to delete it\n"
-                    )
-                    .as_bytes(),
-                );
+                io.print_err(&format!(
+                    "error: the branch '{name}' is not fully merged; use -D to delete it\n"
+                ));
                 return 1;
             }
         }
         if repo::delete_reference(ctx, root, &reference).is_err() {
-            io.err
-                .extend_from_slice(format!("error: branch '{name}' not found\n").as_bytes());
+            io.print_err(&format!("error: branch '{name}' not found\n"));
             return 1;
         }
-        io.out.extend_from_slice(
-            format!("Deleted branch {name} (was {}).\n", repo::short(&commit)).as_bytes(),
-        );
+        io.print(&format!(
+            "Deleted branch {name} (was {}).\n",
+            repo::short(&commit)
+        ));
     }
     0
 }
@@ -1945,13 +1928,11 @@ fn rename_branch(
         return fatal(io, &format!("invalid branch name: {to}"));
     }
     let Some(commit) = repo::read_reference(ctx, root, &format!("refs/heads/{from}")) else {
-        io.err
-            .extend_from_slice(format!("error: branch '{from}' not found\n").as_bytes());
+        io.print_err(&format!("error: branch '{from}' not found\n"));
         return 1;
     };
     if !force && repo::read_reference(ctx, root, &format!("refs/heads/{to}")).is_some() {
-        io.err
-            .extend_from_slice(format!("fatal: a branch named '{to}' already exists\n").as_bytes());
+        io.print_err(&format!("fatal: a branch named '{to}' already exists\n"));
         return 128;
     }
     if let Err(error) = repo::write_reference(ctx, root, &format!("refs/heads/{to}"), &commit) {
@@ -2034,13 +2015,13 @@ pub(crate) fn git_tag(
             let was =
                 repo::read_reference(ctx, &root, &format!("refs/tags/{name}")).unwrap_or_default();
             if repo::delete_reference(ctx, &root, &format!("refs/tags/{name}")).is_err() {
-                io.err
-                    .extend_from_slice(format!("error: tag '{name}' not found.\n").as_bytes());
+                io.print_err(&format!("error: tag '{name}' not found.\n"));
                 return 1;
             }
-            io.out.extend_from_slice(
-                format!("Deleted tag '{name}' (was {})\n", repo::short(&was)).as_bytes(),
-            );
+            io.print(&format!(
+                "Deleted tag '{name}' (was {})\n",
+                repo::short(&was)
+            ));
         }
         return 0;
     }
@@ -2069,14 +2050,14 @@ pub(crate) fn git_tag(
                 else {
                     return usage(io, &format!("unsupported tag format: {format}"));
                 };
-                io.out.extend_from_slice(format!("{line}\n").as_bytes());
+                io.print(&format!("{line}\n"));
                 continue;
             }
             match repo::read_annotation(ctx, &root, &name).filter(|_| annotations) {
                 Some(annotation) => io
                     .out
                     .extend_from_slice(format!("{name:<15} {}\n", annotation.subject()).as_bytes()),
-                None => io.out.extend_from_slice(format!("{name}\n").as_bytes()),
+                None => io.print(&format!("{name}\n")),
             }
         }
         return 0;
@@ -2087,14 +2068,12 @@ pub(crate) fn git_tag(
     }
     let start = operands.get(1).map_or("HEAD", String::as_str);
     let Some(commit) = repo::resolve_revision(ctx, &root, start) else {
-        io.err
-            .extend_from_slice(format!("fatal: not a valid object name: '{start}'\n").as_bytes());
+        io.print_err(&format!("fatal: not a valid object name: '{start}'\n"));
         return 128;
     };
     let reference = format!("refs/tags/{name}");
     if !force && repo::read_reference(ctx, &root, &reference).is_some() {
-        io.err
-            .extend_from_slice(format!("fatal: tag '{name}' already exists\n").as_bytes());
+        io.print_err(&format!("fatal: tag '{name}' already exists\n"));
         return 128;
     }
     if let Err(error) = repo::write_reference(ctx, &root, &reference, &commit) {
@@ -2181,18 +2160,15 @@ pub(crate) fn refuse_untracked_overwrite(
     if doomed.is_empty() {
         return false;
     }
-    io.err.extend_from_slice(
-        format!(
-            "error: The following untracked working tree files would be overwritten by {verb}:\n"
-        )
-        .as_bytes(),
-    );
+    io.print_err(&format!(
+        "error: The following untracked working tree files would be overwritten by {verb}:\n"
+    ));
     for path in doomed {
-        io.err.extend_from_slice(format!("\t{path}\n").as_bytes());
+        io.print_err(&format!("\t{path}\n"));
     }
-    io.err.extend_from_slice(
-        format!("Please move or remove them before you {advice}.\nAborting\n").as_bytes(),
-    );
+    io.print_err(&format!(
+        "Please move or remove them before you {advice}.\nAborting\n"
+    ));
     true
 }
 
@@ -2230,7 +2206,7 @@ fn checkout_commit(
     io: &mut Io,
 ) -> Result<(), i32> {
     if let Some(reason) = unfinished_operation(ctx, root) {
-        io.err.extend_from_slice(reason.as_bytes());
+        io.print_err(&reason);
         return Err(if reason.starts_with("fatal") { 128 } else { 1 });
     }
     if let Some(previous) = repo::current_branch(ctx, root) {
@@ -2245,14 +2221,14 @@ fn checkout_commit(
     let old = &snapshot.head;
     let blocked = blocking_changes(&snapshot, &new);
     if !blocked.is_empty() {
-        io.err.extend_from_slice(
-            b"error: Your local changes to the following files would be overwritten by checkout:\n",
+        io.print_err(
+            "error: Your local changes to the following files would be overwritten by checkout:\n",
         );
         for path in blocked {
-            io.err.extend_from_slice(format!("\t{path}\n").as_bytes());
+            io.print_err(&format!("\t{path}\n"));
         }
-        io.err.extend_from_slice(
-            b"Please commit your changes or stash them before you switch branches.\nAborting\n",
+        io.print_err(
+            "Please commit your changes or stash them before you switch branches.\nAborting\n",
         );
         return Err(1);
     }
@@ -2260,8 +2236,7 @@ fn checkout_commit(
         return Err(1);
     }
     if let Err(error) = repo::update_work_tree(ctx, root, old, &new) {
-        io.err
-            .extend_from_slice(format!("git switch: {error}\n").as_bytes());
+        io.print_err(&format!("git switch: {error}\n"));
         return Err(1);
     }
     let index = carried_index(&snapshot, &new);
@@ -2323,13 +2298,11 @@ pub(crate) fn switch_to_branch(
     io: &mut Io,
 ) -> i32 {
     let Some(commit) = repo::read_reference(ctx, root, &format!("refs/heads/{branch}")) else {
-        io.err
-            .extend_from_slice(format!("fatal: invalid reference: {branch}\n").as_bytes());
+        io.print_err(&format!("fatal: invalid reference: {branch}\n"));
         return 128;
     };
     if repo::current_branch(ctx, root).as_deref() == Some(branch) {
-        io.err
-            .extend_from_slice(format!("Already on '{branch}'\n").as_bytes());
+        io.print_err(&format!("Already on '{branch}'\n"));
         return 0;
     }
     if let Err(status) = checkout_commit(ctx, root, &commit, io) {
@@ -2341,16 +2314,14 @@ pub(crate) fn switch_to_branch(
         return super::cannot_write(io, "HEAD", &error);
     }
     if announce {
-        io.err
-            .extend_from_slice(format!("Switched to branch '{branch}'\n").as_bytes());
+        io.print_err(&format!("Switched to branch '{branch}'\n"));
     }
     0
 }
 
 fn switch_detached(ctx: &mut CommandContext<'_>, root: &str, revision: &str, io: &mut Io) -> i32 {
     let Some(commit) = repo::resolve_revision(ctx, root, revision) else {
-        io.err
-            .extend_from_slice(format!("fatal: invalid reference: {revision}\n").as_bytes());
+        io.print_err(&format!("fatal: invalid reference: {revision}\n"));
         return 128;
     };
     if let Err(status) = checkout_commit(ctx, root, &commit, io) {
@@ -2360,16 +2331,13 @@ fn switch_detached(ctx: &mut CommandContext<'_>, root: &str, revision: &str, io:
     if let Err(error) = repo::set_head_detached(ctx, root, &commit, &action) {
         return super::cannot_write(io, "HEAD", &error);
     }
-    io.err.extend_from_slice(
-        format!(
-            "Note: switching to '{revision}'.\nHEAD is now at {} {}\n",
-            repo::short(&commit),
-            repo::load_commit(ctx, root, &commit)
-                .map(|commit| commit.subject().to_string())
-                .unwrap_or_default()
-        )
-        .as_bytes(),
-    );
+    io.print_err(&format!(
+        "Note: switching to '{revision}'.\nHEAD is now at {} {}\n",
+        repo::short(&commit),
+        repo::load_commit(ctx, root, &commit)
+            .map(|commit| commit.subject().to_string())
+            .unwrap_or_default()
+    ));
     0
 }
 
@@ -2448,8 +2416,7 @@ pub(crate) fn git_switch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             match branch {
                 Some(branch) => switch_to_branch(ctx, &root, &branch, true, io),
                 None => {
-                    io.err
-                        .extend_from_slice(b"fatal: no previous branch to switch to\n");
+                    io.print_err("fatal: no previous branch to switch to\n");
                     128
                 }
             }
@@ -2527,10 +2494,9 @@ pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &m
                 return switch_detached(ctx, &root, target, io);
             }
             if !super::names_a_path(ctx, &root, target) {
-                io.err.extend_from_slice(
-                    format!("error: pathspec '{target}' did not match any file(s) known to git\n")
-                        .as_bytes(),
-                );
+                io.print_err(&format!(
+                    "error: pathspec '{target}' did not match any file(s) known to git\n"
+                ));
                 return 1;
             }
             // A bare path argument means "discard my changes to that path".
@@ -2587,9 +2553,9 @@ fn checkout_side(
     for operand in named {
         let path = super::pathspec(&cwd, root, operand);
         let Some(entry) = stages.get(&path) else {
-            io.err.extend_from_slice(
-                format!("error: path '{operand}' does not have their version\n").as_bytes(),
-            );
+            io.print_err(&format!(
+                "error: path '{operand}' does not have their version\n"
+            ));
             return 1;
         };
         let hash = match side {
@@ -2598,9 +2564,9 @@ fn checkout_side(
         };
         // A side that deleted the file has nothing to check out, which Git reports the same way.
         let Some(hash) = hash else {
-            io.err.extend_from_slice(
-                format!("error: path '{operand}' does not have their version\n").as_bytes(),
-            );
+            io.print_err(&format!(
+                "error: path '{operand}' does not have their version\n"
+            ));
             return 1;
         };
         chosen.push((path, hash));
@@ -2608,19 +2574,16 @@ fn checkout_side(
     let count = chosen.len();
     for (path, hash) in chosen {
         let Some(data) = repo::read_blob(ctx, root, &hash) else {
-            io.err
-                .extend_from_slice(format!("error: missing blob for '{path}'\n").as_bytes());
+            io.print_err(&format!("error: missing blob for '{path}'\n"));
             return 1;
         };
         if repo::write_vfs(ctx, &repo::path_join(root, &path), &data).is_err() {
-            io.err
-                .extend_from_slice(format!("error: cannot write '{path}'\n").as_bytes());
+            io.print_err(&format!("error: cannot write '{path}'\n"));
             return 1;
         }
     }
     let plural = if count == 1 { "" } else { "s" };
-    io.out
-        .extend_from_slice(format!("Updated {count} path{plural} from the index\n").as_bytes());
+    io.print(&format!("Updated {count} path{plural} from the index\n"));
     0
 }
 
@@ -2679,18 +2642,15 @@ pub(crate) fn git_merge(
         return usage(io, "usage: git merge [--no-ff|--ff-only] BRANCH");
     };
     let Some(other) = repo::resolve_revision(ctx, &root, target) else {
-        io.err.extend_from_slice(
-            format!("merge: {target} - not something we can merge\n").as_bytes(),
-        );
+        io.print_err(&format!("merge: {target} - not something we can merge\n"));
         return 1;
     };
     let Some(head) = repo::head_commit(ctx, &root) else {
-        io.err
-            .extend_from_slice(b"fatal: no commit on the current branch to merge into\n");
+        io.print_err("fatal: no commit on the current branch to merge into\n");
         return 128;
     };
     if repo::ancestors(ctx, &root, &head).contains(&other) {
-        io.out.extend_from_slice(b"Already up to date.\n");
+        io.print("Already up to date.\n");
         return 0;
     }
     let incoming = match super::require_tree(ctx, &root, &other, io) {
@@ -2702,8 +2662,7 @@ pub(crate) fn git_merge(
         Err(status) => return status,
     };
     if !blocking_changes(&snapshot, &incoming).is_empty() {
-        io.err
-            .extend_from_slice(b"error: Your local changes would be overwritten by merge.\n");
+        io.print_err("error: Your local changes would be overwritten by merge.\n");
         return 1;
     }
     if refuse_untracked_overwrite(&snapshot, &incoming, "merge", "merge", io) {
@@ -2720,14 +2679,11 @@ pub(crate) fn git_merge(
         if let Err(error) = repo::update_head(ctx, &root, &other, &action) {
             return super::cannot_write(io, "HEAD", &error);
         }
-        io.out.extend_from_slice(
-            format!(
-                "Updating {}..{}\nFast-forward\n",
-                repo::short(&head),
-                repo::short(&other)
-            )
-            .as_bytes(),
-        );
+        io.print(&format!(
+            "Updating {}..{}\nFast-forward\n",
+            repo::short(&head),
+            repo::short(&other)
+        ));
         let before = repo::commit_tree(ctx, &root, &head).unwrap_or_default();
         let after = repo::commit_tree(ctx, &root, &other).unwrap_or_default();
         let options = Options {
@@ -2739,8 +2695,7 @@ pub(crate) fn git_merge(
         return 0;
     }
     if fast_forward_only {
-        io.err
-            .extend_from_slice(b"fatal: Not possible to fast-forward, aborting.\n");
+        io.print_err("fatal: Not possible to fast-forward, aborting.\n");
         return 128;
     }
     let base_tree = match super::parent_tree(ctx, &root, base.as_ref(), io) {
@@ -2774,8 +2729,7 @@ pub(crate) fn git_merge(
     };
     let merged = combined.tree;
     if let Err(error) = repo::update_work_tree(ctx, &root, &head_tree, &merged) {
-        io.err
-            .extend_from_slice(format!("git merge: {error}\n").as_bytes());
+        io.print_err(&format!("git merge: {error}\n"));
         return 1;
     }
     if let Err(error) = repo::store_index(ctx, &root, &merged) {
@@ -2811,8 +2765,7 @@ pub(crate) fn git_merge(
     if let Err(error) = repo::update_head(ctx, &root, &id, &format!("merge {target}")) {
         return super::cannot_write(io, "HEAD", &error);
     }
-    io.out
-        .extend_from_slice(b"Merge made by the 'ort' strategy.\n");
+    io.print("Merge made by the 'ort' strategy.\n");
     // Git shows the per-file diffstat of the merge before the summary.
     let stat = compare::Options {
         format: Format::Stat,
@@ -2891,15 +2844,13 @@ pub(crate) fn git_replay(
         return usage(io, &format!("usage: git {name} [-n] [-m PARENT] COMMIT..."));
     }
     let Some(original) = repo::head_commit(ctx, &root) else {
-        io.err
-            .extend_from_slice(format!("fatal: {name} needs a commit to apply onto\n").as_bytes());
+        io.print_err(&format!("fatal: {name} needs a commit to apply onto\n"));
         return 128;
     };
     let mut todo = Vec::new();
     for revision in &operands {
         let Some(id) = repo::resolve_revision(ctx, &root, revision) else {
-            io.err
-                .extend_from_slice(format!("fatal: bad revision '{revision}'\n").as_bytes());
+            io.print_err(&format!("fatal: bad revision '{revision}'\n"));
             return 128;
         };
         todo.push(id);
@@ -3042,8 +2993,7 @@ fn abort_sequence(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut
             .or_insert_with(|| entry.clone());
     }
     if let Err(error) = repo::replace_work_tree(ctx, root, &previous, &target) {
-        io.err
-            .extend_from_slice(format!("git {name}: {error}\n").as_bytes());
+        io.print_err(&format!("git {name}: {error}\n"));
         return 1;
     }
     if let Err(error) = repo::store_index(ctx, root, &target) {
@@ -3074,38 +3024,29 @@ fn replay_one(
     } = *sequence;
     let name = replay_name(revert);
     if pending_operation(ctx, root).is_some() {
-        io.err.extend_from_slice(
-            format!(
+        io.print_err(&format!(
                 "error: a {name} is already in progress\nhint: try \"git {name} --continue\" or \"git {name} --abort\"\n"
-            )
-            .as_bytes(),
-        );
+            ));
         return 128;
     }
     let Some(id) = repo::resolve_revision(ctx, root, revision) else {
-        io.err
-            .extend_from_slice(format!("fatal: bad revision '{revision}'\n").as_bytes());
+        io.print_err(&format!("fatal: bad revision '{revision}'\n"));
         return 128;
     };
     let Some(commit) = repo::load_commit(ctx, root, &id) else {
-        io.err
-            .extend_from_slice(format!("fatal: bad object {revision}\n").as_bytes());
+        io.print_err(&format!("fatal: bad object {revision}\n"));
         return 128;
     };
     if commit.parents.len() > 1 && mainline.is_none() {
-        io.err.extend_from_slice(
-            format!(
-                "error: commit {id} is a merge but no -m option was given.\nfatal: {name} failed\n"
-            )
-            .as_bytes(),
-        );
+        io.print_err(&format!(
+            "error: commit {id} is a merge but no -m option was given.\nfatal: {name} failed\n"
+        ));
         return 128;
     }
     if let Some(parent) = mainline.filter(|_| commit.parents.len() < 2) {
-        io.err.extend_from_slice(
-            format!("error: mainline was specified but commit {id} is not a merge.\nfatal: {name} failed\n")
-                .as_bytes(),
-        );
+        io.print_err(&format!(
+            "error: mainline was specified but commit {id} is not a merge.\nfatal: {name} failed\n"
+        ));
         let _ = parent;
         return 128;
     }
@@ -3113,15 +3054,13 @@ fn replay_one(
     // A root commit has no parent, and Git measures it against the empty tree rather than
     // refusing: replaying the first commit of a history is an ordinary thing to ask for.
     if against > commit.parents.len() && !commit.parents.is_empty() {
-        io.err.extend_from_slice(
-            format!("error: commit {id} does not have parent {against}\nfatal: {name} failed\n")
-                .as_bytes(),
-        );
+        io.print_err(&format!(
+            "error: commit {id} does not have parent {against}\nfatal: {name} failed\n"
+        ));
         return 128;
     }
     let Some(head) = repo::head_commit(ctx, root) else {
-        io.err
-            .extend_from_slice(format!("fatal: {name} needs a commit to apply onto\n").as_bytes());
+        io.print_err(&format!("fatal: {name} needs a commit to apply onto\n"));
         return 128;
     };
     let commit_tree = match super::require_tree(ctx, root, &id, io) {
@@ -3149,12 +3088,9 @@ fn replay_one(
     };
     let dirty = !no_commit && snapshot.index != head_tree;
     if dirty || !blocking_changes(&snapshot, theirs).is_empty() {
-        io.err.extend_from_slice(
-            format!(
+        io.print_err(&format!(
                 "error: your local changes would be overwritten by {name}.\nhint: commit your changes or stash them to proceed.\nfatal: {name} failed\n"
-            )
-            .as_bytes(),
-        );
+            ));
         return 128;
     }
     let message = if revert {
@@ -3173,8 +3109,7 @@ fn replay_one(
     };
     let applied = combined.tree;
     if let Err(error) = repo::update_work_tree(ctx, root, &head_tree, &applied) {
-        io.err
-            .extend_from_slice(format!("git {name}: {error}\n").as_bytes());
+        io.print_err(&format!("git {name}: {error}\n"));
         return 1;
     }
     // Only the paths the replay touched move in the index; anything else staged is left alone.
@@ -3226,10 +3161,7 @@ fn replay_one(
         return 0;
     }
     if applied == head_tree {
-        io.err.extend_from_slice(
-            format!("The previous cherry-pick is now empty, possibly due to conflict resolution.\nfatal: {name} failed\n")
-                .as_bytes(),
-        );
+        io.print_err(&format!("The previous cherry-pick is now empty, possibly due to conflict resolution.\nfatal: {name} failed\n"));
         return 1;
     }
     // A cherry-pick keeps the original author; a revert is the work of whoever ran it.
@@ -3254,14 +3186,11 @@ fn replay_one(
         return super::cannot_write(io, "HEAD", &error);
     }
     let branch = repo::current_branch(ctx, root).unwrap_or_else(|| "detached HEAD".to_string());
-    io.out.extend_from_slice(
-        format!(
-            "[{branch} {}] {}\n",
-            repo::short(&new_id),
-            replayed.subject()
-        )
-        .as_bytes(),
-    );
+    io.print(&format!(
+        "[{branch} {}] {}\n",
+        repo::short(&new_id),
+        replayed.subject()
+    ));
     emit_commit_summary(ctx, root, &head_tree, &applied, io);
     0
 }
@@ -3308,16 +3237,15 @@ fn pause_for_conflicts(
             "AA" => format!("CONFLICT (add/add): Merge conflict in {path}\n"),
             _ => format!("CONFLICT (content): Merge conflict in {path}\n"),
         };
-        io.err.extend_from_slice(line.as_bytes());
+        io.print_err(&line);
     }
     if !conflict::begin(ctx, root, kind, commit, message)
         || !conflict::store_stages(ctx, root, stages)
     {
-        io.err
-            .extend_from_slice(b"fatal: unable to record the conflicted state\n");
+        io.print_err("fatal: unable to record the conflicted state\n");
         return 128;
     }
-    io.err.extend_from_slice(format!("{advice}\n").as_bytes());
+    io.print_err(&format!("{advice}\n"));
     1
 }
 
@@ -3338,9 +3266,9 @@ fn pending_operation(ctx: &CommandContext<'_>, root: &str) -> Option<(&'static s
 /// Throw away an unfinished merge, cherry-pick, or revert.
 fn abort_pending(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut Io) -> i32 {
     if pending_operation(ctx, root).is_none() {
-        io.err.extend_from_slice(
-            format!("fatal: There is no {name} in progress ({name} --abort).\n").as_bytes(),
-        );
+        io.print_err(&format!(
+            "fatal: There is no {name} in progress ({name} --abort).\n"
+        ));
         return 128;
     }
     let head = repo::head_tree(ctx, root);
@@ -3353,8 +3281,7 @@ fn abort_pending(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut 
         previous.entry(path.clone()).or_insert_with(|| hash.clone());
     }
     if let Err(error) = repo::replace_work_tree(ctx, root, &previous, &head) {
-        io.err
-            .extend_from_slice(format!("git {name}: {error}\n").as_bytes());
+        io.print_err(&format!("git {name}: {error}\n"));
         return 1;
     }
     if let Err(error) = repo::store_index(ctx, root, &head) {
@@ -3373,15 +3300,13 @@ fn continue_pending(
     io: &mut Io,
 ) -> i32 {
     if pending_operation(ctx, root).is_none() {
-        io.err.extend_from_slice(
-            format!("fatal: There is no {name} in progress ({name} --continue).\n").as_bytes(),
-        );
+        io.print_err(&format!(
+            "fatal: There is no {name} in progress ({name} --continue).\n"
+        ));
         return 128;
     }
     if !conflict::load_stages(ctx, root).is_empty() {
-        io.err.extend_from_slice(
-            b"error: Committing is not possible because you have unmerged files.\n",
-        );
+        io.print_err("error: Committing is not possible because you have unmerged files.\n");
         return 1;
     }
     git_commit(ctx, globals, &["--no-edit".to_string()], io)

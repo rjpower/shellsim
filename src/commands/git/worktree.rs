@@ -424,9 +424,7 @@ fn emit_porcelain_v2(report: &Report, io: &mut Io) {
             .branch
             .clone()
             .unwrap_or_else(|| "(detached)".to_string());
-        io.out.extend_from_slice(
-            format!("# branch.oid {commit}\n# branch.head {branch}\n").as_bytes(),
-        );
+        io.print(&format!("# branch.oid {commit}\n# branch.head {branch}\n"));
     }
     let mode = |recorded: Option<&repo::Entry>| recorded.map_or("000000", repo::Entry::mode);
     for (entry, path) in entries.iter().zip(tracked) {
@@ -436,23 +434,20 @@ fn emit_porcelain_v2(report: &Report, io: &mut Io) {
         fn hash(recorded: Option<&repo::Entry>) -> &str {
             recorded.map_or(MISSING, |recorded| recorded.hash.as_str())
         }
-        io.out.extend_from_slice(
-            format!(
-                "1 {x}{y} N... {} {} {} {} {} {}\n",
-                mode(head.get(path)),
-                mode(staged),
-                // A path the index no longer tracks has no working-tree mode to report.
-                if staged.is_some() {
-                    mode(work.get(path))
-                } else {
-                    "000000"
-                },
-                hash(head.get(path)),
-                hash(staged),
-                entry.display(),
-            )
-            .as_bytes(),
-        );
+        io.print(&format!(
+            "1 {x}{y} N... {} {} {} {} {} {}\n",
+            mode(head.get(path)),
+            mode(staged),
+            // A path the index no longer tracks has no working-tree mode to report.
+            if staged.is_some() {
+                mode(work.get(path))
+            } else {
+                "000000"
+            },
+            hash(head.get(path)),
+            hash(staged),
+            entry.display(),
+        ));
     }
     for (path, entry) in unmerged {
         // Every conflict this subset produces comes from a plain two-parent merge.
@@ -460,25 +455,22 @@ fn emit_porcelain_v2(report: &Report, io: &mut Io) {
             Some(_) => "100644",
             None => "000000",
         };
-        io.out.extend_from_slice(
-            format!(
-                "u {} N... {} {} {} 100644 {} {} {} {path}\n",
-                entry.porcelain(),
-                stage(&entry.base),
-                stage(&entry.ours),
-                stage(&entry.theirs),
-                entry.base.as_deref().unwrap_or(MISSING),
-                entry.ours.as_deref().unwrap_or(MISSING),
-                entry.theirs.as_deref().unwrap_or(MISSING),
-            )
-            .as_bytes(),
-        );
+        io.print(&format!(
+            "u {} N... {} {} {} 100644 {} {} {} {path}\n",
+            entry.porcelain(),
+            stage(&entry.base),
+            stage(&entry.ours),
+            stage(&entry.theirs),
+            entry.base.as_deref().unwrap_or(MISSING),
+            entry.ours.as_deref().unwrap_or(MISSING),
+            entry.theirs.as_deref().unwrap_or(MISSING),
+        ));
     }
     for path in untracked {
-        io.out.extend_from_slice(format!("? {path}\n").as_bytes());
+        io.print(&format!("? {path}\n"));
     }
     for path in ignored {
-        io.out.extend_from_slice(format!("! {path}\n").as_bytes());
+        io.print(&format!("! {path}\n"));
     }
 }
 
@@ -497,7 +489,7 @@ fn emit_short_status(report: &Report, io: &mut Io) {
             (Some(branch), Some(_)) => branch.to_string(),
             (None, _) => "HEAD (no branch)".to_string(),
         };
-        io.out.extend_from_slice(format!("## {label}").as_bytes());
+        io.print(&format!("## {label}"));
         io.out.push(terminator);
     }
     // Tracked paths are listed in path order whether or not they are unmerged, as Git lists them.
@@ -512,15 +504,15 @@ fn emit_short_status(report: &Report, io: &mut Io) {
     }));
     tracked.sort_by(|left, right| left.0.cmp(right.0));
     for (_, line) in tracked {
-        io.out.extend_from_slice(line.as_bytes());
+        io.print(&line);
         io.out.push(terminator);
     }
     for path in untracked {
-        io.out.extend_from_slice(format!("?? {path}").as_bytes());
+        io.print(&format!("?? {path}"));
         io.out.push(terminator);
     }
     for path in ignored {
-        io.out.extend_from_slice(format!("!! {path}").as_bytes());
+        io.print(&format!("!! {path}"));
         io.out.push(terminator);
     }
 }
@@ -541,15 +533,14 @@ fn emit_long_status(report: &Report, pending: Option<&str>, io: &mut Io) {
             .extend_from_slice(format!("On branch {branch}\n").as_bytes()),
         None => {
             let id = head.map_or("unknown".to_string(), |id| repo::short(id).to_string());
-            io.out
-                .extend_from_slice(format!("HEAD detached at {id}\n").as_bytes());
+            io.print(&format!("HEAD detached at {id}\n"));
         }
     }
     if head.is_none() {
-        io.out.extend_from_slice(b"\nNo commits yet\n\n");
+        io.print("\nNo commits yet\n\n");
     }
     if let Some(pending) = pending {
-        io.out.extend_from_slice(pending.as_bytes());
+        io.print(pending);
     }
     let staged: Vec<&Entry> = entries
         .iter()
@@ -565,8 +556,8 @@ fn emit_long_status(report: &Report, pending: Option<&str>, io: &mut Io) {
         } else {
             "  (use \"git rm --cached <file>...\" to unstage)\n"
         };
-        io.out.extend_from_slice(b"Changes to be committed:\n");
-        io.out.extend_from_slice(unstage_hint.as_bytes());
+        io.print("Changes to be committed:\n");
+        io.print(unstage_hint);
         for entry in &staged {
             emit_named_change(
                 io,
@@ -577,20 +568,17 @@ fn emit_long_status(report: &Report, pending: Option<&str>, io: &mut Io) {
         io.out.push(b'\n');
     }
     if !unmerged.is_empty() {
-        io.out.extend_from_slice(
-            b"Unmerged paths:\n  (use \"git restore --staged <file>...\" to unstage)\n  (use \"git add <file>...\" to mark resolution)\n",
-        );
+        io.print("Unmerged paths:\n  (use \"git restore --staged <file>...\" to unstage)\n  (use \"git add <file>...\" to mark resolution)\n");
         for (path, entry) in unmerged {
-            io.out.extend_from_slice(
-                format!("\t{:<14}   {path}\n", format!("{}:", entry.label())).as_bytes(),
-            );
+            io.print(&format!(
+                "\t{:<14}   {path}\n",
+                format!("{}:", entry.label())
+            ));
         }
         io.out.push(b'\n');
     }
     if !unstaged.is_empty() {
-        io.out.extend_from_slice(
-            b"Changes not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n  (use \"git restore <file>...\" to discard changes in working directory)\n",
-        );
+        io.print("Changes not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n  (use \"git restore <file>...\" to discard changes in working directory)\n");
         for entry in &unstaged {
             emit_named_change(
                 io,
@@ -601,49 +589,40 @@ fn emit_long_status(report: &Report, pending: Option<&str>, io: &mut Io) {
         io.out.push(b'\n');
     }
     if !untracked.is_empty() {
-        io.out.extend_from_slice(
-            b"Untracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n",
-        );
+        io.print("Untracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n");
         for path in untracked {
-            io.out.extend_from_slice(format!("\t{path}\n").as_bytes());
+            io.print(&format!("\t{path}\n"));
         }
         io.out.push(b'\n');
     }
     if !ignored.is_empty() {
-        io.out.extend_from_slice(
-            b"Ignored files:\n  (use \"git add -f <file>...\" to include in what will be committed)\n",
-        );
+        io.print("Ignored files:\n  (use \"git add -f <file>...\" to include in what will be committed)\n");
         for path in ignored {
-            io.out.extend_from_slice(format!("\t{path}\n").as_bytes());
+            io.print(&format!("\t{path}\n"));
         }
         io.out.push(b'\n');
     }
     if *hide_untracked {
-        io.out.extend_from_slice(
-            b"Untracked files not listed (use -u option to show untracked files)\n",
-        );
+        io.print("Untracked files not listed (use -u option to show untracked files)\n");
     }
     if !unmerged.is_empty() {
-        io.out.extend_from_slice(
-            b"no changes added to commit (use \"git add\" and/or \"git commit -a\")\n",
-        );
+        io.print("no changes added to commit (use \"git add\" and/or \"git commit -a\")\n");
     } else if entries.is_empty() && untracked.is_empty() {
-        io.out
-            .extend_from_slice(b"nothing to commit, working tree clean\n");
+        io.print("nothing to commit, working tree clean\n");
     } else if staged.is_empty() && unstaged.is_empty() && !untracked.is_empty() {
-        io.out.extend_from_slice(
-            b"nothing added to commit but untracked files present (use \"git add\" to track)\n",
+        io.print(
+            "nothing added to commit but untracked files present (use \"git add\" to track)\n",
         );
     } else if staged.is_empty() {
-        io.out.extend_from_slice(
-            b"no changes added to commit (use \"git add\" and/or \"git commit -a\")\n",
-        );
+        io.print("no changes added to commit (use \"git add\" and/or \"git commit -a\")\n");
     }
 }
 
 fn emit_named_change(io: &mut Io, change: Change, path: &str) {
-    io.out
-        .extend_from_slice(format!("\t{:<11} {path}\n", format!("{}:", change.label())).as_bytes());
+    io.print(&format!(
+        "\t{:<11} {path}\n",
+        format!("{}:", change.label())
+    ));
 }
 
 /// Expand pathspecs into the set of repository-relative paths they name.
@@ -712,8 +691,8 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     }
     if !all && !update_only && operands.is_empty() {
         // Git treats this as a no-op with a hint rather than an error.
-        io.err.extend_from_slice(
-            b"Nothing specified, nothing added.\nhint: Maybe you wanted to say 'git add .'?\n",
+        io.print_err(
+            "Nothing specified, nothing added.\nhint: Maybe you wanted to say 'git add .'?\n",
         );
         return 0;
     }
@@ -745,8 +724,7 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         match selected_paths(&cwd, &root, &operands, &index, &work) {
             Ok(paths) => paths,
             Err(message) => {
-                io.err
-                    .extend_from_slice(format!("fatal: {message}\n").as_bytes());
+                io.print_err(&format!("fatal: {message}\n"));
                 return 128;
             }
         }
@@ -765,15 +743,12 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             })
             .collect();
         if !named.is_empty() {
-            io.err.extend_from_slice(
-                b"The following paths are ignored by one of your .gitignore files:\n",
-            );
+            io.print_err("The following paths are ignored by one of your .gitignore files:\n");
             for path in &named {
-                io.err.extend_from_slice(format!("{path}\n").as_bytes());
+                io.print_err(&format!("{path}\n"));
             }
-            io.err
-                .extend_from_slice(b"hint: Use -f if you really want to add them.\n");
-            io.err.extend_from_slice(b"fatal: no files added\n");
+            io.print_err("hint: Use -f if you really want to add them.\n");
+            io.print_err("fatal: no files added\n");
             return 1;
         }
         selected.retain(|path| index.contains_key(path) || !rules.is_ignored(path));
@@ -827,27 +802,24 @@ fn stage_paths(
             "remove"
         };
         if staging != Staging::Silent {
-            io.out
-                .extend_from_slice(format!("{action} '{path}'\n").as_bytes());
+            io.print(&format!("{action} '{path}'\n"));
         }
         if dry_run {
             continue;
         }
         if let Some(recorded) = work.get(path) {
             let Some(data) = repo::read_work_file(ctx, root, path) else {
-                io.err
-                    .extend_from_slice(format!("git add: unable to read '{path}'\n").as_bytes());
+                io.print_err(&format!("git add: unable to read '{path}'\n"));
                 return 1;
             };
             if repo::blob_hash(&data) != recorded.hash {
-                io.err.extend_from_slice(
-                    format!("git add: '{path}' changed while building the index\n").as_bytes(),
-                );
+                io.print_err(&format!(
+                    "git add: '{path}' changed while building the index\n"
+                ));
                 return 1;
             }
             if let Err(error) = repo::write_blob(ctx, root, &data) {
-                io.err
-                    .extend_from_slice(format!("git add: {error}\n").as_bytes());
+                io.print_err(&format!("git add: {error}\n"));
                 return 1;
             }
             index.insert(path.clone(), recorded.clone());
@@ -859,8 +831,7 @@ fn stage_paths(
         return 0;
     }
     if let Err(error) = repo::store_index(ctx, root, index) {
-        io.err
-            .extend_from_slice(format!("git add: {error}\n").as_bytes());
+        io.print_err(&format!("git add: {error}\n"));
         return 1;
     }
     0
@@ -930,21 +901,20 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
             if ignore_unmatch {
                 continue;
             }
-            io.err.extend_from_slice(
-                format!("fatal: pathspec '{operand}' did not match any files\n").as_bytes(),
-            );
+            io.print_err(&format!(
+                "fatal: pathspec '{operand}' did not match any files\n"
+            ));
             return 128;
         }
         if tracked.len() > 1 || tracked[0] != relative {
             if !recursive {
-                io.err.extend_from_slice(
-                    format!("fatal: not removing '{operand}' recursively without -r\n").as_bytes(),
-                );
+                io.print_err(&format!(
+                    "fatal: not removing '{operand}' recursively without -r\n"
+                ));
                 return 128;
             }
         } else if !cached && !ctx.vfs.is_file("/", &absolute) {
-            io.err
-                .extend_from_slice(format!("fatal: pathspec '{operand}' is missing\n").as_bytes());
+            io.print_err(&format!("fatal: pathspec '{operand}' is missing\n"));
             return 128;
         }
         for path in tracked {
@@ -967,13 +937,10 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
                     matches_work && matches_head
                 };
                 if !safe {
-                    io.err.extend_from_slice(
-                        format!(
-                            "error: the following file has local modifications:\n    {path}\n\
+                    io.print_err(&format!(
+                        "error: the following file has local modifications:\n    {path}\n\
                              (use --cached to keep the file, or -f to force removal)\n"
-                        )
-                        .as_bytes(),
-                    );
+                    ));
                     return 1;
                 }
             }
@@ -1000,15 +967,13 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     ctx.resources.release_memory(reserved);
     if let Err(error) = result {
         ctx.vfs = before;
-        io.err
-            .extend_from_slice(format!("git rm: {error}\n").as_bytes());
+        io.print_err(&format!("git rm: {error}\n"));
         return 1;
     }
     conflict::resolve(ctx, &root, selected.iter().map(|(_, path)| path));
     if !quiet {
         for (_, relative) in &selected {
-            io.out
-                .extend_from_slice(format!("rm '{relative}'\n").as_bytes());
+            io.print(&format!("rm '{relative}'\n"));
         }
     }
     0
@@ -1073,8 +1038,7 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
             vec![source_relative.clone()]
         };
         if tracked.is_empty() || tracked.iter().any(|path| !index.contains_key(path)) {
-            io.err
-                .extend_from_slice(format!("fatal: bad source, source={source}\n").as_bytes());
+            io.print_err(&format!("fatal: bad source, source={source}\n"));
             return 128;
         }
         for path in tracked {
@@ -1102,10 +1066,9 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
             if !force
                 && (ctx.vfs.exists("/", &target_absolute) || index.contains_key(&target_relative))
             {
-                io.err.extend_from_slice(
-                    format!("fatal: destination exists, source={source}, destination={target_relative}\n")
-                        .as_bytes(),
-                );
+                io.print_err(&format!(
+                    "fatal: destination exists, source={source}, destination={target_relative}\n"
+                ));
                 return 128;
             }
             moves.push((
@@ -1156,8 +1119,7 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     ctx.resources.release_memory(reserved);
     if let Err(error) = result {
         ctx.vfs = before;
-        io.err
-            .extend_from_slice(format!("git mv: {error}\n").as_bytes());
+        io.print_err(&format!("git mv: {error}\n"));
         return 1;
     }
     0
@@ -1200,8 +1162,7 @@ pub(crate) fn git_restore(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
         return super::history::restore_side(ctx, theirs, &paths, io);
     }
     if paths.is_empty() {
-        io.err
-            .extend_from_slice(b"fatal: you must specify path(s) to restore\n");
+        io.print_err("fatal: you must specify path(s) to restore\n");
         return 128;
     }
     if !staged {
@@ -1282,8 +1243,7 @@ fn restore_paths(
         .collect();
     repo::replace_work_tree(ctx, root, &old, &new).map_or_else(
         |error| {
-            io.err
-                .extend_from_slice(format!("git restore: {error}\n").as_bytes());
+            io.print_err(&format!("git restore: {error}\n"));
             1
         },
         |()| 0,
@@ -1357,8 +1317,7 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
             Err(status) => return status,
         }
         if let Err(error) = repo::replace_work_tree(ctx, &root, &old, &tree) {
-            io.err
-                .extend_from_slice(format!("git reset: {error}\n").as_bytes());
+            io.print_err(&format!("git reset: {error}\n"));
             return 1;
         }
     }
@@ -1379,9 +1338,10 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         let subject = repo::load_commit(ctx, &root, &commit)
             .map(|commit| commit.subject().to_string())
             .unwrap_or_default();
-        io.out.extend_from_slice(
-            format!("HEAD is now at {} {subject}\n", repo::short(&commit)).as_bytes(),
-        );
+        io.print(&format!(
+            "HEAD is now at {} {subject}\n",
+            repo::short(&commit)
+        ));
     }
     0
 }
@@ -1398,9 +1358,9 @@ fn emit_unstaged_after_reset(ctx: &mut CommandContext<'_>, root: &str, tree: &Tr
     if changed.is_empty() {
         return;
     }
-    io.out.extend_from_slice(b"Unstaged changes after reset:\n");
+    io.print("Unstaged changes after reset:\n");
     for path in changed {
-        io.out.extend_from_slice(format!("M\t{path}\n").as_bytes());
+        io.print(&format!("M\t{path}\n"));
     }
 }
 
@@ -1431,9 +1391,7 @@ pub(crate) fn git_clean(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         }
     }
     if !force && !dry_run {
-        io.err.extend_from_slice(
-            b"fatal: clean.requireForce is true and -f not given: refusing to clean\n",
-        );
+        io.print_err("fatal: clean.requireForce is true and -f not given: refusing to clean\n");
         return 128;
     }
     let index = match require_index(ctx, &root, io) {
@@ -1464,8 +1422,7 @@ pub(crate) fn git_clean(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         .collect();
     for entry in &removable {
         if dry_run {
-            io.out
-                .extend_from_slice(format!("Would remove {entry}\n").as_bytes());
+            io.print(&format!("Would remove {entry}\n"));
             continue;
         }
         let absolute = repo::path_join(&root, entry.trim_end_matches('/'));
@@ -1475,12 +1432,10 @@ pub(crate) fn git_clean(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
             ctx.vfs.remove_file("/", &absolute).is_ok()
         };
         if !removed {
-            io.err
-                .extend_from_slice(format!("warning: failed to remove {entry}\n").as_bytes());
+            io.print_err(&format!("warning: failed to remove {entry}\n"));
             continue;
         }
-        io.out
-            .extend_from_slice(format!("Removing {entry}\n").as_bytes());
+        io.print(&format!("Removing {entry}\n"));
     }
     0
 }
@@ -1533,8 +1488,7 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             }
             for (stage, hash) in [(1, &entry.base), (2, &entry.ours), (3, &entry.theirs)] {
                 if let Some(hash) = hash {
-                    io.out
-                        .extend_from_slice(format!("100644 {hash} {stage}\t{path}").as_bytes());
+                    io.print(&format!("100644 {hash} {stage}\t{path}"));
                     io.out.push(if nul { 0 } else { b'\n' });
                 }
             }
@@ -1608,15 +1562,13 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         matched = true;
         if stage {
             let recorded = index.get(&path).cloned().unwrap_or_default();
-            io.out
-                .extend_from_slice(format!("{} {} 0\t", recorded.mode(), recorded.hash).as_bytes());
+            io.print(&format!("{} {} 0\t", recorded.mode(), recorded.hash));
         }
-        io.out.extend_from_slice(displayed.as_bytes());
+        io.print(displayed);
         io.out.push(if nul { 0 } else { b'\n' });
     }
     if error_unmatch && !matched {
-        io.err
-            .extend_from_slice(b"error: pathspec did not match any files\n");
+        io.print_err("error: pathspec did not match any files\n");
         return 1;
     }
     0

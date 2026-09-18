@@ -64,8 +64,7 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         let mut tracked = repo::head_tree(ctx, &root);
         tracked.extend(staged.clone());
         if let Err(error) = repo::replace_work_tree(ctx, &root, &tracked, &staged) {
-            io.err
-                .extend_from_slice(format!("git apply: {error}\n").as_bytes());
+            io.print_err(&format!("git apply: {error}\n"));
             return 1;
         }
         // What is on disk now: the staged content plus whatever was untracked.
@@ -114,8 +113,7 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
                     index.insert(path, repo::Entry { hash, ..recorded });
                 }
                 Err(error) => {
-                    io.err
-                        .extend_from_slice(format!("git apply: {error}\n").as_bytes());
+                    io.print_err(&format!("git apply: {error}\n"));
                     return 1;
                 }
             },
@@ -143,9 +141,9 @@ fn patch_text(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> Opt
     match ctx.fs_read_limited("/", &absolute, 16 * 1024 * 1024) {
         Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
         Err(_) => {
-            io.err.extend_from_slice(
-                format!("error: can't open patch '{file}': No such file or directory\n").as_bytes(),
-            );
+            io.print_err(&format!(
+                "error: can't open patch '{file}': No such file or directory\n"
+            ));
             None
         }
     }
@@ -183,8 +181,7 @@ fn describe(text: &str, report: &str, io: &mut Io) -> i32 {
     let files = patch_counts(text);
     if report == "--numstat" {
         for (name, insertions, deletions) in &files {
-            io.out
-                .extend_from_slice(format!("{insertions}\t{deletions}\t{name}\n").as_bytes());
+            io.print(&format!("{insertions}\t{deletions}\t{name}\n"));
         }
         return 0;
     }
@@ -198,18 +195,17 @@ fn describe(text: &str, report: &str, io: &mut Io) -> i32 {
         insertions += added;
         deletions += removed;
         let total = added + removed;
-        io.out.extend_from_slice(
-            format!(
-                " {name:width$} | {total:>4} {}{}\n",
-                "+".repeat(*added),
-                "-".repeat(*removed)
-            )
-            .as_bytes(),
-        );
+        io.print(&format!(
+            " {name:width$} | {total:>4} {}{}\n",
+            "+".repeat(*added),
+            "-".repeat(*removed)
+        ));
     }
-    io.out.extend_from_slice(
-        super::compare::summary_line(files.len(), insertions, deletions).as_bytes(),
-    );
+    io.print(&super::compare::summary_line(
+        files.len(),
+        insertions,
+        deletions,
+    ));
     0
 }
 

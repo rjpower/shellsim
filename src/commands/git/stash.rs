@@ -148,8 +148,7 @@ fn push(
     io: &mut Io,
 ) -> i32 {
     let Some(base) = repo::head_commit(ctx, root) else {
-        io.err
-            .extend_from_slice(b"fatal: You do not have the initial commit yet\n");
+        io.print_err("fatal: You do not have the initial commit yet\n");
         return 128;
     };
     // An unresolved conflict has three sides, and a stash entry records only one tree, so the
@@ -157,10 +156,9 @@ fn push(
     let unmerged = conflict::load_stages(ctx, root);
     if !unmerged.is_empty() {
         for path in unmerged.keys() {
-            io.err
-                .extend_from_slice(format!("{path}: needs merge\n").as_bytes());
+            io.print_err(&format!("{path}: needs merge\n"));
         }
-        io.err.extend_from_slice(b"error: could not write index\n");
+        io.print_err("error: could not write index\n");
         return 1;
     }
     let index_tree = match require_index(ctx, root, io) {
@@ -176,7 +174,7 @@ fn push(
         work.retain(|path, _| index_tree.contains_key(path) || head_tree.contains_key(path));
     }
     if work == head_tree && index_tree == head_tree {
-        io.out.extend_from_slice(b"No local changes to save\n");
+        io.print("No local changes to save\n");
         return 0;
     }
     // Blobs the stash refers to must outlive the reset, so store them now.
@@ -223,23 +221,21 @@ fn push(
     previous.extend(index_tree);
     previous.extend(work);
     if let Err(error) = repo::replace_work_tree(ctx, root, &previous, &head_tree) {
-        io.err
-            .extend_from_slice(format!("git stash: {error}\n").as_bytes());
+        io.print_err(&format!("git stash: {error}\n"));
         return 1;
     }
     if let Err(error) = repo::store_index(ctx, root, &head_tree) {
         return cannot_write(io, "the index", &error);
     }
-    io.out.extend_from_slice(
-        format!("Saved working directory and index state {message}\n").as_bytes(),
-    );
+    io.print(&format!(
+        "Saved working directory and index state {message}\n"
+    ));
     0
 }
 
 fn list(ctx: &mut CommandContext<'_>, root: &str, io: &mut Io) -> i32 {
     for (position, entry) in load_entries(ctx, root).iter().enumerate() {
-        io.out
-            .extend_from_slice(format!("stash@{{{position}}}: {}\n", entry.message).as_bytes());
+        io.print(&format!("stash@{{{position}}}: {}\n", entry.message));
     }
     0
 }
@@ -254,14 +250,13 @@ fn show(
 ) -> i32 {
     let entries = load_entries(ctx, root);
     let Some(entry) = entries.get(position) else {
-        io.err.extend_from_slice(
-            format!("fatal: stash@{{{position}}} is not a valid reference\n").as_bytes(),
-        );
+        io.print_err(&format!(
+            "fatal: stash@{{{position}}} is not a valid reference\n"
+        ));
         return 128;
     };
     let Some(work) = read_tree(ctx, &tree_path(root, entry.id, "work")) else {
-        io.err
-            .extend_from_slice(b"fatal: the stash entry is unreadable\n");
+        io.print_err("fatal: the stash entry is unreadable\n");
         return 128;
     };
     let base = repo::commit_tree(ctx, root, &entry.base).unwrap_or_default();
@@ -290,17 +285,16 @@ fn apply(
 ) -> i32 {
     let entries = load_entries(ctx, root);
     let Some(entry) = entries.get(position) else {
-        io.err.extend_from_slice(
-            format!("fatal: stash@{{{position}}} is not a valid reference\n").as_bytes(),
-        );
+        io.print_err(&format!(
+            "fatal: stash@{{{position}}} is not a valid reference\n"
+        ));
         return 128;
     };
     let (Some(work), Some(index_tree)) = (
         read_tree(ctx, &tree_path(root, entry.id, "work")),
         read_tree(ctx, &tree_path(root, entry.id, "index")),
     ) else {
-        io.err
-            .extend_from_slice(b"fatal: the stash entry is unreadable\n");
+        io.print_err("fatal: the stash entry is unreadable\n");
         return 128;
     };
     // The entry is merged back in against the commit it was taken from, so anything committed or
@@ -323,8 +317,7 @@ fn apply(
             continue;
         };
         if repo::write_blob(ctx, root, &data).is_err() {
-            io.err
-                .extend_from_slice(format!("git stash: cannot record '{path}'\n").as_bytes());
+            io.print_err(&format!("git stash: cannot record '{path}'\n"));
             return 1;
         }
     }
@@ -343,14 +336,14 @@ fn apply(
         .into_iter()
         .collect();
     if !doomed.is_empty() {
-        io.err.extend_from_slice(
-            b"error: Your local changes to the following files would be overwritten by merge:\n",
+        io.print_err(
+            "error: Your local changes to the following files would be overwritten by merge:\n",
         );
         for path in doomed {
-            io.err.extend_from_slice(format!("\t{path}\n").as_bytes());
+            io.print_err(&format!("\t{path}\n"));
         }
-        io.err.extend_from_slice(
-            b"Please commit your changes or stash them before you merge.\nAborting\n\
+        io.print_err(
+            "Please commit your changes or stash them before you merge.\nAborting\n\
               The stash entry is kept in case you need it again.\n",
         );
         return 1;
@@ -369,8 +362,7 @@ fn apply(
         Err(failed) => return cannot_write(io, &failed.path, &failed.error),
     };
     if let Err(error) = repo::update_work_tree(ctx, root, &mine, &combined.tree) {
-        io.err
-            .extend_from_slice(format!("git stash: {error}\n").as_bytes());
+        io.print_err(&format!("git stash: {error}\n"));
         return 1;
     }
     // A plain apply restores the working tree only, leaving what was staged for the user to stage
@@ -396,18 +388,14 @@ fn apply(
     }
     if !combined.stages.is_empty() {
         for path in combined.stages.keys() {
-            io.err.extend_from_slice(
-                format!("CONFLICT (content): Merge conflict in {path}\n").as_bytes(),
-            );
+            io.print_err(&format!("CONFLICT (content): Merge conflict in {path}\n"));
         }
         if !conflict::store_stages(ctx, root, &combined.stages) {
-            io.err
-                .extend_from_slice(b"fatal: unable to record the conflicted state\n");
+            io.print_err("fatal: unable to record the conflicted state\n");
             return 128;
         }
         // The entry stays on the list so the user can try again after settling the conflict.
-        io.err
-            .extend_from_slice(b"The stash entry is kept in case you need it again.\n");
+        io.print_err("The stash entry is kept in case you need it again.\n");
         return 1;
     }
     super::worktree::git_status(ctx, &[], io);
@@ -420,9 +408,9 @@ fn apply(
 fn drop_entry(ctx: &mut CommandContext<'_>, root: &str, position: usize, io: &mut Io) -> i32 {
     let mut entries = load_entries(ctx, root);
     if position >= entries.len() {
-        io.err.extend_from_slice(
-            format!("fatal: stash@{{{position}}} is not a valid reference\n").as_bytes(),
-        );
+        io.print_err(&format!(
+            "fatal: stash@{{{position}}} is not a valid reference\n"
+        ));
         return 128;
     }
     let entry = entries.remove(position);
@@ -446,8 +434,8 @@ fn drop_entry(ctx: &mut CommandContext<'_>, root: &str, position: usize, io: &mu
     if !store_entries(ctx, root, &entries) {
         return 1;
     }
-    io.out.extend_from_slice(
-        format!("Dropped refs/stash@{{{position}}} ({identifier})\n").as_bytes(),
-    );
+    io.print(&format!(
+        "Dropped refs/stash@{{{position}}} ({identifier})\n"
+    ));
     0
 }

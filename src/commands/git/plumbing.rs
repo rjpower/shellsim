@@ -51,12 +51,11 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     {
         return match mode.as_str() {
             "-t" => {
-                io.out.extend_from_slice(b"blob\n");
+                io.print("blob\n");
                 0
             }
             "-s" => {
-                io.out
-                    .extend_from_slice(format!("{}\n", data.len()).as_bytes());
+                io.print(&format!("{}\n", data.len()));
                 0
             }
             "-e" => 0,
@@ -67,13 +66,11 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         };
     }
     let Some(id) = repo::resolve_revision(ctx, &root, &object) else {
-        io.err
-            .extend_from_slice(format!("fatal: Not a valid object name {object}\n").as_bytes());
+        io.print_err(&format!("fatal: Not a valid object name {object}\n"));
         return 128;
     };
     let Some(commit) = repo::load_commit(ctx, &root, &id) else {
-        io.err
-            .extend_from_slice(format!("fatal: Not a valid object name {object}\n").as_bytes());
+        io.print_err(&format!("fatal: Not a valid object name {object}\n"));
         return 128;
     };
     let tree = repo::commit_tree(ctx, &root, &id).unwrap_or_default();
@@ -96,13 +93,13 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         .filter(|name| repo::read_annotation(ctx, &root, name).is_some())
         .is_some();
     match mode.as_str() {
-        "-t" if annotated => io.out.extend_from_slice(b"tag\n"),
-        "-t" => io.out.extend_from_slice(b"commit\n"),
+        "-t" if annotated => io.print("tag\n"),
+        "-t" => io.print("commit\n"),
         "-e" => {}
         "-s" => io
             .out
             .extend_from_slice(format!("{}\n", body.len()).as_bytes()),
-        _ => io.out.extend_from_slice(body.as_bytes()),
+        _ => io.print(&body),
     }
     0
 }
@@ -145,9 +142,7 @@ pub(crate) fn git_hash_object(ctx: &mut CommandContext<'_>, args: &[String], io:
         match ctx.fs_read_limited("/", &absolute, 16 * 1024 * 1024) {
             Ok(data) => contents.push(data),
             Err(_) => {
-                io.err.extend_from_slice(
-                    format!("fatal: could not open '{file}' for reading\n").as_bytes(),
-                );
+                io.print_err(&format!("fatal: could not open '{file}' for reading\n"));
                 return 128;
             }
         }
@@ -166,7 +161,7 @@ pub(crate) fn git_hash_object(ctx: &mut CommandContext<'_>, args: &[String], io:
                 return cannot_write(io, "the object", &error);
             }
         }
-        io.out.extend_from_slice(format!("{hash}\n").as_bytes());
+        io.print(&format!("{hash}\n"));
     }
     0
 }
@@ -239,14 +234,14 @@ pub(crate) fn git_ls_tree(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
             continue;
         }
         if name_only {
-            io.out.extend_from_slice(format!("{name}\n").as_bytes());
+            io.print(&format!("{name}\n"));
             continue;
         }
         let line = match entry {
             Some(entry) => format!("{} blob {}\t{name}\n", entry.mode(), entry.hash),
             None => format!("040000 tree {}\t{name}\n", subtree_hash(&tree, &name)),
         };
-        io.out.extend_from_slice(line.as_bytes());
+        io.print(&line);
     }
     0
 }
@@ -312,12 +307,11 @@ pub(crate) fn git_check_ignore(ctx: &mut CommandContext<'_>, args: &[String], io
         }
         match (&rule, non_matching) {
             (Some(rule), _) if verbose => {
-                io.out
-                    .extend_from_slice(format!("{rule}\t{path}\n").as_bytes());
+                io.print(&format!("{rule}\t{path}\n"));
             }
-            (Some(_), _) => io.out.extend_from_slice(format!("{path}\n").as_bytes()),
+            (Some(_), _) => io.print(&format!("{path}\n")),
             // `-n` reports the paths no pattern covers, with empty source fields.
-            (None, true) => io.out.extend_from_slice(format!("::\t{path}\n").as_bytes()),
+            (None, true) => io.print(&format!("::\t{path}\n")),
             (None, false) => {}
         }
     }
@@ -360,7 +354,7 @@ pub(crate) fn git_merge_base(ctx: &mut CommandContext<'_>, args: &[String], io: 
     }
     match repo::merge_base(ctx, &root, &left, &right) {
         Some(base) => {
-            io.out.extend_from_slice(format!("{base}\n").as_bytes());
+            io.print(&format!("{base}\n"));
             0
         }
         None => 1,
@@ -412,21 +406,18 @@ pub(crate) fn git_describe(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         } else {
             format!("{tag}-{distance}-g{}", repo::short(&start))
         };
-        io.out
-            .extend_from_slice(format!("{described}\n").as_bytes());
+        io.print(&format!("{described}\n"));
         return 0;
     }
     if always {
-        io.out
-            .extend_from_slice(format!("{}\n", repo::short(&start)).as_bytes());
+        io.print(&format!("{}\n", repo::short(&start)));
         return 0;
     }
-    io.err.extend_from_slice(
-        format!("fatal: No annotated tags can describe '{start}'.\n").as_bytes(),
-    );
+    io.print_err(&format!(
+        "fatal: No annotated tags can describe '{start}'.\n"
+    ));
     if !repo::reference_names(ctx, &root, "tags").is_empty() {
-        io.err
-            .extend_from_slice(b"However, there were unannotated tags: try --tags.\n");
+        io.print_err("However, there were unannotated tags: try --tags.\n");
     }
     128
 }
@@ -488,15 +479,12 @@ pub(crate) fn git_shortlog(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     }
     for (author, subjects) in authors {
         if summary {
-            io.out
-                .extend_from_slice(format!("{:>6}\t{author}\n", subjects.len()).as_bytes());
+            io.print(&format!("{:>6}\t{author}\n", subjects.len()));
             continue;
         }
-        io.out
-            .extend_from_slice(format!("{author} ({}):\n", subjects.len()).as_bytes());
+        io.print(&format!("{author} ({}):\n", subjects.len()));
         for subject in subjects {
-            io.out
-                .extend_from_slice(format!("      {subject}\n").as_bytes());
+            io.print(&format!("      {subject}\n"));
         }
         io.out.push(b'\n');
     }
@@ -567,8 +555,7 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
         .case_insensitive(ignore_case)
         .build()
     else {
-        io.err
-            .extend_from_slice(format!("fatal: invalid pattern: {pattern}\n").as_bytes());
+        io.print_err(&format!("fatal: invalid pattern: {pattern}\n"));
         return 128;
     };
     let cwd = ctx.cwd.clone();
@@ -643,13 +630,11 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             } else {
                 format!("{displayed}:")
             };
-            io.out
-                .extend_from_slice(format!("{location}{line}\n").as_bytes());
+            io.print(&format!("{location}{line}\n"));
         }
         if names_only && (matches != 0) != without_match {
             found = true;
-            io.out
-                .extend_from_slice(format!("{displayed}\n").as_bytes());
+            io.print(&format!("{displayed}\n"));
         }
         if count_only {
             let total = if matches == 0 {
@@ -660,8 +645,7 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
                     .count()
             };
             if total != 0 {
-                io.out
-                    .extend_from_slice(format!("{displayed}:{total}\n").as_bytes());
+                io.print(&format!("{displayed}:{total}\n"));
             }
         }
     }
@@ -728,8 +712,7 @@ pub(crate) fn git_show_ref(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             continue;
         }
         matched = true;
-        io.out
-            .extend_from_slice(format!("{commit} {name}\n").as_bytes());
+        io.print(&format!("{commit} {name}\n"));
     }
     i32::from(!matched)
 }
@@ -766,12 +749,11 @@ pub(crate) fn git_symbolic_ref(ctx: &mut CommandContext<'_>, args: &[String], io
                 } else {
                     reference
                 };
-                io.out.extend_from_slice(format!("{rendered}\n").as_bytes());
+                io.print(&format!("{rendered}\n"));
                 0
             }
             None => {
-                io.err
-                    .extend_from_slice(b"fatal: ref HEAD is not a symbolic ref\n");
+                io.print_err("fatal: ref HEAD is not a symbolic ref\n");
                 1
             }
         },
@@ -817,7 +799,7 @@ pub(crate) fn git_for_each_ref(ctx: &mut CommandContext<'_>, args: &[String], io
         let Some(line) = expand_ref_format(&format, &name, &commit) else {
             return usage(io, &format!("unsupported for-each-ref format: {format}"));
         };
-        io.out.extend_from_slice(format!("{line}\n").as_bytes());
+        io.print(&format!("{line}\n"));
     }
     0
 }
@@ -921,8 +903,7 @@ pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         .get(&path)
         .and_then(|entry| repo::read_blob(ctx, &root, &entry.hash))
     else {
-        io.err
-            .extend_from_slice(format!("fatal: no such path {file} in {revision}\n").as_bytes());
+        io.print_err(&format!("fatal: no such path {file} in {revision}\n"));
         return 128;
     };
     // Blaming the checked-out file, as Git does, means a local edit shows up as uncommitted work.
@@ -1150,13 +1131,10 @@ fn emit_blame(
             )
         };
         let close = if suppress { "" } else { ")" };
-        io.out.extend_from_slice(
-            format!(
-                "{name} {described}{number:>width$}{close}{}{line}\n",
-                if suppress { ") " } else { " " }
-            )
-            .as_bytes(),
-        );
+        io.print(&format!(
+            "{name} {described}{number:>width$}{close}{}{line}\n",
+            if suppress { ") " } else { " " }
+        ));
     }
     0
 }
@@ -1227,14 +1205,11 @@ pub(crate) fn git_reflog(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         .enumerate()
         .take(limit)
     {
-        io.out.extend_from_slice(
-            format!(
-                "{} HEAD@{{{position}}}: {}\n",
-                repo::short(&entry.after),
-                entry.action
-            )
-            .as_bytes(),
-        );
+        io.print(&format!(
+            "{} HEAD@{{{position}}}: {}\n",
+            repo::short(&entry.after),
+            entry.action
+        ));
     }
     0
 }

@@ -136,9 +136,7 @@ pub(crate) fn apply_unified_diff(
             value if value.starts_with("-p") => strip = value.to_string(),
             value if value.starts_with("--unsafe-paths") => {}
             value if value.starts_with('-') => {
-                io.err.extend_from_slice(
-                    format!("git: unsupported apply option: {value}\n").as_bytes(),
-                );
+                io.print_err(&format!("git: unsupported apply option: {value}\n"));
                 return 2;
             }
             value => forwarded.push(value.to_string()),
@@ -168,10 +166,9 @@ pub(crate) fn apply_unified_diff(
     }
     for line in String::from_utf8_lossy(&errors).lines() {
         let message = line.strip_prefix("patch: ").unwrap_or(line);
-        io.err
-            .extend_from_slice(format!("error: {message}\n").as_bytes());
+        io.print_err(&format!("error: {message}\n"));
     }
-    io.err.extend_from_slice(b"error: patch does not apply\n");
+    io.print_err("error: patch does not apply\n");
     status
 }
 
@@ -660,8 +657,7 @@ fn split_bytes_lines(bytes: &[u8]) -> Result<Vec<String>, String> {
 }
 
 fn fail(io: &mut Io, status: i32, message: &str) -> i32 {
-    io.err
-        .extend_from_slice(format!("patch: {message}\n").as_bytes());
+    io.print_err(&format!("patch: {message}\n"));
     status
 }
 

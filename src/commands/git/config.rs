@@ -132,8 +132,7 @@ pub(crate) fn git_config(
         ["--list" | "-l"] => {
             for (key, values) in &readable {
                 for value in values {
-                    io.out
-                        .extend_from_slice(format!("{origin}{key}={value}\n").as_bytes());
+                    io.print(&format!("{origin}{key}={value}\n"));
                 }
             }
             0
@@ -149,8 +148,7 @@ pub(crate) fn git_config(
                 }
                 matched = true;
                 for value in values {
-                    io.out
-                        .extend_from_slice(format!("{origin}{key} {value}\n").as_bytes());
+                    io.print(&format!("{origin}{key} {value}\n"));
                 }
             }
             i32::from(!matched)
@@ -216,8 +214,7 @@ fn emit_one(origin: &str, value: &str, as_boolean: bool, io: &mut Io) {
     } else {
         value.to_string()
     };
-    io.out
-        .extend_from_slice(format!("{origin}{rendered}\n").as_bytes());
+    io.print(&format!("{origin}{rendered}\n"));
 }
 
 /// The command an alias expands to, split into words.
@@ -264,12 +261,10 @@ pub(crate) fn git_remote(
         [] => {
             for (name, url) in remotes(&effective_config(ctx, &root, globals)) {
                 if verbose {
-                    io.out
-                        .extend_from_slice(format!("{name}\t{url} (fetch)\n").as_bytes());
-                    io.out
-                        .extend_from_slice(format!("{name}\t{url} (push)\n").as_bytes());
+                    io.print(&format!("{name}\t{url} (fetch)\n"));
+                    io.print(&format!("{name}\t{url} (push)\n"));
                 } else {
-                    io.out.extend_from_slice(format!("{name}\n").as_bytes());
+                    io.print(&format!("{name}\n"));
                 }
             }
             0
@@ -285,8 +280,7 @@ pub(crate) fn git_remote(
         ["remove" | "rm", name] => {
             let key = format!("remote.{}.url", name.to_ascii_lowercase());
             if config.remove(&key).is_none() {
-                io.err
-                    .extend_from_slice(format!("error: No such remote: '{name}'\n").as_bytes());
+                io.print_err(&format!("error: No such remote: '{name}'\n"));
                 return 2;
             }
             repo::write_config(ctx, &file, &config).map_or(1, |()| 0)
@@ -296,20 +290,18 @@ pub(crate) fn git_remote(
             &format!("remote.{}.url", name.to_ascii_lowercase()),
         ) {
             Some(url) => {
-                io.out.extend_from_slice(format!("{url}\n").as_bytes());
+                io.print(&format!("{url}\n"));
                 0
             }
             None => {
-                io.err
-                    .extend_from_slice(format!("error: No such remote '{name}'\n").as_bytes());
+                io.print_err(&format!("error: No such remote '{name}'\n"));
                 2
             }
         },
         ["set-url", name, url] => {
             let key = format!("remote.{}.url", name.to_ascii_lowercase());
             if !config.contains_key(&key) {
-                io.err
-                    .extend_from_slice(format!("error: No such remote '{name}'\n").as_bytes());
+                io.print_err(&format!("error: No such remote '{name}'\n"));
                 return 2;
             }
             config.insert(key, vec![(*url).to_string()]);

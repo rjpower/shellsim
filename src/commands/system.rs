@@ -200,7 +200,7 @@ fn cmd_envsubst(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) 
             output.push_str(&interp.get_var(&name).unwrap_or_default());
         }
     }
-    io.out.extend_from_slice(output.as_bytes());
+    io.print(&output);
     0
 }
 

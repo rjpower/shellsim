@@ -146,14 +146,13 @@ pub(crate) fn usage(io: &mut Io, message: &str) -> i32 {
     } else {
         format!("error: {message}")
     };
-    io.err.extend_from_slice(format!("{line}\n").as_bytes());
+    io.print_err(&format!("{line}\n"));
     129
 }
 
 /// An operation that was understood but could not be carried out. Git exits 128 for these.
 pub(crate) fn fatal(io: &mut Io, message: &str) -> i32 {
-    io.err
-        .extend_from_slice(format!("fatal: {message}\n").as_bytes());
+    io.print_err(&format!("fatal: {message}\n"));
     128
 }
 
@@ -412,9 +411,7 @@ pub(crate) fn require_tree(
     io: &mut Io,
 ) -> Result<repo::Tree, i32> {
     repo::commit_tree(ctx, root, commit).ok_or_else(|| {
-        io.err.extend_from_slice(
-            format!("fatal: unable to read tree of commit {commit}\n").as_bytes(),
-        );
+        io.print_err(&format!("fatal: unable to read tree of commit {commit}\n"));
         128
     })
 }
@@ -437,18 +434,15 @@ pub(crate) fn names_a_path(ctx: &CommandContext<'_>, root: &str, value: &str) ->
 
 /// Git's diagnostic for an operand that is neither a revision nor a path.
 pub(crate) fn ambiguous_argument(io: &mut Io, value: &str) -> i32 {
-    io.err.extend_from_slice(
-        format!(
+    io.print_err(&format!(
             "fatal: ambiguous argument '{value}': unknown revision or path not in the working tree.\nUse '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'\n"
-        )
-        .as_bytes(),
-    );
+        ));
     128
 }
 
 pub(crate) fn repo_error(io: &mut Io) -> i32 {
-    io.err.extend_from_slice(
-        b"fatal: not a git repository (or any parent up to mount point /)\n\
+    io.print_err(
+        "fatal: not a git repository (or any parent up to mount point /)\n\
               Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
     );
     128
@@ -499,11 +493,11 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             | "--literal-pathspecs"
             | "--no-optional-locks" => {}
             "--version" => {
-                io.out.extend_from_slice(format!("{VERSION}\n").as_bytes());
+                io.print(&format!("{VERSION}\n"));
                 return 0;
             }
             "--help" | "-h" => {
-                io.out.extend_from_slice(HELP.as_bytes());
+                io.print(HELP);
                 return 0;
             }
             "--git-dir" | "--work-tree" => {
@@ -517,20 +511,19 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     }
     let args = &rest[..];
     if args.first().is_some_and(|value| value == "help") {
-        io.out.extend_from_slice(HELP.as_bytes());
+        io.print(HELP);
         return 0;
     }
     let Some(subcommand) = args.first().map(String::as_str) else {
-        io.err.extend_from_slice(HELP.as_bytes());
+        io.print_err(HELP);
         return 1;
     };
     let restore_cwd = match directory {
         Some(target) => {
             if !ctx.vfs.is_dir("/", &target) {
-                io.err.extend_from_slice(
-                    format!("fatal: cannot change to '{target}': No such file or directory\n")
-                        .as_bytes(),
-                );
+                io.print_err(&format!(
+                    "fatal: cannot change to '{target}': No such file or directory\n"
+                ));
                 return 128;
             }
             let previous = ctx.cwd.clone();
@@ -611,10 +604,9 @@ fn dispatch(
         "for-each-ref" => plumbing::git_for_each_ref(ctx, args, io),
         other if NETWORK_COMMANDS.contains(&other) => {
             ctx.note_unsupported(&format!("git:{other}"));
-            io.err.extend_from_slice(
-                format!("fatal: git {other} needs network access, which the simulation does not provide\n")
-                    .as_bytes(),
-            );
+            io.print_err(&format!(
+                "fatal: git {other} needs network access, which the simulation does not provide\n"
+            ));
             128
         }
         other if UNSUPPORTED_COMMANDS.contains(&other) => {
@@ -631,9 +623,9 @@ fn dispatch(
                 }
             }
             ctx.note_unsupported(&format!("git:{other}"));
-            io.err.extend_from_slice(
-                format!("git: '{other}' is not a git command. See 'git --help'.\n").as_bytes(),
-            );
+            io.print_err(&format!(
+                "git: '{other}' is not a git command. See 'git --help'.\n"
+            ));
             1
         }
     }
@@ -670,8 +662,7 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         .unwrap_or_else(|| ctx.cwd.clone());
     if !ctx.vfs.is_dir("/", &target) {
         if let Err(error) = ctx.vfs.mkdir_all("/", &target) {
-            io.err
-                .extend_from_slice(format!("git init: {error}\n").as_bytes());
+            io.print_err(&format!("git init: {error}\n"));
             return 1;
         }
     }
@@ -685,8 +676,7 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         repo::path_join(&git, "objects"),
     ] {
         if let Err(error) = ctx.vfs.mkdir_all("/", &directory) {
-            io.err
-                .extend_from_slice(format!("git init: {error}\n").as_bytes());
+            io.print_err(&format!("git init: {error}\n"));
             return 1;
         }
     }
@@ -708,8 +698,7 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             ),
         ] {
             if let Err(error) = repo::write_vfs(ctx, &path, &contents) {
-                io.err
-                    .extend_from_slice(format!("git init: {error}\n").as_bytes());
+                io.print_err(&format!("git init: {error}\n"));
                 return 1;
             }
         }
@@ -720,8 +709,7 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         } else {
             "Initialized empty"
         };
-        io.out
-            .extend_from_slice(format!("{action} Git repository in {git}/\n").as_bytes());
+        io.print(&format!("{action} Git repository in {git}/\n"));
     }
     0
 }

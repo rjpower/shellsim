@@ -53,6 +53,18 @@ pub struct Io<'a> {
     pub err: &'a mut Vec<u8>,
 }
 
+impl Io<'_> {
+    /// Append text to standard output. Commands write whole lines, terminator included.
+    pub fn print(&mut self, text: &str) {
+        self.out.extend_from_slice(text.as_bytes());
+    }
+
+    /// Append text to standard error.
+    pub fn print_err(&mut self, text: &str) {
+        self.err.extend_from_slice(text.as_bytes());
+    }
+}
+
 /// Uniform command signature. `args` is `argv[1..]`.
 pub type CmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> i32;
 

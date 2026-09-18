@@ -153,17 +153,16 @@ pub(crate) fn emit(
     }
     if options.format == Format::NameOnly {
         for (_, to) in &renames {
-            io.out.extend_from_slice(format!("{to}\n").as_bytes());
+            io.print(&format!("{to}\n"));
         }
         for path in &changed {
-            io.out.extend_from_slice(format!("{path}\n").as_bytes());
+            io.print(&format!("{path}\n"));
         }
         return false;
     }
     if options.format == Format::NameStatus {
         for (from, to) in &renames {
-            io.out
-                .extend_from_slice(format!("R100\t{from}\t{to}\n").as_bytes());
+            io.print(&format!("R100\t{from}\t{to}\n"));
         }
         for path in &changed {
             let status = status_letter(
@@ -171,33 +170,24 @@ pub(crate) fn emit(
                 new.contains_key(path),
                 options.unmerged.contains(path),
             );
-            io.out
-                .extend_from_slice(format!("{status}\t{path}\n").as_bytes());
+            io.print(&format!("{status}\t{path}\n"));
         }
         return false;
     }
     if options.format == Format::Summary {
         for (from, to) in &renames {
-            io.out
-                .extend_from_slice(format!(" rename {from} => {to} (100%)\n").as_bytes());
+            io.print(&format!(" rename {from} => {to} (100%)\n"));
         }
         for path in &changed {
             match (old.get(path), new.get(path)) {
-                (None, Some(entry)) => io.out.extend_from_slice(
-                    format!(" create mode {} {path}\n", entry.mode()).as_bytes(),
-                ),
-                (Some(entry), None) => io.out.extend_from_slice(
-                    format!(" delete mode {} {path}\n", entry.mode()).as_bytes(),
-                ),
+                (None, Some(entry)) => io.print(&format!(" create mode {} {path}\n", entry.mode())),
+                (Some(entry), None) => io.print(&format!(" delete mode {} {path}\n", entry.mode())),
                 (Some(before), Some(after)) if before.executable != after.executable => {
-                    io.out.extend_from_slice(
-                        format!(
-                            " mode change {} => {} {path}\n",
-                            before.mode(),
-                            after.mode()
-                        )
-                        .as_bytes(),
-                    )
+                    io.print(&format!(
+                        " mode change {} => {} {path}\n",
+                        before.mode(),
+                        after.mode()
+                    ))
                 }
                 _ => {}
             }
@@ -213,8 +203,7 @@ pub(crate) fn emit(
                 stats.push((format!("{from} => {to}"), 0, 0, false));
             }
             Format::Patch => {
-                io.out
-                    .extend_from_slice(rename_header(from, to, options.prefixes).as_bytes());
+                io.print(&rename_header(from, to, options.prefixes));
             }
             _ => {}
         }
@@ -226,7 +215,7 @@ pub(crate) fn emit(
             Format::Check => {
                 let report = diff::whitespace_errors(path, before.as_deref(), after.as_deref());
                 check_failed |= !report.is_empty();
-                io.out.extend_from_slice(report.as_bytes());
+                io.print(&report);
             }
             Format::Stat | Format::NumStat | Format::ShortStat => {
                 let binary = before.as_deref().is_some_and(diff::is_binary)
@@ -248,7 +237,7 @@ pub(crate) fn emit(
                     options.prefixes,
                     options.whitespace,
                 );
-                io.out.extend_from_slice(patch.as_bytes());
+                io.print(&patch);
             }
             Format::NameOnly | Format::NameStatus | Format::Summary => {
                 unreachable!("handled above")
@@ -354,11 +343,9 @@ fn emit_stats(stats: &[(String, usize, usize, bool)], format: Format, io: &mut I
     if format == Format::NumStat {
         for (path, insertions, deletions, binary) in stats {
             if *binary {
-                io.out
-                    .extend_from_slice(format!("-\t-\t{path}\n").as_bytes());
+                io.print(&format!("-\t-\t{path}\n"));
             } else {
-                io.out
-                    .extend_from_slice(format!("{insertions}\t{deletions}\t{path}\n").as_bytes());
+                io.print(&format!("{insertions}\t{deletions}\t{path}\n"));
             }
         }
         return;
@@ -378,22 +365,23 @@ fn emit_stats(stats: &[(String, usize, usize, bool)], format: Format, io: &mut I
         for (path, insertions, deletions, binary) in stats {
             let path = shorten_name(path, name_width);
             if *binary {
-                io.out
-                    .extend_from_slice(format!(" {path:name_width$} | Bin\n").as_bytes());
+                io.print(&format!(" {path:name_width$} | Bin\n"));
                 continue;
             }
             let total = insertions + deletions;
             let (plus, minus) = scale_graph(*insertions, *deletions, graph_width, max_change);
             let graph = format!("{}{}", "+".repeat(plus), "-".repeat(minus));
             let separator = if graph.is_empty() { "" } else { " " };
-            io.out.extend_from_slice(
-                format!(" {path:name_width$} | {total:>count_width$}{separator}{graph}\n")
-                    .as_bytes(),
-            );
+            io.print(&format!(
+                " {path:name_width$} | {total:>count_width$}{separator}{graph}\n"
+            ));
         }
     }
-    io.out
-        .extend_from_slice(summary_line(stats.len(), total_insertions, total_deletions).as_bytes());
+    io.print(&summary_line(
+        stats.len(),
+        total_insertions,
+        total_deletions,
+    ));
 }
 
 fn scale_graph(
@@ -514,10 +502,9 @@ fn diff_no_index(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
         ctx.fs_read_limited("/", &absolute, 16 * 1024 * 1024).ok()
     };
     let (Some(before), Some(after)) = (read(left), read(right)) else {
-        io.err.extend_from_slice(
-            format!("fatal: cannot read '{left}' or '{right}': No such file or directory\n")
-                .as_bytes(),
-        );
+        io.print_err(&format!(
+            "fatal: cannot read '{left}' or '{right}': No such file or directory\n"
+        ));
         return 128;
     };
     if before == after {
@@ -543,7 +530,7 @@ fn diff_no_index(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
         // `-w` or `-b` can make files that differ in bytes compare equal.
         return 0;
     }
-    io.out.extend_from_slice(patch.as_bytes());
+    io.print(&patch);
     1
 }
 

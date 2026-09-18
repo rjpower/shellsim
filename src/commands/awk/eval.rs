@@ -420,8 +420,8 @@ impl Runtime<'_, '_, '_> {
                     }
                     rendered.join(&self.state.ofs)
                 };
-                self.io.out.extend_from_slice(result.as_bytes());
-                self.io.out.extend_from_slice(self.state.ors.as_bytes());
+                self.io.print(&result);
+                self.io.print(&self.state.ors);
                 Flow::Normal
             }
             Stmt::Printf(values) => {
@@ -441,7 +441,7 @@ impl Runtime<'_, '_, '_> {
                 .unwrap_or(usize::MAX);
                 match format_printf(&evaluated[0].text, &evaluated[1..], limit) {
                     Ok(output) => {
-                        self.io.out.extend_from_slice(output.as_bytes());
+                        self.io.print(&output);
                         Flow::Normal
                     }
                     Err(FormatError::Invalid(error)) => Flow::Error(error),
