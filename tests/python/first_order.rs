@@ -1,24 +1,6 @@
 //! Differential coverage for ordinary syntax found in unchanged TaskTrove Python sources.
 
-use shellsim::{python, Environment};
-
-fn run(source: &str) -> (i32, String, String) {
-    let mut environment = Environment::default();
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let status = python::run_python(
-        &mut environment,
-        &["python3.14".into(), "-c".into(), source.into()],
-        Vec::new(),
-        &mut stdout,
-        &mut stderr,
-    );
-    (
-        status,
-        String::from_utf8(stdout).expect("UTF-8 stdout"),
-        String::from_utf8(stderr).expect("UTF-8 stderr"),
-    )
-}
+use super::support::run_python_text as run;
 
 #[test]
 fn multiline_strings_line_continuations_and_comment_first_suites_execute() {

@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 
 use shellsim::Environment;
 
-const CORPUS: &str = "tests/fixtures/python/stdlib_slice";
+const CORPUS: &str = "tests/python/corpus/stdlib";
 
 fn cpython_314_available() -> bool {
     let probe = "import sys; print(sys.implementation.name); print(sys.version_info.major, sys.version_info.minor)";

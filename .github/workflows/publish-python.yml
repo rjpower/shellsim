@@ -79,7 +79,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install pytest dist/*.whl
-          python -m pytest python_tests
+          python -m pytest tests/python_package
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.target }}
@@ -121,7 +121,7 @@ jobs:
           python -m pip install --upgrade pip pytest twine
           python -m twine check --strict dist/*
           python -m pip install dist/*manylinux*x86_64.whl
-          python -m pytest python_tests
+          python -m pytest tests/python_package
       - name: Rebuild and smoke-test from the isolated sdist
         run: |
           mkdir "$RUNNER_TEMP/from-sdist"

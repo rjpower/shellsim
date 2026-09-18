@@ -2,27 +2,7 @@
 
 use shellsim::{python, Environment, Limits};
 
-fn run_in(environment: &mut Environment, source: &str) -> (i32, String, String) {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let status = python::run_python(
-        environment,
-        &["python3.14".into(), "-c".into(), source.into()],
-        Vec::new(),
-        &mut stdout,
-        &mut stderr,
-    );
-    (
-        status,
-        String::from_utf8(stdout).expect("UTF-8 stdout"),
-        String::from_utf8(stderr).expect("UTF-8 stderr"),
-    )
-}
-
-fn run(source: &str) -> (i32, String, String) {
-    let mut environment = Environment::default();
-    run_in(&mut environment, source)
-}
+use super::support::{run_python_text as run, run_python_text_in as run_in};
 
 #[test]
 fn urllib_request_uses_typed_routes_and_file_like_responses() {

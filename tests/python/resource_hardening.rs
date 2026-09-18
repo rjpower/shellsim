@@ -1,3 +1,5 @@
+//! Resource-accounting boundaries for Python operations reachable from simulated input.
+
 use shellsim::{python, Environment, Limits, StopReason};
 use std::io::Write;
 

@@ -54,4 +54,4 @@ jobs:
           python -m pip install "maturin>=1.8,<2" "pytest>=8"
           maturin build --release --locked --out dist
           python -m pip install dist/*.whl
-      - run: python -m pytest python_tests
+      - run: python -m pytest tests/python_package tests/tooling

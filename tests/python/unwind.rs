@@ -1,19 +1,8 @@
-use shellsim::Environment;
+//! Control-flow unwinding across functions, loops, generators, and context managers.
+
 use std::process::Command;
 
-fn run(source: &str) -> (i32, String, String) {
-    let mut env = Environment::new();
-    let argv = vec!["python3.14".into(), "-c".into(), source.into()];
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let status =
-        shellsim::python::run_python(&mut env, &argv, Vec::new(), &mut stdout, &mut stderr);
-    (
-        status,
-        String::from_utf8_lossy(&stdout).into_owned(),
-        String::from_utf8_lossy(&stderr).into_owned(),
-    )
-}
+use super::support::run_python_text as run;
 
 fn cpython(source: &str) -> Option<(i32, String, String)> {
     let output = Command::new("python3.14")
