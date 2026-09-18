@@ -6,24 +6,29 @@
 //! * [`ignore`] matches `.gitignore` patterns.
 //! * [`diff`] turns two byte buffers into a unified patch; [`compare`] renders tree differences
 //!   and implements `git diff`.
-//! * [`worktree`] implements the index and working-tree commands; [`history`] implements commits,
-//!   history, refs, branch switching, and merges; [`config`] implements configuration and remotes.
+//! * [`worktree`] implements the index and working-tree commands; [`commit`], [`log`], [`refs`],
+//!   [`switch`], and [`merge`] implement commits, history, references, branch switching, and
+//!   merges; [`config`] implements configuration and remotes.
 //!
 //! This file owns command registration, Git's global options, and dispatch. Anything outside the
 //! supported subset fails visibly rather than approximating Git's behavior, and anything that
 //! would need a network is refused and recorded as unsupported.
 
 mod apply;
+mod commit;
 mod compare;
 mod config;
 mod conflict;
 mod diff;
-mod history;
 mod ignore;
+mod log;
+mod merge;
 mod plumbing;
 mod rebase;
+mod refs;
 mod repo;
 mod stash;
+mod switch;
 mod worktree;
 
 use std::collections::{BTreeMap, HashMap};
@@ -572,21 +577,21 @@ fn dispatch(
         "clean" => worktree::git_clean(ctx, args, io),
         "ls-files" => worktree::git_ls_files(ctx, args, io),
         "diff" => compare::git_diff(ctx, args, io),
-        "commit" => history::git_commit(ctx, globals, args, io),
-        "log" => history::git_log(ctx, args, io),
-        "show" => history::git_show(ctx, args, io),
-        "rev-parse" => history::git_rev_parse(ctx, args, io),
-        "rev-list" => history::git_rev_list(ctx, args, io),
-        "branch" => history::git_branch(ctx, args, io),
-        "tag" => history::git_tag(ctx, globals, args, io),
-        "switch" => history::git_switch(ctx, args, io),
-        "checkout" => history::git_checkout(ctx, args, io),
+        "commit" => commit::git_commit(ctx, globals, args, io),
+        "log" => log::git_log(ctx, args, io),
+        "show" => log::git_show(ctx, args, io),
+        "rev-parse" => refs::git_rev_parse(ctx, args, io),
+        "rev-list" => refs::git_rev_list(ctx, args, io),
+        "branch" => refs::git_branch(ctx, args, io),
+        "tag" => refs::git_tag(ctx, globals, args, io),
+        "switch" => switch::git_switch(ctx, args, io),
+        "checkout" => switch::git_checkout(ctx, args, io),
         "blame" => plumbing::git_blame(ctx, args, io),
         "reflog" => plumbing::git_reflog(ctx, args, io),
         "rebase" => rebase::git_rebase(ctx, globals, args, io),
-        "merge" => history::git_merge(ctx, globals, args, io),
-        "cherry-pick" => history::git_replay(ctx, globals, false, args, io),
-        "revert" => history::git_replay(ctx, globals, true, args, io),
+        "merge" => merge::git_merge(ctx, globals, args, io),
+        "cherry-pick" => merge::git_replay(ctx, globals, false, args, io),
+        "revert" => merge::git_replay(ctx, globals, true, args, io),
         "config" => config::git_config(ctx, globals, args, io),
         "remote" => config::git_remote(ctx, globals, args, io),
         "stash" => stash::git_stash(ctx, args, io),

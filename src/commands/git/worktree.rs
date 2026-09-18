@@ -218,8 +218,8 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         .iter()
         .map(|value| super::pathspec(&cwd, &root, value))
         .collect();
-    let super::history::Snapshot { head, index, work } =
-        match super::history::snapshot(ctx, &root, io) {
+    let super::switch::Snapshot { head, index, work } =
+        match super::switch::snapshot(ctx, &root, io) {
             Ok(snapshot) => snapshot,
             Err(status) => return status,
         };
@@ -1159,7 +1159,7 @@ pub(crate) fn git_restore(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
         }
     }
     if let Some(theirs) = side {
-        return super::history::restore_side(ctx, theirs, &paths, io);
+        return super::switch::restore_side(ctx, theirs, &paths, io);
     }
     if paths.is_empty() {
         io.print_err("fatal: you must specify path(s) to restore\n");

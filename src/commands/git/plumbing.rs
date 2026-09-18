@@ -1123,11 +1123,11 @@ fn emit_blame(
             let when = match repo::load_commit(ctx, root, &origin.commit) {
                 Some(commit) => commit.timestamp,
                 // Work that is not committed yet is dated now, as Git dates it.
-                None => super::history::now_seconds(ctx),
+                None => super::repo::now_seconds(ctx),
             };
             format!(
                 "({author:<author_width$} {} ",
-                super::history::stamp(when, "%Y-%m-%d %H:%M:%S +0000")
+                super::log::stamp(when, "%Y-%m-%d %H:%M:%S +0000")
             )
         };
         let close = if suppress { "" } else { ")" };

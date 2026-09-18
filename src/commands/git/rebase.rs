@@ -7,9 +7,10 @@
 
 use crate::commands::{CommandContext, Io};
 
+use super::commit;
 use super::conflict;
-use super::history;
 use super::repo::{self, Commit};
+use super::switch;
 use super::{cannot_write, repo_error, require_index, usage, Arg, Flags, Globals};
 
 const STATE: &str = "REBASE_STATE";
@@ -144,13 +145,13 @@ pub(crate) fn git_rebase(
         None => upstream_id.clone(),
     };
     // A rebase rewrites the whole tree, so anything not committed has nowhere to go.
-    let snapshot = match history::snapshot(ctx, &root, io) {
+    let snapshot = match switch::snapshot(ctx, &root, io) {
         Ok(snapshot) => snapshot,
         Err(status) => return status,
     };
-    let dirty = history::dirty_paths(&snapshot);
+    let dirty = switch::dirty_paths(&snapshot);
     if !dirty.is_empty() {
-        let what = if history::only_staged(&snapshot, &dirty) {
+        let what = if switch::only_staged(&snapshot, &dirty) {
             "Your index contains uncommitted changes."
         } else {
             "You have unstaged changes."
@@ -161,7 +162,7 @@ pub(crate) fn git_rebase(
         return 1;
     }
     if let Some(wanted) = wanted {
-        let status = history::switch_to_branch(ctx, &root, &wanted, false, io);
+        let status = switch::switch_to_branch(ctx, &root, &wanted, false, io);
         if status != 0 {
             return status;
         }
@@ -246,8 +247,8 @@ fn lay_down(
     io: &mut Io,
 ) -> Result<(), i32> {
     let target = super::require_tree(ctx, root, commit, io)?;
-    let snapshot = history::snapshot(ctx, root, io)?;
-    if history::refuse_untracked_overwrite(&snapshot, &target, "checkout", "switch branches", io) {
+    let snapshot = switch::snapshot(ctx, root, io)?;
+    if switch::refuse_untracked_overwrite(&snapshot, &target, "checkout", "switch branches", io) {
         return Err(1);
     }
     if let Err(error) = repo::replace_work_tree(ctx, root, &snapshot.head, &target) {
@@ -419,7 +420,7 @@ fn resume(ctx: &mut CommandContext<'_>, root: &str, globals: &Globals, io: &mut 
             repo::short(&id),
             original.subject()
         ));
-        history::emit_commit_summary(ctx, root, &head_tree, &staged, io);
+        commit::emit_commit_summary(ctx, root, &head_tree, &staged, io);
     }
     state.todo.remove(0);
     conflict::clear(ctx, root);

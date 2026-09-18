@@ -20,6 +20,8 @@ use crate::commands::CommandContext;
 use crate::interp::Interp;
 use crate::vfs::{parent_of, NodeKind, Result as VfsResult};
 
+use super::Globals;
+
 pub(crate) const GIT_DIR: &str = ".git";
 pub(crate) const HEAD: &str = "HEAD";
 pub(crate) const INDEX: &str = "index";
@@ -537,6 +539,33 @@ pub(crate) fn merge_base(interp: &Interp, root: &str, left: &str, right: &str) -
         }
     }
     None
+}
+
+// -- commit identity and dates ------------------------------------------------------------------
+
+pub(crate) fn author_identity(
+    ctx: &mut CommandContext<'_>,
+    root: &str,
+    globals: &Globals,
+) -> (String, String) {
+    super::config::identity(ctx, root, globals)
+}
+
+pub(crate) fn now_seconds(ctx: &CommandContext<'_>) -> i64 {
+    ctx.clock
+        .wall_time_seconds_floor()
+        .ok()
+        .and_then(|seconds| i64::try_from(seconds).ok())
+        .unwrap_or_default()
+}
+
+/// Format a commit timestamp the way `git log` prints author dates.
+pub(crate) fn format_date(timestamp: i64) -> String {
+    crate::commands::proc::format_date(
+        i128::from(timestamp) * 1_000_000_000,
+        "%a %b %-d %H:%M:%S %Y +0000",
+    )
+    .unwrap_or_else(|_| timestamp.to_string())
 }
 
 // -- references ---------------------------------------------------------------------------------
