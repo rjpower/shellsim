@@ -76,10 +76,43 @@ fn sequence_ordering_uses_element_protocols_and_sets_use_subset_ordering() {
         return self.value < other.value
 print((Key(1), 9) < (Key(2), 0))
 print([Key(2)] > [Key(1)])
-print({1} < {1, 2}, {1, 2} <= {2, 1}, {1, 2} >= {1})"#;
+print({1} < {1, 2}, {1, 2} <= {2, 1}, {1, 2} >= {1})
+print(sorted({1, 2, 3} - {2, 4}))"#;
     assert_eq!(
         run_shell(&format!("python3.14 <<'PY'\n{source}\nPY")),
-        (0, b"True\nTrue\nTrue True True\n".to_vec(), Vec::new(),)
+        (
+            0,
+            b"True\nTrue\nTrue True True\n[1, 3]\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
+fn script_execution_defines_file_without_exposing_the_host() {
+    assert_eq!(
+        run_shell("printf 'print(__file__)\\n' > /work/program.py; python /work/program.py"),
+        (0, b"/work/program.py\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn system_exit_uses_process_status_and_base_exception_hierarchy() {
+    assert_eq!(
+        run_shell(
+            "python - <<'PY'\ntry:\n    raise SystemExit(4)\nexcept Exception:\n    print('wrong')\nexcept BaseException:\n    print('base')\nraise SystemExit(7)\nPY"
+        ),
+        (7, b"base\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn venv_exposes_offline_python_and_pip_entrypoints() {
+    assert_eq!(
+        run_shell(
+            "printf 'numpy==2.1.3\\n' > /work/requirements.txt; python -m venv /tmp/example; /tmp/example/bin/pip install --no-cache-dir -r /work/requirements.txt; /tmp/example/bin/python -c 'import numpy; print(numpy.__version__)'"
+        ),
+        (0, b"2.0.0-shellsim\n".to_vec(), Vec::new())
     );
 }
 
@@ -231,7 +264,9 @@ def combine(a, b):
 payload = {"z": [1, True, None], "a": "x"}
 print(combine(b=2, a=3))
 print(json.dumps(payload))
-print(json.dumps(payload, separators=(",", ":"), sort_keys=True))"#;
+print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+print(json.dumps({"snowman": "☃"}))
+print(json.dumps({"snowman": "☃"}, ensure_ascii=False))"#;
     let mut environment = Environment::new();
     let argv = vec!["python3.14".into(), "-c".into(), source.into()];
     let mut stdout = Vec::new();
@@ -246,7 +281,7 @@ print(json.dumps(payload, separators=(",", ":"), sort_keys=True))"#;
     assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(
         stdout,
-        b"32\n{\"z\": [1, true, null], \"a\": \"x\"}\n{\"a\":\"x\",\"z\":[1,true,null]}\n"
+        b"32\n{\"z\": [1, true, null], \"a\": \"x\"}\n{\"a\":\"x\",\"z\":[1,true,null]}\n{\"snowman\": \"\\u2603\"}\n{\"snowman\": \"\xe2\x98\x83\"}\n"
     );
     assert!(stderr.is_empty());
 }
@@ -585,6 +620,16 @@ fn reflected_binary_slots_follow_the_rhs_type() {
             "python3.14 -c 'class Right:\n    def __radd__(self, left):\n        return left + 10\n    def __rsub__(self, left):\n        return left - 10\n    def __rmul__(self, left):\n        return left * 10\nvalue = Right()\nclass Count(int):\n    pass\nprint(2 + value, 20 - value, 3 * value)\nprint(Count(2) * \"ab\", Count(2) * [1], (1,) * Count(2))'",
         ),
         (0, b"12 10 30\nabab [1, 1] (1, 1)\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn user_length_controls_truth_when_bool_is_absent() {
+    assert_eq!(
+        run_shell(
+            "python - <<'PY'\nclass Sized:\n    def __init__(self, length):\n        self.length = length\n    def __len__(self):\n        return self.length\nprint(bool(Sized(2)), bool(Sized(0)))\nPY"
+        ),
+        (0, b"True False\n".to_vec(), Vec::new())
     );
 }
 

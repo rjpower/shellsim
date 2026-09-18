@@ -1,4 +1,4 @@
-//! Integration coverage for the deterministic, VFS-only Git porcelain subset.
+//! Integration coverage for the deterministic, VFS-only `git` porcelain subset.
 //!
 //! Tests exercise Git through the normal shell dispatcher and inspect only simulated files. They
 //! cover the index/blob boundary because cached content must not change when the working file does.

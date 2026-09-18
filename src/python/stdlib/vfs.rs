@@ -55,6 +55,16 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
         FunctionDef {
             module: "_shellsim_vfs",
+            name: "is_symlink",
+            call: is_symlink,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "list_dir",
+            call: list_dir,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
             name: "stat",
             call: stat,
         },
@@ -166,6 +176,25 @@ fn is_dir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.reject_keywords("_shellsim_vfs.is_dir")?;
     let PyString(path) = args.positional()[0].cast(runtime)?;
     Ok(Value::Bool(runtime.filesystem().is_dir(&path)))
+}
+
+fn is_symlink(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("_shellsim_vfs.is_symlink", 1, 1)?;
+    args.reject_keywords("_shellsim_vfs.is_symlink")?;
+    let PyString(path) = args.positional()[0].cast(runtime)?;
+    Ok(Value::Bool(runtime.filesystem().is_symlink(&path)))
+}
+
+fn list_dir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("_shellsim_vfs.list_dir", 1, 1)?;
+    args.reject_keywords("_shellsim_vfs.list_dir")?;
+    let PyString(path) = args.positional()[0].cast(runtime)?;
+    let entries = runtime.filesystem().list_dir(&path)?;
+    let mut values = Vec::with_capacity(entries.len());
+    for entry in entries {
+        values.push(runtime.new_string(entry)?);
+    }
+    runtime.new_list(values)
 }
 
 fn stat(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {

@@ -36,10 +36,17 @@ print(documented())
 }
 
 #[test]
+fn crlf_blank_lines_do_not_change_python_indentation() {
+    let source = "class Value:\r\n    def get(self):\r\n        first = 20\r\n\r\n        second = 22\r\n        return first + second\r\n\r\nprint(Value().get())\r\n";
+    assert_eq!(run(source), (0, "42\n".into(), String::new()));
+}
+
+#[test]
 fn bitwise_conditional_and_slice_expressions_match_python_precedence() {
     let source = r#"
 values = [0, 1, 2, 3, 4, 5]
 print(1 | 2 & 6 ^ 1)
+print(3 << 4, 65 >> 2)
 print(~5)
 print(-17 // 5, -17 % 5)
 print(values[1:5:2], values[::-1], "café"[1:3])
@@ -49,7 +56,7 @@ print("yes" if values[:2] == [0, 1] else "no")
         run(source),
         (
             0,
-            "3\n-6\n-4 3\n[1, 3] [5, 4, 3, 2, 1, 0] af\nyes\n".into(),
+            "3\n48 16\n-6\n-4 3\n[1, 3] [5, 4, 3, 2, 1, 0] af\nyes\n".into(),
             String::new()
         )
     );
@@ -118,9 +125,12 @@ class Mask:
     def __or__(self, other):
         return Mask(self.value | other.value)
 
-print((Mask(4) | Mask(2)).value)
+    def __lshift__(self, other):
+        return Mask(self.value << other.value)
+
+print((Mask(4) | Mask(2)).value, (Mask(3) << Mask(2)).value)
 "#;
-    assert_eq!(run(source), (0, "6\n".into(), String::new()));
+    assert_eq!(run(source), (0, "6 12\n".into(), String::new()));
 }
 
 #[test]

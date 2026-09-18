@@ -1,4 +1,4 @@
-//! Compatibility and boundary tests for VFS-only compression commands.
+//! Compatibility and boundary tests for VFS-only compression and archive commands.
 
 use std::io::Write;
 
@@ -187,6 +187,22 @@ fn zip_lists_and_extracts_binary_trees() {
     assert_eq!(
         environment.vfs.read("/", "/work/tree/b.bin").unwrap(),
         [0, 1, 255]
+    );
+
+    environment
+        .vfs
+        .write("/", "/work/tree/a.txt", b"stale", 0o644)
+        .unwrap();
+    let (status, _, stderr) = environment.run_script_capture("unzip -qo /tmp/tree.zip -d /work");
+    assert_eq!(
+        status.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        environment.vfs.read("/", "/work/tree/a.txt").unwrap(),
+        b"alpha"
     );
 }
 

@@ -10,15 +10,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import posixpath
 import re
 import shlex
+import stat
 import sys
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-WORKDIR = re.compile(r"^\s*WORKDIR\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
+CHMOD = re.compile(r"(?:^|&&|;)\s*(chmod\s+[^&;]+)")
 
 
 @dataclass(frozen=True)
@@ -32,23 +34,129 @@ class Action:
     unsupported_commands: tuple[str, ...]
     commands: tuple[str, ...]
     stderr: str
+    usage: dict[str, int]
+
+
+@dataclass(frozen=True)
+class DockerCopy:
+    """One literal host-build-context copy that the probe can reproduce safely."""
+
+    sources: tuple[str, ...]
+    destination: str
+    destination_is_dir: bool
+
+
+@dataclass(frozen=True)
+class DockerLayout:
+    """Small Dockerfile subset used to place trusted fixture files in the VFS."""
+
+    workdir: str
+    copies: tuple[DockerCopy, ...]
+    chmod_commands: tuple[str, ...]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="extracted TaskTrove task-directory root")
     parser.add_argument("--task", action="append", default=[], help="sample only this task (repeatable)")
+    parser.add_argument("--offset", type=int, default=0, help="skip the first N selected tasks")
     parser.add_argument("--limit", type=int, help="sample only the first N selected tasks")
+    parser.add_argument(
+        "--memory-mib",
+        type=int,
+        default=256,
+        help="modeled memory limit per replay (default: 256)",
+    )
     parser.add_argument("--quiet", action="store_true", help="do not print task progress")
     return parser.parse_args()
 
 
+def docker_instructions(source: str) -> tuple[str, ...]:
+    """Join Dockerfile continuations without interpreting shell or substitutions."""
+    instructions: list[str] = []
+    parts: list[str] = []
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not parts and (not stripped or stripped.startswith("#")):
+            continue
+        continued = stripped.endswith("\\")
+        parts.append(stripped[:-1].rstrip() if continued else stripped)
+        if not continued:
+            instructions.append(" ".join(parts))
+            parts = []
+    if parts:
+        instructions.append(" ".join(parts))
+    return tuple(instructions)
+
+
+def docker_layout(task: Path) -> DockerLayout:
+    """Extract literal WORKDIR, build-context COPY, and chmod declarations."""
+    dockerfile = task / "environment" / "Dockerfile"
+    if not dockerfile.is_file():
+        return DockerLayout("/work", (), ())
+
+    workdir = "/work"
+    copies: list[DockerCopy] = []
+    chmod_commands: list[str] = []
+    for instruction in docker_instructions(dockerfile.read_text(errors="replace")):
+        operation, separator, arguments = instruction.partition(" ")
+        if not separator:
+            continue
+        operation = operation.upper()
+        if operation == "WORKDIR":
+            fields = shlex.split(arguments)
+            if len(fields) == 1 and fields[0].startswith("/") and "$" not in fields[0]:
+                workdir = posixpath.normpath(fields[0])
+        elif operation == "COPY":
+            fields = shlex.split(arguments)
+            if fields and fields[0].startswith("--"):
+                continue
+            if len(fields) >= 2 and all(
+                not any(marker in value for marker in ("$", "*", "?", "[")) for value in fields
+            ):
+                raw_destination = fields[-1]
+                destination_is_dir = len(fields) > 2 or raw_destination.endswith("/") or raw_destination in (".", "..")
+                destination = raw_destination
+                if not destination.startswith("/"):
+                    destination = posixpath.join(workdir, destination)
+                copies.append(DockerCopy(tuple(fields[:-1]), posixpath.normpath(destination), destination_is_dir))
+        elif operation == "RUN":
+            chmod_commands.extend(match.group(1).strip() for match in CHMOD.finditer(arguments))
+    return DockerLayout(workdir, tuple(copies), tuple(chmod_commands))
+
+
 def task_workdir(task: Path) -> str:
     """Use the last literal Docker WORKDIR, falling back to /work."""
-    dockerfile = task / "environment" / "Dockerfile"
-    matches = WORKDIR.findall(dockerfile.read_text(errors="replace")) if dockerfile.is_file() else []
-    value = matches[-1] if matches else "/work"
-    return value if value.startswith("/") and "$" not in value else "/work"
+    return docker_layout(task).workdir
+
+
+def apply_docker_layout(environment: Any, task: Path, layout: DockerLayout) -> None:
+    """Overlay literal Docker COPY destinations and executable modes in modeled state."""
+    build_context = (task / "environment").resolve()
+    for copy in layout.copies:
+        multiple = len(copy.sources) > 1
+        for source_text in copy.sources:
+            relative = source_text.removeprefix("./")
+            source = (build_context / relative).resolve()
+            try:
+                source.relative_to(build_context)
+            except ValueError as error:
+                raise ValueError(f"COPY source escapes build context: {source_text}") from error
+            if not source.exists() or source.is_symlink():
+                continue
+            destination = copy.destination
+            if source.is_file() and (multiple or copy.destination_is_dir):
+                destination = posixpath.join(destination, source.name)
+            if source.is_dir():
+                environment.mkdir(destination, parents=True)
+                environment.mount(source, destination)
+            else:
+                environment.mkdir(posixpath.dirname(destination), parents=True)
+                mode = stat.S_IMODE(source.stat().st_mode)
+                environment.write_file(destination, source.read_bytes(), mode=mode)
+
+    for command in layout.chmod_commands:
+        environment.run(f"{command} 2>/dev/null || true")
 
 
 def observe(phase: str, result: Any) -> Action:
@@ -63,6 +171,7 @@ def observe(phase: str, result: Any) -> Action:
         unsupported_commands=tuple(result.unsupported_commands),
         commands=tuple(result.commands),
         stderr=stderr,
+        usage=asdict(result.usage),
     )
 
 
@@ -101,15 +210,24 @@ def reward(environment: Any) -> Optional[str]:
     return None
 
 
-def replay(task: Path, environment_type: Any, limits_type: Any) -> dict[str, Any]:
-    environment = environment_type(limits_type(cpu=100_000_000, memory=256 << 20, disk=256 << 20, output=8 << 20))
+def replay(task: Path, environment_type: Any, limits_type: Any, memory_mib: int = 256) -> dict[str, Any]:
+    environment = environment_type(
+        limits_type(
+            cpu=100_000_000,
+            memory=memory_mib << 20,
+            disk=256 << 20,
+            output=8 << 20,
+        )
+    )
     actions: list[Action] = []
     errors: list[str] = []
-    workdir = task_workdir(task)
+    layout = docker_layout(task)
+    workdir = layout.workdir
 
     try:
         environment.mkdir(workdir, parents=True)
         environment.mount(task / "environment", workdir)
+        apply_docker_layout(environment, task, layout)
         run(environment, actions, "setup", f"cd {shlex.quote(workdir)}")
     except Exception as error:
         errors.append(f"environment: {error}")
@@ -207,6 +325,11 @@ def main() -> int:
     if options.task:
         selected = set(options.task)
         tasks = [task for task in tasks if task.name in selected]
+    if options.offset < 0:
+        raise SystemExit("--offset must not be negative")
+    if options.memory_mib <= 0:
+        raise SystemExit("--memory-mib must be positive")
+    tasks = tasks[options.offset :]
     if options.limit is not None:
         tasks = tasks[: options.limit]
     if not tasks:
@@ -221,7 +344,7 @@ def main() -> int:
     for index, task in enumerate(tasks, 1):
         if not options.quiet:
             print(f"[{index}/{len(tasks)}] {task.name}", file=sys.stderr)
-        results.append(replay(task, Environment, Limits))
+        results.append(replay(task, Environment, Limits, options.memory_mib))
     print(
         json.dumps(
             {

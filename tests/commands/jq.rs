@@ -1,4 +1,4 @@
-//! Compatibility strategy: run unchanged ordinary jq filters and assert semantic JSON results.
+//! Compatibility strategy for `jq`: run ordinary filters and assert semantic JSON results.
 //! The cases cover TaskTrove filter shapes plus explicit syntax and resource boundaries.
 
 use shellsim::interp::{Environment, Interp};

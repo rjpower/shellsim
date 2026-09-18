@@ -167,6 +167,8 @@ enum NumericOperation {
     Divide,
     FloorDivide,
     Remainder,
+    LeftShift,
+    RightShift,
     BitwiseAnd,
     BitwiseXor,
     BitwiseOr,
@@ -304,6 +306,22 @@ pub(super) fn slot_bitwise_and(
     slot_binary(runtime, left, right, NumericOperation::BitwiseAnd)
 }
 
+pub(super) fn slot_left_shift(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_binary(runtime, left, right, NumericOperation::LeftShift)
+}
+
+pub(super) fn slot_right_shift(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_binary(runtime, left, right, NumericOperation::RightShift)
+}
+
 pub(super) fn slot_bitwise_xor(
     runtime: &mut dyn PyRuntime,
     left: PyValue,
@@ -338,6 +356,8 @@ fn slot_binary(
             NumericOperation::BitwiseAnd
                 | NumericOperation::BitwiseXor
                 | NumericOperation::BitwiseOr
+                | NumericOperation::LeftShift
+                | NumericOperation::RightShift
         ) {
             return Ok(None);
         }
@@ -379,7 +399,9 @@ fn slot_binary(
             NumericOperation::Remainder => left - (left / right).floor() * right,
             NumericOperation::BitwiseAnd
             | NumericOperation::BitwiseXor
-            | NumericOperation::BitwiseOr => unreachable!("bitwise float rejected above"),
+            | NumericOperation::BitwiseOr
+            | NumericOperation::LeftShift
+            | NumericOperation::RightShift => unreachable!("integer-only operation rejected above"),
         })));
     }
 
@@ -425,6 +447,37 @@ fn slot_binary(
             .new_integer(&left.pow(exponent).to_string())
             .map(Some);
     }
+    if matches!(
+        operation,
+        NumericOperation::LeftShift | NumericOperation::RightShift
+    ) {
+        let shift = integer_decimal(right)
+            .parse::<BigInt>()
+            .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
+        if shift.is_negative() {
+            return Err(PyError::value_error("negative shift count"));
+        }
+        let shift = shift
+            .to_usize()
+            .ok_or_else(|| PyError::resource_error("shift count is too large"))?;
+        let left = integer_decimal(left);
+        let result_bound = left
+            .len()
+            .checked_add(shift.saturating_add(2) / 3)
+            .and_then(|bytes| bytes.checked_add(2))
+            .ok_or_else(|| PyError::resource_error("shift result is too large"))?;
+        runtime.charge_cpu(u64::try_from(result_bound.max(1)).unwrap_or(u64::MAX))?;
+        runtime.reserve_memory(result_bound)?;
+        let left = left
+            .parse::<BigInt>()
+            .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
+        let result = if matches!(operation, NumericOperation::LeftShift) {
+            left << shift
+        } else {
+            left >> shift
+        };
+        return runtime.new_integer(&result.to_string()).map(Some);
+    }
     if let (PyNumber::Int(left), PyNumber::Int(right)) = (&left, &right) {
         let result = match operation {
             NumericOperation::Add => left.checked_add(*right),
@@ -433,6 +486,9 @@ fn slot_binary(
             NumericOperation::Power => unreachable!("power returned above"),
             NumericOperation::Divide => unreachable!("division returned above"),
             NumericOperation::FloorDivide | NumericOperation::Remainder => None,
+            NumericOperation::LeftShift | NumericOperation::RightShift => {
+                unreachable!("shifts returned above")
+            }
             NumericOperation::BitwiseAnd => Some(*left & *right),
             NumericOperation::BitwiseXor => Some(*left ^ *right),
             NumericOperation::BitwiseOr => Some(*left | *right),
@@ -457,6 +513,9 @@ fn slot_binary(
         | NumericOperation::BitwiseOr => left.len().max(right.len()).saturating_add(2),
         NumericOperation::Multiply => work.saturating_add(1),
         NumericOperation::Power => unreachable!("power returned above"),
+        NumericOperation::LeftShift | NumericOperation::RightShift => {
+            unreachable!("shifts returned above")
+        }
         NumericOperation::FloorDivide | NumericOperation::Remainder => {
             left.len().max(right.len()).saturating_add(2)
         }
@@ -484,6 +543,9 @@ fn slot_binary(
         NumericOperation::Subtract => left - right,
         NumericOperation::Multiply => left * right,
         NumericOperation::Power => unreachable!("power returned above"),
+        NumericOperation::LeftShift | NumericOperation::RightShift => {
+            unreachable!("shifts returned above")
+        }
         NumericOperation::Divide => unreachable!("division returned above"),
         NumericOperation::FloorDivide => bigint_floor_div(&left, &right),
         NumericOperation::Remainder => {

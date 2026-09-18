@@ -225,7 +225,9 @@ fn cmd_unzip(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
         match args[index].as_str() {
             "-l" => list = true,
             "-Z1" => names_only = true,
-            "-q" => {}
+            // Extraction already replaces existing VFS files atomically, so `-o` only makes the
+            // non-interactive intent explicit.
+            "-o" | "-q" => {}
             "-d" => {
                 index += 1;
                 directory = args.get(index).cloned();
@@ -233,6 +235,15 @@ fn cmd_unzip(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
                     ewln(io.err, "unzip: -d requires a directory");
                     return 2;
                 }
+            }
+            option
+                if option.len() > 2
+                    && option.starts_with('-')
+                    && option[1..]
+                        .chars()
+                        .all(|value| matches!(value, 'l' | 'o' | 'q')) =>
+            {
+                list |= option[1..].contains('l');
             }
             option if option.starts_with('-') => {
                 ewln(io.err, &format!("unzip: unsupported option: {option}"));

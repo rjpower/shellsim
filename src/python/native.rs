@@ -358,6 +358,8 @@ pub(super) trait PyFilesystem {
     fn exists(&self, path: &str) -> bool;
     fn is_file(&self, path: &str) -> bool;
     fn is_dir(&self, path: &str) -> bool;
+    fn is_symlink(&self, path: &str) -> bool;
+    fn list_dir(&mut self, path: &str) -> PyResult<Vec<String>>;
     fn metadata(&self, path: &str) -> PyResult<PyFileMetadata>;
     fn mkdir(&mut self, path: &str, parents: bool, exist_ok: bool) -> PyResult<()>;
     fn glob(&mut self, pattern: &str) -> PyResult<Vec<String>>;
@@ -469,6 +471,8 @@ pub(super) trait PyRuntime {
     fn mark_dataclass(&mut self, class: PyClass) -> PyResult<()>;
     fn argv0(&self) -> String;
     fn new_argv(&mut self) -> PyResult<PyValue>;
+    /// Return the mutable list consulted for subsequent VFS module imports.
+    fn new_import_path(&mut self) -> PyResult<PyValue>;
     fn new_argument_parser(
         &mut self,
         program: String,

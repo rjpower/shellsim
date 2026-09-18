@@ -103,9 +103,11 @@ fn dumps(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let mut item_separator = ", ".to_string();
     let mut key_separator = ": ".to_string();
     let mut sort_keys = false;
+    let mut ensure_ascii = true;
     let mut indent = None;
     let mut saw_separators = false;
     let mut saw_sort_keys = false;
+    let mut saw_ensure_ascii = false;
     let mut saw_indent = false;
     for (name, value) in args.keywords() {
         match name.as_str() {
@@ -124,6 +126,10 @@ fn dumps(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
                 sort_keys = runtime.truth(value)?;
                 saw_sort_keys = true;
             }
+            "ensure_ascii" if !saw_ensure_ascii => {
+                ensure_ascii = runtime.truth(value)?;
+                saw_ensure_ascii = true;
+            }
             "indent" if !saw_indent => {
                 if !matches!(runtime.kind(value)?, PyKind::None) {
                     let value = runtime.int_value(value).ok_or_else(|| {
@@ -138,7 +144,7 @@ fn dumps(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
                 }
                 saw_indent = true;
             }
-            "separators" | "sort_keys" | "indent" => {
+            "separators" | "sort_keys" | "ensure_ascii" | "indent" => {
                 return Err(PyError::type_error(format!(
                     "json.dumps got multiple values for keyword {name:?}"
                 )))
@@ -167,6 +173,7 @@ fn dumps(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         item_separator: &item_separator,
         key_separator: &key_separator,
         sort_keys,
+        ensure_ascii,
         indent,
     };
     let rendered = dump_value(runtime, value, options, 0, &mut Vec::new())?;
@@ -186,7 +193,31 @@ struct EncodeOptions<'a> {
     item_separator: &'a str,
     key_separator: &'a str,
     sort_keys: bool,
+    ensure_ascii: bool,
     indent: Option<usize>,
+}
+
+fn encode_string(value: &str, ensure_ascii: bool) -> PyResult<String> {
+    let rendered =
+        serde_json::to_string(value).map_err(|error| PyError::value_error(error.to_string()))?;
+    if !ensure_ascii || rendered.is_ascii() {
+        return Ok(rendered);
+    }
+    let mut ascii = String::with_capacity(rendered.len().saturating_mul(2));
+    for value in rendered.chars() {
+        let point = u32::from(value);
+        if point <= 0x7f {
+            ascii.push(value);
+        } else if point <= 0xffff {
+            ascii.push_str(&format!("\\u{point:04x}"));
+        } else {
+            let value = point - 0x1_0000;
+            let high = 0xd800 + (value >> 10);
+            let low = 0xdc00 + (value & 0x3ff);
+            ascii.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
+        }
+    }
+    Ok(ascii)
 }
 
 fn dump_value(
@@ -228,8 +259,8 @@ fn dump_value(
             let value = runtime
                 .string_value(&value)?
                 .ok_or_else(|| PyError::runtime_error("string changed representation"))?;
-            return serde_json::to_string(&value)
-                .map_err(|error| PyError::value_error(error.to_string()));
+            runtime.charge_cpu(u64::try_from(value.chars().count()).unwrap_or(u64::MAX))?;
+            return encode_string(&value, options.ensure_ascii);
         }
         _ => {}
     }
@@ -297,8 +328,8 @@ fn dump_value(
                             "json.dumps currently requires string keys",
                         ));
                     };
-                    let key = serde_json::to_string(&key)
-                        .map_err(|error| PyError::value_error(error.to_string()))?;
+                    runtime.charge_cpu(u64::try_from(key.chars().count()).unwrap_or(u64::MAX))?;
+                    let key = encode_string(&key, options.ensure_ascii)?;
                     let value = dump_value(runtime, value, options, depth + 1, active)?;
                     rendered.push(format!("{key}{}{value}", options.key_separator));
                 }

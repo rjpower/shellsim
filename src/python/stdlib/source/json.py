@@ -7,11 +7,17 @@ from _json import dumps, loads
 JSONDecodeError = ValueError
 
 
-def dump(value, stream, sort_keys=False, separators=None, indent=None):
+def dump(value, stream, sort_keys=False, separators=None, indent=None, ensure_ascii=True):
     if separators is None:
-        text = dumps(value, sort_keys=sort_keys, indent=indent)
+        text = dumps(value, sort_keys=sort_keys, indent=indent, ensure_ascii=ensure_ascii)
     else:
-        text = dumps(value, sort_keys=sort_keys, separators=separators, indent=indent)
+        text = dumps(
+            value,
+            sort_keys=sort_keys,
+            separators=separators,
+            indent=indent,
+            ensure_ascii=ensure_ascii,
+        )
     stream.write(text)
 
 
