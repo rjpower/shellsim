@@ -1840,3 +1840,33 @@ fn blame_attributes_each_line_to_the_commit_that_wrote_it() {
     assert!(pending.contains("00000000 (Not Committed Yet"), "{pending}");
     assert!(pending.trim_end().ends_with("four"), "{pending}");
 }
+
+#[test]
+fn apply_refuses_a_patch_whose_file_has_moved_on() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/f", b"a\nb\nc\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    env.vfs
+        .put_file("/f", b"a\nB\nc\nd\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "git diff > p.patch").0, 0);
+    assert_eq!(run(&mut env, "git checkout -- f").0, 0);
+
+    // The patch's last hunk ran to the end of the file, so it no longer fits once the file grows.
+    env.vfs
+        .put_file("/f", b"a\nb\nc\nZZZ\n".to_vec(), 0o644)
+        .unwrap();
+    let checked = run(&mut env, "git apply --check p.patch");
+    assert_eq!(checked.0, 1);
+    assert!(checked.2.contains("does not apply"), "{}", checked.2);
+    assert_eq!(run(&mut env, "git apply p.patch").0, 1);
+    assert_eq!(env.vfs.read("/", "/f").unwrap(), b"a\nb\nc\nZZZ\n");
+
+    // A hunk in the middle of a file still applies at an offset, as it does in Git.
+    assert_eq!(run(&mut env, "git checkout -- f").0, 0);
+    assert_eq!(run(&mut env, "git apply p.patch").0, 0);
+    assert_eq!(env.vfs.read("/", "/f").unwrap(), b"a\nB\nc\nd\n");
+}

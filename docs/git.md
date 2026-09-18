@@ -20,6 +20,10 @@ and marks lines the working tree has not committed with a zero hash. `git log --
 branch rail, with connectors on lines of their own rather than folded
 into the commit header the way Git does it.
 
+`git apply` holds a patch to the anchors Git holds it to: a hunk with no trailing context has to
+reach the end of the file, and one that starts at the first line has to start there. A hunk that
+does not fit where it says it goes is looked for elsewhere before the patch is refused.
+
 Aliases recorded in configuration are expanded, so `git config alias.st "status --short"`
 makes `git st` work. A `!shell command` alias is not, because it would need host execution.
 

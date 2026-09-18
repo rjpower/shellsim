@@ -557,6 +557,15 @@ fn apply_file_patch(
                 PatchLine::Add(_) => None,
             })
             .collect::<Vec<_>>();
+        // A hunk with no trailing context ran to the end of the file it was made from, and one
+        // that starts at the first line began there; Git holds a patch to both, which is what
+        // stops a stale patch from being dropped into the middle of a file that has since grown.
+        let trailing = hunk
+            .lines
+            .iter()
+            .rev()
+            .take_while(|line| matches!(line, PatchLine::Context(_)))
+            .count();
         let new = hunk
             .lines
             .into_iter()
@@ -565,20 +574,40 @@ fn apply_file_patch(
                 PatchLine::Remove(_) => None,
             })
             .collect::<Vec<_>>();
-        let position = if let Some(start) = hunk.old_start {
-            let base = start.saturating_sub(1);
-            usize::try_from((base as isize).saturating_add(offset))
-                .map_err(|_| "hunk position underflow".to_string())?
+        // Only a unified diff carries the line numbers these anchors rely on; the agent patch
+        // format names no positions at all and is matched purely by context.
+        let anchored_to_end = trailing == 0 && hunk.old_start.is_some();
+        let anchored_to_start = hunk.old_start.is_some_and(|start| start <= 1);
+        let fits = |position: usize| {
+            let Some(end) = position.checked_add(old.len()) else {
+                return false;
+            };
+            end <= lines.len()
+                && lines[position..end] == old
+                && (!anchored_to_end || end == lines.len())
+                && (!anchored_to_start || position == 0)
+        };
+        let declared = match hunk.old_start {
+            Some(start) => {
+                usize::try_from((start.saturating_sub(1) as isize).saturating_add(offset))
+                    .map_err(|_| "hunk position underflow".to_string())?
+            }
+            None => search_from,
+        };
+        let position = if fits(declared) {
+            declared
         } else {
-            find_exact(&lines, &old, search_from)
-                .ok_or_else(|| "hunk context was not found exactly".to_string())?
+            // Git looks for somewhere else the hunk fits before giving up.
+            (search_from..=lines.len().saturating_sub(old.len().min(lines.len())))
+                .find(|position| fits(*position))
+                .ok_or_else(|| match hunk.old_start {
+                    Some(line) => format!("patch failed at line {line}"),
+                    None => "hunk context was not found exactly".to_string(),
+                })?
         };
         let end = position
             .checked_add(old.len())
             .ok_or_else(|| "hunk range overflow".to_string())?;
-        if end > lines.len() || lines[position..end] != old {
-            return Err("hunk does not apply at its declared location".to_string());
-        }
         let old_len = old.len();
         let new_len = new.len();
         lines.splice(position..end, new);
@@ -628,17 +657,6 @@ fn apply_file_patch(
 fn split_bytes_lines(bytes: &[u8]) -> Result<Vec<String>, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "patched files must be UTF-8 text")?;
     Ok(physical_lines(text))
-}
-
-fn find_exact(haystack: &[String], needle: &[String], start: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(start.min(haystack.len()));
-    }
-    if needle.len() > haystack.len() || start > haystack.len() - needle.len() {
-        return None;
-    }
-    (start..=haystack.len().saturating_sub(needle.len()))
-        .find(|position| haystack[*position..*position + needle.len()] == *needle)
 }
 
 fn fail(io: &mut Io, status: i32, message: &str) -> i32 {
