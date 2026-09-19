@@ -148,7 +148,10 @@ def _interactive(environment: Environment, stdin: Any, stdout: Any, stderr: Any)
 def main(arguments: Optional[Sequence[str]] = None) -> int:
     """Run the package CLI and return the simulated or usage exit status."""
 
-    options = _parser().parse_args(sys.argv[1:] if arguments is None else arguments)
+    parsed_arguments = list(sys.argv[1:] if arguments is None else arguments)
+    if parsed_arguments[-1:] == ["--"]:
+        parsed_arguments.pop()
+    options = _parser().parse_args(parsed_arguments)
     environment, preparation_status = _prepare_environment(options, sys.stdout, sys.stderr)
     if environment is None:
         return preparation_status
