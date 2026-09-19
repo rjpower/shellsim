@@ -6,7 +6,7 @@
 //! (thousands of files), while still supporting unix permissions, ownership and symlinks.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type Mode = u32;
 
@@ -237,6 +237,74 @@ impl Vfs {
 
     fn refresh_usage(&mut self) {
         self.disk_used = self.measured_usage();
+    }
+
+    fn node_usage(&self, path: &str, node: &Node) -> u64 {
+        if self.baseline_dirs.contains(path) && matches!(node.kind, NodeKind::Dir) {
+            return 0;
+        }
+        NODE_OVERHEAD.saturating_add(node_payload_len(node))
+    }
+
+    fn projected_usage_after_replacement(&self, path: &str, replacement_usage: u64) -> Result<u64> {
+        let previous = self
+            .nodes
+            .get(path)
+            .map_or(0, |node| self.node_usage(path, node));
+        let used = self
+            .disk_used
+            .saturating_sub(previous)
+            .saturating_add(replacement_usage);
+        if used > self.disk_limit {
+            Err(VfsError::NoSpace)
+        } else {
+            Ok(used)
+        }
+    }
+
+    fn record_usage(&mut self, used: u64) {
+        self.disk_used = used;
+        self.disk_peak = self.disk_peak.max(used);
+    }
+
+    fn missing_directories(&self, abs: &str) -> Result<Vec<String>> {
+        let components = abs.split('/').filter(|component| !component.is_empty());
+        let mut planned = BTreeSet::new();
+        let mut additions = Vec::new();
+        let mut current = "/".to_string();
+        for component in components {
+            let next = if current == "/" {
+                format!("/{component}")
+            } else {
+                format!("{current}/{component}")
+            };
+            let real = self.realpath(&next, true).unwrap_or(next);
+            match self.nodes.get(&real) {
+                Some(Node {
+                    kind: NodeKind::Dir,
+                    ..
+                }) => {}
+                Some(_) => return Err(VfsError::NotADir(real)),
+                None if planned.insert(real.clone()) => additions.push(real.clone()),
+                None => {}
+            }
+            current = real;
+        }
+        Ok(additions)
+    }
+
+    fn directory_addition_usage(&self, additions: &[String]) -> u64 {
+        additions
+            .iter()
+            .filter(|path| !self.baseline_dirs.contains(path.as_str()))
+            .fold(0u64, |usage, _| usage.saturating_add(NODE_OVERHEAD))
+    }
+
+    fn insert_directories(&mut self, additions: Vec<String>) {
+        for path in additions {
+            self.nodes
+                .insert(path, Node::dir(0o755, self.mutation_time_ms));
+        }
     }
 
     fn measured_usage(&self) -> u64 {
@@ -550,8 +618,18 @@ impl Vfs {
 
     pub fn write(&mut self, cwd: &str, path: &str, data: &[u8], mode: Mode) -> Result<()> {
         let target = self.write_target(cwd, path)?;
-        let before = self.nodes.clone();
         self.require_parent_dir(&target)?;
+        if matches!(
+            self.nodes.get(&target),
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            })
+        ) {
+            return Err(VfsError::IsADir(path.to_string()));
+        }
+        let replacement_usage = NODE_OVERHEAD.saturating_add(data.len() as u64);
+        let used = self.projected_usage_after_replacement(&target, replacement_usage)?;
         match self.nodes.get_mut(&target) {
             Some(Node {
                 kind: NodeKind::File(d),
@@ -561,10 +639,6 @@ impl Vfs {
                 *d = data.to_vec();
                 *mtime = self.mutation_time_ms;
             }
-            Some(Node {
-                kind: NodeKind::Dir,
-                ..
-            }) => return Err(VfsError::IsADir(path.to_string())),
             _ => {
                 self.nodes.insert(
                     target,
@@ -572,7 +646,8 @@ impl Vfs {
                 );
             }
         }
-        self.finish_mutation(before)
+        self.record_usage(used);
+        Ok(())
     }
 
     pub fn append(&mut self, cwd: &str, path: &str, data: &[u8], mode: Mode) -> Result<()> {
@@ -663,35 +738,15 @@ impl Vfs {
     pub fn mkdir_all(&mut self, cwd: &str, path: &str) -> Result<()> {
         let abs = resolve_against(cwd, path);
         reject_pseudo_mutation(&abs)?;
-        let before = self.nodes.clone();
-        let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
-        // resolve symlinks progressively
-        let mut cur = "/".to_string();
-        for c in comps {
-            let next = if cur == "/" {
-                format!("/{c}")
-            } else {
-                format!("{cur}/{c}")
-            };
-            let real = self.realpath(&next, true).unwrap_or(next.clone());
-            match self.nodes.get(&real) {
-                Some(Node {
-                    kind: NodeKind::Dir,
-                    ..
-                }) => {}
-                Some(_) => {
-                    self.nodes = before;
-                    self.refresh_usage();
-                    return Err(VfsError::NotADir(real));
-                }
-                None => {
-                    self.nodes
-                        .insert(real.clone(), Node::dir(0o755, self.mutation_time_ms));
-                }
-            }
-            cur = real;
+        let additions = self.missing_directories(&abs)?;
+        let added_usage = self.directory_addition_usage(&additions);
+        let used = self.disk_used.saturating_add(added_usage);
+        if used > self.disk_limit {
+            return Err(VfsError::NoSpace);
         }
-        self.finish_mutation(before)
+        self.insert_directories(additions);
+        self.record_usage(used);
+        Ok(())
     }
 
     pub fn remove_file(&mut self, cwd: &str, path: &str) -> Result<()> {
@@ -900,24 +955,38 @@ impl Vfs {
     pub fn put_file(&mut self, abs: &str, data: Vec<u8>, mode: Mode) -> Result<()> {
         let norm = normalize(abs);
         reject_pseudo_mutation(&norm)?;
-        let before = self.nodes.clone();
-        if let Some(parent) = parent_of(&norm) {
-            self.mkdir_all("/", &parent)?;
+        let additions = match parent_of(&norm) {
+            Some(parent) => self.missing_directories(&parent)?,
+            None => Vec::new(),
+        };
+        let previous = self
+            .nodes
+            .get(&norm)
+            .map_or(0, |node| self.node_usage(&norm, node));
+        let file_usage = NODE_OVERHEAD.saturating_add(data.len() as u64);
+        let used = self
+            .disk_used
+            .saturating_sub(previous)
+            .saturating_add(self.directory_addition_usage(&additions))
+            .saturating_add(file_usage);
+        if used > self.disk_limit {
+            return Err(VfsError::NoSpace);
         }
+        self.insert_directories(additions);
         self.nodes
             .insert(norm, Node::file(data, mode, self.mutation_time_ms));
-        self.finish_mutation(before)
+        self.record_usage(used);
+        Ok(())
     }
 
     pub fn put_dir(&mut self, abs: &str, mode: Mode) -> Result<()> {
         let norm = normalize(abs);
         reject_pseudo_mutation(&norm)?;
-        let before = self.nodes.clone();
         self.mkdir_all("/", &norm)?;
         if let Some(n) = self.nodes.get_mut(&norm) {
             n.mode = mode;
         }
-        self.finish_mutation(before)
+        Ok(())
     }
 
     pub fn all_paths(&self) -> impl Iterator<Item = (&String, &Node)> {
@@ -947,6 +1016,14 @@ fn logical_usage(nodes: &BTreeMap<String, Node>) -> u64 {
             };
             total.saturating_add(NODE_OVERHEAD).saturating_add(payload)
         })
+}
+
+fn node_payload_len(node: &Node) -> u64 {
+    match &node.kind {
+        NodeKind::File(data) => data.len() as u64,
+        NodeKind::Symlink(target) => target.len() as u64,
+        NodeKind::Dir => 0,
+    }
 }
 
 #[cfg(test)]
@@ -1017,6 +1094,51 @@ mod tests {
         v.remove_file("/", "/a").unwrap();
         assert_eq!(v.disk_used(), 0);
         v.write("/", "/b", b"123", 0o644).unwrap();
+    }
+
+    #[test]
+    fn write_preflights_replacement_and_directory_usage() {
+        let mut v = Vfs::with_disk_limit(NODE_OVERHEAD * 2 + 3);
+        v.mkdir_all("/", "/dir").unwrap();
+        v.write("/", "/dir/file", b"123", 0o644).unwrap();
+
+        assert!(matches!(
+            v.write("/", "/dir/file", b"1234", 0o644),
+            Err(VfsError::NoSpace)
+        ));
+        assert_eq!(v.read_string("/", "/dir/file").unwrap(), "123");
+        assert_eq!(v.disk_used(), NODE_OVERHEAD * 2 + 3);
+
+        v.write("/", "/dir/file", b"1", 0o644).unwrap();
+        assert_eq!(v.disk_used(), NODE_OVERHEAD * 2 + 1);
+    }
+
+    #[test]
+    fn mkdir_all_rejects_the_complete_path_atomically() {
+        let mut v = Vfs::with_disk_limit(NODE_OVERHEAD);
+
+        assert!(matches!(
+            v.mkdir_all("/", "/one/two"),
+            Err(VfsError::NoSpace)
+        ));
+        assert!(!v.exists("/", "/one"));
+        assert_eq!(v.disk_used(), 0);
+    }
+
+    #[test]
+    fn put_file_preflights_parents_and_replaces_the_mode() {
+        let mut bounded = Vfs::with_disk_limit(NODE_OVERHEAD * 2);
+        assert!(matches!(
+            bounded.put_file("/one/file", b"x".to_vec(), 0o755),
+            Err(VfsError::NoSpace)
+        ));
+        assert!(!bounded.exists("/", "/one"));
+
+        let mut v = Vfs::new();
+        v.put_file("/file", b"one".to_vec(), 0o755).unwrap();
+        v.put_file("/file", b"two".to_vec(), 0o640).unwrap();
+        assert_eq!(v.metadata("/", "/file", true).unwrap().mode, 0o640);
+        assert_eq!(v.read_string("/", "/file").unwrap(), "two");
     }
 
     #[test]

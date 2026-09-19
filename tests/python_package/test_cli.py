@@ -87,6 +87,24 @@ def test_root_is_a_disposable_snapshot_at_work(tmp_path: Path) -> None:
     assert host_file.read_bytes() == b"host\n"
 
 
+def test_trailing_separator_starts_the_default_shell(tmp_path: Path) -> None:
+    (tmp_path / "value.txt").write_bytes(b"mounted\n")
+
+    completed = run_cli("--root", str(tmp_path), "--", stdin=b"cat value.txt")
+
+    assert completed.returncode == 0
+    assert completed.stdout == b"mounted\n"
+    assert completed.stderr == b""
+
+
+def test_separator_does_not_accept_positional_arguments() -> None:
+    completed = run_cli("--", "unexpected")
+
+    assert completed.returncode == 2
+    assert completed.stdout == b""
+    assert b"unrecognized arguments: -- unexpected" in completed.stderr
+
+
 def test_root_rejects_host_symlinks(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.write_text("host")
