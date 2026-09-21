@@ -883,6 +883,7 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.add = Some(intrinsic(super::stdlib::core::slot_string_add));
     slots.multiply = Some(intrinsic(super::stdlib::core::slot_string_multiply));
     slots.reflected_multiply = Some(intrinsic(super::stdlib::core::slot_string_multiply));
+    slots.remainder = Some(intrinsic(super::stdlib::core::slot_string_remainder));
 
     let slots = &mut types[BuiltinType::Bytes as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_bytes_length));

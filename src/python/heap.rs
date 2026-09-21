@@ -48,6 +48,10 @@ impl SymbolId {
     pub(super) const fn index(self) -> usize {
         self.0 as usize
     }
+
+    pub(super) fn from_index(index: usize) -> Option<Self> {
+        u32::try_from(index).ok().map(Self)
+    }
 }
 
 /// Runtime-local identity for one append-only instance storage layout.
@@ -384,6 +388,43 @@ impl Heap {
     /// Return the runtime identity of an identifier already known to this heap.
     pub fn symbol_id(&self, name: &str) -> Option<SymbolId> {
         self.symbol_ids.get(name).copied()
+    }
+
+    /// Resolve a symbol identity back to its interpreter-owned name.
+    pub fn symbol_name(&self, symbol: SymbolId) -> Option<&str> {
+        self.symbol_names.get(symbol.index()).map(AsRef::as_ref)
+    }
+
+    /// Snapshot the names stored directly on an instance in either attribute representation.
+    pub fn instance_attribute_names(&self, id: ObjectId) -> Result<Vec<String>, String> {
+        let object = self
+            .objects
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .ok_or("invalid object reference")?;
+        let Object::Instance { attributes, .. } = &object.payload else {
+            return Err("object does not have instance attributes".into());
+        };
+        match attributes {
+            InstanceAttributes::Shaped { shape, values } => (0..values.len())
+                .map(|slot| {
+                    let symbol = self
+                        .shape_attribute_at(*shape, slot)
+                        .ok_or("invalid instance shape slot")?;
+                    self.symbol_name(symbol)
+                        .map(str::to_string)
+                        .ok_or_else(|| "invalid instance attribute symbol".into())
+                })
+                .collect(),
+            InstanceAttributes::Dictionary(values) => values
+                .keys()
+                .map(|symbol| {
+                    self.symbol_name(*symbol)
+                        .map(str::to_string)
+                        .ok_or_else(|| "invalid instance attribute symbol".into())
+                })
+                .collect(),
+        }
     }
 
     /// Intern one identifier, charging its process-lifetime storage before mutation.

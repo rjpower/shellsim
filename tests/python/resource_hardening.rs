@@ -70,6 +70,21 @@ fn regex_substitution_reserves_before_constructing_result() {
 }
 
 #[test]
+fn percent_format_width_is_rejected_before_host_allocation() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "print('%1000000s' % 'x')",
+        Limits {
+            memory: 32 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 32 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn native_sorting_consumes_cpu_fuel() {
     let (status, stdout, stderr, usage) = run_with_limits(
         "print(sorted(range(100, 0, -1)))",

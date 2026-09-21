@@ -111,6 +111,7 @@ impl Vm<'_> {
                 "exit" | "quit" => Builtin::Exit,
                 "chr" => Builtin::Character,
                 "repr" => Builtin::Repr,
+                "dir" => Builtin::Dir,
                 "isinstance" => Builtin::IsInstance,
                 "issubclass" => Builtin::IsSubclass,
                 "len" => Builtin::Length,
@@ -119,6 +120,7 @@ impl Vm<'_> {
                 "max" => Builtin::Maximum,
                 "sum" => Builtin::Sum,
                 "abs" => Builtin::Absolute,
+                "pow" => Builtin::Power,
                 "range" => Builtin::Range,
                 "enumerate" => Builtin::Enumerate,
                 "zip" => Builtin::Zip,
@@ -153,6 +155,16 @@ impl Vm<'_> {
                 "TypeError" => {
                     return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
                         "TypeError",
+                    ))))
+                }
+                "OverflowError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "OverflowError",
+                    ))))
+                }
+                "ZeroDivisionError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "ZeroDivisionError",
                     ))))
                 }
                 "KeyError" => {
