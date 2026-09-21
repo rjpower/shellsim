@@ -97,6 +97,29 @@ fn common_bash_guard_idioms() {
 }
 
 #[test]
+fn getopts_handles_clusters_arguments_errors_and_explicit_operands() {
+    let source = r#"
+set -- -ab value rest
+while getopts "ab:" option; do printf '%s:%s:%s\n' "$option" "$OPTARG" "$OPTIND"; done
+printf 'done:%s\n' "$OPTIND"
+OPTIND=1
+while getopts ":x:" option -xinline -z; do printf '%s:%s:%s\n' "$option" "$OPTARG" "$OPTIND"; done
+OPTIND=1
+getopts "ab" option -ab; printf 'reset:%s:%s\n' "$option" "$OPTIND"
+OPTIND=1
+getopts "ab" option -ab; printf 'reset:%s:%s\n' "$option" "$OPTIND"
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "a::1\nb:value:3\ndone:3\nx:inline:2\n?:z:3\nreset:a:1\nreset:a:1\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
 fn double_bracket_covers_predicates_boolean_logic_and_regex_captures() {
     assert_eq!(
         run(

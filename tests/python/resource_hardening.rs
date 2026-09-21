@@ -115,6 +115,21 @@ fn iterable_materialization_is_metered_before_host_growth() {
 }
 
 #[test]
+fn combinatorial_iterators_reserve_before_materializing_results() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import itertools\nlist(itertools.product(range(100), range(100)))",
+        Limits {
+            memory: 64 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 64 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn direct_list_growth_does_not_require_a_full_container_snapshot() {
     let (status, stdout, stderr, usage) = run_with_limits(
         "items = []\nfor value in range(3000):\n    items.append(value)\nprint(len(items))",

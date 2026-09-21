@@ -24,6 +24,13 @@ pub enum ArrayVal {
     Assoc(BTreeMap<String, String>),
 }
 
+/// Cursor retained between calls to the `getopts` shell builtin.
+#[derive(Clone, Debug)]
+pub(crate) struct GetoptsState {
+    pub(crate) optind: usize,
+    pub(crate) offset: usize,
+}
+
 /// A simulated background job started with `&`.
 ///
 /// Its process continuation is owned separately by [`ProcessStates`]. This shell-facing record
@@ -144,6 +151,7 @@ pub struct ProcessState {
     random_state: Cell<u32>,
     /// positional parameters `$1 $2 ... $@`
     pub positional: Vec<String>,
+    pub(crate) getopts: GetoptsState,
     /// `set -e` / `set -u` / `set -x`
     pub opt_errexit: bool,
     pub opt_nounset: bool,
@@ -316,6 +324,7 @@ impl ProcessState {
             last_status: self.last_status,
             random_state: Cell::new(self.random_state.get()),
             positional: self.positional.clone(),
+            getopts: self.getopts.clone(),
             opt_errexit: self.opt_errexit,
             opt_nounset: self.opt_nounset,
             opt_xtrace: self.opt_xtrace,
@@ -550,6 +559,10 @@ impl Environment {
                 last_status: 0,
                 random_state: Cell::new(1),
                 positional: Vec::new(),
+                getopts: GetoptsState {
+                    optind: 1,
+                    offset: 1,
+                },
                 opt_errexit: false,
                 opt_nounset: false,
                 opt_xtrace: false,
@@ -1456,6 +1469,14 @@ impl Environment {
         }
         if name == "PWD" {
             self.cwd = val.clone();
+        }
+        if name == "OPTIND" {
+            self.getopts.optind = val
+                .parse::<usize>()
+                .ok()
+                .filter(|value| *value > 0)
+                .unwrap_or(1);
+            self.getopts.offset = 1;
         }
         // A plain scalar assignment to an array name in bash sets element 0; we instead treat it
         // as a fresh scalar (drop the array) — the common case in our scripts and lower-risk.

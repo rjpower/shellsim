@@ -51,13 +51,22 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "rstrip", string_rstrip),
         method("str", "startswith", string_startswith),
         method("str", "endswith", string_endswith),
+        method("str", "find", string_find),
+        method("str", "rfind", string_rfind),
+        method("str", "index", string_index),
+        method("str", "rindex", string_rindex),
+        method("str", "count", string_count),
+        method("str", "partition", string_partition),
+        method("str", "rpartition", string_rpartition),
         method("str", "split", string_split),
+        method("str", "rsplit", string_rsplit),
         method("str", "splitlines", string_splitlines),
         method("str", "join", string_join),
         method("str", "replace", string_replace),
         method("str", "format", string_format),
         method("str", "ljust", string_ljust),
         method("str", "rjust", string_rjust),
+        method("str", "center", string_center),
         method("str", "encode", string_encode),
         method("str", "lower", string_lower),
         method("str", "upper", string_upper),
@@ -604,6 +613,173 @@ fn string_affix(
     }))
 }
 
+fn string_find(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_find_impl(runtime, receiver, args, false, false)
+}
+
+fn string_rfind(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_find_impl(runtime, receiver, args, true, false)
+}
+
+fn string_index(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_find_impl(runtime, receiver, args, false, true)
+}
+
+fn string_rindex(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_find_impl(runtime, receiver, args, true, true)
+}
+
+fn string_find_impl(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    reverse: bool,
+    raise: bool,
+) -> PyResult {
+    args.expect_positional("str search", 1, 3)?;
+    args.reject_keywords("str search")?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(needle) = args.positional()[0].cast(runtime)?;
+    let characters = value.chars().collect::<Vec<_>>();
+    let needle = needle.chars().collect::<Vec<_>>();
+    runtime.charge_cpu(u64::try_from(characters.len()).unwrap_or(u64::MAX))?;
+    let (start, end) = string_bounds(runtime, args.positional(), characters.len())?;
+    let found = if needle.is_empty() {
+        (start <= end).then_some(if reverse { end } else { start })
+    } else if needle.len() > end.saturating_sub(start) {
+        None
+    } else {
+        let mut candidates = start..=end - needle.len();
+        if reverse {
+            candidates
+                .rev()
+                .find(|index| characters[*index..].starts_with(&needle))
+        } else {
+            candidates.find(|index| characters[*index..].starts_with(&needle))
+        }
+    };
+    match found {
+        Some(index) => i64::try_from(index)
+            .map(Value::Int)
+            .map_err(|_| PyError::overflow_error("string index is too large")),
+        None if raise => Err(PyError::value_error("substring not found")),
+        None => Ok(Value::Int(-1)),
+    }
+}
+
+fn string_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.count", 1, 3)?;
+    args.reject_keywords("str.count")?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(needle) = args.positional()[0].cast(runtime)?;
+    let characters = value.chars().collect::<Vec<_>>();
+    let needle = needle.chars().collect::<Vec<_>>();
+    let (start, end) = string_bounds(runtime, args.positional(), characters.len())?;
+    let count = if needle.is_empty() {
+        if start <= end {
+            end - start + 1
+        } else {
+            0
+        }
+    } else {
+        let mut count = 0usize;
+        let mut index = start;
+        while index + needle.len() <= end {
+            runtime.charge_cpu(1)?;
+            if characters[index..].starts_with(&needle) {
+                count = count.saturating_add(1);
+                index += needle.len();
+            } else {
+                index += 1;
+            }
+        }
+        count
+    };
+    i64::try_from(count)
+        .map(Value::Int)
+        .map_err(|_| PyError::overflow_error("string count is too large"))
+}
+
+fn string_bounds(
+    runtime: &dyn PyRuntime,
+    arguments: &[PyValue],
+    length: usize,
+) -> PyResult<(usize, usize)> {
+    let length_i64 = i64::try_from(length).unwrap_or(i64::MAX);
+    let normalize_start = |value: i64| {
+        if value < 0 {
+            usize::try_from(length_i64.saturating_add(value).max(0)).unwrap_or_default()
+        } else {
+            usize::try_from(value).unwrap_or(usize::MAX)
+        }
+    };
+    let normalize_end = |value: i64| {
+        if value < 0 {
+            usize::try_from(length_i64.saturating_add(value).max(0)).unwrap_or_default()
+        } else {
+            usize::try_from(value).unwrap_or(usize::MAX).min(length)
+        }
+    };
+    let start = arguments
+        .get(1)
+        .map(|value| {
+            runtime
+                .int_value(value)
+                .map(normalize_start)
+                .ok_or_else(|| PyError::type_error("slice indices must be integers"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let end = arguments
+        .get(2)
+        .map(|value| {
+            runtime
+                .int_value(value)
+                .map(normalize_end)
+                .ok_or_else(|| PyError::type_error("slice indices must be integers"))
+        })
+        .transpose()?
+        .unwrap_or(length);
+    Ok((start, end))
+}
+
+fn string_partition(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_partition_impl(runtime, receiver, args, false)
+}
+
+fn string_rpartition(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_partition_impl(runtime, receiver, args, true)
+}
+
+fn string_partition_impl(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    reverse: bool,
+) -> PyResult {
+    args.expect_positional("str.partition", 1, 1)?;
+    args.reject_keywords("str.partition")?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    let OwnedPyString(separator) = args.positional()[0].cast(runtime)?;
+    if separator.is_empty() {
+        return Err(PyError::value_error("empty separator"));
+    }
+    let parts = if reverse {
+        value.rsplit_once(&separator)
+    } else {
+        value.split_once(&separator)
+    };
+    let (left, middle, right) = match parts {
+        Some((left, right)) => (left.to_string(), separator, right.to_string()),
+        None if reverse => (String::new(), String::new(), value),
+        None => (value, String::new(), String::new()),
+    };
+    let left = runtime.new_string(left)?;
+    let middle = runtime.new_string(middle)?;
+    let right = runtime.new_string(right)?;
+    runtime.new_tuple(vec![left, middle, right])
+}
+
 fn string_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.split", 0, 2)?;
     args.reject_keywords("str.split")?;
@@ -634,6 +810,88 @@ fn string_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
         values.push(runtime.new_string(part)?);
     }
     runtime.new_list(values)
+}
+
+fn string_rsplit(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.rsplit", 0, 2)?;
+    args.reject_keywords("str.rsplit")?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    let separator = match args.positional().first() {
+        None => None,
+        Some(value) if runtime.kind(value)? == PyKind::None => None,
+        Some(value) => {
+            let OwnedPyString(value) = (*value).cast(runtime)?;
+            if value.is_empty() {
+                return Err(PyError::value_error("empty separator"));
+            }
+            Some(value)
+        }
+    };
+    let maximum = args
+        .positional()
+        .get(1)
+        .map(|value| {
+            runtime
+                .int_value(value)
+                .ok_or_else(|| PyError::type_error("maxsplit must be an integer"))
+        })
+        .transpose()?
+        .unwrap_or(-1);
+    let limit = if maximum < 0 {
+        usize::MAX
+    } else {
+        usize::try_from(maximum).unwrap_or(usize::MAX)
+    };
+    let mut parts = match separator.as_deref() {
+        Some(separator) => value
+            .rsplitn(limit.saturating_add(1), separator)
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        None => whitespace_rsplit(&value, limit),
+    };
+    parts.reverse();
+    let values = parts
+        .into_iter()
+        .map(|part| runtime.new_string(part))
+        .collect::<PyResult<Vec<_>>>()?;
+    runtime.new_list(values)
+}
+
+fn whitespace_rsplit(value: &str, limit: usize) -> Vec<String> {
+    let value = value.trim_end_matches(char::is_whitespace);
+    if value.is_empty() {
+        return Vec::new();
+    }
+    if limit == 0 {
+        return vec![value.to_string()];
+    }
+    let mut parts = Vec::new();
+    let mut end = value.len();
+    while parts.len() < limit {
+        let mut word_start = end;
+        for (index, character) in value[..end].char_indices().rev() {
+            if character.is_whitespace() {
+                break;
+            }
+            word_start = index;
+        }
+        let mut separator_start = word_start;
+        for (index, character) in value[..word_start].char_indices().rev() {
+            if !character.is_whitespace() {
+                break;
+            }
+            separator_start = index;
+        }
+        if separator_start == word_start {
+            break;
+        }
+        parts.push(value[word_start..end].to_string());
+        end = separator_start;
+    }
+    if end > 0 {
+        parts.push(value[..end].to_string());
+    }
+    parts
 }
 
 fn string_splitlines(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -745,6 +1003,47 @@ fn string_ljust(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
 
 fn string_rjust(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     string_justify(runtime, receiver, args, true)
+}
+
+fn string_center(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.center", 1, 2)?;
+    args.reject_keywords("str.center")?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    let width = runtime
+        .int_value(&args.positional()[0])
+        .ok_or_else(|| PyError::type_error("width must be an integer"))?;
+    let fill = if let Some(fill) = args.positional().get(1) {
+        let OwnedPyString(fill) = (*fill).cast(runtime)?;
+        if fill.chars().count() != 1 {
+            return Err(PyError::type_error(
+                "the fill character must be exactly one character long",
+            ));
+        }
+        fill
+    } else {
+        " ".to_string()
+    };
+    let padding = usize::try_from(width)
+        .ok()
+        .unwrap_or_default()
+        .saturating_sub(value.chars().count());
+    let left = padding / 2;
+    let right = padding - left;
+    let fill_bytes = fill
+        .len()
+        .checked_mul(padding)
+        .ok_or_else(|| PyError::resource_error("centered string is too large"))?;
+    let capacity = value
+        .len()
+        .checked_add(fill_bytes)
+        .ok_or_else(|| PyError::resource_error("centered string is too large"))?;
+    runtime.reserve_memory(capacity)?;
+    runtime.charge_cpu(u64::try_from(capacity).unwrap_or(u64::MAX))?;
+    runtime.new_string(format!(
+        "{}{value}{}",
+        fill.repeat(left),
+        fill.repeat(right)
+    ))
 }
 
 fn string_justify(

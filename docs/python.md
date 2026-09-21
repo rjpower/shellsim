@@ -42,6 +42,8 @@ The bytecode is shellsim's internal semantic format, not CPython bytecode. Value
 scalars or typed objects in an interpreter-owned arena. User-visible identity, mutation, type
 lookup, descriptors, and operator slots are modeled explicitly. CPU is charged per instruction
 and native loop; source, recursion, calls, allocation, iteration, and output are bounded.
+Native operations may use conservative constant or linear estimates. Accounting aims for stable
+order-of-magnitude costs, not exact host allocation sizes or execution time.
 
 Native modules exchange a type-erased `PyValue` and recover checked views such as `PyNumber`,
 `PyString`, `PyList`, or `PyArray`. They receive only the capabilities declared by `PyRuntime`.
@@ -57,7 +59,7 @@ For either form:
 
 1. define the useful supported surface and the explicit unsupported frontier;
 2. validate arguments and reject unknown keywords;
-3. meter loops and reserve result storage before allocation;
+3. meter loops and reserve result storage before allocation using a simple proportional estimate;
 4. keep mutable interpreter layouts behind checked runtime views;
 5. add differential tests against the matching CPython behavior where deterministic.
 

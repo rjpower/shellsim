@@ -189,6 +189,35 @@ print("radians" in dir(math), "sqrt" in dir(cmath))"#;
 }
 
 #[test]
+fn finite_itertools_bisect_and_integer_math_cover_common_recipes() {
+    let source = r#"import bisect
+import itertools
+import math
+
+values = [1, 3, 3, 7]
+print(bisect.bisect_left(values, 3), bisect.bisect(values, 3))
+bisect.insort(values, 4)
+bisect.insort_left(values, 3)
+print(values)
+print(list(itertools.chain([1, 2], [3])))
+print(list(itertools.product("ab", repeat=2)))
+print(list(itertools.permutations([1, 2, 3], 2)))
+print(list(itertools.combinations([1, 2, 3], 2)))
+print(math.floor(-1.2), math.trunc(-1.8), math.fabs(-2))
+print(math.isfinite(1.0), math.isfinite(math.inf))
+print(math.gcd(18, 24), math.lcm(6, 8), math.factorial(6))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"1 3\n[1, 3, 3, 3, 4, 7]\n[1, 2, 3]\n[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')]\n[(1, 2), (1, 3), (2, 1), (2, 3), (3, 1), (3, 2)]\n[(1, 2), (1, 3), (2, 3)]\n-2 -1 2.0\nTrue False\n6 24 720\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
 fn finite_iterator_heap_bisect_reduce_and_safe_imports_match_cpython() {
     let source = r#"import itertools
 import heapq

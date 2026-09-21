@@ -179,6 +179,44 @@ print(sum([Addend(2), Addend(3)]).value)
 }
 
 #[test]
+fn common_numeric_and_callable_builtins_match_python() {
+    let source = r#"
+print(ord("A"), ord(b"z"))
+print(bin(10), oct(10), hex(255), hex(-16))
+print(divmod(17, 5), divmod(-17, 5))
+print(callable(print), callable(1))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "65 122\n0b1010 0o12 0xff -0x10\n(3, 2) (-4, 3)\nTrue False\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn common_string_search_split_and_alignment_methods_match_python() {
+    let source = r#"
+value = "bananas"
+print(value.find("na"), value.rfind("na"), value.index("ana"), value.rindex("a"))
+print(value.count("a"), value.partition("na"), value.rpartition("na"))
+print("a,b,c".rsplit(",", 1), "x".center(5, "-"))
+print("abc".find("", 4), "abc".count("", 4))
+print("  a  b  ".rsplit(None, 0), "  a  b  ".rsplit(None, 1))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "2 4 1 5\n3 ('ba', 'na', 'nas') ('bana', 'na', 's')\n['a,b', 'c'] --x--\n-1 0\n['  a  b'] ['  a', 'b']\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
 fn bitwise_operators_dispatch_through_user_type_slots() {
     let source = r#"
 class Mask:
