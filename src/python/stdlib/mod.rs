@@ -48,6 +48,7 @@ pub(super) fn frozen_module(name: &str) -> Option<&'static str> {
 /// Resolve a builtin implemented by a frozen module without preloading that module into the VFS.
 pub(super) fn frozen_builtin(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
+        "complex" => Some(("_complex", "complex")),
         "open" => Some(("_io", "open")),
         _ => None,
     }

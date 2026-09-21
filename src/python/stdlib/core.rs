@@ -13,7 +13,7 @@ use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, MethodDef, NativeTypeDef, OwnedPyString, PyByteArray, PyBytes,
     PyCallable, PyDict, PyError, PyKind, PyList, PyProperty, PyResult, PyRuntime, PySequence,
-    PySet, PyValue, PyValueCast,
+    PySet, PyTuple, PyValue, PyValueCast,
 };
 use super::super::number::PyNumber;
 use super::super::slice::SlicePlan;
@@ -56,6 +56,8 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "join", string_join),
         method("str", "replace", string_replace),
         method("str", "format", string_format),
+        method("str", "ljust", string_ljust),
+        method("str", "rjust", string_rjust),
         method("str", "encode", string_encode),
         method("str", "lower", string_lower),
         method("str", "upper", string_upper),
@@ -735,6 +737,293 @@ fn string_replace(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
         None => value.replace(&old, &new),
     };
     runtime.new_string(result)
+}
+
+fn string_ljust(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_justify(runtime, receiver, args, false)
+}
+
+fn string_rjust(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_justify(runtime, receiver, args, true)
+}
+
+fn string_justify(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    right: bool,
+) -> PyResult {
+    let name = if right { "str.rjust" } else { "str.ljust" };
+    args.expect_positional(name, 1, 2)?;
+    args.reject_keywords(name)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    let width = runtime
+        .int_value(&args.positional()[0])
+        .ok_or_else(|| PyError::type_error("width must be an integer"))?;
+    let fill = if let Some(fill) = args.positional().get(1) {
+        let OwnedPyString(fill) = (*fill).cast(runtime)?;
+        if fill.chars().count() != 1 {
+            return Err(PyError::type_error(
+                "the fill character must be exactly one character long",
+            ));
+        }
+        fill
+    } else {
+        " ".to_string()
+    };
+    let padding = usize::try_from(width)
+        .ok()
+        .unwrap_or_default()
+        .saturating_sub(value.chars().count());
+    let added = fill
+        .len()
+        .checked_mul(padding)
+        .ok_or_else(|| PyError::resource_error("justified string is too large"))?;
+    let capacity = value
+        .len()
+        .checked_add(added)
+        .ok_or_else(|| PyError::resource_error("justified string is too large"))?;
+    runtime.reserve_memory(capacity)?;
+    runtime.charge_cpu(u64::try_from(capacity).unwrap_or(u64::MAX))?;
+    let padding = fill.repeat(padding);
+    runtime.new_string(if right {
+        format!("{padding}{value}")
+    } else {
+        format!("{value}{padding}")
+    })
+}
+
+/// Implement the established string `%` protocol without routing numeric remainder through it.
+pub(crate) fn slot_string_remainder(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let OwnedPyString(template) = left.cast(runtime)?;
+    runtime.reserve_memory(template.len())?;
+    let arguments = if runtime.kind(&right)? == PyKind::Tuple {
+        right.cast::<PyTuple>(runtime)?.items(runtime)?
+    } else {
+        vec![right]
+    };
+    let mut argument = 0usize;
+    let mut used_mapping = false;
+    let mut output = String::new();
+    let characters = template.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < characters.len() {
+        runtime.charge_cpu(1)?;
+        if characters[index] != '%' {
+            output.push(characters[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if characters.get(index) == Some(&'%') {
+            output.push('%');
+            index += 1;
+            continue;
+        }
+        let mapping_key = if characters.get(index) == Some(&'(') {
+            index += 1;
+            let start = index;
+            while characters
+                .get(index)
+                .is_some_and(|character| *character != ')')
+            {
+                index += 1;
+            }
+            if characters.get(index) != Some(&')') {
+                return Err(PyError::value_error("incomplete format key"));
+            }
+            let key = characters[start..index].iter().collect::<String>();
+            index += 1;
+            Some(key)
+        } else {
+            None
+        };
+        let mut left_align = false;
+        let mut plus = false;
+        let mut space = false;
+        let mut alternate = false;
+        let mut zero = false;
+        while let Some(flag) = characters.get(index) {
+            match flag {
+                '-' => left_align = true,
+                '+' => plus = true,
+                ' ' => space = true,
+                '#' => alternate = true,
+                '0' => zero = true,
+                _ => break,
+            }
+            index += 1;
+        }
+        let width = parse_format_digits(&characters, &mut index)?;
+        let precision = if characters.get(index) == Some(&'.') {
+            index += 1;
+            Some(parse_format_digits(&characters, &mut index)?.unwrap_or(0))
+        } else {
+            None
+        };
+        let requested = width.unwrap_or_default().max(precision.unwrap_or_default());
+        runtime.reserve_memory(requested)?;
+        runtime.charge_cpu(u64::try_from(requested).unwrap_or(u64::MAX))?;
+        let conversion = *characters
+            .get(index)
+            .ok_or_else(|| PyError::value_error("incomplete format"))?;
+        index += 1;
+        let value = if let Some(key) = mapping_key {
+            used_mapping = true;
+            let mapping = right.cast::<PyDict>(runtime)?;
+            let key_value = runtime.new_string(key.clone())?;
+            runtime
+                .dict_get(mapping, &key_value)?
+                .ok_or_else(|| PyError::exception("KeyError", key))?
+        } else {
+            let value = arguments
+                .get(argument)
+                .copied()
+                .ok_or_else(|| PyError::type_error("not enough arguments for format string"))?;
+            argument += 1;
+            value
+        };
+        let mut rendered = match conversion {
+            's' => runtime.display(&value)?,
+            'r' | 'a' => runtime.repr(&value)?,
+            'd' | 'i' | 'u' => runtime
+                .integer_text(&value)?
+                .ok_or_else(|| PyError::type_error("%d format: a real number is required"))?,
+            'x' | 'X' | 'o' => {
+                let decimal = runtime
+                    .integer_text(&value)?
+                    .ok_or_else(|| PyError::type_error("integer format requires an integer"))?;
+                let integer = decimal
+                    .parse::<BigInt>()
+                    .map_err(|_| PyError::runtime_error("invalid internal integer"))?;
+                let digits = match conversion {
+                    'x' => format!("{integer:x}"),
+                    'X' => format!("{integer:X}"),
+                    'o' => format!("{integer:o}"),
+                    _ => unreachable!(),
+                };
+                if alternate && integer != BigInt::zero() {
+                    match conversion {
+                        'x' => format!("0x{digits}"),
+                        'X' => format!("0X{digits}"),
+                        'o' => format!("0o{digits}"),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    digits
+                }
+            }
+            'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+                let number = value.cast::<PyNumber>(runtime)?.into_f64()?;
+                let precision = precision.unwrap_or(6);
+                match conversion {
+                    'f' | 'F' => format!("{number:.precision$}"),
+                    'e' => format!("{number:.precision$e}"),
+                    'E' => format!("{number:.precision$E}"),
+                    'g' | 'G' => {
+                        let mut text = format!("{number:.precision$}");
+                        if conversion == 'G' {
+                            text.make_ascii_uppercase();
+                        }
+                        text
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            'c' => {
+                if let Some(integer) = runtime.int_value(&value) {
+                    u32::try_from(integer)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| PyError::overflow_error("%c arg not in range"))?
+                        .to_string()
+                } else {
+                    let OwnedPyString(text) = value.cast(runtime)?;
+                    if text.chars().count() != 1 {
+                        return Err(PyError::type_error("%c requires int or char"));
+                    }
+                    text
+                }
+            }
+            other => {
+                return Err(PyError::value_error(format!(
+                    "unsupported format character {other:?}"
+                )))
+            }
+        };
+        if matches!(conversion, 's' | 'r' | 'a') {
+            if let Some(precision) = precision {
+                rendered = rendered.chars().take(precision).collect();
+            }
+        } else if matches!(conversion, 'd' | 'i' | 'u') {
+            rendered = pad_integer_precision(rendered, precision);
+        }
+        if matches!(
+            conversion,
+            'd' | 'i' | 'u' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G'
+        ) && !rendered.starts_with('-')
+        {
+            if plus {
+                rendered.insert(0, '+');
+            } else if space {
+                rendered.insert(0, ' ');
+            }
+        }
+        if let Some(width) = width {
+            let padding = width.saturating_sub(rendered.chars().count());
+            if padding > 0 {
+                let fill = if zero && !left_align { '0' } else { ' ' };
+                if left_align {
+                    rendered.extend(std::iter::repeat_n(fill, padding));
+                } else if fill == '0' && matches!(rendered.chars().next(), Some('+' | '-' | ' ')) {
+                    let sign = rendered.remove(0);
+                    rendered = format!("{sign}{}{rendered}", "0".repeat(padding));
+                } else {
+                    rendered = format!("{}{rendered}", fill.to_string().repeat(padding));
+                }
+            }
+        }
+        runtime.reserve_memory(rendered.len())?;
+        output.push_str(&rendered);
+    }
+    if !used_mapping && argument < arguments.len() {
+        return Err(PyError::type_error(
+            "not all arguments converted during string formatting",
+        ));
+    }
+    runtime.reserve_memory(output.len())?;
+    Ok(Some(runtime.new_string(output)?))
+}
+
+fn parse_format_digits(characters: &[char], index: &mut usize) -> PyResult<Option<usize>> {
+    let start = *index;
+    let mut value = 0usize;
+    while let Some(character) = characters.get(*index).and_then(|value| value.to_digit(10)) {
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(character as usize))
+            .ok_or_else(|| PyError::resource_error("format width is too large"))?;
+        *index += 1;
+    }
+    Ok((*index != start).then_some(value))
+}
+
+fn pad_integer_precision(mut value: String, precision: Option<usize>) -> String {
+    let Some(precision) = precision else {
+        return value;
+    };
+    let sign = value.starts_with('-').then(|| value.remove(0));
+    if value.len() < precision {
+        value = format!("{}{value}", "0".repeat(precision - value.len()));
+    }
+    if let Some(sign) = sign {
+        value.insert(0, sign);
+    }
+    value
 }
 
 fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

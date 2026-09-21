@@ -19,6 +19,26 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     functions: &[
         FunctionDef {
             module: "math",
+            name: "acos",
+            call: native_acos,
+        },
+        FunctionDef {
+            module: "math",
+            name: "asin",
+            call: native_asin,
+        },
+        FunctionDef {
+            module: "math",
+            name: "atan",
+            call: native_atan,
+        },
+        FunctionDef {
+            module: "math",
+            name: "atan2",
+            call: native_atan2,
+        },
+        FunctionDef {
+            module: "math",
             name: "ceil",
             call: native_ceil,
         },
@@ -29,8 +49,18 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
         FunctionDef {
             module: "math",
+            name: "degrees",
+            call: native_degrees,
+        },
+        FunctionDef {
+            module: "math",
             name: "exp",
             call: native_exp,
+        },
+        FunctionDef {
+            module: "math",
+            name: "hypot",
+            call: native_hypot,
         },
         FunctionDef {
             module: "math",
@@ -46,6 +76,21 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             module: "math",
             name: "log",
             call: native_log,
+        },
+        FunctionDef {
+            module: "math",
+            name: "log10",
+            call: native_log10,
+        },
+        FunctionDef {
+            module: "math",
+            name: "pow",
+            call: native_pow,
+        },
+        FunctionDef {
+            module: "math",
+            name: "radians",
+            call: native_radians,
         },
         FunctionDef {
             module: "math",
@@ -87,6 +132,22 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     ],
 };
 
+fn native_acos(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "acos")
+}
+
+fn native_asin(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "asin")
+}
+
+fn native_atan(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "atan")
+}
+
+fn native_atan2(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "atan2")
+}
+
 fn native_ceil(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "ceil")
 }
@@ -95,8 +156,16 @@ fn native_cos(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "cos")
 }
 
+fn native_degrees(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "degrees")
+}
+
 fn native_exp(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "exp")
+}
+
+fn native_hypot(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "hypot")
 }
 
 fn native_isinf(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -109,6 +178,18 @@ fn native_isnan(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 
 fn native_log(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "log")
+}
+
+fn native_log10(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "log10")
+}
+
+fn native_pow(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "pow")
+}
+
+fn native_radians(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "radians")
 }
 
 fn native_sin(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -220,9 +301,19 @@ pub fn constant(name: &str) -> Option<MathValue> {
 /// Dispatch one of the observed/reviewer-requested `math` functions.
 pub fn call(name: &str, args: &[f64]) -> MathResult {
     match name {
+        "acos" => unary("acos", args, acos),
+        "asin" => unary("asin", args, asin),
+        "atan" => unary("atan", args, |value| Ok(MathValue::Float(value.atan()))),
+        "atan2" => binary("atan2", args, |y, x| Ok(MathValue::Float(y.atan2(x)))),
         "ceil" => unary("ceil", args, ceil),
         "cos" => unary("cos", args, cos),
+        "degrees" => unary("degrees", args, |value| {
+            Ok(MathValue::Float(value.to_degrees()))
+        }),
         "exp" => unary("exp", args, exp),
+        "hypot" => Ok(MathValue::Float(
+            args.iter().copied().fold(0.0_f64, f64::hypot),
+        )),
         "isinf" => unary("isinf", args, |value| Ok(MathValue::Bool(isinf(value)))),
         "isnan" => unary("isnan", args, |value| Ok(MathValue::Bool(isnan(value)))),
         "log" => match args {
@@ -234,11 +325,31 @@ pub fn call(name: &str, args: &[f64]) -> MathResult {
                 actual: args.len(),
             }),
         },
+        "log10" => unary("log10", args, log10),
+        "pow" => binary("pow", args, pow),
+        "radians" => unary("radians", args, |value| {
+            Ok(MathValue::Float(value.to_radians()))
+        }),
         "sin" => unary("sin", args, sin),
         "sqrt" => unary("sqrt", args, sqrt),
         "tan" => unary("tan", args, tan),
         _ => Err(MathError::UnknownFunction(name.to_string())),
     }
+}
+
+fn binary(
+    function: &'static str,
+    args: &[f64],
+    operation: impl FnOnce(f64, f64) -> MathResult,
+) -> MathResult {
+    let [left, right] = args else {
+        return Err(MathError::Arity {
+            function,
+            expected: "exactly 2",
+            actual: args.len(),
+        });
+    };
+    operation(*left, *right)
 }
 
 fn unary(
@@ -286,6 +397,45 @@ pub fn exp(value: f64) -> MathResult {
         return Err(MathError::OverflowError("math range error"));
     }
     Ok(MathValue::Float(result))
+}
+
+/// Return the inverse sine in radians.
+pub fn asin(value: f64) -> MathResult {
+    if !(-1.0..=1.0).contains(&value) {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    Ok(MathValue::Float(value.asin()))
+}
+
+/// Return the inverse cosine in radians.
+pub fn acos(value: f64) -> MathResult {
+    if !(-1.0..=1.0).contains(&value) {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    Ok(MathValue::Float(value.acos()))
+}
+
+/// Return the base-ten logarithm of a positive value.
+pub fn log10(value: f64) -> MathResult {
+    if value <= 0.0 {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    Ok(MathValue::Float(value.log10()))
+}
+
+/// Return `left**right` with Python's real-number domain and overflow errors.
+pub fn pow(left: f64, right: f64) -> MathResult {
+    if left == 0.0 && right < 0.0 {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    let value = left.powf(right);
+    if value.is_nan() && !(left.is_nan() || right.is_nan()) {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    if value.is_infinite() && left.is_finite() && right.is_finite() {
+        return Err(MathError::OverflowError("math range error"));
+    }
+    Ok(MathValue::Float(value))
 }
 
 /// Return whether `value` is positive or negative infinity.

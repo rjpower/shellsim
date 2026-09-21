@@ -220,6 +220,39 @@ print(f"{'x':>3} {['a']!r}")
 }
 
 #[test]
+fn percent_formatting_justification_and_pow_cover_common_agent_output() {
+    let source = r#"
+print("%s %.2f %+d %04d %%" % ("value", 1.25, 3, 7))
+print("%r %.3s %#x" % ([1], "abcdef", 31))
+print("%(name)s=%(value)03d" % {"name": "count", "value": 5})
+print("x".ljust(3, "-"), "x".rjust(3, "-"))
+print(pow(2, 10), pow(2, -2))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "value 1.25 +3 0007 %\n[1] abc 0x1f\ncount=005\nx-- --x\n1024 0.25\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn dir_lists_current_globals_and_object_attributes() {
+    let source = r#"
+class Record:
+    kind = "record"
+    def __init__(self):
+        self.value = 42
+
+record = Record()
+print("record" in dir(), "kind" in dir(Record), "value" in dir(record))
+"#;
+    assert_eq!(run(source), (0, "True True True\n".into(), String::new()));
+}
+
+#[test]
 fn adjacent_string_literals_are_folded_before_execution() {
     let source = r#"
 name = "world"

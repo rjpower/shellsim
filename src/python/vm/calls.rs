@@ -1,13 +1,59 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
 use super::{
-    expect_arity, protocol, range_length, Builtin, BytecodeFrame, CallArgs, CallMode, CallResult,
-    ClassLayout, CodeRef, Execution, FunctionInvocation, FunctionReturn, HashMap,
-    InstanceAttributes, InstancePayload, NativeValue, Object, Ordering, PendingNativeCall, PyError,
-    PyErrorKind, PyRuntime, RaisedException, ScopeId, Slot, Stream, Value, Vm,
+    expect_arity, protocol, range_length, BinaryOperator, Builtin, BytecodeFrame, CallArgs,
+    CallMode, CallResult, ClassLayout, CodeRef, Execution, FunctionInvocation, FunctionReturn,
+    HashMap, InstanceAttributes, InstancePayload, NativeValue, Object, Ordering, PendingNativeCall,
+    PyError, PyErrorKind, PyRuntime, RaisedException, ScopeId, Slot, Stream, Value, Vm,
 };
 
 impl Vm<'_> {
+    fn dir_names(&self, value: &Value) -> Result<Vec<String>, String> {
+        if let Some(NativeValue::Module(module)) = value.native_value() {
+            return Ok(module
+                .functions
+                .iter()
+                .map(|function| function.name.to_string())
+                .chain(module.values.iter().map(|value| value.name().to_string()))
+                .collect());
+        }
+        let Some(id) = value.object_id() else {
+            return Ok(Vec::new());
+        };
+        match self.state.heap.get(id)? {
+            Object::Module { scope, .. } => {
+                Ok(self.state.heap.scope_values(*scope)?.into_keys().collect())
+            }
+            Object::Class {
+                attributes, mro, ..
+            } => {
+                let mut names = attributes.keys().cloned().collect::<Vec<_>>();
+                for ancestor in mro {
+                    if let Object::Class { attributes, .. } = self.state.heap.get(*ancestor)? {
+                        names.extend(attributes.keys().cloned());
+                    }
+                }
+                Ok(names)
+            }
+            Object::Instance { class, .. } => {
+                let mut names = self.state.heap.instance_attribute_names(id)?;
+                if let Object::Class {
+                    attributes, mro, ..
+                } = self.state.heap.get(*class)?
+                {
+                    names.extend(attributes.keys().cloned());
+                    for ancestor in mro {
+                        if let Object::Class { attributes, .. } = self.state.heap.get(*ancestor)? {
+                            names.extend(attributes.keys().cloned());
+                        }
+                    }
+                }
+                Ok(names)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
     pub(super) fn call(
         &mut self,
         positional: usize,
@@ -526,6 +572,41 @@ impl Vm<'_> {
                 let value = self.repr_value(&arguments[0])?;
                 Ok(CallResult::Value(self.allocate_string(value)?))
             }
+            Builtin::Dir => {
+                expect_arity(&arguments, 0, 1)?;
+                let mut names = if let Some(value) = arguments.first() {
+                    self.dir_names(value)?
+                } else {
+                    self.state
+                        .globals
+                        .values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, value)| {
+                            value.and_then(|_| {
+                                let symbol = super::super::heap::SymbolId::from_index(index)?;
+                                self.state.heap.symbol_name(symbol).map(str::to_string)
+                            })
+                        })
+                        .collect()
+                };
+                let name_bytes = names.iter().try_fold(0usize, |total, name| {
+                    total
+                        .checked_add(name.len())
+                        .ok_or("dir() result is too large")
+                })?;
+                self.reserve_result(name_bytes)?;
+                self.charge_cpu(u64::try_from(names.len()).unwrap_or(u64::MAX))?;
+                names.sort();
+                names.dedup();
+                let values = names
+                    .into_iter()
+                    .map(|name| self.allocate_string(name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(CallResult::Value(
+                    self.allocate_object(Object::List(values))?,
+                ))
+            }
             Builtin::IsInstance => {
                 expect_arity(&arguments, 2, 2)?;
                 Ok(CallResult::Value(Value::Bool(
@@ -703,6 +784,14 @@ impl Vm<'_> {
                     .invoke_slot(&arguments[0], Slot::Absolute, "__abs__", Vec::new())?
                     .ok_or("bad operand type for abs()")?;
                 Ok(CallResult::Value(value))
+            }
+            Builtin::Power => {
+                expect_arity(&arguments, 2, 2)?;
+                Ok(CallResult::Value(self.binary_value(
+                    BinaryOperator::Power,
+                    arguments[0],
+                    arguments[1],
+                )?))
             }
             Builtin::Iter => {
                 expect_arity(&arguments, 1, 2)?;

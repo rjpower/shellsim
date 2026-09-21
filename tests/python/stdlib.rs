@@ -168,6 +168,27 @@ print(math.log(8, 2), math.sin(0))"#;
 }
 
 #[test]
+fn expanded_math_and_complex_functions_cover_agent_numeric_checks() {
+    let source = r#"import cmath
+import math
+print(math.radians(180), math.degrees(math.pi))
+print(math.pow(2, 3), math.log10(100), math.hypot(3, 4))
+print(round(math.atan(1), 6), round(math.atan2(1, 1), 6), round(math.asin(1), 6))
+value = complex(1, 2)
+print(value, value.real, value.imag, value.conjugate(), abs(complex(3, 4)))
+print(cmath.sqrt(-1), cmath.exp(0), tuple(round(x, 6) for x in cmath.polar(complex(3, 4))))
+print("radians" in dir(math), "sqrt" in dir(cmath))"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"3.141592653589793 180.0\n8.0 2.0 5.0\n0.785398 0.785398 1.570796\n(1+2j) 1.0 2.0 (1-2j) 5.0\n1j (1+0j) (5.0, 0.927295)\nTrue True\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
 fn finite_iterator_heap_bisect_reduce_and_safe_imports_match_cpython() {
     let source = r#"import itertools
 import heapq
