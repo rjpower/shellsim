@@ -54,6 +54,57 @@ with urlopen(request) as response:
 }
 
 #[test]
+fn copy_textwrap_pathlib_and_shutil_cover_common_file_recipes() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .mkdir_all("/", "/work/source/nested")
+        .unwrap();
+    environment
+        .vfs
+        .put_file("/work/source/value.txt", b"value".to_vec(), 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .put_file("/work/source/nested/leaf.txt", b"leaf".to_vec(), 0o644)
+        .unwrap();
+    let source = r#"import copy
+import shutil
+import textwrap
+from pathlib import Path
+
+original = {"items": [[1], [2]]}
+cloned = copy.deepcopy(original)
+cloned["items"][0].append(3)
+print(original, cloned)
+print(repr(textwrap.dedent("    one\n      two\n")))
+print(textwrap.fill("one two three four", width=9))
+print(repr(textwrap.indent("a\n\nb\n", "> ")))
+print(textwrap.shorten("one two three four", 13))
+
+path = Path("archive.tar.gz")
+print(path.suffixes, path.with_name("other.txt"), path.as_posix())
+created = Path("/work/touched")
+created.touch()
+print(created.exists(), created.read_bytes())
+
+print(shutil.copy("/work/source/value.txt", "/work/copied.txt"))
+print(shutil.copytree("/work/source", "/work/tree"))
+print(Path("/work/copied.txt").read_text(), Path("/work/tree/nested/leaf.txt").read_text())
+shutil.rmtree("/work/tree")
+print(Path("/work/tree").exists())
+"#;
+    assert_eq!(
+        run_in(&mut environment, source),
+        (
+            0,
+            "{'items': [[1], [2]]} {'items': [[1, 3], [2]]}\n'one\\n  two\\n'\none two\nthree\nfour\n'> a\\n\\n> b\\n'\none two [...]\n['.tar', '.gz'] other.txt archive.tar.gz\nTrue b''\n/work/copied.txt\n/work/tree\nvalue leaf\nFalse\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
 fn urllib_post_redirects_and_errors_preserve_http_semantics() {
     let mut environment = Environment::new();
     environment

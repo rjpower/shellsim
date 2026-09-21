@@ -8,32 +8,67 @@ use std::cmp::Ordering;
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyError, PyResult, PyRuntime, PySequence, PyValueCast,
+    CallArgs, FunctionDef, ModuleDef, PyError, PyList, PyResult, PyRuntime, PySequence, PyValueCast,
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "bisect",
-    functions: &[FunctionDef {
-        module: "bisect",
-        name: "bisect_left",
-        call: native_bisect_left,
-    }],
+    functions: &[
+        FunctionDef {
+            module: "bisect",
+            name: "bisect_left",
+            call: native_bisect_left,
+        },
+        FunctionDef {
+            module: "bisect",
+            name: "bisect_right",
+            call: native_bisect_right,
+        },
+        FunctionDef {
+            module: "bisect",
+            name: "bisect",
+            call: native_bisect_right,
+        },
+        FunctionDef {
+            module: "bisect",
+            name: "insort_left",
+            call: native_insort_left,
+        },
+        FunctionDef {
+            module: "bisect",
+            name: "insort_right",
+            call: native_insort_right,
+        },
+        FunctionDef {
+            module: "bisect",
+            name: "insort",
+            call: native_insort_right,
+        },
+    ],
     values: &[],
 };
 
 fn native_bisect_left(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("bisect_left", 2, 2)?;
-    args.reject_keywords("bisect_left")?;
+    native_bisect(runtime, args, false)
+}
+
+fn native_bisect_right(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_bisect(runtime, args, true)
+}
+
+fn native_bisect(runtime: &mut dyn PyRuntime, args: CallArgs, right: bool) -> PyResult {
+    args.expect_positional("bisect", 2, 4)?;
+    args.reject_keywords("bisect")?;
     let values = args.positional()[0]
         .cast::<PySequence>(runtime)?
         .items(runtime)?;
     let needle = &args.positional()[1];
-    let mut low = 0usize;
-    let mut high = values.len();
+    let (mut low, mut high) = bisect_bounds(runtime, &args, values.len())?;
     while low < high {
         runtime.charge_cpu(1)?;
         let middle = low + (high - low) / 2;
-        if runtime.compare(&values[middle], needle)? == Ordering::Less {
+        let ordering = runtime.compare(&values[middle], needle)?;
+        if ordering == Ordering::Less || (right && ordering == Ordering::Equal) {
             low = middle + 1;
         } else {
             high = middle;
@@ -42,6 +77,69 @@ fn native_bisect_left(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     i64::try_from(low)
         .map(Value::Int)
         .map_err(|_| PyError::overflow_error("bisect result exceeds bounded integer range"))
+}
+
+fn bisect_bounds(
+    runtime: &dyn PyRuntime,
+    args: &CallArgs,
+    length: usize,
+) -> PyResult<(usize, usize)> {
+    let low = args
+        .positional()
+        .get(2)
+        .map(|value| {
+            runtime
+                .int_value(value)
+                .ok_or_else(|| PyError::type_error("lo must be an integer"))
+                .and_then(|value| {
+                    usize::try_from(value)
+                        .map_err(|_| PyError::value_error("lo must be non-negative"))
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let high = args
+        .positional()
+        .get(3)
+        .map(|value| {
+            runtime
+                .int_value(value)
+                .ok_or_else(|| PyError::type_error("hi must be an integer"))
+                .and_then(|value| {
+                    usize::try_from(value)
+                        .map_err(|_| PyError::value_error("hi must be non-negative"))
+                })
+        })
+        .transpose()?
+        .unwrap_or(length);
+    if high > length {
+        return Err(PyError::value_error("hi exceeds sequence length"));
+    }
+    Ok((low, high))
+}
+
+fn native_insort_left(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_insort(runtime, args, false)
+}
+
+fn native_insort_right(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_insort(runtime, args, true)
+}
+
+fn native_insort(runtime: &mut dyn PyRuntime, args: CallArgs, right: bool) -> PyResult {
+    let list = args
+        .positional()
+        .first()
+        .copied()
+        .ok_or_else(|| PyError::type_error("insort expected a list and a value"))?
+        .cast::<PyList>(runtime)?;
+    let index_value = native_bisect(runtime, args.clone(), right)?;
+    let index = runtime
+        .int_value(&index_value)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| PyError::runtime_error("bisect returned an invalid index"))?;
+    runtime.list_insert(list, index, args.positional()[1])?;
+    Ok(Value::None)
 }
 
 /// Errors for an explicitly bounded search.

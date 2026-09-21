@@ -78,6 +78,16 @@ class Path:
         return name[index:]
 
     @property
+    def suffixes(self):
+        name = self.name
+        if name.startswith("."):
+            name = name[1:]
+        parts = name.split(".")
+        if len(parts) <= 1:
+            return []
+        return ["." + suffix for suffix in parts[1:] if suffix != ""]
+
+    @property
     def stem(self):
         suffix = self.suffix
         if suffix == "":
@@ -95,6 +105,9 @@ class Path:
 
     def is_absolute(self):
         return self._path.startswith("/")
+
+    def as_posix(self):
+        return self._path
 
     def mkdir(self, parents=False, exist_ok=False):
         _shellsim_vfs.mkdir(self._path, parents, exist_ok)
@@ -139,6 +152,23 @@ class Path:
         if self.suffix == "":
             return Path(self._path + suffix)
         return Path(self._path[:-len(self.suffix)] + suffix)
+
+    def with_name(self, name):
+        if self.name == "":
+            raise ValueError("Path has an empty name")
+        parent = self.parent
+        if str(parent) == ".":
+            return Path(name)
+        return parent / name
+
+    def touch(self, mode=438, exist_ok=True):
+        if self.exists():
+            if not exist_ok:
+                raise FileExistsError(self._path)
+            if self.is_dir():
+                raise IsADirectoryError(self._path)
+            return
+        _shellsim_vfs.write_bytes(self._path, b"")
 
     def replace(self, target):
         target = str(target)

@@ -25,6 +25,9 @@ shellsim's Rust codebase. See `CONTRIBUTING.md` for the human-facing workflow.
 - Reject unsupported syntax and capabilities explicitly. Never fall back to host execution.
 - Meter loops, allocation, output, filesystem growth, and other work reachable from simulated
   input before performing unbounded host work.
+- Keep resource costs simple and roughly proportional to real work. Order-of-magnitude CPU and
+  memory estimates are sufficient; prefer a conservative constant or linear bound over complex
+  exact accounting. Resource limits are safety and scheduling controls, not a profiler.
 - Add a small unit test for tricky logic and an integration or differential test for observable
   compatibility behavior.
 

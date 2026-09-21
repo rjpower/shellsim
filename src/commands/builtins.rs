@@ -50,7 +50,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_resumable(m, &["command"], Trust::Real, cmd_command, start_command);
     reg(m, &["alias"], Trust::Partial, cmd_alias);
     reg(m, &["unalias"], Trust::Real, cmd_unalias);
-    reg_unsupported(m, &["getopts"]);
+    reg(m, &["getopts"], Trust::Real, cmd_getopts);
     reg(m, &["let"], Trust::Real, cmd_let);
     reg(m, &["mapfile", "readarray"], Trust::Real, cmd_mapfile);
     reg(m, &["pushd"], Trust::Real, cmd_pushd);
@@ -1257,6 +1257,125 @@ fn cmd_shift(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> 
         interp.positional.remove(0);
     }
     0
+}
+
+fn cmd_getopts(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.len() < 2 {
+        ewln(io.err, "getopts: usage: getopts optstring name [arg ...]");
+        return 2;
+    }
+    let optstring = &args[0];
+    let name = &args[1];
+    let operands = if args.len() > 2 {
+        args[2..].to_vec()
+    } else {
+        interp.positional.clone()
+    };
+    let visible_optind = interp
+        .get_var("OPTIND")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    if visible_optind != interp.getopts.optind {
+        interp.getopts.optind = visible_optind;
+        interp.getopts.offset = 1;
+    }
+
+    let argument_index = interp.getopts.optind - 1;
+    let Some(argument) = operands.get(argument_index) else {
+        set_getopts_optind(interp);
+        return 1;
+    };
+    if argument == "--" {
+        interp.getopts.optind += 1;
+        interp.getopts.offset = 1;
+        set_getopts_optind(interp);
+        return 1;
+    }
+    let option_characters = argument.chars().collect::<Vec<_>>();
+    if !argument.starts_with('-')
+        || argument == "-"
+        || interp.getopts.offset >= option_characters.len()
+    {
+        set_getopts_optind(interp);
+        return 1;
+    }
+
+    let option = option_characters[interp.getopts.offset];
+    let silent = optstring.starts_with(':');
+    let specification = optstring
+        .trim_start_matches(':')
+        .chars()
+        .collect::<Vec<_>>();
+    let Some(specification_index) = specification
+        .iter()
+        .position(|candidate| *candidate == option)
+    else {
+        advance_getopts(interp, option_characters.len());
+        if silent {
+            interp.set_var("OPTARG", option.to_string());
+        } else {
+            interp.vars.remove("OPTARG");
+        }
+        interp.set_var(name, "?");
+        set_getopts_optind(interp);
+        if !silent {
+            ewln(io.err, &format!("getopts: illegal option -- {option}"));
+        }
+        return 0;
+    };
+    let requires_argument = specification.get(specification_index + 1) == Some(&':');
+    if !requires_argument {
+        advance_getopts(interp, option_characters.len());
+        interp.vars.remove("OPTARG");
+        interp.set_var(name, option.to_string());
+        set_getopts_optind(interp);
+        return 0;
+    }
+
+    let inline = option_characters[interp.getopts.offset + 1..]
+        .iter()
+        .collect::<String>();
+    let option_argument = if !inline.is_empty() {
+        interp.getopts.optind += 1;
+        inline
+    } else if let Some(value) = operands.get(argument_index + 1) {
+        interp.getopts.optind += 2;
+        value.clone()
+    } else {
+        interp.getopts.optind += 1;
+        interp.getopts.offset = 1;
+        set_getopts_optind(interp);
+        interp.set_var(name, if silent { ":" } else { "?" });
+        if silent {
+            interp.set_var("OPTARG", option.to_string());
+        } else {
+            interp.vars.remove("OPTARG");
+            ewln(
+                io.err,
+                &format!("getopts: option requires an argument -- {option}"),
+            );
+        }
+        return 0;
+    };
+    interp.getopts.offset = 1;
+    interp.set_var("OPTARG", option_argument);
+    interp.set_var(name, option.to_string());
+    set_getopts_optind(interp);
+    0
+}
+
+fn advance_getopts(interp: &mut CommandContext<'_>, argument_length: usize) {
+    interp.getopts.offset += 1;
+    if interp.getopts.offset >= argument_length {
+        interp.getopts.optind += 1;
+        interp.getopts.offset = 1;
+    }
+}
+
+fn set_getopts_optind(interp: &mut CommandContext<'_>) {
+    let value = interp.getopts.optind.to_string();
+    interp.vars.insert("OPTIND".to_string(), value);
 }
 
 fn cmd_test(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

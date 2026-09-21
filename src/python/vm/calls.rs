@@ -1,7 +1,7 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
 use super::{
-    expect_arity, protocol, range_length, BinaryOperator, Builtin, BytecodeFrame, CallArgs,
+    expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BytecodeFrame, CallArgs,
     CallMode, CallResult, ClassLayout, CodeRef, Execution, FunctionInvocation, FunctionReturn,
     HashMap, InstanceAttributes, InstancePayload, NativeValue, Object, Ordering, PendingNativeCall,
     PyError, PyErrorKind, PyRuntime, RaisedException, ScopeId, Slot, Stream, Value, Vm,
@@ -567,6 +567,62 @@ impl Vm<'_> {
                     self.allocate_string(codepoint.to_string())?,
                 ))
             }
+            Builtin::Ordinal => {
+                expect_arity(&arguments, 1, 1)?;
+                let value = if let Some(text) =
+                    protocol::string_value(&self.state.heap, &arguments[0])?
+                {
+                    let mut characters = text.chars();
+                    let character = characters.next().ok_or("ord() expected a character")?;
+                    if characters.next().is_some() {
+                        return Err("ord() expected a character".into());
+                    }
+                    u32::from(character) as i64
+                } else if let Some(bytes) = <Self as PyRuntime>::bytes_value(self, &arguments[0])
+                    .map_err(|error| error.to_string())?
+                {
+                    if bytes.len() != 1 {
+                        return Err("ord() expected a character".into());
+                    }
+                    i64::from(bytes[0])
+                } else {
+                    return Err("ord() expected string of length 1".into());
+                };
+                Ok(CallResult::Value(Value::Int(value)))
+            }
+            Builtin::Binary | Builtin::Octal | Builtin::Hexadecimal => {
+                expect_arity(&arguments, 1, 1)?;
+                let decimal = <Self as PyRuntime>::integer_text(self, &arguments[0])
+                    .map_err(|error| error.to_string())?
+                    .ok_or("integer argument expected")?;
+                let integer = decimal
+                    .parse::<BigInt>()
+                    .map_err(|_| "invalid internal integer representation")?;
+                let output_bound = decimal
+                    .len()
+                    .checked_mul(4)
+                    .and_then(|length| length.checked_add(3))
+                    .ok_or("integer representation is too large")?;
+                <Self as PyRuntime>::reserve_memory(self, output_bound)
+                    .map_err(|error| error.to_string())?;
+                <Self as PyRuntime>::charge_cpu(
+                    self,
+                    u64::try_from(output_bound).unwrap_or(u64::MAX),
+                )
+                .map_err(|error| error.to_string())?;
+                let (prefix, digits) = match function {
+                    Builtin::Binary => ("0b", format!("{integer:b}")),
+                    Builtin::Octal => ("0o", format!("{integer:o}")),
+                    Builtin::Hexadecimal => ("0x", format!("{integer:x}")),
+                    _ => unreachable!(),
+                };
+                let rendered = if let Some(digits) = digits.strip_prefix('-') {
+                    format!("-{prefix}{digits}")
+                } else {
+                    format!("{prefix}{digits}")
+                };
+                Ok(CallResult::Value(self.allocate_string(rendered)?))
+            }
             Builtin::Repr => {
                 expect_arity(&arguments, 1, 1)?;
                 let value = self.repr_value(&arguments[0])?;
@@ -792,6 +848,22 @@ impl Vm<'_> {
                     arguments[0],
                     arguments[1],
                 )?))
+            }
+            Builtin::Divmod => {
+                expect_arity(&arguments, 2, 2)?;
+                let quotient =
+                    self.binary_value(BinaryOperator::FloorDivide, arguments[0], arguments[1])?;
+                let remainder =
+                    self.binary_value(BinaryOperator::Remainder, arguments[0], arguments[1])?;
+                Ok(CallResult::Value(self.allocate_object(Object::Tuple(
+                    vec![quotient, remainder],
+                ))?))
+            }
+            Builtin::Callable => {
+                expect_arity(&arguments, 1, 1)?;
+                let callable = <Self as PyRuntime>::is_callable(self, &arguments[0])
+                    .map_err(|error| error.to_string())?;
+                Ok(CallResult::Value(Value::Bool(callable)))
             }
             Builtin::Iter => {
                 expect_arity(&arguments, 1, 2)?;

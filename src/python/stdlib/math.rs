@@ -7,6 +7,9 @@
 
 use std::fmt;
 
+use num_bigint::BigInt;
+use num_traits::{Signed, ToPrimitive, Zero};
+
 use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyResult, PyRuntime, PyValueCast,
@@ -59,8 +62,33 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
         FunctionDef {
             module: "math",
+            name: "fabs",
+            call: native_fabs,
+        },
+        FunctionDef {
+            module: "math",
+            name: "factorial",
+            call: native_factorial,
+        },
+        FunctionDef {
+            module: "math",
+            name: "floor",
+            call: native_floor,
+        },
+        FunctionDef {
+            module: "math",
+            name: "gcd",
+            call: native_gcd,
+        },
+        FunctionDef {
+            module: "math",
             name: "hypot",
             call: native_hypot,
+        },
+        FunctionDef {
+            module: "math",
+            name: "isfinite",
+            call: native_isfinite,
         },
         FunctionDef {
             module: "math",
@@ -71,6 +99,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             module: "math",
             name: "isnan",
             call: native_isnan,
+        },
+        FunctionDef {
+            module: "math",
+            name: "lcm",
+            call: native_lcm,
         },
         FunctionDef {
             module: "math",
@@ -101,6 +134,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             module: "math",
             name: "sqrt",
             call: native_sqrt,
+        },
+        FunctionDef {
+            module: "math",
+            name: "trunc",
+            call: native_trunc,
         },
         FunctionDef {
             module: "math",
@@ -164,12 +202,139 @@ fn native_exp(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "exp")
 }
 
+fn native_fabs(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "fabs")
+}
+
+fn native_factorial(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("math.factorial", 1, 1)?;
+    args.reject_keywords("math.factorial")?;
+    let value = integer_argument(runtime, &args.positional()[0], "factorial")?;
+    if value.is_negative() {
+        return Err(PyError::value_error(
+            "factorial() not defined for negative values",
+        ));
+    }
+    let value = value
+        .to_u64()
+        .ok_or_else(|| PyError::resource_error("factorial argument is too large"))?;
+    if value > 100_000 {
+        return Err(PyError::resource_error("factorial argument is too large"));
+    }
+    let result_bound = usize::try_from(value)
+        .unwrap_or(usize::MAX)
+        .checked_mul(value.to_string().len())
+        .ok_or_else(|| PyError::resource_error("factorial result is too large"))?;
+    runtime.reserve_memory(result_bound)?;
+    let mut result = BigInt::from(1_u8);
+    for factor in 2..=value {
+        runtime.charge_cpu(1)?;
+        result *= factor;
+    }
+    runtime.new_integer(&result.to_string())
+}
+
+fn native_floor(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_round_direction(runtime, args, true)
+}
+
+fn native_trunc(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_round_direction(runtime, args, false)
+}
+
+fn native_round_direction(runtime: &mut dyn PyRuntime, args: CallArgs, floor: bool) -> PyResult {
+    args.expect_positional("math integer conversion", 1, 1)?;
+    args.reject_keywords("math integer conversion")?;
+    if let Some(integer) = runtime.integer_text(&args.positional()[0])? {
+        return runtime.new_integer(&integer);
+    }
+    let value = args.positional()[0].cast::<PyNumber>(runtime)?.into_f64()?;
+    if value.is_nan() {
+        return Err(PyError::value_error("cannot convert float NaN to integer"));
+    }
+    if value.is_infinite() {
+        return Err(PyError::overflow_error(
+            "cannot convert float infinity to integer",
+        ));
+    }
+    let value = if floor { value.floor() } else { value.trunc() };
+    runtime.new_integer(&format!("{value:.0}"))
+}
+
+fn native_gcd(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    integer_fold(runtime, args, false)
+}
+
+fn native_lcm(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    integer_fold(runtime, args, true)
+}
+
+fn integer_fold(runtime: &mut dyn PyRuntime, args: CallArgs, lcm: bool) -> PyResult {
+    args.reject_keywords(if lcm { "math.lcm" } else { "math.gcd" })?;
+    let mut result = if lcm {
+        BigInt::from(1_u8)
+    } else {
+        BigInt::zero()
+    };
+    for value in args.positional() {
+        runtime.charge_cpu(1)?;
+        let value = integer_argument(runtime, value, if lcm { "lcm" } else { "gcd" })?.abs();
+        if lcm {
+            if result.is_zero() || value.is_zero() {
+                result = BigInt::zero();
+            } else {
+                let divisor = bigint_gcd(runtime, result.clone(), value.clone())?;
+                let product_bytes = bigint_bytes(&result)?
+                    .checked_add(bigint_bytes(&value)?)
+                    .ok_or_else(|| PyError::resource_error("lcm result is too large"))?;
+                runtime.reserve_memory(product_bytes)?;
+                result = (result / divisor) * value;
+            }
+        } else {
+            result = bigint_gcd(runtime, result, value)?;
+        }
+    }
+    runtime.new_integer(&result.to_string())
+}
+
+fn integer_argument(runtime: &dyn PyRuntime, value: &Value, name: &str) -> PyResult<BigInt> {
+    runtime
+        .integer_text(value)?
+        .ok_or_else(|| PyError::type_error(format!("{name}() only accepts integral values")))?
+        .parse::<BigInt>()
+        .map_err(|_| PyError::runtime_error("invalid internal integer representation"))
+}
+
+fn bigint_gcd(
+    runtime: &mut dyn PyRuntime,
+    mut left: BigInt,
+    mut right: BigInt,
+) -> PyResult<BigInt> {
+    runtime.reserve_memory(bigint_bytes(&left)?.max(bigint_bytes(&right)?))?;
+    while !right.is_zero() {
+        runtime.charge_cpu(1)?;
+        let remainder = left % &right;
+        left = right;
+        right = remainder;
+    }
+    Ok(left.abs())
+}
+
+fn bigint_bytes(value: &BigInt) -> PyResult<usize> {
+    usize::try_from(value.bits().div_ceil(8).max(1))
+        .map_err(|_| PyError::resource_error("integer result is too large"))
+}
+
 fn native_hypot(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "hypot")
 }
 
 fn native_isinf(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "isinf")
+}
+
+fn native_isfinite(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "isfinite")
 }
 
 fn native_isnan(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -311,9 +476,13 @@ pub fn call(name: &str, args: &[f64]) -> MathResult {
             Ok(MathValue::Float(value.to_degrees()))
         }),
         "exp" => unary("exp", args, exp),
+        "fabs" => unary("fabs", args, |value| Ok(MathValue::Float(value.abs()))),
         "hypot" => Ok(MathValue::Float(
             args.iter().copied().fold(0.0_f64, f64::hypot),
         )),
+        "isfinite" => unary("isfinite", args, |value| {
+            Ok(MathValue::Bool(value.is_finite()))
+        }),
         "isinf" => unary("isinf", args, |value| Ok(MathValue::Bool(isinf(value)))),
         "isnan" => unary("isnan", args, |value| Ok(MathValue::Bool(isnan(value)))),
         "log" => match args {
