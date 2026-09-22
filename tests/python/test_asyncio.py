@@ -744,6 +744,185 @@ def test_task_cancellation_propagates_to_its_awaited_future():
     assert events == ["cleaned"]
 
 
+def test_task_cancellation_propagates_through_nested_awaits_but_not_shield():
+    events = []
+
+    async def child(name):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append(name + " cleaned")
+
+    async def main():
+        nested_child = asyncio.create_task(child("nested"))
+
+        async def nested_parent():
+            await nested_child
+
+        nested = asyncio.create_task(nested_parent())
+        await asyncio.sleep(0)
+        assert nested.cancel()
+        try:
+            await nested
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("nested cancellation must reach the parent")
+        assert nested_child.cancelled()
+
+        async def direct_parent():
+            await child("direct")
+
+        direct = asyncio.create_task(direct_parent())
+        await asyncio.sleep(0)
+        direct.cancel()
+        try:
+            await direct
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("cancellation must cross a direct coroutine await")
+
+        shielded_child = asyncio.create_task(child("shielded"))
+
+        async def shielded_parent():
+            await asyncio.shield(shielded_child)
+
+        shielded = asyncio.create_task(shielded_parent())
+        await asyncio.sleep(0)
+        assert shielded.cancel()
+        try:
+            await shielded
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("shielded parent must still be cancelled")
+        assert not shielded_child.done()
+        shielded_child.cancel()
+        try:
+            await shielded_child
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(main())
+    assert events == ["nested cleaned", "direct cleaned", "shielded cleaned"]
+
+
+def test_gather_is_a_future_and_preserves_child_cancellation_semantics():
+    events = []
+
+    async def child(name):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append(name)
+
+    async def main():
+        first = asyncio.create_task(child("first"))
+        second = asyncio.create_task(child("second"))
+        group = asyncio.gather(first, second)
+        assert asyncio.isfuture(group)
+        await asyncio.sleep(0)
+        assert group.cancel()
+        try:
+            await group
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("cancelled gather must raise CancelledError")
+        assert not group.cancelled()
+        assert first.cancelled()
+        assert second.cancelled()
+
+        cancelled = asyncio.create_task(child("returned"))
+        returned = asyncio.gather(cancelled, return_exceptions=True)
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        results = await returned
+        assert len(results) == 1
+        assert isinstance(results[0], asyncio.CancelledError)
+
+    asyncio.run(main())
+    assert events == ["first", "second", "returned"]
+
+
+def test_gather_failure_leaves_siblings_running_and_preserves_duplicate_results():
+    events = []
+
+    async def fail():
+        await asyncio.sleep(0)
+        raise ValueError("failed")
+
+    async def finish():
+        await asyncio.sleep(0.001)
+        events.append("finished")
+        return 9
+
+    async def main():
+        sibling = asyncio.create_task(finish())
+        group = asyncio.gather(fail(), sibling)
+        try:
+            await group
+        except ValueError as error:
+            assert str(error) == "failed"
+        else:
+            raise AssertionError("gather must propagate its first child failure")
+        assert not sibling.cancelled()
+        assert await sibling == 9
+
+        duplicate = asyncio.create_task(asyncio.sleep(0, result=5))
+        assert await asyncio.gather(duplicate, duplicate) == [5, 5]
+
+        assert await asyncio.shield(asyncio.sleep(0, result=11)) == 11
+
+    asyncio.run(main())
+    assert events == ["finished"]
+
+
+def test_wait_returns_on_failure_without_cancelling_pending_tasks():
+    events = []
+
+    async def fail():
+        await asyncio.sleep(0)
+        raise ValueError("failed")
+
+    async def finish():
+        await asyncio.sleep(0.002)
+        events.append("finished")
+        return 7
+
+    async def main():
+        failed = asyncio.create_task(fail())
+        pending_task = asyncio.create_task(finish())
+        done, pending = await asyncio.wait({failed, pending_task}, return_when=asyncio.FIRST_EXCEPTION)
+        assert done == {failed}
+        assert pending == {pending_task}
+        assert isinstance(failed.exception(), ValueError)
+        assert await pending_task == 7
+
+        timed = asyncio.create_task(finish())
+        done, pending = await asyncio.wait({timed}, timeout=0)
+        assert done == set()
+        assert pending == {timed}
+        assert await timed == 7
+
+        surviving = asyncio.create_task(finish())
+        waiting = asyncio.create_task(asyncio.wait({surviving}))
+        await asyncio.sleep(0)
+        waiting.cancel()
+        try:
+            await waiting
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("cancelled wait must raise CancelledError")
+        assert not surviving.cancelled()
+        assert await surviving == 7
+
+    asyncio.run(main())
+    assert events == ["finished", "finished", "finished"]
+
+
 def test_callback_handles_are_fifo_cancellable_and_timer_backed():
     events = []
 
