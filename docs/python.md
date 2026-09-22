@@ -33,8 +33,9 @@ cleanup code.
 
 `async def`, `await`, `async with`, and `async for` run on a deterministic cooperative scheduler.
 The bundled `asyncio` surface includes task creation and introspection, `gather`, `wait`,
-`as_completed`, `shield`, virtual-time sleeps and timeouts, task groups, events, queues, locks,
-semaphores, conditions, and modeled subprocesses. `create_subprocess_exec` and
+`as_completed`, `shield`, virtual-time sleeps and timeout contexts, task groups, events, bounded
+FIFO, priority, and LIFO queues with work tracking, locks, semaphores, conditions, and modeled
+subprocesses. `create_subprocess_exec` and
 `create_subprocess_shell` provide byte-oriented stdin, stdout, and stderr streams with cooperative
 pipe backpressure, `wait`, `communicate`, signals, cancellation, and virtual-time timeouts. Task
 failures cross `await` with their Python exception type, and cancellation or timeout resumes the
