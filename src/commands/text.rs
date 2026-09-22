@@ -1,7 +1,6 @@
 //! Text processing: output (cat/tac/tee), windowing (head/tail), counting and reshaping
-//! (wc/uniq/cut/tr/rev/nl/seq/paste/comm/diff/cmp), pattern tools (grep/sed), xargs, and the
-//! small arithmetic helpers expr/bc. Unavailable formatting utilities are registered here as
-//! explicit capability boundaries.
+//! (wc/uniq/cut/tr/rev/nl/seq/paste/comm/diff/cmp), table and formatting utilities, pattern
+//! tools (grep/sed), xargs, and the small arithmetic helpers expr/bc.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -18,7 +17,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_resumable(m, &["cat"], Trust::Real, cmd_cat, start_cat);
     reg(m, &["tac"], Trust::Real, cmd_tac);
     reg(m, &["tee"], Trust::Real, cmd_tee);
-    reg_unsupported(m, &["yes"]);
+    reg_resumable(m, &["yes"], Trust::Real, cmd_yes, start_yes);
     reg_resumable(m, &["head"], Trust::Real, cmd_head, start_head);
     reg(m, &["tail"], Trust::Real, cmd_tail);
     reg(m, &["wc"], Trust::Real, cmd_wc);
@@ -32,11 +31,38 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["nl"], Trust::Real, cmd_nl);
     reg(m, &["seq"], Trust::Real, cmd_seq);
     reg(m, &["paste"], Trust::Real, cmd_paste);
-    reg_unsupported(m, &["fold", "fmt", "expand", "unexpand", "column", "pr"]);
+    reg_buffered_resumable(m, &["fold"], Trust::Real, cmd_fold, start_buffered_text);
+    reg_buffered_resumable(m, &["fmt"], Trust::Partial, cmd_fmt, start_buffered_text);
+    reg_buffered_resumable(m, &["expand"], Trust::Real, cmd_expand, start_buffered_text);
+    reg_buffered_resumable(
+        m,
+        &["unexpand"],
+        Trust::Real,
+        cmd_unexpand,
+        start_buffered_text,
+    );
+    reg_buffered_resumable(
+        m,
+        &["column"],
+        Trust::Partial,
+        cmd_column,
+        start_buffered_text,
+    );
+    reg_unsupported(m, &["pr"]);
     reg_buffered_resumable(m, &["xargs"], Trust::Real, cmd_xargs, start_xargs);
     reg(m, &["comm"], Trust::Real, cmd_comm);
     reg(m, &["diff"], Trust::Partial, cmd_diff);
     reg(m, &["cmp"], Trust::Real, cmd_cmp);
+    reg_buffered_resumable(m, &["join"], Trust::Partial, cmd_join, start_buffered_text);
+    reg_buffered_resumable(
+        m,
+        &["split"],
+        Trust::Partial,
+        cmd_split,
+        start_buffered_text,
+    );
+    reg_buffered_resumable(m, &["shuf"], Trust::Partial, cmd_shuf, start_buffered_text);
+    reg_buffered_resumable(m, &["tsort"], Trust::Real, cmd_tsort, start_buffered_text);
     reg(m, &["expr"], Trust::Real, cmd_expr);
     reg(m, &["bc"], Trust::Real, cmd_bc);
     reg_unsupported(m, &["factor"]);
@@ -68,6 +94,13 @@ pub(crate) struct HeadStream {
 pub(crate) enum TextStream {
     Cat(StreamState),
     Head(HeadStream),
+    Yes(YesStream),
+}
+
+#[derive(Clone)]
+pub(crate) struct YesStream {
+    stream: StreamState,
+    line: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -212,6 +245,28 @@ fn start_head(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
             done: options.bytes == Some(0) || (options.bytes.is_none() && options.lines == 0),
         }),
     ))
+}
+
+fn start_yes(_interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> CommandPoll {
+    let line = format!(
+        "{}\n",
+        if args.is_empty() {
+            "y".to_string()
+        } else {
+            args.join(" ")
+        }
+    )
+    .into_bytes();
+    CommandPoll::Yielded(crate::commands::CommandResume::TextStream(TextStream::Yes(
+        YesStream {
+            stream: StreamState {
+                sources: VecDeque::new(),
+                pending: line.clone(),
+                offset: 0,
+            },
+            line,
+        },
+    )))
 }
 
 fn wait_reason(wait: IoWait) -> WaitReason {
@@ -397,11 +452,31 @@ fn poll_head(interp: &mut Interp, mut state: HeadStream) -> CommandPoll {
     }
 }
 
+fn poll_yes(interp: &mut Interp, mut state: YesStream) -> CommandPoll {
+    match flush_pending(interp, &mut state.stream) {
+        FlushPoll::Complete => {
+            state.stream.pending.clone_from(&state.line);
+            CommandPoll::Yielded(crate::commands::CommandResume::TextStream(TextStream::Yes(
+                state,
+            )))
+        }
+        FlushPoll::Yielded => CommandPoll::Yielded(crate::commands::CommandResume::TextStream(
+            TextStream::Yes(state),
+        )),
+        FlushPoll::Blocked(reason) => CommandPoll::Blocked(
+            reason,
+            crate::commands::CommandResume::TextStream(TextStream::Yes(state)),
+        ),
+        FlushPoll::Failed(status) => CommandPoll::Ready(status),
+    }
+}
+
 /// Resume one bounded streaming text-command quantum.
 pub(crate) fn resume_stream(interp: &mut Interp, continuation: TextStream) -> CommandPoll {
     match continuation {
         TextStream::Cat(state) => poll_cat(interp, state),
         TextStream::Head(state) => poll_head(interp, state),
+        TextStream::Yes(state) => poll_yes(interp, state),
     }
 }
 
@@ -1286,6 +1361,349 @@ fn xargs_commands(
     Ok(commands)
 }
 
+fn cmd_yes(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let line = format!(
+        "{}\n",
+        if args.is_empty() {
+            "y".to_string()
+        } else {
+            args.join(" ")
+        }
+    );
+    let remaining = usize::try_from(interp.resources.output_remaining()).unwrap_or(usize::MAX);
+    if line.is_empty() || remaining == usize::MAX {
+        ewln(io.err, "yes: a finite output limit is required");
+        return 1;
+    }
+    let repetitions = remaining / line.len() + 1;
+    let allocation = u64::try_from(repetitions.saturating_mul(line.len())).unwrap_or(u64::MAX);
+    if !interp.reserve_memory(allocation) {
+        return 137;
+    }
+    let chunk_repetitions = repetitions.min((64 * 1024 / line.len()).max(1));
+    let chunk = line.repeat(chunk_repetitions);
+    let mut remaining_repetitions = repetitions;
+    while remaining_repetitions >= chunk_repetitions {
+        io.out.extend_from_slice(chunk.as_bytes());
+        remaining_repetitions -= chunk_repetitions;
+    }
+    for _ in 0..remaining_repetitions {
+        io.out.extend_from_slice(line.as_bytes());
+    }
+    interp.resources.release_memory(allocation);
+    0
+}
+
+fn start_buffered_text(
+    interp: &mut CommandContext<'_>,
+    args: &[String],
+    io: &mut Io,
+) -> CommandPoll {
+    let command = interp.command_name().to_string();
+    let status = match command.as_str() {
+        "fold" => cmd_fold(interp, args, io),
+        "fmt" => cmd_fmt(interp, args, io),
+        "expand" => cmd_expand(interp, args, io),
+        "unexpand" => cmd_unexpand(interp, args, io),
+        "column" => cmd_column(interp, args, io),
+        "join" => cmd_join(interp, args, io),
+        "split" => cmd_split(interp, args, io),
+        "shuf" => cmd_shuf(interp, args, io),
+        "tsort" => cmd_tsort(interp, args, io),
+        _ => unreachable!("registered buffered text command"),
+    };
+    CommandPoll::Ready(status)
+}
+
+fn parse_width<'a>(
+    command: &str,
+    args: &'a [String],
+    default: usize,
+) -> Result<(usize, Vec<&'a String>), String> {
+    let mut width = default;
+    let mut files = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "-w" || argument == "--width" {
+            index += 1;
+            let value = args
+                .get(index)
+                .ok_or_else(|| format!("{command}: option requires an argument"))?;
+            width = value
+                .parse()
+                .map_err(|_| format!("{command}: invalid width: {value}"))?;
+        } else if let Some(value) = argument.strip_prefix("--width=") {
+            width = value
+                .parse()
+                .map_err(|_| format!("{command}: invalid width: {value}"))?;
+        } else if argument.starts_with('-') && argument != "-" {
+            return Err(format!("{command}: unsupported option '{argument}'"));
+        } else {
+            files.push(argument);
+        }
+        index += 1;
+    }
+    if width == 0 {
+        return Err(format!("{command}: width must be positive"));
+    }
+    Ok((width, files))
+}
+
+fn cmd_fold(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let (width, files) = match parse_width("fold", args, 80) {
+        Ok(value) => value,
+        Err(error) => {
+            ewln(io.err, &error);
+            return 1;
+        }
+    };
+    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("fold: {error}"));
+        return 1;
+    }
+    for line in String::from_utf8_lossy(&data).split_inclusive('\n') {
+        let (line, terminated) = line
+            .strip_suffix('\n')
+            .map_or((line, false), |value| (value, true));
+        let characters = line.chars().collect::<Vec<_>>();
+        if characters.is_empty() && terminated {
+            io.out.push(b'\n');
+            continue;
+        }
+        for chunk in characters.chunks(width) {
+            w(io.out, &chunk.iter().collect::<String>());
+            io.out.push(b'\n');
+        }
+        if !terminated && !characters.is_empty() {
+            io.out.pop();
+        }
+    }
+    0
+}
+
+fn cmd_fmt(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let (width, files) = match parse_width("fmt", args, 75) {
+        Ok(value) => value,
+        Err(error) => {
+            ewln(io.err, &error);
+            return 1;
+        }
+    };
+    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("fmt: {error}"));
+        return 1;
+    }
+    let text = String::from_utf8_lossy(&data);
+    let paragraphs = text.split("\n\n").collect::<Vec<_>>();
+    for (paragraph_index, paragraph) in paragraphs.iter().enumerate() {
+        let mut column = 0usize;
+        for word in paragraph.split_whitespace() {
+            if column == 0 {
+                w(io.out, word);
+                column = word.chars().count();
+            } else if column.saturating_add(1 + word.chars().count()) <= width {
+                io.out.push(b' ');
+                w(io.out, word);
+                column += 1 + word.chars().count();
+            } else {
+                io.out.push(b'\n');
+                w(io.out, word);
+                column = word.chars().count();
+            }
+        }
+        io.out.push(b'\n');
+        if paragraph_index + 1 < paragraphs.len() {
+            io.out.push(b'\n');
+        }
+    }
+    0
+}
+
+fn parse_tab_stop<'a>(
+    command: &str,
+    args: &'a [String],
+) -> Result<(usize, bool, Vec<&'a String>), String> {
+    let mut stop = 8usize;
+    let mut all = false;
+    let mut files = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-a" | "--all" => all = true,
+            "-t" | "--tabs" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| format!("{command}: option requires an argument"))?;
+                stop = value
+                    .parse()
+                    .map_err(|_| format!("{command}: invalid tab size: {value}"))?;
+            }
+            value if value.starts_with("--tabs=") => {
+                stop = value[7..]
+                    .parse()
+                    .map_err(|_| format!("{command}: invalid tab size"))?
+            }
+            value if value.starts_with('-') && value != "-" => {
+                return Err(format!("{command}: unsupported option '{value}'"))
+            }
+            _ => files.push(&args[index]),
+        }
+        index += 1;
+    }
+    if stop == 0 {
+        return Err(format!("{command}: tab size must be positive"));
+    }
+    Ok((stop, all, files))
+}
+
+fn cmd_expand(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let (stop, _, files) = match parse_tab_stop("expand", args) {
+        Ok(v) => v,
+        Err(e) => {
+            ewln(io.err, &e);
+            return 1;
+        }
+    };
+    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("expand: {error}"));
+        return 1;
+    }
+    let mut column = 0usize;
+    for character in String::from_utf8_lossy(&data).chars() {
+        match character {
+            '\t' => {
+                let count = stop - column % stop;
+                io.out.extend(std::iter::repeat_n(b' ', count));
+                column += count;
+            }
+            '\n' => {
+                io.out.push(b'\n');
+                column = 0;
+            }
+            value => {
+                w(io.out, &value.to_string());
+                column += 1;
+            }
+        }
+    }
+    0
+}
+
+fn cmd_unexpand(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let (stop, all, files) = match parse_tab_stop("unexpand", args) {
+        Ok(v) => v,
+        Err(e) => {
+            ewln(io.err, &e);
+            return 1;
+        }
+    };
+    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("unexpand: {error}"));
+        return 1;
+    }
+    for line in String::from_utf8_lossy(&data).split_inclusive('\n') {
+        let mut column = 0usize;
+        let mut spaces = 0usize;
+        let mut leading = true;
+        for character in line.chars() {
+            if character == ' ' && (all || leading) {
+                spaces += 1;
+                column += 1;
+                if column.is_multiple_of(stop) {
+                    io.out.push(b'\t');
+                    spaces = 0;
+                }
+            } else {
+                io.out.extend(std::iter::repeat_n(b' ', spaces));
+                spaces = 0;
+                w(io.out, &character.to_string());
+                if character == '\n' {
+                    column = 0;
+                    leading = true;
+                } else {
+                    column += 1;
+                    leading = false;
+                }
+            }
+        }
+        io.out.extend(std::iter::repeat_n(b' ', spaces));
+    }
+    0
+}
+
+fn cmd_column(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut separator = None;
+    let mut table = false;
+    let mut files = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-t" | "--table" => table = true,
+            "-s" | "--separator" => {
+                index += 1;
+                separator = args.get(index).and_then(|v| v.chars().next());
+                if separator.is_none() {
+                    ewln(io.err, "column: missing separator");
+                    return 1;
+                }
+            }
+            value if value.starts_with('-') && value != "-" => {
+                ewln(io.err, &format!("column: unsupported option '{value}'"));
+                return 1;
+            }
+            _ => files.push(&args[index]),
+        }
+        index += 1;
+    }
+    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("column: {error}"));
+        return 1;
+    }
+    if !table {
+        io.out.extend_from_slice(&data);
+        return 0;
+    }
+    let rows = String::from_utf8_lossy(&data)
+        .lines()
+        .map(|line| {
+            separator.map_or_else(
+                || line.split_whitespace().map(str::to_string).collect(),
+                |sep| line.split(sep).map(str::to_string).collect(),
+            )
+        })
+        .collect::<Vec<Vec<String>>>();
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| cell.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            w(io.out, cell);
+            if index + 1 < row.len() {
+                w(
+                    io.out,
+                    &" ".repeat(widths[index].saturating_sub(cell.chars().count()) + 2),
+                );
+            }
+        }
+        io.out.push(b'\n');
+    }
+    0
+}
+
 fn cmd_comm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, _l) = split_flags(args);
     if ops.len() < 2 {
@@ -1330,45 +1748,722 @@ fn cmd_comm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     0
 }
 
+fn cmd_join(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut separator = None;
+    let mut field1 = 0usize;
+    let mut field2 = 0usize;
+    let mut include_unpaired = [false, false];
+    let mut files = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-t" => {
+                index += 1;
+                separator = args.get(index).and_then(|value| value.chars().next());
+                if separator.is_none() {
+                    ewln(io.err, "join: missing delimiter");
+                    return 1;
+                }
+            }
+            "-1" | "-2" => {
+                let side = usize::from(args[index] == "-2");
+                index += 1;
+                let Some(value) = args
+                    .get(index)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .and_then(|v| v.checked_sub(1))
+                else {
+                    ewln(io.err, "join: invalid field number");
+                    return 1;
+                };
+                if side == 0 {
+                    field1 = value;
+                } else {
+                    field2 = value;
+                }
+            }
+            "-a" => {
+                index += 1;
+                match args.get(index).map(String::as_str) {
+                    Some("1") => include_unpaired[0] = true,
+                    Some("2") => include_unpaired[1] = true,
+                    _ => {
+                        ewln(io.err, "join: invalid file number");
+                        return 1;
+                    }
+                }
+            }
+            value if value.starts_with('-') && value != "-" => {
+                ewln(io.err, &format!("join: unsupported option '{value}'"));
+                return 1;
+            }
+            _ => files.push(&args[index]),
+        }
+        index += 1;
+    }
+    if files.len() != 2 {
+        ewln(io.err, "join: expected two files");
+        return 1;
+    }
+    let mut inputs = Vec::new();
+    for file in files {
+        let data = if file == "-" {
+            io.stdin.clone()
+        } else {
+            match interp.fs_read(&interp.cwd, file) {
+                Ok(v) => v,
+                Err(e) => {
+                    ewln(io.err, &format!("join: {file}: {e}"));
+                    return 1;
+                }
+            }
+        };
+        inputs.push(
+            lines_of(&data)
+                .into_iter()
+                .map(|line| {
+                    separator.map_or_else(
+                        || line.split_whitespace().map(str::to_string).collect(),
+                        |sep| line.split(sep).map(str::to_string).collect(),
+                    )
+                })
+                .collect::<Vec<Vec<String>>>(),
+        );
+    }
+    let output_separator = separator.unwrap_or(' ').to_string();
+    let comparison_work = inputs[0].len().saturating_mul(inputs[1].len());
+    let retained_memory = inputs
+        .iter()
+        .flatten()
+        .flatten()
+        .map(String::len)
+        .sum::<usize>()
+        .saturating_add(inputs[1].len());
+    if !interp.charge_cpu(u64::try_from(comparison_work).unwrap_or(u64::MAX)) {
+        return 137;
+    }
+    let retained_memory = u64::try_from(retained_memory).unwrap_or(u64::MAX);
+    if !interp.reserve_memory(retained_memory) {
+        return 137;
+    }
+    let mut matched2 = vec![false; inputs[1].len()];
+    for row1 in &inputs[0] {
+        let key = row1.get(field1);
+        let mut matched = false;
+        for (right_index, row2) in inputs[1].iter().enumerate() {
+            if key.is_some() && key == row2.get(field2) {
+                matched = true;
+                matched2[right_index] = true;
+                let mut output = vec![key.cloned().unwrap_or_default()];
+                output.extend(
+                    row1.iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != field1)
+                        .map(|(_, v)| v.clone()),
+                );
+                output.extend(
+                    row2.iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != field2)
+                        .map(|(_, v)| v.clone()),
+                );
+                wln(io.out, &output.join(&output_separator));
+            }
+        }
+        if !matched && include_unpaired[0] {
+            wln(io.out, &row1.join(&output_separator));
+        }
+    }
+    if include_unpaired[1] {
+        for (index, row) in inputs[1].iter().enumerate() {
+            if !matched2[index] {
+                wln(io.out, &row.join(&output_separator));
+            }
+        }
+    }
+    interp.resources.release_memory(retained_memory);
+    0
+}
+
+fn cmd_split(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut line_count = 1000usize;
+    let mut byte_count = None;
+    let mut operands = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-l" => {
+                index += 1;
+                line_count = match args.get(index).and_then(|v| v.parse().ok()) {
+                    Some(0) | None => {
+                        ewln(io.err, "split: invalid line count");
+                        return 1;
+                    }
+                    Some(v) => v,
+                };
+            }
+            "-b" => {
+                index += 1;
+                byte_count = match args.get(index).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(0) | None => {
+                        ewln(io.err, "split: invalid byte count");
+                        return 1;
+                    }
+                    value => value,
+                };
+            }
+            value if value.starts_with('-') && value != "-" => {
+                ewln(io.err, &format!("split: unsupported option '{value}'"));
+                return 1;
+            }
+            _ => operands.push(&args[index]),
+        }
+        index += 1;
+    }
+    if operands.len() > 2 {
+        ewln(io.err, "split: extra operand");
+        return 1;
+    }
+    let data = match operands.first().map(|v| v.as_str()) {
+        None | Some("-") => io.stdin.clone(),
+        Some(file) => match interp.fs_read(&interp.cwd, file) {
+            Ok(v) => v,
+            Err(e) => {
+                ewln(io.err, &format!("split: {file}: {e}"));
+                return 1;
+            }
+        },
+    };
+    let prefix = operands.get(1).map_or("x", |value| value.as_str());
+    let data_len = data.len();
+    if !interp.charge_cpu(u64::try_from(data_len).unwrap_or(u64::MAX)) {
+        return 137;
+    }
+    let chunk_memory = data_len.saturating_mul(2).saturating_add(
+        data_len
+            .min(26 * 26)
+            .saturating_mul(std::mem::size_of::<Vec<u8>>()),
+    );
+    let chunk_memory = u64::try_from(chunk_memory).unwrap_or(u64::MAX);
+    if !interp.reserve_memory(chunk_memory) {
+        return 137;
+    }
+    let chunks = if let Some(bytes) = byte_count {
+        data.chunks(bytes).map(<[u8]>::to_vec).collect::<Vec<_>>()
+    } else {
+        let mut chunks = Vec::new();
+        let mut current = Vec::new();
+        let mut lines = 0;
+        for byte in data {
+            current.push(byte);
+            if byte == b'\n' {
+                lines += 1;
+            }
+            if lines == line_count {
+                chunks.push(std::mem::take(&mut current));
+                lines = 0;
+            }
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        chunks
+    };
+    for (number, chunk) in chunks.iter().enumerate() {
+        if number >= 26 * 26 {
+            ewln(io.err, "split: output file suffixes exhausted");
+            interp.resources.release_memory(chunk_memory);
+            return 1;
+        }
+        let name = format!(
+            "{prefix}{}{}",
+            char::from(b'a' + (number / 26) as u8),
+            char::from(b'a' + (number % 26) as u8)
+        );
+        let cwd = interp.cwd.clone();
+        let mode = 0o666 & !u32::from(interp.umask);
+        if let Err(error) = interp.vfs.write(&cwd, &name, chunk, mode) {
+            ewln(io.err, &format!("split: {name}: {error}"));
+            interp.resources.release_memory(chunk_memory);
+            return 1;
+        }
+    }
+    interp.resources.release_memory(chunk_memory);
+    0
+}
+
+fn cmd_shuf(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut count = None;
+    let mut files = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "-n" || args[index] == "--head-count" {
+            index += 1;
+            count = args.get(index).and_then(|v| v.parse::<usize>().ok());
+            if count.is_none() {
+                ewln(io.err, "shuf: invalid line count");
+                return 1;
+            }
+        } else if args[index].starts_with('-') && args[index] != "-" {
+            ewln(
+                io.err,
+                &format!("shuf: unsupported option '{}'", args[index]),
+            );
+            return 1;
+        } else {
+            files.push(&args[index]);
+        }
+        index += 1;
+    }
+    if files.len() > 1 {
+        ewln(io.err, "shuf: extra operand");
+        return 1;
+    }
+    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("shuf: {error}"));
+        return 1;
+    }
+    let mut lines = lines_of(&data);
+    // A fixed generator makes simulations reproducible while retaining permutation semantics.
+    let mut state = 0x9e37_79b9_u32;
+    for end in (1..lines.len()).rev() {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let other = state as usize % (end + 1);
+        lines.swap(end, other);
+    }
+    let take = count.unwrap_or(lines.len()).min(lines.len());
+    for line in &lines[..take] {
+        wln(io.out, line);
+    }
+    0
+}
+
+fn cmd_tsort(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.len() > 1 {
+        ewln(io.err, "tsort: extra operand");
+        return 1;
+    }
+    let files = args.iter().collect::<Vec<_>>();
+    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if let Some(error) = errors.first() {
+        ewln(io.err, &format!("tsort: {error}"));
+        return 1;
+    }
+    let words = String::from_utf8_lossy(&data)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if words.len() % 2 != 0 {
+        ewln(io.err, "tsort: input contains an odd number of tokens");
+        return 1;
+    }
+    let mut edges = std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    let mut indegree = std::collections::BTreeMap::<String, usize>::new();
+    for pair in words.chunks(2) {
+        indegree.entry(pair[0].clone()).or_default();
+        indegree.entry(pair[1].clone()).or_default();
+        if pair[0] != pair[1]
+            && edges
+                .entry(pair[0].clone())
+                .or_default()
+                .insert(pair[1].clone())
+        {
+            *indegree.entry(pair[1].clone()).or_default() += 1;
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(node, _)| node.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut emitted = 0;
+    while let Some(node) = ready.pop_first() {
+        wln(io.out, &node);
+        emitted += 1;
+        if let Some(next) = edges.get(&node) {
+            for target in next {
+                let degree = indegree.get_mut(target).expect("known node");
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.insert(target.clone());
+                }
+            }
+        }
+    }
+    if emitted != indegree.len() {
+        ewln(io.err, "tsort: input contains a loop");
+        return 1;
+    }
+    0
+}
+
 fn cmd_diff(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (_f, ops, _l) = split_flags(args);
-    if ops.len() < 2 {
+    let mut unified = false;
+    let mut recursive = false;
+    let mut brief = false;
+    let mut absent_empty = false;
+    let mut whitespace = DiffWhitespace::Exact;
+    let mut operands = Vec::new();
+    for argument in args {
+        match argument.as_str() {
+            "-u" | "--unified" => unified = true,
+            "-r" | "--recursive" => recursive = true,
+            "-q" | "--brief" => brief = true,
+            "-N" | "--new-file" => absent_empty = true,
+            "-w" | "--ignore-all-space" => whitespace = DiffWhitespace::All,
+            "-b" | "--ignore-space-change" => {
+                if whitespace != DiffWhitespace::All {
+                    whitespace = DiffWhitespace::Change;
+                }
+            }
+            "--" => {}
+            value
+                if value.starts_with('-')
+                    && value.len() > 2
+                    && value[1..]
+                        .chars()
+                        .all(|flag| matches!(flag, 'u' | 'r' | 'q' | 'N' | 'w' | 'b')) =>
+            {
+                for flag in value[1..].chars() {
+                    match flag {
+                        'u' => unified = true,
+                        'r' => recursive = true,
+                        'q' => brief = true,
+                        'N' => absent_empty = true,
+                        'w' => whitespace = DiffWhitespace::All,
+                        'b' if whitespace != DiffWhitespace::All => {
+                            whitespace = DiffWhitespace::Change;
+                        }
+                        'b' => {}
+                        _ => unreachable!("guarded option flag"),
+                    }
+                }
+            }
+            value if value.starts_with('-') => {
+                ewln(io.err, &format!("diff: unsupported option '{value}'"));
+                return 2;
+            }
+            _ => operands.push(argument),
+        }
+    }
+    if operands.len() != 2 {
         ewln(io.err, "diff: missing operand");
         return 2;
     }
-    let a = match interp.fs_read(&interp.cwd, ops[0]) {
-        Ok(data) => String::from_utf8_lossy(&data).into_owned(),
-        Err(error) => {
-            ewln(io.err, &format!("diff: {}: {error}", ops[0]));
+    let options = DiffOptions {
+        unified,
+        brief,
+        absent_empty,
+        whitespace,
+    };
+    let left_meta = interp.fs_metadata(&interp.cwd, operands[0], true);
+    let right_meta = interp.fs_metadata(&interp.cwd, operands[1], true);
+    let directories = matches!(
+        left_meta.as_ref().map(|n| &n.kind),
+        Ok(crate::vfs::NodeKind::Dir)
+    ) || matches!(
+        right_meta.as_ref().map(|n| &n.kind),
+        Ok(crate::vfs::NodeKind::Dir)
+    );
+    if directories {
+        if !recursive {
+            ewln(io.err, "diff: directory comparison requires -r");
             return 2;
         }
-    };
-    let b = match interp.fs_read(&interp.cwd, ops[1]) {
-        Ok(data) => String::from_utf8_lossy(&data).into_owned(),
-        Err(error) => {
-            ewln(io.err, &format!("diff: {}: {error}", ops[1]));
-            return 2;
-        }
-    };
-    if a == b {
-        0
-    } else {
-        // minimal unified-ish output (not a real LCS diff)
-        let al: Vec<&str> = a.lines().collect();
-        let bl: Vec<&str> = b.lines().collect();
-        for (i, line) in al.iter().enumerate() {
-            if bl.get(i) != Some(line) {
-                wln(io.out, &format!("< {line}"));
-            }
-        }
-        wln(io.out, "---");
-        for (i, line) in bl.iter().enumerate() {
-            if al.get(i) != Some(line) {
-                wln(io.out, &format!("> {line}"));
-            }
-        }
-        1
+        return diff_directories(interp, operands[0], operands[1], &options, io);
     }
+    diff_files(interp, operands[0], operands[1], &options, io)
+}
+
+struct DiffOptions {
+    unified: bool,
+    brief: bool,
+    absent_empty: bool,
+    whitespace: DiffWhitespace,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffWhitespace {
+    Exact,
+    Change,
+    All,
+}
+
+#[derive(Clone, Copy)]
+enum DiffLine<'a> {
+    Same(&'a str),
+    Remove(&'a str),
+    Add(&'a str),
+}
+
+fn diff_files(
+    interp: &mut CommandContext<'_>,
+    left: &str,
+    right: &str,
+    options: &DiffOptions,
+    io: &mut Io,
+) -> i32 {
+    let read = |interp: &CommandContext<'_>, path: &str| interp.fs_read(&interp.cwd, path);
+    let left_data = match read(interp, left) {
+        Ok(v) => v,
+        Err(_) if options.absent_empty => Vec::new(),
+        Err(e) => {
+            ewln(io.err, &format!("diff: {left}: {e}"));
+            return 2;
+        }
+    };
+    let right_data = match read(interp, right) {
+        Ok(v) => v,
+        Err(_) if options.absent_empty => Vec::new(),
+        Err(e) => {
+            ewln(io.err, &format!("diff: {right}: {e}"));
+            return 2;
+        }
+    };
+    if left_data == right_data {
+        return 0;
+    }
+    let left_text = String::from_utf8_lossy(&left_data);
+    let right_text = String::from_utf8_lossy(&right_data);
+    let left_lines = left_text.lines().collect::<Vec<_>>();
+    let right_lines = right_text.lines().collect::<Vec<_>>();
+    let left_keys = left_lines
+        .iter()
+        .map(|line| diff_line_key(line, options.whitespace))
+        .collect::<Vec<_>>();
+    let right_keys = right_lines
+        .iter()
+        .map(|line| diff_line_key(line, options.whitespace))
+        .collect::<Vec<_>>();
+    if left_keys == right_keys {
+        return 0;
+    }
+    if options.brief {
+        wln(io.out, &format!("Files {left} and {right} differ"));
+        return 1;
+    }
+    let cells = left_lines
+        .len()
+        .saturating_add(1)
+        .saturating_mul(right_lines.len().saturating_add(1));
+    if cells > 1_000_000 {
+        ewln(io.err, "diff: inputs are too large for line comparison");
+        return 2;
+    }
+    if !interp.charge_cpu(u64::try_from(cells).unwrap_or(u64::MAX)) {
+        return 137;
+    }
+    let matrix_memory = u64::try_from(cells)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(std::mem::size_of::<usize>() as u64);
+    if !interp.reserve_memory(matrix_memory) {
+        return 137;
+    }
+    let edits = lcs_edits(&left_lines, &right_lines, &left_keys, &right_keys);
+    interp.resources.release_memory(matrix_memory);
+    if options.unified {
+        wln(io.out, &format!("--- {left}"));
+        wln(io.out, &format!("+++ {right}"));
+        wln(
+            io.out,
+            &format!("@@ -1,{} +1,{} @@", left_lines.len(), right_lines.len()),
+        );
+        for edit in edits {
+            match edit {
+                DiffLine::Same(line) => wln(io.out, &format!(" {line}")),
+                DiffLine::Remove(line) => wln(io.out, &format!("-{line}")),
+                DiffLine::Add(line) => wln(io.out, &format!("+{line}")),
+            }
+        }
+    } else {
+        for edit in edits {
+            match edit {
+                DiffLine::Same(_) => {}
+                DiffLine::Remove(line) => wln(io.out, &format!("< {line}")),
+                DiffLine::Add(line) => wln(io.out, &format!("> {line}")),
+            }
+        }
+    }
+    1
+}
+
+fn diff_line_key(line: &str, whitespace: DiffWhitespace) -> String {
+    match whitespace {
+        DiffWhitespace::Exact => line.to_string(),
+        DiffWhitespace::All => line
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect(),
+        DiffWhitespace::Change => {
+            let mut key = String::with_capacity(line.len());
+            let mut in_whitespace = false;
+            for character in line.chars() {
+                if character.is_whitespace() {
+                    in_whitespace = true;
+                } else {
+                    if in_whitespace && !key.is_empty() {
+                        key.push(' ');
+                    }
+                    key.push(character);
+                    in_whitespace = false;
+                }
+            }
+            key
+        }
+    }
+}
+
+fn lcs_edits<'a>(
+    left: &[&'a str],
+    right: &[&'a str],
+    left_keys: &[String],
+    right_keys: &[String],
+) -> Vec<DiffLine<'a>> {
+    let width = right.len() + 1;
+    let mut lengths = vec![0usize; (left.len() + 1) * width];
+    for i in (0..left.len()).rev() {
+        for j in (0..right.len()).rev() {
+            lengths[i * width + j] = if left_keys[i] == right_keys[j] {
+                lengths[(i + 1) * width + j + 1] + 1
+            } else {
+                lengths[(i + 1) * width + j].max(lengths[i * width + j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut edits = Vec::new();
+    while i < left.len() || j < right.len() {
+        if i < left.len() && j < right.len() && left_keys[i] == right_keys[j] {
+            edits.push(DiffLine::Same(left[i]));
+            i += 1;
+            j += 1;
+        } else if j < right.len()
+            && (i == left.len() || lengths[i * width + j + 1] > lengths[(i + 1) * width + j])
+        {
+            edits.push(DiffLine::Add(right[j]));
+            j += 1;
+        } else {
+            edits.push(DiffLine::Remove(left[i]));
+            i += 1;
+        }
+    }
+    edits
+}
+
+fn diff_directories(
+    interp: &mut CommandContext<'_>,
+    left: &str,
+    right: &str,
+    options: &DiffOptions,
+    io: &mut Io,
+) -> i32 {
+    let left_abs = crate::vfs::resolve_against(&interp.cwd, left);
+    let right_abs = crate::vfs::resolve_against(&interp.cwd, right);
+    let relative_entries =
+        |interp: &CommandContext<'_>, root: &str| -> std::collections::BTreeMap<String, bool> {
+            interp
+                .fs_walk("/", root)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|path| {
+                    let relative = path.strip_prefix(root)?.trim_start_matches('/');
+                    if relative.is_empty() {
+                        return None;
+                    }
+                    let directory = matches!(
+                        interp.fs_metadata("/", &path, true).map(|node| node.kind),
+                        Ok(crate::vfs::NodeKind::Dir)
+                    );
+                    Some((relative.to_string(), directory))
+                })
+                .collect()
+        };
+    let left_entries = relative_entries(interp, &left_abs);
+    let right_entries = relative_entries(interp, &right_abs);
+    let names = left_entries
+        .keys()
+        .chain(right_entries.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut status = 0;
+    let mut omitted_directories = Vec::<String>::new();
+    for name in names {
+        if omitted_directories
+            .iter()
+            .any(|directory| name.starts_with(&format!("{directory}/")))
+        {
+            continue;
+        }
+        let left_kind = left_entries.get(&name);
+        let right_kind = right_entries.get(&name);
+        if left_kind.is_none() || right_kind.is_none() {
+            if options.absent_empty && (left_kind == Some(&false) || right_kind == Some(&false)) {
+                // Missing regular files are compared with an empty file below.
+            } else {
+                let (side, directory) = if let Some(directory) = left_kind {
+                    (left, *directory)
+                } else {
+                    (right, *right_kind.expect("entry exists on one side"))
+                };
+                print_only_in(io.out, side, &name);
+                if directory {
+                    omitted_directories.push(name);
+                }
+                status = 1;
+                continue;
+            }
+        }
+        if let (Some(left_directory), Some(right_directory)) = (left_kind, right_kind) {
+            if left_directory != right_directory {
+                wln(
+                    io.out,
+                    &format!(
+                        "File {}/{} is a {} while file {}/{} is a {}",
+                        left.trim_end_matches('/'),
+                        name,
+                        if *left_directory {
+                            "directory"
+                        } else {
+                            "regular file"
+                        },
+                        right.trim_end_matches('/'),
+                        name,
+                        if *right_directory {
+                            "directory"
+                        } else {
+                            "regular file"
+                        }
+                    ),
+                );
+                status = 1;
+                continue;
+            }
+            if *left_directory {
+                continue;
+            }
+        }
+        if left_kind == Some(&true) || right_kind == Some(&true) {
+            status = 1;
+            continue;
+        }
+        let left_path = format!("{}/{name}", left.trim_end_matches('/'));
+        let right_path = format!("{}/{name}", right.trim_end_matches('/'));
+        let file_status = diff_files(interp, &left_path, &right_path, options, io);
+        if file_status == 2 || file_status == 137 {
+            return file_status;
+        }
+        status = status.max(file_status);
+    }
+    status
+}
+
+fn print_only_in(output: &mut Vec<u8>, root: &str, relative: &str) {
+    let (parent, basename) = relative.rsplit_once('/').map_or(
+        (root.trim_end_matches('/').to_string(), relative),
+        |(parent, basename)| (format!("{}/{parent}", root.trim_end_matches('/')), basename),
+    );
+    wln(output, &format!("Only in {parent}: {basename}"));
 }
 
 fn cmd_cmp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

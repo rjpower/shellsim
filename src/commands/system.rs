@@ -25,6 +25,10 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["df"], Trust::Real, cmd_df);
     reg(m, &["free"], Trust::Real, cmd_free);
     reg(m, &["ps"], Trust::Partial, cmd_ps);
+    reg(m, &["pgrep"], Trust::Partial, cmd_pgrep);
+    reg(m, &["lsof"], Trust::Partial, cmd_lsof);
+    reg(m, &["ss", "netstat"], Trust::Partial, cmd_sockets);
+    reg(m, &["nohup"], Trust::Partial, cmd_nohup);
 }
 
 fn cmd_env(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -445,23 +449,90 @@ fn cmd_free(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
 }
 
 fn cmd_ps(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let aux = args == ["aux"];
-    let flags_valid = args.iter().all(|argument| {
-        argument.starts_with('-') && argument[1..].chars().all(|flag| matches!(flag, 'e' | 'f'))
-    });
-    if !args.is_empty() && !aux && !flags_valid {
-        ewln(
-            io.err,
-            "ps: only ps, ps -e/-f/-ef, and ps aux are supported",
-        );
-        return 2;
+    let mut aux = false;
+    let mut full = false;
+    let mut columns: Option<Vec<&str>> = None;
+    let mut selected_pids: Option<Vec<u32>> = None;
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        match argument.as_str() {
+            "aux" => aux = true,
+            "-e" | "-A" => {}
+            "-f" | "-ef" => full = true,
+            "-o" => {
+                index += 1;
+                let Some(specification) = args.get(index) else {
+                    ewln(io.err, "ps: -o requires a column list");
+                    return 2;
+                };
+                let parsed = specification
+                    .split(',')
+                    .map(|column| column.split('=').next().unwrap_or(column))
+                    .collect::<Vec<_>>();
+                if parsed.iter().any(|column| {
+                    !matches!(
+                        *column,
+                        "pid"
+                            | "ppid"
+                            | "pgid"
+                            | "sid"
+                            | "stat"
+                            | "comm"
+                            | "cmd"
+                            | "args"
+                            | "user"
+                            | "uid"
+                    )
+                }) {
+                    ewln(io.err, "ps: unsupported output column");
+                    return 2;
+                }
+                columns = Some(parsed);
+            }
+            "-p" | "--pid" => {
+                index += 1;
+                let Some(list) = args.get(index) else {
+                    ewln(io.err, "ps: -p requires a PID list");
+                    return 2;
+                };
+                let parsed = list
+                    .split(',')
+                    .map(str::parse::<u32>)
+                    .collect::<Result<Vec<_>, _>>();
+                let Ok(parsed) = parsed else {
+                    ewln(io.err, "ps: invalid PID list");
+                    return 2;
+                };
+                selected_pids = Some(parsed);
+            }
+            pid if pid.bytes().all(|byte| byte.is_ascii_digit()) => {
+                let Ok(pid) = pid.parse::<u32>() else {
+                    ewln(io.err, "ps: invalid PID");
+                    return 2;
+                };
+                selected_pids.get_or_insert_with(Vec::new).push(pid);
+            }
+            option => {
+                ewln(io.err, &format!("ps: unsupported option {option}"));
+                return 2;
+            }
+        }
+        index += 1;
     }
-    let full = !aux && args.iter().any(|argument| argument.contains('f'));
     let pid = interp.pid;
     let cwd = interp.cwd.clone();
     let environment = interp.child_env().into_iter().collect();
     interp.processes.update_current(pid, &cwd, environment);
-    if aux {
+    if let Some(columns) = &columns {
+        wln(
+            io.out,
+            &columns
+                .iter()
+                .map(|column| ps_heading(column))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    } else if aux {
         wln(
             io.out,
             "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND",
@@ -475,12 +546,27 @@ fn cmd_ps(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         wln(io.out, "    PID TTY          TIME CMD");
     }
     for process in interp.processes.iter() {
+        if selected_pids
+            .as_ref()
+            .is_some_and(|pids| !pids.contains(&process.pid))
+        {
+            continue;
+        }
         let state = match process.status {
             ProcessStatus::Running => "R",
             ProcessStatus::Stopped(_) => "T",
             ProcessStatus::Exited(_) => "Z",
         };
-        if aux {
+        if let Some(columns) = &columns {
+            wln(
+                io.out,
+                &columns
+                    .iter()
+                    .map(|column| ps_value(column, process, state))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        } else if aux {
             wln(
                 io.out,
                 &format!(
@@ -504,6 +590,221 @@ fn cmd_ps(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         }
     }
     0
+}
+
+fn ps_heading(column: &str) -> &'static str {
+    match column {
+        "pid" => "PID",
+        "ppid" => "PPID",
+        "pgid" => "PGID",
+        "sid" => "SID",
+        "stat" => "STAT",
+        "comm" => "COMMAND",
+        "cmd" | "args" => "CMD",
+        "user" => "USER",
+        "uid" => "UID",
+        _ => unreachable!(),
+    }
+}
+
+fn ps_value(column: &str, process: &crate::process::ProcessRecord, state: &str) -> String {
+    match column {
+        "pid" => process.pid.to_string(),
+        "ppid" => process.ppid.to_string(),
+        "pgid" => process.process_group.to_string(),
+        "sid" => process.session_id.to_string(),
+        "stat" => state.to_string(),
+        "comm" => process
+            .command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string(),
+        "cmd" | "args" => process.command.clone(),
+        "user" => "root".into(),
+        "uid" => "0".into(),
+        _ => unreachable!(),
+    }
+}
+
+fn cmd_pgrep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut full = false;
+    let mut exact = false;
+    let mut list_name = false;
+    let mut list_full = false;
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        match argument.as_str() {
+            "-f" => full = true,
+            "-x" => exact = true,
+            "-l" => list_name = true,
+            "-a" => list_full = true,
+            value if value.starts_with('-') => {
+                ewln(io.err, &format!("pgrep: unsupported option {value}"));
+                return 2;
+            }
+            _ => break,
+        }
+        index += 1;
+    }
+    let Some(pattern) = args.get(index) else {
+        ewln(io.err, "pgrep: pattern required");
+        return 2;
+    };
+    if index + 1 != args.len() {
+        ewln(io.err, "pgrep: too many patterns");
+        return 2;
+    }
+    let regex = match regex::Regex::new(pattern) {
+        Ok(regex) => regex,
+        Err(error) => {
+            ewln(io.err, &format!("pgrep: invalid pattern: {error}"));
+            return 2;
+        }
+    };
+    let mut found = false;
+    for process in interp
+        .processes
+        .iter()
+        .filter(|process| !matches!(process.status, ProcessStatus::Exited(_)))
+    {
+        let short = process
+            .command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
+        let candidate = if full {
+            process.command.as_str()
+        } else {
+            short
+        };
+        let matched = if exact {
+            regex
+                .find(candidate)
+                .is_some_and(|found| found.as_str() == candidate)
+        } else {
+            regex.is_match(candidate)
+        };
+        if matched {
+            found = true;
+            if list_full {
+                wln(io.out, &format!("{} {}", process.pid, process.command));
+            } else if list_name {
+                wln(io.out, &format!("{} {short}", process.pid));
+            } else {
+                wln(io.out, &process.pid.to_string());
+            }
+        }
+    }
+    i32::from(!found)
+}
+
+fn cmd_lsof(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut selected_pid = None;
+    let mut selected_name = None;
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        match argument.as_str() {
+            "-p" => {
+                index += 1;
+                selected_pid = args.get(index).and_then(|value| value.parse::<u32>().ok());
+                if selected_pid.is_none() {
+                    ewln(io.err, "lsof: -p requires a PID");
+                    return 2;
+                }
+            }
+            value if value.starts_with('-') => {
+                ewln(io.err, &format!("lsof: unsupported option {value}"));
+                return 2;
+            }
+            value => selected_name = Some(value.to_string()),
+        }
+        index += 1;
+    }
+    wln(io.out, "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME");
+    let mut found = false;
+    for process in interp.processes.iter() {
+        if selected_pid.is_some_and(|pid| process.pid != pid) {
+            continue;
+        }
+        let command = process
+            .command
+            .split_whitespace()
+            .next()
+            .unwrap_or("?")
+            .rsplit('/')
+            .next()
+            .unwrap_or("?");
+        for (fd, name) in &process.descriptors {
+            if selected_name
+                .as_ref()
+                .is_some_and(|selected| selected != name)
+            {
+                continue;
+            }
+            found = true;
+            wln(
+                io.out,
+                &format!("{command} {} root {fd}u REG 0,0 0 0 {name}", process.pid),
+            );
+        }
+    }
+    i32::from(!found && (selected_pid.is_some() || selected_name.is_some()))
+}
+
+fn cmd_sockets(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.iter().any(|argument| !argument.starts_with('-')) {
+        ewln(io.err, "socket listing: operands are not supported");
+        return 2;
+    }
+    if args
+        .iter()
+        .flat_map(|argument| argument.trim_start_matches('-').chars())
+        .any(|flag| !matches!(flag, 'l' | 'n' | 't' | 'u' | 'a' | 'p'))
+    {
+        ewln(io.err, "socket listing: unsupported option");
+        return 2;
+    }
+    wln(
+        io.out,
+        "State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process",
+    );
+    let mut listeners = interp
+        .net
+        .listening
+        .iter()
+        .filter(|(_, active)| **active)
+        .map(|(address, _)| address)
+        .collect::<Vec<_>>();
+    listeners.sort();
+    for address in listeners {
+        wln(
+            io.out,
+            &format!("LISTEN 0      128    {address:<18} 0.0.0.0:*         -"),
+        );
+    }
+    0
+}
+
+fn cmd_nohup(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let argv = if args.first().map(String::as_str) == Some("--") {
+        &args[1..]
+    } else {
+        args
+    };
+    if argv.is_empty() {
+        ewln(io.err, "nohup: missing operand");
+        return 125;
+    }
+    // Captured shellsim streams are not terminals, so GNU nohup's nohup.out redirection does not
+    // apply. Signal disposition is process-local; the delegated command runs synchronously here.
+    crate::commands::run(interp, argv, std::mem::take(&mut io.stdin), io.out, io.err)
 }
 
 fn human_size(bytes: u64) -> String {

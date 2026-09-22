@@ -199,6 +199,7 @@ pub enum RedirOp {
     Read,       // <
     Write,      // >
     Append,     // >>
+    ReadWrite,  // <>
     DupOut,     // >&N  / N>&M
     Close,      // >&-
     Heredoc,    // << (target carries the already-captured body; quoted flag in op variant below)
@@ -323,8 +324,10 @@ impl Lexer {
                         self.i += 2;
                     } else if self.at(1) == Some('>') {
                         // &> file  → redirect both
-                        self.i += 2;
-                        self.toks.push(Tok::RedirFd(1, "&>".into()));
+                        let append = self.at(2) == Some('>');
+                        self.i += if append { 3 } else { 2 };
+                        self.toks
+                            .push(Tok::RedirFd(1, if append { "&>>" } else { "&>" }.into()));
                     } else {
                         self.toks.push(Tok::Op("&".into()));
                         self.i += 1;
@@ -337,6 +340,9 @@ impl Lexer {
                         self.toks.push(Tok::Word(word.into()));
                     } else if self.at(1) == Some('|') {
                         self.toks.push(Tok::Op("||".into()));
+                        self.i += 2;
+                    } else if self.at(1) == Some('&') {
+                        self.toks.push(Tok::Op("|&".into()));
                         self.i += 2;
                     } else {
                         self.toks.push(Tok::Op("|".into()));
@@ -371,6 +377,13 @@ impl Lexer {
                         self.i += 1;
                         let group = self.read_balanced_paren();
                         self.toks.push(Tok::Word(format!("<{group}")));
+                    } else if self.at(1) == Some('&') {
+                        self.i += 2;
+                        let target = self.read_descriptor_target();
+                        self.toks.push(Tok::RedirFd(0, format!("<&{target}")));
+                    } else if self.at(1) == Some('>') {
+                        self.i += 2;
+                        self.toks.push(Tok::RedirFd(0, "<>".into()));
                     } else if self.at(1) == Some('<') && self.at(2) == Some('<') {
                         self.i += 3;
                         while matches!(self.peek(), Some(' ' | '\t')) {
@@ -406,8 +419,15 @@ impl Lexer {
                     if self.in_double_bracket {
                         self.toks.push(Tok::Word(">".into()));
                         self.i += 1;
+                    } else if self.at(1) == Some('(') {
+                        self.i += 1;
+                        let group = self.read_balanced_paren();
+                        self.toks.push(Tok::Word(format!(">{group}")));
                     } else if self.at(1) == Some('>') {
                         self.toks.push(Tok::DGreat);
+                        self.i += 2;
+                    } else if self.at(1) == Some('|') {
+                        self.toks.push(Tok::Great);
                         self.i += 2;
                     } else if self.at(1) == Some('&') {
                         // >&N
@@ -467,9 +487,17 @@ impl Lexer {
                             self.toks.push(Tok::RedirFd(fd, ">".into()));
                         }
                     } else {
-                        // <
                         self.i += 1;
-                        self.toks.push(Tok::RedirFd(fd, "<".into()));
+                        if self.peek() == Some('&') {
+                            self.i += 1;
+                            let target = self.read_descriptor_target();
+                            self.toks.push(Tok::RedirFd(fd, format!("<&{target}")));
+                        } else if self.peek() == Some('>') {
+                            self.i += 1;
+                            self.toks.push(Tok::RedirFd(fd, "<>".into()));
+                        } else {
+                            self.toks.push(Tok::RedirFd(fd, "<".into()));
+                        }
                     }
                 }
                 _ => {
@@ -498,6 +526,18 @@ impl Lexer {
         }
         self.toks.push(Tok::Eof);
         (self.toks, self.heredocs_complete, self.error)
+    }
+
+    fn read_descriptor_target(&mut self) -> String {
+        if self.peek() == Some('-') {
+            self.i += 1;
+            return "-".into();
+        }
+        let start = self.i;
+        while self.peek().is_some_and(|value| value.is_ascii_digit()) {
+            self.i += 1;
+        }
+        self.chars[start..self.i].iter().collect()
     }
 
     fn prev_is_boundary(&self) -> bool {
@@ -871,6 +911,33 @@ const RESERVED: &[&str] = &[
     "in", "function", "{", "}", "!", "[[", "]]",
 ];
 
+fn redirect_pipeline_stderr(node: Node) -> Node {
+    let redirect = Redirect {
+        fd: 2,
+        op: RedirOp::DupOut,
+        target: "&1".into(),
+    };
+    match node {
+        Node::Command {
+            assigns,
+            words,
+            mut redirects,
+        } => {
+            redirects.push(redirect);
+            Node::Command {
+                assigns,
+                words,
+                redirects,
+            }
+        }
+        Node::Redirected(node, mut redirects) => {
+            redirects.push(redirect);
+            Node::Redirected(node, redirects)
+        }
+        node => Node::Redirected(Box::new(node), vec![redirect]),
+    }
+}
+
 impl Parser {
     fn new(toks: Vec<Tok>) -> Self {
         Parser {
@@ -980,8 +1047,13 @@ impl Parser {
             self.i += 1;
         }
         let mut stages = vec![self.parse_command()];
-        while matches!(self.peek(), Tok::Op(o) if o == "|") {
+        while matches!(self.peek(), Tok::Op(o) if o == "|" || o == "|&") {
+            let redirect_stderr = matches!(self.peek(), Tok::Op(o) if o == "|&");
             self.i += 1;
+            if redirect_stderr {
+                let stage = stages.pop().expect("a pipeline always has a left stage");
+                stages.push(redirect_pipeline_stderr(stage));
+            }
             self.skip_blank_newlines();
             stages.push(self.parse_command());
         }
@@ -1162,11 +1234,15 @@ impl Parser {
                 }
                 Tok::RedirFd(fd, op) => {
                     self.i += 1;
-                    if op == "&>" {
+                    if op == "&>" || op == "&>>" {
                         let t = self.take_word();
                         redirects.push(Redirect {
                             fd: 1,
-                            op: RedirOp::Write,
+                            op: if op == "&>>" {
+                                RedirOp::Append
+                            } else {
+                                RedirOp::Write
+                            },
                             target: t.clone(),
                         });
                         redirects.push(Redirect {
@@ -1174,7 +1250,7 @@ impl Parser {
                             op: RedirOp::DupOut,
                             target: "&1".into(),
                         });
-                    } else if op == ">&-" {
+                    } else if op == ">&-" || op == "<&-" {
                         redirects.push(Redirect {
                             fd,
                             op: RedirOp::Close,
@@ -1185,6 +1261,19 @@ impl Parser {
                             fd,
                             op: RedirOp::DupOut,
                             target: format!("&{rest}"),
+                        });
+                    } else if let Some(rest) = op.strip_prefix("<&") {
+                        redirects.push(Redirect {
+                            fd,
+                            op: RedirOp::DupOut,
+                            target: format!("&{rest}"),
+                        });
+                    } else if op == "<>" {
+                        let t = self.take_word();
+                        redirects.push(Redirect {
+                            fd,
+                            op: RedirOp::ReadWrite,
+                            target: t,
                         });
                     } else if op == ">" {
                         let t = self.take_word();
@@ -1300,11 +1389,15 @@ impl Parser {
                 Tok::RedirFd(fd, op) => {
                     self.i += 1;
                     let (op, target) = match op.as_str() {
-                        "&>" => {
+                        "&>" | "&>>" => {
                             let target = self.take_word();
                             redirs.push(Redirect {
                                 fd: 1,
-                                op: RedirOp::Write,
+                                op: if op == "&>>" {
+                                    RedirOp::Append
+                                } else {
+                                    RedirOp::Write
+                                },
                                 target,
                             });
                             redirs.push(Redirect {
@@ -1317,8 +1410,12 @@ impl Parser {
                         ">" => (RedirOp::Write, self.take_word()),
                         ">>" => (RedirOp::Append, self.take_word()),
                         "<" => (RedirOp::Read, self.take_word()),
-                        ">&-" => (RedirOp::Close, "-".into()),
+                        "<>" => (RedirOp::ReadWrite, self.take_word()),
+                        ">&-" | "<&-" => (RedirOp::Close, "-".into()),
                         value if value.starts_with(">&") => {
+                            (RedirOp::DupOut, format!("&{}", &value[2..]))
+                        }
+                        value if value.starts_with("<&") => {
                             (RedirOp::DupOut, format!("&{}", &value[2..]))
                         }
                         _ => unreachable!("lexer emitted an unknown descriptor redirect"),

@@ -17,7 +17,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["set"], Trust::Real, cmd_set);
     reg(m, &["declare", "typeset"], Trust::Real, cmd_declare);
     reg(m, &["local"], Trust::Real, cmd_local);
-    reg_unsupported(m, &["readonly"]);
+    reg(m, &["readonly"], Trust::Real, cmd_readonly);
     reg_resumable(m, &["source", "."], Trust::Real, cmd_source, start_source);
     reg_resumable(m, &["eval"], Trust::Real, cmd_eval, start_eval);
     reg(m, &["exit"], Trust::Real, cmd_exit);
@@ -37,14 +37,16 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["bg"], Trust::Real, cmd_bg);
     reg(m, &["trap"], Trust::Real, cmd_trap);
     reg(m, &["flock"], Trust::Partial, cmd_flock);
-    reg_unsupported(
-        m,
-        &[
-            "disown", "umask", "ulimit", "hash", "complete", "shopt", "bind", "history", "exec",
-        ],
-    );
+    reg(m, &["disown"], Trust::Real, cmd_disown);
+    reg(m, &["umask"], Trust::Partial, cmd_umask);
+    reg(m, &["ulimit"], Trust::Partial, cmd_ulimit);
+    reg(m, &["hash"], Trust::Real, cmd_hash);
+    reg(m, &["shopt"], Trust::Partial, cmd_shopt);
+    reg(m, &["exec"], Trust::Partial, cmd_exec);
+    reg_unsupported(m, &["complete", "bind", "history"]);
     reg(m, &["kill"], Trust::Real, cmd_kill);
-    reg_unsupported(m, &["killall", "pkill"]);
+    reg(m, &["killall"], Trust::Partial, cmd_killall);
+    reg(m, &["pkill"], Trust::Partial, cmd_pkill);
     reg(m, &["which"], Trust::Real, cmd_which);
     reg(m, &["type"], Trust::Real, cmd_type);
     reg_resumable(m, &["command"], Trust::Real, cmd_command, start_command);
@@ -56,6 +58,266 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["pushd"], Trust::Real, cmd_pushd);
     reg(m, &["popd"], Trust::Real, cmd_popd);
     reg(m, &["dirs"], Trust::Real, cmd_dirs);
+}
+
+fn cmd_readonly(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.is_empty() || args == ["-p"] {
+        for name in &interp.readonly {
+            let value = interp.get_var(name).unwrap_or_default();
+            wln(io.out, &format!("declare -r {name}=\"{value}\""));
+        }
+        return 0;
+    }
+    let mut status = 0;
+    for argument in args.iter().filter(|argument| argument.as_str() != "--") {
+        if argument.starts_with('-') {
+            ewln(io.err, &format!("readonly: unsupported option {argument}"));
+            status = 2;
+            continue;
+        }
+        let name = declare_name_of(argument);
+        if !shell_identifier(name) {
+            ewln(io.err, &format!("readonly: {name}: not a valid identifier"));
+            status = 1;
+            continue;
+        }
+        if let Some((raw_key, raw_value)) = split_decl_assign(argument) {
+            if interp.readonly.contains(name) {
+                ewln(io.err, &format!("readonly: {name}: readonly variable"));
+                status = 1;
+                continue;
+            }
+            crate::exec::apply_assignment(interp, &raw_key, &raw_value);
+        } else if interp.get_var(name).is_none() && !interp.arrays.contains_key(name) {
+            interp.set_var(name, "");
+        }
+        interp.readonly.insert(name.to_string());
+    }
+    status
+}
+
+fn cmd_umask(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    match args {
+        [] => {
+            wln(io.out, &format!("{:04o}", interp.umask));
+            0
+        }
+        [flag] if flag == "-S" => {
+            let allowed = 0o777 & !interp.umask;
+            let triplet = |shift| {
+                let bits = (allowed >> shift) & 7_u16;
+                format!(
+                    "{}{}{}",
+                    if bits & 4_u16 != 0_u16 { "r" } else { "" },
+                    if bits & 2_u16 != 0_u16 { "w" } else { "" },
+                    if bits & 1_u16 != 0_u16 { "x" } else { "" }
+                )
+            };
+            wln(
+                io.out,
+                &format!("u={},g={},o={}", triplet(6), triplet(3), triplet(0)),
+            );
+            0
+        }
+        [value] => match u16::from_str_radix(
+            match value.trim_start_matches('0') {
+                "" if !value.is_empty() => "0",
+                digits => digits,
+            },
+            8,
+        ) {
+            Ok(mask) if mask <= 0o777 => {
+                interp.umask = mask;
+                0
+            }
+            _ => {
+                ewln(io.err, &format!("umask: {value}: invalid octal mask"));
+                1
+            }
+        },
+        _ => {
+            ewln(io.err, "umask: usage: umask [-S] [octal-mask]");
+            2
+        }
+    }
+}
+
+fn cmd_ulimit(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let limits = interp.resources.limits();
+    let selected = args.first().map(String::as_str).unwrap_or("-f");
+    if args.len() > 1 || !matches!(selected, "-a" | "-f" | "-n" | "-t" | "-v") {
+        ewln(
+            io.err,
+            "ulimit: setting limits and this option are not supported",
+        );
+        return 2;
+    }
+    let blocks = |bytes: u64| {
+        if bytes == u64::MAX {
+            "unlimited".into()
+        } else {
+            (bytes / 1024).to_string()
+        }
+    };
+    match selected {
+        "-a" => {
+            wln(
+                io.out,
+                &format!(
+                    "file size               (blocks, -f) {}",
+                    blocks(limits.disk)
+                ),
+            );
+            wln(io.out, "open files                      (-n) 1024");
+            wln(
+                io.out,
+                &format!("cpu time               (seconds, -t) {}", limits.cpu),
+            );
+            wln(
+                io.out,
+                &format!(
+                    "virtual memory           (kbytes, -v) {}",
+                    blocks(limits.memory)
+                ),
+            );
+        }
+        "-f" => wln(io.out, &blocks(limits.disk)),
+        "-n" => wln(io.out, "1024"),
+        "-t" => wln(io.out, &limits.cpu.to_string()),
+        "-v" => wln(io.out, &blocks(limits.memory)),
+        _ => unreachable!(),
+    }
+    0
+}
+
+fn cmd_hash(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args == ["-r"] {
+        interp.command_hash.clear();
+        return 0;
+    }
+    if args.first().map(String::as_str) == Some("-t") {
+        let mut status = 0;
+        for name in &args[1..] {
+            if let Some(path) = interp.command_hash.get(name) {
+                wln(io.out, path);
+            } else {
+                ewln(io.err, &format!("hash: {name}: not found"));
+                status = 1;
+            }
+        }
+        return status;
+    }
+    if args.is_empty() {
+        for (name, path) in &interp.command_hash {
+            wln(io.out, &format!("{path}\t{name}"));
+        }
+        return 0;
+    }
+    let mut status = 0;
+    for name in args {
+        let path = if crate::commands::is_registered(name) {
+            Some(format!("/usr/bin/{name}"))
+        } else if let crate::commands::util::ExecutableLookup::Found(path) =
+            crate::commands::util::resolve_executable(interp, name)
+        {
+            Some(path)
+        } else {
+            None
+        };
+        if let Some(path) = path {
+            interp.command_hash.insert(name.clone(), path);
+        } else {
+            ewln(io.err, &format!("hash: {name}: not found"));
+            status = 1;
+        }
+    }
+    status
+}
+
+const COMPAT_SHOPTS: &[&str] = &["expand_aliases", "sourcepath"];
+
+fn cmd_shopt(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let (mode, names) = match args.first().map(String::as_str) {
+        Some("-s") => ('s', &args[1..]),
+        Some("-u") => ('u', &args[1..]),
+        Some("-q") => ('q', &args[1..]),
+        Some(option) if option.starts_with('-') => {
+            ewln(io.err, &format!("shopt: unsupported option {option}"));
+            return 2;
+        }
+        _ => ('p', args),
+    };
+    let selected = if names.is_empty() {
+        COMPAT_SHOPTS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    } else {
+        names.to_vec()
+    };
+    let mut status = 0;
+    for name in selected {
+        if !COMPAT_SHOPTS.contains(&name.as_str()) {
+            ewln(io.err, &format!("shopt: {name}: invalid shell option name"));
+            status = 1;
+            continue;
+        }
+        match mode {
+            's' => {
+                interp.shell_options.insert(name);
+            }
+            'u' => {
+                interp.shell_options.remove(&name);
+            }
+            'q' => status |= i32::from(!interp.shell_options.contains(&name)),
+            _ => wln(
+                io.out,
+                &format!(
+                    "{}\t{}",
+                    name,
+                    if interp.shell_options.contains(&name) {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ),
+            ),
+        }
+    }
+    status
+}
+
+fn cmd_disown(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args == ["-a"] {
+        interp.jobs.clear();
+        return 0;
+    }
+    let position = match job_position(interp, args, "disown") {
+        Ok(position) => position,
+        Err(error) => {
+            ewln(io.err, &format!("disown: {error}"));
+            return 1;
+        }
+    };
+    interp.jobs.remove(position);
+    0
+}
+
+fn cmd_exec(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.is_empty() {
+        return 0;
+    }
+    let argv = if args.first().map(String::as_str) == Some("--") {
+        &args[1..]
+    } else {
+        args
+    };
+    if argv.is_empty() {
+        return 0;
+    }
+    let status = crate::commands::run(interp, argv, std::mem::take(&mut io.stdin), io.out, io.err);
+    interp.exiting = Some(status);
+    status
 }
 
 const MAX_TRAP_STATE_BYTES: u64 = 1024 * 1024;
@@ -469,6 +731,155 @@ fn cmd_kill(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     status
 }
 
+fn cmd_pkill(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut signal = crate::process::Signal::Terminate;
+    let mut full = false;
+    let mut exact = false;
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        match argument.as_str() {
+            "-f" => full = true,
+            "-x" => exact = true,
+            "-s" | "--signal" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    ewln(io.err, "pkill: signal name required");
+                    return 2;
+                };
+                let Ok(Some(parsed)) = parse_signal(value) else {
+                    ewln(io.err, &format!("pkill: invalid signal: {value}"));
+                    return 2;
+                };
+                signal = parsed;
+            }
+            value if value.starts_with('-') && value.len() > 1 => {
+                let Ok(Some(parsed)) = parse_signal(&value[1..]) else {
+                    ewln(io.err, &format!("pkill: unsupported option {value}"));
+                    return 2;
+                };
+                signal = parsed;
+            }
+            _ => break,
+        }
+        index += 1;
+    }
+    let Some(pattern) = args.get(index) else {
+        ewln(io.err, "pkill: pattern required");
+        return 2;
+    };
+    if index + 1 != args.len() {
+        ewln(io.err, "pkill: too many patterns");
+        return 2;
+    }
+    let regex = match regex::Regex::new(pattern) {
+        Ok(regex) => regex,
+        Err(error) => {
+            ewln(io.err, &format!("pkill: invalid pattern: {error}"));
+            return 2;
+        }
+    };
+    let current = interp.pid;
+    let targets = interp
+        .processes
+        .iter()
+        .filter(|record| {
+            record.pid != current
+                && !matches!(record.status, crate::process::ProcessStatus::Exited(_))
+        })
+        .filter(|record| {
+            let candidate = if full {
+                record.command.as_str()
+            } else {
+                record
+                    .command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+            };
+            if exact {
+                regex
+                    .find(candidate)
+                    .is_some_and(|found| found.as_str() == candidate)
+            } else {
+                regex.is_match(candidate)
+            }
+        })
+        .map(|record| record.pid)
+        .collect::<Vec<_>>();
+    for pid in &targets {
+        let _ = interp.send_signal(*pid, signal);
+    }
+    i32::from(targets.is_empty())
+}
+
+fn cmd_killall(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut signal = crate::process::Signal::Terminate;
+    let mut names = Vec::new();
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        match argument.as_str() {
+            "-s" | "--signal" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    ewln(io.err, "killall: signal name required");
+                    return 2;
+                };
+                let Ok(Some(parsed)) = parse_signal(value) else {
+                    ewln(io.err, &format!("killall: invalid signal: {value}"));
+                    return 2;
+                };
+                signal = parsed;
+            }
+            value if value.starts_with('-') => {
+                let Ok(Some(parsed)) = parse_signal(&value[1..]) else {
+                    ewln(io.err, &format!("killall: unsupported option {value}"));
+                    return 2;
+                };
+                signal = parsed;
+            }
+            name => names.push(name.to_string()),
+        }
+        index += 1;
+    }
+    if names.is_empty() {
+        ewln(io.err, "killall: process name required");
+        return 2;
+    }
+    let current = interp.pid;
+    let targets = interp
+        .processes
+        .iter()
+        .filter(|record| {
+            let command = record
+                .command
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .rsplit('/')
+                .next()
+                .unwrap_or("");
+            record.pid != current
+                && !matches!(record.status, crate::process::ProcessStatus::Exited(_))
+                && names.iter().any(|name| name == command)
+        })
+        .map(|record| record.pid)
+        .collect::<Vec<_>>();
+    for pid in &targets {
+        let _ = interp.send_signal(*pid, signal);
+    }
+    if targets.is_empty() {
+        for name in names {
+            ewln(io.err, &format!("killall: {name}: no process found"));
+        }
+        1
+    } else {
+        0
+    }
+}
+
 fn parse_signal(value: &str) -> Result<Option<crate::process::Signal>, String> {
     if value == "0" {
         Ok(None)
@@ -859,19 +1270,26 @@ fn print_directory_stack(interp: &CommandContext<'_>, one_per_line: bool, io: &m
     }
 }
 
-fn cmd_export(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_export(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut status = 0;
     for a in args {
         if let Some((k, v)) = a.split_once('=') {
+            if interp.readonly.contains(k) {
+                ewln(io.err, &format!("export: {k}: readonly variable"));
+                status = 1;
+                continue;
+            }
             interp.set_var(k, v);
             interp.export(k);
         } else {
             interp.export(a);
         }
     }
-    0
+    status
 }
 
-fn cmd_unset(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_unset(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut status = 0;
     for a in args {
         if a == "-v" || a == "-f" {
             continue;
@@ -880,18 +1298,28 @@ fn cmd_unset(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> 
         if let Some(br) = a.find('[') {
             if a.ends_with(']') {
                 let name = &a[..br];
+                if interp.readonly.contains(name) {
+                    ewln(io.err, &format!("unset: {name}: readonly variable"));
+                    status = 1;
+                    continue;
+                }
                 let key = &a[br + 1..a.len() - 1];
                 let key = key.trim_matches('"').trim_matches('\'');
                 interp.array_unset_elem(name, key);
                 continue;
             }
         }
+        if interp.readonly.contains(a) {
+            ewln(io.err, &format!("unset: {a}: readonly variable"));
+            status = 1;
+            continue;
+        }
         interp.vars.remove(a);
         interp.arrays.remove(a);
         interp.exported.remove(a);
         interp.funcs.remove(a);
     }
-    0
+    status
 }
 
 fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -979,6 +1407,7 @@ fn cmd_declare(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
     let mut assoc = false;
     let mut indexed = false;
     let mut print = false;
+    let mut status = 0;
     for a in args {
         if a == "--" {
             continue;
@@ -991,6 +1420,11 @@ fn cmd_declare(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
         }
         // operand: NAME, NAME=value, NAME=( … ), NAME[sub]=value
         let name = declare_name_of(a);
+        if interp.readonly.contains(name) && split_decl_assign(a).is_some() {
+            ewln(io.err, &format!("declare: {name}: readonly variable"));
+            status = 1;
+            continue;
+        }
         // Establish the array kind first so a following literal lands in the right store.
         if assoc {
             interp.declare_assoc(name);
@@ -1012,7 +1446,7 @@ fn cmd_declare(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
             }
         }
     }
-    0
+    status
 }
 
 fn cmd_local(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -1845,14 +2279,17 @@ fn is_shell_builtin_name(name: &str) -> bool {
             | "command"
             | "continue"
             | "declare"
+            | "disown"
             | "dirs"
             | "echo"
             | "eval"
+            | "exec"
             | "exit"
             | "export"
             | "false"
             | "fg"
             | "getopts"
+            | "hash"
             | "jobs"
             | "kill"
             | "let"
@@ -1868,12 +2305,15 @@ fn is_shell_builtin_name(name: &str) -> bool {
             | "return"
             | "set"
             | "shift"
+            | "shopt"
             | "source"
             | "test"
             | "trap"
             | "true"
             | "type"
             | "typeset"
+            | "ulimit"
+            | "umask"
             | "unalias"
             | "unset"
             | "wait"

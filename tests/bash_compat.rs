@@ -142,14 +142,47 @@ fn input_process_substitution_preserves_bytes_and_parent_shell_mutation() {
         (0, "one:two:2\na:b:2\n".into(), String::new())
     );
 
-    let unsupported = run("cat <(printf data)");
-    assert_eq!(unsupported.0, 2);
-    assert!(
-        unsupported
-            .2
-            .contains("supported only as an input redirection"),
-        "{}",
-        unsupported.2
+    assert_eq!(
+        run("cat <(printf data); printf streamed | tee >(cat > /captured) > /dev/null; cat /captured"),
+        (0, "datastreamed".into(), String::new())
+    );
+}
+
+#[test]
+fn failed_process_substitution_preparation_removes_temporary_files() {
+    let mut environment = Environment::new();
+    let (outcome, _, _) = environment.run_script_capture("cat >(cat > /captured) <(if)");
+    assert_ne!(outcome.exit_status, 0);
+    assert!(environment
+        .vfs
+        .walk("/tmp")
+        .iter()
+        .all(|path| !path.contains(".shellsim-process-substitution-")));
+}
+
+#[test]
+fn extended_redirection_operators_match_common_shell_idioms() {
+    assert_eq!(
+        run("missing-one &> /log; missing-two &>> /log; cat /log"),
+        (
+            0,
+            "missing-one: command not found\nmissing-two: command not found\n".into(),
+            String::new(),
+        )
+    );
+    assert_eq!(
+        run(
+            "missing-command |& cat; printf copied | cat 3<&0 <&3; printf kept >| /file; cat /file"
+        ),
+        (
+            0,
+            "missing-command: command not found\ncopiedkept".into(),
+            String::new(),
+        )
+    );
+    assert_eq!(
+        run("printf original > /rw; read value 3<>/rw <&3; printf %s \"$value\""),
+        (0, "original".into(), String::new())
     );
 }
 

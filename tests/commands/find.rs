@@ -56,7 +56,7 @@ fn depth_path_and_nul_printing_match_common_find_usage() {
 fn unsupported_or_invalid_predicates_fail_before_walking() {
     let mut environment = Environment::new();
     for (source, expected) in [
-        ("find . -exec echo {} ';'", "unsupported predicate"),
+        ("find . -printf '%p\\n'", "unsupported predicate"),
         ("find . \\( -name x", "missing ')'"),
         ("find . -maxdepth nope", "invalid argument"),
     ] {
@@ -78,4 +78,76 @@ fn find_output_obeys_the_environment_limit() {
     );
     assert_eq!(outcome.exit_status, 137);
     assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
+}
+
+#[test]
+fn metadata_predicates_and_delete_cover_common_cleanup_usage() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "mkdir -p root/empty root/full; : > root/zero; printf data > root/full/data; chmod 600 root/full/data; find root -empty -print; find root -type f -size 4c -perm 600; find root/empty -delete; test ! -e root/empty",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"root/empty\nroot/zero\nroot/full/data\n");
+}
+
+#[test]
+fn size_units_round_nonempty_files_up() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "mkdir root; : > root/zero; printf x > root/one; find root -type f -size 1; find root -type f -size -1",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"root/one\nroot/zero\n");
+}
+
+#[test]
+fn failed_delete_is_an_operational_error() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "mkdir -p root/child; find root -maxdepth 0 -delete",
+    );
+    assert_eq!(status, 1);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("cannot delete 'root'"), "{stderr}");
+    assert!(stderr.contains("Directory not empty"), "{stderr}");
+}
+
+#[test]
+fn virtual_age_predicates_use_elapsed_simulated_time() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "mkdir root; touch root/old; sleep 61; touch root/new; find root -type f -mmin +0; find root -type f -mmin 0",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"root/old\nroot/new\n");
+}
+
+#[test]
+fn exec_dispatches_modeled_commands_immediately_or_in_a_batch() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        r"mkdir root; touch root/a root/b; find root -type f -exec printf '<%s>' {} \;; echo; find root -type f -exec printf '[%s]' {} +; echo; find root -type f -exec false \; -print",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"<root/a><root/b>\n[root/a][root/b]\n");
+}
+
+#[test]
+fn malformed_exec_forms_fail_during_expression_parsing() {
+    let mut environment = Environment::new();
+    for source in [
+        "find . -exec echo {}",
+        "find . -exec +",
+        "find . -exec echo +",
+    ] {
+        let (status, stdout, stderr) = run(&mut environment, source);
+        assert_eq!(status, 2, "{source}: {stderr}");
+        assert!(stdout.is_empty(), "{source}");
+        assert!(stderr.contains("find:"), "{source}: {stderr}");
+    }
 }
