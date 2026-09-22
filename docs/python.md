@@ -31,11 +31,14 @@ support `yield`, `yield from`, `send`, `throw`, and `close`, including suspensio
 `with` regions. Generator shutdown uses a deliberately simple bounded drain through pending
 cleanup code.
 
+User-defined exception subclasses preserve inherited constructor arguments, including compatible
+`args`, `str`, and `repr` behavior.
+
 `async def`, `await`, `async with`, and `async for` run on a deterministic cooperative scheduler.
 The bundled `asyncio` surface includes task creation and introspection, `gather`, `wait`,
-`as_completed`, `shield`, virtual-time sleeps and timeout contexts, task groups, events, bounded
-FIFO, priority, and LIFO queues with work tracking, locks, semaphores, conditions, and modeled
-subprocesses. `create_subprocess_exec` and
+`as_completed`, `shield`, futures, deterministic callback and timer scheduling, virtual-time sleeps
+and timeout contexts, task groups, events, bounded FIFO, priority, and LIFO queues with work
+tracking, locks, semaphores, conditions, and modeled subprocesses. `create_subprocess_exec` and
 `create_subprocess_shell` provide byte-oriented stdin, stdout, and stderr streams with cooperative
 pipe backpressure, `wait`, `communicate`, signals, cancellation, and virtual-time timeouts. Task
 failures cross `await` with their Python exception type, and cancellation or timeout resumes the

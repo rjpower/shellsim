@@ -31,6 +31,14 @@ class Child(Base):
         return super().describe() + " Child"
 
 
+class ParentError(Exception):
+    pass
+
+
+class ChildError(ParentError):
+    pass
+
+
 class Reflected:
     def __radd__(self, left):
         return left + 10
@@ -89,6 +97,26 @@ def test_descriptors_and_super_share_the_mro():
     assert value.value == 9
     assert value.describe() == "Base Child"
     assert Child.describe(value) == "Base Child"
+
+
+def test_exception_subclasses_inherit_argument_storage_and_rendering():
+    empty = ParentError()
+    single = ParentError("boom")
+    multiple = ChildError("bad", 7)
+    assert empty.args == ()
+    assert str(empty) == ""
+    assert repr(empty) == "ParentError()"
+    assert single.args == ("boom",)
+    assert str(single) == "boom"
+    assert repr(single) == "ParentError('boom')"
+    assert multiple.args == ("bad", 7)
+    assert str(multiple) == "('bad', 7)"
+    assert repr(multiple) == "ChildError('bad', 7)"
+
+    try:
+        raise multiple
+    except ParentError as observed:
+        assert observed is multiple
 
 
 def test_metaclass_hooks_use_the_shared_allocator():

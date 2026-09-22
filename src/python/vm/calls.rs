@@ -200,6 +200,7 @@ impl Vm<'_> {
                     name,
                     metaclass,
                     layout,
+                    exception_base,
                     is_dataclass,
                     dataclass_fields,
                     enum_members,
@@ -339,6 +340,16 @@ impl Vm<'_> {
                         payload,
                         attributes: InstanceAttributes::default(),
                     })?;
+                    if exception_base.is_some() {
+                        let exception_args =
+                            self.allocate_object(Object::Tuple(arguments.clone()))?;
+                        self.state.heap.insert_attribute(
+                            instance.object_id().expect("instances are heap objects"),
+                            "args".into(),
+                            exception_args,
+                            &mut self.interp.resources,
+                        )?;
+                    }
                     if is_dataclass {
                         let mut values = Vec::new();
                         for (index, (field, default)) in dataclass_fields.iter().enumerate() {
@@ -428,7 +439,10 @@ impl Vm<'_> {
                                 unreachable!("immediate initializer cannot suspend")
                             }
                         }
+                    } else if exception_base.is_some() && !keyword_arguments.is_empty() {
+                        return Err(format!("{name}() does not accept keyword arguments"));
                     } else if layout == ClassLayout::Object
+                        && exception_base.is_none()
                         && (!arguments.is_empty() || !keyword_arguments.is_empty())
                     {
                         return Err(format!("{name}() takes no arguments"));
