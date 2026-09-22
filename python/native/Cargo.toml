@@ -2,7 +2,7 @@
 
 [package]
 name = "shellsim-python-bindings"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 description = "Python bindings for shellsim"
 license = "Apache-2.0"
