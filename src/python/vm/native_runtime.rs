@@ -62,6 +62,36 @@ fn validate_array_layout(layout: &PyArrayLayout, storage_len: usize) -> PyResult
     Ok(())
 }
 
+fn wait_reason_ready(
+    interp: &crate::interp::Interp,
+    reason: &crate::scheduler::WaitReason,
+    now: u64,
+) -> bool {
+    use crate::scheduler::WaitReason;
+
+    match reason {
+        WaitReason::Timer(deadline) => *deadline <= now,
+        WaitReason::InputReadable(description) => interp.descriptors.input_readable(*description),
+        WaitReason::PipeReadable(pipe) => interp.descriptors.pipe_readable(*pipe),
+        WaitReason::PipeWritable(pipe) => interp.descriptors.pipe_writable(*pipe),
+        WaitReason::Child(pid) | WaitReason::ChildActivity(pid) => matches!(
+            interp.processes.get(*pid).map(|record| record.status),
+            Some(crate::process::ProcessStatus::Exited(_))
+        ),
+        WaitReason::ChildDeadline(pid, deadline)
+        | WaitReason::ChildActivityDeadline(pid, deadline) => {
+            *deadline <= now
+                || matches!(
+                    interp.processes.get(*pid).map(|record| record.status),
+                    Some(crate::process::ProcessStatus::Exited(_))
+                )
+        }
+        WaitReason::Any(reasons) => reasons
+            .iter()
+            .any(|reason| wait_reason_ready(interp, reason, now)),
+    }
+}
+
 impl PyRuntime for Vm<'_> {
     fn reserve_memory(&mut self, bytes: usize) -> PyResult<()> {
         self.reserve_result(bytes).map_err(PyError::resource_error)
@@ -1766,6 +1796,12 @@ impl PyRuntime for Vm<'_> {
             ));
         }
         let now = self.interp.clock.monotonic_ns();
+        if reasons
+            .iter()
+            .any(|reason| wait_reason_ready(self.interp, reason, now))
+        {
+            return Ok(());
+        }
         self.execution
             .async_timer_deadlines
             .retain(|deadline| *deadline > now);

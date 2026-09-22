@@ -221,3 +221,30 @@ asyncio.run(main())
     assert_eq!(String::from_utf8(stdout).unwrap(), "0 100000 None\n");
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn task_group_failure_cancels_unfinished_siblings() {
+    let source = r#"import asyncio
+events = []
+async def blocked():
+    try:
+        await asyncio.Event().wait()
+    finally:
+        events.append("cleaned")
+async def fail():
+    await asyncio.sleep(0)
+    raise ValueError("boom")
+async def main():
+    try:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(blocked())
+            group.create_task(fail())
+    except ValueError as error:
+        print(str(error))
+asyncio.run(main())
+print(events)
+"#;
+    let (status, stdout, stderr) = run_python_text(source);
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "boom\n['cleaned']\n");
+}

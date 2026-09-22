@@ -194,6 +194,34 @@ impl DescriptorArena {
         })
     }
 
+    /// Whether retrying a blocked input read can now make progress.
+    pub(crate) fn input_readable(&self, id: DescriptionId) -> bool {
+        self.descriptions
+            .get(&id)
+            .is_some_and(|entry| match &entry.description {
+                OpenDescription::Input {
+                    bytes,
+                    cursor,
+                    closed,
+                } => *cursor < bytes.len() || *closed,
+                _ => false,
+            })
+    }
+
+    /// Whether retrying a blocked pipe read can now return bytes or EOF.
+    pub(crate) fn pipe_readable(&self, id: PipeId) -> bool {
+        self.pipes
+            .get(&id)
+            .is_some_and(|pipe| !pipe.bytes.is_empty() || pipe.writers == 0)
+    }
+
+    /// Whether retrying a blocked pipe write can now write or report a closed reader.
+    pub(crate) fn pipe_writable(&self, id: PipeId) -> bool {
+        self.pipes
+            .get(&id)
+            .is_some_and(|pipe| pipe.readers == 0 || pipe.bytes.len() < pipe.capacity)
+    }
+
     /// Append explicitly supplied bytes to a streaming input description.
     pub fn append_input(&mut self, id: DescriptionId, input: &[u8]) -> Result<(), DescriptorError> {
         let entry = self
