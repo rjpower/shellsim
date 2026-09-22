@@ -1,6 +1,6 @@
 [package]
 name = "shellsim"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 description = "In-process BusyBox-like environment for RL rollouts and agent tests"
 license = "Apache-2.0"
