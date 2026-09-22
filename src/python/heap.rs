@@ -202,13 +202,14 @@ pub enum Object {
         exhausted: bool,
     },
     /// A suspended Python generator frame. The bytecode is immutable; the instruction pointer,
-    /// exception-handler stack, and lexical scope are the complete resumable state.
+    /// exception state, and lexical scope are the complete resumable state.
     Generator {
         name: String,
         code: CodeRef,
         scope: ScopeId,
         instruction_pointer: usize,
         handlers: Vec<(usize, usize)>,
+        exceptions: Vec<(String, Value)>,
         stack: Vec<Value>,
         exhausted: bool,
         running: bool,
@@ -1433,11 +1434,13 @@ fn trace_object(
         }
         Object::Generator {
             scope,
+            exceptions,
             stack,
             return_value,
             ..
         } => {
             scope_work.push(*scope);
+            trace_values(exceptions.iter().map(|(_, value)| *value), object_work);
             trace_values(stack.iter().copied(), object_work);
             trace_value(*return_value, object_work);
         }
@@ -1566,12 +1569,14 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             name,
             code,
             handlers,
+            exceptions,
             stack,
             ..
         } => name
             .len()
             .checked_add(code.instructions.len())
             .and_then(|size| size.checked_add(handlers.len()))
+            .and_then(|size| size.checked_add(exceptions.len()))
             .and_then(|size| size.checked_add(stack.len()))
             .ok_or("modeled object size overflow")?,
         Object::Module { name, .. } => name.len(),

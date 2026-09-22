@@ -980,3 +980,119 @@ def test_semaphore_and_condition_coordinate_waiters_in_fifo_order():
     assert events.index("a exit") < events.index("b enter")
     assert events.index("b enter") < events.index("b exit")
     assert events.count("condition ready") == 1
+
+
+def test_run_cancels_pending_tasks_and_allows_async_cleanup():
+    events = []
+
+    async def worker():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            await asyncio.sleep(0)
+            events.append("async cleanup")
+        finally:
+            events.append("finally")
+
+    async def main():
+        asyncio.create_task(worker())
+        await asyncio.sleep(0)
+        events.append("main returned")
+
+    asyncio.run(main())
+    assert events == ["main returned", "cancelled", "async cleanup", "finally"], events
+
+
+def test_run_cleans_up_pending_tasks_when_main_raises():
+    events = []
+
+    async def worker():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("worker closed")
+
+    async def main():
+        asyncio.create_task(worker())
+        await asyncio.sleep(0)
+        raise ValueError("root failure")
+
+    try:
+        asyncio.run(main())
+    except ValueError as error:
+        assert str(error) == "root failure", str(error)
+    else:
+        raise AssertionError("asyncio.run must preserve the root exception")
+    assert events == ["worker closed"], events
+
+
+def test_run_cancels_nested_pending_tasks_once_and_waits_for_both():
+    events = []
+
+    async def child():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("child closed")
+
+    async def parent():
+        try:
+            await child()
+        finally:
+            events.append("parent closed")
+
+    async def main():
+        asyncio.create_task(parent())
+        await asyncio.sleep(0)
+
+    asyncio.run(main())
+    assert events == ["child closed", "parent closed"]
+
+
+def test_run_cleans_up_siblings_when_main_is_cancelled():
+    events = []
+
+    async def worker():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("worker closed")
+
+    async def main():
+        asyncio.create_task(worker())
+        await asyncio.sleep(0)
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+
+    try:
+        asyncio.run(main())
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("asyncio.run must preserve main-task cancellation")
+    assert events == ["worker closed"]
+
+
+def test_run_closes_its_loop_and_successive_runs_are_isolated():
+    loops = []
+
+    async def identify():
+        loop = asyncio.get_running_loop()
+        loops.append(loop)
+        assert loop.is_running()
+        return len(asyncio.all_tasks())
+
+    assert asyncio.run(identify()) == 1
+    assert loops[0].is_closed()
+    assert not loops[0].is_running()
+    assert asyncio.run(identify()) == 1
+    assert loops[1].is_closed()
+    assert loops[0] is not loops[1]
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError as error:
+        assert str(error) == "no running event loop"
+    else:
+        raise AssertionError("the completed loop must not remain current")

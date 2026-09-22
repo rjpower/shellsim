@@ -45,9 +45,12 @@ failures cross `await` with their Python exception type, and cancellation or tim
 coroutine so `finally` cleanup runs. Task groups cancel unfinished siblings on failure and raise
 the first child error directly because the runtime does not yet model exception groups. Direct
 task cancellation follows nested awaits, while `shield` and `wait` preserve child tasks according
-to their asyncio contracts. The VM parks its logical Python process on the union of the timers,
-child states, and pipes awaited by its coroutines, then retries only inside the simulation when one
-becomes ready. Async sockets,
+to their asyncio contracts. `asyncio.run` cancels and awaits unfinished tasks, permits their
+asynchronous cleanup, shuts down its bounded loop facilities, and closes the loop even when the
+main coroutine fails. Suspended coroutines and generators retain their own active exception state,
+so cleanup and bare reraises cannot interfere across tasks. The VM parks its logical Python process
+on the union of the timers, child states, and pipes awaited by its coroutines, then retries only
+inside the simulation when one becomes ready. Native async generators, async sockets,
 executors, host threads, text-mode subprocess streams, and custom event loops are not exposed;
 synchronous calls made inside a coroutine retain their usual blocking behavior.
 

@@ -274,28 +274,38 @@ impl Vm<'_> {
         if self.call_depth >= MAX_GENERATOR_DEPTH {
             return Err("maximum recursion depth exceeded".into());
         }
-        let (code, scope, instruction_pointer, mut handlers, frame_stack, exhausted, running) =
-            match self.state.heap.get(id)?.clone() {
-                Object::Generator {
-                    code,
-                    scope,
-                    instruction_pointer,
-                    handlers,
-                    stack,
-                    exhausted,
-                    running,
-                    ..
-                } => (
-                    code,
-                    scope,
-                    instruction_pointer,
-                    handlers,
-                    stack,
-                    exhausted,
-                    running,
-                ),
-                _ => return Err("object is not a generator".into()),
-            };
+        let (
+            code,
+            scope,
+            instruction_pointer,
+            mut handlers,
+            exceptions,
+            frame_stack,
+            exhausted,
+            running,
+        ) = match self.state.heap.get(id)?.clone() {
+            Object::Generator {
+                code,
+                scope,
+                instruction_pointer,
+                handlers,
+                exceptions,
+                stack,
+                exhausted,
+                running,
+                ..
+            } => (
+                code,
+                scope,
+                instruction_pointer,
+                handlers,
+                exceptions,
+                stack,
+                exhausted,
+                running,
+            ),
+            _ => return Err("object is not a generator".into()),
+        };
         if exhausted {
             return Ok(None);
         }
@@ -313,11 +323,20 @@ impl Vm<'_> {
         if instruction_pointer != 0 {
             self.stack.push(sent);
         }
+        let generator_exceptions = exceptions
+            .into_iter()
+            .map(|(kind, value)| super::RaisedException { kind, value })
+            .collect();
+        let outer_exceptions = std::mem::replace(&mut self.exception_stack, generator_exceptions);
         self.local_scopes.push(scope);
         self.call_depth += 1;
         let result = self.execute_code_from(&code, instruction_pointer, &mut handlers, 0);
         self.call_depth -= 1;
         self.local_scopes.pop();
+        let generator_exceptions = std::mem::replace(&mut self.exception_stack, outer_exceptions)
+            .into_iter()
+            .map(|exception| (exception.kind, exception.value))
+            .collect();
         let frame_result_stack = std::mem::take(&mut self.stack);
         self.stack = outer_stack;
 
@@ -328,6 +347,7 @@ impl Vm<'_> {
                 if let Object::Generator {
                     instruction_pointer,
                     handlers: saved_handlers,
+                    exceptions: saved_exceptions,
                     stack: saved_stack,
                     running,
                     ..
@@ -335,6 +355,7 @@ impl Vm<'_> {
                 {
                     *instruction_pointer = next_instruction;
                     *saved_handlers = handlers;
+                    *saved_exceptions = generator_exceptions;
                     *saved_stack = frame_result_stack;
                     *running = false;
                 }
