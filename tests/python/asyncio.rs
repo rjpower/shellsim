@@ -109,3 +109,53 @@ print(events)
     assert_eq!(status, 0, "{stderr}");
     assert_eq!(stdout, "['a enter', 'a exit', 'b enter', 'b exit']\n");
 }
+
+#[test]
+fn task_exceptions_propagate_and_gather_can_return_them() {
+    let source = r#"import asyncio
+async def fail():
+    await asyncio.sleep(0)
+    raise ValueError("boom")
+async def main():
+    task = asyncio.create_task(fail())
+    try:
+        await task
+    except ValueError as error:
+        print(str(error))
+    results = await asyncio.gather(fail(), return_exceptions=True)
+    print(isinstance(results[0], ValueError))
+asyncio.run(main())
+"#;
+    let (status, stdout, stderr) = run_python_text(source);
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "boom\nTrue\n");
+}
+
+#[test]
+fn cancellation_and_wait_for_run_finally_cleanup() {
+    let source = r#"import asyncio
+events = []
+async def blocked(label):
+    try:
+        await asyncio.Event().wait()
+    finally:
+        events.append(label)
+async def main():
+    task = asyncio.create_task(blocked("cancel"))
+    await asyncio.sleep(0)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        print(task.done(), task.cancelled())
+    try:
+        await asyncio.wait_for(blocked("timeout"), 1)
+    except TimeoutError:
+        print("timed out")
+asyncio.run(main())
+print(events)
+"#;
+    let (status, stdout, stderr) = run_python_text(source);
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "True True\ntimed out\n['cancel', 'timeout']\n");
+}

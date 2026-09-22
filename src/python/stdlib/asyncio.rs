@@ -34,13 +34,8 @@ fn step(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     }
     let iterator = coroutine.cast::<PyIterator>(runtime)?;
     let sent = args.positional()[1];
-    match runtime.generator_send(iterator, sent)? {
-        Some(value) => runtime.new_tuple(vec![Value::Bool(false), value]),
-        None => {
-            let value = runtime.generator_return_value(iterator)?;
-            runtime.new_tuple(vec![Value::Bool(true), value])
-        }
-    }
+    let (status, value) = runtime.coroutine_step(iterator, sent)?;
+    runtime.new_tuple(vec![Value::Int(i64::from(status)), value])
 }
 
 fn is_coroutine(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {

@@ -1018,6 +1018,26 @@ impl PyRuntime for Vm<'_> {
         }
     }
 
+    fn coroutine_step(&mut self, coroutine: PyIterator, value: Value) -> PyResult<(u8, Value)> {
+        let id = coroutine.object_id();
+        if !matches!(
+            self.state.heap.get(id).map_err(PyError::runtime_error)?,
+            Object::Generator { .. }
+        ) {
+            return Err(PyError::type_error("expected a coroutine"));
+        }
+        match self.resume_generator_with(id, value) {
+            Ok(Some(value)) => Ok((0, value)),
+            Ok(None) => self
+                .generator_return_value(coroutine)
+                .map(|value| (1, value)),
+            Err(error) => match self.pending_exception.take() {
+                Some(exception) => Ok((2, exception.value)),
+                None => Err(PyError::runtime_error(error)),
+            },
+        }
+    }
+
     fn generator_close(&mut self, generator: PyIterator) -> PyResult<()> {
         let id = generator.object_id();
         if !matches!(

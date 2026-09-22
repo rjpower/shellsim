@@ -216,8 +216,30 @@ def test_async_context_managers_and_iterators_follow_protocols():
     async def main():
         async with Context() as value:
             assert value == "value"
-            observed = [item async for item in Values()]
+            observed = []
+            async for item in Values():
+                observed.append(item)
         return observed
 
     assert asyncio.run(main()) == [0, 1, 2]
     assert events == ["enter", "exit"]
+
+
+def test_async_context_manager_can_suppress_an_exception():
+    events = []
+
+    class Context:
+        async def __aenter__(self):
+            events.append("enter")
+
+        async def __aexit__(self, kind, value, traceback):
+            events.append(kind is not None)
+            return True
+
+    async def main():
+        async with Context():
+            raise ValueError("suppressed")
+        events.append("continued")
+
+    asyncio.run(main())
+    assert events == ["enter", True, "continued"]

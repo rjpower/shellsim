@@ -62,7 +62,6 @@ fn builtins() {
 }
 
 #[test]
-#[ignore = "full asyncio compatibility target includes unsupported cancellation and protocols"]
 fn asyncio() {
     assert_source_suite("test_asyncio.py", ASYNCIO);
 }

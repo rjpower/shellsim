@@ -263,6 +263,7 @@ impl Vm<'_> {
                         instruction_pointer + 1,
                     )))
                 }
+                Opcode::AwaitResult => self.dispatch_await_result(),
                 Opcode::RuntimeError(error) => Err(code.error(error).to_owned()),
                 Opcode::Assert => self.dispatch_assert(),
                 Opcode::TryBegin(target) => {
@@ -316,6 +317,8 @@ impl Vm<'_> {
                 Opcode::WithEnter => self.dispatch_with_enter(),
                 Opcode::WithExit => self.dispatch_with_exit(),
                 Opcode::WithExitException => self.dispatch_with_exit_exception(),
+                Opcode::AsyncWithExitException => self.dispatch_async_with_exit_exception(),
+                Opcode::AsyncWithFinishException => self.dispatch_async_with_finish_exception(),
                 Opcode::PopExpression => self.dispatch_pop_expression(),
                 Opcode::Halt => {
                     if self.finish_deferred_frame(Value::None) {
@@ -413,6 +416,30 @@ impl Vm<'_> {
         Err("assertion failed".into())
     }
 
+    fn dispatch_await_result(&mut self) -> Result<DispatchControl, String> {
+        let outcome = self.pop()?;
+        let Some(id) = outcome.object_id() else {
+            return Err("invalid coroutine scheduler outcome".into());
+        };
+        let (success, value) = match self.state.heap.get(id)? {
+            super::super::heap::Object::Tuple(items) if items.len() == 2 => (items[0], items[1]),
+            _ => return Err("invalid coroutine scheduler outcome".into()),
+        };
+        if self.truth_value(&success)? {
+            self.stack.push(value);
+            return Ok(DispatchControl::Next);
+        }
+        let kind = if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, &value)? {
+            kind
+        } else if let Some(kind) = self.user_exception_kind(&value)? {
+            kind
+        } else {
+            return Err("coroutine scheduler injected a non-exception".into());
+        };
+        self.pending_exception = Some(RaisedException { kind, value });
+        Err("exception raised across await".into())
+    }
+
     #[cold]
     #[inline(never)]
     fn dispatch_raise(&mut self, has_value: bool) -> Result<DispatchControl, String> {
@@ -504,6 +531,44 @@ impl Vm<'_> {
         if self.truth_value(&result)? {
             self.pending_exception = None;
             self.exception_stack.pop();
+            Ok(DispatchControl::Next)
+        } else {
+            self.pending_exception = Some(exception);
+            Err("exception raised".into())
+        }
+    }
+
+    fn dispatch_async_with_exit_exception(&mut self) -> Result<DispatchControl, String> {
+        let context = self.pop()?;
+        self.pop()?;
+        let exception = self
+            .exception_stack
+            .last()
+            .cloned()
+            .ok_or("no active exception")?;
+        self.stack.push(context);
+        self.load_attribute("__aexit__")?;
+        let exception_kind = self.allocate_string(exception.kind)?;
+        self.stack
+            .extend([exception_kind, exception.value, Value::None]);
+        match self.call(3, &[], &[false, false, false], CallMode::Immediate)? {
+            CallResult::Value(value) => {
+                self.stack.push(value);
+                Ok(DispatchControl::Next)
+            }
+            CallResult::Exit(status) => Ok(DispatchControl::Complete(Execution::Exit(status))),
+            CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
+            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                unreachable!("immediate call cannot suspend")
+            }
+        }
+    }
+
+    fn dispatch_async_with_finish_exception(&mut self) -> Result<DispatchControl, String> {
+        let suppress = self.pop()?;
+        let exception = self.exception_stack.pop().ok_or("no active exception")?;
+        if self.truth_value(&suppress)? {
+            self.pending_exception = None;
             Ok(DispatchControl::Next)
         } else {
             self.pending_exception = Some(exception);

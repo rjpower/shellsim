@@ -224,9 +224,12 @@ pub enum Opcode {
     Reraise,
     Raise(bool),
     Yield,
+    AwaitResult,
     WithEnter,
     WithExit,
     WithExitException,
+    AsyncWithExitException,
+    AsyncWithFinishException,
     PopExpression,
     Halt,
 }
@@ -322,9 +325,13 @@ pub enum Operation {
     Raise(bool),
     /// Suspend a generator frame and return the value on top of the stack.
     Yield,
+    /// Unwrap the scheduler outcome sent into a suspended coroutine.
+    AwaitResult,
     WithEnter,
     WithExit,
     WithExitException,
+    AsyncWithExitException,
+    AsyncWithFinishException,
     PopExpression,
     Halt,
 }
@@ -490,9 +497,12 @@ impl CodeBuilder {
             Operation::Reraise => Opcode::Reraise,
             Operation::Raise(cause) => Opcode::Raise(cause),
             Operation::Yield => Opcode::Yield,
+            Operation::AwaitResult => Opcode::AwaitResult,
             Operation::WithEnter => Opcode::WithEnter,
             Operation::WithExit => Opcode::WithExit,
             Operation::WithExitException => Opcode::WithExitException,
+            Operation::AsyncWithExitException => Opcode::AsyncWithExitException,
+            Operation::AsyncWithFinishException => Opcode::AsyncWithFinishException,
             Operation::PopExpression => Opcode::PopExpression,
             Operation::Halt => Opcode::Halt,
         }

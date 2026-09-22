@@ -50,6 +50,12 @@ pub enum StatementKind {
         body: Vec<Statement>,
         otherwise: Vec<Statement>,
     },
+    AsyncFor {
+        target: AssignmentTarget,
+        iterable: Expression,
+        body: Vec<Statement>,
+        otherwise: Vec<Statement>,
+    },
     Function {
         name: String,
         parameters: Vec<Parameter>,
@@ -128,6 +134,7 @@ impl StatementKind {
             Self::If { .. }
                 | Self::While { .. }
                 | Self::For { .. }
+                | Self::AsyncFor { .. }
                 | Self::Function { .. }
                 | Self::Class { .. }
                 | Self::Decorated { .. }

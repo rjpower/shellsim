@@ -322,6 +322,65 @@ impl Compiler {
                 let finished = self.instructions.len();
                 self.finish_loop(finished);
             }
+            StatementKind::AsyncFor {
+                target,
+                iterable,
+                body,
+                otherwise,
+            } => {
+                let iterator_name =
+                    format!("$__shellsim_async_iterator_{}", self.instructions.len());
+                self.expression(iterable);
+                self.emit(Operation::LoadAttribute("__aiter__".into()), span);
+                self.emit(
+                    Operation::Call {
+                        positional: 0,
+                        keywords: Vec::new(),
+                        starred: Vec::new(),
+                    },
+                    span,
+                );
+                self.emit(Operation::StoreName(iterator_name.clone()), span);
+                let next = self.instructions.len();
+                let begin = self.emit(Operation::TryBegin(usize::MAX), span);
+                self.emit(Operation::LoadName(iterator_name), span);
+                self.emit(Operation::LoadAttribute("__anext__".into()), span);
+                self.emit(
+                    Operation::Call {
+                        positional: 0,
+                        keywords: Vec::new(),
+                        starred: Vec::new(),
+                    },
+                    span,
+                );
+                self.emit(Operation::Yield, span);
+                self.emit(Operation::AwaitResult, span);
+                self.emit(Operation::TryEnd, span);
+                self.store_target(target, span);
+                self.loops.push(LoopContext {
+                    continue_target: next,
+                    iterator_on_stack: false,
+                    finalizer_depth: self.finalizers.len(),
+                    breaks: Vec::new(),
+                });
+                self.statements(body);
+                self.emit(Operation::Jump(next), span);
+                let handler = self.instructions.len();
+                self.patch_try_begin(begin, handler);
+                self.emit(Operation::LoadName("StopAsyncIteration".into()), span);
+                self.emit(Operation::MatchException { typed: true }, span);
+                let rethrow = self.emit(Operation::PopJumpIfFalse(usize::MAX), span);
+                self.emit(Operation::PopTop, span);
+                self.emit(Operation::ClearException, span);
+                self.statements(otherwise);
+                let done = self.emit(Operation::Jump(usize::MAX), span);
+                self.patch_jump(rethrow, self.instructions.len());
+                self.emit(Operation::PopTop, span);
+                self.emit(Operation::Reraise, span);
+                let finished = self.instructions.len();
+                self.patch_jump(done, finished);
+                self.finish_loop(finished);
+            }
             StatementKind::Function {
                 name,
                 parameters,
@@ -684,13 +743,16 @@ impl Compiler {
                     span,
                 );
                 self.emit(Operation::Yield, span);
+                self.emit(Operation::AwaitResult, span);
                 if let Some(target) = target {
                     self.store_target(target, span);
                 } else {
                     self.emit(Operation::PopTop, span);
                 }
+                let begin = self.emit(Operation::TryBegin(usize::MAX), span);
                 self.statements(body);
-                self.emit(Operation::LoadName(context_name), span);
+                self.emit(Operation::TryEnd, span);
+                self.emit(Operation::LoadName(context_name.clone()), span);
                 self.emit(Operation::LoadAttribute("__aexit__".into()), span);
                 for _ in 0..3 {
                     self.emit(Operation::LoadConstant(Constant::None), span);
@@ -704,7 +766,17 @@ impl Compiler {
                     span,
                 );
                 self.emit(Operation::Yield, span);
+                self.emit(Operation::AwaitResult, span);
                 self.emit(Operation::PopTop, span);
+                let done = self.emit(Operation::Jump(usize::MAX), span);
+                let handler = self.instructions.len();
+                self.patch_try_begin(begin, handler);
+                self.emit(Operation::LoadName(context_name), span);
+                self.emit(Operation::AsyncWithExitException, span);
+                self.emit(Operation::Yield, span);
+                self.emit(Operation::AwaitResult, span);
+                self.emit(Operation::AsyncWithFinishException, span);
+                self.patch_jump(done, self.instructions.len());
             }
         }
     }
@@ -1026,6 +1098,7 @@ impl Compiler {
                 } else {
                     self.expression(*value);
                     self.emit(Operation::Yield, span);
+                    self.emit(Operation::AwaitResult, span);
                 }
             }
             ExpressionKind::Attribute { value, name } => {

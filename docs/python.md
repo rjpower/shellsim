@@ -31,6 +31,14 @@ support `yield`, `yield from`, `send`, `throw`, and `close`, including suspensio
 `with` regions. Generator shutdown uses a deliberately simple bounded drain through pending
 cleanup code.
 
+`async def`, `await`, `async with`, and `async for` run on a deterministic cooperative scheduler.
+The bundled `asyncio` surface includes `run`, `create_task`, `gather`, `sleep`, `wait_for`, tasks,
+events, queues, and locks. Task failures cross `await` with their Python exception type, and
+cancellation or timeout resumes the coroutine so `finally` cleanup runs. Logical sleep durations
+control timer ordering without consuming host time. Async sockets, subprocess streams, executors,
+and host-thread APIs are not exposed; synchronous calls made inside a coroutine retain their usual
+blocking behavior.
+
 The bounded `pytest` runner supports ordinary and yield fixtures, fixture dependencies, literal
 `@pytest.mark.parametrize` cases, `tmp_path`/`tmpdir`, skip markers, `pytest.raises`, and explicit
 test files. Fixture scopes and dynamic parametrization remain outside this small runner. `unittest`

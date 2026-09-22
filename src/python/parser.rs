@@ -91,8 +91,10 @@ impl Parser {
             self.separators();
         }
         let is_async = self.take(|kind| matches!(kind, TokenKind::Async)).is_some();
-        if is_async && !self.at(|kind| matches!(kind, TokenKind::Def | TokenKind::With)) {
-            return Err(self.error("expected 'def' or 'with' after 'async'"));
+        if is_async
+            && !self.at(|kind| matches!(kind, TokenKind::Def | TokenKind::For | TokenKind::With))
+        {
+            return Err(self.error("expected 'def', 'for', or 'with' after 'async'"));
         }
         let kind = if self.take(|kind| matches!(kind, TokenKind::If)).is_some() {
             self.if_statement(start)?
@@ -188,11 +190,20 @@ impl Parser {
             } else {
                 Vec::new()
             };
-            StatementKind::For {
-                target,
-                iterable,
-                body,
-                otherwise,
+            if is_async {
+                StatementKind::AsyncFor {
+                    target,
+                    iterable,
+                    body,
+                    otherwise,
+                }
+            } else {
+                StatementKind::For {
+                    target,
+                    iterable,
+                    body,
+                    otherwise,
+                }
             }
         } else if self.take(|kind| matches!(kind, TokenKind::Def)).is_some() {
             let name = self.name("expected a function name after 'def'")?;

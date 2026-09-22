@@ -6,6 +6,10 @@ from _asyncio import _is_coroutine, _step
 _running_loop = None
 
 
+class CancelledError(Exception):
+    pass
+
+
 class _Sleep:
     def __init__(self, delay):
         self.delay = delay
@@ -26,6 +30,19 @@ class _LockWait:
         self.lock = lock
 
 
+class _WaitFor:
+    def __init__(self, task, timeout):
+        self.task = task
+        self.timeout = timeout
+
+
+class _TimeoutWait:
+    def __init__(self, parent, child):
+        self.parent = parent
+        self.child = child
+        self.timed_out = False
+
+
 class Task:
     def __init__(self, coroutine, loop):
         if not _is_coroutine(coroutine):
@@ -38,6 +55,8 @@ class Task:
         self._exception = None
         self._waiters = []
         self._send_value = None
+        self._started = False
+        self._waiting_on = None
 
     def done(self):
         return self._done
@@ -51,6 +70,12 @@ class Task:
         if self._exception is not None:
             raise self._exception
         return self._result
+
+    def cancel(self):
+        if self._done:
+            return False
+        self._loop._cancel(self)
+        return True
 
 
 class Event:
@@ -153,8 +178,23 @@ class _Loop:
         return task
 
     def _schedule(self, task, value):
-        task._send_value = value
-        self._ready.append(task)
+        if not task._done:
+            task._send_value = (True, value)
+            self._ready.append(task)
+
+    def _schedule_failure(self, task, error):
+        if not task._done:
+            task._send_value = (False, error)
+            self._ready.append(task)
+
+    def _cancel(self, task):
+        if not task._started:
+            task._done = True
+            task._cancelled = True
+            task._exception = CancelledError()
+            self._wake_waiters(task)
+        else:
+            self._schedule_failure(task, CancelledError())
 
     def _sleep(self, task, delay):
         if delay <= 0:
@@ -164,29 +204,57 @@ class _Loop:
 
     def _wake_next_timers(self):
         deadline = self._timers[0][0]
-        for timer_deadline, task in self._timers:
+        for timer_deadline, timer in self._timers:
             if timer_deadline < deadline:
                 deadline = timer_deadline
         self._time = deadline
         pending = []
-        for timer_deadline, task in self._timers:
+        for timer_deadline, timer in self._timers:
             if timer_deadline <= deadline:
-                self._schedule(task, None)
+                if isinstance(timer, _TimeoutWait):
+                    if timer.parent._waiting_on is timer:
+                        timer.timed_out = True
+                        timer.child.cancel()
+                else:
+                    self._schedule(timer, None)
             else:
-                pending.append((timer_deadline, task))
+                pending.append((timer_deadline, timer))
         self._timers = pending
+
+    def _wake_waiters(self, task):
+        waiters = task._waiters
+        task._waiters = []
+        for waiter in waiters:
+            if isinstance(waiter, _TimeoutWait):
+                waiter.parent._waiting_on = None
+                if waiter.timed_out:
+                    self._schedule_failure(waiter.parent, TimeoutError())
+                elif task._exception is not None:
+                    self._schedule_failure(waiter.parent, task._exception)
+                else:
+                    self._schedule(waiter.parent, task._result)
+            elif task._exception is not None:
+                self._schedule_failure(waiter, task._exception)
+            else:
+                self._schedule(waiter, task._result)
 
     def _finish(self, task, result):
         task._done = True
         task._result = result
-        waiters = task._waiters
-        task._waiters = []
-        for waiter in waiters:
-            self._schedule(waiter, result)
+        self._wake_waiters(task)
+
+    def _fail(self, task, error):
+        task._done = True
+        task._exception = error
+        task._cancelled = isinstance(error, CancelledError)
+        self._wake_waiters(task)
 
     def _block_on_task(self, task, awaited):
         if awaited._done:
-            self._schedule(task, awaited.result())
+            if awaited._exception is not None:
+                self._schedule_failure(task, awaited._exception)
+            else:
+                self._schedule(task, awaited._result)
         else:
             awaited._waiters.append(task)
 
@@ -207,6 +275,14 @@ class _Loop:
                 awaited.queue._getters.append(task)
         elif isinstance(awaited, _LockWait):
             awaited.lock._waiters.append(task)
+        elif isinstance(awaited, _WaitFor):
+            if awaited.task._done:
+                self._block_on_task(task, awaited.task)
+            else:
+                timeout = _TimeoutWait(task, awaited.task)
+                task._waiting_on = timeout
+                awaited.task._waiters.append(timeout)
+                self._timers.append((self._time + awaited.timeout, timeout))
         elif _is_coroutine(awaited):
             self._block_on_task(task, self.create_task(awaited))
         else:
@@ -221,10 +297,15 @@ class _Loop:
                 else:
                     raise RuntimeError("asyncio deadlock: no runnable tasks")
             task = self._ready.pop(0)
-            done, value = _step(task._coroutine, task._send_value)
+            if task._done:
+                continue
+            task._started = True
+            status, value = _step(task._coroutine, task._send_value)
             task._send_value = None
-            if done:
+            if status == 1:
                 self._finish(task, value)
+            elif status == 2:
+                self._fail(task, value)
             else:
                 self._dispatch_yield(task, value)
         return root.result()
@@ -261,6 +342,14 @@ async def gather(*coroutines, return_exceptions=False):
                 raise
             results.append(error)
     return results
+
+
+async def wait_for(awaitable, timeout):
+    if isinstance(awaitable, Task):
+        task = awaitable
+    else:
+        task = create_task(awaitable)
+    return await _WaitFor(task, timeout)
 
 
 def run(coroutine):
