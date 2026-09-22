@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "shellsim"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "base64",
  "crc32fast",
