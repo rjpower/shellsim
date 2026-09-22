@@ -32,16 +32,18 @@ support `yield`, `yield from`, `send`, `throw`, and `close`, including suspensio
 cleanup code.
 
 `async def`, `await`, `async with`, and `async for` run on a deterministic cooperative scheduler.
-The bundled `asyncio` surface includes `run`, `create_task`, `gather`, `sleep`, `wait_for`, tasks,
-events, queues, locks, and modeled subprocesses. `create_subprocess_exec` and
+The bundled `asyncio` surface includes task creation and introspection, `gather`, `wait`,
+`as_completed`, `shield`, virtual-time sleeps and timeouts, task groups, events, queues, locks,
+semaphores, conditions, and modeled subprocesses. `create_subprocess_exec` and
 `create_subprocess_shell` provide byte-oriented stdin, stdout, and stderr streams with cooperative
 pipe backpressure, `wait`, `communicate`, signals, cancellation, and virtual-time timeouts. Task
 failures cross `await` with their Python exception type, and cancellation or timeout resumes the
-coroutine so `finally` cleanup runs. The VM parks its logical Python process on the union of the
-timers, child states, and pipes awaited by its coroutines, then retries only inside the simulation
-when one becomes ready. Async sockets, executors, host threads, text-mode subprocess streams, and
-custom event loops are not exposed; synchronous calls made inside a coroutine retain their usual
-blocking behavior.
+coroutine so `finally` cleanup runs. Task groups cancel unfinished siblings on failure and raise
+the first child error directly because the runtime does not yet model exception groups. The VM
+parks its logical Python process on the union of the timers, child states, and pipes awaited by its
+coroutines, then retries only inside the simulation when one becomes ready. Async sockets,
+executors, host threads, text-mode subprocess streams, and custom event loops are not exposed;
+synchronous calls made inside a coroutine retain their usual blocking behavior.
 
 The bounded `pytest` runner supports ordinary and yield fixtures, fixture dependencies, literal
 `@pytest.mark.parametrize` cases, `tmp_path`/`tmpdir`, skip markers, `pytest.raises`, and explicit

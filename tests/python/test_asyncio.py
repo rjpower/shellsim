@@ -329,3 +329,150 @@ def test_wait_for_none_disables_the_timeout():
         return 42
 
     assert asyncio.run(asyncio.wait_for(value(), None)) == 42
+
+
+def test_wait_supports_completion_modes_and_non_destructive_timeouts():
+    async def delayed(value, delay):
+        await asyncio.sleep(delay)
+        return value
+
+    async def main():
+        slow = asyncio.create_task(delayed("slow", 2))
+        fast = asyncio.create_task(delayed("fast", 1))
+        done, pending = await asyncio.wait({slow, fast}, return_when=asyncio.FIRST_COMPLETED)
+        assert len(done) == 1
+        assert next(iter(done)).result() == "fast"
+        assert pending == {slow}
+
+        done, pending = await asyncio.wait({slow}, timeout=0)
+        assert done == set()
+        assert pending == {slow}
+        assert not slow.cancelled()
+        return await slow
+
+    assert asyncio.run(main()) == "slow"
+
+
+def test_as_completed_yields_results_in_completion_order():
+    async def delayed(value, delay):
+        await asyncio.sleep(delay)
+        return value
+
+    async def main():
+        results = []
+        for result in asyncio.as_completed([delayed("last", 0.003), delayed("first", 0.001), delayed("middle", 0.002)]):
+            results.append(await result)
+        return results
+
+    assert asyncio.run(main()) == ["first", "middle", "last"]
+
+
+def test_shield_keeps_the_inner_task_alive_when_its_waiter_is_cancelled():
+    events = []
+
+    async def main():
+        release = asyncio.Event()
+
+        async def inner():
+            await release.wait()
+            events.append("inner finished")
+            return 42
+
+        inner_task = asyncio.create_task(inner())
+
+        async def outer():
+            return await asyncio.shield(inner_task)
+
+        outer_task = asyncio.create_task(outer())
+        await asyncio.sleep(0)
+        outer_task.cancel()
+        try:
+            await outer_task
+        except asyncio.CancelledError:
+            pass
+        release.set()
+        assert await inner_task == 42
+        return inner_task.cancelled()
+
+    assert asyncio.run(main()) is False
+    assert events == ["inner finished"]
+
+
+def test_task_group_names_and_task_introspection():
+    async def worker(value):
+        assert asyncio.current_task() in asyncio.all_tasks()
+        await asyncio.sleep(0)
+        return value
+
+    async def main():
+        async with asyncio.TaskGroup() as group:
+            first = group.create_task(worker(1), name="first")
+            second = group.create_task(worker(2), name="second")
+            assert first.get_name() == "first"
+            second.set_name("renamed")
+            assert second.get_name() == "renamed"
+        return first.result() + second.result()
+
+    assert asyncio.run(main()) == 3
+
+
+def test_task_callbacks_and_cancellation_introspection():
+    observed = []
+
+    async def value():
+        return 42
+
+    async def main():
+        completed = asyncio.create_task(value())
+        completed.add_done_callback(lambda task: observed.append(task.result()))
+        assert await completed == 42
+        assert completed.exception() is None
+
+        cancelled = asyncio.create_task(value())
+        cancelled.add_done_callback(lambda task: observed.append(task.cancelled()))
+        assert cancelled.cancel()
+        try:
+            await cancelled
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0)
+        assert cancelled.cancelling() == 1
+        assert cancelled.uncancel() == 0
+
+    asyncio.run(main())
+    assert observed == [42, True]
+
+
+def test_semaphore_and_condition_coordinate_waiters_in_fifo_order():
+    events = []
+
+    async def main():
+        semaphore = asyncio.Semaphore(1)
+        condition = asyncio.Condition()
+        ready = False
+
+        async def serialized(name):
+            async with semaphore:
+                events.append(name + " enter")
+                await asyncio.sleep(0)
+                events.append(name + " exit")
+
+        async def consumer():
+            async with condition:
+                await condition.wait_for(lambda: ready)
+                events.append("condition ready")
+
+        async def producer():
+            nonlocal ready
+            await asyncio.sleep(0)
+            async with condition:
+                ready = True
+                condition.notify_all()
+
+        await asyncio.gather(serialized("a"), serialized("b"), consumer(), producer())
+
+    asyncio.run(main())
+    assert events.index("a enter") < events.index("a exit")
+    assert events.index("a exit") < events.index("b enter")
+    assert events.index("b enter") < events.index("b exit")
+    assert events.count("condition ready") == 1

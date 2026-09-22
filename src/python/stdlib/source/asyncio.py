@@ -15,6 +15,11 @@ from _asyncio import (
 
 _running_loop = None
 
+ALL_COMPLETED = "ALL_COMPLETED"
+FIRST_COMPLETED = "FIRST_COMPLETED"
+FIRST_EXCEPTION = "FIRST_EXCEPTION"
+TimeoutError = TimeoutError
+
 
 class CancelledError(Exception):
     pass
@@ -40,6 +45,16 @@ class _LockWait:
         self.lock = lock
 
 
+class _SemaphoreWait:
+    def __init__(self, semaphore):
+        self.semaphore = semaphore
+
+
+class _ConditionWait:
+    def __init__(self, condition):
+        self.condition = condition
+
+
 class _ResourceWait:
     def __init__(self, token):
         self.token = token
@@ -59,7 +74,7 @@ class _TimeoutWait:
 
 
 class Task:
-    def __init__(self, coroutine, loop):
+    def __init__(self, coroutine, loop, name=None):
         if not _is_coroutine(coroutine):
             raise TypeError("a coroutine was expected")
         self._coroutine = coroutine
@@ -72,6 +87,9 @@ class Task:
         self._send_value = None
         self._started = False
         self._waiting_on = None
+        self._name = name
+        self._callbacks = []
+        self._cancel_requests = 0
 
     def done(self):
         return self._done
@@ -86,9 +104,45 @@ class Task:
             raise self._exception
         return self._result
 
-    def cancel(self):
+    def exception(self):
+        if not self._done:
+            raise RuntimeError("task is not complete")
+        if self._cancelled:
+            raise CancelledError()
+        return self._exception
+
+    def get_coro(self):
+        return self._coroutine
+
+    def get_name(self):
+        return self._name
+
+    def set_name(self, name):
+        self._name = str(name)
+
+    def cancelling(self):
+        return self._cancel_requests
+
+    def uncancel(self):
+        if self._cancel_requests:
+            self._cancel_requests -= 1
+        return self._cancel_requests
+
+    def add_done_callback(self, callback, context=None):
+        if self._done:
+            callback(self)
+        else:
+            self._callbacks.append(callback)
+
+    def remove_done_callback(self, callback):
+        previous = len(self._callbacks)
+        self._callbacks = [item for item in self._callbacks if item is not callback]
+        return previous - len(self._callbacks)
+
+    def cancel(self, msg=None):
         if self._done:
             return False
+        self._cancel_requests += 1
         self._loop._cancel(self)
         return True
 
@@ -179,6 +233,137 @@ class Lock:
 
     async def __aexit__(self, kind, value, traceback):
         self.release()
+
+
+class Semaphore:
+    def __init__(self, value=1):
+        if value < 0:
+            raise ValueError("Semaphore initial value must be >= 0")
+        self._value = value
+        self._waiters = []
+
+    def locked(self):
+        return self._value == 0
+
+    async def acquire(self):
+        if self._value > 0:
+            self._value -= 1
+            return True
+        return await _SemaphoreWait(self)
+
+    def release(self):
+        if self._waiters:
+            task = self._waiters.pop(0)
+            task._loop._schedule(task, True)
+        else:
+            self._value += 1
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, kind, value, traceback):
+        self.release()
+
+
+class BoundedSemaphore(Semaphore):
+    def __init__(self, value=1):
+        super().__init__(value)
+        self._bound_value = value
+
+    def release(self):
+        if not self._waiters and self._value >= self._bound_value:
+            raise ValueError("BoundedSemaphore released too many times")
+        super().release()
+
+
+class Condition:
+    def __init__(self, lock=None):
+        self._lock = lock if lock is not None else Lock()
+        self._waiters = []
+
+    def locked(self):
+        return self._lock.locked()
+
+    async def acquire(self):
+        return await self._lock.acquire()
+
+    def release(self):
+        self._lock.release()
+
+    async def wait(self):
+        if not self.locked():
+            raise RuntimeError("cannot wait on un-acquired lock")
+        self.release()
+        try:
+            return await _ConditionWait(self)
+        finally:
+            await self.acquire()
+
+    async def wait_for(self, predicate):
+        result = predicate()
+        while not result:
+            await self.wait()
+            result = predicate()
+        return result
+
+    def notify(self, n=1):
+        if not self.locked():
+            raise RuntimeError("cannot notify on un-acquired lock")
+        for _ in range(min(n, len(self._waiters))):
+            task = self._waiters.pop(0)
+            task._loop._schedule(task, True)
+
+    def notify_all(self):
+        self.notify(len(self._waiters))
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, kind, value, traceback):
+        self.release()
+
+
+class TaskGroup:
+    def __init__(self):
+        self._tasks = []
+        self._entered = False
+
+    async def __aenter__(self):
+        self._entered = True
+        return self
+
+    def create_task(self, coroutine, name=None, context=None):
+        if not self._entered:
+            raise RuntimeError("TaskGroup has not been entered")
+        task = create_task(coroutine, name=name)
+        self._tasks.append(task)
+        return task
+
+    async def __aexit__(self, kind, value, traceback):
+        self._entered = False
+        if kind is not None:
+            for task in self._tasks:
+                task.cancel()
+            await gather(*self._tasks, return_exceptions=True)
+            return False
+        if not self._tasks:
+            return False
+        done, pending = await wait(self._tasks, return_when=FIRST_EXCEPTION)
+        failed = []
+        for task in self._tasks:
+            if task not in done:
+                continue
+            if not task.cancelled() and task.exception() is not None:
+                failed.append(task.exception())
+        if failed:
+            for task in pending:
+                task.cancel()
+            await gather(*pending, return_exceptions=True)
+            raise failed[0]
+        await gather(*pending)
+        return False
 
 
 class StreamReader:
@@ -299,9 +484,12 @@ class _Loop:
         self._ready = []
         self._timers = []
         self._resource_waiters = []
+        self._tasks = []
+        self._current = None
 
-    def create_task(self, coroutine):
-        task = Task(coroutine, self)
+    def create_task(self, coroutine, name=None):
+        task = Task(coroutine, self, name)
+        self._tasks.append(task)
         self._ready.append(task)
         return task
 
@@ -327,6 +515,7 @@ class _Loop:
             task._cancelled = True
             task._exception = CancelledError()
             self._wake_waiters(task)
+            self._run_done_callbacks(task)
         else:
             self._schedule_failure(task, CancelledError())
 
@@ -391,16 +580,27 @@ class _Loop:
             else:
                 self._schedule(waiter, task._result)
 
+    def _run_done_callbacks(self, task):
+        callbacks = task._callbacks
+        task._callbacks = []
+        for callback in callbacks:
+            try:
+                callback(task)
+            except Exception:
+                pass
+
     def _finish(self, task, result):
         task._done = True
         task._result = result
         self._wake_waiters(task)
+        self._run_done_callbacks(task)
 
     def _fail(self, task, error):
         task._done = True
         task._exception = error
         task._cancelled = isinstance(error, CancelledError)
         self._wake_waiters(task)
+        self._run_done_callbacks(task)
 
     def _block_on_task(self, task, awaited):
         if awaited._done:
@@ -428,6 +628,10 @@ class _Loop:
                 awaited.queue._getters.append(task)
         elif isinstance(awaited, _LockWait):
             awaited.lock._waiters.append(task)
+        elif isinstance(awaited, _SemaphoreWait):
+            awaited.semaphore._waiters.append(task)
+        elif isinstance(awaited, _ConditionWait):
+            awaited.condition._waiters.append(task)
         elif isinstance(awaited, _WaitFor):
             if awaited.task._done:
                 self._block_on_task(task, awaited.task)
@@ -456,7 +660,9 @@ class _Loop:
             if task._done:
                 continue
             task._started = True
+            self._current = task
             status, value = _step(task._coroutine, task._send_value)
+            self._current = None
             task._send_value = None
             if status == 1:
                 self._finish(task, value)
@@ -473,8 +679,30 @@ def get_running_loop():
     return _running_loop
 
 
-def create_task(coroutine):
-    return get_running_loop().create_task(coroutine)
+def create_task(coroutine, name=None, context=None):
+    return get_running_loop().create_task(coroutine, name)
+
+
+def ensure_future(awaitable):
+    return _ensure_task(awaitable)
+
+
+def current_task(loop=None):
+    if loop is None:
+        loop = get_running_loop()
+    return loop._current
+
+
+def all_tasks(loop=None):
+    if loop is None:
+        loop = get_running_loop()
+    return {task for task in loop._tasks if not task.done()}
+
+
+def _ensure_task(awaitable):
+    if isinstance(awaitable, Task):
+        return awaitable
+    return create_task(awaitable)
 
 
 async def sleep(delay, result=None):
@@ -483,12 +711,7 @@ async def sleep(delay, result=None):
 
 
 async def gather(*coroutines, return_exceptions=False):
-    tasks = []
-    for coroutine in coroutines:
-        if isinstance(coroutine, Task):
-            tasks.append(coroutine)
-        else:
-            tasks.append(create_task(coroutine))
+    tasks = [_ensure_task(coroutine) for coroutine in coroutines]
     results = []
     for task in tasks:
         try:
@@ -501,13 +724,98 @@ async def gather(*coroutines, return_exceptions=False):
 
 
 async def wait_for(awaitable, timeout):
-    if isinstance(awaitable, Task):
-        task = awaitable
-    else:
-        task = create_task(awaitable)
+    task = _ensure_task(awaitable)
     if timeout is None:
         return await task
     return await _WaitFor(task, timeout)
+
+
+def _wait_condition(tasks, return_when):
+    done = {task for task in tasks if task.done()}
+    if return_when == FIRST_COMPLETED:
+        return bool(done)
+    if return_when == FIRST_EXCEPTION:
+        for task in done:
+            if not task.cancelled() and task.exception() is not None:
+                return True
+        return len(done) == len(tasks)
+    return len(done) == len(tasks)
+
+
+async def wait(awaitables, timeout=None, return_when=ALL_COMPLETED):
+    if return_when not in (ALL_COMPLETED, FIRST_COMPLETED, FIRST_EXCEPTION):
+        raise ValueError("invalid return_when value")
+    tasks = []
+    for awaitable in awaitables:
+        if awaitable not in tasks:
+            tasks.append(awaitable)
+    if not tasks:
+        raise ValueError("Set of Tasks/Futures is empty")
+    for task in tasks:
+        if not isinstance(task, Task):
+            raise TypeError("Passing coroutines is forbidden, use tasks explicitly")
+    changed = Event()
+
+    def task_completed(task):
+        changed.set()
+
+    observed = [task for task in tasks if not task.done()]
+    for task in observed:
+        task.add_done_callback(task_completed)
+
+    async def wait_until_ready():
+        while not _wait_condition(tasks, return_when):
+            changed.clear()
+            if _wait_condition(tasks, return_when):
+                break
+            await changed.wait()
+
+    try:
+        if timeout is None:
+            await wait_until_ready()
+        else:
+            try:
+                await wait_for(wait_until_ready(), timeout)
+            except TimeoutError:
+                pass
+    finally:
+        for task in observed:
+            task.remove_done_callback(task_completed)
+    done = {task for task in tasks if task.done()}
+    return done, set(tasks) - done
+
+
+def as_completed(awaitables, timeout=None):
+    tasks = []
+    for awaitable in awaitables:
+        task = _ensure_task(awaitable)
+        if task not in tasks:
+            tasks.append(task)
+    completed = Queue()
+    deadline = None
+    if timeout is not None:
+        deadline = _monotonic_ns() + int(timeout * 1000000000)
+
+    def task_completed(task):
+        completed.put_nowait(task)
+
+    for task in tasks:
+        task.add_done_callback(task_completed)
+
+    async def next_result():
+        if deadline is None:
+            task = await completed.get()
+        else:
+            remaining = (deadline - _monotonic_ns()) / 1000000000
+            task = await wait_for(completed.get(), max(0, remaining))
+        return task.result()
+
+    for task in tasks:
+        yield next_result()
+
+
+async def shield(awaitable):
+    return await _ensure_task(awaitable)
 
 
 async def create_subprocess_exec(program, *args, stdin=None, stdout=None, stderr=None,
