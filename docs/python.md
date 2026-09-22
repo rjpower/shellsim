@@ -25,10 +25,17 @@ shellsim-python ./project/tests --pytest
 to frozen modules and the virtual filesystem.
 
 The runtime supports functions and closures, classes and descriptors, exceptions and context
-managers, comprehensions and generators, arbitrary-precision integers, mutable containers,
-f-strings, VFS imports, and the common language protocols needed by real scripts. `pytest` and
-`unittest` provide bounded runners for straightforward test files. Unsupported syntax and runner
-features produce an error rather than a false passing result.
+managers, comprehensions and lazy generators, arbitrary-precision integers, mutable containers,
+f-strings, VFS imports, and the common language protocols needed by real scripts. Generators
+support `yield`, `yield from`, `send`, `throw`, and `close`, including suspension in `try` and
+`with` regions. Generator shutdown uses a deliberately simple bounded drain through pending
+cleanup code.
+
+The bounded `pytest` runner supports ordinary and yield fixtures, fixture dependencies, literal
+`@pytest.mark.parametrize` cases, `tmp_path`/`tmpdir`, skip markers, `pytest.raises`, and explicit
+test files. Fixture scopes and dynamic parametrization remain outside this small runner. `unittest`
+supports straightforward test classes. Unsupported syntax and runner features produce an error
+rather than a false passing result.
 
 ## Runtime model
 

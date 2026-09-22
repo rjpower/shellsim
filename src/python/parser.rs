@@ -1431,6 +1431,13 @@ impl Parser {
             TokenKind::False => ExpressionKind::Constant(Constant::Bool(false)),
             TokenKind::Name(name) => ExpressionKind::Name(name),
             TokenKind::Yield => {
+                if self.take(|kind| matches!(kind, TokenKind::From)).is_some() {
+                    let value = self.expression()?;
+                    return Ok(Expression {
+                        kind: ExpressionKind::YieldFrom(Box::new(value)),
+                        span: token.span.through(self.previous().span),
+                    });
+                }
                 let value = if self.at(|kind| {
                     matches!(
                         kind,

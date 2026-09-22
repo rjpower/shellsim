@@ -51,17 +51,42 @@ fn assert_and_pytest_controls_have_expected_statuses() {
 }
 
 #[test]
-fn rejects_fixture_arguments_decorators_and_unknown_flags() {
-    let with_fixture = "def test_needs_fixture(tmp_path):\n    pass\n";
-    let (status, _stdout, stderr) = run_pytest(with_fixture, "pytest /test_sample.py");
-    assert_eq!(status, 2);
-    assert!(String::from_utf8_lossy(&stderr).contains("fixtures are unsupported"));
+fn runs_fixtures_parametrization_and_tmp_path() {
+    let source = r#"import pytest
+events = []
 
-    let decorated = "@fixture\ndef test_decorated():\n    pass\n";
-    let (status, _stdout, stderr) = run_pytest(decorated, "pytest /test_sample.py");
-    assert_eq!(status, 2);
-    assert!(String::from_utf8_lossy(&stderr).contains("decorators are unsupported"));
+@pytest.fixture
+def base():
+    return 3
 
+@pytest.fixture()
+def doubled(base):
+    yield base * 2
+    events.append("closed")
+
+@pytest.mark.parametrize("offset, expected", [(1, 7), (2, 8)])
+def test_math(doubled, offset, expected, tmp_path):
+    assert doubled + offset == expected
+    assert tmp_path.exists()
+
+def test_fixture_teardown():
+    assert events == ["closed", "closed"]
+
+@pytest.mark.skip(reason="later")
+def test_skipped_marker():
+    assert False
+"#;
+    let (status, stdout, stderr) = run_pytest(source, "pytest /test_sample.py");
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        stdout,
+        b"/test_sample.py::test_math[0] PASSED\n/test_sample.py::test_math[1] PASSED\n/test_sample.py::test_fixture_teardown PASSED\n/test_sample.py::test_skipped_marker SKIPPED\n"
+    );
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn rejects_unknown_flags() {
     let (status, _stdout, stderr) = run_pytest(
         "def test_ok():\n    pass\n",
         "pytest --bogus /test_sample.py",

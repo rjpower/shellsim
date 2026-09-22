@@ -617,6 +617,10 @@ impl Default for TypeRegistry {
             &super::stdlib::core::SET_TYPE,
         );
         install_native_methods(
+            &mut types[BuiltinType::Generator as usize],
+            &super::stdlib::core::GENERATOR_TYPE,
+        );
+        install_native_methods(
             &mut types[BuiltinType::Property as usize],
             &super::stdlib::core::PROPERTY_TYPE,
         );

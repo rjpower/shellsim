@@ -23,20 +23,20 @@ pub(crate) static RAISES_CONTEXT_TYPE: NativeTypeDef = NativeTypeDef {
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
-    name: "pytest",
+    name: "_pytest",
     functions: &[
         FunctionDef {
-            module: "pytest",
+            module: "_pytest",
             name: "fail",
             call: fail,
         },
         FunctionDef {
-            module: "pytest",
+            module: "_pytest",
             name: "skip",
             call: skip,
         },
         FunctionDef {
-            module: "pytest",
+            module: "_pytest",
             name: "raises",
             call: raises,
         },

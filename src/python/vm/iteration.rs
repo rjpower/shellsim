@@ -262,6 +262,14 @@ impl Vm<'_> {
         &mut self,
         id: super::super::heap::ObjectId,
     ) -> Result<Option<Value>, String> {
+        self.resume_generator_with(id, Value::None)
+    }
+
+    pub(super) fn resume_generator_with(
+        &mut self,
+        id: super::super::heap::ObjectId,
+        sent: Value,
+    ) -> Result<Option<Value>, String> {
         const MAX_GENERATOR_DEPTH: usize = 256;
         if self.call_depth >= MAX_GENERATOR_DEPTH {
             return Err("maximum recursion depth exceeded".into());
@@ -291,6 +299,9 @@ impl Vm<'_> {
         if exhausted {
             return Ok(None);
         }
+        if instruction_pointer == 0 && !sent.is_none() {
+            return Err("can't send non-None value to a just-started generator".into());
+        }
         if running {
             return Err("generator already executing".into());
         }
@@ -300,9 +311,7 @@ impl Vm<'_> {
         let outer_stack = std::mem::take(&mut self.stack);
         self.stack = frame_stack;
         if instruction_pointer != 0 {
-            // `next()` resumes a yield expression with None in this slice (send(value) is not
-            // exposed yet), which also supplies the value popped by a yield statement's wrapper.
-            self.stack.push(Value::None);
+            self.stack.push(sent);
         }
         self.local_scopes.push(scope);
         self.call_depth += 1;

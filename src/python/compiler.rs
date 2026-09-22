@@ -936,20 +936,12 @@ impl Compiler {
                 self.emit_dict_comprehension(*key, *value, clauses, span);
             }
             ExpressionKind::GeneratorExpression { element, clauses } => {
-                // The first implementation intentionally materializes generator expressions.
-                // It is still a separate function scope (like CPython's generator frame), and
-                // all iteration remains metered by the ordinary bytecode loop.
-                self.emit_comprehension(ComprehensionKind::List, *element, clauses, span);
+                self.emit_generator_expression(*element, clauses, span);
             }
             ExpressionKind::Yield(value) => {
                 if !self.in_function {
                     self.emit(
                         Operation::RuntimeError("'yield' outside function".into()),
-                        span,
-                    );
-                } else if let Some(region) = self.protected_regions.last() {
-                    self.emit(
-                        Operation::RuntimeError(format!("yield is not supported inside a {region} cleanup region; suspending here would lose exception or context-manager state")),
                         span,
                     );
                 } else {
@@ -959,6 +951,24 @@ impl Compiler {
                         self.emit(Operation::LoadConstant(Constant::None), span);
                     }
                     self.emit(Operation::Yield, span);
+                }
+            }
+            ExpressionKind::YieldFrom(value) => {
+                if !self.in_function {
+                    self.emit(
+                        Operation::RuntimeError("'yield from' outside function".into()),
+                        span,
+                    );
+                } else {
+                    self.expression(*value);
+                    self.emit(Operation::GetIterator, span);
+                    let next = self.emit(Operation::ForIterator(usize::MAX), span);
+                    self.emit(Operation::Yield, span);
+                    self.emit(Operation::PopTop, span);
+                    self.emit(Operation::Jump(next), span);
+                    let exhausted = self.instructions.len();
+                    self.patch_jump(next, exhausted);
+                    self.emit(Operation::LoadConstant(Constant::None), span);
                 }
             }
             ExpressionKind::Attribute { value, name } => {
@@ -1216,6 +1226,46 @@ impl Compiler {
         );
     }
 
+    fn emit_generator_expression(
+        &mut self,
+        element: Expression,
+        clauses: Vec<ComprehensionClause>,
+        span: Span,
+    ) {
+        let named_expression = self.comprehension_named_expression_context();
+        let mut nested = Compiler {
+            instructions: Vec::new(),
+            loops: Vec::new(),
+            finalizers: Vec::new(),
+            protected_regions: Vec::new(),
+            in_function: true,
+            globals: HashSet::new(),
+            nonlocals: HashSet::new(),
+            named_expression,
+            is_class_scope: false,
+            structural_depth: self.structural_depth,
+        };
+        nested.emit_generator_comprehension_body(&clauses, 0, &element, span);
+        nested.emit(Operation::LoadConstant(Constant::None), span);
+        nested.emit(Operation::Return, span);
+        self.emit(
+            Operation::MakeFunction {
+                name: "<genexpr>".into(),
+                code: nested.finish(Vec::new()),
+                defaults: 0,
+            },
+            span,
+        );
+        self.emit(
+            Operation::Call {
+                positional: 0,
+                keywords: Vec::new(),
+                starred: Vec::new(),
+            },
+            span,
+        );
+    }
+
     fn emit_dict_comprehension(
         &mut self,
         key: Expression,
@@ -1300,6 +1350,35 @@ impl Compiler {
                 },
                 span,
             );
+            self.emit(Operation::PopTop, span);
+        }
+        self.emit(Operation::Jump(next), span);
+        let exhausted = self.instructions.len();
+        self.patch_jump(next, exhausted);
+    }
+
+    fn emit_generator_comprehension_body(
+        &mut self,
+        clauses: &[ComprehensionClause],
+        index: usize,
+        element: &Expression,
+        span: Span,
+    ) {
+        let clause = &clauses[index];
+        self.expression(clause.iterable.clone());
+        self.emit(Operation::GetIterator, span);
+        let next = self.emit(Operation::ForIterator(usize::MAX), span);
+        self.store_target(clause.target.clone(), span);
+        for condition in &clause.conditions {
+            self.expression(condition.clone());
+            let skip = self.emit(Operation::PopJumpIfFalse(usize::MAX), span);
+            self.patch_jump(skip, next);
+        }
+        if index + 1 < clauses.len() {
+            self.emit_generator_comprehension_body(clauses, index + 1, element, span);
+        } else {
+            self.expression(element.clone());
+            self.emit(Operation::Yield, span);
             self.emit(Operation::PopTop, span);
         }
         self.emit(Operation::Jump(next), span);

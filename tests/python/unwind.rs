@@ -90,24 +90,19 @@ fn loop_control_does_not_exit_an_enclosing_context_manager() {
 }
 
 #[test]
-fn yield_in_cleanup_region_is_rejected_loudly() {
-    let source = "def bad():\n    try:\n        yield 1\n    finally:\n        print('cleanup')\nprint(next(bad()))";
+fn generator_suspends_and_resumes_inside_finally_region() {
+    let source = "def values():\n    try:\n        yield 1\n        yield 2\n    finally:\n        print('cleanup')\ngenerator = values()\nprint(next(generator))\nprint(next(generator))\nprint(next(generator, 'done'))";
     let (status, out, err) = run(source);
-    assert_eq!(status, 2, "out={out:?} err={err:?}");
-    assert!(out.is_empty());
-    assert!(
-        err.contains("yield is not supported inside a try/except/finally cleanup region"),
-        "{err}"
-    );
+    assert_eq!(status, 0, "out={out:?} err={err:?}");
+    assert_eq!(out, "1\n2\ncleanup\ndone\n");
+    assert!(err.is_empty());
 }
 
 #[test]
-fn generator_suspension_does_not_cross_a_with_region() {
-    let source = "class C:\n    def __enter__(self):\n        return self\n    def __exit__(self, kind, value, traceback):\n        print('exit')\ndef bad():\n    with C():\n        yield 1\nprint(next(bad()))";
-    let (status, _out, err) = run(source);
-    assert_eq!(status, 2, "out={_out:?} err={err:?}");
-    assert!(
-        err.contains("yield is not supported inside a with cleanup region"),
-        "{err}"
-    );
+fn generator_suspends_and_resumes_inside_with_region() {
+    let source = "class C:\n    def __enter__(self):\n        print('enter')\n        return self\n    def __exit__(self, kind, value, traceback):\n        print('exit')\ndef values():\n    with C():\n        yield 1\n        yield 2\ngenerator = values()\nprint(next(generator))\nprint(next(generator))\nprint(next(generator, 'done'))";
+    let (status, out, err) = run(source);
+    assert_eq!(status, 0, "out={out:?} err={err:?}");
+    assert_eq!(out, "enter\n1\n2\nexit\ndone\n");
+    assert!(err.is_empty());
 }
