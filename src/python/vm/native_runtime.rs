@@ -8,7 +8,8 @@ use super::{
     PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker,
     PyMatch, PyMatchData, PyModule, PyNativeKind, PyProcessRunner, PyProperty, PyRaisesContext,
     PyRegex, PyResult, PyRuntime, PySet, PySubcommandSpec, PySubparsersSpec, PyTuple, PyValueCast,
-    Stream, ToPrimitive, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES, MODELED_VALUE_BYTES,
+    RaisedException, Stream, ToPrimitive, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    MODELED_VALUE_BYTES,
 };
 
 fn array_offset(layout: &PyArrayLayout, index: &[usize]) -> PyResult<usize> {
@@ -986,6 +987,66 @@ impl PyRuntime for Vm<'_> {
             Object::Generator { .. } => self.resume_generator(id).map_err(PyError::runtime_error),
             _ => Err(PyError::type_error("expected an iterator")),
         }
+    }
+
+    fn generator_send(&mut self, generator: PyIterator, value: Value) -> PyResult<Option<Value>> {
+        let id = generator.object_id();
+        if !matches!(
+            self.state.heap.get(id).map_err(PyError::runtime_error)?,
+            Object::Generator { .. }
+        ) {
+            return Err(PyError::type_error("expected a generator"));
+        }
+        self.resume_generator_with(id, value)
+            .map_err(PyError::runtime_error)
+    }
+
+    fn generator_close(&mut self, generator: PyIterator) -> PyResult<()> {
+        let id = generator.object_id();
+        if !matches!(
+            self.state.heap.get(id).map_err(PyError::runtime_error)?,
+            Object::Generator { .. }
+        ) {
+            return Err(PyError::type_error("expected a generator"));
+        }
+        // A compact approximation of GeneratorExit: drive the bounded frame through its
+        // cleanup path and discard values yielded while closing.
+        while self
+            .resume_generator(id)
+            .map_err(PyError::runtime_error)?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn generator_throw(&mut self, generator: PyIterator, exception: Value) -> PyResult {
+        self.generator_close(generator)?;
+        let raised = if let Some((kind, _)) =
+            protocol::exception_parts(&self.state.heap, &exception)
+                .map_err(PyError::runtime_error)?
+        {
+            RaisedException {
+                kind,
+                value: exception,
+            }
+        } else if let Some(NativeValue::ExceptionType(ExceptionType(kind))) =
+            exception.native_value()
+        {
+            let value = self
+                .allocate_exception(kind.into(), String::new())
+                .map_err(PyError::resource_error)?;
+            RaisedException {
+                kind: kind.into(),
+                value,
+            }
+        } else {
+            return Err(PyError::type_error("generator.throw expects an exception"));
+        };
+        self.pending_exception = Some(raised);
+        Err(PyError::new(
+            PyErrorKind::Raised,
+            "generator exception raised",
+        ))
     }
 
     fn new_iterator(&mut self, values: Vec<Value>) -> PyResult<Value> {

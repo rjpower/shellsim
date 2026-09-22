@@ -28,6 +28,18 @@ def test_comprehensions_cover_clauses_filters_and_scopes():
 
 def test_generator_expressions_are_lazy_scoped_iterables():
     item = 50
+    visited = []
+
+    def observe():
+        for value in range(3):
+            visited.append(value)
+            yield value
+
+    expression = (value * 2 for value in observe())
+    assert visited == []
+    assert next(expression) == 0
+    assert visited == [0]
+    assert list(expression) == [2, 4]
     assert sum(value * value for value in range(5) if value % 2) == 10
     assert list(value + 1 for value in [1, 2, 3]) == [2, 3, 4]  # noqa: C400
     assert item == 50
@@ -54,6 +66,48 @@ def test_dataclasses_and_enums_use_normal_runtime_values():
     assert Color.RED.value == 1
     assert Color.RED is Color.RED
     assert [member.name for member in Color] == ["RED", "GREEN"]
+
+
+def test_modern_typing_names_and_runtime_helpers_are_inert():
+    from typing import (
+        Annotated,
+        Generator,
+        Iterable,
+        Literal,
+        Mapping,
+        Protocol,
+        Self,
+        Sequence,
+        TypeVar,
+        Union,
+        cast,
+        get_args,
+        get_origin,
+        overload,
+        runtime_checkable,
+    )
+
+    marker = TypeVar("marker")
+    assert str(marker) == "~marker"
+    assert cast(int, "value") == "value"
+    assert get_origin(marker) is None
+    assert get_args(marker) == ()
+    assert all(
+        value is not None
+        for value in [
+            Annotated,
+            Generator,
+            Iterable,
+            Literal,
+            Mapping,
+            Protocol,
+            Self,
+            Sequence,
+            Union,
+            overload,
+            runtime_checkable,
+        ]
+    )
 
 
 def test_exception_handlers_else_finally_and_with():
@@ -162,6 +216,52 @@ def test_generators_suspend_with_persistent_lexical_state():
 
     closure = make(4)()
     assert [next(closure), next(closure), next(closure, None)] == [1, 5, None]
+
+    def delegated():
+        yield from [1, 2, 3]
+
+    assert list(delegated()) == [1, 2, 3]
+
+    def receiver():
+        received = yield "ready"
+        yield received
+
+    messages = receiver()
+    assert messages.__next__() == "ready"
+    assert messages.send("sent") == "sent"
+    assert next(messages, "done") == "done"
+
+    cleaned = []
+
+    def closable():
+        try:
+            yield "open"
+        finally:
+            cleaned.append("closed")
+
+    open_generator = closable()
+    assert next(open_generator) == "open"
+    assert open_generator.close() is None
+    assert cleaned == ["closed"]
+    assert next(open_generator, "done") == "done"
+
+    thrown_cleanup = []
+
+    def throwable():
+        try:
+            yield "open"
+        finally:
+            thrown_cleanup.append("closed")
+
+    thrown = throwable()
+    assert next(thrown) == "open"
+    try:
+        thrown.throw(ValueError)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("generator.throw did not raise")
+    assert thrown_cleanup == ["closed"]
 
 
 def test_numeric_literals_and_arithmetic_match_python():

@@ -173,14 +173,13 @@ pub enum ExpressionKind {
         value: Box<Expression>,
         clauses: Vec<ComprehensionClause>,
     },
-    /// The VM deliberately materializes this as a list for now.  This gives
-    /// generator expressions an ordinary iterable and isolated comprehension
-    /// scope while keeping the bounded-resource contract simple and explicit.
+    /// A lazy comprehension evaluated in its own generator frame.
     GeneratorExpression {
         element: Box<Expression>,
         clauses: Vec<ComprehensionClause>,
     },
     Yield(Option<Box<Expression>>),
+    YieldFrom(Box<Expression>),
     Attribute {
         value: Box<Expression>,
         name: String,

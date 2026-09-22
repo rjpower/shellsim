@@ -75,7 +75,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "math" => Some(&math::MODULE),
         "numpy" => Some(&numpy::MODULE),
         "_os" => Some(&os::MODULE),
-        "pytest" => Some(&pytest::MODULE),
+        "_pytest" => Some(&pytest::MODULE),
         "re" => Some(&re::MODULE),
         "string" => Some(&string::MODULE),
         "_struct" => Some(&r#struct::MODULE),

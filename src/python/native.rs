@@ -447,6 +447,13 @@ pub(super) trait PyRuntime {
     fn is_callable(&self, value: &PyValue) -> PyResult<bool>;
     fn iterator(&mut self, value: PyValue) -> PyResult<PyIterator>;
     fn iterator_next(&mut self, iterator: PyIterator) -> PyResult<Option<PyValue>>;
+    fn generator_send(
+        &mut self,
+        generator: PyIterator,
+        value: PyValue,
+    ) -> PyResult<Option<PyValue>>;
+    fn generator_close(&mut self, generator: PyIterator) -> PyResult<()>;
+    fn generator_throw(&mut self, generator: PyIterator, exception: PyValue) -> PyResult;
     fn new_iterator(&mut self, values: Vec<PyValue>) -> PyResult<PyValue>;
     fn new_count_iterator(&mut self, start: i64, step: i64) -> PyResult<PyValue>;
     fn new_default_dict(&mut self, factory: PyCallable) -> PyResult<PyValue>;

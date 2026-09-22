@@ -12,8 +12,8 @@ use num_traits::{Signed, Zero};
 use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, MethodDef, NativeTypeDef, OwnedPyString, PyByteArray, PyBytes,
-    PyCallable, PyDict, PyError, PyKind, PyList, PyProperty, PyResult, PyRuntime, PySequence,
-    PySet, PyTuple, PyValue, PyValueCast,
+    PyCallable, PyDict, PyError, PyIterator, PyKind, PyList, PyProperty, PyResult, PyRuntime,
+    PySequence, PySet, PyTuple, PyValue, PyValueCast,
 };
 use super::super::number::PyNumber;
 use super::super::slice::SlicePlan;
@@ -154,6 +154,16 @@ pub(crate) static TYPE_TYPE: NativeTypeDef = NativeTypeDef {
     methods: &[method("type", "__new__", type_new)],
 };
 
+pub(crate) static GENERATOR_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "generator",
+    methods: &[
+        method("generator", "__next__", generator_next),
+        method("generator", "send", generator_send),
+        method("generator", "throw", generator_throw),
+        method("generator", "close", generator_close),
+    ],
+};
+
 const fn method(
     type_name: &'static str,
     name: &'static str,
@@ -164,6 +174,39 @@ const fn method(
         name,
         call,
     }
+}
+
+fn generator_next(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    args.expect_positional("generator.__next__", 0, 0)?;
+    args.reject_keywords("generator.__next__")?;
+    let generator = receiver.cast::<PyIterator>(runtime)?;
+    runtime
+        .generator_send(generator, Value::None)?
+        .ok_or_else(|| PyError::exception("StopIteration", ""))
+}
+
+fn generator_send(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    args.expect_positional("generator.send", 1, 1)?;
+    args.reject_keywords("generator.send")?;
+    let generator = receiver.cast::<PyIterator>(runtime)?;
+    runtime
+        .generator_send(generator, args.positional()[0])?
+        .ok_or_else(|| PyError::exception("StopIteration", ""))
+}
+
+fn generator_close(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    args.expect_positional("generator.close", 0, 0)?;
+    args.reject_keywords("generator.close")?;
+    let generator = receiver.cast::<PyIterator>(runtime)?;
+    runtime.generator_close(generator)?;
+    Ok(Value::None)
+}
+
+fn generator_throw(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    args.expect_positional("generator.throw", 1, 1)?;
+    args.reject_keywords("generator.throw")?;
+    let generator = receiver.cast::<PyIterator>(runtime)?;
+    runtime.generator_throw(generator, args.positional()[0])
 }
 
 fn string_strip(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

@@ -28,6 +28,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "numpy.random" => Some(include_str!("source/numpy_random.py")),
         "os" => Some(include_str!("source/os.py")),
         "pathlib" => Some(include_str!("source/pathlib.py")),
+        "pytest" => Some(include_str!("source/pytest.py")),
         "random" => Some(include_str!("source/random.py")),
         "shutil" => Some(include_str!("source/shutil.py")),
         "statistics" => Some(include_str!("source/statistics.py")),
