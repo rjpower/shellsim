@@ -23,8 +23,10 @@ mod archives;
 mod awk;
 mod builtins;
 mod dd;
+mod diff;
 mod echo;
 mod find;
+mod format;
 mod fs;
 pub(crate) mod git;
 mod hashing;
@@ -39,6 +41,7 @@ mod regex_compat;
 mod rgcmd;
 mod sed;
 mod sort;
+mod streams;
 mod system;
 mod tarcmd;
 mod text;
@@ -122,7 +125,7 @@ pub(crate) enum CommandResume {
         command: String,
         continuation: Box<crate::python::PythonContinuation>,
     },
-    TextStream(text::TextStream),
+    TextStream(streams::TextStream),
 }
 
 /// One scheduler-owned argv invocation requested by a modeled native command.
@@ -287,10 +290,13 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     archives::register(&mut m);
     awk::register(&mut m);
     dd::register(&mut m);
+    diff::register(&mut m);
     echo::register(&mut m);
     find::register(&mut m);
+    format::register(&mut m);
     printf::register(&mut m);
     sort::register(&mut m);
+    streams::register(&mut m);
     system::register(&mut m);
     tarcmd::register(&mut m);
     text::register(&mut m);
@@ -364,7 +370,7 @@ pub(crate) fn starts_before_input(argv: &[String]) -> bool {
     argv.first().is_some_and(|requested| {
         let command = standard_utility_name(requested).unwrap_or(requested);
         if matches!(command, "cat" | "head") {
-            return text::streams_before_input(command, &argv[1..]);
+            return streams::streams_before_input(command, &argv[1..]);
         }
         registry()
             .get(command)
@@ -620,7 +626,7 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
                 },
             ),
         },
-        CommandResume::TextStream(continuation) => text::resume_stream(interp, continuation),
+        CommandResume::TextStream(continuation) => streams::resume_stream(interp, continuation),
     };
     finish_ready_invocation(interp, &result);
     result

@@ -9,10 +9,14 @@ mod archive;
 mod awk;
 #[path = "commands/dd.rs"]
 mod dd;
+#[path = "commands/diff.rs"]
+mod diff;
 #[path = "commands/filesystem_extra.rs"]
 mod filesystem_extra;
 #[path = "commands/find.rs"]
 mod find;
+#[path = "commands/formatting.rs"]
+mod formatting;
 #[path = "commands/git.rs"]
 mod git;
 #[path = "commands/grep.rs"]
@@ -25,9 +29,11 @@ mod make;
 mod network;
 #[path = "commands/patch.rs"]
 mod patch;
+#[path = "commands/records.rs"]
+mod records;
 #[path = "commands/rg.rs"]
 mod rg;
 #[path = "commands/sed.rs"]
 mod sed;
-#[path = "commands/text_surface.rs"]
-mod text_surface;
+#[path = "commands/streams.rs"]
+mod streams;
