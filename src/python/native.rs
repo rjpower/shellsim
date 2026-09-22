@@ -452,6 +452,9 @@ pub(super) trait PyRuntime {
         generator: PyIterator,
         value: PyValue,
     ) -> PyResult<Option<PyValue>>;
+    fn generator_return_value(&self, generator: PyIterator) -> PyResult<PyValue>;
+    /// Resume a coroutine and return 0 for yield, 1 for return, or 2 for an exception.
+    fn coroutine_step(&mut self, coroutine: PyIterator, value: PyValue) -> PyResult<(u8, PyValue)>;
     fn generator_close(&mut self, generator: PyIterator) -> PyResult<()>;
     fn generator_throw(&mut self, generator: PyIterator, exception: PyValue) -> PyResult;
     fn new_iterator(&mut self, values: Vec<PyValue>) -> PyResult<PyValue>;

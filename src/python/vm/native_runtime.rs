@@ -1001,6 +1001,43 @@ impl PyRuntime for Vm<'_> {
             .map_err(PyError::runtime_error)
     }
 
+    fn generator_return_value(&self, generator: PyIterator) -> PyResult<Value> {
+        match self
+            .state
+            .heap
+            .get(generator.object_id())
+            .map_err(PyError::runtime_error)?
+        {
+            Object::Generator {
+                exhausted: true,
+                return_value,
+                ..
+            } => Ok(*return_value),
+            Object::Generator { .. } => Err(PyError::runtime_error("coroutine has not completed")),
+            _ => Err(PyError::type_error("expected a coroutine")),
+        }
+    }
+
+    fn coroutine_step(&mut self, coroutine: PyIterator, value: Value) -> PyResult<(u8, Value)> {
+        let id = coroutine.object_id();
+        if !matches!(
+            self.state.heap.get(id).map_err(PyError::runtime_error)?,
+            Object::Generator { .. }
+        ) {
+            return Err(PyError::type_error("expected a coroutine"));
+        }
+        match self.resume_generator_with(id, value) {
+            Ok(Some(value)) => Ok((0, value)),
+            Ok(None) => self
+                .generator_return_value(coroutine)
+                .map(|value| (1, value)),
+            Err(error) => match self.pending_exception.take() {
+                Some(exception) => Ok((2, exception.value)),
+                None => Err(PyError::runtime_error(error)),
+            },
+        }
+    }
+
     fn generator_close(&mut self, generator: PyIterator) -> PyResult<()> {
         let id = generator.object_id();
         if !matches!(

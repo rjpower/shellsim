@@ -69,7 +69,7 @@ id	status	task_id	source_path	script	expected_stdout
 068	supported	multi-labeller	solution/solve.sh	case_068.py	6
 069	supported	neural-architecture-search-final	tests/test_outputs.py	case_069.py	7
 070	supported	server-log-analysis	tests/grader.py	case_070.py	True
-071	frontier	california-housing-api	solution/solve.sh	case_071.py	async
+071	supported	california-housing-api	solution/solve.sh	case_071.py	async
 072	supported	etl_checkpoint_resume_bug	tests/test_outputs.py	case_072.py	generator
 073	supported	python-api-rate-limit	environment/src/limiter/window.py	case_073.py	value=3
 074	supported	submission_a63937a5_20251224_152124	solution/solve.sh	case_074.py	3.0

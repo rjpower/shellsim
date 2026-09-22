@@ -65,6 +65,7 @@ pub struct Code {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallSignature {
     pub is_generator: bool,
+    pub is_coroutine: bool,
     pub positional_count: usize,
     pub variadic_slot: Option<usize>,
     pub default_slots: Box<[usize]>,
@@ -223,9 +224,12 @@ pub enum Opcode {
     Reraise,
     Raise(bool),
     Yield,
+    AwaitResult,
     WithEnter,
     WithExit,
     WithExitException,
+    AsyncWithExitException,
+    AsyncWithFinishException,
     PopExpression,
     Halt,
 }
@@ -321,9 +325,13 @@ pub enum Operation {
     Raise(bool),
     /// Suspend a generator frame and return the value on top of the stack.
     Yield,
+    /// Unwrap the scheduler outcome sent into a suspended coroutine.
+    AwaitResult,
     WithEnter,
     WithExit,
     WithExitException,
+    AsyncWithExitException,
+    AsyncWithFinishException,
     PopExpression,
     Halt,
 }
@@ -489,9 +497,12 @@ impl CodeBuilder {
             Operation::Reraise => Opcode::Reraise,
             Operation::Raise(cause) => Opcode::Raise(cause),
             Operation::Yield => Opcode::Yield,
+            Operation::AwaitResult => Opcode::AwaitResult,
             Operation::WithEnter => Opcode::WithEnter,
             Operation::WithExit => Opcode::WithExit,
             Operation::WithExitException => Opcode::WithExitException,
+            Operation::AsyncWithExitException => Opcode::AsyncWithExitException,
+            Operation::AsyncWithFinishException => Opcode::AsyncWithFinishException,
             Operation::PopExpression => Opcode::PopExpression,
             Operation::Halt => Opcode::Halt,
         }
@@ -503,6 +514,7 @@ impl CodeBuilder {
         spans: Vec<Span>,
         parameters: Vec<Parameter>,
         local_names: Vec<String>,
+        is_coroutine: bool,
     ) -> CodeRef {
         let positional_count = parameters
             .iter()
@@ -512,6 +524,7 @@ impl CodeBuilder {
             is_generator: instructions
                 .iter()
                 .any(|instruction| matches!(instruction.opcode, Opcode::Yield)),
+            is_coroutine,
             positional_count,
             variadic_slot: parameters.iter().position(|parameter| parameter.variadic),
             default_slots: parameters

@@ -1952,6 +1952,32 @@ impl Vm<'_> {
     }
 
     pub(super) fn is_instance(&mut self, value: &Value, class: &Value) -> Result<bool, String> {
+        if let Some(NativeValue::ExceptionType(ExceptionType(expected))) = class.native_value() {
+            let actual =
+                if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, value)? {
+                    Some(kind)
+                } else {
+                    self.user_exception_kind(value)?
+                };
+            let Some(actual) = actual else {
+                return Ok(false);
+            };
+            let os_error = matches!(
+                actual.as_str(),
+                "OSError"
+                    | "FileNotFoundError"
+                    | "FileExistsError"
+                    | "IsADirectoryError"
+                    | "NotADirectoryError"
+                    | "PermissionError"
+            );
+            return Ok(expected == "BaseException"
+                || (expected == "Exception"
+                    && actual != "BaseException"
+                    && actual != "SystemExit")
+                || expected == actual
+                || (expected == "OSError" && os_error));
+        }
         if let Some(class_id) = class.object_id() {
             if let Object::Tuple(classes) = self.state.heap.get(class_id)? {
                 let classes = classes.clone();

@@ -280,6 +280,8 @@ impl<'a> Lexer<'a> {
             "raise" => TokenKind::Raise,
             "with" => TokenKind::With,
             "yield" => TokenKind::Yield,
+            "async" => TokenKind::Async,
+            "await" => TokenKind::Await,
             name => TokenKind::Name((*name).to_string()),
         }
     }

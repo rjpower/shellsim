@@ -3,6 +3,8 @@
 //! Private implementation invariants stay beside their production modules. These modules exercise
 //! Python through shellsim's public interfaces; Python-only semantics live in source suites.
 
+#[path = "python/asyncio.rs"]
+mod asyncio;
 #[path = "python/bytes.rs"]
 mod bytes;
 #[path = "python/cli.rs"]

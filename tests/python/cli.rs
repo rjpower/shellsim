@@ -108,7 +108,7 @@ fn directory_mode_discovers_python_tests() {
 #[test]
 fn json_mode_reports_unsupported_behavior() {
     let project = TestDirectory::new();
-    std::fs::write(project.path().join("main.py"), "import asyncio\n").expect("write script");
+    std::fs::write(project.path().join("main.py"), "import threading\n").expect("write script");
 
     let output = Command::new(env!("CARGO_BIN_EXE_shellsim-python"))
         .arg("--json")
@@ -123,7 +123,7 @@ fn json_mode_reports_unsupported_behavior() {
     assert_eq!(report["mounted_files"], 1);
     assert!(report["unsupported"][0]
         .as_str()
-        .is_some_and(|value| value.contains("asyncio")));
+        .is_some_and(|value| value.contains("threading")));
 }
 
 #[test]

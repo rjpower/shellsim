@@ -188,6 +188,11 @@ impl Vm<'_> {
                         "StopIteration",
                     ))))
                 }
+                "StopAsyncIteration" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "StopAsyncIteration",
+                    ))))
+                }
                 "EOFError" => {
                     return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
                         "EOFError",
@@ -226,6 +231,11 @@ impl Vm<'_> {
                 "SystemExit" => {
                     return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
                         "SystemExit",
+                    ))))
+                }
+                "TimeoutError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "TimeoutError",
                     ))))
                 }
                 "AssertionError" => {

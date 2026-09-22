@@ -105,8 +105,8 @@ fn tasktrove_100_cases_match_checked_outputs_and_cpython() {
         }
     }
 
-    assert_eq!(supported, 99);
-    assert_eq!(frontier, 1);
+    assert_eq!(supported, 100);
+    assert_eq!(frontier, 0);
     assert_eq!(supported + frontier, 100);
     eprintln!(
         "TaskTrove differential corpus: {supported} supported, {frontier} frontier (CPython 3.14: {})",

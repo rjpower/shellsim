@@ -179,6 +179,8 @@ fn exception_type_code(name: &str) -> u64 {
         "NotADirectoryError" => 20,
         "PermissionError" => 21,
         "SystemExit" => 22,
+        "TimeoutError" => 23,
+        "StopAsyncIteration" => 24,
         _ => unreachable!("exception type must come from the closed builtin table"),
     }
 }
@@ -208,6 +210,8 @@ fn exception_type_name(code: u64) -> &'static str {
         20 => "NotADirectoryError",
         21 => "PermissionError",
         22 => "SystemExit",
+        23 => "TimeoutError",
+        24 => "StopAsyncIteration",
         _ => unreachable!("invalid private exception-type handle"),
     }
 }

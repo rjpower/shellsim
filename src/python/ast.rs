@@ -50,10 +50,17 @@ pub enum StatementKind {
         body: Vec<Statement>,
         otherwise: Vec<Statement>,
     },
+    AsyncFor {
+        target: AssignmentTarget,
+        iterable: Expression,
+        body: Vec<Statement>,
+        otherwise: Vec<Statement>,
+    },
     Function {
         name: String,
         parameters: Vec<Parameter>,
         body: Vec<Statement>,
+        is_async: bool,
     },
     Class {
         name: String,
@@ -91,6 +98,11 @@ pub enum StatementKind {
         target: Option<AssignmentTarget>,
         body: Vec<Statement>,
     },
+    AsyncWith {
+        context: Expression,
+        target: Option<AssignmentTarget>,
+        body: Vec<Statement>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -122,11 +134,13 @@ impl StatementKind {
             Self::If { .. }
                 | Self::While { .. }
                 | Self::For { .. }
+                | Self::AsyncFor { .. }
                 | Self::Function { .. }
                 | Self::Class { .. }
                 | Self::Decorated { .. }
                 | Self::Try { .. }
                 | Self::With { .. }
+                | Self::AsyncWith { .. }
         )
     }
 }
@@ -180,6 +194,7 @@ pub enum ExpressionKind {
     },
     Yield(Option<Box<Expression>>),
     YieldFrom(Box<Expression>),
+    Await(Box<Expression>),
     Attribute {
         value: Box<Expression>,
         name: String,
