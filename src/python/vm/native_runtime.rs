@@ -1754,6 +1754,77 @@ impl PyRuntime for Vm<'_> {
         Value::Native(NativeValue::ExceptionType(ExceptionType(name)))
     }
 
+    fn wait_on(&mut self, reasons: Vec<crate::scheduler::WaitReason>) -> PyResult<()> {
+        if reasons.is_empty() {
+            return Err(PyError::runtime_error(
+                "cannot wait on an empty resource set",
+            ));
+        }
+        if !self.native_suspend_allowed {
+            return Err(PyError::runtime_error(
+                "resource waits require bytecode scheduler dispatch",
+            ));
+        }
+        let now = self.interp.clock.monotonic_ns();
+        self.execution
+            .async_timer_deadlines
+            .retain(|deadline| *deadline > now);
+        for reason in &reasons {
+            let crate::scheduler::WaitReason::Timer(deadline) = reason else {
+                continue;
+            };
+            if *deadline <= now {
+                return Ok(());
+            }
+            if self.execution.async_timer_deadlines.insert(*deadline) {
+                self.interp
+                    .clock
+                    .schedule_at(
+                        *deadline,
+                        crate::clock::EventKind::WakeTask {
+                            task: u64::from(self.interp.process.pid),
+                        },
+                    )
+                    .map_err(|error| PyError::resource_error(error.to_string()))?;
+            }
+        }
+        if !self.mode.scheduler_owned {
+            let deadline = reasons
+                .iter()
+                .filter_map(|reason| match reason {
+                    crate::scheduler::WaitReason::Timer(deadline) => Some(*deadline),
+                    _ => None,
+                })
+                .min();
+            let target = self
+                .interp
+                .live_children
+                .iter()
+                .find(|(_, child)| child.owner == self.interp.process.pid)
+                .map(|(pid, _)| *pid);
+            if let Some(target) = target {
+                crate::exec::drive_scheduler_step(self.interp, target, deadline)
+                    .map_err(PyError::runtime_error)?;
+            } else if let Some(deadline) = deadline {
+                self.interp
+                    .clock
+                    .advance_to(deadline)
+                    .map_err(|error| PyError::resource_error(error.to_string()))?;
+            } else {
+                return Err(PyError::runtime_error(
+                    "asyncio resource wait has no live modeled child",
+                ));
+            }
+            return Ok(());
+        }
+        self.pending_wait = Some(if reasons.len() == 1 {
+            reasons.into_iter().next().expect("length was checked")
+        } else {
+            crate::scheduler::WaitReason::Any(reasons)
+        });
+        Ok(())
+    }
+
     fn clock(&mut self) -> &mut dyn PyClock {
         self
     }

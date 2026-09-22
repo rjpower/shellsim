@@ -1,6 +1,16 @@
 """Deterministic cooperative subset of asyncio for shellsim."""
 
-from _asyncio import _is_coroutine, _step
+import subprocess
+
+from _asyncio import (
+    _is_coroutine,
+    _monotonic_ns,
+    _process_poll,
+    _process_read,
+    _process_write,
+    _step,
+    _wait_resources,
+)
 
 
 _running_loop = None
@@ -28,6 +38,11 @@ class _QueueGet:
 class _LockWait:
     def __init__(self, lock):
         self.lock = lock
+
+
+class _ResourceWait:
+    def __init__(self, token):
+        self.token = token
 
 
 class _WaitFor:
@@ -166,11 +181,124 @@ class Lock:
         self.release()
 
 
+class StreamReader:
+    def __init__(self, process, fd):
+        self._process = process
+        self._fd = fd
+
+    async def read(self, n=-1):
+        while True:
+            ready, value, token = _process_read(self._process._handle, self._fd, n)
+            if ready:
+                return value
+            await _ResourceWait(token)
+
+    async def readline(self):
+        result = b""
+        while True:
+            part = await self.read(1)
+            if not part:
+                return result
+            result += part
+            if part == b"\n":
+                return result
+
+
+class StreamWriter:
+    def __init__(self, process):
+        self._process = process
+        self._buffer = b""
+        self._closing = False
+
+    def write(self, data):
+        if self._closing:
+            raise RuntimeError("write to closing subprocess stream")
+        if not isinstance(data, bytes):
+            raise TypeError("subprocess stdin data must be bytes")
+        self._buffer += data
+
+    async def drain(self):
+        while self._buffer:
+            ready, written, token = _process_write(self._process._handle, self._buffer)
+            if ready:
+                self._buffer = self._buffer[written:]
+            else:
+                await _ResourceWait(token)
+
+    def close(self):
+        if not self._closing:
+            self._closing = True
+            if not self._buffer:
+                self._process._popen.stdin.close()
+
+    def is_closing(self):
+        return self._closing
+
+    async def wait_closed(self):
+        await self.drain()
+        if not self._process._popen.stdin.closed:
+            self._process._popen.stdin.close()
+        return None
+
+    def write_eof(self):
+        self.close()
+
+    def can_write_eof(self):
+        return True
+
+
+class Process:
+    def __init__(self, popen):
+        self._popen = popen
+        self._handle = popen._handle
+        self.pid = popen.pid
+        self.stdin = StreamWriter(self) if popen.stdin is not None else None
+        self.stdout = StreamReader(self, 1) if popen.stdout is not None else None
+        self.stderr = StreamReader(self, 2) if popen.stderr is not None else None
+
+    @property
+    def returncode(self):
+        return self._popen.poll()
+
+    async def wait(self):
+        status = _process_poll(self._handle)
+        while status is None:
+            await _ResourceWait(("child", self.pid))
+            status = _process_poll(self._handle)
+        self._popen.returncode = status
+        return status
+
+    async def communicate(self, input=None):
+        stdout_task = create_task(self.stdout.read()) if self.stdout is not None else None
+        stderr_task = create_task(self.stderr.read()) if self.stderr is not None else None
+        if input is not None:
+            if self.stdin is None:
+                raise ValueError("stdin was not opened with PIPE")
+            self.stdin.write(input)
+            await self.stdin.drain()
+        if self.stdin is not None:
+            self.stdin.close()
+        status_task = create_task(self.wait())
+        stdout = await stdout_task if stdout_task is not None else None
+        stderr = await stderr_task if stderr_task is not None else None
+        await status_task
+        return stdout, stderr
+
+    def send_signal(self, signal):
+        self._popen.send_signal(signal)
+
+    def terminate(self):
+        self._popen.terminate()
+
+    def kill(self):
+        self._popen.kill()
+
+
 class _Loop:
     def __init__(self):
         self._ready = []
         self._timers = []
-        self._time = 0.0
+        self._resource_waiters = []
 
     def create_task(self, coroutine):
         task = Task(coroutine, self)
@@ -179,11 +307,17 @@ class _Loop:
 
     def _schedule(self, task, value):
         if not task._done:
+            self._resource_waiters = [
+                waiter for waiter in self._resource_waiters if waiter[0] is not task
+            ]
             task._send_value = (True, value)
             self._ready.append(task)
 
     def _schedule_failure(self, task, error):
         if not task._done:
+            self._resource_waiters = [
+                waiter for waiter in self._resource_waiters if waiter[0] is not task
+            ]
             task._send_value = (False, error)
             self._ready.append(task)
 
@@ -200,17 +334,13 @@ class _Loop:
         if delay <= 0:
             self._schedule(task, None)
         else:
-            self._timers.append((self._time + delay, task))
+            self._timers.append((_monotonic_ns() + int(delay * 1000000000), task))
 
-    def _wake_next_timers(self):
-        deadline = self._timers[0][0]
-        for timer_deadline, timer in self._timers:
-            if timer_deadline < deadline:
-                deadline = timer_deadline
-        self._time = deadline
+    def _wake_due_timers(self):
+        now = _monotonic_ns()
         pending = []
         for timer_deadline, timer in self._timers:
-            if timer_deadline <= deadline:
+            if timer_deadline <= now:
                 if isinstance(timer, _TimeoutWait):
                     if timer.parent._waiting_on is timer:
                         timer.timed_out = True
@@ -220,6 +350,29 @@ class _Loop:
             else:
                 pending.append((timer_deadline, timer))
         self._timers = pending
+
+    def _next_timer_token(self):
+        if not self._timers:
+            return None
+        deadline = self._timers[0][0]
+        for timer_deadline, timer in self._timers:
+            if timer_deadline < deadline:
+                deadline = timer_deadline
+        return ("timer", deadline)
+
+    def _wait_for_resources(self):
+        reasons = [waiter[1] for waiter in self._resource_waiters]
+        timer = self._next_timer_token()
+        if timer is not None:
+            reasons.append(timer)
+        if not reasons:
+            raise RuntimeError("asyncio deadlock: no runnable tasks")
+        _wait_resources(reasons)
+        self._wake_due_timers()
+        waiters = self._resource_waiters
+        self._resource_waiters = []
+        for task, token in waiters:
+            self._schedule(task, None)
 
     def _wake_waiters(self, task):
         waiters = task._waiters
@@ -282,7 +435,11 @@ class _Loop:
                 timeout = _TimeoutWait(task, awaited.task)
                 task._waiting_on = timeout
                 awaited.task._waiters.append(timeout)
-                self._timers.append((self._time + awaited.timeout, timeout))
+                self._timers.append(
+                    (_monotonic_ns() + int(awaited.timeout * 1000000000), timeout)
+                )
+        elif isinstance(awaited, _ResourceWait):
+            self._resource_waiters.append((task, awaited.token))
         elif _is_coroutine(awaited):
             self._block_on_task(task, self.create_task(awaited))
         else:
@@ -292,10 +449,9 @@ class _Loop:
         root = self.create_task(coroutine)
         while not root.done():
             if not self._ready:
-                if self._timers:
-                    self._wake_next_timers()
-                else:
-                    raise RuntimeError("asyncio deadlock: no runnable tasks")
+                self._wake_due_timers()
+            if not self._ready:
+                self._wait_for_resources()
             task = self._ready.pop(0)
             if task._done:
                 continue
@@ -349,7 +505,42 @@ async def wait_for(awaitable, timeout):
         task = awaitable
     else:
         task = create_task(awaitable)
+    if timeout is None:
+        return await task
     return await _WaitFor(task, timeout)
+
+
+async def create_subprocess_exec(program, *args, stdin=None, stdout=None, stderr=None,
+                                 cwd=None, env=None, start_new_session=False, limit=65536):
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    popen = subprocess.Popen(
+        [program] + list(args),
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        cwd=cwd,
+        env=env,
+        start_new_session=start_new_session,
+    )
+    return Process(popen)
+
+
+async def create_subprocess_shell(command, stdin=None, stdout=None, stderr=None,
+                                  cwd=None, env=None, start_new_session=False, limit=65536):
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    popen = subprocess.Popen(
+        command,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        cwd=cwd,
+        env=env,
+        shell=True,
+        start_new_session=start_new_session,
+    )
+    return Process(popen)
 
 
 def run(coroutine):

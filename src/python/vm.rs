@@ -7,7 +7,7 @@
 use crate::interp::Interp;
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
@@ -26,9 +26,9 @@ use super::native::{
     PyArray, PyArrayDtype, PyArrayLayout, PyBinaryOp, PyByteArray, PyCallable, PyClass, PyClock,
     PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity,
     PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
-    PyProcessHandle, PyProcessOutput, PyProcessRunner, PyProcessStartRequest, PyProperty,
-    PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PySubcommandSpec, PySubparsersSpec,
-    PyTuple, PyValueCast,
+    PyProcessHandle, PyProcessOutput, PyProcessPoll, PyProcessRunner, PyProcessStartRequest,
+    PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PySubcommandSpec,
+    PySubparsersSpec, PyTuple, PyValueCast,
 };
 use super::number;
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
@@ -423,7 +423,7 @@ impl VmProgram {
         }
         match &execution {
             Ok(Execution::Pending) => return VmPoll::Runnable,
-            Ok(Execution::Blocked(reason)) => return VmPoll::Blocked(*reason),
+            Ok(Execution::Blocked(reason)) => return VmPoll::Blocked(reason.clone()),
             _ => {}
         }
         vm.bytecode_frames
@@ -467,6 +467,7 @@ struct VmState {
     call_depth: usize,
     pending_exception: Option<RaisedException>,
     pending_wait: Option<crate::scheduler::WaitReason>,
+    async_timer_deadlines: BTreeSet<u64>,
     native_suspend_allowed: bool,
     exception_stack: Vec<RaisedException>,
     with_contexts: Vec<Value>,

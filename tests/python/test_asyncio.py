@@ -243,3 +243,89 @@ def test_async_context_manager_can_suppress_an_exception():
 
     asyncio.run(main())
     assert events == ["enter", True, "continued"]
+
+
+def test_async_subprocess_communicate_captures_output_and_status():
+    async def main():
+        process = await asyncio.create_subprocess_exec(
+            "sh",
+            "-c",
+            "printf stdout; printf stderr >&2; exit 3",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        return process.returncode, stdout, stderr
+
+    assert asyncio.run(main()) == (3, b"stdout", b"stderr")
+
+
+def test_async_subprocess_streams_handle_duplex_backpressure():
+    data = b"abcdefgh" * 20000
+
+    async def main():
+        process = await asyncio.create_subprocess_exec(
+            "cat",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate(data)
+        return process.returncode, stdout, stderr
+
+    status, stdout, stderr = asyncio.run(main())
+    assert status == 0
+    assert stdout == data
+    assert stderr is None
+
+
+def test_async_subprocess_line_reads_and_wait_are_cooperative():
+    async def main():
+        process = await asyncio.create_subprocess_shell(
+            "printf 'first\\nsecond\\n'",
+            stdout=asyncio.subprocess.PIPE,
+        )
+        first = await process.stdout.readline()
+        remainder = await process.stdout.read()
+        status = await process.wait()
+        return first, remainder, status
+
+    assert asyncio.run(main()) == (b"first\n", b"second\n", 0)
+
+
+def test_async_subprocess_timeout_can_cancel_wait_without_deadlock():
+    async def main():
+        process = await asyncio.create_subprocess_exec("sleep", "10")
+        try:
+            await asyncio.wait_for(process.wait(), 1)
+        except TimeoutError:
+            process.kill()
+        return await process.wait()
+
+    assert asyncio.run(main()) == -9
+
+
+def test_async_subprocess_writer_close_flushes_buffered_input():
+    data = b"close-after-write" * 1000
+
+    async def main():
+        process = await asyncio.create_subprocess_exec(
+            "cat",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        process.stdin.write(data)
+        process.stdin.close()
+        await process.stdin.wait_closed()
+        output = await process.stdout.read()
+        status = await process.wait()
+        return output, status
+
+    assert asyncio.run(main()) == (data, 0)
+
+
+def test_wait_for_none_disables_the_timeout():
+    async def value():
+        await asyncio.sleep(0)
+        return 42
+
+    assert asyncio.run(asyncio.wait_for(value(), None)) == 42

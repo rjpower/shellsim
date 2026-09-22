@@ -12,7 +12,7 @@ use crate::process::ProcessId;
 pub const MAX_TASKS: usize = crate::process::MAX_PROCESSES;
 
 /// Resource condition on which a cooperative task is suspended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WaitReason {
     Timer(u64),
     InputReadable(u32),
@@ -25,10 +25,61 @@ pub enum WaitReason {
     ChildDeadline(ProcessId, u64),
     /// Child-tree descriptor progress or completion, bounded by a virtual deadline.
     ChildActivityDeadline(ProcessId, u64),
+    /// Wake when any contained modeled resource becomes ready.
+    Any(Vec<WaitReason>),
+}
+
+impl WaitReason {
+    /// Whether this blocked condition accepts a concrete resource wake.
+    pub(crate) fn accepts(&self, wake: &WaitReason) -> bool {
+        match self {
+            Self::Any(reasons) => reasons.iter().any(|reason| reason.accepts(wake)),
+            reason => reason == wake,
+        }
+    }
+
+    /// Whether a timer event at this deadline satisfies the blocked condition.
+    pub(crate) fn accepts_timer(&self, deadline_ns: u64) -> bool {
+        match self {
+            Self::Timer(deadline)
+            | Self::ChildDeadline(_, deadline)
+            | Self::ChildActivityDeadline(_, deadline) => *deadline == deadline_ns,
+            Self::Any(reasons) => reasons
+                .iter()
+                .any(|reason| reason.accepts_timer(deadline_ns)),
+            _ => false,
+        }
+    }
+
+    fn waits_for_child(&self, child: ProcessId) -> bool {
+        match self {
+            Self::Child(pid) | Self::ChildDeadline(pid, _) => *pid == child,
+            Self::Any(reasons) => reasons.iter().any(|reason| reason.waits_for_child(child)),
+            _ => false,
+        }
+    }
+
+    fn waits_for_child_activity(&self, child: ProcessId) -> bool {
+        match self {
+            Self::ChildActivity(pid) | Self::ChildActivityDeadline(pid, _) => *pid == child,
+            Self::Any(reasons) => reasons
+                .iter()
+                .any(|reason| reason.waits_for_child_activity(child)),
+            _ => false,
+        }
+    }
+
+    fn has_timer(&self) -> bool {
+        match self {
+            Self::Timer(_) => true,
+            Self::Any(reasons) => reasons.iter().any(Self::has_timer),
+            _ => false,
+        }
+    }
 }
 
 /// Scheduler-owned lifecycle for one logical task.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskState {
     Runnable,
     Running,
@@ -39,7 +90,7 @@ pub enum TaskState {
 }
 
 /// Scheduler state restored when a stopped task receives `SIGCONT`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoppedTask {
     Runnable,
     Blocked(WaitReason),
@@ -114,7 +165,7 @@ impl Scheduler {
 
     /// Wake one blocked task. Repeated wakes are idempotent for an already runnable task.
     pub fn wake(&mut self, pid: ProcessId) -> Result<(), SchedulerError> {
-        match self.states.get(&pid).copied() {
+        match self.states.get(&pid).cloned() {
             Some(TaskState::Blocked(_)) => {
                 self.states.insert(pid, TaskState::Runnable);
                 self.blocked.retain(|blocked| *blocked != pid);
@@ -141,7 +192,7 @@ impl Scheduler {
     /// Waking a stopped blocked task changes its saved resume state to runnable while leaving it
     /// stopped. This prevents elapsed timers and descriptor readiness from being lost.
     pub fn stop(&mut self, pid: ProcessId) -> Result<(), SchedulerError> {
-        let stopped = match self.states.get(&pid).copied() {
+        let stopped = match self.states.get(&pid).cloned() {
             Some(TaskState::Runnable) => {
                 self.runnable.retain(|queued| *queued != pid);
                 StoppedTask::Runnable
@@ -163,7 +214,7 @@ impl Scheduler {
 
     /// Continue a stopped task, restoring its runnable or blocked scheduler state.
     pub fn continue_task(&mut self, pid: ProcessId) -> Result<(), SchedulerError> {
-        match self.states.get(&pid).copied() {
+        match self.states.get(&pid).cloned() {
             Some(TaskState::Stopped(StoppedTask::Runnable)) => {
                 self.states.insert(pid, TaskState::Runnable);
                 self.runnable.push_back(pid);
@@ -190,7 +241,7 @@ impl Scheduler {
                     self.state(*pid),
                     Some(TaskState::Blocked(blocked))
                         | Some(TaskState::Stopped(StoppedTask::Blocked(blocked)))
-                        if blocked == reason
+                        if blocked.accepts(&reason)
                 )
             })
             .collect();
@@ -203,26 +254,15 @@ impl Scheduler {
 
     /// Wake tasks whose next child-status check may now complete.
     pub fn wake_child_waiters(&mut self, child: ProcessId) -> usize {
-        self.wake_matching(|reason| {
-            matches!(
-                reason,
-                WaitReason::Child(pid) | WaitReason::ChildDeadline(pid, _) if pid == child
-            )
-        })
+        self.wake_matching(|reason| reason.waits_for_child(child))
     }
 
     /// Wake tasks coordinating pipe activity anywhere beneath one child handle.
     pub fn wake_child_activity_waiters(&mut self, child: ProcessId) -> usize {
-        self.wake_matching(|reason| {
-            matches!(
-                reason,
-                WaitReason::ChildActivity(pid) | WaitReason::ChildActivityDeadline(pid, _)
-                    if pid == child
-            )
-        })
+        self.wake_matching(|reason| reason.waits_for_child_activity(child))
     }
 
-    fn wake_matching(&mut self, predicate: impl Fn(WaitReason) -> bool) -> usize {
+    fn wake_matching(&mut self, predicate: impl Fn(&WaitReason) -> bool) -> usize {
         let waiting: Vec<ProcessId> = self
             .blocked
             .iter()
@@ -232,7 +272,7 @@ impl Scheduler {
                     self.state(*pid),
                     Some(TaskState::Blocked(reason))
                         | Some(TaskState::Stopped(StoppedTask::Blocked(reason)))
-                        if predicate(reason)
+                        if predicate(&reason)
                 )
             })
             .collect();
@@ -273,7 +313,7 @@ impl Scheduler {
     }
 
     pub fn state(&self, pid: ProcessId) -> Option<TaskState> {
-        self.states.get(&pid).copied()
+        self.states.get(&pid).cloned()
     }
 
     /// Timer-blocked tasks in stable blocking order, used for legacy enclosing deadlines that do
@@ -283,20 +323,18 @@ impl Scheduler {
             .iter()
             .copied()
             .filter(|pid| {
-                matches!(
-                    self.state(*pid),
-                    Some(TaskState::Blocked(WaitReason::Timer(_)))
-                        | Some(TaskState::Stopped(StoppedTask::Blocked(WaitReason::Timer(
-                            _
-                        ))))
-                )
+                matches!(self.state(*pid), Some(TaskState::Blocked(reason)) if reason.has_timer())
+                    || matches!(
+                        self.state(*pid),
+                        Some(TaskState::Stopped(StoppedTask::Blocked(reason))) if reason.has_timer()
+                    )
             })
             .collect()
     }
 
     /// Remove an exited task after its parent has collected the status.
     pub fn reap(&mut self, pid: ProcessId) -> Result<i32, SchedulerError> {
-        match self.states.get(&pid).copied() {
+        match self.states.get(&pid).cloned() {
             Some(TaskState::Exited(status)) => {
                 self.states.remove(&pid);
                 Ok(status)
@@ -375,6 +413,21 @@ mod tests {
             scheduler.state(3),
             Some(TaskState::Blocked(WaitReason::PipeWritable(7)))
         );
+    }
+
+    #[test]
+    fn any_wait_wakes_for_one_matching_resource() {
+        let mut scheduler = Scheduler::new(1);
+        scheduler
+            .block_current(WaitReason::Any(vec![
+                WaitReason::PipeReadable(7),
+                WaitReason::Child(9),
+            ]))
+            .unwrap();
+
+        assert_eq!(scheduler.wake_waiters(WaitReason::PipeWritable(7)), 0);
+        assert_eq!(scheduler.wake_child_waiters(9), 1);
+        assert_eq!(scheduler.state(1), Some(TaskState::Runnable));
     }
 
     #[test]
