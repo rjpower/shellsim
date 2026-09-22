@@ -68,6 +68,18 @@ def test_create_task_allows_a_sibling_to_wake_an_event_waiter():
     assert events == ["consumer waiting", "producer running", "consumer awake"]
 
 
+def test_current_task_is_stable_across_direct_awaits():
+    async def nested(expected):
+        assert asyncio.current_task() is expected
+
+    async def main():
+        task = asyncio.current_task()
+        await nested(task)
+        assert asyncio.current_task() is task
+
+    asyncio.run(main())
+
+
 def test_event_state_is_visible_and_clearable():
     async def main():
         event = asyncio.Event()
@@ -95,6 +107,107 @@ def test_queue_is_fifo_and_blocked_get_is_woken_by_put():
         return await task
 
     assert asyncio.run(main()) == ["first", "second"]
+
+
+def test_bounded_queue_applies_backpressure_and_tracks_work():
+    events = []
+
+    async def main():
+        queue = asyncio.Queue(maxsize=1)
+        assert queue.maxsize == 1
+        assert queue.empty()
+        await queue.put("first")
+        assert queue.full()
+
+        async def producer():
+            events.append("put waiting")
+            await queue.put("second")
+            events.append("put complete")
+
+        producer_task = asyncio.create_task(producer())
+        await asyncio.sleep(0)
+        assert events == ["put waiting"]
+
+        assert await queue.get() == "first"
+        queue.task_done()
+        await producer_task
+        assert events == ["put waiting", "put complete"]
+
+        join_task = asyncio.create_task(queue.join())
+        await asyncio.sleep(0)
+        assert not join_task.done()
+        assert queue.get_nowait() == "second"
+        queue.task_done()
+        await join_task
+        assert queue.empty()
+
+    asyncio.run(main())
+
+
+def test_queue_nowait_errors_and_specialized_ordering():
+    async def main():
+        queue = asyncio.Queue(maxsize=1)
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        else:
+            raise AssertionError("empty queue must raise QueueEmpty")
+
+        queue.put_nowait("full")
+        try:
+            queue.put_nowait("overflow")
+        except asyncio.QueueFull:
+            pass
+        else:
+            raise AssertionError("full queue must raise QueueFull")
+
+        priority = asyncio.PriorityQueue()
+        await priority.put((2, "second"))
+        await priority.put((1, "first"))
+        assert await priority.get() == (1, "first")
+        assert await priority.get() == (2, "second")
+
+        lifo = asyncio.LifoQueue()
+        await lifo.put("first")
+        await lifo.put("second")
+        assert await lifo.get() == "second"
+        assert await lifo.get() == "first"
+
+    asyncio.run(main())
+
+
+def test_cancelled_queue_waiters_do_not_consume_items_or_capacity():
+    async def main():
+        queue = asyncio.Queue(maxsize=1)
+        await queue.put("existing")
+        cancelled_put = asyncio.create_task(queue.put("cancelled"))
+        await asyncio.sleep(0)
+        cancelled_put.cancel()
+        try:
+            await cancelled_put
+        except asyncio.CancelledError:
+            pass
+
+        assert await queue.get() == "existing"
+        queue.task_done()
+        await queue.put("replacement")
+        assert await queue.get() == "replacement"
+        queue.task_done()
+
+        cancelled_get = asyncio.create_task(queue.get())
+        await asyncio.sleep(0)
+        cancelled_get.cancel()
+        try:
+            await cancelled_get
+        except asyncio.CancelledError:
+            pass
+        await queue.put("delivered")
+        assert await queue.get() == "delivered"
+        queue.task_done()
+        await queue.join()
+
+    asyncio.run(main())
 
 
 def test_lock_serializes_tasks_across_await_points():
@@ -329,6 +442,74 @@ def test_wait_for_none_disables_the_timeout():
         return 42
 
     assert asyncio.run(asyncio.wait_for(value(), None)) == 42
+
+
+def test_timeout_context_cancels_the_body_and_runs_cleanup():
+    events = []
+
+    async def main():
+        guard = None
+        try:
+            async with asyncio.timeout(0.001) as guard:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("cleaned")
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("expired context must raise TimeoutError")
+        assert guard.expired()
+        assert asyncio.current_task().cancelling() == 0
+
+    asyncio.run(main())
+    assert events == ["cleaned"]
+
+
+def test_timeout_can_be_disabled_rescheduled_and_set_at_a_deadline():
+    async def main():
+        loop = asyncio.get_running_loop()
+        async with asyncio.timeout(None) as guard:
+            assert guard.when() is None
+            guard.reschedule(loop.time() + 1)
+            assert guard.when() is not None
+            await asyncio.sleep(0)
+        assert not guard.expired()
+
+        async with asyncio.timeout_at(loop.time() + 1):
+            await asyncio.sleep(0)
+
+        try:
+            async with asyncio.timeout(None) as rescheduled:
+                rescheduled.reschedule(loop.time())
+                await asyncio.Event().wait()
+        except TimeoutError:
+            assert rescheduled.expired()
+        else:
+            raise AssertionError("rescheduled timeout must expire")
+
+    asyncio.run(main())
+
+
+def test_timeout_does_not_transform_external_cancellation():
+    async def worker():
+        async with asyncio.timeout(10):
+            await asyncio.Event().wait()
+
+    async def main():
+        task = asyncio.create_task(worker())
+        await asyncio.sleep(0)
+        task.cancel()
+        outcome = None
+        try:
+            await task
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+        except TimeoutError:
+            outcome = "timeout"
+        assert outcome == "cancelled"
+
+    asyncio.run(main())
 
 
 def test_wait_supports_completion_modes_and_non_destructive_timeouts():

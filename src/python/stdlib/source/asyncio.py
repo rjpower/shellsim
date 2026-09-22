@@ -25,6 +25,14 @@ class CancelledError(Exception):
     pass
 
 
+class QueueEmpty(Exception):
+    pass
+
+
+class QueueFull(Exception):
+    pass
+
+
 class _Sleep:
     def __init__(self, delay):
         self.delay = delay
@@ -38,6 +46,12 @@ class _EventWait:
 class _QueueGet:
     def __init__(self, queue):
         self.queue = queue
+
+
+class _QueuePut:
+    def __init__(self, queue, item):
+        self.queue = queue
+        self.item = item
 
 
 class _LockWait:
@@ -90,6 +104,7 @@ class Task:
         self._name = name
         self._callbacks = []
         self._cancel_requests = 0
+        self._logical_task = self
 
     def done(self):
         return self._done
@@ -176,32 +191,107 @@ class Queue:
         self._maxsize = maxsize
         self._items = []
         self._getters = []
+        self._putters = []
+        self._unfinished_tasks = 0
+        self._finished = Event()
+        self._finished.set()
+
+    @property
+    def maxsize(self):
+        return self._maxsize
 
     def empty(self):
         return len(self._items) == 0
 
+    def full(self):
+        return self._maxsize > 0 and len(self._items) >= self._maxsize
+
     def qsize(self):
         return len(self._items)
 
-    def put_nowait(self, item):
-        if self._getters:
+    def _put(self, item):
+        self._items.append(item)
+
+    def _get(self):
+        return self._items.pop(0)
+
+    def _next_getter(self):
+        while self._getters:
             task = self._getters.pop(0)
-            task._loop._schedule(task, item)
+            if not task.done():
+                return task
+        return None
+
+    def _next_putter(self):
+        while self._putters:
+            task, item = self._putters.pop(0)
+            if not task.done():
+                return task, item
+        return None
+
+    def _put_item(self, item):
+        self._unfinished_tasks += 1
+        self._finished.clear()
+        getter = self._next_getter()
+        if getter is None:
+            self._put(item)
         else:
-            self._items.append(item)
+            getter._loop._schedule(getter, item)
+
+    def _wake_putter(self):
+        putter = self._next_putter()
+        if putter is None:
+            return
+        task, item = putter
+        self._put_item(item)
+        task._loop._schedule(task, None)
+
+    def _get_item(self):
+        item = self._get()
+        self._wake_putter()
+        return item
+
+    def put_nowait(self, item):
+        if self.full():
+            raise QueueFull()
+        self._put_item(item)
 
     async def put(self, item):
-        self.put_nowait(item)
+        if self.full():
+            return await _QueuePut(self, item)
+        self._put_item(item)
 
     def get_nowait(self):
         if not self._items:
-            raise RuntimeError("queue is empty")
-        return self._items.pop(0)
+            raise QueueEmpty()
+        return self._get_item()
 
     async def get(self):
         if self._items:
-            return self._items.pop(0)
+            return self._get_item()
         return await _QueueGet(self)
+
+    def task_done(self):
+        if self._unfinished_tasks <= 0:
+            raise ValueError("task_done() called too many times")
+        self._unfinished_tasks -= 1
+        if self._unfinished_tasks == 0:
+            self._finished.set()
+
+    async def join(self):
+        if self._unfinished_tasks:
+            await self._finished.wait()
+
+
+class PriorityQueue(Queue):
+    def _put(self, item):
+        self._items.append(item)
+        self._items.sort()
+
+
+class LifoQueue(Queue):
+    def _get(self):
+        return self._items.pop()
 
 
 class Lock:
@@ -493,6 +583,14 @@ class _Loop:
         self._ready.append(task)
         return task
 
+    def _create_awaited_task(self, coroutine, parent):
+        task = self.create_task(coroutine)
+        task._logical_task = parent._logical_task
+        return task
+
+    def time(self):
+        return _monotonic_ns() / 1000000000
+
     def _schedule(self, task, value):
         if not task._done:
             self._resource_waiters = [
@@ -623,9 +721,15 @@ class _Loop:
                 awaited.event._waiters.append(task)
         elif isinstance(awaited, _QueueGet):
             if awaited.queue._items:
-                self._schedule(task, awaited.queue._items.pop(0))
+                self._schedule(task, awaited.queue._get_item())
             else:
                 awaited.queue._getters.append(task)
+        elif isinstance(awaited, _QueuePut):
+            if awaited.queue.full():
+                awaited.queue._putters.append((task, awaited.item))
+            else:
+                awaited.queue._put_item(awaited.item)
+                self._schedule(task, None)
         elif isinstance(awaited, _LockWait):
             awaited.lock._waiters.append(task)
         elif isinstance(awaited, _SemaphoreWait):
@@ -645,7 +749,7 @@ class _Loop:
         elif isinstance(awaited, _ResourceWait):
             self._resource_waiters.append((task, awaited.token))
         elif _is_coroutine(awaited):
-            self._block_on_task(task, self.create_task(awaited))
+            self._block_on_task(task, self._create_awaited_task(awaited, task))
         else:
             raise TypeError("object cannot be used in 'await' expression")
 
@@ -690,7 +794,9 @@ def ensure_future(awaitable):
 def current_task(loop=None):
     if loop is None:
         loop = get_running_loop()
-    return loop._current
+    if loop._current is None:
+        return None
+    return loop._current._logical_task
 
 
 def all_tasks(loop=None):
@@ -728,6 +834,71 @@ async def wait_for(awaitable, timeout):
     if timeout is None:
         return await task
     return await _WaitFor(task, timeout)
+
+
+class Timeout:
+    def __init__(self, when):
+        self._when = when
+        self._task = None
+        self._timer = None
+        self._cancelling = 0
+        self._expired = False
+
+    def when(self):
+        return self._when
+
+    def expired(self):
+        return self._expired
+
+    def reschedule(self, when):
+        if self._task is None:
+            raise RuntimeError("Timeout has not been entered")
+        if self._expired:
+            raise RuntimeError("Cannot change state of expired Timeout")
+        if self._timer is not None:
+            self._timer.cancel()
+        self._when = when
+        self._timer = self._start_timer()
+
+    def _start_timer(self):
+        if self._when is None:
+            return None
+
+        async def expire():
+            delay = self._when - get_running_loop().time()
+            await sleep(delay)
+            self._expired = True
+            self._task.cancel()
+
+        return create_task(expire())
+
+    async def __aenter__(self):
+        if self._task is not None:
+            raise RuntimeError("Timeout has already been entered")
+        self._task = current_task()
+        self._cancelling = self._task.cancelling()
+        self._timer = self._start_timer()
+        return self
+
+    async def __aexit__(self, kind, value, traceback):
+        if self._timer is not None:
+            self._timer.cancel()
+        if not self._expired:
+            return False
+        remaining = self._task.uncancel()
+        if remaining <= self._cancelling and isinstance(value, CancelledError):
+            raise TimeoutError()
+        return False
+
+
+def timeout(delay):
+    if delay is None:
+        return Timeout(None)
+    return Timeout(get_running_loop().time() + delay)
+
+
+def timeout_at(when):
+    return Timeout(when)
 
 
 def _wait_condition(tasks, return_when):
