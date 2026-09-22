@@ -68,6 +68,48 @@ def test_dataclasses_and_enums_use_normal_runtime_values():
     assert [member.name for member in Color] == ["RED", "GREEN"]
 
 
+def test_modern_typing_names_and_runtime_helpers_are_inert():
+    from typing import (
+        Annotated,
+        Generator,
+        Iterable,
+        Literal,
+        Mapping,
+        Protocol,
+        Self,
+        Sequence,
+        TypeVar,
+        Union,
+        cast,
+        get_args,
+        get_origin,
+        overload,
+        runtime_checkable,
+    )
+
+    marker = TypeVar("marker")
+    assert str(marker) == "~marker"
+    assert cast(int, "value") == "value"
+    assert get_origin(marker) is None
+    assert get_args(marker) == ()
+    assert all(
+        value is not None
+        for value in [
+            Annotated,
+            Generator,
+            Iterable,
+            Literal,
+            Mapping,
+            Protocol,
+            Self,
+            Sequence,
+            Union,
+            overload,
+            runtime_checkable,
+        ]
+    )
+
+
 def test_exception_handlers_else_finally_and_with():
     events = []
     try:
