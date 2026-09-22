@@ -1,6 +1,7 @@
 //! Filesystem commands operating on the VFS: listing (ls), tree mutation
 //! (mkdir/rmdir/rm/cp/mv/touch/ln), permissions (chmod/chown), path math
-//! (basename/dirname/realpath/readlink), inspection (stat/file/find/du), and mktemp.
+//! (basename/dirname/realpath/readlink), inspection (stat/file/find/du/tree), installation,
+//! truncation, and temporary files.
 
 use std::collections::HashMap;
 
@@ -29,6 +30,9 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["du"], Trust::Real, cmd_du);
     reg(m, &["mktemp"], Trust::Real, cmd_mktemp);
     reg(m, &["file"], Trust::Real, cmd_file);
+    reg(m, &["install"], Trust::Real, cmd_install);
+    reg(m, &["truncate"], Trust::Real, cmd_truncate);
+    reg(m, &["tree"], Trust::Real, cmd_tree);
 }
 
 fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -903,4 +907,478 @@ fn cmd_file(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         wln(io.out, &format!("{p}: {desc}"));
     }
     status
+}
+
+fn cmd_install(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut create_parents = false;
+    let mut directories = false;
+    let mut mode_arg: Option<String> = None;
+    let mut operands = Vec::new();
+    let mut options = true;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if options && arg == "--" {
+            options = false;
+        } else if options && arg == "-D" {
+            create_parents = true;
+        } else if options && (arg == "-d" || arg == "--directory") {
+            directories = true;
+        } else if options && arg == "-Dm" {
+            create_parents = true;
+            index += 1;
+            let Some(value) = args.get(index) else {
+                ewln(io.err, "install: option requires an argument -- 'm'");
+                return 2;
+            };
+            mode_arg = Some(value.clone());
+        } else if options && arg.starts_with("-Dm") && arg.len() > 3 {
+            create_parents = true;
+            mode_arg = Some(arg[3..].to_string());
+        } else if options && (arg == "-m" || arg == "--mode") {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                ewln(io.err, "install: option requires an argument -- 'm'");
+                return 2;
+            };
+            mode_arg = Some(value.clone());
+        } else if options && arg.starts_with("-m") && arg.len() > 2 {
+            mode_arg = Some(arg[2..].to_string());
+        } else if options && arg.starts_with("--mode=") {
+            mode_arg = Some(arg[7..].to_string());
+        } else if options && arg.starts_with('-') && arg != "-" {
+            ewln(io.err, &format!("install: unimplemented option '{arg}'"));
+            return 2;
+        } else {
+            operands.push(arg.clone());
+        }
+        index += 1;
+    }
+
+    if create_parents && directories {
+        ewln(io.err, "install: options '-D' and '-d' cannot be combined");
+        return 2;
+    }
+    let default_mode = 0o755;
+    let Some(mode) = mode_arg.as_deref().map_or(Some(default_mode), |value| {
+        install_mode(value, default_mode)
+    }) else {
+        ewln(
+            io.err,
+            &format!(
+                "install: invalid mode '{}'",
+                mode_arg.as_deref().unwrap_or_default()
+            ),
+        );
+        return 1;
+    };
+
+    let cwd = interp.cwd.clone();
+    if directories {
+        if operands.is_empty() {
+            ewln(io.err, "install: missing operand");
+            return 1;
+        }
+        let mut status = 0;
+        for path in operands {
+            if !interp.charge_cpu(1) {
+                return 137;
+            }
+            if let Err(error) = interp
+                .vfs
+                .mkdir_all(&cwd, &path)
+                .and_then(|()| interp.vfs.chmod(&cwd, &path, mode))
+            {
+                ewln(
+                    io.err,
+                    &format!("install: cannot create directory '{path}': {error}"),
+                );
+                status = 1;
+            }
+        }
+        return status;
+    }
+
+    if operands.len() < 2 {
+        ewln(io.err, "install: missing destination file operand");
+        return 1;
+    }
+    let destination = operands.last().expect("operand count checked");
+    let destination_is_dir = matches!(
+        interp.fs_metadata(&cwd, destination, true),
+        Ok(crate::vfs::Node {
+            kind: crate::vfs::NodeKind::Dir,
+            ..
+        })
+    );
+    let sources = &operands[..operands.len() - 1];
+    if sources.len() > 1 && (!destination_is_dir || create_parents) {
+        ewln(
+            io.err,
+            &format!("install: target '{destination}' is not a directory"),
+        );
+        return 1;
+    }
+
+    let mut status = 0;
+    for source in sources {
+        let target = if destination_is_dir {
+            format!(
+                "{}/{}",
+                destination.trim_end_matches('/'),
+                crate::vfs::basename(source)
+            )
+        } else {
+            destination.clone()
+        };
+        let data = match interp.fs_read(&cwd, source) {
+            Ok(data) => data,
+            Err(error) => {
+                ewln(io.err, &format!("install: cannot stat '{source}': {error}"));
+                status = 1;
+                continue;
+            }
+        };
+        if !interp.charge_cpu(data.len() as u64) {
+            return 137;
+        }
+        let result = if create_parents {
+            let absolute = resolve_against(&cwd, &target);
+            if matches!(
+                interp.fs_metadata("/", &absolute, false),
+                Ok(crate::vfs::Node {
+                    kind: crate::vfs::NodeKind::Dir,
+                    ..
+                })
+            ) {
+                Err(crate::vfs::VfsError::IsADir(target.clone()))
+            } else {
+                // `put_file` plans the missing parent directories and the file replacement as
+                // one quota-checked mutation. A failed `install -D` therefore leaves no parents.
+                interp.vfs.put_file(&absolute, data, mode)
+            }
+        } else {
+            interp
+                .vfs
+                .write(&cwd, &target, &data, mode)
+                .and_then(|()| interp.vfs.chmod(&cwd, &target, mode))
+        };
+        if let Err(error) = result {
+            ewln(
+                io.err,
+                &format!("install: cannot create regular file '{target}': {error}"),
+            );
+            status = 1;
+        }
+    }
+    status
+}
+
+fn install_mode(value: &str, default: u32) -> Option<u32> {
+    if !value.is_empty() && value.chars().all(|ch| ch.is_digit(8)) {
+        return u32::from_str_radix(value, 8).ok().map(|mode| mode & 0o7777);
+    }
+    if value.split(',').all(|clause| {
+        let Some(operator) = clause.find(['+', '-', '=']) else {
+            return false;
+        };
+        let (who, permission) = clause.split_at(operator);
+        who.chars().all(|ch| matches!(ch, 'u' | 'g' | 'o' | 'a'))
+            && permission.len() > 1
+            && permission[1..]
+                .chars()
+                .all(|ch| matches!(ch, 'r' | 'w' | 'x'))
+    }) {
+        Some(parse_mode(value, default))
+    } else {
+        None
+    }
+}
+
+fn cmd_truncate(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut no_create = false;
+    let mut size_arg = None;
+    let mut files = Vec::new();
+    let mut options = true;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if options && arg == "--" {
+            options = false;
+        } else if options && (arg == "-c" || arg == "--no-create") {
+            no_create = true;
+        } else if options && (arg == "-s" || arg == "--size") {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                ewln(io.err, "truncate: option requires an argument -- 's'");
+                return 2;
+            };
+            size_arg = Some(value.clone());
+        } else if options && arg.starts_with("-s") && arg.len() > 2 {
+            size_arg = Some(arg[2..].to_string());
+        } else if options && arg.starts_with("--size=") {
+            size_arg = Some(arg[7..].to_string());
+        } else if options && arg.starts_with('-') && arg != "-" {
+            ewln(io.err, &format!("truncate: unimplemented option '{arg}'"));
+            return 2;
+        } else {
+            files.push(arg.clone());
+        }
+        index += 1;
+    }
+    let Some(size_arg) = size_arg else {
+        ewln(io.err, "truncate: missing operand");
+        return 1;
+    };
+    let Some(change) = parse_size_change(&size_arg) else {
+        ewln(io.err, &format!("truncate: invalid number: '{size_arg}'"));
+        return 1;
+    };
+    if files.is_empty() {
+        ewln(io.err, "truncate: missing file operand");
+        return 1;
+    }
+
+    let cwd = interp.cwd.clone();
+    let mut status = 0;
+    for file in files {
+        let (mut data, mode) = match interp.fs_metadata(&cwd, &file, true) {
+            Ok(node) => match node.kind {
+                crate::vfs::NodeKind::File(data) => (data, node.mode),
+                _ => {
+                    ewln(
+                        io.err,
+                        &format!("truncate: cannot open '{file}': Not a file"),
+                    );
+                    status = 1;
+                    continue;
+                }
+            },
+            Err(_) if no_create => continue,
+            Err(_) => (Vec::new(), 0o666),
+        };
+        let Some(new_len) = change.apply(data.len()) else {
+            ewln(io.err, &format!("truncate: invalid number: '{size_arg}'"));
+            status = 1;
+            continue;
+        };
+        if !interp.charge_cpu(new_len.saturating_sub(data.len()) as u64) {
+            return 137;
+        }
+        if !interp.reserve_memory(new_len as u64) {
+            return 137;
+        }
+        data.resize(new_len, 0);
+        let result = interp.vfs.write(&cwd, &file, &data, mode);
+        interp.resources.release_memory(new_len as u64);
+        if let Err(error) = result {
+            ewln(io.err, &format!("truncate: cannot open '{file}': {error}"));
+            status = 1;
+        }
+    }
+    status
+}
+
+#[derive(Clone, Copy)]
+enum SizeChange {
+    Absolute(usize),
+    Increase(usize),
+    Decrease(usize),
+}
+
+impl SizeChange {
+    fn apply(self, current: usize) -> Option<usize> {
+        match self {
+            Self::Absolute(size) => Some(size),
+            Self::Increase(size) => current.checked_add(size),
+            Self::Decrease(size) => Some(current.saturating_sub(size)),
+        }
+    }
+}
+
+fn parse_size_change(value: &str) -> Option<SizeChange> {
+    let (kind, amount) = match value.as_bytes().first() {
+        Some(b'+') => (1, &value[1..]),
+        Some(b'-') => (2, &value[1..]),
+        _ => (0, value),
+    };
+    if amount.is_empty() {
+        return None;
+    }
+    let digits = amount.trim_end_matches(|ch: char| ch.is_ascii_alphabetic());
+    let suffix = &amount[digits.len()..];
+    let multiplier = match suffix {
+        "" => 1usize,
+        "K" | "KiB" => 1024,
+        "M" | "MiB" => 1024 * 1024,
+        "G" | "GiB" => 1024 * 1024 * 1024,
+        "KB" => 1000,
+        "MB" => 1000 * 1000,
+        "GB" => 1000 * 1000 * 1000,
+        _ => return None,
+    };
+    let size = digits.parse::<usize>().ok()?.checked_mul(multiplier)?;
+    Some(match kind {
+        1 => SizeChange::Increase(size),
+        2 => SizeChange::Decrease(size),
+        _ => SizeChange::Absolute(size),
+    })
+}
+
+fn cmd_tree(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let mut all = false;
+    let mut max_depth = None;
+    let mut operands = Vec::new();
+    let mut options = true;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if options && arg == "--" {
+            options = false;
+        } else if options && (arg == "-a" || arg == "--all") {
+            all = true;
+        } else if options && (arg == "-L" || arg == "--level") {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                ewln(io.err, "tree: option requires an argument -- 'L'");
+                return 2;
+            };
+            let Ok(depth) = value.parse::<usize>() else {
+                ewln(io.err, "tree: invalid level, must be greater than 0");
+                return 2;
+            };
+            if depth == 0 {
+                ewln(io.err, "tree: invalid level, must be greater than 0");
+                return 2;
+            }
+            max_depth = Some(depth);
+        } else if options && arg.starts_with('-') && arg != "-" {
+            ewln(io.err, &format!("tree: unimplemented option '{arg}'"));
+            return 2;
+        } else {
+            operands.push(arg.clone());
+        }
+        index += 1;
+    }
+    if operands.len() > 1 {
+        ewln(io.err, "tree: too many operands");
+        return 2;
+    }
+    let root = operands.first().map_or(".", String::as_str);
+    let node = match interp.fs_metadata(&interp.cwd, root, false) {
+        Ok(node) => node,
+        Err(error) => {
+            ewln(io.err, &format!("tree: {root}: {error}"));
+            return 1;
+        }
+    };
+    wln(io.out, root);
+    let mut directories = 0usize;
+    let mut files = 0usize;
+    if matches!(node.kind, crate::vfs::NodeKind::Dir) {
+        let status = tree_directory(
+            interp,
+            root,
+            "",
+            1,
+            max_depth,
+            all,
+            &mut directories,
+            &mut files,
+            io,
+        );
+        if status != 0 {
+            return status;
+        }
+    } else {
+        files = 1;
+    }
+    wln(io.out, "");
+    wln(
+        io.out,
+        &format!(
+            "{directories} director{}, {files} file{}",
+            if directories == 1 { "y" } else { "ies" },
+            if files == 1 { "" } else { "s" }
+        ),
+    );
+    0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tree_directory(
+    interp: &mut CommandContext<'_>,
+    path: &str,
+    prefix: &str,
+    depth: usize,
+    max_depth: Option<usize>,
+    all: bool,
+    directories: &mut usize,
+    files: &mut usize,
+    io: &mut Io,
+) -> i32 {
+    let mut entries = match interp.fs_list_dir(&interp.cwd, path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            ewln(io.err, &format!("tree: {path}: {error}"));
+            return 1;
+        }
+    };
+    entries.sort();
+    if !all {
+        entries.retain(|entry| !entry.starts_with('.'));
+    }
+    for (position, entry) in entries.iter().enumerate() {
+        if !interp.charge_cpu(1) {
+            return 137;
+        }
+        let last = position + 1 == entries.len();
+        let child = if path == "/" {
+            format!("/{entry}")
+        } else {
+            format!("{}/{entry}", path.trim_end_matches('/'))
+        };
+        let node = match interp.fs_metadata(&interp.cwd, &child, false) {
+            Ok(node) => node,
+            Err(error) => {
+                ewln(io.err, &format!("tree: {child}: {error}"));
+                return 1;
+            }
+        };
+        let suffix = match &node.kind {
+            crate::vfs::NodeKind::Symlink(target) => format!(" -> {target}"),
+            _ => String::new(),
+        };
+        wln(
+            io.out,
+            &format!(
+                "{prefix}{} {entry}{suffix}",
+                if last { "└──" } else { "├──" }
+            ),
+        );
+        match node.kind {
+            crate::vfs::NodeKind::Dir => {
+                *directories = directories.saturating_add(1);
+                if max_depth.is_none_or(|maximum| depth < maximum) {
+                    let next_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
+                    let status = tree_directory(
+                        interp,
+                        &child,
+                        &next_prefix,
+                        depth + 1,
+                        max_depth,
+                        all,
+                        directories,
+                        files,
+                        io,
+                    );
+                    if status != 0 {
+                        return status;
+                    }
+                }
+            }
+            _ => *files = files.saturating_add(1),
+        }
+    }
+    0
 }

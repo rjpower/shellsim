@@ -137,6 +137,15 @@ pub struct ProcessState {
     /// array; it shadows any scalar `vars` entry of the same name for `${name[...]}` access.
     pub arrays: HashMap<String, ArrayVal>,
     pub exported: std::collections::BTreeSet<String>,
+    /// Variable names protected by the `readonly` builtin.
+    pub readonly: std::collections::BTreeSet<String>,
+    /// Process-local file creation mask. Creation sites apply this value explicitly.
+    pub umask: u16,
+    /// Compatibility options recorded by `shopt`; options with behavioral effects remain
+    /// rejected until their corresponding parser or expansion support exists.
+    pub shell_options: std::collections::BTreeSet<String>,
+    /// Successful executable resolutions retained by the `hash` builtin.
+    pub command_hash: BTreeMap<String, String>,
     pub cwd: String,
     /// Bash-style directory stack, stored oldest-to-newest beneath the current directory.
     pub directory_stack: Vec<String>,
@@ -316,6 +325,10 @@ impl ProcessState {
             vars: self.vars.clone(),
             arrays: self.arrays.clone(),
             exported: self.exported.clone(),
+            readonly: self.readonly.clone(),
+            umask: self.umask,
+            shell_options: self.shell_options.clone(),
+            command_hash: self.command_hash.clone(),
             cwd: self.cwd.clone(),
             directory_stack: self.directory_stack.clone(),
             funcs: self.funcs.clone(),
@@ -424,6 +437,17 @@ impl ProcessState {
                         .iter()
                         .fold(0, |total, word| total.saturating_add(string(word))),
                 );
+        }
+        for name in &self.readonly {
+            bytes = bytes.saturating_add(string(name));
+        }
+        for name in &self.shell_options {
+            bytes = bytes.saturating_add(string(name));
+        }
+        for (name, path) in &self.command_hash {
+            bytes = bytes
+                .saturating_add(string(name))
+                .saturating_add(string(path));
         }
         for scope in &self.local_scopes {
             for (name, binding) in scope {
@@ -551,6 +575,10 @@ impl Environment {
                 vars,
                 arrays: HashMap::new(),
                 exported,
+                readonly: std::collections::BTreeSet::new(),
+                umask: 0o022,
+                shell_options: std::collections::BTreeSet::new(),
+                command_hash: BTreeMap::new(),
                 cwd: "/".to_string(),
                 directory_stack: Vec::new(),
                 funcs: HashMap::new(),

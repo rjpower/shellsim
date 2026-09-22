@@ -206,8 +206,18 @@ enum ShellFrame {
         command: PreparedCommand,
         pid: crate::process::ProcessId,
         capture: crate::descriptors::DescriptionId,
-        redirect: usize,
+        location: ProcessSubstitutionLocation,
     },
+    RunOutputSubstitutions {
+        substitutions: Vec<OutputProcessSubstitution>,
+        command_status: Option<i32>,
+    },
+    AwaitOutputProcessSubstitution {
+        substitutions: Vec<OutputProcessSubstitution>,
+        command_status: i32,
+        pid: crate::process::ProcessId,
+    },
+    CleanupProcessSubstitutionFiles(Vec<String>),
     PrepareFor(PreparedFor),
     AwaitForSubstitution {
         state: PreparedFor,
@@ -350,6 +360,20 @@ struct PreparedCommand {
     redirects: Vec<Redirect>,
     temporary_variables: Vec<(String, Option<String>)>,
     substitution_status: Option<i32>,
+    output_substitutions: Vec<OutputProcessSubstitution>,
+    process_substitution_files: Vec<String>,
+}
+
+#[derive(Clone)]
+enum ProcessSubstitutionLocation {
+    Redirect(usize),
+    Word(usize),
+}
+
+#[derive(Clone)]
+struct OutputProcessSubstitution {
+    path: String,
+    source: String,
 }
 
 #[derive(Clone)]
@@ -509,6 +533,17 @@ impl ShellContinuation {
         for frame in std::mem::take(&mut self.frames).into_iter().rev() {
             match frame {
                 ShellFrame::RestoreRedirect(scope) => end_redirects(interp, scope),
+                ShellFrame::CleanupProcessSubstitutionFiles(paths) => {
+                    for path in paths {
+                        let _ = interp.vfs.remove_file("/", &path);
+                    }
+                }
+                ShellFrame::RunOutputSubstitutions { substitutions, .. }
+                | ShellFrame::AwaitOutputProcessSubstitution { substitutions, .. } => {
+                    for substitution in substitutions {
+                        let _ = interp.vfs.remove_file("/", &substitution.path);
+                    }
+                }
                 ShellFrame::FinishFunction {
                     positional,
                     variables,
@@ -575,13 +610,38 @@ impl ShellContinuation {
     }
 
     fn prepare_command(&mut self, interp: &mut Interp, mut command: PreparedCommand) {
-        if let Some((redirect, source)) = next_process_substitution(&command) {
+        if let Some((word, source)) = next_output_process_substitution(&command) {
+            if !self.ensure_capacity(interp, 1) {
+                cleanup_prepared_process_substitutions(interp, &command);
+                restore_command_variables(interp, command.temporary_variables);
+                return;
+            }
+            let source = source.to_string();
+            let path = match create_process_substitution_file(interp, &[]) {
+                Ok(path) => path,
+                Err(message) => {
+                    write_diagnostic(interp, &message);
+                    cleanup_prepared_process_substitutions(interp, &command);
+                    restore_command_variables(interp, command.temporary_variables);
+                    self.status = 125;
+                    return;
+                }
+            };
+            command.words[word] = path.clone();
+            command
+                .output_substitutions
+                .push(OutputProcessSubstitution { path, source });
+            self.push(interp, ShellFrame::PrepareCommand(command));
+            return;
+        }
+        if let Some((location, source)) = next_process_substitution(&command) {
             let (pid, capture) = match start_command_substitution(interp, source) {
                 Ok(child) => child,
                 Err((status, message)) => {
                     if !message.is_empty() {
                         write_diagnostic(interp, &message);
                     }
+                    cleanup_prepared_process_substitutions(interp, &command);
                     restore_command_variables(interp, command.temporary_variables);
                     self.status = status;
                     return;
@@ -591,26 +651,14 @@ impl ShellContinuation {
                 command,
                 pid,
                 capture,
-                redirect,
+                location,
             });
             self.switched = true;
             return;
         }
-        if command
-            .words
-            .iter()
-            .any(|word| process_substitution_source(word).is_some())
-        {
-            write_diagnostic(
-                interp,
-                "shellsim: process substitution is supported only as an input redirection\n",
-            );
-            restore_command_variables(interp, command.temporary_variables);
-            self.status = 2;
-            return;
-        }
         if let Some((location, substitution)) = next_command_substitution(&command) {
             if !self.ensure_capacity(interp, 1) {
+                cleanup_prepared_process_substitutions(interp, &command);
                 restore_command_variables(interp, command.temporary_variables);
                 return;
             }
@@ -618,6 +666,7 @@ impl ShellContinuation {
                 Ok(variable) => variable,
                 Err(message) => {
                     write_diagnostic(interp, &message);
+                    cleanup_prepared_process_substitutions(interp, &command);
                     restore_command_variables(interp, command.temporary_variables);
                     self.status = 125;
                     return;
@@ -631,6 +680,7 @@ impl ShellContinuation {
                     if !message.is_empty() {
                         write_diagnostic(interp, &message);
                     }
+                    cleanup_prepared_process_substitutions(interp, &command);
                     restore_command_variables(interp, command.temporary_variables);
                     self.status = status;
                     return;
@@ -647,21 +697,49 @@ impl ShellContinuation {
             return;
         }
 
-        let needed = 1 + usize::from(!command.redirects.is_empty());
+        let needed = 1
+            + usize::from(!command.redirects.is_empty())
+            + usize::from(!command.output_substitutions.is_empty())
+            + usize::from(!command.process_substitution_files.is_empty());
         if !self.ensure_capacity(interp, needed) {
+            cleanup_prepared_process_substitutions(interp, &command);
             restore_command_variables(interp, command.temporary_variables);
             return;
         }
-        if !command.redirects.is_empty() {
+        let descriptor_only_exec = matches!(command.words.as_slice(), [word] if word == "exec")
+            || matches!(command.words.as_slice(), [word, separator] if word == "exec" && separator == "--");
+        let redirect_scope = if command.redirects.is_empty() {
+            None
+        } else {
             match begin_redirects(interp, &command.redirects) {
-                Ok(scope) => self.frames.push(ShellFrame::RestoreRedirect(scope)),
+                Ok(scope) if descriptor_only_exec => {
+                    commit_redirects(interp, scope);
+                    None
+                }
+                Ok(scope) => Some(scope),
                 Err(error) => {
                     write_diagnostic(interp, &format!("shellsim: redirection: {error}\n"));
+                    cleanup_prepared_process_substitutions(interp, &command);
                     restore_command_variables(interp, command.temporary_variables);
                     self.status = 1;
                     return;
                 }
             }
+        };
+        if !command.output_substitutions.is_empty() {
+            self.frames.push(ShellFrame::RunOutputSubstitutions {
+                substitutions: command.output_substitutions,
+                command_status: None,
+            });
+        }
+        if !command.process_substitution_files.is_empty() {
+            self.frames
+                .push(ShellFrame::CleanupProcessSubstitutionFiles(
+                    command.process_substitution_files,
+                ));
+        }
+        if let Some(scope) = redirect_scope {
+            self.frames.push(ShellFrame::RestoreRedirect(scope));
         }
         self.frames.push(ShellFrame::RunCommand {
             assigns: command.assigns,
@@ -949,6 +1027,11 @@ impl ShellContinuation {
                 previous,
             } => {
                 let (status, value) = finish_command_substitution(interp, pid, capture);
+                if !self.ensure_capacity(interp, 1) {
+                    cleanup_prepared_process_substitutions(interp, &command);
+                    restore_command_variables(interp, command.temporary_variables);
+                    return;
+                }
                 interp.set_var(&variable, value);
                 command.temporary_variables.push((variable, previous));
                 command.substitution_status = Some(status);
@@ -958,12 +1041,93 @@ impl ShellContinuation {
                 mut command,
                 pid,
                 capture,
-                redirect,
+                location,
             } => {
                 let (_, bytes) = finish_substitution(interp, pid, capture);
-                command.redirects[redirect].op = RedirOp::HeredocRaw;
-                command.redirects[redirect].target = String::from_utf8_lossy(&bytes).into_owned();
+                if !self.ensure_capacity(interp, 1) {
+                    cleanup_prepared_process_substitutions(interp, &command);
+                    restore_command_variables(interp, command.temporary_variables);
+                    return;
+                }
+                match location {
+                    ProcessSubstitutionLocation::Redirect(redirect) => {
+                        command.redirects[redirect].op = RedirOp::HeredocRaw;
+                        command.redirects[redirect].target =
+                            String::from_utf8_lossy(&bytes).into_owned();
+                    }
+                    ProcessSubstitutionLocation::Word(word) => {
+                        let path = match create_process_substitution_file(interp, &bytes) {
+                            Ok(path) => path,
+                            Err(message) => {
+                                write_diagnostic(interp, &message);
+                                cleanup_prepared_process_substitutions(interp, &command);
+                                restore_command_variables(interp, command.temporary_variables);
+                                self.status = 125;
+                                return;
+                            }
+                        };
+                        command.words[word] = path.clone();
+                        command.process_substitution_files.push(path);
+                    }
+                }
                 self.push(interp, ShellFrame::PrepareCommand(command));
+            }
+            ShellFrame::RunOutputSubstitutions {
+                mut substitutions,
+                command_status,
+            } => {
+                let command_status = command_status.unwrap_or(self.status);
+                let Some(substitution) = substitutions.pop() else {
+                    self.status = command_status;
+                    return;
+                };
+                let bytes = interp.fs_read("/", &substitution.path).unwrap_or_default();
+                let _ = interp.vfs.remove_file("/", &substitution.path);
+                match start_process_substitution_consumer(interp, &substitution.source, bytes) {
+                    Ok(pid) => {
+                        self.frames
+                            .push(ShellFrame::AwaitOutputProcessSubstitution {
+                                substitutions,
+                                command_status,
+                                pid,
+                            });
+                        self.switched = true;
+                    }
+                    Err((status, message)) => {
+                        if !message.is_empty() {
+                            write_diagnostic(interp, &message);
+                        }
+                        for substitution in substitutions {
+                            let _ = interp.vfs.remove_file("/", &substitution.path);
+                        }
+                        self.status = if command_status == 0 {
+                            status
+                        } else {
+                            command_status
+                        };
+                    }
+                }
+            }
+            ShellFrame::AwaitOutputProcessSubstitution {
+                substitutions,
+                command_status,
+                pid,
+            } => {
+                interp.processes.reap(pid);
+                let _ = interp.scheduler.reap(pid);
+                self.status = command_status;
+                self.push(
+                    interp,
+                    ShellFrame::RunOutputSubstitutions {
+                        substitutions,
+                        command_status: Some(command_status),
+                    },
+                );
+            }
+            ShellFrame::CleanupProcessSubstitutionFiles(paths) => {
+                for path in paths {
+                    let _ = interp.vfs.remove_file("/", &path);
+                }
             }
             ShellFrame::PrepareFor(state) => self.prepare_for(interp, state),
             ShellFrame::AwaitForSubstitution {
@@ -1599,6 +1763,8 @@ impl ShellContinuation {
                         redirects,
                         temporary_variables: Vec::new(),
                         substitution_status: None,
+                        output_substitutions: Vec::new(),
+                        process_substitution_files: Vec::new(),
                     }),
                 );
             }
@@ -1775,6 +1941,12 @@ impl ShellContinuation {
         if argv.is_empty() {
             for (key, value) in &assigns {
                 apply_assignment(interp, key, value);
+                if let Some(message) = interp.expansion_error.take() {
+                    write_diagnostic(interp, &message);
+                    restore_command_variables(interp, temporary_variables);
+                    self.status = 1;
+                    return;
+                }
             }
             restore_command_variables(interp, temporary_variables);
             self.status = substitution_status.unwrap_or(0);
@@ -2013,7 +2185,13 @@ fn process_substitution_source(value: &str) -> Option<&str> {
     value.strip_prefix("<(")?.strip_suffix(')')
 }
 
-fn next_process_substitution(command: &PreparedCommand) -> Option<(usize, &str)> {
+fn output_process_substitution_source(value: &str) -> Option<&str> {
+    value.strip_prefix(">(")?.strip_suffix(')')
+}
+
+fn next_process_substitution(
+    command: &PreparedCommand,
+) -> Option<(ProcessSubstitutionLocation, &str)> {
     command
         .redirects
         .iter()
@@ -2022,8 +2200,42 @@ fn next_process_substitution(command: &PreparedCommand) -> Option<(usize, &str)>
             (redirect.op == RedirOp::Read)
                 .then(|| process_substitution_source(&redirect.target))
                 .flatten()
-                .map(|source| (index, source))
+                .map(|source| (ProcessSubstitutionLocation::Redirect(index), source))
         })
+        .or_else(|| {
+            command.words.iter().enumerate().find_map(|(index, word)| {
+                process_substitution_source(word)
+                    .map(|source| (ProcessSubstitutionLocation::Word(index), source))
+            })
+        })
+}
+
+fn next_output_process_substitution(command: &PreparedCommand) -> Option<(usize, &str)> {
+    command.words.iter().enumerate().find_map(|(index, word)| {
+        output_process_substitution_source(word).map(|source| (index, source))
+    })
+}
+
+fn create_process_substitution_file(interp: &mut Interp, bytes: &[u8]) -> Result<String, String> {
+    let identifier = interp
+        .next_temp_id()
+        .ok_or_else(|| "shellsim: process substitution identity exhausted\n".to_string())?;
+    let path = format!("/tmp/.shellsim-process-substitution-{identifier}");
+    interp.sync_vfs_time();
+    interp
+        .vfs
+        .write("/", &path, bytes, 0o600)
+        .map_err(|error| format!("shellsim: process substitution: {error}\n"))?;
+    Ok(path)
+}
+
+fn cleanup_prepared_process_substitutions(interp: &mut Interp, command: &PreparedCommand) {
+    for substitution in &command.output_substitutions {
+        let _ = interp.vfs.remove_file("/", &substitution.path);
+    }
+    for path in &command.process_substitution_files {
+        let _ = interp.vfs.remove_file("/", path);
+    }
 }
 
 fn replace_substitution(
@@ -2137,6 +2349,35 @@ fn start_command_substitution(
         .set_continuation(pid, Some(ShellContinuation::new(&ast)))
         .expect("command substitution child must accept a continuation");
     Ok((pid, capture))
+}
+
+fn start_process_substitution_consumer(
+    interp: &mut Interp,
+    source: &str,
+    bytes: Vec<u8>,
+) -> Result<crate::process::ProcessId, (i32, String)> {
+    let mut diagnostic = Vec::new();
+    let ast = crate::commands::parse_shell_source(interp, source, &mut diagnostic)
+        .map_err(|status| (status, String::from_utf8_lossy(&diagnostic).into_owned()))?;
+    let input = interp
+        .descriptors
+        .open_input(bytes)
+        .map_err(|error| (125, format!("shellsim: process substitution: {error:?}\n")))?;
+    let pid = match interp.start_child(">(process substitution)", false) {
+        Ok(pid) => pid,
+        Err(error) => {
+            let _ = interp.descriptors.discard_unreferenced(input);
+            return Err((125, format!("shellsim: {error}\n")));
+        }
+    };
+    interp
+        .install_process_description(pid, 0, input)
+        .expect("process substitution child must accept a valid input description");
+    interp
+        .process
+        .set_continuation(pid, Some(ShellContinuation::new(&ast)))
+        .expect("process substitution child must accept a continuation");
+    Ok(pid)
 }
 
 fn rollback_pipeline(
@@ -2630,6 +2871,11 @@ fn end_redirects(interp: &mut Interp, scope: RedirectScope) {
     interp.resources.release_memory(scope.reserved_memory);
 }
 
+fn commit_redirects(interp: &mut Interp, mut scope: RedirectScope) {
+    scope.saved.close_all(&mut interp.descriptors);
+    interp.resources.release_memory(scope.reserved_memory);
+}
+
 /// Apply redirections from left to right. `dup` retains the open description selected at that
 /// point, so `2>&1 >file` and `>file 2>&1` have distinct, Bash-compatible destinations.
 fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), String> {
@@ -2671,6 +2917,34 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
                         .install_new_description(redirect.fd, description)
                         .map_err(|error| format!("{path}: {error:?}"))?;
                 }
+            }
+            RedirOp::ReadWrite => {
+                let path = redirect_path(interp, &redirect.target)?;
+                if path == "/dev/null" {
+                    let description = interp
+                        .descriptors
+                        .open_null()
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    interp
+                        .install_new_description(redirect.fd, description)
+                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    continue;
+                }
+                let created_by_open = !interp.vfs.lexists("/", &path);
+                if created_by_open {
+                    interp.sync_vfs_time();
+                    interp
+                        .vfs
+                        .write("/", &path, &[], 0o666 & !u32::from(interp.umask))
+                        .map_err(|error| error.to_string())?;
+                }
+                let description = interp
+                    .descriptors
+                    .open_file(path.clone(), 0, true, true, created_by_open)
+                    .map_err(|error| format!("{path}: {error:?}"))?;
+                interp
+                    .install_new_description(redirect.fd, description)
+                    .map_err(|error| format!("{path}: {error:?}"))?;
             }
             RedirOp::Heredoc | RedirOp::HeredocRaw | RedirOp::HereString => {
                 let mut bytes = match redirect.op {
@@ -2732,7 +3006,7 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
                 let cursor = if redirect.op == RedirOp::Append {
                     interp
                         .vfs
-                        .append("/", &path, &[], 0o644)
+                        .append("/", &path, &[], 0o666 & !u32::from(interp.umask))
                         .map_err(|error| error.to_string())?;
                     interp
                         .vfs
@@ -2741,7 +3015,7 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
                 } else {
                     interp
                         .vfs
-                        .write("/", &path, &[], 0o644)
+                        .write("/", &path, &[], 0o666 & !u32::from(interp.umask))
                         .map_err(|error| error.to_string())?;
                     0
                 };
@@ -2842,6 +3116,10 @@ fn install_command_variables(
         .map(|(k, _)| (k.clone(), interp.vars.get(k).cloned()))
         .collect();
     for (k, v) in &expanded_assigns {
+        if interp.readonly.contains(k) {
+            interp.expansion_error = Some(format!("shellsim: {k}: readonly variable\n"));
+            break;
+        }
         interp.set_var(k, v.clone());
         interp.export(k); // exported to child for the command
     }
@@ -2934,6 +3212,10 @@ pub fn apply_assignment(interp: &mut Interp, raw_key: &str, raw_val: &str) {
         }
         _ => (key_body, None),
     };
+    if interp.readonly.contains(name) {
+        interp.expansion_error = Some(format!("shellsim: {name}: readonly variable\n"));
+        return;
+    }
 
     // Array literal value: `( … )`.
     let trimmed = raw_val.trim();

@@ -42,7 +42,7 @@ fn unavailable_binaries_fail_and_remain_queryable() {
 
 #[test]
 fn workload_observed_unavailable_binaries_share_the_same_contract() {
-    for command in ["openssl", "setfacl", "netstat", "redis-cli"] {
+    for command in ["openssl", "setfacl", "redis-cli"] {
         let mut environment = Environment::new();
         let (outcome, stdout, stderr) = environment.run_script_capture(command);
 
@@ -84,7 +84,7 @@ fn realpath_missing_mode_resolves_symlinks_and_normalizes_absent_suffixes() {
 #[test]
 fn find_rejects_unsupported_and_malformed_predicates() {
     for source in [
-        "find /proc -delete",
+        "find /proc -execdir echo {} \\;",
         "find /proc -type z",
         "find /proc -name",
     ] {
@@ -139,9 +139,10 @@ fn common_text_options_are_exact_or_explicitly_unsupported() {
         text("printf 'a\nb\nc\n' | grep -n -A1 a"),
         (0, "1:a\n2-b\n".into(), String::new())
     );
-    let (status, _, stderr) = text("printf data | fold");
-    assert_eq!(status, 127);
-    assert!(stderr.contains("not implemented"), "{stderr}");
+    assert_eq!(
+        text("printf data | fold"),
+        (0, "data".into(), String::new())
+    );
 }
 
 #[test]
@@ -337,11 +338,6 @@ fn system_queries_compose_options_and_reject_unknown_ones() {
         let (status, _, stderr) = text(source);
         assert_eq!(status, 2, "{source}: {stderr}");
         assert!(stderr.contains("unimplemented"), "{source}: {stderr}");
-    }
-    for source in ["yes", "readonly value=one"] {
-        let (status, _, stderr) = text(source);
-        assert_eq!(status, 127, "{source}: {stderr}");
-        assert!(stderr.contains("not implemented"), "{source}: {stderr}");
     }
 }
 

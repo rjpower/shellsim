@@ -9,6 +9,8 @@ mod archive;
 mod awk;
 #[path = "commands/dd.rs"]
 mod dd;
+#[path = "commands/filesystem_extra.rs"]
+mod filesystem_extra;
 #[path = "commands/find.rs"]
 mod find;
 #[path = "commands/git.rs"]
@@ -27,3 +29,5 @@ mod patch;
 mod rg;
 #[path = "commands/sed.rs"]
 mod sed;
+#[path = "commands/text_surface.rs"]
+mod text_surface;
