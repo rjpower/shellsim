@@ -197,6 +197,24 @@ class Future:
         self._loop._wake_waiters(self)
 
 
+class _GatheringFuture(Future):
+    def __init__(self, children, *, loop):
+        Future.__init__(self, loop=loop)
+        self._children = children
+        self._cancel_requested = False
+
+    def cancel(self, msg=None):
+        if self._done:
+            return False
+        cancelled = False
+        for child in self._children:
+            if child.cancel(msg=msg):
+                cancelled = True
+        if cancelled:
+            self._cancel_requested = True
+        return cancelled
+
+
 class Task:
     def __init__(self, coroutine, loop, name=None):
         if not _is_coroutine(coroutine):
@@ -737,7 +755,10 @@ class _Loop:
             self._ready.append(task)
 
     def _cancel(self, task):
-        if isinstance(task._waiting_on, Future) and task._waiting_on.cancel():
+        dependency = task._waiting_on
+        if isinstance(dependency, (Task, Future)) and dependency.cancel():
+            return
+        if isinstance(dependency, _TimeoutWait) and dependency.child.cancel():
             return
         if not task._started:
             task._done = True
@@ -856,8 +877,7 @@ class _Loop:
             else:
                 self._schedule(task, awaited._result)
         else:
-            if isinstance(awaited, Future):
-                task._waiting_on = awaited
+            task._waiting_on = awaited
             awaited._waiters.append(task)
 
     def _dispatch_yield(self, task, awaited):
@@ -978,17 +998,50 @@ async def sleep(delay, result=None):
     return result
 
 
-async def gather(*coroutines, return_exceptions=False):
+def gather(*coroutines, return_exceptions=False):
     tasks = [_ensure_task(coroutine) for coroutine in coroutines]
-    results = []
+    observed = []
     for task in tasks:
-        try:
-            results.append(await task)
-        except Exception as error:
+        if task not in observed:
+            observed.append(task)
+    loop = get_running_loop()
+    outer = _GatheringFuture(observed, loop=loop)
+    if not tasks:
+        outer.set_result([])
+        return outer
+
+    results = [None for task in tasks]
+    completed = [False for task in tasks]
+
+    def child_completed(child):
+        if outer.done():
+            return
+        if outer._cancel_requested:
+            if all(task.done() for task in observed):
+                outer.set_exception(CancelledError())
+            return
+        if child.cancelled():
             if not return_exceptions:
-                raise
-            results.append(error)
-    return results
+                outer.set_exception(CancelledError())
+                return
+            result = CancelledError()
+        elif child.exception() is not None:
+            if not return_exceptions:
+                outer.set_exception(child.exception())
+                return
+            result = child.exception()
+        else:
+            result = child.result()
+        for index in range(len(tasks)):
+            if tasks[index] is child:
+                completed[index] = True
+                results[index] = result
+        if all(completed):
+            outer.set_result(results)
+
+    for task in observed:
+        task.add_done_callback(child_completed)
+    return outer
 
 
 async def wait_for(awaitable, timeout):
@@ -1147,8 +1200,24 @@ def as_completed(awaitables, timeout=None):
         yield next_result()
 
 
-async def shield(awaitable):
-    return await _ensure_task(awaitable)
+def shield(awaitable):
+    inner = _ensure_task(awaitable)
+    if inner.done():
+        return inner
+    outer = get_running_loop().create_future()
+
+    def inner_completed(completed):
+        if outer.done():
+            return
+        if completed.cancelled():
+            outer.cancel()
+        elif completed.exception() is not None:
+            outer.set_exception(completed.exception())
+        else:
+            outer.set_result(completed.result())
+
+    inner.add_done_callback(inner_completed)
+    return outer
 
 
 async def create_subprocess_exec(program, *args, stdin=None, stdout=None, stderr=None,

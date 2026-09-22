@@ -43,9 +43,11 @@ tracking, locks, semaphores, conditions, and modeled subprocesses. `create_subpr
 pipe backpressure, `wait`, `communicate`, signals, cancellation, and virtual-time timeouts. Task
 failures cross `await` with their Python exception type, and cancellation or timeout resumes the
 coroutine so `finally` cleanup runs. Task groups cancel unfinished siblings on failure and raise
-the first child error directly because the runtime does not yet model exception groups. The VM
-parks its logical Python process on the union of the timers, child states, and pipes awaited by its
-coroutines, then retries only inside the simulation when one becomes ready. Async sockets,
+the first child error directly because the runtime does not yet model exception groups. Direct
+task cancellation follows nested awaits, while `shield` and `wait` preserve child tasks according
+to their asyncio contracts. The VM parks its logical Python process on the union of the timers,
+child states, and pipes awaited by its coroutines, then retries only inside the simulation when one
+becomes ready. Async sockets,
 executors, host threads, text-mode subprocess streams, and custom event loops are not exposed;
 synchronous calls made inside a coroutine retain their usual blocking behavior.
 
