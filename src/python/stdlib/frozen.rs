@@ -7,6 +7,7 @@
 /// cannot accidentally expose build-machine files at runtime.
 pub(super) fn module_source(name: &str) -> Option<&'static str> {
     match name {
+        "asyncio" => Some(include_str!("source/asyncio.py")),
         "abc" => Some(include_str!("source/abc.py")),
         "base64" => Some(include_str!("source/base64.py")),
         "codecs" => Some(include_str!("source/codecs.py")),

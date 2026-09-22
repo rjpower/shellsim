@@ -1302,6 +1302,7 @@ fn collect_pytest_functions(source: &str) -> Result<PytestCollection, String> {
             name,
             parameters,
             body,
+            ..
         } = function
         else {
             unreachable!()

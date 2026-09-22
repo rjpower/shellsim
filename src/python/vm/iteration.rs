@@ -340,7 +340,21 @@ impl Vm<'_> {
                 }
                 Ok(Some(value))
             }
-            Ok(Execution::Return(_)) | Ok(Execution::Halt) | Ok(Execution::Exit(_)) => {
+            Ok(Execution::Return(value)) => {
+                if let Object::Generator {
+                    exhausted,
+                    running,
+                    return_value,
+                    ..
+                } = self.state.heap.get_mut(id)?
+                {
+                    *exhausted = true;
+                    *running = false;
+                    *return_value = value;
+                }
+                Ok(None)
+            }
+            Ok(Execution::Halt) | Ok(Execution::Exit(_)) => {
                 if let Object::Generator {
                     exhausted, running, ..
                 } = self.state.heap.get_mut(id)?

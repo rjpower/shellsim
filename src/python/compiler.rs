@@ -15,6 +15,7 @@ pub fn compile(program: Program) -> CodeRef {
         finalizers: Vec::new(),
         protected_regions: Vec::new(),
         in_function: false,
+        is_coroutine: false,
         globals: HashSet::new(),
         nonlocals: HashSet::new(),
         named_expression: NamedExpressionContext::local(),
@@ -38,6 +39,7 @@ struct Compiler {
     /// at compile time rather than losing that state in a suspended generator.
     protected_regions: Vec<&'static str>,
     in_function: bool,
+    is_coroutine: bool,
     globals: HashSet<String>,
     nonlocals: HashSet<String>,
     named_expression: NamedExpressionContext,
@@ -155,7 +157,7 @@ impl Compiler {
             });
             spans.push(instruction.span);
         }
-        builder.finish(bytecode, spans, parameters, local_names)
+        builder.finish(bytecode, spans, parameters, local_names, self.is_coroutine)
     }
 
     fn statements(&mut self, statements: Vec<Statement>) {
@@ -324,6 +326,7 @@ impl Compiler {
                 name,
                 parameters,
                 body,
+                is_async,
             } => {
                 let defaults = parameters
                     .iter()
@@ -338,6 +341,7 @@ impl Compiler {
                     finalizers: Vec::new(),
                     protected_regions: Vec::new(),
                     in_function: true,
+                    is_coroutine: is_async,
                     globals: HashSet::new(),
                     nonlocals: HashSet::new(),
                     named_expression: NamedExpressionContext::local(),
@@ -391,6 +395,7 @@ impl Compiler {
                     finalizers: Vec::new(),
                     protected_regions: Vec::new(),
                     in_function: false,
+                    is_coroutine: false,
                     globals: HashSet::new(),
                     nonlocals: HashSet::new(),
                     named_expression: NamedExpressionContext::local(),
@@ -659,6 +664,47 @@ impl Compiler {
                 self.patch_try_begin(begin, handler);
                 self.emit(Operation::WithExitException, span);
                 self.patch_jump(done, self.instructions.len());
+            }
+            StatementKind::AsyncWith {
+                context,
+                target,
+                body,
+            } => {
+                let context_name = format!("$__shellsim_async_context_{}", self.instructions.len());
+                self.expression(context);
+                self.emit(Operation::StoreName(context_name.clone()), span);
+                self.emit(Operation::LoadName(context_name.clone()), span);
+                self.emit(Operation::LoadAttribute("__aenter__".into()), span);
+                self.emit(
+                    Operation::Call {
+                        positional: 0,
+                        keywords: Vec::new(),
+                        starred: Vec::new(),
+                    },
+                    span,
+                );
+                self.emit(Operation::Yield, span);
+                if let Some(target) = target {
+                    self.store_target(target, span);
+                } else {
+                    self.emit(Operation::PopTop, span);
+                }
+                self.statements(body);
+                self.emit(Operation::LoadName(context_name), span);
+                self.emit(Operation::LoadAttribute("__aexit__".into()), span);
+                for _ in 0..3 {
+                    self.emit(Operation::LoadConstant(Constant::None), span);
+                }
+                self.emit(
+                    Operation::Call {
+                        positional: 3,
+                        keywords: Vec::new(),
+                        starred: vec![false; 3],
+                    },
+                    span,
+                );
+                self.emit(Operation::Yield, span);
+                self.emit(Operation::PopTop, span);
             }
         }
     }
@@ -971,6 +1017,17 @@ impl Compiler {
                     self.emit(Operation::LoadConstant(Constant::None), span);
                 }
             }
+            ExpressionKind::Await(value) => {
+                if !self.is_coroutine {
+                    self.emit(
+                        Operation::RuntimeError("'await' outside async function".into()),
+                        span,
+                    );
+                } else {
+                    self.expression(*value);
+                    self.emit(Operation::Yield, span);
+                }
+            }
             ExpressionKind::Attribute { value, name } => {
                 self.expression(*value);
                 self.emit(Operation::LoadAttribute(name), span);
@@ -1042,6 +1099,7 @@ impl Compiler {
                     finalizers: Vec::new(),
                     protected_regions: Vec::new(),
                     in_function: true,
+                    is_coroutine: false,
                     globals: HashSet::new(),
                     nonlocals: HashSet::new(),
                     named_expression: NamedExpressionContext::local(),
@@ -1190,6 +1248,7 @@ impl Compiler {
             finalizers: Vec::new(),
             protected_regions: Vec::new(),
             in_function: true,
+            is_coroutine: false,
             globals: HashSet::new(),
             nonlocals: HashSet::new(),
             named_expression,
@@ -1239,6 +1298,7 @@ impl Compiler {
             finalizers: Vec::new(),
             protected_regions: Vec::new(),
             in_function: true,
+            is_coroutine: false,
             globals: HashSet::new(),
             nonlocals: HashSet::new(),
             named_expression,
@@ -1280,6 +1340,7 @@ impl Compiler {
             finalizers: Vec::new(),
             protected_regions: Vec::new(),
             in_function: true,
+            is_coroutine: false,
             globals: HashSet::new(),
             nonlocals: HashSet::new(),
             named_expression,

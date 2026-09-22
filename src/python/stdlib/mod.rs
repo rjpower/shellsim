@@ -4,6 +4,7 @@
 //! Keeping this directory self-contained makes each shim straightforward to review and test.
 
 pub mod argparse;
+mod asyncio;
 mod base64;
 pub mod bisect;
 pub mod collections;
@@ -57,6 +58,7 @@ pub(super) fn frozen_builtin(name: &str) -> Option<(&'static str, &'static str)>
 /// Resolve one capability-free module through the declarative native registry.
 pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
     match name {
+        "_asyncio" => Some(&asyncio::MODULE),
         "argparse" => Some(&argparse::MODULE),
         "_base64" => Some(&base64::MODULE),
         "_json" => Some(&json::MODULE),

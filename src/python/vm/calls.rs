@@ -1095,7 +1095,7 @@ impl Vm<'_> {
             mode,
             pop_method_frame,
         } = invocation;
-        if code.call_signature.is_generator {
+        if code.call_signature.is_generator || code.call_signature.is_coroutine {
             return self.create_generator(
                 name,
                 code,
@@ -1168,6 +1168,7 @@ impl Vm<'_> {
             stack: Vec::new(),
             exhausted: false,
             running: false,
+            return_value: Value::None,
         })?;
         Ok(CallResult::Value(generator))
     }

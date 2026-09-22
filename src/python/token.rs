@@ -97,6 +97,8 @@ pub enum TokenKind {
     Raise,
     With,
     Yield,
+    Async,
+    Await,
 }
 
 #[derive(Clone, Debug, PartialEq)]

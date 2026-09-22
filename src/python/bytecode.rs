@@ -65,6 +65,7 @@ pub struct Code {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallSignature {
     pub is_generator: bool,
+    pub is_coroutine: bool,
     pub positional_count: usize,
     pub variadic_slot: Option<usize>,
     pub default_slots: Box<[usize]>,
@@ -503,6 +504,7 @@ impl CodeBuilder {
         spans: Vec<Span>,
         parameters: Vec<Parameter>,
         local_names: Vec<String>,
+        is_coroutine: bool,
     ) -> CodeRef {
         let positional_count = parameters
             .iter()
@@ -512,6 +514,7 @@ impl CodeBuilder {
             is_generator: instructions
                 .iter()
                 .any(|instruction| matches!(instruction.opcode, Opcode::Yield)),
+            is_coroutine,
             positional_count,
             variadic_slot: parameters.iter().position(|parameter| parameter.variadic),
             default_slots: parameters

@@ -90,6 +90,10 @@ impl Parser {
             )?;
             self.separators();
         }
+        let is_async = self.take(|kind| matches!(kind, TokenKind::Async)).is_some();
+        if is_async && !self.at(|kind| matches!(kind, TokenKind::Def | TokenKind::With)) {
+            return Err(self.error("expected 'def' or 'with' after 'async'"));
+        }
         let kind = if self.take(|kind| matches!(kind, TokenKind::If)).is_some() {
             self.if_statement(start)?
         } else if self.take(|kind| matches!(kind, TokenKind::Try)).is_some() {
@@ -145,10 +149,18 @@ impl Parser {
                 None
             };
             let body = self.suite()?;
-            StatementKind::With {
-                context,
-                target,
-                body,
+            if is_async {
+                StatementKind::AsyncWith {
+                    context,
+                    target,
+                    body,
+                }
+            } else {
+                StatementKind::With {
+                    context,
+                    target,
+                    body,
+                }
             }
         } else if self.take(|kind| matches!(kind, TokenKind::While)).is_some() {
             let test = self.expression()?;
@@ -257,6 +269,7 @@ impl Parser {
                 name,
                 parameters,
                 body: self.suite()?,
+                is_async,
             }
         } else if self.take(|kind| matches!(kind, TokenKind::Class)).is_some() {
             let name = self.name("expected a class name after 'class'")?;
@@ -1180,6 +1193,13 @@ impl Parser {
 
     fn unary(&mut self) -> Result<Expression, ParseError> {
         let start = self.peek().span;
+        if self.take(|kind| matches!(kind, TokenKind::Await)).is_some() {
+            let value = self.postfix()?;
+            return Ok(Expression {
+                span: start.through(value.span),
+                kind: ExpressionKind::Await(Box::new(value)),
+            });
+        }
         let operator = if self.take(|kind| matches!(kind, TokenKind::Plus)).is_some() {
             Some(UnaryOperator::Positive)
         } else if self.take(|kind| matches!(kind, TokenKind::Minus)).is_some() {

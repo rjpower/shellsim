@@ -212,6 +212,7 @@ pub enum Object {
         stack: Vec<Value>,
         exhausted: bool,
         running: bool,
+        return_value: Value,
     },
     Module {
         name: String,
@@ -1430,9 +1431,15 @@ fn trace_object(
             trace_value(*callable, object_work);
             trace_value(*sentinel, object_work);
         }
-        Object::Generator { scope, stack, .. } => {
+        Object::Generator {
+            scope,
+            stack,
+            return_value,
+            ..
+        } => {
             scope_work.push(*scope);
             trace_values(stack.iter().copied(), object_work);
+            trace_value(*return_value, object_work);
         }
         Object::Module { scope, .. } => scope_work.push(*scope),
         Object::Array { storage, .. } => object_work.push(*storage),

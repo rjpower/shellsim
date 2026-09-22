@@ -1001,6 +1001,23 @@ impl PyRuntime for Vm<'_> {
             .map_err(PyError::runtime_error)
     }
 
+    fn generator_return_value(&self, generator: PyIterator) -> PyResult<Value> {
+        match self
+            .state
+            .heap
+            .get(generator.object_id())
+            .map_err(PyError::runtime_error)?
+        {
+            Object::Generator {
+                exhausted: true,
+                return_value,
+                ..
+            } => Ok(*return_value),
+            Object::Generator { .. } => Err(PyError::runtime_error("coroutine has not completed")),
+            _ => Err(PyError::type_error("expected a coroutine")),
+        }
+    }
+
     fn generator_close(&mut self, generator: PyIterator) -> PyResult<()> {
         let id = generator.object_id();
         if !matches!(
