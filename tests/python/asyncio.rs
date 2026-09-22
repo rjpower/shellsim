@@ -1,6 +1,7 @@
 //! Observable compatibility tests for shellsim's cooperative asyncio subset.
 
 use super::support::run_python_text;
+use shellsim::Environment;
 
 #[test]
 fn async_function_is_lazy_and_returns_through_await() {
@@ -158,4 +159,65 @@ print(events)
     let (status, stdout, stderr) = run_python_text(source);
     assert_eq!(status, 0, "{stderr}");
     assert_eq!(stdout, "True True\ntimed out\n['cancel', 'timeout']\n");
+}
+
+#[test]
+fn subprocess_streams_make_progress_across_modeled_resource_waits() {
+    let source = r#"import asyncio
+async def main():
+    process = await asyncio.create_subprocess_exec(
+        "cat", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
+    )
+    output, error = await process.communicate(b"x" * 100000)
+    print(process.returncode, len(output), error)
+asyncio.run(main())
+"#;
+    let (status, stdout, stderr) = run_python_text(source);
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "0 100000 None\n");
+}
+
+#[test]
+fn subprocess_wait_timeout_uses_virtual_time_and_remains_recoverable() {
+    let source = r#"import asyncio
+async def main():
+    process = await asyncio.create_subprocess_exec("sleep", "10")
+    try:
+        await asyncio.wait_for(process.wait(), 1)
+    except TimeoutError:
+        print("timeout")
+        process.kill()
+    print(await process.wait())
+asyncio.run(main())
+"#;
+    let (status, stdout, stderr) = run_python_text(source);
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "timeout\n-9\n");
+}
+
+#[test]
+fn scheduled_python_wakes_when_any_async_child_resource_is_ready() {
+    let source = r#"import asyncio
+async def main():
+    process = await asyncio.create_subprocess_exec(
+        "cat", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
+    )
+    output, error = await process.communicate(b"x" * 100000)
+    print(process.returncode, len(output), error)
+asyncio.run(main())
+"#;
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .put_file("/async.py", source.as_bytes().to_vec(), 0o644)
+        .expect("install async process script");
+    let (outcome, stdout, stderr) = environment.run_script_capture("python3.14 /async.py");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(String::from_utf8(stdout).unwrap(), "0 100000 None\n");
+    assert!(stderr.is_empty());
 }

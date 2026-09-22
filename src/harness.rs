@@ -304,7 +304,7 @@ pub enum ProcessViewStatus {
 }
 
 /// Serializable scheduler wait reason without exposing implementation strings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitReasonView {
     Timer { deadline_ns: u64 },
@@ -315,6 +315,7 @@ pub enum WaitReasonView {
     ChildActivity { pid: u32 },
     ChildDeadline { pid: u32, deadline_ns: u64 },
     ChildActivityDeadline { pid: u32, deadline_ns: u64 },
+    Any { reasons: Vec<WaitReasonView> },
 }
 
 /// One stable path-level difference from the last checkpoint.
@@ -1259,6 +1260,9 @@ fn wait_reason_view(reason: WaitReason) -> WaitReasonView {
         WaitReason::ChildActivityDeadline(pid, deadline_ns) => {
             WaitReasonView::ChildActivityDeadline { pid, deadline_ns }
         }
+        WaitReason::Any(reasons) => WaitReasonView::Any {
+            reasons: reasons.into_iter().map(wait_reason_view).collect(),
+        },
     }
 }
 

@@ -81,7 +81,7 @@ impl fmt::Debug for ValueKindDef {
 }
 
 /// Stable error categories produced by native Python operations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PyErrorKind {
     Type,
     Value,
@@ -298,6 +298,12 @@ pub(super) struct PyProcessOutput {
     pub inherited_stderr: Vec<u8>,
 }
 
+/// Result of probing a modeled process operation without driving the scheduler.
+pub(super) enum PyProcessPoll<T> {
+    Ready(T),
+    Blocked(crate::scheduler::WaitReason),
+}
+
 /// Fully-owned request for a child that outlives the native launch call.
 pub(super) struct PyProcessStartRequest {
     pub argv: Vec<String>,
@@ -339,8 +345,19 @@ pub(super) trait PyProcessRunner {
         fd: i32,
         amount: Option<usize>,
     ) -> PyResult<Vec<u8>>;
+    fn try_read_pipe(
+        &mut self,
+        handle: PyProcessHandle,
+        fd: i32,
+        amount: Option<usize>,
+    ) -> PyResult<PyProcessPoll<Vec<u8>>>;
     /// Write bytes to a captured child stdin, cooperatively scheduling while the pipe is full.
     fn write_pipe(&mut self, handle: PyProcessHandle, input: Vec<u8>) -> PyResult<usize>;
+    fn try_write_pipe(
+        &mut self,
+        handle: PyProcessHandle,
+        input: Vec<u8>,
+    ) -> PyResult<PyProcessPoll<usize>>;
     /// Close one parent-side captured stream endpoint.
     fn close_pipe(&mut self, handle: PyProcessHandle, fd: i32) -> PyResult<()>;
     fn send_signal(
@@ -557,6 +574,8 @@ pub(super) trait PyRuntime {
     fn exception_type_name(&self, value: &PyValue) -> Option<&'static str>;
     /// Return one interpreter-owned exception class from the runtime's closed type table.
     fn exception_type(&self, name: &'static str) -> PyValue;
+    /// Suspend the enclosing logical process until any modeled resource becomes ready.
+    fn wait_on(&mut self, reasons: Vec<crate::scheduler::WaitReason>) -> PyResult<()>;
     fn clock(&mut self) -> &mut dyn PyClock;
     fn environment(&self) -> &dyn PyEnvironment;
     fn filesystem(&mut self) -> &mut dyn PyFilesystem;

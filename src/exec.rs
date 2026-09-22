@@ -405,7 +405,7 @@ enum ExpansionLocation {
     Redirect(usize),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ShellPoll {
     Pending,
     Blocked(crate::scheduler::WaitReason),
@@ -2507,21 +2507,13 @@ fn handle_ready_events(interp: &mut Interp) -> Result<(), String> {
                     continue;
                 };
                 let deadline = event.id.deadline_ns();
-                let timed_wait = matches!(
-                    interp.scheduler.state(pid),
-                    Some(crate::scheduler::TaskState::Blocked(
-                        crate::scheduler::WaitReason::Timer(value)
-                            | crate::scheduler::WaitReason::ChildDeadline(_, value)
-                            | crate::scheduler::WaitReason::ChildActivityDeadline(_, value)
-                    ))
-                        | Some(crate::scheduler::TaskState::Stopped(
-                            crate::scheduler::StoppedTask::Blocked(
-                                crate::scheduler::WaitReason::Timer(value)
-                                    | crate::scheduler::WaitReason::ChildDeadline(_, value)
-                                    | crate::scheduler::WaitReason::ChildActivityDeadline(_, value)
-                            )
-                        )) if value == deadline
-                );
+                let timed_wait = match interp.scheduler.state(pid) {
+                    Some(crate::scheduler::TaskState::Blocked(reason))
+                    | Some(crate::scheduler::TaskState::Stopped(
+                        crate::scheduler::StoppedTask::Blocked(reason),
+                    )) => reason.accepts_timer(deadline),
+                    _ => false,
+                };
                 if timed_wait {
                     interp
                         .scheduler

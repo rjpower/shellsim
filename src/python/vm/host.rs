@@ -1,8 +1,8 @@
 //! Capability-scoped process, clock, and environment adapters for native modules.
 
 use super::{
-    PyClock, PyEnvironment, PyError, PyProcessHandle, PyProcessOutput, PyProcessRunner,
-    PyProcessStartRequest, PyResult, Vm,
+    PyClock, PyEnvironment, PyError, PyProcessHandle, PyProcessOutput, PyProcessPoll,
+    PyProcessRunner, PyProcessStartRequest, PyResult, Vm,
 };
 
 impl PyProcessRunner for Vm<'_> {
@@ -80,6 +80,18 @@ impl PyProcessRunner for Vm<'_> {
         super::super::process::read_pipe(self.interp, handle, fd, amount)
     }
 
+    fn try_read_pipe(
+        &mut self,
+        handle: PyProcessHandle,
+        fd: i32,
+        amount: Option<usize>,
+    ) -> PyResult<PyProcessPoll<Vec<u8>>> {
+        match super::super::process::read_pipe_if_ready(self.interp, handle, fd, amount)? {
+            Ok(bytes) => Ok(PyProcessPoll::Ready(bytes)),
+            Err(reason) => Ok(PyProcessPoll::Blocked(reason)),
+        }
+    }
+
     fn write_pipe(&mut self, handle: PyProcessHandle, input: Vec<u8>) -> PyResult<usize> {
         if self.mode.scheduler_owned && self.native_suspend_allowed {
             return match super::super::process::write_pipe_if_ready(self.interp, handle, input)? {
@@ -88,6 +100,17 @@ impl PyProcessRunner for Vm<'_> {
             };
         }
         super::super::process::write_pipe(self.interp, handle, input)
+    }
+
+    fn try_write_pipe(
+        &mut self,
+        handle: PyProcessHandle,
+        input: Vec<u8>,
+    ) -> PyResult<PyProcessPoll<usize>> {
+        match super::super::process::write_pipe_if_ready(self.interp, handle, input)? {
+            Ok(written) => Ok(PyProcessPoll::Ready(written)),
+            Err(reason) => Ok(PyProcessPoll::Blocked(reason)),
+        }
     }
 
     fn close_pipe(&mut self, handle: PyProcessHandle, fd: i32) -> PyResult<()> {
