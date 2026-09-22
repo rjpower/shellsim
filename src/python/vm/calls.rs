@@ -1179,6 +1179,7 @@ impl Vm<'_> {
             scope,
             instruction_pointer: 0,
             handlers: Vec::new(),
+            exceptions: Vec::new(),
             stack: Vec::new(),
             exhausted: false,
             running: false,

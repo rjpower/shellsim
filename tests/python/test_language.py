@@ -360,3 +360,40 @@ def test_user_subscript_methods_receive_ordinary_slice_values():
         ("set", None, 3, None, 9),
         ("del", None, None, -1),
     ]
+
+
+def test_except_then_finally_runs_cleanup_once():
+    events = []
+
+    try:
+        raise ValueError("handled")
+    except ValueError:
+        events.append("except")
+    finally:
+        events.append("finally")
+
+    assert events == ["except", "finally"]
+
+
+def test_generators_keep_active_exceptions_isolated_while_suspended():
+    def suspended():
+        try:
+            raise ValueError("preserved")
+        except ValueError:
+            yield "paused"
+            raise
+
+    generator = suspended()
+    assert next(generator) == "paused"
+
+    try:
+        raise RuntimeError("unrelated")
+    except RuntimeError:
+        pass
+
+    try:
+        next(generator)
+    except ValueError as error:
+        assert str(error) == "preserved"
+    else:
+        raise AssertionError("bare raise lost the generator's active exception")

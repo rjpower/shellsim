@@ -659,8 +659,6 @@ impl Compiler {
                     self.protected_regions.pop();
                     if let Some(handler_body_try) = handler_body_try {
                         self.emit(Operation::TryEnd, span);
-                        self.emit(Operation::ClearException, span);
-                        self.statements(finalbody.clone());
                         let handler_body_done = self.emit(Operation::Jump(usize::MAX), span);
                         let handler_body_cleanup = self.instructions.len();
                         self.patch_try_begin(handler_body_try, handler_body_cleanup);

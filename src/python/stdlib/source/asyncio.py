@@ -232,6 +232,7 @@ class Task:
         self._name = name
         self._callbacks = []
         self._cancel_requests = 0
+        self._must_cancel = False
         self._logical_task = self
 
     def done(self):
@@ -269,6 +270,8 @@ class Task:
     def uncancel(self):
         if self._cancel_requests:
             self._cancel_requests -= 1
+        if not self._cancel_requests:
+            self._must_cancel = False
         return self._cancel_requests
 
     def add_done_callback(self, callback, context=None):
@@ -704,8 +707,12 @@ class _Loop:
         self._resource_waiters = []
         self._tasks = []
         self._current = None
+        self._running = False
+        self._closed = False
 
     def create_task(self, coroutine, name=None):
+        if self._closed:
+            raise RuntimeError("Event loop is closed")
         task = Task(coroutine, self, name)
         self._tasks.append(task)
         self._ready.append(task)
@@ -723,6 +730,8 @@ class _Loop:
         return _monotonic_ns() / 1000000000
 
     def call_soon(self, callback, *args, context=None):
+        if self._closed:
+            raise RuntimeError("Event loop is closed")
         handle = Handle(callback, args)
         self._ready.append(handle)
         return handle
@@ -731,6 +740,8 @@ class _Loop:
         return self.call_soon(callback, *args, context=context)
 
     def call_at(self, when, callback, *args, context=None):
+        if self._closed:
+            raise RuntimeError("Event loop is closed")
         handle = TimerHandle(when, callback, args)
         self._timers.append((int(when * 1000000000), handle))
         return handle
@@ -744,7 +755,8 @@ class _Loop:
                 waiter for waiter in self._resource_waiters if waiter[0] is not task
             ]
             task._send_value = (True, value)
-            self._ready.append(task)
+            if task not in self._ready:
+                self._ready.append(task)
 
     def _schedule_failure(self, task, error):
         if not task._done:
@@ -752,9 +764,13 @@ class _Loop:
                 waiter for waiter in self._resource_waiters if waiter[0] is not task
             ]
             task._send_value = (False, error)
-            self._ready.append(task)
+            if task not in self._ready:
+                self._ready.append(task)
 
     def _cancel(self, task):
+        if self._current is task:
+            task._must_cancel = True
+            return
         dependency = task._waiting_on
         if isinstance(dependency, (Task, Future)) and dependency.cancel():
             return
@@ -925,30 +941,83 @@ class _Loop:
             raise TypeError("object cannot be used in 'await' expression")
 
     def run(self, coroutine):
+        if self._closed:
+            raise RuntimeError("Event loop is closed")
+        if self._running:
+            raise RuntimeError("This event loop is already running")
         root = self.create_task(coroutine)
-        while not root.done():
-            if not self._ready:
-                self._wake_due_timers()
-            if not self._ready:
-                self._wait_for_resources()
-            task = self._ready.pop(0)
-            if isinstance(task, Handle):
-                task._run()
-                continue
-            if task._done:
-                continue
-            task._started = True
-            self._current = task
-            status, value = _step(task._coroutine, task._send_value)
+        self._running = True
+        try:
+            while not root.done():
+                if not self._ready:
+                    self._wake_due_timers()
+                if not self._ready:
+                    self._wait_for_resources()
+                task = self._ready.pop(0)
+                if isinstance(task, Handle):
+                    task._run()
+                    continue
+                if task._done:
+                    continue
+                task._started = True
+                self._current = task
+                status, value = _step(task._coroutine, task._send_value)
+                self._current = None
+                task._send_value = None
+                if status == 1:
+                    self._finish(task, value)
+                elif status == 2:
+                    self._fail(task, value)
+                elif task._must_cancel:
+                    task._must_cancel = False
+                    self._schedule_failure(task, CancelledError())
+                else:
+                    self._dispatch_yield(task, value)
+            return root.result()
+        finally:
             self._current = None
-            task._send_value = None
-            if status == 1:
-                self._finish(task, value)
-            elif status == 2:
-                self._fail(task, value)
-            else:
-                self._dispatch_yield(task, value)
-        return root.result()
+            self._running = False
+
+    def run_until_complete(self, awaitable):
+        async def wait_for_awaitable():
+            return await awaitable
+
+        return self.run(wait_for_awaitable())
+
+    def is_running(self):
+        return self._running
+
+    def is_closed(self):
+        return self._closed
+
+    async def shutdown_asyncgens(self):
+        return None
+
+    async def shutdown_default_executor(self, timeout=None):
+        return None
+
+    def _shutdown(self):
+        pending = [task for task in self._tasks if not task.done()]
+        if not pending:
+            return
+        for task in pending:
+            task.cancel()
+
+        async def wait_for_pending():
+            await gather(*pending, return_exceptions=True)
+
+        self.run(wait_for_pending())
+
+    def close(self):
+        if self._running:
+            raise RuntimeError("Cannot close a running event loop")
+        if self._closed:
+            return
+        self._closed = True
+        self._ready = []
+        self._timers = []
+        self._resource_waiters = []
+        self._tasks = []
 
 
 def get_running_loop():
@@ -1262,4 +1331,10 @@ def run(coroutine):
     try:
         return loop.run(coroutine)
     finally:
-        _running_loop = None
+        try:
+            loop._shutdown()
+            loop.run(loop.shutdown_asyncgens())
+            loop.run(loop.shutdown_default_executor())
+        finally:
+            loop.close()
+            _running_loop = None
