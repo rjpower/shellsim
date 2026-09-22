@@ -33,6 +33,40 @@ class QueueFull(Exception):
     pass
 
 
+class InvalidStateError(Exception):
+    pass
+
+
+class Handle:
+    def __init__(self, callback, args):
+        self._callback = callback
+        self._args = args
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def cancelled(self):
+        return self._cancelled
+
+    def _run(self):
+        if self._cancelled:
+            return
+        try:
+            self._callback(*self._args)
+        except Exception:
+            pass
+
+
+class TimerHandle(Handle):
+    def __init__(self, when, callback, args):
+        Handle.__init__(self, callback, args)
+        self._when = when
+
+    def when(self):
+        return self._when
+
+
 class _Sleep:
     def __init__(self, delay):
         self.delay = delay
@@ -85,6 +119,82 @@ class _TimeoutWait:
         self.parent = parent
         self.child = child
         self.timed_out = False
+
+
+class Future:
+    def __init__(self, *, loop=None):
+        if loop is None:
+            loop = get_running_loop()
+        self._loop = loop
+        self._done = False
+        self._cancelled = False
+        self._result = None
+        self._exception = None
+        self._waiters = []
+        self._callbacks = []
+
+    def get_loop(self):
+        return self._loop
+
+    def done(self):
+        return self._done
+
+    def cancelled(self):
+        return self._cancelled
+
+    def result(self):
+        if not self._done:
+            raise InvalidStateError("Result is not ready")
+        if self._cancelled:
+            raise CancelledError()
+        if self._exception is not None:
+            raise self._exception
+        return self._result
+
+    def exception(self):
+        if not self._done:
+            raise InvalidStateError("Exception is not set")
+        if self._cancelled:
+            raise CancelledError()
+        return self._exception
+
+    def add_done_callback(self, callback, *, context=None):
+        if self._done:
+            self._loop.call_soon(callback, self)
+        else:
+            self._callbacks.append(callback)
+
+    def remove_done_callback(self, callback):
+        previous = len(self._callbacks)
+        self._callbacks = [item for item in self._callbacks if item is not callback]
+        return previous - len(self._callbacks)
+
+    def cancel(self, msg=None):
+        if self._done:
+            return False
+        self._done = True
+        self._cancelled = True
+        self._loop._run_done_callbacks(self)
+        self._loop._wake_waiters(self)
+        return True
+
+    def set_result(self, result):
+        if self._done:
+            raise InvalidStateError("invalid state")
+        self._done = True
+        self._result = result
+        self._loop._run_done_callbacks(self)
+        self._loop._wake_waiters(self)
+
+    def set_exception(self, exception):
+        if self._done:
+            raise InvalidStateError("invalid state")
+        if not isinstance(exception, BaseException):
+            raise TypeError("invalid exception object")
+        self._done = True
+        self._exception = exception
+        self._loop._run_done_callbacks(self)
+        self._loop._wake_waiters(self)
 
 
 class Task:
@@ -145,7 +255,7 @@ class Task:
 
     def add_done_callback(self, callback, context=None):
         if self._done:
-            callback(self)
+            self._loop.call_soon(callback, self)
         else:
             self._callbacks.append(callback)
 
@@ -583,6 +693,9 @@ class _Loop:
         self._ready.append(task)
         return task
 
+    def create_future(self):
+        return Future(loop=self)
+
     def _create_awaited_task(self, coroutine, parent):
         task = self.create_task(coroutine)
         task._logical_task = parent._logical_task
@@ -590,6 +703,22 @@ class _Loop:
 
     def time(self):
         return _monotonic_ns() / 1000000000
+
+    def call_soon(self, callback, *args, context=None):
+        handle = Handle(callback, args)
+        self._ready.append(handle)
+        return handle
+
+    def call_soon_threadsafe(self, callback, *args, context=None):
+        return self.call_soon(callback, *args, context=context)
+
+    def call_at(self, when, callback, *args, context=None):
+        handle = TimerHandle(when, callback, args)
+        self._timers.append((int(when * 1000000000), handle))
+        return handle
+
+    def call_later(self, delay, callback, *args, context=None):
+        return self.call_at(self.time() + delay, callback, *args, context=context)
 
     def _schedule(self, task, value):
         if not task._done:
@@ -608,6 +737,8 @@ class _Loop:
             self._ready.append(task)
 
     def _cancel(self, task):
+        if isinstance(task._waiting_on, Future) and task._waiting_on.cancel():
+            return
         if not task._started:
             task._done = True
             task._cancelled = True
@@ -627,11 +758,15 @@ class _Loop:
         now = _monotonic_ns()
         pending = []
         for timer_deadline, timer in self._timers:
+            if isinstance(timer, TimerHandle) and timer.cancelled():
+                continue
             if timer_deadline <= now:
                 if isinstance(timer, _TimeoutWait):
                     if timer.parent._waiting_on is timer:
                         timer.timed_out = True
                         timer.child.cancel()
+                elif isinstance(timer, TimerHandle):
+                    self._ready.append(timer)
                 else:
                     self._schedule(timer, None)
             else:
@@ -639,10 +774,15 @@ class _Loop:
         self._timers = pending
 
     def _next_timer_token(self):
-        if not self._timers:
+        active = [
+            item
+            for item in self._timers
+            if not isinstance(item[1], TimerHandle) or not item[1].cancelled()
+        ]
+        if not active:
             return None
-        deadline = self._timers[0][0]
-        for timer_deadline, timer in self._timers:
+        deadline = active[0][0]
+        for timer_deadline, timer in active:
             if timer_deadline < deadline:
                 deadline = timer_deadline
         return ("timer", deadline)
@@ -661,31 +801,38 @@ class _Loop:
         for task, token in waiters:
             self._schedule(task, None)
 
-    def _wake_waiters(self, task):
-        waiters = task._waiters
-        task._waiters = []
+    def _wake_waiters(self, future):
+        waiters = future._waiters
+        future._waiters = []
         for waiter in waiters:
             if isinstance(waiter, _TimeoutWait):
                 waiter.parent._waiting_on = None
                 if waiter.timed_out:
                     self._schedule_failure(waiter.parent, TimeoutError())
-                elif task._exception is not None:
-                    self._schedule_failure(waiter.parent, task._exception)
+                elif future._cancelled:
+                    self._schedule_failure(waiter.parent, CancelledError())
+                elif future._exception is not None:
+                    self._schedule_failure(waiter.parent, future._exception)
                 else:
-                    self._schedule(waiter.parent, task._result)
-            elif task._exception is not None:
-                self._schedule_failure(waiter, task._exception)
+                    self._schedule(waiter.parent, future._result)
+            elif future._cancelled:
+                if waiter._waiting_on is future:
+                    waiter._waiting_on = None
+                self._schedule_failure(waiter, CancelledError())
+            elif future._exception is not None:
+                if waiter._waiting_on is future:
+                    waiter._waiting_on = None
+                self._schedule_failure(waiter, future._exception)
             else:
-                self._schedule(waiter, task._result)
+                if waiter._waiting_on is future:
+                    waiter._waiting_on = None
+                self._schedule(waiter, future._result)
 
-    def _run_done_callbacks(self, task):
-        callbacks = task._callbacks
-        task._callbacks = []
+    def _run_done_callbacks(self, future):
+        callbacks = future._callbacks
+        future._callbacks = []
         for callback in callbacks:
-            try:
-                callback(task)
-            except Exception:
-                pass
+            self.call_soon(callback, future)
 
     def _finish(self, task, result):
         task._done = True
@@ -700,18 +847,22 @@ class _Loop:
         self._wake_waiters(task)
         self._run_done_callbacks(task)
 
-    def _block_on_task(self, task, awaited):
+    def _block_on_future(self, task, awaited):
         if awaited._done:
-            if awaited._exception is not None:
+            if awaited._cancelled:
+                self._schedule_failure(task, CancelledError())
+            elif awaited._exception is not None:
                 self._schedule_failure(task, awaited._exception)
             else:
                 self._schedule(task, awaited._result)
         else:
+            if isinstance(awaited, Future):
+                task._waiting_on = awaited
             awaited._waiters.append(task)
 
     def _dispatch_yield(self, task, awaited):
-        if isinstance(awaited, Task):
-            self._block_on_task(task, awaited)
+        if isinstance(awaited, (Task, Future)):
+            self._block_on_future(task, awaited)
         elif isinstance(awaited, _Sleep):
             self._sleep(task, awaited.delay)
         elif isinstance(awaited, _EventWait):
@@ -738,7 +889,7 @@ class _Loop:
             awaited.condition._waiters.append(task)
         elif isinstance(awaited, _WaitFor):
             if awaited.task._done:
-                self._block_on_task(task, awaited.task)
+                self._block_on_future(task, awaited.task)
             else:
                 timeout = _TimeoutWait(task, awaited.task)
                 task._waiting_on = timeout
@@ -749,7 +900,7 @@ class _Loop:
         elif isinstance(awaited, _ResourceWait):
             self._resource_waiters.append((task, awaited.token))
         elif _is_coroutine(awaited):
-            self._block_on_task(task, self._create_awaited_task(awaited, task))
+            self._block_on_future(task, self._create_awaited_task(awaited, task))
         else:
             raise TypeError("object cannot be used in 'await' expression")
 
@@ -761,6 +912,9 @@ class _Loop:
             if not self._ready:
                 self._wait_for_resources()
             task = self._ready.pop(0)
+            if isinstance(task, Handle):
+                task._run()
+                continue
             if task._done:
                 continue
             task._started = True
@@ -783,12 +937,20 @@ def get_running_loop():
     return _running_loop
 
 
+def get_event_loop():
+    return get_running_loop()
+
+
 def create_task(coroutine, name=None, context=None):
     return get_running_loop().create_task(coroutine, name)
 
 
 def ensure_future(awaitable):
     return _ensure_task(awaitable)
+
+
+def isfuture(value):
+    return isinstance(value, (Future, Task))
 
 
 def current_task(loop=None):
@@ -806,7 +968,7 @@ def all_tasks(loop=None):
 
 
 def _ensure_task(awaitable):
-    if isinstance(awaitable, Task):
+    if isinstance(awaitable, (Task, Future)):
         return awaitable
     return create_task(awaitable)
 
@@ -923,7 +1085,7 @@ async def wait(awaitables, timeout=None, return_when=ALL_COMPLETED):
     if not tasks:
         raise ValueError("Set of Tasks/Futures is empty")
     for task in tasks:
-        if not isinstance(task, Task):
+        if not isinstance(task, (Task, Future)):
             raise TypeError("Passing coroutines is forbidden, use tasks explicitly")
     changed = Event()
 

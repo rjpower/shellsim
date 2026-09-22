@@ -20,6 +20,25 @@ pub fn display(heap: &Heap, value: &Value) -> Result<String, String> {
     if let Some((kind, message)) = exception_parts(heap, value)? {
         return Ok(if message.is_empty() { kind } else { message });
     }
+    if let Some((_, args)) = user_exception_parts(heap, value)? {
+        return match args.as_slice() {
+            [] => Ok(String::new()),
+            [only] => {
+                if let Some(value) = string_value(heap, only)? {
+                    Ok(value)
+                } else {
+                    repr(heap, only)
+                }
+            }
+            _ => {
+                let values = args
+                    .iter()
+                    .map(|value| repr(heap, value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(format!("({})", values.join(", ")))
+            }
+        };
+    }
     repr(heap, value)
 }
 
@@ -98,6 +117,41 @@ pub fn exception_parts(heap: &Heap, value: &Value) -> Result<Option<(String, Str
         Object::Exception { kind, message } => Some((kind.clone(), message.clone())),
         _ => None,
     })
+}
+
+fn user_exception_parts(
+    heap: &Heap,
+    value: &Value,
+) -> Result<Option<(String, Vec<Value>)>, String> {
+    let Some(id) = value.object_id() else {
+        return Ok(None);
+    };
+    let Object::Instance { class, .. } = heap.get(id)? else {
+        return Ok(None);
+    };
+    let Object::Class {
+        name,
+        exception_base,
+        ..
+    } = heap.get(*class)?
+    else {
+        return Ok(None);
+    };
+    if exception_base.is_none() {
+        return Ok(None);
+    }
+    let args = if let Some(symbol) = heap.symbol_id("args") {
+        heap.attribute_by_symbol(id, symbol)?
+            .and_then(|value| value.object_id())
+            .and_then(|args| match heap.get(args).ok()? {
+                Object::Tuple(values) => Some(values.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Ok(Some((name.clone(), args)))
 }
 
 fn bigint_value<'a>(heap: &'a Heap, value: &Value) -> Option<&'a BigInt> {
@@ -244,6 +298,15 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::Instance { class, payload, .. } => match payload {
                 InstancePayload::Int(value) => value.to_string(),
                 InstancePayload::Object => match heap.get(*class)? {
+                    Object::Class {
+                        name,
+                        exception_base: Some(_),
+                        ..
+                    } => {
+                        let (_, args) = user_exception_parts(heap, value)?
+                            .ok_or("exception instance lost its native base")?;
+                        format!("{name}({})", render_values(heap, &args, active)?.join(", "))
+                    }
                     Object::Class { name, .. } => format!("<{name} object>"),
                     _ => return Err("instance has an invalid class".into()),
                 },

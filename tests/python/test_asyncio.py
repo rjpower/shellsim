@@ -624,6 +624,150 @@ def test_task_callbacks_and_cancellation_introspection():
     assert observed == [42, True]
 
 
+def test_future_results_callbacks_and_identity_follow_asyncio_ordering():
+    events = []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        assert asyncio.get_event_loop() is loop
+        future = loop.create_future()
+        assert asyncio.isfuture(future)
+        assert asyncio.ensure_future(future) is future
+        assert future.get_loop() is loop
+        assert not future.done()
+
+        future.add_done_callback(lambda completed: events.append(completed.result()))
+        loop.call_soon(future.set_result, 42)
+        assert await future == 42
+        assert future.done()
+        assert not future.cancelled()
+        assert future.result() == 42
+        assert future.exception() is None
+        assert events == [42]
+
+        future.add_done_callback(lambda completed: events.append("late"))
+        assert events == [42]
+        await asyncio.sleep(0)
+        assert events == [42, "late"]
+
+    asyncio.run(main())
+
+
+def test_future_exceptions_invalid_states_and_callback_removal():
+    events = []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        pending = loop.create_future()
+        try:
+            pending.result()
+        except asyncio.InvalidStateError:
+            pass
+        else:
+            raise AssertionError("pending future result must be unavailable")
+
+        def callback(completed):
+            events.append(completed.result())
+
+        pending.add_done_callback(callback)
+        assert pending.remove_done_callback(callback) == 1
+        error = ValueError("future failed")
+        loop.call_soon(pending.set_exception, error)
+        try:
+            await pending
+        except ValueError as observed:
+            assert observed is error
+        else:
+            raise AssertionError("future exception must cross await")
+        assert pending.exception() is error
+        assert events == []
+
+        try:
+            pending.set_result(1)
+        except asyncio.InvalidStateError:
+            pass
+        else:
+            raise AssertionError("completed future must reject a new result")
+
+        invalid = loop.create_future()
+        try:
+            invalid.set_exception("not an exception")
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("future must reject a non-exception failure")
+
+    asyncio.run(main())
+
+
+def test_task_cancellation_propagates_to_its_awaited_future():
+    events = []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        async def waiter():
+            try:
+                await future
+            finally:
+                events.append("cleaned")
+
+        task = asyncio.create_task(waiter())
+        await asyncio.sleep(0)
+        assert task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("cancelled future waiter must be cancelled")
+        assert future.cancelled()
+        assert task.cancelled()
+        try:
+            future.result()
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("cancelled future result must raise")
+
+        timed = loop.create_future()
+        loop.call_soon(timed.cancel)
+        try:
+            await asyncio.wait_for(timed, 1)
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("wait_for must preserve future cancellation")
+
+    asyncio.run(main())
+    assert events == ["cleaned"]
+
+
+def test_callback_handles_are_fifo_cancellable_and_timer_backed():
+    events = []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        loop.call_soon(events.append, "soon first")
+        cancelled = loop.call_soon(events.append, "cancelled")
+        cancelled.cancel()
+        assert cancelled.cancelled()
+        loop.call_soon_threadsafe(events.append, "soon second")
+        await asyncio.sleep(0)
+        assert events == ["soon first", "soon second"]
+
+        cancelled_timer = loop.call_later(0.001, events.append, "cancelled timer")
+        assert cancelled_timer.when() >= loop.time()
+        cancelled_timer.cancel()
+        loop.call_later(0.001, events.append, "later")
+        loop.call_at(loop.time() + 0.002, events.append, "at")
+        await asyncio.sleep(0.003)
+        assert events == ["soon first", "soon second", "later", "at"]
+
+    asyncio.run(main())
+
+
 def test_semaphore_and_condition_coordinate_waiters_in_fifo_order():
     events = []
 
