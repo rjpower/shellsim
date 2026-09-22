@@ -132,7 +132,7 @@ def test_task_exceptions_propagate_to_awaiters_and_gather():
         except ValueError as error:
             assert str(error) == "boom"
         else:
-            assert False, "awaiting a failed task must raise its exception"
+            raise AssertionError("awaiting a failed task must raise its exception")
 
         results = await asyncio.gather(fail(), return_exceptions=True)
         assert len(results) == 1
@@ -179,7 +179,7 @@ def test_task_cancellation_runs_finally_and_reports_cancelled_state():
         except asyncio.CancelledError:
             pass
         else:
-            assert False, "awaiting a cancelled task must raise CancelledError"
+            raise AssertionError("awaiting a cancelled task must raise CancelledError")
         assert task.done()
         assert task.cancelled()
 
