@@ -98,8 +98,9 @@ fn imported_shell_and_python_corpora_match_checked_behavior() {
     for (name, minimum_cases) in [
         ("oils-spec", 50),
         ("micropython-basics", 50),
+        ("python-derived", 30),
         ("posix-derived", 8),
-        ("whole-programs", 30),
+        ("whole-programs", 15),
     ] {
         let report = run_frozen_corpus(name);
         assert_eq!(
@@ -175,4 +176,102 @@ fn command_cases_can_use_a_modeled_module_entrypoint() {
 
     assert_eq!(report.expectation_failures, 0);
     assert_eq!(report.cases[0].class, ResultClass::Pass);
+}
+
+#[test]
+fn derived_cases_support_inline_programs_fixtures_and_readable_io() {
+    let root = fixture_root();
+    let manifest = br#"{
+        "version": 1,
+        "profile": "stock_agent_v1",
+        "cases": [{
+            "id": "inline-python",
+            "kind": "python",
+            "code": "from helper import decorate\nprint(decorate(input()))",
+            "covers": ["python.import.local", "python.io.stdio"],
+            "stdin": "world\n",
+            "fixtures": [{
+                "contents": "def decorate(value):\n    return f'<{value}>'\n",
+                "destination": "/work/helper.py"
+            }],
+            "expect": {
+                "disposition": "pass",
+                "stdout": "<world>\n",
+                "stderr": ""
+            }
+        }]
+    }"#;
+    let report = corpus::run_manifest_bytes(&root, manifest).expect("valid manifest");
+
+    assert_eq!(
+        report.expectation_failures, 0,
+        "{:?}",
+        report.cases[0].detail
+    );
+    assert_eq!(report.coverage["python.import.local"].passing, 1);
+    assert_eq!(report.coverage["python.io.stdio"].passing, 1);
+}
+
+#[test]
+fn frontier_cases_require_an_exact_failure_class() {
+    let manifest = br#"{
+        "version": 1,
+        "profile": "stock_agent_v1",
+        "cases": [{
+            "id": "ambiguous-frontier",
+            "kind": "python",
+            "code": "import unavailable",
+            "expect": {"disposition": "frontier"}
+        }]
+    }"#;
+    let error = corpus::run_manifest_bytes(&fixture_root(), manifest).unwrap_err();
+
+    assert!(
+        error.contains("must declare an exact result class"),
+        "{error}"
+    );
+}
+
+#[test]
+fn corpus_rejects_ambiguous_inline_inputs() {
+    let manifest = br#"{
+        "version": 1,
+        "profile": "stock_agent_v1",
+        "cases": [{
+            "id": "ambiguous-input",
+            "kind": "shell",
+            "entrypoint": "/work/script.sh",
+            "code": "true",
+            "expect": {"disposition": "pass"}
+        }]
+    }"#;
+    let error = corpus::run_manifest_bytes(&fixture_root(), manifest).unwrap_err();
+
+    assert!(error.contains("both entrypoint and code"), "{error}");
+}
+
+#[test]
+fn inline_shell_arguments_start_at_one() {
+    let manifest = br#"{
+        "version": 1,
+        "profile": "stock_agent_v1",
+        "cases": [{
+            "id": "inline-shell-arguments",
+            "kind": "shell",
+            "code": "printf '%s\\n' \"$1\"",
+            "args": ["value"],
+            "expect": {
+                "disposition": "pass",
+                "stdout": "value\n",
+                "stderr": ""
+            }
+        }]
+    }"#;
+    let report = corpus::run_manifest_bytes(&fixture_root(), manifest).expect("valid manifest");
+
+    assert_eq!(
+        report.expectation_failures, 0,
+        "{:?}",
+        report.cases[0].detail
+    );
 }
