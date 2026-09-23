@@ -8,6 +8,7 @@
 //!   shellsim serve [--cpu N] [--memory N] [--disk N] [--output N]
 //!   shellsim mcp [--root PATH] [limits]
 //!   shellsim replay SCENARIO.ndjson [--root PATH] [--transcript PATH] [limits]
+//!   shellsim corpus MANIFEST.json
 
 use std::process::exit;
 
@@ -39,8 +40,45 @@ fn main() {
         "serve" => serve(&args[2..]),
         "mcp" => mcp(&args[2..]),
         "replay" => replay(&args[2..]),
+        "corpus" => corpus(&args[2..]),
         command => usage_error(&format!("unknown command: {command}")),
     }
+}
+
+fn corpus(args: &[String]) -> ! {
+    const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
+    let [path] = args else {
+        usage_error("corpus requires exactly one manifest path");
+    };
+    let path = std::path::Path::new(path);
+    let metadata = std::fs::metadata(path).unwrap_or_else(|error| {
+        eprintln!(
+            "shellsim corpus: cannot inspect {}: {error}",
+            path.display()
+        );
+        exit(2);
+    });
+    if metadata.len() > MAX_MANIFEST_BYTES {
+        eprintln!("shellsim corpus: manifest exceeds the 4 MiB limit");
+        exit(2);
+    }
+    let bytes = std::fs::read(path).unwrap_or_else(|error| {
+        eprintln!("shellsim corpus: cannot read {}: {error}", path.display());
+        exit(2);
+    });
+    shellsim::sandbox::apply();
+    let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let report = shellsim::corpus::run_manifest_bytes(base, &bytes).unwrap_or_else(|error| {
+        eprintln!("shellsim corpus: {error}");
+        exit(2);
+    });
+    let failed = report.expectation_failures != 0;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).expect("corpus report is serializable")
+    );
+    exit(i32::from(failed));
 }
 
 fn fresh_environment(limits: Limits, positional: &[String]) -> Environment {
@@ -710,7 +748,7 @@ fn read_stdin_bytes() -> Vec<u8> {
 fn usage_error(message: &str) -> ! {
     eprintln!("shellsim: {message}");
     eprintln!(
-        "usage: shellsim -c SOURCE | run SCRIPT [ARGS...] | shell [LIMITS] | eval [LIMITS] -c SOURCE | serve [LIMITS] | replay SCENARIO.ndjson [--transcript PATH] [LIMITS]"
+        "usage: shellsim -c SOURCE | run SCRIPT [ARGS...] | shell [LIMITS] | eval [LIMITS] -c SOURCE | serve [LIMITS] | replay SCENARIO.ndjson [--transcript PATH] [LIMITS] | corpus MANIFEST.json"
     );
     exit(2);
 }

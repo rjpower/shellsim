@@ -98,6 +98,8 @@ pub enum ProcessStatus {
 pub struct ProcessRecord {
     pub pid: ProcessId,
     pub ppid: ProcessId,
+    /// Modeled effective user identity inherited across logical forks.
+    pub uid: u32,
     /// Process-group identity used for job-wide signal delivery.
     pub process_group: ProcessId,
     /// Session identity. A new session is also led by its first process group.
@@ -208,6 +210,7 @@ impl ProcessTable {
             ProcessRecord {
                 pid: root_pid,
                 ppid: 0,
+                uid: 0,
                 process_group: root_pid,
                 session_id: root_pid,
                 command: "bash".to_string(),
@@ -238,6 +241,7 @@ impl ProcessTable {
         let pid = self.next_pid;
         self.next_pid = self.next_pid.checked_add(1)?;
         let parent = self.records.get(&ppid)?;
+        let uid = parent.uid;
         let (process_group, session_id) = match placement {
             ChildPlacement::Inherit => (parent.process_group, parent.session_id),
             ChildPlacement::NewProcessGroup => (pid, parent.session_id),
@@ -248,6 +252,7 @@ impl ProcessTable {
             ProcessRecord {
                 pid,
                 ppid,
+                uid,
                 process_group,
                 session_id,
                 command: command.to_string(),
@@ -258,6 +263,13 @@ impl ProcessTable {
             },
         );
         Some(pid)
+    }
+
+    /// Update the effective identity retained for one logical process.
+    pub fn set_uid(&mut self, pid: ProcessId, uid: u32) {
+        if let Some(record) = self.records.get_mut(&pid) {
+            record.uid = uid;
+        }
     }
 
     /// Mark a logical process complete and capture its final working directory.

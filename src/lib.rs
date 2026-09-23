@@ -12,6 +12,7 @@
 
 pub mod clock;
 pub mod commands;
+pub mod corpus;
 pub mod descriptors;
 pub mod exec;
 pub mod expand;
@@ -25,6 +26,7 @@ pub mod mcp;
 pub mod net;
 pub mod netcmd;
 pub mod process;
+pub mod profile;
 pub mod pseudo_fs;
 pub mod python;
 pub mod resources;
@@ -39,5 +41,6 @@ pub use clock::{
     BlockOutcome, EventId, EventKind, ScheduledEvent, Timeline, TimelineError, TimelineLimits,
 };
 pub use interp::{Environment, Interp, ProcessState};
+pub use profile::EnvironmentProfile;
 pub use resources::{Limits, RunOutcome, StopReason, Usage};
 pub use telemetry::{CommandTrust, InvocationEvent};

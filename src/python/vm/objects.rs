@@ -439,6 +439,16 @@ impl Vm<'_> {
                 _ => protocol::repr(&self.state.heap, &index)?,
             };
             self.allocate_string(format!("typing.List[{parameter}]"))?
+        } else if matches!(owner.native_value(), Some(NativeValue::Environment)) {
+            let name = protocol::string_ref(&self.state.heap, &index)?
+                .ok_or("environment key must be a string")?
+                .as_str()
+                .to_string();
+            let value = self
+                .interp
+                .get_var(&name)
+                .ok_or_else(|| format!("environment key not found: {name}"))?;
+            self.allocate_string(value)?
         } else if let Some(character) = protocol::string_index(&self.state.heap, &owner, &index)? {
             self.allocate_string(character.to_string())?
         } else if let Some(id) = owner.object_id() {

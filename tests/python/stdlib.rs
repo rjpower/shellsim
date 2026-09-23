@@ -7,6 +7,28 @@ use shellsim::Environment;
 use super::support::{run_python as run, run_python_in as run_in};
 
 #[test]
+fn os_environ_supports_required_key_lookup() {
+    let mut environment = Environment::new();
+    environment.set_var("SHELLSIM_REQUIRED", "present");
+
+    assert_eq!(
+        run_in(
+            &mut environment,
+            "import os\nprint(os.environ['SHELLSIM_REQUIRED'])"
+        ),
+        (0, b"present\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn print_accepts_common_output_keywords() {
+    assert_eq!(
+        run("print('a', 'b', sep=':', end='!')"),
+        (0, b"a:b!".to_vec(), Vec::new())
+    );
+}
+
+#[test]
 fn os_chdir_changes_only_the_simulated_process_directory() {
     let mut environment = Environment::new();
     environment.set_var("PWD", "/work");
