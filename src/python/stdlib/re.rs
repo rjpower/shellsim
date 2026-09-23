@@ -166,18 +166,26 @@ fn pattern_sub(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
 fn match_group(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("re.Match.group", 0, 1)?;
     args.reject_keywords("re.Match.group")?;
-    let index = args
-        .positional()
-        .first()
-        .cloned()
-        .map(|value| value.cast::<PyIndex>(runtime).map(|index| index.0))
-        .transpose()?
-        .unwrap_or(0);
-    let index = usize::try_from(index).map_err(|_| PyError::value_error("no such group"))?;
     let data = runtime.match_data(receiver.cast::<PyMatch>(runtime)?)?;
+    let index = match args.positional().first() {
+        None => 0,
+        Some(value) => {
+            if let Some(name) = runtime.string_value(value)? {
+                data.group_names
+                    .iter()
+                    .position(|candidate| candidate.as_deref() == Some(&name))
+                    .ok_or_else(|| PyError::exception("IndexError", "no such group"))?
+            } else {
+                let index = (*value).cast::<PyIndex>(runtime)?.0;
+                usize::try_from(index)
+                    .map_err(|_| PyError::exception("IndexError", "no such group"))?
+            }
+        }
+    };
     match data.groups.get(index).cloned().flatten() {
         Some(value) => runtime.new_string(value),
-        None => Ok(Value::None),
+        None if index < data.groups.len() => Ok(Value::None),
+        None => Err(PyError::exception("IndexError", "no such group")),
     }
 }
 
@@ -331,7 +339,7 @@ fn capture(runtime: &mut dyn PyRuntime, args: CallArgs, mode: CaptureMode) -> Py
         }),
     };
     match captures {
-        Some(captures) => allocate_match(runtime, &text, &captures),
+        Some(captures) => allocate_match(runtime, &regex, &text, &captures),
         None => Ok(Value::None),
     }
 }
@@ -368,7 +376,7 @@ fn find(runtime: &mut dyn PyRuntime, args: CallArgs, return_matches: bool) -> Py
         runtime.reserve_memory(64)?;
         let value =
             if return_matches {
-                allocate_match(runtime, &text, &captures)?
+                allocate_match(runtime, &regex, &text, &captures)?
             } else {
                 match capture_count {
                     0 => runtime.new_string(captures[0].to_string())?,
@@ -515,6 +523,7 @@ pub(in crate::python) fn build_regex(pattern: &str, flags: u32) -> PyResult<Rege
 
 fn allocate_match(
     runtime: &mut dyn PyRuntime,
+    regex: &Regex,
     text: &str,
     captures: &regex::Captures<'_>,
 ) -> PyResult {
@@ -525,9 +534,13 @@ fn allocate_match(
         .iter()
         .map(|capture| capture.map(|matched| matched.as_str().to_string()))
         .collect();
+    let group_names = regex
+        .capture_names()
+        .map(|name| name.map(str::to_string))
+        .collect();
     let start = text[..whole.start()].chars().count();
     let end = text[..whole.end()].chars().count();
-    runtime.new_match(whole.as_str().to_string(), groups, start, end)
+    runtime.new_match(whole.as_str().to_string(), groups, group_names, start, end)
 }
 
 pub(in crate::python) fn normalize_replacement(replacement: &str) -> PyResult<String> {

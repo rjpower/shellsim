@@ -106,6 +106,7 @@ pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytearray", "partition", bytes_partition),
         method("bytearray", "rpartition", bytes_rpartition),
         method("bytearray", "center", bytes_center),
+        method("bytearray", "reverse", bytearray_reverse),
     ],
 };
 
@@ -661,6 +662,17 @@ fn bytearray_extend(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallAr
         .ok_or_else(|| PyError::resource_error("bytearray is too large"))?;
     runtime.reserve_memory(length)?;
     items.extend(additions);
+    runtime.replace_bytearray_items(array, items)?;
+    Ok(PyValue::None)
+}
+
+fn bytearray_reverse(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytearray.reverse", 0, 0)?;
+    args.reject_keywords("bytearray.reverse")?;
+    let array = receiver.cast::<PyByteArray>(runtime)?;
+    let mut items = runtime.bytearray_items(array)?;
+    runtime.charge_cpu(u64::try_from(items.len()).unwrap_or(u64::MAX))?;
+    items.reverse();
     runtime.replace_bytearray_items(array, items)?;
     Ok(PyValue::None)
 }
@@ -1525,11 +1537,7 @@ fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
                         Some(character) => field.push(character),
                     }
                 }
-                if field.contains(['!', ':']) {
-                    return Err(PyError::value_error(
-                        "format conversions and specifications are not implemented",
-                    ));
-                }
+                let (field, conversion, specification) = parse_format_field(&field)?;
                 let value = if field.is_empty() {
                     if used_manual_index {
                         return Err(PyError::value_error(
@@ -1558,11 +1566,11 @@ fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
                     *args
                         .keywords()
                         .iter()
-                        .find(|(name, _)| name == &field)
+                        .find(|(name, _)| name == field)
                         .map(|(_, value)| value)
-                        .ok_or_else(|| PyError::exception("KeyError", field.clone()))?
+                        .ok_or_else(|| PyError::exception("KeyError", field))?
                 };
-                result.push_str(&runtime.display(&value)?);
+                result.push_str(&runtime.format_value(&value, conversion, specification)?);
             }
             '}' => return Err(PyError::value_error("single '}' in format string")),
             character => result.push(character),
@@ -1570,6 +1578,26 @@ fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
     }
     runtime.reserve_memory(result.len())?;
     runtime.new_string(result)
+}
+
+fn parse_format_field(field: &str) -> PyResult<(&str, Option<char>, &str)> {
+    let (selector_and_conversion, specification) =
+        field.split_once(':').map_or((field, ""), |parts| parts);
+    let (selector, conversion) = match selector_and_conversion.split_once('!') {
+        Some((selector, conversion)) => {
+            let mut characters = conversion.chars();
+            let conversion = characters
+                .next()
+                .filter(|conversion| matches!(conversion, 'r' | 's' | 'a'))
+                .ok_or_else(|| PyError::value_error("unknown format conversion"))?;
+            if characters.next().is_some() {
+                return Err(PyError::value_error("invalid format conversion"));
+            }
+            (selector, Some(conversion))
+        }
+        None => (selector_and_conversion, None),
+    };
+    Ok((selector, conversion, specification))
 }
 
 fn split_text(value: &str, separator: Option<&str>, maximum: Option<i64>) -> Vec<String> {

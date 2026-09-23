@@ -18,6 +18,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "collections" => Some(include_str!("source/collections.py")),
         "copy" => Some(include_str!("source/copy.py")),
         "glob" => Some(include_str!("source/glob.py")),
+        "functools" => Some(include_str!("source/functools.py")),
         "hashlib" => Some(include_str!("source/hashlib.py")),
         "http" => Some(include_str!("source/http.py")),
         "http.client" => Some(include_str!("source/http_client.py")),

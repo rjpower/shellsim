@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use num_bigint::BigInt;
+use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
@@ -154,66 +154,55 @@ impl NativeValue {
     }
 }
 
+const EXCEPTION_TYPES: [&str; 25] = [
+    "Exception",
+    "BaseException",
+    "AssertionError",
+    "TypeError",
+    "ValueError",
+    "RuntimeError",
+    "ZeroDivisionError",
+    "OverflowError",
+    "KeyError",
+    "IndexError",
+    "StopIteration",
+    "Skipped",
+    "Failed",
+    "CalledProcessError",
+    "TimeoutExpired",
+    "EOFError",
+    "OSError",
+    "FileNotFoundError",
+    "FileExistsError",
+    "IsADirectoryError",
+    "NotADirectoryError",
+    "PermissionError",
+    "SystemExit",
+    "TimeoutError",
+    "StopAsyncIteration",
+];
+
+fn known_exception_type(name: &str) -> Option<&'static str> {
+    EXCEPTION_TYPES
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == name)
+}
+
 fn exception_type_code(name: &str) -> u64 {
-    match name {
-        "Exception" => 0,
-        "BaseException" => 1,
-        "AssertionError" => 2,
-        "TypeError" => 3,
-        "ValueError" => 4,
-        "RuntimeError" => 5,
-        "ZeroDivisionError" => 6,
-        "OverflowError" => 7,
-        "KeyError" => 8,
-        "IndexError" => 9,
-        "StopIteration" => 10,
-        "Skipped" => 11,
-        "Failed" => 12,
-        "CalledProcessError" => 13,
-        "TimeoutExpired" => 14,
-        "EOFError" => 15,
-        "OSError" => 16,
-        "FileNotFoundError" => 17,
-        "FileExistsError" => 18,
-        "IsADirectoryError" => 19,
-        "NotADirectoryError" => 20,
-        "PermissionError" => 21,
-        "SystemExit" => 22,
-        "TimeoutError" => 23,
-        "StopAsyncIteration" => 24,
-        _ => unreachable!("exception type must come from the closed builtin table"),
-    }
+    EXCEPTION_TYPES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .and_then(|index| u64::try_from(index).ok())
+        .expect("exception type must come from the closed builtin table")
 }
 
 fn exception_type_name(code: u64) -> &'static str {
-    match code {
-        0 => "Exception",
-        1 => "BaseException",
-        2 => "AssertionError",
-        3 => "TypeError",
-        4 => "ValueError",
-        5 => "RuntimeError",
-        6 => "ZeroDivisionError",
-        7 => "OverflowError",
-        8 => "KeyError",
-        9 => "IndexError",
-        10 => "StopIteration",
-        11 => "Skipped",
-        12 => "Failed",
-        13 => "CalledProcessError",
-        14 => "TimeoutExpired",
-        15 => "EOFError",
-        16 => "OSError",
-        17 => "FileNotFoundError",
-        18 => "FileExistsError",
-        19 => "IsADirectoryError",
-        20 => "NotADirectoryError",
-        21 => "PermissionError",
-        22 => "SystemExit",
-        23 => "TimeoutError",
-        24 => "StopAsyncIteration",
-        _ => unreachable!("invalid private exception-type handle"),
-    }
+    usize::try_from(code)
+        .ok()
+        .and_then(|index| EXCEPTION_TYPES.get(index))
+        .copied()
+        .expect("invalid private exception-type handle")
 }
 
 impl NativeValue {
@@ -1160,12 +1149,49 @@ fn format_float(value: f64, spec: &str) -> Result<String, String> {
     Ok(pad_rendered_number(rendered, width, zero_pad))
 }
 
-fn pad_number(value: String, options: &str) -> Result<String, String> {
+fn format_integer(value: BigInt, spec: &str) -> Result<String, String> {
+    let presentation = spec
+        .chars()
+        .last()
+        .ok_or_else(|| "empty integer format".to_string())?;
+    let mut options = &spec[..spec.len() - presentation.len_utf8()];
+    let alternate = options.starts_with('#');
+    if alternate {
+        options = &options[1..];
+    }
+    if options.contains('#') {
+        return Err(format!("unsupported numeric format {spec:?}"));
+    }
+    let (radix, prefix, uppercase) = match presentation {
+        'd' => (10, "", false),
+        'b' => (2, "0b", false),
+        'o' => (8, "0o", false),
+        'x' => (16, "0x", false),
+        'X' => (16, "0X", true),
+        _ => return Err(format!("unsupported integer format {spec:?}")),
+    };
+    if alternate && radix == 10 {
+        return Err(format!("alternate form is not allowed for {presentation}"));
+    }
+    let negative = value.sign() == Sign::Minus;
+    let magnitude = if negative { -value } else { value };
+    let mut digits = magnitude.to_str_radix(radix);
+    if uppercase {
+        digits.make_ascii_uppercase();
+    }
+    let prefix = if alternate { prefix } else { "" };
     let (width, precision, zero_pad) = parse_numeric_format(options)?;
     if precision.is_some() {
         return Err("precision is not allowed in integer format".into());
     }
-    Ok(pad_rendered_number(value, width, zero_pad))
+    let sign = if negative { "-" } else { "" };
+    let content_width = sign.len() + prefix.len() + digits.len();
+    let padding = width.saturating_sub(content_width);
+    if zero_pad {
+        Ok(format!("{sign}{prefix}{}{digits}", "0".repeat(padding)))
+    } else {
+        Ok(format!("{}{sign}{prefix}{digits}", " ".repeat(padding)))
+    }
 }
 
 fn parse_numeric_format(options: &str) -> Result<(usize, Option<usize>, bool), String> {

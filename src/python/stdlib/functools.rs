@@ -1,13 +1,13 @@
-//! Capability-free arithmetic helpers for the VM's small :mod:`functools` slice.
+//! Native arithmetic core for the frozen :mod:`functools` compatibility layer.
 
 use super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyCallable, PyError, PyResult, PyRuntime, PyValueCast,
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
-    name: "functools",
+    name: "_functools",
     functions: &[FunctionDef {
-        module: "functools",
+        module: "_functools",
         name: "reduce",
         call: native_reduce,
     }],

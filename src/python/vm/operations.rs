@@ -1,7 +1,7 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
 use super::{
-    format_float, format_text, number, pad_number, protocol, BigInt, BinaryOperator,
+    format_float, format_integer, format_text, number, protocol, BigInt, BinaryOperator,
     ComparisonOperator, Object, Ordering, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value,
     Vm,
 };
@@ -344,25 +344,35 @@ impl Vm<'_> {
         format_spec: &str,
     ) -> Result<(), String> {
         let value = self.pop()?;
+        let rendered = self.render_formatted_value(&value, conversion, format_spec)?;
+        self.charge_cpu(u64::try_from(rendered.len()).unwrap_or(u64::MAX))?;
+        let rendered = self.allocate_string(rendered)?;
+        self.stack.push(rendered);
+        Ok(())
+    }
+
+    pub(super) fn render_formatted_value(
+        &self,
+        value: &Value,
+        conversion: Option<char>,
+        format_spec: &str,
+    ) -> Result<String, String> {
         let converted = match conversion {
-            Some('r' | 'a') => Some(protocol::repr(&self.state.heap, &value)?),
-            Some('s') => Some(protocol::display(&self.state.heap, &value)?),
+            Some('r' | 'a') => Some(protocol::repr(&self.state.heap, value)?),
+            Some('s') => Some(protocol::display(&self.state.heap, value)?),
             Some(other) => return Err(format!("unsupported f-string conversion !{other}")),
             None => None,
         };
         let rendered = if format_spec.is_empty() {
-            converted.unwrap_or(protocol::display(&self.state.heap, &value)?)
+            converted.unwrap_or(protocol::display(&self.state.heap, value)?)
         } else if format_spec.contains(['{', '}']) {
             return Err("nested f-string format specifications are not implemented".into());
         } else if let Some(converted) = converted {
             format_text(&converted, format_spec)?
         } else {
-            self.format_unconverted_value(&value, format_spec)?
+            self.format_unconverted_value(value, format_spec)?
         };
-        self.charge_cpu(u64::try_from(rendered.len()).unwrap_or(u64::MAX))?;
-        let rendered = self.allocate_string(rendered)?;
-        self.stack.push(rendered);
-        Ok(())
+        Ok(rendered)
     }
 
     fn format_unconverted_value(&self, value: &Value, spec: &str) -> Result<String, String> {
@@ -372,12 +382,11 @@ impl Vm<'_> {
                 .ok_or("floating-point format requires a number")?;
             return format_float(number, spec);
         }
-        if presentation == 'd' {
-            let text = self
+        if matches!(presentation, 'd' | 'b' | 'o' | 'x' | 'X') {
+            let integer = self
                 .bigint_operand(value)
-                .map_err(|_| "integer format requires an integer")?
-                .to_string();
-            return pad_number(text, &spec[..spec.len() - 1]);
+                .map_err(|_| "integer format requires an integer")?;
+            return format_integer(integer, spec);
         }
         if let Some(text) = protocol::string_value(&self.state.heap, value)? {
             return format_text(&text, spec);

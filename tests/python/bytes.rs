@@ -46,6 +46,8 @@ for value in (b'ababa', bytearray(b'ababa')):
     print(missing, type(missing[0]) is type(value))
     print(value.center(8, b'.'), type(value.center(8)) is type(value))
 print(bytes.count(b'aaaa', b'aa'))
+mutable = bytearray(b'abcd')
+print(mutable.reverse(), mutable)
 "#;
     assert_eq!(
         run_python_text(source),
@@ -61,6 +63,7 @@ print(bytes.count(b'aaaa', b'aa'))
                 "(bytearray(b'ababa'), bytearray(b''), bytearray(b'')) True\n",
                 "bytearray(b'.ababa..') True\n",
                 "2\n",
+                "None bytearray(b'dcba')\n",
             )
             .into(),
             String::new(),

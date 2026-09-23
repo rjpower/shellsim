@@ -230,7 +230,12 @@ impl Vm<'_> {
                 Object::Module { scope, .. } => {
                     return Ok(self.state.heap.scope_get(scope, name).copied());
                 }
-                Object::Class { .. } => {
+                Object::Class {
+                    name: class_name, ..
+                } => {
+                    if name == "__name__" {
+                        return Ok(Some(self.allocate_string(class_name)?));
+                    }
                     let mut entry = self.class_attribute_entry(id, name)?;
                     if entry.is_none() {
                         let Object::Class { metaclass, .. } = self.state.heap.get(id)? else {
@@ -358,13 +363,19 @@ impl Vm<'_> {
                 _ => {}
             }
         }
-        let value = if matches!(owner.native_value(), Some(NativeValue::UnitTestBase))
-            && name == "__name__"
-        {
-            Some(self.allocate_string("TestCase".into())?)
-        } else {
-            None
+        let native_name = match owner.native_value() {
+            Some(NativeValue::UnitTestBase) if name == "__name__" => Some("TestCase"),
+            Some(NativeValue::ExceptionType(ExceptionType(exception_name)))
+                if name == "__name__" =>
+            {
+                Some(exception_name)
+            }
+            _ => None,
         };
+        let value = native_name
+            .map(str::to_string)
+            .map(|name| self.allocate_string(name))
+            .transpose()?;
         Ok(value)
     }
 
@@ -1962,7 +1973,7 @@ impl Vm<'_> {
         })
     }
 
-    fn type_of(&self, value: &Value) -> Result<Value, String> {
+    pub(super) fn type_of(&self, value: &Value) -> Result<Value, String> {
         self.state.types.value(self.type_id(value)?)
     }
 

@@ -40,3 +40,14 @@ fn keyword_only_arguments_reject_positional_values() {
     assert!(stdout.is_empty());
     assert!(String::from_utf8_lossy(&stderr).contains("takes 0 positional arguments"));
 }
+
+#[test]
+fn varargs_start_a_new_keyword_only_default_sequence() {
+    let source =
+        "def f(a=1, *args, scale=2):\n    return a, args, scale\nprint(f(3, 4, 5, scale=6))";
+    let (status, stdout, stderr) = run_python(source);
+
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"(3, (4, 5), 6)\n");
+    assert!(stderr.is_empty());
+}

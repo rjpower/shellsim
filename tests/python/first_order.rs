@@ -249,11 +249,16 @@ fn common_fstring_conversions_and_numeric_formats_are_supported() {
     let source = r#"
 value = 12.34567
 print(f"{value:.2f} {value:08.3f} {42:05d}")
+print(f"{31:#x} {31:#06x} {-10:#06X} {5:#b} {9:#o}")
 print(f"{'x':>3} {['a']!r}")
 "#;
     assert_eq!(
         run(source),
-        (0, "12.35 0012.346 00042\n  x ['a']\n".into(), String::new())
+        (
+            0,
+            "12.35 0012.346 00042\n0x1f 0x001f -0X00A 0b101 0o11\n  x ['a']\n".into(),
+            String::new()
+        )
     );
 }
 

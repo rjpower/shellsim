@@ -91,7 +91,7 @@ fn raises_exit(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> 
         return Err(PyError::exception("Failed", "DID NOT RAISE"));
     }
     let kind = runtime
-        .string_value(&args.positional()[0])?
+        .exception_type_name(&args.positional()[0])
         .ok_or_else(|| PyError::type_error("invalid exception context"))?;
     Ok(Value::Bool(
         expected == "Exception" || expected == "BaseException" || kind == expected,
