@@ -98,6 +98,7 @@ impl Vm<'_> {
                 "tuple" => Some(BuiltinType::Tuple),
                 "dict" => Some(BuiltinType::Dict),
                 "set" => Some(BuiltinType::Set),
+                "frozenset" => Some(BuiltinType::FrozenSet),
                 _ => None,
             };
             if let Some(builtin_type) = builtin_type {

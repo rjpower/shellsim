@@ -127,7 +127,7 @@ impl PyRuntime for Vm<'_> {
                 Object::Tuple(_) => PyKind::Tuple,
                 Object::Slice { .. } => PyKind::Native,
                 Object::Dict(_) | Object::DefaultDict { .. } => PyKind::Dict,
-                Object::Set(_) => PyKind::Set,
+                Object::Set(_) | Object::FrozenSet(_) => PyKind::Set,
                 Object::Range { .. } => PyKind::Native,
                 Object::Function { .. } | Object::DescriptorBoundMethod { .. } => PyKind::Function,
                 Object::Class { .. } => PyKind::Class,
@@ -672,7 +672,7 @@ impl PyRuntime for Vm<'_> {
             .get(set.object_id())
             .map_err(PyError::runtime_error)?
         {
-            Object::Set(items) => items,
+            Object::Set(items) | Object::FrozenSet(items) => items,
             _ => return Err(PyError::runtime_error("set handle changed object kind")),
         };
         let bytes = items
@@ -686,7 +686,20 @@ impl PyRuntime for Vm<'_> {
             .get(set.object_id())
             .map_err(PyError::runtime_error)?
         {
-            Object::Set(items) => Ok(items.clone()),
+            Object::Set(items) | Object::FrozenSet(items) => Ok(items.clone()),
+            _ => Err(PyError::runtime_error("set handle changed object kind")),
+        }
+    }
+
+    fn set_is_frozen(&self, set: PySet) -> PyResult<bool> {
+        match self
+            .state
+            .heap
+            .get(set.object_id())
+            .map_err(PyError::runtime_error)?
+        {
+            Object::FrozenSet(_) => Ok(true),
+            Object::Set(_) => Ok(false),
             _ => Err(PyError::runtime_error("set handle changed object kind")),
         }
     }
@@ -1189,6 +1202,10 @@ impl PyRuntime for Vm<'_> {
 
     fn new_set(&mut self, items: Vec<Value>) -> PyResult<Value> {
         Vm::allocate_object(self, Object::Set(items)).map_err(PyError::resource_error)
+    }
+
+    fn new_frozen_set(&mut self, items: Vec<Value>) -> PyResult<Value> {
+        Vm::allocate_object(self, Object::FrozenSet(items)).map_err(PyError::resource_error)
     }
 
     fn new_value_kind(

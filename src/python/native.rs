@@ -464,6 +464,7 @@ pub(super) trait PyRuntime {
     fn dict_remove(&mut self, dict: PyDict, key: &PyValue) -> PyResult<Option<PyValue>>;
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(PyValue, PyValue)>) -> PyResult<()>;
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<PyValue>>;
+    fn set_is_frozen(&self, set: PySet) -> PyResult<bool>;
     fn set_insert(&mut self, set: PySet, value: PyValue) -> PyResult<bool>;
     fn set_remove(&mut self, set: PySet, value: &PyValue) -> PyResult<bool>;
     fn replace_list_items(&mut self, list: PyList, items: Vec<PyValue>) -> PyResult<()>;
@@ -488,6 +489,7 @@ pub(super) trait PyRuntime {
     fn new_tuple(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
     fn new_dict(&mut self, items: Vec<(PyValue, PyValue)>) -> PyResult<PyValue>;
     fn new_set(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
+    fn new_frozen_set(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
     fn new_value_kind(&self, kind: &'static ValueKindDef, payload: u64) -> PyResult<PyValue>;
     fn value_kind_payload(&self, value: &PyValue, kind: &'static ValueKindDef) -> Option<u64>;
     fn value_kind_type(&self, kind: &'static ValueKindDef) -> PyResult<PyValue>;

@@ -514,6 +514,7 @@ impl Vm<'_> {
                 | Object::ByteArray(_)
                 | Object::Slice { .. }
                 | Object::Exception { .. }
+                | Object::FrozenSet(_)
                 | Object::BigInt(_)
                 | Object::Function { .. }
                 | Object::Class { .. }
@@ -717,7 +718,9 @@ impl Vm<'_> {
                     entries.push((index, value));
                 }
             }
-            Object::Tuple(_) => return Err("tuple object does not support item assignment".into()),
+            Object::Tuple(_) | Object::FrozenSet(_) => {
+                return Err("immutable object does not support item assignment".into())
+            }
             Object::String(_)
             | Object::Bytes(_)
             | Object::ByteArray(_)
@@ -1847,7 +1850,7 @@ impl Vm<'_> {
                     self.allocate_bytearray(value)?
                 }
             }
-            BuiltinType::List | BuiltinType::Tuple | BuiltinType::Set => {
+            BuiltinType::List | BuiltinType::Tuple | BuiltinType::Set | BuiltinType::FrozenSet => {
                 expect_arity(&arguments, 0, 1)?;
                 let values = arguments
                     .first()
@@ -1857,7 +1860,7 @@ impl Vm<'_> {
                 let object = match builtin_type {
                     BuiltinType::List => Object::List(values),
                     BuiltinType::Tuple => Object::Tuple(values),
-                    BuiltinType::Set => {
+                    BuiltinType::Set | BuiltinType::FrozenSet => {
                         let mut unique = Vec::new();
                         for value in values {
                             self.charge_cpu(1)?;
@@ -1866,7 +1869,11 @@ impl Vm<'_> {
                                 unique.push(value);
                             }
                         }
-                        Object::Set(unique)
+                        if builtin_type == BuiltinType::Set {
+                            Object::Set(unique)
+                        } else {
+                            Object::FrozenSet(unique)
+                        }
                     }
                     _ => unreachable!(),
                 };

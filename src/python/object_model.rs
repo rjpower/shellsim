@@ -40,6 +40,7 @@ pub(super) enum BuiltinType {
     Tuple,
     Dict,
     Set,
+    FrozenSet,
     Range,
     Function,
     Module,
@@ -58,7 +59,7 @@ pub(super) enum BuiltinType {
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 28] = [
+    pub(super) const ALL: [Self; 29] = [
         Self::Object,
         Self::Type,
         Self::None,
@@ -72,6 +73,7 @@ impl BuiltinType {
         Self::Tuple,
         Self::Dict,
         Self::Set,
+        Self::FrozenSet,
         Self::Range,
         Self::Function,
         Self::Module,
@@ -108,6 +110,7 @@ impl BuiltinType {
             Self::Tuple => "tuple",
             Self::Dict => "dict",
             Self::Set => "set",
+            Self::FrozenSet => "frozenset",
             Self::Range => "range",
             Self::Function => "function",
             Self::Module => "module",
@@ -617,6 +620,10 @@ impl Default for TypeRegistry {
             &super::stdlib::core::SET_TYPE,
         );
         install_native_methods(
+            &mut types[BuiltinType::FrozenSet as usize],
+            &super::stdlib::core::FROZENSET_TYPE,
+        );
+        install_native_methods(
             &mut types[BuiltinType::Generator as usize],
             &super::stdlib::core::GENERATOR_TYPE,
         );
@@ -935,6 +942,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.less_equal = Some(intrinsic(super::stdlib::core::slot_set_less_equal));
     slots.greater_than = Some(intrinsic(super::stdlib::core::slot_set_greater));
     slots.greater_equal = Some(intrinsic(super::stdlib::core::slot_set_greater_equal));
+
+    types[BuiltinType::FrozenSet as usize].slots = types[BuiltinType::Set as usize].slots.clone();
 
     let slots = &mut types[BuiltinType::Tuple as usize].slots;
     slots.add = Some(intrinsic(super::stdlib::core::slot_tuple_add));

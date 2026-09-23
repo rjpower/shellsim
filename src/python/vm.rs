@@ -834,7 +834,10 @@ impl<'a> Vm<'a> {
             }
         } else if let Some(id) = value.object_id() {
             match self.state.heap.get(id)?.clone() {
-                Object::List(values) | Object::Tuple(values) | Object::Set(values) => {
+                Object::List(values)
+                | Object::Tuple(values)
+                | Object::Set(values)
+                | Object::FrozenSet(values) => {
                     for value in values {
                         self.push_materialized(&mut result, value)?;
                     }
@@ -956,12 +959,12 @@ impl<'a> Vm<'a> {
 
     fn find_set_entry(&mut self, id: ObjectId, needle: &Value) -> Result<Option<usize>, String> {
         let length = match self.state.heap.get(id)? {
-            Object::Set(values) => values.len(),
+            Object::Set(values) | Object::FrozenSet(values) => values.len(),
             _ => return Err("set handle changed object kind".into()),
         };
         for position in 0..length {
             let candidate = match self.state.heap.get(id)? {
-                Object::Set(values) => values[position],
+                Object::Set(values) | Object::FrozenSet(values) => values[position],
                 _ => return Err("set handle changed object kind".into()),
             };
             self.charge_cpu(1)?;

@@ -263,6 +263,25 @@ print(f"{'x':>3} {['a']!r}")
 }
 
 #[test]
+fn frozenset_is_immutable_and_preserves_left_operand_type() {
+    let source = r#"
+frozen = frozenset([1, 2, 2])
+mutable = {2, 3}
+print(frozen, frozen == {1, 2}, isinstance(frozen | mutable, frozenset))
+print(isinstance(mutable | frozen, set), sorted(frozen.union([4])))
+print('immutable', hasattr(frozen, 'add'))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "frozenset({1, 2}) True True\nTrue [1, 2, 4]\nimmutable False\n".into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
 fn percent_formatting_justification_and_pow_cover_common_agent_output() {
     let source = r#"
 print("%s %.2f %+d %04d %%" % ("value", 1.25, 3, 7))

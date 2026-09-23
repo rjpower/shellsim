@@ -126,6 +126,7 @@ pub enum Object {
         entries: OrderedMap,
     },
     Set(Vec<Value>),
+    FrozenSet(Vec<Value>),
     BigInt(BigInt),
     /// Reusable arithmetic sequence. Iteration state lives in a separate iterator object.
     Range {
@@ -1110,6 +1111,7 @@ impl Heap {
             Object::Slice { .. } => BuiltinType::Native.id(),
             Object::Dict(_) | Object::DefaultDict { .. } => BuiltinType::Dict.id(),
             Object::Set(_) => BuiltinType::Set.id(),
+            Object::FrozenSet(_) => BuiltinType::FrozenSet.id(),
             Object::BigInt(_) => BuiltinType::Int.id(),
             Object::Range { .. } => BuiltinType::Range.id(),
             Object::Function { .. } | Object::DescriptorBoundMethod { .. } => {
@@ -1360,6 +1362,7 @@ fn trace_object(
         Object::List(items)
         | Object::Tuple(items)
         | Object::Set(items)
+        | Object::FrozenSet(items)
         | Object::ArrayStorage(items) => trace_values(items.iter().copied(), object_work),
         Object::Dict(entries) => {
             for (key, value) in entries {
@@ -1508,7 +1511,10 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .len()
             .checked_add(message.len())
             .ok_or("modeled object size overflow")?,
-        Object::List(values) | Object::Tuple(values) | Object::Set(values) => values.len(),
+        Object::List(values)
+        | Object::Tuple(values)
+        | Object::Set(values)
+        | Object::FrozenSet(values) => values.len(),
         Object::Slice { .. } => 3,
         Object::BigInt(value) => usize::try_from(value.bits().saturating_add(7) / 8)
             .map_err(|_| "modeled big integer size overflow")?,

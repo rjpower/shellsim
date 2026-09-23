@@ -35,6 +35,10 @@ support `yield`, `yield from`, `send`, `throw`, and `close`, including suspensio
 `with` regions. Generator shutdown uses a deliberately simple bounded drain through pending
 cleanup code.
 
+The core collection surface includes mutable sets and immutable `frozenset` values with mixed
+comparison and set algebra. VFS-backed text and binary files support read, write, append, and
+their `+` update variants with a shared seekable cursor.
+
 Function calls support positional, variadic, keyword-only, and keyword-variadic parameters,
 including bounded `*iterable` and `**mapping` expansion. Duplicate keywords, non-string mapping
 keys, and non-mapping `**` operands are rejected explicitly.
