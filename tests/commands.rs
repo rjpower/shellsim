@@ -37,3 +37,5 @@ mod rg;
 mod sed;
 #[path = "commands/streams.rs"]
 mod streams;
+#[path = "commands/xargs.rs"]
+mod xargs;

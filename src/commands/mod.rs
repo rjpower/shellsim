@@ -29,6 +29,7 @@ mod find;
 mod format;
 mod fs;
 pub(crate) mod git;
+mod grep;
 mod hashing;
 mod makecmd;
 mod net;
@@ -47,6 +48,7 @@ mod tarcmd;
 mod text;
 mod unavailable;
 pub mod util;
+mod xargs;
 mod zipcmd;
 
 /// Bundled standard I/O for a command invocation.
@@ -294,6 +296,7 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     echo::register(&mut m);
     find::register(&mut m);
     format::register(&mut m);
+    grep::register(&mut m);
     printf::register(&mut m);
     sort::register(&mut m);
     streams::register(&mut m);
@@ -301,6 +304,7 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     tarcmd::register(&mut m);
     text::register(&mut m);
     unavailable::register(&mut m);
+    xargs::register(&mut m);
     fs::register(&mut m);
     git::register(&mut m);
     hashing::register(&mut m);
