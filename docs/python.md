@@ -24,6 +24,10 @@ shellsim-python ./project/tests --pytest
 `--entry`, `--pytest`, `--root`, resource limits, and `--json`. Simulated imports remain confined
 to frozen modules and the virtual filesystem.
 
+Virtual-filesystem packages execute their `__init__.py` before child modules, expose stable
+`__name__`, `__package__`, and `__file__` values, cache module identity, and resolve leading-dot
+imports within the current package. Imports beyond the top-level package fail explicitly.
+
 The runtime supports functions and closures, classes and descriptors, exceptions and context
 managers, comprehensions and lazy generators, arbitrary-precision integers, mutable containers,
 f-strings, VFS imports, and the common language protocols needed by real scripts. Generators

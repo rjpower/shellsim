@@ -1,8 +1,9 @@
 //! Name, scope, import, and per-code cache operations used by bytecode execution.
 
 use super::{
-    is_os_error, Arc, Builtin, BuiltinType, CodeRef, ExceptionType, Execution, HashMap, NameId,
-    NativeValue, Object, PyModuleLoader, PyRuntime, RaisedException, ScopeId, SymbolId, Value, Vm,
+    is_os_error, protocol, Arc, Builtin, BuiltinType, CodeRef, ExceptionType, Execution, HashMap,
+    NameId, NativeValue, Object, PyModuleLoader, PyRuntime, RaisedException, ScopeId, SymbolId,
+    Value, Vm,
 };
 
 impl Vm<'_> {
@@ -530,20 +531,31 @@ impl Vm<'_> {
     }
 
     pub(super) fn import(&mut self, name: &str, bind_root: bool) -> Result<(), String> {
-        if let Some(module) = super::super::stdlib::native_module(name) {
-            return self.finish_import(name, Value::Native(NativeValue::Module(module)), bind_root);
+        let name = self.resolve_import_name(name)?;
+        if let Some(module) = super::super::stdlib::native_module(&name) {
+            return self.finish_import(
+                &name,
+                Value::Native(NativeValue::Module(module)),
+                bind_root,
+            );
         }
-        if let Some(module) = self.state.modules.get(name).cloned() {
-            return self.finish_import(name, module, bind_root);
+        if let Some(module) = self.state.modules.get(&name).cloned() {
+            return self.finish_import(&name, module, bind_root);
         }
 
-        let relative_name = name.trim_start_matches('.');
-        let source = if let Some(source) = super::super::stdlib::frozen_module(relative_name) {
+        self.ensure_package_parent(&name)?;
+        // A package initializer may import the requested child itself. Reuse that exact module
+        // object so classes and exceptions retain identity across the import cycle.
+        if let Some(module) = self.state.modules.get(&name).copied() {
+            return self.finish_import(&name, module, bind_root);
+        }
+
+        let source = if let Some(source) = super::super::stdlib::frozen_module(&name) {
             Some((format!("<frozen {name}>"), source.to_string()))
         } else {
             let roots = self.import_roots()?;
             self.interp
-                .load_module_source(&roots, relative_name)
+                .load_module_source(&roots, &name)
                 .map_err(|error| self.record_native_error(error))?
         };
         let Some((path, source)) = source else {
@@ -573,19 +585,32 @@ impl Vm<'_> {
             )
         })?;
         let code = super::super::compiler::compile(program);
-        let module_name = self.allocate_string(relative_name.to_string())?;
+        let is_package = path.ends_with("/__init__.py");
+        let package_name = if is_package {
+            name.clone()
+        } else {
+            name.rsplit_once('.')
+                .map_or_else(String::new, |(package, _)| package.to_string())
+        };
+        let module_name = self.allocate_string(name.clone())?;
+        let module_package = self.allocate_string(package_name)?;
+        let module_file = self.allocate_string(path.clone())?;
         let scope = self.state.heap.allocate_scope(
             None,
             false,
             Arc::from([]),
-            HashMap::from([("__name__".into(), module_name)]),
+            HashMap::from([
+                ("__name__".into(), module_name),
+                ("__package__".into(), module_package),
+                ("__file__".into(), module_file),
+            ]),
             &mut self.interp.resources,
         )?;
         let module = self.allocate_object(Object::Module {
-            name: name.to_string(),
+            name: name.clone(),
             scope,
         })?;
-        self.state.modules.insert(name.to_string(), module);
+        self.state.modules.insert(name.clone(), module);
 
         let temporary_import_path = (!path.starts_with('<')).then(|| {
             path.rsplit_once('/')
@@ -603,21 +628,21 @@ impl Vm<'_> {
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
-            Ok(Execution::Halt) => self.finish_import(name, module, bind_root),
+            Ok(Execution::Halt) => self.finish_import(&name, module, bind_root),
             Ok(Execution::Return(_)) => {
-                self.state.modules.remove(name);
+                self.state.modules.remove(&name);
                 Err(format!("'return' outside function in module {name:?}"))
             }
             Ok(Execution::Yield(_, _)) => {
-                self.state.modules.remove(name);
+                self.state.modules.remove(&name);
                 Err(format!("'yield' outside function in module {name:?}"))
             }
             Ok(Execution::Exit(status)) => {
-                self.state.modules.remove(name);
+                self.state.modules.remove(&name);
                 Err(format!("module {name:?} exited with status {status}"))
             }
             Err((error, span)) => {
-                self.state.modules.remove(name);
+                self.state.modules.remove(&name);
                 Err(format!(
                     "{error} in {path} at line {}, column {}",
                     span.line, span.column
@@ -626,9 +651,83 @@ impl Vm<'_> {
         }
     }
 
+    fn resolve_import_name(&self, requested: &str) -> Result<String, String> {
+        let level = requested
+            .chars()
+            .take_while(|character| *character == '.')
+            .count();
+        if level == 0 {
+            return Ok(requested.to_string());
+        }
+        let scope = self
+            .local_scopes
+            .last()
+            .copied()
+            .ok_or("relative import requires a package context")?;
+        let package = self
+            .state
+            .heap
+            .scope_get(scope, "__package__")
+            .ok_or("relative import requires __package__")?;
+        let package = protocol::string_value(&self.state.heap, package)?
+            .filter(|package| !package.is_empty())
+            .ok_or("relative import requires a non-empty package")?;
+        let mut parts = package.split('.').collect::<Vec<_>>();
+        if level > parts.len() {
+            return Err("attempted relative import beyond top-level package".into());
+        }
+        parts.truncate(parts.len() + 1 - level);
+        let suffix = &requested[level..];
+        if !suffix.is_empty() {
+            parts.push(suffix);
+        }
+        Ok(parts.join("."))
+    }
+
+    fn ensure_package_parent(&mut self, name: &str) -> Result<(), String> {
+        let Some((parent, _)) = name.rsplit_once('.') else {
+            return Ok(());
+        };
+        if self.state.modules.contains_key(parent) {
+            return Ok(());
+        }
+        let standard = super::super::stdlib::native_module(parent).is_some()
+            || super::super::stdlib::frozen_module(parent).is_some();
+        let vfs_package = if standard {
+            false
+        } else {
+            let roots = self.import_roots()?;
+            self.interp
+                .load_module_source(&roots, parent)
+                .map_err(|error| self.record_native_error(error))?
+                .is_some_and(|(path, _)| path.ends_with("/__init__.py"))
+        };
+        if standard || vfs_package {
+            self.import(parent, false)?;
+            self.stack.pop().ok_or("parent import produced no value")?;
+        }
+        Ok(())
+    }
+
     /// Install synthetic package parents for a dotted import and push the value selected by
     /// Python's ordinary import binding rule. Package objects contain only VM module references.
     fn finish_import(&mut self, name: &str, leaf: Value, bind_root: bool) -> Result<(), String> {
+        if let Some((parent_name, child_name)) = name.rsplit_once('.') {
+            if let Some(parent) = self.state.modules.get(parent_name).copied() {
+                let parent_id = parent
+                    .object_id()
+                    .ok_or_else(|| format!("module {parent_name:?} cannot contain submodules"))?;
+                let Object::Module { scope, .. } = self.state.heap.get(parent_id)? else {
+                    return Err(format!("module {parent_name:?} changed object kind"));
+                };
+                self.state.heap.scope_insert(
+                    *scope,
+                    child_name.to_string(),
+                    leaf,
+                    &mut self.interp.resources,
+                )?;
+            }
+        }
         if !bind_root || !name.contains('.') {
             self.stack.push(leaf);
             return Ok(());
