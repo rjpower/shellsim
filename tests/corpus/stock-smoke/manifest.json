@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "profile": "stock_agent_v1",
+  "cases": [
+    {
+      "id": "stock-shell-environment",
+      "kind": "shell",
+      "entrypoint": "/work/hello.sh",
+      "args": ["argument ready"],
+      "fixtures": [
+        {"source": "hello.sh", "destination": "/work/hello.sh", "mode": 493},
+        {"source": "message.txt", "destination": "/work/input/message.txt"}
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L2hvbWUvc2hlbGxzaW18c2hlbGxzaW18L3dvcmt8VVRDfGFyZ3VtZW50IHJlYWR5CmZpeHR1cmUtcmVhZHkK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "stock-python-environment",
+      "kind": "python",
+      "entrypoint": "/work/python_env.py",
+      "fixtures": [
+        {"source": "python_env.py", "destination": "/work/python_env.py"},
+        {"source": "message.txt", "destination": "/work/input/message.txt"}
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L2hvbWUvc2hlbGxzaW0KZml4dHVyZS1yZWFkeQo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "documented-expensive-frontier",
+      "kind": "shell",
+      "entrypoint": "/work/perl-workload.sh",
+      "expect": {
+        "disposition": "skip",
+        "skip_reason": "requires a general Perl runtime; one-liner compatibility is evaluated separately"
+      }
+    }
+  ]
+}

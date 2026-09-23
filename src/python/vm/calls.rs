@@ -523,18 +523,50 @@ impl Vm<'_> {
         let Some(NativeValue::Function(function)) = function.native_value() else {
             return Err("object is not callable".into());
         };
-        if !keyword_arguments.is_empty() && !matches!(function, Builtin::Sorted) {
+        if !keyword_arguments.is_empty() && !matches!(function, Builtin::Print | Builtin::Sorted) {
             return Err("this builtin does not accept keyword arguments".into());
         }
         match function {
             Builtin::Print => {
+                let mut separator = " ".to_string();
+                let mut ending = "\n".to_string();
+                let mut stream = Stream::Stdout;
+                for (name, value) in &keyword_arguments {
+                    match name.as_str() {
+                        "sep" => {
+                            if value.is_none() {
+                                continue;
+                            }
+                            separator = protocol::string_value(&self.state.heap, value)?
+                                .ok_or("sep must be None or a string")?;
+                        }
+                        "end" => {
+                            if value.is_none() {
+                                continue;
+                            }
+                            ending = protocol::string_value(&self.state.heap, value)?
+                                .ok_or("end must be None or a string")?;
+                        }
+                        "file" => match value.native_value() {
+                            Some(NativeValue::Stream(selected)) => stream = selected,
+                            _ if value.is_none() => {}
+                            _ => return Err("print file must be a modeled text stream".into()),
+                        },
+                        "flush" => {}
+                        _ => {
+                            return Err(format!(
+                                "print() got an unexpected keyword argument {name:?}"
+                            ))
+                        }
+                    }
+                }
                 let mut rendered = Vec::with_capacity(arguments.len());
                 for value in &arguments {
                     rendered.push(self.display_value(value)?);
                 }
-                let text = rendered.join(" ");
-                self.write_output(Stream::Stdout, text.as_bytes());
-                self.write_output(Stream::Stdout, b"\n");
+                let text = rendered.join(&separator);
+                self.write_output(stream, text.as_bytes());
+                self.write_output(stream, ending.as_bytes());
                 Ok(CallResult::Value(Value::None))
             }
             Builtin::Input => {

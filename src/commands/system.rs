@@ -567,19 +567,24 @@ fn cmd_ps(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                     .join(" "),
             );
         } else if aux {
+            let user = process
+                .environment
+                .get("USER")
+                .map(String::as_str)
+                .unwrap_or("user");
             wln(
                 io.out,
                 &format!(
-                    "root      {:>5}  0.0  0.0      0     0 ?        {state:<4} 00:00   0:00 {}",
-                    process.pid, process.command
+                    "{user:<8}  {:>5}  0.0  0.0      0     0 ?        {state:<4} 00:00   0:00 {}",
+                    process.pid, process.command,
                 ),
             );
         } else if full {
             wln(
                 io.out,
                 &format!(
-                    "root       {:>5} {:>7}  0 00:00 ?        00:00:00 {}",
-                    process.pid, process.ppid, process.command
+                    "{:<10} {:>5} {:>7}  0 00:00 ?        00:00:00 {}",
+                    process.uid, process.pid, process.ppid, process.command
                 ),
             );
         } else {
@@ -624,8 +629,12 @@ fn ps_value(column: &str, process: &crate::process::ProcessRecord, state: &str) 
             .unwrap_or("")
             .to_string(),
         "cmd" | "args" => process.command.clone(),
-        "user" => "root".into(),
-        "uid" => "0".into(),
+        "user" => process
+            .environment
+            .get("USER")
+            .cloned()
+            .unwrap_or_else(|| "user".into()),
+        "uid" => process.uid.to_string(),
         _ => unreachable!(),
     }
 }

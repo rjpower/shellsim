@@ -1276,7 +1276,8 @@ fn invocation_names(events: &[InvocationEvent], trust: CommandTrust) -> Vec<Stri
         .collect()
 }
 
-fn workspace_diff(before: &Vfs, after: &Vfs) -> Result<Vec<WorkspaceChange>, String> {
+/// Return a bounded, stable description of changes under `/work` between two VFS snapshots.
+pub fn workspace_diff(before: &Vfs, after: &Vfs) -> Result<Vec<WorkspaceChange>, String> {
     let paths = before
         .all_paths()
         .map(|(path, _)| path)

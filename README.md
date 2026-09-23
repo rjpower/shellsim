@@ -125,6 +125,8 @@ result = environment.run_python("print('persistent VFS, fresh Python interpreter
 bounded execution, streaming actions, VFS operations, checkpoints, workspace diffs, process and
 resource inspection, and deterministic session forks. `shellsim mcp` exposes the same environment
 as a stdio MCP server. `shellsim replay scenario.ndjson` reruns checked action transcripts.
+`shellsim corpus manifest.json` runs frozen shell and Python workloads under a versioned stock
+environment and emits a classified JSON report. See [compatibility testing](docs/compatibility-testing.md).
 
 ```sh
 printf '%s\n' \
