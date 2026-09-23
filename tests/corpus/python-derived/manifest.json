@@ -98,12 +98,7 @@
         {"contents": "VALUE = 42\n", "destination": "/work/package/value.py"},
         {"contents": "from . import VALUE\ndef answer():\n    return VALUE\n", "destination": "/work/package/api.py"}
       ],
-      "expect": {
-        "disposition": "frontier",
-        "class": "unsupported_feature",
-        "exit_status": 2,
-        "unsupported": ["python:no module named \".\" in the virtual filesystem in /work/package/api.py at line 1, column 1 at line 1, column 1"]
-      }
+      "expect": {"disposition": "pass", "stdout": "42\n", "stderr": ""}
     },
     {
       "id": "file-update-and-seek",

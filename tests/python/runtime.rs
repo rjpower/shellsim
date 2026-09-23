@@ -81,6 +81,47 @@ print(helpers.add(5), plus(6), add_ten(3))
 }
 
 #[test]
+fn package_initializers_and_relative_imports_share_module_identity() {
+    let mut environment = Environment::new();
+    for (path, source) in [
+        (
+            "/app/package/__init__.py",
+            "print('init', __package__, __name__)\nBASE = 40\n",
+        ),
+        (
+            "/app/package/value.py",
+            "print(__package__, __name__)\nDELTA = 2\n",
+        ),
+        (
+            "/app/package/api.py",
+            "from . import BASE\nfrom .value import DELTA\ndef answer(): return BASE + DELTA\n",
+        ),
+        (
+            "/app/main.py",
+            "from package.api import answer\nfrom package.api import answer as again\nprint(answer(), answer is again)\n",
+        ),
+    ] {
+        environment
+            .vfs
+            .put_file(path, source.as_bytes().to_vec(), 0o644)
+            .unwrap();
+    }
+
+    let (outcome, stdout, stderr) = environment.run_script_capture("python3.14 /app/main.py");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        stdout,
+        b"init package package\npackage package.value\n42 True\n"
+    );
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn computed_string_allocation_is_bounded_before_allocation() {
     let mut environment = Environment::with_limits(Limits {
         memory: 40 * 1024,
