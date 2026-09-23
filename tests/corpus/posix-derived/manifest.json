@@ -6,6 +6,7 @@
       "id": "posix-quoted-ifs",
       "kind": "shell",
       "entrypoint": "/work/cases/quoted-ifs.sh",
+      "covers": ["shell.expansion.field_splitting", "shell.quoting.double", "shell.parameter.positional"],
       "fixtures": [{"source": "cases/quoted-ifs.sh", "destination": "/work/cases/quoted-ifs.sh", "sha256": "38d097b23b1d68fa9d6f5d043bae49916800797721d210bf6331efea0e965c86"}],
       "expect": {"disposition": "pass", "stdout_base64": "MzphOmI6YwoxOlthIGIgIGNdCg==", "stderr_base64": ""}
     },
@@ -13,6 +14,7 @@
       "id": "posix-positional-function",
       "kind": "shell",
       "entrypoint": "/work/cases/positional-function.sh",
+      "covers": ["shell.function.posix", "shell.parameter.at", "shell.builtin.shift"],
       "fixtures": [{"source": "cases/positional-function.sh", "destination": "/work/cases/positional-function.sh", "sha256": "4cbfd7fd5169fb0ebf40868b0b4d099dae54aec6e1668e1d9025594d51b29c3c"}],
       "expect": {"disposition": "pass", "stdout_base64": "W29uZV0KW3R3byB0aHJlZV0KMTpbdHdvIHRocmVlXQo=", "stderr_base64": ""}
     },
@@ -20,6 +22,7 @@
       "id": "posix-parameter-defaults",
       "kind": "shell",
       "entrypoint": "/work/cases/parameter-defaults.sh",
+      "covers": ["shell.parameter.default", "shell.parameter.alternate", "shell.parameter.assign"],
       "fixtures": [{"source": "cases/parameter-defaults.sh", "destination": "/work/cases/parameter-defaults.sh", "sha256": "810db6f39d32366cfa9ed55d36501a9cce14322365b723d43625b6f5b4a495fc"}],
       "expect": {"disposition": "pass", "stdout_base64": "ZGVmYXVsdDpkZWZhdWx0OjoKOmRlZmF1bHQ6YWx0Ogp2YWx1ZTp2YWx1ZTphbHQ6YWx0CmFzc2lnbmVkOmFzc2lnbmVkCg==", "stderr_base64": ""}
     },
@@ -27,6 +30,7 @@
       "id": "posix-subshell-command-sub",
       "kind": "shell",
       "entrypoint": "/work/cases/subshell-command-sub.sh",
+      "covers": ["shell.compound.subshell", "shell.expansion.command_substitution"],
       "fixtures": [{"source": "cases/subshell-command-sub.sh", "destination": "/work/cases/subshell-command-sub.sh", "sha256": "2677f565eef15fb7bcd5cc27f090b6b24ca1646146cfd09ef5d061d040afbbc1"}],
       "expect": {"disposition": "pass", "stdout_base64": "aW5uZXIKb3V0ZXIKW2FdCg==", "stderr_base64": ""}
     },
@@ -34,6 +38,7 @@
       "id": "posix-ordinary-redirection",
       "kind": "shell",
       "entrypoint": "/work/cases/ordinary-redirection.sh",
+      "covers": ["shell.redirection.input", "shell.redirection.output", "shell.redirection.append", "shell.redirection.order"],
       "fixtures": [{"source": "cases/ordinary-redirection.sh", "destination": "/work/cases/ordinary-redirection.sh", "sha256": "c499d9ecf2a0ab8d7fe43977882ac9c0b47f1b937d11f6ac5eec710170ceca78"}],
       "expect": {"disposition": "pass", "stdout_base64": "Zmlyc3QKc2Vjb25kCnByb2JsZW0K", "stderr_base64": ""}
     },
@@ -41,6 +46,7 @@
       "id": "posix-control-flow",
       "kind": "shell",
       "entrypoint": "/work/cases/control-flow.sh",
+      "covers": ["shell.compound.for", "shell.compound.while", "shell.compound.until", "shell.compound.case"],
       "fixtures": [{"source": "cases/control-flow.sh", "destination": "/work/cases/control-flow.sh", "sha256": "04404381f5f28383c7aedf213b3d3f3f707a3d5a2f534bd850834ad767b5652e"}],
       "expect": {"disposition": "pass", "stdout_base64": "Zm9yOmEKZm9yOmIKd2hpbGU6MAp3aGlsZToxCmNhc2U6Mwo=", "stderr_base64": ""}
     },
@@ -48,6 +54,7 @@
       "id": "posix-status-lists",
       "kind": "shell",
       "entrypoint": "/work/cases/status-lists.sh",
+      "covers": ["shell.pipeline.status", "shell.and_or.status", "shell.reserved.negate"],
       "fixtures": [{"source": "cases/status-lists.sh", "destination": "/work/cases/status-lists.sh", "sha256": "7e013c5d9d2d3bc5b12a8a3565d914c5c2115952b028c4c50bfee1026fbb8483"}],
       "expect": {"disposition": "pass", "stdout_base64": "cGlwZS1yaWdodDowCnBpcGUtZmFpbDoxCm5lZ2F0ZWQ6MApmYWxsYmFjawo=", "stderr_base64": ""}
     },
@@ -55,6 +62,7 @@
       "id": "posix-assignment-export",
       "kind": "shell",
       "entrypoint": "/work/cases/assignment-export.sh",
+      "covers": ["shell.assignment.environment", "shell.builtin.export", "shell.builtin.readonly"],
       "fixtures": [{"source": "cases/assignment-export.sh", "destination": "/work/cases/assignment-export.sh", "sha256": "67a27a5a6b7ca5d1db6ced4dda053fcd4d33eb4db31d6de3fdd87498dc56e7f2"}],
       "expect": {"disposition": "pass", "stdout_base64": "dGVtcG9yYXJ5CmFmdGVyOnBhcmVudApyZWFkb25seTp2YWx1ZQo=", "stderr_base64": ""}
     }

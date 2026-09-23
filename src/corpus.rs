@@ -51,7 +51,12 @@ pub enum ExpectedDisposition {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fixture {
-    pub source: String,
+    /// Host fixture path relative to the manifest directory.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Inline UTF-8 fixture contents for compact derived cases.
+    #[serde(default)]
+    pub contents: Option<String>,
     pub destination: String,
     #[serde(default)]
     pub sha256: Option<String>,
@@ -72,8 +77,14 @@ pub struct CaseExpectation {
     pub exit_status: Option<i32>,
     #[serde(default)]
     pub stdout_base64: Option<String>,
+    /// Exact UTF-8 stdout. Mutually exclusive with `stdout_base64`.
+    #[serde(default)]
+    pub stdout: Option<String>,
     #[serde(default)]
     pub stderr_base64: Option<String>,
+    /// Exact UTF-8 stderr. Mutually exclusive with `stderr_base64`.
+    #[serde(default)]
+    pub stderr: Option<String>,
     #[serde(default)]
     pub skip_reason: Option<String>,
     /// Unsupported language features that are part of the checked behavior.
@@ -95,9 +106,20 @@ pub struct CorpusCase {
     #[serde(default)]
     pub source: Option<Provenance>,
     pub kind: ProgramKind,
-    pub entrypoint: String,
+    /// VFS path or modeled command name to execute.
+    #[serde(default)]
+    pub entrypoint: Option<String>,
+    /// Inline shell or Python source. Mutually exclusive with `entrypoint`.
+    #[serde(default)]
+    pub code: Option<String>,
+    /// Stable capability identifiers exercised by this case.
+    #[serde(default)]
+    pub covers: Vec<String>,
     #[serde(default)]
     pub args: Vec<String>,
+    /// UTF-8 standard input. Mutually exclusive with `stdin_base64`.
+    #[serde(default)]
+    pub stdin: Option<String>,
     #[serde(default)]
     pub stdin_base64: String,
     #[serde(default)]
@@ -157,6 +179,16 @@ pub struct CaseResult {
     pub unsupported: Vec<String>,
     pub unsupported_commands: Vec<String>,
     pub workspace_changes: Vec<crate::harness::WorkspaceChange>,
+    pub covers: Vec<String>,
+}
+
+/// Aggregate observations for one capability identifier.
+#[derive(Debug, Default, Serialize)]
+pub struct CoverageResult {
+    pub passing: usize,
+    pub frontiers: usize,
+    pub skipped: usize,
+    pub expectation_failures: usize,
 }
 
 /// Aggregate output of one manifest run.
@@ -167,6 +199,7 @@ pub struct CorpusReport {
     pub total: usize,
     pub expectation_failures: usize,
     pub classes: BTreeMap<ResultClass, usize>,
+    pub coverage: BTreeMap<String, CoverageResult>,
     pub cases: Vec<CaseResult>,
 }
 
@@ -189,6 +222,7 @@ pub fn run_manifest(base: &Path, manifest: CorpusManifest) -> Result<CorpusRepor
         return Err(format!("corpus exceeds the {MAX_CASES}-case limit"));
     }
 
+    validate_manifest(&manifest)?;
     let mut cases = Vec::with_capacity(manifest.cases.len());
     for case in manifest.cases {
         cases.push(run_case(base, manifest.profile, case));
@@ -198,14 +232,148 @@ pub fn run_manifest(base: &Path, manifest: CorpusManifest) -> Result<CorpusRepor
         *classes.entry(case.class).or_insert(0) += 1;
     }
     let expectation_failures = cases.iter().filter(|case| !case.expectation_met).count();
+    let mut coverage: BTreeMap<String, CoverageResult> = BTreeMap::new();
+    for case in &cases {
+        for requirement in &case.covers {
+            let result = coverage.entry(requirement.clone()).or_default();
+            if !case.expectation_met {
+                result.expectation_failures += 1;
+            } else {
+                match case.class {
+                    ResultClass::Pass => result.passing += 1,
+                    ResultClass::Skipped => result.skipped += 1,
+                    _ => result.frontiers += 1,
+                }
+            }
+        }
+    }
     Ok(CorpusReport {
         version: FORMAT_VERSION,
         profile: manifest.profile,
         total: cases.len(),
         expectation_failures,
         classes,
+        coverage,
         cases,
     })
+}
+
+fn validate_manifest(manifest: &CorpusManifest) -> Result<(), String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for case in &manifest.cases {
+        if case.id.is_empty() {
+            return Err("case id must not be empty".to_string());
+        }
+        if !ids.insert(&case.id) {
+            return Err(format!("duplicate case id {:?}", case.id));
+        }
+        match (&case.entrypoint, &case.code) {
+            (Some(_), None) | (None, Some(_)) => {}
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "case {:?} must not set both entrypoint and code",
+                    case.id
+                ))
+            }
+            (None, None) => {
+                if case.expect.disposition != ExpectedDisposition::Skip {
+                    return Err(format!(
+                        "case {:?} must set exactly one of entrypoint or code",
+                        case.id
+                    ));
+                }
+            }
+        }
+        if case.entrypoint.as_ref().is_some_and(String::is_empty) {
+            return Err(format!("case {:?} has an empty entrypoint", case.id));
+        }
+        if case.kind == ProgramKind::Command && case.code.is_some() {
+            return Err(format!(
+                "command case {:?} cannot execute inline code",
+                case.id
+            ));
+        }
+        if case.expect.disposition == ExpectedDisposition::Frontier && case.expect.class.is_none() {
+            return Err(format!(
+                "frontier case {:?} must declare an exact result class",
+                case.id
+            ));
+        }
+        if case.expect.disposition == ExpectedDisposition::Frontier {
+            match case.expect.class {
+                Some(ResultClass::UnsupportedFeature) if case.expect.unsupported.is_empty() => {
+                    return Err(format!(
+                        "unsupported-feature frontier {:?} must declare unsupported",
+                        case.id
+                    ));
+                }
+                Some(ResultClass::UnknownCommand)
+                    if case.expect.unsupported_commands.is_empty() =>
+                {
+                    return Err(format!(
+                        "unknown-command frontier {:?} must declare unsupported_commands",
+                        case.id
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if case.expect.stdout.is_some() && case.expect.stdout_base64.is_some() {
+            return Err(format!(
+                "case {:?} must not set both stdout and stdout_base64",
+                case.id
+            ));
+        }
+        if case.expect.stderr.is_some() && case.expect.stderr_base64.is_some() {
+            return Err(format!(
+                "case {:?} must not set both stderr and stderr_base64",
+                case.id
+            ));
+        }
+        if case.stdin.is_some() && !case.stdin_base64.is_empty() {
+            return Err(format!(
+                "case {:?} must not set both stdin and stdin_base64",
+                case.id
+            ));
+        }
+        let mut requirements = std::collections::BTreeSet::new();
+        for requirement in &case.covers {
+            if requirement.is_empty() || !requirements.insert(requirement) {
+                return Err(format!(
+                    "case {:?} has an empty or duplicate covers entry",
+                    case.id
+                ));
+            }
+        }
+        for fixture in &case.fixtures {
+            match (&fixture.source, &fixture.contents) {
+                (Some(_), None) | (None, Some(_)) => {}
+                _ => {
+                    return Err(format!(
+                        "fixture {:?} in case {:?} must set exactly one of source or contents",
+                        fixture.destination, case.id
+                    ))
+                }
+            }
+            if fixture.sha256.is_some() && fixture.source.is_none() {
+                return Err(format!(
+                    "inline fixture {:?} in case {:?} cannot declare sha256",
+                    fixture.destination, case.id
+                ));
+            }
+            if fixture
+                .contents
+                .as_ref()
+                .is_some_and(|contents| contents.len() as u64 > MAX_FIXTURE_BYTES)
+            {
+                return Err(format!(
+                    "inline fixture {:?} in case {:?} exceeds the byte limit",
+                    fixture.destination, case.id
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_case(base: &Path, profile: EnvironmentProfile, case: CorpusCase) -> CaseResult {
@@ -231,55 +399,73 @@ fn run_case(base: &Path, profile: EnvironmentProfile, case: CorpusCase) -> CaseR
             unsupported: Vec::new(),
             unsupported_commands: Vec::new(),
             workspace_changes: Vec::new(),
+            covers: case.covers,
         };
     }
 
-    let stdin = match STANDARD.decode(&case.stdin_base64) {
-        Ok(stdin) => stdin,
-        Err(error) => return setup_failure(&case, format!("invalid stdin_base64: {error}")),
+    let stdin = if let Some(stdin) = &case.stdin {
+        stdin.as_bytes().to_vec()
+    } else {
+        match STANDARD.decode(&case.stdin_base64) {
+            Ok(stdin) => stdin,
+            Err(error) => return setup_failure(&case, format!("invalid stdin_base64: {error}")),
+        }
     };
     let mut environment = match profile.create(case.limits.unwrap_or_default()) {
         Ok(environment) => environment,
         Err(error) => return setup_failure(&case, error),
     };
     for fixture in &case.fixtures {
-        let source = match safe_fixture_path(base, &fixture.source) {
-            Ok(path) => path,
-            Err(error) => return setup_failure(&case, error),
-        };
-        let metadata = match std::fs::metadata(&source) {
-            Ok(metadata) => metadata,
-            Err(error) => {
+        let data = if let Some(relative) = &fixture.source {
+            let source = match safe_fixture_path(base, relative) {
+                Ok(path) => path,
+                Err(error) => return setup_failure(&case, error),
+            };
+            let metadata = match std::fs::metadata(&source) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return setup_failure(
+                        &case,
+                        format!("cannot inspect {}: {error}", source.display()),
+                    )
+                }
+            };
+            if metadata.len() > MAX_FIXTURE_BYTES {
                 return setup_failure(
                     &case,
-                    format!("cannot inspect {}: {error}", source.display()),
-                )
-            }
-        };
-        if metadata.len() > MAX_FIXTURE_BYTES {
-            return setup_failure(
-                &case,
-                format!("fixture {} exceeds the byte limit", source.display()),
-            );
-        }
-        let data = match std::fs::read(&source) {
-            Ok(data) => data,
-            Err(error) => {
-                return setup_failure(&case, format!("cannot read {}: {error}", source.display()))
-            }
-        };
-        if let Some(expected) = &fixture.sha256 {
-            let actual = format!("{:x}", Sha256::digest(&data));
-            if &actual != expected {
-                return setup_failure(
-                    &case,
-                    format!(
-                        "fixture {} has sha256 {actual}, expected {expected}",
-                        source.display()
-                    ),
+                    format!("fixture {} exceeds the byte limit", source.display()),
                 );
             }
-        }
+            let data = match std::fs::read(&source) {
+                Ok(data) => data,
+                Err(error) => {
+                    return setup_failure(
+                        &case,
+                        format!("cannot read {}: {error}", source.display()),
+                    )
+                }
+            };
+            if let Some(expected) = &fixture.sha256 {
+                let actual = format!("{:x}", Sha256::digest(&data));
+                if &actual != expected {
+                    return setup_failure(
+                        &case,
+                        format!(
+                            "fixture {} has sha256 {actual}, expected {expected}",
+                            source.display()
+                        ),
+                    );
+                }
+            }
+            data
+        } else {
+            fixture
+                .contents
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec()
+        };
         if !fixture.destination.starts_with('/') {
             return setup_failure(&case, "fixture destination must be absolute".to_string());
         }
@@ -309,10 +495,21 @@ fn run_case(base: &Path, profile: EnvironmentProfile, case: CorpusCase) -> CaseR
         environment.exported.insert(name.clone());
     }
     let workspace_before = environment.vfs.clone();
-    let mut command = match case.kind {
-        ProgramKind::Command => quote_shell(&case.entrypoint),
-        ProgramKind::Shell => format!("bash {}", quote_shell(&case.entrypoint)),
-        ProgramKind::Python => format!("python3.14 {}", quote_shell(&case.entrypoint)),
+    let mut command = match (case.kind, &case.entrypoint, &case.code) {
+        (ProgramKind::Command, Some(entrypoint), None) => quote_shell(entrypoint),
+        (ProgramKind::Shell, Some(entrypoint), None) => {
+            format!("bash {}", quote_shell(entrypoint))
+        }
+        (ProgramKind::Python, Some(entrypoint), None) => {
+            format!("python3.14 {}", quote_shell(entrypoint))
+        }
+        (ProgramKind::Shell, None, Some(code)) => {
+            format!("bash -c {} shellsim-corpus", quote_shell(code))
+        }
+        (ProgramKind::Python, None, Some(code)) => {
+            format!("python3.14 -c {}", quote_shell(code))
+        }
+        _ => unreachable!("manifest validation enforces executable case shape"),
     };
     for argument in &case.args {
         command.push(' ');
@@ -337,13 +534,21 @@ fn run_case(base: &Path, profile: EnvironmentProfile, case: CorpusCase) -> CaseR
     }
     check_output(
         "stdout",
-        case.expect.stdout_base64.as_deref(),
+        expected_output(
+            case.expect.stdout.as_deref(),
+            case.expect.stdout_base64.as_deref(),
+        )
+        .as_deref(),
         &stdout,
         &mut mismatches,
     );
     check_output(
         "stderr",
-        case.expect.stderr_base64.as_deref(),
+        expected_output(
+            case.expect.stderr.as_deref(),
+            case.expect.stderr_base64.as_deref(),
+        )
+        .as_deref(),
         &stderr,
         &mut mismatches,
     );
@@ -410,7 +615,13 @@ fn run_case(base: &Path, profile: EnvironmentProfile, case: CorpusCase) -> CaseR
         unsupported,
         unsupported_commands,
         workspace_changes,
+        covers: case.covers,
     }
+}
+
+fn expected_output(text: Option<&str>, encoded: Option<&str>) -> Option<String> {
+    text.map(|value| STANDARD.encode(value.as_bytes()))
+        .or_else(|| encoded.map(str::to_string))
 }
 
 fn result_class_name(class: ResultClass) -> &'static str {
@@ -553,6 +764,7 @@ fn setup_failure(case: &CorpusCase, detail: String) -> CaseResult {
         unsupported: Vec::new(),
         unsupported_commands: Vec::new(),
         workspace_changes: Vec::new(),
+        covers: case.covers.clone(),
     }
 }
 

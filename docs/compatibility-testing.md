@@ -35,8 +35,17 @@ fixture, semantic, runtime, resource, hang, and capability failures. Some classe
 schema categories and should remain empty. A known frontier is not counted as a pass, even when it
 is expected.
 
-Frontier cases may set `class` to require one exact failure category. This prevents a known missing
+Frontier cases must set `class` to require one exact failure category. This prevents a known missing
 dependency from silently turning into a parser failure, hang, or resource regression.
+
+Compact derived cases may put shell or Python source in `code`, UTF-8 standard input in `stdin`,
+and UTF-8 expectations in `stdout` and `stderr`. Inline fixtures use `contents`. Imported fixtures
+continue to use pinned relative `source` paths and optional hashes. These forms are mutually
+exclusive, and ambiguous manifests are rejected before any case runs.
+
+Cases attach stable capability identifiers through `covers`. Reports aggregate passing, frontier,
+skipped, and unexpectedly failing observations for each identifier. Frontier cases must declare
+an exact `class`; a boundary changing from an unsupported feature to a parse error is a regression.
 
 `pass` cases may declare exact `unsupported` and `unsupported_commands` lists. This is useful when
 the behavior under test intentionally invokes a missing command, such as a parser ambiguity whose
@@ -57,11 +66,13 @@ The current Python baseline remains the 100-case TaskTrove differential corpus u
 The compatibility runner adds reviewed suites without replacing that unchanged-source test:
 
 - `micropython-basics` freezes 100 unchanged language tests with checked CPython output;
+- `python-derived` supplies small readable contracts for language composition and commonly used
+  APIs, including exact frontiers for support work;
 - `oils-spec` freezes 50 shell-specification case bodies with upstream provenance;
 - `posix-derived` supplies compact standards-oriented probes for common behavior underrepresented
   in the imported suite.
-- `whole-programs` runs maintained shell probes, Python exercise suites, and configure paths while
-  keeping broad ShellSpec and Modernish composition frontiers explicit.
+- `whole-programs` runs maintained shell probes and configure paths while keeping broad ShellSpec
+  and Modernish composition frontiers explicit.
 
 These suites measure compatibility breadth. They do not confer POSIX certification or complete
 CPython compatibility.
