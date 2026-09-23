@@ -56,6 +56,28 @@ fn corpus_cli_emits_a_machine_readable_report() {
 }
 
 #[test]
+fn corpus_checks_generated_file_contents() {
+    let manifest = br#"{
+        "version": 1,
+        "profile": "stock_agent_v1",
+        "cases": [{
+            "id": "generated-file",
+            "kind": "shell",
+            "code": "printf 'actual\\n' > /work/result",
+            "expect": {"disposition": "pass", "files": {"/work/result": "expected\n"}}
+        }]
+    }"#;
+    let report = corpus::run_manifest_bytes(&fixture_root(), manifest).expect("valid manifest");
+
+    assert_eq!(report.expectation_failures, 1);
+    assert_eq!(report.cases[0].class, ResultClass::SemanticMismatch);
+    assert!(report.cases[0]
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("/work/result")));
+}
+
+#[test]
 fn setup_failures_are_reported_without_panicking() {
     let manifest = br#"{
         "version": 1,
@@ -100,7 +122,7 @@ fn imported_shell_and_python_corpora_match_checked_behavior() {
         ("micropython-basics", 50),
         ("python-derived", 30),
         ("posix-derived", 8),
-        ("whole-programs", 15),
+        ("whole-programs", 19),
     ] {
         let report = run_frozen_corpus(name);
         assert_eq!(
