@@ -366,7 +366,7 @@ pub(crate) fn poll(
 
 /// Whether the command has a continuation-aware entry point that does not consume standard
 /// input before it can suspend.
-pub(crate) fn starts_before_input(argv: &[String]) -> bool {
+pub(crate) fn starts_before_input(interp: &Interp, argv: &[String]) -> bool {
     if argv.len() == 1
         && argv
             .first()
@@ -375,7 +375,7 @@ pub(crate) fn starts_before_input(argv: &[String]) -> bool {
         return false;
     }
     argv.first().is_some_and(|requested| {
-        let command = standard_utility_name(requested).unwrap_or(requested);
+        let command = native_command_name(interp, requested);
         if matches!(command, "cat" | "head") {
             return streams::streams_before_input(command, &argv[1..]);
         }
@@ -394,7 +394,7 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
     let Some(requested) = argv.first() else {
         return false;
     };
-    let command = standard_utility_name(requested).unwrap_or(requested);
+    let command = native_command_name(interp, requested);
     if command == "git" {
         return git::reads_standard_input(&argv[1..]);
     }
@@ -721,9 +721,9 @@ fn dispatch(
     resumable: bool,
 ) -> CommandPoll {
     let requested = argv[0].as_str();
-    // Agents frequently use explicit paths or `/usr/bin/env` shebangs. Standard utility paths
-    // resolve to the same in-process command without pretending arbitrary host paths exist.
-    let cmd = standard_utility_name(requested).unwrap_or(requested);
+    // Missing standard utility paths retain their native aliases. An installed VFS executable
+    // at that path wins, so one command can migrate without changing the rest of the registry.
+    let cmd = native_command_name(interp, requested);
     let args = &argv[1..];
     if let Some(spec) = registry().get(cmd) {
         let unsupported_reason =
@@ -948,6 +948,22 @@ fn standard_utility_name(path: &str) -> Option<&str> {
     ]
     .into_iter()
     .find_map(|prefix| path.strip_prefix(prefix).filter(|name| !name.contains('/')))
+}
+
+/// A real VFS entry at an explicit path takes precedence over the synthetic utility alias.
+/// This lets a bundled Wasm command replace one native utility without changing unrelated names.
+fn native_command_name<'a>(interp: &Interp, requested: &'a str) -> &'a str {
+    let Some(name) = standard_utility_name(requested) else {
+        return requested;
+    };
+    if matches!(
+        util::resolve_executable(interp, requested),
+        util::ExecutableLookup::NotFound
+    ) {
+        name
+    } else {
+        requested
+    }
 }
 
 /// Provide `run_script_into` for nested execution (source, eval, scripts).

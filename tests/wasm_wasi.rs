@@ -88,6 +88,66 @@ fn compiled_wasi_wc_obeys_cpu_limit() {
 }
 
 #[test]
+fn explicit_virtual_executable_overrides_standard_native_alias() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/usr/bin").unwrap();
+    let guest = wat::parse_str(
+        r#"
+        (module
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $write (param i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 32) "guest\n")
+          (func (export "_start")
+            (i32.store (i32.const 0) (i32.const 32))
+            (i32.store (i32.const 4) (i32.const 6))
+            (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))
+    "#,
+    )
+    .unwrap();
+    environment
+        .vfs
+        .write("/", "/usr/bin/wc", &guest, 0o755)
+        .unwrap();
+    assert_eq!(run(&mut environment, "/usr/bin/wc").1, b"guest\n");
+    assert_eq!(run(&mut environment, "printf x | wc -c").1, b"1\n");
+    environment.vfs.chmod("/", "/usr/bin/wc", 0o644).unwrap();
+    let (status, stdout, stderr) = run(&mut environment, "/usr/bin/wc");
+    assert_eq!(status, 126);
+    assert!(stdout.is_empty());
+    assert!(String::from_utf8_lossy(&stderr).contains("permission denied"));
+}
+
+#[test]
+fn native_find_and_compiled_wasi_wc_coexist() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/usr/bin").unwrap();
+    environment
+        .vfs
+        .write(
+            "/",
+            "/usr/bin/wc",
+            include_bytes!("../guest/wc/wc.wasm"),
+            0o755,
+        )
+        .unwrap();
+    environment
+        .vfs
+        .write("/", "/work/one", b"one\n", 0o644)
+        .unwrap();
+    let native_find = run(&mut environment, "find /work -type f");
+    assert_eq!(
+        run(&mut environment, "/usr/bin/find /work -type f"),
+        native_find
+    );
+    let native_wc = run(&mut environment, "find /work -type f | wc -l");
+    assert_eq!(
+        run(&mut environment, "find /work -type f | /usr/bin/wc -l"),
+        native_wc
+    );
+}
+
+#[test]
 fn wasi_stdout_and_exit_code_use_virtual_command_streams() {
     let mut environment = Environment::new();
     install(

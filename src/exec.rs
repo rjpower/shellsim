@@ -2069,7 +2069,7 @@ impl ShellContinuation {
         if record_trace {
             interp.cmd_trace.record(&argv[0]);
         }
-        if crate::commands::starts_before_input(&argv) {
+        if crate::commands::starts_before_input(interp, &argv) {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             match crate::commands::poll(interp, &argv, Vec::new(), &mut stdout, &mut stderr) {
