@@ -1,0 +1,1312 @@
+{
+  "version": 1,
+  "profile": "stock_agent_v1",
+  "cases": [
+    {
+      "id": "oils-smoke-001-builtin",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/smoke.test.sh case 1: builtin",
+        "sha256": "ab08508fdf5ca4da5c4995987bc41c56c048aaa5eeb046417ae4049b7d40286e",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/smoke-001-builtin.sh",
+      "fixtures": [
+        {
+          "source": "cases/smoke-001-builtin.sh",
+          "destination": "/work/cases/smoke-001-builtin.sh",
+          "sha256": "ab08508fdf5ca4da5c4995987bc41c56c048aaa5eeb046417ae4049b7d40286e",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "aGkK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-smoke-002-command-sub",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/smoke.test.sh case 2: command sub",
+        "sha256": "a5a73d7138f0d069aa741813fa4d75af568520d8b99c7d837ebeb8e83cdda5dc",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/smoke-002-command-sub.sh",
+      "fixtures": [
+        {
+          "source": "cases/smoke-002-command-sub.sh",
+          "destination": "/work/cases/smoke-002-command-sub.sh",
+          "sha256": "a5a73d7138f0d069aa741813fa4d75af568520d8b99c7d837ebeb8e83cdda5dc",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "Mwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-smoke-003-command-sub-with-builtin",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/smoke.test.sh case 3: command sub with builtin",
+        "sha256": "8d7ef7b61b4a4a5f54f02684b6b5ea39243fca428ef1f122e11e477f992b5a18",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/smoke-003-command-sub-with-builtin.sh",
+      "fixtures": [
+        {
+          "source": "cases/smoke-003-command-sub-with-builtin.sh",
+          "destination": "/work/cases/smoke-003-command-sub-with-builtin.sh",
+          "sha256": "8d7ef7b61b4a4a5f54f02684b6b5ea39243fca428ef1f122e11e477f992b5a18",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "aGkK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-smoke-004-pipeline",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/smoke.test.sh case 4: pipeline",
+        "sha256": "5fd0a69062e4811b91162a07508374ae116eee48baf56cc6ca38470777dac367",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/smoke-004-pipeline.sh",
+      "fixtures": [
+        {
+          "source": "cases/smoke-004-pipeline.sh",
+          "destination": "/work/cases/smoke-004-pipeline.sh",
+          "sha256": "5fd0a69062e4811b91162a07508374ae116eee48baf56cc6ca38470777dac367",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-smoke-005-pipeline-with-builtin",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/smoke.test.sh case 5: pipeline with builtin",
+        "sha256": "d671bf710e6eb507bb845fa74d170dc73c4583e8d089e4862faf98a2508b2d61",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/smoke-005-pipeline-with-builtin.sh",
+      "fixtures": [
+        {
+          "source": "cases/smoke-005-pipeline-with-builtin.sh",
+          "destination": "/work/cases/smoke-005-pipeline-with-builtin.sh",
+          "sha256": "d671bf710e6eb507bb845fa74d170dc73c4583e8d089e4862faf98a2508b2d61",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-smoke-006-and-or-chains",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/smoke.test.sh case 6: and-or chains",
+        "sha256": "f8a541b044c39c6a705ef560a9a544242b26052f13a7a2f208f4521b8fd0b848",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/smoke-006-and-or-chains.sh",
+      "fixtures": [
+        {
+          "source": "cases/smoke-006-and-or-chains.sh",
+          "destination": "/work/cases/smoke-006-and-or-chains.sh",
+          "sha256": "f8a541b044c39c6a705ef560a9a544242b26052f13a7a2f208f4521b8fd0b848",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQoyCjQKLS0KQQpCCkMKRAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-smoke-007-here-doc-with-var",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/smoke.test.sh case 7: here doc with var",
+        "sha256": "c6783616e58e0ddd6c1783d877e22d7cdf4e18bab0e6773461e4f065f1186bcb",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/smoke-007-here-doc-with-var.sh",
+      "fixtures": [
+        {
+          "source": "cases/smoke-007-here-doc-with-var.sh",
+          "destination": "/work/cases/smoke-007-here-doc-with-var.sh",
+          "sha256": "c6783616e58e0ddd6c1783d877e22d7cdf4e18bab0e6773461e4f065f1186bcb",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "InR3bwpvbmUK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-smoke-008-here-doc-without-var",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/smoke.test.sh case 8: here doc without var",
+        "sha256": "d977b04b87c2d2bfd2148a8b4772ab5b5bee9a9d2a4eb9c1945db221f97dbe2e",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/smoke-008-here-doc-without-var.sh",
+      "fixtures": [
+        {
+          "source": "cases/smoke-008-here-doc-without-var.sh",
+          "destination": "/work/cases/smoke-008-here-doc-without-var.sh",
+          "sha256": "d977b04b87c2d2bfd2148a8b4772ab5b5bee9a9d2a4eb9c1945db221f97dbe2e",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "InR3bwokdgo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-var-op-test-012-s-foo-and-s-foo-when-set-u",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/var-op-test.test.sh case 12: ${s+foo} and ${s:+foo} when set -u",
+        "sha256": "30d047dc4ec8e3f48f7f341bb2cdde2bf95ec3fab0aec442930d0921b5945dd2",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/var-op-test-012-s-foo-and-s-foo-when-set-u.sh",
+      "fixtures": [
+        {
+          "source": "cases/var-op-test-012-s-foo-and-s-foo-when-set-u.sh",
+          "destination": "/work/cases/var-op-test-012-s-foo-and-s-foo-when-set-u.sh",
+          "sha256": "30d047dc4ec8e3f48f7f341bb2cdde2bf95ec3fab0aec442930d0921b5945dd2",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "dj1mb28Kdj1mb28Kdj0Kdj0K",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-var-op-test-014-undefined-foo-and-undefined-foo-with-set-u",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/var-op-test.test.sh case 14: \"${undefined[@]+foo}\" and \"${undefined[@]:+foo}\", with set -u",
+        "sha256": "97c66a52ea018986f6de1cdccc11b06b3853f0d8498be202745381b003a3ef54",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/var-op-test-014-undefined-foo-and-undefined-foo-with-set-u.sh",
+      "fixtures": [
+        {
+          "source": "cases/var-op-test-014-undefined-foo-and-undefined-foo-with-set-u.sh",
+          "destination": "/work/cases/var-op-test-014-undefined-foo-and-undefined-foo-with-set-u.sh",
+          "sha256": "97c66a52ea018986f6de1cdccc11b06b3853f0d8498be202745381b003a3ef54",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "cGx1cyAvLwpwbHVzIGNvbG9uIC8vCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-var-op-test-016-v-foo-and-v-foo-when-set-u",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/var-op-test.test.sh case 16: ${v-foo} and ${v:-foo} when set -u",
+        "sha256": "faa1d9981e3832329e976121f2401aa259a0473c16f5ecf0a4eecc9f821ce130",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/var-op-test-016-v-foo-and-v-foo-when-set-u.sh",
+      "fixtures": [
+        {
+          "source": "cases/var-op-test-016-v-foo-and-v-foo-when-set-u.sh",
+          "destination": "/work/cases/var-op-test-016-v-foo-and-v-foo-when-set-u.sh",
+          "sha256": "faa1d9981e3832329e976121f2401aa259a0473c16f5ecf0a4eecc9f821ce130",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "dj12CnY9dgp2PWZvbwp2PWZvbwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-var-op-test-019-and-and",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/var-op-test.test.sh case 19: $@ (\"\") and - and +",
+        "sha256": "5c3719c3217c92bfbf0d2b94198b254b3a40f536a979c3af0d36aebe22c6b7b5",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/var-op-test-019-and-and.sh",
+      "fixtures": [
+        {
+          "source": "cases/var-op-test-019-and-and.sh",
+          "destination": "/work/cases/var-op-test-019-and-and.sh",
+          "sha256": "5c3719c3217c92bfbf0d2b94198b254b3a40f536a979c3af0d36aebe22c6b7b5",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "YXJndj0KYXJndj1wbHVzCmFyZ3Y9bWludXMKYXJndj0K",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-var-op-test-022-and-and-ifs",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/var-op-test.test.sh case 22: \"$*\" (\"\" \"\") and - and + (IFS=)",
+        "sha256": "82c58331a3018466b1486b6ea4e980d1465e204eaab117b4e67eb781fc6d69d9",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/var-op-test-022-and-and-ifs.sh",
+      "fixtures": [
+        {
+          "source": "cases/var-op-test-022-and-and-ifs.sh",
+          "destination": "/work/cases/var-op-test-022-and-and-ifs.sh",
+          "sha256": "82c58331a3018466b1486b6ea4e980d1465e204eaab117b4e67eb781fc6d69d9",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "YXJndj0KYXJndj1wbHVzCmFyZ3Y9bWludXMKYXJndj0K",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-var-op-test-027-var-x-dynamic-scope",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/var-op-test.test.sh case 27: ${var=x} dynamic scope",
+        "sha256": "3731a1e2d3df2bcc7fa9340851c9cb29ab6b6cb4bd5591a6115866acdb362166",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/var-op-test-027-var-x-dynamic-scope.sh",
+      "fixtures": [
+        {
+          "source": "cases/var-op-test-027-var-x-dynamic-scope.sh",
+          "destination": "/work/cases/var-op-test-027-var-x-dynamic-scope.sh",
+          "sha256": "3731a1e2d3df2bcc7fa9340851c9cb29ab6b6cb4bd5591a6115866acdb362166",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "eApoZWxsbz14CmhlbGxvPXgK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-redirect-002-2-1-with-no-command",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/redirect.test.sh case 2: 2>&1 with no command",
+        "sha256": "8c5d015960a766ae41f82d8cf347b1d701cf42f87260fe6a24658fd0f9dab475",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/redirect-002-2-1-with-no-command.sh",
+      "fixtures": [
+        {
+          "source": "cases/redirect-002-2-1-with-no-command.sh",
+          "destination": "/work/cases/redirect-002-2-1-with-no-command.sh",
+          "sha256": "8c5d015960a766ae41f82d8cf347b1d701cf42f87260fe6a24658fd0f9dab475",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "c3RhdHVzPTQyCnN0YXR1cz0wCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-redirect-003-2-1-is-it-a-redirect-or-is-it-like-a-1",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/redirect.test.sh case 3: 2&>1 (is it a redirect or is it like a&>1)",
+        "sha256": "cd27edf8064bcff23856a5e5dbb86097182c35d2e8ba18553eaf6c00c617e53d",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/redirect-003-2-1-is-it-a-redirect-or-is-it-like-a-1.sh",
+      "fixtures": [
+        {
+          "source": "cases/redirect-003-2-1-is-it-a-redirect-or-is-it-like-a-1.sh",
+          "destination": "/work/cases/redirect-003-2-1-is-it-a-redirect-or-is-it-like-a-1.sh",
+          "sha256": "cd27edf8064bcff23856a5e5dbb86097182c35d2e8ba18553eaf6c00c617e53d",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "c3RhdHVzPTEyNwo=",
+        "stderr_base64": "",
+        "unsupported": [
+          "2"
+        ],
+        "unsupported_commands": [
+          "2"
+        ]
+      }
+    },
+    {
+      "id": "oils-redirect-019-open-descriptor-with-exec",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/redirect.test.sh case 19: Open descriptor with exec",
+        "sha256": "cd43f452a8c8455ad3152094ce1324b9c9f8a068a58cae6af7ecb60610a8df04",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/redirect-019-open-descriptor-with-exec.sh",
+      "fixtures": [
+        {
+          "source": "cases/redirect-019-open-descriptor-with-exec.sh",
+          "destination": "/work/cases/redirect-019-open-descriptor-with-exec.sh",
+          "sha256": "cd43f452a8c8455ad3152094ce1324b9c9f8a068a58cae6af7ecb60610a8df04",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "aGkK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-redirect-020-open-multiple-descriptors-with-exec",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/redirect.test.sh case 20: Open multiple descriptors with exec",
+        "sha256": "9dc9ea4776a856f840213e2e2451a871b85a11f35158622ac93dfb8b02482436",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/redirect-020-open-multiple-descriptors-with-exec.sh",
+      "fixtures": [
+        {
+          "source": "cases/redirect-020-open-multiple-descriptors-with-exec.sh",
+          "destination": "/work/cases/redirect-020-open-multiple-descriptors-with-exec.sh",
+          "sha256": "9dc9ea4776a856f840213e2e2451a871b85a11f35158622ac93dfb8b02482436",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "dGhyZWUKZm91cgo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-redirect-036-parsing-of-x-1-and-related-cases",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/redirect.test.sh case 36: Parsing of x=1> and related cases",
+        "sha256": "a06b90bd59edd94fcdf5c148ce16fd072aa88cd2f94734503cbb6a484fedf93b",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/redirect-036-parsing-of-x-1-and-related-cases.sh",
+      "fixtures": [
+        {
+          "source": "cases/redirect-036-parsing-of-x-1-and-related-cases.sh",
+          "destination": "/work/cases/redirect-036-parsing-of-x-1-and-related-cases.sh",
+          "sha256": "a06b90bd59edd94fcdf5c148ce16fd072aa88cd2f94734503cbb6a484fedf93b",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "eD0xCng9MQp4PQorMQorMQorCmExCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-for-expr-001-c-style-for-loop",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/for-expr.test.sh case 1: C-style for loop",
+        "sha256": "656fda6a89b2a19ad03c0ca913fddc95a3a8a98c859c2bdc736c5bbc904420ad",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/for-expr-001-c-style-for-loop.sh",
+      "fixtures": [
+        {
+          "source": "cases/for-expr-001-c-style-for-loop.sh",
+          "destination": "/work/cases/for-expr-001-c-style-for-loop.sh",
+          "sha256": "656fda6a89b2a19ad03c0ca913fddc95a3a8a98c859c2bdc736c5bbc904420ad",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQoyCjQKNQo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-for-expr-002-for-loop-with-and-without-semicolon",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/for-expr.test.sh case 2: For loop with and without semicolon",
+        "sha256": "3a3c7d01012f725b8bc1a225d18fd2343fc7f7e9150d8da523a078e8e8290984",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/for-expr-002-for-loop-with-and-without-semicolon.sh",
+      "fixtures": [
+        {
+          "source": "cases/for-expr-002-for-loop-with-and-without-semicolon.sh",
+          "destination": "/work/cases/for-expr-002-for-loop-with-and-without-semicolon.sh",
+          "sha256": "3a3c7d01012f725b8bc1a225d18fd2343fc7f7e9150d8da523a078e8e8290984",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQoyCjMKMQoyCjMK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-for-expr-004-empty-init",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/for-expr.test.sh case 4: Empty init",
+        "sha256": "9f09abe923cd1117fe8fa043b49ee505a02c34ace577530a9a538309d5be096e",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/for-expr-004-empty-init.sh",
+      "fixtures": [
+        {
+          "source": "cases/for-expr-004-empty-init.sh",
+          "destination": "/work/cases/for-expr-004-empty-init.sh",
+          "sha256": "9f09abe923cd1117fe8fa043b49ee505a02c34ace577530a9a538309d5be096e",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQoyCjMK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-for-expr-005-empty-init-and-cond",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/for-expr.test.sh case 5: Empty init and cond",
+        "sha256": "4c9e9eaee5b0fe167ee7073b96547b1ae3f40ec154214b451702aeac10ee3c74",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/for-expr-005-empty-init-and-cond.sh",
+      "fixtures": [
+        {
+          "source": "cases/for-expr-005-empty-init-and-cond.sh",
+          "destination": "/work/cases/for-expr-005-empty-init-and-cond.sh",
+          "sha256": "4c9e9eaee5b0fe167ee7073b96547b1ae3f40ec154214b451702aeac10ee3c74",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQoyCjMK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-for-expr-006-infinite-loop-with",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/for-expr.test.sh case 6: Infinite loop with ((;;))",
+        "sha256": "93d8aa31ab83e075eaefee0f1bca976dd725c2ada58ed0d5670cc9f9379842dd",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/for-expr-006-infinite-loop-with.sh",
+      "fixtures": [
+        {
+          "source": "cases/for-expr-006-infinite-loop-with.sh",
+          "destination": "/work/cases/for-expr-006-infinite-loop-with.sh",
+          "sha256": "93d8aa31ab83e075eaefee0f1bca976dd725c2ada58ed0d5670cc9f9379842dd",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQoyCjMK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-command-sub-001-case",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/command-sub.test.sh case 1: case",
+        "sha256": "14efbcf48ae895dc9ee4bb0d860eb179b5b1742199d8148b64e7e315582e3271",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/command-sub-001-case.sh",
+      "fixtures": [
+        {
+          "source": "cases/command-sub-001-case.sh",
+          "destination": "/work/cases/command-sub-001-case.sh",
+          "sha256": "14efbcf48ae895dc9ee4bb0d860eb179b5b1742199d8148b64e7e315582e3271",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "bGV0dGVyCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-command-sub-003-command-sub-word-part",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/command-sub.test.sh case 3: Command sub word part",
+        "sha256": "3228a491a0c07012b4980d720da7e939d6938caacdc04caf2724d8a81fef2471",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/command-sub-003-command-sub-word-part.sh",
+      "fixtures": [
+        {
+          "source": "cases/command-sub-003-command-sub-word-part.sh",
+          "destination": "/work/cases/command-sub-003-command-sub-word-part.sh",
+          "sha256": "3228a491a0c07012b4980d720da7e939d6938caacdc04caf2724d8a81fef2471",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "Rk9PYmFyRk9PCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-command-sub-004-backtick",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/command-sub.test.sh case 4: Backtick",
+        "sha256": "2f975019ec6e21b16eecf9b47849c205127c46c67f8fd1a01160ec81e9da10b8",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/command-sub-004-backtick.sh",
+      "fixtures": [
+        {
+          "source": "cases/command-sub-004-backtick.sh",
+          "destination": "/work/cases/command-sub-004-backtick.sh",
+          "sha256": "2f975019ec6e21b16eecf9b47849c205127c46c67f8fd1a01160ec81e9da10b8",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "Rk9PYmFyRk9PCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-command-sub-005-backtick-2",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/command-sub.test.sh case 5: Backtick 2",
+        "sha256": "80c6c95fed13a75a6ceb4e312e9a8569665aec591967ff08c7a6c64c52d4a2ad",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/command-sub-005-backtick-2.sh",
+      "fixtures": [
+        {
+          "source": "cases/command-sub-005-backtick-2.sh",
+          "destination": "/work/cases/command-sub-005-backtick-2.sh",
+          "sha256": "80c6c95fed13a75a6ceb4e312e9a8569665aec591967ff08c7a6c64c52d4a2ad",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "bHMK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-command-sub-007-making-command-out-of-command-sub-should-work",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/command-sub.test.sh case 7: Making command out of command sub should work",
+        "sha256": "3da4e394b6eb70c8199a591c52b451e91f2c104a0b3503cc3b5b16ec3a617b87",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/command-sub-007-making-command-out-of-command-sub-should-work.sh",
+      "fixtures": [
+        {
+          "source": "cases/command-sub-007-making-command-out-of-command-sub-should-work.sh",
+          "destination": "/work/cases/command-sub-007-making-command-out-of-command-sub-should-work.sh",
+          "sha256": "3da4e394b6eb70c8199a591c52b451e91f2c104a0b3503cc3b5b16ec3a617b87",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "c3BsaXQgYnVpbHRpbgo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-command-sub-009-command-sub-with-here-doc",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/command-sub.test.sh case 9: Command sub with here doc",
+        "sha256": "c8e38f664b14dac708e94f5a07310b5b040c6d94be4844efbe1cde7e8ae6d5a7",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/command-sub-009-command-sub-with-here-doc.sh",
+      "fixtures": [
+        {
+          "source": "cases/command-sub-009-command-sub-with-here-doc.sh",
+          "destination": "/work/cases/command-sub-009-command-sub-with-here-doc.sh",
+          "sha256": "c8e38f664b14dac708e94f5a07310b5b040c6d94be4844efbe1cde7e8ae6d5a7",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "dHdvIG9uZQo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-command-sub-010-here-doc-with-pipeline",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/command-sub.test.sh case 10: Here doc with pipeline",
+        "sha256": "1edcc7cc784b3cae955edcd11e96c7ebf3f8c1f0c9eecc0c168145f257c96838",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/command-sub-010-here-doc-with-pipeline.sh",
+      "fixtures": [
+        {
+          "source": "cases/command-sub-010-here-doc-with-pipeline.sh",
+          "destination": "/work/cases/command-sub-010-here-doc-with-pipeline.sh",
+          "sha256": "1edcc7cc784b3cae955edcd11e96c7ebf3f8c1f0c9eecc0c168145f257c96838",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "dHdvWG9uZVg=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-command-sub-014-command-sub-and-exit-code",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/command-sub.test.sh case 14: Command Sub and exit code",
+        "sha256": "63ee106e025459508b1bbc5ab107b5e2790f8e3c025f538d2b2f9301661eb939",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/command-sub-014-command-sub-and-exit-code.sh",
+      "fixtures": [
+        {
+          "source": "cases/command-sub-014-command-sub-and-exit-code.sh",
+          "destination": "/work/cases/command-sub-014-command-sub-and-exit-code.sh",
+          "sha256": "63ee106e025459508b1bbc5ab107b5e2790f8e3c025f538d2b2f9301661eb939",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "eAowCjMzCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-word-split-053-regression-v-should-be-split",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/word-split.test.sh case 53: Regression: ${!v} should be split",
+        "sha256": "60cd502a694775cbccfb0895b3af09e020931e256351e3b904e0525fae09ab7c",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/word-split-053-regression-v-should-be-split.sh",
+      "fixtures": [
+        {
+          "source": "cases/word-split-053-regression-v-should-be-split.sh",
+          "destination": "/work/cases/word-split-053-regression-v-should-be-split.sh",
+          "sha256": "60cd502a694775cbccfb0895b3af09e020931e256351e3b904e0525fae09ab7c",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "CjUK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-glob-001-glob-double-quote-escape",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/glob.test.sh case 1: glob double quote escape",
+        "sha256": "8fb8e7721478acb4faddd10cf6239124ccb9783b935f5bf05cbe98142ab58a0a",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/glob-001-glob-double-quote-escape.sh",
+      "fixtures": [
+        {
+          "source": "cases/glob-001-glob-double-quote-escape.sh",
+          "destination": "/work/cases/glob-001-glob-double-quote-escape.sh",
+          "sha256": "8fb8e7721478acb4faddd10cf6239124ccb9783b935f5bf05cbe98142ab58a0a",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "Ki5zaAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-glob-002-glob-single-quote-escape",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/glob.test.sh case 2: glob single quote escape",
+        "sha256": "8fb8e7721478acb4faddd10cf6239124ccb9783b935f5bf05cbe98142ab58a0a",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/glob-002-glob-single-quote-escape.sh",
+      "fixtures": [
+        {
+          "source": "cases/glob-002-glob-single-quote-escape.sh",
+          "destination": "/work/cases/glob-002-glob-single-quote-escape.sh",
+          "sha256": "8fb8e7721478acb4faddd10cf6239124ccb9783b935f5bf05cbe98142ab58a0a",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "Ki5zaAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-glob-003-glob-backslash-escape",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/glob.test.sh case 3: glob backslash escape",
+        "sha256": "ffa93bbec631e1da17b77aaf9932f141ba1e4172242a02e59771f1eb166f4446",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/glob-003-glob-backslash-escape.sh",
+      "fixtures": [
+        {
+          "source": "cases/glob-003-glob-backslash-escape.sh",
+          "destination": "/work/cases/glob-003-glob-backslash-escape.sh",
+          "sha256": "ffa93bbec631e1da17b77aaf9932f141ba1e4172242a02e59771f1eb166f4446",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "Ki5zaAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-glob-005-0-char-glob-does-not-work",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/glob.test.sh case 5: 0 char glob -- does NOT work",
+        "sha256": "71518e3002e95964cef62d0013d52a79d9db3d210bad47f71e9f92dfb866d7bd",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/glob-005-0-char-glob-does-not-work.sh",
+      "fixtures": [
+        {
+          "source": "cases/glob-005-0-char-glob-does-not-work.sh",
+          "destination": "/work/cases/glob-005-0-char-glob-does-not-work.sh",
+          "sha256": "71518e3002e95964cef62d0013d52a79d9db3d210bad47f71e9f92dfb866d7bd",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "W11iaW4K",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-glob-006-looks-like-glob-at-the-start-but-isn-t",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/glob.test.sh case 6: looks like glob at the start, but isn't",
+        "sha256": "f2710a9c6a2ecc537fe878e2b88f8103aacee1695b384ccbf435d7bbdf954513",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/glob-006-looks-like-glob-at-the-start-but-isn-t.sh",
+      "fixtures": [
+        {
+          "source": "cases/glob-006-looks-like-glob-at-the-start-but-isn-t.sh",
+          "destination": "/work/cases/glob-006-looks-like-glob-at-the-start-but-isn-t.sh",
+          "sha256": "f2710a9c6a2ecc537fe878e2b88f8103aacee1695b384ccbf435d7bbdf954513",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "W2Jpbgo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-glob-007-looks-like-glob-plus-negation-at-the-start-but-i",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/glob.test.sh case 7: looks like glob plus negation at the start, but isn't",
+        "sha256": "6ef7c60f35ae8571b7cb3bb35ce6e7a14e06b5271d287dea3fc62d72d730b33b",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/glob-007-looks-like-glob-plus-negation-at-the-start-but-i.sh",
+      "fixtures": [
+        {
+          "source": "cases/glob-007-looks-like-glob-plus-negation-at-the-start-but-i.sh",
+          "destination": "/work/cases/glob-007-looks-like-glob-plus-negation-at-the-start-but-i.sh",
+          "sha256": "6ef7c60f35ae8571b7cb3bb35ce6e7a14e06b5271d287dea3fc62d72d730b33b",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "WyFiaW4K",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-glob-011-glob-after-expansion",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/glob.test.sh case 11: glob after \"$@\" expansion",
+        "sha256": "18d9819350fc9160dcd036bc66ab6e05e48bc4454f27956b17f0df527c4f170c",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/glob-011-glob-after-expansion.sh",
+      "fixtures": [
+        {
+          "source": "cases/glob-011-glob-after-expansion.sh",
+          "destination": "/work/cases/glob-011-glob-after-expansion.sh",
+          "sha256": "18d9819350fc9160dcd036bc66ab6e05e48bc4454f27956b17f0df527c4f170c",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "X3RtcC8qLkIK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-glob-013-no-glob-after-expansion",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/glob.test.sh case 13: no glob after ~ expansion",
+        "sha256": "a45158c6bebeac688b122a0bc18f6419154b92f916703b3e36ca5bdcbf2f89bd",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/glob-013-no-glob-after-expansion.sh",
+      "fixtures": [
+        {
+          "source": "cases/glob-013-no-glob-after-expansion.sh",
+          "destination": "/work/cases/glob-013-no-glob-after-expansion.sh",
+          "sha256": "a45158c6bebeac688b122a0bc18f6419154b92f916703b3e36ca5bdcbf2f89bd",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "Ki8qLnB5Cg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-exit-status-002-truncating-return-status",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/exit-status.test.sh case 2: Truncating 'return' status",
+        "sha256": "d0219145c5bddd25b2b45e598109beb9dd50ff9f60359bca9d5be29cd3b9d67b",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/exit-status-002-truncating-return-status.sh",
+      "fixtures": [
+        {
+          "source": "cases/exit-status-002-truncating-return-status.sh",
+          "destination": "/work/cases/exit-status-002-truncating-return-status.sh",
+          "sha256": "d0219145c5bddd25b2b45e598109beb9dd50ff9f60359bca9d5be29cd3b9d67b",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "c3RhdHVzPTI1NQpzdGF0dXM9MApzdGF0dXM9MQo9PT0Kc3RhdHVzPTI1NQpzdGF0dXM9MjU0Cg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-exit-status-006-if-subshell-true",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/exit-status.test.sh case 6: If subshell true",
+        "sha256": "8154204022a0f376c10dd04db64d668d2b4308285359eb4afded5bbe4974558e",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/exit-status-006-if-subshell-true.sh",
+      "fixtures": [
+        {
+          "source": "cases/exit-status-006-if-subshell-true.sh",
+          "destination": "/work/cases/exit-status-006-if-subshell-true.sh",
+          "sha256": "8154204022a0f376c10dd04db64d668d2b4308285359eb4afded5bbe4974558e",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "VFJVRQo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-exit-status-009-if-subshell-false-exit-code-is-propagated-in-a-w",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/exit-status.test.sh case 9: If subshell false -- exit code is propagated in a weird way (strict_argv prevents)",
+        "sha256": "f8b022634e16457356638247ca28b70c8625d70b0f92e3e2546bb7d0a2c7611a",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/exit-status-009-if-subshell-false-exit-code-is-propagated-in-a-w.sh",
+      "fixtures": [
+        {
+          "source": "cases/exit-status-009-if-subshell-false-exit-code-is-propagated-in-a-w.sh",
+          "destination": "/work/cases/exit-status-009-if-subshell-false-exit-code-is-propagated-in-a-w.sh",
+          "sha256": "f8b022634e16457356638247ca28b70c8625d70b0f92e3e2546bb7d0a2c7611a",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "RkFMU0UK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-exit-status-010-exit-code-when-command-sub-evaluates-to-empty-st",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/exit-status.test.sh case 10: Exit code when command sub evaluates to empty str, e.g. `false` (#2416)",
+        "sha256": "06aa1ba5672f757e7dd2cc8299bb1e934c88df39daa3cd8c032c13c94c71bbdc",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/exit-status-010-exit-code-when-command-sub-evaluates-to-empty-st.sh",
+      "fixtures": [
+        {
+          "source": "cases/exit-status-010-exit-code-when-command-sub-evaluates-to-empty-st.sh",
+          "destination": "/work/cases/exit-status-010-exit-code-when-command-sub-evaluates-to-empty-st.sh",
+          "sha256": "06aa1ba5672f757e7dd2cc8299bb1e934c88df39daa3cd8c032c13c94c71bbdc",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MAoxCjAKMQotLS0KMAoxCjAKMQo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-exit-status-011-more-test-cases-with-empty-argv",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/exit-status.test.sh case 11: More test cases with empty argv",
+        "sha256": "605db5682f15c164e3779cb2bcc499f7692a26fd871e5057b596d23f283fc73a",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/exit-status-011-more-test-cases-with-empty-argv.sh",
+      "fixtures": [
+        {
+          "source": "cases/exit-status-011-more-test-cases-with-empty-argv.sh",
+          "destination": "/work/cases/exit-status-011-more-test-cases-with-empty-argv.sh",
+          "sha256": "605db5682f15c164e3779cb2bcc499f7692a26fd871e5057b596d23f283fc73a",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "c3RhdHVzPTAKc3RhdHVzPTQyCnN0YXR1cz00Mwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-assign-006-foo-foo-echo-foo",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/assign.test.sh case 6: FOO=foo echo [foo]",
+        "sha256": "b16588d2d3daf622a8489fbc6673c75af01a47a0d749997090d745829a0d3858",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/assign-006-foo-foo-echo-foo.sh",
+      "fixtures": [
+        {
+          "source": "cases/assign-006-foo-foo-echo-foo.sh",
+          "destination": "/work/cases/assign-006-foo-foo-echo-foo.sh",
+          "sha256": "b16588d2d3daf622a8489fbc6673c75af01a47a0d749997090d745829a0d3858",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "W10K",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-assign-007-foo-foo-fun",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/assign.test.sh case 7: FOO=foo fun",
+        "sha256": "dc2f9c75b619e9cbb9d00c46c3adcb5937fe9d2231d9474039c2896b14435bed",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/assign-007-foo-foo-fun.sh",
+      "fixtures": [
+        {
+          "source": "cases/assign-007-foo-foo-fun.sh",
+          "destination": "/work/cases/assign-007-foo-foo-fun.sh",
+          "sha256": "dc2f9c75b619e9cbb9d00c46c3adcb5937fe9d2231d9474039c2896b14435bed",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "W2Zvb10K",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-assign-013-assignments-array-assignments-not-interpreted-af",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/assign.test.sh case 13: assignments / array assignments not interpreted after 'echo'",
+        "sha256": "9293d0d23e7ec80e98472229a013682d7810e27068d2a513104eb67b7d9a6a9c",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/assign-013-assignments-array-assignments-not-interpreted-af.sh",
+      "fixtures": [
+        {
+          "source": "cases/assign-013-assignments-array-assignments-not-interpreted-af.sh",
+          "destination": "/work/cases/assign-013-assignments-array-assignments-not-interpreted-af.sh",
+          "sha256": "9293d0d23e7ec80e98472229a013682d7810e27068d2a513104eb67b7d9a6a9c",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "YlswXT0yIGM9Mwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "oils-assign-016-local-x-and-then-array-assignment",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "spec/assign.test.sh case 16: 'local x' and then array assignment",
+        "sha256": "652223536168d22d9c4a2813fef65de0978d76d7102a08ec222f67394dc9fd44",
+        "license": "Apache-2.0"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/cases/assign-016-local-x-and-then-array-assignment.sh",
+      "fixtures": [
+        {
+          "source": "cases/assign-016-local-x-and-then-array-assignment.sh",
+          "destination": "/work/cases/assign-016-local-x-and-then-array-assignment.sh",
+          "sha256": "652223536168d22d9c4a2813fef65de0978d76d7102a08ec222f67394dc9fd44",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "Zm9vCg==",
+        "stderr_base64": ""
+      }
+    }
+  ]
+}

@@ -200,6 +200,11 @@ impl Vm<'_> {
                 return Ok(Some(value));
             }
         }
+        if let Some(NativeValue::BuiltinType(builtin)) = owner.native_value() {
+            if let Some(value) = self.state.types.attribute(builtin.id(), name)? {
+                return Ok(Some(value));
+            }
+        }
         let owner_type = self.type_id(&owner)?;
         if let Some(method) = self
             .state

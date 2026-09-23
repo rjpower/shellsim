@@ -87,6 +87,10 @@ pub(crate) static BYTES_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytes", "startswith", bytes_startswith),
         method("bytes", "endswith", bytes_endswith),
         method("bytes", "find", bytes_find),
+        method("bytes", "count", bytes_count),
+        method("bytes", "partition", bytes_partition),
+        method("bytes", "rpartition", bytes_rpartition),
+        method("bytes", "center", bytes_center),
     ],
 };
 
@@ -98,6 +102,10 @@ pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytearray", "decode", bytes_decode),
         method("bytearray", "hex", bytes_hex),
         method("bytearray", "find", bytes_find),
+        method("bytearray", "count", bytes_count),
+        method("bytearray", "partition", bytes_partition),
+        method("bytearray", "rpartition", bytes_rpartition),
+        method("bytearray", "center", bytes_center),
     ],
 };
 
@@ -505,6 +513,126 @@ fn bytes_find(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
             .and_then(|value| i64::try_from(value).ok())
             .unwrap_or(-1),
     ))
+}
+
+fn bytes_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytes.count", 1, 3)?;
+    args.reject_keywords("bytes.count")?;
+    let PyBytes(value) = receiver.cast(runtime)?;
+    let PyBytes(needle) = args.positional()[0].cast(runtime)?;
+    let (start, end) = string_bounds(runtime, args.positional(), value.len())?;
+    let mut count = 0usize;
+    let mut index = start;
+    if needle.is_empty() {
+        count = end
+            .saturating_sub(start)
+            .saturating_add(usize::from(start <= end));
+    } else {
+        while index.saturating_add(needle.len()) <= end {
+            runtime.charge_cpu(1)?;
+            if value[index..].starts_with(&needle) {
+                count = count.saturating_add(1);
+                index = index.saturating_add(needle.len());
+            } else {
+                index = index.saturating_add(1);
+            }
+        }
+    }
+    i64::try_from(count)
+        .map(PyValue::Int)
+        .map_err(|_| PyError::overflow_error("byte count is too large"))
+}
+
+fn bytes_partition(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    bytes_partition_impl(runtime, receiver, args, false)
+}
+
+fn bytes_rpartition(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    bytes_partition_impl(runtime, receiver, args, true)
+}
+
+fn bytes_partition_impl(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    reverse: bool,
+) -> PyResult {
+    args.expect_positional("bytes.partition", 1, 1)?;
+    args.reject_keywords("bytes.partition")?;
+    let kind = runtime.kind(&receiver)?;
+    let PyBytes(value) = receiver.cast(runtime)?;
+    let PyBytes(separator) = args.positional()[0].cast(runtime)?;
+    if separator.is_empty() {
+        return Err(PyError::value_error("empty separator"));
+    }
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    let position = if reverse {
+        value
+            .windows(separator.len())
+            .rposition(|window| window == separator)
+    } else {
+        value
+            .windows(separator.len())
+            .position(|window| window == separator)
+    };
+    let (left, middle, right) = match position {
+        Some(position) => (
+            value[..position].to_vec(),
+            separator.clone(),
+            value[position + separator.len()..].to_vec(),
+        ),
+        None if reverse => (Vec::new(), Vec::new(), value),
+        None => (value, Vec::new(), Vec::new()),
+    };
+    let left = new_bytes_like(runtime, kind, left)?;
+    let middle = new_bytes_like(runtime, kind, middle)?;
+    let right = new_bytes_like(runtime, kind, right)?;
+    runtime.new_tuple(vec![left, middle, right])
+}
+
+fn bytes_center(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytes.center", 1, 2)?;
+    args.reject_keywords("bytes.center")?;
+    let kind = runtime.kind(&receiver)?;
+    let PyBytes(value) = receiver.cast(runtime)?;
+    let width = runtime
+        .int_value(&args.positional()[0])
+        .ok_or_else(|| PyError::type_error("width must be an integer"))?;
+    let fill = if let Some(fill) = args.positional().get(1) {
+        let PyBytes(fill) = (*fill).cast(runtime)?;
+        if fill.len() != 1 {
+            return Err(PyError::type_error(
+                "center() argument 2 must be a byte string of length 1",
+            ));
+        }
+        fill[0]
+    } else {
+        b' '
+    };
+    let padding = usize::try_from(width)
+        .ok()
+        .unwrap_or_default()
+        .saturating_sub(value.len());
+    let capacity = value
+        .len()
+        .checked_add(padding)
+        .ok_or_else(|| PyError::resource_error("centered bytes are too large"))?;
+    runtime.reserve_memory(capacity)?;
+    runtime.charge_cpu(u64::try_from(capacity).unwrap_or(u64::MAX))?;
+    let left = padding / 2;
+    let mut result = Vec::with_capacity(capacity);
+    result.extend(std::iter::repeat_n(fill, left));
+    result.extend(value);
+    result.extend(std::iter::repeat_n(fill, padding - left));
+    new_bytes_like(runtime, kind, result)
+}
+
+fn new_bytes_like(runtime: &mut dyn PyRuntime, kind: PyKind, value: Vec<u8>) -> PyResult {
+    if kind == PyKind::ByteArray {
+        runtime.new_bytearray(value)
+    } else {
+        runtime.new_bytes(value)
+    }
 }
 
 fn bytearray_append(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
