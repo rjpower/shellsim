@@ -81,6 +81,20 @@ fn abrupt_control_flow_exits_a_context_manager_once() {
 }
 
 #[test]
+fn context_manager_receives_the_exception_class() {
+    let source = "class C:\n    def __enter__(self): pass\n    def __exit__(self, kind, value, traceback):\n        print(kind.__name__, isinstance(value, kind))\n        return True\nwith C():\n    raise KeyError('hidden')\nprint('continued')";
+    let simulated = run(source);
+
+    assert_eq!(
+        simulated,
+        (0, "KeyError True\ncontinued\n".into(), String::new())
+    );
+    if let Some(reference) = cpython(source) {
+        assert_eq!(reference, simulated);
+    }
+}
+
+#[test]
 fn loop_control_does_not_exit_an_enclosing_context_manager() {
     let source = "class C:\n    def __enter__(self):\n        print('enter')\n    def __exit__(self, kind, value, traceback):\n        print('exit')\nwith C():\n    for value in [1, 2, 3]:\n        if value == 1:\n            continue\n        if value == 2:\n            break\nprint('done')";
     let (status, out, err) = run(source);

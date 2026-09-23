@@ -31,6 +31,12 @@ support `yield`, `yield from`, `send`, `throw`, and `close`, including suspensio
 `with` regions. Generator shutdown uses a deliberately simple bounded drain through pending
 cleanup code.
 
+Text formatting uses one protocol for f-strings and `str.format`, including conversions,
+alignment, width and precision, and decimal, binary, octal, and hexadecimal integer formats.
+The frozen `functools` module provides `reduce` and positional argument binding with `partial`.
+Binding keyword arguments with `partial` remains unsupported until the VM supports `**kwargs`;
+attempting it produces an explicit argument error.
+
 User-defined exception subclasses preserve inherited constructor arguments, including compatible
 `args`, `str`, and `repr` behavior.
 

@@ -39,7 +39,7 @@
         "disposition": "frontier",
         "class": "unsupported_feature",
         "exit_status": 2,
-        "unsupported": ["python:non-default argument follows default argument at line 1, column 26"]
+        "unsupported": ["python:expected a parameter name at line 1, column 37"]
       }
     },
     {
@@ -75,12 +75,7 @@
       "kind": "python",
       "code": "events = []\nclass Guard:\n    def __enter__(self):\n        events.append('enter')\n        return self\n    def __exit__(self, kind, value, traceback):\n        events.append(kind.__name__)\n        return True\n\nwith Guard():\n    raise KeyError('hidden')\nprint(events)",
       "covers": ["python.statement.with", "python.protocol.context_manager"],
-      "expect": {
-        "disposition": "frontier",
-        "class": "unsupported_feature",
-        "exit_status": 2,
-        "unsupported": ["python:attribute \"__name__\" is not implemented in __exit__ at line 7, column 23 at line 10, column 1"]
-      }
+      "expect": {"disposition": "pass", "stdout": "['enter', 'KeyError']\n", "stderr": ""}
     },
     {
       "id": "local-module-import",
@@ -146,12 +141,7 @@
       "kind": "python",
       "code": "import re\nmatch = re.search(r'(?P<word>[a-z]+)-(\\d+)', 'id abc-42 end')\nprint(match.group(0), match.group('word'), match.groups())\nprint(re.sub(r'\\d+', '#', 'a1 b22'))",
       "covers": ["python.module.re.search", "python.module.re.groups", "python.module.re.sub"],
-      "expect": {
-        "disposition": "frontier",
-        "class": "unsupported_feature",
-        "exit_status": 2,
-        "unsupported": ["python:TypeError: expected an integer index, got str at line 3, column 23"]
-      }
+      "expect": {"disposition": "pass", "stdout": "abc-42 abc ('abc', '42')\na# b#\n", "stderr": ""}
     },
     {
       "id": "collections-types",
@@ -172,12 +162,7 @@
       "kind": "python",
       "code": "from functools import partial, reduce\ndef add(a, b): return a + b\nplus_ten = partial(add, 10)\nprint(plus_ten(5), reduce(add, [1, 2, 3, 4]))",
       "covers": ["python.module.functools.partial", "python.module.functools.reduce"],
-      "expect": {
-        "disposition": "frontier",
-        "class": "unsupported_feature",
-        "exit_status": 2,
-        "unsupported": ["python:attribute \"partial\" is not implemented at line 1, column 1"]
-      }
+      "expect": {"disposition": "pass", "stdout": "15 10\n", "stderr": ""}
     },
     {
       "id": "string-method-family",
@@ -191,12 +176,7 @@
       "kind": "python",
       "code": "data = b'ababa'\nprint(data.count(b'ab'), data.partition(b'b'), data.rpartition(b'b'))\nmutable = bytearray(b'ab')\nmutable.extend(b'cd'); mutable.reverse()\nprint(mutable, mutable.center(6, b'.'))",
       "covers": ["python.value.bytes", "python.value.bytearray"],
-      "expect": {
-        "disposition": "frontier",
-        "class": "unsupported_feature",
-        "exit_status": 2,
-        "unsupported": ["python:attribute \"reverse\" is not implemented at line 4, column 24"]
-      }
+      "expect": {"disposition": "pass", "stdout": "2 (b'a', b'b', b'aba') (b'aba', b'b', b'a')\nbytearray(b'dcba') bytearray(b'.dcba.')\n", "stderr": ""}
     },
     {
       "id": "set-and-frozenset",
@@ -236,12 +216,7 @@
       "kind": "python",
       "code": "print(f'{12:04d} {3.14159:.2f} {255:#x}')\nprint('{name!r:^9}'.format(name='x'))",
       "covers": ["python.expression.fstring", "python.value.str.format", "python.protocol.format"],
-      "expect": {
-        "disposition": "frontier",
-        "class": "unsupported_feature",
-        "exit_status": 2,
-        "unsupported": ["python:unsupported format specification \"#x\" at line 1, column 7"]
-      }
+      "expect": {"disposition": "pass", "stdout": "0012 3.14 0xff\n   'x'   \n", "stderr": ""}
     },
     {
       "id": "iteration-builtins",

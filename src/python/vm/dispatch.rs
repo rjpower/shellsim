@@ -515,7 +515,7 @@ impl Vm<'_> {
             .ok_or("no active exception")?;
         self.stack.push(context);
         self.load_attribute("__exit__")?;
-        let exception_kind = self.allocate_string(exception.kind.clone())?;
+        let exception_kind = self.exception_class(&exception)?;
         self.stack
             .extend([exception_kind, exception.value, Value::None]);
         let result = match self.call(3, &[], &[false, false, false], CallMode::Immediate)? {
@@ -548,7 +548,7 @@ impl Vm<'_> {
             .ok_or("no active exception")?;
         self.stack.push(context);
         self.load_attribute("__aexit__")?;
-        let exception_kind = self.allocate_string(exception.kind)?;
+        let exception_kind = self.exception_class(&exception)?;
         self.stack
             .extend([exception_kind, exception.value, Value::None]);
         match self.call(3, &[], &[false, false, false], CallMode::Immediate)? {
@@ -561,6 +561,22 @@ impl Vm<'_> {
             CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
                 unreachable!("immediate call cannot suspend")
             }
+        }
+    }
+
+    fn exception_class(&self, exception: &super::RaisedException) -> Result<Value, String> {
+        if protocol::exception_parts(&self.state.heap, &exception.value)?.is_some() {
+            let name = super::known_exception_type(&exception.kind).ok_or_else(|| {
+                format!(
+                    "exception type metadata is not modeled for {:?}",
+                    exception.kind
+                )
+            })?;
+            Ok(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                name,
+            ))))
+        } else {
+            self.type_of(&exception.value)
         }
     }
 

@@ -72,7 +72,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "_importlib" => Some(&importlib::MODULE),
         "_shellsim_vfs" => Some(&vfs::MODULE),
         "_zlib" => Some(&zlib::MODULE),
-        "functools" => Some(&functools::MODULE),
+        "_functools" => Some(&functools::MODULE),
         "itertools" => Some(&itertools::MODULE),
         "math" => Some(&math::MODULE),
         "numpy" => Some(&numpy::MODULE),

@@ -254,6 +254,8 @@ values = [4, 1, 3]
 heapq.heapify(values)
 print(heapq.heappop(values), bisect.bisect_left([1, 3, 5], 4))
 print(functools.reduce(lambda a, b: a + b, [1, 2, 3]))
+plus_ten = functools.partial(lambda a, b: a + b, 10)
+print(plus_ten(5), plus_ten.func(2, 3), plus_ten.args, plus_ten.keywords)
 print(typing.List[int])
 print(next(counter))
 "#;
@@ -268,7 +270,7 @@ print(next(counter))
         simulated,
         (
             0,
-            b"[3, 4, 5]\n1 2\n6\ntyping.List[int]\n6\n".to_vec(),
+            b"[3, 4, 5]\n1 2\n6\n15 5 (10,) {}\ntyping.List[int]\n6\n".to_vec(),
             Vec::new()
         )
     );
@@ -295,6 +297,8 @@ print(re.search(r"b", text, flags=re.IGNORECASE).group())
 pattern = re.compile(r"([a-z])(\d)")
 matched = pattern.search("a1 b2")
 print(matched.group(1), pattern.findall("a1 b2"), pattern.sub("#", "a1 b2"))
+named = re.search(r"(?P<word>[a-z]+)-(?P<number>\d+)", "abc-42")
+print(named.group("word"), named.group("number"), named.groups())
 "##;
     let simulated = run(source);
     let reference = Command::new("python3.14").arg("-c").arg(source).output();
@@ -307,7 +311,7 @@ print(matched.group(1), pattern.findall("a1 b2"), pattern.sub("#", "a1 b2"))
         simulated,
         (
             0,
-            b"A12 A 12 0 3\nA\n['12', '34']\nA# b#\na\\+b\\?\\ c\nb\na [('a', '1'), ('b', '2')] # #\n".to_vec(),
+            b"A12 A 12 0 3\nA\n['12', '34']\nA# b#\na\\+b\\?\\ c\nb\na [('a', '1'), ('b', '2')] # #\nabc 42 ('abc', '42')\n".to_vec(),
             Vec::new()
         )
     );

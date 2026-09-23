@@ -239,6 +239,7 @@ pub enum Object {
     Match {
         text: String,
         groups: Vec<Option<String>>,
+        group_names: Vec<Option<String>>,
         start: usize,
         end: usize,
     },
@@ -1588,7 +1589,12 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .and_then(|size| size.checked_add(3))
             .ok_or("modeled object size overflow")?,
         Object::Regex { pattern, .. } => pattern.len(),
-        Object::Match { text, groups, .. } => text
+        Object::Match {
+            text,
+            groups,
+            group_names,
+            ..
+        } => text
             .len()
             .checked_add(
                 groups
@@ -1596,6 +1602,14 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
                     .map(|group| group.as_ref().map_or(0, String::len))
                     .sum(),
             )
+            .and_then(|size| {
+                size.checked_add(
+                    group_names
+                        .iter()
+                        .map(|name| name.as_ref().map_or(0, String::len))
+                        .sum(),
+                )
+            })
             .ok_or("modeled object size overflow")?,
         Object::ArgumentParser {
             prog,

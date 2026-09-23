@@ -430,6 +430,13 @@ pub(super) trait PyRuntime {
     fn truth(&mut self, value: &PyValue) -> PyResult<bool>;
     fn display(&mut self, value: &PyValue) -> PyResult<String>;
     fn repr(&mut self, value: &PyValue) -> PyResult<String>;
+    /// Render through the same bounded formatting protocol used by f-strings.
+    fn format_value(
+        &mut self,
+        value: &PyValue,
+        conversion: Option<char>,
+        specification: &str,
+    ) -> PyResult<String>;
     fn equals(&mut self, left: &PyValue, right: &PyValue) -> PyResult<bool>;
     fn compare(&mut self, left: &PyValue, right: &PyValue) -> PyResult<Ordering>;
     /// Resolve an attribute through the runtime's descriptor and MRO protocol.
@@ -520,6 +527,7 @@ pub(super) trait PyRuntime {
         &mut self,
         text: String,
         groups: Vec<Option<String>>,
+        group_names: Vec<Option<String>>,
         start: usize,
         end: usize,
     ) -> PyResult<PyValue>;
@@ -764,6 +772,7 @@ impl FromPyValue for PyMatch {
 /// Owned, metered snapshot of a match payload.
 pub(super) struct PyMatchData {
     pub groups: Vec<Option<String>>,
+    pub group_names: Vec<Option<String>>,
     pub start: usize,
     pub end: usize,
 }

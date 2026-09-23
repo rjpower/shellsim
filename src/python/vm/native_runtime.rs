@@ -298,6 +298,16 @@ impl PyRuntime for Vm<'_> {
         self.repr_value(value).map_err(PyError::runtime_error)
     }
 
+    fn format_value(
+        &mut self,
+        value: &Value,
+        conversion: Option<char>,
+        specification: &str,
+    ) -> PyResult<String> {
+        self.render_formatted_value(value, conversion, specification)
+            .map_err(PyError::value_error)
+    }
+
     fn equals(&mut self, left: &Value, right: &Value) -> PyResult<bool> {
         protocol::equals(&self.state.heap, left, right).map_err(PyError::runtime_error)
     }
@@ -1401,6 +1411,7 @@ impl PyRuntime for Vm<'_> {
         &mut self,
         text: String,
         groups: Vec<Option<String>>,
+        group_names: Vec<Option<String>>,
         start: usize,
         end: usize,
     ) -> PyResult<Value> {
@@ -1409,6 +1420,7 @@ impl PyRuntime for Vm<'_> {
             Object::Match {
                 text,
                 groups,
+                group_names,
                 start,
                 end,
             },
@@ -1433,7 +1445,11 @@ impl PyRuntime for Vm<'_> {
 
     fn match_data(&mut self, matched: PyMatch) -> PyResult<PyMatchData> {
         let Object::Match {
-            groups, start, end, ..
+            groups,
+            group_names,
+            start,
+            end,
+            ..
         } = self
             .state
             .heap
@@ -1442,15 +1458,24 @@ impl PyRuntime for Vm<'_> {
         else {
             return Err(PyError::runtime_error("match handle changed object kind"));
         };
-        let bytes = groups.iter().try_fold(0usize, |total, group| {
-            total.checked_add(group.as_ref().map_or(0, String::len))
-        });
+        let bytes = groups
+            .iter()
+            .chain(group_names)
+            .try_fold(0usize, |total, value| {
+                total.checked_add(value.as_ref().map_or(0, String::len))
+            });
         let bytes = bytes.ok_or_else(|| PyError::resource_error("match snapshot is too large"))?;
         let groups = groups.clone();
+        let group_names = group_names.clone();
         let start = *start;
         let end = *end;
         self.reserve_memory(bytes)?;
-        Ok(PyMatchData { groups, start, end })
+        Ok(PyMatchData {
+            groups,
+            group_names,
+            start,
+            end,
+        })
     }
 
     fn marker(&self, marker: PyMarker) -> Value {

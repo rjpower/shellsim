@@ -246,7 +246,7 @@ impl Parser {
                         }
                         Some(self.expression()?)
                     } else {
-                        if saw_default && !keyword_only {
+                        if saw_default && !keyword_only && !variadic {
                             return Err(self.error("non-default argument follows default argument"));
                         }
                         None
@@ -822,7 +822,7 @@ impl Parser {
                     }
                     Some(self.expression()?)
                 } else {
-                    if saw_default && !keyword_only {
+                    if saw_default && !keyword_only && !variadic {
                         return Err(self.error("non-default argument follows default argument"));
                     }
                     None
