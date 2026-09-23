@@ -458,6 +458,18 @@ fn source_and_eval_execute_inline_continuation_frames() {
 }
 
 #[test]
+fn return_exits_the_nearest_sourced_script() {
+    assert_eq!(
+        run("printf '%s\n' 'printf before' 'return 7' 'printf after' > /tmp/body; . /tmp/body; printf ':%s' \"$?\""),
+        (0, "before:7".into(), String::new())
+    );
+
+    let outside = run("return 4");
+    assert_eq!(outside.0, 1);
+    assert!(outside.2.contains("can only be used"), "{}", outside.2);
+}
+
+#[test]
 fn command_substitutions_use_scheduled_captured_children() {
     assert_eq!(
         run("(sleep 1; printf ready > /tmp/marker) & value=$(sleep 2; cat /tmp/marker); printf '<%s>' \"$value\"; wait"),

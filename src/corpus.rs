@@ -32,6 +32,8 @@ pub struct CorpusManifest {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgramKind {
+    /// Execute `entrypoint` and `args` through modeled command dispatch.
+    Command,
     Shell,
     Python,
 }
@@ -80,6 +82,9 @@ pub struct CaseExpectation {
     /// Unsupported command names that are part of the checked behavior.
     #[serde(default)]
     pub unsupported_commands: Vec<String>,
+    /// Required failure classification for a frontier case.
+    #[serde(default)]
+    pub class: Option<ResultClass>,
 }
 
 /// One program and its fully declared inputs.
@@ -116,7 +121,7 @@ pub struct Provenance {
 }
 
 /// First decisive outcome of a compatibility workload.
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultClass {
     Pass,
@@ -305,6 +310,7 @@ fn run_case(base: &Path, profile: EnvironmentProfile, case: CorpusCase) -> CaseR
     }
     let workspace_before = environment.vfs.clone();
     let mut command = match case.kind {
+        ProgramKind::Command => quote_shell(&case.entrypoint),
         ProgramKind::Shell => format!("bash {}", quote_shell(&case.entrypoint)),
         ProgramKind::Python => format!("python3.14 {}", quote_shell(&case.entrypoint)),
     };
@@ -377,9 +383,18 @@ fn run_case(base: &Path, profile: EnvironmentProfile, case: CorpusCase) -> CaseR
     {
         class = ResultClass::Pass;
     }
+    if let Some(expected) = case.expect.class {
+        if expected != class {
+            mismatches.push(format!(
+                "expected result class {}, got {}",
+                result_class_name(expected),
+                result_class_name(class)
+            ));
+        }
+    }
     let expectation_met = match case.expect.disposition {
         ExpectedDisposition::Pass => mismatches.is_empty() && class == ResultClass::Pass,
-        ExpectedDisposition::Frontier => class != ResultClass::Pass,
+        ExpectedDisposition::Frontier => class != ResultClass::Pass && mismatches.is_empty(),
         ExpectedDisposition::Skip => unreachable!(),
     };
     CaseResult {
@@ -395,6 +410,24 @@ fn run_case(base: &Path, profile: EnvironmentProfile, case: CorpusCase) -> CaseR
         unsupported,
         unsupported_commands,
         workspace_changes,
+    }
+}
+
+fn result_class_name(class: ResultClass) -> &'static str {
+    match class {
+        ResultClass::Pass => "pass",
+        ResultClass::Skipped => "skipped",
+        ResultClass::SetupFailure => "setup_failure",
+        ResultClass::ParseOrCompileFailure => "parse_or_compile_failure",
+        ResultClass::UnknownCommand => "unknown_command",
+        ResultClass::UnsupportedFeature => "unsupported_feature",
+        ResultClass::MissingPythonModule => "missing_python_module",
+        ResultClass::FixtureAssumption => "fixture_assumption",
+        ResultClass::SemanticMismatch => "semantic_mismatch",
+        ResultClass::RuntimeFailure => "runtime_failure",
+        ResultClass::ResourceExhaustion => "resource_exhaustion",
+        ResultClass::HangOrDeadlock => "hang_or_deadlock",
+        ResultClass::CapabilityViolation => "capability_violation",
     }
 }
 

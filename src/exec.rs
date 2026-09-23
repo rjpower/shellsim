@@ -316,6 +316,9 @@ enum ShellFrame {
     FinishInlineCommand {
         variables: Vec<(String, Option<String>)>,
     },
+    FinishSource {
+        variables: Vec<(String, Option<String>)>,
+    },
     FinishSignalHandler {
         previous_status: i32,
     },
@@ -555,6 +558,11 @@ impl ShellContinuation {
                 ShellFrame::FinishInlineCommand { variables } => {
                     restore_command_variables(interp, variables);
                 }
+                ShellFrame::FinishSource { variables } => {
+                    interp.source_depth = interp.source_depth.saturating_sub(1);
+                    interp.returning = None;
+                    restore_command_variables(interp, variables);
+                }
                 ShellFrame::FinishSignalHandler { .. } => interp.finish_signal_handler(),
                 ShellFrame::FinishExitTrap { .. } => {}
                 ShellFrame::FinishLoop => {
@@ -606,6 +614,21 @@ impl ShellContinuation {
         }
         self.frames
             .push(ShellFrame::FinishInlineCommand { variables });
+        self.frames.push(ShellFrame::Eval(node));
+    }
+
+    fn enter_source(
+        &mut self,
+        interp: &mut Interp,
+        variables: Vec<(String, Option<String>)>,
+        node: Node,
+    ) {
+        if !self.ensure_capacity(interp, 2) {
+            restore_command_variables(interp, variables);
+            return;
+        }
+        interp.source_depth = interp.source_depth.saturating_add(1);
+        self.frames.push(ShellFrame::FinishSource { variables });
         self.frames.push(ShellFrame::Eval(node));
     }
 
@@ -1456,6 +1479,17 @@ impl ShellContinuation {
                     interp.vfs.disk_used(),
                 );
             }
+            ShellFrame::FinishSource { variables } => {
+                interp.source_depth = interp.source_depth.saturating_sub(1);
+                self.status = interp.returning.take().unwrap_or(self.status);
+                restore_command_variables(interp, variables);
+                interp.invocations.finish_latest(
+                    interp.process.pid,
+                    self.status,
+                    interp.resources.cpu_used(),
+                    interp.vfs.disk_used(),
+                );
+            }
             ShellFrame::FinishSignalHandler { previous_status } => {
                 interp.finish_signal_handler();
                 self.status = previous_status;
@@ -1511,6 +1545,9 @@ impl ShellContinuation {
                     }
                     crate::commands::CommandPoll::Inline(node) => {
                         self.enter_inline_command(interp, variables, node);
+                    }
+                    crate::commands::CommandPoll::InlineSource(node) => {
+                        self.enter_source(interp, variables, node);
                     }
                     crate::commands::CommandPoll::Blocked(reason, continuation) => {
                         self.frames.push(ShellFrame::ResumeCommand {
@@ -1614,6 +1651,10 @@ impl ShellContinuation {
                     crate::commands::CommandPoll::Inline(node) => {
                         debug_assert!(stdout.is_empty() && stderr.is_empty());
                         self.enter_inline_command(interp, variables, node);
+                    }
+                    crate::commands::CommandPoll::InlineSource(node) => {
+                        debug_assert!(stdout.is_empty() && stderr.is_empty());
+                        self.enter_source(interp, variables, node);
                     }
                     crate::commands::CommandPoll::Blocked(reason, continuation) => {
                         debug_assert!(stdout.is_empty() && stderr.is_empty());
@@ -2041,6 +2082,10 @@ impl ShellContinuation {
                 crate::commands::CommandPoll::Inline(node) => {
                     debug_assert!(stdout.is_empty() && stderr.is_empty());
                     self.enter_inline_command(interp, variables, node);
+                }
+                crate::commands::CommandPoll::InlineSource(node) => {
+                    debug_assert!(stdout.is_empty() && stderr.is_empty());
+                    self.enter_source(interp, variables, node);
                 }
                 crate::commands::CommandPoll::Blocked(reason, continuation) => {
                     self.frames.push(ShellFrame::ResumeCommand {

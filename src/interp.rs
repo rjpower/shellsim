@@ -177,6 +177,8 @@ pub struct ProcessState {
     /// Number of active shell loops, used to reject loop-control builtins out of context.
     pub loop_depth: u32,
     pub returning: Option<i32>,
+    /// Active sourced-script boundaries that may consume the `return` builtin.
+    pub(crate) source_depth: u32,
     pub exiting: Option<i32>,
     /// depth of "condition" contexts (if/while/&&/||/!) where `set -e` is suppressed
     pub cond_depth: u32,
@@ -349,6 +351,7 @@ impl ProcessState {
             loop_continue: 0,
             loop_depth: if new_shell { 0 } else { self.loop_depth },
             returning: None,
+            source_depth: 0,
             exiting: None,
             cond_depth: self.cond_depth,
             deadline_interrupt: self.deadline_interrupt,
@@ -602,6 +605,7 @@ impl Environment {
                 loop_continue: 0,
                 loop_depth: 0,
                 returning: None,
+                source_depth: 0,
                 exiting: None,
                 cond_depth: 0,
                 deadline_interrupt: None,

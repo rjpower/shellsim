@@ -90,6 +90,8 @@ pub(crate) enum CommandPoll {
     Switched(CommandResume),
     /// Continue by executing shell syntax in the current process context.
     Inline(crate::shell::Node),
+    /// Run sourced shell code and consume `return` at this command boundary.
+    InlineSource(crate::shell::Node),
 }
 
 /// Command-owned state retained by the shell while a native command is suspended.
@@ -344,7 +346,7 @@ pub fn run(
         CommandPoll::Switched(_) => {
             unreachable!("synchronous command dispatch cannot switch processes")
         }
-        CommandPoll::Inline(_) => {
+        CommandPoll::Inline(_) | CommandPoll::InlineSource(_) => {
             unreachable!("synchronous command dispatch cannot inject shell frames")
         }
     }
@@ -892,7 +894,8 @@ fn finish_ready_invocation(interp: &mut Interp, result: &CommandPoll) {
         CommandPoll::Yielded(_)
         | CommandPoll::Blocked(_, _)
         | CommandPoll::Switched(_)
-        | CommandPoll::Inline(_) => return,
+        | CommandPoll::Inline(_)
+        | CommandPoll::InlineSource(_) => return,
     };
     interp.invocations.finish_latest(
         interp.process.pid,
