@@ -9,6 +9,18 @@ fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/stock-smoke")
 }
 
+fn corpus_root(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/corpus")
+        .join(name)
+}
+
+fn run_frozen_corpus(name: &str) -> corpus::CorpusReport {
+    let root = corpus_root(name);
+    let manifest = std::fs::read(root.join("manifest.json")).expect("manifest fixture");
+    corpus::run_manifest_bytes(&root, &manifest).expect("valid corpus")
+}
+
 #[test]
 fn stock_manifest_runs_shell_python_and_explicit_skip_cases() {
     let root = fixture_root();
@@ -79,4 +91,63 @@ fn a_profile_that_does_not_fit_is_a_setup_failure() {
 
     assert_eq!(report.expectation_failures, 1);
     assert_eq!(report.cases[0].class, ResultClass::SetupFailure);
+}
+
+#[test]
+fn imported_shell_and_python_corpora_match_checked_behavior() {
+    for (name, minimum_cases) in [
+        ("oils-spec", 50),
+        ("micropython-basics", 50),
+        ("posix-derived", 8),
+    ] {
+        let report = run_frozen_corpus(name);
+        assert_eq!(
+            report.expectation_failures,
+            0,
+            "{name}: {:?}",
+            report
+                .cases
+                .iter()
+                .filter(|case| !case.expectation_met)
+                .map(|case| (&case.id, case.class, &case.detail))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report.total >= minimum_cases,
+            "{name} should retain its semantic breadth"
+        );
+    }
+}
+
+#[test]
+fn an_expected_unknown_command_can_be_part_of_a_pass_case() {
+    let root = fixture_root();
+    let manifest = br#"{
+        "version": 1,
+        "profile": "stock_agent_v1",
+        "cases": [{
+            "id": "checked-command-not-found",
+            "kind": "shell",
+            "entrypoint": "/work/missing.sh",
+            "fixtures": [{"source": "missing.sh", "destination": "/work/missing.sh"}],
+            "expect": {
+                "disposition": "pass",
+                "exit_status": 127,
+                "unsupported": ["definitely-missing"],
+                "unsupported_commands": ["definitely-missing"]
+            }
+        }]
+    }"#;
+    let report = corpus::run_manifest_bytes(&root, manifest).expect("valid manifest");
+
+    assert_eq!(
+        report.expectation_failures,
+        0,
+        "class={:?} detail={:?} unsupported={:?} commands={:?}",
+        report.cases[0].class,
+        report.cases[0].detail,
+        report.cases[0].unsupported,
+        report.cases[0].unsupported_commands
+    );
+    assert_eq!(report.cases[0].class, ResultClass::Pass);
 }

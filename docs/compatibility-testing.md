@@ -35,6 +35,10 @@ fixture, semantic, runtime, resource, hang, and capability failures. Some classe
 schema categories and should remain empty. A known frontier is not counted as a pass, even when it
 is expected.
 
+`pass` cases may declare exact `unsupported` and `unsupported_commands` lists. This is useful when
+the behavior under test intentionally invokes a missing command, such as a parser ambiguity whose
+contract includes status 127. Undeclared entries remain failures.
+
 ## Corpus policy
 
 Every imported program must record its source URL, pinned revision, path, content hash, and
@@ -47,5 +51,12 @@ fixtures, dependencies, license, and expected behavior have been reviewed.
 
 The current Python baseline remains the 100-case TaskTrove differential corpus under
 `tests/python/corpus/tasktrove`. All 100 cases are expected to match checked CPython 3.14 output.
-The compatibility runner adds whole-environment reporting without replacing that unchanged-source
-differential test.
+The compatibility runner adds three reviewed suites without replacing that unchanged-source test:
+
+- `micropython-basics` freezes 100 unchanged language tests with checked CPython output;
+- `oils-spec` freezes 50 shell-specification case bodies with upstream provenance;
+- `posix-derived` supplies compact standards-oriented probes for common behavior underrepresented
+  in the imported suite.
+
+These suites measure compatibility breadth. They do not confer POSIX certification or complete
+CPython compatibility.

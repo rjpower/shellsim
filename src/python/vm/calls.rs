@@ -6,8 +6,19 @@ use super::{
     HashMap, InstanceAttributes, InstancePayload, NativeValue, Object, Ordering, PendingNativeCall,
     PyError, PyErrorKind, PyRuntime, RaisedException, ScopeId, Slot, Stream, Value, Vm,
 };
+use num_traits::{Signed, Zero};
 
 impl Vm<'_> {
+    fn pow_integer_argument(&self, value: &Value) -> Result<(BigInt, usize), PyError> {
+        let decimal = <Self as PyRuntime>::integer_text(self, value)?.ok_or_else(|| {
+            PyError::type_error("pow() 3rd argument not allowed unless all arguments are integers")
+        })?;
+        let integer = decimal
+            .parse::<BigInt>()
+            .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
+        Ok((integer, decimal.len()))
+    }
+
     fn dir_names(&self, value: &Value) -> Result<Vec<String>, String> {
         if let Some(NativeValue::Module(module)) = value.native_value() {
             return Ok(module
@@ -474,7 +485,7 @@ impl Vm<'_> {
             ));
         }
         if let Some(NativeValue::NativeMethod(method)) = function.native_value() {
-            if method.name != "__new__" || arguments.is_empty() {
+            if arguments.is_empty() {
                 return Err("unbound native method requires a receiver".into());
             }
             let receiver = arguments.remove(0);
@@ -888,7 +899,42 @@ impl Vm<'_> {
                 Ok(CallResult::Value(value))
             }
             Builtin::Power => {
-                expect_arity(&arguments, 2, 2)?;
+                expect_arity(&arguments, 2, 3)?;
+                if arguments.len() == 3 && arguments[2] != Value::None {
+                    let parsed = self.pow_integer_argument(&arguments[0]);
+                    let (base, base_len) =
+                        parsed.map_err(|error| self.record_native_error(error))?;
+                    let parsed = self.pow_integer_argument(&arguments[1]);
+                    let (exponent, exponent_len) =
+                        parsed.map_err(|error| self.record_native_error(error))?;
+                    let parsed = self.pow_integer_argument(&arguments[2]);
+                    let (modulus, modulus_len) =
+                        parsed.map_err(|error| self.record_native_error(error))?;
+                    if modulus.is_zero() {
+                        let error = PyError::zero_division_error("pow() 3rd argument cannot be 0");
+                        return Err(self.record_native_error(error));
+                    }
+                    if exponent.is_negative() {
+                        let error =
+                            PyError::value_error("negative exponent with modulus is not supported");
+                        return Err(self.record_native_error(error));
+                    }
+                    let work = base_len
+                        .saturating_add(modulus_len)
+                        .saturating_mul(exponent_len.saturating_mul(4).max(1));
+                    <Self as PyRuntime>::charge_cpu(self, u64::try_from(work).unwrap_or(u64::MAX))
+                        .map_err(|error| error.to_string())?;
+                    <Self as PyRuntime>::reserve_memory(self, modulus_len.saturating_mul(4).max(1))
+                        .map_err(|error| error.to_string())?;
+                    let positive_modulus = modulus.abs();
+                    let mut result = base.modpow(&exponent, &positive_modulus);
+                    if modulus.is_negative() && !result.is_zero() {
+                        result += modulus;
+                    }
+                    let result = <Self as PyRuntime>::new_integer(self, &result.to_string())
+                        .map_err(|error| error.to_string())?;
+                    return Ok(CallResult::Value(result));
+                }
                 Ok(CallResult::Value(self.binary_value(
                     BinaryOperator::Power,
                     arguments[0],

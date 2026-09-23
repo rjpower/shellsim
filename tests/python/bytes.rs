@@ -35,3 +35,60 @@ with open(path, 'rb') as stream:
         )
     );
 }
+
+#[test]
+fn bytes_and_bytearray_support_common_search_and_layout_methods() {
+    let source = r#"
+for value in (b'ababa', bytearray(b'ababa')):
+    print(value.count(b'ab'), value.count(b'', 1, 3))
+    print(value.partition(b'ba'), value.rpartition(b'ba'))
+    missing = value.partition(b'x')
+    print(missing, type(missing[0]) is type(value))
+    print(value.center(8, b'.'), type(value.center(8)) is type(value))
+print(bytes.count(b'aaaa', b'aa'))
+"#;
+    assert_eq!(
+        run_python_text(source),
+        (
+            0,
+            concat!(
+                "2 3\n",
+                "(b'a', b'ba', b'ba') (b'aba', b'ba', b'')\n",
+                "(b'ababa', b'', b'') True\n",
+                "b'.ababa..' True\n",
+                "2 3\n",
+                "(bytearray(b'a'), bytearray(b'ba'), bytearray(b'ba')) (bytearray(b'aba'), bytearray(b'ba'), bytearray(b''))\n",
+                "(bytearray(b'ababa'), bytearray(b''), bytearray(b'')) True\n",
+                "bytearray(b'.ababa..') True\n",
+                "2\n",
+            )
+            .into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
+fn three_argument_pow_uses_bounded_integer_modular_exponentiation() {
+    let source = r#"
+print(pow(2, 10, 17), pow(-2, 3, 5), pow(2, 3, -5))
+try:
+    pow(2, 3, 0)
+except ZeroDivisionError:
+    print("zero modulus")
+for arguments in (("x", 2, 3), (2, "x", 3), (2, 3, "x")):
+    try:
+        pow(*arguments)
+    except TypeError:
+        print("integer arguments")
+"#;
+    assert_eq!(
+        run_python_text(source),
+        (
+            0,
+            "4 2 -2\nzero modulus\ninteger arguments\ninteger arguments\ninteger arguments\n"
+                .into(),
+            String::new()
+        )
+    );
+}

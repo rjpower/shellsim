@@ -74,6 +74,12 @@ pub struct CaseExpectation {
     pub stderr_base64: Option<String>,
     #[serde(default)]
     pub skip_reason: Option<String>,
+    /// Unsupported language features that are part of the checked behavior.
+    #[serde(default)]
+    pub unsupported: Vec<String>,
+    /// Unsupported command names that are part of the checked behavior.
+    #[serde(default)]
+    pub unsupported_commands: Vec<String>,
 }
 
 /// One program and its fully declared inputs.
@@ -343,13 +349,34 @@ fn run_case(base: &Path, profile: EnvironmentProfile, case: CorpusCase) -> CaseR
         .filter(|event| event.trust == CommandTrust::Unsupported)
         .filter_map(|event| event.argv.first().cloned())
         .collect();
-    let class = classify(
+    check_string_set(
+        "unsupported features",
+        &case.expect.unsupported,
+        &unsupported,
+        &mut mismatches,
+    );
+    check_string_set(
+        "unsupported commands",
+        &case.expect.unsupported_commands,
+        &unsupported_commands,
+        &mut mismatches,
+    );
+    let mut class = classify(
         &outcome,
         &stderr,
         &unsupported,
         &unsupported_commands,
         &mismatches,
     );
+    if case.expect.disposition == ExpectedDisposition::Pass
+        && mismatches.is_empty()
+        && matches!(
+            class,
+            ResultClass::UnknownCommand | ResultClass::UnsupportedFeature
+        )
+    {
+        class = ResultClass::Pass;
+    }
     let expectation_met = match case.expect.disposition {
         ExpectedDisposition::Pass => mismatches.is_empty() && class == ResultClass::Pass,
         ExpectedDisposition::Frontier => class != ResultClass::Pass,
@@ -417,6 +444,21 @@ fn check_output(label: &str, expected: Option<&str>, actual: &[u8], mismatches: 
     }
 }
 
+fn check_string_set(
+    label: &str,
+    expected: &[String],
+    actual: &[String],
+    mismatches: &mut Vec<String>,
+) {
+    let mut expected = expected.to_vec();
+    let mut actual = actual.to_vec();
+    expected.sort();
+    actual.sort();
+    if expected != actual {
+        mismatches.push(format!("{label} differ from checked values"));
+    }
+}
+
 fn classify(
     outcome: &RunOutcome,
     stderr: &[u8],
@@ -444,6 +486,11 @@ fn classify(
     if !unsupported.is_empty() {
         return ResultClass::UnsupportedFeature;
     }
+    // The manifest's checked status and output are the observable contract. Diagnostics may
+    // intentionally contain words such as "not found", and a non-zero status can be expected.
+    if mismatches.is_empty() {
+        return ResultClass::Pass;
+    }
     if stderr.contains("ModuleNotFoundError") || stderr.contains("ImportError") {
         return ResultClass::MissingPythonModule;
     }
@@ -453,13 +500,10 @@ fn classify(
     if stderr.contains("No such file") || stderr.contains("not found") {
         return ResultClass::FixtureAssumption;
     }
-    if !mismatches.is_empty() {
-        return ResultClass::SemanticMismatch;
-    }
     if outcome.exit_status != 0 {
         return ResultClass::RuntimeFailure;
     }
-    ResultClass::Pass
+    ResultClass::SemanticMismatch
 }
 
 fn setup_failure(case: &CorpusCase, detail: String) -> CaseResult {
