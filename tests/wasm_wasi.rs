@@ -12,6 +12,82 @@ fn run(environment: &mut Environment, source: &str) -> (i32, Vec<u8>, Vec<u8>) {
 }
 
 #[test]
+fn compiled_wasi_wc_matches_native_wc_on_virtual_streams_and_files() {
+    let guest = include_bytes!("../guest/wc/wc.wasm");
+    let cases = [
+        "printf 'one two\\n' | COMMAND",
+        "printf 'one two\\n' > /work/input; COMMAND -lc /work/input",
+        "printf 'é one\\n' > /work/a; printf 'two\\n' > /work/b; COMMAND -m /work/a /work/b",
+    ];
+    for case in cases {
+        let mut environment = Environment::new();
+        environment
+            .vfs
+            .write("/", "/guest-wc", guest, 0o755)
+            .unwrap();
+        let native = run(&mut environment, &case.replace("COMMAND", "wc"));
+        let guest = run(&mut environment, &case.replace("COMMAND", "/guest-wc"));
+        assert_eq!(guest, native, "{case}");
+    }
+}
+
+#[test]
+fn compiled_wasi_wc_rejects_invalid_option_without_host_execution() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write(
+            "/",
+            "/guest-wc",
+            include_bytes!("../guest/wc/wc.wasm"),
+            0o755,
+        )
+        .unwrap();
+    let (status, stdout, stderr) = run(&mut environment, "/guest-wc -Z");
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty());
+    assert!(String::from_utf8_lossy(&stderr).contains("unimplemented option"));
+}
+
+#[test]
+fn compiled_wasi_wc_reports_missing_virtual_file() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write(
+            "/",
+            "/guest-wc",
+            include_bytes!("../guest/wc/wc.wasm"),
+            0o755,
+        )
+        .unwrap();
+    let (status, stdout, stderr) = run(&mut environment, "/guest-wc /missing");
+    assert_eq!(status, 1);
+    assert!(stdout.is_empty());
+    assert!(String::from_utf8_lossy(&stderr).contains("/missing"));
+}
+
+#[test]
+fn compiled_wasi_wc_obeys_cpu_limit() {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 100_000,
+        ..Limits::default()
+    });
+    environment
+        .vfs
+        .write(
+            "/",
+            "/guest-wc",
+            include_bytes!("../guest/wc/wc.wasm"),
+            0o755,
+        )
+        .unwrap();
+    let (status, stdout, _) = run(&mut environment, "/guest-wc");
+    assert_eq!(status, 137);
+    assert!(stdout.is_empty());
+}
+
+#[test]
 fn wasi_stdout_and_exit_code_use_virtual_command_streams() {
     let mut environment = Environment::new();
     install(
@@ -94,6 +170,27 @@ fn wasi_preopen_writes_only_to_virtual_filesystem() {
         environment.vfs.read("/", "/work/result.txt").unwrap(),
         b"artifact"
     );
+}
+
+#[test]
+fn wasi_rejects_unsupported_open_flags_explicitly() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"
+        (module
+          (import "wasi_snapshot_preview1" "path_open"
+            (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 64) "file")
+          (func (export "_start")
+            (call $exit
+              (call $open (i32.const 3) (i32.const 0) (i32.const 64) (i32.const 4)
+                (i32.const 0) (i64.const 2) (i64.const 0) (i32.const 4) (i32.const 0)))))
+    "#,
+    );
+    assert_eq!(run(&mut environment, "/app").0, 28);
 }
 
 #[test]
@@ -201,13 +298,16 @@ fn wasi_clock_uses_virtual_time() {
 #[test]
 fn invalid_iovec_pointer_returns_fault_without_host_panic() {
     let mut environment = Environment::new();
-    install(&mut environment, r#"
+    install(
+        &mut environment,
+        r#"
         (module
           (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
           (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
           (memory (export "memory") 1)
           (func (export "_start")
             (call $exit (call $write (i32.const 1) (i32.const -2) (i32.const 1) (i32.const 8)))))
-    "#);
+    "#,
+    );
     assert_eq!(run(&mut environment, "/app"), (21, Vec::new(), Vec::new()));
 }

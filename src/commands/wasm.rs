@@ -4,13 +4,15 @@
 //! bounded regular-file access. Unknown imports fail instantiation rather than acquiring
 //! ambient host capabilities. Live pipe suspension remains outside this first slice.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use wasmi::{
     Caller, Config, EnforcedLimits, Engine, Error, Extern, Linker, Memory, Module, Store,
     StoreLimits, StoreLimitsBuilder,
 };
 
+use crate::descriptors::DescriptorError;
 use crate::interp::Interp;
+use crate::syscalls::{self, OpenFile, SyscallError};
 use crate::vfs::{resolve_against, NodeKind, VfsError};
 
 use super::{util::ewln, CommandPoll};
@@ -28,14 +30,6 @@ const ERRNO_NOENT: i32 = 44;
 const ERRNO_NOTDIR: i32 = 54;
 const ERRNO_PERM: i32 = 63;
 
-struct FileHandle {
-    path: String,
-    cursor: usize,
-    readable: bool,
-    writable: bool,
-    append: bool,
-}
-
 struct Host<'a> {
     interp: &'a mut Interp,
     cwd: String,
@@ -45,8 +39,8 @@ struct Host<'a> {
     stdin_offset: usize,
     stdout: &'a mut Vec<u8>,
     stderr: &'a mut Vec<u8>,
-    files: BTreeMap<u32, FileHandle>,
-    next_fd: u32,
+    open_files: BTreeSet<i32>,
+    append_files: BTreeSet<i32>,
     random_state: u64,
     limits: StoreLimits,
 }
@@ -60,6 +54,29 @@ fn vfs_errno(error: &VfsError) -> i32 {
         VfsError::ReadOnly(_) => ERRNO_PERM,
         _ => ERRNO_INVAL,
     }
+}
+
+fn syscall_errno(error: &SyscallError) -> i32 {
+    match error {
+        SyscallError::File(error) => vfs_errno(error),
+        SyscallError::Descriptor(DescriptorError::InvalidFd | DescriptorError::WrongAccess) => {
+            ERRNO_BADF
+        }
+        SyscallError::Descriptor(_) => ERRNO_INVAL,
+        SyscallError::InvalidArgument => ERRNO_INVAL,
+        SyscallError::IsDirectory => ERRNO_ISDIR,
+        SyscallError::Permission => ERRNO_PERM,
+    }
+}
+
+fn guest_file(
+    caller: &Caller<'_, Host<'_>>,
+    fd: i32,
+) -> Result<crate::descriptors::FileState, i32> {
+    if !caller.data().open_files.contains(&fd) {
+        return Err(ERRNO_BADF);
+    }
+    syscalls::file_state(caller.data().interp, fd).map_err(|error| syscall_errno(&error))
 }
 
 fn memory(caller: &Caller<'_, Host<'_>>) -> Option<Memory> {
@@ -166,6 +183,12 @@ fn path_open(mut caller: Caller<'_, Host<'_>>, request: PathOpen) -> i32 {
     if request.directory != 3 {
         return ERRNO_BADF;
     }
+    if request.oflags & !0b1111 != 0 || request.fdflags & !1 != 0 {
+        return ERRNO_INVAL;
+    }
+    if request.oflags & 2 != 0 {
+        return ERRNO_NOTDIR;
+    }
     if request.path_length as usize > 4096 {
         return ERRNO_INVAL;
     }
@@ -185,65 +208,30 @@ fn path_open(mut caller: Caller<'_, Host<'_>>, request: PathOpen) -> i32 {
     if path.contains('\0') || path.is_empty() {
         return ERRNO_INVAL;
     }
-    let absolute = resolve_against(&caller.data().cwd, path);
     let readable = request.rights_base & 2 != 0;
     let writable = request.rights_base & 64 != 0;
-    if !readable && !writable {
-        return ERRNO_INVAL;
-    }
-    let existing = caller.data().interp.vfs.metadata("/", &absolute, true);
-    match existing {
-        Ok(node) => {
-            if matches!(node.kind, NodeKind::Dir) {
-                return ERRNO_ISDIR;
-            }
-            if request.oflags & 4 != 0 {
-                return ERRNO_EXIST;
-            }
-            if request.oflags & 8 != 0 {
-                if !writable {
-                    return ERRNO_PERM;
-                }
-                caller.data_mut().interp.sync_vfs_time();
-                if let Err(error) = caller
-                    .data_mut()
-                    .interp
-                    .vfs
-                    .write("/", &absolute, &[], 0o666)
-                {
-                    return vfs_errno(&error);
-                }
-            }
-        }
-        Err(VfsError::NotFound(_)) if request.oflags & 1 != 0 && writable => {
-            caller.data_mut().interp.sync_vfs_time();
-            if let Err(error) = caller
-                .data_mut()
-                .interp
-                .vfs
-                .write("/", &absolute, &[], 0o666)
-            {
-                return vfs_errno(&error);
-            }
-        }
-        Err(error) => return vfs_errno(&error),
-    }
-    let fd = caller.data().next_fd;
-    if fd == u32::MAX || !write_u32(&mut caller, request.result, fd) {
+    let cwd = caller.data().cwd.clone();
+    let options = OpenFile {
+        readable,
+        writable,
+        create: request.oflags & 1 != 0,
+        exclusive: request.oflags & 4 != 0,
+        truncate: request.oflags & 8 != 0,
+        append: request.fdflags & 1 != 0,
+    };
+    let fd = match syscalls::open_file(caller.data_mut().interp, &cwd, path, options) {
+        Ok(fd) => fd,
+        Err(error) => return syscall_errno(&error),
+    };
+    if !write_u32(&mut caller, request.result, fd as u32) {
+        let _ = syscalls::close(caller.data_mut().interp, fd);
         return ERRNO_FAULT;
     }
     let host = caller.data_mut();
-    host.next_fd += 1;
-    host.files.insert(
-        fd,
-        FileHandle {
-            path: absolute,
-            cursor: 0,
-            readable,
-            writable,
-            append: request.fdflags & 1 != 0,
-        },
-    );
+    host.open_files.insert(fd);
+    if options.append {
+        host.append_files.insert(fd);
+    }
     ERRNO_SUCCESS
 }
 
@@ -300,12 +288,12 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host<'_>>, fd: u32, pointer: u32) -> i32
             value[0] = 3;
             u64::MAX
         }
-        _ => match caller.data().files.get(&fd) {
-            Some(file) => {
+        _ => match guest_file(&caller, fd as i32) {
+            Ok(file) => {
                 value[0] = 4;
                 (if file.readable { 2 } else { 0 }) | (if file.writable { 64 } else { 0 })
             }
-            None => return ERRNO_BADF,
+            Err(error) => return error,
         },
     };
     value[8..16].copy_from_slice(&rights.to_le_bytes());
@@ -321,47 +309,37 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host<'_>>, fd: u32, pointer: u32) -> i32
 }
 
 fn fd_close(mut caller: Caller<'_, Host<'_>>, fd: u32) -> i32 {
-    if caller.data_mut().files.remove(&fd).is_some() {
-        ERRNO_SUCCESS
-    } else {
-        ERRNO_BADF
+    let fd = fd as i32;
+    if !caller.data_mut().open_files.remove(&fd) {
+        return ERRNO_BADF;
+    }
+    caller.data_mut().append_files.remove(&fd);
+    match syscalls::close(caller.data_mut().interp, fd) {
+        Ok(()) => ERRNO_SUCCESS,
+        Err(error) => syscall_errno(&error),
     }
 }
 
 fn fd_seek(mut caller: Caller<'_, Host<'_>>, fd: u32, delta: i64, whence: u32, result: u32) -> i32 {
-    let Some(file) = caller.data().files.get(&fd) else {
-        return ERRNO_BADF;
+    if let Err(error) = guest_file(&caller, fd as i32) {
+        return error;
+    }
+    let position = match syscalls::seek(caller.data_mut().interp, fd as i32, delta, whence) {
+        Ok(position) => position,
+        Err(error) => return syscall_errno(&error),
     };
-    let base = match whence {
-        0 => 0_i128,
-        1 => file.cursor as i128,
-        2 => match caller.data().interp.vfs.file_len("/", &file.path) {
-            Ok(size) => size as i128,
-            Err(error) => return vfs_errno(&error),
-        },
-        _ => return ERRNO_INVAL,
-    };
-    let position = base + i128::from(delta);
-    let Ok(position) = usize::try_from(position) else {
-        return ERRNO_INVAL;
-    };
-    if !write_u64(&mut caller, result, position as u64) {
+    if !write_u64(&mut caller, result, position) {
         return ERRNO_FAULT;
     }
-    caller
-        .data_mut()
-        .files
-        .get_mut(&fd)
-        .expect("validated fd")
-        .cursor = position;
     ERRNO_SUCCESS
 }
 
 fn fd_tell(mut caller: Caller<'_, Host<'_>>, fd: u32, result: u32) -> i32 {
-    let Some(file) = caller.data().files.get(&fd) else {
-        return ERRNO_BADF;
+    let file = match guest_file(&caller, fd as i32) {
+        Ok(file) => file,
+        Err(error) => return error,
     };
-    let position = file.cursor as u64;
+    let position = file.cursor;
     if write_u64(&mut caller, result, position) {
         ERRNO_SUCCESS
     } else {
@@ -392,9 +370,9 @@ fn filestat(node: &crate::vfs::Node) -> [u8; 64] {
 fn fd_filestat_get(mut caller: Caller<'_, Host<'_>>, fd: u32, result: u32) -> i32 {
     let path = match fd {
         3 => caller.data().cwd.clone(),
-        _ => match caller.data().files.get(&fd) {
-            Some(file) => file.path.clone(),
-            None => return ERRNO_BADF,
+        _ => match guest_file(&caller, fd as i32) {
+            Ok(file) => file.path,
+            Err(error) => return error,
         },
     };
     let node = match caller.data().interp.vfs.metadata("/", &path, true) {
@@ -486,15 +464,12 @@ fn random_get(mut caller: Caller<'_, Host<'_>>, pointer: u32, length: u32) -> i3
 }
 
 fn fd_write(mut caller: Caller<'_, Host<'_>>, fd: i32, iovs: u32, count: u32, written: u32) -> i32 {
-    if fd != 1
-        && fd != 2
-        && !caller
-            .data()
-            .files
-            .get(&(fd as u32))
-            .is_some_and(|file| file.writable)
-    {
-        return ERRNO_BADF;
+    if fd != 1 && fd != 2 {
+        match guest_file(&caller, fd) {
+            Ok(file) if file.writable => {}
+            Ok(_) => return ERRNO_BADF,
+            Err(error) => return error,
+        }
     }
     if count > 1024 {
         return ERRNO_INVAL;
@@ -511,7 +486,8 @@ fn fd_write(mut caller: Caller<'_, Host<'_>>, fd: i32, iovs: u32, count: u32, wr
         let Some(length_address) = base.checked_add(4) else {
             return ERRNO_FAULT;
         };
-        let (Some(pointer), Some(length)) = (read_u32(&caller, base), read_u32(&caller, length_address))
+        let (Some(pointer), Some(length)) =
+            (read_u32(&caller, base), read_u32(&caller, length_address))
         else {
             return ERRNO_FAULT;
         };
@@ -555,48 +531,30 @@ fn fd_write(mut caller: Caller<'_, Host<'_>>, fd: i32, iovs: u32, count: u32, wr
             destination.extend_from_slice(&chunk);
         }
     } else {
-        let (path, mut cursor, append) = {
-            let file = caller.data().files.get(&(fd as u32)).expect("validated fd");
-            (file.path.clone(), file.cursor, file.append)
-        };
-        if append {
-            cursor = match caller.data().interp.vfs.file_len("/", &path) {
-                Ok(size) => size,
-                Err(error) => return vfs_errno(&error),
-            };
+        if caller.data().append_files.contains(&fd) {
+            if let Err(error) = syscalls::seek(caller.data_mut().interp, fd, 0, 2) {
+                return syscall_errno(&error);
+            }
         }
         let mut bytes = Vec::with_capacity(total);
         for chunk in chunks {
             bytes.extend_from_slice(&chunk);
         }
-        caller.data_mut().interp.sync_vfs_time();
-        if let Err(error) = caller
-            .data_mut()
-            .interp
-            .vfs
-            .write_at("/", &path, cursor, &bytes)
-        {
-            return vfs_errno(&error);
+        match caller.data_mut().interp.write_fd(fd, &bytes) {
+            Ok(crate::descriptors::IoPoll::Ready(_)) => {}
+            Ok(crate::descriptors::IoPoll::Blocked(_)) | Err(_) => return ERRNO_INVAL,
         }
-        caller
-            .data_mut()
-            .files
-            .get_mut(&(fd as u32))
-            .expect("validated fd")
-            .cursor = cursor.saturating_add(total);
     }
     ERRNO_SUCCESS
 }
 
 fn fd_read(mut caller: Caller<'_, Host<'_>>, fd: i32, iovs: u32, count: u32, read: u32) -> i32 {
-    if fd != 0
-        && !caller
-            .data()
-            .files
-            .get(&(fd as u32))
-            .is_some_and(|file| file.readable)
-    {
-        return ERRNO_BADF;
+    if fd != 0 {
+        match guest_file(&caller, fd) {
+            Ok(file) if file.readable => {}
+            Ok(_) => return ERRNO_BADF,
+            Err(error) => return error,
+        }
     }
     if count > 1024 {
         return ERRNO_INVAL;
@@ -604,22 +562,8 @@ fn fd_read(mut caller: Caller<'_, Host<'_>>, fd: i32, iovs: u32, count: u32, rea
     let Some(memory) = memory(&caller) else {
         return ERRNO_FAULT;
     };
-    let (input, initial_offset) = if fd == 0 {
-        (caller.data().stdin.to_vec(), caller.data().stdin_offset)
-    } else {
-        let file = caller.data().files.get(&(fd as u32)).expect("validated fd");
-        let bytes = match caller
-            .data()
-            .interp
-            .vfs
-            .read_limited("/", &file.path, MAX_WASM_MEMORY)
-        {
-            Ok(bytes) => bytes,
-            Err(error) => return vfs_errno(&error),
-        };
-        (bytes, file.cursor)
-    };
-    let mut copied = 0usize;
+    let mut vectors = Vec::new();
+    let mut total = 0usize;
     for index in 0..count {
         let Some(base) = iovs.checked_add(index.saturating_mul(8)) else {
             return ERRNO_FAULT;
@@ -627,23 +571,44 @@ fn fd_read(mut caller: Caller<'_, Host<'_>>, fd: i32, iovs: u32, count: u32, rea
         let Some(length_address) = base.checked_add(4) else {
             return ERRNO_FAULT;
         };
-        let (Some(pointer), Some(length)) = (read_u32(&caller, base), read_u32(&caller, length_address))
+        let (Some(pointer), Some(length)) =
+            (read_u32(&caller, base), read_u32(&caller, length_address))
         else {
             return ERRNO_FAULT;
         };
-        let start = initial_offset.saturating_add(copied);
-        let take = (length as usize).min(input.len().saturating_sub(start));
-        if copied.saturating_add(take) > MAX_IO_BYTES {
+        let Some(end) = (pointer as usize).checked_add(length as usize) else {
+            return ERRNO_FAULT;
+        };
+        if end > memory.data(&caller).len() {
+            return ERRNO_FAULT;
+        }
+        total = total.saturating_add(length as usize);
+        if total > MAX_IO_BYTES {
             return ERRNO_INVAL;
         }
+        vectors.push((pointer, length as usize));
+    }
+    let input = if fd == 0 {
+        let offset = caller.data().stdin_offset;
+        let end = offset.saturating_add(total).min(caller.data().stdin.len());
+        caller.data().stdin[offset..end].to_vec()
+    } else {
+        match caller.data_mut().interp.read_fd(fd, total) {
+            Ok(crate::descriptors::IoPoll::Ready(bytes)) => bytes,
+            Ok(crate::descriptors::IoPoll::Blocked(_)) | Err(_) => return ERRNO_INVAL,
+        }
+    };
+    let mut copied = 0usize;
+    for (pointer, length) in vectors {
+        let take = length.min(input.len().saturating_sub(copied));
         if memory
-            .write(&mut caller, pointer as usize, &input[start..start + take])
+            .write(&mut caller, pointer as usize, &input[copied..copied + take])
             .is_err()
         {
             return ERRNO_FAULT;
         }
         copied += take;
-        if take < length as usize {
+        if take < length {
             break;
         }
     }
@@ -655,13 +620,6 @@ fn fd_read(mut caller: Caller<'_, Host<'_>>, fd: i32, iovs: u32, count: u32, rea
     }
     if fd == 0 {
         caller.data_mut().stdin_offset += copied;
-    } else {
-        caller
-            .data_mut()
-            .files
-            .get_mut(&(fd as u32))
-            .expect("validated fd")
-            .cursor += copied;
     }
     ERRNO_SUCCESS
 }
@@ -819,7 +777,7 @@ pub(super) fn run(
             "wasi_snapshot_preview1",
             "fd_sync",
             |caller: Caller<'_, Host<'_>>, fd: u32| {
-                if fd < 4 || caller.data().files.contains_key(&fd) {
+                if fd < 4 || caller.data().open_files.contains(&(fd as i32)) {
                     ERRNO_SUCCESS
                 } else {
                     ERRNO_BADF
@@ -832,7 +790,7 @@ pub(super) fn run(
             "wasi_snapshot_preview1",
             "fd_datasync",
             |caller: Caller<'_, Host<'_>>, fd: u32| {
-                if fd < 4 || caller.data().files.contains_key(&fd) {
+                if fd < 4 || caller.data().open_files.contains(&(fd as i32)) {
                     ERRNO_SUCCESS
                 } else {
                     ERRNO_BADF
@@ -904,8 +862,8 @@ pub(super) fn run(
         stdin_offset: 0,
         stdout: out,
         stderr: err,
-        files: BTreeMap::new(),
-        next_fd: 4,
+        open_files: BTreeSet::new(),
+        append_files: BTreeSet::new(),
         random_state: 0x5eed_5eed_5eed_5eed,
         limits: StoreLimitsBuilder::new()
             .memory_size(memory_limit)
@@ -939,6 +897,10 @@ pub(super) fn run(
         });
     let consumed = fuel.saturating_sub(store.get_fuel().unwrap_or(0));
     let _ = store.data_mut().interp.resources.charge_cpu(consumed);
+    let open_files = std::mem::take(&mut store.data_mut().open_files);
+    for fd in open_files {
+        let _ = syscalls::close(store.data_mut().interp, fd);
+    }
     store
         .data_mut()
         .interp

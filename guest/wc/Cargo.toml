@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "shellsim-wc-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "wc"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

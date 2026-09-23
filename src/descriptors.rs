@@ -670,6 +670,23 @@ impl DescriptorArena {
         Ok(())
     }
 
+    /// Set the shared cursor after a checked seek on a regular file.
+    pub(crate) fn seek_file(
+        &mut self,
+        id: DescriptionId,
+        position: u64,
+    ) -> Result<(), DescriptorError> {
+        let entry = self
+            .descriptions
+            .get_mut(&id)
+            .ok_or(DescriptorError::InvalidFd)?;
+        let OpenDescription::File { cursor, .. } = &mut entry.description else {
+            return Err(DescriptorError::WrongAccess);
+        };
+        *cursor = position;
+        Ok(())
+    }
+
     /// Return the pipe and endpoint direction for scheduler readiness notifications.
     pub(crate) fn pipe_endpoint(
         &self,

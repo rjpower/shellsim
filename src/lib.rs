@@ -34,6 +34,7 @@ pub mod sandbox;
 pub mod scenario;
 pub mod scheduler;
 pub mod shell;
+mod syscalls;
 pub mod telemetry;
 pub mod vfs;
 

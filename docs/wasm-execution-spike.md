@@ -4,11 +4,14 @@
 
 Shellsim now recognizes executable Wasm bytes in its VFS and runs bounded modules with Wasmi 2.0.
 A custom WASI Preview 1 adapter uses shellsim's buffered streams, virtual clock, exported process
-environment, deterministic random source, and VFS. It rejects unknown imports and never grants
+environment, deterministic random source, and process-owned VFS descriptors. A separately
+compiled Rust `wasm32-wasip1` `wc` fixture reads piped input and virtual files, and its selected
+outputs match the native `wc`. It rejects unknown imports and never grants
 the guest host filesystem, process, network, environment, or clock access. WAT integration cases
 cover stdout, stdin, exit status, arguments, environment, time, regular-file creation, invalid
 guest pointers, memory limits, fuel exhaustion, and unknown imports. This is a useful Stage 0
-result, but not a completed Stage 1 or Stage 2 implementation.
+result, but not a completed Stage 1 or Stage 2 implementation. Stdio is still buffered at command
+dispatch; a Wasm guest cannot yet suspend on a live pipe or be cloned as a live process snapshot.
 
 A concrete compiler trial used WCPL revision `458a542ca81fa7a8fd8c8eed38a32dce8ed45135` in a
 temporary checkout. A trusted native bootstrap built a 307 KiB `wcpl.wasm`. Loaded into shellsim's
@@ -26,7 +29,7 @@ regression test: fuel alone is insufficient if the interpreter consumes host sta
 
 | Gate | Current state | Required next work |
 |---|---|---|
-| 0. Validate and run bounded Wasm with virtual stdio and VFS | Demonstrated with nine executable-module tests and a Wasm-hosted WCPL compiling/running a minimal C program. | Try a real `wasi-sdk`-built file-copy program when a pinned toolchain fixture is available. |
+| 0. Validate and run bounded Wasm with virtual stdio and VFS | Demonstrated with WAT ABI tests, a standalone Rust WASI `wc`, and a Wasm-hosted WCPL compiling/running a minimal C program. Regular-file handles now use process-owned descriptors. | Extend the compiled guest fixture to exercise file writes, close/reopen, and larger inputs. |
 | 1. Model a full logical Wasm process | **Open.** Buffered stdin works; live pipe reads cannot suspend and resume a Wasm instruction. | Use Wasmi's resumable host-trap API at shellsim's scheduler boundary. Decide how live continuations interact with deterministic session forks. Add pipe, cancellation, and timeout tests. |
 | 2. Build surface | **Open.** `ar`, `ranlib`, `ld`, and a C compiler remain unsupported. | Select the compiler and object ABI first. Then implement bounded archives with a real symbol index, and drive `configure`/`make` with a pinned virtual HTTP fixture. |
 
