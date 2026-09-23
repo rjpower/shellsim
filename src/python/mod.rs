@@ -1057,6 +1057,8 @@ pub fn run_unittest(interp: &mut Interp, args: &[String], out: Out, err: Out) ->
             item.push_str("    finally:\n");
             if class.teardown {
                 item.push_str("        __shellsim_unittest_case.tearDown()\n");
+            } else {
+                item.push_str("        pass\n");
             }
             item.push_str(&format!("    print({label:?}, 'ok')\n"));
             item.push_str("except Exception as error:\n");

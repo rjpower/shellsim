@@ -1576,7 +1576,12 @@ impl Parser {
                 }
             }
             self.expect_op(")");
-            let body = self.parse_program();
+            self.skip_newlines();
+            let body = if matches!(self.peek(), Tok::Op(operator) if operator == ";;") {
+                Node::Empty
+            } else {
+                self.parse_program()
+            };
             arms.push((pats, body));
             self.skip_newlines();
             if matches!(self.peek(), Tok::Op(o) if o == ";;") {
@@ -1895,5 +1900,6 @@ mod tests {
     #[test]
     fn case_arm_terminators_stop_the_arm_body() {
         assert!(parse("case value in v*) printf yes;; *) printf no;; esac").is_ok());
+        assert!(parse("case value in v*) ;; *)\n;; esac").is_ok());
     }
 }

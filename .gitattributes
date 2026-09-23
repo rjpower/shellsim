@@ -1,3 +1,6 @@
 # Imported fixtures remain byte-for-byte identical to their pinned upstream source.
 tests/corpus/micropython-basics/cases/** -whitespace
 tests/corpus/oils-spec/cases/** -whitespace
+tests/corpus/whole-programs/exercism/** -whitespace
+tests/corpus/whole-programs/modernish/probes/** -whitespace
+tests/corpus/whole-programs/zlib/{configure,Makefile.in,zconf.h.in,zlib.h} -whitespace

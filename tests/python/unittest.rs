@@ -50,6 +50,18 @@ fn exposes_testcase_name_and_rejects_unsupported_discovery() {
 }
 
 #[test]
+fn runs_a_test_class_without_teardown() {
+    let source = "import unittest\nclass Sample(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(2 + 2, 4)\n";
+    let (status, stdout, stderr) = run_unittest(source, "python3.14 -m unittest /test_sample.py");
+
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        stdout,
+        b"/test_sample.py::Sample.test_ok ok\nRan 1 tests\nOK\n"
+    );
+}
+
+#[test]
 fn caps_generated_unittest_wrapper_before_execution() {
     let mut environment = Environment::new();
     let mut source = String::from("import unittest\nclass Many(unittest.TestCase):\n");

@@ -1526,7 +1526,12 @@ fn cmd_source(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
         return 2;
     };
     match interp.fs_read(&interp.cwd, path) {
-        Ok(src) => interp.run_script_into(&String::from_utf8_lossy(&src), io.out, io.err),
+        Ok(src) => {
+            interp.source_depth = interp.source_depth.saturating_add(1);
+            let status = interp.run_script_into(&String::from_utf8_lossy(&src), io.out, io.err);
+            interp.source_depth = interp.source_depth.saturating_sub(1);
+            interp.returning.take().unwrap_or(status)
+        }
         Err(_) => {
             ewln(
                 io.err,
@@ -1553,7 +1558,7 @@ fn start_source(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
         }
     };
     match crate::commands::parse_shell_source(interp, &source, io.err) {
-        Ok(ast) => CommandPoll::Inline(ast),
+        Ok(ast) => CommandPoll::InlineSource(ast),
         Err(status) => CommandPoll::Ready(status),
     }
 }
@@ -1592,7 +1597,7 @@ fn cmd_exit(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
 }
 
 fn cmd_return(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    if !interp.in_function_scope() {
+    if !interp.in_function_scope() && interp.source_depth == 0 {
         ewln(io.err, "return: can only be used in a function");
         return 1;
     }

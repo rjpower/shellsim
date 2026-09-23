@@ -1,0 +1,1323 @@
+{
+  "version": 1,
+  "profile": "stock_agent_v1",
+  "cases": [
+    {
+      "id": "modernish-addassign",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/ADDASSIGN.t",
+        "sha256": "78877cbdc5c7fc01ad1c63a6d638378d7f54e9eeefc8b11375bb3b5f46725f7f",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/ADDASSIGN.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/ADDASSIGN.t",
+          "destination": "/work/probes/ADDASSIGN.t",
+          "sha256": "78877cbdc5c7fc01ad1c63a6d638378d7f54e9eeefc8b11375bb3b5f46725f7f",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "modernish-arithcmd",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/ARITHCMD.t",
+        "sha256": "874a8e7b7e4f023eeb641d6ade9838b6ad54f39058f8c85b5418ec85464c2e6c",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/ARITHCMD.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/ARITHCMD.t",
+          "destination": "/work/probes/ARITHCMD.t",
+          "sha256": "874a8e7b7e4f023eeb641d6ade9838b6ad54f39058f8c85b5418ec85464c2e6c",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "modernish-bug_bracquot",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/BUG_BRACQUOT.t",
+        "sha256": "301551df98c7863d19e6a616207ff54659bb6f727bd402f02b7cfd1de7940f56",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/BUG_BRACQUOT.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/BUG_BRACQUOT.t",
+          "destination": "/work/probes/BUG_BRACQUOT.t",
+          "sha256": "301551df98c7863d19e6a616207ff54659bb6f727bd402f02b7cfd1de7940f56",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "modernish-bug_caseempt",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/BUG_CASEEMPT.t",
+        "sha256": "845fcf925c3ccc004d7cf3aa7e661971a7bae15c2e79bb9d061bdb7cee8351b7",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/BUG_CASEEMPT.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/BUG_CASEEMPT.t",
+          "destination": "/work/probes/BUG_CASEEMPT.t",
+          "sha256": "845fcf925c3ccc004d7cf3aa7e661971a7bae15c2e79bb9d061bdb7cee8351b7",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "modernish-bug_csubrmlf",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/BUG_CSUBRMLF.t",
+        "sha256": "1f03a89582d682a387cded215e078d11569b2fe583f949e636ab2f699207b1ed",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/BUG_CSUBRMLF.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/BUG_CSUBRMLF.t",
+          "destination": "/work/probes/BUG_CSUBRMLF.t",
+          "sha256": "1f03a89582d682a387cded215e078d11569b2fe583f949e636ab2f699207b1ed",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "modernish-bug_dqglob",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/BUG_DQGLOB.t",
+        "sha256": "e41f6f22a7780c82e0813b80b129d297d725e22488844479ba502b8c618ff01c",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/BUG_DQGLOB.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/BUG_DQGLOB.t",
+          "destination": "/work/probes/BUG_DQGLOB.t",
+          "sha256": "e41f6f22a7780c82e0813b80b129d297d725e22488844479ba502b8c618ff01c",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "modernish-bug_hdocbksl",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/BUG_HDOCBKSL.t",
+        "sha256": "2e120af79f0bff736dde299f1fb96914739f473f214639cd4a4db41edfca0942",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/BUG_HDOCBKSL.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/BUG_HDOCBKSL.t",
+          "destination": "/work/probes/BUG_HDOCBKSL.t",
+          "sha256": "2e120af79f0bff736dde299f1fb96914739f473f214639cd4a4db41edfca0942",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "modernish-bug_loopret1",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/BUG_LOOPRET1.t",
+        "sha256": "8326ffb06fb83e7364982f6a1dc3183a894c41a03c9b93c7fc3d875775ef4f75",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/BUG_LOOPRET1.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/BUG_LOOPRET1.t",
+          "destination": "/work/probes/BUG_LOOPRET1.t",
+          "sha256": "8326ffb06fb83e7364982f6a1dc3183a894c41a03c9b93c7fc3d875775ef4f75",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "modernish-bug_psubnewln",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/BUG_PSUBNEWLN.t",
+        "sha256": "acb768b5e765af6f017d4654ad88214f15dc4a4cf3c1a7806299ef65b3ac2a93",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/BUG_PSUBNEWLN.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/BUG_PSUBNEWLN.t",
+          "destination": "/work/probes/BUG_PSUBNEWLN.t",
+          "sha256": "acb768b5e765af6f017d4654ad88214f15dc4a4cf3c1a7806299ef65b3ac2a93",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "modernish-bug_trapexit",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/BUG_TRAPEXIT.t",
+        "sha256": "7b77f6d8cfb6b7b66451816f3c101b296bd33ac77e5cd91f9c940fe406935f9a",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/BUG_TRAPEXIT.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/BUG_TRAPEXIT.t",
+          "destination": "/work/probes/BUG_TRAPEXIT.t",
+          "sha256": "7b77f6d8cfb6b7b66451816f3c101b296bd33ac77e5cd91f9c940fe406935f9a",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MQo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "modernish-herestr",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/HERESTR.t",
+        "sha256": "454e6397b322915bdb367512fbc8b17bf2db944bdfec9273f7203bdd400cedfb",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/HERESTR.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/HERESTR.t",
+          "destination": "/work/probes/HERESTR.t",
+          "sha256": "454e6397b322915bdb367512fbc8b17bf2db944bdfec9273f7203bdd400cedfb",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "modernish-localvars",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "lib/modernish/cap/LOCALVARS.t",
+        "sha256": "798287b611743099a4c158a196eec2314a2854977c1a9437648690b422f954f3",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/probe-driver.sh",
+      "args": [
+        "/work/probes/LOCALVARS.t"
+      ],
+      "fixtures": [
+        {
+          "source": "modernish/probe-driver.sh",
+          "destination": "/work/probe-driver.sh",
+          "sha256": "3d43eb4cfe8e1090e38590bb469f6d93b628f846f492a43ebfec67ca61e0f9c2",
+          "mode": 493
+        },
+        {
+          "source": "modernish/probes/LOCALVARS.t",
+          "destination": "/work/probes/LOCALVARS.t",
+          "sha256": "798287b611743099a4c158a196eec2314a2854977c1a9437648690b422f954f3",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "MAo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-acronym",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/acronym",
+        "sha256": "a6716e8efdec6484658fa5c1abd729b3c6080b780dc62e0515c3b05f2d043b1f",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/acronym_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/acronym/acronym.py",
+          "destination": "/work/acronym.py",
+          "sha256": "71992b8294815270e503c81ed38a850145203225d0af005e3d4fd744a3dac91f",
+          "mode": 420
+        },
+        {
+          "source": "exercism/acronym/acronym_test.py",
+          "destination": "/work/acronym_test.py",
+          "sha256": "a6716e8efdec6484658fa5c1abd729b3c6080b780dc62e0515c3b05f2d043b1f",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvYWNyb255bV90ZXN0LnB5OjpBY3JvbnltVGVzdC50ZXN0X2Jhc2ljIG9rCi93b3JrL2Fjcm9ueW1fdGVzdC5weTo6QWNyb255bVRlc3QudGVzdF9sb3dlcmNhc2Vfd29yZHMgb2sKL3dvcmsvYWNyb255bV90ZXN0LnB5OjpBY3JvbnltVGVzdC50ZXN0X3B1bmN0dWF0aW9uIG9rCi93b3JrL2Fjcm9ueW1fdGVzdC5weTo6QWNyb255bVRlc3QudGVzdF9hbGxfY2Fwc193b3JkIG9rCi93b3JrL2Fjcm9ueW1fdGVzdC5weTo6QWNyb255bVRlc3QudGVzdF9wdW5jdHVhdGlvbl93aXRob3V0X3doaXRlc3BhY2Ugb2sKL3dvcmsvYWNyb255bV90ZXN0LnB5OjpBY3JvbnltVGVzdC50ZXN0X3ZlcnlfbG9uZ19hYmJyZXZpYXRpb24gb2sKL3dvcmsvYWNyb255bV90ZXN0LnB5OjpBY3JvbnltVGVzdC50ZXN0X2NvbnNlY3V0aXZlX2RlbGltaXRlcnMgb2sKL3dvcmsvYWNyb255bV90ZXN0LnB5OjpBY3JvbnltVGVzdC50ZXN0X2Fwb3N0cm9waGVzIG9rCi93b3JrL2Fjcm9ueW1fdGVzdC5weTo6QWNyb255bVRlc3QudGVzdF91bmRlcnNjb3JlX2VtcGhhc2lzIG9rClJhbiA5IHRlc3RzCk9LCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-binary-search-tree",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/binary-search-tree",
+        "sha256": "031fc58dcc791ea1a366877ad8182f978a80f6390478f1ecce7ae450258d4760",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/binary_search_tree_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/binary-search-tree/binary_search_tree.py",
+          "destination": "/work/binary_search_tree.py",
+          "sha256": "a7cc3f6e9f3df46d18272459324cf9e9595ecdc953e3499e855c0a2f2182155f",
+          "mode": 420
+        },
+        {
+          "source": "exercism/binary-search-tree/binary_search_tree_test.py",
+          "destination": "/work/binary_search_tree_test.py",
+          "sha256": "031fc58dcc791ea1a366877ad8182f978a80f6390478f1ecce7ae450258d4760",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvYmluYXJ5X3NlYXJjaF90cmVlX3Rlc3QucHk6OkJpbmFyeVNlYXJjaFRyZWVUZXN0LnRlc3RfZGF0YV9pc19yZXRhaW5lZCBvawovd29yay9iaW5hcnlfc2VhcmNoX3RyZWVfdGVzdC5weTo6QmluYXJ5U2VhcmNoVHJlZVRlc3QudGVzdF9zbWFsbGVyX251bWJlcl9hdF9sZWZ0X25vZGUgb2sKL3dvcmsvYmluYXJ5X3NlYXJjaF90cmVlX3Rlc3QucHk6OkJpbmFyeVNlYXJjaFRyZWVUZXN0LnRlc3Rfc2FtZV9udW1iZXJfYXRfbGVmdF9ub2RlIG9rCi93b3JrL2JpbmFyeV9zZWFyY2hfdHJlZV90ZXN0LnB5OjpCaW5hcnlTZWFyY2hUcmVlVGVzdC50ZXN0X2dyZWF0ZXJfbnVtYmVyX2F0X3JpZ2h0X25vZGUgb2sKL3dvcmsvYmluYXJ5X3NlYXJjaF90cmVlX3Rlc3QucHk6OkJpbmFyeVNlYXJjaFRyZWVUZXN0LnRlc3RfY2FuX2NyZWF0ZV9jb21wbGV4X3RyZWUgb2sKL3dvcmsvYmluYXJ5X3NlYXJjaF90cmVlX3Rlc3QucHk6OkJpbmFyeVNlYXJjaFRyZWVUZXN0LnRlc3RfY2FuX3NvcnRfc2luZ2xlX251bWJlciBvawovd29yay9iaW5hcnlfc2VhcmNoX3RyZWVfdGVzdC5weTo6QmluYXJ5U2VhcmNoVHJlZVRlc3QudGVzdF9jYW5fc29ydF9pZl9zZWNvbmRfbnVtYmVyX2lzX3NtYWxsZXJfdGhhbl9maXJzdCBvawovd29yay9iaW5hcnlfc2VhcmNoX3RyZWVfdGVzdC5weTo6QmluYXJ5U2VhcmNoVHJlZVRlc3QudGVzdF9jYW5fc29ydF9pZl9zZWNvbmRfbnVtYmVyX2lzX3NhbWVfYXNfZmlyc3Qgb2sKL3dvcmsvYmluYXJ5X3NlYXJjaF90cmVlX3Rlc3QucHk6OkJpbmFyeVNlYXJjaFRyZWVUZXN0LnRlc3RfY2FuX3NvcnRfaWZfc2Vjb25kX251bWJlcl9pc19ncmVhdGVyX3RoYW5fZmlyc3Qgb2sKL3dvcmsvYmluYXJ5X3NlYXJjaF90cmVlX3Rlc3QucHk6OkJpbmFyeVNlYXJjaFRyZWVUZXN0LnRlc3RfY2FuX3NvcnRfY29tcGxleF90cmVlIG9rClJhbiAxMCB0ZXN0cwpPSwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-bob",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/bob",
+        "sha256": "64e295eb4ef9d6862aab157dd22bc9f515c9b17e30c1d4dee248a3309ce74428",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/bob_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/bob/bob.py",
+          "destination": "/work/bob.py",
+          "sha256": "f9162a6932c526d8ce23a710ddd488fb3c8e02115ba3bd9702a8da316b19242b",
+          "mode": 420
+        },
+        {
+          "source": "exercism/bob/bob_test.py",
+          "destination": "/work/bob_test.py",
+          "sha256": "64e295eb4ef9d6862aab157dd22bc9f515c9b17e30c1d4dee248a3309ce74428",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvYm9iX3Rlc3QucHk6OkJvYlRlc3QudGVzdF9hc2tpbmdfYV9xdWVzdGlvbiBvawovd29yay9ib2JfdGVzdC5weTo6Qm9iVGVzdC50ZXN0X3Nob3V0aW5nIG9rCi93b3JrL2JvYl90ZXN0LnB5OjpCb2JUZXN0LnRlc3RfZm9yY2VmdWxfcXVlc3Rpb24gb2sKL3dvcmsvYm9iX3Rlc3QucHk6OkJvYlRlc3QudGVzdF9zaWxlbmNlIG9rCi93b3JrL2JvYl90ZXN0LnB5OjpCb2JUZXN0LnRlc3Rfc3RhdGluZ19zb21ldGhpbmcgb2sKL3dvcmsvYm9iX3Rlc3QucHk6OkJvYlRlc3QudGVzdF9hc2tpbmdfYV9udW1lcmljX3F1ZXN0aW9uIG9rCi93b3JrL2JvYl90ZXN0LnB5OjpCb2JUZXN0LnRlc3RfYXNraW5nX2dpYmJlcmlzaCBvawovd29yay9ib2JfdGVzdC5weTo6Qm9iVGVzdC50ZXN0X3F1ZXN0aW9uX3dpdGhfbm9fbGV0dGVycyBvawovd29yay9ib2JfdGVzdC5weTo6Qm9iVGVzdC50ZXN0X25vbl9sZXR0ZXJzX3dpdGhfcXVlc3Rpb24gb2sKL3dvcmsvYm9iX3Rlc3QucHk6OkJvYlRlc3QudGVzdF9wcmF0dGxpbmdfb24gb2sKL3dvcmsvYm9iX3Rlc3QucHk6OkJvYlRlc3QudGVzdF9lbmRpbmdfd2l0aF93aGl0ZXNwYWNlIG9rCi93b3JrL2JvYl90ZXN0LnB5OjpCb2JUZXN0LnRlc3RfbXVsdGlwbGVfbGluZV9xdWVzdGlvbiBvawovd29yay9ib2JfdGVzdC5weTo6Qm9iVGVzdC50ZXN0X3Nob3V0aW5nX2dpYmJlcmlzaCBvawovd29yay9ib2JfdGVzdC5weTo6Qm9iVGVzdC50ZXN0X3Nob3V0aW5nX2Ffc3RhdGVtZW50X2NvbnRhaW5pbmdfYV9xdWVzdGlvbl9tYXJrIG9rCi93b3JrL2JvYl90ZXN0LnB5OjpCb2JUZXN0LnRlc3Rfc2hvdXRpbmdfbnVtYmVycyBvawovd29yay9ib2JfdGVzdC5weTo6Qm9iVGVzdC50ZXN0X3Nob3V0aW5nX3dpdGhfc3BlY2lhbF9jaGFyYWN0ZXJzIG9rCi93b3JrL2JvYl90ZXN0LnB5OjpCb2JUZXN0LnRlc3Rfc2hvdXRpbmdfd2l0aF9ub19leGNsYW1hdGlvbl9tYXJrIG9rCi93b3JrL2JvYl90ZXN0LnB5OjpCb2JUZXN0LnRlc3RfcHJvbG9uZ2VkX3NpbGVuY2Ugb2sKL3dvcmsvYm9iX3Rlc3QucHk6OkJvYlRlc3QudGVzdF9hbHRlcm5hdGVfc2lsZW5jZSBvawovd29yay9ib2JfdGVzdC5weTo6Qm9iVGVzdC50ZXN0X290aGVyX3doaXRlc3BhY2Ugb2sKL3dvcmsvYm9iX3Rlc3QucHk6OkJvYlRlc3QudGVzdF90YWxraW5nX2ZvcmNlZnVsbHkgb2sKL3dvcmsvYm9iX3Rlc3QucHk6OkJvYlRlc3QudGVzdF91c2luZ19hY3Jvbnltc19pbl9yZWd1bGFyX3NwZWVjaCBvawovd29yay9ib2JfdGVzdC5weTo6Qm9iVGVzdC50ZXN0X25vX2xldHRlcnMgb2sKL3dvcmsvYm9iX3Rlc3QucHk6OkJvYlRlc3QudGVzdF9zdGF0ZW1lbnRfY29udGFpbmluZ19xdWVzdGlvbl9tYXJrIG9rCi93b3JrL2JvYl90ZXN0LnB5OjpCb2JUZXN0LnRlc3Rfc3RhcnRpbmdfd2l0aF93aGl0ZXNwYWNlIG9rCi93b3JrL2JvYl90ZXN0LnB5OjpCb2JUZXN0LnRlc3Rfbm9uX3F1ZXN0aW9uX2VuZGluZ193aXRoX3doaXRlc3BhY2Ugb2sKUmFuIDI2IHRlc3RzCk9LCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-book-store",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/book-store",
+        "sha256": "59204f1edbb004c2402cea2aa7d1389c5293766fae4ce5d79a83627970c7acf3",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/book_store_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/book-store/book_store.py",
+          "destination": "/work/book_store.py",
+          "sha256": "728655581209a08f392aa2d6a5060bca855f53ea3e96f66a86db738dbf23d751",
+          "mode": 420
+        },
+        {
+          "source": "exercism/book-store/book_store_test.py",
+          "destination": "/work/book_store_test.py",
+          "sha256": "59204f1edbb004c2402cea2aa7d1389c5293766fae4ce5d79a83627970c7acf3",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvYm9va19zdG9yZV90ZXN0LnB5OjpCb29rU3RvcmVUZXN0LnRlc3Rfb25seV9hX3NpbmdsZV9ib29rIG9rCi93b3JrL2Jvb2tfc3RvcmVfdGVzdC5weTo6Qm9va1N0b3JlVGVzdC50ZXN0X3R3b19vZl90aGVfc2FtZV9ib29rIG9rCi93b3JrL2Jvb2tfc3RvcmVfdGVzdC5weTo6Qm9va1N0b3JlVGVzdC50ZXN0X2VtcHR5X2Jhc2tldCBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF90d29fZGlmZmVyZW50X2Jvb2tzIG9rCi93b3JrL2Jvb2tfc3RvcmVfdGVzdC5weTo6Qm9va1N0b3JlVGVzdC50ZXN0X3RocmVlX2RpZmZlcmVudF9ib29rcyBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF9mb3VyX2RpZmZlcmVudF9ib29rcyBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF9maXZlX2RpZmZlcmVudF9ib29rcyBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF90d29fZ3JvdXBzX29mX2ZvdXJfaXNfY2hlYXBlcl90aGFuX2dyb3VwX29mX2ZpdmVfcGx1c19ncm91cF9vZl90aHJlZSBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF90d29fZ3JvdXBzX29mX2ZvdXJfaXNfY2hlYXBlcl90aGFuX2dyb3Vwc19vZl9maXZlX2FuZF90aHJlZSBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF9ncm91cF9vZl9mb3VyX3BsdXNfZ3JvdXBfb2ZfdHdvX2lzX2NoZWFwZXJfdGhhbl90d29fZ3JvdXBzX29mX3RocmVlIG9rCi93b3JrL2Jvb2tfc3RvcmVfdGVzdC5weTo6Qm9va1N0b3JlVGVzdC50ZXN0X3R3b19lYWNoX29mX2ZpcnN0X2ZvdXJfYm9va3NfYW5kX29uZV9jb3B5X2VhY2hfb2ZfcmVzdCBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF90d29fY29waWVzX29mX2VhY2hfYm9vayBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF90aHJlZV9jb3BpZXNfb2ZfZmlyc3RfYm9va19hbmRfdHdvX2VhY2hfb2ZfcmVtYWluaW5nIG9rCi93b3JrL2Jvb2tfc3RvcmVfdGVzdC5weTo6Qm9va1N0b3JlVGVzdC50ZXN0X3RocmVlX2VhY2hfb2ZfZmlyc3RfdHdvX2Jvb2tzX2FuZF90d29fZWFjaF9vZl9yZW1haW5pbmdfYm9va3Mgb2sKL3dvcmsvYm9va19zdG9yZV90ZXN0LnB5OjpCb29rU3RvcmVUZXN0LnRlc3RfZm91cl9ncm91cHNfb2ZfZm91cl9hcmVfY2hlYXBlcl90aGFuX3R3b19ncm91cHNfZWFjaF9vZl9maXZlX2FuZF90aHJlZSBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF9jaGVja190aGF0X2dyb3Vwc19vZl9mb3VyX2FyZV9jcmVhdGVkX3Byb3Blcmx5X2V2ZW5fd2hlbl90aGVyZV9hcmVfbW9yZV9ncm91cHNfb2ZfdGhyZWVfdGhhbl9ncm91cHNfb2ZfZml2ZSBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF9vbmVfZ3JvdXBfb2Zfb25lX2FuZF9mb3VyX2lzX2NoZWFwZXJfdGhhbl9vbmVfZ3JvdXBfb2ZfdHdvX2FuZF90aHJlZSBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF9vbmVfZ3JvdXBfb2Zfb25lX2FuZF90d29fcGx1c190aHJlZV9ncm91cHNfb2ZfZm91cl9pc19jaGVhcGVyX3RoYW5fb25lX2dyb3VwX29mX2VhY2hfc2l6ZSBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF90d29fZ3JvdXBzX29mX2ZvdXJfYW5kX2FfZ3JvdXBfb2ZfZml2ZSBvawovd29yay9ib29rX3N0b3JlX3Rlc3QucHk6OkJvb2tTdG9yZVRlc3QudGVzdF9zaHVmZmxlZF9ib29rX29yZGVyIG9rClJhbiAyMCB0ZXN0cwpPSwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-connect",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/connect",
+        "sha256": "901c80868737406b3aaf40b74a83aeb8f722e34ad0a22090931eccf8dcfcf548",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/connect_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/connect/connect.py",
+          "destination": "/work/connect.py",
+          "sha256": "8664d19c48528035ebd15fc7917d19c40f7c43ad9b95c5f488d2633e01520705",
+          "mode": 420
+        },
+        {
+          "source": "exercism/connect/connect_test.py",
+          "destination": "/work/connect_test.py",
+          "sha256": "901c80868737406b3aaf40b74a83aeb8f722e34ad0a22090931eccf8dcfcf548",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvY29ubmVjdF90ZXN0LnB5OjpDb25uZWN0VGVzdC50ZXN0X2FuX2VtcHR5X2JvYXJkX2hhc19ub193aW5uZXIgb2sKL3dvcmsvY29ubmVjdF90ZXN0LnB5OjpDb25uZWN0VGVzdC50ZXN0X3hfY2FuX3dpbl9vbl9hXzF4MV9ib2FyZCBvawovd29yay9jb25uZWN0X3Rlc3QucHk6OkNvbm5lY3RUZXN0LnRlc3Rfb19jYW5fd2luX29uX2FfMXgxX2JvYXJkIG9rCi93b3JrL2Nvbm5lY3RfdGVzdC5weTo6Q29ubmVjdFRlc3QudGVzdF9vbmx5X2VkZ2VzX2RvZXNfbm90X21ha2VfYV93aW5uZXIgb2sKL3dvcmsvY29ubmVjdF90ZXN0LnB5OjpDb25uZWN0VGVzdC50ZXN0X2lsbGVnYWxfZGlhZ29uYWxfZG9lc19ub3RfbWFrZV9hX3dpbm5lciBvawovd29yay9jb25uZWN0X3Rlc3QucHk6OkNvbm5lY3RUZXN0LnRlc3Rfbm9ib2R5X3dpbnNfY3Jvc3NpbmdfYWRqYWNlbnRfYW5nbGVzIG9rCi93b3JrL2Nvbm5lY3RfdGVzdC5weTo6Q29ubmVjdFRlc3QudGVzdF94X3dpbnNfY3Jvc3NpbmdfZnJvbV9sZWZ0X3RvX3JpZ2h0IG9rCi93b3JrL2Nvbm5lY3RfdGVzdC5weTo6Q29ubmVjdFRlc3QudGVzdF94X3dpbnNfd2l0aF9sZWZ0X2hhbmRfZGVhZF9lbmRfZm9yayBvawovd29yay9jb25uZWN0X3Rlc3QucHk6OkNvbm5lY3RUZXN0LnRlc3RfeF93aW5zX3dpdGhfcmlnaHRfaGFuZF9kZWFkX2VuZF9mb3JrIG9rCi93b3JrL2Nvbm5lY3RfdGVzdC5weTo6Q29ubmVjdFRlc3QudGVzdF9vX3dpbnNfY3Jvc3NpbmdfZnJvbV90b3BfdG9fYm90dG9tIG9rCi93b3JrL2Nvbm5lY3RfdGVzdC5weTo6Q29ubmVjdFRlc3QudGVzdF94X3dpbnNfdXNpbmdfYV9jb252b2x1dGVkX3BhdGggb2sKL3dvcmsvY29ubmVjdF90ZXN0LnB5OjpDb25uZWN0VGVzdC50ZXN0X3hfd2luc191c2luZ19hX3NwaXJhbF9wYXRoIG9rClJhbiAxMiB0ZXN0cwpPSwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-diamond",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/diamond",
+        "sha256": "62740d7a08d4276dc3725c079270adc3e5337db992a6dec41c410fdb68cd35e0",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/diamond_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/diamond/diamond.py",
+          "destination": "/work/diamond.py",
+          "sha256": "ac5663df10f9a1db21e0fa5fd626bd3cbb620f1bc15a73869a62d009418395c7",
+          "mode": 420
+        },
+        {
+          "source": "exercism/diamond/diamond_test.py",
+          "destination": "/work/diamond_test.py",
+          "sha256": "62740d7a08d4276dc3725c079270adc3e5337db992a6dec41c410fdb68cd35e0",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvZGlhbW9uZF90ZXN0LnB5OjpEaWFtb25kVGVzdC50ZXN0X2RlZ2VuZXJhdGVfY2FzZV93aXRoX2Ffc2luZ2xlX2Ffcm93IG9rCi93b3JrL2RpYW1vbmRfdGVzdC5weTo6RGlhbW9uZFRlc3QudGVzdF9kZWdlbmVyYXRlX2Nhc2Vfd2l0aF9ub19yb3dfY29udGFpbmluZ18zX2Rpc3RpbmN0X2dyb3Vwc19vZl9zcGFjZXMgb2sKL3dvcmsvZGlhbW9uZF90ZXN0LnB5OjpEaWFtb25kVGVzdC50ZXN0X3NtYWxsZXN0X25vbl9kZWdlbmVyYXRlX2Nhc2Vfd2l0aF9vZGRfZGlhbW9uZF9zaWRlX2xlbmd0aCBvawovd29yay9kaWFtb25kX3Rlc3QucHk6OkRpYW1vbmRUZXN0LnRlc3Rfc21hbGxlc3Rfbm9uX2RlZ2VuZXJhdGVfY2FzZV93aXRoX2V2ZW5fZGlhbW9uZF9zaWRlX2xlbmd0aCBvawovd29yay9kaWFtb25kX3Rlc3QucHk6OkRpYW1vbmRUZXN0LnRlc3RfbGFyZ2VzdF9wb3NzaWJsZV9kaWFtb25kIG9rClJhbiA1IHRlc3RzCk9LCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-etl",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/etl",
+        "sha256": "eb428ef26e444402681714112e56e4353b151d3af62639ed402eb72866258a21",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/etl_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/etl/etl.py",
+          "destination": "/work/etl.py",
+          "sha256": "822b8f2ee63bf3697fda3d508cef8cb1b71442de3620afb5e7a34ddc65058167",
+          "mode": 420
+        },
+        {
+          "source": "exercism/etl/etl_test.py",
+          "destination": "/work/etl_test.py",
+          "sha256": "eb428ef26e444402681714112e56e4353b151d3af62639ed402eb72866258a21",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvZXRsX3Rlc3QucHk6OkV0bFRlc3QudGVzdF9zaW5nbGVfbGV0dGVyIG9rCi93b3JrL2V0bF90ZXN0LnB5OjpFdGxUZXN0LnRlc3Rfc2luZ2xlX3Njb3JlX3dpdGhfbXVsdGlwbGVfbGV0dGVycyBvawovd29yay9ldGxfdGVzdC5weTo6RXRsVGVzdC50ZXN0X211bHRpcGxlX3Njb3Jlc193aXRoX211bHRpcGxlX2xldHRlcnMgb2sKL3dvcmsvZXRsX3Rlc3QucHk6OkV0bFRlc3QudGVzdF9tdWx0aXBsZV9zY29yZXNfd2l0aF9kaWZmZXJpbmdfbnVtYmVyc19vZl9sZXR0ZXJzIG9rClJhbiA0IHRlc3RzCk9LCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-food-chain",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/food-chain",
+        "sha256": "e1547135c0ea999dfeda485d52960a6e194bd755db2c4818d60e1c9f565edf36",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/food_chain_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/food-chain/food_chain.py",
+          "destination": "/work/food_chain.py",
+          "sha256": "8eea5c1f75e15326ac221952e38c9289cacdabdd9dc1dcc4a5b52b4fb0682640",
+          "mode": 420
+        },
+        {
+          "source": "exercism/food-chain/food_chain_test.py",
+          "destination": "/work/food_chain_test.py",
+          "sha256": "e1547135c0ea999dfeda485d52960a6e194bd755db2c4818d60e1c9f565edf36",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvZm9vZF9jaGFpbl90ZXN0LnB5OjpGb29kQ2hhaW5UZXN0LnRlc3RfZmx5IG9rCi93b3JrL2Zvb2RfY2hhaW5fdGVzdC5weTo6Rm9vZENoYWluVGVzdC50ZXN0X3NwaWRlciBvawovd29yay9mb29kX2NoYWluX3Rlc3QucHk6OkZvb2RDaGFpblRlc3QudGVzdF9iaXJkIG9rCi93b3JrL2Zvb2RfY2hhaW5fdGVzdC5weTo6Rm9vZENoYWluVGVzdC50ZXN0X2NhdCBvawovd29yay9mb29kX2NoYWluX3Rlc3QucHk6OkZvb2RDaGFpblRlc3QudGVzdF9kb2cgb2sKL3dvcmsvZm9vZF9jaGFpbl90ZXN0LnB5OjpGb29kQ2hhaW5UZXN0LnRlc3RfZ29hdCBvawovd29yay9mb29kX2NoYWluX3Rlc3QucHk6OkZvb2RDaGFpblRlc3QudGVzdF9jb3cgb2sKL3dvcmsvZm9vZF9jaGFpbl90ZXN0LnB5OjpGb29kQ2hhaW5UZXN0LnRlc3RfaG9yc2Ugb2sKL3dvcmsvZm9vZF9jaGFpbl90ZXN0LnB5OjpGb29kQ2hhaW5UZXN0LnRlc3RfbXVsdGlwbGVfdmVyc2VzIG9rCi93b3JrL2Zvb2RfY2hhaW5fdGVzdC5weTo6Rm9vZENoYWluVGVzdC50ZXN0X2Z1bGxfc29uZyBvawpSYW4gMTAgdGVzdHMKT0sK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-game-of-life",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/game-of-life",
+        "sha256": "9a9e12087037e9f9284e1903d4fbd7700077c735c5c377d1ebd5f6511619116a",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/game_of_life_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/game-of-life/game_of_life.py",
+          "destination": "/work/game_of_life.py",
+          "sha256": "09a47c9cf6db95463e4530ed8111265b610873669265467f12f0ec257423a5e9",
+          "mode": 420
+        },
+        {
+          "source": "exercism/game-of-life/game_of_life_test.py",
+          "destination": "/work/game_of_life_test.py",
+          "sha256": "9a9e12087037e9f9284e1903d4fbd7700077c735c5c377d1ebd5f6511619116a",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvZ2FtZV9vZl9saWZlX3Rlc3QucHk6OkdhbWVPZkxpZmVUZXN0LnRlc3RfZW1wdHlfbWF0cml4IG9rCi93b3JrL2dhbWVfb2ZfbGlmZV90ZXN0LnB5OjpHYW1lT2ZMaWZlVGVzdC50ZXN0X2xpdmVfY2VsbHNfd2l0aF96ZXJvX2xpdmVfbmVpZ2hib3JzX2RpZSBvawovd29yay9nYW1lX29mX2xpZmVfdGVzdC5weTo6R2FtZU9mTGlmZVRlc3QudGVzdF9saXZlX2NlbGxzX3dpdGhfb25seV9vbmVfbGl2ZV9uZWlnaGJvcl9kaWUgb2sKL3dvcmsvZ2FtZV9vZl9saWZlX3Rlc3QucHk6OkdhbWVPZkxpZmVUZXN0LnRlc3RfbGl2ZV9jZWxsc193aXRoX3R3b19saXZlX25laWdoYm9yc19zdGF5X2FsaXZlIG9rCi93b3JrL2dhbWVfb2ZfbGlmZV90ZXN0LnB5OjpHYW1lT2ZMaWZlVGVzdC50ZXN0X2xpdmVfY2VsbHNfd2l0aF90aHJlZV9saXZlX25laWdoYm9yc19zdGF5X2FsaXZlIG9rCi93b3JrL2dhbWVfb2ZfbGlmZV90ZXN0LnB5OjpHYW1lT2ZMaWZlVGVzdC50ZXN0X2RlYWRfY2VsbHNfd2l0aF90aHJlZV9saXZlX25laWdoYm9yc19iZWNvbWVfYWxpdmUgb2sKL3dvcmsvZ2FtZV9vZl9saWZlX3Rlc3QucHk6OkdhbWVPZkxpZmVUZXN0LnRlc3RfbGl2ZV9jZWxsc193aXRoX2ZvdXJfb3JfbW9yZV9uZWlnaGJvcnNfZGllIG9rCi93b3JrL2dhbWVfb2ZfbGlmZV90ZXN0LnB5OjpHYW1lT2ZMaWZlVGVzdC50ZXN0X2JpZ2dlcl9tYXRyaXggb2sKUmFuIDggdGVzdHMKT0sK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-grade-school",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/grade-school",
+        "sha256": "e3391f00449acc0803022a715349e7a5c22f19668e0b5d1b8735eb651df1b89b",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/grade_school_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/grade-school/grade_school.py",
+          "destination": "/work/grade_school.py",
+          "sha256": "f6a52a73ebe023737547952d2b27231a0eaa086f2b9804aac4c137b9fd687473",
+          "mode": 420
+        },
+        {
+          "source": "exercism/grade-school/grade_school_test.py",
+          "destination": "/work/grade_school_test.py",
+          "sha256": "e3391f00449acc0803022a715349e7a5c22f19668e0b5d1b8735eb651df1b89b",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvZ3JhZGVfc2Nob29sX3Rlc3QucHk6OkdyYWRlU2Nob29sVGVzdC50ZXN0X3Jvc3Rlcl9pc19lbXB0eV93aGVuX25vX3N0dWRlbnRfaXNfYWRkZWQgb2sKL3dvcmsvZ3JhZGVfc2Nob29sX3Rlc3QucHk6OkdyYWRlU2Nob29sVGVzdC50ZXN0X2FkZF9hX3N0dWRlbnQgb2sKL3dvcmsvZ3JhZGVfc2Nob29sX3Rlc3QucHk6OkdyYWRlU2Nob29sVGVzdC50ZXN0X3N0dWRlbnRfaXNfYWRkZWRfdG9fdGhlX3Jvc3RlciBvawovd29yay9ncmFkZV9zY2hvb2xfdGVzdC5weTo6R3JhZGVTY2hvb2xUZXN0LnRlc3RfYWRkaW5nX211bHRpcGxlX3N0dWRlbnRzX2luX3RoZV9zYW1lX2dyYWRlX2luX3RoZV9yb3N0ZXIgb2sKL3dvcmsvZ3JhZGVfc2Nob29sX3Rlc3QucHk6OkdyYWRlU2Nob29sVGVzdC50ZXN0X211bHRpcGxlX3N0dWRlbnRzX2luX3RoZV9zYW1lX2dyYWRlX2FyZV9hZGRlZF90b190aGVfcm9zdGVyIG9rCi93b3JrL2dyYWRlX3NjaG9vbF90ZXN0LnB5OjpHcmFkZVNjaG9vbFRlc3QudGVzdF9jYW5ub3RfYWRkX3N0dWRlbnRfdG9fc2FtZV9ncmFkZV9pbl90aGVfcm9zdGVyX21vcmVfdGhhbl9vbmNlIG9rCi93b3JrL2dyYWRlX3NjaG9vbF90ZXN0LnB5OjpHcmFkZVNjaG9vbFRlc3QudGVzdF9zdHVkZW50X25vdF9hZGRlZF90b19zYW1lX2dyYWRlX2luX3RoZV9yb3N0ZXJfbW9yZV90aGFuX29uY2Ugb2sKL3dvcmsvZ3JhZGVfc2Nob29sX3Rlc3QucHk6OkdyYWRlU2Nob29sVGVzdC50ZXN0X2FkZGluZ19zdHVkZW50c19pbl9tdWx0aXBsZV9ncmFkZXMgb2sKL3dvcmsvZ3JhZGVfc2Nob29sX3Rlc3QucHk6OkdyYWRlU2Nob29sVGVzdC50ZXN0X3N0dWRlbnRzX2luX211bHRpcGxlX2dyYWRlc19hcmVfYWRkZWRfdG9fdGhlX3Jvc3RlciBvawovd29yay9ncmFkZV9zY2hvb2xfdGVzdC5weTo6R3JhZGVTY2hvb2xUZXN0LnRlc3RfY2Fubm90X2FkZF9zYW1lX3N0dWRlbnRfdG9fbXVsdGlwbGVfZ3JhZGVzX2luX3RoZV9yb3N0ZXIgb2sKL3dvcmsvZ3JhZGVfc2Nob29sX3Rlc3QucHk6OkdyYWRlU2Nob29sVGVzdC50ZXN0X3N0dWRlbnRfbm90X2FkZGVkX3RvX211bHRpcGxlX2dyYWRlc19pbl90aGVfcm9zdGVyIG9rCi93b3JrL2dyYWRlX3NjaG9vbF90ZXN0LnB5OjpHcmFkZVNjaG9vbFRlc3QudGVzdF9zdHVkZW50c19hcmVfc29ydGVkX2J5X2dyYWRlc19pbl90aGVfcm9zdGVyIG9rCi93b3JrL2dyYWRlX3NjaG9vbF90ZXN0LnB5OjpHcmFkZVNjaG9vbFRlc3QudGVzdF9zdHVkZW50c19hcmVfc29ydGVkX2J5X25hbWVfaW5fdGhlX3Jvc3RlciBvawovd29yay9ncmFkZV9zY2hvb2xfdGVzdC5weTo6R3JhZGVTY2hvb2xUZXN0LnRlc3Rfc3R1ZGVudHNfYXJlX3NvcnRlZF9ieV9ncmFkZXNfYW5kX3RoZW5fYnlfbmFtZV9pbl90aGVfcm9zdGVyIG9rCi93b3JrL2dyYWRlX3NjaG9vbF90ZXN0LnB5OjpHcmFkZVNjaG9vbFRlc3QudGVzdF9ncmFkZV9pc19lbXB0eV9pZl9ub19zdHVkZW50c19pbl90aGVfcm9zdGVyIG9rCi93b3JrL2dyYWRlX3NjaG9vbF90ZXN0LnB5OjpHcmFkZVNjaG9vbFRlc3QudGVzdF9ncmFkZV9pc19lbXB0eV9pZl9ub19zdHVkZW50c19pbl90aGF0X2dyYWRlIG9rCi93b3JrL2dyYWRlX3NjaG9vbF90ZXN0LnB5OjpHcmFkZVNjaG9vbFRlc3QudGVzdF9zdHVkZW50X25vdF9hZGRlZF90b19zYW1lX2dyYWRlX21vcmVfdGhhbl9vbmNlIG9rCi93b3JrL2dyYWRlX3NjaG9vbF90ZXN0LnB5OjpHcmFkZVNjaG9vbFRlc3QudGVzdF9zdHVkZW50X25vdF9hZGRlZF90b19tdWx0aXBsZV9ncmFkZXMgb2sKL3dvcmsvZ3JhZGVfc2Nob29sX3Rlc3QucHk6OkdyYWRlU2Nob29sVGVzdC50ZXN0X3N0dWRlbnRfbm90X2FkZGVkX3RvX290aGVyX2dyYWRlX2Zvcl9tdWx0aXBsZV9ncmFkZXMgb2sKL3dvcmsvZ3JhZGVfc2Nob29sX3Rlc3QucHk6OkdyYWRlU2Nob29sVGVzdC50ZXN0X3N0dWRlbnRzX2FyZV9zb3J0ZWRfYnlfbmFtZV9pbl9hX2dyYWRlIG9rClJhbiAyMCB0ZXN0cwpPSwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-kindergarten-garden",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/kindergarten-garden",
+        "sha256": "422a822d9bd4e4452c1eed13f52fe96ffd094140a49ec00f5620ce8dcc85d897",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/kindergarten_garden_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/kindergarten-garden/kindergarten_garden.py",
+          "destination": "/work/kindergarten_garden.py",
+          "sha256": "7f3e07aa5a5e0032676c2d4a35586895504b5ee8510e8a3e28b96f9884478f72",
+          "mode": 420
+        },
+        {
+          "source": "exercism/kindergarten-garden/kindergarten_garden_test.py",
+          "destination": "/work/kindergarten_garden_test.py",
+          "sha256": "422a822d9bd4e4452c1eed13f52fe96ffd094140a49ec00f5620ce8dcc85d897",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsva2luZGVyZ2FydGVuX2dhcmRlbl90ZXN0LnB5OjpLaW5kZXJnYXJ0ZW5HYXJkZW5UZXN0LnRlc3RfcGFydGlhbF9nYXJkZW5fZ2FyZGVuX3dpdGhfc2luZ2xlX3N0dWRlbnQgb2sKL3dvcmsva2luZGVyZ2FydGVuX2dhcmRlbl90ZXN0LnB5OjpLaW5kZXJnYXJ0ZW5HYXJkZW5UZXN0LnRlc3RfcGFydGlhbF9nYXJkZW5fZGlmZmVyZW50X2dhcmRlbl93aXRoX3NpbmdsZV9zdHVkZW50IG9rCi93b3JrL2tpbmRlcmdhcnRlbl9nYXJkZW5fdGVzdC5weTo6S2luZGVyZ2FydGVuR2FyZGVuVGVzdC50ZXN0X3BhcnRpYWxfZ2FyZGVuX2dhcmRlbl93aXRoX3R3b19zdHVkZW50cyBvawovd29yay9raW5kZXJnYXJ0ZW5fZ2FyZGVuX3Rlc3QucHk6OktpbmRlcmdhcnRlbkdhcmRlblRlc3QudGVzdF9wYXJ0aWFsX2dhcmRlbl9zZWNvbmRfc3R1ZGVudF9zX2dhcmRlbiBvawovd29yay9raW5kZXJnYXJ0ZW5fZ2FyZGVuX3Rlc3QucHk6OktpbmRlcmdhcnRlbkdhcmRlblRlc3QudGVzdF9wYXJ0aWFsX2dhcmRlbl90aGlyZF9zdHVkZW50X3NfZ2FyZGVuIG9rCi93b3JrL2tpbmRlcmdhcnRlbl9nYXJkZW5fdGVzdC5weTo6S2luZGVyZ2FydGVuR2FyZGVuVGVzdC50ZXN0X2Z1bGxfZ2FyZGVuX2Zvcl9hbGljZV9maXJzdF9zdHVkZW50X3NfZ2FyZGVuIG9rCi93b3JrL2tpbmRlcmdhcnRlbl9nYXJkZW5fdGVzdC5weTo6S2luZGVyZ2FydGVuR2FyZGVuVGVzdC50ZXN0X2Z1bGxfZ2FyZGVuX2Zvcl9ib2Jfc2Vjb25kX3N0dWRlbnRfc19nYXJkZW4gb2sKL3dvcmsva2luZGVyZ2FydGVuX2dhcmRlbl90ZXN0LnB5OjpLaW5kZXJnYXJ0ZW5HYXJkZW5UZXN0LnRlc3RfZnVsbF9nYXJkZW5fZm9yX2NoYXJsaWUgb2sKL3dvcmsva2luZGVyZ2FydGVuX2dhcmRlbl90ZXN0LnB5OjpLaW5kZXJnYXJ0ZW5HYXJkZW5UZXN0LnRlc3RfZnVsbF9nYXJkZW5fZm9yX2RhdmlkIG9rCi93b3JrL2tpbmRlcmdhcnRlbl9nYXJkZW5fdGVzdC5weTo6S2luZGVyZ2FydGVuR2FyZGVuVGVzdC50ZXN0X2Z1bGxfZ2FyZGVuX2Zvcl9ldmUgb2sKL3dvcmsva2luZGVyZ2FydGVuX2dhcmRlbl90ZXN0LnB5OjpLaW5kZXJnYXJ0ZW5HYXJkZW5UZXN0LnRlc3RfZnVsbF9nYXJkZW5fZm9yX2ZyZWQgb2sKL3dvcmsva2luZGVyZ2FydGVuX2dhcmRlbl90ZXN0LnB5OjpLaW5kZXJnYXJ0ZW5HYXJkZW5UZXN0LnRlc3RfZnVsbF9nYXJkZW5fZm9yX2dpbm55IG9rCi93b3JrL2tpbmRlcmdhcnRlbl9nYXJkZW5fdGVzdC5weTo6S2luZGVyZ2FydGVuR2FyZGVuVGVzdC50ZXN0X2Z1bGxfZ2FyZGVuX2Zvcl9oYXJyaWV0IG9rCi93b3JrL2tpbmRlcmdhcnRlbl9nYXJkZW5fdGVzdC5weTo6S2luZGVyZ2FydGVuR2FyZGVuVGVzdC50ZXN0X2Z1bGxfZ2FyZGVuX2Zvcl9pbGVhbmEgb2sKL3dvcmsva2luZGVyZ2FydGVuX2dhcmRlbl90ZXN0LnB5OjpLaW5kZXJnYXJ0ZW5HYXJkZW5UZXN0LnRlc3RfZnVsbF9nYXJkZW5fZm9yX2pvc2VwaCBvawovd29yay9raW5kZXJnYXJ0ZW5fZ2FyZGVuX3Rlc3QucHk6OktpbmRlcmdhcnRlbkdhcmRlblRlc3QudGVzdF9mdWxsX2dhcmRlbl9mb3Jfa2luY2FpZF9zZWNvbmRfdG9fbGFzdF9zdHVkZW50X3NfZ2FyZGVuIG9rCi93b3JrL2tpbmRlcmdhcnRlbl9nYXJkZW5fdGVzdC5weTo6S2luZGVyZ2FydGVuR2FyZGVuVGVzdC50ZXN0X2Z1bGxfZ2FyZGVuX2Zvcl9sYXJyeV9sYXN0X3N0dWRlbnRfc19nYXJkZW4gb2sKL3dvcmsva2luZGVyZ2FydGVuX2dhcmRlbl90ZXN0LnB5OjpLaW5kZXJnYXJ0ZW5HYXJkZW5UZXN0LnRlc3Rfc3R1ZGVudHNfYXJlX3Vub3JkZXJlZF9maXJzdF9zdHVkZW50IG9rCi93b3JrL2tpbmRlcmdhcnRlbl9nYXJkZW5fdGVzdC5weTo6S2luZGVyZ2FydGVuR2FyZGVuVGVzdC50ZXN0X3N0dWRlbnRzX2FyZV91bm9yZGVyZWRfbGFzdF9zdHVkZW50IG9rClJhbiAxOSB0ZXN0cwpPSwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-knapsack",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/knapsack",
+        "sha256": "74913a1d2d104bceddf8791d0340af1910211ff5099e2e58d29bd9820cd245fe",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/knapsack_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/knapsack/knapsack.py",
+          "destination": "/work/knapsack.py",
+          "sha256": "a0ffb9f3689142e0955cf1db1be4a5dc864d83c2ea60068a63e11dddaca4d3ba",
+          "mode": 420
+        },
+        {
+          "source": "exercism/knapsack/knapsack_test.py",
+          "destination": "/work/knapsack_test.py",
+          "sha256": "74913a1d2d104bceddf8791d0340af1910211ff5099e2e58d29bd9820cd245fe",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsva25hcHNhY2tfdGVzdC5weTo6S25hcHNhY2tUZXN0LnRlc3Rfbm9faXRlbXMgb2sKL3dvcmsva25hcHNhY2tfdGVzdC5weTo6S25hcHNhY2tUZXN0LnRlc3Rfb25lX2l0ZW1fdG9vX2hlYXZ5IG9rCi93b3JrL2tuYXBzYWNrX3Rlc3QucHk6OktuYXBzYWNrVGVzdC50ZXN0X2ZpdmVfaXRlbXNfY2Fubm90X2JlX2dyZWVkeV9ieV93ZWlnaHQgb2sKL3dvcmsva25hcHNhY2tfdGVzdC5weTo6S25hcHNhY2tUZXN0LnRlc3RfZml2ZV9pdGVtc19jYW5ub3RfYmVfZ3JlZWR5X2J5X3ZhbHVlIG9rCi93b3JrL2tuYXBzYWNrX3Rlc3QucHk6OktuYXBzYWNrVGVzdC50ZXN0X2V4YW1wbGVfa25hcHNhY2sgb2sKL3dvcmsva25hcHNhY2tfdGVzdC5weTo6S25hcHNhY2tUZXN0LnRlc3RfOF9pdGVtcyBvawovd29yay9rbmFwc2Fja190ZXN0LnB5OjpLbmFwc2Fja1Rlc3QudGVzdF8xNV9pdGVtcyBvawpSYW4gNyB0ZXN0cwpPSwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-list-ops",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/list-ops",
+        "sha256": "373082dc316d8c4cb1f1c40d9b238e7312d41dcd507aa0d745880670089cde9a",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/list_ops_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/list-ops/list_ops.py",
+          "destination": "/work/list_ops.py",
+          "sha256": "fb206c755414929f90770f4e086f1ab11236a458be1b8edaa2bb0bd974dc8a93",
+          "mode": 420
+        },
+        {
+          "source": "exercism/list-ops/list_ops_test.py",
+          "destination": "/work/list_ops_test.py",
+          "sha256": "373082dc316d8c4cb1f1c40d9b238e7312d41dcd507aa0d745880670089cde9a",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvbGlzdF9vcHNfdGVzdC5weTo6TGlzdE9wc1Rlc3QudGVzdF9hcHBlbmRfZW1wdHlfbGlzdHMgb2sKL3dvcmsvbGlzdF9vcHNfdGVzdC5weTo6TGlzdE9wc1Rlc3QudGVzdF9hcHBlbmRfbGlzdF90b19lbXB0eV9saXN0IG9rCi93b3JrL2xpc3Rfb3BzX3Rlc3QucHk6Okxpc3RPcHNUZXN0LnRlc3RfYXBwZW5kX2VtcHR5X2xpc3RfdG9fbGlzdCBvawovd29yay9saXN0X29wc190ZXN0LnB5OjpMaXN0T3BzVGVzdC50ZXN0X2FwcGVuZF9ub25fZW1wdHlfbGlzdHMgb2sKL3dvcmsvbGlzdF9vcHNfdGVzdC5weTo6TGlzdE9wc1Rlc3QudGVzdF9jb25jYXRfZW1wdHlfbGlzdCBvawovd29yay9saXN0X29wc190ZXN0LnB5OjpMaXN0T3BzVGVzdC50ZXN0X2NvbmNhdF9saXN0X29mX2xpc3RzIG9rCi93b3JrL2xpc3Rfb3BzX3Rlc3QucHk6Okxpc3RPcHNUZXN0LnRlc3RfY29uY2F0X2xpc3Rfb2ZfbmVzdGVkX2xpc3RzIG9rCi93b3JrL2xpc3Rfb3BzX3Rlc3QucHk6Okxpc3RPcHNUZXN0LnRlc3RfZmlsdGVyX2VtcHR5X2xpc3Qgb2sKL3dvcmsvbGlzdF9vcHNfdGVzdC5weTo6TGlzdE9wc1Rlc3QudGVzdF9maWx0ZXJfbm9uX2VtcHR5X2xpc3Qgb2sKL3dvcmsvbGlzdF9vcHNfdGVzdC5weTo6TGlzdE9wc1Rlc3QudGVzdF9sZW5ndGhfZW1wdHlfbGlzdCBvawovd29yay9saXN0X29wc190ZXN0LnB5OjpMaXN0T3BzVGVzdC50ZXN0X2xlbmd0aF9ub25fZW1wdHlfbGlzdCBvawovd29yay9saXN0X29wc190ZXN0LnB5OjpMaXN0T3BzVGVzdC50ZXN0X21hcF9lbXB0eV9saXN0IG9rCi93b3JrL2xpc3Rfb3BzX3Rlc3QucHk6Okxpc3RPcHNUZXN0LnRlc3RfbWFwX25vbl9lbXB0eV9saXN0IG9rCi93b3JrL2xpc3Rfb3BzX3Rlc3QucHk6Okxpc3RPcHNUZXN0LnRlc3RfZm9sZGxfZW1wdHlfbGlzdCBvawovd29yay9saXN0X29wc190ZXN0LnB5OjpMaXN0T3BzVGVzdC50ZXN0X2ZvbGRsX2RpcmVjdGlvbl9pbmRlcGVuZGVudF9mdW5jdGlvbl9hcHBsaWVkX3RvX25vbl9lbXB0eV9saXN0IG9rCi93b3JrL2xpc3Rfb3BzX3Rlc3QucHk6Okxpc3RPcHNUZXN0LnRlc3RfZm9sZGxfZGlyZWN0aW9uX2RlcGVuZGVudF9mdW5jdGlvbl9hcHBsaWVkX3RvX25vbl9lbXB0eV9saXN0IG9rCi93b3JrL2xpc3Rfb3BzX3Rlc3QucHk6Okxpc3RPcHNUZXN0LnRlc3RfZm9sZHJfZW1wdHlfbGlzdCBvawovd29yay9saXN0X29wc190ZXN0LnB5OjpMaXN0T3BzVGVzdC50ZXN0X2ZvbGRyX2RpcmVjdGlvbl9pbmRlcGVuZGVudF9mdW5jdGlvbl9hcHBsaWVkX3RvX25vbl9lbXB0eV9saXN0IG9rCi93b3JrL2xpc3Rfb3BzX3Rlc3QucHk6Okxpc3RPcHNUZXN0LnRlc3RfZm9sZHJfZGlyZWN0aW9uX2RlcGVuZGVudF9mdW5jdGlvbl9hcHBsaWVkX3RvX25vbl9lbXB0eV9saXN0IG9rCi93b3JrL2xpc3Rfb3BzX3Rlc3QucHk6Okxpc3RPcHNUZXN0LnRlc3RfcmV2ZXJzZV9lbXB0eV9saXN0IG9rCi93b3JrL2xpc3Rfb3BzX3Rlc3QucHk6Okxpc3RPcHNUZXN0LnRlc3RfcmV2ZXJzZV9ub25fZW1wdHlfbGlzdCBvawovd29yay9saXN0X29wc190ZXN0LnB5OjpMaXN0T3BzVGVzdC50ZXN0X3JldmVyc2VfbGlzdF9vZl9saXN0c19pc19ub3RfZmxhdHRlbmVkIG9rCi93b3JrL2xpc3Rfb3BzX3Rlc3QucHk6Okxpc3RPcHNUZXN0LnRlc3RfZm9sZHJfZm9sZHJfYWRkX3N0cmluZyBvawovd29yay9saXN0X29wc190ZXN0LnB5OjpMaXN0T3BzVGVzdC50ZXN0X3JldmVyc2VfcmV2ZXJzZV9taXhlZF90eXBlcyBvawpSYW4gMjQgdGVzdHMKT0sK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-matrix",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/matrix",
+        "sha256": "0e568e80ebcf9c9f97a2aaf1a6aa43fa39ba2d77ad9187eb441d364304d562c5",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/matrix_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/matrix/matrix.py",
+          "destination": "/work/matrix.py",
+          "sha256": "ef0e9fb9763f955fdd663c7f736cb6dccd91575884609ae1729210f7d1264adb",
+          "mode": 420
+        },
+        {
+          "source": "exercism/matrix/matrix_test.py",
+          "destination": "/work/matrix_test.py",
+          "sha256": "0e568e80ebcf9c9f97a2aaf1a6aa43fa39ba2d77ad9187eb441d364304d562c5",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvbWF0cml4X3Rlc3QucHk6Ok1hdHJpeFRlc3QudGVzdF9leHRyYWN0X3Jvd19mcm9tX29uZV9udW1iZXJfbWF0cml4IG9rCi93b3JrL21hdHJpeF90ZXN0LnB5OjpNYXRyaXhUZXN0LnRlc3RfY2FuX2V4dHJhY3Rfcm93IG9rCi93b3JrL21hdHJpeF90ZXN0LnB5OjpNYXRyaXhUZXN0LnRlc3RfZXh0cmFjdF9yb3dfd2hlcmVfbnVtYmVyc19oYXZlX2RpZmZlcmVudF93aWR0aHMgb2sKL3dvcmsvbWF0cml4X3Rlc3QucHk6Ok1hdHJpeFRlc3QudGVzdF9jYW5fZXh0cmFjdF9yb3dfZnJvbV9ub25fc3F1YXJlX21hdHJpeF93aXRoX25vX2NvcnJlc3BvbmRpbmdfY29sdW1uIG9rCi93b3JrL21hdHJpeF90ZXN0LnB5OjpNYXRyaXhUZXN0LnRlc3RfZXh0cmFjdF9jb2x1bW5fZnJvbV9vbmVfbnVtYmVyX21hdHJpeCBvawovd29yay9tYXRyaXhfdGVzdC5weTo6TWF0cml4VGVzdC50ZXN0X2Nhbl9leHRyYWN0X2NvbHVtbiBvawovd29yay9tYXRyaXhfdGVzdC5weTo6TWF0cml4VGVzdC50ZXN0X2Nhbl9leHRyYWN0X2NvbHVtbl9mcm9tX25vbl9zcXVhcmVfbWF0cml4X3dpdGhfbm9fY29ycmVzcG9uZGluZ19yb3cgb2sKL3dvcmsvbWF0cml4X3Rlc3QucHk6Ok1hdHJpeFRlc3QudGVzdF9leHRyYWN0X2NvbHVtbl93aGVyZV9udW1iZXJzX2hhdmVfZGlmZmVyZW50X3dpZHRocyBvawpSYW4gOCB0ZXN0cwpPSwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-poker",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/poker",
+        "sha256": "b39f023208318973e18a341449aa076f7595ff98f07174082a2a1b05c84ad8fd",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/poker_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/poker/poker.py",
+          "destination": "/work/poker.py",
+          "sha256": "9627361e2566290218239ed64ea4edf610f826e94ae7044d9eef9316d241ec43",
+          "mode": 420
+        },
+        {
+          "source": "exercism/poker/poker_test.py",
+          "destination": "/work/poker_test.py",
+          "sha256": "b39f023208318973e18a341449aa076f7595ff98f07174082a2a1b05c84ad8fd",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3Rfc2luZ2xlX2hhbmRfYWx3YXlzX3dpbnMgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3RfaGlnaGVzdF9jYXJkX291dF9vZl9hbGxfaGFuZHNfd2lucyBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF9hX3RpZV9oYXNfbXVsdGlwbGVfd2lubmVycyBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF9tdWx0aXBsZV9oYW5kc193aXRoX3RoZV9zYW1lX2hpZ2hfY2FyZHNfdGllX2NvbXBhcmVzX25leHRfaGlnaGVzdF9yYW5rZWRfZG93bl90b19sYXN0X2NhcmQgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3Rfd2lubmluZ19oaWdoX2NhcmRfaGFuZF9hbHNvX2hhc190aGVfbG93ZXN0X2NhcmQgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3Rfb25lX3BhaXJfYmVhdHNfaGlnaF9jYXJkIG9rCi93b3JrL3Bva2VyX3Rlc3QucHk6OlBva2VyVGVzdC50ZXN0X2hpZ2hlc3RfcGFpcl93aW5zIG9rCi93b3JrL3Bva2VyX3Rlc3QucHk6OlBva2VyVGVzdC50ZXN0X2JvdGhfaGFuZHNfaGF2ZV90aGVfc2FtZV9wYWlyX2hpZ2hfY2FyZF93aW5zIG9rCi93b3JrL3Bva2VyX3Rlc3QucHk6OlBva2VyVGVzdC50ZXN0X3R3b19wYWlyc19iZWF0c19vbmVfcGFpciBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF9ib3RoX2hhbmRzX2hhdmVfdHdvX3BhaXJzX2hpZ2hlc3RfcmFua2VkX3BhaXJfd2lucyBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF9ib3RoX2hhbmRzX2hhdmVfdHdvX3BhaXJzX3dpdGhfdGhlX3NhbWVfaGlnaGVzdF9yYW5rZWRfcGFpcl90aWVfZ29lc190b19sb3dfcGFpciBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF9ib3RoX2hhbmRzX2hhdmVfdHdvX2lkZW50aWNhbGx5X3JhbmtlZF9wYWlyc190aWVfZ29lc190b19yZW1haW5pbmdfY2FyZF9raWNrZXIgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3RfYm90aF9oYW5kc19oYXZlX3R3b19wYWlyc190aGF0X2FkZF90b190aGVfc2FtZV92YWx1ZV93aW5fZ29lc190b19oaWdoZXN0X3BhaXIgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3RfdHdvX3BhaXJzX2ZpcnN0X3JhbmtlZF9ieV9sYXJnZXN0X3BhaXIgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3RfdGhyZWVfb2ZfYV9raW5kX2JlYXRzX3R3b19wYWlyIG9rCi93b3JrL3Bva2VyX3Rlc3QucHk6OlBva2VyVGVzdC50ZXN0X2JvdGhfaGFuZHNfaGF2ZV90aHJlZV9vZl9hX2tpbmRfdGllX2dvZXNfdG9faGlnaGVzdF9yYW5rZWRfdHJpcGxldCBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF93aXRoX211bHRpcGxlX2RlY2tzX3R3b19wbGF5ZXJzX2Nhbl9oYXZlX3NhbWVfdGhyZWVfb2ZfYV9raW5kX3RpZXNfZ29fdG9faGlnaGVzdF9yZW1haW5pbmdfY2FyZHMgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3RfYV9zdHJhaWdodF9iZWF0c190aHJlZV9vZl9hX2tpbmQgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3RfYWNlc19jYW5fZW5kX2Ffc3RyYWlnaHRfMTBfal9xX2tfYSBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF9hY2VzX2Nhbl9zdGFydF9hX3N0cmFpZ2h0X2FfMl8zXzRfNSBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF9hY2VzX2Nhbm5vdF9iZV9pbl90aGVfbWlkZGxlX29mX2Ffc3RyYWlnaHRfcV9rX2FfMl8zIG9rCi93b3JrL3Bva2VyX3Rlc3QucHk6OlBva2VyVGVzdC50ZXN0X2JvdGhfaGFuZHNfd2l0aF9hX3N0cmFpZ2h0X3RpZV9nb2VzX3RvX2hpZ2hlc3RfcmFua2VkX2NhcmQgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3RfZXZlbl90aG91Z2hfYW5fYWNlX2lzX3VzdWFsbHlfaGlnaF9hXzVfaGlnaF9zdHJhaWdodF9pc190aGVfbG93ZXN0X3Njb3Jpbmdfc3RyYWlnaHQgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3RfZmx1c2hfYmVhdHNfYV9zdHJhaWdodCBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF9ib3RoX2hhbmRzX2hhdmVfYV9mbHVzaF90aWVfZ29lc190b19oaWdoX2NhcmRfZG93bl90b190aGVfbGFzdF9vbmVfaWZfbmVjZXNzYXJ5IG9rCi93b3JrL3Bva2VyX3Rlc3QucHk6OlBva2VyVGVzdC50ZXN0X2Z1bGxfaG91c2VfYmVhdHNfYV9mbHVzaCBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF9ib3RoX2hhbmRzX2hhdmVfYV9mdWxsX2hvdXNlX3RpZV9nb2VzX3RvX2hpZ2hlc3RfcmFua2VkX3RyaXBsZXQgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3Rfd2l0aF9tdWx0aXBsZV9kZWNrc19ib3RoX2hhbmRzX2hhdmVfYV9mdWxsX2hvdXNlX3dpdGhfdGhlX3NhbWVfdHJpcGxldF90aWVfZ29lc190b190aGVfcGFpciBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF9mb3VyX29mX2Ffa2luZF9iZWF0c19hX2Z1bGxfaG91c2Ugb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3RfYm90aF9oYW5kc19oYXZlX2ZvdXJfb2ZfYV9raW5kX3RpZV9nb2VzX3RvX2hpZ2hfcXVhZCBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF93aXRoX211bHRpcGxlX2RlY2tzX2JvdGhfaGFuZHNfd2l0aF9pZGVudGljYWxfZm91cl9vZl9hX2tpbmRfdGllX2RldGVybWluZWRfYnlfa2lja2VyIG9rCi93b3JrL3Bva2VyX3Rlc3QucHk6OlBva2VyVGVzdC50ZXN0X3N0cmFpZ2h0X2ZsdXNoX2JlYXRzX2ZvdXJfb2ZfYV9raW5kIG9rCi93b3JrL3Bva2VyX3Rlc3QucHk6OlBva2VyVGVzdC50ZXN0X2FjZXNfY2FuX2VuZF9hX3N0cmFpZ2h0X2ZsdXNoXzEwX2pfcV9rX2Egb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3RfYWNlc19jYW5fc3RhcnRfYV9zdHJhaWdodF9mbHVzaF9hXzJfM180XzUgb2sKL3dvcmsvcG9rZXJfdGVzdC5weTo6UG9rZXJUZXN0LnRlc3RfYWNlc19jYW5ub3RfYmVfaW5fdGhlX21pZGRsZV9vZl9hX3N0cmFpZ2h0X2ZsdXNoX3Ffa19hXzJfMyBvawovd29yay9wb2tlcl90ZXN0LnB5OjpQb2tlclRlc3QudGVzdF9ib3RoX2hhbmRzX2hhdmVfYV9zdHJhaWdodF9mbHVzaF90aWVfZ29lc190b19oaWdoZXN0X3JhbmtlZF9jYXJkIG9rCi93b3JrL3Bva2VyX3Rlc3QucHk6OlBva2VyVGVzdC50ZXN0X2V2ZW5fdGhvdWdoX2FuX2FjZV9pc191c3VhbGx5X2hpZ2hfYV81X2hpZ2hfc3RyYWlnaHRfZmx1c2hfaXNfdGhlX2xvd2VzdF9zY29yaW5nX3N0cmFpZ2h0X2ZsdXNoIG9rClJhbiAzNyB0ZXN0cwpPSwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-robot-simulator",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/robot-simulator",
+        "sha256": "3f018ff05c06499abdc252a9d596479086f43fc0cdd66c0b09adf1343d303ffd",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/robot_simulator_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/robot-simulator/robot_simulator.py",
+          "destination": "/work/robot_simulator.py",
+          "sha256": "1ccd276a6c411c04fbf13d0140b47d7482d890826fdc7c24067cf15a0d19714d",
+          "mode": 420
+        },
+        {
+          "source": "exercism/robot-simulator/robot_simulator_test.py",
+          "destination": "/work/robot_simulator_test.py",
+          "sha256": "3f018ff05c06499abdc252a9d596479086f43fc0cdd66c0b09adf1343d303ffd",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvcm9ib3Rfc2ltdWxhdG9yX3Rlc3QucHk6OlJvYm90U2ltdWxhdG9yVGVzdC50ZXN0X2F0X29yaWdpbl9mYWNpbmdfbm9ydGggb2sKL3dvcmsvcm9ib3Rfc2ltdWxhdG9yX3Rlc3QucHk6OlJvYm90U2ltdWxhdG9yVGVzdC50ZXN0X2F0X25lZ2F0aXZlX3Bvc2l0aW9uX2ZhY2luZ19zb3V0aCBvawovd29yay9yb2JvdF9zaW11bGF0b3JfdGVzdC5weTo6Um9ib3RTaW11bGF0b3JUZXN0LnRlc3RfY2hhbmdlc19ub3J0aF90b19lYXN0IG9rCi93b3JrL3JvYm90X3NpbXVsYXRvcl90ZXN0LnB5OjpSb2JvdFNpbXVsYXRvclRlc3QudGVzdF9jaGFuZ2VzX2Vhc3RfdG9fc291dGggb2sKL3dvcmsvcm9ib3Rfc2ltdWxhdG9yX3Rlc3QucHk6OlJvYm90U2ltdWxhdG9yVGVzdC50ZXN0X2NoYW5nZXNfc291dGhfdG9fd2VzdCBvawovd29yay9yb2JvdF9zaW11bGF0b3JfdGVzdC5weTo6Um9ib3RTaW11bGF0b3JUZXN0LnRlc3RfY2hhbmdlc193ZXN0X3RvX25vcnRoIG9rCi93b3JrL3JvYm90X3NpbXVsYXRvcl90ZXN0LnB5OjpSb2JvdFNpbXVsYXRvclRlc3QudGVzdF9jaGFuZ2VzX25vcnRoX3RvX3dlc3Qgb2sKL3dvcmsvcm9ib3Rfc2ltdWxhdG9yX3Rlc3QucHk6OlJvYm90U2ltdWxhdG9yVGVzdC50ZXN0X2NoYW5nZXNfd2VzdF90b19zb3V0aCBvawovd29yay9yb2JvdF9zaW11bGF0b3JfdGVzdC5weTo6Um9ib3RTaW11bGF0b3JUZXN0LnRlc3RfY2hhbmdlc19zb3V0aF90b19lYXN0IG9rCi93b3JrL3JvYm90X3NpbXVsYXRvcl90ZXN0LnB5OjpSb2JvdFNpbXVsYXRvclRlc3QudGVzdF9jaGFuZ2VzX2Vhc3RfdG9fbm9ydGggb2sKL3dvcmsvcm9ib3Rfc2ltdWxhdG9yX3Rlc3QucHk6OlJvYm90U2ltdWxhdG9yVGVzdC50ZXN0X2ZhY2luZ19ub3J0aF9pbmNyZW1lbnRzX3kgb2sKL3dvcmsvcm9ib3Rfc2ltdWxhdG9yX3Rlc3QucHk6OlJvYm90U2ltdWxhdG9yVGVzdC50ZXN0X2ZhY2luZ19zb3V0aF9kZWNyZW1lbnRzX3kgb2sKL3dvcmsvcm9ib3Rfc2ltdWxhdG9yX3Rlc3QucHk6OlJvYm90U2ltdWxhdG9yVGVzdC50ZXN0X2ZhY2luZ19lYXN0X2luY3JlbWVudHNfeCBvawovd29yay9yb2JvdF9zaW11bGF0b3JfdGVzdC5weTo6Um9ib3RTaW11bGF0b3JUZXN0LnRlc3RfZmFjaW5nX3dlc3RfZGVjcmVtZW50c194IG9rCi93b3JrL3JvYm90X3NpbXVsYXRvcl90ZXN0LnB5OjpSb2JvdFNpbXVsYXRvclRlc3QudGVzdF9tb3ZpbmdfZWFzdF9hbmRfbm9ydGhfZnJvbV9yZWFkbWUgb2sKL3dvcmsvcm9ib3Rfc2ltdWxhdG9yX3Rlc3QucHk6OlJvYm90U2ltdWxhdG9yVGVzdC50ZXN0X21vdmluZ193ZXN0X2FuZF9ub3J0aCBvawovd29yay9yb2JvdF9zaW11bGF0b3JfdGVzdC5weTo6Um9ib3RTaW11bGF0b3JUZXN0LnRlc3RfbW92aW5nX3dlc3RfYW5kX3NvdXRoIG9rCi93b3JrL3JvYm90X3NpbXVsYXRvcl90ZXN0LnB5OjpSb2JvdFNpbXVsYXRvclRlc3QudGVzdF9tb3ZpbmdfZWFzdF9hbmRfbm9ydGggb2sKUmFuIDE4IHRlc3RzCk9LCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-roman-numerals",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/roman-numerals",
+        "sha256": "a34718ea5f105324ce381185713efe33b5ac0741090b0a25a16aa0ab080a5ed7",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/roman_numerals_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/roman-numerals/roman_numerals.py",
+          "destination": "/work/roman_numerals.py",
+          "sha256": "b9eae2615bc8c90f74752ad35899c912f5f4f71d8155b90f46471ca2c817f864",
+          "mode": 420
+        },
+        {
+          "source": "exercism/roman-numerals/roman_numerals_test.py",
+          "destination": "/work/roman_numerals_test.py",
+          "sha256": "a34718ea5f105324ce381185713efe33b5ac0741090b0a25a16aa0ab080a5ed7",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF8xX2lzX2kgb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF8yX2lzX2lpIG9rCi93b3JrL3JvbWFuX251bWVyYWxzX3Rlc3QucHk6OlJvbWFuTnVtZXJhbHNUZXN0LnRlc3RfM19pc19paWkgb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF80X2lzX2l2IG9rCi93b3JrL3JvbWFuX251bWVyYWxzX3Rlc3QucHk6OlJvbWFuTnVtZXJhbHNUZXN0LnRlc3RfNV9pc192IG9rCi93b3JrL3JvbWFuX251bWVyYWxzX3Rlc3QucHk6OlJvbWFuTnVtZXJhbHNUZXN0LnRlc3RfNl9pc192aSBvawovd29yay9yb21hbl9udW1lcmFsc190ZXN0LnB5OjpSb21hbk51bWVyYWxzVGVzdC50ZXN0XzlfaXNfaXggb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF8xNl9pc194dmkgb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF8yN19pc194eHZpaSBvawovd29yay9yb21hbl9udW1lcmFsc190ZXN0LnB5OjpSb21hbk51bWVyYWxzVGVzdC50ZXN0XzQ4X2lzX3hsdmlpaSBvawovd29yay9yb21hbl9udW1lcmFsc190ZXN0LnB5OjpSb21hbk51bWVyYWxzVGVzdC50ZXN0XzQ5X2lzX3hsaXggb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF81OV9pc19saXggb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF82Nl9pc19seHZpIG9rCi93b3JrL3JvbWFuX251bWVyYWxzX3Rlc3QucHk6OlJvbWFuTnVtZXJhbHNUZXN0LnRlc3RfOTNfaXNfeGNpaWkgb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF8xNDFfaXNfY3hsaSBvawovd29yay9yb21hbl9udW1lcmFsc190ZXN0LnB5OjpSb21hbk51bWVyYWxzVGVzdC50ZXN0XzE2M19pc19jbHhpaWkgb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF8xNjZfaXNfY2x4dmkgb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF80MDJfaXNfY2RpaSBvawovd29yay9yb21hbl9udW1lcmFsc190ZXN0LnB5OjpSb21hbk51bWVyYWxzVGVzdC50ZXN0XzU3NV9pc19kbHh4diBvawovd29yay9yb21hbl9udW1lcmFsc190ZXN0LnB5OjpSb21hbk51bWVyYWxzVGVzdC50ZXN0XzY2Nl9pc19kY2x4dmkgb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF85MTFfaXNfY214aSBvawovd29yay9yb21hbl9udW1lcmFsc190ZXN0LnB5OjpSb21hbk51bWVyYWxzVGVzdC50ZXN0XzEwMjRfaXNfbXh4aXYgb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF8xNjY2X2lzX21kY2x4dmkgb2sKL3dvcmsvcm9tYW5fbnVtZXJhbHNfdGVzdC5weTo6Um9tYW5OdW1lcmFsc1Rlc3QudGVzdF8zMDAwX2lzX21tbSBvawovd29yay9yb21hbl9udW1lcmFsc190ZXN0LnB5OjpSb21hbk51bWVyYWxzVGVzdC50ZXN0XzMwMDFfaXNfbW1taSBvawovd29yay9yb21hbl9udW1lcmFsc190ZXN0LnB5OjpSb21hbk51bWVyYWxzVGVzdC50ZXN0XzM4ODhfaXNfbW1tZGNjY2x4eHh2aWlpIG9rCi93b3JrL3JvbWFuX251bWVyYWxzX3Rlc3QucHk6OlJvbWFuTnVtZXJhbHNUZXN0LnRlc3RfMzk5OV9pc19tbW1jbXhjaXggb2sKUmFuIDI3IHRlc3RzCk9LCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-sieve",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/sieve",
+        "sha256": "d7d0defba0b8c2d11b9803f1f8ed351b0c596f9e6e8a80e84a08704f498f5c87",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/sieve_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/sieve/sieve.py",
+          "destination": "/work/sieve.py",
+          "sha256": "ed2e115b1dcee9dbd8417464de6830406a09a65480c1c70ae0bd43bba09918ee",
+          "mode": 420
+        },
+        {
+          "source": "exercism/sieve/sieve_test.py",
+          "destination": "/work/sieve_test.py",
+          "sha256": "d7d0defba0b8c2d11b9803f1f8ed351b0c596f9e6e8a80e84a08704f498f5c87",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvc2lldmVfdGVzdC5weTo6U2lldmVUZXN0LnRlc3Rfbm9fcHJpbWVzX3VuZGVyX3R3byBvawovd29yay9zaWV2ZV90ZXN0LnB5OjpTaWV2ZVRlc3QudGVzdF9maW5kX2ZpcnN0X3ByaW1lIG9rCi93b3JrL3NpZXZlX3Rlc3QucHk6OlNpZXZlVGVzdC50ZXN0X2ZpbmRfcHJpbWVzX3VwX3RvXzEwIG9rCi93b3JrL3NpZXZlX3Rlc3QucHk6OlNpZXZlVGVzdC50ZXN0X2xpbWl0X2lzX3ByaW1lIG9rCi93b3JrL3NpZXZlX3Rlc3QucHk6OlNpZXZlVGVzdC50ZXN0X2ZpbmRfcHJpbWVzX3VwX3RvXzEwMDAgb2sKUmFuIDUgdGVzdHMKT0sK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-space-age",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/space-age",
+        "sha256": "d9cf8e7f4009ba33d91a0485f9bc1cf1d3e21c70b2f9bf3e5b23507fa9dd5f6e",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/space_age_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/space-age/space_age.py",
+          "destination": "/work/space_age.py",
+          "sha256": "4c71c6a68d843444fa25a79f8d7a8af56502653d61383268e4fd7e5b98a54c3a",
+          "mode": 420
+        },
+        {
+          "source": "exercism/space-age/space_age_test.py",
+          "destination": "/work/space_age_test.py",
+          "sha256": "d9cf8e7f4009ba33d91a0485f9bc1cf1d3e21c70b2f9bf3e5b23507fa9dd5f6e",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvc3BhY2VfYWdlX3Rlc3QucHk6OlNwYWNlQWdlVGVzdC50ZXN0X2FnZV9vbl9lYXJ0aCBvawovd29yay9zcGFjZV9hZ2VfdGVzdC5weTo6U3BhY2VBZ2VUZXN0LnRlc3RfYWdlX29uX21lcmN1cnkgb2sKL3dvcmsvc3BhY2VfYWdlX3Rlc3QucHk6OlNwYWNlQWdlVGVzdC50ZXN0X2FnZV9vbl92ZW51cyBvawovd29yay9zcGFjZV9hZ2VfdGVzdC5weTo6U3BhY2VBZ2VUZXN0LnRlc3RfYWdlX29uX21hcnMgb2sKL3dvcmsvc3BhY2VfYWdlX3Rlc3QucHk6OlNwYWNlQWdlVGVzdC50ZXN0X2FnZV9vbl9qdXBpdGVyIG9rCi93b3JrL3NwYWNlX2FnZV90ZXN0LnB5OjpTcGFjZUFnZVRlc3QudGVzdF9hZ2Vfb25fc2F0dXJuIG9rCi93b3JrL3NwYWNlX2FnZV90ZXN0LnB5OjpTcGFjZUFnZVRlc3QudGVzdF9hZ2Vfb25fdXJhbnVzIG9rCi93b3JrL3NwYWNlX2FnZV90ZXN0LnB5OjpTcGFjZUFnZVRlc3QudGVzdF9hZ2Vfb25fbmVwdHVuZSBvawpSYW4gOCB0ZXN0cwpPSwo=",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "exercism-zipper",
+      "source": {
+        "url": "https://github.com/exercism/python",
+        "revision": "9e74e0c36700cf0fbe1393f277095bac325db930",
+        "path": "exercises/practice/zipper",
+        "sha256": "a3cf6e5ebcf6b2171bcc80fa0ce81b425af23b522f222e841fa2abd3119e95b2",
+        "license": "MIT"
+      },
+      "kind": "command",
+      "entrypoint": "python3.14",
+      "args": [
+        "-m",
+        "unittest",
+        "/work/zipper_test.py"
+      ],
+      "fixtures": [
+        {
+          "source": "exercism/zipper/zipper.py",
+          "destination": "/work/zipper.py",
+          "sha256": "c1eff987dcc104ad0721087a18b96735f5630d4eb3828532e09adf434f6a06df",
+          "mode": 420
+        },
+        {
+          "source": "exercism/zipper/zipper_test.py",
+          "destination": "/work/zipper_test.py",
+          "sha256": "a3cf6e5ebcf6b2171bcc80fa0ce81b425af23b522f222e841fa2abd3119e95b2",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "L3dvcmsvemlwcGVyX3Rlc3QucHk6OlppcHBlclRlc3QudGVzdF9kYXRhX2lzX3JldGFpbmVkIG9rCi93b3JrL3ppcHBlcl90ZXN0LnB5OjpaaXBwZXJUZXN0LnRlc3RfbGVmdF9yaWdodF9hbmRfdmFsdWUgb2sKL3dvcmsvemlwcGVyX3Rlc3QucHk6OlppcHBlclRlc3QudGVzdF9kZWFkX2VuZCBvawovd29yay96aXBwZXJfdGVzdC5weTo6WmlwcGVyVGVzdC50ZXN0X3RyZWVfZnJvbV9kZWVwX2ZvY3VzIG9rCi93b3JrL3ppcHBlcl90ZXN0LnB5OjpaaXBwZXJUZXN0LnRlc3RfdHJhdmVyc2luZ191cF9mcm9tX3RvcCBvawovd29yay96aXBwZXJfdGVzdC5weTo6WmlwcGVyVGVzdC50ZXN0X2xlZnRfcmlnaHRfYW5kX3VwIG9rCi93b3JrL3ppcHBlcl90ZXN0LnB5OjpaaXBwZXJUZXN0LnRlc3RfdGVzdF9hYmlsaXR5X3RvX2Rlc2NlbmRfbXVsdGlwbGVfbGV2ZWxzX2FuZF9yZXR1cm4gb2sKL3dvcmsvemlwcGVyX3Rlc3QucHk6OlppcHBlclRlc3QudGVzdF9zZXRfdmFsdWUgb2sKL3dvcmsvemlwcGVyX3Rlc3QucHk6OlppcHBlclRlc3QudGVzdF9zZXRfdmFsdWVfYWZ0ZXJfdHJhdmVyc2luZ191cCBvawovd29yay96aXBwZXJfdGVzdC5weTo6WmlwcGVyVGVzdC50ZXN0X3NldF9sZWZ0X3dpdGhfbGVhZiBvawovd29yay96aXBwZXJfdGVzdC5weTo6WmlwcGVyVGVzdC50ZXN0X3NldF9yaWdodF93aXRoX251bGwgb2sKL3dvcmsvemlwcGVyX3Rlc3QucHk6OlppcHBlclRlc3QudGVzdF9zZXRfcmlnaHRfd2l0aF9zdWJ0cmVlIG9rCi93b3JrL3ppcHBlcl90ZXN0LnB5OjpaaXBwZXJUZXN0LnRlc3Rfc2V0X3ZhbHVlX29uX2RlZXBfZm9jdXMgb2sKL3dvcmsvemlwcGVyX3Rlc3QucHk6OlppcHBlclRlc3QudGVzdF9kaWZmZXJlbnRfcGF0aHNfdG9fc2FtZV96aXBwZXIgb2sKUmFuIDE0IHRlc3RzCk9LCg==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "id": "zlib-configure-help",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "Python-2.7.13/Modules/zlib/configure",
+        "sha256": "94159ff86133515dee243814d92238192d1f2c36c86fdc1472e0a0a797d1dd2f",
+        "license": "Zlib"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/configure",
+      "args": [
+        "--help"
+      ],
+      "fixtures": [
+        {
+          "source": "zlib/configure",
+          "destination": "/work/configure",
+          "sha256": "94159ff86133515dee243814d92238192d1f2c36c86fdc1472e0a0a797d1dd2f",
+          "mode": 493
+        },
+        {
+          "source": "zlib/zlib.h",
+          "destination": "/work/zlib.h",
+          "sha256": "726b0569915917b967f87f3f08a1eec039101bf9dcc29d61c0b2b0b8f271b58d",
+          "mode": 420
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 0,
+        "stdout_base64": "dXNhZ2U6CiAgY29uZmlndXJlIFstLWNvbnN0XSBbLS16cHJlZml4XSBbLS1wcmVmaXg9UFJFRklYXSAgWy0tZXByZWZpeD1FWFBSRUZJWF0KICAgIFstLXN0YXRpY10gWy0tNjRdIFstLWxpYmRpcj1MSUJESVJdIFstLXNoYXJlZGxpYmRpcj1MSUJESVJdCiAgICBbLS1pbmNsdWRlZGlyPUlOQ0xVREVESVJdIFstLWFyY2hzPSItYXJjaCBpMzg2IC1hcmNoIHg4Nl82NCJdCg==",
+        "stderr_base64": "",
+        "unsupported": [
+          "ar",
+          "ranlib",
+          "nm"
+        ],
+        "unsupported_commands": [
+          "ar",
+          "ranlib",
+          "nm"
+        ]
+      }
+    },
+    {
+      "id": "zlib-configure-static-stubbed",
+      "source": {
+        "url": "https://github.com/oils-for-unix/oils",
+        "revision": "08310e96b182cf1d2dd65161e07b1743d17f8936",
+        "path": "Python-2.7.13/Modules/zlib/configure",
+        "sha256": "94159ff86133515dee243814d92238192d1f2c36c86fdc1472e0a0a797d1dd2f",
+        "license": "Zlib"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/configure",
+      "args": [
+        "--static",
+        "--prefix=/opt/zlib"
+      ],
+      "env": {
+        "CC": "/work/bin/cc",
+        "AR": "/work/bin/ar",
+        "RANLIB": "/work/bin/ranlib"
+      },
+      "fixtures": [
+        {
+          "source": "zlib/configure",
+          "destination": "/work/configure",
+          "sha256": "94159ff86133515dee243814d92238192d1f2c36c86fdc1472e0a0a797d1dd2f",
+          "mode": 493
+        },
+        {
+          "source": "zlib/zlib.h",
+          "destination": "/work/zlib.h",
+          "sha256": "726b0569915917b967f87f3f08a1eec039101bf9dcc29d61c0b2b0b8f271b58d",
+          "mode": 420
+        },
+        {
+          "source": "zlib/zconf.h.in",
+          "destination": "/work/zconf.h.in",
+          "sha256": "ec0d0a6e87b749ab5fc3f27c0e8292b7aed139ca0b6121ab27e6eb30e2e9b6ba",
+          "mode": 420
+        },
+        {
+          "source": "zlib/Makefile.in",
+          "destination": "/work/Makefile.in",
+          "sha256": "edb322ca9ea5055eb1c5fd0b277e152986bb9135a86500039f6de19a68d6a5f7",
+          "mode": 420
+        },
+        {
+          "source": "zlib/tool-stub.sh",
+          "destination": "/work/bin/cc",
+          "sha256": "867f647cf75ff0edfc9aa8da06a43b834088e09fb440df21da96476f95bdfd89",
+          "mode": 493
+        },
+        {
+          "source": "zlib/tool-stub.sh",
+          "destination": "/work/bin/ar",
+          "sha256": "867f647cf75ff0edfc9aa8da06a43b834088e09fb440df21da96476f95bdfd89",
+          "mode": 493
+        },
+        {
+          "source": "zlib/tool-stub.sh",
+          "destination": "/work/bin/ranlib",
+          "sha256": "867f647cf75ff0edfc9aa8da06a43b834088e09fb440df21da96476f95bdfd89",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "frontier",
+        "exit_status": 1,
+        "class": "unknown_command",
+        "unsupported": [
+          "ar",
+          "ranlib",
+          "nm"
+        ],
+        "unsupported_commands": [
+          "ar",
+          "ranlib",
+          "nm"
+        ]
+      }
+    },
+    {
+      "id": "modernish-full-initialization",
+      "source": {
+        "url": "https://github.com/modernish/modernish",
+        "revision": "63bdae02eeda8ae2ffb9b517cf26a6f4fd52e180",
+        "path": "bin/modernish",
+        "sha256": "5c6b643439e7b628b2dacac047a40e454aae5870045150ae1abe700d8abf69d9",
+        "license": "ISC"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/modernish",
+      "expect": {
+        "disposition": "skip",
+        "skip_reason": "Full initialization requires Modernish helper functions and shell quirks beyond the standalone capability probes."
+      }
+    },
+    {
+      "id": "shellspec-simple-spec",
+      "source": {
+        "url": "https://github.com/shellspec/shellspec",
+        "revision": "f2d13f991885ef44e6b54e571e0842222251b111",
+        "path": "shellspec",
+        "sha256": "ed757a6c192f435f699c3fcbaa6711e0fb88f667bdf2356b583a88df677040da",
+        "license": "MIT"
+      },
+      "kind": "shell",
+      "entrypoint": "/work/shellspec",
+      "expect": {
+        "disposition": "skip",
+        "skip_reason": "The ShellSpec launcher currently reaches compound grammar outside shellsim's parser frontier."
+      }
+    }
+  ]
+}

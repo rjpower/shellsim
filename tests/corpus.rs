@@ -99,6 +99,7 @@ fn imported_shell_and_python_corpora_match_checked_behavior() {
         ("oils-spec", 50),
         ("micropython-basics", 50),
         ("posix-derived", 8),
+        ("whole-programs", 30),
     ] {
         let report = run_frozen_corpus(name);
         assert_eq!(
@@ -149,5 +150,29 @@ fn an_expected_unknown_command_can_be_part_of_a_pass_case() {
         report.cases[0].unsupported,
         report.cases[0].unsupported_commands
     );
+    assert_eq!(report.cases[0].class, ResultClass::Pass);
+}
+
+#[test]
+fn command_cases_can_use_a_modeled_module_entrypoint() {
+    let root = fixture_root();
+    let manifest = br#"{
+        "version": 1,
+        "profile": "stock_agent_v1",
+        "cases": [{
+            "id": "module-entrypoint",
+            "kind": "command",
+            "entrypoint": "python3.14",
+            "args": ["-c", "print('module command')"],
+            "expect": {
+                "disposition": "pass",
+                "stdout_base64": "bW9kdWxlIGNvbW1hbmQK",
+                "stderr_base64": ""
+            }
+        }]
+    }"#;
+    let report = corpus::run_manifest_bytes(&root, manifest).expect("valid manifest");
+
+    assert_eq!(report.expectation_failures, 0);
     assert_eq!(report.cases[0].class, ResultClass::Pass);
 }
