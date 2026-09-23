@@ -886,7 +886,7 @@ impl PyRuntime for Vm<'_> {
         let unpacked = vec![false; total];
         let keyword_names = keywords
             .iter()
-            .map(|(name, _)| name.clone())
+            .map(|(name, _)| Some(name.clone()))
             .collect::<Vec<_>>();
         self.stack.push(callable);
         self.stack.extend(positional);

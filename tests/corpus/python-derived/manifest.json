@@ -35,12 +35,7 @@
       "kind": "python",
       "code": "def collect(a, b=2, *args, scale=1, **kwargs):\n    return (a + b + sum(args)) * scale, sorted(kwargs.items())\n\nprint(collect(1, 3, 4, 5, scale=2, z=9, y=8))",
       "covers": ["python.function.arguments", "python.function.varargs", "python.function.kwargs"],
-      "expect": {
-        "disposition": "frontier",
-        "class": "unsupported_feature",
-        "exit_status": 2,
-        "unsupported": ["python:expected a parameter name at line 1, column 37"]
-      }
+      "expect": {"disposition": "pass", "stdout": "(26, [('y', 8), ('z', 9)])\n", "stderr": ""}
     },
     {
       "id": "closure-and-nonlocal",
