@@ -929,7 +929,7 @@ fn kill_target_exists(interp: &CommandContext<'_>, target: KillTarget) -> bool {
 
 fn list_signal(argument: Option<&String>, io: &mut Io) -> i32 {
     let Some(argument) = argument else {
-        wln(io.out, "HUP INT KILL PIPE TERM CHLD CONT STOP");
+        wln(io.out, "HUP INT KILL USR1 USR2 PIPE TERM CHLD CONT STOP");
         return 0;
     };
     let normalized = argument
@@ -1993,20 +1993,26 @@ fn num(s: &str) -> i64 {
 }
 
 fn cmd_read(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _long) = split_flags(args);
+    let (flags, ops, long) = split_flags(args);
+    if !long.is_empty() || flags.iter().any(|flag| !matches!(flag, 'a' | 'r')) {
+        ewln(io.err, "read: supported options are -a and -r");
+        return 2;
+    }
     // `read -a arr`: split the line into an indexed array (the name follows `-a`).
     if flags.contains(&'a') {
         let line = read_one_line(interp, io);
         let Some(line) = line else { return 1 };
+        let line = if flags.contains(&'r') {
+            line
+        } else {
+            decode_read_backslashes(&line)
+        };
         let arr = ops.first().map(|s| s.as_str()).unwrap_or("REPLY");
         let ifs = interp.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
         let elems: Vec<String> = if ifs.is_empty() {
             vec![line]
         } else {
-            line.split(|c| ifs.contains(c))
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect()
+            split_read_fields(&line, &ifs)
         };
         interp.set_array(arr, elems);
         return 0;
@@ -2015,6 +2021,11 @@ fn cmd_read(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     // cursor (set up by a `< file` redirect on an enclosing loop).
     let Some(line) = read_one_line(interp, io) else {
         return 1;
+    };
+    let line = if flags.contains(&'r') {
+        line
+    } else {
+        decode_read_backslashes(&line)
     };
 
     let ifs = interp.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
@@ -2026,19 +2037,64 @@ fn cmd_read(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             interp.set_var(v, "");
         }
     } else {
-        let parts: Vec<&str> = line
-            .split(|c| ifs.contains(c))
-            .filter(|s| !s.is_empty())
-            .collect();
+        let parts = split_read_fields(&line, &ifs);
+        let separator = ifs.chars().next().unwrap_or(' ').to_string();
         for (i, var) in ops.iter().enumerate() {
             if i == ops.len() - 1 {
-                interp.set_var(var, parts[i..].join(" "));
+                interp.set_var(var, parts.get(i..).unwrap_or_default().join(&separator));
             } else {
-                interp.set_var(var, parts.get(i).copied().unwrap_or(""));
+                interp.set_var(var, parts.get(i).map_or("", String::as_str));
             }
         }
     }
     0
+}
+
+/// Split a `read` record according to POSIX IFS classes.
+///
+/// IFS whitespace collapses and trims. Every non-whitespace IFS character is a delimiter in its
+/// own right, so adjacent delimiters retain an empty field for assignment to the final variable.
+fn split_read_fields(line: &str, ifs: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut after_ifs_whitespace = false;
+    for character in line.chars() {
+        if ifs.contains(character) && matches!(character, ' ' | '\t' | '\n') {
+            if !field.is_empty() {
+                fields.push(std::mem::take(&mut field));
+            }
+            after_ifs_whitespace = true;
+        } else if ifs.contains(character) {
+            if !field.is_empty() {
+                fields.push(std::mem::take(&mut field));
+            } else if !after_ifs_whitespace {
+                fields.push(String::new());
+            }
+            after_ifs_whitespace = false;
+        } else {
+            field.push(character);
+            after_ifs_whitespace = false;
+        }
+    }
+    if !field.is_empty() {
+        fields.push(field);
+    }
+    fields
+}
+
+fn decode_read_backslashes(line: &str) -> String {
+    let mut decoded = String::with_capacity(line.len());
+    let mut characters = line.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            if let Some(escaped) = characters.next() {
+                decoded.push(escaped);
+            }
+        } else {
+            decoded.push(character);
+        }
+    }
+    decoded
 }
 
 const MAX_MAPFILE_RECORDS: usize = 100_000;

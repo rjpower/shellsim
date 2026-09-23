@@ -444,6 +444,8 @@ pub(crate) enum ShellPoll {
 pub(crate) struct ShellContinuation {
     frames: Vec<ShellFrame>,
     status: i32,
+    /// Whether the current nonzero status came from an errexit-exempt AND-OR or negation context.
+    errexit_exempt: bool,
     switched: bool,
     yielded: bool,
     blocked: Option<crate::scheduler::WaitReason>,
@@ -455,6 +457,7 @@ impl ShellContinuation {
         Self {
             frames: vec![ShellFrame::Eval(node.clone())],
             status: 0,
+            errexit_exempt: false,
             switched: false,
             yielded: false,
             blocked: None,
@@ -822,11 +825,13 @@ impl ShellContinuation {
             return;
         }
         let items = expand_words(interp, &state.words);
-        if let Some(message) = interp.expansion_error.take() {
-            write_diagnostic(interp, &message);
+        if let Some(error) = interp.expansion_error.take() {
+            write_diagnostic(interp, &error.message);
             restore_command_variables(interp, state.temporary_variables);
-            self.status = 1;
-            interp.exiting = Some(1);
+            self.status = error.status;
+            if error.abort_shell {
+                interp.exiting = Some(error.status);
+            }
             return;
         }
         restore_command_variables(interp, state.temporary_variables);
@@ -913,11 +918,13 @@ impl ShellContinuation {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        if let Some(message) = interp.expansion_error.take() {
-            write_diagnostic(interp, &message);
+        if let Some(error) = interp.expansion_error.take() {
+            write_diagnostic(interp, &error.message);
             restore_command_variables(interp, state.temporary_variables);
-            self.status = 1;
-            interp.exiting = Some(1);
+            self.status = error.status;
+            if error.abort_shell {
+                interp.exiting = Some(error.status);
+            }
             return;
         }
         restore_command_variables(interp, state.temporary_variables);
@@ -1200,7 +1207,12 @@ impl ShellContinuation {
                     }
                     return;
                 }
-                if next > 0 && self.status != 0 && interp.opt_errexit && interp.cond_depth == 0 {
+                if next > 0
+                    && self.status != 0
+                    && interp.opt_errexit
+                    && interp.cond_depth == 0
+                    && !self.errexit_exempt
+                {
                     interp.exiting = Some(self.status);
                     return;
                 }
@@ -1222,12 +1234,16 @@ impl ShellContinuation {
             } => {
                 interp.cond_depth = interp.cond_depth.saturating_sub(1);
                 if !should_unwind(interp) && (self.status == 0) == run_on_success {
+                    self.errexit_exempt = false;
                     self.push(interp, ShellFrame::Eval(rhs));
+                } else if !should_unwind(interp) {
+                    self.errexit_exempt = true;
                 }
             }
             ShellFrame::Negate => {
                 interp.cond_depth = interp.cond_depth.saturating_sub(1);
                 self.status = i32::from(self.status == 0);
+                self.errexit_exempt = true;
             }
             ShellFrame::IfNext {
                 branches,
@@ -1796,6 +1812,7 @@ impl ShellContinuation {
                 words,
                 redirects,
             } => {
+                self.errexit_exempt = false;
                 self.push(
                     interp,
                     ShellFrame::PrepareCommand(PreparedCommand {
@@ -1809,8 +1826,14 @@ impl ShellContinuation {
                     }),
                 );
             }
-            Node::ArgvCommand(argv) => self.eval_external_argv(interp, argv, Vec::new(), true),
-            Node::Pipeline(stages) => self.spawn_pipeline(interp, stages),
+            Node::ArgvCommand(argv) => {
+                self.errexit_exempt = false;
+                self.eval_external_argv(interp, argv, Vec::new(), true);
+            }
+            Node::Pipeline(stages) => {
+                self.errexit_exempt = false;
+                self.spawn_pipeline(interp, stages);
+            }
             Node::And(lhs, rhs) => {
                 interp.cond_depth = interp.cond_depth.saturating_add(1);
                 if self.push(
@@ -1846,7 +1869,10 @@ impl ShellContinuation {
                 self.push(interp, ShellFrame::Sequence { nodes, next: 0 });
             }
             Node::Background(inner) => self.status = exec_background(interp, &inner),
-            Node::Subshell(inner) => self.spawn_child(interp, *inner, "(subshell)", true),
+            Node::Subshell(inner) => {
+                self.errexit_exempt = false;
+                self.spawn_child(interp, *inner, "(subshell)", true);
+            }
             Node::Group(inner) => {
                 self.push(interp, ShellFrame::Eval(*inner));
             }
@@ -1963,11 +1989,13 @@ impl ShellContinuation {
         substitution_status: Option<i32>,
     ) {
         let argv = expand_argv(interp, &words);
-        if let Some(message) = interp.expansion_error.take() {
-            write_diagnostic(interp, &message);
+        if let Some(error) = interp.expansion_error.take() {
+            write_diagnostic(interp, &error.message);
             restore_command_variables(interp, temporary_variables);
-            self.status = 1;
-            interp.exiting = Some(1);
+            self.status = error.status;
+            if error.abort_shell {
+                interp.exiting = Some(error.status);
+            }
             return;
         }
         let argv = match expand_alias_argv(interp, argv) {
@@ -1982,10 +2010,13 @@ impl ShellContinuation {
         if argv.is_empty() {
             for (key, value) in &assigns {
                 apply_assignment(interp, key, value);
-                if let Some(message) = interp.expansion_error.take() {
-                    write_diagnostic(interp, &message);
+                if let Some(error) = interp.expansion_error.take() {
+                    write_diagnostic(interp, &error.message);
                     restore_command_variables(interp, temporary_variables);
-                    self.status = 1;
+                    self.status = error.status;
+                    if error.abort_shell {
+                        interp.exiting = Some(error.status);
+                    }
                     return;
                 }
             }
@@ -1994,12 +2025,14 @@ impl ShellContinuation {
             return;
         }
         let variables = install_command_variables(interp, &assigns);
-        if let Some(message) = interp.expansion_error.take() {
-            write_diagnostic(interp, &message);
+        if let Some(error) = interp.expansion_error.take() {
+            write_diagnostic(interp, &error.message);
             restore_command_variables(interp, variables);
             restore_command_variables(interp, temporary_variables);
-            self.status = 1;
-            interp.exiting = Some(1);
+            self.status = error.status;
+            if error.abort_shell {
+                interp.exiting = Some(error.status);
+            }
             return;
         }
         restore_command_variables(interp, temporary_variables);
@@ -3004,9 +3037,11 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
                     }
                     _ => unreachable!(),
                 };
-                if let Some(message) = interp.expansion_error.take() {
-                    interp.exiting = Some(1);
-                    return Err(message.trim().to_string());
+                if let Some(error) = interp.expansion_error.take() {
+                    if error.abort_shell {
+                        interp.exiting = Some(error.status);
+                    }
+                    return Err(error.message.trim().to_string());
                 }
                 let description = interp
                     .descriptors
@@ -3099,9 +3134,11 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
 
 fn redirect_path(interp: &mut Interp, word: &str) -> Result<String, String> {
     let fields = expand_word(interp, word, true);
-    if let Some(message) = interp.expansion_error.take() {
-        interp.exiting = Some(1);
-        return Err(message.trim().to_string());
+    if let Some(error) = interp.expansion_error.take() {
+        if error.abort_shell {
+            interp.exiting = Some(error.status);
+        }
+        return Err(error.message.trim().to_string());
     }
     if fields.len() != 1 {
         return Err(format!("{word}: ambiguous redirect"));
@@ -3162,7 +3199,9 @@ fn install_command_variables(
         .collect();
     for (k, v) in &expanded_assigns {
         if interp.readonly.contains(k) {
-            interp.expansion_error = Some(format!("shellsim: {k}: readonly variable\n"));
+            interp.expansion_error = Some(crate::interp::ShellExpansionError::assignment(format!(
+                "shellsim: {k}: readonly variable\n"
+            )));
             break;
         }
         interp.set_var(k, v.clone());
@@ -3258,7 +3297,9 @@ pub fn apply_assignment(interp: &mut Interp, raw_key: &str, raw_val: &str) {
         _ => (key_body, None),
     };
     if interp.readonly.contains(name) {
-        interp.expansion_error = Some(format!("shellsim: {name}: readonly variable\n"));
+        interp.expansion_error = Some(crate::interp::ShellExpansionError::assignment(format!(
+            "shellsim: {name}: readonly variable\n"
+        )));
         return;
     }
 

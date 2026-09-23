@@ -7,11 +7,13 @@ scripts depend on:
 
 | Area | Cases |
 | --- | --- |
-| quoting, field splitting, positional parameters | `quoted-ifs`, `positional-function` |
-| parameter and command substitution | `parameter-defaults`, `subshell-command-sub` |
-| redirection and virtual filesystem data flow | `ordinary-redirection` |
-| POSIX loops, `case`, functions, and subshell scope | `control-flow`, `positional-function`, `subshell-command-sub` |
-| pipeline, negation, AND-OR, assignment, and export status | `status-lists`, `assignment-export` |
+| quoting, field splitting, positional parameters | `quoted-ifs`, `ifs-boundaries`, `star-at-expansion`, `positional-function` |
+| parameter and command substitution | `parameter-defaults`, `parameter-trimming`, `parameter-error`, `subshell-command-sub` |
+| redirection and virtual filesystem data flow | `ordinary-redirection`, `descriptor-ordering`, `heredoc-expansion`, `group-redirection` |
+| POSIX loops, `case`, functions, and subshell scope | `control-flow`, `case-patterns`, `function-return-scope`, `subshell-directory-scope` |
+| pipeline, negation, AND-OR, assignment, and export status | `status-lists`, `errexit-contexts`, `errexit-positive`, `errexit-or-positive`, `assignment-export`, `pipeline-scope` |
+| stateful builtins and signals | `read-raw`, `read-escapes`, `getopts-options`, `trap-signal` |
 
-Expected output was checked with Bash 5.2 in POSIX-compatible syntax. Each file is hashed in the
+Expected output was checked with Bash and dash in POSIX-compatible syntax. Cases normalize behavior
+that POSIX permits shells to report with different nonzero statuses. Each file is hashed in the
 manifest so a changed probe requires an explicit expectation review.
