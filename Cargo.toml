@@ -39,6 +39,7 @@ md-5 = "0.10"
 base64 = "0.22"
 crc32fast = "1"
 flate2 = "1"
+wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "prefer-btree-collections", "portable-dispatch"] }
 num-bigint = "0.4"
 num-traits = "0.2"
 
@@ -53,6 +54,9 @@ libc = "0.2"
 default = []
 # Retained as an empty compatibility feature. Python is now always the minimal `-c` shim.
 python = []
+
+[dev-dependencies]
+wat = "1"
 
 [profile.dev]
 opt-level = 1

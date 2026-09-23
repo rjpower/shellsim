@@ -292,6 +292,11 @@ pub(crate) fn try_exec_script(
     resumable: bool,
 ) -> Option<crate::commands::CommandPoll> {
     let data = interp.vfs.read("/", path).ok()?;
+    if data.starts_with(b"\0asm") {
+        return Some(crate::commands::wasm::run(
+            interp, path, &data, args, stdin, out, err,
+        ));
+    }
     let text = String::from_utf8_lossy(&data);
     let first = text.lines().next().unwrap_or("");
     let code = if first.starts_with("#!") && first.contains("python") {

@@ -48,6 +48,7 @@ mod tarcmd;
 mod text;
 mod unavailable;
 pub mod util;
+mod wasm;
 mod xargs;
 mod zipcmd;
 
