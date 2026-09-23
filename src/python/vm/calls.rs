@@ -780,9 +780,10 @@ impl Vm<'_> {
                     length
                 } else if let Some(id) = arguments[0].object_id() {
                     match self.state.heap.get(id)? {
-                        Object::List(values) | Object::Tuple(values) | Object::Set(values) => {
-                            values.len()
-                        }
+                        Object::List(values)
+                        | Object::Tuple(values)
+                        | Object::Set(values)
+                        | Object::FrozenSet(values) => values.len(),
                         Object::Range { start, stop, step } => range_length(*start, *stop, *step)?,
                         Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                             entries.len()

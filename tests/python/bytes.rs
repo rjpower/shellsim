@@ -37,6 +37,38 @@ with open(path, 'rb') as stream:
 }
 
 #[test]
+fn update_modes_share_one_seekable_read_write_cursor() {
+    let source = r#"
+with open('/tmp/value.txt', 'w+') as stream:
+    stream.write('abcdef')
+    stream.seek(2)
+    stream.write('XY')
+    stream.seek(0)
+    print(stream.read())
+with open('/tmp/value.txt', 'a+') as stream:
+    stream.seek(0)
+    print(stream.read())
+    stream.seek(0)
+    stream.write('!')
+    stream.seek(0)
+    print(stream.read())
+with open('/tmp/sparse.bin', 'w+b') as stream:
+    stream.seek(2)
+    stream.write(b'x')
+    stream.seek(0)
+    print(stream.read())
+"#;
+    assert_eq!(
+        run_python_text(source),
+        (
+            0,
+            "abXYef\nabXYef\nabXYef!\nb'\\x00\\x00x'\n".into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
 fn bytes_and_bytearray_support_common_search_and_layout_methods() {
     let source = r#"
 for value in (b'ababa', bytearray(b'ababa')):

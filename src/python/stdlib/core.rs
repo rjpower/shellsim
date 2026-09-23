@@ -153,6 +153,14 @@ pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
     ],
 };
 
+pub(crate) static FROZENSET_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "frozenset",
+    methods: &[
+        method("frozenset", "union", set_union),
+        method("frozenset", "copy", set_copy),
+    ],
+};
+
 pub(crate) static PROPERTY_TYPE: NativeTypeDef = NativeTypeDef {
     name: "property",
     methods: &[method("property", "setter", property_setter)],
@@ -1995,7 +2003,9 @@ fn set_modify(
 
 fn set_union(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.reject_keywords("set.union")?;
-    let mut values = receiver.cast::<PySet>(runtime)?.items(runtime)?;
+    let receiver = receiver.cast::<PySet>(runtime)?;
+    let frozen = runtime.set_is_frozen(receiver)?;
+    let mut values = receiver.items(runtime)?;
     for source in args.positional() {
         let iterator = runtime.iterator(*source)?;
         while let Some(value) = runtime.iterator_next(iterator)? {
@@ -2013,14 +2023,24 @@ fn set_union(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
             }
         }
     }
-    runtime.new_set(values)
+    if frozen {
+        runtime.new_frozen_set(values)
+    } else {
+        runtime.new_set(values)
+    }
 }
 
 fn set_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("set.copy", 0, 0)?;
     args.reject_keywords("set.copy")?;
-    let values = receiver.cast::<PySet>(runtime)?.items(runtime)?;
-    runtime.new_set(values)
+    let receiver = receiver.cast::<PySet>(runtime)?;
+    let frozen = runtime.set_is_frozen(receiver)?;
+    let values = receiver.items(runtime)?;
+    if frozen {
+        runtime.new_frozen_set(values)
+    } else {
+        runtime.new_set(values)
+    }
 }
 
 fn set_is_subset(
@@ -2028,7 +2048,8 @@ fn set_is_subset(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<(bool, bool)> {
-    let left = left.cast::<PySet>(runtime)?.items(runtime)?;
+    let left = left.cast::<PySet>(runtime)?;
+    let left = left.items(runtime)?;
     let right = right.cast::<PySet>(runtime)?.items(runtime)?;
     let mut subset = true;
     for value in &left {
@@ -2132,7 +2153,9 @@ fn set_binary(
     right: PyValue,
     operation: SetBinaryOperation,
 ) -> PyResult<Option<PyValue>> {
-    let left = left.cast::<PySet>(runtime)?.items(runtime)?;
+    let left = left.cast::<PySet>(runtime)?;
+    let frozen = runtime.set_is_frozen(left)?;
+    let left = left.items(runtime)?;
     let Ok(right) = right.cast::<PySet>(runtime) else {
         return Ok(None);
     };
@@ -2158,7 +2181,11 @@ fn set_binary(
             }
         }
     }
-    runtime.new_set(result).map(Some)
+    if frozen {
+        runtime.new_frozen_set(result).map(Some)
+    } else {
+        runtime.new_set(result).map(Some)
+    }
 }
 
 fn set_contains(

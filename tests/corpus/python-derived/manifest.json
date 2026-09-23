@@ -105,12 +105,7 @@
       "kind": "python",
       "code": "with open('/work/data.txt', 'w+') as stream:\n    stream.write('abcdef')\n    stream.seek(2)\n    stream.write('XY')\n    stream.seek(0)\n    print(stream.read())",
       "covers": ["python.io.open", "python.io.seek", "python.io.update_mode"],
-      "expect": {
-        "disposition": "frontier",
-        "class": "unsupported_feature",
-        "exit_status": 2,
-        "unsupported": ["python:ValueError: only modes r, w, a, rb, wb, and ab are supported at line 1, column 6"]
-      }
+      "expect": {"disposition": "pass", "stdout": "abXYef\n", "stderr": ""}
     },
     {
       "id": "pathlib-file-operations",
@@ -173,12 +168,7 @@
       "kind": "python",
       "code": "left = {1, 2, 3}\nright = frozenset([3, 4])\nprint(sorted(left | right), sorted(left & right), right <= {3, 4, 5})",
       "covers": ["python.value.set", "python.value.frozenset"],
-      "expect": {
-        "disposition": "frontier",
-        "class": "unsupported_feature",
-        "exit_status": 2,
-        "unsupported": ["python:name \"frozenset\" is not defined at line 2, column 9"]
-      }
+      "expect": {"disposition": "pass", "stdout": "[1, 2, 3, 4] [3] True\n", "stderr": ""}
     },
     {
       "id": "sorting-with-key",

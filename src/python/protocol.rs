@@ -216,6 +216,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::Slice { .. } => "slice(...)",
                 Object::Dict(_) | Object::DefaultDict { .. } => "{...}",
                 Object::Set(_) => "set(...)",
+                Object::FrozenSet(_) => "frozenset(...)",
                 Object::Range { .. } => "range(...)",
                 Object::Function { .. } => "<function ...>",
                 Object::Class { .. } => "<class ...>",
@@ -284,6 +285,11 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::Set(values) => {
                 format!("{{{}}}", render_values(heap, values, active)?.join(", "))
             }
+            Object::FrozenSet(values) if values.is_empty() => "frozenset()".into(),
+            Object::FrozenSet(values) => format!(
+                "frozenset({{{}}})",
+                render_values(heap, values, active)?.join(", ")
+            ),
             Object::Range { start, stop, step } => {
                 if *step == 1 && *start == 0 {
                     format!("range({stop})")
@@ -394,7 +400,10 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         Object::Bytes(value) => !value.is_empty(),
         Object::ByteArray(value) => !value.is_empty(),
         Object::Exception { .. } => true,
-        Object::List(values) | Object::Tuple(values) | Object::Set(values) => !values.is_empty(),
+        Object::List(values)
+        | Object::Tuple(values)
+        | Object::Set(values)
+        | Object::FrozenSet(values) => !values.is_empty(),
         Object::Slice { .. } => true,
         Object::Dict(entries) | Object::DefaultDict { entries, .. } => !entries.is_empty(),
         Object::BigInt(value) => !value.is_zero(),
@@ -546,7 +555,10 @@ fn equals_inner(
                         all
                     }
                 }
-                (Object::Set(left), Object::Set(right)) => {
+                (
+                    Object::Set(left) | Object::FrozenSet(left),
+                    Object::Set(right) | Object::FrozenSet(right),
+                ) => {
                     if left.len() != right.len() {
                         false
                     } else {
@@ -777,7 +789,10 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
                     .ok_or("bytes containment requires an integer in range(0, 256)")?;
                 Ok(value.contains(&needle))
             }
-            Object::List(values) | Object::Tuple(values) | Object::Set(values) => {
+            Object::List(values)
+            | Object::Tuple(values)
+            | Object::Set(values)
+            | Object::FrozenSet(values) => {
                 for value in values {
                     if identical(value, needle) || equals(heap, value, needle)? {
                         return Ok(true);

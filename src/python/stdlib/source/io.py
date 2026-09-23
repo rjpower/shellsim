@@ -5,14 +5,19 @@ import _shellsim_vfs
 
 class _File:
     def __init__(self, path, mode="r"):
-        if mode not in ["r", "w", "a", "rb", "wb", "ab"]:
-            raise ValueError("only modes r, w, a, rb, wb, and ab are supported")
+        if mode not in [
+            "r", "w", "a", "r+", "w+", "a+",
+            "rb", "wb", "ab", "rb+", "wb+", "ab+", "r+b", "w+b", "a+b",
+        ]:
+            raise ValueError("invalid file mode: " + mode)
         self.name = path
         self.mode = mode
         self.closed = False
         self._position = 0
         self._binary = "b" in mode
         self._operation = mode[0]
+        self._readable = self._operation == "r" or "+" in mode
+        self._writable = self._operation != "r" or "+" in mode
         self._empty = b"" if self._binary else ""
         if self._operation == "r":
             self._data = self._read_file()
@@ -37,6 +42,8 @@ class _File:
     def read(self, size=-1):
         if self.closed:
             raise ValueError("I/O operation on closed file")
+        if not self._readable:
+            raise ValueError("file is not open for reading")
         if size < 0:
             value = self._data[self._position:]
             self._position = len(self._data)
@@ -46,6 +53,10 @@ class _File:
         return value
 
     def readline(self):
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        if not self._readable:
+            raise ValueError("file is not open for reading")
         if self._position >= len(self._data):
             return self._empty
         end = self._position
@@ -67,7 +78,9 @@ class _File:
         return values
 
     def write(self, value):
-        if self.closed or self._operation == "r":
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        if not self._writable:
             raise ValueError("file is not open for writing")
         if self._operation == "a":
             if self._binary:
@@ -76,6 +89,9 @@ class _File:
                 self._position = _shellsim_vfs.append_text(self.name, value)
             self._data += value
             return len(value)
+        if self._position > len(self._data):
+            padding = b"\x00" if self._binary else "\x00"
+            self._data += padding * (self._position - len(self._data))
         before = self._data[:self._position]
         after_start = self._position + len(value)
         after = self._data[after_start:]
@@ -115,7 +131,7 @@ class _File:
         return position
 
     def flush(self):
-        if not self.closed and self._operation != "r":
+        if not self.closed and self._writable:
             self._write_file()
 
     def __enter__(self):
