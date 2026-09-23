@@ -85,6 +85,9 @@ pub struct CaseExpectation {
     /// Exact UTF-8 stderr. Mutually exclusive with `stderr_base64`.
     #[serde(default)]
     pub stderr: Option<String>,
+    /// Exact UTF-8 contents of files after the program exits, keyed by VFS path.
+    #[serde(default)]
+    pub files: BTreeMap<String, String>,
     #[serde(default)]
     pub skip_reason: Option<String>,
     /// Unsupported language features that are part of the checked behavior.
@@ -336,6 +339,14 @@ fn validate_manifest(manifest: &CorpusManifest) -> Result<(), String> {
                 case.id
             ));
         }
+        for path in case.expect.files.keys() {
+            if !path.starts_with('/') || path == "/" {
+                return Err(format!(
+                    "case {:?} has a non-absolute expected file path {path:?}",
+                    case.id
+                ));
+            }
+        }
         let mut requirements = std::collections::BTreeSet::new();
         for requirement in &case.covers {
             if requirement.is_empty() || !requirements.insert(requirement) {
@@ -552,6 +563,18 @@ fn run_case(base: &Path, profile: EnvironmentProfile, case: CorpusCase) -> CaseR
         &stderr,
         &mut mismatches,
     );
+    for (path, expected) in &case.expect.files {
+        match environment
+            .vfs
+            .read_limited("/", path, expected.len().saturating_add(1))
+        {
+            Ok(actual) if actual == expected.as_bytes() => {}
+            Ok(_) => mismatches.push(format!("expected file {path:?} has different contents")),
+            Err(error) => {
+                mismatches.push(format!("cannot check expected file {path:?}: {error:?}"))
+            }
+        }
+    }
     let unsupported = environment.unsupported.values();
     let unsupported_commands: Vec<String> = environment
         .invocations

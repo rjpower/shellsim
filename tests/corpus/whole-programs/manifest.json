@@ -548,6 +548,83 @@
       }
     },
     {
+      "id": "derived-build-index",
+      "kind": "shell",
+      "entrypoint": "/work/build-index.sh",
+      "args": ["-o", "/work/index", "/work/records.txt"],
+      "covers": ["shell.whole_program.pipeline", "shell.whole_program.file_generation"],
+      "fixtures": [
+        {
+          "source": "derived/build-index.sh",
+          "destination": "/work/build-index.sh",
+          "sha256": "d9dc0a87844b2db8ecbfd95037657fdcbea5900eca15c81fe6fe24a8eec865c6",
+          "mode": 493
+        },
+        {
+          "source": "derived/records.txt",
+          "destination": "/work/records.txt",
+          "sha256": "4fc9d5cecc2b183de1729c6d9ed4dee194cd974b83ba5a60739db8b5e6418981"
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "stdout": "indexed 3 records\n",
+        "stderr": "",
+        "files": {
+          "/work/index/records": "alpha:1\nbeta:2\ngamma:3\n",
+          "/work/index/names": "alpha\nbeta\ngamma\n"
+        }
+      }
+    },
+    {
+      "id": "derived-build-index-empty",
+      "kind": "shell",
+      "entrypoint": "/work/build-index.sh",
+      "args": ["/work/records.txt"],
+      "covers": ["shell.whole_program.empty_pipeline"],
+      "fixtures": [
+        {
+          "source": "derived/build-index.sh",
+          "destination": "/work/build-index.sh",
+          "sha256": "d9dc0a87844b2db8ecbfd95037657fdcbea5900eca15c81fe6fe24a8eec865c6",
+          "mode": 493
+        },
+        {
+          "contents": "# no records\n",
+          "destination": "/work/records.txt"
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "stdout": "indexed 0 records\n",
+        "stderr": "",
+        "files": {
+          "/work/output/records": "",
+          "/work/output/names": ""
+        }
+      }
+    },
+    {
+      "id": "derived-build-index-usage",
+      "kind": "shell",
+      "entrypoint": "/work/build-index.sh",
+      "covers": ["shell.whole_program.usage_error"],
+      "fixtures": [
+        {
+          "source": "derived/build-index.sh",
+          "destination": "/work/build-index.sh",
+          "sha256": "d9dc0a87844b2db8ecbfd95037657fdcbea5900eca15c81fe6fe24a8eec865c6",
+          "mode": 493
+        }
+      ],
+      "expect": {
+        "disposition": "pass",
+        "exit_status": 2,
+        "stdout": "",
+        "stderr": "usage: build-index [-o directory] input\n"
+      }
+    },
+    {
       "id": "modernish-full-initialization",
       "source": {
         "url": "https://github.com/modernish/modernish",

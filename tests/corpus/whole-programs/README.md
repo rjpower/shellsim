@@ -4,6 +4,8 @@ This corpus checks whether supported features compose in maintained programs. It
 
 - twelve unchanged Modernish capability probes, sourced through a small status driver;
 - zlib's `configure` help path and a bounded static-configuration attempt with modeled tool stubs;
+- an original index builder that composes option parsing, pipelines, file generation, and a usage
+  error path;
 - explicit skipped targets for full Modernish initialization and a ShellSpec smoke run.
 
 The manifest pins repository revisions and hashes every executed fixture. The adjacent license

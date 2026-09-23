@@ -43,6 +43,9 @@ and UTF-8 expectations in `stdout` and `stderr`. Inline fixtures use `contents`.
 continue to use pinned relative `source` paths and optional hashes. These forms are mutually
 exclusive, and ambiguous manifests are rejected before any case runs.
 
+Cases that generate files can assert exact UTF-8 contents with `expect.files`, keyed by absolute
+virtual paths. The runner bounds each read by the expected length before comparing bytes.
+
 Cases attach stable capability identifiers through `covers`. Reports aggregate passing, frontier,
 skipped, and unexpectedly failing observations for each identifier. Frontier cases must declare
 an exact `class`; a boundary changing from an unsupported feature to a parse error is a regression.
