@@ -83,6 +83,34 @@ pub(crate) enum SignalDelivery {
     Handler(crate::shell::Node),
 }
 
+/// A failed shell expansion with the status and unwinding behavior required by its cause.
+#[derive(Clone, Debug)]
+pub(crate) struct ShellExpansionError {
+    pub(crate) message: String,
+    pub(crate) status: i32,
+    pub(crate) abort_shell: bool,
+}
+
+impl ShellExpansionError {
+    /// Parameter expansion errors abort a non-interactive shell with Bash-compatible status.
+    pub(crate) fn parameter(message: String) -> Self {
+        Self {
+            message,
+            status: 1,
+            abort_shell: true,
+        }
+    }
+
+    /// Assignment errors fail their simple command without unconditionally exiting the shell.
+    pub(crate) fn assignment(message: String) -> Self {
+        Self {
+            message,
+            status: 1,
+            abort_shell: false,
+        }
+    }
+}
+
 /// Machine-wide state and limits shared by cooperatively scheduled logical processes.
 #[derive(Clone)]
 pub struct Environment {
@@ -165,8 +193,8 @@ pub struct ProcessState {
     pub opt_errexit: bool,
     pub opt_nounset: bool,
     pub opt_xtrace: bool,
-    /// Fatal diagnostic raised while expanding the current shell word.
-    pub(crate) expansion_error: Option<String>,
+    /// Diagnostic and control-flow effect raised while expanding the current shell word.
+    pub(crate) expansion_error: Option<ShellExpansionError>,
     /// `set -o pipefail`
     pub opt_pipefail: bool,
     pub jobs: Vec<Job>,
@@ -470,7 +498,11 @@ impl ProcessState {
                 }
             }
         }
-        bytes = bytes.saturating_add(self.expansion_error.as_ref().map_or(0, string));
+        bytes = bytes.saturating_add(
+            self.expansion_error
+                .as_ref()
+                .map_or(0, |error| string(&error.message)),
+        );
         for disposition in self.signal_dispositions.values() {
             bytes = bytes.saturating_add(match disposition {
                 ShellSignalDisposition::Ignore => 16,

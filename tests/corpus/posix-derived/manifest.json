@@ -65,6 +65,150 @@
       "covers": ["shell.assignment.environment", "shell.builtin.export", "shell.builtin.readonly"],
       "fixtures": [{"source": "cases/assignment-export.sh", "destination": "/work/cases/assignment-export.sh", "sha256": "67a27a5a6b7ca5d1db6ced4dda053fcd4d33eb4db31d6de3fdd87498dc56e7f2"}],
       "expect": {"disposition": "pass", "stdout_base64": "dGVtcG9yYXJ5CmFmdGVyOnBhcmVudApyZWFkb25seTp2YWx1ZQo=", "stderr_base64": ""}
+    },
+    {
+      "id": "posix-ifs-boundaries",
+      "kind": "shell",
+      "entrypoint": "/work/cases/ifs-boundaries.sh",
+      "covers": ["shell.expansion.field_splitting", "shell.variable.ifs"],
+      "fixtures": [{"source": "cases/ifs-boundaries.sh", "destination": "/work/cases/ifs-boundaries.sh", "sha256": "e2b102994d38e2cc2d85c5a84ab72c11f90ac1aa98c010fd97c8b9e8f4887a7e"}],
+      "expect": {"disposition": "pass", "stdout_base64": "Y29sb246NDw+PGE+PD48Yj4KZW1wdHk6MTo8OmE6OmI6Pgo=", "stderr_base64": ""}
+    },
+    {
+      "id": "posix-star-at-expansion",
+      "kind": "shell",
+      "entrypoint": "/work/cases/star-at-expansion.sh",
+      "covers": ["shell.parameter.star", "shell.parameter.at", "shell.expansion.field_splitting"],
+      "fixtures": [{"source": "cases/star-at-expansion.sh", "destination": "/work/cases/star-at-expansion.sh", "sha256": "ca847bfedba30071373280f2bd4a287b345925032b0788b6fb709e2dd3af888b"}],
+      "expect": {"disposition": "pass", "stdout_base64": "cXVvdGVkLXN0YXI6PGEgYiAgYz4KcXVvdGVkLWF0OjxhIGI+PD48Yz4KdW5xdW90ZWQtc3Rhcjo8YT48Yj48Yz4K", "stderr_base64": ""}
+    },
+    {
+      "id": "posix-parameter-trimming",
+      "kind": "shell",
+      "entrypoint": "/work/cases/parameter-trimming.sh",
+      "covers": ["shell.parameter.length", "shell.parameter.remove_prefix", "shell.parameter.remove_suffix"],
+      "fixtures": [{"source": "cases/parameter-trimming.sh", "destination": "/work/cases/parameter-trimming.sh", "sha256": "0c9380c827d6e2c704f8b45a6db8de8bac5dfe76827eb63417d8bf769b563368"}],
+      "expect": {"disposition": "pass", "stdout_base64": "bGVuZ3RoOjIwCnByZWZpeDp3b3JrL2FyY2hpdmUudGFyLmd6OmFyY2hpdmUudGFyLmd6CnN1ZmZpeDovd29yay9hcmNoaXZlLnRhcjovd29yay9hcmNoaXZlCg==", "stderr_base64": ""}
+    },
+    {
+      "id": "posix-function-return-scope",
+      "kind": "shell",
+      "entrypoint": "/work/cases/function-return-scope.sh",
+      "covers": ["shell.function.positional_scope", "shell.builtin.return", "shell.parameter.status"],
+      "fixtures": [{"source": "cases/function-return-scope.sh", "destination": "/work/cases/function-return-scope.sh", "sha256": "1ea29d2835537514942b6e276c2d9ab12d6f516d11f4b3b10074c8e251f8cb8e"}],
+      "expect": {"disposition": "pass", "stdout_base64": "aW5zaWRlOjI6PGNoaWxkPjo8dGhyZWUgd29yZHM+Cm91dHNpZGU6NzoyOjxwYXJlbnQ+Ojx0d28gd29yZHM+Cg==", "stderr_base64": ""}
+    },
+    {
+      "id": "posix-descriptor-ordering",
+      "kind": "shell",
+      "entrypoint": "/work/cases/descriptor-ordering.sh",
+      "covers": ["shell.redirection.duplication", "shell.redirection.order", "shell.function.redirection"],
+      "fixtures": [{"source": "cases/descriptor-ordering.sh", "destination": "/work/cases/descriptor-ordering.sh", "sha256": "f7d6d9d4990854cba350508c3eaec2be72c27d693f58af2e75e26576e22eb5fa"}],
+      "expect": {"disposition": "pass", "stdout_base64": "ZXJyCmJvdGg6b3V0CmVycgpvdXQtb25seTpvdXQK", "stderr_base64": ""}
+    },
+    {
+      "id": "posix-trap-signal",
+      "kind": "shell",
+      "entrypoint": "/work/cases/trap-signal.sh",
+      "covers": ["shell.builtin.trap", "shell.signal.delivery", "shell.special_parameter.pid"],
+      "fixtures": [{"source": "cases/trap-signal.sh", "destination": "/work/cases/trap-signal.sh", "sha256": "e09cb82baf494654166e49a6eaf66581dcd447e2ab37a2d38276d8b872661ce2"}],
+      "expect": {"disposition": "pass", "stdout_base64": "Y2F1Z2h0OlVTUjEKYWZ0ZXItc2lnbmFsCm9uLWV4aXQ6MAo=", "stderr_base64": ""}
+    },
+    {
+      "id": "posix-errexit-contexts",
+      "kind": "shell",
+      "entrypoint": "/work/cases/errexit-contexts.sh",
+      "covers": ["shell.option.errexit", "shell.and_or.status", "shell.pipeline.status", "shell.compound.if"],
+      "fixtures": [{"source": "cases/errexit-contexts.sh", "destination": "/work/cases/errexit-contexts.sh", "sha256": "9482dafc6465594316d10fcdfd2f458d813c6f69717a709aa33f0cfcf15c6dda"}],
+      "expect": {"disposition": "pass", "stdout_base64": "YWxpdmUK", "stderr_base64": ""}
+    },
+    {
+      "id": "posix-heredoc-expansion",
+      "kind": "shell",
+      "entrypoint": "/work/cases/heredoc-expansion.sh",
+      "covers": ["shell.redirection.heredoc", "shell.redirection.heredoc_quoted", "shell.redirection.heredoc_strip_tabs"],
+      "fixtures": [{"source": "cases/heredoc-expansion.sh", "destination": "/work/cases/heredoc-expansion.sh", "sha256": "2b52171675e71439e9bc51cf8cbf7e484af666a5021ff41e006a6449a1c58035"}],
+      "expect": {"disposition": "pass", "stdout_base64": "ZXhwYW5kZWQKJHZhbHVlCnRhYi1zdHJpcHBlZAo=", "stderr_base64": ""}
+    },
+    {
+      "id": "posix-read-raw",
+      "kind": "shell",
+      "entrypoint": "/work/cases/read-raw.sh",
+      "covers": ["shell.builtin.read", "shell.builtin.read.raw", "shell.variable.ifs"],
+      "fixtures": [{"source": "cases/read-raw.sh", "destination": "/work/cases/read-raw.sh", "sha256": "32917192de788a5a1922c213a99957222f908a3acbe2554e918b23d136bb4b2f"}],
+      "expect": {"disposition": "pass", "stdout_base64": "PCAgbGVmdCByaWdodCAgXHRhaWw+CjxhPjxiPjw6Yz4K", "stderr_base64": ""}
+    },
+    {
+      "id": "posix-getopts-options",
+      "kind": "shell",
+      "entrypoint": "/work/cases/getopts-options.sh",
+      "covers": ["shell.builtin.getopts", "shell.variable.optind", "shell.variable.optarg"],
+      "fixtures": [{"source": "cases/getopts-options.sh", "destination": "/work/cases/getopts-options.sh", "sha256": "b64ff084795b8280ed7414027a4032cb6b63807d71ed1ab97d18b292056eebaa"}],
+      "expect": {"disposition": "pass", "stdout_base64": "YQpiOnZhbHVlCnJlc3Q6MTo8dGFpbD4K", "stderr_base64": ""}
+    },
+    {
+      "id": "posix-read-escapes",
+      "kind": "shell",
+      "entrypoint": "/work/cases/read-escapes.sh",
+      "covers": ["shell.builtin.read", "shell.builtin.read.raw", "shell.quoting.backslash"],
+      "fixtures": [{"source": "cases/read-escapes.sh", "destination": "/work/cases/read-escapes.sh", "sha256": "892a120dd8c9364bc93969689901d80c06181e2dedbc83658d5cf2c8fe80ceed"}],
+      "expect": {"disposition": "pass", "stdout": "default:<one two\\three>\nraw:<one\\ two\\\\three>\n", "stderr": ""}
+    },
+    {
+      "id": "posix-errexit-positive",
+      "kind": "shell",
+      "entrypoint": "/work/cases/errexit-positive.sh",
+      "covers": ["shell.option.errexit", "shell.and_or.status"],
+      "fixtures": [{"source": "cases/errexit-positive.sh", "destination": "/work/cases/errexit-positive.sh", "sha256": "41aed45722ed78c79d64ea70dfe71020b08d8d5885b6920cfe5715f4a685ff7e"}],
+      "expect": {"disposition": "pass", "exit_status": 1, "stdout": "", "stderr": ""}
+    },
+    {
+      "id": "posix-errexit-or-positive",
+      "kind": "shell",
+      "entrypoint": "/work/cases/errexit-or-positive.sh",
+      "covers": ["shell.option.errexit", "shell.and_or.status"],
+      "fixtures": [{"source": "cases/errexit-or-positive.sh", "destination": "/work/cases/errexit-or-positive.sh", "sha256": "30c8db1710fa5ea099bdc28230c544c0d31b056ffaebaa93b8e7dee9cf3123e5"}],
+      "expect": {"disposition": "pass", "exit_status": 1, "stdout": "", "stderr": ""}
+    },
+    {
+      "id": "posix-subshell-directory-scope",
+      "kind": "shell",
+      "entrypoint": "/work/cases/subshell-directory-scope.sh",
+      "covers": ["shell.compound.subshell", "shell.builtin.cd", "shell.variable.scope"],
+      "fixtures": [{"source": "cases/subshell-directory-scope.sh", "destination": "/work/cases/subshell-directory-scope.sh", "sha256": "dc862b1ed4c37e9662272a190a30bddf3aed1eaa8e2d9833c3245f4ab537cad1"}],
+      "expect": {"disposition": "pass", "stdout": "inside:inside:/work/child\noutside:unset:/work\n", "stderr": ""}
+    },
+    {
+      "id": "posix-pipeline-scope",
+      "kind": "shell",
+      "entrypoint": "/work/cases/pipeline-scope.sh",
+      "covers": ["shell.pipeline.scope", "shell.builtin.read"],
+      "fixtures": [{"source": "cases/pipeline-scope.sh", "destination": "/work/cases/pipeline-scope.sh", "sha256": "59c8a904e04cb488e51db9fa892bdabaac69ef0e8a69d9559984437a8abe19c6"}],
+      "expect": {"disposition": "pass", "stdout": "after:parent\n", "stderr": ""}
+    },
+    {
+      "id": "posix-group-redirection",
+      "kind": "shell",
+      "entrypoint": "/work/cases/group-redirection.sh",
+      "covers": ["shell.compound.group", "shell.redirection.output", "shell.redirection.scope"],
+      "fixtures": [{"source": "cases/group-redirection.sh", "destination": "/work/cases/group-redirection.sh", "sha256": "eab6559d78a91c9a9146aa19aed4ecf941f72d4a52ae355716c655fd2f267219"}],
+      "expect": {"disposition": "pass", "stdout": "first\nsecond\noutside\n", "stderr": ""}
+    },
+    {
+      "id": "posix-case-patterns",
+      "kind": "shell",
+      "entrypoint": "/work/cases/case-patterns.sh",
+      "covers": ["shell.compound.case", "shell.pattern.bracket", "shell.pattern.wildcard"],
+      "fixtures": [{"source": "cases/case-patterns.sh", "destination": "/work/cases/case-patterns.sh", "sha256": "2cb77bf03f0f311661732ab87286f83154575566df7685d08a165af788922803"}],
+      "expect": {"disposition": "pass", "stdout": "letter:alpha\nnumber:beta-42\nother:other\n", "stderr": ""}
+    },
+    {
+      "id": "posix-parameter-error",
+      "kind": "shell",
+      "entrypoint": "/work/cases/parameter-error.sh",
+      "covers": ["shell.parameter.error", "shell.compound.subshell", "shell.parameter.status"],
+      "fixtures": [{"source": "cases/parameter-error.sh", "destination": "/work/cases/parameter-error.sh", "sha256": "be80e105b5061be8081ce31b845a1c0471d3d75c4d0f43f0d666ca7a262afce4"}],
+      "expect": {"disposition": "pass", "stdout": "rejected-invalid-expansion\nparent-alive\n", "stderr": ""}
     }
   ]
 }

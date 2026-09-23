@@ -22,6 +22,8 @@ pub enum Signal {
     Hangup,
     Interrupt,
     Kill,
+    User1,
+    User2,
     Pipe,
     Terminate,
     Child,
@@ -36,6 +38,8 @@ impl Signal {
             Self::Hangup => 1,
             Self::Interrupt => 2,
             Self::Kill => 9,
+            Self::User1 => 10,
+            Self::User2 => 12,
             Self::Pipe => 13,
             Self::Terminate => 15,
             Self::Child => 17,
@@ -48,7 +52,13 @@ impl Signal {
     pub const fn terminates(self) -> bool {
         matches!(
             self,
-            Self::Hangup | Self::Interrupt | Self::Kill | Self::Pipe | Self::Terminate
+            Self::Hangup
+                | Self::Interrupt
+                | Self::Kill
+                | Self::User1
+                | Self::User2
+                | Self::Pipe
+                | Self::Terminate
         )
     }
 
@@ -57,6 +67,8 @@ impl Signal {
             Self::Hangup => "HUP",
             Self::Interrupt => "INT",
             Self::Kill => "KILL",
+            Self::User1 => "USR1",
+            Self::User2 => "USR2",
             Self::Pipe => "PIPE",
             Self::Terminate => "TERM",
             Self::Child => "CHLD",
@@ -72,6 +84,8 @@ impl Signal {
             "1" | "HUP" => Some(Self::Hangup),
             "2" | "INT" => Some(Self::Interrupt),
             "9" | "KILL" => Some(Self::Kill),
+            "10" | "USR1" => Some(Self::User1),
+            "12" | "USR2" => Some(Self::User2),
             "13" | "PIPE" => Some(Self::Pipe),
             "15" | "TERM" => Some(Self::Terminate),
             "17" | "CHLD" => Some(Self::Child),
@@ -394,6 +408,15 @@ impl ProcessTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_signals_accept_names_prefixes_and_numbers() {
+        assert_eq!(Signal::parse("USR1"), Some(Signal::User1));
+        assert_eq!(Signal::parse("SIGUSR2"), Some(Signal::User2));
+        assert_eq!(Signal::parse("10"), Some(Signal::User1));
+        assert_eq!(Signal::parse("12"), Some(Signal::User2));
+        assert!(Signal::User1.terminates());
+    }
 
     #[test]
     fn pids_are_stable_and_exited_children_are_reapable() {

@@ -1,7 +1,7 @@
 //! Word expansion: quoting, parameter/variable expansion, command & arithmetic
 //! substitution, tilde, word-splitting and pathname globbing.
 
-use crate::interp::Interp;
+use crate::interp::{Interp, ShellExpansionError};
 use crate::vfs::resolve_against;
 
 /// One syntactic command substitution within a shell word.
@@ -153,9 +153,9 @@ fn scalar_value(interp: &mut Interp, name: &str) -> String {
         Some(value) => value,
         None => {
             if interp.opt_nounset && !matches!(name, "@" | "*") {
-                interp
-                    .expansion_error
-                    .get_or_insert_with(|| format!("shellsim: {name}: unbound variable\n"));
+                interp.expansion_error.get_or_insert_with(|| {
+                    ShellExpansionError::parameter(format!("shellsim: {name}: unbound variable\n"))
+                });
             }
             String::new()
         }
@@ -316,29 +316,43 @@ fn assemble(interp: &mut Interp, parts: Vec<Part>, do_split_glob: bool) -> Vec<S
     let mut cur = String::new();
     let mut cur_glob = false;
     let mut started = false;
+    let mut after_ifs_whitespace = false;
     for p in parts {
         if p.field_break && started {
             fields.push((std::mem::take(&mut cur), cur_glob));
             cur_glob = false;
             started = false;
+            after_ifs_whitespace = false;
         }
         if p.quoted || !do_split_glob {
             cur.push_str(&p.text);
             started = true;
+            after_ifs_whitespace = false;
             cur_glob |= p.has_glob && !p.quoted;
         } else {
-            // split unquoted text on IFS
-            let chars = p.text.chars();
-            for c in chars {
-                if ifs.contains(c) {
+            // POSIX distinguishes IFS whitespace from other delimiters. Whitespace runs collapse
+            // and trim, while each non-whitespace delimiter can delimit an empty field.
+            for c in p.text.chars() {
+                if ifs.contains(c) && matches!(c, ' ' | '\t' | '\n') {
                     if started {
                         fields.push((std::mem::take(&mut cur), cur_glob));
                         cur_glob = false;
                         started = false;
                     }
+                    after_ifs_whitespace = true;
+                } else if ifs.contains(c) {
+                    if started {
+                        fields.push((std::mem::take(&mut cur), cur_glob));
+                        cur_glob = false;
+                        started = false;
+                    } else if !after_ifs_whitespace {
+                        fields.push((String::new(), false));
+                    }
+                    after_ifs_whitespace = false;
                 } else {
                     cur.push(c);
                     started = true;
+                    after_ifs_whitespace = false;
                 }
             }
             cur_glob |= p.has_glob;
@@ -919,9 +933,9 @@ fn apply_param_op(
                 } else {
                     arg.to_string()
                 };
-                interp
-                    .expansion_error
-                    .get_or_insert_with(|| format!("shellsim: {message}\n"));
+                interp.expansion_error.get_or_insert_with(|| {
+                    ShellExpansionError::parameter(format!("shellsim: {message}\n"))
+                });
                 String::new()
             }
         }
@@ -934,9 +948,9 @@ fn apply_param_op(
                 } else {
                     arg.to_string()
                 };
-                interp
-                    .expansion_error
-                    .get_or_insert_with(|| format!("shellsim: {message}\n"));
+                interp.expansion_error.get_or_insert_with(|| {
+                    ShellExpansionError::parameter(format!("shellsim: {message}\n"))
+                });
                 String::new()
             }
         }
@@ -1000,34 +1014,34 @@ fn glob_to_regex(pat: &str) -> String {
 }
 
 fn strip_prefix_glob(s: &str, pat: &str, greedy: bool) -> String {
-    // try to match pat (glob) at the start, removing shortest/longest match
-    let re = glob_to_regex(pat);
-    let re = re.trim_start_matches('^').trim_end_matches('$');
-    let full = if greedy {
-        format!("^({re})")
-    } else {
-        // shortest: make * lazy
-        format!("^({})", re.replace(".*", ".*?"))
+    let Ok(pattern) = regex::Regex::new(&glob_to_regex(pat)) else {
+        return s.to_string();
     };
-    if let Ok(r) = regex::Regex::new(&full) {
-        if let Some(m) = r.find(s) {
-            return s[m.end()..].to_string();
+    let mut boundaries = s.char_indices().map(|(index, _)| index).collect::<Vec<_>>();
+    boundaries.push(s.len());
+    if greedy {
+        boundaries.reverse();
+    }
+    for boundary in boundaries {
+        if pattern.is_match(&s[..boundary]) {
+            return s[boundary..].to_string();
         }
     }
     s.to_string()
 }
 
 fn strip_suffix_glob(s: &str, pat: &str, greedy: bool) -> String {
-    let re = glob_to_regex(pat);
-    let re = re.trim_start_matches('^').trim_end_matches('$');
-    let full = if greedy {
-        format!("({re})$")
-    } else {
-        format!("({})$", re.replace(".*", ".*?"))
+    let Ok(pattern) = regex::Regex::new(&glob_to_regex(pat)) else {
+        return s.to_string();
     };
-    if let Ok(r) = regex::Regex::new(&full) {
-        if let Some(m) = r.find(s) {
-            return s[..m.start()].to_string();
+    let mut boundaries = s.char_indices().map(|(index, _)| index).collect::<Vec<_>>();
+    boundaries.push(s.len());
+    if !greedy {
+        boundaries.reverse();
+    }
+    for boundary in boundaries {
+        if pattern.is_match(&s[boundary..]) {
+            return s[..boundary].to_string();
         }
     }
     s.to_string()
@@ -1508,6 +1522,24 @@ mod tests {
         assert_eq!(expand_word(&mut i, "${F%%.*}", true), vec!["file"]);
         assert_eq!(expand_word(&mut i, "${F#*.}", true), vec!["tar.gz"]);
         assert_eq!(expand_word(&mut i, "${F##*.}", true), vec!["gz"]);
+    }
+
+    #[test]
+    fn non_whitespace_ifs_delimiters_preserve_empty_fields() {
+        let mut i = Interp::new();
+        i.set_var("IFS", ":");
+        i.set_var("VALUE", ":a::b:");
+        assert_eq!(expand_word(&mut i, "$VALUE", true), vec!["", "a", "", "b"]);
+    }
+
+    #[test]
+    fn parameter_errors_request_shell_abort_with_failure_status() {
+        let mut i = Interp::new();
+        assert!(expand_word(&mut i, "${MISSING:?required}", true).is_empty());
+        let error = i.expansion_error.take().unwrap();
+        assert_eq!(error.status, 1);
+        assert!(error.abort_shell);
+        assert!(error.message.contains("required"));
     }
 
     #[test]
