@@ -68,6 +68,7 @@ pub struct CallSignature {
     pub is_coroutine: bool,
     pub positional_count: usize,
     pub variadic_slot: Option<usize>,
+    pub keyword_variadic_slot: Option<usize>,
     pub default_slots: Box<[usize]>,
 }
 
@@ -113,8 +114,15 @@ impl Code {
 pub struct Parameter {
     pub name: String,
     pub has_default: bool,
-    pub variadic: bool,
-    pub keyword_only: bool,
+    pub kind: ParameterKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParameterKind {
+    Positional,
+    Variadic,
+    KeywordOnly,
+    KeywordVariadic,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,7 +138,7 @@ pub struct Instruction {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CallSpec {
     pub positional: usize,
-    pub keywords: Box<[NameId]>,
+    pub keywords: Box<[Option<NameId>]>,
     pub starred: Box<[bool]>,
 }
 
@@ -300,7 +308,7 @@ pub enum Operation {
     Compare(ComparisonOperator),
     Call {
         positional: usize,
-        keywords: Vec<String>,
+        keywords: Vec<Option<String>>,
         starred: Vec<bool>,
     },
     Copy(usize),
@@ -466,7 +474,7 @@ impl CodeBuilder {
             } => {
                 let keywords = keywords
                     .into_iter()
-                    .map(|keyword| self.name(keyword))
+                    .map(|keyword| keyword.map(|keyword| self.name(keyword)))
                     .collect();
                 let id = CallId::new(self.calls.len());
                 self.calls.push(CallSpec {
@@ -518,15 +526,20 @@ impl CodeBuilder {
     ) -> CodeRef {
         let positional_count = parameters
             .iter()
-            .position(|parameter| parameter.variadic || parameter.keyword_only)
-            .unwrap_or(parameters.len());
+            .take_while(|parameter| parameter.kind == ParameterKind::Positional)
+            .count();
         let call_signature = CallSignature {
             is_generator: instructions
                 .iter()
                 .any(|instruction| matches!(instruction.opcode, Opcode::Yield)),
             is_coroutine,
             positional_count,
-            variadic_slot: parameters.iter().position(|parameter| parameter.variadic),
+            variadic_slot: parameters
+                .iter()
+                .position(|parameter| parameter.kind == ParameterKind::Variadic),
+            keyword_variadic_slot: parameters
+                .iter()
+                .position(|parameter| parameter.kind == ParameterKind::KeywordVariadic),
             default_slots: parameters
                 .iter()
                 .enumerate()

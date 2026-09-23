@@ -1459,7 +1459,7 @@ impl Vm<'_> {
             .ok_or("too many call arguments")?;
         let keyword_names = keyword_arguments
             .iter()
-            .map(|(name, _)| name.clone())
+            .map(|(name, _)| Some(name.clone()))
             .collect::<Vec<_>>();
         self.stack.push(callable);
         self.stack.extend(arguments);

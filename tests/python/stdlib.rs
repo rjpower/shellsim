@@ -256,6 +256,8 @@ print(heapq.heappop(values), bisect.bisect_left([1, 3, 5], 4))
 print(functools.reduce(lambda a, b: a + b, [1, 2, 3]))
 plus_ten = functools.partial(lambda a, b: a + b, 10)
 print(plus_ten(5), plus_ten.func(2, 3), plus_ten.args, plus_ten.keywords)
+scaled = functools.partial(lambda value, scale=1: value * scale, scale=3)
+print(scaled(4), scaled(4, scale=5), scaled.keywords)
 print(typing.List[int])
 print(next(counter))
 "#;
@@ -270,7 +272,7 @@ print(next(counter))
         simulated,
         (
             0,
-            b"[3, 4, 5]\n1 2\n6\n15 5 (10,) {}\ntyping.List[int]\n6\n".to_vec(),
+            b"[3, 4, 5]\n1 2\n6\n15 5 (10,) {}\n12 20 {'scale': 3}\ntyping.List[int]\n6\n".to_vec(),
             Vec::new()
         )
     );

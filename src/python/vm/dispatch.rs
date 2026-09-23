@@ -363,7 +363,7 @@ impl Vm<'_> {
         let keywords = call
             .keywords
             .iter()
-            .map(|name| code.name(*name).to_owned())
+            .map(|name| name.map(|name| code.name(name).to_owned()))
             .collect::<Vec<_>>();
         match self.call(
             call.positional,

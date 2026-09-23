@@ -1395,7 +1395,7 @@ fn parse_parametrize(
     }
     let positional = arguments
         .iter()
-        .filter(|argument| argument.name.is_none() && !argument.starred)
+        .filter(|argument| matches!(argument.kind, ast::CallArgumentKind::Positional))
         .collect::<Vec<_>>();
     if positional.len() < 2 {
         return Err("pytest.mark.parametrize requires names and values".into());
@@ -1456,8 +1456,17 @@ fn parse_skip_marker(expression: &ast::Expression) -> Result<bool, String> {
         Some("mark.skipif" | "pytest.mark.skipif") => {
             let condition = arguments
                 .iter()
-                .find(|argument| argument.name.as_deref() == Some("condition"))
-                .or_else(|| arguments.iter().find(|argument| argument.name.is_none()))
+                .find(|argument| {
+                    matches!(
+                        &argument.kind,
+                        ast::CallArgumentKind::Keyword(name) if name == "condition"
+                    )
+                })
+                .or_else(|| {
+                    arguments
+                        .iter()
+                        .find(|argument| matches!(argument.kind, ast::CallArgumentKind::Positional))
+                })
                 .ok_or("pytest.mark.skipif requires a condition")?;
             match condition.value.kind {
                 ast::ExpressionKind::Constant(ast::Constant::Bool(value)) => Ok(value),

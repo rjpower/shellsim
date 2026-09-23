@@ -1,9 +1,10 @@
 //! Recursive-descent parser for the first expression-and-simple-statement slice.
 
 use super::ast::{
-    AssignmentTarget, BinaryOperator, BooleanOperator, CallArgument, ComparisonOperator,
-    ComprehensionClause, Constant, DictEntry, ExceptHandler, Expression, ExpressionKind,
-    FStringPart, Parameter, Program, Statement, StatementKind, UnaryOperator,
+    AssignmentTarget, BinaryOperator, BooleanOperator, CallArgument, CallArgumentKind,
+    ComparisonOperator, ComprehensionClause, Constant, DictEntry, ExceptHandler, Expression,
+    ExpressionKind, FStringPart, Parameter, ParameterKind, Program, Statement, StatementKind,
+    UnaryOperator,
 };
 use super::source::Span;
 use super::token::{Token, TokenKind};
@@ -217,6 +218,9 @@ impl Parser {
             let mut keyword_only = false;
             if !self.at(|kind| matches!(kind, TokenKind::RightParen)) {
                 loop {
+                    let keyword_variadic = self
+                        .take(|kind| matches!(kind, TokenKind::DoubleStar))
+                        .is_some();
                     let variadic = self.take(|kind| matches!(kind, TokenKind::Star)).is_some();
                     if variadic && self.take(|kind| matches!(kind, TokenKind::Comma)).is_some() {
                         if keyword_only {
@@ -238,15 +242,15 @@ impl Parser {
                         })?;
                     }
                     let default = if self.take(|kind| matches!(kind, TokenKind::Equal)).is_some() {
-                        if variadic {
-                            return Err(self.error("*args cannot have a default"));
+                        if variadic || keyword_variadic {
+                            return Err(self.error("variadic parameters cannot have a default"));
                         }
                         if !keyword_only {
                             saw_default = true;
                         }
                         Some(self.expression()?)
                     } else {
-                        if saw_default && !keyword_only && !variadic {
+                        if saw_default && !keyword_only && !variadic && !keyword_variadic {
                             return Err(self.error("non-default argument follows default argument"));
                         }
                         None
@@ -254,9 +258,24 @@ impl Parser {
                     parameters.push(Parameter {
                         name,
                         default,
-                        variadic,
-                        keyword_only: keyword_only && !variadic,
+                        kind: if keyword_variadic {
+                            ParameterKind::KeywordVariadic
+                        } else if variadic {
+                            ParameterKind::Variadic
+                        } else if keyword_only {
+                            ParameterKind::KeywordOnly
+                        } else {
+                            ParameterKind::Positional
+                        },
                     });
+                    if keyword_variadic {
+                        if self.take(|kind| matches!(kind, TokenKind::Comma)).is_some()
+                            && !self.at(|kind| matches!(kind, TokenKind::RightParen))
+                        {
+                            return Err(self.error("parameters cannot follow **kwargs"));
+                        }
+                        break;
+                    }
                     if variadic {
                         saw_variadic = true;
                         keyword_only = true;
@@ -801,6 +820,9 @@ impl Parser {
         let mut keyword_only = false;
         if !self.at(|kind| matches!(kind, TokenKind::Colon)) {
             loop {
+                let keyword_variadic = self
+                    .take(|kind| matches!(kind, TokenKind::DoubleStar))
+                    .is_some();
                 let variadic = self.take(|kind| matches!(kind, TokenKind::Star)).is_some();
                 if variadic && self.take(|kind| matches!(kind, TokenKind::Comma)).is_some() {
                     if keyword_only {
@@ -814,15 +836,15 @@ impl Parser {
                 }
                 let name = self.name("expected a lambda parameter")?;
                 let default = if self.take(|kind| matches!(kind, TokenKind::Equal)).is_some() {
-                    if variadic {
-                        return Err(self.error("*args cannot have a default"));
+                    if variadic || keyword_variadic {
+                        return Err(self.error("variadic parameters cannot have a default"));
                     }
                     if !keyword_only {
                         saw_default = true;
                     }
                     Some(self.expression()?)
                 } else {
-                    if saw_default && !keyword_only && !variadic {
+                    if saw_default && !keyword_only && !variadic && !keyword_variadic {
                         return Err(self.error("non-default argument follows default argument"));
                     }
                     None
@@ -830,9 +852,24 @@ impl Parser {
                 parameters.push(Parameter {
                     name,
                     default,
-                    variadic,
-                    keyword_only: keyword_only && !variadic,
+                    kind: if keyword_variadic {
+                        ParameterKind::KeywordVariadic
+                    } else if variadic {
+                        ParameterKind::Variadic
+                    } else if keyword_only {
+                        ParameterKind::KeywordOnly
+                    } else {
+                        ParameterKind::Positional
+                    },
                 });
+                if keyword_variadic {
+                    if self.take(|kind| matches!(kind, TokenKind::Comma)).is_some()
+                        && !self.at(|kind| matches!(kind, TokenKind::Colon))
+                    {
+                        return Err(self.error("parameters cannot follow **kwargs"));
+                    }
+                    break;
+                }
                 if variadic {
                     saw_variadic = true;
                     keyword_only = true;
@@ -1342,33 +1379,43 @@ impl Parser {
                 let mut saw_keyword = false;
                 if !self.at(|kind| matches!(kind, TokenKind::RightParen)) {
                     loop {
-                        let name = match (
-                            &self.peek().kind,
-                            self.tokens.get(self.current + 1).map(|token| &token.kind),
-                        ) {
-                            (TokenKind::Name(name), Some(TokenKind::Equal)) => {
-                                let name = name.clone();
-                                self.advance();
-                                self.advance();
-                                saw_keyword = true;
-                                Some(name)
+                        let keyword_unpack = self
+                            .take(|kind| matches!(kind, TokenKind::DoubleStar))
+                            .is_some();
+                        let name = if keyword_unpack {
+                            None
+                        } else {
+                            match (
+                                &self.peek().kind,
+                                self.tokens.get(self.current + 1).map(|token| &token.kind),
+                            ) {
+                                (TokenKind::Name(name), Some(TokenKind::Equal)) => {
+                                    let name = name.clone();
+                                    self.advance();
+                                    self.advance();
+                                    Some(name)
+                                }
+                                _ => None,
                             }
-                            _ if saw_keyword => {
-                                return Err(
-                                    self.error("positional argument follows keyword argument")
-                                )
-                            }
-                            _ => None,
                         };
-                        let starred = self.take(|kind| matches!(kind, TokenKind::Star)).is_some();
+                        let starred = !keyword_unpack
+                            && self.take(|kind| matches!(kind, TokenKind::Star)).is_some();
+                        if (name.is_none() && !keyword_unpack && !starred) && saw_keyword {
+                            return Err(self.error("positional argument follows keyword argument"));
+                        }
                         if starred && saw_keyword {
                             return Err(self.error("positional argument follows keyword argument"));
+                        }
+                        if name.is_some() || keyword_unpack {
+                            saw_keyword = true;
                         }
                         let mut argument_value = self.expression()?;
                         // Python permits the unparenthesized generator form in a call, e.g.
                         // ``sum(value for value in values)``.  The surrounding call already
                         // supplies the closing delimiter, so only the clauses belong here.
                         if name.is_none()
+                            && !keyword_unpack
+                            && !starred
                             && self.take(|kind| matches!(kind, TokenKind::For)).is_some()
                         {
                             let (clauses, _) = self.comprehension_clauses(argument_value.span)?;
@@ -1381,9 +1428,16 @@ impl Parser {
                             };
                         }
                         arguments.push(CallArgument {
-                            name,
                             value: argument_value,
-                            starred,
+                            kind: if keyword_unpack {
+                                CallArgumentKind::KeywordUnpack
+                            } else if starred {
+                                CallArgumentKind::PositionalUnpack
+                            } else if let Some(name) = name {
+                                CallArgumentKind::Keyword(name)
+                            } else {
+                                CallArgumentKind::Positional
+                            },
                         });
                         if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
                             break;

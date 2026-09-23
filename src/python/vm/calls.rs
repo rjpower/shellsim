@@ -68,7 +68,7 @@ impl Vm<'_> {
     pub(super) fn call(
         &mut self,
         positional: usize,
-        keyword_names: &[String],
+        keyword_names: &[Option<String>],
         starred: &[bool],
         mode: CallMode,
     ) -> Result<CallResult, String> {
@@ -84,14 +84,6 @@ impl Vm<'_> {
         let arguments_start = self.stack.len() - count;
         let mut raw_arguments = self.stack.split_off(arguments_start);
         let keyword_values = raw_arguments.split_off(positional);
-        if starred[..positional].iter().any(|expanded| *expanded)
-            && keyword_names
-                .iter()
-                .zip(&starred[positional..])
-                .any(|(_, expanded)| *expanded)
-        {
-            return Err("invalid starred keyword argument metadata".into());
-        }
         let positional_starred = &starred[..positional];
         let mut arguments = Vec::new();
         for (argument, expanded) in raw_arguments.into_iter().zip(positional_starred) {
@@ -103,11 +95,50 @@ impl Vm<'_> {
                 self.push_materialized(&mut arguments, argument)?;
             }
         }
-        let keyword_arguments = keyword_names
+        let mut keyword_arguments = Vec::new();
+        for ((name, value), expanded) in keyword_names
             .iter()
-            .cloned()
             .zip(keyword_values)
-            .collect::<Vec<_>>();
+            .zip(&starred[positional..])
+        {
+            let additions = match (name, expanded) {
+                (Some(name), false) => vec![(name.clone(), value)],
+                (None, true) => {
+                    let entries = match value
+                        .object_id()
+                        .map(|id| self.state.heap.get(id).cloned())
+                        .transpose()?
+                    {
+                        Some(Object::Dict(entries)) | Some(Object::DefaultDict { entries, .. }) => {
+                            self.reserve_result(entries.len().saturating_mul(64))?;
+                            entries.to_vec()
+                        }
+                        _ => return Err("argument after ** must be a mapping".into()),
+                    };
+                    let mut additions = Vec::with_capacity(entries.len());
+                    for (key, value) in entries {
+                        let name = protocol::string_value(&self.state.heap, &key)?
+                            .ok_or("keywords must be strings")?;
+                        self.reserve_result(64usize.saturating_add(name.len()))?;
+                        self.charge_cpu(1)?;
+                        additions.push((name, value));
+                    }
+                    additions
+                }
+                _ => return Err("invalid keyword argument metadata".into()),
+            };
+            for (name, value) in additions {
+                if keyword_arguments
+                    .iter()
+                    .any(|(existing, _)| existing == &name)
+                {
+                    return Err(format!("got multiple values for keyword argument {name:?}"));
+                }
+                self.reserve_result(64usize.saturating_add(name.len()))?;
+                self.charge_cpu(1)?;
+                keyword_arguments.push((name, value));
+            }
+        }
         let function = self.pop()?;
         if let Some(id) = function.object_id() {
             return match self.state.heap.get(id)?.clone() {
@@ -1297,12 +1328,23 @@ impl Vm<'_> {
         if let Some(slot) = signature.variadic_slot {
             locals[slot] = Some(self.allocate_object(Object::Tuple(extra_positional))?);
         }
+        let mut extra_keywords = Vec::new();
         for (keyword, value) in keyword_arguments {
-            let Some(slot) = code
-                .parameters
-                .iter()
-                .position(|parameter| parameter.name == keyword && !parameter.variadic)
-            else {
+            let slot = code.parameters.iter().position(|parameter| {
+                parameter.name == keyword
+                    && matches!(
+                        parameter.kind,
+                        super::super::bytecode::ParameterKind::Positional
+                            | super::super::bytecode::ParameterKind::KeywordOnly
+                    )
+            });
+            let Some(slot) = slot else {
+                if signature.keyword_variadic_slot.is_some() {
+                    let key = self.allocate_string(keyword)?;
+                    self.reserve_result(64)?;
+                    extra_keywords.push((key, value));
+                    continue;
+                }
                 return Err(format!(
                     "{name}() got an unexpected keyword argument {keyword:?}"
                 ));
@@ -1313,6 +1355,9 @@ impl Vm<'_> {
                 ));
             }
         }
+        if let Some(slot) = signature.keyword_variadic_slot {
+            locals[slot] = Some(self.allocate_object(Object::Dict(extra_keywords.into()))?);
+        }
         if defaults.len() != signature.default_slots.len() {
             return Err(format!("{name}() has invalid default argument metadata"));
         }
@@ -1321,11 +1366,19 @@ impl Vm<'_> {
                 locals[slot] = Some(*default);
             }
         }
-        if let Some((slot, parameter)) = code
-            .parameters
-            .iter()
-            .enumerate()
-            .find(|(slot, parameter)| locals[*slot].is_none() && !parameter.has_default)
+        if let Some((slot, parameter)) =
+            code.parameters
+                .iter()
+                .enumerate()
+                .find(|(slot, parameter)| {
+                    locals[*slot].is_none()
+                        && !parameter.has_default
+                        && !matches!(
+                            parameter.kind,
+                            super::super::bytecode::ParameterKind::Variadic
+                                | super::super::bytecode::ParameterKind::KeywordVariadic
+                        )
+                })
         {
             debug_assert!(slot < locals.len());
             return Err(format!(

@@ -4,12 +4,13 @@ from _functools import reduce
 
 
 class partial:
-    def __init__(self, func, *args):
+    def __init__(self, func, *args, **keywords):
         if not callable(func):
             raise TypeError("the first argument must be callable")
         self.func = func
         self.args = args
-        self.keywords = {}
+        self.keywords = keywords
 
-    def __call__(self, *args):
-        return self.func(*(self.args + args))
+    def __call__(self, *args, **keywords):
+        combined = {**self.keywords, **keywords}
+        return self.func(*(self.args + args), **combined)

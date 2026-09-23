@@ -1,10 +1,14 @@
 //! Compiler from the owned AST to typed stack-machine operations.
 
 use super::ast::{
-    AssignmentTarget, BooleanOperator, ComprehensionClause, Constant, DictEntry, Expression,
-    ExpressionKind, FStringPart, Program, Statement, StatementKind,
+    AssignmentTarget, BooleanOperator, CallArgumentKind, ComprehensionClause, Constant, DictEntry,
+    Expression, ExpressionKind, FStringPart, ParameterKind as AstParameterKind, Program, Statement,
+    StatementKind,
 };
-use super::bytecode::{ClassField, CodeBuilder, CodeRef, Instruction, Operation, Parameter};
+use super::bytecode::{
+    ClassField, CodeBuilder, CodeRef, Instruction, Operation, Parameter,
+    ParameterKind as BytecodeParameterKind,
+};
 use super::source::Span;
 use std::collections::HashSet;
 
@@ -87,6 +91,15 @@ struct LoopContext {
 enum Cleanup {
     Finally(Vec<Statement>),
     WithExit,
+}
+
+fn compile_parameter_kind(kind: AstParameterKind) -> BytecodeParameterKind {
+    match kind {
+        AstParameterKind::Positional => BytecodeParameterKind::Positional,
+        AstParameterKind::Variadic => BytecodeParameterKind::Variadic,
+        AstParameterKind::KeywordOnly => BytecodeParameterKind::KeywordOnly,
+        AstParameterKind::KeywordVariadic => BytecodeParameterKind::KeywordVariadic,
+    }
 }
 
 fn contains_star(target: &AssignmentTarget) -> bool {
@@ -416,8 +429,7 @@ impl Compiler {
                         .map(|parameter| super::bytecode::Parameter {
                             name: parameter.name.clone(),
                             has_default: parameter.default.is_some(),
-                            variadic: parameter.variadic,
-                            keyword_only: parameter.keyword_only,
+                            kind: compile_parameter_kind(parameter.kind),
                         })
                         .collect(),
                 );
@@ -1139,12 +1151,24 @@ impl Compiler {
                 let mut keywords = Vec::new();
                 let mut starred = Vec::new();
                 for argument in arguments {
-                    if let Some(name) = argument.name {
-                        keywords.push(name);
-                    } else {
-                        positional += 1;
+                    match argument.kind {
+                        CallArgumentKind::Positional => {
+                            positional += 1;
+                            starred.push(false);
+                        }
+                        CallArgumentKind::PositionalUnpack => {
+                            positional += 1;
+                            starred.push(true);
+                        }
+                        CallArgumentKind::Keyword(name) => {
+                            keywords.push(Some(name));
+                            starred.push(false);
+                        }
+                        CallArgumentKind::KeywordUnpack => {
+                            keywords.push(None);
+                            starred.push(true);
+                        }
                     }
-                    starred.push(argument.starred);
                     self.expression(argument.value);
                 }
                 self.emit(
@@ -1188,8 +1212,7 @@ impl Compiler {
                                 .map(|parameter| super::bytecode::Parameter {
                                     name: parameter.name.clone(),
                                     has_default: parameter.default.is_some(),
-                                    variadic: parameter.variadic,
-                                    keyword_only: parameter.keyword_only,
+                                    kind: compile_parameter_kind(parameter.kind),
                                 })
                                 .collect(),
                         ),
@@ -1635,7 +1658,8 @@ mod tests {
     #[test]
     fn call_shape_is_compiled_once_with_the_function() {
         let code = compile(
-            parse(lex("def generate(first, second, *rest):\n    yield first\n").unwrap()).unwrap(),
+            parse(lex("def generate(first, second, *rest, **extras):\n    yield first\n").unwrap())
+                .unwrap(),
         );
         let function = code
             .instructions
@@ -1649,6 +1673,7 @@ mod tests {
         assert!(signature.is_generator);
         assert_eq!(signature.positional_count, 2);
         assert_eq!(signature.variadic_slot, Some(2));
+        assert_eq!(signature.keyword_variadic_slot, Some(3));
         assert!(signature.default_slots.is_empty());
     }
 

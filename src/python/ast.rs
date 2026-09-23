@@ -249,9 +249,16 @@ pub enum DictEntry {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CallArgument {
-    pub name: Option<String>,
     pub value: Expression,
-    pub starred: bool,
+    pub kind: CallArgumentKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CallArgumentKind {
+    Positional,
+    PositionalUnpack,
+    Keyword(String),
+    KeywordUnpack,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -274,8 +281,15 @@ pub enum FStringPart {
 pub struct Parameter {
     pub name: String,
     pub default: Option<Expression>,
-    pub variadic: bool,
-    pub keyword_only: bool,
+    pub kind: ParameterKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParameterKind {
+    Positional,
+    Variadic,
+    KeywordOnly,
+    KeywordVariadic,
 }
 
 #[derive(Clone, Debug, PartialEq)]
