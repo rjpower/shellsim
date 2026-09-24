@@ -13,6 +13,7 @@ use wasmtime::{
 };
 
 use crate::descriptors::DescriptorError;
+use crate::display::DisplayError;
 use crate::interp::Interp;
 use crate::syscalls::{self, OpenFile, SyscallError};
 use crate::vfs::{resolve_against, NodeKind, VfsError};
@@ -27,6 +28,8 @@ const MAX_IO_BYTES: usize = 1024 * 1024;
 const WASM_FUEL_PER_CPU_UNIT: u64 = 10;
 const ERRNO_SUCCESS: i32 = 0;
 const ERRNO_BADF: i32 = 8;
+const ERRNO_AGAIN: i32 = 6;
+const ERRNO_BUSY: i32 = 10;
 const ERRNO_FAULT: i32 = 21;
 const ERRNO_INVAL: i32 = 28;
 const ERRNO_EXIST: i32 = 20;
@@ -35,6 +38,7 @@ const ERRNO_NOENT: i32 = 44;
 const ERRNO_NOTDIR: i32 = 54;
 const ERRNO_NOTEMPTY: i32 = 55;
 const ERRNO_PERM: i32 = 63;
+const ERRNO_NOSPC: i32 = 51;
 
 struct Host {
     interp: Interp,
@@ -85,6 +89,15 @@ fn syscall_errno(error: &SyscallError) -> i32 {
         SyscallError::InvalidArgument => ERRNO_INVAL,
         SyscallError::IsDirectory => ERRNO_ISDIR,
         SyscallError::Permission => ERRNO_PERM,
+    }
+}
+
+fn display_errno(error: DisplayError) -> i32 {
+    match error {
+        DisplayError::InvalidArgument => ERRNO_INVAL,
+        DisplayError::InvalidHandle => ERRNO_BADF,
+        DisplayError::Busy => ERRNO_BUSY,
+        DisplayError::QueueFull | DisplayError::ResourceExhausted => ERRNO_NOSPC,
     }
 }
 
@@ -267,6 +280,83 @@ fn path_chmod(mut caller: Caller<'_, Host>, pointer: u32, length: u32, mode: u32
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
+}
+
+// These calls copy pixels and key events through guest memory. No guest pointer or host device
+// escapes the active virtual process.
+fn display_open(mut caller: Caller<'_, Host>, width: u32, height: u32, format: u32) -> i32 {
+    match syscalls::display_open(&mut caller.data_mut().interp, width, height, format) {
+        Ok(handle) => handle as i32,
+        Err(error) => -display_errno(error),
+    }
+}
+
+fn display_present(
+    mut caller: Caller<'_, Host>,
+    handle: u32,
+    pointer: u32,
+    length: u32,
+    stride: u32,
+) -> i32 {
+    let Some(frame) = caller.data().interp.display.frame() else {
+        return ERRNO_BADF;
+    };
+    if usize::try_from(length).ok() != Some(frame.pixels.len()) {
+        return ERRNO_INVAL;
+    }
+    let Some(memory) = memory(&mut caller) else {
+        return ERRNO_FAULT;
+    };
+    if !caller
+        .data_mut()
+        .interp
+        .resources
+        .reserve_memory(u64::from(length))
+    {
+        return ERRNO_NOSPC;
+    }
+    let mut pixels = vec![0; length as usize];
+    let read = memory.read(&caller, pointer as usize, &mut pixels);
+    let result = if read.is_ok() {
+        syscalls::display_present(&mut caller.data_mut().interp, handle, &pixels, stride)
+            .map_or_else(display_errno, |_| ERRNO_SUCCESS)
+    } else {
+        ERRNO_FAULT
+    };
+    caller
+        .data_mut()
+        .interp
+        .resources
+        .release_memory(u64::from(length));
+    result
+}
+
+fn input_poll_key(mut caller: Caller<'_, Host>, handle: u32, result: u32) -> i32 {
+    let Some(memory) = memory(&mut caller) else {
+        return ERRNO_FAULT;
+    };
+    let mut slot = [0; 8];
+    if memory.read(&caller, result as usize, &mut slot).is_err() {
+        return ERRNO_FAULT;
+    }
+    match syscalls::input_poll_key(&mut caller.data_mut().interp, handle) {
+        Ok(Some(event)) => {
+            slot[..4].copy_from_slice(&event.code.to_le_bytes());
+            slot[4..].copy_from_slice(&u32::from(event.pressed).to_le_bytes());
+            if memory.write(&mut caller, result as usize, &slot).is_ok() {
+                ERRNO_SUCCESS
+            } else {
+                ERRNO_FAULT
+            }
+        }
+        Ok(None) => ERRNO_AGAIN,
+        Err(error) => display_errno(error),
+    }
+}
+
+fn display_close(mut caller: Caller<'_, Host>, handle: u32) -> i32 {
+    syscalls::display_close(&mut caller.data_mut().interp, handle)
+        .map_or_else(display_errno, |_| ERRNO_SUCCESS)
 }
 
 fn fd_prestat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
@@ -888,6 +978,18 @@ pub(super) fn run(
         .func_wrap("shellsim", "path_chmod", path_chmod)
         .expect("unique shellsim import");
     linker
+        .func_wrap("shellsim", "display_open", display_open)
+        .expect("unique shellsim import");
+    linker
+        .func_wrap("shellsim", "display_present", display_present)
+        .expect("unique shellsim import");
+    linker
+        .func_wrap("shellsim", "input_poll_key", input_poll_key)
+        .expect("unique shellsim import");
+    linker
+        .func_wrap("shellsim", "display_close", display_close)
+        .expect("unique shellsim import");
+    linker
         .func_wrap("wasi_snapshot_preview1", "fd_prestat_get", fd_prestat_get)
         .expect("unique WASI import");
     linker
@@ -991,7 +1093,15 @@ pub(super) fn run(
     // success. Non-WASI namespaces must still be rejected at instantiation.
     for import in module.imports() {
         if import.module() != "wasi_snapshot_preview1"
-            && (import.module(), import.name()) != ("shellsim", "path_chmod")
+            && !(import.module() == "shellsim"
+                && matches!(
+                    import.name(),
+                    "path_chmod"
+                        | "display_open"
+                        | "display_present"
+                        | "input_poll_key"
+                        | "display_close"
+                ))
         {
             ewln(
                 err,
@@ -1089,6 +1199,8 @@ pub(super) fn run(
     for fd in open_files {
         let _ = syscalls::close(&mut store.data_mut().interp, fd);
     }
+    let pid = store.data().interp.process.pid;
+    store.data_mut().interp.display.close_owner(pid);
     store
         .data_mut()
         .interp

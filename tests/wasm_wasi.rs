@@ -1,5 +1,5 @@
 // The fixtures exercise the WASI ABI from compiled Wasm, not a host process or filesystem.
-use shellsim::{Environment, Limits};
+use shellsim::{display::KeyEvent, Environment, Limits};
 use std::sync::OnceLock;
 
 fn guest_wc() -> &'static [u8] {
@@ -43,6 +43,103 @@ fn install(environment: &mut Environment, wat_source: &str) {
 fn run(environment: &mut Environment, source: &str) -> (i32, Vec<u8>, Vec<u8>) {
     let (outcome, stdout, stderr) = environment.run_script_capture(source);
     (outcome.exit_status, stdout, stderr)
+}
+
+#[test]
+fn virtual_display_presents_frame_and_consumes_injected_key() {
+    const GUEST: &str = r#"(module
+        (import "shellsim" "display_open" (func $open (param i32 i32 i32) (result i32)))
+        (import "shellsim" "display_present" (func $present (param i32 i32 i32 i32) (result i32)))
+        (import "shellsim" "input_poll_key" (func $poll (param i32 i32) (result i32)))
+        (import "shellsim" "display_close" (func $close (param i32) (result i32)))
+        (memory (export "memory") 1)
+        (func (export "_start") (local $handle i32)
+            (local.set $handle (call $open (i32.const 2) (i32.const 1) (i32.const 1)))
+            (if (i32.le_s (local.get $handle) (i32.const 0)) (then unreachable))
+            (if (i32.ne (call $present (local.get $handle) (i32.const 32) (i32.const 8) (i32.const 8)) (i32.const 0)) (then unreachable))
+            (if (i32.eq (call $poll (local.get $handle) (i32.const 16)) (i32.const 0))
+                (then
+                    (i32.store8 (i32.const 32) (i32.const 255))
+                    (if (i32.ne (call $present (local.get $handle) (i32.const 32) (i32.const 8) (i32.const 8)) (i32.const 0)) (then unreachable))))
+            (if (i32.ne (call $close (local.get $handle)) (i32.const 0)) (then unreachable))))"#;
+
+    let mut idle = Environment::new();
+    install(&mut idle, GUEST);
+    assert_eq!(run(&mut idle, "/app"), (0, Vec::new(), Vec::new()));
+    assert_eq!(idle.display.frame().unwrap().pixels, vec![0; 8]);
+
+    let mut active = Environment::new();
+    active
+        .inject_key(KeyEvent {
+            code: 32,
+            pressed: true,
+        })
+        .unwrap();
+    install(&mut active, GUEST);
+    assert_eq!(run(&mut active, "/app"), (0, Vec::new(), Vec::new()));
+    let frame = active.display.frame().unwrap();
+    assert_eq!((frame.width, frame.height), (2, 1));
+    assert_eq!(frame.pixels, [255, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn virtual_display_rejects_bad_geometry_and_unmetered_allocation() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+            (import "shellsim" "display_open" (func $open (param i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "_start")
+                (if (i32.ne (call $open (i32.const 0) (i32.const 1) (i32.const 1)) (i32.const -28)) (then unreachable))
+                (if (i32.ne (call $open (i32.const 1) (i32.const 1) (i32.const 2)) (i32.const -28)) (then unreachable))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert!(environment.display.frame().is_none());
+
+    let mut constrained = Environment::with_limits(Limits {
+        memory: 16 * 1024 * 1024,
+        ..Limits::default()
+    });
+    install(
+        &mut constrained,
+        r#"(module
+            (import "shellsim" "display_open" (func $open (param i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "_start")
+                (drop (call $open (i32.const 2) (i32.const 2) (i32.const 1)))))"#,
+    );
+    assert_eq!(run(&mut constrained, "/app").0, 137);
+    assert!(constrained.display.frame().is_none());
+}
+
+#[test]
+fn virtual_display_rejects_bad_pointers_without_losing_input() {
+    let mut environment = Environment::new();
+    environment
+        .inject_key(KeyEvent {
+            code: 27,
+            pressed: true,
+        })
+        .unwrap();
+    install(
+        &mut environment,
+        r#"(module
+            (import "shellsim" "display_open" (func $open (param i32 i32 i32) (result i32)))
+            (import "shellsim" "display_present" (func $present (param i32 i32 i32 i32) (result i32)))
+            (import "shellsim" "input_poll_key" (func $poll (param i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "_start") (local $handle i32)
+                (local.set $handle (call $open (i32.const 1) (i32.const 1) (i32.const 1)))
+                (if (i32.ne (call $poll (local.get $handle) (i32.const 65532)) (i32.const 21)) (then unreachable))
+                (if (i32.ne (call $poll (local.get $handle) (i32.const 16)) (i32.const 0)) (then unreachable))
+                (if (i32.ne (i32.load (i32.const 16)) (i32.const 27)) (then unreachable))
+                (if (i32.ne (call $poll (local.get $handle) (i32.const 16)) (i32.const 6)) (then unreachable))
+                (if (i32.ne (call $present (i32.const 99) (i32.const 32) (i32.const 4) (i32.const 4)) (i32.const 8)) (then unreachable))
+                (if (i32.ne (call $present (local.get $handle) (i32.const 65534) (i32.const 4) (i32.const 4)) (i32.const 21)) (then unreachable))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert_eq!(environment.display.frame().unwrap().pixels, [0, 0, 0, 0]);
 }
 
 #[test]
