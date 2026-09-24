@@ -140,10 +140,9 @@ through that virtual toolchain. This is a tested subset of libc, not full POSIX 
 `wasm32-wasip1` command that uses only the listed imports can be written to the VFS with
 executable permissions and invoked by path or through `PATH`.
 
-An opt-in [Doom browser demo](docs/virtual-display.md#external-doom-end-to-end-probe) builds
-separately supplied Doomgeneric source and Freedoom data inside the VFS, then presents live frames
-through a host-driven resumable Wasm session. It does not bundle the game or expose a host display
-or network device to the guest.
+The [virtual display](docs/virtual-display.md) lets a Wasm guest present RGBA frames and poll
+bounded key events. A host-driven session can resume the guest between frames without granting it
+ambient display, input, or network access.
 
 ## Agent harness
 
