@@ -56,18 +56,27 @@ SHELLSIM_DOOM_WAD=/path/to/freedoom1.wad \
 cargo test --test doom_probe -- --ignored
 ```
 
-To play with a separately obtained WAD, run the local browser demo from this PR:
+To fetch the pinned external inputs and play from the repository root, run:
+
+```sh
+./examples/play-doom.sh
+```
+
+The launcher requires `curl`, `tar`, `unzip`, `sha256sum`, and the pinned Rust toolchain. It
+downloads into a temporary directory, verifies the WAD hash, and removes the downloads when the
+player exits. The engine and game data remain external to the repository. To use source and a WAD
+you obtained separately, run the browser demo directly:
 
 ```sh
 cargo run --release --example doom_player -- /path/to/doomgeneric/doomgeneric /path/to/freedoom1.wad
 ```
 
-The launch compiles Doomgeneric inside shellsim's VFS. Open the
-loopback URL printed by the example. Arrow keys move, Ctrl fires, Space uses, Shift runs, and Esc
+The launch compiles Doomgeneric inside shellsim's VFS. Open the loopback URL printed by the
+example. Arrow keys move, Ctrl fires, Space uses, Shift runs, and Esc
 opens the menu. The browser only sees copied RGBA frames and sends bounded key events to a host
 demo process; the guest has no host network access. The demo binds an ephemeral `127.0.0.1` port
 and exits when its Stop button is pressed. The external [Freedoom release](https://github.com/freedoom/freedoom/releases/tag/v0.13.0)
-provides a playable WAD; shellsim does not download or bundle it.
+provides a playable WAD; only the opt-in launcher downloads it.
 
 The probe and demo select Doomgeneric's console-error path instead of its optional Zenity
 `system()` call. The platform adapter still uses a deterministic, adapter-local tick
