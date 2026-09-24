@@ -991,7 +991,7 @@ fn resolved_native_image(interp: &Interp, requested: &str) -> Option<crate::vfs:
 }
 
 /// A real VFS entry at an explicit path takes precedence over the synthetic utility alias.
-/// This lets a bundled Wasm command replace one native utility without changing unrelated names.
+/// This lets an installed Wasm command replace one native utility without changing unrelated names.
 fn native_command_name<'a>(interp: &Interp, requested: &'a str) -> &'a str {
     let Some(name) = standard_utility_name(requested) else {
         return requested;

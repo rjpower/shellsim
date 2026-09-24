@@ -1,5 +1,39 @@
 // The fixtures exercise the WASI ABI from compiled Wasm, not a host process or filesystem.
 use shellsim::{Environment, Limits};
+use std::sync::OnceLock;
+
+fn guest_wc() -> &'static [u8] {
+    static GUEST: OnceLock<Vec<u8>> = OnceLock::new();
+    GUEST.get_or_init(|| {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let output = std::env::temp_dir().join(format!("shellsim-wc-{}.wasm", std::process::id()));
+        let result = std::process::Command::new("rustc")
+            .current_dir(root)
+            .args([
+                "--edition=2021",
+                "--target=wasm32-wasip1",
+                "-C",
+                "opt-level=z",
+                "-C",
+                "lto=fat",
+                "-C",
+                "strip=symbols",
+                "guest/wc/src/main.rs",
+                "-o",
+            ])
+            .arg(&output)
+            .output()
+            .expect("run rustc to build the WASI wc fixture");
+        assert!(
+            result.status.success(),
+            "failed to build WASI wc fixture: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let bytes = std::fs::read(&output).expect("read compiled WASI wc fixture");
+        std::fs::remove_file(&output).expect("remove temporary WASI wc fixture");
+        bytes
+    })
+}
 
 fn install(environment: &mut Environment, wat_source: &str) {
     let bytes = wat::parse_str(wat_source).unwrap();
@@ -13,7 +47,7 @@ fn run(environment: &mut Environment, source: &str) -> (i32, Vec<u8>, Vec<u8>) {
 
 #[test]
 fn compiled_wasi_wc_matches_native_wc_on_virtual_streams_and_files() {
-    let guest = include_bytes!("../guest/wc/wc.wasm");
+    let guest = guest_wc();
     let cases = [
         "printf 'one two\\n' | COMMAND",
         "printf 'one two\\n' > /work/input; COMMAND -lc /work/input",
@@ -37,12 +71,7 @@ fn compiled_wasi_wc_counts_a_pipe_larger_than_pipe_capacity() {
     environment.vfs.mkdir_all("/", "/usr/bin").unwrap();
     environment
         .vfs
-        .write(
-            "/",
-            "/usr/bin/wc",
-            include_bytes!("../guest/wc/wc.wasm"),
-            0o755,
-        )
+        .write("/", "/usr/bin/wc", guest_wc(), 0o755)
         .unwrap();
     environment
         .vfs
@@ -61,12 +90,7 @@ fn compiled_wasi_wc_rejects_invalid_option_without_host_execution() {
     let mut environment = Environment::new();
     environment
         .vfs
-        .write(
-            "/",
-            "/guest-wc",
-            include_bytes!("../guest/wc/wc.wasm"),
-            0o755,
-        )
+        .write("/", "/guest-wc", guest_wc(), 0o755)
         .unwrap();
     let (status, stdout, stderr) = run(&mut environment, "/guest-wc -Z");
     assert_eq!(status, 2);
@@ -79,12 +103,7 @@ fn compiled_wasi_wc_reports_missing_virtual_file() {
     let mut environment = Environment::new();
     environment
         .vfs
-        .write(
-            "/",
-            "/guest-wc",
-            include_bytes!("../guest/wc/wc.wasm"),
-            0o755,
-        )
+        .write("/", "/guest-wc", guest_wc(), 0o755)
         .unwrap();
     let (status, stdout, stderr) = run(&mut environment, "/guest-wc /missing");
     assert_eq!(status, 1);
@@ -100,12 +119,7 @@ fn compiled_wasi_wc_obeys_cpu_limit() {
     });
     environment
         .vfs
-        .write(
-            "/",
-            "/guest-wc",
-            include_bytes!("../guest/wc/wc.wasm"),
-            0o755,
-        )
+        .write("/", "/guest-wc", guest_wc(), 0o755)
         .unwrap();
     let (status, stdout, _) = run(&mut environment, "/guest-wc");
     assert_eq!(status, 137);
@@ -149,12 +163,7 @@ fn native_find_and_compiled_wasi_wc_coexist() {
     environment.vfs.mkdir_all("/", "/usr/bin").unwrap();
     environment
         .vfs
-        .write(
-            "/",
-            "/usr/bin/wc",
-            include_bytes!("../guest/wc/wc.wasm"),
-            0o755,
-        )
+        .write("/", "/usr/bin/wc", guest_wc(), 0o755)
         .unwrap();
     environment
         .vfs

@@ -22,10 +22,10 @@ test budget. A `puts` program found the virtual `<stdio.h>` after explicit `-I`/
 Wasm-hosted compiler failed to load its `stdio.wo` object; the same source and library paths worked
 in the native bootstrap. That is a concrete library-linking frontier, not evidence of zlib support.
 
-The pinned compiler is now checked in under `guest/wcpl/` and covered by a shell-level workflow:
-`/usr/bin/wcpl` reads virtual C files, writes a virtual Wasm executable, and the shell executes
-that output with the C program's exit status. A two-file C program links in one invocation.
-Invalid source and CPU exhaustion fail visibly. WCPL compiles and links in one invocation, so no
+An earlier pinned compiler was tested through a shell-level workflow:
+`/usr/bin/wcpl` read virtual C files, wrote a virtual Wasm executable, and the shell executed
+that output with the C program's exit status. A two-file C program linked in one invocation.
+Invalid source and CPU exhaustion failed visibly. WCPL compiles and links in one invocation, so no
 process-spawn extension is needed. The checked case is self-contained C, not a libc-backed program.
 Further probing found that the Wasm-hosted compiler constructs
 `res://lib/include\stdio.h` for its embedded header on this path. A local path-selection change
@@ -41,9 +41,9 @@ regression test: fuel alone is insufficient if the interpreter consumes host sta
 
 | Gate | Current state | Required next work |
 |---|---|---|
-| 0. Validate and run bounded Wasm with virtual stdio and VFS | Demonstrated with WAT ABI tests, a standalone Rust WASI `wc`, and a Wasm-hosted compiler workflow. Regular-file handles use process-owned descriptors; a multi-stage `wc` pipeline handles input larger than pipe capacity. | Extend the compiled guest fixture to exercise file writes and close/reopen. |
+| 0. Validate and run bounded Wasm with virtual stdio and VFS | Demonstrated with WAT ABI tests and a source-built Rust WASI `wc`. Regular-file handles use process-owned descriptors; a multi-stage `wc` pipeline handles input larger than pipe capacity. | Extend the compiled guest fixture to exercise file writes and close/reopen. |
 | 1. Model a full logical Wasm process | **Open.** Buffered stdin works; live pipe reads cannot suspend and resume a Wasm instruction. | Use Wasmi's resumable host-trap API at shellsim's scheduler boundary. Decide how live continuations interact with deterministic session forks. Add pipe, cancellation, and timeout tests. |
-| 2. Build surface | **Partial beyond the checked zlib workflow.** A limited Wasm C toolchain and virtual archive/link commands build pinned zlib through `./configure && make`; see [the build result](zlib-build-goal.md). | Broaden compiler and object compatibility before claiming general C package support. |
+| 2. Build surface | **Open.** Virtual archive commands exist, but no C compiler is integrated. The unchanged zlib configure script fails visibly at its `cc` probe; see [the acceptance target](zlib-build-goal.md). | Run the pinned tinycc Wasm compiler through a compatible engine, then retest configure, make, and generated programs. |
 
 The snapshot constraint is substantive. Shellsim's process continuations and environments are
 cloneable, and a harness fork must make an independent replay snapshot. Wasmi's live `Store` and
@@ -56,21 +56,21 @@ change behind a shallow wrapper.
 Archive work should not precede the object ABI. A Unix `ar` container without a compatible symbol
 index is not enough for `ld`, and an archive of WCPL's `.wo` files differs from an archive of
 standard relocatable Wasm objects. `ranlib` must build or validate a useful index, not silently
-report success. The current implementation leaves these commands explicitly unsupported.
+report success. The current `ar`/`ranlib` implementation handles indexed Wasm objects but does not
+establish compatibility with tinycc's output.
 
 ## Compiler candidates
 
 | Candidate | Fit | Constraint |
 |---|---|---|
-| [WCPL](https://github.com/false-schemers/wcpl) | Best next experiment: MIT-licensed, self-hosted C-subset compiler, linker, and libc already targeting Wasm/WASI. Its README shows `wcpl.wasm` recompiling itself. | Uses a custom extended-WAT `.wo` object format and lacks a full C preprocessor and newer C features. An unchanged zlib build is unlikely without porting work. |
-| [TinyCC](https://github.com/TinyCC/tinycc) | Stronger conventional C frontend and existing archive/linker machinery. | No Wasm target in the listed architectures. The backend, WASI bootstrap, object/linker path, and LGPL distribution review are substantial work. |
+| [WCPL](https://github.com/false-schemers/wcpl) | An earlier C-subset experiment proved a small self-contained compile/run path. | Its custom `.wo` format and libc failures do not suit the unchanged zlib target. Its binary fixture was removed. |
+| [TinyCC Wasm fork](https://github.com/rjpower/tinycc/tree/wasm) | The preferred next compiler; its CI builds `tcc.wasm` and a Wasm sysroot. | The current shellsim engine rejects the artifact with `exceptions proposal not enabled`. Validate an exception-capable engine and its resource/continuation model before integration. |
 | [Chibicc](https://github.com/rui314/chibicc) | Broad C11 frontend and preprocessor; a possible frontend reference. | Emits x86-64 assembly and targets native Linux, so it still needs a Wasm backend and linker. The upstream repository may rewrite history. |
 | [WASI SDK](https://github.com/WebAssembly/wasi-sdk) / [Wasm Clang demo](https://github.com/binji/wasm-clang) | Full Clang/LLVM C compatibility and standard Wasm object format. A Wasm-hosted Clang/LLD precedent exists. | Large runtime/sysroot footprint and integration cost; the demo has custom memory filesystem plumbing and describes itself as alpha. |
 | [PunyCC](https://github.com/bobbl/punycc) | Tiny, self-hosted, and already has Wasm host and target combinations. | No preprocessor, linker, standard library, or useful type system. Good engine smoke test, not a zlib compiler. |
 
-The new evidence changes the proposed compiler order: try WCPL under the virtual WASI adapter
-before forking TinyCC. Pin a WCPL revision, build its Wasm-hosted compiler with trusted external
-tooling, load it as a fixture, and test whether it can compile and run a small multi-file program
-entirely in shellsim. If its C or `.wo` boundary blocks the target workload, a TinyCC backend or
-Wasm-hosted Clang/LLD can be judged against a concrete gap. Do not claim zlib support until the
-actual checked build runs, links, and executes its output in the virtual environment.
+The next compiler gate is tinycc, not another WCPL or XCC fixture. Wasmi 2.0 has no
+exception-handling switch; its source rejects exception tags. Either add the required proposal
+to an engine or use an engine that already implements it, while preserving shellsim's bounded
+process and VFS interfaces. Do not claim zlib support until the checked build runs, links, and
+executes its output in the virtual environment.

@@ -22,11 +22,10 @@ used as an intermediate gate, but it does not satisfy the unqualified acceptance
 2. Close shell and build-tool gaps exposed by the real scripts: executable script dispatch,
    substitutions, redirections, tests, text tools, Makefile expansion and graph evaluation. Fix
    coherent semantics rather than special-casing zlib; reject unsupported constructs visibly.
-3. Choose and integrate a Wasm-hosted C toolchain that accepts zlib's C and conventional object,
-   archive, and link workflow. WCPL currently proves only self-contained small C programs; its
-   custom `.wo` format, limited preprocessor, and broken libc-backed output are not enough for
-   unchanged zlib. Evaluate a Wasm-hosted Clang/LLD or another compact toolchain against measured
-   C and resource requirements before committing to an object ABI.
+3. Integrate a Wasm-hosted C toolchain that accepts zlib's C and conventional object, archive,
+   and link workflow. Prefer the pinned tinycc Wasm build once the runtime supports its exception
+   instructions. Validate the compiler, sysroot, and generated programs through the same virtual
+   process interface before claiming zlib support.
 4. Wire `cc`, `ar`, `ranlib`, and linker invocation through virtual process execution. Keep native
    Rust commands and Wasm executables on the same virtual syscall boundary. Any compiler package
    data or sysroot must live in the virtual filesystem, not be mounted from the host.
@@ -50,25 +49,12 @@ used as an intermediate gate, but it does not satisfy the unqualified acceptance
 
 The integration harness extracts the pinned, unmodified zlib 1.3.2 source archive into the VFS.
 Its PAX global `comment` record is accepted as inert metadata; other global PAX keys remain
-explicitly unsupported. The pinned [XCC](https://github.com/tyfkda/xcc) guest, with a documented
-compiler and libc patch, completes `./configure && make` and produces `libz.a`, `example`, and
-`minigzip`. The `example` executable runs under shellsim and reports a successful compress and
-uncompress round trip. All compiler inputs, intermediate files, archive members, and linked
-executables stay inside the virtual filesystem. No host compiler or archive tool is invoked by
-the product path.
+explicitly unsupported. Without a compiler installed, unchanged `./configure` fails visibly and
+records the missing `cc` probe. This is the checked frontier, not a successful zlib build.
 
-The work exposed general gaps rather than zlib-specific source changes: PAX metadata handling,
-Make rule expansion and continued recipes, an open-but-unlinked file lifetime, WASI filesystem
-operations, backward `goto` lowering in XCC, missing C headers/libc stream error reporting, and
-an indexed Wasm-object `ar` implementation. WASI Preview 1 cannot change file permission bits,
-so the guest linker uses the explicit `shellsim.path_chmod` extension to mark an executable.
-
-The current test sets a bounded 20-billion-unit CPU limit and 128 MiB VFS disk limit. It checks
-the full default build, not only `make static`; zlib's configure selects its supported build mode
-for this Wasm toolchain. This is not a claim that XCC supports arbitrary C projects or ELF shared
-libraries. The default zlib build is the acceptance target; wider toolchain compatibility and
-shared-library semantics remain separate work. The older
-[Wasm-hosted Clang demonstration](https://github.com/binji/wasm-clang) uses a legacy WASI ABI and
-large modules; modern [YoWASP Clang](https://github.com/YoWASP/clang) is more complete but its
-published package uses split Wasm modules and JavaScript orchestration. Neither was needed to
-reach this target.
+The shell and build-tool work already added Make rule expansion, continued recipes, open-but-
+unlinked file lifetime, additional WASI filesystem operations, and an indexed Wasm-object `ar`.
+The tinycc CI artifact currently fails Wasmi module validation with `exceptions proposal not
+enabled`. The next compiler step is to support that Wasm feature or use an engine that does, then
+run tinycc against the virtual sysroot and the unchanged zlib acceptance case. Keep compiler
+artifacts generated from pinned inputs; do not check in `.wasm` files.

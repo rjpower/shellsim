@@ -131,8 +131,9 @@ This is not full WASI process support. A compiled `wc` can read pipeline input a
 downstream pipe, including input larger than the pipe buffer, but the shell collects its entire
 stdin before starting Wasm. A producer that needs its consumer to act before EOF can therefore
 still deadlock or exhaust the input memory budget. `poll_oneoff`, sockets, and guest process
-creation remain unsupported. The checked zlib workflow uses a limited Wasm C toolchain and
-virtual archive/link commands; it does not imply general C or ELF compatibility. A prebuilt
+creation remain unsupported. No C compiler is installed by default; the unchanged zlib configure
+script currently reports that frontier. The current Wasmi engine also rejects the tinycc Wasm
+artifact's exception instructions. A prebuilt
 `wasm32-wasip1` command that uses only the listed imports can be written to the VFS with
 executable permissions and invoked by path or through `PATH`.
 

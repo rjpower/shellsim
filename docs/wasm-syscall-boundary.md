@@ -31,7 +31,7 @@ from shell-only variables, aliases, functions, job control, and parser state. Bu
 The new `syscalls.rs` begins this boundary for regular files. It accepts typed open options,
 allocates descriptors in the active process, and owns close and seek. The WASI adapter now uses
 those descriptors for open, read, write, seek, stat, and close; it no longer keeps a second file
-handle table. The compiled `guest/wc/wc.wasm` fixture proves that a standalone Rust WASI command
+handle table. The source-built `guest/wc` fixture proves that a standalone Rust WASI command
 can read piped input and virtual files and match selected native `wc` behavior. The fixture is
 loaded into the VFS only by tests; standard `wc` remains native.
 
