@@ -39,6 +39,64 @@ fn builds_prerequisites_in_order_and_expands_variables() {
 }
 
 #[test]
+fn backslashes_in_comments_do_not_start_line_continuations() {
+    let mut env = Environment::new();
+    let (status, stdout, stderr) = run_make(
+        &mut env,
+        "# commented flags \\\nFLAGS=-O2 # explanatory comment \\\nall:\n\t@printf '%s' $(FLAGS)\n",
+        "",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "-O2");
+}
+
+#[test]
+fn expands_variables_inside_target_and_prerequisite_names() {
+    let mut env = Environment::new();
+    let (status, stdout, stderr) = run_make(
+        &mut env,
+        "SUFFIX=.txt\nNAME=result\nall: $(NAME)$(SUFFIX)\n\t@cat result.txt\nresult$(SUFFIX):\n\t@printf ready > $@\n",
+        "",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert!(stdout.ends_with("ready"));
+    assert_eq!(env.vfs.read_string("/", "/result.txt").unwrap(), "ready");
+}
+
+#[test]
+fn continued_recipe_runs_in_one_shell_process() {
+    let mut env = Environment::new();
+    let (status, stdout, stderr) = run_make(
+        &mut env,
+        "all:\n\t@VALUE=ready; \\\n\tprintf '%s' \"$VALUE\"\n",
+        "",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "ready");
+}
+
+#[test]
+fn recipe_dash_prefix_ignores_only_that_command_failure() {
+    let mut env = Environment::new();
+    let (status, stdout, stderr) = run_make(&mut env, "all:\n\t-@false\n\t@printf done\n", "");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "done");
+}
+
+#[test]
+fn later_dependency_only_rule_extends_existing_target() {
+    let mut env = Environment::new();
+    env.vfs.write("/", "/input", b"source", 0o644).unwrap();
+    let (status, stdout, stderr) = run_make(
+        &mut env,
+        "result:\n\t@printf ready > result\nresult: input\nall: result\n\t@cat result\n",
+        "all",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "ready");
+}
+
+#[test]
 fn builds_a_file_target_and_skips_it_when_up_to_date() {
     let mut env = Environment::new();
     env.vfs

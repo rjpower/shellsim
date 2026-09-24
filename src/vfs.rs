@@ -86,6 +86,9 @@ pub type Result<T> = std::result::Result<T, VfsError>;
 #[derive(Clone)]
 pub struct Vfs {
     nodes: BTreeMap<String, Node>,
+    /// Unlinked files retained by open descriptions until their last close.
+    orphaned: BTreeMap<u64, Node>,
+    next_orphan: u64,
     /// Wall-clock timestamp assigned to subsequent content mutations.  The environment updates
     /// this immediately before an effect; the VFS never consults the host clock.
     mutation_time_ms: u64,
@@ -176,6 +179,8 @@ impl Vfs {
         let disk_used = logical_usage(&nodes);
         Vfs {
             nodes,
+            orphaned: BTreeMap::new(),
+            next_orphan: 1,
             mutation_time_ms: 0,
             disk_limit,
             baseline_dirs: std::collections::BTreeSet::new(),
@@ -323,6 +328,9 @@ impl Vfs {
             .count() as u64;
         logical_usage(&self.nodes)
             .saturating_sub(present_baseline_dirs.saturating_mul(NODE_OVERHEAD))
+            .saturating_add(self.orphaned.values().fold(0_u64, |total, node| {
+                total.saturating_add(NODE_OVERHEAD.saturating_add(node_payload_len(node)))
+            }))
     }
 
     // ---- low level ----
@@ -765,6 +773,85 @@ impl Vfs {
             }
             None => Err(VfsError::NotFound(path.to_string())),
         }
+    }
+
+    /// Remove a pathname while retaining its node for descriptors that already have it open.
+    /// The returned identity is not a path and is inaccessible through ordinary VFS lookup.
+    pub(crate) fn unlink_open_file(&mut self, cwd: &str, path: &str) -> Result<u64> {
+        let abs = resolve_against(cwd, path);
+        reject_pseudo_mutation(&abs)?;
+        let real = self.realpath(&abs, false)?;
+        if !matches!(
+            self.nodes.get(&real).map(|node| &node.kind),
+            Some(NodeKind::File(_))
+        ) {
+            return Err(VfsError::NotFound(path.to_string()));
+        }
+        let id = self.next_orphan;
+        self.next_orphan = id.checked_add(1).ok_or(VfsError::NoSpace)?;
+        let node = self.nodes.remove(&real).expect("file was checked");
+        self.orphaned.insert(id, node);
+        self.refresh_usage();
+        Ok(id)
+    }
+
+    pub(crate) fn orphan_metadata(&self, id: u64) -> Result<Node> {
+        self.orphaned
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| VfsError::NotFound(format!("unlinked file {id}")))
+    }
+
+    pub(crate) fn orphan_len(&self, id: u64) -> Result<usize> {
+        let node = self.orphan_metadata(id)?;
+        let NodeKind::File(bytes) = node.kind else {
+            unreachable!("orphan is always a file")
+        };
+        Ok(bytes.len())
+    }
+
+    pub(crate) fn read_orphan_limited(&self, id: u64, limit: usize) -> Result<Vec<u8>> {
+        let node = self.orphan_metadata(id)?;
+        let NodeKind::File(bytes) = node.kind else {
+            unreachable!("orphan is always a file")
+        };
+        if bytes.len() > limit {
+            return Err(VfsError::TooLarge {
+                path: format!("unlinked file {id}"),
+                limit,
+            });
+        }
+        self.read_bytes
+            .set(self.read_bytes.get().saturating_add(bytes.len() as u64));
+        Ok(bytes)
+    }
+
+    pub(crate) fn write_orphan_at(&mut self, id: u64, offset: usize, data: &[u8]) -> Result<()> {
+        let end = offset.checked_add(data.len()).ok_or(VfsError::NoSpace)?;
+        let node = self
+            .orphaned
+            .get_mut(&id)
+            .ok_or_else(|| VfsError::NotFound(format!("unlinked file {id}")))?;
+        let NodeKind::File(bytes) = &mut node.kind else {
+            unreachable!("orphan is always a file")
+        };
+        let growth = end.saturating_sub(bytes.len()) as u64;
+        if self.disk_used.saturating_add(growth) > self.disk_limit {
+            return Err(VfsError::NoSpace);
+        }
+        if end > bytes.len() {
+            bytes.resize(end, 0);
+        }
+        bytes[offset..end].copy_from_slice(data);
+        node.mtime = self.mutation_time_ms;
+        self.record_usage(self.disk_used.saturating_add(growth));
+        Ok(())
+    }
+
+    /// Reclaim unlinked storage once no file description names its orphan identity.
+    pub(crate) fn retain_orphans(&mut self, live: &BTreeSet<u64>) {
+        self.orphaned.retain(|id, _| live.contains(id));
+        self.refresh_usage();
     }
 
     pub fn remove_all(&mut self, cwd: &str, path: &str) -> Result<()> {

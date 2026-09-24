@@ -28,6 +28,7 @@ const ERRNO_EXIST: i32 = 20;
 const ERRNO_ISDIR: i32 = 31;
 const ERRNO_NOENT: i32 = 44;
 const ERRNO_NOTDIR: i32 = 54;
+const ERRNO_NOTEMPTY: i32 = 55;
 const ERRNO_PERM: i32 = 63;
 
 struct Host<'a> {
@@ -51,6 +52,7 @@ fn vfs_errno(error: &VfsError) -> i32 {
         VfsError::Exists(_) => ERRNO_EXIST,
         VfsError::IsADir(_) => ERRNO_ISDIR,
         VfsError::NotADir(_) => ERRNO_NOTDIR,
+        VfsError::NotEmpty(_) => ERRNO_NOTEMPTY,
         VfsError::ReadOnly(_) => ERRNO_PERM,
         _ => ERRNO_INVAL,
     }
@@ -179,38 +181,47 @@ struct PathOpen {
     result: u32,
 }
 
-fn path_open(mut caller: Caller<'_, Host<'_>>, request: PathOpen) -> i32 {
-    if request.directory != 3 {
-        return ERRNO_BADF;
+fn read_path(caller: &Caller<'_, Host<'_>>, pointer: u32, length: u32) -> Result<String, i32> {
+    if length == 0 || length as usize > 4096 {
+        return Err(ERRNO_INVAL);
     }
+    let memory = memory(caller).ok_or(ERRNO_FAULT)?;
+    let mut bytes = vec![0; length as usize];
+    memory
+        .read(caller, pointer as usize, &mut bytes)
+        .map_err(|_| ERRNO_FAULT)?;
+    let path = std::str::from_utf8(&bytes).map_err(|_| ERRNO_INVAL)?;
+    if path.contains('\0') {
+        return Err(ERRNO_INVAL);
+    }
+    Ok(path.to_string())
+}
+
+fn preopen_base(caller: &Caller<'_, Host<'_>>, fd: u32) -> Result<String, i32> {
+    match fd {
+        3 => Ok(caller.data().cwd.clone()),
+        4 => Ok("/".to_string()),
+        _ => Err(ERRNO_BADF),
+    }
+}
+
+fn path_open(mut caller: Caller<'_, Host<'_>>, request: PathOpen) -> i32 {
+    let cwd = match preopen_base(&caller, request.directory) {
+        Ok(cwd) => cwd,
+        Err(error) => return error,
+    };
     if request.oflags & !0b1111 != 0 || request.fdflags & !1 != 0 {
         return ERRNO_INVAL;
     }
     if request.oflags & 2 != 0 {
         return ERRNO_NOTDIR;
     }
-    if request.path_length as usize > 4096 {
-        return ERRNO_INVAL;
-    }
-    let Some(memory) = memory(&caller) else {
-        return ERRNO_FAULT;
+    let path = match read_path(&caller, request.path_pointer, request.path_length) {
+        Ok(path) => path,
+        Err(error) => return error,
     };
-    let mut bytes = vec![0; request.path_length as usize];
-    if memory
-        .read(&caller, request.path_pointer as usize, &mut bytes)
-        .is_err()
-    {
-        return ERRNO_FAULT;
-    }
-    let Ok(path) = std::str::from_utf8(&bytes) else {
-        return ERRNO_INVAL;
-    };
-    if path.contains('\0') || path.is_empty() {
-        return ERRNO_INVAL;
-    }
     let readable = request.rights_base & 2 != 0;
     let writable = request.rights_base & 64 != 0;
-    let cwd = caller.data().cwd.clone();
     let options = OpenFile {
         readable,
         writable,
@@ -219,7 +230,7 @@ fn path_open(mut caller: Caller<'_, Host<'_>>, request: PathOpen) -> i32 {
         truncate: request.oflags & 8 != 0,
         append: request.fdflags & 1 != 0,
     };
-    let fd = match syscalls::open_file(caller.data_mut().interp, &cwd, path, options) {
+    let fd = match syscalls::open_file(caller.data_mut().interp, &cwd, &path, options) {
         Ok(fd) => fd,
         Err(error) => return syscall_errno(&error),
     };
@@ -235,8 +246,22 @@ fn path_open(mut caller: Caller<'_, Host<'_>>, request: PathOpen) -> i32 {
     ERRNO_SUCCESS
 }
 
+// WASI Preview 1 has no permission-changing operation. Toolchains use this bounded extension to
+// mark a linked module executable without receiving access to host filesystem metadata.
+fn path_chmod(mut caller: Caller<'_, Host<'_>>, pointer: u32, length: u32, mode: u32) -> i32 {
+    let path = match read_path(&caller, pointer, length) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let cwd = caller.data().cwd.clone();
+    match syscalls::chmod(caller.data_mut().interp, &cwd, &path, mode) {
+        Ok(()) => ERRNO_SUCCESS,
+        Err(error) => syscall_errno(&error),
+    }
+}
+
 fn fd_prestat_get(mut caller: Caller<'_, Host<'_>>, fd: u32, pointer: u32) -> i32 {
-    if fd != 3 {
+    if !matches!(fd, 3 | 4) {
         return ERRNO_BADF;
     }
     let Some(memory) = memory(&caller) else {
@@ -257,7 +282,7 @@ fn fd_prestat_dir_name(
     pointer: u32,
     length: u32,
 ) -> i32 {
-    if fd != 3 {
+    if !matches!(fd, 3 | 4) {
         return ERRNO_BADF;
     }
     if length < 1 {
@@ -266,7 +291,8 @@ fn fd_prestat_dir_name(
     let Some(memory) = memory(&caller) else {
         return ERRNO_FAULT;
     };
-    if memory.write(&mut caller, pointer as usize, b".").is_ok() {
+    let name = if fd == 3 { b"." } else { b"/" };
+    if memory.write(&mut caller, pointer as usize, name).is_ok() {
         ERRNO_SUCCESS
     } else {
         ERRNO_FAULT
@@ -284,7 +310,7 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host<'_>>, fd: u32, pointer: u32) -> i32
             value[0] = 2;
             64_u64
         }
-        3 => {
+        3 | 4 => {
             value[0] = 3;
             u64::MAX
         }
@@ -368,14 +394,27 @@ fn filestat(node: &crate::vfs::Node) -> [u8; 64] {
 }
 
 fn fd_filestat_get(mut caller: Caller<'_, Host<'_>>, fd: u32, result: u32) -> i32 {
-    let path = match fd {
-        3 => caller.data().cwd.clone(),
-        _ => match guest_file(&caller, fd as i32) {
-            Ok(file) => file.path,
+    let file = if fd >= 5 {
+        match guest_file(&caller, fd as i32) {
+            Ok(file) => Some(file),
             Err(error) => return error,
-        },
+        }
+    } else {
+        None
     };
-    let node = match caller.data().interp.vfs.metadata("/", &path, true) {
+    let node = match file.as_ref().and_then(|file| file.orphan) {
+        Some(id) => caller.data().interp.vfs.orphan_metadata(id),
+        None => {
+            let path = match (fd, file) {
+                (3, _) => caller.data().cwd.clone(),
+                (4, _) => "/".to_string(),
+                (_, Some(file)) => file.path,
+                _ => return ERRNO_BADF,
+            };
+            caller.data().interp.vfs.metadata("/", &path, true)
+        }
+    };
+    let node = match node {
         Ok(node) => node,
         Err(error) => return vfs_errno(&error),
     };
@@ -400,26 +439,15 @@ fn path_filestat_get(
     length: u32,
     result: u32,
 ) -> i32 {
-    if fd != 3 {
-        return ERRNO_BADF;
-    }
-    if length as usize > 4096 {
-        return ERRNO_INVAL;
-    }
-    let Some(memory) = memory(&caller) else {
-        return ERRNO_FAULT;
+    let cwd = match preopen_base(&caller, fd) {
+        Ok(cwd) => cwd,
+        Err(error) => return error,
     };
-    let mut bytes = vec![0; length as usize];
-    if memory.read(&caller, pointer as usize, &mut bytes).is_err() {
-        return ERRNO_FAULT;
-    }
-    let Ok(path) = std::str::from_utf8(&bytes) else {
-        return ERRNO_INVAL;
+    let path = match read_path(&caller, pointer, length) {
+        Ok(path) => path,
+        Err(error) => return error,
     };
-    if path.contains('\0') {
-        return ERRNO_INVAL;
-    }
-    let path = resolve_against(&caller.data().cwd, path);
+    let path = resolve_against(&cwd, &path);
     let node = match caller
         .data()
         .interp
@@ -429,6 +457,9 @@ fn path_filestat_get(
         Ok(node) => node,
         Err(error) => return vfs_errno(&error),
     };
+    let Some(memory) = memory(&caller) else {
+        return ERRNO_FAULT;
+    };
     if memory
         .write(&mut caller, result as usize, &filestat(&node))
         .is_ok()
@@ -436,6 +467,91 @@ fn path_filestat_get(
         ERRNO_SUCCESS
     } else {
         ERRNO_FAULT
+    }
+}
+
+fn path_unlink_file(mut caller: Caller<'_, Host<'_>>, fd: u32, pointer: u32, length: u32) -> i32 {
+    let cwd = match preopen_base(&caller, fd) {
+        Ok(cwd) => cwd,
+        Err(error) => return error,
+    };
+    let path = match read_path(&caller, pointer, length) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match syscalls::unlink(caller.data_mut().interp, &cwd, &path) {
+        Ok(()) => ERRNO_SUCCESS,
+        Err(error) => syscall_errno(&error),
+    }
+}
+
+fn path_create_directory(
+    mut caller: Caller<'_, Host<'_>>,
+    fd: u32,
+    pointer: u32,
+    length: u32,
+) -> i32 {
+    let cwd = match preopen_base(&caller, fd) {
+        Ok(cwd) => cwd,
+        Err(error) => return error,
+    };
+    let path = match read_path(&caller, pointer, length) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match syscalls::mkdir(caller.data_mut().interp, &cwd, &path) {
+        Ok(()) => ERRNO_SUCCESS,
+        Err(error) => syscall_errno(&error),
+    }
+}
+
+fn path_remove_directory(
+    mut caller: Caller<'_, Host<'_>>,
+    fd: u32,
+    pointer: u32,
+    length: u32,
+) -> i32 {
+    let cwd = match preopen_base(&caller, fd) {
+        Ok(cwd) => cwd,
+        Err(error) => return error,
+    };
+    let path = match read_path(&caller, pointer, length) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match syscalls::rmdir(caller.data_mut().interp, &cwd, &path) {
+        Ok(()) => ERRNO_SUCCESS,
+        Err(error) => syscall_errno(&error),
+    }
+}
+
+fn path_rename(
+    mut caller: Caller<'_, Host<'_>>,
+    old_fd: u32,
+    old_pointer: u32,
+    old_length: u32,
+    new_fd: u32,
+    new_pointer: u32,
+    new_length: u32,
+) -> i32 {
+    if !matches!(old_fd, 3 | 4) || !matches!(new_fd, 3 | 4) {
+        return ERRNO_BADF;
+    }
+    let old_base = preopen_base(&caller, old_fd).expect("preopen fd was checked");
+    let new_base = preopen_base(&caller, new_fd).expect("preopen fd was checked");
+    let old_path = match read_path(&caller, old_pointer, old_length) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let new_path = match read_path(&caller, new_pointer, new_length) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let old_path = resolve_against(&old_base, &old_path);
+    let new_path = resolve_against(&new_base, &new_path);
+    match syscalls::rename(caller.data_mut().interp, "/", &old_path, &new_path) {
+        Ok(()) => ERRNO_SUCCESS,
+        Err(error) => syscall_errno(&error),
     }
 }
 
@@ -647,7 +763,9 @@ pub(super) fn run(
     }
     let mut config = Config::default();
     config.consume_fuel(true);
-    config.enforced_limits(EnforcedLimits::strict());
+    // The strict profile rejects legitimate compiler modules with over 1,000 small data
+    // segments. Module bytes, guest memory, and execution fuel remain independently bounded.
+    config.enforced_limits(EnforcedLimits::default());
     let engine = Engine::new(&config);
     let module = match Module::new(&engine, wasm) {
         Ok(module) => module,
@@ -731,6 +849,33 @@ pub(super) fn run(
         )
         .expect("unique WASI import");
     linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "path_unlink_file",
+            path_unlink_file,
+        )
+        .expect("unique WASI import");
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "path_create_directory",
+            path_create_directory,
+        )
+        .expect("unique WASI import");
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "path_remove_directory",
+            path_remove_directory,
+        )
+        .expect("unique WASI import");
+    linker
+        .func_wrap("wasi_snapshot_preview1", "path_rename", path_rename)
+        .expect("unique WASI import");
+    linker
+        .func_wrap("shellsim", "path_chmod", path_chmod)
+        .expect("unique shellsim import");
+    linker
         .func_wrap("wasi_snapshot_preview1", "fd_prestat_get", fd_prestat_get)
         .expect("unique WASI import");
     linker
@@ -777,7 +922,7 @@ pub(super) fn run(
             "wasi_snapshot_preview1",
             "fd_sync",
             |caller: Caller<'_, Host<'_>>, fd: u32| {
-                if fd < 4 || caller.data().open_files.contains(&(fd as i32)) {
+                if fd <= 4 || caller.data().open_files.contains(&(fd as i32)) {
                     ERRNO_SUCCESS
                 } else {
                     ERRNO_BADF
@@ -790,7 +935,7 @@ pub(super) fn run(
             "wasi_snapshot_preview1",
             "fd_datasync",
             |caller: Caller<'_, Host<'_>>, fd: u32| {
-                if fd < 4 || caller.data().open_files.contains(&(fd as i32)) {
+                if fd <= 4 || caller.data().open_files.contains(&(fd as i32)) {
                     ERRNO_SUCCESS
                 } else {
                     ERRNO_BADF

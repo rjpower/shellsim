@@ -20,6 +20,7 @@ use crate::scheduler::WaitReason;
 pub use crate::telemetry::CommandTrust as Trust;
 
 mod archives;
+mod arcmd;
 mod awk;
 mod builtins;
 mod dd;
@@ -305,6 +306,7 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     streams::register(&mut m);
     system::register(&mut m);
     tarcmd::register(&mut m);
+    arcmd::register(&mut m);
     text::register(&mut m);
     unavailable::register(&mut m);
     xargs::register(&mut m);
@@ -715,11 +717,15 @@ fn dispatch(
     resumable: bool,
 ) -> CommandPoll {
     let requested = argv[0].as_str();
-    // Missing standard utility paths retain their native aliases. An installed VFS executable
-    // at that path wins, so one command can migrate without changing the rest of the registry.
+    // Missing standard utility paths retain their native aliases. A VFS executable found through
+    // PATH wins over the registry, including deliberately unsupported tool names such as `cc`.
     let cmd = native_command_name(interp, requested);
     let args = &argv[1..];
-    if let Some(spec) = registry().get(cmd) {
+    let installed = matches!(
+        util::resolve_executable(interp, requested),
+        util::ExecutableLookup::Found(_)
+    );
+    if let Some(spec) = (!installed).then(|| registry().get(cmd)).flatten() {
         let unsupported_reason =
             (spec.trust == Trust::Unsupported).then(|| "not implemented in shellsim".to_string());
         interp.invocations.begin(

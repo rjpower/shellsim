@@ -981,6 +981,7 @@ impl Environment {
             })
             .collect::<Vec<_>>();
         self.process.fds.close_all(&mut self.descriptors);
+        self.vfs.retain_orphans(&self.descriptors.live_orphans());
         for (pipe, reader) in endpoints {
             let reason = if reader {
                 WaitReason::PipeWritable(pipe)
@@ -1205,6 +1206,7 @@ impl Environment {
     pub(crate) fn cancel_unstarted_child(&mut self, pid: ProcessId) {
         if let Some(mut child) = self.process.remove(pid) {
             child.fds.close_all(&mut self.descriptors);
+            self.vfs.retain_orphans(&self.descriptors.live_orphans());
             self.resources.release_memory(child.fork_allocation_bytes);
         }
         let _ = self.scheduler.discard_runnable(pid);
@@ -1257,9 +1259,11 @@ impl Environment {
             }
             let cursor = usize::try_from(file.cursor)
                 .map_err(|_| "file cursor exceeds addressable memory".to_string())?;
-            let data = self
-                .fs_read_limited("/", &file.path, MAX_CAPTURE_BYTES)
-                .map_err(|error| error.to_string())?;
+            let data = match file.orphan {
+                Some(id) => self.vfs.read_orphan_limited(id, MAX_CAPTURE_BYTES),
+                None => self.fs_read_limited("/", &file.path, MAX_CAPTURE_BYTES),
+            }
+            .map_err(|error| error.to_string())?;
             let end = cursor.saturating_add(maximum).min(data.len());
             let bytes = if cursor >= data.len() {
                 Vec::new()
@@ -1330,7 +1334,11 @@ impl Environment {
             let cursor = usize::try_from(file.cursor)
                 .map_err(|_| "file cursor exceeds addressable memory".to_string())?;
             self.sync_vfs_time();
-            if let Err(error) = self.vfs.write_at("/", &file.path, cursor, bytes) {
+            let result = match file.orphan {
+                Some(id) => self.vfs.write_orphan_at(id, cursor, bytes),
+                None => self.vfs.write_at("/", &file.path, cursor, bytes),
+            };
+            if let Err(error) = result {
                 if file.remove_on_first_write_error && cursor == 0 {
                     let _ = self.vfs.remove_file("/", &file.path);
                 }

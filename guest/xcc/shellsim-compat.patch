@@ -1,0 +1,198 @@
+diff --git a/include/errno.h b/include/errno.h
+index 067bc6a..38f155c 100644
+--- a/include/errno.h
++++ b/include/errno.h
+@@ -25,0 +26 @@ extern int *__errno_location(void) /*__THROW __attribute__((__const__))*/;
++#define EWOULDBLOCK     EAGAIN
+diff --git a/include/stdio.h b/include/stdio.h
+index c268ea9..41bc0ed 100644
+--- a/include/stdio.h
++++ b/include/stdio.h
+@@ -9,5 +9,3 @@
+-enum {
+-  SEEK_SET,  // 0
+-  SEEK_CUR,  // 1
+-  SEEK_END,  // 2
+-};
++#define SEEK_SET 0
++#define SEEK_CUR 1
++#define SEEK_END 2
+@@ -55,0 +54 @@ int feof(FILE *fp);
++int ferror(FILE *fp);
+diff --git a/libsrc/stdio/_file.c b/libsrc/stdio/_file.c
+index c2a8779..e93d394 100644
+--- a/libsrc/stdio/_file.c
++++ b/libsrc/stdio/_file.c
+@@ -55,0 +56,5 @@ ssize_t _fread(void *cookie, char *buf, size_t total) {
++    if (len < 0) {
++      fp->flag |= FF_ERR;
++      fp->rp = fp->rs = 0;
++      return p - (unsigned char*)buf;
++    }
+@@ -57 +62 @@ ssize_t _fread(void *cookie, char *buf, size_t total) {
+-    size_t n = len < 0 || (size_t)len < total ? (size_t)len : total;
++    size_t n = (size_t)len < total ? (size_t)len : total;
+@@ -76,0 +82,2 @@ ssize_t _fread(void *cookie, char *buf, size_t total) {
++    } else {
++      fp->flag |= FF_ERR;
+@@ -87,0 +95,2 @@ ssize_t _fwrite(void *cookie, const char *buf, size_t size) {
++    fp->flag |= FF_ERR;
++  if (fp->flag & FF_ERR)
+@@ -95,0 +105,2 @@ ssize_t _fwrite(void *cookie, const char *buf, size_t size) {
++        fp->flag |= FF_ERR;
++      if (fp->flag & FF_ERR)
+diff --git a/libsrc/stdio/_file.h b/libsrc/stdio/_file.h
+index 20ff2c9..a2a9bac 100644
+--- a/libsrc/stdio/_file.h
++++ b/libsrc/stdio/_file.h
+@@ -9,0 +10 @@
++#define FF_ERR          (1 << 6)
+diff --git a/libsrc/stdio/ferror.c b/libsrc/stdio/ferror.c
+new file mode 100644
+index 0000000..33bf033
+--- /dev/null
++++ b/libsrc/stdio/ferror.c
+@@ -0,0 +1,7 @@
++#include "stdio.h"
++
++#include "_file.h"
++
++int ferror(FILE *fp) {
++  return (fp->flag & FF_ERR) ? 1 : 0;
++}
+diff --git a/libsrc/stdio/fread.c b/libsrc/stdio/fread.c
+index 67e0876..d76521f 100644
+--- a/libsrc/stdio/fread.c
++++ b/libsrc/stdio/fread.c
+@@ -6 +6 @@ size_t fread(void *buffer, size_t size, size_t count, FILE *fp) {
+-  if (!(fp->flag & FF_READ))
++  if (size == 0 || !(fp->flag & FF_READ))
+@@ -8,0 +9,2 @@ size_t fread(void *buffer, size_t size, size_t count, FILE *fp) {
++  if (result < 0)
++    fp->flag |= FF_ERR;
+diff --git a/libsrc/stdio/fwrite.c b/libsrc/stdio/fwrite.c
+index 29deac1..09ff564 100644
+--- a/libsrc/stdio/fwrite.c
++++ b/libsrc/stdio/fwrite.c
+@@ -7 +7 @@ size_t fwrite(const void *buffer, size_t size, size_t count, FILE *fp) {
+-  if (!(fp->flag & FF_WRITE))
++  if (size == 0 || !(fp->flag & FF_WRITE))
+@@ -10,0 +11,2 @@ size_t fwrite(const void *buffer, size_t size, size_t count, FILE *fp) {
++  if (result < 0)
++    fp->flag |= FF_ERR;
+diff --git a/src/cc/frontend/ast.h b/src/cc/frontend/ast.h
+index d40a42e..ca3fa03 100644
+--- a/src/cc/frontend/ast.h
++++ b/src/cc/frontend/ast.h
+@@ -348,0 +349 @@ enum StmtKind {
++  ST_LOOP_FOR_LABEL,
+@@ -494,0 +496 @@ typedef struct GotoLabel {
++  bool loop;
+diff --git a/src/cc/frontend/fe_misc.c b/src/cc/frontend/fe_misc.c
+index e990d0c..b821a60 100644
+--- a/src/cc/frontend/fe_misc.c
++++ b/src/cc/frontend/fe_misc.c
+@@ -749,0 +750 @@ static void check_reachability_stmt(Stmt *stmt) {
++  case ST_LOOP_FOR_LABEL:
+diff --git a/src/wcc/gen_wasm.c b/src/wcc/gen_wasm.c
+index 6e0245b..0985914 100644
+--- a/src/wcc/gen_wasm.c
++++ b/src/wcc/gen_wasm.c
+@@ -519,0 +520 @@ static void gen_block_for_label(Stmt *stmt, bool is_last) {
++  goto_label->loop = false;
+@@ -527,0 +529,14 @@ static void gen_block_for_label(Stmt *stmt, bool is_last) {
++static void gen_loop_for_label(Stmt *stmt, bool is_last) {
++  assert(curfunc != NULL && curfunc->label_table != NULL);
++  GotoLabel *goto_label = table_get(curfunc->label_table, stmt->block_for_label.label);
++  assert(goto_label != NULL);
++  goto_label->depth = cur_depth;
++  goto_label->loop = true;
++
++  ++cur_depth;
++  ADD_CODE(OP_LOOP, WT_VOID); {
++    gen_stmts(stmt->block_for_label.stmts, is_last);
++  } ADD_CODE(OP_END);
++  --cur_depth;
++}
++
+@@ -558,0 +574 @@ void gen_stmt(Stmt *stmt, bool is_last) {
++  case ST_LOOP_FOR_LABEL: gen_loop_for_label(stmt, is_last); break;
+diff --git a/src/wcc/traverse.c b/src/wcc/traverse.c
+index fad418a..2fa1035 100644
+--- a/src/wcc/traverse.c
++++ b/src/wcc/traverse.c
+@@ -636,0 +637,6 @@ static void traverse_goto(Stmt *stmt) {
++  if (goto_label->loop) {
++    if (is_ancestor(label->parent, stmt) == NULL)
++      parse_error(PE_NOFATAL, stmt->token, "goto into a backward label loop is unsupported");
++    return;
++  }
++
+@@ -686,0 +693 @@ static void traverse_stmt(Stmt *stmt) {
++  case ST_LOOP_FOR_LABEL:
+@@ -714,0 +722,34 @@ static inline int traverse_label(Stmt *stmt, Vector *stmts, int i) {
++  GotoLabel *goto_label = table_get(curfunc->label_table, stmt->token->ident);
++  bool backward = false;
++  if (goto_label != NULL) {
++    for (int k = 0; k < goto_label->gotos->len; ++k) {
++      Stmt *target = goto_label->gotos->data[k];
++      Stmt *child = is_ancestor(stmt->parent, target);
++      if (child == NULL)
++        continue;
++      for (int j = 0; j < stmts->len; ++j) {
++        if (stmts->data[j] == child && j >= i)
++          backward = true;
++      }
++    }
++  }
++  if (backward) {
++    Stmt *loop = new_stmt(ST_LOOP_FOR_LABEL, NULL);
++    loop->parent = stmt->parent;
++    loop->block_for_label.label = stmt->token->ident;
++    loop->block_for_label.stmts = new_vector();
++    stmt->label.stmt->parent = loop;
++    vec_push(loop->block_for_label.stmts, stmt->label.stmt);
++    for (int j = i + 1; j < stmts->len; ++j) {
++      Stmt *child = stmts->data[j];
++      child->parent = loop;
++      vec_push(loop->block_for_label.stmts, child);
++    }
++    while (stmts->len > i + 1)
++      vec_remove_at(stmts, i + 1);
++    stmts->data[i] = loop;
++    stmt->parent = loop;
++    goto_label->loop = true;
++    traverse_stmt(loop);
++    return i;
++  }
+diff --git a/src/wcc/traverse_setjmp.c b/src/wcc/traverse_setjmp.c
+index 1151ddd..c383335 100644
+--- a/src/wcc/traverse_setjmp.c
++++ b/src/wcc/traverse_setjmp.c
+@@ -110,0 +111 @@ static bool traverse_ast_stmt(Stmt **pstmt, LexicalStack *parent, TraverseAstPar
++  case ST_LOOP_FOR_LABEL:
+diff --git a/src/wcc/wasm_linker.c b/src/wcc/wasm_linker.c
+index 965ed64..f3e93b4 100644
+--- a/src/wcc/wasm_linker.c
++++ b/src/wcc/wasm_linker.c
+@@ -19,0 +20,5 @@
++#if defined(__wasm)
++__attribute__((import_module("shellsim"), import_name("path_chmod")))
++int shellsim_path_chmod(const char *path, size_t length, unsigned int mode);
++#endif
++
+@@ -1315,0 +1321,7 @@ bool linker_emit_wasm(WasmLinker *linker, const char *ofn, Table *exports) {
++#if defined(__wasm)
++  if (shellsim_path_chmod(ofn, strlen(ofn), 0755) != 0) {
++    fprintf(stderr, "cannot mark executable: %s\n", ofn);
++    return false;
++  }
++#endif
++
+diff --git a/src/wcc/wcc.c b/src/wcc/wcc.c
+index 2efda48..434340e 100644
+--- a/src/wcc/wcc.c
++++ b/src/wcc/wcc.c
+@@ -344 +344 @@ static void parse_options(int argc, char *argv[], Options *opts) {
+-    {"O", required_argument, OPT_OPTIMIZE},
++    {"O", optional_argument, OPT_OPTIMIZE},

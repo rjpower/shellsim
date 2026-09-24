@@ -374,17 +374,59 @@ fn decode(interp: &mut CommandContext<'_>, archive: &[u8]) -> Result<Vec<Entry>,
         }
         let mode = u32::try_from(parse_octal(&header[100..108])?)
             .map_err(|_| "invalid entry mode".to_string())?;
-        let kind = match header[156] {
-            0 | b'0' => EntryKind::File(archive[start..end].to_vec()),
-            b'5' if size == 0 => EntryKind::Directory,
+        match header[156] {
+            0 | b'0' => entries.push(Entry {
+                name,
+                mode,
+                kind: EntryKind::File(archive[start..end].to_vec()),
+            }),
+            b'5' if size == 0 => entries.push(Entry {
+                name,
+                mode,
+                kind: EntryKind::Directory,
+            }),
+            b'g' => parse_pax_global(&archive[start..end])?,
             _ => return Err(format!("unsupported entry type for {name}")),
-        };
-        entries.push(Entry { name, mode, kind });
+        }
         offset = start
             .checked_add(round_block(size))
             .ok_or_else(|| "archive offset overflow".to_string())?;
     }
     Err("archive is truncated or lacks an end marker".to_string())
+}
+
+/// Accept global metadata that cannot change extraction semantics. Path, size, or per-file
+/// overrides need explicit handling rather than being ignored and extracting the wrong entry.
+fn parse_pax_global(data: &[u8]) -> Result<(), String> {
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let remainder = &data[offset..];
+        let separator = remainder
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(|| "malformed PAX record".to_string())?;
+        let length = std::str::from_utf8(&remainder[..separator])
+            .ok()
+            .and_then(|text| text.parse::<usize>().ok())
+            .ok_or_else(|| "malformed PAX record length".to_string())?;
+        if length <= separator + 1 || length > remainder.len() {
+            return Err("malformed PAX record length".to_string());
+        }
+        let record = &remainder[separator + 1..length];
+        if record.last() != Some(&b'\n') {
+            return Err("malformed PAX record".to_string());
+        }
+        let text = std::str::from_utf8(&record[..record.len() - 1])
+            .map_err(|_| "PAX record is not UTF-8".to_string())?;
+        let (key, _) = text
+            .split_once('=')
+            .ok_or_else(|| "malformed PAX record".to_string())?;
+        if key != "comment" {
+            return Err(format!("unsupported PAX global key: {key}"));
+        }
+        offset += length;
+    }
+    Ok(())
 }
 
 fn validate_name(name: &str) -> Result<(), String> {
@@ -570,5 +612,23 @@ fn set_mode(current: &mut Option<Mode>, next: Mode) -> Result<(), String> {
     } else {
         *current = Some(next);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pax_global;
+
+    #[test]
+    fn pax_global_comments_are_accepted_but_semantic_overrides_are_not() {
+        assert!(parse_pax_global(b"20 comment=upstream\n").is_ok());
+        assert_eq!(
+            parse_pax_global(b"14 path=wrong\n"),
+            Err("unsupported PAX global key: path".to_string())
+        );
+        assert_eq!(
+            parse_pax_global(b"99 comment=truncated\n"),
+            Err("malformed PAX record length".to_string())
+        );
     }
 }

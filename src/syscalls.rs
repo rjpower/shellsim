@@ -104,7 +104,8 @@ pub(crate) fn open_file(
     if interp.process.fds.iter().count() >= MAX_FDS_PER_PROCESS {
         return Err(SyscallError::Descriptor(DescriptorError::DescriptorLimit));
     }
-    let fd = (4..MAX_FDS_PER_PROCESS as Fd + 4)
+    // WASI adapters reserve 3 for the working directory and 4 for the VFS root.
+    let fd = (5..MAX_FDS_PER_PROCESS as Fd + 5)
         .find(|&candidate| interp.process.fds.get(candidate).is_err())
         .ok_or(SyscallError::Descriptor(DescriptorError::DescriptorLimit))?;
     let absolute = resolve_against(cwd, path);
@@ -130,13 +131,14 @@ pub(crate) fn open_file(
         }
         Err(error) => return Err(error.into()),
     }
+    let backing_path = interp.vfs.realpath(&absolute, true)?;
     let cursor = if options.append {
-        interp.vfs.file_len("/", &absolute)? as u64
+        interp.vfs.file_len("/", &backing_path)? as u64
     } else {
         0
     };
     let description = interp.descriptors.open_file(
-        absolute,
+        backing_path,
         cursor,
         options.readable,
         options.writable,
@@ -144,6 +146,21 @@ pub(crate) fn open_file(
     )?;
     interp.install_new_description(fd, description)?;
     Ok(fd)
+}
+
+/// Change virtual permission bits for a path owned by the active process.
+pub(crate) fn chmod(
+    interp: &mut Interp,
+    cwd: &str,
+    path: &str,
+    mode: u32,
+) -> Result<(), SyscallError> {
+    if path.is_empty() || path.contains('\0') || mode & !0o7777 != 0 {
+        return Err(SyscallError::InvalidArgument);
+    }
+    interp.sync_vfs_time();
+    interp.vfs.chmod(cwd, path, mode)?;
+    Ok(())
 }
 
 /// Return regular-file state for an active process descriptor.
@@ -158,8 +175,53 @@ pub(crate) fn file_state(interp: &Interp, fd: Fd) -> Result<FileState, SyscallEr
 /// Close a process-owned descriptor and update process metadata.
 pub(crate) fn close(interp: &mut Interp, fd: Fd) -> Result<(), SyscallError> {
     interp.process.fds.close(fd, &mut interp.descriptors)?;
+    interp
+        .vfs
+        .retain_orphans(&interp.descriptors.live_orphans());
     interp.refresh_descriptor_snapshot(interp.process.pid);
     Ok(())
+}
+
+/// Remove one regular file through the virtual filesystem, without exposing host paths.
+pub(crate) fn unlink(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError> {
+    interp.sync_vfs_time();
+    let absolute = resolve_against(cwd, path);
+    let entry = interp.vfs.realpath(&absolute, false)?;
+    if interp.descriptors.has_open_file(&entry)
+        && matches!(
+            interp.vfs.metadata("/", &entry, false)?.kind,
+            NodeKind::File(_)
+        )
+    {
+        let orphan = interp.vfs.unlink_open_file("/", &entry)?;
+        interp.descriptors.detach_file(&entry, orphan);
+        Ok(())
+    } else {
+        interp.vfs.remove_file(cwd, path).map_err(Into::into)
+    }
+}
+
+/// Create one directory; unlike `mkdir_all`, this retains POSIX's existing-parent requirement.
+pub(crate) fn mkdir(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError> {
+    interp.sync_vfs_time();
+    interp.vfs.mkdir(cwd, path).map_err(Into::into)
+}
+
+/// Remove only an empty virtual directory.
+pub(crate) fn rmdir(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError> {
+    interp.sync_vfs_time();
+    interp.vfs.rmdir(cwd, path).map_err(Into::into)
+}
+
+/// Move a virtual path within the same modeled filesystem.
+pub(crate) fn rename(
+    interp: &mut Interp,
+    cwd: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), SyscallError> {
+    interp.sync_vfs_time();
+    interp.vfs.rename(cwd, from, to).map_err(Into::into)
 }
 
 /// Seek one regular-file description. The returned cursor is shared with duplicated fds.
@@ -174,7 +236,10 @@ pub(crate) fn seek(
     let base = match whence {
         0 => 0_i128,
         1 => i128::from(file.cursor),
-        2 => interp.vfs.file_len("/", &file.path)? as i128,
+        2 => match file.orphan {
+            Some(id) => interp.vfs.orphan_len(id)? as i128,
+            None => interp.vfs.file_len("/", &file.path)? as i128,
+        },
         _ => return Err(SyscallError::InvalidArgument),
     };
     let position =
@@ -224,5 +289,70 @@ mod tests {
             file_state(&interp, fd),
             Err(SyscallError::Descriptor(DescriptorError::InvalidFd))
         ));
+    }
+
+    #[test]
+    fn unlink_keeps_open_file_live_until_last_close() {
+        let mut interp = Interp::new();
+        interp.vfs.write("/", "/work/temp", b"abc", 0o600).unwrap();
+        let fd = open_file(
+            &mut interp,
+            "/work",
+            "temp",
+            OpenFile {
+                readable: true,
+                writable: true,
+                create: false,
+                exclusive: false,
+                truncate: false,
+                append: false,
+            },
+        )
+        .unwrap();
+        unlink(&mut interp, "/work", "temp").unwrap();
+        assert!(!interp.vfs.lexists("/", "/work/temp"));
+        assert_eq!(
+            interp.read_fd(fd, 3).unwrap(),
+            IoPoll::Ready(b"abc".to_vec())
+        );
+        seek(&mut interp, fd, 0, 0).unwrap();
+        assert_eq!(interp.write_fd(fd, b"xy").unwrap(), IoPoll::Ready(2));
+        seek(&mut interp, fd, 0, 0).unwrap();
+        assert_eq!(
+            interp.read_fd(fd, 3).unwrap(),
+            IoPoll::Ready(b"xyc".to_vec())
+        );
+        let before_close = interp.vfs.disk_used();
+        close(&mut interp, fd).unwrap();
+        assert!(interp.vfs.disk_used() < before_close);
+        assert!(!interp.vfs.lexists("/", "/work/temp"));
+    }
+
+    #[test]
+    fn unlinking_open_symlink_keeps_target_and_descriptor() {
+        let mut interp = Interp::new();
+        interp.vfs.write("/", "/work/target", b"ok", 0o600).unwrap();
+        interp.vfs.symlink("/", "target", "/work/link").unwrap();
+        let fd = open_file(
+            &mut interp,
+            "/work",
+            "link",
+            OpenFile {
+                readable: true,
+                writable: false,
+                create: false,
+                exclusive: false,
+                truncate: false,
+                append: false,
+            },
+        )
+        .unwrap();
+        unlink(&mut interp, "/work", "link").unwrap();
+        assert!(!interp.vfs.lexists("/", "/work/link"));
+        assert!(interp.vfs.lexists("/", "/work/target"));
+        assert_eq!(
+            interp.read_fd(fd, 2).unwrap(),
+            IoPoll::Ready(b"ok".to_vec())
+        );
     }
 }

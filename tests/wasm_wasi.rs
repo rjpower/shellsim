@@ -110,7 +110,7 @@ fn explicit_virtual_executable_overrides_standard_native_alias() {
         .write("/", "/usr/bin/wc", &guest, 0o755)
         .unwrap();
     assert_eq!(run(&mut environment, "/usr/bin/wc").1, b"guest\n");
-    assert_eq!(run(&mut environment, "printf x | wc -c").1, b"1\n");
+    assert_eq!(run(&mut environment, "printf x | wc -c").1, b"guest\n");
     environment.vfs.chmod("/", "/usr/bin/wc", 0o644).unwrap();
     let (status, stdout, stderr) = run(&mut environment, "/usr/bin/wc");
     assert_eq!(status, 126);
