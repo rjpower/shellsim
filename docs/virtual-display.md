@@ -62,7 +62,7 @@ To play with a separately obtained WAD, run the local browser demo from this PR:
 cargo run --release --example doom_player -- /path/to/doomgeneric/doomgeneric /path/to/freedoom1.wad
 ```
 
-The first launch compiles Doomgeneric inside shellsim's VFS and may take about a minute. Open the
+The launch compiles Doomgeneric inside shellsim's VFS. Open the
 loopback URL printed by the example. Arrow keys move, Ctrl fires, Space uses, Shift runs, and Esc
 opens the menu. The browser only sees copied RGBA frames and sends bounded key events to a host
 demo process; the guest has no host network access. The demo binds an ephemeral `127.0.0.1` port
