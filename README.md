@@ -125,15 +125,17 @@ An executable VFS file beginning with the WebAssembly magic bytes runs through a
 Wasmtime engine. The current WASI Preview 1 adapter provides buffered standard streams, arguments,
 exported environment variables, the virtual clock, deterministic random bytes, and basic regular
 file access relative to the virtual working directory. It does not expose host files, processes,
-network, environment, or time. Invalid modules and unavailable imports fail with a diagnostic.
+network, environment, or time. Invalid modules and imports outside the WASI namespace fail with a
+diagnostic. Unavailable WASI calls trap if reached; they never report fake success.
 
 This is not full WASI process support. A compiled `wc` can read pipeline input and write to a
 downstream pipe, including input larger than the pipe buffer, but the shell collects its entire
 stdin before starting Wasm. A producer that needs its consumer to act before EOF can therefore
 still deadlock or exhaust the input memory budget. `poll_oneoff`, sockets, and guest process
 creation remain unsupported. No C compiler is installed by default; the unchanged zlib configure
-script currently reports that frontier. The engine accepts Wasm exception instructions, but
-tinycc still needs import and end-to-end compiler validation. A prebuilt
+script currently reports that frontier. The engine accepts Wasm exception instructions. A pinned
+external tinycc fixture compiles and runs a libc-free C program in the virtual environment, but
+the full wasi-libc sysroot and its additional operations are not integrated. A prebuilt
 `wasm32-wasip1` command that uses only the listed imports can be written to the VFS with
 executable permissions and invoked by path or through `PATH`.
 

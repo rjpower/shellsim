@@ -54,7 +54,8 @@ records the missing `cc` probe. This is the checked frontier, not a successful z
 
 The shell and build-tool work already added Make rule expansion, continued recipes, open-but-
 unlinked file lifetime, additional WASI filesystem operations, and an indexed Wasm-object `ar`.
-The tinycc CI artifact validates with Wasmtime's exception support, but imports WASI calls not yet
-provided by shellsim. The next compiler step is to implement the required bounded virtual
-operations, then run tinycc against the virtual sysroot and the unchanged zlib acceptance case. Keep compiler
+The pinned tinycc CI artifact compiles a libc-free WASI command in shellsim, and the shell runs
+that result. A standard C build still requires its wasi-libc sysroot and additional virtual WASI
+operations. The next compiler step is to integrate those bounded operations, then run tinycc
+against the virtual sysroot and the unchanged zlib acceptance case. Keep compiler
 artifacts generated from pinned inputs; do not check in `.wasm` files.

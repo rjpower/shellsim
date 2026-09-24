@@ -78,7 +78,8 @@ streaming command and a filesystem walker. WASI Preview 1 alone does not supply 
 An earlier WCPL experiment showed that compilation itself requires no special syscall: the shell
 resolved the compiler as a VFS executable, and it read source and wrote a Wasm binary through
 ordinary virtual file descriptors. That fixture is no longer shipped. The preferred next compiler
-is tinycc, whose published Wasm artifact now validates but requires more virtual WASI imports.
+is tinycc. Its pinned artifact compiles a libc-free WASI command inside shellsim; a standard
+libc build still requires a sysroot and more virtual WASI operations.
 The current Wasm command path is still buffered, not yet a separately
 scheduled guest program image.
 

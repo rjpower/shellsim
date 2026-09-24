@@ -1,8 +1,9 @@
 //! Bounded WASI preview1 execution against shellsim's virtual command boundary.
 //!
 //! The host functions expose buffered streams, process metadata, the virtual clock, and
-//! bounded regular-file access. Unknown imports fail instantiation rather than acquiring
-//! ambient host capabilities. Live pipe suspension remains outside this first slice.
+//! bounded regular-file access. Unavailable WASI calls trap if reached; other namespaces fail
+//! instantiation. Neither path grants ambient host capabilities. Live pipe suspension remains
+//! outside this first slice.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -968,6 +969,28 @@ pub(super) fn run(
             |_caller: Caller<'_, Host>| ERRNO_SUCCESS,
         )
         .expect("unique WASI import");
+    // Toolchains import a broad libc surface even when a particular compile does not call it.
+    // An unavailable WASI operation must trap if reached, never touch the host or return fake
+    // success. Non-WASI namespaces must still be rejected at instantiation.
+    for import in module.imports() {
+        if import.module() != "wasi_snapshot_preview1"
+            && (import.module(), import.name()) != ("shellsim", "path_chmod")
+        {
+            ewln(
+                err,
+                &format!(
+                    "{path}: unsupported wasm import: {}.{}",
+                    import.module(),
+                    import.name()
+                ),
+            );
+            return CommandPoll::Ready(126);
+        }
+    }
+    if let Err(error) = linker.define_unknown_imports_as_traps(&module) {
+        ewln(err, &format!("{path}: invalid wasm imports: {error}"));
+        return CommandPoll::Ready(126);
+    }
     let arguments = std::iter::once(path.as_bytes().to_vec())
         .chain(args.iter().map(|arg| arg.as_bytes().to_vec()))
         .collect();
@@ -1062,7 +1085,7 @@ pub(super) fn run(
         Err(error) => {
             ewln(
                 &mut store.data_mut().stderr,
-                &format!("{path}: wasm execution failed: {error}"),
+                &format!("{path}: wasm execution failed: {error:#}"),
             );
             CommandPoll::Ready(126)
         }

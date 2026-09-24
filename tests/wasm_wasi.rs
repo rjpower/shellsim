@@ -324,6 +324,21 @@ fn unsupported_import_fails_explicitly_without_host_fallback() {
 }
 
 #[test]
+fn unknown_import_namespace_is_rejected_even_when_unused() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+            (import "host" "run" (func))
+            (func (export "_start")))"#,
+    );
+    let (status, stdout, stderr) = run(&mut environment, "/app");
+    assert_eq!(status, 126);
+    assert!(stdout.is_empty());
+    assert!(String::from_utf8_lossy(&stderr).contains("host.run"));
+}
+
+#[test]
 fn infinite_wasm_loop_is_metered() {
     let mut environment = Environment::with_limits(Limits {
         cpu: 100_000,
