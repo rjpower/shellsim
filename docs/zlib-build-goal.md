@@ -40,7 +40,7 @@ used as an intermediate gate, but it does not satisfy the unqualified acceptance
 - Upstream's default build includes shared-library linking. Wasm's module/linking model does not
   directly provide ELF `.so` semantics. We need either a compatible virtual shared-library model
   or an explicit target-compatible configuration path; do not silently omit `shared`.
-- Building a full compiler inside Wasmi may exceed current memory, module-size, and CPU budgets.
+- Building a full compiler inside Wasmtime may exceed current memory, module-size, and CPU budgets.
   Increase them only with bounded accounting and measured fixtures, not unlimited host work.
 - Do not execute upstream build scripts on the host as the product path. A reference build in an
   isolated test harness may aid diagnosis, but the acceptance result must come from shellsim.
@@ -52,10 +52,16 @@ Its PAX global `comment` record is accepted as inert metadata; other global PAX 
 explicitly unsupported. Without a compiler installed, unchanged `./configure` fails visibly and
 records the missing `cc` probe. This is the checked frontier, not a successful zlib build.
 
-The shell and build-tool work already added Make rule expansion, continued recipes, open-but-
-unlinked file lifetime, additional WASI filesystem operations, and an indexed Wasm-object `ar`.
-The pinned tinycc CI artifact compiles a libc-free WASI command in shellsim, and the shell runs
-that result. A standard C build still requires its wasi-libc sysroot and additional virtual WASI
-operations. The next compiler step is to integrate those bounded operations, then run tinycc
-against the virtual sysroot and the unchanged zlib acceptance case. Keep compiler
-artifacts generated from pinned inputs; do not check in `.wasm` files.
+The static build now passes `./configure --static`, `make`, and zlib's `make test` with unchanged
+zlib 1.3.2 source. The test installs pinned TinyCC and wasi-libc archives into the VFS, then runs
+the compiler and generated programs through shellsim. TinyCC's shellsim-targeted artifact uses a
+virtual `path_chmod` import to mark linked programs executable. Its small MIT-licensed libc bridge
+also maps C `chmod()` to that import, resolving relative paths against the guest's current
+directory. `ar` indexes both Wasm objects and TinyCC's ELF32 Wasm objects. WASI stdio descriptors
+can be closed by libc-backed programs.
+
+This is a static-library milestone, not the unqualified acceptance target. Upstream's default
+configuration still requests a shared-library workflow, which needs a deliberate Wasm-compatible
+linking model rather than silently treating a static archive as a shared library. The checked-in
+TinyCC artifact is built by an external project and includes its license and provenance; the
+permissively licensed wasi-libc sysroot subset is likewise pinned and documented.

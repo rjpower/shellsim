@@ -7,11 +7,11 @@ fn ar_rejects_non_object_without_creating_an_archive() {
     let mut environment = Environment::new();
     environment
         .vfs
-        .write("/", "/work/plain", b"not wasm", 0o644)
+        .write("/", "/work/plain", b"not an object", 0o644)
         .unwrap();
     let (outcome, _, stderr) = environment.run_script_capture("ar rc /work/lib.a /work/plain");
     assert_eq!(outcome.exit_status, 2);
-    assert!(String::from_utf8_lossy(&stderr).contains("not a WebAssembly object"));
+    assert!(String::from_utf8_lossy(&stderr).contains("not a supported WebAssembly object"));
     assert!(!environment.vfs.lexists("/", "/work/lib.a"));
 }
 

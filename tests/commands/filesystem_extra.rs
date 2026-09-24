@@ -14,6 +14,52 @@ fn run(environment: &mut Interp, source: &str) -> (i32, Vec<u8>, String) {
 }
 
 #[test]
+fn cp_p_preserves_source_mode_and_mtime() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/source", b"data", 0o640)
+        .unwrap();
+    environment.vfs.touch("/", "/source", 12_345).unwrap();
+    environment
+        .vfs
+        .write("/", "/target", b"old", 0o600)
+        .unwrap();
+
+    let (status, _, stderr) = run(&mut environment, "cp -p /source /target");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(environment.vfs.read("/", "/target").unwrap(), b"data");
+    let target = environment.vfs.metadata("/", "/target", true).unwrap();
+    assert_eq!(target.mode, 0o640);
+    assert_eq!(target.mtime, 12_345);
+}
+
+#[test]
+fn cp_a_preserves_nested_metadata() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/source/sub").unwrap();
+    environment
+        .vfs
+        .write("/", "/source/sub/file", b"data", 0o640)
+        .unwrap();
+    environment
+        .vfs
+        .touch("/", "/source/sub/file", 12_345)
+        .unwrap();
+    environment.vfs.touch("/", "/source/sub", 23_456).unwrap();
+
+    let (status, _, stderr) = run(&mut environment, "cp -a /source /copy");
+    assert_eq!(status, 0, "{stderr}");
+    let file = environment
+        .vfs
+        .metadata("/", "/copy/sub/file", true)
+        .unwrap();
+    let directory = environment.vfs.metadata("/", "/copy/sub", true).unwrap();
+    assert_eq!((file.mode, file.mtime), (0o640, 12_345));
+    assert_eq!(directory.mtime, 23_456);
+}
+
+#[test]
 fn install_copies_files_and_sets_requested_modes() {
     let mut environment = Environment::new();
     let (status, stdout, stderr) = run(

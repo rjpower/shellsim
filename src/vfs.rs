@@ -1017,11 +1017,26 @@ impl Vfs {
         self.write(cwd, to, &data, source.mode)
     }
 
-    pub fn copy_recursive(&mut self, cwd: &str, from: &str, to: &str) -> Result<()> {
+    /// Copy a subtree within the VFS, optionally retaining each node's virtual modification time.
+    /// Permission bits and ownership are retained in either mode; ordinary copies receive the
+    /// current virtual mutation time.
+    pub fn copy_recursive(
+        &mut self,
+        cwd: &str,
+        from: &str,
+        to: &str,
+        preserve: bool,
+    ) -> Result<()> {
         let from_abs = resolve_against(cwd, from);
         let from_real = self.realpath(&from_abs, true)?;
         if !self.is_dir(cwd, from) {
-            return self.copy_file(cwd, from, to);
+            self.copy_file(cwd, from, to)?;
+            if preserve {
+                let source = self.metadata(cwd, from, true)?;
+                self.chmod(cwd, to, source.mode)?;
+                self.touch(cwd, to, source.mtime)?;
+            }
+            return Ok(());
         }
         let mut to_target = self.write_target(cwd, to)?;
         let before = self.nodes.clone();
@@ -1041,7 +1056,9 @@ impl Vfs {
         }
         for k in self.walk(&from_real) {
             let mut node = self.nodes.get(&k).unwrap().clone();
-            node.mtime = self.mutation_time_ms;
+            if !preserve {
+                node.mtime = self.mutation_time_ms;
+            }
             let suffix = &k[from_real.len()..];
             let newk = format!("{to_target}{suffix}");
             self.nodes.insert(newk, node);
@@ -1254,7 +1271,7 @@ mod tests {
         assert!(!v.is_file("/", "/src/a.txt"));
         assert_eq!(v.read_string("/", "/src/b.txt").unwrap(), "A");
         v.mkdir_all("/", "/dst").unwrap();
-        v.copy_recursive("/", "/src", "/dst").unwrap();
+        v.copy_recursive("/", "/src", "/dst", false).unwrap();
         assert_eq!(v.read_string("/", "/dst/src/b.txt").unwrap(), "A");
     }
 

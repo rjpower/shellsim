@@ -45,6 +45,7 @@ struct Host {
     stdin_offset: usize,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    closed_stdio: BTreeSet<i32>,
     open_files: BTreeSet<i32>,
     append_files: BTreeSet<i32>,
     random_state: u64,
@@ -303,6 +304,9 @@ fn fd_prestat_dir_name(mut caller: Caller<'_, Host>, fd: u32, pointer: u32, leng
 }
 
 fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
+    if caller.data().closed_stdio.contains(&(fd as i32)) {
+        return ERRNO_BADF;
+    }
     let mut value = [0; 24];
     let rights = match fd {
         0 => {
@@ -339,6 +343,13 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
 
 fn fd_close(mut caller: Caller<'_, Host>, fd: u32) -> i32 {
     let fd = fd as i32;
+    if (0..=2).contains(&fd) {
+        return if caller.data_mut().closed_stdio.insert(fd) {
+            ERRNO_SUCCESS
+        } else {
+            ERRNO_BADF
+        };
+    }
     if !caller.data_mut().open_files.remove(&fd) {
         return ERRNO_BADF;
     }
@@ -573,6 +584,9 @@ fn random_get(mut caller: Caller<'_, Host>, pointer: u32, length: u32) -> i32 {
 }
 
 fn fd_write(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, written: u32) -> i32 {
+    if caller.data().closed_stdio.contains(&fd) {
+        return ERRNO_BADF;
+    }
     if fd != 1 && fd != 2 {
         match guest_file(&caller, fd) {
             Ok(file) if file.writable => {}
@@ -659,6 +673,9 @@ fn fd_write(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, writte
 }
 
 fn fd_read(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, read: u32) -> i32 {
+    if caller.data().closed_stdio.contains(&fd) {
+        return ERRNO_BADF;
+    }
     if fd != 0 {
         match guest_file(&caller, fd) {
             Ok(file) if file.readable => {}
@@ -1024,6 +1041,7 @@ pub(super) fn run(
         stdin_offset: 0,
         stdout: std::mem::take(out),
         stderr: std::mem::take(err),
+        closed_stdio: BTreeSet::new(),
         open_files: BTreeSet::new(),
         append_files: BTreeSet::new(),
         random_state: 0x5eed_5eed_5eed_5eed,

@@ -1,10 +1,13 @@
-//! Check the unsupported compiler frontier with unchanged upstream zlib.
+//! Build and exercise unchanged upstream zlib against a pinned virtual C toolchain.
 //!
-//! The pinned source archive is installed into the VFS; no build step runs on the host.
+//! Source, compiler, and sysroot archives are installed into the VFS. No build step runs on the
+//! host, and the compiler has no ambient filesystem or process access.
 
 use shellsim::{Environment, Limits};
 
 const SOURCE: &[u8] = include_bytes!("fixtures/zlib-1.3.2.tar.gz");
+const TINYCC: &[u8] = include_bytes!("fixtures/tinycc/tcc-shellsim-package.tar.gz");
+const SYSROOT: &[u8] = include_bytes!("fixtures/wasi-libc/sysroot-34.tar.gz");
 
 fn zlib_environment() -> Environment {
     let mut environment = Environment::with_limits(Limits {
@@ -17,6 +20,45 @@ fn zlib_environment() -> Environment {
     environment
         .vfs
         .write("/", "/work/zlib.tar.gz", SOURCE, 0o644)
+        .unwrap();
+    environment
+}
+
+fn toolchain_environment() -> Environment {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 50_000_000_000,
+        memory: 256 * 1024 * 1024,
+        disk: 512 * 1024 * 1024,
+        output: 16 * 1024 * 1024,
+    });
+    for path in ["/work", "/tcc", "/wasi-sysroot", "/usr/bin"] {
+        environment.vfs.mkdir_all("/", path).unwrap();
+    }
+    for (path, bytes) in [
+        ("/work/tcc.tar.gz", TINYCC),
+        ("/work/sysroot.tar.gz", SYSROOT),
+    ] {
+        environment.vfs.write("/", path, bytes, 0o644).unwrap();
+    }
+    for command in [
+        "tar -xzf /work/tcc.tar.gz -C /tcc",
+        "tar -xzf /work/sysroot.tar.gz -C /wasi-sysroot",
+    ] {
+        let (result, _, stderr) = environment.run_script_capture(command);
+        assert_eq!(
+            result.exit_status,
+            0,
+            "{command}: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    environment
+        .vfs
+        .chmod("/", "/tcc/tcc-shellsim.wasm", 0o755)
+        .unwrap();
+    environment
+        .vfs
+        .symlink("/", "/tcc/tcc-shellsim.wasm", "/usr/bin/cc")
         .unwrap();
     environment
 }
@@ -49,4 +91,91 @@ fn upstream_zlib_configure_reports_missing_c_compiler() {
         .unwrap();
     assert!(String::from_utf8_lossy(&log).contains("cc -c"));
     assert!(!environment.vfs.is_file("/", "/work/zlib-1.3.2/libz.a"));
+}
+
+#[test]
+fn upstream_zlib_builds_and_runs_with_virtual_toolchain() {
+    let mut environment = toolchain_environment();
+    environment
+        .vfs
+        .write("/", "/work/zlib.tar.gz", SOURCE, 0o644)
+        .unwrap();
+    let (extract, _, stderr) =
+        environment.run_script_capture("tar -xzf /work/zlib.tar.gz -C /work");
+    assert_eq!(
+        extract.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    for command in [
+        "cd /work/zlib-1.3.2 && ./configure --static",
+        "make -C /work/zlib-1.3.2",
+        "make -C /work/zlib-1.3.2 test",
+    ] {
+        let (result, stdout, stderr) = environment.run_script_capture(command);
+        assert_eq!(
+            result.exit_status,
+            0,
+            "{command}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(
+            stderr.is_empty(),
+            "{command}: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    assert!(environment.vfs.is_file("/", "/work/zlib-1.3.2/libz.a"));
+    let example = environment
+        .vfs
+        .metadata("/", "/work/zlib-1.3.2/example", true)
+        .unwrap();
+    assert_ne!(example.mode & 0o111, 0);
+}
+
+#[test]
+fn c_chmod_uses_the_guest_working_directory_and_reports_errors() {
+    let mut environment = toolchain_environment();
+    environment.vfs.mkdir_all("/", "/work/sub").unwrap();
+    environment
+        .vfs
+        .write("/", "/work/sub/file", b"data", 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .write(
+            "/",
+            "/work/chmod.c",
+            br#"
+#include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(void) {
+    if (chdir("/work/sub") != 0) return 1;
+    if (chmod("file", 0700) != 0) return 2;
+    if (chmod("missing", 0700) != -1 || errno != ENOENT) return 3;
+    return 0;
+}
+"#,
+            0o644,
+        )
+        .unwrap();
+    for command in ["cd /work && cc -o chmod-test chmod.c", "/work/chmod-test"] {
+        let (result, stdout, stderr) = environment.run_script_capture(command);
+        assert_eq!(
+            result.exit_status,
+            0,
+            "{command}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    let file = environment
+        .vfs
+        .metadata("/", "/work/sub/file", true)
+        .unwrap();
+    assert_eq!(file.mode, 0o700);
 }
