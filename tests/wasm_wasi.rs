@@ -46,6 +46,49 @@ fn run(environment: &mut Environment, source: &str) -> (i32, Vec<u8>, Vec<u8>) {
 }
 
 #[test]
+fn repeated_exec_reuses_code_but_not_guest_state_or_replaced_file() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+            (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (global $count (mut i32) (i32.const 0))
+            (data (i32.const 32) "0\n")
+            (func (export "_start")
+                (global.set $count (i32.add (global.get $count) (i32.const 1)))
+                (i32.store8 (i32.const 32) (i32.add (i32.const 48) (global.get $count)))
+                (i32.store (i32.const 0) (i32.const 32))
+                (i32.store (i32.const 4) (i32.const 2))
+                (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))"#,
+    );
+    assert_eq!(
+        run(&mut environment, "/app"),
+        (0, b"1\n".to_vec(), Vec::new())
+    );
+    assert_eq!(
+        run(&mut environment, "/app"),
+        (0, b"1\n".to_vec(), Vec::new())
+    );
+
+    install(
+        &mut environment,
+        r#"(module
+            (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 32) "B\n")
+            (func (export "_start")
+                (i32.store (i32.const 0) (i32.const 32))
+                (i32.store (i32.const 4) (i32.const 2))
+                (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))"#,
+    );
+    assert_eq!(
+        run(&mut environment, "/app"),
+        (0, b"B\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
 fn virtual_display_presents_frame_and_consumes_injected_key() {
     const GUEST: &str = r#"(module
         (import "shellsim" "display_open" (func $open (param i32 i32 i32) (result i32)))
