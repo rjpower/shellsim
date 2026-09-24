@@ -10,7 +10,7 @@ use std::fmt;
 use std::future::poll_fn;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use wasmtime::{
     Caller, Config, Engine, Error, Extern, Linker, Memory, Module, Store, StoreLimits,
@@ -28,6 +28,8 @@ use super::{util::ewln, CommandPoll};
 const MAX_WASM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WASM_MEMORY: usize = 16 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 1024 * 1024;
+const MAX_CACHED_MODULES: usize = 4;
+const MAX_CACHED_MODULE_BYTES: usize = 128 * 1024 * 1024;
 // Wasm instructions are cheaper than a modeled CPU unit. This keeps a compiled byte-oriented
 // utility usable on ordinary input without relaxing the host's execution bound.
 const WASM_FUEL_PER_CPU_UNIT: u64 = 10;
@@ -44,6 +46,81 @@ const ERRNO_NOTDIR: i32 = 54;
 const ERRNO_NOTEMPTY: i32 = 55;
 const ERRNO_PERM: i32 = 63;
 const ERRNO_NOSPC: i32 = 51;
+
+struct CachedModule {
+    source: Vec<u8>,
+    module: Module,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct ModuleCache {
+    entries: VecDeque<CachedModule>,
+    bytes: usize,
+}
+
+impl ModuleCache {
+    fn get(&mut self, source: &[u8]) -> Option<Module> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.source == source)?;
+        let entry = self.entries.remove(index).expect("index from cache");
+        let module = entry.module.clone();
+        self.entries.push_back(entry);
+        Some(module)
+    }
+
+    fn insert(&mut self, source: &[u8], module: Module) {
+        let image = module.image_range();
+        let bytes = source
+            .len()
+            .saturating_add((image.end as usize).saturating_sub(image.start as usize));
+        if bytes > MAX_CACHED_MODULE_BYTES {
+            return;
+        }
+        while self.entries.len() >= MAX_CACHED_MODULES
+            || self.bytes.saturating_add(bytes) > MAX_CACHED_MODULE_BYTES
+        {
+            let old = self
+                .entries
+                .pop_front()
+                .expect("cache has an entry to evict");
+            self.bytes -= old.bytes;
+        }
+        self.entries.push_back(CachedModule {
+            source: source.to_vec(),
+            module,
+            bytes,
+        });
+        self.bytes += bytes;
+    }
+}
+
+fn command_engine() -> &'static Engine {
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let mut config = Config::default();
+        config.consume_fuel(true).wasm_exceptions(true);
+        Engine::new(&config).expect("valid Wasmtime configuration")
+    })
+}
+
+fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
+    static CACHE: OnceLock<Mutex<ModuleCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(ModuleCache::default()));
+    if let Some(module) = cache.lock().expect("module cache lock").get(source) {
+        return Ok(module);
+    }
+    let module = Module::new(command_engine(), source)?;
+    let mut cache = cache.lock().expect("module cache lock");
+    // A concurrent miss may have populated the cache while compilation ran.
+    if let Some(existing) = cache.get(source) {
+        return Ok(existing);
+    }
+    cache.insert(source, module.clone());
+    Ok(module)
+}
 
 struct Host {
     interp: Interp,
@@ -1415,20 +1492,17 @@ pub(super) fn run(
         ewln(err, &format!("{path}: wasm compilation budget exhausted"));
         return CommandPoll::Ready(137);
     }
-    let mut config = Config::default();
-    config.consume_fuel(true);
-    // The strict profile rejects legitimate compiler modules with over 1,000 small data
-    // segments. Module bytes, guest memory, and execution fuel remain independently bounded.
-    config.wasm_exceptions(true);
-    let engine = Engine::new(&config).expect("valid Wasmtime configuration");
-    let module = match Module::new(&engine, wasm) {
+    // Charge the same virtual cost on a cache hit. Host cache state must not change whether a
+    // simulated process passes its resource limit.
+    let engine = command_engine();
+    let module = match compiled_command_module(wasm) {
         Ok(module) => module,
         Err(error) => {
             ewln(err, &format!("{path}: invalid wasm module: {error}"));
             return CommandPoll::Ready(126);
         }
     };
-    let mut linker = build_linker(&engine);
+    let mut linker = build_linker(engine);
     // Toolchains import a broad libc surface even when a particular compile does not call it.
     // An unavailable WASI operation must trap if reached, never touch the host or return fake
     // success. Non-WASI namespaces must still be rejected at instantiation.
@@ -1504,7 +1578,7 @@ pub(super) fn run(
             .build(),
         interaction: None,
     };
-    let mut store = Store::new(&engine, host);
+    let mut store = Store::new(engine, host);
     store.limiter(|host| &mut host.limits);
     let fuel = store
         .data()
@@ -1567,4 +1641,34 @@ pub(super) fn run(
     *out = host.stdout;
     *err = host.stderr;
     stopped.map_or(status, |reason| CommandPoll::Ready(reason.exit_status()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_reuses_exact_module_bytes_and_evicts_oldest_entry() {
+        let mut cache = ModuleCache::default();
+        let sources = (0..=MAX_CACHED_MODULES)
+            .map(|number| {
+                wat::parse_str(format!(
+                    "(module (func (export \"_start\") (drop (i32.const {number}))))"
+                ))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let first = Module::new(command_engine(), &sources[0]).unwrap();
+        cache.insert(&sources[0], first.clone());
+        assert!(Module::same(&first, &cache.get(&sources[0]).unwrap()));
+        assert!(cache.get(&sources[1]).is_none());
+
+        for source in sources.iter().skip(1) {
+            cache.insert(source, Module::new(command_engine(), source).unwrap());
+        }
+        assert_eq!(cache.entries.len(), MAX_CACHED_MODULES);
+        assert!(cache.get(&sources[0]).is_none());
+        assert!(cache.get(&sources[1]).is_some());
+        assert!(cache.bytes <= MAX_CACHED_MODULE_BYTES);
+    }
 }
