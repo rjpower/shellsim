@@ -11,9 +11,15 @@ in the shell process. Their source files need not be combined; their authority s
 to the shell's process-scoped syscall interface.
 
 The current machine already creates a root process with descriptors and a scheduler entry, and
-shell continuations belong to logical processes. It does not yet enforce the stronger boundary:
-shell and native-command code can still mutate `Environment` directly, and some external native
-commands execute as functions in the active process. The target is a loader that starts `/bin/sh`
+program continuations belong to logical processes. A child argv loader can retain either a
+shell continuation or a native Rust image. The first native images are `pwd`, `true`, and `false`
+when invoked through that child loader, including from Python subprocesses. They receive a
+borrowed, process-scoped syscall handle for the current poll quantum; it provides cwd, descriptor
+write, and resource accounting, not `Environment` or host handles. Their owned state survives
+blocked and partial writes. The shell still boots as the root logical process, and most native
+commands still run through the existing dispatcher. It does not yet enforce the stronger boundary:
+shell and most native-command code can still mutate `Environment` directly, and some external
+native commands execute as functions in the active process. The target is a loader that starts `/bin/sh`
 by default, treats Rust, Wasm, and Python program images as ordinary processes, and runs each
 external invocation as a child or `exec` replacement. Generic process state should be separate
 from shell-only variables, aliases, functions, job control, and parser state. Builtins such as
@@ -37,7 +43,7 @@ change, not just dropping a binary into `PATH`.
 | Kernel operation | Guest mapping | Native shell/userland mapping |
 |---|---|---|
 | Open/close/seek regular file | WASI `path_open`, `fd_close`, `fd_seek` | Redirections and external command I/O |
-| Read/write descriptor | WASI `fd_read`, `fd_write` | `Interp::read_fd` / `write_fd` |
+| Read/write descriptor | WASI `fd_read`, `fd_write` | Process-scoped native handle backed by `Interp::read_fd` / `write_fd` |
 | Stat and directory enumeration | WASI `path_filestat_get`, future `fd_readdir` | VFS metadata and shell globbing |
 | Spawn/wait/signal | Future versioned shellsim extension | Shell executor and process scheduler |
 | Clock/random | WASI clock/random imports | Virtual clock and deterministic stream |

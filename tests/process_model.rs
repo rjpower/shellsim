@@ -44,6 +44,24 @@ fn proc_self_describes_the_active_logical_shell() {
 }
 
 #[test]
+fn native_argv_children_use_process_cwd_and_leave_the_shell_unchanged() {
+    let mut env = Environment::new();
+    assert_eq!(
+        run(&mut env, "env -C /work pwd"),
+        (0, "/work\n".into(), "".into())
+    );
+    assert!(env
+        .invocations
+        .events()
+        .iter()
+        .any(|event| { event.pid != 1_234 && event.argv == ["pwd"] && event.status == Some(0) }));
+    assert_eq!(run(&mut env, "pwd"), (0, "/\n".into(), "".into()));
+    assert_eq!(run(&mut env, "env false").0, 1);
+    assert_eq!(run(&mut env, "env true").0, 0);
+    assert_eq!(run(&mut env, "readlink /proc/self").1, "1234\n");
+}
+
+#[test]
 fn proc_reports_a_parent_blocked_while_its_child_runs() {
     let mut env = Environment::new();
     let status = run(&mut env, "(cat /proc/1234/status)");

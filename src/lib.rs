@@ -27,6 +27,7 @@ pub mod net;
 pub mod netcmd;
 pub mod process;
 pub mod profile;
+mod program;
 pub mod pseudo_fs;
 pub mod python;
 pub mod resources;

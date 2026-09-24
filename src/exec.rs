@@ -582,7 +582,7 @@ impl ShellContinuation {
         }
     }
 
-    fn inject_signal_handler(&mut self, interp: &mut Interp, body: Node) {
+    pub(crate) fn inject_signal_handler(&mut self, interp: &mut Interp, body: Node) {
         if !self.ensure_capacity(interp, 2) {
             interp.finish_signal_handler();
             return;
@@ -2497,7 +2497,7 @@ pub(crate) enum MachinePoll {
 
 /// Install a shell continuation without driving the scheduler.
 pub(crate) fn start_node(interp: &mut Interp, node: &Node) -> Result<u32, i32> {
-    if interp.process.shell_continuation.is_some() {
+    if interp.process.program.is_some() {
         write_diagnostic(
             interp,
             "shellsim: attempted to replace an active shell continuation\n",
@@ -2505,7 +2505,9 @@ pub(crate) fn start_node(interp: &mut Interp, node: &Node) -> Result<u32, i32> {
         return Err(125);
     }
     let target_pid = interp.process.pid;
-    interp.process.shell_continuation = Some(ShellContinuation::new(node));
+    interp.process.program = Some(crate::program::ProgramContinuation::Shell(
+        ShellContinuation::new(node),
+    ));
     if interp.scheduler.has_runnable() {
         interp
             .scheduler
@@ -2549,7 +2551,7 @@ pub(crate) fn poll_machine(
                     interp.vfs.disk_used(),
                 );
                 if owner_pid == target_pid {
-                    interp.process.shell_continuation = None;
+                    interp.process.program = None;
                     interp.exiting = Some(status);
                     return Ok(MachinePoll::Ready(status));
                 }
@@ -2566,11 +2568,11 @@ pub(crate) fn poll_machine(
             }
             crate::interp::SignalDelivery::Handler(body) => {
                 let mut continuation =
-                    interp.process.shell_continuation.take().ok_or_else(|| {
-                        format!("active signaled process {owner_pid} has no shell continuation")
+                    interp.process.program.take().ok_or_else(|| {
+                        format!("active signaled process {owner_pid} has no program")
                     })?;
-                continuation.inject_signal_handler(interp, body);
-                interp.process.shell_continuation = Some(continuation);
+                continuation.inject_signal_handler(interp, body)?;
+                interp.process.program = Some(continuation);
             }
         }
     }
@@ -2578,14 +2580,13 @@ pub(crate) fn poll_machine(
     let owner_pid = interp.process.pid;
     let mut continuation = interp
         .process
-        .shell_continuation
+        .program
         .take()
-        .ok_or_else(|| format!("active process {owner_pid} has no shell continuation"))?;
+        .ok_or_else(|| format!("active process {owner_pid} has no program"))?;
+    let is_native = continuation.is_native();
     match continuation.poll(interp, SHELL_POLL_QUANTUM) {
         ShellPoll::Pending => {
-            interp
-                .process
-                .set_continuation(owner_pid, Some(continuation))?;
+            interp.process.set_program(owner_pid, Some(continuation))?;
             if interp.scheduler.has_runnable() {
                 interp
                     .scheduler
@@ -2596,15 +2597,11 @@ pub(crate) fn poll_machine(
             Ok(MachinePoll::Progress)
         }
         ShellPoll::Switched => {
-            interp
-                .process
-                .set_continuation(owner_pid, Some(continuation))?;
+            interp.process.set_program(owner_pid, Some(continuation))?;
             Ok(MachinePoll::Progress)
         }
         ShellPoll::Blocked(reason) => {
-            interp
-                .process
-                .set_continuation(owner_pid, Some(continuation))?;
+            interp.process.set_program(owner_pid, Some(continuation))?;
             interp
                 .scheduler
                 .block_current(reason)
@@ -2615,8 +2612,26 @@ pub(crate) fn poll_machine(
                 Ok(MachinePoll::Blocked)
             }
         }
-        ShellPoll::Ready(status) if owner_pid == target_pid => Ok(MachinePoll::Ready(status)),
+        ShellPoll::Ready(status) if owner_pid == target_pid => {
+            if is_native {
+                interp.invocations.finish_latest(
+                    owner_pid,
+                    status,
+                    interp.resources.cpu_used(),
+                    interp.vfs.disk_used(),
+                );
+            }
+            Ok(MachinePoll::Ready(status))
+        }
         ShellPoll::Ready(status) => {
+            if is_native {
+                interp.invocations.finish_latest(
+                    owner_pid,
+                    status,
+                    interp.resources.cpu_used(),
+                    interp.vfs.disk_used(),
+                );
+            }
             interp.finish_child(owner_pid, status);
             Ok(MachinePoll::Progress)
         }
@@ -2733,39 +2748,51 @@ fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
                 return Ok(());
             }
             crate::interp::SignalDelivery::Handler(body) => {
-                let mut continuation =
-                    interp.process.shell_continuation.take().ok_or_else(|| {
-                        format!("scheduled process {owner} has no shell continuation")
-                    })?;
-                continuation.inject_signal_handler(interp, body);
-                interp.process.shell_continuation = Some(continuation);
+                let mut continuation = interp
+                    .process
+                    .program
+                    .take()
+                    .ok_or_else(|| format!("scheduled process {owner} has no program"))?;
+                continuation.inject_signal_handler(interp, body)?;
+                interp.process.program = Some(continuation);
             }
         }
     }
     let mut continuation = interp
         .process
-        .shell_continuation
+        .program
         .take()
-        .ok_or_else(|| format!("scheduled process {owner} has no shell continuation"))?;
+        .ok_or_else(|| format!("scheduled process {owner} has no program"))?;
+    let is_native = continuation.is_native();
     match continuation.poll(interp, SHELL_POLL_QUANTUM) {
         ShellPoll::Pending => {
-            interp.process.set_continuation(owner, Some(continuation))?;
+            interp.process.set_program(owner, Some(continuation))?;
             interp
                 .scheduler
                 .yield_current()
                 .map_err(|error| format!("{error:?}"))?;
         }
         ShellPoll::Switched => {
-            interp.process.set_continuation(owner, Some(continuation))?;
+            interp.process.set_program(owner, Some(continuation))?;
         }
         ShellPoll::Blocked(reason) => {
-            interp.process.set_continuation(owner, Some(continuation))?;
+            interp.process.set_program(owner, Some(continuation))?;
             interp
                 .scheduler
                 .block_current(reason)
                 .map_err(|error| format!("{error:?}"))?;
         }
-        ShellPoll::Ready(status) => interp.finish_child(owner, status),
+        ShellPoll::Ready(status) => {
+            if is_native {
+                interp.invocations.finish_latest(
+                    owner,
+                    status,
+                    interp.resources.cpu_used(),
+                    interp.vfs.disk_used(),
+                );
+            }
+            interp.finish_child(owner, status);
+        }
     }
     Ok(())
 }

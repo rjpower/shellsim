@@ -3,9 +3,60 @@
 //! Paths resolve only in the virtual filesystem. Open files live in the process descriptor
 //! table, so a guest cannot keep a second, unaccounted set of file handles or cursors.
 
-use crate::descriptors::{DescriptorError, Fd, FileState, MAX_FDS_PER_PROCESS};
+use crate::descriptors::{DescriptorError, Fd, FileState, IoPoll, MAX_FDS_PER_PROCESS};
 use crate::interp::Interp;
 use crate::vfs::{resolve_against, NodeKind, VfsError};
+
+/// Operations available to a native process during one scheduler quantum. The borrowed handle
+/// cannot outlive the poll, so blocked programs retain only their own data and wait reason.
+pub(crate) trait NativeSyscalls {
+    fn cwd(&self) -> &str;
+    fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, String>;
+    fn charge_cpu(&mut self, units: u64) -> bool;
+    fn output_remaining(&self) -> u64;
+    fn charge_output(&mut self, bytes: u64) -> bool;
+    fn stop_status(&self) -> i32;
+}
+
+/// Active-PID adapter; neither native programs nor guest ABI adapters receive `Interp`.
+pub(crate) struct ActiveProcessSyscalls<'a> {
+    interp: &'a mut Interp,
+}
+
+impl<'a> ActiveProcessSyscalls<'a> {
+    pub(crate) fn new(interp: &'a mut Interp) -> Self {
+        Self { interp }
+    }
+}
+
+impl NativeSyscalls for ActiveProcessSyscalls<'_> {
+    fn cwd(&self) -> &str {
+        &self.interp.process.cwd
+    }
+
+    fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, String> {
+        self.interp.write_fd(fd, bytes)
+    }
+
+    fn charge_cpu(&mut self, units: u64) -> bool {
+        self.interp.resources.charge_cpu(units)
+    }
+
+    fn output_remaining(&self) -> u64 {
+        self.interp.resources.output_remaining()
+    }
+
+    fn charge_output(&mut self, bytes: u64) -> bool {
+        self.interp.resources.charge_output(bytes)
+    }
+
+    fn stop_status(&self) -> i32 {
+        self.interp
+            .resources
+            .stop_reason()
+            .map_or(137, |reason| reason.exit_status())
+    }
+}
 
 /// Access and creation requested by one virtual process.
 #[derive(Clone, Copy, Debug)]

@@ -224,8 +224,8 @@ pub struct ProcessState {
     pub python_repl: Option<crate::python::ReplState>,
     /// Unix-style descriptor map inherited by logical children.
     pub(crate) fds: FdTable,
-    /// Resumable shell execution frames retained across scheduler activations.
-    pub(crate) shell_continuation: Option<crate::exec::ShellContinuation>,
+    /// Resumable program image retained across scheduler activations.
+    pub(crate) program: Option<crate::program::ProgramContinuation>,
     /// Coalesced standard signals awaiting delivery at a scheduler boundary.
     pending_signals: std::collections::BTreeSet<Signal>,
     /// Non-default signal actions installed by the shell `trap` builtin.
@@ -295,11 +295,22 @@ impl ProcessStates {
         pid: ProcessId,
         continuation: Option<crate::exec::ShellContinuation>,
     ) -> Result<(), String> {
+        self.set_program(
+            pid,
+            continuation.map(crate::program::ProgramContinuation::Shell),
+        )
+    }
+
+    pub(crate) fn set_program(
+        &mut self,
+        pid: ProcessId,
+        program: Option<crate::program::ProgramContinuation>,
+    ) -> Result<(), String> {
         let state = self
             .states
             .get_mut(&pid)
             .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
-        state.shell_continuation = continuation;
+        state.program = program;
         Ok(())
     }
 
@@ -388,7 +399,7 @@ impl ProcessState {
             input_pos: self.input_pos,
             python_repl: None,
             fds,
-            shell_continuation: None,
+            program: None,
             pending_signals: std::collections::BTreeSet::new(),
             signal_dispositions: if new_shell {
                 self.signal_dispositions
@@ -646,7 +657,7 @@ impl Environment {
                 input_pos: 0,
                 python_repl: None,
                 fds,
-                shell_continuation: None,
+                program: None,
                 pending_signals: std::collections::BTreeSet::new(),
                 signal_dispositions: BTreeMap::new(),
                 exit_disposition: None,
@@ -680,6 +691,45 @@ impl Environment {
             true,
             false,
             crate::process::ChildPlacement::Inherit,
+        )
+    }
+
+    /// Load an argv child through one image boundary. Migrated native commands execute as
+    /// process-scoped Rust images; other argv still use the shell executor until ported.
+    pub(crate) fn load_argv_program(
+        &mut self,
+        pid: ProcessId,
+        argv: Vec<String>,
+    ) -> Result<(), String> {
+        if let Some(native) = crate::program::NativeProcess::from_argv(&argv) {
+            let state = self
+                .process
+                .states
+                .get_mut(&pid)
+                .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
+            // Caught shell traps do not survive replacement with an executable image.
+            state.signal_dispositions.clear();
+            state.exit_disposition = None;
+            state.handling_signal = false;
+            self.process.set_program(
+                pid,
+                Some(crate::program::ProgramContinuation::Native(native)),
+            )?;
+            self.invocations.begin(
+                pid,
+                &argv,
+                crate::telemetry::CommandTrust::Real,
+                None,
+                self.resources.cpu_used(),
+                self.vfs.disk_used(),
+            );
+            return Ok(());
+        }
+        self.process.set_continuation(
+            pid,
+            Some(crate::exec::ShellContinuation::new(
+                &crate::shell::Node::ArgvCommand(argv),
+            )),
         )
     }
 

@@ -701,13 +701,7 @@ pub(crate) fn start_child_command(
         .configure_process(pid, command.cwd, command.environment)
         .expect("new child process must accept its launch configuration");
     interp
-        .process
-        .set_continuation(
-            pid,
-            Some(crate::exec::ShellContinuation::new(
-                &crate::shell::Node::ArgvCommand(command.argv),
-            )),
-        )
+        .load_argv_program(pid, command.argv)
         .expect("new child process must accept an argv continuation");
     Ok(pid)
 }

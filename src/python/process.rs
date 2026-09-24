@@ -47,13 +47,7 @@ pub(super) fn start(
             setup_output(interp, pid, 2, request.stderr, &mut endpoints)?;
         }
         interp
-            .process
-            .set_continuation(
-                pid,
-                Some(crate::exec::ShellContinuation::new(
-                    &crate::shell::Node::ArgvCommand(request.argv),
-                )),
-            )
+            .load_argv_program(pid, request.argv)
             .map_err(|error| error.to_string())?;
         Ok(())
     })();
