@@ -27,6 +27,7 @@ pub mod net;
 pub mod netcmd;
 pub mod process;
 pub mod profile;
+mod program;
 pub mod pseudo_fs;
 pub mod python;
 pub mod resources;
@@ -34,6 +35,7 @@ pub mod sandbox;
 pub mod scenario;
 pub mod scheduler;
 pub mod shell;
+mod syscalls;
 pub mod telemetry;
 pub mod vfs;
 

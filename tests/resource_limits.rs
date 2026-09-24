@@ -63,6 +63,19 @@ fn output_limit_is_reported_separately() {
 }
 
 #[test]
+fn native_child_output_uses_the_same_limit() {
+    let mut env = Environment::with_limits(Limits {
+        output: 1,
+        ..Limits::unlimited()
+    });
+    let (outcome, stdout, _) = env.run_script_capture("env pwd");
+    assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
+    assert_eq!(outcome.usage.output_bytes, 1);
+    assert_eq!(outcome.exit_status, 137);
+    assert_eq!(stdout, b"/");
+}
+
+#[test]
 fn command_trace_contains_resource_deltas() {
     let mut env = Environment::new();
     let (outcome, stdout, _) = env.run_script_capture("printf 'b\\na\\n' | sort");

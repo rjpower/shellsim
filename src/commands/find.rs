@@ -457,7 +457,9 @@ fn evaluate(
                 .kind;
             Ok(matches!(
                 (expected, kind),
-                ('f', NodeKind::File(_)) | ('d', NodeKind::Dir) | ('l', NodeKind::Symlink(_))
+                ('f', NodeKind::File(_) | NodeKind::NativeExecutable(_))
+                    | ('d', NodeKind::Dir)
+                    | ('l', NodeKind::Symlink(_))
             ))
         }
         Expr::Name(pattern) => Ok(glob_eq(pattern, crate::vfs::basename(path))),
@@ -473,7 +475,7 @@ fn evaluate(
                     .list_dir("/", path)
                     .map_err(|error| EvalError::Operational(format!("{display}: {error}")))?
                     .is_empty(),
-                NodeKind::Symlink(_) => false,
+                NodeKind::Symlink(_) | NodeKind::NativeExecutable(_) => false,
             })
         }
         Expr::Newer(reference) => {
@@ -495,7 +497,7 @@ fn evaluate(
             {
                 NodeKind::File(data) => data.len() as u64,
                 NodeKind::Symlink(target) => target.len() as u64,
-                NodeKind::Dir => 0,
+                NodeKind::Dir | NodeKind::NativeExecutable(_) => 0,
             };
             let units = size.saturating_add(comparison.unit_bytes.saturating_sub(1))
                 / comparison.unit_bytes;

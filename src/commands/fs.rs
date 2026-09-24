@@ -180,7 +180,7 @@ fn emit_listing(interp: &Interp, dir: &str, entries: &[String], long: bool, out:
                     let sz = match &n.kind {
                         crate::vfs::NodeKind::File(d) => d.len(),
                         crate::vfs::NodeKind::Symlink(target) => target.len(),
-                        crate::vfs::NodeKind::Dir => 0,
+                        crate::vfs::NodeKind::Dir | crate::vfs::NodeKind::NativeExecutable(_) => 0,
                     };
                     // A long listing names what a link points at rather than following it.
                     let target = match &n.kind {
@@ -772,6 +772,7 @@ fn cmd_stat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                                 crate::vfs::NodeKind::File(_) => "regular file",
                                 crate::vfs::NodeKind::Dir => "directory",
                                 crate::vfs::NodeKind::Symlink(_) => "symbolic link",
+                                crate::vfs::NodeKind::NativeExecutable(_) => "native executable",
                             },
                         )
                         .replace("%N", f)

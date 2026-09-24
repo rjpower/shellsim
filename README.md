@@ -119,6 +119,24 @@ environment = shellsim.Environment()
 result = environment.run_python("print('persistent VFS, fresh Python interpreter')")
 ```
 
+## Experimental Wasm executables
+
+An executable VFS file beginning with the WebAssembly magic bytes runs through a bounded Wasmi
+interpreter. The current WASI Preview 1 adapter provides buffered standard streams, arguments,
+exported environment variables, the virtual clock, deterministic random bytes, and basic regular
+file access relative to the virtual working directory. It does not expose host files, processes,
+network, environment, or time. Invalid modules and unavailable imports fail with a diagnostic.
+
+This is not full WASI process support. A compiled `wc` can read pipeline input and write to a
+downstream pipe, including input larger than the pipe buffer, but the shell collects its entire
+stdin before starting Wasm. A producer that needs its consumer to act before EOF can therefore
+still deadlock or exhaust the input memory budget. `poll_oneoff`, sockets, and guest process
+creation remain unsupported. No C compiler is installed by default; the unchanged zlib configure
+script currently reports that frontier. The current Wasmi engine also rejects the tinycc Wasm
+artifact's exception instructions. A prebuilt
+`wasm32-wasip1` command that uses only the listed imports can be written to the VFS with
+executable permissions and invoked by path or through `PATH`.
+
 ## Agent harness
 
 `shellsim serve --root ./project` runs a persistent newline-delimited JSON session. It supports

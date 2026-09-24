@@ -189,7 +189,7 @@ impl PyFilesystem for Interp {
         let size = match &node.kind {
             crate::vfs::NodeKind::File(data) => data.len(),
             crate::vfs::NodeKind::Symlink(target) => target.len(),
-            crate::vfs::NodeKind::Dir => 0,
+            crate::vfs::NodeKind::Dir | crate::vfs::NodeKind::NativeExecutable(_) => 0,
         };
         Ok(PyFileMetadata {
             mode: node.mode,

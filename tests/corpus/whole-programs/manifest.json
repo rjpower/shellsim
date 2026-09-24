@@ -456,13 +456,9 @@
         "stdout_base64": "dXNhZ2U6CiAgY29uZmlndXJlIFstLWNvbnN0XSBbLS16cHJlZml4XSBbLS1wcmVmaXg9UFJFRklYXSAgWy0tZXByZWZpeD1FWFBSRUZJWF0KICAgIFstLXN0YXRpY10gWy0tNjRdIFstLWxpYmRpcj1MSUJESVJdIFstLXNoYXJlZGxpYmRpcj1MSUJESVJdCiAgICBbLS1pbmNsdWRlZGlyPUlOQ0xVREVESVJdIFstLWFyY2hzPSItYXJjaCBpMzg2IC1hcmNoIHg4Nl82NCJdCg==",
         "stderr_base64": "",
         "unsupported": [
-          "ar",
-          "ranlib",
           "nm"
         ],
         "unsupported_commands": [
-          "ar",
-          "ranlib",
           "nm"
         ]
       }
@@ -536,13 +532,9 @@
         "exit_status": 1,
         "class": "unknown_command",
         "unsupported": [
-          "ar",
-          "ranlib",
           "nm"
         ],
         "unsupported_commands": [
-          "ar",
-          "ranlib",
           "nm"
         ]
       }

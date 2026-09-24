@@ -20,6 +20,7 @@ use crate::scheduler::WaitReason;
 pub use crate::telemetry::CommandTrust as Trust;
 
 mod archives;
+mod arcmd;
 mod awk;
 mod builtins;
 mod dd;
@@ -48,6 +49,7 @@ mod tarcmd;
 mod text;
 mod unavailable;
 pub mod util;
+mod wasm;
 mod xargs;
 mod zipcmd;
 
@@ -304,6 +306,7 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     streams::register(&mut m);
     system::register(&mut m);
     tarcmd::register(&mut m);
+    arcmd::register(&mut m);
     text::register(&mut m);
     unavailable::register(&mut m);
     xargs::register(&mut m);
@@ -365,7 +368,7 @@ pub(crate) fn poll(
 
 /// Whether the command has a continuation-aware entry point that does not consume standard
 /// input before it can suspend.
-pub(crate) fn starts_before_input(argv: &[String]) -> bool {
+pub(crate) fn starts_before_input(interp: &Interp, argv: &[String]) -> bool {
     if argv.len() == 1
         && argv
             .first()
@@ -374,7 +377,12 @@ pub(crate) fn starts_before_input(argv: &[String]) -> bool {
         return false;
     }
     argv.first().is_some_and(|requested| {
-        let command = standard_utility_name(requested).unwrap_or(requested);
+        if !(builtins::is_shell_builtin_name(requested) && !requested.contains('/'))
+            && resolved_native_image(interp, requested).is_some()
+        {
+            return true;
+        }
+        let command = native_command_name(interp, requested);
         if matches!(command, "cat" | "head") {
             return streams::streams_before_input(command, &argv[1..]);
         }
@@ -393,7 +401,10 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
     let Some(requested) = argv.first() else {
         return false;
     };
-    let command = standard_utility_name(requested).unwrap_or(requested);
+    if resolved_native_image(interp, requested).is_some() {
+        return false;
+    }
+    let command = native_command_name(interp, requested);
     if command == "git" {
         return git::reads_standard_input(&argv[1..]);
     }
@@ -700,13 +711,7 @@ pub(crate) fn start_child_command(
         .configure_process(pid, command.cwd, command.environment)
         .expect("new child process must accept its launch configuration");
     interp
-        .process
-        .set_continuation(
-            pid,
-            Some(crate::exec::ShellContinuation::new(
-                &crate::shell::Node::ArgvCommand(command.argv),
-            )),
-        )
+        .load_argv_program(pid, command.argv)
         .expect("new child process must accept an argv continuation");
     Ok(pid)
 }
@@ -720,11 +725,37 @@ fn dispatch(
     resumable: bool,
 ) -> CommandPoll {
     let requested = argv[0].as_str();
-    // Agents frequently use explicit paths or `/usr/bin/env` shebangs. Standard utility paths
-    // resolve to the same in-process command without pretending arbitrary host paths exist.
-    let cmd = standard_utility_name(requested).unwrap_or(requested);
+    // Bare shell builtins remain in the shell process. An explicit path always invokes the
+    // corresponding external image, even if its basename is also a builtin.
+    let builtin = !requested.contains('/') && builtins::is_shell_builtin_name(requested);
+    let lookup = util::resolve_executable(interp, requested);
+    let native = resolved_native_image(interp, requested);
+    if !builtin && resumable && native.is_some() {
+        return start_child_sequence(
+            interp,
+            vec![ChildCommand {
+                argv: argv.to_vec(),
+                stdin,
+                cwd: None,
+                environment: None,
+            }],
+            true,
+        );
+    }
+    // Legacy synchronous nested dispatch still uses the old command bodies until migrated.
+    let cmd = if !builtin && !resumable {
+        native.map_or_else(
+            || native_command_name(interp, requested),
+            |image| image.name(),
+        )
+    } else {
+        native_command_name(interp, requested)
+    };
     let args = &argv[1..];
-    if let Some(spec) = registry().get(cmd) {
+    let installed = !builtin
+        && !(native.is_some() && !resumable)
+        && matches!(lookup, util::ExecutableLookup::Found(_));
+    if let Some(spec) = (!installed).then(|| registry().get(cmd)).flatten() {
         let unsupported_reason =
             (spec.trust == Trust::Unsupported).then(|| "not implemented in shellsim".to_string());
         interp.invocations.begin(
@@ -947,6 +978,35 @@ fn standard_utility_name(path: &str) -> Option<&str> {
     ]
     .into_iter()
     .find_map(|prefix| path.strip_prefix(prefix).filter(|name| !name.contains('/')))
+}
+
+fn resolved_native_image(interp: &Interp, requested: &str) -> Option<crate::vfs::NativeProgram> {
+    let util::ExecutableLookup::Found(path) = util::resolve_executable(interp, requested) else {
+        return None;
+    };
+    match interp.vfs.metadata("/", &path, true).ok()?.kind {
+        crate::vfs::NodeKind::NativeExecutable(image) => Some(image),
+        _ => None,
+    }
+}
+
+/// A real VFS entry at an explicit path takes precedence over the synthetic utility alias.
+/// This lets an installed Wasm command replace one native utility without changing unrelated names.
+fn native_command_name<'a>(interp: &Interp, requested: &'a str) -> &'a str {
+    let Some(name) = standard_utility_name(requested) else {
+        return requested;
+    };
+    if crate::vfs::NativeProgram::from_name(name).is_some() {
+        return requested;
+    }
+    if matches!(
+        util::resolve_executable(interp, requested),
+        util::ExecutableLookup::NotFound
+    ) {
+        name
+    } else {
+        requested
+    }
 }
 
 /// Provide `run_script_into` for nested execution (source, eval, scripts).

@@ -10,11 +10,39 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub type Mode = u32;
 
+/// Native program image stored by identity rather than pretending to contain machine bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeProgram {
+    True,
+    False,
+    Pwd,
+}
+
+impl NativeProgram {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "true" => Some(Self::True),
+            "false" => Some(Self::False),
+            "pwd" => Some(Self::Pwd),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::True => "true",
+            Self::False => "false",
+            Self::Pwd => "pwd",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum NodeKind {
     File(Vec<u8>),
     Dir,
     Symlink(String),
+    NativeExecutable(NativeProgram),
 }
 
 #[derive(Clone, Debug)]
@@ -86,12 +114,17 @@ pub type Result<T> = std::result::Result<T, VfsError>;
 #[derive(Clone)]
 pub struct Vfs {
     nodes: BTreeMap<String, Node>,
+    /// Unlinked files retained by open descriptions until their last close.
+    orphaned: BTreeMap<u64, Node>,
+    next_orphan: u64,
     /// Wall-clock timestamp assigned to subsequent content mutations.  The environment updates
     /// this immediately before an effect; the VFS never consults the host clock.
     mutation_time_ms: u64,
     disk_limit: u64,
     /// Directory nodes supplied by the base image rather than created by simulated actions.
     baseline_dirs: std::collections::BTreeSet<String>,
+    /// Native images supplied by the base image do not consume writable quota.
+    baseline_native: BTreeMap<String, NativeProgram>,
     disk_used: u64,
     disk_peak: u64,
     read_bytes: Cell<u64>,
@@ -176,9 +209,12 @@ impl Vfs {
         let disk_used = logical_usage(&nodes);
         Vfs {
             nodes,
+            orphaned: BTreeMap::new(),
+            next_orphan: 1,
             mutation_time_ms: 0,
             disk_limit,
             baseline_dirs: std::collections::BTreeSet::new(),
+            baseline_native: BTreeMap::new(),
             disk_used,
             disk_peak: disk_used,
             read_bytes: Cell::new(0),
@@ -241,6 +277,10 @@ impl Vfs {
 
     fn node_usage(&self, path: &str, node: &Node) -> u64 {
         if self.baseline_dirs.contains(path) && matches!(node.kind, NodeKind::Dir) {
+            return 0;
+        }
+        if matches!(node.kind, NodeKind::NativeExecutable(program) if self.baseline_native.get(path) == Some(&program))
+        {
             return 0;
         }
         NODE_OVERHEAD.saturating_add(node_payload_len(node))
@@ -321,8 +361,25 @@ impl Vfs {
                 )
             })
             .count() as u64;
+        let present_baseline_native = self
+            .baseline_native
+            .iter()
+            .filter(|(path, program)| {
+                matches!(
+                    self.nodes.get(path.as_str()),
+                    Some(Node {
+                        kind: NodeKind::NativeExecutable(actual),
+                        ..
+                    }) if actual == *program
+                )
+            })
+            .count() as u64;
         logical_usage(&self.nodes)
             .saturating_sub(present_baseline_dirs.saturating_mul(NODE_OVERHEAD))
+            .saturating_sub(present_baseline_native.saturating_mul(NODE_OVERHEAD))
+            .saturating_add(self.orphaned.values().fold(0_u64, |total, node| {
+                total.saturating_add(NODE_OVERHEAD.saturating_add(node_payload_len(node)))
+            }))
     }
 
     // ---- low level ----
@@ -398,7 +455,7 @@ impl Vfs {
             Ok(p) => matches!(
                 self.nodes.get(&p),
                 Some(Node {
-                    kind: NodeKind::File(_),
+                    kind: NodeKind::File(_) | NodeKind::NativeExecutable(_),
                     ..
                 })
             ),
@@ -415,6 +472,10 @@ impl Vfs {
                 kind: NodeKind::File(data),
                 ..
             }) => Ok(data.len()),
+            Some(Node {
+                kind: NodeKind::NativeExecutable(_),
+                ..
+            }) => Ok(0),
             Some(Node {
                 kind: NodeKind::Dir,
                 ..
@@ -455,6 +516,12 @@ impl Vfs {
                 kind: NodeKind::Dir,
                 ..
             }) => Err(VfsError::IsADir(path.to_string())),
+            Some(Node {
+                kind: NodeKind::NativeExecutable(_),
+                ..
+            }) => Err(VfsError::Invalid(format!(
+                "opaque native executable: {path}"
+            ))),
             _ => Err(VfsError::NotFound(path.to_string())),
         }
     }
@@ -482,6 +549,12 @@ impl Vfs {
                 kind: NodeKind::Dir,
                 ..
             }) => Err(VfsError::IsADir(path.to_string())),
+            Some(Node {
+                kind: NodeKind::NativeExecutable(_),
+                ..
+            }) => Err(VfsError::Invalid(format!(
+                "opaque native executable: {path}"
+            ))),
             _ => Err(VfsError::NotFound(path.to_string())),
         }
     }
@@ -517,6 +590,12 @@ impl Vfs {
                 kind: NodeKind::Dir,
                 ..
             }) => Err(VfsError::IsADir(path.to_string())),
+            Some(Node {
+                kind: NodeKind::NativeExecutable(_),
+                ..
+            }) => Err(VfsError::Invalid(format!(
+                "opaque native executable: {path}"
+            ))),
             _ => Err(VfsError::NotFound(path.to_string())),
         }
     }
@@ -767,6 +846,85 @@ impl Vfs {
         }
     }
 
+    /// Remove a pathname while retaining its node for descriptors that already have it open.
+    /// The returned identity is not a path and is inaccessible through ordinary VFS lookup.
+    pub(crate) fn unlink_open_file(&mut self, cwd: &str, path: &str) -> Result<u64> {
+        let abs = resolve_against(cwd, path);
+        reject_pseudo_mutation(&abs)?;
+        let real = self.realpath(&abs, false)?;
+        if !matches!(
+            self.nodes.get(&real).map(|node| &node.kind),
+            Some(NodeKind::File(_))
+        ) {
+            return Err(VfsError::NotFound(path.to_string()));
+        }
+        let id = self.next_orphan;
+        self.next_orphan = id.checked_add(1).ok_or(VfsError::NoSpace)?;
+        let node = self.nodes.remove(&real).expect("file was checked");
+        self.orphaned.insert(id, node);
+        self.refresh_usage();
+        Ok(id)
+    }
+
+    pub(crate) fn orphan_metadata(&self, id: u64) -> Result<Node> {
+        self.orphaned
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| VfsError::NotFound(format!("unlinked file {id}")))
+    }
+
+    pub(crate) fn orphan_len(&self, id: u64) -> Result<usize> {
+        let node = self.orphan_metadata(id)?;
+        let NodeKind::File(bytes) = node.kind else {
+            unreachable!("orphan is always a file")
+        };
+        Ok(bytes.len())
+    }
+
+    pub(crate) fn read_orphan_limited(&self, id: u64, limit: usize) -> Result<Vec<u8>> {
+        let node = self.orphan_metadata(id)?;
+        let NodeKind::File(bytes) = node.kind else {
+            unreachable!("orphan is always a file")
+        };
+        if bytes.len() > limit {
+            return Err(VfsError::TooLarge {
+                path: format!("unlinked file {id}"),
+                limit,
+            });
+        }
+        self.read_bytes
+            .set(self.read_bytes.get().saturating_add(bytes.len() as u64));
+        Ok(bytes)
+    }
+
+    pub(crate) fn write_orphan_at(&mut self, id: u64, offset: usize, data: &[u8]) -> Result<()> {
+        let end = offset.checked_add(data.len()).ok_or(VfsError::NoSpace)?;
+        let node = self
+            .orphaned
+            .get_mut(&id)
+            .ok_or_else(|| VfsError::NotFound(format!("unlinked file {id}")))?;
+        let NodeKind::File(bytes) = &mut node.kind else {
+            unreachable!("orphan is always a file")
+        };
+        let growth = end.saturating_sub(bytes.len()) as u64;
+        if self.disk_used.saturating_add(growth) > self.disk_limit {
+            return Err(VfsError::NoSpace);
+        }
+        if end > bytes.len() {
+            bytes.resize(end, 0);
+        }
+        bytes[offset..end].copy_from_slice(data);
+        node.mtime = self.mutation_time_ms;
+        self.record_usage(self.disk_used.saturating_add(growth));
+        Ok(())
+    }
+
+    /// Reclaim unlinked storage once no file description names its orphan identity.
+    pub(crate) fn retain_orphans(&mut self, live: &BTreeSet<u64>) {
+        self.orphaned.retain(|id, _| live.contains(id));
+        self.refresh_usage();
+    }
+
     pub fn remove_all(&mut self, cwd: &str, path: &str) -> Result<()> {
         let abs = resolve_against(cwd, path);
         reject_pseudo_mutation(&abs)?;
@@ -838,9 +996,25 @@ impl Vfs {
 
     pub fn copy_file(&mut self, cwd: &str, from: &str, to: &str) -> Result<()> {
         reject_pseudo_mutation(&resolve_against(cwd, to))?;
+        let source = self.metadata(cwd, from, true)?;
+        if let NodeKind::NativeExecutable(program) = source.kind {
+            let target = self.write_target(cwd, to)?;
+            self.require_parent_dir(&target)?;
+            let before = self.nodes.clone();
+            self.nodes.insert(
+                target,
+                Node {
+                    kind: NodeKind::NativeExecutable(program),
+                    mode: source.mode,
+                    uid: source.uid,
+                    gid: source.gid,
+                    mtime: self.mutation_time_ms,
+                },
+            );
+            return self.finish_mutation(before);
+        }
         let data = self.read(cwd, from)?;
-        let mode = self.metadata(cwd, from, true)?.mode;
-        self.write(cwd, to, &data, mode)
+        self.write(cwd, to, &data, source.mode)
     }
 
     pub fn copy_recursive(&mut self, cwd: &str, from: &str, to: &str) -> Result<()> {
@@ -979,6 +1153,23 @@ impl Vfs {
         Ok(())
     }
 
+    /// Install a trusted native image at a virtual executable path in the base environment.
+    pub(crate) fn seed_native_executable(&mut self, abs: &str, program: NativeProgram) {
+        let norm = normalize(abs);
+        self.nodes.insert(
+            norm.clone(),
+            Node {
+                kind: NodeKind::NativeExecutable(program),
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                mtime: self.mutation_time_ms,
+            },
+        );
+        self.baseline_native.insert(norm, program);
+        self.refresh_usage();
+    }
+
     pub fn put_dir(&mut self, abs: &str, mode: Mode) -> Result<()> {
         let norm = normalize(abs);
         reject_pseudo_mutation(&norm)?;
@@ -1012,7 +1203,7 @@ fn logical_usage(nodes: &BTreeMap<String, Node>) -> u64 {
             let payload = match &node.kind {
                 NodeKind::File(data) => data.len() as u64,
                 NodeKind::Symlink(target) => target.len() as u64,
-                NodeKind::Dir => 0,
+                NodeKind::Dir | NodeKind::NativeExecutable(_) => 0,
             };
             total.saturating_add(NODE_OVERHEAD).saturating_add(payload)
         })
@@ -1022,7 +1213,7 @@ fn node_payload_len(node: &Node) -> u64 {
     match &node.kind {
         NodeKind::File(data) => data.len() as u64,
         NodeKind::Symlink(target) => target.len() as u64,
-        NodeKind::Dir => 0,
+        NodeKind::Dir | NodeKind::NativeExecutable(_) => 0,
     }
 }
 

@@ -215,12 +215,14 @@ fn cmd_hash(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     }
     let mut status = 0;
     for name in args {
-        let path = if crate::commands::is_registered(name) {
-            Some(format!("/usr/bin/{name}"))
-        } else if let crate::commands::util::ExecutableLookup::Found(path) =
+        let path = if let crate::commands::util::ExecutableLookup::Found(path) =
             crate::commands::util::resolve_executable(interp, name)
         {
             Some(path)
+        } else if crate::commands::is_registered(name)
+            && crate::vfs::NativeProgram::from_name(name).is_none()
+        {
+            Some(format!("/usr/bin/{name}"))
         } else {
             None
         };
@@ -2302,20 +2304,24 @@ fn command_lookup(
     for a in args.iter().filter(|arg| !arg.starts_with('-')) {
         if interp.funcs.contains_key(a) {
             wln(io.out, &format!("{a} is a function"));
-        } else if crate::commands::is_registered(a) {
-            if describe {
-                if is_shell_builtin_name(a) {
-                    wln(io.out, &format!("{a} is a shell builtin"));
-                } else {
-                    wln(io.out, &format!("{a} is /usr/bin/{a}"));
-                }
-            } else {
-                wln(io.out, &format!("/usr/bin/{a}"));
-            }
+        } else if describe && is_shell_builtin_name(a) {
+            wln(io.out, &format!("{a} is a shell builtin"));
         } else if let crate::commands::util::ExecutableLookup::Found(path) =
             crate::commands::util::resolve_executable(interp, a)
         {
-            wln(io.out, &path);
+            if describe {
+                wln(io.out, &format!("{a} is {path}"));
+            } else {
+                wln(io.out, &path);
+            }
+        } else if crate::commands::is_registered(a)
+            && crate::vfs::NativeProgram::from_name(a).is_none()
+        {
+            if describe {
+                wln(io.out, &format!("{a} is /usr/bin/{a}"));
+            } else {
+                wln(io.out, &format!("/usr/bin/{a}"));
+            }
         } else {
             ok = false;
         }
@@ -2327,7 +2333,7 @@ fn command_lookup(
     }
 }
 
-fn is_shell_builtin_name(name: &str) -> bool {
+pub(crate) fn is_shell_builtin_name(name: &str) -> bool {
     matches!(
         name,
         "." | ":"

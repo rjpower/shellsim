@@ -173,6 +173,24 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn recipe_prefixes(recipe: &str) -> (bool, bool, &str) {
+    let mut command = recipe.trim_start();
+    let mut silent = false;
+    let mut ignore_error = false;
+    loop {
+        if let Some(rest) = command.strip_prefix('@') {
+            silent = true;
+            command = rest;
+        } else if let Some(rest) = command.strip_prefix('-') {
+            ignore_error = true;
+            command = rest;
+        } else {
+            break;
+        }
+    }
+    (silent, ignore_error, command.trim_start())
+}
+
 #[derive(Default)]
 struct Options {
     file: Option<String>,
@@ -403,18 +421,19 @@ impl MakePlan<'_> {
                 if expanded.trim().is_empty() {
                     continue;
                 }
-                let silent = expanded.starts_with('@');
-                let command = if silent {
-                    expanded[1..].trim_start().to_string()
-                } else {
-                    expanded.clone()
-                };
+                let (silent, ignore_error, command) = recipe_prefixes(&expanded);
                 self.recipes.push(PlannedRecipe {
-                    source: if dry_run { String::new() } else { command },
+                    source: if dry_run {
+                        String::new()
+                    } else if ignore_error {
+                        format!("( {command} ) || true")
+                    } else {
+                        command.to_string()
+                    },
                     display: if silent && !dry_run {
                         String::new()
                     } else {
-                        expanded.trim_start_matches('@').trim_start().to_string()
+                        command.to_string()
                     },
                 });
             }
@@ -496,28 +515,19 @@ fn parse_makefile(interp: &mut Interp, source: &str) -> Result<Makefile, String>
     }
     let mut out = Makefile::default();
     let mut current_targets: Vec<String> = Vec::new();
+    let mut current_has_prior_recipe = false;
     let mut recipe_count = 0usize;
-    for (line_no, raw) in source.lines().enumerate() {
-        if line_no >= MAX_LINES {
-            return Err(format!("line limit exceeded ({MAX_LINES})"));
-        }
-        if raw.ends_with('\\') {
-            return Err(format!(
-                "line continuation is unsupported at line {}",
-                line_no + 1
-            ));
-        }
+    for (line_no, raw) in logical_make_lines(source)? {
         if let Some(recipe) = raw.strip_prefix('\t') {
             if current_targets.is_empty() {
-                return Err(format!("recipe without a target at line {}", line_no + 1));
+                return Err(format!("recipe without a target at line {line_no}"));
             }
-            let recipe = recipe.to_string();
-            if recipe.trim_start().starts_with('-') {
+            if current_has_prior_recipe {
                 return Err(format!(
-                    "recipe '-' prefix is unsupported at line {}",
-                    line_no + 1
+                    "target has multiple recipe definitions at line {line_no}"
                 ));
             }
+            let recipe = recipe.to_string();
             recipe_count = recipe_count.saturating_add(1);
             if recipe_count > MAX_RECIPES {
                 return Err(format!("recipe limit exceeded ({MAX_RECIPES})"));
@@ -537,26 +547,30 @@ fn parse_makefile(interp: &mut Interp, source: &str) -> Result<Makefile, String>
         }
         if line.starts_with('.') {
             let Some(rest) = line.strip_prefix(".PHONY:") else {
-                return Err(format!("unsupported directive at line {}", line_no + 1));
+                return Err(format!("unsupported directive at line {line_no}"));
             };
             for target in rest.split_whitespace() {
-                validate_name(target, line_no + 1)?;
+                validate_name(target, line_no)?;
                 out.phony.insert(target.to_string());
             }
             current_targets.clear();
+            current_has_prior_recipe = false;
             continue;
         }
         if let Some((name, value)) = parse_assignment(line) {
             out.vars.insert(name, value);
             current_targets.clear();
+            current_has_prior_recipe = false;
             continue;
         }
-        let Some((lhs, rhs)) = line.split_once(':') else {
-            return Err(format!("missing ':' at line {}", line_no + 1));
+        // Make expands target and prerequisite names while reading a rule, unlike recipes.
+        let expanded = expand_vars(line, &out.vars, "", &[], MAX_EXPANSION_DEPTH)?;
+        let Some((lhs, rhs)) = expanded.split_once(':') else {
+            return Err(format!("missing ':' at line {line_no}"));
         };
         let targets = lhs.split_whitespace().collect::<Vec<_>>();
         if targets.is_empty() {
-            return Err(format!("empty target at line {}", line_no + 1));
+            return Err(format!("empty target at line {line_no}"));
         }
         let prerequisites = rhs
             .split_whitespace()
@@ -566,16 +580,17 @@ fn parse_makefile(interp: &mut Interp, source: &str) -> Result<Makefile, String>
             if prerequisite == "|" {
                 return Err(format!(
                     "order-only prerequisites are unsupported at line {}",
-                    line_no + 1
+                    line_no
                 ));
             }
             if !(prerequisite.starts_with("$(") && prerequisite.ends_with(')')) {
-                validate_name(prerequisite, line_no + 1)?;
+                validate_name(prerequisite, line_no)?;
             }
         }
         current_targets.clear();
+        current_has_prior_recipe = false;
         for target in targets {
-            validate_name(target, line_no + 1)?;
+            validate_name(target, line_no)?;
             if out.rules.len() >= MAX_TARGETS && !out.rules.contains_key(target) {
                 return Err(format!("target limit exceeded ({MAX_TARGETS})"));
             }
@@ -586,14 +601,54 @@ fn parse_makefile(interp: &mut Interp, source: &str) -> Result<Makefile, String>
                     recipes: Vec::new(),
                 }
             });
-            if !entry.recipes.is_empty() {
-                return Err(format!("target '{target}' has multiple recipe definitions"));
-            }
+            current_has_prior_recipe |= !entry.recipes.is_empty();
             entry.prerequisites.extend(prerequisites.iter().cloned());
             current_targets.push(target.to_string());
         }
     }
     Ok(out)
+}
+
+/// Keep one continued recipe in one shell invocation. Non-recipe continuation remains outside
+/// this bounded Makefile subset, and a trailing backslash in a comment has no effect.
+fn logical_make_lines(source: &str) -> Result<Vec<(usize, String)>, String> {
+    let mut lines = Vec::new();
+    let mut pending: Option<(usize, String)> = None;
+    for (index, raw) in source.lines().enumerate() {
+        let line_no = index + 1;
+        if index >= MAX_LINES {
+            return Err(format!("line limit exceeded ({MAX_LINES})"));
+        }
+        if let Some((_, content)) = &mut pending {
+            content.push('\n');
+            content.push_str(raw.strip_prefix('\t').unwrap_or(raw));
+            if !raw.trim_end().ends_with('\\') {
+                lines.push(pending.take().expect("pending recipe was checked"));
+            }
+            continue;
+        }
+        let meaningful = if raw.starts_with('\t') {
+            raw
+        } else {
+            raw.split('#').next().unwrap_or("")
+        };
+        if meaningful.trim_end().ends_with('\\') {
+            if !raw.starts_with('\t') {
+                return Err(format!(
+                    "line continuation is unsupported at line {line_no}"
+                ));
+            }
+            pending = Some((line_no, raw.to_string()));
+        } else {
+            lines.push((line_no, raw.to_string()));
+        }
+    }
+    if let Some((line_no, _)) = pending {
+        return Err(format!(
+            "unterminated recipe continuation at line {line_no}"
+        ));
+    }
+    Ok(lines)
 }
 
 fn validate_name(name: &str, line: usize) -> Result<(), String> {
@@ -656,12 +711,7 @@ impl MakeRun<'_, '_> {
                 if expanded.trim().is_empty() {
                     continue;
                 }
-                let silent = expanded.starts_with('@');
-                let command = if silent {
-                    expanded[1..].trim_start()
-                } else {
-                    expanded.as_str()
-                };
+                let (silent, ignore_error, command) = recipe_prefixes(&expanded);
                 if self.dry_run || !silent {
                     wln(self.out, command);
                 }
@@ -678,7 +728,7 @@ impl MakeRun<'_, '_> {
                 self.interp.set_var("PWD", saved_cwd);
                 self.out.extend_from_slice(&command_out);
                 self.err.extend_from_slice(&command_err);
-                if status != 0 {
+                if status != 0 && !ignore_error {
                     self.visiting.remove(target);
                     return Err(format!("recipe for '{target}' failed with status {status}"));
                 }
@@ -845,7 +895,7 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.vars["OUT"], "result.txt");
         assert!(parsed.phony.contains("all"));
-        assert_eq!(parsed.rules["all"].prerequisites, vec!["$(OUT)"]);
+        assert_eq!(parsed.rules["all"].prerequisites, vec!["result.txt"]);
     }
 
     #[test]

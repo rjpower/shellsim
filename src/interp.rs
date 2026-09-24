@@ -224,8 +224,8 @@ pub struct ProcessState {
     pub python_repl: Option<crate::python::ReplState>,
     /// Unix-style descriptor map inherited by logical children.
     pub(crate) fds: FdTable,
-    /// Resumable shell execution frames retained across scheduler activations.
-    pub(crate) shell_continuation: Option<crate::exec::ShellContinuation>,
+    /// Resumable program image retained across scheduler activations.
+    pub(crate) program: Option<crate::program::ProgramContinuation>,
     /// Coalesced standard signals awaiting delivery at a scheduler boundary.
     pending_signals: std::collections::BTreeSet<Signal>,
     /// Non-default signal actions installed by the shell `trap` builtin.
@@ -295,11 +295,22 @@ impl ProcessStates {
         pid: ProcessId,
         continuation: Option<crate::exec::ShellContinuation>,
     ) -> Result<(), String> {
+        self.set_program(
+            pid,
+            continuation.map(crate::program::ProgramContinuation::Shell),
+        )
+    }
+
+    pub(crate) fn set_program(
+        &mut self,
+        pid: ProcessId,
+        program: Option<crate::program::ProgramContinuation>,
+    ) -> Result<(), String> {
         let state = self
             .states
             .get_mut(&pid)
             .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
-        state.shell_continuation = continuation;
+        state.program = program;
         Ok(())
     }
 
@@ -388,7 +399,7 @@ impl ProcessState {
             input_pos: self.input_pos,
             python_repl: None,
             fds,
-            shell_continuation: None,
+            program: None,
             pending_signals: std::collections::BTreeSet::new(),
             signal_dispositions: if new_shell {
                 self.signal_dispositions
@@ -580,7 +591,14 @@ impl Environment {
         }
         let mut vfs = Vfs::with_disk_limit(limits.disk);
         vfs.set_mutation_time(clock.unix_ms());
-        vfs.seed_dirs(["/root", "/tmp", "/work"]);
+        vfs.seed_dirs(["/root", "/tmp", "/work", "/usr", "/usr/bin"]);
+        for (name, program) in [
+            ("true", crate::vfs::NativeProgram::True),
+            ("false", crate::vfs::NativeProgram::False),
+            ("pwd", crate::vfs::NativeProgram::Pwd),
+        ] {
+            vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
+        }
         const ROOT_PID: ProcessId = 1_234;
         let process_environment = exported
             .iter()
@@ -646,7 +664,7 @@ impl Environment {
                 input_pos: 0,
                 python_repl: None,
                 fds,
-                shell_continuation: None,
+                program: None,
                 pending_signals: std::collections::BTreeSet::new(),
                 signal_dispositions: BTreeMap::new(),
                 exit_disposition: None,
@@ -680,6 +698,95 @@ impl Environment {
             true,
             false,
             crate::process::ChildPlacement::Inherit,
+        )
+    }
+
+    /// Load an argv child through one image boundary. Migrated native commands execute as
+    /// process-scoped Rust images; other argv still use the shell executor until ported.
+    pub(crate) fn load_argv_program(
+        &mut self,
+        pid: ProcessId,
+        mut argv: Vec<String>,
+    ) -> Result<(), String> {
+        let state = self
+            .process
+            .states
+            .get(&pid)
+            .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
+        let lookup = crate::commands::util::resolve_executable_in(
+            &self.vfs,
+            &state.cwd,
+            state
+                .vars
+                .get("PATH")
+                .map(String::as_str)
+                .unwrap_or_default(),
+            &argv[0],
+        );
+        let native = match lookup {
+            crate::commands::util::ExecutableLookup::Found(path) => {
+                match self
+                    .vfs
+                    .metadata("/", &path, true)
+                    .ok()
+                    .map(|node| node.kind)
+                {
+                    Some(crate::vfs::NodeKind::NativeExecutable(image)) => {
+                        Some(crate::program::NativeProcess::from_image(image))
+                    }
+                    _ => {
+                        argv[0] = path;
+                        None
+                    }
+                }
+            }
+            crate::commands::util::ExecutableLookup::NotExecutable(path)
+                if crate::vfs::NativeProgram::from_name(&argv[0]).is_some() =>
+            {
+                Some(crate::program::NativeProcess::failure(
+                    126,
+                    format!("{}: {path}: permission denied\n", argv[0]),
+                ))
+            }
+            crate::commands::util::ExecutableLookup::NotFound
+                if crate::vfs::NativeProgram::from_name(&argv[0]).is_some() =>
+            {
+                Some(crate::program::NativeProcess::failure(
+                    127,
+                    format!("{}: command not found\n", argv[0]),
+                ))
+            }
+            _ => None,
+        };
+        if let Some(native) = native {
+            let state = self
+                .process
+                .states
+                .get_mut(&pid)
+                .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
+            // Caught shell traps do not survive replacement with an executable image.
+            state.signal_dispositions.clear();
+            state.exit_disposition = None;
+            state.handling_signal = false;
+            self.process.set_program(
+                pid,
+                Some(crate::program::ProgramContinuation::Native(native)),
+            )?;
+            self.invocations.begin(
+                pid,
+                &argv,
+                crate::telemetry::CommandTrust::Real,
+                None,
+                self.resources.cpu_used(),
+                self.vfs.disk_used(),
+            );
+            return Ok(());
+        }
+        self.process.set_continuation(
+            pid,
+            Some(crate::exec::ShellContinuation::new(
+                &crate::shell::Node::ArgvCommand(argv),
+            )),
         )
     }
 
@@ -931,6 +1038,7 @@ impl Environment {
             })
             .collect::<Vec<_>>();
         self.process.fds.close_all(&mut self.descriptors);
+        self.vfs.retain_orphans(&self.descriptors.live_orphans());
         for (pipe, reader) in endpoints {
             let reason = if reader {
                 WaitReason::PipeWritable(pipe)
@@ -1155,6 +1263,7 @@ impl Environment {
     pub(crate) fn cancel_unstarted_child(&mut self, pid: ProcessId) {
         if let Some(mut child) = self.process.remove(pid) {
             child.fds.close_all(&mut self.descriptors);
+            self.vfs.retain_orphans(&self.descriptors.live_orphans());
             self.resources.release_memory(child.fork_allocation_bytes);
         }
         let _ = self.scheduler.discard_runnable(pid);
@@ -1207,9 +1316,11 @@ impl Environment {
             }
             let cursor = usize::try_from(file.cursor)
                 .map_err(|_| "file cursor exceeds addressable memory".to_string())?;
-            let data = self
-                .fs_read_limited("/", &file.path, MAX_CAPTURE_BYTES)
-                .map_err(|error| error.to_string())?;
+            let data = match file.orphan {
+                Some(id) => self.vfs.read_orphan_limited(id, MAX_CAPTURE_BYTES),
+                None => self.fs_read_limited("/", &file.path, MAX_CAPTURE_BYTES),
+            }
+            .map_err(|error| error.to_string())?;
             let end = cursor.saturating_add(maximum).min(data.len());
             let bytes = if cursor >= data.len() {
                 Vec::new()
@@ -1280,7 +1391,11 @@ impl Environment {
             let cursor = usize::try_from(file.cursor)
                 .map_err(|_| "file cursor exceeds addressable memory".to_string())?;
             self.sync_vfs_time();
-            if let Err(error) = self.vfs.write_at("/", &file.path, cursor, bytes) {
+            let result = match file.orphan {
+                Some(id) => self.vfs.write_orphan_at(id, cursor, bytes),
+                None => self.vfs.write_at("/", &file.path, cursor, bytes),
+            };
+            if let Err(error) = result {
                 if file.remove_on_first_write_error && cursor == 0 {
                     let _ = self.vfs.remove_file("/", &file.path);
                 }

@@ -39,7 +39,6 @@ pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
             "gunicorn",
             "flask",
             "ld",
-            "ar",
             "rustc",
             "go",
         ],

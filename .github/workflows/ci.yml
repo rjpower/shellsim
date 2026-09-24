@@ -37,6 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup show active-toolchain
+      - run: rustup target add wasm32-wasip1
       - run: ./infra/ci/run_tests.py
 
   python-package:

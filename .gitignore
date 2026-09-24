@@ -3,6 +3,7 @@
 debug
 target
 dist/
+*.wasm
 
 # Python bytecode cache (from py_compile syntax-check test on src/python/*.py)
 __pycache__/

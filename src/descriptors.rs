@@ -116,6 +116,7 @@ enum OpenDescription {
     },
     File {
         path: String,
+        orphan: Option<u64>,
         cursor: u64,
         readable: bool,
         writable: bool,
@@ -143,6 +144,7 @@ struct Pipe {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FileState {
     pub path: String,
+    pub orphan: Option<u64>,
     pub cursor: u64,
     pub readable: bool,
     pub writable: bool,
@@ -291,11 +293,44 @@ impl DescriptorArena {
     ) -> Result<DescriptionId, DescriptorError> {
         self.allocate(OpenDescription::File {
             path,
+            orphan: None,
             cursor,
             readable,
             writable,
             remove_on_first_write_error,
         })
+    }
+
+    /// Move every open description for one pathname onto the same detached VFS identity.
+    pub(crate) fn detach_file(&mut self, path: &str, orphan_id: u64) {
+        for entry in self.descriptions.values_mut() {
+            if let OpenDescription::File {
+                path: open_path,
+                orphan,
+                ..
+            } = &mut entry.description
+            {
+                if open_path == path {
+                    *orphan = Some(orphan_id);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn has_open_file(&self, path: &str) -> bool {
+        self.descriptions.values().any(|entry| {
+            matches!(&entry.description, OpenDescription::File { path: open_path, orphan: None, .. } if open_path == path)
+        })
+    }
+
+    pub(crate) fn live_orphans(&self) -> std::collections::BTreeSet<u64> {
+        self.descriptions
+            .values()
+            .filter_map(|entry| match &entry.description {
+                OpenDescription::File { orphan, .. } => *orphan,
+                _ => None,
+            })
+            .collect()
     }
 
     /// Create the two independently reference-counted descriptions for one pipe.
@@ -625,12 +660,14 @@ impl DescriptorArena {
         Ok(match description {
             OpenDescription::File {
                 path,
+                orphan,
                 cursor,
                 readable,
                 writable,
                 remove_on_first_write_error,
             } => Some(FileState {
                 path: path.clone(),
+                orphan: *orphan,
                 cursor: *cursor,
                 readable: *readable,
                 writable: *writable,
@@ -667,6 +704,23 @@ impl DescriptorArena {
         *cursor = cursor
             .checked_add(u64::try_from(bytes).map_err(|_| DescriptorError::OutputLimit)?)
             .ok_or(DescriptorError::OutputLimit)?;
+        Ok(())
+    }
+
+    /// Set the shared cursor after a checked seek on a regular file.
+    pub(crate) fn seek_file(
+        &mut self,
+        id: DescriptionId,
+        position: u64,
+    ) -> Result<(), DescriptorError> {
+        let entry = self
+            .descriptions
+            .get_mut(&id)
+            .ok_or(DescriptorError::InvalidFd)?;
+        let OpenDescription::File { cursor, .. } = &mut entry.description else {
+            return Err(DescriptorError::WrongAccess);
+        };
+        *cursor = position;
         Ok(())
     }
 
@@ -911,6 +965,7 @@ mod tests {
             arena.file_state(fds.get(5).unwrap()).unwrap(),
             Some(FileState {
                 path: "/work/value".into(),
+                orphan: None,
                 cursor: 5,
                 readable: true,
                 writable: true,
