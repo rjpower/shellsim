@@ -77,6 +77,5 @@ void DG_SetWindowTitle(const char *title) {
 
 int main(int argc, char **argv) {
     doomgeneric_Create(argc, argv);
-    for (int frame = 0; frame < 16; ++frame) doomgeneric_Tick();
-    return shellsim_display_close(display_handle);
+    for (;;) doomgeneric_Tick();
 }

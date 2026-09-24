@@ -22,7 +22,7 @@ an experimental shellsim extension, not a WASI standard.
 
 The ignored `tests/doom_probe.rs` test builds Doomgeneric from source with the virtual TinyCC
 toolchain, links a small shellsim platform adapter, loads a separately supplied Freedoom WAD,
-renders a 640×400 frame, and checks that an injected Escape key changes the frame. Neither the
+yields 640×400 frames, and checks that an Escape key injected between frames changes the image. Neither the
 GPL engine nor game data is included in the repository. The test harness alone imports the
 trusted host inputs into the VFS before simulated execution; the guest cannot reach those host
 paths.
@@ -45,9 +45,23 @@ SHELLSIM_DOOM_WAD=/path/to/freedoom1.wad \
 cargo test --test doom_probe -- --ignored
 ```
 
-The probe selects Doomgeneric's console-error path instead of its optional Zenity `system()`
-call. Its platform adapter supplies a deterministic, adapter-local 35 Hz tick approximation,
-not a general sleep implementation. Key input is prequeued before launch, and the Wasm guest
-still runs to completion. Live input, virtual-time waits, and pipe interaction need resumable
-Wasm execution integrated with the process scheduler. Audio and networking are outside this
-single-player proof. The original Doom/Quake engines and assets are not bundled or installed.
+To play with a separately obtained WAD, run the local browser demo from this PR:
+
+```sh
+cargo run --release --example doom_player -- /path/to/doomgeneric/doomgeneric /path/to/freedoom1.wad
+```
+
+The first launch compiles Doomgeneric inside shellsim's VFS and may take about a minute. Open the
+loopback URL printed by the example. Arrow keys move, Ctrl fires, Space uses, Shift runs, and Esc
+opens the menu. The browser only sees copied RGBA frames and sends bounded key events to a host
+demo process; the guest has no host network access. The demo binds an ephemeral `127.0.0.1` port
+and exits when its Stop button is pressed. The external [Freedoom release](https://github.com/freedoom/freedoom/releases/tag/v0.13.0)
+provides a playable WAD; shellsim does not download or bundle it.
+
+The probe and demo select Doomgeneric's console-error path instead of its optional Zenity
+`system()` call. The platform adapter still uses a deterministic, adapter-local tick
+approximation. Wasmtime's async stack preserves guest execution between frames; a host-driven
+`WasmSession` owns its environment until it stops, so live Wasmtime state is never copied by
+`Environment::clone()`. This is not yet a scheduler-owned Wasm process: live pipe waits and virtual
+timer sleeps still need integration with the process table and scheduler. Audio and networking are
+outside this single-player proof. The original Doom/Quake engines and assets are not bundled.

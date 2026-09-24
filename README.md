@@ -140,6 +140,11 @@ through that virtual toolchain. This is a tested subset of libc, not full POSIX 
 `wasm32-wasip1` command that uses only the listed imports can be written to the VFS with
 executable permissions and invoked by path or through `PATH`.
 
+An opt-in [Doom browser demo](docs/virtual-display.md#external-doom-end-to-end-probe) builds
+separately supplied Doomgeneric source and Freedoom data inside the VFS, then presents live frames
+through a host-driven resumable Wasm session. It does not bundle the game or expose a host display
+or network device to the guest.
+
 ## Agent harness
 
 `shellsim serve --root ./project` runs a persistent newline-delimited JSON session. It supports

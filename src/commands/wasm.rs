@@ -5,8 +5,13 @@
 //! instantiation. Neither path grants ambient host capabilities. Live pipe suspension remains
 //! outside this first slice.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
+use std::future::poll_fn;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use wasmtime::{
     Caller, Config, Engine, Error, Extern, Linker, Memory, Module, Store, StoreLimits,
     StoreLimitsBuilder,
@@ -54,6 +59,15 @@ struct Host {
     append_files: BTreeSet<i32>,
     random_state: u64,
     limits: StoreLimits,
+    interaction: Option<Arc<Mutex<Interaction>>>,
+}
+
+#[derive(Default)]
+struct Interaction {
+    frame: Option<crate::display::DisplayFrame>,
+    generation: u64,
+    keys: VecDeque<crate::display::KeyEvent>,
+    stop_requested: bool,
 }
 
 #[derive(Debug)]
@@ -328,6 +342,13 @@ fn display_present(
         .interp
         .resources
         .release_memory(u64::from(length));
+    if result == ERRNO_SUCCESS {
+        if let Some(interaction) = &caller.data().interaction {
+            let mut interaction = interaction.lock().expect("interactive state lock");
+            interaction.frame = caller.data().interp.display.frame().cloned();
+            interaction.generation = interaction.generation.saturating_add(1);
+        }
+    }
     result
 }
 
@@ -338,6 +359,18 @@ fn input_poll_key(mut caller: Caller<'_, Host>, handle: u32, result: u32) -> i32
     let mut slot = [0; 8];
     if memory.read(&caller, result as usize, &mut slot).is_err() {
         return ERRNO_FAULT;
+    }
+    if let Some(interaction) = &caller.data().interaction {
+        let event = interaction
+            .lock()
+            .expect("interactive state lock")
+            .keys
+            .pop_front();
+        if let Some(event) = event {
+            if let Err(error) = caller.data_mut().interp.inject_key(event) {
+                return display_errno(error);
+            }
+        }
     }
     match syscalls::input_poll_key(&mut caller.data_mut().interp, handle) {
         Ok(Some(event)) => {
@@ -842,41 +875,8 @@ fn fd_read(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, read: u
     ERRNO_SUCCESS
 }
 
-/// Execute one validated Wasm command with a restricted WASI preview1 import set.
-pub(super) fn run(
-    interp: &mut Interp,
-    path: &str,
-    wasm: &[u8],
-    args: &[String],
-    stdin: &[u8],
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
-) -> CommandPoll {
-    if wasm.len() > MAX_WASM_BYTES {
-        ewln(err, &format!("{path}: wasm module exceeds size limit"));
-        return CommandPoll::Ready(126);
-    }
-    if !interp
-        .resources
-        .charge_cpu((wasm.len() as u64).saturating_mul(10))
-    {
-        ewln(err, &format!("{path}: wasm compilation budget exhausted"));
-        return CommandPoll::Ready(137);
-    }
-    let mut config = Config::default();
-    config.consume_fuel(true);
-    // The strict profile rejects legitimate compiler modules with over 1,000 small data
-    // segments. Module bytes, guest memory, and execution fuel remain independently bounded.
-    config.wasm_exceptions(true);
-    let engine = Engine::new(&config).expect("valid Wasmtime configuration");
-    let module = match Module::new(&engine, wasm) {
-        Ok(module) => module,
-        Err(error) => {
-            ewln(err, &format!("{path}: invalid wasm module: {error}"));
-            return CommandPoll::Ready(126);
-        }
-    };
-    let mut linker = Linker::<Host>::new(&engine);
+fn build_linker(engine: &Engine) -> Linker<Host> {
+    let mut linker = Linker::<Host>::new(engine);
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
@@ -1088,6 +1088,347 @@ pub(super) fn run(
             |_caller: Caller<'_, Host>| ERRNO_SUCCESS,
         )
         .expect("unique WASI import");
+    linker
+}
+
+/// Host-visible progress from one bounded async Wasm execution quantum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionPoll {
+    /// Guest is still running; poll again after serving host-side work.
+    Running,
+    /// A complete frame with this generation number is available from `frame()`.
+    Frame(u64),
+    /// Guest exited or exhausted its virtual resource budget.
+    Ready(i32),
+}
+
+/// Completed guest output and the virtual environment returned to its caller.
+pub struct SessionResult {
+    /// Machine state returned after the guest's Wasmtime stack has stopped.
+    pub environment: Interp,
+    /// Guest exit status, or 126/137 for a trap or resource exhaustion.
+    pub status: i32,
+    /// Captured guest standard output.
+    pub stdout: Vec<u8>,
+    /// Captured guest standard error and trap diagnostics.
+    pub stderr: Vec<u8>,
+}
+
+/// A single guest execution that the host can poll between frames without cloning live Wasm.
+///
+/// The session owns its environment until completion. It does not grant the guest host I/O or
+/// make an active Wasmtime stack part of `Environment`'s cloneable snapshot.
+pub struct WasmSession {
+    execution: Pin<Box<dyn Future<Output = SessionResult> + Send>>,
+    interaction: Arc<Mutex<Interaction>>,
+    generation: u64,
+    result: Option<SessionResult>,
+}
+
+impl WasmSession {
+    /// Start an executable Wasm file already present in the virtual filesystem.
+    ///
+    /// The environment is moved into the session so its active Wasmtime stack cannot be cloned.
+    /// Startup errors return a diagnostic and discard that moved environment.
+    pub fn start(mut environment: Interp, path: &str, args: &[String]) -> Result<Self, String> {
+        let node = environment
+            .vfs
+            .metadata("/", path, true)
+            .map_err(|error| error.to_string())?;
+        if node.mode & 0o111 == 0 {
+            return Err(format!("{path}: permission denied"));
+        }
+        let wasm = environment
+            .vfs
+            .read_limited("/", path, MAX_WASM_BYTES)
+            .map_err(|error| error.to_string())?;
+        if !wasm.starts_with(b"\0asm") {
+            return Err(format!("{path}: not a Wasm executable"));
+        }
+        if !environment
+            .resources
+            .charge_cpu((wasm.len() as u64).saturating_mul(10))
+        {
+            return Err(format!("{path}: wasm compilation budget exhausted"));
+        }
+        let mut config = Config::default();
+        config.consume_fuel(true).wasm_exceptions(true);
+        let engine = Engine::new(&config).map_err(|error| error.to_string())?;
+        let module = Module::new(&engine, &wasm).map_err(|error| error.to_string())?;
+        for import in module.imports() {
+            if import.module() != "wasi_snapshot_preview1"
+                && !(import.module() == "shellsim"
+                    && matches!(
+                        import.name(),
+                        "path_chmod"
+                            | "display_open"
+                            | "display_present"
+                            | "input_poll_key"
+                            | "display_close"
+                    ))
+            {
+                return Err(format!(
+                    "{path}: unsupported wasm import: {}.{}",
+                    import.module(),
+                    import.name()
+                ));
+            }
+        }
+        let mut linker = build_linker(&engine);
+        linker.allow_shadowing(true);
+        linker
+            .func_wrap_async(
+                "shellsim",
+                "display_present",
+                |caller: Caller<'_, Host>,
+                 (handle, pointer, length, stride): (u32, u32, u32, u32)| {
+                    Box::new(async move {
+                        let interaction =
+                            caller.data().interaction.clone().expect("interactive host");
+                        let result = display_present(caller, handle, pointer, length, stride);
+                        if result == ERRNO_SUCCESS {
+                            let mut yielded = false;
+                            poll_fn(|context| {
+                                if yielded {
+                                    Poll::Ready(())
+                                } else {
+                                    yielded = true;
+                                    context.waker().wake_by_ref();
+                                    Poll::Pending
+                                }
+                            })
+                            .await;
+                        }
+                        if interaction
+                            .lock()
+                            .expect("interactive state lock")
+                            .stop_requested
+                        {
+                            Err(Error::new(GuestExit(130)))
+                        } else {
+                            Ok(result)
+                        }
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        linker
+            .define_unknown_imports_as_traps(&module)
+            .map_err(|error| error.to_string())?;
+
+        let memory_limit = environment
+            .resources
+            .memory_remaining()
+            .min(MAX_WASM_MEMORY as u64) as usize;
+        if !environment.resources.reserve_memory(memory_limit as u64) {
+            return Err(format!("{path}: wasm memory budget exhausted"));
+        }
+        let interaction = Arc::new(Mutex::new(Interaction::default()));
+        let host = Host {
+            cwd: environment.cwd.clone(),
+            args: std::iter::once(path.as_bytes().to_vec())
+                .chain(args.iter().map(|arg| arg.as_bytes().to_vec()))
+                .collect(),
+            environment: environment
+                .process
+                .exported
+                .iter()
+                .filter_map(|name| {
+                    environment
+                        .process
+                        .vars
+                        .get(name)
+                        .map(|value| format!("{name}={value}").into_bytes())
+                })
+                .collect(),
+            interp: environment,
+            stdin: Vec::new(),
+            stdin_offset: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            closed_stdio: BTreeSet::new(),
+            open_files: BTreeSet::new(),
+            append_files: BTreeSet::new(),
+            random_state: 0x5eed_5eed_5eed_5eed,
+            limits: StoreLimitsBuilder::new()
+                .memory_size(memory_limit)
+                .table_elements(10_000)
+                .memories(1)
+                .tables(16)
+                .build(),
+            interaction: Some(interaction.clone()),
+        };
+        let path = path.to_string();
+        let execution = Box::pin(async move {
+            let mut store = Store::new(&engine, host);
+            store.limiter(|host| &mut host.limits);
+            let fuel = store
+                .data()
+                .interp
+                .resources
+                .cpu_remaining()
+                .saturating_mul(WASM_FUEL_PER_CPU_UNIT);
+            store.set_fuel(fuel).expect("fuel configured");
+            store
+                .fuel_async_yield_interval(Some(1_000_000))
+                .expect("fuel configured");
+            let result = match linker.instantiate_async(&mut store, &module).await {
+                Ok(instance) => match instance.get_typed_func::<(), ()>(&mut store, "_start") {
+                    Ok(start) => start.call_async(&mut store, ()).await,
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            let consumed = fuel.saturating_sub(store.get_fuel().unwrap_or(0));
+            let cpu_cost =
+                consumed.saturating_add(WASM_FUEL_PER_CPU_UNIT - 1) / WASM_FUEL_PER_CPU_UNIT;
+            let _ = store.data_mut().interp.resources.charge_cpu(cpu_cost);
+            let open_files = std::mem::take(&mut store.data_mut().open_files);
+            for fd in open_files {
+                let _ = syscalls::close(&mut store.data_mut().interp, fd);
+            }
+            let pid = store.data().interp.process.pid;
+            store.data_mut().interp.display.close_owner(pid);
+            store
+                .data_mut()
+                .interp
+                .resources
+                .release_memory(memory_limit as u64);
+            let status = match result {
+                Ok(()) => 0,
+                Err(error) if error.downcast_ref::<GuestExit>().is_some() => {
+                    error.downcast_ref::<GuestExit>().expect("checked exit").0
+                }
+                Err(error) => {
+                    ewln(
+                        &mut store.data_mut().stderr,
+                        &format!("{path}: wasm execution failed: {error:#}"),
+                    );
+                    if store.get_fuel().unwrap_or(0) == 0 {
+                        137
+                    } else {
+                        126
+                    }
+                }
+            };
+            let mut host = store.into_data();
+            SessionResult {
+                status: host
+                    .interp
+                    .resources
+                    .stop_reason()
+                    .map_or(status, |reason| reason.exit_status()),
+                environment: std::mem::take(&mut host.interp),
+                stdout: host.stdout,
+                stderr: host.stderr,
+            }
+        });
+        Ok(Self {
+            execution,
+            interaction,
+            generation: 0,
+            result: None,
+        })
+    }
+
+    /// Advance the guest by one Wasmtime async poll and report a newly presented frame.
+    pub fn poll(&mut self) -> SessionPoll {
+        if let Some(result) = &self.result {
+            return SessionPoll::Ready(result.status);
+        }
+        let outcome = self
+            .execution
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        if let Poll::Ready(result) = outcome {
+            let status = result.status;
+            self.result = Some(result);
+            return SessionPoll::Ready(status);
+        }
+        let generation = self
+            .interaction
+            .lock()
+            .expect("interactive state lock")
+            .generation;
+        if generation > self.generation {
+            self.generation = generation;
+            SessionPoll::Frame(generation)
+        } else {
+            SessionPoll::Running
+        }
+    }
+
+    /// Queue one bounded key transition for the guest's next input poll.
+    pub fn inject_key(&mut self, event: crate::display::KeyEvent) -> Result<(), DisplayError> {
+        if event.code == 0 || event.code > 0xffff {
+            return Err(DisplayError::InvalidArgument);
+        }
+        let mut interaction = self.interaction.lock().expect("interactive state lock");
+        if interaction.keys.len() >= 256 {
+            return Err(DisplayError::QueueFull);
+        }
+        interaction.keys.push_back(event);
+        Ok(())
+    }
+
+    /// Copy the last completed frame without exposing guest memory or a host window.
+    pub fn frame(&self) -> Option<crate::display::DisplayFrame> {
+        self.interaction
+            .lock()
+            .expect("interactive state lock")
+            .frame
+            .clone()
+    }
+
+    /// Stop at the next frame boundary and return the environment with status 130.
+    pub fn request_stop(&mut self) {
+        self.interaction
+            .lock()
+            .expect("interactive state lock")
+            .stop_requested = true;
+    }
+
+    /// Return the environment and output after execution has completed, or `None` if still live.
+    pub fn into_result(self) -> Option<SessionResult> {
+        self.result
+    }
+}
+
+/// Execute one validated Wasm command with a restricted WASI preview1 import set.
+pub(super) fn run(
+    interp: &mut Interp,
+    path: &str,
+    wasm: &[u8],
+    args: &[String],
+    stdin: &[u8],
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+) -> CommandPoll {
+    if wasm.len() > MAX_WASM_BYTES {
+        ewln(err, &format!("{path}: wasm module exceeds size limit"));
+        return CommandPoll::Ready(126);
+    }
+    if !interp
+        .resources
+        .charge_cpu((wasm.len() as u64).saturating_mul(10))
+    {
+        ewln(err, &format!("{path}: wasm compilation budget exhausted"));
+        return CommandPoll::Ready(137);
+    }
+    let mut config = Config::default();
+    config.consume_fuel(true);
+    // The strict profile rejects legitimate compiler modules with over 1,000 small data
+    // segments. Module bytes, guest memory, and execution fuel remain independently bounded.
+    config.wasm_exceptions(true);
+    let engine = Engine::new(&config).expect("valid Wasmtime configuration");
+    let module = match Module::new(&engine, wasm) {
+        Ok(module) => module,
+        Err(error) => {
+            ewln(err, &format!("{path}: invalid wasm module: {error}"));
+            return CommandPoll::Ready(126);
+        }
+    };
+    let mut linker = build_linker(&engine);
     // Toolchains import a broad libc surface even when a particular compile does not call it.
     // An unavailable WASI operation must trap if reached, never touch the host or return fake
     // success. Non-WASI namespaces must still be rejected at instantiation.
@@ -1161,6 +1502,7 @@ pub(super) fn run(
             .memories(1)
             .tables(16)
             .build(),
+        interaction: None,
     };
     let mut store = Store::new(&engine, host);
     store.limiter(|host| &mut host.limits);

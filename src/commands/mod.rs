@@ -50,6 +50,7 @@ mod text;
 mod unavailable;
 pub mod util;
 mod wasm;
+pub use wasm::{SessionPoll, SessionResult, WasmSession};
 mod xargs;
 mod zipcmd;
 

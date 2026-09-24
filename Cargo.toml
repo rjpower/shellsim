@@ -39,7 +39,7 @@ md-5 = "0.10"
 base64 = "0.22"
 crc32fast = "1"
 flate2 = "1"
-wasmtime = { version = "49.0.0", default-features = false, features = ["runtime", "cranelift", "gc-null", "std"] }
+wasmtime = { version = "49.0.0", default-features = false, features = ["runtime", "cranelift", "gc-null", "std", "async"] }
 num-bigint = "0.4"
 num-traits = "0.2"
 
