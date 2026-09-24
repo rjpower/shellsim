@@ -1,6 +1,6 @@
-//! Bounded Unix archive construction for WebAssembly object files.
+//! Bounded Unix archive construction for WebAssembly and TinyCC object files.
 //!
-//! The archive index names only defined, externally visible Wasm linking symbols. Parsing stays
+//! The archive index names only defined, externally visible linking symbols. Parsing stays
 //! inside the VFS and rejects object variants or archive names this small tool does not support.
 
 use std::collections::HashMap;
@@ -314,8 +314,11 @@ impl<'a> Cursor<'a> {
 }
 
 fn object_symbols(bytes: &[u8]) -> Result<Vec<String>, String> {
+    if bytes.starts_with(b"\x7fELF") {
+        return elf_symbols(bytes);
+    }
     if !bytes.starts_with(b"\0asm\x01\0\0\0") {
-        return Err("member is not a WebAssembly object".into());
+        return Err("member is not a supported WebAssembly object".into());
     }
     let mut module = Cursor::new(&bytes[8..]);
     while module.pos < module.bytes.len() {
@@ -335,6 +338,103 @@ fn object_symbols(bytes: &[u8]) -> Result<Vec<String>, String> {
         }
     }
     Err("Wasm object has no linking symbol table".into())
+}
+
+fn elf_symbols(bytes: &[u8]) -> Result<Vec<String>, String> {
+    // TinyCC's wasm32 target emits ELF32 relocatable objects with EM_WEBASSEMBLY.
+    if bytes.len() < 52
+        || bytes[4..7] != [1, 1, 1]
+        || read_u16(bytes, 16)? != 1
+        || read_u16(bytes, 18)? != 0x4157
+    {
+        return Err("unsupported ELF object".into());
+    }
+    let section_offset = read_u32(bytes, 32)? as usize;
+    let section_size = usize::from(read_u16(bytes, 46)?);
+    let section_count = usize::from(read_u16(bytes, 48)?);
+    if section_size < 40 || section_count > 4_096 {
+        return Err("unsupported ELF sections".into());
+    }
+    let sections_len = section_size
+        .checked_mul(section_count)
+        .ok_or("ELF section table overflow")?;
+    checked_slice(bytes, section_offset, sections_len)?;
+    let mut names = Vec::new();
+    for index in 0..section_count {
+        let section = checked_slice(bytes, section_offset + index * section_size, section_size)?;
+        if read_u32(section, 4)? != 2 {
+            continue;
+        }
+        let entries = checked_slice(
+            bytes,
+            read_u32(section, 16)? as usize,
+            read_u32(section, 20)? as usize,
+        )?;
+        let entry_size = read_u32(section, 36)? as usize;
+        if entry_size < 16
+            || entries.len() % entry_size != 0
+            || entries.len() / entry_size > 100_000
+        {
+            return Err("invalid ELF symbol table".into());
+        }
+        let strings_index = read_u32(section, 24)? as usize;
+        if strings_index >= section_count {
+            return Err("invalid ELF string table index".into());
+        }
+        let strings_section = checked_slice(
+            bytes,
+            section_offset + strings_index * section_size,
+            section_size,
+        )?;
+        if read_u32(strings_section, 4)? != 3 {
+            return Err("invalid ELF string table".into());
+        }
+        let strings = checked_slice(
+            bytes,
+            read_u32(strings_section, 16)? as usize,
+            read_u32(strings_section, 20)? as usize,
+        )?;
+        for entry in entries.chunks_exact(entry_size) {
+            let binding = entry[12] >> 4;
+            let defined = read_u16(entry, 14)? != 0;
+            if !defined || (binding != 1 && binding != 2) {
+                continue;
+            }
+            let offset = read_u32(entry, 0)? as usize;
+            let name = strings.get(offset..).ok_or("invalid ELF symbol name")?;
+            let end = name
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or("unterminated ELF symbol name")?;
+            if end > 0 {
+                names.push(
+                    std::str::from_utf8(&name[..end])
+                        .map_err(|_| "non-UTF-8 ELF symbol name")?
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn checked_slice(bytes: &[u8], start: usize, len: usize) -> Result<&[u8], String> {
+    let end = start.checked_add(len).ok_or("ELF object offset overflow")?;
+    bytes
+        .get(start..end)
+        .ok_or_else(|| "truncated ELF object".into())
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    Ok(u16::from_le_bytes(
+        checked_slice(bytes, offset, 2)?.try_into().unwrap(),
+    ))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(
+        checked_slice(bytes, offset, 4)?.try_into().unwrap(),
+    ))
 }
 
 fn parse_symbols(table: &mut Cursor<'_>) -> Result<Vec<String>, String> {
@@ -407,5 +507,34 @@ mod tests {
     fn malformed_object_is_rejected() {
         assert!(object_symbols(b"not wasm").is_err());
         assert!(object_symbols(&OBJECT[..OBJECT.len() - 1]).is_err());
+        assert!(object_symbols(b"\x7fELF").is_err());
+    }
+
+    #[test]
+    fn tinycc_elf32_symbols_are_indexed() {
+        let mut object = vec![0; 52 + 3 * 40 + 2 * 16 + 5];
+        object[..7].copy_from_slice(b"\x7fELF\x01\x01\x01");
+        object[16..18].copy_from_slice(&1_u16.to_le_bytes());
+        object[18..20].copy_from_slice(&0x4157_u16.to_le_bytes());
+        object[32..36].copy_from_slice(&52_u32.to_le_bytes());
+        object[46..48].copy_from_slice(&40_u16.to_le_bytes());
+        object[48..50].copy_from_slice(&3_u16.to_le_bytes());
+        let symbols = 52 + 40;
+        object[symbols + 4..symbols + 8].copy_from_slice(&2_u32.to_le_bytes());
+        object[symbols + 16..symbols + 20].copy_from_slice(&172_u32.to_le_bytes());
+        object[symbols + 20..symbols + 24].copy_from_slice(&32_u32.to_le_bytes());
+        object[symbols + 24..symbols + 28].copy_from_slice(&2_u32.to_le_bytes());
+        object[symbols + 36..symbols + 40].copy_from_slice(&16_u32.to_le_bytes());
+        let strings = 52 + 80;
+        object[strings + 4..strings + 8].copy_from_slice(&3_u32.to_le_bytes());
+        object[strings + 16..strings + 20].copy_from_slice(&204_u32.to_le_bytes());
+        object[strings + 20..strings + 24].copy_from_slice(&5_u32.to_le_bytes());
+        object[188..192].copy_from_slice(&1_u32.to_le_bytes());
+        object[200] = 0x10;
+        object[202..204].copy_from_slice(&1_u16.to_le_bytes());
+        object[204..].copy_from_slice(b"\0foo\0");
+
+        assert_eq!(object_symbols(&object).unwrap(), ["foo"]);
+        assert!(object_symbols(&object[..object.len() - 1]).is_err());
     }
 }

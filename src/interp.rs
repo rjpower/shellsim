@@ -1316,17 +1316,16 @@ impl Environment {
             }
             let cursor = usize::try_from(file.cursor)
                 .map_err(|_| "file cursor exceeds addressable memory".to_string())?;
-            let data = match file.orphan {
-                Some(id) => self.vfs.read_orphan_limited(id, MAX_CAPTURE_BYTES),
-                None => self.fs_read_limited("/", &file.path, MAX_CAPTURE_BYTES),
+            let bytes = match file.orphan {
+                Some(id) => self
+                    .vfs
+                    .read_orphan_range(id, cursor, maximum.min(MAX_CAPTURE_BYTES)),
+                None => {
+                    self.vfs
+                        .read_range("/", &file.path, cursor, maximum.min(MAX_CAPTURE_BYTES))
+                }
             }
             .map_err(|error| error.to_string())?;
-            let end = cursor.saturating_add(maximum).min(data.len());
-            let bytes = if cursor >= data.len() {
-                Vec::new()
-            } else {
-                data[cursor..end].to_vec()
-            };
             self.descriptors
                 .advance_file(description, bytes.len())
                 .map_err(descriptor_message)?;

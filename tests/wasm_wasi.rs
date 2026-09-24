@@ -46,6 +46,40 @@ fn run(environment: &mut Environment, source: &str) -> (i32, Vec<u8>, Vec<u8>) {
 }
 
 #[test]
+fn exception_handling_module_runs_without_extra_host_capabilities() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+            (tag $error (param i32))
+            (func (export "_start")
+                (block $caught (result i32)
+                    (try_table (catch $error $caught)
+                        (i32.const 7)
+                        (throw $error))
+                    (i32.const 0))
+                (drop)))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn wasi_stdio_close_invalidates_the_guest_descriptor() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+            (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))
+            (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+            (func (export "_start")
+                (if (i32.ne (call $close (i32.const 1)) (i32.const 0)) (then unreachable))
+                (if (i32.ne (call $close (i32.const 1)) (i32.const 8)) (then unreachable))
+                (if (i32.ne (call $write (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0)) (i32.const 8)) (then unreachable))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+}
+
+#[test]
 fn compiled_wasi_wc_matches_native_wc_on_virtual_streams_and_files() {
     let guest = guest_wc();
     let cases = [
@@ -303,6 +337,21 @@ fn unsupported_import_fails_explicitly_without_host_fallback() {
     assert_eq!(status, 126);
     assert!(stdout.is_empty());
     assert!(String::from_utf8_lossy(&stderr).contains("sock_accept"));
+}
+
+#[test]
+fn unknown_import_namespace_is_rejected_even_when_unused() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+            (import "host" "run" (func))
+            (func (export "_start")))"#,
+    );
+    let (status, stdout, stderr) = run(&mut environment, "/app");
+    assert_eq!(status, 126);
+    assert!(stdout.is_empty());
+    assert!(String::from_utf8_lossy(&stderr).contains("host.run"));
 }
 
 #[test]

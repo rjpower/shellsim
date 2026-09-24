@@ -62,10 +62,10 @@ Wasm stdin/stdout/stderr are still buffered at command dispatch. The shell drain
 pipe before starting a Wasm consumer, so a compiled `wc` can count input larger than pipe
 capacity and pass its result to another command. It does not prove suspension on a live pipe:
 an interactive producer-consumer exchange still cannot run. The next slice should move
-stdio onto process descriptors and use Wasmi's resumable host-call mechanism when a descriptor
+stdio onto process descriptors and define a Wasmtime suspension mechanism when a descriptor
 returns `IoPoll::Blocked`. A guest continuation must resume at the blocked instruction, not
 restart `_start` or treat temporary absence of input as EOF. Before enabling Wasm by default,
-resolve how an active Wasmi continuation can be independently cloned for harness forks, or
+resolve how an active Wasmtime continuation can be independently cloned for harness forks, or
 reject that fork explicitly. The Rust shell program image and native `wc` should remain until
 those gates pass.
 
@@ -78,8 +78,9 @@ streaming command and a filesystem walker. WASI Preview 1 alone does not supply 
 An earlier WCPL experiment showed that compilation itself requires no special syscall: the shell
 resolved the compiler as a VFS executable, and it read source and wrote a Wasm binary through
 ordinary virtual file descriptors. That fixture is no longer shipped. The preferred next compiler
-is tinycc, whose published Wasm artifact currently requires exception handling outside this
-engine's supported surface. The current Wasm command path is still buffered, not yet a separately
+is TinyCC. Its pinned package and a wasi-libc subset compile and run C programs inside shellsim;
+additional libc behavior still requires corresponding virtual WASI operations.
+The current Wasm command path is still buffered, not yet a separately
 scheduled guest program image.
 
 If a compiler driver or a Wasm-hosted shell must launch separate tools, add a versioned

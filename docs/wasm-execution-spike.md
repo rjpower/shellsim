@@ -2,11 +2,12 @@
 
 ## Result
 
-Shellsim now recognizes executable Wasm bytes in its VFS and runs bounded modules with Wasmi 2.0.
+Shellsim recognizes executable Wasm bytes in its VFS and runs bounded modules with Wasmtime 49.
 A custom WASI Preview 1 adapter uses shellsim's buffered streams, virtual clock, exported process
 environment, deterministic random source, and process-owned VFS descriptors. A separately
 compiled Rust `wasm32-wasip1` `wc` fixture reads piped input and virtual files, and its selected
-outputs match the native `wc`. It rejects unknown imports and never grants
+outputs match the native `wc`. Unsupported WASI calls trap if reached, and other import
+namespaces fail instantiation; neither grants
 the guest host filesystem, process, network, environment, or clock access. WAT integration cases
 cover stdout, stdin, exit status, arguments, environment, time, regular-file creation, invalid
 guest pointers, memory limits, fuel exhaustion, and unknown imports. A multi-stage `wc` pipeline
@@ -34,20 +35,20 @@ printed only its first character and a `putchar` program produced invalid Wasm. 
 remain a compiler-guest compatibility gate, not a supported workflow.
 
 The first Wasmi build used a recursive instruction dispatcher and overflowed the host stack on a
-100,000-fuel loop. Enabling Wasmi's `portable-dispatch` feature fixed that case. Keep the loop
-regression test: fuel alone is insufficient if the interpreter consumes host stack per step.
+100,000-fuel loop. Its `portable-dispatch` feature fixed that case before the Wasmtime migration.
+Keep the loop regression test: fuel alone is insufficient if an engine consumes host stack per step.
 
 ## Stage gates
 
 | Gate | Current state | Required next work |
 |---|---|---|
 | 0. Validate and run bounded Wasm with virtual stdio and VFS | Demonstrated with WAT ABI tests and a source-built Rust WASI `wc`. Regular-file handles use process-owned descriptors; a multi-stage `wc` pipeline handles input larger than pipe capacity. | Extend the compiled guest fixture to exercise file writes and close/reopen. |
-| 1. Model a full logical Wasm process | **Open.** Buffered stdin works; live pipe reads cannot suspend and resume a Wasm instruction. | Use Wasmi's resumable host-trap API at shellsim's scheduler boundary. Decide how live continuations interact with deterministic session forks. Add pipe, cancellation, and timeout tests. |
-| 2. Build surface | **Open.** Virtual archive commands exist, but no C compiler is integrated. The unchanged zlib configure script fails visibly at its `cc` probe; see [the acceptance target](zlib-build-goal.md). | Run the pinned tinycc Wasm compiler through a compatible engine, then retest configure, make, and generated programs. |
+| 1. Model a full logical Wasm process | **Open.** Buffered stdin works; live pipe reads cannot suspend and resume a Wasm instruction. | Define resumable Wasmtime execution at shellsim's scheduler boundary. Decide how live continuations interact with deterministic session forks. Add pipe, cancellation, and timeout tests. |
+| 2. Build surface | **Partial.** A pinned external TinyCC package and wasi-libc subset compile and run C programs in the VFS. No compiler is installed by default. | Broaden the checked libc and process surface with real applications; keep unsupported calls explicit. |
 
 The snapshot constraint is substantive. Shellsim's process continuations and environments are
-cloneable, and a harness fork must make an independent replay snapshot. Wasmi's live `Store` and
-resumable call are not cloneable. Putting them in an `Arc` would share mutable guest state between
+cloneable, and a harness fork must make an independent replay snapshot. Wasmtime's live `Store` is
+not cloneable. Putting it in an `Arc` would share mutable guest state between
 forks and violate that contract. A coherent path is to record bounded WASI responses and replay
 the guest deterministically to a suspension point when cloning; another is to make an active-Wasm
 session explicitly non-forkable, which would narrow the current session API. Do not hide either
@@ -64,13 +65,11 @@ establish compatibility with tinycc's output.
 | Candidate | Fit | Constraint |
 |---|---|---|
 | [WCPL](https://github.com/false-schemers/wcpl) | An earlier C-subset experiment proved a small self-contained compile/run path. | Its custom `.wo` format and libc failures do not suit the unchanged zlib target. Its binary fixture was removed. |
-| [TinyCC Wasm fork](https://github.com/rjpower/tinycc/tree/wasm) | The preferred next compiler; its CI builds `tcc.wasm` and a Wasm sysroot. | The current shellsim engine rejects the artifact with `exceptions proposal not enabled`. Validate an exception-capable engine and its resource/continuation model before integration. |
+| [TinyCC Wasm fork](https://github.com/rjpower/tinycc/tree/wasm) | Its pinned external package compiles and links C programs against a wasi-libc subset through shellsim. | The supported libc and WASI surface is still limited; unsupported imports trap if called. |
 | [Chibicc](https://github.com/rui314/chibicc) | Broad C11 frontend and preprocessor; a possible frontend reference. | Emits x86-64 assembly and targets native Linux, so it still needs a Wasm backend and linker. The upstream repository may rewrite history. |
 | [WASI SDK](https://github.com/WebAssembly/wasi-sdk) / [Wasm Clang demo](https://github.com/binji/wasm-clang) | Full Clang/LLVM C compatibility and standard Wasm object format. A Wasm-hosted Clang/LLD precedent exists. | Large runtime/sysroot footprint and integration cost; the demo has custom memory filesystem plumbing and describes itself as alpha. |
 | [PunyCC](https://github.com/bobbl/punycc) | Tiny, self-hosted, and already has Wasm host and target combinations. | No preprocessor, linker, standard library, or useful type system. Good engine smoke test, not a zlib compiler. |
 
-The next compiler gate is tinycc, not another WCPL or XCC fixture. Wasmi 2.0 has no
-exception-handling switch; its source rejects exception tags. Either add the required proposal
-to an engine or use an engine that already implements it, while preserving shellsim's bounded
-process and VFS interfaces. Do not claim zlib support until the checked build runs, links, and
-executes its output in the virtual environment.
+The next compiler gate is broader application behavior, not another WCPL or XCC fixture.
+Wasmtime accepts TinyCC's exception instructions, and the pinned package plus sysroot exercises
+the bounded virtual operations currently implemented. This does not establish full libc support.

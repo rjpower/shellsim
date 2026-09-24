@@ -335,10 +335,11 @@ fn cmd_rm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
 
 fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, long) = split_flags(args);
-    if reject_options("cp", &flags, "rRaf", &long, io) {
+    if reject_options("cp", &flags, "rRafp", &long, io) {
         return 2;
     }
     let recursive = flags.contains(&'r') || flags.contains(&'R') || flags.contains(&'a');
+    let preserve = flags.contains(&'p') || flags.contains(&'a');
     if ops.len() < 2 {
         ewln(io.err, "cp: missing destination operand");
         return 1;
@@ -378,13 +379,24 @@ fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             (*dest).clone()
         };
         let r = if recursive {
-            interp.vfs.copy_recursive(&cwd, s, &target)
+            interp.vfs.copy_recursive(&cwd, s, &target, preserve)
         } else {
             interp.vfs.copy_file(&cwd, s, &target)
         };
-        if let Err(e) = r {
-            ewln(io.err, &format!("cp: cannot copy '{s}': {e}"));
-            status = 1;
+        let r = r.and_then(|()| {
+            if preserve && !recursive {
+                let source = interp.vfs.metadata(&cwd, s, true)?;
+                interp.vfs.chmod(&cwd, &target, source.mode)?;
+                interp.vfs.touch(&cwd, &target, source.mtime)?;
+            }
+            Ok(())
+        });
+        match r {
+            Ok(()) => {}
+            Err(e) => {
+                ewln(io.err, &format!("cp: cannot copy '{s}': {e}"));
+                status = 1;
+            }
         }
     }
     status
