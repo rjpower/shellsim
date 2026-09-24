@@ -116,6 +116,8 @@ impl ShellExpansionError {
 pub struct Environment {
     pub vfs: Vfs,
     pub clock: Clock,
+    /// Virtual framebuffer and input queue; guests never receive host device handles.
+    pub display: crate::display::VirtualDisplay,
     pub net: VirtualNet,
     /// Deterministic CPU, transient-memory, and output accounting for this environment.
     pub resources: Resources,
@@ -553,6 +555,14 @@ impl Environment {
         Self::with_limits(Limits::default())
     }
 
+    /// Inject a key transition into the virtual display without consulting host input.
+    pub fn inject_key(
+        &mut self,
+        event: crate::display::KeyEvent,
+    ) -> Result<(), crate::display::DisplayError> {
+        self.display.inject_key(&mut self.resources, event)
+    }
+
     pub fn with_limits(limits: Limits) -> Self {
         let mut vars: HashMap<String, String> = HashMap::new();
         vars.insert("HOME".into(), "/root".into());
@@ -613,6 +623,7 @@ impl Environment {
         Environment {
             vfs,
             clock,
+            display: crate::display::VirtualDisplay::default(),
             net: VirtualNet::new(),
             resources: Resources::new(limits),
             processes,

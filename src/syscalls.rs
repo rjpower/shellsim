@@ -4,6 +4,7 @@
 //! table, so a guest cannot keep a second, unaccounted set of file handles or cursors.
 
 use crate::descriptors::{DescriptorError, Fd, FileState, IoPoll, MAX_FDS_PER_PROCESS};
+use crate::display::{DisplayError, KeyEvent};
 use crate::interp::Interp;
 use crate::vfs::{resolve_against, NodeKind, VfsError};
 
@@ -57,6 +58,53 @@ impl NativeSyscalls for ActiveProcessSyscalls<'_> {
             .stop_reason()
             .map_or(137, |reason| reason.exit_status())
     }
+}
+
+/// Open the single virtual display for the active process.
+pub(crate) fn display_open(
+    interp: &mut Interp,
+    width: u32,
+    height: u32,
+    format: u32,
+) -> Result<u32, DisplayError> {
+    interp.display.open(
+        &mut interp.resources,
+        interp.process.pid,
+        width,
+        height,
+        format,
+    )
+}
+
+/// Copy a complete RGBA frame from a process into the virtual display.
+pub(crate) fn display_present(
+    interp: &mut Interp,
+    handle: u32,
+    pixels: &[u8],
+    stride: u32,
+) -> Result<(), DisplayError> {
+    interp.display.present(
+        &mut interp.resources,
+        interp.process.pid,
+        handle,
+        pixels,
+        stride,
+    )
+}
+
+/// Receive one injected key event, or report that no event is ready.
+pub(crate) fn input_poll_key(
+    interp: &mut Interp,
+    handle: u32,
+) -> Result<Option<KeyEvent>, DisplayError> {
+    interp
+        .display
+        .poll_key(&mut interp.resources, interp.process.pid, handle)
+}
+
+/// Relinquish the display while retaining its last frame for inspection.
+pub(crate) fn display_close(interp: &mut Interp, handle: u32) -> Result<(), DisplayError> {
+    interp.display.close(interp.process.pid, handle)
 }
 
 /// Access and creation requested by one virtual process.
