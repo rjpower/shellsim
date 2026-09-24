@@ -179,3 +179,41 @@ int main(void) {
         .unwrap();
     assert_eq!(file.mode, 0o700);
 }
+
+#[test]
+fn c_stdio_seeks_back_from_large_virtual_file() {
+    let mut environment = toolchain_environment();
+    let mut data = vec![0; 28_795_076];
+    data[..4].copy_from_slice(b"IWAD");
+    environment
+        .vfs
+        .write("/", "/work/large.wad", &data, 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .write(
+            "/",
+            "/work/read.c",
+            br#"
+#include <stdio.h>
+int main(void) {
+    char header[4] = {0};
+    FILE *file = fopen("/work/large.wad", "rb");
+    if (!file) return 1;
+    if (fseek(file, 0, SEEK_END)) return 2;
+    if (ftell(file) != 28795076) return 3;
+    if (fseek(file, 0, SEEK_SET)) return 4;
+    if (fread(header, 1, 4, file) != 4) return 5;
+    if (header[0] != 'I' || header[1] != 'W' || header[2] != 'A' || header[3] != 'D') return 6;
+    return 0;
+}
+"#,
+            0o644,
+        )
+        .unwrap();
+    let (build, _, stderr) = environment.run_script_capture("cc /work/read.c -o /work/read.wasm");
+    assert_eq!(build.exit_status, 0, "{}", String::from_utf8_lossy(&stderr));
+    let (run, _, stderr) =
+        environment.run_script_capture("chmod +x /work/read.wasm && /work/read.wasm");
+    assert_eq!(run.exit_status, 0, "{}", String::from_utf8_lossy(&stderr));
+}
