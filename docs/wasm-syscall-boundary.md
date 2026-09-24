@@ -75,11 +75,12 @@ streaming command and a filesystem walker. WASI Preview 1 alone does not supply 
 
 ## Compiler execution and a future process extension
 
-The pinned WCPL guest demonstrates that compilation itself requires no special syscall. The shell
-resolves it as a VFS executable; it reads source and writes a Wasm binary through ordinary virtual
-file descriptors. WCPL links in the same invocation, so the shell can run its output without the
-compiler spawning another process. The current Wasm command path is still buffered, not yet a
-separately scheduled guest program image.
+An earlier WCPL experiment showed that compilation itself requires no special syscall: the shell
+resolved the compiler as a VFS executable, and it read source and wrote a Wasm binary through
+ordinary virtual file descriptors. That fixture is no longer shipped. The preferred next compiler
+is tinycc, whose published Wasm artifact currently requires exception handling outside this
+engine's supported surface. The current Wasm command path is still buffered, not yet a separately
+scheduled guest program image.
 
 If a compiler driver or a Wasm-hosted shell must launch separate tools, add a versioned
 `shellsim_process_v1` guest import adapter over typed kernel operations, not a compiler-specific
