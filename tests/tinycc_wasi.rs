@@ -124,8 +124,9 @@ fn tinycc_builds_a_guest_that_presents_and_reacts_to_virtual_input() {
         .vfs
         .write("/", "/work/display.c", DISPLAY_PROGRAM, 0o644)
         .unwrap();
-    let (compile, stdout, stderr) =
-        environment.run_script_capture("/toolchain/tcc-shellsim.wasm -nostdlib -o /work/display.wasm /work/display.c");
+    let (compile, stdout, stderr) = environment.run_script_capture(
+        "/toolchain/tcc-shellsim.wasm -nostdlib -o /work/display.wasm /work/display.c",
+    );
     assert_eq!(
         compile.exit_status,
         0,
