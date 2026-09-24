@@ -28,3 +28,48 @@ Wasmtime state is never copied by `Environment::clone()`.
 This is not yet a scheduler-owned Wasm process. Live pipe waits and virtual timer sleeps still
 need integration with the process table and scheduler. The interface supplies a display and keys,
 not audio or networking.
+
+## External Doom end-to-end probe
+
+The ignored `tests/doom_probe.rs` test builds Doomgeneric from source with the virtual TinyCC
+toolchain, links a small shellsim platform adapter, loads a separately supplied Freedoom WAD,
+yields 640×400 frames, and checks that an Escape key injected between frames changes the image. Neither the
+GPL engine nor game data is included in the repository. The test harness alone imports the
+trusted host inputs into the VFS before simulated execution; the guest cannot reach those host
+paths.
+
+The proven inputs were:
+
+- [Doomgeneric](https://github.com/ozkl/doomgeneric) commit
+  `dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284`, with
+  `SHELLSIM_DOOM_SOURCE` pointing to its `doomgeneric/` source directory.
+- [Freedoom 0.13.0](https://github.com/freedoom/freedoom/releases/tag/v0.13.0)
+  `freedoom1.wad`, SHA-256
+  `7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d`, with
+  `SHELLSIM_DOOM_WAD` pointing to that file.
+
+Run the opt-in probe with both variables set:
+
+```sh
+SHELLSIM_DOOM_SOURCE=/path/to/doomgeneric/doomgeneric \
+SHELLSIM_DOOM_WAD=/path/to/freedoom1.wad \
+cargo test --test doom_probe -- --ignored
+```
+
+To play with a separately obtained WAD, run the local browser demo from this PR:
+
+```sh
+cargo run --release --example doom_player -- /path/to/doomgeneric/doomgeneric /path/to/freedoom1.wad
+```
+
+The first launch compiles Doomgeneric inside shellsim's VFS and may take about a minute. Open the
+loopback URL printed by the example. Arrow keys move, Ctrl fires, Space uses, Shift runs, and Esc
+opens the menu. The browser only sees copied RGBA frames and sends bounded key events to a host
+demo process; the guest has no host network access. The demo binds an ephemeral `127.0.0.1` port
+and exits when its Stop button is pressed. The external [Freedoom release](https://github.com/freedoom/freedoom/releases/tag/v0.13.0)
+provides a playable WAD; shellsim does not download or bundle it.
+
+The probe and demo select Doomgeneric's console-error path instead of its optional Zenity
+`system()` call. The platform adapter still uses a deterministic, adapter-local tick
+approximation. Audio and networking are outside this single-player proof. The original Doom/Quake
+engines and assets are not bundled.
