@@ -30,8 +30,9 @@ The current environment includes:
   third-party module surface.
 
 Python is source-compatible where supported, not ABI-compatible with CPython. Native extensions,
-network package installation, compilers, and arbitrary machine code are outside the simulation
-boundary. The simulated `pip` and `uv` paths can activate packages already bundled with
+network package installation, and arbitrary host machine code are outside the simulation
+boundary. A limited Wasm-hosted C toolchain can be supplied as a virtual executable. The simulated
+`pip` and `uv` paths can activate packages already bundled with
 shellsim; they reject other packages instead of fetching them. See
 [Python in shellsim](docs/python.md) for the current contract.
 
@@ -132,10 +133,10 @@ This is not full WASI process support. A compiled `wc` can read pipeline input a
 downstream pipe, including input larger than the pipe buffer, but the shell collects its entire
 stdin before starting Wasm. A producer that needs its consumer to act before EOF can therefore
 still deadlock or exhaust the input memory budget. `poll_oneoff`, sockets, and guest process
-creation remain unsupported. No C compiler is installed by default; the unchanged zlib configure
-script currently reports that frontier. The engine accepts Wasm exception instructions. A pinned
-external tinycc fixture compiles and runs a libc-free C program in the virtual environment, but
-the full wasi-libc sysroot and its additional operations are not integrated. A prebuilt
+creation remain unsupported. No C compiler is installed by default. The engine accepts Wasm
+exception instructions. A pinned external TinyCC package and permissively licensed wasi-libc
+sysroot can be installed into the VFS by a caller; integration tests compile and run C programs
+through that virtual toolchain. This is a tested subset of libc, not full POSIX support. A prebuilt
 `wasm32-wasip1` command that uses only the listed imports can be written to the VFS with
 executable permissions and invoked by path or through `PATH`.
 

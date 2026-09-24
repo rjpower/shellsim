@@ -8,7 +8,7 @@ SHA-256 `3d637426ef54d66dfb7a03276ecbf16f925b481145573a127d244093978b65be`.
 
 The subset retains C headers and the `wasm32-wasip1` `libc.a`, `libsetjmp.a`, and
 `libc-printscan-long-double.a` libraries. It omits the `eh` and `noeh` C++ header trees, which
-the C-only zlib workflow does not use. The archive is test input mounted in shellsim's virtual
+the C-only toolchain tests do not use. The archive is test input mounted in shellsim's virtual
 filesystem, not a host-installed library.
 
 wasi-libc is offered under MIT, Apache-2.0, or Apache-2.0 with LLVM exceptions. The archive also

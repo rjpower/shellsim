@@ -563,6 +563,41 @@ impl Vfs {
         Ok(String::from_utf8_lossy(&self.read(cwd, path)?).into_owned())
     }
 
+    /// Read a bounded slice of a regular file, even when the whole file exceeds a capture limit.
+    pub(crate) fn read_range(
+        &self,
+        cwd: &str,
+        path: &str,
+        offset: usize,
+        maximum: usize,
+    ) -> Result<Vec<u8>> {
+        let abs = resolve_against(cwd, path);
+        let real = self.realpath(&abs, true)?;
+        match self.nodes.get(&real) {
+            Some(Node {
+                kind: NodeKind::File(data),
+                ..
+            }) => {
+                let start = offset.min(data.len());
+                let end = start.saturating_add(maximum).min(data.len());
+                self.read_bytes
+                    .set(self.read_bytes.get().saturating_add((end - start) as u64));
+                Ok(data[start..end].to_vec())
+            }
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => Err(VfsError::IsADir(path.to_string())),
+            Some(Node {
+                kind: NodeKind::NativeExecutable(_),
+                ..
+            }) => Err(VfsError::Invalid(format!(
+                "opaque native executable: {path}"
+            ))),
+            _ => Err(VfsError::NotFound(path.to_string())),
+        }
+    }
+
     /// Read a UTF-8-ish file only when it is within `limit` bytes.
     ///
     /// Unlike checking `metadata`, this avoids cloning a potentially enormous file merely to
@@ -881,20 +916,24 @@ impl Vfs {
         Ok(bytes.len())
     }
 
-    pub(crate) fn read_orphan_limited(&self, id: u64, limit: usize) -> Result<Vec<u8>> {
-        let node = self.orphan_metadata(id)?;
-        let NodeKind::File(bytes) = node.kind else {
+    pub(crate) fn read_orphan_range(
+        &self,
+        id: u64,
+        offset: usize,
+        maximum: usize,
+    ) -> Result<Vec<u8>> {
+        let node = self
+            .orphaned
+            .get(&id)
+            .ok_or_else(|| VfsError::NotFound(format!("unlinked file {id}")))?;
+        let NodeKind::File(bytes) = &node.kind else {
             unreachable!("orphan is always a file")
         };
-        if bytes.len() > limit {
-            return Err(VfsError::TooLarge {
-                path: format!("unlinked file {id}"),
-                limit,
-            });
-        }
+        let start = offset.min(bytes.len());
+        let end = start.saturating_add(maximum).min(bytes.len());
         self.read_bytes
-            .set(self.read_bytes.get().saturating_add(bytes.len() as u64));
-        Ok(bytes)
+            .set(self.read_bytes.get().saturating_add((end - start) as u64));
+        Ok(bytes[start..end].to_vec())
     }
 
     pub(crate) fn write_orphan_at(&mut self, id: u64, offset: usize, data: &[u8]) -> Result<()> {
