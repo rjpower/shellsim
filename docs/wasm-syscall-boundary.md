@@ -4,10 +4,20 @@
 
 Keep the virtual kernel in Rust and define its process operations independently of any guest
 ABI. A WASI adapter translates guest memory, rights, and errno values into those operations.
-The shell remains a privileged, native simulated process that uses the same descriptors,
-filesystem, clock, scheduler, and quotas. Its parser and executor need not occupy one Rust file:
-`shell.rs` already owns syntax, `exec.rs` runs commands, and state-changing builtins run in the
-shell process. Moving that code into a single file would not strengthen the boundary.
+Boot a shell as an ordinary logical process by default, selected through the same program loader
+as any other executable. Its Rust implementation is a program image, not a privileged process
+class. `shell.rs` already owns syntax, `exec.rs` runs commands, and state-changing builtins run
+in the shell process. Their source files need not be combined; their authority should be limited
+to the shell's process-scoped syscall interface.
+
+The current machine already creates a root process with descriptors and a scheduler entry, and
+shell continuations belong to logical processes. It does not yet enforce the stronger boundary:
+shell and native-command code can still mutate `Environment` directly, and some external native
+commands execute as functions in the active process. The target is a loader that starts `/bin/sh`
+by default, treats Rust, Wasm, and Python program images as ordinary processes, and runs each
+external invocation as a child or `exec` replacement. Generic process state should be separate
+from shell-only variables, aliases, functions, job control, and parser state. Builtins such as
+`cd` and `export` still act in the shell PID; they do not require kernel privilege.
 
 The new `syscalls.rs` begins this boundary for regular files. It accepts typed open options,
 allocates descriptors in the active process, and owns close and seek. The WASI adapter now uses
@@ -46,7 +56,8 @@ stdio onto process descriptors and use Wasmi's resumable host-call mechanism whe
 returns `IoPoll::Blocked`. A guest continuation must resume at the blocked instruction, not
 restart `_start` or treat temporary absence of input as EOF. Before enabling Wasm by default,
 resolve how an active Wasmi continuation can be independently cloned for harness forks, or
-reject that fork explicitly. The native shell and `wc` should remain until those gates pass.
+reject that fork explicitly. The Rust shell program image and native `wc` should remain until
+those gates pass.
 
 Only after live pipe behavior is sound should shellsim consider a default Wasm `wc`, then a
 streaming command and a filesystem walker. A compiler guest also needs an explicit process
