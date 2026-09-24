@@ -14,6 +14,7 @@ pub mod clock;
 pub mod commands;
 pub mod corpus;
 pub mod descriptors;
+pub mod display;
 pub mod exec;
 pub mod expand;
 pub mod harness;
