@@ -18,7 +18,8 @@ pub(crate) trait NativeSyscalls {
     fn stop_status(&self) -> i32;
 }
 
-/// Active-PID adapter; neither native programs nor guest ABI adapters receive `Interp`.
+/// Active-PID adapter; native program bodies receive this handle, not `Interp`.
+/// The current WASI adapter still holds `Interp` while translating its imports.
 pub(crate) struct ActiveProcessSyscalls<'a> {
     interp: &'a mut Interp,
 }

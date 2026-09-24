@@ -3,7 +3,11 @@
 //! The suite checks observable shell behavior and directly verifies that generated `/proc` state
 //! neither enters nor mutates the persistent VFS.
 
-use shellsim::{scheduler::TaskState, Environment, Limits, StopReason};
+use shellsim::{
+    scheduler::TaskState,
+    vfs::{NativeProgram, NodeKind},
+    Environment, Limits, StopReason,
+};
 
 fn run(env: &mut Environment, source: &str) -> (i32, String, String) {
     let (outcome, stdout, stderr) = env.run_script_capture(source);
@@ -59,6 +63,57 @@ fn native_argv_children_use_process_cwd_and_leave_the_shell_unchanged() {
     assert_eq!(run(&mut env, "env false").0, 1);
     assert_eq!(run(&mut env, "env true").0, 0);
     assert_eq!(run(&mut env, "readlink /proc/self").1, "1234\n");
+}
+
+#[test]
+fn native_images_are_opaque_vfs_executables_found_through_path() {
+    let mut env = Environment::new();
+    let node = env.vfs.metadata("/", "/usr/bin/pwd", true).unwrap();
+    assert!(matches!(
+        node.kind,
+        NodeKind::NativeExecutable(NativeProgram::Pwd)
+    ));
+    assert_eq!(node.mode & 0o111, 0o111);
+    assert!(env.vfs.read("/", "/usr/bin/pwd").is_err());
+    env.vfs.copy_file("/", "/usr/bin/pwd", "/work/cwd").unwrap();
+    assert_eq!(run(&mut env, "/work/cwd"), (0, "/\n".into(), "".into()));
+    assert_eq!(run(&mut env, "which pwd").1, "/usr/bin/pwd\n");
+    assert_eq!(run(&mut env, "/usr/bin/pwd"), (0, "/\n".into(), "".into()));
+    assert_eq!(
+        run(&mut env, "printf x | /usr/bin/pwd | wc -c"),
+        (0, "2\n".into(), "".into())
+    );
+}
+
+#[test]
+fn native_images_follow_executable_permissions_and_can_be_replaced() {
+    let mut env = Environment::new();
+    env.vfs.chmod("/", "/usr/bin/pwd", 0o644).unwrap();
+    let denied = run(&mut env, "env pwd");
+    assert_eq!(denied.0, 126);
+    assert!(denied.2.contains("permission denied"), "{}", denied.2);
+    assert_eq!(run(&mut env, "pwd"), (0, "/\n".into(), "".into()));
+    assert_eq!(run(&mut env, "env -i PATH=/missing pwd").0, 127);
+
+    env.vfs.remove_file("/", "/usr/bin/pwd").unwrap();
+    let missing = run(&mut env, "env pwd");
+    assert_eq!(missing.0, 127);
+    assert!(missing.2.contains("command not found"), "{}", missing.2);
+    assert_eq!(run(&mut env, "/usr/bin/pwd").0, 127);
+    assert_eq!(run(&mut env, "which pwd").0, 1);
+
+    env.vfs
+        .write(
+            "/",
+            "/usr/bin/pwd",
+            b"#!/bin/sh\nprintf 'replacement\\n'\n",
+            0o755,
+        )
+        .unwrap();
+    assert_eq!(
+        run(&mut env, "env pwd"),
+        (0, "replacement\n".into(), "".into())
+    );
 }
 
 #[test]

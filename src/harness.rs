@@ -249,6 +249,7 @@ pub enum PathType {
     File,
     Directory,
     Symlink,
+    NativeExecutable,
 }
 
 /// Stable process/resource inspection for an active session.
@@ -344,6 +345,7 @@ pub enum WorkspaceNode {
     File { mode: u32, data_base64: String },
     Directory { mode: u32 },
     Symlink { mode: u32, target: String },
+    NativeExecutable { mode: u32, program: String },
 }
 
 /// One persistent simulated environment and its VFS checkpoint.
@@ -1095,6 +1097,7 @@ impl HarnessSession {
                 let size = target.len() as u64;
                 (PathType::Symlink, size, Some(target))
             }
+            NodeKind::NativeExecutable(_) => (PathType::NativeExecutable, 0, None),
         };
         Ok(HarnessResult::PathMetadata(PathMetadata {
             path,
@@ -1325,6 +1328,7 @@ fn nodes_equal(left: Option<&Node>, right: Option<&Node>) -> bool {
             (NodeKind::File(left), NodeKind::File(right)) => left == right,
             (NodeKind::Dir, NodeKind::Dir) => true,
             (NodeKind::Symlink(left), NodeKind::Symlink(right)) => left == right,
+            (NodeKind::NativeExecutable(left), NodeKind::NativeExecutable(right)) => left == right,
             _ => false,
         },
         _ => false,
@@ -1336,6 +1340,7 @@ fn node_transfer_bytes(node: &Node) -> usize {
         NodeKind::File(data) => data.len(),
         NodeKind::Dir => 0,
         NodeKind::Symlink(target) => target.len(),
+        NodeKind::NativeExecutable(_) => 0,
     }
 }
 
@@ -1349,6 +1354,10 @@ fn workspace_node(node: &Node) -> WorkspaceNode {
         NodeKind::Symlink(target) => WorkspaceNode::Symlink {
             mode: node.mode,
             target: target.clone(),
+        },
+        NodeKind::NativeExecutable(program) => WorkspaceNode::NativeExecutable {
+            mode: node.mode,
+            program: program.name().to_string(),
         },
     }
 }

@@ -53,19 +53,31 @@ pub(crate) enum NativeProcess {
         output: Option<Vec<u8>>,
         offset: usize,
     },
+    Failure {
+        status: i32,
+        message: Vec<u8>,
+        offset: usize,
+    },
 }
 
 impl NativeProcess {
-    /// Resolve commands that have a process-scoped native implementation.
-    pub(crate) fn from_argv(argv: &[String]) -> Option<Self> {
-        match argv.first()?.as_str() {
-            "true" => Some(Self::Status(0)),
-            "false" => Some(Self::Status(1)),
-            "pwd" => Some(Self::Pwd {
+    /// Construct an owned continuation from one VFS native program identity.
+    pub(crate) fn from_image(image: crate::vfs::NativeProgram) -> Self {
+        match image {
+            crate::vfs::NativeProgram::True => Self::Status(0),
+            crate::vfs::NativeProgram::False => Self::Status(1),
+            crate::vfs::NativeProgram::Pwd => Self::Pwd {
                 output: None,
                 offset: 0,
-            }),
-            _ => None,
+            },
+        }
+    }
+
+    pub(crate) fn failure(status: i32, message: String) -> Self {
+        Self::Failure {
+            status,
+            message: message.into_bytes(),
+            offset: 0,
         }
     }
 
@@ -81,38 +93,49 @@ impl NativeProcess {
                     bytes.push(b'\n');
                     bytes
                 });
-                let mut quantum = 4096_usize;
-                while *offset < bytes.len() {
-                    if quantum == 0 {
-                        return ShellPoll::Pending;
-                    }
-                    let remaining = syscalls.output_remaining().min(quantum as u64) as usize;
-                    if remaining == 0 {
-                        let _ = syscalls.charge_output(1);
-                        return ShellPoll::Ready(syscalls.stop_status());
-                    }
-                    let end = offset.saturating_add(remaining).min(bytes.len());
-                    match syscalls.write(1, &bytes[*offset..end]) {
-                        Ok(IoPoll::Ready(0)) => return ShellPoll::Ready(1),
-                        Ok(IoPoll::Ready(written)) => {
-                            *offset += written;
-                            quantum -= written;
-                            if !syscalls.charge_cpu(written as u64)
-                                || !syscalls.charge_output(written as u64)
-                            {
-                                return ShellPoll::Ready(syscalls.stop_status());
-                            }
-                        }
-                        Ok(IoPoll::Blocked(wait)) => {
-                            return ShellPoll::Blocked(wait_reason(wait));
-                        }
-                        Err(_) => return ShellPoll::Ready(1),
-                    }
-                }
-                ShellPoll::Ready(0)
+                poll_write(syscalls, 1, bytes, offset, 0)
             }
+            Self::Failure {
+                status,
+                message,
+                offset,
+            } => poll_write(syscalls, 2, message, offset, *status),
         }
     }
+}
+
+fn poll_write(
+    syscalls: &mut impl NativeSyscalls,
+    fd: i32,
+    bytes: &[u8],
+    offset: &mut usize,
+    status: i32,
+) -> ShellPoll {
+    let mut quantum = 4096_usize;
+    while *offset < bytes.len() {
+        if quantum == 0 {
+            return ShellPoll::Pending;
+        }
+        let remaining = syscalls.output_remaining().min(quantum as u64) as usize;
+        if remaining == 0 {
+            let _ = syscalls.charge_output(1);
+            return ShellPoll::Ready(syscalls.stop_status());
+        }
+        let end = offset.saturating_add(remaining).min(bytes.len());
+        match syscalls.write(fd, &bytes[*offset..end]) {
+            Ok(IoPoll::Ready(0)) => return ShellPoll::Ready(1),
+            Ok(IoPoll::Ready(written)) => {
+                *offset += written;
+                quantum -= written;
+                if !syscalls.charge_cpu(written as u64) || !syscalls.charge_output(written as u64) {
+                    return ShellPoll::Ready(syscalls.stop_status());
+                }
+            }
+            Ok(IoPoll::Blocked(wait)) => return ShellPoll::Blocked(wait_reason(wait)),
+            Err(_) => return ShellPoll::Ready(1),
+        }
+    }
+    ShellPoll::Ready(status)
 }
 
 fn wait_reason(wait: IoWait) -> WaitReason {
@@ -174,7 +197,7 @@ mod tests {
 
     #[test]
     fn native_process_retains_output_across_blocked_and_partial_writes() {
-        let mut process = NativeProcess::from_argv(&["pwd".into()]).unwrap();
+        let mut process = NativeProcess::from_image(crate::vfs::NativeProgram::Pwd);
         let mut syscalls = PartialWriter {
             calls: 0,
             bytes: Vec::new(),
@@ -191,7 +214,7 @@ mod tests {
 
     #[test]
     fn native_process_stops_at_the_output_limit() {
-        let mut process = NativeProcess::from_argv(&["pwd".into()]).unwrap();
+        let mut process = NativeProcess::from_image(crate::vfs::NativeProgram::Pwd);
         let mut syscalls = PartialWriter {
             calls: 1,
             bytes: Vec::new(),

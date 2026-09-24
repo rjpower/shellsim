@@ -136,6 +136,9 @@ fn collect_entries(
             NodeKind::Symlink(_) => {
                 return Err(format!("{operand}: symbolic links are not supported"));
             }
+            NodeKind::NativeExecutable(_) => {
+                return Err(format!("{operand}: native executables cannot be archived"));
+            }
         }
     }
     if paths.len() > MAX_ENTRIES {
@@ -153,6 +156,9 @@ fn collect_entries(
             NodeKind::File(data) => EntryKind::File(data),
             NodeKind::Symlink(_) => {
                 return Err(format!("{path}: symbolic links are not supported"));
+            }
+            NodeKind::NativeExecutable(_) => {
+                return Err(format!("{path}: native executables cannot be archived"));
             }
         };
         entries.push(Entry {

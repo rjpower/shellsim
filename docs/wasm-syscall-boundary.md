@@ -12,14 +12,17 @@ to the shell's process-scoped syscall interface.
 
 The current machine already creates a root process with descriptors and a scheduler entry, and
 program continuations belong to logical processes. A child argv loader can retain either a
-shell continuation or a native Rust image. The first native images are `pwd`, `true`, and `false`
-when invoked through that child loader, including from Python subprocesses. They receive a
+shell continuation or a native Rust image. The first native images are `pwd`, `true`, and `false`.
+They are opaque executable entries in the virtual `/usr/bin`, resolved through the same cwd and
+`PATH` search as Wasm files and scripts when launched as external commands. Bare names that are
+shell builtins still run in the shell process. The native images receive a
 borrowed, process-scoped syscall handle for the current poll quantum; it provides cwd, descriptor
 write, and resource accounting, not `Environment` or host handles. Their owned state survives
 blocked and partial writes. The shell still boots as the root logical process, and most native
 commands still run through the existing dispatcher. It does not yet enforce the stronger boundary:
-shell and most native-command code can still mutate `Environment` directly, and some external
-native commands execute as functions in the active process. The target is a loader that starts `/bin/sh`
+shell and most native-command code can still mutate `Environment` directly, the WASI adapter
+still holds `Interp` while translating imports, and some external native commands execute as
+functions in the active process. The target is a loader that starts `/bin/sh`
 by default, treats Rust, Wasm, and Python program images as ordinary processes, and runs each
 external invocation as a child or `exec` replacement. Generic process state should be separate
 from shell-only variables, aliases, functions, job control, and parser state. Builtins such as

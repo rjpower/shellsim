@@ -251,18 +251,31 @@ pub enum ExecutableLookup {
 
 /// Resolve a command path using the process `PATH`, without consulting the host filesystem.
 pub fn resolve_executable(interp: &Interp, name: &str) -> ExecutableLookup {
+    resolve_executable_in(
+        &interp.vfs,
+        &interp.cwd,
+        &interp.get_var("PATH").unwrap_or_default(),
+        name,
+    )
+}
+
+/// Resolve using one process's cwd and PATH, including before that process becomes active.
+pub(crate) fn resolve_executable_in(
+    vfs: &crate::vfs::Vfs,
+    cwd: &str,
+    path_value: &str,
+    name: &str,
+) -> ExecutableLookup {
     let candidates = if name.contains('/') {
-        vec![crate::vfs::resolve_against(&interp.cwd, name)]
+        vec![crate::vfs::resolve_against(cwd, name)]
     } else {
-        interp
-            .get_var("PATH")
-            .unwrap_or_default()
+        path_value
             .split(':')
             .map(|directory| {
                 let directory = if directory.is_empty() {
-                    interp.cwd.clone()
+                    cwd.to_string()
                 } else {
-                    crate::vfs::resolve_against(&interp.cwd, directory)
+                    crate::vfs::resolve_against(cwd, directory)
                 };
                 crate::vfs::resolve_against(&directory, name)
             })
@@ -270,10 +283,14 @@ pub fn resolve_executable(interp: &Interp, name: &str) -> ExecutableLookup {
     };
     let mut denied = None;
     for path in candidates {
-        let Ok(metadata) = interp.fs_metadata("/", &path, true) else {
+        let Ok(metadata) = vfs.metadata("/", &path, true) else {
             continue;
         };
-        if matches!(metadata.kind, crate::vfs::NodeKind::File(_)) && metadata.mode & 0o111 != 0 {
+        if matches!(
+            metadata.kind,
+            crate::vfs::NodeKind::File(_) | crate::vfs::NodeKind::NativeExecutable(_)
+        ) && metadata.mode & 0o111 != 0
+        {
             return ExecutableLookup::Found(path);
         }
         denied.get_or_insert(path);

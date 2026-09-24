@@ -380,7 +380,7 @@ fn filestat(node: &crate::vfs::Node) -> [u8; 64] {
     let mut value = [0; 64];
     value[16] = match &node.kind {
         NodeKind::Dir => 3,
-        NodeKind::File(_) => 4,
+        NodeKind::File(_) | NodeKind::NativeExecutable(_) => 4,
         NodeKind::Symlink(_) => 7,
     };
     value[24..32].copy_from_slice(&1_u64.to_le_bytes());

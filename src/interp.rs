@@ -591,7 +591,14 @@ impl Environment {
         }
         let mut vfs = Vfs::with_disk_limit(limits.disk);
         vfs.set_mutation_time(clock.unix_ms());
-        vfs.seed_dirs(["/root", "/tmp", "/work"]);
+        vfs.seed_dirs(["/root", "/tmp", "/work", "/usr", "/usr/bin"]);
+        for (name, program) in [
+            ("true", crate::vfs::NativeProgram::True),
+            ("false", crate::vfs::NativeProgram::False),
+            ("pwd", crate::vfs::NativeProgram::Pwd),
+        ] {
+            vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
+        }
         const ROOT_PID: ProcessId = 1_234;
         let process_environment = exported
             .iter()
@@ -699,9 +706,59 @@ impl Environment {
     pub(crate) fn load_argv_program(
         &mut self,
         pid: ProcessId,
-        argv: Vec<String>,
+        mut argv: Vec<String>,
     ) -> Result<(), String> {
-        if let Some(native) = crate::program::NativeProcess::from_argv(&argv) {
+        let state = self
+            .process
+            .states
+            .get(&pid)
+            .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
+        let lookup = crate::commands::util::resolve_executable_in(
+            &self.vfs,
+            &state.cwd,
+            state
+                .vars
+                .get("PATH")
+                .map(String::as_str)
+                .unwrap_or_default(),
+            &argv[0],
+        );
+        let native = match lookup {
+            crate::commands::util::ExecutableLookup::Found(path) => {
+                match self
+                    .vfs
+                    .metadata("/", &path, true)
+                    .ok()
+                    .map(|node| node.kind)
+                {
+                    Some(crate::vfs::NodeKind::NativeExecutable(image)) => {
+                        Some(crate::program::NativeProcess::from_image(image))
+                    }
+                    _ => {
+                        argv[0] = path;
+                        None
+                    }
+                }
+            }
+            crate::commands::util::ExecutableLookup::NotExecutable(path)
+                if crate::vfs::NativeProgram::from_name(&argv[0]).is_some() =>
+            {
+                Some(crate::program::NativeProcess::failure(
+                    126,
+                    format!("{}: {path}: permission denied\n", argv[0]),
+                ))
+            }
+            crate::commands::util::ExecutableLookup::NotFound
+                if crate::vfs::NativeProgram::from_name(&argv[0]).is_some() =>
+            {
+                Some(crate::program::NativeProcess::failure(
+                    127,
+                    format!("{}: command not found\n", argv[0]),
+                ))
+            }
+            _ => None,
+        };
+        if let Some(native) = native {
             let state = self
                 .process
                 .states

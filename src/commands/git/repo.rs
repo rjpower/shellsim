@@ -282,7 +282,7 @@ fn tracked_content(kind: &NodeKind) -> Option<Vec<u8>> {
     match kind {
         NodeKind::File(data) => Some(data.clone()),
         NodeKind::Symlink(target) => Some(target.as_bytes().to_vec()),
-        NodeKind::Dir => None,
+        NodeKind::Dir | NodeKind::NativeExecutable(_) => None,
     }
 }
 

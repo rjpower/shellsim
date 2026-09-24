@@ -377,6 +377,11 @@ pub(crate) fn starts_before_input(interp: &Interp, argv: &[String]) -> bool {
         return false;
     }
     argv.first().is_some_and(|requested| {
+        if !(builtins::is_shell_builtin_name(requested) && !requested.contains('/'))
+            && resolved_native_image(interp, requested).is_some()
+        {
+            return true;
+        }
         let command = native_command_name(interp, requested);
         if matches!(command, "cat" | "head") {
             return streams::streams_before_input(command, &argv[1..]);
@@ -396,6 +401,9 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
     let Some(requested) = argv.first() else {
         return false;
     };
+    if resolved_native_image(interp, requested).is_some() {
+        return false;
+    }
     let command = native_command_name(interp, requested);
     if command == "git" {
         return git::reads_standard_input(&argv[1..]);
@@ -717,14 +725,36 @@ fn dispatch(
     resumable: bool,
 ) -> CommandPoll {
     let requested = argv[0].as_str();
-    // Missing standard utility paths retain their native aliases. A VFS executable found through
-    // PATH wins over the registry, including deliberately unsupported tool names such as `cc`.
-    let cmd = native_command_name(interp, requested);
+    // Bare shell builtins remain in the shell process. An explicit path always invokes the
+    // corresponding external image, even if its basename is also a builtin.
+    let builtin = !requested.contains('/') && builtins::is_shell_builtin_name(requested);
+    let lookup = util::resolve_executable(interp, requested);
+    let native = resolved_native_image(interp, requested);
+    if !builtin && resumable && native.is_some() {
+        return start_child_sequence(
+            interp,
+            vec![ChildCommand {
+                argv: argv.to_vec(),
+                stdin,
+                cwd: None,
+                environment: None,
+            }],
+            true,
+        );
+    }
+    // Legacy synchronous nested dispatch still uses the old command bodies until migrated.
+    let cmd = if !builtin && !resumable {
+        native.map_or_else(
+            || native_command_name(interp, requested),
+            |image| image.name(),
+        )
+    } else {
+        native_command_name(interp, requested)
+    };
     let args = &argv[1..];
-    let installed = matches!(
-        util::resolve_executable(interp, requested),
-        util::ExecutableLookup::Found(_)
-    );
+    let installed = !builtin
+        && !(native.is_some() && !resumable)
+        && matches!(lookup, util::ExecutableLookup::Found(_));
     if let Some(spec) = (!installed).then(|| registry().get(cmd)).flatten() {
         let unsupported_reason =
             (spec.trust == Trust::Unsupported).then(|| "not implemented in shellsim".to_string());
@@ -950,12 +980,25 @@ fn standard_utility_name(path: &str) -> Option<&str> {
     .find_map(|prefix| path.strip_prefix(prefix).filter(|name| !name.contains('/')))
 }
 
+fn resolved_native_image(interp: &Interp, requested: &str) -> Option<crate::vfs::NativeProgram> {
+    let util::ExecutableLookup::Found(path) = util::resolve_executable(interp, requested) else {
+        return None;
+    };
+    match interp.vfs.metadata("/", &path, true).ok()?.kind {
+        crate::vfs::NodeKind::NativeExecutable(image) => Some(image),
+        _ => None,
+    }
+}
+
 /// A real VFS entry at an explicit path takes precedence over the synthetic utility alias.
 /// This lets a bundled Wasm command replace one native utility without changing unrelated names.
 fn native_command_name<'a>(interp: &Interp, requested: &'a str) -> &'a str {
     let Some(name) = standard_utility_name(requested) else {
         return requested;
     };
+    if crate::vfs::NativeProgram::from_name(name).is_some() {
+        return requested;
+    }
     if matches!(
         util::resolve_executable(interp, requested),
         util::ExecutableLookup::NotFound
