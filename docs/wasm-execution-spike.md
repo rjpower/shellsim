@@ -21,6 +21,17 @@ test budget. A `puts` program found the virtual `<stdio.h>` after explicit `-I`/
 Wasm-hosted compiler failed to load its `stdio.wo` object; the same source and library paths worked
 in the native bootstrap. That is a concrete library-linking frontier, not evidence of zlib support.
 
+The pinned compiler is now checked in under `guest/wcpl/` and covered by a shell-level workflow:
+`/usr/bin/wcpl` reads virtual C files, writes a virtual Wasm executable, and the shell executes
+that output with the C program's exit status. A two-file C program links in one invocation.
+Invalid source and CPU exhaustion fail visibly. WCPL compiles and links in one invocation, so no
+process-spawn extension is needed. The checked case is self-contained C, not a libc-backed program.
+Further probing found that the Wasm-hosted compiler constructs
+`res://lib/include\stdio.h` for its embedded header on this path. A local path-selection change
+let it find the header, but a `puts` program
+printed only its first character and a `putchar` program produced invalid Wasm. Those failures
+remain a compiler-guest compatibility gate, not a supported workflow.
+
 The first Wasmi build used a recursive instruction dispatcher and overflowed the host stack on a
 100,000-fuel loop. Enabling Wasmi's `portable-dispatch` feature fixed that case. Keep the loop
 regression test: fuel alone is insufficient if the interpreter consumes host stack per step.
@@ -31,7 +42,7 @@ regression test: fuel alone is insufficient if the interpreter consumes host sta
 |---|---|---|
 | 0. Validate and run bounded Wasm with virtual stdio and VFS | Demonstrated with WAT ABI tests, a standalone Rust WASI `wc`, and a Wasm-hosted WCPL compiling/running a minimal C program. Regular-file handles now use process-owned descriptors. | Extend the compiled guest fixture to exercise file writes, close/reopen, and larger inputs. |
 | 1. Model a full logical Wasm process | **Open.** Buffered stdin works; live pipe reads cannot suspend and resume a Wasm instruction. | Use Wasmi's resumable host-trap API at shellsim's scheduler boundary. Decide how live continuations interact with deterministic session forks. Add pipe, cancellation, and timeout tests. |
-| 2. Build surface | **Open.** `ar`, `ranlib`, `ld`, and a C compiler remain unsupported. | Select the compiler and object ABI first. Then implement bounded archives with a real symbol index, and drive `configure`/`make` with a pinned virtual HTTP fixture. |
+| 2. Build surface | **Partial.** Pinned WCPL can compile and link self-contained one- and two-file C programs through the shell. libc-backed output and conventional `ar`/`ld` remain unsupported. | Diagnose the WCPL guest/libc failures; then select the object ABI before implementing archive and linker tools. Prove a checked package build before claiming package support. |
 
 The snapshot constraint is substantive. Shellsim's process continuations and environments are
 cloneable, and a harness fork must make an independent replay snapshot. Wasmi's live `Store` and

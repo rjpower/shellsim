@@ -66,6 +66,26 @@ reject that fork explicitly. The Rust shell program image and native `wc` should
 those gates pass.
 
 Only after live pipe behavior is sound should shellsim consider a default Wasm `wc`, then a
-streaming command and a filesystem walker. A compiler guest also needs an explicit process
-extension for invoking linker or archive tools; WASI Preview 1 alone does not supply Unix
+streaming command and a filesystem walker. WASI Preview 1 alone does not supply Unix
 `exec`/`wait` semantics.
+
+## Compiler execution and a future process extension
+
+The pinned WCPL guest demonstrates that compilation itself requires no special syscall. The shell
+resolves it as a VFS executable; it reads source and writes a Wasm binary through ordinary virtual
+file descriptors. WCPL links in the same invocation, so the shell can run its output without the
+compiler spawning another process. The current Wasm command path is still buffered, not yet a
+separately scheduled guest program image.
+
+If a compiler driver or a Wasm-hosted shell must launch separate tools, add a versioned
+`shellsim_process_v1` guest import adapter over typed kernel operations, not a compiler-specific
+host callback. The initial contract should accept a validated virtual path, argv, environment,
+cwd, and explicit descriptor inheritance/remapping; return a logical PID; and allow the caller to
+wait for that PID's exit status. `exec` replacement can be a distinct operation after spawn/wait
+works. The native shell would call the same typed kernel operations directly. The adapter must
+reject unsupported flags and paths rather than trying the host.
+
+The blocking `wait` operation is gated on a resumable Wasm continuation. When a child is running,
+the caller must suspend on a scheduler wait reason while the child makes progress; a blocking host
+call or a permanent `EAGAIN` retry loop would deadlock programs that work on Unix. This is why
+the extension should follow live Wasm process scheduling, not precede it.
