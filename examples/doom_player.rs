@@ -231,7 +231,7 @@ fn run() -> Result<(), String> {
     if args.next().is_some() {
         return Err("expected exactly two paths".into());
     }
-    eprintln!("Building external Doomgeneric inside shellsim; this may take about a minute...");
+    eprintln!("Building external Doomgeneric inside shellsim...");
     let environment = doom_support::build(&source, &wad)?;
     let mut session = WasmSession::start(
         environment,
