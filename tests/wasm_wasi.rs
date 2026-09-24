@@ -46,6 +46,24 @@ fn run(environment: &mut Environment, source: &str) -> (i32, Vec<u8>, Vec<u8>) {
 }
 
 #[test]
+fn exception_handling_module_runs_without_extra_host_capabilities() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+            (tag $error (param i32))
+            (func (export "_start")
+                (block $caught (result i32)
+                    (try_table (catch $error $caught)
+                        (i32.const 7)
+                        (throw $error))
+                    (i32.const 0))
+                (drop)))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+}
+
+#[test]
 fn compiled_wasi_wc_matches_native_wc_on_virtual_streams_and_files() {
     let guest = guest_wc();
     let cases = [
