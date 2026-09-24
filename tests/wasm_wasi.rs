@@ -32,6 +32,31 @@ fn compiled_wasi_wc_matches_native_wc_on_virtual_streams_and_files() {
 }
 
 #[test]
+fn compiled_wasi_wc_counts_a_pipe_larger_than_pipe_capacity() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/usr/bin").unwrap();
+    environment
+        .vfs
+        .write(
+            "/",
+            "/usr/bin/wc",
+            include_bytes!("../guest/wc/wc.wasm"),
+            0o755,
+        )
+        .unwrap();
+    environment
+        .vfs
+        .write("/", "/work/input", &vec![b'x'; 131_072], 0o644)
+        .unwrap();
+
+    let script = "cat /work/input | wc -c | cat";
+    assert_eq!(
+        run(&mut environment, script),
+        (0, b"131072\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
 fn compiled_wasi_wc_rejects_invalid_option_without_host_execution() {
     let mut environment = Environment::new();
     environment

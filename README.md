@@ -127,11 +127,14 @@ exported environment variables, the virtual clock, deterministic random bytes, a
 file access relative to the virtual working directory. It does not expose host files, processes,
 network, environment, or time. Invalid modules and unavailable imports fail with a diagnostic.
 
-This is an execution spike, not full WASI process support. Live pipe reads cannot suspend a Wasm
-instruction yet; the shell buffers input before starting the module. Directory operations,
-`poll_oneoff`, sockets, and the C compiler, archive, and linker commands remain unsupported. A
-prebuilt `wasm32-wasip1` command that uses only the listed imports can be written to the VFS with
-executable permissions and invoked by path.
+This is not full WASI process support. A compiled `wc` can read pipeline input and write to a
+downstream pipe, including input larger than the pipe buffer, but the shell collects its entire
+stdin before starting Wasm. A producer that needs its consumer to act before EOF can therefore
+still deadlock or exhaust the input memory budget. `poll_oneoff`, sockets, and guest process
+creation remain unsupported. The checked zlib workflow uses a limited Wasm C toolchain and
+virtual archive/link commands; it does not imply general C or ELF compatibility. A prebuilt
+`wasm32-wasip1` command that uses only the listed imports can be written to the VFS with
+executable permissions and invoked by path or through `PATH`.
 
 ## Agent harness
 

@@ -20,6 +20,9 @@ use super::{util::ewln, CommandPoll};
 const MAX_WASM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WASM_MEMORY: usize = 16 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 1024 * 1024;
+// Wasm instructions are cheaper than a modeled CPU unit. This keeps a compiled byte-oriented
+// utility usable on ordinary input without relaxing the host's execution bound.
+const WASM_FUEL_PER_CPU_UNIT: u64 = 10;
 const ERRNO_SUCCESS: i32 = 0;
 const ERRNO_BADF: i32 = 8;
 const ERRNO_FAULT: i32 = 21;
@@ -1018,7 +1021,12 @@ pub(super) fn run(
     };
     let mut store = Store::new(&engine, host);
     store.limiter(|host| &mut host.limits);
-    let fuel = store.data().interp.resources.cpu_remaining();
+    let fuel = store
+        .data()
+        .interp
+        .resources
+        .cpu_remaining()
+        .saturating_mul(WASM_FUEL_PER_CPU_UNIT);
     if store.set_fuel(fuel).is_err() {
         store
             .data_mut()
@@ -1041,7 +1049,8 @@ pub(super) fn run(
             start.call(&mut store, &[], &mut [])
         });
     let consumed = fuel.saturating_sub(store.get_fuel().unwrap_or(0));
-    let _ = store.data_mut().interp.resources.charge_cpu(consumed);
+    let cpu_cost = consumed.saturating_add(WASM_FUEL_PER_CPU_UNIT - 1) / WASM_FUEL_PER_CPU_UNIT;
+    let _ = store.data_mut().interp.resources.charge_cpu(cpu_cost);
     let open_files = std::mem::take(&mut store.data_mut().open_files);
     for fd in open_files {
         let _ = syscalls::close(store.data_mut().interp, fd);

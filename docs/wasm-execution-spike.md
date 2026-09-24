@@ -9,9 +9,10 @@ compiled Rust `wasm32-wasip1` `wc` fixture reads piped input and virtual files, 
 outputs match the native `wc`. It rejects unknown imports and never grants
 the guest host filesystem, process, network, environment, or clock access. WAT integration cases
 cover stdout, stdin, exit status, arguments, environment, time, regular-file creation, invalid
-guest pointers, memory limits, fuel exhaustion, and unknown imports. This is a useful Stage 0
-result, but not a completed Stage 1 or Stage 2 implementation. Stdio is still buffered at command
-dispatch; a Wasm guest cannot yet suspend on a live pipe or be cloned as a live process snapshot.
+guest pointers, memory limits, fuel exhaustion, and unknown imports. A multi-stage `wc` pipeline
+also handles input larger than pipe capacity under default limits. Stdio is still buffered at
+command dispatch; a Wasm guest cannot yet suspend on a live pipe or be cloned as a live process
+snapshot.
 
 A concrete compiler trial used WCPL revision `458a542ca81fa7a8fd8c8eed38a32dce8ed45135` in a
 temporary checkout. A trusted native bootstrap built a 307 KiB `wcpl.wasm`. Loaded into shellsim's
@@ -40,9 +41,9 @@ regression test: fuel alone is insufficient if the interpreter consumes host sta
 
 | Gate | Current state | Required next work |
 |---|---|---|
-| 0. Validate and run bounded Wasm with virtual stdio and VFS | Demonstrated with WAT ABI tests, a standalone Rust WASI `wc`, and a Wasm-hosted WCPL compiling/running a minimal C program. Regular-file handles now use process-owned descriptors. | Extend the compiled guest fixture to exercise file writes, close/reopen, and larger inputs. |
+| 0. Validate and run bounded Wasm with virtual stdio and VFS | Demonstrated with WAT ABI tests, a standalone Rust WASI `wc`, and a Wasm-hosted compiler workflow. Regular-file handles use process-owned descriptors; a multi-stage `wc` pipeline handles input larger than pipe capacity. | Extend the compiled guest fixture to exercise file writes and close/reopen. |
 | 1. Model a full logical Wasm process | **Open.** Buffered stdin works; live pipe reads cannot suspend and resume a Wasm instruction. | Use Wasmi's resumable host-trap API at shellsim's scheduler boundary. Decide how live continuations interact with deterministic session forks. Add pipe, cancellation, and timeout tests. |
-| 2. Build surface | **Partial.** Pinned WCPL can compile and link self-contained one- and two-file C programs through the shell. libc-backed output and conventional `ar`/`ld` remain unsupported. | Diagnose the WCPL guest/libc failures; then select the object ABI before implementing archive and linker tools. Prove a checked package build before claiming package support. |
+| 2. Build surface | **Partial beyond the checked zlib workflow.** A limited Wasm C toolchain and virtual archive/link commands build pinned zlib through `./configure && make`; see [the build result](zlib-build-goal.md). | Broaden compiler and object compatibility before claiming general C package support. |
 
 The snapshot constraint is substantive. Shellsim's process continuations and environments are
 cloneable, and a harness fork must make an independent replay snapshot. Wasmi's live `Store` and

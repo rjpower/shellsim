@@ -32,11 +32,10 @@ handle table. The compiled `guest/wc/wc.wasm` fixture proves that a standalone R
 can read piped input and virtual files and match selected native `wc` behavior. The fixture is
 loaded into the VFS only by tests; standard `wc` remains native.
 
-For migration, an executable placed at an explicit standard path such as `/usr/bin/wc` now takes
-precedence over the synthetic native alias at that path. If no VFS entry exists, `/usr/bin/find`
-and similar paths still reach their native implementations. Bare `wc` and `find` remain native
-registry commands for now. Replacing a bare command requires an explicit registry and base-image
-change, not just dropping a binary into `PATH`.
+For migration, an executable placed at a standard path such as `/usr/bin/wc` takes precedence
+over the synthetic native alias. A bare `wc` also resolves that executable through `PATH`; if
+no VFS entry exists, the native implementation remains available. This lets a harness opt in to
+the compiled command without changing the default base image.
 
 ## Contract to extend
 
@@ -56,8 +55,10 @@ point so both native and Wasm work count against the same budget.
 
 ## Current limits and next gate
 
-Wasm stdin/stdout/stderr are still buffered at command dispatch. Thus `wc` demonstrates a real
-compiled executable but does not prove suspension on a live pipe. The next slice should move
+Wasm stdin/stdout/stderr are still buffered at command dispatch. The shell drains a producer's
+pipe before starting a Wasm consumer, so a compiled `wc` can count input larger than pipe
+capacity and pass its result to another command. It does not prove suspension on a live pipe:
+an interactive producer-consumer exchange still cannot run. The next slice should move
 stdio onto process descriptors and use Wasmi's resumable host-call mechanism when a descriptor
 returns `IoPoll::Blocked`. A guest continuation must resume at the blocked instruction, not
 restart `_start` or treat temporary absence of input as EOF. Before enabling Wasm by default,
