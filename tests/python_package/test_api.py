@@ -56,9 +56,10 @@ def test_direct_python_uses_the_modeled_process_scheduler() -> None:
 
     assert result.returncode == 0
     assert result.stdout == b"b'child'\n"
+    # Like execvp, PATH lookup does not rewrite the child's argv[0].
     assert [invocation.argv[0] for invocation in result.invocations] == [
         "python3.14",
-        "/usr/bin/printf",
+        "printf",
     ]
 
 
