@@ -12,6 +12,13 @@ use crate::syscalls::{ActiveSystem, SyscallError, System};
 
 mod cat;
 
+/// Invocation view borrowed by a native command for one scheduler quantum.
+/// Only the owned command continuation survives a blocked operation.
+pub(crate) struct ProcessContext<'a> {
+    pub(crate) system: &'a mut dyn System,
+    pub(crate) args: &'a [String],
+}
+
 /// Owned state needed to resume one process after a scheduler turn.
 #[derive(Clone)]
 pub(crate) enum ProgramContinuation {
@@ -59,17 +66,85 @@ pub(crate) enum NativeProcess {
         output: Vec<u8>,
         offset: usize,
     },
-    Mkdir {
-        args: Vec<String>,
-        result: Option<(i32, Vec<u8>)>,
-        offset: usize,
-    },
+    SystemCommand(SystemCommandProcess),
     Cat(cat::CatProcess),
     Failure {
         status: i32,
         message: Vec<u8>,
         offset: usize,
     },
+}
+
+/// Adapter for existing bounded commands whose bodies already use only `System`.
+/// Output is retained across descriptor backpressure; commands with live input use an owned
+/// continuation instead.
+#[derive(Clone)]
+pub(crate) struct SystemCommandProcess {
+    args: Vec<String>,
+    run: crate::commands::SystemCmdFn,
+    result: Option<SystemCommandOutput>,
+}
+
+#[derive(Clone)]
+struct SystemCommandOutput {
+    status: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_offset: usize,
+    stderr_offset: usize,
+}
+
+impl SystemCommandProcess {
+    fn new(run: crate::commands::SystemCmdFn, args: &[String]) -> Self {
+        Self {
+            args: args.to_vec(),
+            run,
+            result: None,
+        }
+    }
+
+    fn poll(&mut self, system: &mut impl System) -> ShellPoll {
+        let result = self.result.get_or_insert_with(|| {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let argument_bytes = self
+                .args
+                .iter()
+                .fold(0_u64, |total, arg| total.saturating_add(arg.len() as u64));
+            let status = if !system.charge_cpu(100_u64.saturating_add(argument_bytes)) {
+                system.stop_status()
+            } else {
+                let mut io = crate::commands::Io {
+                    stdin: Vec::new(),
+                    out: &mut stdout,
+                    err: &mut stderr,
+                };
+                let mut context = ProcessContext {
+                    system,
+                    args: &self.args,
+                };
+                (self.run)(&mut context, &mut io)
+            };
+            SystemCommandOutput {
+                status,
+                stdout,
+                stderr,
+                stdout_offset: 0,
+                stderr_offset: 0,
+            }
+        });
+        match poll_write(system, 1, &result.stdout, &mut result.stdout_offset, 0) {
+            ShellPoll::Ready(0) => {}
+            other => return other,
+        }
+        poll_write(
+            system,
+            2,
+            &result.stderr,
+            &mut result.stderr_offset,
+            result.status,
+        )
+    }
 }
 
 impl NativeProcess {
@@ -101,16 +176,16 @@ impl NativeProcess {
                 let output = line.repeat((4096 / line.len()).max(1));
                 Self::Yes { output, offset: 0 }
             }
-            crate::vfs::NativeProgram::Mkdir => Self::Mkdir {
-                args: argv[1..].to_vec(),
-                result: None,
-                offset: 0,
-            },
             crate::vfs::NativeProgram::Cat => Self::Cat(cat::CatProcess::new(&argv[1..])),
-            crate::vfs::NativeProgram::Registered(_) => Self::failure(
-                125,
-                "registered program needs a command continuation\n".into(),
-            ),
+            crate::vfs::NativeProgram::Registered(name) => {
+                let Some(run) = crate::commands::system_command(name) else {
+                    return Self::failure(
+                        125,
+                        "registered program needs a command continuation\n".into(),
+                    );
+                };
+                Self::SystemCommand(SystemCommandProcess::new(run, &argv[1..]))
+            }
         }
     }
 
@@ -143,31 +218,7 @@ impl NativeProcess {
                 }
                 other => other,
             },
-            Self::Mkdir {
-                args,
-                result,
-                offset,
-            } => {
-                let (status, diagnostic) = result.get_or_insert_with(|| {
-                    let mut stdout = Vec::new();
-                    let mut stderr = Vec::new();
-                    let argument_bytes = args
-                        .iter()
-                        .fold(0_u64, |total, arg| total.saturating_add(arg.len() as u64));
-                    let status = if !syscalls.charge_cpu(100_u64.saturating_add(argument_bytes)) {
-                        syscalls.stop_status()
-                    } else {
-                        let mut io = crate::commands::Io {
-                            stdin: Vec::new(),
-                            out: &mut stdout,
-                            err: &mut stderr,
-                        };
-                        crate::commands::fs::run_mkdir(syscalls, args, &mut io)
-                    };
-                    (status, stderr)
-                });
-                poll_write(syscalls, 2, diagnostic, offset, *status)
-            }
+            Self::SystemCommand(command) => command.poll(syscalls),
             Self::Cat(cat) => cat.poll(syscalls),
             Self::Failure {
                 status,

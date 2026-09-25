@@ -10,25 +10,14 @@ class. `shell.rs` already owns syntax, `exec.rs` runs commands, and state-changi
 in the shell process. Their source files need not be combined; their authority should be limited
 to the shell's process-scoped syscall interface.
 
-The current machine already creates a root process with descriptors and a scheduler entry, and
-program continuations belong to logical processes. A child argv loader can retain either a
-shell continuation or a native Rust image. The first images that use the scoped `System` handle
-are `pwd`, `true`, `false`, `yes`, `mkdir`, and `cat`. All registered Rust commands now have opaque executable
-entries in the virtual `/usr/bin`, resolved through the same cwd and
-`PATH` search as Wasm files and scripts when launched as external commands. Bare names that are
-shell builtins still run in the shell process. The native images receive a
-borrowed, process-scoped syscall handle for the current poll quantum; it provides cwd, descriptor
-write, and resource accounting, not `Environment` or host handles. Their owned state survives
-blocked and partial writes. Registered commands not yet ported to `System` still run through the
-existing dispatcher after VFS resolution. The shell still boots as the root logical process.
-It does not yet enforce the stronger boundary:
-shell and most native-command code can still mutate `Environment` directly, the WASI adapter
-still holds `Interp` while translating imports, and some external native commands execute as
-functions in the active process. The target is a loader that starts `/bin/sh`
-by default, treats Rust, Wasm, and Python program images as ordinary processes, and runs each
-external invocation as a child or `exec` replacement. Generic process state should be separate
-from shell-only variables, aliases, functions, job control, and parser state. Builtins such as
-`cd` and `export` still act in the shell PID; they do not require kernel privilege.
+The current machine creates logical processes with descriptors and scheduler entries. Native
+executables are opaque VFS nodes resolved through cwd and `PATH`, just like Wasm files and scripts.
+A process continuation borrows a PID-scoped `System` handle for each poll and retains only owned
+state across blocking operations. Existing registered commands are migrating to this interface;
+those not yet ported still use a dispatcher with broad `Interp` access. The target loader starts
+`/bin/sh` by default and treats the shell as another process image. Shell-only variables,
+aliases, functions, jobs, and parser state stay with that image. Builtins such as `cd` and
+`export` still run in the shell PID, but need no kernel privilege.
 
 The host can now create additional persistent shell sessions in one `Environment` and select a
 session for each action. Sessions share the VFS and scheduler, but retain separate shell state,
@@ -42,15 +31,9 @@ receive it directly; the Wasm adapter should translate imports to the same opera
 `cd`/`pwd` and `umask` now use this interface for process cwd and creation mask. The shell keeps
 `PWD` and `OLDPWD` variables in its own userland state after a successful `chdir`.
 Descriptor and filesystem operations have typed results; the Wasm adapter uses `System` for
-open files, file metadata, directory mutation, and the virtual display. Native `ls` uses typed
-metadata, directory listing, and tree walking; external `mkdir` is a scheduler-owned native
-image that creates directories through its scoped handle. The shell still invokes `ls` through
-the legacy dispatcher, and WASI stdio buffering, clock, and process imports still need to move
-to this boundary.
-Native `cat` reads stdin, virtual files, and generated devices through process descriptors. It
-suspends on input and pipe readiness and retains only owned continuation state. The argv child
-launcher now distinguishes inherited fd 0 from an explicitly supplied empty input stream;
-retained actions report the child's blocking resource through the shell's child wait.
+open files, file metadata, directory mutation, and the virtual display. A shared native command
+adapter now runs typed command bodies as scheduled processes. WASI stdio buffering, clock, and
+process imports still need to move to this boundary.
 
 The new `syscalls.rs` begins this boundary for regular files. It accepts typed open options,
 allocates descriptors in the active process, and owns close and seek. The WASI adapter now uses
@@ -58,9 +41,6 @@ those descriptors for open, read, write, seek, stat, and close; it no longer kee
 handle table. The source-built `guest/wc` fixture proves that a standalone Rust WASI command
 can read piped input and virtual files and match selected native `wc` behavior. The fixture is
 loaded into the VFS only by tests; standard `wc` remains native.
-Native `yes` now runs as a VFS executable and resumes across pipe backpressure through a
-process-scoped syscall handle. A typed broken-pipe result determines its exit status without
-matching an error message.
 
 Replacing `/usr/bin/wc` with a Wasm file selects that file through ordinary VFS lookup. If a
 registered executable is removed or absent from `PATH`, shellsim reports command not found; it
@@ -85,8 +65,7 @@ point so both native and Wasm work count against the same budget.
 
 ## Current limits and next gate
 
-Extend `System` with the remaining typed process operations, then load the filesystem-walking
-utility as a native process image. The legacy command registry still
+Extend `System` with the remaining typed process operations. The legacy command registry still
 hands most native bodies a `CommandContext` that dereferences to all of `Interp`; remove that
 access as commands migrate, rather than renaming it and retaining broad authority.
 Finally, give the Rust shell a process-scoped handle for execution, files, and process control;

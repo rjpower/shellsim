@@ -17,7 +17,6 @@ pub enum NativeProgram {
     False,
     Pwd,
     Yes,
-    Mkdir,
     Cat,
     /// Existing Rust command body pending migration to the scoped `System` interface.
     Registered(&'static str),
@@ -30,7 +29,6 @@ impl NativeProgram {
             "false" => Some(Self::False),
             "pwd" => Some(Self::Pwd),
             "yes" => Some(Self::Yes),
-            "mkdir" => Some(Self::Mkdir),
             "cat" => Some(Self::Cat),
             _ => None,
         }
@@ -42,7 +40,6 @@ impl NativeProgram {
             Self::False => "false",
             Self::Pwd => "pwd",
             Self::Yes => "yes",
-            Self::Mkdir => "mkdir",
             Self::Cat => "cat",
             Self::Registered(name) => name,
         }

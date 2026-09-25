@@ -272,6 +272,9 @@ pub(crate) struct FileInfo {
     pub size: u64,
     pub link_target: Option<String>,
     pub mtime_ms: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub native_executable: bool,
 }
 
 /// Kinds observable through the virtual filesystem interface.
@@ -284,14 +287,14 @@ pub(crate) enum FileKind {
 
 impl From<crate::vfs::Node> for FileInfo {
     fn from(node: crate::vfs::Node) -> Self {
-        let (kind, size, link_target) = match node.kind {
-            NodeKind::File(data) => (FileKind::File, data.len() as u64, None),
-            NodeKind::Dir => (FileKind::Directory, 0, None),
+        let (kind, size, link_target, native_executable) = match node.kind {
+            NodeKind::File(data) => (FileKind::File, data.len() as u64, None, false),
+            NodeKind::Dir => (FileKind::Directory, 0, None, false),
             NodeKind::Symlink(target) => {
                 let size = target.len() as u64;
-                (FileKind::Symlink, size, Some(target))
+                (FileKind::Symlink, size, Some(target), false)
             }
-            NodeKind::NativeExecutable(_) => (FileKind::File, 0, None),
+            NodeKind::NativeExecutable(_) => (FileKind::File, 0, None, true),
         };
         Self {
             kind,
@@ -299,6 +302,9 @@ impl From<crate::vfs::Node> for FileInfo {
             size,
             link_target,
             mtime_ms: node.mtime,
+            uid: node.uid,
+            gid: node.gid,
+            native_executable,
         }
     }
 }

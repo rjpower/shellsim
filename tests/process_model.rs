@@ -136,6 +136,98 @@ fn native_mkdir_uses_the_child_system_handle() {
 }
 
 #[test]
+fn typed_registered_commands_run_in_child_processes() {
+    let mut env = Environment::new();
+    env.vfs.mkdir("/", "/work/typed").unwrap();
+    env.vfs
+        .write("/", "/work/typed/item", b"content", 0o644)
+        .unwrap();
+
+    assert_eq!(
+        run(&mut env, "env -C /work ls typed"),
+        (0, "item\n".into(), "".into())
+    );
+    assert_eq!(run(&mut env, "env -C /work mv typed/item typed/moved").0, 0);
+    assert_eq!(run(&mut env, "chmod 600 /work/typed/moved").0, 0);
+    assert_eq!(
+        env.vfs
+            .metadata("/", "/work/typed/moved", true)
+            .unwrap()
+            .mode
+            & 0o777,
+        0o600
+    );
+    assert_eq!(run(&mut env, "rmdir /work/typed").0, 1);
+    assert_eq!(
+        run(&mut env, "stat -c '%a:%s' /work/typed/moved"),
+        (0, "600:7\n".into(), "".into())
+    );
+    assert_eq!(run(&mut env, "du -b /work/typed").1, "7\t/work/typed\n");
+    assert!(run(&mut env, "tree /work/typed").1.contains("└── moved"));
+    assert_eq!(run(&mut env, "basename /work/typed/moved").1, "moved\n");
+    assert_eq!(
+        run(&mut env, "dirname /work/typed/moved").1,
+        "/work/typed\n"
+    );
+    assert_eq!(run(&mut env, "chmod -R 700 /work/absent").0, 1);
+    env.vfs.remove_file("/", "/work/typed/moved").unwrap();
+    assert_eq!(run(&mut env, "rmdir /work/typed").0, 0);
+    for command in [
+        "ls", "mv", "chmod", "rmdir", "stat", "du", "tree", "basename", "dirname",
+    ] {
+        assert!(
+            env.invocations.events().iter().any(|event| {
+                event.pid != 1_234
+                    && event.argv.first().is_some_and(|arg| arg == command)
+                    && event.status.is_some()
+            }),
+            "{command} did not run in a child process"
+        );
+    }
+    env.vfs
+        .copy_file("/", "/usr/bin/ls", "/work/list-typed")
+        .unwrap();
+    assert_eq!(run(&mut env, "/work/list-typed /work").0, 0);
+    env.vfs.remove_file("/", "/usr/bin/ls").unwrap();
+    assert_eq!(run(&mut env, "ls /work").0, 127);
+}
+
+#[test]
+fn typed_registered_output_obeys_the_shared_limit() {
+    let mut env = Environment::with_limits(Limits {
+        cpu: 1_000_000,
+        memory: 16 * 1024 * 1024,
+        disk: 16 * 1024 * 1024,
+        output: 8,
+    });
+    for name in ["first", "second", "third"] {
+        env.vfs
+            .write("/", &format!("/work/{name}"), b"", 0o644)
+            .unwrap();
+    }
+    let (outcome, stdout, _) = env.run_script_capture("ls /work");
+    assert_eq!(outcome.exit_status, 137);
+    assert!(stdout.len() <= 8);
+    assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
+}
+
+#[test]
+fn typed_registered_output_resumes_across_pipe_backpressure() {
+    let mut env = Environment::new();
+    env.vfs.mkdir("/", "/work/many").unwrap();
+    let suffix = "x".repeat(90);
+    for index in 0..800 {
+        env.vfs
+            .write("/", &format!("/work/many/{index:04}-{suffix}"), b"", 0o644)
+            .unwrap();
+    }
+    assert_eq!(
+        run(&mut env, "ls /work/many | wc -l"),
+        (0, "800\n".into(), "".into())
+    );
+}
+
+#[test]
 fn native_images_are_opaque_vfs_executables_found_through_path() {
     let mut env = Environment::new();
     let node = env.vfs.metadata("/", "/usr/bin/pwd", true).unwrap();
