@@ -6,6 +6,7 @@
 use crate::descriptors::{DescriptorError, Fd, FileState, IoPoll, MAX_FDS_PER_PROCESS};
 use crate::display::{DisplayError, KeyEvent};
 use crate::interp::Interp;
+use crate::net::{HttpRequest, HttpResponse, NetworkRequest, RequestError, RouteError};
 use crate::vfs::{resolve_against, NodeKind, VfsError};
 
 /// Virtual clock selected by a guest ABI or native process.
@@ -106,6 +107,18 @@ pub(crate) trait System {
     fn clock_time_ns(&self, clock: ClockId) -> Result<u64, SyscallError>;
     fn random_fill(&mut self, bytes: &mut [u8]) -> Result<(), SyscallError>;
     fn allocate_temp_id(&mut self) -> Option<u64>;
+    /// Submit a request to the configured virtual route table, never to the host network.
+    fn http_request(&mut self, request: HttpRequest) -> Result<HttpResponse, RequestError>;
+    fn http_route_static(
+        &mut self,
+        pattern: &str,
+        status: u16,
+        body: Vec<u8>,
+    ) -> Result<(), RouteError>;
+    fn http_route_file(&mut self, pattern: &str, path: &str) -> Result<(), RouteError>;
+    fn network_listen(&mut self, host_port: &str);
+    fn network_request_count(&self) -> usize;
+    fn network_request_at(&self, index: usize) -> Option<NetworkRequest>;
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError>;
     fn display_present(
         &mut self,
@@ -399,6 +412,35 @@ impl System for ActiveSystem<'_> {
 
     fn allocate_temp_id(&mut self) -> Option<u64> {
         self.interp.next_temp_id()
+    }
+
+    fn http_request(&mut self, request: HttpRequest) -> Result<HttpResponse, RequestError> {
+        self.interp.net.request(request, &self.interp.vfs)
+    }
+
+    fn http_route_static(
+        &mut self,
+        pattern: &str,
+        status: u16,
+        body: Vec<u8>,
+    ) -> Result<(), RouteError> {
+        self.interp.net.route_static(pattern, status, body)
+    }
+
+    fn http_route_file(&mut self, pattern: &str, path: &str) -> Result<(), RouteError> {
+        self.interp.net.route_vfs(pattern, path)
+    }
+
+    fn network_listen(&mut self, host_port: &str) {
+        self.interp.net.listen(host_port);
+    }
+
+    fn network_request_count(&self) -> usize {
+        self.interp.net.log.len()
+    }
+
+    fn network_request_at(&self, index: usize) -> Option<NetworkRequest> {
+        self.interp.net.log.get(index).cloned()
     }
 
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError> {
