@@ -607,16 +607,13 @@ impl Environment {
             ("false", crate::vfs::NativeProgram::False),
             ("pwd", crate::vfs::NativeProgram::Pwd),
             ("yes", crate::vfs::NativeProgram::Yes),
-            ("mkdir", crate::vfs::NativeProgram::Mkdir),
+            ("cat", crate::vfs::NativeProgram::Cat),
         ] {
             vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
         }
-        for name in crate::commands::registered_executable_names() {
-            if crate::vfs::NativeProgram::from_name(name).is_none() {
-                vfs.seed_native_executable(
-                    &format!("/usr/bin/{name}"),
-                    crate::vfs::NativeProgram::Registered(name),
-                );
+        for (path, image) in crate::commands::registered_executables() {
+            if crate::vfs::NativeProgram::from_name(image.name()).is_none() {
+                vfs.seed_native_executable(&path, image);
             }
         }
         const ROOT_PID: ProcessId = 1_234;
@@ -749,8 +746,8 @@ impl Environment {
                     .map(|node| node.kind)
                 {
                     Some(crate::vfs::NodeKind::NativeExecutable(
-                        crate::vfs::NativeProgram::Registered(_),
-                    )) => {
+                        crate::vfs::NativeProgram::Registered(name),
+                    )) if crate::commands::system_command(name).is_none() => {
                         argv[0] = path;
                         None
                     }

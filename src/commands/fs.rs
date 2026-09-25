@@ -12,35 +12,43 @@ use crate::syscalls::{FileKind, System};
 use crate::vfs::resolve_against;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
-    reg(m, &["ls"], Trust::Real, cmd_ls);
-    reg(m, &["mkdir"], Trust::Real, cmd_mkdir);
-    reg(m, &["rmdir"], Trust::Real, cmd_rmdir);
+    use super::{reg, reg_system};
+    reg_system(m, "/usr/bin/ls", Trust::Real, cmd_ls, run_ls);
+    reg_system(m, "/usr/bin/mkdir", Trust::Real, cmd_mkdir, run_mkdir);
+    reg_system(m, "/usr/bin/rmdir", Trust::Real, cmd_rmdir, run_rmdir);
     reg(m, &["rm"], Trust::Real, cmd_rm);
     reg(m, &["cp"], Trust::Real, cmd_cp);
-    reg(m, &["mv"], Trust::Real, cmd_mv);
+    reg_system(m, "/usr/bin/mv", Trust::Real, cmd_mv, run_mv);
     reg(m, &["touch"], Trust::Real, cmd_touch);
     reg(m, &["ln"], Trust::Real, cmd_ln);
-    reg(m, &["chmod"], Trust::Real, cmd_chmod);
+    reg_system(m, "/usr/bin/chmod", Trust::Real, cmd_chmod, run_chmod);
     reg(m, &["chown", "chgrp"], Trust::Real, cmd_chown);
-    reg(m, &["basename"], Trust::Real, cmd_basename);
-    reg(m, &["dirname"], Trust::Real, cmd_dirname);
+    reg_system(
+        m,
+        "/usr/bin/basename",
+        Trust::Real,
+        cmd_basename,
+        run_basename,
+    );
+    reg_system(m, "/usr/bin/dirname", Trust::Real, cmd_dirname, run_dirname);
     reg(m, &["realpath"], Trust::Real, cmd_realpath);
     reg(m, &["readlink"], Trust::Real, cmd_readlink);
-    reg(m, &["stat"], Trust::Real, cmd_stat);
-    reg(m, &["du"], Trust::Real, cmd_du);
+    reg_system(m, "/usr/bin/stat", Trust::Real, cmd_stat, run_stat);
+    reg_system(m, "/usr/bin/du", Trust::Real, cmd_du, run_du);
     reg(m, &["mktemp"], Trust::Real, cmd_mktemp);
     reg(m, &["file"], Trust::Real, cmd_file);
     reg(m, &["install"], Trust::Real, cmd_install);
     reg(m, &["truncate"], Trust::Real, cmd_truncate);
-    reg(m, &["tree"], Trust::Real, cmd_tree);
+    reg_system(m, "/usr/bin/tree", Trust::Real, cmd_tree, run_tree);
 }
 
 fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    run_ls(&mut interp.system(), args, io)
+    super::run_system_from_legacy(interp, args, io, run_ls)
 }
 
-fn run_ls(system: &mut impl System, args: &[String], io: &mut Io) -> i32 {
+fn run_ls(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let mut flags = Vec::new();
     let mut ops = Vec::new();
     let mut options = true;
@@ -167,7 +175,7 @@ fn run_ls(system: &mut impl System, args: &[String], io: &mut Io) -> i32 {
 }
 
 fn emit_listing(
-    system: &mut impl System,
+    system: &mut dyn System,
     dir: &str,
     entries: &[String],
     long: bool,
@@ -261,11 +269,13 @@ fn reject_options(
 }
 
 fn cmd_mkdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    run_mkdir(&mut interp.system(), args, io)
+    super::run_system_from_legacy(interp, args, io, run_mkdir)
 }
 
 /// Execute directory creation through one process-scoped kernel handle.
-pub(crate) fn run_mkdir(system: &mut impl System, args: &[String], io: &mut Io) -> i32 {
+fn run_mkdir(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let (flags, ops, long) = split_flags(args);
     if reject_options("mkdir", &flags, "p", &long, io) {
         return 2;
@@ -295,6 +305,12 @@ pub(crate) fn run_mkdir(system: &mut impl System, args: &[String], io: &mut Io) 
 }
 
 fn cmd_rmdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    super::run_system_from_legacy(interp, args, io, run_rmdir)
+}
+
+fn run_rmdir(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let (flags, ops, long) = split_flags(args);
     if reject_options("rmdir", &flags, "", &long, io) {
         return 2;
@@ -303,7 +319,6 @@ fn cmd_rmdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
         ewln(io.err, "rmdir: missing operand");
         return 1;
     }
-    let mut system = interp.system();
     let cwd = system.cwd().to_string();
     let mut status = 0;
     for d in &ops {
@@ -417,6 +432,12 @@ fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
 }
 
 fn cmd_mv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    super::run_system_from_legacy(interp, args, io, run_mv)
+}
+
+fn run_mv(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let (flags, ops, long) = split_flags(args);
     if reject_options("mv", &flags, "f", &long, io) {
         return 2;
@@ -425,12 +446,12 @@ fn cmd_mv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         ewln(io.err, "mv: missing destination operand");
         return 1;
     }
-    let cwd = interp.cwd.clone();
+    let cwd = system.cwd().to_string();
     let dest = ops.last().unwrap();
     let destination_is_dir = matches!(
-        interp.fs_metadata(&cwd, dest, true),
-        Ok(crate::vfs::Node {
-            kind: crate::vfs::NodeKind::Dir,
+        system.metadata(&cwd, dest, true),
+        Ok(crate::syscalls::FileInfo {
+            kind: FileKind::Directory,
             ..
         })
     );
@@ -445,7 +466,7 @@ fn cmd_mv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         } else {
             (*dest).clone()
         };
-        if let Err(e) = interp.vfs.rename(&cwd, s, &target) {
+        if let Err(e) = system.rename(&cwd, s, &target) {
             ewln(io.err, &format!("mv: cannot move '{s}': {e}"));
             status = 1;
         }
@@ -551,6 +572,12 @@ fn parse_mode(s: &str, cur: u32) -> u32 {
 }
 
 fn cmd_chmod(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    super::run_system_from_legacy(interp, args, io, run_chmod)
+}
+
+fn run_chmod(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let mut recursive = false;
     let mut mode_arg = None;
     let mut targets = Vec::new();
@@ -570,23 +597,29 @@ fn cmd_chmod(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
         ewln(io.err, "chmod: missing operand");
         return 1;
     };
-    let cwd = interp.cwd.clone();
+    let cwd = system.cwd().to_string();
     let mut status = 0;
     for t in &targets {
         let paths = if recursive {
             let abs = crate::vfs::resolve_against(&cwd, t);
-            interp.vfs.walk(&abs)
+            match system.walk("/", &abs) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    ewln(io.err, &format!("chmod: {error}"));
+                    status = 1;
+                    continue;
+                }
+            }
         } else {
             vec![crate::vfs::resolve_against(&cwd, t)]
         };
         for p in paths {
-            let cur = interp
-                .vfs
+            let cur = system
                 .metadata("/", &p, true)
                 .map(|n| n.mode)
                 .unwrap_or(0o644);
             let m = parse_mode(&mode_arg, cur);
-            if let Err(e) = interp.vfs.chmod("/", &p, m) {
+            if let Err(e) = system.chmod("/", &p, m) {
                 ewln(io.err, &format!("chmod: {e}"));
                 status = 1;
             }
@@ -636,7 +669,12 @@ fn parse_owner(spec: &str) -> (Option<u32>, Option<u32>) {
     }
 }
 
-fn cmd_basename(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_basename(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    super::run_system_from_legacy(interp, args, io, run_basename)
+}
+
+fn run_basename(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     let Some(p) = args.first() else { return 1 };
     let trimmed = p.trim_end_matches('/');
     let mut base = if trimmed.is_empty() && p.starts_with('/') {
@@ -653,7 +691,12 @@ fn cmd_basename(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) 
     0
 }
 
-fn cmd_dirname(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_dirname(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    super::run_system_from_legacy(interp, args, io, run_dirname)
+}
+
+fn run_dirname(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     let Some(p) = args.first() else { return 1 };
     let p = p.trim_end_matches('/');
     if p.is_empty() {
@@ -726,6 +769,13 @@ fn realpath_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -
 }
 
 fn cmd_stat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    super::run_system_from_legacy(interp, args, io, run_stat)
+}
+
+fn run_stat(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
+    let cwd = system.cwd().to_string();
     let (_f, ops, long) = split_flags(args);
     let fmt = long
         .iter()
@@ -776,12 +826,9 @@ fn cmd_stat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         }
     }
     for f in &files {
-        match interp.fs_metadata(&interp.cwd, f, follow) {
+        match system.metadata(&cwd, f, follow) {
             Ok(n) => {
-                let size = match &n.kind {
-                    crate::vfs::NodeKind::File(d) => d.len(),
-                    _ => 0,
-                };
+                let size = if n.kind == FileKind::File { n.size } else { 0 };
                 if let Some(fmt) = &format {
                     let s = fmt
                         .replace("%%", "\0")
@@ -791,14 +838,14 @@ fn cmd_stat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                         .replace("%U", "root")
                         .replace("%u", &n.uid.to_string())
                         .replace("%g", &n.gid.to_string())
-                        .replace("%Y", &(n.mtime / 1000).to_string())
+                        .replace("%Y", &(n.mtime_ms / 1000).to_string())
                         .replace(
                             "%F",
                             match n.kind {
-                                crate::vfs::NodeKind::File(_) => "regular file",
-                                crate::vfs::NodeKind::Dir => "directory",
-                                crate::vfs::NodeKind::Symlink(_) => "symbolic link",
-                                crate::vfs::NodeKind::NativeExecutable(_) => "native executable",
+                                FileKind::File if n.native_executable => "native executable",
+                                FileKind::File => "regular file",
+                                FileKind::Directory => "directory",
+                                FileKind::Symlink => "symbolic link",
                             },
                         )
                         .replace("%N", f)
@@ -818,6 +865,13 @@ fn cmd_stat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
 }
 
 fn cmd_du(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    super::run_system_from_legacy(interp, args, io, run_du)
+}
+
+fn run_du(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
+    let cwd = system.cwd().to_string();
     let (flags, ops, long) = split_flags(args);
     if flags.iter().any(|flag| !matches!(flag, 's' | 'b')) || !long.is_empty() {
         ewln(io.err, "du: unimplemented option");
@@ -831,14 +885,15 @@ fn cmd_du(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     };
     let mut status = 0;
     for path in paths {
-        match interp.fs_walk(&interp.cwd, path) {
+        match system.walk(&cwd, path) {
             Ok(nodes) => {
-                let total = nodes.into_iter().fold(0usize, |sum, node| {
-                    sum.saturating_add(match interp.fs_metadata("/", &node, false) {
-                        Ok(crate::vfs::Node {
-                            kind: crate::vfs::NodeKind::File(data),
+                let total = nodes.into_iter().fold(0u64, |sum, node| {
+                    sum.saturating_add(match system.metadata("/", &node, false) {
+                        Ok(crate::syscalls::FileInfo {
+                            kind: FileKind::File,
+                            size,
                             ..
-                        }) => data.len(),
+                        }) => size,
                         _ => 0,
                     })
                 });
@@ -1253,6 +1308,13 @@ fn parse_size_change(value: &str) -> Option<SizeChange> {
 }
 
 fn cmd_tree(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    super::run_system_from_legacy(interp, args, io, run_tree)
+}
+
+fn run_tree(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
+    let cwd = system.cwd().to_string();
     let mut all = false;
     let mut max_depth = None;
     let mut operands = Vec::new();
@@ -1292,7 +1354,7 @@ fn cmd_tree(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         return 2;
     }
     let root = operands.first().map_or(".", String::as_str);
-    let node = match interp.fs_metadata(&interp.cwd, root, false) {
+    let node = match system.metadata(&cwd, root, false) {
         Ok(node) => node,
         Err(error) => {
             ewln(io.err, &format!("tree: {root}: {error}"));
@@ -1302,9 +1364,9 @@ fn cmd_tree(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     wln(io.out, root);
     let mut directories = 0usize;
     let mut files = 0usize;
-    if matches!(node.kind, crate::vfs::NodeKind::Dir) {
+    if matches!(node.kind, FileKind::Directory) {
         let status = tree_directory(
-            interp,
+            system,
             root,
             "",
             1,
@@ -1334,7 +1396,7 @@ fn cmd_tree(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
 
 #[allow(clippy::too_many_arguments)]
 fn tree_directory(
-    interp: &mut CommandContext<'_>,
+    system: &mut dyn System,
     path: &str,
     prefix: &str,
     depth: usize,
@@ -1344,7 +1406,8 @@ fn tree_directory(
     files: &mut usize,
     io: &mut Io,
 ) -> i32 {
-    let mut entries = match interp.fs_list_dir(&interp.cwd, path) {
+    let cwd = system.cwd().to_string();
+    let mut entries = match system.list_dir(&cwd, path) {
         Ok(entries) => entries,
         Err(error) => {
             ewln(io.err, &format!("tree: {path}: {error}"));
@@ -1356,8 +1419,8 @@ fn tree_directory(
         entries.retain(|entry| !entry.starts_with('.'));
     }
     for (position, entry) in entries.iter().enumerate() {
-        if !interp.charge_cpu(1) {
-            return 137;
+        if !system.charge_cpu(1) {
+            return system.stop_status();
         }
         let last = position + 1 == entries.len();
         let child = if path == "/" {
@@ -1365,17 +1428,17 @@ fn tree_directory(
         } else {
             format!("{}/{entry}", path.trim_end_matches('/'))
         };
-        let node = match interp.fs_metadata(&interp.cwd, &child, false) {
+        let node = match system.metadata(&cwd, &child, false) {
             Ok(node) => node,
             Err(error) => {
                 ewln(io.err, &format!("tree: {child}: {error}"));
                 return 1;
             }
         };
-        let suffix = match &node.kind {
-            crate::vfs::NodeKind::Symlink(target) => format!(" -> {target}"),
-            _ => String::new(),
-        };
+        let suffix = node
+            .link_target
+            .as_ref()
+            .map_or_else(String::new, |target| format!(" -> {target}"));
         wln(
             io.out,
             &format!(
@@ -1384,12 +1447,12 @@ fn tree_directory(
             ),
         );
         match node.kind {
-            crate::vfs::NodeKind::Dir => {
+            FileKind::Directory => {
                 *directories = directories.saturating_add(1);
                 if max_depth.is_none_or(|maximum| depth < maximum) {
                     let next_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
                     let status = tree_directory(
-                        interp,
+                        system,
                         &child,
                         &next_prefix,
                         depth + 1,

@@ -21,13 +21,26 @@ fn run(env: &mut Environment, source: &str) -> (i32, String, String) {
 #[test]
 fn proc_self_describes_the_active_logical_shell() {
     let mut env = Environment::new();
-    let status = run(&mut env, "cat /proc/self/status");
+    let status = run(&mut env, "cat /proc/1234/status");
     assert_eq!(status.0, 0, "{}", status.2);
     assert!(status.1.contains("Name:\tbash\n"), "{}", status.1);
     assert!(status.1.contains("Pid:\t1234\n"), "{}", status.1);
     assert!(status.1.contains("PPid:\t0\n"), "{}", status.1);
     assert!(status.1.contains("NSpgid:\t1234\n"), "{}", status.1);
     assert!(status.1.contains("NSsid:\t1234\n"), "{}", status.1);
+
+    let child_status = run(&mut env, "cat /proc/self/status");
+    assert_eq!(child_status.0, 0, "{}", child_status.2);
+    assert!(
+        child_status.1.contains("PPid:\t1234\n"),
+        "{}",
+        child_status.1
+    );
+    assert!(
+        !child_status.1.lines().any(|line| line == "Pid:\t1234"),
+        "{}",
+        child_status.1
+    );
 
     assert_eq!(run(&mut env, "readlink /proc/self").1, "1234\n");
     assert_eq!(run(&mut env, "readlink /proc/self/cwd").1, "/\n");
@@ -119,6 +132,99 @@ fn native_mkdir_uses_the_child_system_handle() {
         "{}",
         unsupported.2
     );
+    assert!(run(&mut env, "cat --help").2.contains("--help"));
+}
+
+#[test]
+fn typed_registered_commands_run_in_child_processes() {
+    let mut env = Environment::new();
+    env.vfs.mkdir("/", "/work/typed").unwrap();
+    env.vfs
+        .write("/", "/work/typed/item", b"content", 0o644)
+        .unwrap();
+
+    assert_eq!(
+        run(&mut env, "env -C /work ls typed"),
+        (0, "item\n".into(), "".into())
+    );
+    assert_eq!(run(&mut env, "env -C /work mv typed/item typed/moved").0, 0);
+    assert_eq!(run(&mut env, "chmod 600 /work/typed/moved").0, 0);
+    assert_eq!(
+        env.vfs
+            .metadata("/", "/work/typed/moved", true)
+            .unwrap()
+            .mode
+            & 0o777,
+        0o600
+    );
+    assert_eq!(run(&mut env, "rmdir /work/typed").0, 1);
+    assert_eq!(
+        run(&mut env, "stat -c '%a:%s' /work/typed/moved"),
+        (0, "600:7\n".into(), "".into())
+    );
+    assert_eq!(run(&mut env, "du -b /work/typed").1, "7\t/work/typed\n");
+    assert!(run(&mut env, "tree /work/typed").1.contains("└── moved"));
+    assert_eq!(run(&mut env, "basename /work/typed/moved").1, "moved\n");
+    assert_eq!(
+        run(&mut env, "dirname /work/typed/moved").1,
+        "/work/typed\n"
+    );
+    assert_eq!(run(&mut env, "chmod -R 700 /work/absent").0, 1);
+    env.vfs.remove_file("/", "/work/typed/moved").unwrap();
+    assert_eq!(run(&mut env, "rmdir /work/typed").0, 0);
+    for command in [
+        "ls", "mv", "chmod", "rmdir", "stat", "du", "tree", "basename", "dirname",
+    ] {
+        assert!(
+            env.invocations.events().iter().any(|event| {
+                event.pid != 1_234
+                    && event.argv.first().is_some_and(|arg| arg == command)
+                    && event.status.is_some()
+            }),
+            "{command} did not run in a child process"
+        );
+    }
+    env.vfs
+        .copy_file("/", "/usr/bin/ls", "/work/list-typed")
+        .unwrap();
+    assert_eq!(run(&mut env, "/work/list-typed /work").0, 0);
+    env.vfs.remove_file("/", "/usr/bin/ls").unwrap();
+    assert_eq!(run(&mut env, "ls /work").0, 127);
+}
+
+#[test]
+fn typed_registered_output_obeys_the_shared_limit() {
+    let mut env = Environment::with_limits(Limits {
+        cpu: 1_000_000,
+        memory: 16 * 1024 * 1024,
+        disk: 16 * 1024 * 1024,
+        output: 8,
+    });
+    for name in ["first", "second", "third"] {
+        env.vfs
+            .write("/", &format!("/work/{name}"), b"", 0o644)
+            .unwrap();
+    }
+    let (outcome, stdout, _) = env.run_script_capture("ls /work");
+    assert_eq!(outcome.exit_status, 137);
+    assert!(stdout.len() <= 8);
+    assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
+}
+
+#[test]
+fn typed_registered_output_resumes_across_pipe_backpressure() {
+    let mut env = Environment::new();
+    env.vfs.mkdir("/", "/work/many").unwrap();
+    let suffix = "x".repeat(90);
+    for index in 0..800 {
+        env.vfs
+            .write("/", &format!("/work/many/{index:04}-{suffix}"), b"", 0o644)
+            .unwrap();
+    }
+    assert_eq!(
+        run(&mut env, "ls /work/many | wc -l"),
+        (0, "800\n".into(), "".into())
+    );
 }
 
 #[test]
@@ -181,7 +287,7 @@ fn registered_native_commands_resolve_only_from_executable_vfs_entries() {
     let node = env.vfs.metadata("/", "/usr/bin/cat", true).unwrap();
     assert!(matches!(
         node.kind,
-        NodeKind::NativeExecutable(NativeProgram::Registered("cat"))
+        NodeKind::NativeExecutable(NativeProgram::Cat)
     ));
     assert_eq!(run(&mut env, "which cat").1, "/usr/bin/cat\n");
     assert_eq!(run(&mut env, "env -i PATH=/missing cat /work/note").0, 127);
@@ -196,6 +302,71 @@ fn registered_native_commands_resolve_only_from_executable_vfs_entries() {
     assert_eq!(run(&mut env, "cat /work/note").0, 127);
     assert_eq!(run(&mut env, "which cat").0, 1);
     assert_eq!(run(&mut env, "/work/reader /work/note").1, "visible");
+}
+
+#[test]
+fn native_cat_streams_files_pipes_and_generated_devices() {
+    let mut env = Environment::new();
+    env.vfs.write("/", "/work/one", b"alpha\n", 0o644).unwrap();
+    env.vfs.write("/", "/work/two", b"beta\n", 0o644).unwrap();
+    assert_eq!(
+        run(&mut env, "cat -n /work/one /work/two"),
+        (0, "     1\talpha\n     2\tbeta\n".into(), String::new())
+    );
+    let missing = run(&mut env, "cat /work/one /work/missing /work/two");
+    assert_eq!(missing.0, 1);
+    assert_eq!(missing.1, "alpha\nbeta\n");
+    assert!(missing.2.contains("/work/missing"), "{}", missing.2);
+    assert_eq!(run(&mut env, "printf 'live\n' | cat").1, "live\n");
+    assert_eq!(run(&mut env, "cat /dev/zero | head -c 8192").1.len(), 8192);
+    assert_eq!(
+        run(&mut env, "cat /dev/null"),
+        (0, String::new(), String::new())
+    );
+    let unsupported = run(&mut env, "cat -z /work/one");
+    assert_eq!(unsupported.0, 2);
+    assert!(
+        unsupported.2.contains("unimplemented option"),
+        "{}",
+        unsupported.2
+    );
+    assert!(env
+        .invocations
+        .events()
+        .iter()
+        .any(|event| { event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == "cat") }));
+}
+
+#[test]
+fn native_cat_stops_at_the_virtual_output_limit() {
+    let mut env = Environment::with_limits(Limits {
+        cpu: 1_000_000,
+        memory: 16 * 1024 * 1024,
+        disk: 16 * 1024 * 1024,
+        output: 128,
+    });
+    env.vfs
+        .write("/", "/work/big", &[b'x'; 4096], 0o644)
+        .unwrap();
+    let (outcome, stdout, _) = env.run_script_capture("cat /work/big");
+    assert_eq!(outcome.exit_status, 137);
+    assert!(stdout.len() <= 128);
+    assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
+
+    let mut diagnostic_env = Environment::with_limits(Limits {
+        cpu: 1_000_000,
+        memory: 16 * 1024 * 1024,
+        disk: 16 * 1024 * 1024,
+        output: 8,
+    });
+    let (outcome, _, stderr) = diagnostic_env.run_script_capture("cat /work/missing");
+    assert_eq!(
+        outcome.exit_status,
+        137,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
 }
 
 #[test]

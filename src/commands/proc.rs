@@ -249,7 +249,7 @@ fn start_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) 
         interp,
         ChildCommand {
             argv: invocation.argv,
-            stdin: std::mem::take(&mut io.stdin),
+            stdin: Some(std::mem::take(&mut io.stdin)),
             cwd: None,
             environment: None,
         },

@@ -76,6 +76,23 @@ impl Io<'_> {
 /// Uniform command signature. `args` is `argv[1..]`.
 pub type CmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> i32;
 
+/// A native command body limited to the active process's virtual kernel operations.
+pub(crate) type SystemCmdFn = fn(&mut crate::program::ProcessContext<'_>, &mut Io) -> i32;
+
+fn run_system_from_legacy(
+    context: &mut CommandContext<'_>,
+    args: &[String],
+    io: &mut Io,
+    run: SystemCmdFn,
+) -> i32 {
+    let mut system = context.system();
+    let mut process = crate::program::ProcessContext {
+        system: &mut system,
+        args,
+    };
+    run(&mut process, io)
+}
+
 /// Result of starting a command from a resumable shell continuation.
 pub(crate) enum CommandPoll {
     Ready(i32),
@@ -139,7 +156,8 @@ pub(crate) enum CommandResume {
 #[derive(Clone)]
 pub(crate) struct ChildCommand {
     pub argv: Vec<String>,
-    pub stdin: Vec<u8>,
+    /// `None` inherits fd 0; `Some` replaces it even when the byte stream is empty.
+    pub stdin: Option<Vec<u8>>,
     pub cwd: Option<String>,
     pub environment: Option<std::collections::BTreeMap<String, String>>,
 }
@@ -192,6 +210,8 @@ impl DerefMut for CommandContext<'_> {
 /// A registered command: its implementation and trust level.
 pub struct CommandSpec {
     pub run: CmdFn,
+    system_run: Option<SystemCmdFn>,
+    native_path: Option<&'static str>,
     resume: Option<ResumableCmdFn>,
     resume_before_input: bool,
     pub trust: Trust,
@@ -205,15 +225,33 @@ fn registry() -> &'static HashMap<&'static str, CommandSpec> {
     REGISTRY.get_or_init(build_registry)
 }
 
-/// Names backed by legacy Rust command bodies and installed as opaque VFS executables.
-pub(crate) fn registered_executable_names() -> Vec<&'static str> {
-    let mut names = registry()
-        .keys()
-        .copied()
-        .filter(|name| !matches!(*name, "." | "..") && !name.contains('/'))
+/// Install native registrations at their virtual paths. Older entries retain the conventional
+/// `/usr/bin/<name>` path until their bodies move to the process interface.
+pub(crate) fn registered_executables() -> Vec<(String, crate::vfs::NativeProgram)> {
+    let mut entries = registry()
+        .iter()
+        .filter(|(name, _)| !matches!(**name, "." | "..") && !name.contains('/'))
+        .map(|(name, spec)| {
+            (
+                spec.native_path
+                    .map_or_else(|| format!("/usr/bin/{name}"), str::to_string),
+                crate::vfs::NativeProgram::Registered(name),
+            )
+        })
         .collect::<Vec<_>>();
-    names.sort_unstable();
-    names
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+pub(crate) fn system_command(name: &str) -> Option<SystemCmdFn> {
+    registry().get(name).and_then(|spec| spec.system_run)
+}
+
+fn runs_native_process(image: crate::vfs::NativeProgram) -> bool {
+    match image {
+        crate::vfs::NativeProgram::Registered(name) => system_command(name).is_some(),
+        _ => true,
+    }
 }
 
 /// Register `f` under every name in `names` with trust `t`.
@@ -252,6 +290,8 @@ fn reg_costed(
             n,
             CommandSpec {
                 run: f,
+                system_run: None,
+                native_path: None,
                 resume: None,
                 resume_before_input: false,
                 trust: t,
@@ -260,6 +300,23 @@ fn reg_costed(
             },
         );
     }
+}
+
+/// Register one existing command body for both nested dispatch and process-owned execution.
+fn reg_system(
+    map: &mut HashMap<&'static str, CommandSpec>,
+    path: &'static str,
+    trust: Trust,
+    legacy: CmdFn,
+    system: SystemCmdFn,
+) {
+    let name = path.rsplit('/').next().expect("executable has basename");
+    reg(map, &[name], trust, legacy);
+    let spec = map
+        .get_mut(name)
+        .expect("newly registered command must exist");
+    spec.system_run = Some(system);
+    spec.native_path = Some(path);
 }
 
 /// Register a command that can suspend when called by the shell while retaining a synchronous
@@ -276,6 +333,8 @@ fn reg_resumable(
             name,
             CommandSpec {
                 run,
+                system_run: None,
+                native_path: None,
                 resume: Some(resume),
                 resume_before_input: true,
                 trust,
@@ -390,8 +449,7 @@ pub(crate) fn starts_before_input(interp: &Interp, argv: &[String]) -> bool {
     }
     argv.first().is_some_and(|requested| {
         if !(builtins::is_shell_builtin_name(requested) && !requested.contains('/'))
-            && resolved_native_image(interp, requested)
-                .is_some_and(|image| !matches!(image, crate::vfs::NativeProgram::Registered(_)))
+            && resolved_native_image(interp, requested).is_some_and(runs_native_process)
         {
             return true;
         }
@@ -416,9 +474,7 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
     let Some(requested) = argv.first() else {
         return false;
     };
-    if resolved_native_image(interp, requested)
-        .is_some_and(|image| !matches!(image, crate::vfs::NativeProgram::Registered(_)))
-    {
+    if resolved_native_image(interp, requested).is_some_and(runs_native_process) {
         return false;
     }
     if !builtins::is_shell_builtin_name(requested) {
@@ -721,21 +777,26 @@ pub(crate) fn start_child_command(
     if command.argv.is_empty() {
         return Err(0);
     }
-    let input = interp
-        .descriptors
-        .open_input(command.stdin)
+    let input = command
+        .stdin
+        .map(|bytes| interp.descriptors.open_input(bytes))
+        .transpose()
         .map_err(|_| 125)?;
     let display = command.argv.join(" ");
     let pid = match interp.start_child(&display, true) {
         Ok(pid) => pid,
         Err(_) => {
-            let _ = interp.descriptors.discard_unreferenced(input);
+            if let Some(input) = input {
+                let _ = interp.descriptors.discard_unreferenced(input);
+            }
             return Err(125);
         }
     };
-    interp
-        .install_process_description(pid, 0, input)
-        .expect("new child process must accept prepared standard input");
+    if let Some(input) = input {
+        interp
+            .install_process_description(pid, 0, input)
+            .expect("new child process must accept prepared standard input");
+    }
     interp
         .configure_process(pid, command.cwd, command.environment)
         .expect("new child process must accept its launch configuration");
@@ -758,15 +819,12 @@ fn dispatch(
     // corresponding external image, even if its basename is also a builtin.
     let builtin = !requested.contains('/') && builtins::is_shell_builtin_name(requested);
     let native = resolved_native_image(interp, requested);
-    if !builtin
-        && resumable
-        && native.is_some_and(|image| !matches!(image, crate::vfs::NativeProgram::Registered(_)))
-    {
+    if !builtin && resumable && native.is_some_and(runs_native_process) {
         return start_child_sequence(
             interp,
             vec![ChildCommand {
                 argv: argv.to_vec(),
-                stdin,
+                stdin: (!stdin.is_empty()).then_some(stdin),
                 cwd: None,
                 environment: None,
             }],

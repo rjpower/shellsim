@@ -916,7 +916,7 @@ impl HarnessSession {
                                 }
                             }
                             Some(TaskState::Blocked(reason)) => ActionState::Blocked {
-                                reason: Some(wait_reason_view(reason)),
+                                reason: Some(action_wait_reason_view(&self.environment, reason)),
                             },
                             _ => ActionState::Blocked { reason: None },
                         };
@@ -1269,6 +1269,20 @@ fn wait_reason_view(reason: WaitReason) -> WaitReasonView {
             reasons: reasons.into_iter().map(wait_reason_view).collect(),
         },
     }
+}
+
+/// Surface the resource that can unblock an action, even when its shell awaits a child.
+fn action_wait_reason_view(environment: &Environment, mut reason: WaitReason) -> WaitReasonView {
+    for _ in 0..8 {
+        let WaitReason::Child(pid) = reason else {
+            break;
+        };
+        let Some(TaskState::Blocked(child_reason)) = environment.scheduler.state(pid) else {
+            break;
+        };
+        reason = child_reason;
+    }
+    wait_reason_view(reason)
 }
 
 fn invocation_names(events: &[InvocationEvent], trust: CommandTrust) -> Vec<String> {

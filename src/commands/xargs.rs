@@ -36,7 +36,7 @@ fn start_xargs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
             .into_iter()
             .map(|argv| ChildCommand {
                 argv,
-                stdin: Vec::new(),
+                stdin: Some(Vec::new()),
                 cwd: None,
                 environment: None,
             })
