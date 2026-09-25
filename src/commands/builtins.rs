@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use crate::commands::util::{ewln, split_flags, wln};
 use crate::commands::{CommandContext, CommandPoll, CommandResume, CommandSpec, Io, Trust};
 use crate::interp::Interp;
+use crate::syscalls::System;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     use super::{reg, reg_resumable, reg_unsupported};
@@ -99,11 +100,11 @@ fn cmd_readonly(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
 fn cmd_umask(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     match args {
         [] => {
-            wln(io.out, &format!("{:04o}", interp.umask));
+            wln(io.out, &format!("{:04o}", interp.system().umask()));
             0
         }
         [flag] if flag == "-S" => {
-            let allowed = 0o777 & !interp.umask;
+            let allowed = 0o777 & !interp.system().umask();
             let triplet = |shift| {
                 let bits = (allowed >> shift) & 7_u16;
                 format!(
@@ -127,7 +128,10 @@ fn cmd_umask(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
             8,
         ) {
             Ok(mask) if mask <= 0o777 => {
-                interp.umask = mask;
+                interp
+                    .system()
+                    .set_umask(mask)
+                    .expect("validated octal mask");
                 0
             }
             _ => {
@@ -143,7 +147,7 @@ fn cmd_umask(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
 }
 
 fn cmd_ulimit(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let limits = interp.resources.limits();
+    let limits = interp.system().limits();
     let selected = args.first().map(String::as_str).unwrap_or("-f");
     if args.len() > 1 || !matches!(selected, "-a" | "-f" | "-n" | "-t" | "-v") {
         ewln(
@@ -1133,7 +1137,7 @@ fn cmd_unalias(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
 }
 
 fn cmd_pwd(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
-    wln(io.out, &interp.cwd);
+    wln(io.out, interp.system().cwd());
     0
 }
 
@@ -1165,19 +1169,9 @@ fn cmd_cd(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
 }
 
 fn change_directory(interp: &mut CommandContext<'_>, target: &str) -> Result<(), ()> {
-    let absolute = crate::vfs::resolve_against(&interp.cwd, target);
-    if !matches!(
-        interp.fs_metadata("/", &absolute, true),
-        Ok(crate::vfs::Node {
-            kind: crate::vfs::NodeKind::Dir,
-            ..
-        })
-    ) {
-        return Err(());
-    }
     let old = interp.cwd.clone();
+    interp.system().chdir(target).map_err(|_| ())?;
     interp.set_var("OLDPWD", old);
-    interp.cwd = interp.fs_realpath("/", &absolute, true).unwrap_or(absolute);
     let cwd = interp.cwd.clone();
     interp.set_var("PWD", cwd);
     Ok(())

@@ -8,10 +8,18 @@ use crate::display::{DisplayError, KeyEvent};
 use crate::interp::Interp;
 use crate::vfs::{resolve_against, NodeKind, VfsError};
 
-/// Operations available to a native process during one scheduler quantum. The borrowed handle
-/// cannot outlive the poll, so blocked programs retain only their own data and wait reason.
-pub(crate) trait NativeSyscalls {
+/// PID-scoped virtual kernel operations available during one execution quantum.
+///
+/// Native programs call this interface directly. A guest ABI adapter must translate its imports
+/// to the same operations; neither path receives host capabilities or the owning `Environment`.
+/// The borrowed handle cannot outlive the quantum, so blocked programs retain only owned state.
+pub(crate) trait System {
     fn cwd(&self) -> &str;
+    fn chdir(&mut self, path: &str) -> Result<(), SyscallError>;
+    fn umask(&self) -> u16;
+    fn set_umask(&mut self, mask: u16) -> Result<(), SyscallError>;
+    fn limits(&self) -> crate::resources::Limits;
+    fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError>;
     fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError>;
     fn charge_cpu(&mut self, units: u64) -> bool;
     fn output_remaining(&self) -> u64;
@@ -21,19 +29,53 @@ pub(crate) trait NativeSyscalls {
 
 /// Active-PID adapter; native program bodies receive this handle, not `Interp`.
 /// The current WASI adapter still holds `Interp` while translating its imports.
-pub(crate) struct ActiveProcessSyscalls<'a> {
+pub(crate) struct ActiveSystem<'a> {
     interp: &'a mut Interp,
 }
 
-impl<'a> ActiveProcessSyscalls<'a> {
+impl<'a> ActiveSystem<'a> {
     pub(crate) fn new(interp: &'a mut Interp) -> Self {
         Self { interp }
     }
 }
 
-impl NativeSyscalls for ActiveProcessSyscalls<'_> {
+impl System for ActiveSystem<'_> {
     fn cwd(&self) -> &str {
         &self.interp.process.cwd
+    }
+
+    fn chdir(&mut self, path: &str) -> Result<(), SyscallError> {
+        if path.is_empty() || path.contains('\0') {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let absolute = resolve_against(&self.interp.process.cwd, path);
+        let node = self.interp.fs_metadata("/", &absolute, true)?;
+        if !matches!(node.kind, NodeKind::Dir) {
+            return Err(SyscallError::File(VfsError::NotADir(absolute)));
+        }
+        let resolved = self.interp.fs_realpath("/", &absolute, true)?;
+        self.interp.process.cwd = resolved;
+        Ok(())
+    }
+
+    fn umask(&self) -> u16 {
+        self.interp.process.umask
+    }
+
+    fn set_umask(&mut self, mask: u16) -> Result<(), SyscallError> {
+        if mask > 0o777 {
+            return Err(SyscallError::InvalidArgument);
+        }
+        self.interp.process.umask = mask;
+        Ok(())
+    }
+
+    fn limits(&self) -> crate::resources::Limits {
+        self.interp.resources.limits()
+    }
+
+    fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
+        self.interp.read_fd_checked(fd, maximum)
     }
 
     fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError> {
@@ -126,6 +168,7 @@ pub(crate) enum SyscallError {
     InvalidArgument,
     IsDirectory,
     Permission,
+    ResourceExhausted,
 }
 
 impl From<VfsError> for SyscallError {
@@ -300,6 +343,56 @@ pub(crate) fn seek(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_system_changes_only_the_current_process_directory_and_mask() {
+        let mut interp = Interp::new();
+        let mut system = ActiveSystem::new(&mut interp);
+        assert_eq!(system.cwd(), "/");
+        assert!(system.chdir("/work").is_ok());
+        assert_eq!(system.cwd(), "/work");
+        assert!(system.chdir("/proc").is_ok());
+        assert_eq!(system.cwd(), "/proc");
+        assert!(matches!(
+            system.chdir("/missing"),
+            Err(SyscallError::File(VfsError::NotFound(_)))
+        ));
+        assert_eq!(system.cwd(), "/proc");
+        assert!(matches!(
+            system.set_umask(0o1000),
+            Err(SyscallError::InvalidArgument)
+        ));
+        assert_eq!(system.umask(), 0o022);
+        system.set_umask(0o077).unwrap();
+        assert_eq!(system.umask(), 0o077);
+    }
+
+    #[test]
+    fn active_system_reads_virtual_descriptors_without_host_access() {
+        let mut interp = Interp::new();
+        interp
+            .vfs
+            .write("/", "/work/data", b"sample", 0o644)
+            .unwrap();
+        let fd = open_file(
+            &mut interp,
+            "/work",
+            "data",
+            OpenFile {
+                readable: true,
+                writable: false,
+                create: false,
+                exclusive: false,
+                truncate: false,
+                append: false,
+            },
+        )
+        .unwrap();
+        let mut system = ActiveSystem::new(&mut interp);
+        assert_eq!(system.read(fd, 3).unwrap(), IoPoll::Ready(b"sam".to_vec()));
+        assert_eq!(system.read(fd, 3).unwrap(), IoPoll::Ready(b"ple".to_vec()));
+        assert_eq!(system.read(fd, 3).unwrap(), IoPoll::Ready(Vec::new()));
+    }
     use crate::descriptors::IoPoll;
 
     #[test]

@@ -161,6 +161,32 @@ fn independent_shell_sessions_share_files_but_keep_shell_state() {
 }
 
 #[test]
+fn shell_directory_changes_use_process_scoped_system_state() {
+    let mut env = Environment::new();
+    let first = env.spawn_shell_session().unwrap();
+    let second = env.spawn_shell_session().unwrap();
+
+    assert_eq!(
+        env.run_shell_session_capture(first, "cd /work; umask 077; pwd; umask")
+            .unwrap()
+            .1,
+        b"/work\n0077\n"
+    );
+    assert_eq!(
+        env.run_shell_session_capture(second, "pwd; umask")
+            .unwrap()
+            .1,
+        b"/\n0022\n"
+    );
+    assert_eq!(
+        env.run_shell_session_capture(first, "cd /missing; pwd")
+            .unwrap()
+            .1,
+        b"/work\n"
+    );
+}
+
+#[test]
 fn exited_shell_session_cannot_accept_another_action() {
     let mut env = Environment::new();
     let session = env.spawn_shell_session().unwrap();

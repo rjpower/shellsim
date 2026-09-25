@@ -8,7 +8,7 @@ use crate::descriptors::{IoPoll, IoWait};
 use crate::exec::{ShellContinuation, ShellPoll};
 use crate::interp::Interp;
 use crate::scheduler::WaitReason;
-use crate::syscalls::{ActiveProcessSyscalls, NativeSyscalls, SyscallError};
+use crate::syscalls::{ActiveSystem, SyscallError, System};
 
 /// Owned state needed to resume one process after a scheduler turn.
 #[derive(Clone)]
@@ -25,7 +25,7 @@ impl ProgramContinuation {
     pub(crate) fn poll(&mut self, interp: &mut Interp, budget: usize) -> ShellPoll {
         match self {
             Self::Shell(shell) => shell.poll(interp, budget),
-            Self::Native(native) => native.poll(&mut ActiveProcessSyscalls::new(interp)),
+            Self::Native(native) => native.poll(&mut ActiveSystem::new(interp)),
         }
     }
 
@@ -104,7 +104,7 @@ impl NativeProcess {
         }
     }
 
-    fn poll(&mut self, syscalls: &mut impl NativeSyscalls) -> ShellPoll {
+    fn poll(&mut self, syscalls: &mut impl System) -> ShellPoll {
         if !syscalls.charge_cpu(1) {
             return ShellPoll::Ready(syscalls.stop_status());
         }
@@ -135,7 +135,7 @@ impl NativeProcess {
 }
 
 fn poll_write(
-    syscalls: &mut impl NativeSyscalls,
+    syscalls: &mut impl System,
     fd: i32,
     bytes: &[u8],
     offset: &mut usize,
@@ -190,9 +190,29 @@ mod tests {
         stopped: bool,
     }
 
-    impl NativeSyscalls for PartialWriter {
+    impl System for PartialWriter {
         fn cwd(&self) -> &str {
             "/work"
+        }
+
+        fn chdir(&mut self, _path: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not change directory")
+        }
+
+        fn umask(&self) -> u16 {
+            unreachable!("native writer does not inspect umask")
+        }
+
+        fn set_umask(&mut self, _mask: u16) -> Result<(), SyscallError> {
+            unreachable!("native writer does not change umask")
+        }
+
+        fn limits(&self) -> crate::resources::Limits {
+            unreachable!("native writer does not inspect limits")
+        }
+
+        fn read(&mut self, _fd: i32, _maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
+            unreachable!("native writer does not read")
         }
 
         fn write(&mut self, fd: i32, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError> {

@@ -35,6 +35,14 @@ cwd, descriptors, and PID. Idle sessions survive environment snapshots. This is 
 API, not yet a VFS-loaded `/bin/sh`: the default shell is still a distinguished root process,
 and shell execution still has direct `Interp` access.
 
+The typed Rust interface is `System`, borrowed for one execution quantum. It represents the
+active PID's view of the virtual kernel, not shell state or a host capability. Native images
+receive it directly; the Wasm adapter should translate imports to the same operations. Shell
+`cd`/`pwd` and `umask` now use this interface for process cwd and creation mask. The shell keeps
+`PWD` and `OLDPWD` variables in its own userland state after a successful `chdir`.
+Descriptor reads and writes have typed results; the Wasm adapter uses the same operations for
+open virtual files. Its stdio buffering and other imports still need to move to this boundary.
+
 The new `syscalls.rs` begins this boundary for regular files. It accepts typed open options,
 allocates descriptors in the active process, and owns close and seek. The WASI adapter now uses
 those descriptors for open, read, write, seek, stat, and close; it no longer keeps a second file
@@ -69,8 +77,10 @@ point so both native and Wasm work count against the same budget.
 ## Current limits and next gate
 
 Make VFS program identity authoritative for external native commands, then remove the synthetic
-basename fallback. Extend the borrowed native syscall handle with typed descriptor reads and
-filesystem operations, and move a small reader and a filesystem-walking utility across it.
+basename fallback. Extend `System` with the remaining typed filesystem and process operations,
+and move a reader and a filesystem-walking utility across it. The legacy command registry still
+hands most native bodies a `CommandContext` that dereferences to all of `Interp`; remove that
+access as commands migrate, rather than renaming it and retaining broad authority.
 Finally, give the Rust shell a process-scoped handle for execution, files, and process control;
 leave `cd`, variables, and other state-changing builtins in its own PID. Only then should the
 default shell be loaded from `/bin/sh` like any other native program image. Native Rust commands

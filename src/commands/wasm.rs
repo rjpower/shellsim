@@ -20,7 +20,7 @@ use wasmtime::{
 use crate::descriptors::DescriptorError;
 use crate::display::DisplayError;
 use crate::interp::Interp;
-use crate::syscalls::{self, OpenFile, SyscallError};
+use crate::syscalls::{self, ActiveSystem, OpenFile, SyscallError, System};
 use crate::vfs::{resolve_against, NodeKind, VfsError};
 
 use super::{util::ewln, CommandPoll};
@@ -180,6 +180,7 @@ fn syscall_errno(error: &SyscallError) -> i32 {
         SyscallError::InvalidArgument => ERRNO_INVAL,
         SyscallError::IsDirectory => ERRNO_ISDIR,
         SyscallError::Permission => ERRNO_PERM,
+        SyscallError::ResourceExhausted => ERRNO_INVAL,
     }
 }
 
@@ -864,7 +865,7 @@ fn fd_write(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, writte
         for chunk in chunks {
             bytes.extend_from_slice(&chunk);
         }
-        match caller.data_mut().interp.write_fd(fd, &bytes) {
+        match ActiveSystem::new(&mut caller.data_mut().interp).write(fd, &bytes) {
             Ok(crate::descriptors::IoPoll::Ready(_)) => {}
             Ok(crate::descriptors::IoPoll::Blocked(_)) | Err(_) => return ERRNO_INVAL,
         }
@@ -921,7 +922,7 @@ fn fd_read(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, read: u
         let end = offset.saturating_add(total).min(caller.data().stdin.len());
         caller.data().stdin[offset..end].to_vec()
     } else {
-        match caller.data_mut().interp.read_fd(fd, total) {
+        match ActiveSystem::new(&mut caller.data_mut().interp).read(fd, total) {
             Ok(crate::descriptors::IoPoll::Ready(bytes)) => bytes,
             Ok(crate::descriptors::IoPoll::Blocked(_)) | Err(_) => return ERRNO_INVAL,
         }

@@ -1421,17 +1421,40 @@ impl Environment {
 
     /// Read from an active process descriptor without granting access to host handles.
     pub(crate) fn read_fd(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, String> {
-        let description = self.process.fds.get(fd).map_err(descriptor_message)?;
-        if let Some(file) = self
-            .descriptors
-            .file_state(description)
-            .map_err(descriptor_message)?
-        {
+        self.read_fd_checked(fd, maximum)
+            .map_err(|error| match error {
+                crate::syscalls::SyscallError::Descriptor(error) => descriptor_message(error),
+                crate::syscalls::SyscallError::File(error) => error.to_string(),
+                crate::syscalls::SyscallError::Permission => {
+                    "descriptor is not open for reading".to_string()
+                }
+                crate::syscalls::SyscallError::InvalidArgument => {
+                    "file cursor exceeds addressable memory".to_string()
+                }
+                crate::syscalls::SyscallError::IsDirectory => "is a directory".to_string(),
+                crate::syscalls::SyscallError::ResourceExhausted => {
+                    self.resources.stop_reason().map_or_else(
+                        || "device read limit exceeded".to_string(),
+                        |reason| reason.to_string(),
+                    )
+                }
+            })
+    }
+
+    /// Typed descriptor read for native programs and guest ABI adapters.
+    pub(crate) fn read_fd_checked(
+        &mut self,
+        fd: Fd,
+        maximum: usize,
+    ) -> Result<IoPoll<Vec<u8>>, crate::syscalls::SyscallError> {
+        use crate::syscalls::SyscallError;
+
+        let description = self.process.fds.get(fd)?;
+        if let Some(file) = self.descriptors.file_state(description)? {
             if !file.readable {
-                return Err("descriptor is not open for reading".to_string());
+                return Err(SyscallError::Permission);
             }
-            let cursor = usize::try_from(file.cursor)
-                .map_err(|_| "file cursor exceeds addressable memory".to_string())?;
+            let cursor = usize::try_from(file.cursor).map_err(|_| SyscallError::InvalidArgument)?;
             let bytes = match file.orphan {
                 Some(id) => self
                     .vfs
@@ -1440,48 +1463,28 @@ impl Environment {
                     self.vfs
                         .read_range("/", &file.path, cursor, maximum.min(MAX_CAPTURE_BYTES))
                 }
-            }
-            .map_err(|error| error.to_string())?;
-            self.descriptors
-                .advance_file(description, bytes.len())
-                .map_err(descriptor_message)?;
+            }?;
+            self.descriptors.advance_file(description, bytes.len())?;
             return Ok(IoPoll::Ready(bytes));
         }
-        let maximum = if self
-            .descriptors
-            .is_generated_device(description)
-            .map_err(descriptor_message)?
-        {
+        let maximum = if self.descriptors.is_generated_device(description)? {
             let maximum = maximum
                 .min(crate::descriptors::DEVICE_READ_QUANTUM)
                 .min(usize::try_from(self.resources.cpu_remaining() / 2).unwrap_or(usize::MAX));
             if maximum == 0 {
                 let _ = self.resources.charge_cpu(1);
-                return Err(self.resources.stop_reason().map_or_else(
-                    || "device read limit exceeded".to_string(),
-                    |reason| reason.to_string(),
-                ));
+                return Err(SyscallError::ResourceExhausted);
             }
             if !self.resources.charge_cpu(maximum as u64) {
-                return Err(self.resources.stop_reason().map_or_else(
-                    || "device read limit exceeded".to_string(),
-                    |reason| reason.to_string(),
-                ));
+                return Err(SyscallError::ResourceExhausted);
             }
             maximum
         } else {
             maximum
         };
-        let result = self
-            .descriptors
-            .read(description, maximum)
-            .map_err(descriptor_message)?;
+        let result = self.descriptors.read(description, maximum)?;
         if matches!(result, IoPoll::Ready(_)) {
-            if let Some((pipe, true)) = self
-                .descriptors
-                .pipe_endpoint(description)
-                .map_err(descriptor_message)?
-            {
+            if let Some((pipe, true)) = self.descriptors.pipe_endpoint(description)? {
                 self.scheduler.wake_waiters(WaitReason::PipeWritable(pipe));
                 // A Python parent may be coordinating several child pipes through one
                 // `communicate()` operation. Child activity is its retry signal; completion is
@@ -1505,6 +1508,9 @@ impl Environment {
                     "file cursor exceeds addressable memory".to_string()
                 }
                 crate::syscalls::SyscallError::IsDirectory => "is a directory".to_string(),
+                crate::syscalls::SyscallError::ResourceExhausted => {
+                    "resource limit exceeded".to_string()
+                }
             })
     }
 
