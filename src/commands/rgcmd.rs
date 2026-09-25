@@ -7,10 +7,13 @@
 use std::collections::HashMap;
 
 use crate::commands::util::{ewln, glob_eq, wln};
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
+use crate::program::ProcessContext;
+use crate::syscalls::{FileKind, System};
 
 pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
-    super::reg(commands, &["rg"], Trust::Partial, cmd_rg);
+    super::reg_system_poll(commands, "/usr/bin/rg", Trust::Partial, cmd_rg);
 }
 
 #[derive(Default)]
@@ -38,12 +41,13 @@ struct Options {
     paths: Vec<String>,
 }
 
-fn cmd_rg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_rg(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let options = match parse_options(args) {
         Ok(options) => options,
         Err(error) => {
             ewln(io.err, &format!("rg: {error}"));
-            return 2;
+            return ShellPoll::Ready(2);
         }
     };
     let matcher = if options.list_files {
@@ -53,7 +57,7 @@ fn cmd_rg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             Ok(matcher) => Some(matcher),
             Err(error) => {
                 ewln(io.err, &format!("rg: {error}"));
-                return 2;
+                return ShellPoll::Ready(2);
             }
         }
     };
@@ -69,22 +73,27 @@ fn cmd_rg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             io.err,
             "rg: --only-matching cannot be combined with inverse, context, or file-list modes",
         );
-        return 2;
+        return ShellPoll::Ready(2);
     }
-    let (inputs, reserved) = match collect_inputs(interp, &options, &io.stdin) {
+    if options.paths.is_empty() || options.paths.iter().any(|path| path == "-") {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (inputs, reserved) = match collect_inputs(context.system, &options, &io.stdin) {
         Ok(inputs) => inputs,
         Err(error) => {
             ewln(io.err, &format!("rg: {error}"));
-            return 2;
+            return ShellPoll::Ready(2);
         }
     };
-    let status = search_inputs(interp, &options, matcher.as_ref(), inputs, io);
-    interp.resources.release_memory(reserved);
-    status
+    let status = search_inputs(context.system, &options, matcher.as_ref(), inputs, io);
+    context.system.release_memory(reserved);
+    ShellPoll::Ready(status)
 }
 
 fn search_inputs(
-    interp: &mut CommandContext<'_>,
+    system: &mut dyn System,
     options: &Options,
     matcher: Option<&Matcher>,
     inputs: Vec<Input>,
@@ -95,8 +104,8 @@ fn search_inputs(
         .unwrap_or(inputs.len() > 1 || inputs.iter().any(|input| input.recursive));
     let mut any = false;
     for input in inputs {
-        if !interp.charge_cpu(1) {
-            return 137;
+        if !system.charge_cpu(1) {
+            return system.stop_status();
         }
         if options.list_files {
             wln(io.out, &input.label);
@@ -115,7 +124,7 @@ fn search_inputs(
             && !options.files_without
         {
             let Some(matched_count) = search_with_context(
-                interp,
+                system,
                 options,
                 matcher,
                 &input.label,
@@ -123,7 +132,7 @@ fn search_inputs(
                 &text,
                 io,
             ) else {
-                return 137;
+                return system.stop_status();
             };
             any |= matched_count != 0;
             continue;
@@ -133,8 +142,8 @@ fn search_inputs(
             if options.max_count == Some(0) {
                 break;
             }
-            if !interp.charge_cpu(1_u64.saturating_add(line.len() as u64)) {
-                return 137;
+            if !system.charge_cpu(1_u64.saturating_add(line.len() as u64)) {
+                return system.stop_status();
             }
             if !(matcher.is_match(line) ^ options.invert) {
                 continue;
@@ -196,7 +205,7 @@ fn search_inputs(
 }
 
 fn search_with_context(
-    interp: &mut CommandContext<'_>,
+    system: &mut dyn System,
     options: &Options,
     matcher: &Matcher,
     label: &str,
@@ -206,15 +215,15 @@ fn search_with_context(
 ) -> Option<usize> {
     let line_count = text.lines().count();
     let reserved = (line_count as u64).saturating_mul(18);
-    if !interp.reserve_memory(reserved) {
+    if !system.reserve_memory(reserved) {
         return None;
     }
     let lines = text.lines().collect::<Vec<_>>();
     let mut matches = Vec::with_capacity(line_count);
     let mut matched_count = 0_usize;
     for line in &lines {
-        if !interp.charge_cpu(1_u64.saturating_add(line.len() as u64)) {
-            interp.resources.release_memory(reserved);
+        if !system.charge_cpu(1_u64.saturating_add(line.len() as u64)) {
+            system.release_memory(reserved);
             return None;
         }
         let matched = (matcher.is_match(line) ^ options.invert)
@@ -251,7 +260,7 @@ fn search_with_context(
         }
         last_emitted = Some(end - 1);
     }
-    interp.resources.release_memory(reserved);
+    system.release_memory(reserved);
     Some(matched_count)
 }
 
@@ -296,12 +305,12 @@ struct Input {
 }
 
 fn collect_inputs(
-    interp: &mut CommandContext<'_>,
+    system: &mut dyn System,
     options: &Options,
     stdin: &[u8],
 ) -> Result<(Vec<Input>, u64), String> {
     if options.paths.is_empty() && !stdin.is_empty() {
-        if !interp.reserve_memory(stdin.len() as u64) {
+        if !system.reserve_memory(stdin.len() as u64) {
             return Err("memory limit exceeded".to_string());
         }
         return Ok((
@@ -321,10 +330,25 @@ fn collect_inputs(
     let mut inputs = Vec::new();
     let mut reserved = 0_u64;
     for operand in paths {
-        let absolute = crate::vfs::resolve_against(&interp.cwd, &operand);
-        if interp.vfs.is_file("/", &absolute) {
+        if operand == "-" {
+            if !system.reserve_memory(stdin.len() as u64) {
+                system.release_memory(reserved);
+                return Err("memory limit exceeded".to_string());
+            }
+            reserved = reserved.saturating_add(stdin.len() as u64);
+            inputs.push(Input {
+                label: "-".to_string(),
+                bytes: stdin.to_vec(),
+                recursive: false,
+            });
+            continue;
+        }
+        let absolute = crate::vfs::resolve_against(system.cwd(), &operand);
+        let metadata = system.metadata("/", &absolute, true);
+        if matches!(metadata, Ok(ref info) if info.kind == FileKind::File && !info.native_executable)
+        {
             if let Err(error) = push_file(
-                interp,
+                system,
                 options,
                 &absolute,
                 operand,
@@ -332,24 +356,33 @@ fn collect_inputs(
                 &mut inputs,
                 &mut reserved,
             ) {
-                interp.resources.release_memory(reserved);
+                system.release_memory(reserved);
                 return Err(error);
             }
             continue;
         }
-        if !interp.vfs.is_dir("/", &absolute) {
-            interp.resources.release_memory(reserved);
+        if !matches!(metadata, Ok(ref info) if info.kind == FileKind::Directory) {
+            system.release_memory(reserved);
             return Err(format!("{operand}: No such file or directory"));
         }
-        let mut paths = interp.vfs.walk(&absolute);
+        let mut paths = match system.walk("/", &absolute) {
+            Ok(paths) => paths,
+            Err(error) => {
+                system.release_memory(reserved);
+                return Err(error.to_string());
+            }
+        };
         paths.sort();
         for path in paths {
-            if !interp.vfs.is_file("/", &path) {
+            if !matches!(
+                system.metadata("/", &path, true),
+                Ok(ref info) if info.kind == FileKind::File && !info.native_executable
+            ) {
                 continue;
             }
-            let label = display_path(&interp.cwd, &path);
+            let label = display_path(system.cwd(), &path);
             if let Err(error) = push_file(
-                interp,
+                system,
                 options,
                 &path,
                 label,
@@ -357,7 +390,7 @@ fn collect_inputs(
                 &mut inputs,
                 &mut reserved,
             ) {
-                interp.resources.release_memory(reserved);
+                system.release_memory(reserved);
                 return Err(error);
             }
         }
@@ -366,7 +399,7 @@ fn collect_inputs(
 }
 
 fn push_file(
-    interp: &mut CommandContext<'_>,
+    system: &mut dyn System,
     options: &Options,
     absolute: &str,
     label: String,
@@ -384,10 +417,10 @@ fn push_file(
     if !matches_globs(&options.globs, &label) || !matches_types(&options.types, &label) {
         return Ok(());
     }
-    let bytes = interp
-        .fs_read_limited("/", absolute, crate::descriptors::MAX_CAPTURE_BYTES)
+    let bytes = system
+        .read_file_limited("/", absolute, crate::descriptors::MAX_CAPTURE_BYTES)
         .map_err(|error| error.to_string())?;
-    if !interp.reserve_memory(bytes.len() as u64) {
+    if !system.reserve_memory(bytes.len() as u64) {
         return Err("memory limit exceeded".to_string());
     }
     *reserved = reserved.saturating_add(bytes.len() as u64);

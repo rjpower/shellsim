@@ -91,6 +91,8 @@ pub(crate) enum SystemRun {
 pub(crate) struct SystemCommand {
     pub(crate) run: SystemRun,
     pub(crate) base_cpu: u64,
+    pub(crate) base_memory: u64,
+    pub(crate) trust: Trust,
 }
 
 fn run_system_from_legacy(
@@ -300,10 +302,14 @@ pub(crate) fn system_command(path: &str) -> Option<SystemCommand> {
         CommandBody::System(run) => Some(SystemCommand {
             run: SystemRun::Once(run),
             base_cpu: spec.base_cpu,
+            base_memory: spec.base_memory,
+            trust: spec.trust,
         }),
         CommandBody::SystemPoll(run) => Some(SystemCommand {
             run: SystemRun::Poll(run),
             base_cpu: spec.base_cpu,
+            base_memory: spec.base_memory,
+            trust: spec.trust,
         }),
         CommandBody::Legacy(_) => None,
     }
@@ -381,7 +387,14 @@ fn reg_system_costed(
     base_cpu: u64,
     system: SystemCmdFn,
 ) {
-    reg_system_input(map, path, trust, base_cpu, CommandBody::System(system));
+    reg_system_input(
+        map,
+        path,
+        trust,
+        base_cpu,
+        10 * 1024,
+        CommandBody::System(system),
+    );
 }
 
 /// Register a native command that can suspend on descriptor I/O.
@@ -391,7 +404,25 @@ fn reg_system_poll(
     trust: Trust,
     system: SystemPollFn,
 ) {
-    reg_system_input(map, path, trust, 100, CommandBody::SystemPoll(system));
+    reg_system_poll_costed(map, path, trust, 100, 10 * 1024, system);
+}
+
+fn reg_system_poll_costed(
+    map: &mut HashMap<&'static str, CommandSpec>,
+    path: &'static str,
+    trust: Trust,
+    base_cpu: u64,
+    base_memory: u64,
+    system: SystemPollFn,
+) {
+    reg_system_input(
+        map,
+        path,
+        trust,
+        base_cpu,
+        base_memory,
+        CommandBody::SystemPoll(system),
+    );
 }
 
 fn reg_system_input(
@@ -399,6 +430,7 @@ fn reg_system_input(
     path: &'static str,
     trust: Trust,
     base_cpu: u64,
+    base_memory: u64,
     body: CommandBody,
 ) {
     assert!(path.starts_with('/') && !path.ends_with('/'));
@@ -409,7 +441,7 @@ fn reg_system_input(
         resume_before_input: false,
         trust,
         base_cpu,
-        base_memory: 10 * 1024,
+        base_memory,
     };
     assert!(
         map.insert(path, spec).is_none(),

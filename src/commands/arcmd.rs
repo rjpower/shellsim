@@ -6,16 +6,17 @@
 use std::collections::HashMap;
 
 use crate::commands::util::ewln;
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandSpec, Io, Trust};
+use crate::program::ProcessContext;
+use crate::syscalls::{FileKind, System};
 
 const MAX_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MEMBERS: usize = 4_096;
 const MAGIC: &[u8] = b"!<arch>\n";
 
 pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
-    reg(commands, &["ar"], Trust::Partial, cmd_ar);
-    reg(commands, &["ranlib"], Trust::Partial, cmd_ranlib);
+    super::reg_system(commands, "/usr/bin/ar", Trust::Partial, cmd_ar);
+    super::reg_system(commands, "/usr/bin/ranlib", Trust::Partial, cmd_ranlib);
 }
 
 struct Member {
@@ -24,7 +25,8 @@ struct Member {
     symbols: Vec<String>,
 }
 
-fn cmd_ar(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_ar(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     let Some((flags, rest)) = args.split_first() else {
         ewln(io.err, "ar: expected operation and archive");
         return 2;
@@ -35,8 +37,8 @@ fn cmd_ar(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         return 2;
     };
     let result = match flags {
-        "s" => reindex(interp, archive),
-        "rc" | "cr" | "rcs" | "crs" => replace(interp, archive, paths),
+        "s" => reindex(context.system, archive),
+        "rc" | "cr" | "rcs" | "crs" => replace(context.system, archive, paths),
         _ => Err(format!("unsupported operation '{flags}'")),
     };
     match result {
@@ -48,12 +50,13 @@ fn cmd_ar(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     }
 }
 
-fn cmd_ranlib(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_ranlib(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     let [archive] = args else {
         ewln(io.err, "ranlib: expected one archive path");
         return 2;
     };
-    match reindex(interp, archive) {
+    match reindex(context.system, archive) {
         Ok(()) => 0,
         Err(error) => {
             ewln(io.err, &format!("ranlib: {error}"));
@@ -62,12 +65,16 @@ fn cmd_ranlib(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     }
 }
 
-fn replace(interp: &mut CommandContext<'_>, archive: &str, paths: &[String]) -> Result<(), String> {
+fn replace(system: &mut dyn System, archive: &str, paths: &[String]) -> Result<(), String> {
     if paths.is_empty() {
         return Err("expected at least one object".into());
     }
-    let mut members = if interp.vfs.is_file(&interp.cwd, archive) {
-        let bytes = read_input(interp, archive)?;
+    let cwd = system.cwd().to_string();
+    let mut members = if matches!(
+        system.metadata(&cwd, archive, true).map(|info| info.kind),
+        Ok(FileKind::File)
+    ) {
+        let bytes = read_input(system, archive)?;
         decode_archive(&bytes)?
     } else {
         Vec::new()
@@ -77,7 +84,7 @@ fn replace(interp: &mut CommandContext<'_>, archive: &str, paths: &[String]) -> 
         if name.is_empty() || name.len() > 15 || !name.is_ascii() {
             return Err(format!("unsupported member name '{name}'"));
         }
-        let data = read_input(interp, path)?;
+        let data = read_input(system, path)?;
         let symbols = object_symbols(&data)?;
         let member = Member {
             name: name.into(),
@@ -93,43 +100,42 @@ fn replace(interp: &mut CommandContext<'_>, archive: &str, paths: &[String]) -> 
             return Err("too many archive members".into());
         }
     }
-    save(interp, archive, &members)
+    save(system, archive, &members)
 }
 
-fn reindex(interp: &mut CommandContext<'_>, archive: &str) -> Result<(), String> {
-    let bytes = read_input(interp, archive)?;
+fn reindex(system: &mut dyn System, archive: &str) -> Result<(), String> {
+    let bytes = read_input(system, archive)?;
     let members = decode_archive(&bytes)?;
-    save(interp, archive, &members)
+    save(system, archive, &members)
 }
 
-fn save(interp: &mut CommandContext<'_>, archive: &str, members: &[Member]) -> Result<(), String> {
+fn save(system: &mut dyn System, archive: &str, members: &[Member]) -> Result<(), String> {
     let work = members.iter().try_fold(0usize, |total, member| {
         total
             .checked_add(member.data.len())
             .ok_or("archive size overflow")
     })?;
-    if work > MAX_ARCHIVE_BYTES || !interp.resources.charge_cpu(work as u64) {
+    if work > MAX_ARCHIVE_BYTES || !system.charge_cpu(work as u64) {
         return Err("archive resource limit exceeded".into());
     }
     let bytes = encode_archive(members)?;
-    let cwd = interp.cwd.clone();
-    interp
-        .vfs
-        .write(&cwd, archive, &bytes, 0o644)
+    let cwd = system.cwd().to_string();
+    system
+        .write_file(&cwd, archive, &bytes, 0o644)
         .map_err(|error| error.to_string())
 }
 
-fn read_input(interp: &mut CommandContext<'_>, path: &str) -> Result<Vec<u8>, String> {
-    let size = interp
-        .vfs
-        .file_len(&interp.cwd, path)
+fn read_input(system: &mut dyn System, path: &str) -> Result<Vec<u8>, String> {
+    let cwd = system.cwd().to_string();
+    let size = system
+        .metadata(&cwd, path, true)
+        .map(|info| info.size)
         .map_err(|error| error.to_string())?;
-    if size > MAX_ARCHIVE_BYTES || !interp.resources.charge_cpu(size as u64) {
+    if size > MAX_ARCHIVE_BYTES as u64 || !system.charge_cpu(size) {
         return Err("archive resource limit exceeded".into());
     }
-    interp
-        .vfs
-        .read(&interp.cwd, path)
+    system
+        .read_file_limited(&cwd, path, MAX_ARCHIVE_BYTES)
         .map_err(|error| error.to_string())
 }
 

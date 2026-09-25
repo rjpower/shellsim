@@ -88,3 +88,23 @@ fn output_growth_obeys_disk_limits() {
     assert_eq!(outcome.exit_status, 137);
     assert_eq!(outcome.stop_reason, Some(StopReason::MemoryExhausted));
 }
+
+#[test]
+fn dd_reads_large_pipe_and_resolves_child_files() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/input", &vec![b'x'; 128 * 1024], 0o644)
+        .unwrap();
+    let (status, stdout, stderr) =
+        run(&mut environment, "cat /work/input | dd status=none | wc -c");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"131072\n");
+
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "env -C /work dd if=input of=copy status=none; wc -c /work/copy",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"131072 /work/copy\n");
+}

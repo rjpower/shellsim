@@ -799,6 +799,7 @@ impl Environment {
             _ => None,
         };
         if let Some(native) = native {
+            let trust = native.trust();
             let state = self
                 .process
                 .states
@@ -815,7 +816,7 @@ impl Environment {
             self.invocations.begin(
                 pid,
                 &argv,
-                crate::telemetry::CommandTrust::Real,
+                trust,
                 None,
                 self.resources.cpu_used(),
                 self.vfs.disk_used(),

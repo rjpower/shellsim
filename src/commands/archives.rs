@@ -12,14 +12,16 @@ use flate2::{Compression, GzBuilder};
 
 use crate::commands::util::ewln;
 use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
+use crate::program::ProcessContext;
+use crate::syscalls::{FileKind, System};
 
 const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
-    reg(commands, &["gzip"], Trust::Partial, cmd_gzip);
-    reg(commands, &["gunzip"], Trust::Partial, cmd_gunzip);
-    reg(commands, &["zcat"], Trust::Partial, cmd_zcat);
+    super::reg_system_poll(commands, "/usr/bin/gzip", Trust::Partial, cmd_gzip);
+    super::reg_system_poll(commands, "/usr/bin/gunzip", Trust::Partial, cmd_gunzip);
+    super::reg_system_poll(commands, "/usr/bin/zcat", Trust::Partial, cmd_zcat);
 }
 
 #[derive(Clone, Copy)]
@@ -37,58 +39,81 @@ struct Options {
     files: Vec<String>,
 }
 
-fn cmd_gzip(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    run(interp, args, io, Operation::Compress, false)
+fn cmd_gzip(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    run(context, io, Operation::Compress, false)
 }
 
-fn cmd_gunzip(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    run(interp, args, io, Operation::Decompress, false)
+fn cmd_gunzip(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    run(context, io, Operation::Decompress, false)
 }
 
-fn cmd_zcat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    run(interp, args, io, Operation::Decompress, true)
+fn cmd_zcat(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    run(context, io, Operation::Decompress, true)
 }
 
 fn run(
-    interp: &mut CommandContext<'_>,
-    args: &[String],
+    context: &mut ProcessContext<'_>,
     io: &mut Io,
     default_operation: Operation,
     force_stdout: bool,
-) -> i32 {
-    let options = match parse_options(args, default_operation, force_stdout) {
+) -> ShellPoll {
+    let options = match parse_options(context.args, default_operation, force_stdout) {
         Ok(options) => options,
         Err(message) => {
             ewln(io.err, &message);
-            return 1;
+            return ShellPoll::Ready(1);
         }
     };
+    if options.files.is_empty() || options.files.iter().any(|file| file == "-") {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let mark = context.system.memory_used();
+    let status = run_ready(context.system, io, &options);
+    context
+        .system
+        .release_memory(context.system.memory_used().saturating_sub(mark));
+    ShellPoll::Ready(status)
+}
+
+fn run_ready(system: &mut dyn System, io: &mut Io, options: &Options) -> i32 {
     if options.files.is_empty() {
-        return transform_to_stdout(interp, &options, &io.stdin, io.out, io.err);
+        return transform_to_stdout(system, options, &io.stdin, io.out, io.err);
     }
 
     let mut status = 0;
     for path in &options.files {
         if path == "-" {
-            if transform_to_stdout(interp, &options, &io.stdin, io.out, io.err) != 0 {
+            if transform_to_stdout(system, options, &io.stdin, io.out, io.err) != 0 {
                 status = 1;
             }
             continue;
         }
-        let input_len = match interp.vfs.file_len(&interp.cwd, path) {
-            Ok(length) => length,
+        let cwd = system.cwd().to_string();
+        let input_len = match system.metadata(&cwd, path, true) {
+            Ok(info) if info.kind == FileKind::File => info.size,
+            Ok(_) => {
+                ewln(io.err, &format!("gzip: {path}: not a regular file"));
+                status = 1;
+                continue;
+            }
             Err(error) => {
                 ewln(io.err, &format!("gzip: {path}: {error}"));
                 status = 1;
                 continue;
             }
         };
-        if !interp.reserve_memory(u64::try_from(input_len).unwrap_or(u64::MAX)) {
+        if !system.reserve_memory(input_len) {
             ewln(io.err, &format!("gzip: {path}: memory limit exceeded"));
             status = 1;
             continue;
         }
-        let input = match interp.vfs.read(&interp.cwd, path) {
+        let input = match system.read_file_limited(
+            &cwd,
+            path,
+            usize::try_from(system.limits().memory).unwrap_or(usize::MAX),
+        ) {
             Ok(input) => input,
             Err(error) => {
                 ewln(io.err, &format!("gzip: {path}: {error}"));
@@ -97,7 +122,7 @@ fn run(
             }
         };
         if options.stdout {
-            if transform_to_stdout(interp, &options, &input, io.out, io.err) != 0 {
+            if transform_to_stdout(system, options, &input, io.out, io.err) != 0 {
                 status = 1;
             }
             continue;
@@ -110,12 +135,12 @@ fn run(
                 continue;
             }
         };
-        if !options.force && interp.vfs.exists(&interp.cwd, &destination) {
+        if !options.force && system.metadata(&cwd, &destination, false).is_ok() {
             ewln(io.err, &format!("gzip: {destination} already exists"));
             status = 1;
             continue;
         }
-        let output = match transform(interp, options.operation, options.level, &input) {
+        let output = match transform(system, options.operation, options.level, &input) {
             Ok(output) => output,
             Err(message) => {
                 ewln(io.err, &format!("gzip: {path}: {message}"));
@@ -123,27 +148,29 @@ fn run(
                 continue;
             }
         };
-        let cwd = interp.cwd.clone();
-        if let Err(error) = interp.vfs.write(&cwd, &destination, &output, 0o644) {
+        if let Err(error) = system.write_file(&cwd, &destination, &output, 0o644) {
             ewln(io.err, &format!("gzip: {destination}: {error}"));
             status = 1;
             continue;
         }
         if !options.keep {
-            let _ = interp.vfs.remove_file(&cwd, path);
+            if let Err(error) = system.unlink(&cwd, path) {
+                ewln(io.err, &format!("gzip: {path}: {error}"));
+                status = 1;
+            }
         }
     }
     status
 }
 
 fn transform_to_stdout(
-    interp: &mut CommandContext<'_>,
+    system: &mut dyn System,
     options: &Options,
     input: &[u8],
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> i32 {
-    match transform(interp, options.operation, options.level, input) {
+    match transform(system, options.operation, options.level, input) {
         Ok(output) => {
             out.extend_from_slice(&output);
             0
@@ -156,12 +183,12 @@ fn transform_to_stdout(
 }
 
 fn transform(
-    interp: &mut CommandContext<'_>,
+    system: &mut dyn System,
     operation: Operation,
     level: u32,
     input: &[u8],
 ) -> Result<Vec<u8>, String> {
-    if !interp.charge_cpu(u64::try_from(input.len()).unwrap_or(u64::MAX)) {
+    if !system.charge_cpu(u64::try_from(input.len()).unwrap_or(u64::MAX)) {
         return Err("resource limit exceeded".to_string());
     }
     match operation {
@@ -171,7 +198,7 @@ fn transform(
                 .checked_add(input.len() / 8)
                 .and_then(|size| size.checked_add(128))
                 .ok_or_else(|| "compressed output is too large".to_string())?;
-            if !interp.reserve_memory(u64::try_from(bound).unwrap_or(u64::MAX)) {
+            if !system.reserve_memory(u64::try_from(bound).unwrap_or(u64::MAX)) {
                 return Err("memory limit exceeded".to_string());
             }
             let encoder = GzBuilder::new()
@@ -184,7 +211,7 @@ fn transform(
             encoder.finish().map_err(|error| error.to_string())
         }
         Operation::Decompress => {
-            if !interp.reserve_memory(MAX_DECOMPRESSED_BYTES as u64) {
+            if !system.reserve_memory(MAX_DECOMPRESSED_BYTES as u64) {
                 return Err("memory limit exceeded".to_string());
             }
             let decoder = MultiGzDecoder::new(input);
@@ -196,7 +223,7 @@ fn transform(
             if output.len() > MAX_DECOMPRESSED_BYTES {
                 return Err("decompressed output exceeds the 16 MiB limit".to_string());
             }
-            if !interp.charge_cpu(u64::try_from(output.len()).unwrap_or(u64::MAX)) {
+            if !system.charge_cpu(u64::try_from(output.len()).unwrap_or(u64::MAX)) {
                 return Err("resource limit exceeded".to_string());
             }
             Ok(output)
@@ -206,7 +233,7 @@ fn transform(
 
 /// Compress a tar byte stream with shellsim's deterministic gzip envelope.
 pub(super) fn gzip_bytes(interp: &mut CommandContext<'_>, input: &[u8]) -> Result<Vec<u8>, String> {
-    transform(interp, Operation::Compress, 6, input)
+    transform(&mut interp.system(), Operation::Compress, 6, input)
 }
 
 /// Decompress a bounded gzip byte stream for another modeled archive command.
@@ -214,7 +241,7 @@ pub(super) fn gunzip_bytes(
     interp: &mut CommandContext<'_>,
     input: &[u8],
 ) -> Result<Vec<u8>, String> {
-    transform(interp, Operation::Decompress, 6, input)
+    transform(&mut interp.system(), Operation::Decompress, 6, input)
 }
 
 fn output_name(path: &str, operation: Operation) -> Result<String, String> {

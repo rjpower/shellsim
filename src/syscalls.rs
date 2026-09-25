@@ -137,6 +137,8 @@ pub(crate) trait System {
     fn output_remaining(&self) -> u64;
     fn charge_output(&mut self, bytes: u64) -> bool;
     fn stop_status(&self) -> i32;
+    /// Record a rejected feature so callers can distinguish an unsupported surface.
+    fn note_unsupported(&mut self, feature: &str);
 }
 
 /// Active-PID adapter; native program bodies receive this handle, not `Interp`.
@@ -505,6 +507,10 @@ impl System for ActiveSystem<'_> {
             .resources
             .stop_reason()
             .map_or(137, |reason| reason.exit_status())
+    }
+
+    fn note_unsupported(&mut self, feature: &str) {
+        self.interp.note_unsupported(feature);
     }
 }
 

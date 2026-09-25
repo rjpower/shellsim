@@ -78,6 +78,8 @@ impl ProgramContinuation {
         if let Self::Native(NativeProcess::SystemCommand(command)) = self {
             interp.resources.release_memory(command.reserved_input);
             command.reserved_input = 0;
+            interp.resources.release_memory(command.base_reserved);
+            command.base_reserved = 0;
         }
     }
 
@@ -133,7 +135,10 @@ pub(crate) struct SystemCommandProcess {
     args: Vec<String>,
     run: crate::commands::SystemRun,
     base_cpu: u64,
+    base_memory: u64,
+    trust: crate::telemetry::CommandTrust,
     started: bool,
+    base_reserved: u64,
     cpu_before: u64,
     disk_before: u64,
     usage_recorded: bool,
@@ -159,7 +164,10 @@ impl SystemCommandProcess {
             args: args.to_vec(),
             run: command.run,
             base_cpu: command.base_cpu,
+            base_memory: command.base_memory,
+            trust: command.trust,
             started: false,
+            base_reserved: 0,
             cpu_before: 0,
             disk_before: 0,
             usage_recorded: false,
@@ -184,8 +192,13 @@ impl SystemCommandProcess {
                 self.started = true;
                 self.cpu_before = system.cpu_used();
                 self.disk_before = system.disk_used();
-                (!system.charge_cpu(self.base_cpu.saturating_add(argument_bytes)))
-                    .then(|| system.stop_status())
+                if !system.reserve_memory(self.base_memory) {
+                    Some(system.stop_status())
+                } else {
+                    self.base_reserved = self.base_memory;
+                    (!system.charge_cpu(self.base_cpu.saturating_add(argument_bytes)))
+                        .then(|| system.stop_status())
+                }
             };
             let outcome = if let Some(status) = start_status {
                 ShellPoll::Ready(status)
@@ -237,6 +250,8 @@ impl SystemCommandProcess {
             };
             system.release_memory(self.reserved_input);
             self.reserved_input = 0;
+            system.release_memory(self.base_reserved);
+            self.base_reserved = 0;
             if self.result.is_none() {
                 self.result = Some(SystemCommandOutput {
                     status,
@@ -268,6 +283,13 @@ impl SystemCommandProcess {
 }
 
 impl NativeProcess {
+    pub(crate) fn trust(&self) -> crate::telemetry::CommandTrust {
+        match self {
+            Self::SystemCommand(command) => command.trust,
+            _ => crate::telemetry::CommandTrust::Real,
+        }
+    }
+
     /// Construct an owned continuation from one VFS native program identity.
     pub(crate) fn from_image(image: crate::vfs::NativeProgram, argv: &[String]) -> Self {
         match image {
@@ -727,6 +749,10 @@ mod tests {
 
         fn stop_status(&self) -> i32 {
             137
+        }
+
+        fn note_unsupported(&mut self, _feature: &str) {
+            unreachable!("native writer does not reject features")
         }
     }
 

@@ -7,12 +7,12 @@ use std::collections::HashMap;
 
 use super::options::{parse_options_or_report, OptionSpec};
 use super::util::{ewln, read_inputs_system, uses_standard_input};
-use super::{reg_system_poll, CommandSpec, Io, Trust};
+use super::{reg_system_poll_costed, CommandSpec, Io, Trust};
 use crate::exec::ShellPoll;
 use crate::program::ProcessContext;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    reg_system_poll(m, "/usr/bin/sort", Trust::Real, run);
+    reg_system_poll_costed(m, "/usr/bin/sort", Trust::Real, 100, 16 * 1024, run);
 }
 
 fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
@@ -112,11 +112,9 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         .filter(|byte| **byte == b'\n')
         .count()
         .saturating_add(1) as u64;
-    let scratch = 16_u64.saturating_mul(1024).saturating_add(
-        (data.len() as u64)
-            .saturating_mul(2)
-            .saturating_add(line_count.saturating_mul(24)),
-    );
+    let scratch = (data.len() as u64)
+        .saturating_mul(2)
+        .saturating_add(line_count.saturating_mul(24));
     let comparisons = line_count.saturating_mul(line_count.max(1).ilog2() as u64);
     if !context.system.reserve_memory(scratch) {
         return ShellPoll::Ready(context.system.stop_status());

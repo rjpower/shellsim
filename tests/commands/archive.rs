@@ -38,6 +38,34 @@ fn gzip_round_trips_named_files_and_standard_streams() {
 }
 
 #[test]
+fn gzip_reads_large_pipe_and_uses_child_working_directory() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/input", &vec![b'x'; 128 * 1024], 0o644)
+        .unwrap();
+    let (outcome, stdout, stderr) =
+        environment.run_script_capture("cat /work/input | gzip -c | gunzip -c | wc -c");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"131072\n");
+
+    let (outcome, stdout, stderr) = environment
+        .run_script_capture("env -C /work gzip -k input; gunzip -c /work/input.gz | wc -c");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"131072\n");
+}
+
+#[test]
 fn gunzip_replaces_archives_and_rejects_invalid_inputs() {
     let mut environment = Environment::new();
     environment

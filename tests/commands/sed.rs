@@ -99,3 +99,34 @@ fn generated_text_obeys_memory_and_output_limits() {
     assert_eq!(outcome.exit_status, 137);
     assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
 }
+
+#[test]
+fn sed_reads_pipe_to_eof_and_resolves_child_cwd() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/long", &vec![b'a'; 128 * 1024], 0o644)
+        .unwrap();
+    let (outcome, stdout, stderr) = environment.run_script_capture("cat /work/long | sed -n '$=' ");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"1\n");
+
+    let (outcome, stdout, stderr) = environment.run_script_capture("env -C /work sed -n '$=' long");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"1\n");
+    assert!(environment
+        .invocations
+        .events()
+        .iter()
+        .any(|event| { event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == "sed") }));
+}
