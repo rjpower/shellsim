@@ -161,6 +161,11 @@ impl CommandContext<'_> {
         self.command_name
     }
 
+    /// Borrow the PID-scoped virtual kernel interface for a command operation.
+    pub(crate) fn system(&mut self) -> crate::syscalls::ActiveSystem<'_> {
+        crate::syscalls::ActiveSystem::new(self.env)
+    }
+
     pub fn charge_cpu(&mut self, units: u64) -> bool {
         self.env.resources.charge_cpu(units)
     }

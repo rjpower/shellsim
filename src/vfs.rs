@@ -16,6 +16,7 @@ pub enum NativeProgram {
     True,
     False,
     Pwd,
+    Yes,
 }
 
 impl NativeProgram {
@@ -24,6 +25,7 @@ impl NativeProgram {
             "true" => Some(Self::True),
             "false" => Some(Self::False),
             "pwd" => Some(Self::Pwd),
+            "yes" => Some(Self::Yes),
             _ => None,
         }
     }
@@ -33,6 +35,7 @@ impl NativeProgram {
             Self::True => "true",
             Self::False => "false",
             Self::Pwd => "pwd",
+            Self::Yes => "yes",
         }
     }
 }

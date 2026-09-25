@@ -189,6 +189,11 @@ class Environment:
         metadata, stdout, stderr = self._native.run(source, _as_bytes("stdin", stdin))
         return _decode_result(metadata, stdout, stderr)
 
+    def create_shell(self) -> ShellSession:
+        """Create a persistent shell with private state and a shared virtual filesystem."""
+
+        return ShellSession(self, self._native.create_shell())
+
     def run_python(
         self,
         source: str,
@@ -298,6 +303,25 @@ class Environment:
             files=report["files"],
             skipped_directories=tuple(report["skipped_directories"]),
         )
+
+
+class ShellSession:
+    """One persistent shell process in an :class:`Environment`.
+
+    Actions are serialized through the owning environment. An exited shell cannot be reused.
+    """
+
+    def __init__(self, environment: Environment, pid: int) -> None:
+        self._environment = environment
+        self.pid = pid
+
+    def run(self, source: str, stdin: Union[bytes, bytearray, memoryview] = b"") -> RunResult:
+        """Execute one action in this shell, retaining its state for the next action."""
+
+        if not isinstance(source, str):
+            raise TypeError("source must be str")
+        metadata, stdout, stderr = self._environment._native.run_shell(self.pid, source, _as_bytes("stdin", stdin))
+        return _decode_result(metadata, stdout, stderr)
 
 
 def run(

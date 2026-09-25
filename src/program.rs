@@ -8,7 +8,7 @@ use crate::descriptors::{IoPoll, IoWait};
 use crate::exec::{ShellContinuation, ShellPoll};
 use crate::interp::Interp;
 use crate::scheduler::WaitReason;
-use crate::syscalls::{ActiveProcessSyscalls, NativeSyscalls};
+use crate::syscalls::{ActiveSystem, SyscallError, System};
 
 /// Owned state needed to resume one process after a scheduler turn.
 #[derive(Clone)]
@@ -25,7 +25,7 @@ impl ProgramContinuation {
     pub(crate) fn poll(&mut self, interp: &mut Interp, budget: usize) -> ShellPoll {
         match self {
             Self::Shell(shell) => shell.poll(interp, budget),
-            Self::Native(native) => native.poll(&mut ActiveProcessSyscalls::new(interp)),
+            Self::Native(native) => native.poll(&mut ActiveSystem::new(interp)),
         }
     }
 
@@ -53,6 +53,10 @@ pub(crate) enum NativeProcess {
         output: Option<Vec<u8>>,
         offset: usize,
     },
+    Yes {
+        output: Vec<u8>,
+        offset: usize,
+    },
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -62,7 +66,7 @@ pub(crate) enum NativeProcess {
 
 impl NativeProcess {
     /// Construct an owned continuation from one VFS native program identity.
-    pub(crate) fn from_image(image: crate::vfs::NativeProgram) -> Self {
+    pub(crate) fn from_image(image: crate::vfs::NativeProgram, argv: &[String]) -> Self {
         match image {
             crate::vfs::NativeProgram::True => Self::Status(0),
             crate::vfs::NativeProgram::False => Self::Status(1),
@@ -70,6 +74,25 @@ impl NativeProcess {
                 output: None,
                 offset: 0,
             },
+            crate::vfs::NativeProgram::Yes => {
+                let args = &argv[1..];
+                let line_bytes = args
+                    .iter()
+                    .fold(args.len().saturating_sub(1), |total, arg| {
+                        total.saturating_add(arg.len())
+                    })
+                    .saturating_add(1);
+                if line_bytes > 4096 {
+                    return Self::failure(1, "yes: arguments exceed 4096 bytes\n".into());
+                }
+                let line = if args.is_empty() {
+                    b"y\n".to_vec()
+                } else {
+                    format!("{}\n", args.join(" ")).into_bytes()
+                };
+                let output = line.repeat((4096 / line.len()).max(1));
+                Self::Yes { output, offset: 0 }
+            }
         }
     }
 
@@ -81,7 +104,7 @@ impl NativeProcess {
         }
     }
 
-    fn poll(&mut self, syscalls: &mut impl NativeSyscalls) -> ShellPoll {
+    fn poll(&mut self, syscalls: &mut impl System) -> ShellPoll {
         if !syscalls.charge_cpu(1) {
             return ShellPoll::Ready(syscalls.stop_status());
         }
@@ -95,6 +118,13 @@ impl NativeProcess {
                 });
                 poll_write(syscalls, 1, bytes, offset, 0)
             }
+            Self::Yes { output, offset } => match poll_write(syscalls, 1, output, offset, 0) {
+                ShellPoll::Ready(0) => {
+                    *offset = 0;
+                    ShellPoll::Pending
+                }
+                other => other,
+            },
             Self::Failure {
                 status,
                 message,
@@ -105,7 +135,7 @@ impl NativeProcess {
 }
 
 fn poll_write(
-    syscalls: &mut impl NativeSyscalls,
+    syscalls: &mut impl System,
     fd: i32,
     bytes: &[u8],
     offset: &mut usize,
@@ -132,6 +162,9 @@ fn poll_write(
                 }
             }
             Ok(IoPoll::Blocked(wait)) => return ShellPoll::Blocked(wait_reason(wait)),
+            Err(SyscallError::Descriptor(crate::descriptors::DescriptorError::BrokenPipe)) => {
+                return ShellPoll::Ready(141);
+            }
             Err(_) => return ShellPoll::Ready(1),
         }
     }
@@ -157,12 +190,32 @@ mod tests {
         stopped: bool,
     }
 
-    impl NativeSyscalls for PartialWriter {
+    impl System for PartialWriter {
         fn cwd(&self) -> &str {
             "/work"
         }
 
-        fn write(&mut self, fd: i32, bytes: &[u8]) -> Result<IoPoll<usize>, String> {
+        fn chdir(&mut self, _path: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not change directory")
+        }
+
+        fn umask(&self) -> u16 {
+            unreachable!("native writer does not inspect umask")
+        }
+
+        fn set_umask(&mut self, _mask: u16) -> Result<(), SyscallError> {
+            unreachable!("native writer does not change umask")
+        }
+
+        fn limits(&self) -> crate::resources::Limits {
+            unreachable!("native writer does not inspect limits")
+        }
+
+        fn read(&mut self, _fd: i32, _maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
+            unreachable!("native writer does not read")
+        }
+
+        fn write(&mut self, fd: i32, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError> {
             assert_eq!(fd, 1);
             self.calls += 1;
             if self.calls == 1 {
@@ -171,6 +224,76 @@ mod tests {
             let written = bytes.len().min(2);
             self.bytes.extend_from_slice(&bytes[..written]);
             Ok(IoPoll::Ready(written))
+        }
+
+        fn open_file(
+            &mut self,
+            _base: &str,
+            _path: &str,
+            _options: crate::syscalls::OpenFile,
+        ) -> Result<i32, SyscallError> {
+            unreachable!("native writer does not open files")
+        }
+
+        fn file_state(&self, _fd: i32) -> Result<crate::descriptors::FileState, SyscallError> {
+            unreachable!("native writer does not inspect files")
+        }
+
+        fn close(&mut self, _fd: i32) -> Result<(), SyscallError> {
+            unreachable!("native writer does not close files")
+        }
+
+        fn seek(&mut self, _fd: i32, _delta: i64, _whence: u32) -> Result<u64, SyscallError> {
+            unreachable!("native writer does not seek")
+        }
+
+        fn chmod(&mut self, _base: &str, _path: &str, _mode: u32) -> Result<(), SyscallError> {
+            unreachable!("native writer does not change file modes")
+        }
+
+        fn unlink(&mut self, _base: &str, _path: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not unlink files")
+        }
+
+        fn mkdir(&mut self, _base: &str, _path: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not create directories")
+        }
+
+        fn rmdir(&mut self, _base: &str, _path: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not remove directories")
+        }
+
+        fn rename(&mut self, _base: &str, _from: &str, _to: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not rename files")
+        }
+
+        fn display_open(
+            &mut self,
+            _width: u32,
+            _height: u32,
+            _format: u32,
+        ) -> Result<u32, crate::display::DisplayError> {
+            unreachable!("native writer does not open displays")
+        }
+
+        fn display_present(
+            &mut self,
+            _handle: u32,
+            _pixels: &[u8],
+            _stride: u32,
+        ) -> Result<(), crate::display::DisplayError> {
+            unreachable!("native writer does not present displays")
+        }
+
+        fn input_poll_key(
+            &mut self,
+            _handle: u32,
+        ) -> Result<Option<crate::display::KeyEvent>, crate::display::DisplayError> {
+            unreachable!("native writer does not read keys")
+        }
+
+        fn display_close(&mut self, _handle: u32) -> Result<(), crate::display::DisplayError> {
+            unreachable!("native writer does not close displays")
         }
 
         fn charge_cpu(&mut self, _units: u64) -> bool {
@@ -197,7 +320,8 @@ mod tests {
 
     #[test]
     fn native_process_retains_output_across_blocked_and_partial_writes() {
-        let mut process = NativeProcess::from_image(crate::vfs::NativeProgram::Pwd);
+        let mut process =
+            NativeProcess::from_image(crate::vfs::NativeProgram::Pwd, &["pwd".into()]);
         let mut syscalls = PartialWriter {
             calls: 0,
             bytes: Vec::new(),
@@ -214,7 +338,8 @@ mod tests {
 
     #[test]
     fn native_process_stops_at_the_output_limit() {
-        let mut process = NativeProcess::from_image(crate::vfs::NativeProgram::Pwd);
+        let mut process =
+            NativeProcess::from_image(crate::vfs::NativeProgram::Pwd, &["pwd".into()]);
         let mut syscalls = PartialWriter {
             calls: 1,
             bytes: Vec::new(),

@@ -14,6 +14,8 @@ pub const MAX_TASKS: usize = crate::process::MAX_PROCESSES;
 /// Resource condition on which a cooperative task is suspended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WaitReason {
+    /// A persistent shell session is idle until its host selects another action.
+    ShellSession(ProcessId),
     Timer(u64),
     InputReadable(u32),
     PipeReadable(u32),
@@ -137,6 +139,35 @@ impl Scheduler {
         }
         self.states.insert(pid, TaskState::Runnable);
         self.runnable.push_back(pid);
+        Ok(())
+    }
+
+    /// Park a newly created runnable shell until its host supplies an action.
+    pub(crate) fn park_runnable(
+        &mut self,
+        pid: ProcessId,
+        reason: WaitReason,
+    ) -> Result<(), SchedulerError> {
+        if !matches!(self.states.get(&pid), Some(TaskState::Runnable)) {
+            return Err(SchedulerError::InvalidTransition);
+        }
+        self.runnable.retain(|queued| *queued != pid);
+        self.states.insert(pid, TaskState::Blocked(reason));
+        self.blocked.push_back(pid);
+        Ok(())
+    }
+
+    /// Select a host-addressed shell session without running unrelated ready children first.
+    pub(crate) fn dispatch_pid(&mut self, pid: ProcessId) -> Result<(), SchedulerError> {
+        if self.current.is_some() {
+            return Err(SchedulerError::TaskAlreadyRunning);
+        }
+        if !matches!(self.states.get(&pid), Some(TaskState::Runnable)) {
+            return Err(SchedulerError::InvalidTransition);
+        }
+        self.runnable.retain(|queued| *queued != pid);
+        self.states.insert(pid, TaskState::Running);
+        self.current = Some(pid);
         Ok(())
     }
 
@@ -386,6 +417,33 @@ mod tests {
         assert_eq!(scheduler.wake(99), Err(SchedulerError::UnknownTask));
         assert_eq!(scheduler.current(), Some(1));
         assert_eq!(scheduler.state(1), Some(TaskState::Running));
+    }
+
+    #[test]
+    fn host_can_select_one_idle_shell_without_running_other_tasks() {
+        let mut scheduler = Scheduler::new(1);
+        scheduler.spawn(2).unwrap();
+        scheduler.spawn(3).unwrap();
+        scheduler
+            .park_runnable(3, WaitReason::ShellSession(3))
+            .unwrap();
+        scheduler
+            .block_current(WaitReason::ShellSession(1))
+            .unwrap();
+        scheduler.wake(3).unwrap();
+        scheduler.dispatch_pid(3).unwrap();
+        assert_eq!(scheduler.current(), Some(3));
+        assert_eq!(scheduler.state(2), Some(TaskState::Runnable));
+        scheduler
+            .block_current(WaitReason::ShellSession(3))
+            .unwrap();
+        scheduler.wake(1).unwrap();
+        scheduler.dispatch_pid(1).unwrap();
+        assert_eq!(scheduler.current(), Some(1));
+        assert_eq!(
+            scheduler.dispatch(),
+            Err(SchedulerError::TaskAlreadyRunning)
+        );
     }
 
     #[test]

@@ -8,11 +8,37 @@ use crate::display::{DisplayError, KeyEvent};
 use crate::interp::Interp;
 use crate::vfs::{resolve_against, NodeKind, VfsError};
 
-/// Operations available to a native process during one scheduler quantum. The borrowed handle
-/// cannot outlive the poll, so blocked programs retain only their own data and wait reason.
-pub(crate) trait NativeSyscalls {
+/// PID-scoped virtual kernel operations available during one execution quantum.
+///
+/// Native programs call this interface directly. A guest ABI adapter must translate its imports
+/// to the same operations; neither path receives host capabilities or the owning `Environment`.
+/// The borrowed handle cannot outlive the quantum, so blocked programs retain only owned state.
+pub(crate) trait System {
     fn cwd(&self) -> &str;
-    fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, String>;
+    fn chdir(&mut self, path: &str) -> Result<(), SyscallError>;
+    fn umask(&self) -> u16;
+    fn set_umask(&mut self, mask: u16) -> Result<(), SyscallError>;
+    fn limits(&self) -> crate::resources::Limits;
+    fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError>;
+    fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError>;
+    fn open_file(&mut self, base: &str, path: &str, options: OpenFile) -> Result<Fd, SyscallError>;
+    fn file_state(&self, fd: Fd) -> Result<FileState, SyscallError>;
+    fn close(&mut self, fd: Fd) -> Result<(), SyscallError>;
+    fn seek(&mut self, fd: Fd, delta: i64, whence: u32) -> Result<u64, SyscallError>;
+    fn chmod(&mut self, base: &str, path: &str, mode: u32) -> Result<(), SyscallError>;
+    fn unlink(&mut self, base: &str, path: &str) -> Result<(), SyscallError>;
+    fn mkdir(&mut self, base: &str, path: &str) -> Result<(), SyscallError>;
+    fn rmdir(&mut self, base: &str, path: &str) -> Result<(), SyscallError>;
+    fn rename(&mut self, base: &str, from: &str, to: &str) -> Result<(), SyscallError>;
+    fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError>;
+    fn display_present(
+        &mut self,
+        handle: u32,
+        pixels: &[u8],
+        stride: u32,
+    ) -> Result<(), DisplayError>;
+    fn input_poll_key(&mut self, handle: u32) -> Result<Option<KeyEvent>, DisplayError>;
+    fn display_close(&mut self, handle: u32) -> Result<(), DisplayError>;
     fn charge_cpu(&mut self, units: u64) -> bool;
     fn output_remaining(&self) -> u64;
     fn charge_output(&mut self, bytes: u64) -> bool;
@@ -21,23 +47,114 @@ pub(crate) trait NativeSyscalls {
 
 /// Active-PID adapter; native program bodies receive this handle, not `Interp`.
 /// The current WASI adapter still holds `Interp` while translating its imports.
-pub(crate) struct ActiveProcessSyscalls<'a> {
+pub(crate) struct ActiveSystem<'a> {
     interp: &'a mut Interp,
 }
 
-impl<'a> ActiveProcessSyscalls<'a> {
+impl<'a> ActiveSystem<'a> {
     pub(crate) fn new(interp: &'a mut Interp) -> Self {
         Self { interp }
     }
 }
 
-impl NativeSyscalls for ActiveProcessSyscalls<'_> {
+impl System for ActiveSystem<'_> {
     fn cwd(&self) -> &str {
         &self.interp.process.cwd
     }
 
-    fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, String> {
-        self.interp.write_fd(fd, bytes)
+    fn chdir(&mut self, path: &str) -> Result<(), SyscallError> {
+        if path.is_empty() || path.contains('\0') {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let absolute = resolve_against(&self.interp.process.cwd, path);
+        let node = self.interp.fs_metadata("/", &absolute, true)?;
+        if !matches!(node.kind, NodeKind::Dir) {
+            return Err(SyscallError::File(VfsError::NotADir(absolute)));
+        }
+        let resolved = self.interp.fs_realpath("/", &absolute, true)?;
+        self.interp.process.cwd = resolved;
+        Ok(())
+    }
+
+    fn umask(&self) -> u16 {
+        self.interp.process.umask
+    }
+
+    fn set_umask(&mut self, mask: u16) -> Result<(), SyscallError> {
+        if mask > 0o777 {
+            return Err(SyscallError::InvalidArgument);
+        }
+        self.interp.process.umask = mask;
+        Ok(())
+    }
+
+    fn limits(&self) -> crate::resources::Limits {
+        self.interp.resources.limits()
+    }
+
+    fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
+        self.interp.read_fd_checked(fd, maximum)
+    }
+
+    fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError> {
+        self.interp.write_fd_checked(fd, bytes)
+    }
+
+    fn open_file(&mut self, base: &str, path: &str, options: OpenFile) -> Result<Fd, SyscallError> {
+        open_file(self.interp, base, path, options)
+    }
+
+    fn file_state(&self, fd: Fd) -> Result<FileState, SyscallError> {
+        file_state(self.interp, fd)
+    }
+
+    fn close(&mut self, fd: Fd) -> Result<(), SyscallError> {
+        close(self.interp, fd)
+    }
+
+    fn seek(&mut self, fd: Fd, delta: i64, whence: u32) -> Result<u64, SyscallError> {
+        seek(self.interp, fd, delta, whence)
+    }
+
+    fn chmod(&mut self, base: &str, path: &str, mode: u32) -> Result<(), SyscallError> {
+        chmod(self.interp, base, path, mode)
+    }
+
+    fn unlink(&mut self, base: &str, path: &str) -> Result<(), SyscallError> {
+        unlink(self.interp, base, path)
+    }
+
+    fn mkdir(&mut self, base: &str, path: &str) -> Result<(), SyscallError> {
+        mkdir(self.interp, base, path)
+    }
+
+    fn rmdir(&mut self, base: &str, path: &str) -> Result<(), SyscallError> {
+        rmdir(self.interp, base, path)
+    }
+
+    fn rename(&mut self, base: &str, from: &str, to: &str) -> Result<(), SyscallError> {
+        rename(self.interp, base, from, to)
+    }
+
+    fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError> {
+        display_open(self.interp, width, height, format)
+    }
+
+    fn display_present(
+        &mut self,
+        handle: u32,
+        pixels: &[u8],
+        stride: u32,
+    ) -> Result<(), DisplayError> {
+        display_present(self.interp, handle, pixels, stride)
+    }
+
+    fn input_poll_key(&mut self, handle: u32) -> Result<Option<KeyEvent>, DisplayError> {
+        input_poll_key(self.interp, handle)
+    }
+
+    fn display_close(&mut self, handle: u32) -> Result<(), DisplayError> {
+        display_close(self.interp, handle)
     }
 
     fn charge_cpu(&mut self, units: u64) -> bool {
@@ -61,7 +178,7 @@ impl NativeSyscalls for ActiveProcessSyscalls<'_> {
 }
 
 /// Open the single virtual display for the active process.
-pub(crate) fn display_open(
+fn display_open(
     interp: &mut Interp,
     width: u32,
     height: u32,
@@ -77,7 +194,7 @@ pub(crate) fn display_open(
 }
 
 /// Copy a complete RGBA frame from a process into the virtual display.
-pub(crate) fn display_present(
+fn display_present(
     interp: &mut Interp,
     handle: u32,
     pixels: &[u8],
@@ -93,17 +210,14 @@ pub(crate) fn display_present(
 }
 
 /// Receive one injected key event, or report that no event is ready.
-pub(crate) fn input_poll_key(
-    interp: &mut Interp,
-    handle: u32,
-) -> Result<Option<KeyEvent>, DisplayError> {
+fn input_poll_key(interp: &mut Interp, handle: u32) -> Result<Option<KeyEvent>, DisplayError> {
     interp
         .display
         .poll_key(&mut interp.resources, interp.process.pid, handle)
 }
 
 /// Relinquish the display while retaining its last frame for inspection.
-pub(crate) fn display_close(interp: &mut Interp, handle: u32) -> Result<(), DisplayError> {
+fn display_close(interp: &mut Interp, handle: u32) -> Result<(), DisplayError> {
     interp.display.close(interp.process.pid, handle)
 }
 
@@ -126,6 +240,7 @@ pub(crate) enum SyscallError {
     InvalidArgument,
     IsDirectory,
     Permission,
+    ResourceExhausted,
 }
 
 impl From<VfsError> for SyscallError {
@@ -141,7 +256,7 @@ impl From<DescriptorError> for SyscallError {
 }
 
 /// Open a regular virtual file in the active process, assigning the lowest free guest fd.
-pub(crate) fn open_file(
+fn open_file(
     interp: &mut Interp,
     cwd: &str,
     path: &str,
@@ -198,12 +313,7 @@ pub(crate) fn open_file(
 }
 
 /// Change virtual permission bits for a path owned by the active process.
-pub(crate) fn chmod(
-    interp: &mut Interp,
-    cwd: &str,
-    path: &str,
-    mode: u32,
-) -> Result<(), SyscallError> {
+fn chmod(interp: &mut Interp, cwd: &str, path: &str, mode: u32) -> Result<(), SyscallError> {
     if path.is_empty() || path.contains('\0') || mode & !0o7777 != 0 {
         return Err(SyscallError::InvalidArgument);
     }
@@ -213,7 +323,7 @@ pub(crate) fn chmod(
 }
 
 /// Return regular-file state for an active process descriptor.
-pub(crate) fn file_state(interp: &Interp, fd: Fd) -> Result<FileState, SyscallError> {
+fn file_state(interp: &Interp, fd: Fd) -> Result<FileState, SyscallError> {
     let description = interp.process.fds.get(fd)?;
     interp
         .descriptors
@@ -222,7 +332,7 @@ pub(crate) fn file_state(interp: &Interp, fd: Fd) -> Result<FileState, SyscallEr
 }
 
 /// Close a process-owned descriptor and update process metadata.
-pub(crate) fn close(interp: &mut Interp, fd: Fd) -> Result<(), SyscallError> {
+fn close(interp: &mut Interp, fd: Fd) -> Result<(), SyscallError> {
     interp.process.fds.close(fd, &mut interp.descriptors)?;
     interp
         .vfs
@@ -232,7 +342,7 @@ pub(crate) fn close(interp: &mut Interp, fd: Fd) -> Result<(), SyscallError> {
 }
 
 /// Remove one regular file through the virtual filesystem, without exposing host paths.
-pub(crate) fn unlink(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError> {
+fn unlink(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError> {
     interp.sync_vfs_time();
     let absolute = resolve_against(cwd, path);
     let entry = interp.vfs.realpath(&absolute, false)?;
@@ -251,35 +361,25 @@ pub(crate) fn unlink(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), S
 }
 
 /// Create one directory; unlike `mkdir_all`, this retains POSIX's existing-parent requirement.
-pub(crate) fn mkdir(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError> {
+fn mkdir(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError> {
     interp.sync_vfs_time();
     interp.vfs.mkdir(cwd, path).map_err(Into::into)
 }
 
 /// Remove only an empty virtual directory.
-pub(crate) fn rmdir(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError> {
+fn rmdir(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError> {
     interp.sync_vfs_time();
     interp.vfs.rmdir(cwd, path).map_err(Into::into)
 }
 
 /// Move a virtual path within the same modeled filesystem.
-pub(crate) fn rename(
-    interp: &mut Interp,
-    cwd: &str,
-    from: &str,
-    to: &str,
-) -> Result<(), SyscallError> {
+fn rename(interp: &mut Interp, cwd: &str, from: &str, to: &str) -> Result<(), SyscallError> {
     interp.sync_vfs_time();
     interp.vfs.rename(cwd, from, to).map_err(Into::into)
 }
 
 /// Seek one regular-file description. The returned cursor is shared with duplicated fds.
-pub(crate) fn seek(
-    interp: &mut Interp,
-    fd: Fd,
-    delta: i64,
-    whence: u32,
-) -> Result<u64, SyscallError> {
+fn seek(interp: &mut Interp, fd: Fd, delta: i64, whence: u32) -> Result<u64, SyscallError> {
     let description = interp.process.fds.get(fd)?;
     let file = file_state(interp, fd)?;
     let base = match whence {
@@ -300,6 +400,56 @@ pub(crate) fn seek(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_system_changes_only_the_current_process_directory_and_mask() {
+        let mut interp = Interp::new();
+        let mut system = ActiveSystem::new(&mut interp);
+        assert_eq!(system.cwd(), "/");
+        assert!(system.chdir("/work").is_ok());
+        assert_eq!(system.cwd(), "/work");
+        assert!(system.chdir("/proc").is_ok());
+        assert_eq!(system.cwd(), "/proc");
+        assert!(matches!(
+            system.chdir("/missing"),
+            Err(SyscallError::File(VfsError::NotFound(_)))
+        ));
+        assert_eq!(system.cwd(), "/proc");
+        assert!(matches!(
+            system.set_umask(0o1000),
+            Err(SyscallError::InvalidArgument)
+        ));
+        assert_eq!(system.umask(), 0o022);
+        system.set_umask(0o077).unwrap();
+        assert_eq!(system.umask(), 0o077);
+    }
+
+    #[test]
+    fn active_system_reads_virtual_descriptors_without_host_access() {
+        let mut interp = Interp::new();
+        interp
+            .vfs
+            .write("/", "/work/data", b"sample", 0o644)
+            .unwrap();
+        let fd = open_file(
+            &mut interp,
+            "/work",
+            "data",
+            OpenFile {
+                readable: true,
+                writable: false,
+                create: false,
+                exclusive: false,
+                truncate: false,
+                append: false,
+            },
+        )
+        .unwrap();
+        let mut system = ActiveSystem::new(&mut interp);
+        assert_eq!(system.read(fd, 3).unwrap(), IoPoll::Ready(b"sam".to_vec()));
+        assert_eq!(system.read(fd, 3).unwrap(), IoPoll::Ready(b"ple".to_vec()));
+        assert_eq!(system.read(fd, 3).unwrap(), IoPoll::Ready(Vec::new()));
+    }
     use crate::descriptors::IoPoll;
 
     #[test]

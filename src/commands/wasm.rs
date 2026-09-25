@@ -20,7 +20,7 @@ use wasmtime::{
 use crate::descriptors::DescriptorError;
 use crate::display::DisplayError;
 use crate::interp::Interp;
-use crate::syscalls::{self, OpenFile, SyscallError};
+use crate::syscalls::{ActiveSystem, OpenFile, SyscallError, System};
 use crate::vfs::{resolve_against, NodeKind, VfsError};
 
 use super::{util::ewln, CommandPoll};
@@ -180,6 +180,7 @@ fn syscall_errno(error: &SyscallError) -> i32 {
         SyscallError::InvalidArgument => ERRNO_INVAL,
         SyscallError::IsDirectory => ERRNO_ISDIR,
         SyscallError::Permission => ERRNO_PERM,
+        SyscallError::ResourceExhausted => ERRNO_INVAL,
     }
 }
 
@@ -192,11 +193,16 @@ fn display_errno(error: DisplayError) -> i32 {
     }
 }
 
-fn guest_file(caller: &Caller<'_, Host>, fd: i32) -> Result<crate::descriptors::FileState, i32> {
+fn guest_file(
+    caller: &mut Caller<'_, Host>,
+    fd: i32,
+) -> Result<crate::descriptors::FileState, i32> {
     if !caller.data().open_files.contains(&fd) {
         return Err(ERRNO_BADF);
     }
-    syscalls::file_state(&caller.data().interp, fd).map_err(|error| syscall_errno(&error))
+    ActiveSystem::new(&mut caller.data_mut().interp)
+        .file_state(fd)
+        .map_err(|error| syscall_errno(&error))
 }
 
 fn memory(caller: &mut Caller<'_, Host>) -> Option<Memory> {
@@ -343,12 +349,13 @@ fn path_open(mut caller: Caller<'_, Host>, request: PathOpen) -> i32 {
         truncate: request.oflags & 8 != 0,
         append: request.fdflags & 1 != 0,
     };
-    let fd = match syscalls::open_file(&mut caller.data_mut().interp, &cwd, &path, options) {
+    let fd = match ActiveSystem::new(&mut caller.data_mut().interp).open_file(&cwd, &path, options)
+    {
         Ok(fd) => fd,
         Err(error) => return syscall_errno(&error),
     };
     if !write_u32(&mut caller, request.result, fd as u32) {
-        let _ = syscalls::close(&mut caller.data_mut().interp, fd);
+        let _ = ActiveSystem::new(&mut caller.data_mut().interp).close(fd);
         return ERRNO_FAULT;
     }
     let host = caller.data_mut();
@@ -367,7 +374,7 @@ fn path_chmod(mut caller: Caller<'_, Host>, pointer: u32, length: u32, mode: u32
         Err(error) => return error,
     };
     let cwd = caller.data().cwd.clone();
-    match syscalls::chmod(&mut caller.data_mut().interp, &cwd, &path, mode) {
+    match ActiveSystem::new(&mut caller.data_mut().interp).chmod(&cwd, &path, mode) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
@@ -376,7 +383,7 @@ fn path_chmod(mut caller: Caller<'_, Host>, pointer: u32, length: u32, mode: u32
 // These calls copy pixels and key events through guest memory. No guest pointer or host device
 // escapes the active virtual process.
 fn display_open(mut caller: Caller<'_, Host>, width: u32, height: u32, format: u32) -> i32 {
-    match syscalls::display_open(&mut caller.data_mut().interp, width, height, format) {
+    match ActiveSystem::new(&mut caller.data_mut().interp).display_open(width, height, format) {
         Ok(handle) => handle as i32,
         Err(error) => -display_errno(error),
     }
@@ -409,7 +416,8 @@ fn display_present(
     let mut pixels = vec![0; length as usize];
     let read = memory.read(&caller, pointer as usize, &mut pixels);
     let result = if read.is_ok() {
-        syscalls::display_present(&mut caller.data_mut().interp, handle, &pixels, stride)
+        ActiveSystem::new(&mut caller.data_mut().interp)
+            .display_present(handle, &pixels, stride)
             .map_or_else(display_errno, |_| ERRNO_SUCCESS)
     } else {
         ERRNO_FAULT
@@ -449,7 +457,7 @@ fn input_poll_key(mut caller: Caller<'_, Host>, handle: u32, result: u32) -> i32
             }
         }
     }
-    match syscalls::input_poll_key(&mut caller.data_mut().interp, handle) {
+    match ActiveSystem::new(&mut caller.data_mut().interp).input_poll_key(handle) {
         Ok(Some(event)) => {
             slot[..4].copy_from_slice(&event.code.to_le_bytes());
             slot[4..].copy_from_slice(&u32::from(event.pressed).to_le_bytes());
@@ -465,7 +473,8 @@ fn input_poll_key(mut caller: Caller<'_, Host>, handle: u32, result: u32) -> i32
 }
 
 fn display_close(mut caller: Caller<'_, Host>, handle: u32) -> i32 {
-    syscalls::display_close(&mut caller.data_mut().interp, handle)
+    ActiveSystem::new(&mut caller.data_mut().interp)
+        .display_close(handle)
         .map_or_else(display_errno, |_| ERRNO_SUCCESS)
 }
 
@@ -521,7 +530,7 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
             value[0] = 3;
             u64::MAX
         }
-        _ => match guest_file(&caller, fd as i32) {
+        _ => match guest_file(&mut caller, fd as i32) {
             Ok(file) => {
                 value[0] = 4;
                 (if file.readable { 2 } else { 0 }) | (if file.writable { 64 } else { 0 })
@@ -554,20 +563,21 @@ fn fd_close(mut caller: Caller<'_, Host>, fd: u32) -> i32 {
         return ERRNO_BADF;
     }
     caller.data_mut().append_files.remove(&fd);
-    match syscalls::close(&mut caller.data_mut().interp, fd) {
+    match ActiveSystem::new(&mut caller.data_mut().interp).close(fd) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
 }
 
 fn fd_seek(mut caller: Caller<'_, Host>, fd: u32, delta: i64, whence: u32, result: u32) -> i32 {
-    if let Err(error) = guest_file(&caller, fd as i32) {
+    if let Err(error) = guest_file(&mut caller, fd as i32) {
         return error;
     }
-    let position = match syscalls::seek(&mut caller.data_mut().interp, fd as i32, delta, whence) {
-        Ok(position) => position,
-        Err(error) => return syscall_errno(&error),
-    };
+    let position =
+        match ActiveSystem::new(&mut caller.data_mut().interp).seek(fd as i32, delta, whence) {
+            Ok(position) => position,
+            Err(error) => return syscall_errno(&error),
+        };
     if !write_u64(&mut caller, result, position) {
         return ERRNO_FAULT;
     }
@@ -575,7 +585,7 @@ fn fd_seek(mut caller: Caller<'_, Host>, fd: u32, delta: i64, whence: u32, resul
 }
 
 fn fd_tell(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
-    let file = match guest_file(&caller, fd as i32) {
+    let file = match guest_file(&mut caller, fd as i32) {
         Ok(file) => file,
         Err(error) => return error,
     };
@@ -609,7 +619,7 @@ fn filestat(node: &crate::vfs::Node) -> [u8; 64] {
 
 fn fd_filestat_get(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
     let file = if fd >= 5 {
-        match guest_file(&caller, fd as i32) {
+        match guest_file(&mut caller, fd as i32) {
             Ok(file) => Some(file),
             Err(error) => return error,
         }
@@ -693,7 +703,7 @@ fn path_unlink_file(mut caller: Caller<'_, Host>, fd: u32, pointer: u32, length:
         Ok(path) => path,
         Err(error) => return error,
     };
-    match syscalls::unlink(&mut caller.data_mut().interp, &cwd, &path) {
+    match ActiveSystem::new(&mut caller.data_mut().interp).unlink(&cwd, &path) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
@@ -708,7 +718,7 @@ fn path_create_directory(mut caller: Caller<'_, Host>, fd: u32, pointer: u32, le
         Ok(path) => path,
         Err(error) => return error,
     };
-    match syscalls::mkdir(&mut caller.data_mut().interp, &cwd, &path) {
+    match ActiveSystem::new(&mut caller.data_mut().interp).mkdir(&cwd, &path) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
@@ -723,7 +733,7 @@ fn path_remove_directory(mut caller: Caller<'_, Host>, fd: u32, pointer: u32, le
         Ok(path) => path,
         Err(error) => return error,
     };
-    match syscalls::rmdir(&mut caller.data_mut().interp, &cwd, &path) {
+    match ActiveSystem::new(&mut caller.data_mut().interp).rmdir(&cwd, &path) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
@@ -753,7 +763,7 @@ fn path_rename(
     };
     let old_path = resolve_against(&old_base, &old_path);
     let new_path = resolve_against(&new_base, &new_path);
-    match syscalls::rename(&mut caller.data_mut().interp, "/", &old_path, &new_path) {
+    match ActiveSystem::new(&mut caller.data_mut().interp).rename("/", &old_path, &new_path) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
@@ -788,7 +798,7 @@ fn fd_write(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, writte
         return ERRNO_BADF;
     }
     if fd != 1 && fd != 2 {
-        match guest_file(&caller, fd) {
+        match guest_file(&mut caller, fd) {
             Ok(file) if file.writable => {}
             Ok(_) => return ERRNO_BADF,
             Err(error) => return error,
@@ -856,7 +866,7 @@ fn fd_write(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, writte
         }
     } else {
         if caller.data().append_files.contains(&fd) {
-            if let Err(error) = syscalls::seek(&mut caller.data_mut().interp, fd, 0, 2) {
+            if let Err(error) = ActiveSystem::new(&mut caller.data_mut().interp).seek(fd, 0, 2) {
                 return syscall_errno(&error);
             }
         }
@@ -864,7 +874,7 @@ fn fd_write(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, writte
         for chunk in chunks {
             bytes.extend_from_slice(&chunk);
         }
-        match caller.data_mut().interp.write_fd(fd, &bytes) {
+        match ActiveSystem::new(&mut caller.data_mut().interp).write(fd, &bytes) {
             Ok(crate::descriptors::IoPoll::Ready(_)) => {}
             Ok(crate::descriptors::IoPoll::Blocked(_)) | Err(_) => return ERRNO_INVAL,
         }
@@ -877,7 +887,7 @@ fn fd_read(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, read: u
         return ERRNO_BADF;
     }
     if fd != 0 {
-        match guest_file(&caller, fd) {
+        match guest_file(&mut caller, fd) {
             Ok(file) if file.readable => {}
             Ok(_) => return ERRNO_BADF,
             Err(error) => return error,
@@ -921,7 +931,7 @@ fn fd_read(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, read: u
         let end = offset.saturating_add(total).min(caller.data().stdin.len());
         caller.data().stdin[offset..end].to_vec()
     } else {
-        match caller.data_mut().interp.read_fd(fd, total) {
+        match ActiveSystem::new(&mut caller.data_mut().interp).read(fd, total) {
             Ok(crate::descriptors::IoPoll::Ready(bytes)) => bytes,
             Ok(crate::descriptors::IoPoll::Blocked(_)) | Err(_) => return ERRNO_INVAL,
         }
@@ -1362,7 +1372,7 @@ impl WasmSession {
             let _ = store.data_mut().interp.resources.charge_cpu(cpu_cost);
             let open_files = std::mem::take(&mut store.data_mut().open_files);
             for fd in open_files {
-                let _ = syscalls::close(&mut store.data_mut().interp, fd);
+                let _ = ActiveSystem::new(&mut store.data_mut().interp).close(fd);
             }
             let pid = store.data().interp.process.pid;
             store.data_mut().interp.display.close_owner(pid);
@@ -1613,7 +1623,7 @@ pub(super) fn run(
     let _ = store.data_mut().interp.resources.charge_cpu(cpu_cost);
     let open_files = std::mem::take(&mut store.data_mut().open_files);
     for fd in open_files {
-        let _ = syscalls::close(&mut store.data_mut().interp, fd);
+        let _ = ActiveSystem::new(&mut store.data_mut().interp).close(fd);
     }
     let pid = store.data().interp.process.pid;
     store.data_mut().interp.display.close_owner(pid);
