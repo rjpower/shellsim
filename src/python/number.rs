@@ -8,7 +8,7 @@ use num_traits::{Signed, ToPrimitive, Zero};
 
 use super::ast::{BinaryOperator, ComparisonOperator};
 use super::heap::{Heap, InstancePayload, Object};
-use super::native::{FromPyValue, PyError, PyResult, PyRuntime, PyValue};
+use super::native::{CallArgs, FromPyValue, PyError, PyResult, PyRuntime, PyValue};
 use super::ValueTag;
 
 /// Borrowed numeric payload used by VM protocols without exposing physical value tags.
@@ -55,6 +55,25 @@ pub(super) fn as_f64(heap: &Heap, value: &PyValue) -> Option<f64> {
         NumberRef::BigInt(value) => num_traits::ToPrimitive::to_f64(value),
         NumberRef::Float(value) => Some(value),
     }
+}
+
+/// Construct a capability-free complex value through the frozen Python class.
+pub(super) fn create_complex(
+    runtime: &mut dyn PyRuntime,
+    real: f64,
+    imaginary: f64,
+) -> PyResult<PyValue> {
+    let module = runtime.import_module("_complex")?;
+    let constructor = runtime
+        .get_attribute(module, "complex")?
+        .ok_or_else(|| PyError::runtime_error("complex type is unavailable"))?;
+    runtime.call_value(
+        constructor,
+        CallArgs::new(
+            vec![PyValue::Float(real), PyValue::Float(imaginary)],
+            Vec::new(),
+        ),
+    )
 }
 
 /// Parse the textual forms accepted by the bounded `int` constructor.
@@ -436,6 +455,16 @@ fn binary_numbers(
                     return Err(PyError::zero_division_error(
                         "0.0 cannot be raised to a negative power",
                     ));
+                }
+                if left < 0.0 && right.is_finite() && right.fract() != 0.0 {
+                    let magnitude = (-left).powf(right);
+                    let angle = std::f64::consts::PI * right;
+                    return create_complex(
+                        runtime,
+                        magnitude * angle.cos(),
+                        magnitude * angle.sin(),
+                    )
+                    .map(Some);
                 }
                 let value = left.powf(right);
                 if value.is_nan() {

@@ -190,6 +190,32 @@ print(math.log(8, 2), math.sin(0))"#;
 }
 
 #[test]
+fn math_base_two_and_ten_logarithms_handle_values_and_errors() {
+    let source = r#"import math
+print(math.log2(8), math.log10(100))
+print(math.log2(math.inf), math.isnan(math.log10(math.nan)))
+for function in (math.log2, math.log10):
+    for value in (0, -1):
+        try:
+            function(value)
+        except ValueError as error:
+            print("ValueError", str(error))
+    try:
+        function()
+    except TypeError:
+        print("TypeError")
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"3.0 2.0\ninf True\nValueError math domain error\nValueError math domain error\nTypeError\nValueError math domain error\nValueError math domain error\nTypeError\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
 fn expanded_math_and_complex_functions_cover_agent_numeric_checks() {
     let source = r#"import cmath
 import math

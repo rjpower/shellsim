@@ -110,6 +110,7 @@ impl Vm<'_> {
             let builtin = match name {
                 "print" => Builtin::Print,
                 "input" => Builtin::Input,
+                "exec" => Builtin::Exec,
                 "exit" | "quit" => Builtin::Exit,
                 "chr" => Builtin::Character,
                 "ord" => Builtin::Ordinal,

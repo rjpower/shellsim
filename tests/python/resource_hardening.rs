@@ -85,6 +85,36 @@ fn percent_format_width_is_rejected_before_host_allocation() {
 }
 
 #[test]
+fn format_spec_width_is_rejected_before_host_allocation() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "print('{value:1000000s}'.format(value='x'))",
+        Limits {
+            memory: 32 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 32 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn exec_source_consumes_cpu_before_parsing() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "exec('pass\\n' * 10000)",
+        Limits {
+            cpu: 1000,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 1000);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn native_sorting_consumes_cpu_fuel() {
     let (status, stdout, stderr, usage) = run_with_limits(
         "print(sorted(range(100, 0, -1)))",

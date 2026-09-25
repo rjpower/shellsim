@@ -1,9 +1,9 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
 use super::{
-    format_float, format_integer, format_text, number, protocol, BigInt, BinaryOperator,
-    ComparisonOperator, Object, Ordering, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value,
-    Vm,
+    align_rendered, format_default_float, format_float, format_integer, format_text, number,
+    pad_rendered_number, parse_alignment, protocol, BigInt, BinaryOperator, ComparisonOperator,
+    Object, Ordering, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
 };
 
 impl Vm<'_> {
@@ -352,11 +352,12 @@ impl Vm<'_> {
     }
 
     pub(super) fn render_formatted_value(
-        &self,
+        &mut self,
         value: &Value,
         conversion: Option<char>,
         format_spec: &str,
     ) -> Result<String, String> {
+        self.reserve_format_spec(format_spec)?;
         let converted = match conversion {
             Some('r' | 'a') => Some(protocol::repr(&self.state.heap, value)?),
             Some('s') => Some(protocol::display(&self.state.heap, value)?),
@@ -375,9 +376,29 @@ impl Vm<'_> {
         Ok(rendered)
     }
 
+    /// Reserve the largest width or precision before formatting can allocate padding.
+    fn reserve_format_spec(&mut self, spec: &str) -> Result<(), String> {
+        let mut largest = 0_usize;
+        let mut digits = None::<usize>;
+        for byte in spec.bytes() {
+            if byte.is_ascii_digit() {
+                let next = digits
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(usize::from(byte - b'0'));
+                digits = Some(next);
+                largest = largest.max(next);
+            } else {
+                digits = None;
+            }
+        }
+        self.charge_cpu(u64::try_from(largest).unwrap_or(u64::MAX))?;
+        self.reserve_result(largest)
+    }
+
     fn format_unconverted_value(&self, value: &Value, spec: &str) -> Result<String, String> {
         let presentation = spec.chars().last().unwrap_or(' ');
-        if matches!(presentation, 'f' | 'e' | 'E') {
+        if matches!(presentation, 'f' | 'e' | 'E' | 'g' | 'G') {
             let number = super::number::as_f64(&self.state.heap, value)
                 .ok_or("floating-point format requires a number")?;
             return format_float(number, spec);
@@ -387,6 +408,24 @@ impl Vm<'_> {
                 .bigint_operand(value)
                 .map_err(|_| "integer format requires an integer")?;
             return format_integer(integer, spec);
+        }
+        if presentation.is_ascii_digit() && super::number::view(&self.state.heap, value).is_some() {
+            if spec.contains(['.', '+']) {
+                let number = match super::number::view(&self.state.heap, value) {
+                    Some(number::NumberRef::Float(number)) => number,
+                    _ => return Err("precision is not allowed in integer format".into()),
+                };
+                return format_default_float(number, spec);
+            }
+            let (alignment, width_text) = parse_alignment(spec);
+            let width = width_text
+                .parse::<usize>()
+                .map_err(|_| format!("unsupported numeric format {spec:?}"))?;
+            let rendered = protocol::display(&self.state.heap, value)?;
+            return Ok(match alignment {
+                Some(alignment) => align_rendered(&rendered, width, alignment),
+                None => pad_rendered_number(rendered, width, false),
+            });
         }
         if let Some(text) = protocol::string_value(&self.state.heap, value)? {
             return format_text(&text, spec);

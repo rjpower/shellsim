@@ -237,6 +237,7 @@ pub(super) enum Stream {
 pub(super) enum Builtin {
     Print,
     Input,
+    Exec,
     Exit,
     Character,
     Ordinal,
@@ -769,6 +770,9 @@ impl<'a> Vm<'a> {
                 self.allocate_object(Object::BigInt(value))?
             }
             Constant::Float(value) => Value::Float(*value),
+            Constant::Imaginary(value) => {
+                number::create_complex(self, 0.0, *value).map_err(|error| error.to_string())?
+            }
             Constant::String(value) => self.allocate_string(value.clone())?,
             Constant::Bytes(value) => self.allocate_bytes(value.clone())?,
         })
@@ -1141,15 +1145,120 @@ fn is_os_error(name: &str) -> bool {
 fn format_float(value: f64, spec: &str) -> Result<String, String> {
     let presentation = spec.chars().last().ok_or("empty float format")?;
     let options = &spec[..spec.len() - presentation.len_utf8()];
+    let (alignment, options) = parse_alignment(options);
+    let (positive_sign, options) = match options.strip_prefix('+') {
+        Some(options) => (true, options),
+        None => (false, options),
+    };
     let (width, precision, zero_pad) = parse_numeric_format(options)?;
     let precision = precision.unwrap_or(6);
     let rendered = match presentation {
+        'f' if positive_sign => format!("{value:+.precision$}"),
         'f' => format!("{value:.precision$}"),
+        'e' if positive_sign => format!("{value:+.precision$e}"),
         'e' => format!("{value:.precision$e}"),
+        'E' if positive_sign => format!("{value:+.precision$e}").to_uppercase(),
         'E' => format!("{value:.precision$e}").to_uppercase(),
+        'g' => format_general(value, precision, positive_sign, false, false),
+        'G' => format_general(value, precision, positive_sign, false, true),
         _ => return Err(format!("unsupported floating-point format {spec:?}")),
     };
-    Ok(pad_rendered_number(rendered, width, zero_pad))
+    Ok(match alignment {
+        Some(alignment) => align_rendered(&rendered, width, alignment),
+        None => pad_rendered_number(rendered, width, zero_pad),
+    })
+}
+
+/// Format significant digits using Python's fixed/scientific thresholds.
+fn format_general(
+    value: f64,
+    precision: usize,
+    positive_sign: bool,
+    default_type: bool,
+    uppercase: bool,
+) -> String {
+    if !value.is_finite() {
+        let sign = if value.is_sign_negative() {
+            "-"
+        } else if positive_sign {
+            "+"
+        } else {
+            ""
+        };
+        let label = if value.is_nan() { "nan" } else { "inf" };
+        return format!(
+            "{sign}{}",
+            if uppercase {
+                label.to_uppercase()
+            } else {
+                label.into()
+            }
+        );
+    }
+    let precision = precision.max(1);
+    let decimals = precision.saturating_sub(1);
+    let scientific = if positive_sign {
+        format!("{value:+.decimals$e}")
+    } else {
+        format!("{value:.decimals$e}")
+    };
+    let (mantissa, exponent) = scientific.split_once('e').expect("Rust scientific format");
+    let exponent = exponent.parse::<i32>().expect("Rust scientific exponent");
+    let threshold = if default_type {
+        precision.saturating_sub(1)
+    } else {
+        precision
+    };
+    let use_scientific = exponent < -4 || usize::try_from(exponent).is_ok_and(|e| e >= threshold);
+    if use_scientific {
+        let mantissa = trim_fraction(mantissa, false);
+        return format!(
+            "{mantissa}{}{exponent:+03}",
+            if uppercase { 'E' } else { 'e' }
+        );
+    }
+    let decimals = usize::try_from(precision as i128 - i128::from(exponent) - 1)
+        .expect("fixed precision is nonnegative");
+    let rendered = if positive_sign {
+        format!("{value:+.decimals$}")
+    } else {
+        format!("{value:.decimals$}")
+    };
+    trim_fraction(&rendered, default_type)
+}
+
+fn format_default_float(value: f64, spec: &str) -> Result<String, String> {
+    let (alignment, options) = parse_alignment(spec);
+    let (positive_sign, options) = match options.strip_prefix('+') {
+        Some(options) => (true, options),
+        None => (false, options),
+    };
+    let (width, precision, zero_pad) = parse_numeric_format(options)?;
+    let rendered = match precision {
+        Some(precision) => format_general(value, precision, positive_sign, true, false),
+        None if positive_sign => format!("{value:+}"),
+        None => format!("{value}"),
+    };
+    Ok(match alignment {
+        Some(alignment) => align_rendered(&rendered, width, alignment),
+        None => pad_rendered_number(rendered, width, zero_pad),
+    })
+}
+
+fn trim_fraction(value: &str, preserve_decimal: bool) -> String {
+    let Some((integer, fraction)) = value.split_once('.') else {
+        return value.to_string();
+    };
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        if preserve_decimal {
+            format!("{integer}.0")
+        } else {
+            integer.to_string()
+        }
+    } else {
+        format!("{integer}.{fraction}")
+    }
 }
 
 fn format_integer(value: BigInt, spec: &str) -> Result<String, String> {
@@ -1157,7 +1266,8 @@ fn format_integer(value: BigInt, spec: &str) -> Result<String, String> {
         .chars()
         .last()
         .ok_or_else(|| "empty integer format".to_string())?;
-    let mut options = &spec[..spec.len() - presentation.len_utf8()];
+    let options = &spec[..spec.len() - presentation.len_utf8()];
+    let (alignment, mut options) = parse_alignment(options);
     let alternate = options.starts_with('#');
     if alternate {
         options = &options[1..];
@@ -1190,10 +1300,23 @@ fn format_integer(value: BigInt, spec: &str) -> Result<String, String> {
     let sign = if negative { "-" } else { "" };
     let content_width = sign.len() + prefix.len() + digits.len();
     let padding = width.saturating_sub(content_width);
-    if zero_pad {
+    if let Some(alignment) = alignment {
+        Ok(align_rendered(
+            &format!("{sign}{prefix}{digits}"),
+            width,
+            alignment,
+        ))
+    } else if zero_pad {
         Ok(format!("{sign}{prefix}{}{digits}", "0".repeat(padding)))
     } else {
         Ok(format!("{}{sign}{prefix}{digits}", " ".repeat(padding)))
+    }
+}
+
+fn parse_alignment(spec: &str) -> (Option<char>, &str) {
+    match spec.chars().next() {
+        Some(alignment @ ('<' | '>' | '^')) => (Some(alignment), &spec[alignment.len_utf8()..]),
+        _ => (None, spec),
     }
 }
 
@@ -1235,13 +1358,20 @@ fn pad_rendered_number(value: String, width: usize, zero_pad: bool) -> String {
 }
 
 fn format_text(value: &str, spec: &str) -> Result<String, String> {
-    let (alignment, width_text) = match spec.chars().next() {
-        Some(alignment @ ('<' | '>' | '^')) => (alignment, &spec[alignment.len_utf8()..]),
-        _ => ('<', spec),
+    let spec = spec.strip_suffix('s').unwrap_or(spec);
+    let (alignment, width_text) = parse_alignment(spec);
+    let alignment = alignment.unwrap_or('<');
+    let width = if width_text.is_empty() {
+        0
+    } else {
+        width_text
+            .parse::<usize>()
+            .map_err(|_| format!("unsupported string format {spec:?}"))?
     };
-    let width = width_text
-        .parse::<usize>()
-        .map_err(|_| format!("unsupported string format {spec:?}"))?;
+    Ok(align_rendered(value, width, alignment))
+}
+
+fn align_rendered(value: &str, width: usize, alignment: char) -> String {
     let padding = width.saturating_sub(value.chars().count());
     let left = match alignment {
         '>' => padding,
@@ -1249,12 +1379,7 @@ fn format_text(value: &str, spec: &str) -> Result<String, String> {
         _ => 0,
     };
     let right = padding - left;
-    Ok(format!(
-        "{}{}{}",
-        " ".repeat(left),
-        value,
-        " ".repeat(right)
-    ))
+    format!("{}{}{}", " ".repeat(left), value, " ".repeat(right))
 }
 
 fn select_string_slice(

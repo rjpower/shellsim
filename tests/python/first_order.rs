@@ -263,6 +263,78 @@ print(f"{'x':>3} {['a']!r}")
 }
 
 #[test]
+fn format_specs_support_alignment_string_width_and_signed_precision() {
+    let source = r#"
+x = "cat"
+print("|{x:>10}|{x:5s}|{x:20s}|{x:s}|{value:+.2f}|".format(x=x, value=1.25))
+print(f"|{x:^7s}|{-1.25:+.2f}|{42:>5d}|{1.5:>5}|")
+print("{:.4g} {:+.1} {:+.4} {:+.6}".format(12.34567, 1.25, 1.25, 1.25))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "|       cat|cat  |cat                 |cat|+1.25|\n|  cat  |-1.25|   42|  1.5|\n12.35 +1e+00 +1.25 +1.25\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn general_float_format_switches_at_python_exponent_thresholds() {
+    let source = r#"
+for value in (0.0, 1.0, 12.34567, 12345.67, 0.000012345):
+    print("{:.4g} {:+.4}".format(value, value))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "0 +0.0\n1 +1.0\n12.35 +12.35\n1.235e+04 +1.235e+04\n1.234e-05 +1.234e-05\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn imaginary_literals_and_fractional_negative_powers_produce_complex_values() {
+    let source = r#"
+print(1j, 2j, 1 + 1j, 1j * 1j)
+value = (-1) ** 0.5
+print(abs(value.real) < 1e-12, round(value.imag, 6))
+"#;
+    assert_eq!(
+        run(source),
+        (0, "1j 2j (1+1j) (-1+0j)\nTrue 1.0\n".into(), String::new())
+    );
+}
+
+#[test]
+fn exec_runs_source_in_the_simulated_namespace() {
+    let source = r#"
+exec("answer = 6 * 7")
+print(answer)
+print(exec("answer += 1"), answer)
+try:
+    exec(42)
+except TypeError:
+    print("TypeError")
+"#;
+    assert_eq!(
+        run(source),
+        (0, "42\nNone 43\nTypeError\n".into(), String::new())
+    );
+}
+
+#[test]
+fn exec_rejects_unimplemented_syntax_without_host_fallback() {
+    let (status, stdout, stderr) = run("exec('match 1:\\n    case 1: pass')");
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("unsupported by minimal shim"));
+}
+
+#[test]
 fn frozenset_is_immutable_and_preserves_left_operand_type() {
     let source = r#"
 frozen = frozenset([1, 2, 2])

@@ -335,6 +335,13 @@ impl<'a> Lexer<'a> {
         }
 
         let spelling = self.source[offset..self.offset].replace('_', "");
+        if matches!(self.peek(), Some('j' | 'J')) {
+            self.bump();
+            return spelling
+                .parse::<f64>()
+                .map(TokenKind::Imaginary)
+                .map_err(|_| self.error(start, "invalid imaginary literal"));
+        }
         if is_float {
             spelling
                 .parse::<f64>()
@@ -815,6 +822,15 @@ mod tests {
             tokens[0].kind,
             TokenKind::BigInteger("999999999999999999999999999999".into())
         );
+    }
+
+    #[test]
+    fn imaginary_literals_require_a_valid_decimal_component() {
+        let tokens = lex("1j .5J 1e2j").unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Imaginary(1.0));
+        assert_eq!(tokens[1].kind, TokenKind::Imaginary(0.5));
+        assert_eq!(tokens[2].kind, TokenKind::Imaginary(100.0));
+        assert!(lex("1_j").is_err());
     }
 
     #[test]

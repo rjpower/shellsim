@@ -299,6 +299,7 @@ pub enum Constant {
     Integer(i64),
     BigInteger(String),
     Float(f64),
+    Imaginary(f64),
     String(String),
     Bytes(Vec<u8>),
 }
