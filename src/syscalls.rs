@@ -19,6 +19,10 @@ pub(crate) trait System {
     fn umask(&self) -> u16;
     fn set_umask(&mut self, mask: u16) -> Result<(), SyscallError>;
     fn limits(&self) -> crate::resources::Limits;
+    fn metadata(&mut self, base: &str, path: &str, follow: bool) -> Result<FileInfo, SyscallError>;
+    fn metadata_fd(&mut self, fd: Fd) -> Result<FileInfo, SyscallError>;
+    fn list_dir(&mut self, base: &str, path: &str) -> Result<Vec<String>, SyscallError>;
+    fn walk(&mut self, base: &str, path: &str) -> Result<Vec<String>, SyscallError>;
     fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError>;
     fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError>;
     fn open_file(&mut self, base: &str, path: &str, options: OpenFile) -> Result<Fd, SyscallError>;
@@ -28,6 +32,7 @@ pub(crate) trait System {
     fn chmod(&mut self, base: &str, path: &str, mode: u32) -> Result<(), SyscallError>;
     fn unlink(&mut self, base: &str, path: &str) -> Result<(), SyscallError>;
     fn mkdir(&mut self, base: &str, path: &str) -> Result<(), SyscallError>;
+    fn mkdir_all(&mut self, base: &str, path: &str) -> Result<(), SyscallError>;
     fn rmdir(&mut self, base: &str, path: &str) -> Result<(), SyscallError>;
     fn rename(&mut self, base: &str, from: &str, to: &str) -> Result<(), SyscallError>;
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError>;
@@ -92,6 +97,27 @@ impl System for ActiveSystem<'_> {
         self.interp.resources.limits()
     }
 
+    fn metadata(&mut self, base: &str, path: &str, follow: bool) -> Result<FileInfo, SyscallError> {
+        Ok(FileInfo::from(self.interp.fs_metadata(base, path, follow)?))
+    }
+
+    fn metadata_fd(&mut self, fd: Fd) -> Result<FileInfo, SyscallError> {
+        let file = file_state(self.interp, fd)?;
+        let node = match file.orphan {
+            Some(id) => self.interp.vfs.orphan_metadata(id)?,
+            None => self.interp.fs_metadata("/", &file.path, true)?,
+        };
+        Ok(FileInfo::from(node))
+    }
+
+    fn list_dir(&mut self, base: &str, path: &str) -> Result<Vec<String>, SyscallError> {
+        Ok(self.interp.fs_list_dir(base, path)?)
+    }
+
+    fn walk(&mut self, base: &str, path: &str) -> Result<Vec<String>, SyscallError> {
+        Ok(self.interp.fs_walk(base, path)?)
+    }
+
     fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
         self.interp.read_fd_checked(fd, maximum)
     }
@@ -126,6 +152,12 @@ impl System for ActiveSystem<'_> {
 
     fn mkdir(&mut self, base: &str, path: &str) -> Result<(), SyscallError> {
         mkdir(self.interp, base, path)
+    }
+
+    fn mkdir_all(&mut self, base: &str, path: &str) -> Result<(), SyscallError> {
+        self.interp.sync_vfs_time();
+        self.interp.vfs.mkdir_all(base, path)?;
+        Ok(())
     }
 
     fn rmdir(&mut self, base: &str, path: &str) -> Result<(), SyscallError> {
@@ -232,6 +264,45 @@ pub(crate) struct OpenFile {
     pub append: bool,
 }
 
+/// Data visible from `stat` without exposing file bytes or native program identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileInfo {
+    pub kind: FileKind,
+    pub mode: u32,
+    pub size: u64,
+    pub link_target: Option<String>,
+    pub mtime_ms: u64,
+}
+
+/// Kinds observable through the virtual filesystem interface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+impl From<crate::vfs::Node> for FileInfo {
+    fn from(node: crate::vfs::Node) -> Self {
+        let (kind, size, link_target) = match node.kind {
+            NodeKind::File(data) => (FileKind::File, data.len() as u64, None),
+            NodeKind::Dir => (FileKind::Directory, 0, None),
+            NodeKind::Symlink(target) => {
+                let size = target.len() as u64;
+                (FileKind::Symlink, size, Some(target))
+            }
+            NodeKind::NativeExecutable(_) => (FileKind::File, 0, None),
+        };
+        Self {
+            kind,
+            mode: node.mode,
+            size,
+            link_target,
+            mtime_ms: node.mtime,
+        }
+    }
+}
+
 /// Typed failure at the simulated process/kernel boundary.
 #[derive(Debug)]
 pub(crate) enum SyscallError {
@@ -241,6 +312,19 @@ pub(crate) enum SyscallError {
     IsDirectory,
     Permission,
     ResourceExhausted,
+}
+
+impl std::fmt::Display for SyscallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(error) => error.fmt(formatter),
+            Self::Descriptor(error) => write!(formatter, "{error:?}"),
+            Self::InvalidArgument => write!(formatter, "invalid argument"),
+            Self::IsDirectory => write!(formatter, "is a directory"),
+            Self::Permission => write!(formatter, "permission denied"),
+            Self::ResourceExhausted => write!(formatter, "resource exhausted"),
+        }
+    }
 }
 
 impl From<VfsError> for SyscallError {
@@ -450,6 +534,34 @@ mod tests {
         assert_eq!(system.read(fd, 3).unwrap(), IoPoll::Ready(b"ple".to_vec()));
         assert_eq!(system.read(fd, 3).unwrap(), IoPoll::Ready(Vec::new()));
     }
+
+    #[test]
+    fn metadata_and_directory_listing_use_the_active_virtual_process() {
+        let mut interp = Interp::new();
+        interp.vfs.mkdir("/", "/work/tree").unwrap();
+        interp
+            .vfs
+            .write("/", "/work/tree/data", b"sample", 0o640)
+            .unwrap();
+        interp.vfs.symlink("/", "data", "/work/tree/link").unwrap();
+        let mut system = ActiveSystem::new(&mut interp);
+        system.chdir("/work/tree").unwrap();
+        let cwd = system.cwd().to_string();
+        assert_eq!(system.list_dir(&cwd, ".").unwrap(), ["data", "link"]);
+        assert_eq!(system.walk(&cwd, ".").unwrap().len(), 3);
+        let file = system.metadata(&cwd, "data", true).unwrap();
+        assert_eq!(file.kind, FileKind::File);
+        assert_eq!(file.mode, 0o640);
+        assert_eq!(file.size, 6);
+        let link = system.metadata(&cwd, "link", false).unwrap();
+        assert_eq!(link.kind, FileKind::Symlink);
+        assert_eq!(link.link_target.as_deref(), Some("data"));
+        assert_eq!(system.metadata(&cwd, "link", true).unwrap(), file);
+        assert!(matches!(
+            system.metadata(&cwd, "missing", false),
+            Err(SyscallError::File(VfsError::NotFound(_)))
+        ));
+    }
     use crate::descriptors::IoPoll;
 
     #[test]
@@ -510,6 +622,10 @@ mod tests {
         .unwrap();
         unlink(&mut interp, "/work", "temp").unwrap();
         assert!(!interp.vfs.lexists("/", "/work/temp"));
+        assert_eq!(
+            ActiveSystem::new(&mut interp).metadata_fd(fd).unwrap().size,
+            3
+        );
         assert_eq!(
             interp.read_fd(fd, 3).unwrap(),
             IoPoll::Ready(b"abc".to_vec())

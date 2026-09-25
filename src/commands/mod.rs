@@ -28,7 +28,7 @@ mod diff;
 mod echo;
 mod find;
 mod format;
-mod fs;
+pub(crate) mod fs;
 pub(crate) mod git;
 mod grep;
 mod hashing;

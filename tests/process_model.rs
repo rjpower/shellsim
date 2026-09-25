@@ -48,6 +48,30 @@ fn proc_self_describes_the_active_logical_shell() {
 }
 
 #[test]
+fn ls_inspects_virtual_directory_metadata_and_symlinks() {
+    let mut env = Environment::new();
+    env.vfs.mkdir("/", "/work/listing").unwrap();
+    env.vfs.mkdir("/", "/work/listing/sub").unwrap();
+    env.vfs
+        .write("/", "/work/listing/sub/data", b"sixish", 0o640)
+        .unwrap();
+    env.vfs
+        .symlink("/", "sub/data", "/work/listing/link")
+        .unwrap();
+    let listing = run(&mut env, "cd /work; ls -l listing");
+    assert_eq!(listing.0, 0, "{}", listing.2);
+    assert!(listing.1.contains("link -> sub/data"), "{}", listing.1);
+    assert!(listing.1.contains("sub"), "{}", listing.1);
+    let recursive = run(&mut env, "ls -R /work/listing");
+    assert_eq!(recursive.0, 0, "{}", recursive.2);
+    assert!(
+        recursive.1.contains("/work/listing/sub:\ndata\n"),
+        "{}",
+        recursive.1
+    );
+}
+
+#[test]
 fn native_argv_children_use_process_cwd_and_leave_the_shell_unchanged() {
     let mut env = Environment::new();
     assert_eq!(
@@ -63,6 +87,38 @@ fn native_argv_children_use_process_cwd_and_leave_the_shell_unchanged() {
     assert_eq!(run(&mut env, "env false").0, 1);
     assert_eq!(run(&mut env, "env true").0, 0);
     assert_eq!(run(&mut env, "readlink /proc/self").1, "1234\n");
+}
+
+#[test]
+fn native_mkdir_uses_the_child_system_handle() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "env -C /work mkdir -p nested/leaf").0, 0);
+    assert!(matches!(
+        env.vfs
+            .metadata("/", "/work/nested/leaf", true)
+            .unwrap()
+            .kind,
+        NodeKind::Dir
+    ));
+    assert!(env.invocations.events().iter().any(|event| {
+        event.pid != 1_234
+            && event.argv == ["mkdir", "-p", "nested/leaf"]
+            && event.status == Some(0)
+    }));
+    let failure = run(&mut env, "mkdir /missing/leaf");
+    assert_eq!(failure.0, 1);
+    assert!(
+        failure.2.contains("cannot create directory"),
+        "{}",
+        failure.2
+    );
+    let unsupported = run(&mut env, "mkdir --mode=777 /work/nope");
+    assert_eq!(unsupported.0, 2);
+    assert!(
+        unsupported.2.contains("unimplemented option"),
+        "{}",
+        unsupported.2
+    );
 }
 
 #[test]

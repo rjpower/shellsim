@@ -13,7 +13,7 @@ to the shell's process-scoped syscall interface.
 The current machine already creates a root process with descriptors and a scheduler entry, and
 program continuations belong to logical processes. A child argv loader can retain either a
 shell continuation or a native Rust image. The first images that use the scoped `System` handle
-are `pwd`, `true`, `false`, and `yes`. All registered Rust commands now have opaque executable
+are `pwd`, `true`, `false`, `yes`, and `mkdir`. All registered Rust commands now have opaque executable
 entries in the virtual `/usr/bin`, resolved through the same cwd and
 `PATH` search as Wasm files and scripts when launched as external commands. Bare names that are
 shell builtins still run in the shell process. The native images receive a
@@ -42,8 +42,11 @@ receive it directly; the Wasm adapter should translate imports to the same opera
 `cd`/`pwd` and `umask` now use this interface for process cwd and creation mask. The shell keeps
 `PWD` and `OLDPWD` variables in its own userland state after a successful `chdir`.
 Descriptor and filesystem operations have typed results; the Wasm adapter uses `System` for
-open files, directory mutation, and the virtual display. Its stdio buffering and remaining
-metadata, clock, and process imports still need to move to this boundary.
+open files, file metadata, directory mutation, and the virtual display. Native `ls` uses typed
+metadata, directory listing, and tree walking; external `mkdir` is a scheduler-owned native
+image that creates directories through its scoped handle. The shell still invokes `ls` through
+the legacy dispatcher, and WASI stdio buffering, clock, and process imports still need to move
+to this boundary.
 
 The new `syscalls.rs` begins this boundary for regular files. It accepts typed open options,
 allocates descriptors in the active process, and owns close and seek. The WASI adapter now uses
@@ -66,7 +69,7 @@ commands without changing unrelated entries in the base image.
 |---|---|---|
 | Open/close/seek regular file | WASI `path_open`, `fd_close`, `fd_seek` | Redirections and external command I/O |
 | Read/write descriptor | WASI `fd_read`, `fd_write` | Process-scoped native handle backed by `Interp::read_fd` / `write_fd` |
-| Stat and directory enumeration | WASI `path_filestat_get`, future `fd_readdir` | VFS metadata and shell globbing |
+| Stat and directory enumeration | WASI `path_filestat_get` / `fd_filestat_get`, future `fd_readdir` | Native `ls`, then shell globbing |
 | Spawn/wait/signal | Future versioned shellsim extension | Shell executor and process scheduler |
 | Clock/random | WASI clock/random imports | Virtual clock and deterministic stream |
 
@@ -78,8 +81,8 @@ point so both native and Wasm work count against the same budget.
 
 ## Current limits and next gate
 
-Extend `System` with the remaining typed filesystem and process operations, then move a reader
-and a filesystem-walking utility across it. The legacy command registry still
+Extend `System` with the remaining typed process operations, then move a reader across it and
+load the filesystem-walking utility as a native process image. The legacy command registry still
 hands most native bodies a `CommandContext` that dereferences to all of `Interp`; remove that
 access as commands migrate, rather than renaming it and retaining broad authority.
 Finally, give the Rust shell a process-scoped handle for execution, files, and process control;
