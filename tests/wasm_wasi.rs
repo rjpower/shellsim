@@ -89,6 +89,54 @@ fn repeated_exec_reuses_code_but_not_guest_state_or_replaced_file() {
 }
 
 #[test]
+fn wasi_random_is_process_owned_and_faults_do_not_advance_it() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+            (import "wasi_snapshot_preview1" "random_get" (func $random (param i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "_start")
+                (if (i32.ne (call $random (i32.const 65535) (i32.const 4)) (i32.const 21)) (then unreachable))
+                (if (i32.ne (call $random (i32.const 32) (i32.const 4)) (i32.const 0)) (then unreachable))
+                (i32.store (i32.const 0) (i32.const 32))
+                (i32.store (i32.const 4) (i32.const 4))
+                (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))"#,
+    );
+    let mut snapshot = environment.clone();
+    assert_eq!(
+        run(&mut environment, "/app"),
+        (0, vec![209, 80, 25, 124], Vec::new())
+    );
+    assert_eq!(
+        run(&mut environment, "/app"),
+        (0, vec![162, 199, 198, 172], Vec::new())
+    );
+    assert_eq!(
+        run(&mut snapshot, "/app"),
+        (0, vec![209, 80, 25, 124], Vec::new())
+    );
+}
+
+#[test]
+fn wasi_random_obeys_virtual_cpu_limit() {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 20_000,
+        ..Limits::default()
+    });
+    install(
+        &mut environment,
+        r#"(module
+            (import "wasi_snapshot_preview1" "random_get" (func $random (param i32 i32) (result i32)))
+            (memory (export "memory") 2)
+            (func (export "_start")
+                (drop (call $random (i32.const 0) (i32.const 100000)))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app").0, 137);
+}
+
+#[test]
 fn virtual_display_presents_frame_and_consumes_injected_key() {
     const GUEST: &str = r#"(module
         (import "shellsim" "display_open" (func $open (param i32 i32 i32) (result i32)))

@@ -8,6 +8,13 @@ use crate::display::{DisplayError, KeyEvent};
 use crate::interp::Interp;
 use crate::vfs::{resolve_against, NodeKind, VfsError};
 
+/// Virtual clock selected by a guest ABI or native process.
+#[derive(Clone, Copy)]
+pub(crate) enum ClockId {
+    Realtime,
+    Monotonic,
+}
+
 /// PID-scoped virtual kernel operations available during one execution quantum.
 ///
 /// Native programs call this interface directly. A guest ABI adapter must translate its imports
@@ -86,6 +93,8 @@ pub(crate) trait System {
         strict: bool,
     ) -> Result<String, SyscallError>;
     fn wall_time_ms(&self) -> u64;
+    fn clock_time_ns(&self, clock: ClockId) -> Result<u64, SyscallError>;
+    fn random_fill(&mut self, bytes: &mut [u8]) -> Result<(), SyscallError>;
     fn allocate_temp_id(&mut self) -> Option<u64>;
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError>;
     fn display_present(
@@ -334,6 +343,28 @@ impl System for ActiveSystem<'_> {
 
     fn wall_time_ms(&self) -> u64 {
         self.interp.clock.unix_ms()
+    }
+
+    fn clock_time_ns(&self, clock: ClockId) -> Result<u64, SyscallError> {
+        match clock {
+            ClockId::Realtime => self
+                .interp
+                .clock
+                .wall_time_ns()
+                .ok()
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or(SyscallError::InvalidArgument),
+            ClockId::Monotonic => Ok(self.interp.clock.monotonic_ns()),
+        }
+    }
+
+    fn random_fill(&mut self, bytes: &mut [u8]) -> Result<(), SyscallError> {
+        let cost = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if !self.interp.resources.charge_cpu(cost) {
+            return Err(SyscallError::ResourceExhausted);
+        }
+        self.interp.process.fill_virtual_random(bytes);
+        Ok(())
     }
 
     fn allocate_temp_id(&mut self) -> Option<u64> {
