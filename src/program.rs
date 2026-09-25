@@ -57,6 +57,11 @@ pub(crate) enum NativeProcess {
         output: Vec<u8>,
         offset: usize,
     },
+    Mkdir {
+        args: Vec<String>,
+        result: Option<(i32, Vec<u8>)>,
+        offset: usize,
+    },
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -93,6 +98,11 @@ impl NativeProcess {
                 let output = line.repeat((4096 / line.len()).max(1));
                 Self::Yes { output, offset: 0 }
             }
+            crate::vfs::NativeProgram::Mkdir => Self::Mkdir {
+                args: argv[1..].to_vec(),
+                result: None,
+                offset: 0,
+            },
             crate::vfs::NativeProgram::Registered(_) => Self::failure(
                 125,
                 "registered program needs a command continuation\n".into(),
@@ -129,6 +139,31 @@ impl NativeProcess {
                 }
                 other => other,
             },
+            Self::Mkdir {
+                args,
+                result,
+                offset,
+            } => {
+                let (status, diagnostic) = result.get_or_insert_with(|| {
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
+                    let argument_bytes = args
+                        .iter()
+                        .fold(0_u64, |total, arg| total.saturating_add(arg.len() as u64));
+                    let status = if !syscalls.charge_cpu(100_u64.saturating_add(argument_bytes)) {
+                        syscalls.stop_status()
+                    } else {
+                        let mut io = crate::commands::Io {
+                            stdin: Vec::new(),
+                            out: &mut stdout,
+                            err: &mut stderr,
+                        };
+                        crate::commands::fs::run_mkdir(syscalls, args, &mut io)
+                    };
+                    (status, stderr)
+                });
+                poll_write(syscalls, 2, diagnostic, offset, *status)
+            }
             Self::Failure {
                 status,
                 message,
@@ -215,6 +250,27 @@ mod tests {
             unreachable!("native writer does not inspect limits")
         }
 
+        fn metadata(
+            &mut self,
+            _base: &str,
+            _path: &str,
+            _follow: bool,
+        ) -> Result<crate::syscalls::FileInfo, SyscallError> {
+            unreachable!("native writer does not inspect files")
+        }
+
+        fn metadata_fd(&mut self, _fd: i32) -> Result<crate::syscalls::FileInfo, SyscallError> {
+            unreachable!("native writer does not inspect descriptors")
+        }
+
+        fn list_dir(&mut self, _base: &str, _path: &str) -> Result<Vec<String>, SyscallError> {
+            unreachable!("native writer does not list directories")
+        }
+
+        fn walk(&mut self, _base: &str, _path: &str) -> Result<Vec<String>, SyscallError> {
+            unreachable!("native writer does not walk directories")
+        }
+
         fn read(&mut self, _fd: i32, _maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
             unreachable!("native writer does not read")
         }
@@ -260,6 +316,10 @@ mod tests {
         }
 
         fn mkdir(&mut self, _base: &str, _path: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not create directories")
+        }
+
+        fn mkdir_all(&mut self, _base: &str, _path: &str) -> Result<(), SyscallError> {
             unreachable!("native writer does not create directories")
         }
 

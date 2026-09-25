@@ -20,8 +20,8 @@ use wasmtime::{
 use crate::descriptors::DescriptorError;
 use crate::display::DisplayError;
 use crate::interp::Interp;
-use crate::syscalls::{ActiveSystem, OpenFile, SyscallError, System};
-use crate::vfs::{resolve_against, NodeKind, VfsError};
+use crate::syscalls::{ActiveSystem, FileInfo, FileKind, OpenFile, SyscallError, System};
+use crate::vfs::{resolve_against, VfsError};
 
 use super::{util::ewln, CommandPoll};
 
@@ -597,20 +597,21 @@ fn fd_tell(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
     }
 }
 
-fn filestat(node: &crate::vfs::Node) -> [u8; 64] {
+fn filestat(info: &FileInfo) -> [u8; 64] {
     let mut value = [0; 64];
-    value[16] = match &node.kind {
-        NodeKind::Dir => 3,
-        NodeKind::File(_) | NodeKind::NativeExecutable(_) => 4,
-        NodeKind::Symlink(_) => 7,
+    value[16] = match info.kind {
+        FileKind::Directory => 3,
+        FileKind::File => 4,
+        FileKind::Symlink => 7,
     };
     value[24..32].copy_from_slice(&1_u64.to_le_bytes());
-    let size = match &node.kind {
-        NodeKind::File(bytes) => bytes.len() as u64,
-        _ => 0,
+    let size = if info.kind == FileKind::File {
+        info.size
+    } else {
+        0
     };
     value[32..40].copy_from_slice(&size.to_le_bytes());
-    let mtime = node.mtime.saturating_mul(1_000_000);
+    let mtime = info.mtime_ms.saturating_mul(1_000_000);
     value[40..48].copy_from_slice(&mtime.to_le_bytes());
     value[48..56].copy_from_slice(&mtime.to_le_bytes());
     value[56..64].copy_from_slice(&mtime.to_le_bytes());
@@ -618,35 +619,23 @@ fn filestat(node: &crate::vfs::Node) -> [u8; 64] {
 }
 
 fn fd_filestat_get(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
-    let file = if fd >= 5 {
-        match guest_file(&mut caller, fd as i32) {
-            Ok(file) => Some(file),
-            Err(error) => return error,
-        }
-    } else {
-        None
+    let cwd = caller.data().cwd.clone();
+    let system = &mut ActiveSystem::new(&mut caller.data_mut().interp);
+    let info = match fd {
+        3 => system.metadata("/", &cwd, true),
+        4 => system.metadata("/", "/", true),
+        5.. => system.metadata_fd(fd as i32),
+        _ => return ERRNO_BADF,
     };
-    let node = match file.as_ref().and_then(|file| file.orphan) {
-        Some(id) => caller.data().interp.vfs.orphan_metadata(id),
-        None => {
-            let path = match (fd, file) {
-                (3, _) => caller.data().cwd.clone(),
-                (4, _) => "/".to_string(),
-                (_, Some(file)) => file.path,
-                _ => return ERRNO_BADF,
-            };
-            caller.data().interp.vfs.metadata("/", &path, true)
-        }
-    };
-    let node = match node {
-        Ok(node) => node,
-        Err(error) => return vfs_errno(&error),
+    let info = match info {
+        Ok(info) => info,
+        Err(error) => return syscall_errno(&error),
     };
     let Some(memory) = memory(&mut caller) else {
         return ERRNO_FAULT;
     };
     if memory
-        .write(&mut caller, result as usize, &filestat(&node))
+        .write(&mut caller, result as usize, &filestat(&info))
         .is_ok()
     {
         ERRNO_SUCCESS
@@ -671,21 +660,19 @@ fn path_filestat_get(
         Ok(path) => path,
         Err(error) => return error,
     };
-    let path = resolve_against(&cwd, &path);
-    let node = match caller
-        .data()
-        .interp
-        .vfs
-        .metadata("/", &path, flags & 1 != 0)
-    {
-        Ok(node) => node,
-        Err(error) => return vfs_errno(&error),
+    let info = match ActiveSystem::new(&mut caller.data_mut().interp).metadata(
+        &cwd,
+        &path,
+        flags & 1 != 0,
+    ) {
+        Ok(info) => info,
+        Err(error) => return syscall_errno(&error),
     };
     let Some(memory) = memory(&mut caller) else {
         return ERRNO_FAULT;
     };
     if memory
-        .write(&mut caller, result as usize, &filestat(&node))
+        .write(&mut caller, result as usize, &filestat(&info))
         .is_ok()
     {
         ERRNO_SUCCESS

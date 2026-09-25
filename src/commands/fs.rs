@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use crate::commands::util::{ewln, split_flags, wln};
 use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::interp::Interp;
+use crate::syscalls::{FileKind, System};
 use crate::vfs::resolve_against;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
@@ -36,6 +37,10 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
 }
 
 fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    run_ls(&mut interp.system(), args, io)
+}
+
+fn run_ls(system: &mut impl System, args: &[String], io: &mut Io) -> i32 {
     let mut flags = Vec::new();
     let mut ops = Vec::new();
     let mut options = true;
@@ -63,16 +68,17 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     let almost_all = flags.contains(&'A');
     let recursive = flags.contains(&'R');
     let directory_as_file = flags.contains(&'d');
+    let cwd = system.cwd().to_string();
     let paths: Vec<String> = if ops.is_empty() {
-        vec![interp.cwd.clone()]
+        vec![cwd.clone()]
     } else {
         ops.iter().map(|s| s.to_string()).collect()
     };
     let mut status = 0;
     for p in &paths {
         if directory_as_file {
-            if interp.fs_metadata(&interp.cwd, p, false).is_ok() {
-                emit_listing(interp, ".", std::slice::from_ref(p), long, io.out);
+            if system.metadata(&cwd, p, false).is_ok() {
+                emit_listing(system, ".", std::slice::from_ref(p), long, io.out);
             } else {
                 ewln(
                     io.err,
@@ -83,13 +89,13 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             continue;
         }
         if matches!(
-            interp.fs_metadata(&interp.cwd, p, true),
-            Ok(crate::vfs::Node {
-                kind: crate::vfs::NodeKind::Dir,
+            system.metadata(&cwd, p, true),
+            Ok(crate::syscalls::FileInfo {
+                kind: FileKind::Directory,
                 ..
             })
         ) {
-            let mut entries = match interp.fs_list_dir(&interp.cwd, p) {
+            let mut entries = match system.list_dir(&cwd, p) {
                 Ok(e) => e,
                 Err(e) => {
                     ewln(io.err, &format!("ls: {e}"));
@@ -106,22 +112,23 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             if paths.len() > 1 || recursive {
                 wln(io.out, &format!("{p}:"));
             }
-            emit_listing(interp, p, &entries, long, io.out);
+            emit_listing(system, p, &entries, long, io.out);
             if recursive {
-                let base = resolve_against(&interp.cwd, p);
-                let Ok(all_paths) = interp.fs_walk(&interp.cwd, p) else {
+                let base = resolve_against(&cwd, p);
+                let Ok(all_paths) = system.walk(&cwd, p) else {
                     status = 2;
                     continue;
                 };
-                for sub in all_paths.into_iter().skip(1).filter(|path| {
-                    matches!(
-                        interp.fs_metadata("/", path, false),
-                        Ok(crate::vfs::Node {
-                            kind: crate::vfs::NodeKind::Dir,
+                for sub in all_paths.into_iter().skip(1) {
+                    if !matches!(
+                        system.metadata("/", &sub, false),
+                        Ok(crate::syscalls::FileInfo {
+                            kind: FileKind::Directory,
                             ..
                         })
-                    )
-                }) {
+                    ) {
+                        continue;
+                    }
                     // Headers name the directory the way the operand did, and a hidden directory
                     // is not descended into unless hidden entries were asked for.
                     let relative = sub
@@ -133,7 +140,7 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                         continue;
                     }
                     let label = format!("{}/{relative}", p.trim_end_matches('/'));
-                    let mut sub_entries = interp.fs_list_dir("/", &sub).unwrap_or_default();
+                    let mut sub_entries = system.list_dir("/", &sub).unwrap_or_default();
                     if !all && !almost_all {
                         sub_entries.retain(|entry| !entry.starts_with('.'));
                     } else if all {
@@ -142,12 +149,12 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
                     }
                     wln(io.out, "");
                     wln(io.out, &format!("{label}:"));
-                    emit_listing(interp, &sub, &sub_entries, long, io.out);
+                    emit_listing(system, &sub, &sub_entries, long, io.out);
                 }
             }
-        } else if interp.fs_metadata(&interp.cwd, p, false).is_ok() {
+        } else if system.metadata(&cwd, p, false).is_ok() {
             // A file operand is listed the same way an entry of a directory is.
-            emit_listing(interp, ".", std::slice::from_ref(p), long, io.out);
+            emit_listing(system, ".", std::slice::from_ref(p), long, io.out);
         } else {
             ewln(
                 io.err,
@@ -159,35 +166,36 @@ fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     status
 }
 
-fn emit_listing(interp: &Interp, dir: &str, entries: &[String], long: bool, out: &mut Vec<u8>) {
+fn emit_listing(
+    system: &mut impl System,
+    dir: &str,
+    entries: &[String],
+    long: bool,
+    out: &mut Vec<u8>,
+) {
+    let cwd = system.cwd().to_string();
     if long {
         for e in entries {
             let full = if e == "." {
                 dir.to_string()
             } else if e == ".." {
-                crate::vfs::parent_of(&crate::vfs::resolve_against(&interp.cwd, dir))
+                crate::vfs::parent_of(&crate::vfs::resolve_against(&cwd, dir))
                     .unwrap_or_else(|| "/".into())
             } else {
                 format!("{}/{}", dir.trim_end_matches('/'), e)
             };
-            let (typ, mode, size, target) = match interp.fs_metadata(&interp.cwd, &full, false) {
+            let (typ, mode, size, target) = match system.metadata(&cwd, &full, false) {
                 Ok(n) => {
                     let t = match n.kind {
-                        crate::vfs::NodeKind::Dir => 'd',
-                        crate::vfs::NodeKind::Symlink(_) => 'l',
+                        FileKind::Directory => 'd',
+                        FileKind::Symlink => 'l',
                         _ => '-',
                     };
-                    let sz = match &n.kind {
-                        crate::vfs::NodeKind::File(d) => d.len(),
-                        crate::vfs::NodeKind::Symlink(target) => target.len(),
-                        crate::vfs::NodeKind::Dir | crate::vfs::NodeKind::NativeExecutable(_) => 0,
-                    };
                     // A long listing names what a link points at rather than following it.
-                    let target = match &n.kind {
-                        crate::vfs::NodeKind::Symlink(target) => format!(" -> {target}"),
-                        _ => String::new(),
-                    };
-                    (t, n.mode, sz, target)
+                    let target = n
+                        .link_target
+                        .map_or_else(String::new, |target| format!(" -> {target}"));
+                    (t, n.mode, n.size, target)
                 }
                 Err(_) => ('-', 0o644, 0, String::new()),
             };
@@ -253,6 +261,11 @@ fn reject_options(
 }
 
 fn cmd_mkdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    run_mkdir(&mut interp.system(), args, io)
+}
+
+/// Execute directory creation through one process-scoped kernel handle.
+pub(crate) fn run_mkdir(system: &mut impl System, args: &[String], io: &mut Io) -> i32 {
     let (flags, ops, long) = split_flags(args);
     if reject_options("mkdir", &flags, "p", &long, io) {
         return 2;
@@ -262,13 +275,13 @@ fn cmd_mkdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
         return 1;
     }
     let parents = flags.contains(&'p');
-    let cwd = interp.cwd.clone();
+    let cwd = system.cwd().to_string();
     let mut status = 0;
     for d in &ops {
         let r = if parents {
-            interp.vfs.mkdir_all(&cwd, d)
+            system.mkdir_all(&cwd, d)
         } else {
-            interp.vfs.mkdir(&cwd, d)
+            system.mkdir(&cwd, d)
         };
         if let Err(e) = r {
             ewln(
@@ -290,10 +303,11 @@ fn cmd_rmdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
         ewln(io.err, "rmdir: missing operand");
         return 1;
     }
-    let cwd = interp.cwd.clone();
+    let mut system = interp.system();
+    let cwd = system.cwd().to_string();
     let mut status = 0;
     for d in &ops {
-        if let Err(e) = interp.vfs.rmdir(&cwd, d) {
+        if let Err(e) = system.rmdir(&cwd, d) {
             ewln(io.err, &format!("rmdir: failed to remove '{d}': {e}"));
             status = 1;
         }

@@ -607,6 +607,7 @@ impl Environment {
             ("false", crate::vfs::NativeProgram::False),
             ("pwd", crate::vfs::NativeProgram::Pwd),
             ("yes", crate::vfs::NativeProgram::Yes),
+            ("mkdir", crate::vfs::NativeProgram::Mkdir),
         ] {
             vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
         }
