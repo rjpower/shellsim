@@ -5,26 +5,29 @@
 //! parsed and applied entirely in memory, then committed to the VFS as one transaction. It never
 //! invokes a host patch program or accesses a host path.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::commands::{reg_costed, CommandContext, CommandSpec, Io, Trust};
-use crate::vfs::{parent_of, resolve_against, NodeKind};
+use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
+use crate::program::ProcessContext;
+use crate::syscalls::{FileChange, FileKind, System};
+use crate::vfs::{parent_of, resolve_against};
 
 const MAX_PATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILE_PATCHES: usize = 10_000;
 
 pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
-    reg_costed(
+    super::reg_system_poll_costed(
         commands,
-        &["apply_patch"],
+        "/usr/bin/apply_patch",
         Trust::Partial,
         100,
         16 * 1024,
         cmd_apply_patch,
     );
-    reg_costed(
+    super::reg_system_poll_costed(
         commands,
-        &["patch"],
+        "/usr/bin/patch",
         Trust::Partial,
         100,
         16 * 1024,
@@ -52,29 +55,52 @@ enum PatchLine {
     Add(String),
 }
 
-fn cmd_apply_patch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let cwd = ctx.cwd.clone();
-    run_patch(ctx, args, io, true, &cwd)
+fn cmd_apply_patch(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    run_native_patch(context, io, true)
 }
 
-fn cmd_patch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let cwd = ctx.cwd.clone();
-    run_patch(ctx, args, io, false, &cwd)
+fn cmd_patch(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    run_native_patch(context, io, false)
+}
+
+fn run_native_patch(
+    context: &mut ProcessContext<'_>,
+    io: &mut Io,
+    agent_command: bool,
+) -> ShellPoll {
+    if parse_options(agent_command, context.args)
+        .ok()
+        .is_some_and(|(_, path)| path.is_none())
+    {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let cwd = context.system.cwd().to_string();
+    ShellPoll::Ready(run_patch(
+        context.system,
+        context.args,
+        io,
+        agent_command,
+        &cwd,
+        false,
+    ))
 }
 
 fn run_patch(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     args: &[String],
     io: &mut Io,
     agent_command: bool,
     cwd: &str,
+    check: bool,
 ) -> i32 {
     let (strip, input_path) = match parse_options(agent_command, args) {
         Ok(options) => options,
         Err(error) => return fail(io, 2, &error),
     };
     let bytes = if let Some(path) = input_path {
-        match ctx.fs_read_limited(&ctx.cwd, &path, MAX_PATCH_BYTES) {
+        match system.read_file_limited(cwd, &path, MAX_PATCH_BYTES) {
             Ok(bytes) => bytes,
             Err(error) => return fail(io, 2, &format!("cannot read patch: {error}")),
         }
@@ -87,17 +113,16 @@ fn run_patch(
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return fail(io, 2, "patch input must be UTF-8 text");
     };
-    let reserved = ctx
-        .vfs
+    let reserved = system
         .disk_used()
         .saturating_mul(4)
         .saturating_add((bytes.len() as u64).saturating_mul(4));
-    if !ctx.reserve_memory(reserved) {
-        return resource_failure(ctx, io);
+    if !system.reserve_memory(reserved) {
+        return resource_failure(system, io);
     }
-    if !ctx.charge_cpu(bytes.len() as u64) {
-        ctx.resources.release_memory(reserved);
-        return resource_failure(ctx, io);
+    if !system.charge_cpu(bytes.len() as u64) {
+        system.release_memory(reserved);
+        return resource_failure(system, io);
     }
     let parsed = if text.starts_with("*** Begin Patch") {
         parse_agent_patch(text)
@@ -106,12 +131,12 @@ fn run_patch(
     };
     let status = match parsed {
         Ok(patches) if patches.len() <= MAX_FILE_PATCHES => {
-            apply_transaction(ctx, patches, io, cwd)
+            apply_transaction(system, patches, io, cwd, check)
         }
         Ok(_) => fail(io, 2, "too many files in patch"),
         Err(error) => fail(io, 2, &error),
     };
-    ctx.resources.release_memory(reserved);
+    system.release_memory(reserved);
     status
 }
 
@@ -144,7 +169,6 @@ pub(crate) fn apply_unified_diff(
     }
     forwarded.insert(0, strip);
     let cwd = ctx.cwd.clone();
-    let before = check.then(|| ctx.vfs.clone());
     // A failure is reported in Git's words, since that is what callers match on.
     let mut errors = Vec::new();
     let status = {
@@ -153,13 +177,17 @@ pub(crate) fn apply_unified_diff(
             out: io.out,
             err: &mut errors,
         };
-        let status = run_patch(ctx, &forwarded, &mut inner, false, &cwd);
+        let status = run_patch(
+            &mut ctx.system(),
+            &forwarded,
+            &mut inner,
+            false,
+            &cwd,
+            check,
+        );
         io.stdin = std::mem::take(&mut inner.stdin);
         status
     };
-    if let Some(before) = before {
-        ctx.vfs = before;
-    }
     if status == 0 {
         io.err.extend_from_slice(&errors);
         return 0;
@@ -186,16 +214,13 @@ pub(crate) fn apply_harness_patch(
         out: &mut stdout,
         err: &mut stderr,
     };
-    let mut context = CommandContext {
-        env: interp,
-        command_name: "patch",
-    };
     let status = run_patch(
-        &mut context,
+        &mut crate::syscalls::ActiveSystem::new(interp),
         &[format!("-p{strip}")],
         &mut io,
         false,
         "/work",
+        false,
     );
     if status == 0 {
         Ok(())
@@ -506,25 +531,34 @@ fn parse_range(range: &str, header: &str) -> Result<(usize, usize), String> {
 }
 
 fn apply_transaction(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     patches: Vec<FilePatch>,
     io: &mut Io,
     cwd: &str,
+    check: bool,
 ) -> i32 {
-    let before = ctx.vfs.clone();
+    let mut staged = BTreeMap::new();
+    let mut changes = Vec::new();
     for patch in patches {
-        if let Err(error) = apply_file_patch(ctx, patch, cwd) {
-            ctx.vfs = before;
+        if let Err(error) = apply_file_patch(system, patch, cwd, &mut staged, &mut changes) {
             return fail(io, 1, &error);
         }
     }
-    0
+    if check {
+        return 0;
+    }
+    match system.apply_file_batch("/", changes) {
+        Ok(()) => 0,
+        Err(error) => fail(io, 1, &error.to_string()),
+    }
 }
 
 fn apply_file_patch(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     patch: FilePatch,
     cwd: &str,
+    staged: &mut BTreeMap<String, Option<(Vec<u8>, u32)>>,
+    changes: &mut Vec<FileChange>,
 ) -> Result<(), String> {
     let source = patch.old_path.as_deref();
     let destination = patch.new_path.as_deref();
@@ -532,13 +566,18 @@ fn apply_file_patch(
         return Err("patch has neither source nor destination".to_string());
     }
     let source_bytes = if let Some(path) = source {
-        ctx.vfs
-            .read(cwd, path)
-            .map_err(|error| format!("{path}: {error}"))?
+        let absolute = resolve_against(cwd, path);
+        match staged.get(&absolute) {
+            Some(Some((bytes, _))) => bytes.clone(),
+            Some(None) => return Err(format!("{path}: no such file")),
+            None => system
+                .read_file_limited(cwd, path, MAX_PATCH_BYTES)
+                .map_err(|error| format!("{path}: {error}"))?,
+        }
     } else {
         Vec::new()
     };
-    if !ctx.charge_cpu(source_bytes.len() as u64) {
+    if !system.charge_cpu(source_bytes.len() as u64) {
         return Err("resource limit exceeded".to_string());
     }
     let directive_delete = destination.is_none() && patch.hunks.is_empty();
@@ -619,34 +658,46 @@ fn apply_file_patch(
                 "deletion patch for '{path}' does not remove all content"
             ));
         }
-        ctx.sync_vfs_time();
-        return ctx
-            .vfs
-            .remove_file(cwd, path)
-            .map_err(|error| format!("{path}: {error}"));
+        let absolute = resolve_against(cwd, path);
+        staged.insert(absolute.clone(), None);
+        changes.push(FileChange::RemoveFile(absolute));
+        return Ok(());
     }
     let path = destination.expect("non-deletion has a destination");
     let absolute = resolve_against(cwd, path);
+    if matches!(
+        system.metadata("/", &absolute, false).map(|info| info.kind),
+        Ok(FileKind::Symlink)
+    ) {
+        return Err(format!(
+            "{path}: symbolic-link destinations are not supported"
+        ));
+    }
     if let Some(parent) = parent_of(&absolute) {
-        ctx.vfs
-            .mkdir_all("/", &parent)
-            .map_err(|error| format!("{path}: {error}"))?;
+        changes.push(FileChange::MkdirAll(parent));
     }
     let mode = source
-        .and_then(|path| ctx.vfs.metadata(cwd, path, true).ok())
-        .and_then(|metadata| match metadata.kind {
-            NodeKind::File(_) => Some(metadata.mode),
-            _ => None,
+        .and_then(|path| {
+            let absolute = resolve_against(cwd, path);
+            match staged.get(&absolute) {
+                Some(Some((_, mode))) => Some(*mode),
+                Some(None) => None,
+                None => system.metadata(cwd, path, true).ok().and_then(|metadata| {
+                    (metadata.kind == FileKind::File).then_some(metadata.mode)
+                }),
+            }
         })
         .unwrap_or(0o644);
-    ctx.sync_vfs_time();
-    ctx.vfs
-        .write("/", &absolute, &output, mode)
-        .map_err(|error| format!("{path}: {error}"))?;
+    changes.push(FileChange::PutFile {
+        path: absolute.clone(),
+        bytes: output.clone(),
+        mode,
+    });
+    staged.insert(absolute, Some((output, mode)));
     if source.is_some_and(|source| source != path) {
-        ctx.vfs
-            .remove_file(cwd, source.unwrap())
-            .map_err(|error| format!("{}: {error}", source.unwrap()))?;
+        let old = resolve_against(cwd, source.expect("rename has a source"));
+        staged.insert(old.clone(), None);
+        changes.push(FileChange::RemoveFile(old));
     }
     Ok(())
 }
@@ -661,12 +712,6 @@ fn fail(io: &mut Io, status: i32, message: &str) -> i32 {
     status
 }
 
-fn resource_failure(ctx: &CommandContext<'_>, io: &mut Io) -> i32 {
-    fail(
-        io,
-        ctx.resources
-            .stop_reason()
-            .map_or(137, |reason| reason.exit_status()),
-        "resource limit exceeded",
-    )
+fn resource_failure(system: &dyn System, io: &mut Io) -> i32 {
+    fail(io, system.stop_status(), "resource limit exceeded")
 }

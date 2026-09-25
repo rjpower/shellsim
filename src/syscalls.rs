@@ -292,6 +292,7 @@ impl System for ActiveSystem<'_> {
         let work = changes.iter().fold(0_u64, |total, change| {
             total.saturating_add(match change {
                 FileChange::MkdirAll(path) => path.len() as u64,
+                FileChange::RemoveFile(path) => path.len() as u64,
                 FileChange::PutFile { path, bytes, .. } => {
                     (path.len() as u64).saturating_add(bytes.len() as u64)
                 }
@@ -313,6 +314,7 @@ impl System for ActiveSystem<'_> {
         staged.set_mutation_time(self.interp.clock.unix_ms());
         let result = changes.into_iter().try_for_each(|change| match change {
             FileChange::MkdirAll(path) => staged.mkdir_all(base, &path),
+            FileChange::RemoveFile(path) => staged.remove_file(base, &path),
             FileChange::PutFile { path, bytes, mode } => {
                 let absolute = resolve_against(base, &path);
                 staged.put_file(&absolute, bytes, mode)
@@ -633,6 +635,7 @@ pub(crate) struct OpenFile {
 #[derive(Clone, Debug)]
 pub(crate) enum FileChange {
     MkdirAll(String),
+    RemoveFile(String),
     PutFile {
         path: String,
         bytes: Vec<u8>,
