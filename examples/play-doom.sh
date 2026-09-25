@@ -26,7 +26,7 @@ curl --fail --location --retry 3 --silent --show-error \
 unzip -p "$freedoom_archive" 'freedoom-0.13.0/freedoom1.wad' > "$wad"
 printf '%s  %s\n' \
   '7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d' "$wad" \
-  | sha256sum --check --status
+  | shasum -a 256 -c
 
 printf 'Starting the shellsim browser player...\n'
 cargo run --locked --manifest-path "$repo_root/Cargo.toml" --example doom_player -- \
