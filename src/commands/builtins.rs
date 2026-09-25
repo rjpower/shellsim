@@ -223,10 +223,6 @@ fn cmd_hash(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             crate::commands::util::resolve_executable(interp, name)
         {
             Some(path)
-        } else if crate::commands::is_registered(name)
-            && crate::vfs::NativeProgram::from_name(name).is_none()
-        {
-            Some(format!("/usr/bin/{name}"))
         } else {
             None
         };
@@ -2281,11 +2277,11 @@ fn read_one_line(interp: &mut Interp, io: &Io) -> Option<String> {
 }
 
 fn cmd_which(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    command_lookup(interp, args, io, false)
+    command_lookup(interp, args, io, false, false)
 }
 
 fn cmd_type(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    command_lookup(interp, args, io, true)
+    command_lookup(interp, args, io, true, true)
 }
 
 fn command_lookup(
@@ -2293,13 +2289,18 @@ fn command_lookup(
     args: &[String],
     io: &mut Io,
     describe: bool,
+    include_builtins: bool,
 ) -> i32 {
     let mut ok = true;
     for a in args.iter().filter(|arg| !arg.starts_with('-')) {
         if interp.funcs.contains_key(a) {
             wln(io.out, &format!("{a} is a function"));
-        } else if describe && is_shell_builtin_name(a) {
-            wln(io.out, &format!("{a} is a shell builtin"));
+        } else if include_builtins && is_shell_builtin_name(a) {
+            if describe {
+                wln(io.out, &format!("{a} is a shell builtin"));
+            } else {
+                wln(io.out, a);
+            }
         } else if let crate::commands::util::ExecutableLookup::Found(path) =
             crate::commands::util::resolve_executable(interp, a)
         {
@@ -2307,14 +2308,6 @@ fn command_lookup(
                 wln(io.out, &format!("{a} is {path}"));
             } else {
                 wln(io.out, &path);
-            }
-        } else if crate::commands::is_registered(a)
-            && crate::vfs::NativeProgram::from_name(a).is_none()
-        {
-            if describe {
-                wln(io.out, &format!("{a} is /usr/bin/{a}"));
-            } else {
-                wln(io.out, &format!("/usr/bin/{a}"));
             }
         } else {
             ok = false;
@@ -2386,7 +2379,7 @@ fn cmd_command(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
         return 0;
     }
     if matches!(args.first().map(String::as_str), Some("-v" | "-V")) {
-        return cmd_which(interp, &args[1..], io);
+        return command_lookup(interp, &args[1..], io, args[0] == "-V", true);
     }
     let argv = if args.first().map(String::as_str) == Some("--") {
         &args[1..]
@@ -2404,7 +2397,13 @@ fn start_command(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) 
         return CommandPoll::Ready(0);
     }
     if matches!(args.first().map(String::as_str), Some("-v" | "-V")) {
-        return CommandPoll::Ready(cmd_which(interp, &args[1..], io));
+        return CommandPoll::Ready(command_lookup(
+            interp,
+            &args[1..],
+            io,
+            args[0] == "-V",
+            true,
+        ));
     }
     let argv = if args.first().map(String::as_str) == Some("--") {
         &args[1..]

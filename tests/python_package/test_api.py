@@ -56,7 +56,10 @@ def test_direct_python_uses_the_modeled_process_scheduler() -> None:
 
     assert result.returncode == 0
     assert result.stdout == b"b'child'\n"
-    assert [invocation.argv[0] for invocation in result.invocations] == ["python3.14", "printf"]
+    assert [invocation.argv[0] for invocation in result.invocations] == [
+        "python3.14",
+        "/usr/bin/printf",
+    ]
 
 
 def test_direct_python_input_raises_catchable_eof() -> None:

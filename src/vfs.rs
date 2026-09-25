@@ -17,6 +17,8 @@ pub enum NativeProgram {
     False,
     Pwd,
     Yes,
+    /// Existing Rust command body pending migration to the scoped `System` interface.
+    Registered(&'static str),
 }
 
 impl NativeProgram {
@@ -36,6 +38,7 @@ impl NativeProgram {
             Self::False => "false",
             Self::Pwd => "pwd",
             Self::Yes => "yes",
+            Self::Registered(name) => name,
         }
     }
 }

@@ -610,6 +610,14 @@ impl Environment {
         ] {
             vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
         }
+        for name in crate::commands::registered_executable_names() {
+            if crate::vfs::NativeProgram::from_name(name).is_none() {
+                vfs.seed_native_executable(
+                    &format!("/usr/bin/{name}"),
+                    crate::vfs::NativeProgram::Registered(name),
+                );
+            }
+        }
         const ROOT_PID: ProcessId = 1_234;
         let process_environment = exported
             .iter()
@@ -728,11 +736,7 @@ impl Environment {
         let lookup = crate::commands::util::resolve_executable_in(
             &self.vfs,
             &state.cwd,
-            state
-                .vars
-                .get("PATH")
-                .map(String::as_str)
-                .unwrap_or_default(),
+            state.vars.get("PATH").map(String::as_str),
             &argv[0],
         );
         let native = match lookup {
@@ -743,6 +747,12 @@ impl Environment {
                     .ok()
                     .map(|node| node.kind)
                 {
+                    Some(crate::vfs::NodeKind::NativeExecutable(
+                        crate::vfs::NativeProgram::Registered(_),
+                    )) => {
+                        argv[0] = path;
+                        None
+                    }
                     Some(crate::vfs::NodeKind::NativeExecutable(image)) => {
                         Some(crate::program::NativeProcess::from_image(image, &argv))
                     }

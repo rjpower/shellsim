@@ -254,7 +254,7 @@ pub fn resolve_executable(interp: &Interp, name: &str) -> ExecutableLookup {
     resolve_executable_in(
         &interp.vfs,
         &interp.cwd,
-        &interp.get_var("PATH").unwrap_or_default(),
+        interp.get_var("PATH").as_deref(),
         name,
     )
 }
@@ -263,9 +263,12 @@ pub fn resolve_executable(interp: &Interp, name: &str) -> ExecutableLookup {
 pub(crate) fn resolve_executable_in(
     vfs: &crate::vfs::Vfs,
     cwd: &str,
-    path_value: &str,
+    path_value: Option<&str>,
     name: &str,
 ) -> ExecutableLookup {
+    // An absent PATH uses the guest's default utility search path. An explicit empty PATH
+    // still names the current directory, as it does in a shell path list.
+    let path_value = path_value.unwrap_or("/bin:/usr/bin");
     let candidates = if name.contains('/') {
         vec![crate::vfs::resolve_against(cwd, name)]
     } else {
@@ -348,7 +351,13 @@ pub(crate) fn try_exec_script(
         })
     {
         if resumable {
-            super::proc::start_shell_source(interp, &text, args.to_vec(), Some(stdin.to_vec()), err)
+            super::proc::start_shell_source(
+                interp,
+                &text,
+                args.to_vec(),
+                (!stdin.is_empty()).then(|| stdin.to_vec()),
+                err,
+            )
         } else {
             let saved_pos = std::mem::replace(&mut interp.positional, args.to_vec());
             let status = interp.run_script_into(&text, out, err);

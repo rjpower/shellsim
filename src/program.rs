@@ -93,6 +93,10 @@ impl NativeProcess {
                 let output = line.repeat((4096 / line.len()).max(1));
                 Self::Yes { output, offset: 0 }
             }
+            crate::vfs::NativeProgram::Registered(_) => Self::failure(
+                125,
+                "registered program needs a command continuation\n".into(),
+            ),
         }
     }
 

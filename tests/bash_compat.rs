@@ -52,7 +52,7 @@ fn standard_paths_and_environment_utilities() {
 }
 
 #[test]
-fn path_resolves_only_executable_vfs_scripts() {
+fn path_resolves_only_executable_vfs_entries() {
     assert_eq!(
         run(
             "mkdir /tools; printf '%s\n' '#!/bin/sh' 'printf path:$1' > /tools/hello; chmod +x /tools/hello; PATH=/tools command -v hello; PATH=/tools hello world",
@@ -71,11 +71,11 @@ fn path_resolves_only_executable_vfs_scripts() {
         interpreter.2
     );
     assert_eq!(
-        run("mkdir /tools; printf '%s\n' '#!/bin/sh' 'sleep 2' 'cat /tmp/ready' > /tools/yielding; chmod +x /tools/yielding; (sleep 1; printf scheduled > /tmp/ready) & PATH=/tools yielding; wait"),
+        run("mkdir /tools; printf '%s\n' '#!/bin/sh' 'sleep 2' 'cat /tmp/ready' > /tools/yielding; chmod +x /tools/yielding; (sleep 1; printf scheduled > /tmp/ready) & PATH=/tools:/usr/bin yielding; wait"),
         (0, "scheduled".into(), String::new())
     );
     assert_eq!(
-        run("mkdir /tools; printf '%s\n' '#!/bin/sh' 'cat' > /tools/read-input; chmod +x /tools/read-input; printf piped | PATH=/tools read-input"),
+        run("mkdir /tools; printf '%s\n' '#!/bin/sh' 'cat' > /tools/read-input; chmod +x /tools/read-input; printf piped | PATH=/tools:/usr/bin read-input"),
         (0, "piped".into(), String::new())
     );
     assert_eq!(
@@ -85,6 +85,19 @@ fn path_resolves_only_executable_vfs_scripts() {
     assert_eq!(
         run("cd /work; printf '%s\n' '#!/bin/sh' 'printf current' > hello; chmod +x hello; PATH=:/usr/bin hello"),
         (0, "current".into(), String::new())
+    );
+}
+
+#[test]
+fn command_v_finds_shell_builtins_without_path_entries() {
+    assert_eq!(
+        run("PATH=/missing command -v local; PATH=/missing command -V local"),
+        (0, "local\nlocal is a shell builtin\n".into(), String::new())
+    );
+    assert_eq!(run("PATH=/missing command -v cat").0, 1);
+    assert_eq!(
+        run("unset PATH; command -v cat; PATH='' command -v cat"),
+        (1, "/usr/bin/cat\n".into(), String::new())
     );
 }
 
