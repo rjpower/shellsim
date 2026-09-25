@@ -517,10 +517,6 @@ mod tests {
             unreachable!("native writer does not open files")
         }
 
-        fn open_input_at(&mut self, _fd: i32, _bytes: Vec<u8>) -> Result<(), SyscallError> {
-            unreachable!("native writer does not open input")
-        }
-
         fn duplicate(&mut self, _source: i32, _destination: i32) -> Result<(), SyscallError> {
             unreachable!("native writer does not duplicate descriptors")
         }

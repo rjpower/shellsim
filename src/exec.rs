@@ -3023,9 +3023,13 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
                     }
                     return Err(error.message.trim().to_string());
                 }
-                ActiveSystem::new(interp)
-                    .open_input_at(redirect.fd, std::mem::take(&mut bytes))
-                    .map_err(|error| format!("here document: {error}"))?;
+                let description = interp
+                    .descriptors
+                    .open_input(std::mem::take(&mut bytes))
+                    .map_err(|error| format!("here document: {error:?}"))?;
+                interp
+                    .install_new_description(redirect.fd, description)
+                    .map_err(|error| format!("here document: {error:?}"))?;
             }
             RedirOp::Write | RedirOp::Append => {
                 let path = redirect_path(interp, &redirect.target)?;

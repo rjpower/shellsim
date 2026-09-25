@@ -382,7 +382,7 @@ fn redirections_use_ordered_process_descriptors() {
 }
 
 #[test]
-fn redirection_syscalls_cover_append_saved_fds_and_here_documents() {
+fn redirections_preserve_append_saved_fds_and_here_documents() {
     assert_eq!(
         run("printf first > /file; printf second >> /file; exec 3< /file; cat <&3; cat <<EOF\nheredoc\nEOF\n"),
         (0, "firstsecondheredoc\n".into(), String::new())

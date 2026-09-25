@@ -65,8 +65,6 @@ pub(crate) trait System {
         path: &str,
         options: OpenFile,
     ) -> Result<(), SyscallError>;
-    /// Install finite command input such as a here-document on a process descriptor.
-    fn open_input_at(&mut self, fd: Fd, bytes: Vec<u8>) -> Result<(), SyscallError>;
     /// Duplicate a process descriptor, sharing its open description and cursor.
     fn duplicate(&mut self, source: Fd, destination: Fd) -> Result<(), SyscallError>;
     fn file_state(&self, fd: Fd) -> Result<FileState, SyscallError>;
@@ -263,12 +261,6 @@ impl System for ActiveSystem<'_> {
         options: OpenFile,
     ) -> Result<(), SyscallError> {
         open_file_at(self.interp, fd, base, path, options)
-    }
-
-    fn open_input_at(&mut self, fd: Fd, bytes: Vec<u8>) -> Result<(), SyscallError> {
-        let description = self.interp.descriptors.open_input(bytes)?;
-        self.interp.install_new_description(fd, description)?;
-        Ok(())
     }
 
     fn duplicate(&mut self, source: Fd, destination: Fd) -> Result<(), SyscallError> {
@@ -843,8 +835,23 @@ mod tests {
     #[test]
     fn chosen_descriptors_share_cursors_and_file_creation_obeys_umask() {
         let mut interp = Interp::new();
+        interp.vfs.write("/work", "source", b"abc", 0o644).unwrap();
         let mut system = ActiveSystem::new(&mut interp);
-        system.open_input_at(8, b"abc".to_vec()).unwrap();
+        system
+            .open_file_at(
+                8,
+                "/work",
+                "source",
+                OpenFile {
+                    readable: true,
+                    writable: false,
+                    create: false,
+                    exclusive: false,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .unwrap();
         system.duplicate(8, 9).unwrap();
         assert_eq!(system.read(9, 1).unwrap(), IoPoll::Ready(b"a".to_vec()));
         assert_eq!(system.read(8, 1).unwrap(), IoPoll::Ready(b"b".to_vec()));
