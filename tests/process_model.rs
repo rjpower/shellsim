@@ -369,6 +369,18 @@ fn remaining_filesystem_tools_run_as_registered_native_children() {
 }
 
 #[test]
+fn copied_registered_image_keeps_its_original_path_entrypoint() {
+    let mut env = Environment::new();
+    env.vfs.write("/", "/work/owned", b"data", 0o644).unwrap();
+    assert_eq!(run(&mut env, "cp /usr/bin/chgrp /work/reassigned").0, 0);
+    env.vfs.remove_file("/", "/usr/bin/chgrp").unwrap();
+    assert_eq!(run(&mut env, "/work/reassigned 42 /work/owned").0, 0);
+    let metadata = env.vfs.metadata("/", "/work/owned", false).unwrap();
+    assert_eq!((metadata.uid, metadata.gid), (0, 42));
+    assert_eq!(run(&mut env, "chgrp 7 /work/owned").0, 127);
+}
+
+#[test]
 fn stateless_commands_read_child_process_state_through_system() {
     let mut env = Environment::new();
     assert_eq!(
