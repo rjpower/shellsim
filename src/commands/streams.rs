@@ -15,10 +15,9 @@ use crate::program::ProcessContext;
 use crate::scheduler::WaitReason;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_resumable, reg_system_poll};
+    use super::{reg_resumable, reg_system_poll};
     reg_resumable(m, &["cat"], Trust::Real, cmd_cat, start_cat);
     reg_system_poll(m, "/usr/bin/tac", Trust::Real, cmd_tac);
-    reg(m, &["tee"], Trust::Real, cmd_tee);
     reg_resumable(m, &["yes"], Trust::Real, cmd_yes, start_yes);
     reg_resumable(m, &["head"], Trust::Real, cmd_head, start_head);
     reg_system_poll(m, "/usr/bin/tail", Trust::Real, cmd_tail);
@@ -486,26 +485,6 @@ fn cmd_tac(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         wln(io.out, l);
     }
     ShellPoll::Ready(0)
-}
-
-fn cmd_tee(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _l) = split_flags(args);
-    let append = flags.contains(&'a');
-    let cwd = interp.cwd.clone();
-    let mut status = 0;
-    for f in &ops {
-        let result = if append {
-            interp.vfs.append(&cwd, f, &io.stdin, 0o644)
-        } else {
-            interp.vfs.write(&cwd, f, &io.stdin, 0o644)
-        };
-        if let Err(error) = result {
-            ewln(io.err, &format!("tee: {f}: {error}"));
-            status = 1;
-        }
-    }
-    io.out.extend_from_slice(&io.stdin);
-    status
 }
 
 fn cmd_head(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

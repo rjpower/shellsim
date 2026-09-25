@@ -11,6 +11,7 @@ use crate::scheduler::WaitReason;
 use crate::syscalls::{ActiveSystem, SyscallError, System};
 
 mod cat;
+mod tee;
 
 /// Invocation view borrowed by a native command for one scheduler quantum.
 /// Only the owned command continuation survives a blocked operation.
@@ -120,6 +121,7 @@ pub(crate) enum NativeProcess {
     },
     SystemCommand(SystemCommandProcess),
     Cat(cat::CatProcess),
+    Tee(tee::TeeProcess),
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -319,6 +321,7 @@ impl NativeProcess {
                 Self::Yes { output, offset: 0 }
             }
             crate::vfs::NativeProgram::Cat => Self::Cat(cat::CatProcess::new(&argv[1..])),
+            crate::vfs::NativeProgram::Tee => Self::Tee(tee::TeeProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Registered(path) => {
                 let Some(command) = crate::commands::system_command(path) else {
                     return Self::failure(
@@ -366,6 +369,7 @@ impl NativeProcess {
             },
             Self::SystemCommand(command) => command.poll(syscalls),
             Self::Cat(cat) => cat.poll(syscalls),
+            Self::Tee(tee) => tee.poll(syscalls),
             Self::Failure {
                 status,
                 message,
