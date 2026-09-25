@@ -19,6 +19,46 @@ pub(crate) struct ProcessContext<'a> {
     pub(crate) command_name: &'a str,
     pub(crate) args: &'a [String],
     pub(crate) environment: &'a std::collections::BTreeMap<String, String>,
+    pub(crate) stdin_state: Option<(&'a mut bool, &'a mut u64)>,
+}
+
+impl ProcessContext<'_> {
+    /// Read fd 0 to EOF in bounded quanta, retaining partial input across scheduler turns.
+    /// Nested synchronous dispatch has already materialized `Io::stdin`.
+    pub(crate) fn read_standard_input(
+        &mut self,
+        io: &mut crate::commands::Io<'_>,
+    ) -> Result<(), ShellPoll> {
+        let Some((complete, reserved)) = self.stdin_state.as_mut() else {
+            return Ok(());
+        };
+        if **complete {
+            return Ok(());
+        }
+        match self.system.read(0, 4096) {
+            Ok(IoPoll::Ready(bytes)) if bytes.is_empty() => {
+                **complete = true;
+                Ok(())
+            }
+            Ok(IoPoll::Ready(bytes)) => {
+                let size = bytes.len() as u64;
+                if !self.system.reserve_memory(size) {
+                    return Err(ShellPoll::Ready(self.system.stop_status()));
+                }
+                **reserved = reserved.saturating_add(size);
+                io.stdin.extend_from_slice(&bytes);
+                Err(ShellPoll::Pending)
+            }
+            Ok(IoPoll::Blocked(wait)) => Err(ShellPoll::Blocked(wait_reason(wait))),
+            Err(error) => {
+                io.print_err(&format!(
+                    "{}: cannot read standard input: {error}\n",
+                    self.command_name
+                ));
+                Err(ShellPoll::Ready(1))
+            }
+        }
+    }
 }
 
 /// Owned state needed to resume one process after a scheduler turn.
@@ -31,6 +71,14 @@ pub(crate) enum ProgramContinuation {
 impl ProgramContinuation {
     pub(crate) fn is_native(&self) -> bool {
         matches!(self, Self::Native(_))
+    }
+
+    /// Return outstanding input reservations when a process exits before consuming EOF.
+    pub(crate) fn release_owned_memory(&mut self, interp: &mut Interp) {
+        if let Self::Native(NativeProcess::SystemCommand(command)) = self {
+            interp.resources.release_memory(command.reserved_input);
+            command.reserved_input = 0;
+        }
     }
 
     pub(crate) fn poll(&mut self, interp: &mut Interp, budget: usize) -> ShellPoll {
@@ -77,15 +125,18 @@ pub(crate) enum NativeProcess {
     },
 }
 
-/// Adapter for existing bounded commands whose bodies already use only `System`.
-/// Output is retained across descriptor backpressure; commands with live input use an owned
-/// continuation instead.
+/// Adapter for bounded commands whose bodies use only `System`.
+/// Input and output remain owned across descriptor backpressure.
 #[derive(Clone)]
 pub(crate) struct SystemCommandProcess {
     name: &'static str,
     args: Vec<String>,
-    run: crate::commands::SystemCmdFn,
+    run: crate::commands::SystemRun,
     base_cpu: u64,
+    started: bool,
+    stdin: Vec<u8>,
+    stdin_complete: bool,
+    reserved_input: u64,
     result: Option<SystemCommandOutput>,
 }
 
@@ -105,24 +156,35 @@ impl SystemCommandProcess {
             args: args.to_vec(),
             run: command.run,
             base_cpu: command.base_cpu,
+            started: false,
+            stdin: Vec::new(),
+            stdin_complete: false,
+            reserved_input: 0,
             result: None,
         }
     }
 
     fn poll(&mut self, system: &mut impl System) -> ShellPoll {
-        let result = self.result.get_or_insert_with(|| {
+        if self.result.is_none() {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let argument_bytes = self
                 .args
                 .iter()
                 .fold(0_u64, |total, arg| total.saturating_add(arg.len() as u64));
-            let status = if !system.charge_cpu(self.base_cpu.saturating_add(argument_bytes)) {
-                system.stop_status()
+            let start_status = if self.started {
+                None
+            } else {
+                self.started = true;
+                (!system.charge_cpu(self.base_cpu.saturating_add(argument_bytes)))
+                    .then(|| system.stop_status())
+            };
+            let outcome = if let Some(status) = start_status {
+                ShellPoll::Ready(status)
             } else {
                 let environment = system.environment();
                 let mut io = crate::commands::Io {
-                    stdin: Vec::new(),
+                    stdin: std::mem::take(&mut self.stdin),
                     out: &mut stdout,
                     err: &mut stderr,
                 };
@@ -131,17 +193,53 @@ impl SystemCommandProcess {
                     command_name: self.name,
                     args: &self.args,
                     environment: &environment,
+                    stdin_state: Some((&mut self.stdin_complete, &mut self.reserved_input)),
                 };
-                (self.run)(&mut context, &mut io)
+                let outcome = match self.run {
+                    crate::commands::SystemRun::Once(run) => {
+                        ShellPoll::Ready(run(&mut context, &mut io))
+                    }
+                    crate::commands::SystemRun::Poll(run) => run(&mut context, &mut io),
+                };
+                if !matches!(outcome, ShellPoll::Ready(_)) {
+                    self.stdin = io.stdin;
+                }
+                outcome
             };
-            SystemCommandOutput {
-                status,
-                stdout,
-                stderr,
-                stdout_offset: 0,
-                stderr_offset: 0,
+            let status = match outcome {
+                ShellPoll::Ready(status) => status,
+                other => {
+                    if !stdout.is_empty() || !stderr.is_empty() {
+                        self.result = Some(SystemCommandOutput {
+                            status: 125,
+                            stdout: Vec::new(),
+                            stderr: format!(
+                                "{}: command suspended after producing output\n",
+                                self.name
+                            )
+                            .into_bytes(),
+                            stdout_offset: 0,
+                            stderr_offset: 0,
+                        });
+                    } else {
+                        return other;
+                    }
+                    125
+                }
+            };
+            system.release_memory(self.reserved_input);
+            self.reserved_input = 0;
+            if self.result.is_none() {
+                self.result = Some(SystemCommandOutput {
+                    status,
+                    stdout,
+                    stderr,
+                    stdout_offset: 0,
+                    stderr_offset: 0,
+                });
             }
-        });
+        }
+        let result = self.result.as_mut().expect("command result was produced");
         match poll_write(system, 1, &result.stdout, &mut result.stdout_offset, 0) {
             ShellPoll::Ready(0) => {}
             other => return other,

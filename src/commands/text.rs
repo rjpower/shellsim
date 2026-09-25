@@ -5,20 +5,22 @@
 
 use std::collections::HashMap;
 
-use crate::commands::util::{ewln, lines_of, read_inputs, split_flags, w, wln};
+use crate::commands::util::{ewln, lines_of, read_inputs, read_inputs_system, split_flags, w, wln};
 use crate::commands::{CommandContext, CommandPoll, CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
 use crate::interp::Interp;
+use crate::program::ProcessContext;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_buffered_resumable, reg_unsupported};
-    reg(m, &["wc"], Trust::Real, cmd_wc);
-    reg(m, &["uniq"], Trust::Real, cmd_uniq);
-    reg(m, &["cut"], Trust::Real, cmd_cut);
-    reg(m, &["tr"], Trust::Real, cmd_tr);
-    reg(m, &["rev"], Trust::Real, cmd_rev);
-    reg(m, &["nl"], Trust::Real, cmd_nl);
+    use super::{reg, reg_buffered_resumable, reg_system_poll, reg_unsupported};
+    reg_system_poll(m, "/usr/bin/wc", Trust::Real, cmd_wc);
+    reg_system_poll(m, "/usr/bin/uniq", Trust::Real, cmd_uniq);
+    reg_system_poll(m, "/usr/bin/cut", Trust::Real, cmd_cut);
+    reg_system_poll(m, "/usr/bin/tr", Trust::Real, cmd_tr);
+    reg_system_poll(m, "/usr/bin/rev", Trust::Real, cmd_rev);
+    reg_system_poll(m, "/usr/bin/nl", Trust::Real, cmd_nl);
     reg(m, &["seq"], Trust::Real, cmd_seq);
-    reg(m, &["paste"], Trust::Real, cmd_paste);
+    reg_system_poll(m, "/usr/bin/paste", Trust::Real, cmd_paste);
     reg_unsupported(m, &["pr"]);
     reg(m, &["comm"], Trust::Real, cmd_comm);
     reg_buffered_resumable(m, &["join"], Trust::Partial, cmd_join, start_buffered_text);
@@ -36,14 +38,27 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_unsupported(m, &["factor"]);
 }
 
-fn cmd_wc(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn reads_file_or_stdin(operands: &[&String]) -> bool {
+    operands.is_empty()
+        || operands
+            .iter()
+            .any(|operand| matches!(operand.as_str(), "-" | "/dev/stdin"))
+}
+
+fn cmd_wc(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let (flags, ops, _l) = split_flags(args);
     if flags
         .iter()
         .any(|flag| !matches!(flag, 'l' | 'w' | 'c' | 'm'))
     {
         ewln(io.err, "wc: unimplemented option");
-        return 2;
+        return ShellPoll::Ready(2);
+    }
+    if reads_file_or_stdin(&ops) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
     }
     let (cl, cw, cc, cm) = (
         flags.contains(&'l'),
@@ -89,30 +104,29 @@ fn cmd_wc(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         let mut totals = (0usize, 0usize, 0usize, 0usize);
         let mut status = 0;
         for f in &ops {
-            match interp.fs_read(&interp.cwd, f) {
-                Ok(data) => {
-                    let values = counts(&data);
-                    print_counts(values, io.out, f);
-                    totals.0 = totals.0.saturating_add(values.0);
-                    totals.1 = totals.1.saturating_add(values.1);
-                    totals.2 = totals.2.saturating_add(values.2);
-                    totals.3 = totals.3.saturating_add(values.3);
-                }
-                Err(error) => {
-                    ewln(io.err, &format!("wc: {f}: {error}"));
-                    status = 1;
-                }
+            let (data, errors) = read_inputs_system(context.system, &[*f], &io.stdin);
+            if errors.is_empty() {
+                let values = counts(&data);
+                print_counts(values, io.out, f);
+                totals.0 = totals.0.saturating_add(values.0);
+                totals.1 = totals.1.saturating_add(values.1);
+                totals.2 = totals.2.saturating_add(values.2);
+                totals.3 = totals.3.saturating_add(values.3);
+            } else {
+                ewln(io.err, &format!("wc: {}", errors[0]));
+                status = 1;
             }
         }
         if ops.len() > 1 {
             print_counts(totals, io.out, "total");
         }
-        return status;
+        return ShellPoll::Ready(status);
     }
-    0
+    ShellPoll::Ready(0)
 }
 
-fn cmd_uniq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_uniq(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let mut count = false;
     let mut only_dup = false;
     let mut only_uniq = false;
@@ -135,11 +149,11 @@ fn cmd_uniq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         if argument == "-f" || argument == "-s" {
             let Some(value) = args.get(index + 1) else {
                 ewln(io.err, &format!("uniq: {argument} requires an argument"));
-                return 1;
+                return ShellPoll::Ready(1);
             };
             let parsed = match parse_count(value, argument, io) {
                 Ok(value) => value,
-                Err(status) => return status,
+                Err(status) => return ShellPoll::Ready(status),
             };
             if argument == "-f" {
                 skip_fields = parsed;
@@ -155,7 +169,7 @@ fn cmd_uniq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         {
             skip_fields = match parse_count(value, "-f", io) {
                 Ok(value) => value,
-                Err(status) => return status,
+                Err(status) => return ShellPoll::Ready(status),
             };
         } else if let Some(value) = argument
             .strip_prefix("-s")
@@ -163,7 +177,7 @@ fn cmd_uniq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         {
             skip_chars = match parse_count(value, "-s", io) {
                 Ok(value) => value,
-                Err(status) => return status,
+                Err(status) => return ShellPoll::Ready(status),
             };
         } else if argument.starts_with('-') && argument != "-" {
             for flag in argument[1..].chars() {
@@ -174,7 +188,7 @@ fn cmd_uniq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                     'i' => ignore_case = true,
                     _ => {
                         ewln(io.err, &format!("uniq: unimplemented option '-{flag}'"));
-                        return 2;
+                        return ShellPoll::Ready(2);
                     }
                 }
             }
@@ -185,12 +199,17 @@ fn cmd_uniq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     }
     if operands.len() > 1 {
         ewln(io.err, "uniq: unimplemented output-file operand");
-        return 2;
+        return ShellPoll::Ready(2);
     }
-    let (data, errors) = read_inputs(interp, &operands, &io.stdin);
+    if reads_file_or_stdin(&operands) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &operands, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("uniq: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     let lines = data
         .split_inclusive(|byte| *byte == b'\n')
@@ -233,10 +252,11 @@ fn cmd_uniq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         }
         i = j;
     }
-    0
+    ShellPoll::Ready(0)
 }
 
-fn cmd_cut(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_cut(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let mut delim = '\t';
     let mut fields: Option<String> = None;
     let mut chars_spec: Option<String> = None;
@@ -261,14 +281,19 @@ fn cmd_cut(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             } else {
                 c.to_string()
             });
-        } else if !a.starts_with('-') {
+        } else if !a.starts_with('-') || a == "-" {
             files.push(a);
         }
     }
-    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if reads_file_or_stdin(&files) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &files, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("cut: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     let parse_ranges = |spec: &str, max: usize| -> Vec<usize> {
         let mut idx = Vec::new();
@@ -309,17 +334,18 @@ fn cmd_cut(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             wln(io.out, &selected);
         }
     }
-    0
+    ShellPoll::Ready(0)
 }
 
-fn cmd_tr(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_tr(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let (flags, ops, _l) = split_flags(args);
     let delete = flags.contains(&'d');
     let squeeze = flags.contains(&'s');
     let complement = flags.contains(&'c');
     if flags.iter().any(|flag| !matches!(flag, 'c' | 'd' | 's')) {
         ewln(io.err, "tr: unimplemented option");
-        return 2;
+        return ShellPoll::Ready(2);
     }
     let required = if delete || (squeeze && ops.len() == 1) {
         1
@@ -328,7 +354,10 @@ fn cmd_tr(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
     };
     if ops.len() != required {
         ewln(io.err, "tr: missing or extra operand");
-        return 1;
+        return ShellPoll::Ready(1);
+    }
+    if let Err(poll) = context.read_standard_input(io) {
+        return poll;
     }
     let set1 = ops.first().map(|s| expand_tr_set(s)).unwrap_or_default();
     let set2 = ops
@@ -364,7 +393,7 @@ fn cmd_tr(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
         }
     }
     w(io.out, &result);
-    0
+    ShellPoll::Ready(0)
 }
 
 fn expand_tr_set(s: &str) -> Vec<char> {
@@ -405,12 +434,18 @@ fn expand_tr_set(s: &str) -> Vec<char> {
     out
 }
 
-fn cmd_rev(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_rev(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let (_f, ops, _l) = split_flags(args);
-    let (data, errors) = read_inputs(interp, &ops, &io.stdin);
+    if reads_file_or_stdin(&ops) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &ops, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("rev: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     for line in data.split_inclusive(|byte| *byte == b'\n') {
         let newline = line.ends_with(b"\n");
@@ -428,15 +463,21 @@ fn cmd_rev(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             io.out.push(b'\n');
         }
     }
-    0
+    ShellPoll::Ready(0)
 }
 
-fn cmd_nl(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_nl(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let (_f, ops, _l) = split_flags(args);
-    let (data, errors) = read_inputs(interp, &ops, &io.stdin);
+    if reads_file_or_stdin(&ops) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &ops, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("nl: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     let mut n = 1;
     for line in String::from_utf8_lossy(&data).lines() {
@@ -447,7 +488,7 @@ fn cmd_nl(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             n += 1;
         }
     }
-    0
+    ShellPoll::Ready(0)
 }
 
 fn cmd_seq(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -501,7 +542,8 @@ fn fmt_num(x: f64, int: bool) -> String {
     }
 }
 
-fn cmd_paste(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_paste(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let mut delim = '\t';
     let mut files = Vec::new();
     let mut it = args.iter();
@@ -512,25 +554,39 @@ fn cmd_paste(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
             delim = d.chars().next().unwrap_or('\t');
         } else if a.starts_with('-') && a != "-" {
             ewln(io.err, &format!("paste: unimplemented option '{a}'"));
-            return 2;
+            return ShellPoll::Ready(2);
         } else {
             files.push(a.clone());
         }
     }
+    if files.is_empty() || files.iter().any(|file| file == "-") {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
     if files.is_empty() {
         io.out.extend_from_slice(&io.stdin);
-        return 0;
+        return ShellPoll::Ready(0);
     }
     let mut columns = Vec::new();
+    let mut retained_bytes = 0usize;
     for file in &files {
         if file == "-" {
+            retained_bytes = retained_bytes.saturating_add(io.stdin.len());
             columns.push(lines_of(&io.stdin));
         } else {
-            match interp.fs_read(&interp.cwd, file) {
-                Ok(data) => columns.push(lines_of(&data)),
+            let cwd = context.system.cwd().to_string();
+            let maximum = usize::try_from(context.system.limits().memory)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(retained_bytes);
+            match context.system.read_file_limited(&cwd, file, maximum) {
+                Ok(data) => {
+                    retained_bytes = retained_bytes.saturating_add(data.len());
+                    columns.push(lines_of(&data));
+                }
                 Err(error) => {
                     ewln(io.err, &format!("paste: {file}: {error}"));
-                    return 1;
+                    return ShellPoll::Ready(1);
                 }
             }
         }
@@ -543,7 +599,7 @@ fn cmd_paste(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
             .collect();
         wln(io.out, &row.join(&delim.to_string()));
     }
-    0
+    ShellPoll::Ready(0)
 }
 
 fn start_buffered_text(

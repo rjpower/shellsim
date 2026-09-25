@@ -160,6 +160,35 @@ pub fn read_inputs(interp: &Interp, files: &[&String], stdin: &[u8]) -> (Vec<u8>
     (data, errors)
 }
 
+/// Gather bounded operand data through the active process's virtual filesystem.
+pub(crate) fn read_inputs_system(
+    system: &mut dyn crate::syscalls::System,
+    files: &[&String],
+    stdin: &[u8],
+) -> (Vec<u8>, Vec<String>) {
+    let mut data = Vec::new();
+    let mut errors = Vec::new();
+    if files.is_empty() {
+        data.extend_from_slice(stdin);
+    } else {
+        for file in files {
+            if matches!(file.as_str(), "-" | "/dev/stdin") {
+                data.extend_from_slice(stdin);
+            } else {
+                let cwd = system.cwd().to_string();
+                let maximum = usize::try_from(system.limits().memory)
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(data.len());
+                match system.read_file_limited(&cwd, file, maximum) {
+                    Ok(bytes) => data.extend(bytes),
+                    Err(error) => errors.push(format!("{file}: {error}")),
+                }
+            }
+        }
+    }
+    (data, errors)
+}
+
 /// Interpret common C-style backslash escapes (used by `echo -e`, `printf`).
 pub fn unescape(s: &str) -> String {
     let mut out = String::new();

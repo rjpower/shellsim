@@ -76,11 +76,20 @@ pub type CmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> i32;
 
 /// A native command body limited to the active process's virtual kernel operations.
 pub(crate) type SystemCmdFn = fn(&mut crate::program::ProcessContext<'_>, &mut Io) -> i32;
+/// A native body that can suspend while reading a process descriptor.
+pub(crate) type SystemPollFn =
+    fn(&mut crate::program::ProcessContext<'_>, &mut Io) -> crate::exec::ShellPoll;
+
+#[derive(Clone, Copy)]
+pub(crate) enum SystemRun {
+    Once(SystemCmdFn),
+    Poll(SystemPollFn),
+}
 
 /// Process-scoped command body and its coarse launch cost.
 #[derive(Clone, Copy)]
 pub(crate) struct SystemCommand {
-    pub(crate) run: SystemCmdFn,
+    pub(crate) run: SystemRun,
     pub(crate) base_cpu: u64,
 }
 
@@ -88,7 +97,7 @@ fn run_system_from_legacy(
     context: &mut CommandContext<'_>,
     args: &[String],
     io: &mut Io,
-    run: SystemCmdFn,
+    run: SystemRun,
 ) -> i32 {
     let command_name = context.command_name().to_string();
     let environment = context.child_env().into_iter().collect();
@@ -98,8 +107,18 @@ fn run_system_from_legacy(
         command_name: &command_name,
         args,
         environment: &environment,
+        stdin_state: None,
     };
-    run(&mut process, io)
+    match run {
+        SystemRun::Once(run) => run(&mut process, io),
+        SystemRun::Poll(run) => match run(&mut process, io) {
+            crate::exec::ShellPoll::Ready(status) => status,
+            _ => {
+                io.print_err("native command cannot suspend in nested dispatch\n");
+                125
+            }
+        },
+    }
 }
 
 /// Result of starting a command from a resumable shell continuation.
@@ -231,6 +250,7 @@ pub struct CommandSpec {
 enum CommandBody {
     Legacy(CmdFn),
     System(SystemCmdFn),
+    SystemPoll(SystemPollFn),
 }
 
 static REGISTRY: OnceLock<HashMap<&'static str, CommandSpec>> = OnceLock::new();
@@ -246,7 +266,11 @@ pub(crate) fn registered_executables() -> Vec<(String, crate::vfs::NativeProgram
         .iter()
         .filter_map(|(key, spec)| {
             if key.starts_with('/') {
-                return matches!(spec.body, CommandBody::System(_)).then(|| {
+                return matches!(
+                    spec.body,
+                    CommandBody::System(_) | CommandBody::SystemPoll(_)
+                )
+                .then(|| {
                     (
                         (*key).to_string(),
                         crate::vfs::NativeProgram::Registered(key),
@@ -274,7 +298,11 @@ pub(crate) fn system_command(path: &str) -> Option<SystemCommand> {
     let spec = registry().get(path)?;
     match spec.body {
         CommandBody::System(run) => Some(SystemCommand {
-            run,
+            run: SystemRun::Once(run),
+            base_cpu: spec.base_cpu,
+        }),
+        CommandBody::SystemPoll(run) => Some(SystemCommand {
+            run: SystemRun::Poll(run),
             base_cpu: spec.base_cpu,
         }),
         CommandBody::Legacy(_) => None,
@@ -353,10 +381,30 @@ fn reg_system_costed(
     base_cpu: u64,
     system: SystemCmdFn,
 ) {
+    reg_system_input(map, path, trust, base_cpu, CommandBody::System(system));
+}
+
+/// Register a native command that can suspend on descriptor I/O.
+fn reg_system_poll(
+    map: &mut HashMap<&'static str, CommandSpec>,
+    path: &'static str,
+    trust: Trust,
+    system: SystemPollFn,
+) {
+    reg_system_input(map, path, trust, 100, CommandBody::SystemPoll(system));
+}
+
+fn reg_system_input(
+    map: &mut HashMap<&'static str, CommandSpec>,
+    path: &'static str,
+    trust: Trust,
+    base_cpu: u64,
+    body: CommandBody,
+) {
     assert!(path.starts_with('/') && !path.ends_with('/'));
     let name = path.rsplit('/').next().expect("executable has basename");
     let spec = CommandSpec {
-        body: CommandBody::System(system),
+        body,
         resume: None,
         resume_before_input: false,
         trust,
@@ -955,7 +1003,10 @@ fn dispatch(
             _ => CommandPoll::Ready(match spec.body {
                 CommandBody::Legacy(run) => run(&mut context, args, &mut io),
                 CommandBody::System(run) => {
-                    run_system_from_legacy(&mut context, args, &mut io, run)
+                    run_system_from_legacy(&mut context, args, &mut io, SystemRun::Once(run))
+                }
+                CommandBody::SystemPoll(run) => {
+                    run_system_from_legacy(&mut context, args, &mut io, SystemRun::Poll(run))
                 }
             }),
         };
