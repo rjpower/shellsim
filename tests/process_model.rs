@@ -86,6 +86,122 @@ fn native_images_are_opaque_vfs_executables_found_through_path() {
 }
 
 #[test]
+fn native_yes_uses_path_and_process_scoped_pipe_backpressure() {
+    let mut env = Environment::new();
+    let node = env.vfs.metadata("/", "/usr/bin/yes", true).unwrap();
+    assert!(matches!(
+        node.kind,
+        NodeKind::NativeExecutable(NativeProgram::Yes)
+    ));
+    assert_eq!(
+        run(&mut env, "yes ready | head -n 3"),
+        (0, "ready\nready\nready\n".into(), "".into())
+    );
+    assert!(
+        env.invocations.events().iter().any(|event| {
+            event.pid != 1_234 && event.argv == ["yes", "ready"] && event.status == Some(141)
+        }),
+        "{:?}",
+        env.invocations.events()
+    );
+
+    env.vfs
+        .copy_file("/", "/usr/bin/yes", "/work/repeat")
+        .unwrap();
+    assert_eq!(
+        run(&mut env, "/work/repeat again | head -n 2").1,
+        "again\nagain\n"
+    );
+    assert_eq!(run(&mut env, "env -i PATH=/missing yes").0, 127);
+}
+
+#[test]
+fn independent_shell_sessions_share_files_but_keep_shell_state() {
+    let mut env = Environment::new();
+    let first = env.spawn_shell_session().unwrap();
+    let second = env.spawn_shell_session().unwrap();
+    assert_ne!(first, second);
+    assert_eq!(env.scheduler.current(), Some(1_234));
+
+    let first_run = env
+        .run_shell_session_capture(
+            first,
+            "cd /work; export OWNER=first; printf shared > note; printf '%s:%s' \"$$\" \"$OWNER\"",
+        )
+        .unwrap();
+    assert_eq!(first_run.0.exit_status, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&first_run.1),
+        format!("{first}:first")
+    );
+
+    let second_run = env
+        .run_shell_session_capture(
+            second,
+            "cd /tmp; export OWNER=second; printf '%s:%s' \"$$\" \"$OWNER\"; cat /work/note",
+        )
+        .unwrap();
+    assert_eq!(second_run.0.exit_status, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&second_run.1),
+        format!("{second}:secondshared")
+    );
+
+    assert_eq!(
+        env.run_shell_session_capture(first, "printf '%s:%s' \"$PWD\" \"$OWNER\"")
+            .unwrap()
+            .1,
+        b"/work:first"
+    );
+    assert_eq!(env.scheduler.current(), Some(1_234));
+    assert_eq!(
+        run(&mut env, "printf '%s:%s' \"$PWD\" \"${OWNER-unset}\"").1,
+        "/:unset"
+    );
+}
+
+#[test]
+fn exited_shell_session_cannot_accept_another_action() {
+    let mut env = Environment::new();
+    let session = env.spawn_shell_session().unwrap();
+    let result = env.run_shell_session_capture(session, "exit 7").unwrap();
+    assert_eq!(result.0.exit_status, 7);
+    assert!(env
+        .run_shell_session_capture(session, "printf stale")
+        .is_err());
+    assert_eq!(run(&mut env, "printf root").1, "root");
+}
+
+#[test]
+fn idle_shell_sessions_survive_environment_snapshots() {
+    let mut env = Environment::new();
+    let session = env.spawn_shell_session().unwrap();
+    env.run_shell_session_capture(session, "cd /work; export LABEL=kept")
+        .unwrap();
+    let mut fork = env.clone();
+    assert_eq!(
+        env.run_shell_session_capture(session, "printf '%s:%s' \"$PWD\" \"$LABEL\"")
+            .unwrap()
+            .1,
+        b"/work:kept"
+    );
+    assert_eq!(
+        fork.run_shell_session_capture(session, "printf '%s:%s' \"$PWD\" \"$LABEL\"")
+            .unwrap()
+            .1,
+        b"/work:kept"
+    );
+    fork.run_shell_session_capture(session, "export LABEL=changed")
+        .unwrap();
+    assert_eq!(
+        env.run_shell_session_capture(session, "printf '%s' \"$LABEL\"")
+            .unwrap()
+            .1,
+        b"kept"
+    );
+}
+
+#[test]
 fn native_images_follow_executable_permissions_and_can_be_replaced() {
     let mut env = Environment::new();
     env.vfs.chmod("/", "/usr/bin/pwd", 0o644).unwrap();

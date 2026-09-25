@@ -90,6 +90,17 @@ assert result.returncode == 0
 assert result.stdout == b"42\n"
 ```
 
+`environment.run()` reuses the default shell. To keep independent shell state in one machine,
+create additional sessions; they share the virtual filesystem and resource limits:
+
+```python
+first = environment.create_shell()
+second = environment.create_shell()
+first.run("cd /work; export LABEL=first")
+assert first.run("printf '%s' \"$LABEL\"").stdout == b"first"
+assert second.run("printf '%s' \"${LABEL-unset}\"").stdout == b"unset"
+```
+
 Static HTTP fixtures use the same isolated environment. They do not enable sockets, DNS, TLS, or
 host-network access:
 

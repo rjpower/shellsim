@@ -8,7 +8,7 @@ use crate::descriptors::{IoPoll, IoWait};
 use crate::exec::{ShellContinuation, ShellPoll};
 use crate::interp::Interp;
 use crate::scheduler::WaitReason;
-use crate::syscalls::{ActiveProcessSyscalls, NativeSyscalls};
+use crate::syscalls::{ActiveProcessSyscalls, NativeSyscalls, SyscallError};
 
 /// Owned state needed to resume one process after a scheduler turn.
 #[derive(Clone)]
@@ -53,6 +53,10 @@ pub(crate) enum NativeProcess {
         output: Option<Vec<u8>>,
         offset: usize,
     },
+    Yes {
+        output: Vec<u8>,
+        offset: usize,
+    },
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -62,7 +66,7 @@ pub(crate) enum NativeProcess {
 
 impl NativeProcess {
     /// Construct an owned continuation from one VFS native program identity.
-    pub(crate) fn from_image(image: crate::vfs::NativeProgram) -> Self {
+    pub(crate) fn from_image(image: crate::vfs::NativeProgram, argv: &[String]) -> Self {
         match image {
             crate::vfs::NativeProgram::True => Self::Status(0),
             crate::vfs::NativeProgram::False => Self::Status(1),
@@ -70,6 +74,25 @@ impl NativeProcess {
                 output: None,
                 offset: 0,
             },
+            crate::vfs::NativeProgram::Yes => {
+                let args = &argv[1..];
+                let line_bytes = args
+                    .iter()
+                    .fold(args.len().saturating_sub(1), |total, arg| {
+                        total.saturating_add(arg.len())
+                    })
+                    .saturating_add(1);
+                if line_bytes > 4096 {
+                    return Self::failure(1, "yes: arguments exceed 4096 bytes\n".into());
+                }
+                let line = if args.is_empty() {
+                    b"y\n".to_vec()
+                } else {
+                    format!("{}\n", args.join(" ")).into_bytes()
+                };
+                let output = line.repeat((4096 / line.len()).max(1));
+                Self::Yes { output, offset: 0 }
+            }
         }
     }
 
@@ -95,6 +118,13 @@ impl NativeProcess {
                 });
                 poll_write(syscalls, 1, bytes, offset, 0)
             }
+            Self::Yes { output, offset } => match poll_write(syscalls, 1, output, offset, 0) {
+                ShellPoll::Ready(0) => {
+                    *offset = 0;
+                    ShellPoll::Pending
+                }
+                other => other,
+            },
             Self::Failure {
                 status,
                 message,
@@ -132,6 +162,9 @@ fn poll_write(
                 }
             }
             Ok(IoPoll::Blocked(wait)) => return ShellPoll::Blocked(wait_reason(wait)),
+            Err(SyscallError::Descriptor(crate::descriptors::DescriptorError::BrokenPipe)) => {
+                return ShellPoll::Ready(141);
+            }
             Err(_) => return ShellPoll::Ready(1),
         }
     }
@@ -162,7 +195,7 @@ mod tests {
             "/work"
         }
 
-        fn write(&mut self, fd: i32, bytes: &[u8]) -> Result<IoPoll<usize>, String> {
+        fn write(&mut self, fd: i32, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError> {
             assert_eq!(fd, 1);
             self.calls += 1;
             if self.calls == 1 {
@@ -197,7 +230,8 @@ mod tests {
 
     #[test]
     fn native_process_retains_output_across_blocked_and_partial_writes() {
-        let mut process = NativeProcess::from_image(crate::vfs::NativeProgram::Pwd);
+        let mut process =
+            NativeProcess::from_image(crate::vfs::NativeProgram::Pwd, &["pwd".into()]);
         let mut syscalls = PartialWriter {
             calls: 0,
             bytes: Vec::new(),
@@ -214,7 +248,8 @@ mod tests {
 
     #[test]
     fn native_process_stops_at_the_output_limit() {
-        let mut process = NativeProcess::from_image(crate::vfs::NativeProgram::Pwd);
+        let mut process =
+            NativeProcess::from_image(crate::vfs::NativeProgram::Pwd, &["pwd".into()]);
         let mut syscalls = PartialWriter {
             calls: 1,
             bytes: Vec::new(),

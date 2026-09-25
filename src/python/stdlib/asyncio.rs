@@ -209,6 +209,11 @@ fn parse_wait_token(
 
 fn wait_token(runtime: &mut dyn PyRuntime, reason: crate::scheduler::WaitReason) -> PyResult {
     let (kind, value) = match reason {
+        crate::scheduler::WaitReason::ShellSession(_) => {
+            return Err(PyError::runtime_error(
+                "shell session waits cannot be used by asyncio",
+            ))
+        }
         crate::scheduler::WaitReason::Timer(value) => ("timer", u64_to_i64(value)?),
         crate::scheduler::WaitReason::InputReadable(value) => ("input_readable", i64::from(value)),
         crate::scheduler::WaitReason::PipeReadable(value) => ("pipe_readable", i64::from(value)),

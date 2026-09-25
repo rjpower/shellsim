@@ -308,6 +308,7 @@ pub enum ProcessViewStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitReasonView {
+    ShellSession { pid: u32 },
     Timer { deadline_ns: u64 },
     InputReadable { description: u32 },
     PipeReadable { pipe: u32 },
@@ -1251,6 +1252,7 @@ fn process_view(record: &ProcessRecord, task_state: Option<TaskState>) -> Proces
 
 fn wait_reason_view(reason: WaitReason) -> WaitReasonView {
     match reason {
+        WaitReason::ShellSession(pid) => WaitReasonView::ShellSession { pid },
         WaitReason::Timer(deadline_ns) => WaitReasonView::Timer { deadline_ns },
         WaitReason::InputReadable(description) => WaitReasonView::InputReadable { description },
         WaitReason::PipeReadable(pipe) => WaitReasonView::PipeReadable { pipe },

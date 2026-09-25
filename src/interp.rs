@@ -606,6 +606,7 @@ impl Environment {
             ("true", crate::vfs::NativeProgram::True),
             ("false", crate::vfs::NativeProgram::False),
             ("pwd", crate::vfs::NativeProgram::Pwd),
+            ("yes", crate::vfs::NativeProgram::Yes),
         ] {
             vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
         }
@@ -743,7 +744,7 @@ impl Environment {
                     .map(|node| node.kind)
                 {
                     Some(crate::vfs::NodeKind::NativeExecutable(image)) => {
-                        Some(crate::program::NativeProcess::from_image(image))
+                        Some(crate::program::NativeProcess::from_image(image, &argv))
                     }
                     _ => {
                         argv[0] = path;
@@ -931,6 +932,110 @@ impl Environment {
             self.process.activate(scheduled)?;
         }
         Ok(pid)
+    }
+
+    /// Create an idle shell in a new logical session over this environment's shared VFS.
+    ///
+    /// The new shell inherits the caller's current shell state once, then retains its own cwd,
+    /// variables, descriptors, and parser state across later host actions. No host process is
+    /// started. The default shell remains available through `run_script_capture`.
+    pub fn spawn_shell_session(&mut self) -> Result<ProcessId, String> {
+        let root = self.terminal.session_id;
+        if self.process.pid != root
+            || self.scheduler.current() != Some(root)
+            || self.process.program.is_some()
+            || self.exiting.is_some()
+        {
+            return Err("shell sessions can be created only from an idle default shell".into());
+        }
+        let pid = self.create_child(
+            "bash",
+            true,
+            false,
+            false,
+            crate::process::ChildPlacement::NewSession,
+        )?;
+        self.scheduler
+            .park_runnable(pid, WaitReason::ShellSession(pid))
+            .map_err(|error| format!("unable to park shell session {pid}: {error:?}"))?;
+        Ok(pid)
+    }
+
+    /// Run one action in a persistent shell session while other sessions keep their state.
+    ///
+    /// Host actions are serialized; modeled children still run cooperatively through the shared
+    /// scheduler. The requested session must be idle, not a background child or exited process.
+    pub fn run_shell_session_capture(
+        &mut self,
+        pid: ProcessId,
+        source: &str,
+    ) -> Result<(RunOutcome, Vec<u8>, Vec<u8>), String> {
+        self.run_shell_session_capture_with_stdin(pid, source, &[])
+    }
+
+    /// Run one action with explicit input bytes in a persistent shell session.
+    pub fn run_shell_session_capture_with_stdin(
+        &mut self,
+        pid: ProcessId,
+        source: &str,
+        stdin: &[u8],
+    ) -> Result<(RunOutcome, Vec<u8>, Vec<u8>), String> {
+        let root = self.terminal.session_id;
+        if self.process.pid != root
+            || self.scheduler.current() != Some(root)
+            || self.process.program.is_some()
+        {
+            return Err("default shell is not idle".into());
+        }
+        if pid == root {
+            return Ok(self.run_script_capture_with_stdin(source, stdin));
+        }
+        if !matches!(
+            self.scheduler.state(pid),
+            Some(crate::scheduler::TaskState::Blocked(WaitReason::ShellSession(waiting)))
+                if waiting == pid
+        ) {
+            return Err(format!("shell session {pid} is not idle"));
+        }
+        self.scheduler
+            .block_current(WaitReason::ShellSession(root))
+            .map_err(|error| format!("unable to park default shell: {error:?}"))?;
+        self.scheduler
+            .wake(pid)
+            .map_err(|error| format!("unable to wake shell session {pid}: {error:?}"))?;
+        self.scheduler
+            .dispatch_pid(pid)
+            .map_err(|error| format!("unable to select shell session {pid}: {error:?}"))?;
+        self.process.activate(pid)?;
+
+        let result = self.run_script_capture_with_stdin(source, stdin);
+        debug_assert_eq!(self.process.pid, pid);
+        if let Some(status) = self.exiting {
+            self.finish_child(pid, status);
+        } else {
+            self.scheduler
+                .block_current(WaitReason::ShellSession(pid))
+                .map_err(|error| format!("unable to park shell session {pid}: {error:?}"))?;
+        }
+        if self
+            .scheduler
+            .current()
+            .is_some_and(|current| current != root)
+        {
+            self.scheduler
+                .yield_current()
+                .map_err(|error| format!("unable to yield to default shell: {error:?}"))?;
+        }
+        if self.scheduler.current().is_none() {
+            self.scheduler
+                .wake(root)
+                .map_err(|error| format!("unable to wake default shell: {error:?}"))?;
+            self.scheduler
+                .dispatch_pid(root)
+                .map_err(|error| format!("unable to select default shell: {error:?}"))?;
+        }
+        self.process.activate(root)?;
+        Ok(result)
     }
 
     /// Replace one descriptor in a retained process before its continuation is dispatched.
@@ -1389,17 +1494,34 @@ impl Environment {
 
     /// Write to an active process descriptor, routing file effects only through the VFS.
     pub(crate) fn write_fd(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, String> {
-        let description = self.process.fds.get(fd).map_err(descriptor_message)?;
-        if let Some(file) = self
-            .descriptors
-            .file_state(description)
-            .map_err(descriptor_message)?
-        {
+        self.write_fd_checked(fd, bytes)
+            .map_err(|error| match error {
+                crate::syscalls::SyscallError::Descriptor(error) => descriptor_message(error),
+                crate::syscalls::SyscallError::File(error) => error.to_string(),
+                crate::syscalls::SyscallError::Permission => {
+                    "descriptor is not open for writing".to_string()
+                }
+                crate::syscalls::SyscallError::InvalidArgument => {
+                    "file cursor exceeds addressable memory".to_string()
+                }
+                crate::syscalls::SyscallError::IsDirectory => "is a directory".to_string(),
+            })
+    }
+
+    /// Typed descriptor write used by native program images and guest syscall adapters.
+    pub(crate) fn write_fd_checked(
+        &mut self,
+        fd: Fd,
+        bytes: &[u8],
+    ) -> Result<IoPoll<usize>, crate::syscalls::SyscallError> {
+        use crate::syscalls::SyscallError;
+
+        let description = self.process.fds.get(fd)?;
+        if let Some(file) = self.descriptors.file_state(description)? {
             if !file.writable {
-                return Err("descriptor is not open for writing".to_string());
+                return Err(SyscallError::Permission);
             }
-            let cursor = usize::try_from(file.cursor)
-                .map_err(|_| "file cursor exceeds addressable memory".to_string())?;
+            let cursor = usize::try_from(file.cursor).map_err(|_| SyscallError::InvalidArgument)?;
             self.sync_vfs_time();
             let result = match file.orphan {
                 Some(id) => self.vfs.write_orphan_at(id, cursor, bytes),
@@ -1409,23 +1531,14 @@ impl Environment {
                 if file.remove_on_first_write_error && cursor == 0 {
                     let _ = self.vfs.remove_file("/", &file.path);
                 }
-                return Err(error.to_string());
+                return Err(error.into());
             }
-            self.descriptors
-                .advance_file(description, bytes.len())
-                .map_err(descriptor_message)?;
+            self.descriptors.advance_file(description, bytes.len())?;
             return Ok(IoPoll::Ready(bytes.len()));
         }
-        let result = self
-            .descriptors
-            .write(description, bytes)
-            .map_err(descriptor_message)?;
+        let result = self.descriptors.write(description, bytes)?;
         if matches!(result, IoPoll::Ready(_)) {
-            if let Some((pipe, false)) = self
-                .descriptors
-                .pipe_endpoint(description)
-                .map_err(descriptor_message)?
-            {
+            if let Some((pipe, false)) = self.descriptors.pipe_endpoint(description)? {
                 self.scheduler.wake_waiters(WaitReason::PipeReadable(pipe));
                 self.wake_child_activity_waiters(self.process.pid);
             }

@@ -12,7 +12,7 @@ use crate::vfs::{resolve_against, NodeKind, VfsError};
 /// cannot outlive the poll, so blocked programs retain only their own data and wait reason.
 pub(crate) trait NativeSyscalls {
     fn cwd(&self) -> &str;
-    fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, String>;
+    fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError>;
     fn charge_cpu(&mut self, units: u64) -> bool;
     fn output_remaining(&self) -> u64;
     fn charge_output(&mut self, bytes: u64) -> bool;
@@ -36,8 +36,8 @@ impl NativeSyscalls for ActiveProcessSyscalls<'_> {
         &self.interp.process.cwd
     }
 
-    fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, String> {
-        self.interp.write_fd(fd, bytes)
+    fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError> {
+        self.interp.write_fd_checked(fd, bytes)
     }
 
     fn charge_cpu(&mut self, units: u64) -> bool {

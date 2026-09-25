@@ -105,6 +105,45 @@ impl NativeEnvironment {
         ))
     }
 
+    /// Create an idle shell with its own process state over the shared virtual machine.
+    fn create_shell(&self, py: Python<'_>) -> PyResult<u32> {
+        py.detach(|| {
+            let mut environment = self.lock_environment()?;
+            on_worker(&mut environment, |environment| {
+                environment.spawn_shell_session()
+            })
+        })
+        .map_err(SimulationError::new_err)
+    }
+
+    /// Execute one action in a selected persistent shell session.
+    fn run_shell(
+        &self,
+        py: Python<'_>,
+        pid: u32,
+        source: String,
+        stdin: Vec<u8>,
+    ) -> PyResult<(String, Py<PyBytes>, Py<PyBytes>)> {
+        let (metadata, stdout, stderr) = py
+            .detach(|| {
+                let mut environment = self.lock_environment()?;
+                on_worker(&mut environment, move |environment| {
+                    let start = metadata_start(environment);
+                    let (outcome, stdout, stderr) =
+                        environment.run_shell_session_capture_with_stdin(pid, &source, &stdin)?;
+                    Ok((metadata_finish(environment, outcome, start), stdout, stderr))
+                })
+            })
+            .map_err(SimulationError::new_err)?;
+        let metadata = serde_json::to_string(&metadata)
+            .map_err(|error| SimulationError::new_err(error.to_string()))?;
+        Ok((
+            metadata,
+            PyBytes::new(py, &stdout).unbind(),
+            PyBytes::new(py, &stderr).unbind(),
+        ))
+    }
+
     /// Execute Python source directly without passing it through the shell parser.
     fn run_python(
         &self,

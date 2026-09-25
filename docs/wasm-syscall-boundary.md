@@ -12,7 +12,8 @@ to the shell's process-scoped syscall interface.
 
 The current machine already creates a root process with descriptors and a scheduler entry, and
 program continuations belong to logical processes. A child argv loader can retain either a
-shell continuation or a native Rust image. The first native images are `pwd`, `true`, and `false`.
+shell continuation or a native Rust image. The first native images are `pwd`, `true`, `false`,
+and `yes`.
 They are opaque executable entries in the virtual `/usr/bin`, resolved through the same cwd and
 `PATH` search as Wasm files and scripts when launched as external commands. Bare names that are
 shell builtins still run in the shell process. The native images receive a
@@ -28,12 +29,21 @@ external invocation as a child or `exec` replacement. Generic process state shou
 from shell-only variables, aliases, functions, job control, and parser state. Builtins such as
 `cd` and `export` still act in the shell PID; they do not require kernel privilege.
 
+The host can now create additional persistent shell sessions in one `Environment` and select a
+session for each action. Sessions share the VFS and scheduler, but retain separate shell state,
+cwd, descriptors, and PID. Idle sessions survive environment snapshots. This is a host control
+API, not yet a VFS-loaded `/bin/sh`: the default shell is still a distinguished root process,
+and shell execution still has direct `Interp` access.
+
 The new `syscalls.rs` begins this boundary for regular files. It accepts typed open options,
 allocates descriptors in the active process, and owns close and seek. The WASI adapter now uses
 those descriptors for open, read, write, seek, stat, and close; it no longer keeps a second file
 handle table. The source-built `guest/wc` fixture proves that a standalone Rust WASI command
 can read piped input and virtual files and match selected native `wc` behavior. The fixture is
 loaded into the VFS only by tests; standard `wc` remains native.
+Native `yes` now runs as a VFS executable and resumes across pipe backpressure through a
+process-scoped syscall handle. A typed broken-pipe result determines its exit status without
+matching an error message.
 
 For migration, an executable placed at a standard path such as `/usr/bin/wc` takes precedence
 over the synthetic native alias. A bare `wc` also resolves that executable through `PATH`; if
@@ -58,6 +68,14 @@ point so both native and Wasm work count against the same budget.
 
 ## Current limits and next gate
 
+Make VFS program identity authoritative for external native commands, then remove the synthetic
+basename fallback. Extend the borrowed native syscall handle with typed descriptor reads and
+filesystem operations, and move a small reader and a filesystem-walking utility across it.
+Finally, give the Rust shell a process-scoped handle for execution, files, and process control;
+leave `cd`, variables, and other state-changing builtins in its own PID. Only then should the
+default shell be loaded from `/bin/sh` like any other native program image. Native Rust commands
+need not become Wasm binaries to use this boundary.
+
 Wasm stdin/stdout/stderr are still buffered at command dispatch. The shell drains a producer's
 pipe before starting a Wasm consumer, so a compiled `wc` can count input larger than pipe
 capacity and pass its result to another command. It does not prove suspension on a live pipe:
@@ -66,7 +84,7 @@ stdio onto process descriptors and define a Wasmtime suspension mechanism when a
 returns `IoPoll::Blocked`. A guest continuation must resume at the blocked instruction, not
 restart `_start` or treat temporary absence of input as EOF. Before enabling Wasm by default,
 resolve how an active Wasmtime continuation can be independently cloned for harness forks, or
-reject that fork explicitly. The Rust shell program image and native `wc` should remain until
+reject that fork explicitly. The Rust shell implementation and native `wc` should remain until
 those gates pass.
 
 Only after live pipe behavior is sound should shellsim consider a default Wasm `wc`, then a
