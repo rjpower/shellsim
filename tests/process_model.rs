@@ -291,6 +291,84 @@ fn typed_file_metadata_commands_use_child_cwd_and_identity() {
 }
 
 #[test]
+fn typed_mktemp_creates_private_process_owned_entries() {
+    let mut env = Environment::new();
+    let file = run(&mut env, "mktemp note.XXXXXX");
+    assert_eq!(file, (0, "/tmp/note.000000\n".into(), "".into()));
+    let metadata = env.vfs.metadata("/", "/tmp/note.000000", false).unwrap();
+    assert_eq!(metadata.mode & 0o777, 0o600);
+    let directory = run(&mut env, "mktemp -d group.XXXXXX");
+    assert_eq!(directory, (0, "/tmp/group.000001\n".into(), "".into()));
+    assert!(matches!(
+        env.vfs
+            .metadata("/", "/tmp/group.000001", false)
+            .unwrap()
+            .kind,
+        NodeKind::Dir
+    ));
+    assert!(env.invocations.events().iter().any(|event| {
+        event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == "mktemp")
+    }));
+}
+
+#[test]
+fn typed_file_reads_virtual_files_and_rejects_unsupported_sources() {
+    let mut env = Environment::new();
+    env.vfs
+        .write("/", "/work/words", b"hello\n", 0o644)
+        .unwrap();
+    env.vfs
+        .write("/", "/work/binary", b"\xff\0", 0o644)
+        .unwrap();
+    assert_eq!(
+        run(&mut env, "file /work/words /work/binary /work"),
+        (
+            0,
+            "/work/words: ASCII text\n/work/binary: data\n/work: directory\n".into(),
+            "".into(),
+        )
+    );
+    let device = run(&mut env, "file /dev/zero");
+    assert_eq!(device.0, 1);
+    assert!(device.1.contains("cannot open"));
+    assert!(env.invocations.events().iter().any(|event| {
+        event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == "file")
+    }));
+}
+
+#[test]
+fn remaining_filesystem_tools_run_as_registered_native_children() {
+    let mut env = Environment::new();
+    env.vfs
+        .write("/", "/work/source", b"payload", 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "cp /work/source /work/copied").0, 0);
+    assert_eq!(run(&mut env, "truncate -s 3 /work/copied").0, 0);
+    assert_eq!(env.vfs.read("/", "/work/copied").unwrap(), b"pay");
+    assert_eq!(run(&mut env, "install -D /work/source /work/bin/tool").0, 0);
+    assert_eq!(env.vfs.read("/", "/work/bin/tool").unwrap(), b"payload");
+    assert_eq!(
+        run(&mut env, "file /work/bin/tool").1,
+        "/work/bin/tool: ASCII text\n"
+    );
+    assert_eq!(run(&mut env, "cp /usr/bin/pwd /work/copied-pwd").0, 0);
+    assert_eq!(
+        run(&mut env, "/work/copied-pwd"),
+        (0, "/\n".into(), "".into())
+    );
+    for command in ["cp", "truncate", "install", "file"] {
+        assert!(
+            env.invocations.events().iter().any(|event| {
+                event.pid != 1_234
+                    && event.argv.first().is_some_and(|arg| arg == command)
+                    && event.status == Some(0)
+            }),
+            "{command} did not run in a child process"
+        );
+    }
+}
+
+#[test]
 fn native_images_are_opaque_vfs_executables_found_through_path() {
     let mut env = Environment::new();
     let node = env.vfs.metadata("/", "/usr/bin/pwd", true).unwrap();

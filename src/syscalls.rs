@@ -23,6 +23,26 @@ pub(crate) trait System {
     fn metadata_fd(&mut self, fd: Fd) -> Result<FileInfo, SyscallError>;
     fn list_dir(&mut self, base: &str, path: &str) -> Result<Vec<String>, SyscallError>;
     fn walk(&mut self, base: &str, path: &str) -> Result<Vec<String>, SyscallError>;
+    fn read_file_limited(
+        &mut self,
+        base: &str,
+        path: &str,
+        maximum: usize,
+    ) -> Result<Vec<u8>, SyscallError>;
+    fn write_file(
+        &mut self,
+        base: &str,
+        path: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) -> Result<(), SyscallError>;
+    fn put_file_with_parents(
+        &mut self,
+        base: &str,
+        path: &str,
+        bytes: Vec<u8>,
+        mode: u32,
+    ) -> Result<(), SyscallError>;
     fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError>;
     fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError>;
     fn open_file(&mut self, base: &str, path: &str, options: OpenFile) -> Result<Fd, SyscallError>;
@@ -35,6 +55,16 @@ pub(crate) trait System {
     fn mkdir_all(&mut self, base: &str, path: &str) -> Result<(), SyscallError>;
     fn rmdir(&mut self, base: &str, path: &str) -> Result<(), SyscallError>;
     fn rename(&mut self, base: &str, from: &str, to: &str) -> Result<(), SyscallError>;
+    /// Clone a VFS entry, including opaque native program identity, atomically under disk quota.
+    fn copy_file(&mut self, base: &str, from: &str, to: &str) -> Result<(), SyscallError>;
+    /// Clone a VFS subtree atomically so quota failure does not leave a partial tree.
+    fn copy_recursive(
+        &mut self,
+        base: &str,
+        from: &str,
+        to: &str,
+        preserve: bool,
+    ) -> Result<(), SyscallError>;
     fn symlink(&mut self, base: &str, target: &str, link: &str) -> Result<(), SyscallError>;
     fn chown(
         &mut self,
@@ -52,6 +82,7 @@ pub(crate) trait System {
         strict: bool,
     ) -> Result<String, SyscallError>;
     fn wall_time_ms(&self) -> u64;
+    fn allocate_temp_id(&mut self) -> Option<u64>;
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError>;
     fn display_present(
         &mut self,
@@ -62,6 +93,8 @@ pub(crate) trait System {
     fn input_poll_key(&mut self, handle: u32) -> Result<Option<KeyEvent>, DisplayError>;
     fn display_close(&mut self, handle: u32) -> Result<(), DisplayError>;
     fn charge_cpu(&mut self, units: u64) -> bool;
+    fn reserve_memory(&mut self, bytes: u64) -> bool;
+    fn release_memory(&mut self, bytes: u64);
     fn output_remaining(&self) -> u64;
     fn charge_output(&mut self, bytes: u64) -> bool;
     fn stop_status(&self) -> i32;
@@ -135,6 +168,40 @@ impl System for ActiveSystem<'_> {
         Ok(self.interp.fs_walk(base, path)?)
     }
 
+    fn read_file_limited(
+        &mut self,
+        base: &str,
+        path: &str,
+        maximum: usize,
+    ) -> Result<Vec<u8>, SyscallError> {
+        Ok(self.interp.fs_read_limited(base, path, maximum)?)
+    }
+
+    fn write_file(
+        &mut self,
+        base: &str,
+        path: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) -> Result<(), SyscallError> {
+        self.interp.sync_vfs_time();
+        self.interp.vfs.write(base, path, bytes, mode)?;
+        Ok(())
+    }
+
+    fn put_file_with_parents(
+        &mut self,
+        base: &str,
+        path: &str,
+        bytes: Vec<u8>,
+        mode: u32,
+    ) -> Result<(), SyscallError> {
+        self.interp.sync_vfs_time();
+        let absolute = resolve_against(base, path);
+        self.interp.vfs.put_file(&absolute, bytes, mode)?;
+        Ok(())
+    }
+
     fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
         self.interp.read_fd_checked(fd, maximum)
     }
@@ -185,6 +252,24 @@ impl System for ActiveSystem<'_> {
         rename(self.interp, base, from, to)
     }
 
+    fn copy_file(&mut self, base: &str, from: &str, to: &str) -> Result<(), SyscallError> {
+        self.interp.sync_vfs_time();
+        self.interp.vfs.copy_file(base, from, to)?;
+        Ok(())
+    }
+
+    fn copy_recursive(
+        &mut self,
+        base: &str,
+        from: &str,
+        to: &str,
+        preserve: bool,
+    ) -> Result<(), SyscallError> {
+        self.interp.sync_vfs_time();
+        self.interp.vfs.copy_recursive(base, from, to, preserve)?;
+        Ok(())
+    }
+
     fn symlink(&mut self, base: &str, target: &str, link: &str) -> Result<(), SyscallError> {
         self.interp.sync_vfs_time();
         self.interp.vfs.symlink(base, target, link)?;
@@ -231,6 +316,10 @@ impl System for ActiveSystem<'_> {
         self.interp.clock.unix_ms()
     }
 
+    fn allocate_temp_id(&mut self) -> Option<u64> {
+        self.interp.next_temp_id()
+    }
+
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError> {
         display_open(self.interp, width, height, format)
     }
@@ -254,6 +343,14 @@ impl System for ActiveSystem<'_> {
 
     fn charge_cpu(&mut self, units: u64) -> bool {
         self.interp.resources.charge_cpu(units)
+    }
+
+    fn reserve_memory(&mut self, bytes: u64) -> bool {
+        self.interp.resources.reserve_memory(bytes)
+    }
+
+    fn release_memory(&mut self, bytes: u64) {
+        self.interp.resources.release_memory(bytes);
     }
 
     fn output_remaining(&self) -> u64 {

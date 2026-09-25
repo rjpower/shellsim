@@ -1,11 +1,9 @@
 //! Built-in commands and coreutils, implemented natively against the VFS.
 //!
-//! Ordinary commands are plain functions with the uniform signature
-//! [`CmdFn`] = `fn(&mut CommandContext, &[String], &mut Io) -> i32`, where the slice is `argv[1..]`
-//! and all I/O flows through the [`Io`] context. Commands that can block may additionally register
-//! a resumable start function; native callers retain the synchronous entry point while shell
-//! continuations receive a typed wait reason. Builtins that mutate environment state do so
-//! through the context.
+//! Native executable bodies receive a process-scoped `ProcessContext` and use
+//! its typed virtual-kernel interface. Older bodies still use [`CommandContext`] while they are
+//! migrated. Commands that can block retain owned continuations and return a typed wait reason;
+//! shell builtins that mutate shell-local state remain in the shell process.
 //!
 //! Commands are looked up in a [`OnceLock`]-backed registry that records each command's
 //! [`Trust`] level, so a run can report whether it stayed inside the faithfully-simulated
@@ -211,14 +209,19 @@ impl DerefMut for CommandContext<'_> {
 
 /// A registered command: its implementation and trust level.
 pub struct CommandSpec {
-    pub run: CmdFn,
-    system_run: Option<SystemCmdFn>,
+    body: CommandBody,
     native_path: Option<&'static str>,
     resume: Option<ResumableCmdFn>,
     resume_before_input: bool,
     pub trust: Trust,
     pub base_cpu: u64,
     pub base_memory: u64,
+}
+
+#[derive(Clone, Copy)]
+enum CommandBody {
+    Legacy(CmdFn),
+    System(SystemCmdFn),
 }
 
 static REGISTRY: OnceLock<HashMap<&'static str, CommandSpec>> = OnceLock::new();
@@ -246,7 +249,10 @@ pub(crate) fn registered_executables() -> Vec<(String, crate::vfs::NativeProgram
 }
 
 pub(crate) fn system_command(name: &str) -> Option<SystemCmdFn> {
-    registry().get(name).and_then(|spec| spec.system_run)
+    match registry().get(name)?.body {
+        CommandBody::System(run) => Some(run),
+        CommandBody::Legacy(_) => None,
+    }
 }
 
 fn runs_native_process(image: crate::vfs::NativeProgram) -> bool {
@@ -291,8 +297,7 @@ fn reg_costed(
         map.insert(
             n,
             CommandSpec {
-                run: f,
-                system_run: None,
+                body: CommandBody::Legacy(f),
                 native_path: None,
                 resume: None,
                 resume_before_input: false,
@@ -304,21 +309,26 @@ fn reg_costed(
     }
 }
 
-/// Register one existing command body for both nested dispatch and process-owned execution.
+/// Register one process-scoped command body at its virtual executable path.
 fn reg_system(
     map: &mut HashMap<&'static str, CommandSpec>,
     path: &'static str,
     trust: Trust,
-    legacy: CmdFn,
     system: SystemCmdFn,
 ) {
     let name = path.rsplit('/').next().expect("executable has basename");
-    reg(map, &[name], trust, legacy);
-    let spec = map
-        .get_mut(name)
-        .expect("newly registered command must exist");
-    spec.system_run = Some(system);
-    spec.native_path = Some(path);
+    map.insert(
+        name,
+        CommandSpec {
+            body: CommandBody::System(system),
+            native_path: Some(path),
+            resume: None,
+            resume_before_input: false,
+            trust,
+            base_cpu: 100,
+            base_memory: 10 * 1024,
+        },
+    );
 }
 
 /// Register a command that can suspend when called by the shell while retaining a synchronous
@@ -334,8 +344,7 @@ fn reg_resumable(
         map.insert(
             name,
             CommandSpec {
-                run,
-                system_run: None,
+                body: CommandBody::Legacy(run),
                 native_path: None,
                 resume: Some(resume),
                 resume_before_input: true,
@@ -898,7 +907,12 @@ fn dispatch(
         };
         let mut result = match (resumable, spec.resume) {
             (true, Some(start)) => start(&mut context, args, &mut io),
-            _ => CommandPoll::Ready((spec.run)(&mut context, args, &mut io)),
+            _ => CommandPoll::Ready(match spec.body {
+                CommandBody::Legacy(run) => run(&mut context, args, &mut io),
+                CommandBody::System(run) => {
+                    run_system_from_legacy(&mut context, args, &mut io, run)
+                }
+            }),
         };
         let out_bytes = io.out.len().saturating_sub(out_before);
         let err_bytes = io.err.len().saturating_sub(err_before);
