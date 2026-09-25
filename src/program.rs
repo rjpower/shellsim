@@ -494,6 +494,14 @@ mod tests {
             unreachable!("native writer does not inspect time")
         }
 
+        fn clock_time_ns(&self, _clock: crate::syscalls::ClockId) -> Result<u64, SyscallError> {
+            unreachable!("native writer does not inspect time")
+        }
+
+        fn random_fill(&mut self, _bytes: &mut [u8]) -> Result<(), SyscallError> {
+            unreachable!("native writer does not request entropy")
+        }
+
         fn allocate_temp_id(&mut self) -> Option<u64> {
             unreachable!("native writer does not allocate temporary names")
         }

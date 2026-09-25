@@ -188,6 +188,8 @@ pub struct ProcessState {
     pub last_status: i32,
     /// Deterministic state for Bash's special `$RANDOM` parameter.
     random_state: Cell<u32>,
+    /// Process-local entropy for guest and native virtual-kernel random calls.
+    syscall_random_state: u64,
     /// positional parameters `$1 $2 ... $@`
     pub positional: Vec<String>,
     pub(crate) getopts: GetoptsState,
@@ -347,6 +349,17 @@ impl DerefMut for ProcessStates {
 const MAX_FORK_STATE_BYTES: u64 = 32 * 1024 * 1024;
 
 impl ProcessState {
+    /// Fill a caller-metered buffer from deterministic process-local virtual entropy.
+    pub(crate) fn fill_virtual_random(&mut self, bytes: &mut [u8]) {
+        for byte in bytes {
+            self.syscall_random_state = self
+                .syscall_random_state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            *byte = (self.syscall_random_state >> 32) as u8;
+        }
+    }
+
     fn fork_for_child(
         &self,
         identity: &crate::process::ProcessRecord,
@@ -379,6 +392,7 @@ impl ProcessState {
             aliases: self.aliases.clone(),
             last_status: self.last_status,
             random_state: Cell::new(self.random_state.get()),
+            syscall_random_state: self.syscall_random_state,
             positional: self.positional.clone(),
             getopts: self.getopts.clone(),
             opt_errexit: self.opt_errexit,
@@ -662,6 +676,7 @@ impl Environment {
                 aliases: HashMap::new(),
                 last_status: 0,
                 random_state: Cell::new(1),
+                syscall_random_state: 0x5eed_5eed_5eed_5eed,
                 positional: Vec::new(),
                 getopts: GetoptsState {
                     optind: 1,

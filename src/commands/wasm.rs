@@ -20,7 +20,7 @@ use wasmtime::{
 use crate::descriptors::DescriptorError;
 use crate::display::DisplayError;
 use crate::interp::Interp;
-use crate::syscalls::{ActiveSystem, FileInfo, FileKind, OpenFile, SyscallError, System};
+use crate::syscalls::{ActiveSystem, ClockId, FileInfo, FileKind, OpenFile, SyscallError, System};
 use crate::vfs::{resolve_against, VfsError};
 
 use super::{util::ewln, CommandPoll};
@@ -134,7 +134,6 @@ struct Host {
     closed_stdio: BTreeSet<i32>,
     open_files: BTreeSet<i32>,
     append_files: BTreeSet<i32>,
-    random_state: u64,
     limits: StoreLimits,
     interaction: Option<Arc<Mutex<Interaction>>>,
 }
@@ -763,21 +762,28 @@ fn random_get(mut caller: Caller<'_, Host>, pointer: u32, length: u32) -> i32 {
     let Some(memory) = memory(&mut caller) else {
         return ERRNO_FAULT;
     };
-    let mut bytes = vec![0; length as usize];
-    for byte in &mut bytes {
-        let state = caller
-            .data()
-            .random_state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1);
-        caller.data_mut().random_state = state;
-        *byte = (state >> 32) as u8;
+    let Some(end) = (pointer as usize).checked_add(length as usize) else {
+        return ERRNO_FAULT;
+    };
+    if end > memory.data(&caller).len() {
+        return ERRNO_FAULT;
     }
-    if memory.write(&mut caller, pointer as usize, &bytes).is_ok() {
+    let reservation = u64::from(length);
+    if !ActiveSystem::new(&mut caller.data_mut().interp).reserve_memory(reservation) {
+        return ERRNO_INVAL;
+    }
+    let mut bytes = vec![0; length as usize];
+    if let Err(error) = ActiveSystem::new(&mut caller.data_mut().interp).random_fill(&mut bytes) {
+        ActiveSystem::new(&mut caller.data_mut().interp).release_memory(reservation);
+        return syscall_errno(&error);
+    }
+    let result = if memory.write(&mut caller, pointer as usize, &bytes).is_ok() {
         ERRNO_SUCCESS
     } else {
         ERRNO_FAULT
-    }
+    };
+    ActiveSystem::new(&mut caller.data_mut().interp).release_memory(reservation);
+    result
 }
 
 fn fd_write(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, written: u32) -> i32 {
@@ -797,6 +803,11 @@ fn fd_write(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, writte
     let Some(memory) = memory(&mut caller) else {
         return ERRNO_FAULT;
     };
+    let output_remaining = if fd == 1 || fd == 2 {
+        ActiveSystem::new(&mut caller.data_mut().interp).output_remaining()
+    } else {
+        u64::MAX
+    };
     let mut chunks = Vec::new();
     let mut total = 0usize;
     for index in 0..count {
@@ -815,10 +826,7 @@ fn fd_write(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, writte
         let Some(next_total) = total.checked_add(length as usize) else {
             return ERRNO_INVAL;
         };
-        if next_total > MAX_IO_BYTES
-            || (fd == 1 || fd == 2)
-                && next_total as u64 > caller.data().interp.resources.output_remaining()
-        {
+        if next_total > MAX_IO_BYTES || next_total as u64 > output_remaining {
             return ERRNO_INVAL;
         }
         let mut chunk = vec![0; length as usize];
@@ -831,16 +839,11 @@ fn fd_write(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, writte
     if !write_u32(&mut caller, written, total as u32) {
         return ERRNO_FAULT;
     }
-    if !caller.data_mut().interp.resources.charge_cpu(total as u64) {
+    if !ActiveSystem::new(&mut caller.data_mut().interp).charge_cpu(total as u64) {
         return ERRNO_INVAL;
     }
     if fd == 1 || fd == 2 {
-        if !caller
-            .data_mut()
-            .interp
-            .resources
-            .charge_output(total as u64)
-        {
+        if !ActiveSystem::new(&mut caller.data_mut().interp).charge_output(total as u64) {
             return ERRNO_INVAL;
         }
         let destination = if fd == 1 {
@@ -940,7 +943,7 @@ fn fd_read(mut caller: Caller<'_, Host>, fd: i32, iovs: u32, count: u32, read: u
     if !write_u32(&mut caller, read, copied as u32) {
         return ERRNO_FAULT;
     }
-    if !caller.data_mut().interp.resources.charge_cpu(copied as u64) {
+    if !ActiveSystem::new(&mut caller.data_mut().interp).charge_cpu(copied as u64) {
         return ERRNO_INVAL;
     }
     if fd == 0 {
@@ -1136,21 +1139,15 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
             "wasi_snapshot_preview1",
             "clock_time_get",
             |mut caller: Caller<'_, Host>, clock: i32, _precision: i64, address: u32| {
-                let now = match clock {
-                    0 => caller
-                        .data()
-                        .interp
-                        .clock
-                        .wall_time_ns()
-                        .ok()
-                        .and_then(|value| u64::try_from(value).ok()),
-                    1 => Some(caller.data().interp.clock.monotonic_ns()),
-                    _ => None,
+                let clock = match clock {
+                    0 => ClockId::Realtime,
+                    1 => ClockId::Monotonic,
+                    _ => return ERRNO_INVAL,
                 };
-                match now {
-                    Some(value) if write_u64(&mut caller, address, value) => ERRNO_SUCCESS,
-                    Some(_) => ERRNO_FAULT,
-                    None => ERRNO_INVAL,
+                match ActiveSystem::new(&mut caller.data_mut().interp).clock_time_ns(clock) {
+                    Ok(value) if write_u64(&mut caller, address, value) => ERRNO_SUCCESS,
+                    Ok(_) => ERRNO_FAULT,
+                    Err(error) => syscall_errno(&error),
                 }
             },
         )
@@ -1299,21 +1296,14 @@ impl WasmSession {
         }
         let interaction = Arc::new(Mutex::new(Interaction::default()));
         let host = Host {
-            cwd: environment.cwd.clone(),
+            cwd: ActiveSystem::new(&mut environment).cwd().to_string(),
             args: std::iter::once(path.as_bytes().to_vec())
                 .chain(args.iter().map(|arg| arg.as_bytes().to_vec()))
                 .collect(),
-            environment: environment
-                .process
-                .exported
+            environment: ActiveSystem::new(&mut environment)
+                .environment()
                 .iter()
-                .filter_map(|name| {
-                    environment
-                        .process
-                        .vars
-                        .get(name)
-                        .map(|value| format!("{name}={value}").into_bytes())
-                })
+                .map(|(name, value)| format!("{name}={value}").into_bytes())
                 .collect(),
             interp: environment,
             stdin: Vec::new(),
@@ -1323,7 +1313,6 @@ impl WasmSession {
             closed_stdio: BTreeSet::new(),
             open_files: BTreeSet::new(),
             append_files: BTreeSet::new(),
-            random_state: 0x5eed_5eed_5eed_5eed,
             limits: StoreLimitsBuilder::new()
                 .memory_size(memory_limit)
                 .table_elements(10_000)
@@ -1533,19 +1522,12 @@ pub(super) fn run(
     let arguments = std::iter::once(path.as_bytes().to_vec())
         .chain(args.iter().map(|arg| arg.as_bytes().to_vec()))
         .collect();
-    let environment = interp
-        .process
-        .exported
+    let environment = ActiveSystem::new(interp)
+        .environment()
         .iter()
-        .filter_map(|name| {
-            interp
-                .process
-                .vars
-                .get(name)
-                .map(|value| format!("{name}={value}").into_bytes())
-        })
+        .map(|(name, value)| format!("{name}={value}").into_bytes())
         .collect();
-    let cwd = interp.cwd.clone();
+    let cwd = ActiveSystem::new(interp).cwd().to_string();
     let memory_limit = interp
         .resources
         .memory_remaining()
@@ -1566,7 +1548,6 @@ pub(super) fn run(
         closed_stdio: BTreeSet::new(),
         open_files: BTreeSet::new(),
         append_files: BTreeSet::new(),
-        random_state: 0x5eed_5eed_5eed_5eed,
         limits: StoreLimitsBuilder::new()
             .memory_size(memory_limit)
             .table_elements(10_000)
