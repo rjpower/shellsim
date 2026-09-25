@@ -1,13 +1,16 @@
+//! Argument-only `printf` formatting for shell builtins and native executable images.
+
 use std::collections::HashMap;
 
 use super::util::{unescape, w};
-use super::{reg_costed, CommandContext, CommandSpec, Io, Trust};
+use super::{reg_system_costed, CommandSpec, Io, Trust};
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    reg_costed(m, &["printf"], Trust::Real, 25, 10 * 1024, run);
+    reg_system_costed(m, "/usr/bin/printf", Trust::Real, 25, run);
 }
 
-fn run(_env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     if args.is_empty() {
         return 0;
     }
