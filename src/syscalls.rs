@@ -35,6 +35,23 @@ pub(crate) trait System {
     fn mkdir_all(&mut self, base: &str, path: &str) -> Result<(), SyscallError>;
     fn rmdir(&mut self, base: &str, path: &str) -> Result<(), SyscallError>;
     fn rename(&mut self, base: &str, from: &str, to: &str) -> Result<(), SyscallError>;
+    fn symlink(&mut self, base: &str, target: &str, link: &str) -> Result<(), SyscallError>;
+    fn chown(
+        &mut self,
+        base: &str,
+        path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<(), SyscallError>;
+    fn touch(&mut self, base: &str, path: &str, mtime_ms: u64) -> Result<(), SyscallError>;
+    fn read_link(&mut self, base: &str, path: &str) -> Result<String, SyscallError>;
+    fn canonicalize(
+        &mut self,
+        base: &str,
+        path: &str,
+        strict: bool,
+    ) -> Result<String, SyscallError>;
+    fn wall_time_ms(&self) -> u64;
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError>;
     fn display_present(
         &mut self,
@@ -166,6 +183,52 @@ impl System for ActiveSystem<'_> {
 
     fn rename(&mut self, base: &str, from: &str, to: &str) -> Result<(), SyscallError> {
         rename(self.interp, base, from, to)
+    }
+
+    fn symlink(&mut self, base: &str, target: &str, link: &str) -> Result<(), SyscallError> {
+        self.interp.sync_vfs_time();
+        self.interp.vfs.symlink(base, target, link)?;
+        Ok(())
+    }
+
+    fn chown(
+        &mut self,
+        base: &str,
+        path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<(), SyscallError> {
+        self.interp.sync_vfs_time();
+        self.interp.vfs.chown(base, path, uid, gid)?;
+        Ok(())
+    }
+
+    fn touch(&mut self, base: &str, path: &str, mtime_ms: u64) -> Result<(), SyscallError> {
+        self.interp.sync_vfs_time();
+        self.interp.vfs.touch(base, path, mtime_ms)?;
+        Ok(())
+    }
+
+    fn read_link(&mut self, base: &str, path: &str) -> Result<String, SyscallError> {
+        Ok(self.interp.fs_read_link(base, path)?)
+    }
+
+    fn canonicalize(
+        &mut self,
+        base: &str,
+        path: &str,
+        strict: bool,
+    ) -> Result<String, SyscallError> {
+        let absolute = resolve_against(base, path);
+        if strict {
+            Ok(self.interp.fs_realpath("/", &absolute, true)?)
+        } else {
+            Ok(self.interp.vfs.realpath(&absolute, true)?)
+        }
+    }
+
+    fn wall_time_ms(&self) -> u64 {
+        self.interp.clock.unix_ms()
     }
 
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError> {

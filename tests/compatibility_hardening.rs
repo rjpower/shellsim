@@ -62,10 +62,25 @@ fn workload_observed_unavailable_binaries_share_the_same_contract() {
 
 #[test]
 fn pseudo_filesystem_is_visible_to_general_filesystem_commands() {
-    assert_eq!(
-        text("cd /proc; test -e cpuinfo; printf '%s\n' \"$PWD\"; find . -maxdepth 1 -name cpuinfo; realpath self"),
-        (0, "/proc\n./cpuinfo\n/proc/1234\n".into(), String::new())
+    let mut environment = Environment::new();
+    let (outcome, stdout, stderr) = environment.run_script_capture(
+        "cd /proc; test -e cpuinfo; printf '%s\n' \"$PWD\"; find . -maxdepth 1 -name cpuinfo; realpath self",
     );
+    assert_eq!(outcome.exit_status, 0);
+    assert!(stderr.is_empty());
+    let output = String::from_utf8(stdout).unwrap();
+    let pid = output
+        .strip_prefix("/proc\n./cpuinfo\n/proc/")
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert_ne!(pid, 1_234);
+    assert!(environment
+        .invocations
+        .events()
+        .iter()
+        .any(|event| { event.pid == pid && event.argv == ["realpath", "self"] }));
     let (_, stdout, stderr) = run("find /proc -maxdepth 1 -print0");
     assert!(stderr.is_empty());
     assert!(stdout

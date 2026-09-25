@@ -7,7 +7,6 @@ use std::collections::HashMap;
 
 use crate::commands::util::{ewln, split_flags, wln};
 use crate::commands::{CommandContext, CommandSpec, Io, Trust};
-use crate::interp::Interp;
 use crate::syscalls::{FileKind, System};
 use crate::vfs::resolve_against;
 
@@ -16,13 +15,14 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_system(m, "/usr/bin/ls", Trust::Real, cmd_ls, run_ls);
     reg_system(m, "/usr/bin/mkdir", Trust::Real, cmd_mkdir, run_mkdir);
     reg_system(m, "/usr/bin/rmdir", Trust::Real, cmd_rmdir, run_rmdir);
-    reg(m, &["rm"], Trust::Real, cmd_rm);
+    reg_system(m, "/usr/bin/rm", Trust::Real, cmd_rm, run_rm);
     reg(m, &["cp"], Trust::Real, cmd_cp);
     reg_system(m, "/usr/bin/mv", Trust::Real, cmd_mv, run_mv);
-    reg(m, &["touch"], Trust::Real, cmd_touch);
-    reg(m, &["ln"], Trust::Real, cmd_ln);
+    reg_system(m, "/usr/bin/touch", Trust::Real, cmd_touch, run_touch);
+    reg_system(m, "/usr/bin/ln", Trust::Real, cmd_ln, run_ln);
     reg_system(m, "/usr/bin/chmod", Trust::Real, cmd_chmod, run_chmod);
-    reg(m, &["chown", "chgrp"], Trust::Real, cmd_chown);
+    reg_system(m, "/usr/bin/chown", Trust::Real, cmd_chown, run_chown);
+    reg_system(m, "/usr/bin/chgrp", Trust::Real, cmd_chown, run_chown);
     reg_system(
         m,
         "/usr/bin/basename",
@@ -31,8 +31,20 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
         run_basename,
     );
     reg_system(m, "/usr/bin/dirname", Trust::Real, cmd_dirname, run_dirname);
-    reg(m, &["realpath"], Trust::Real, cmd_realpath);
-    reg(m, &["readlink"], Trust::Real, cmd_readlink);
+    reg_system(
+        m,
+        "/usr/bin/realpath",
+        Trust::Real,
+        cmd_realpath,
+        run_realpath,
+    );
+    reg_system(
+        m,
+        "/usr/bin/readlink",
+        Trust::Real,
+        cmd_readlink,
+        run_readlink,
+    );
     reg_system(m, "/usr/bin/stat", Trust::Real, cmd_stat, run_stat);
     reg_system(m, "/usr/bin/du", Trust::Real, cmd_du, run_du);
     reg(m, &["mktemp"], Trust::Real, cmd_mktemp);
@@ -331,6 +343,12 @@ fn run_rmdir(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i
 }
 
 fn cmd_rm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    super::run_system_from_legacy(interp, args, io, run_rm)
+}
+
+fn run_rm(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let (flags, ops, long) = split_flags(args);
     if reject_options("rm", &flags, "rRf", &long, io) {
         return 2;
@@ -344,15 +362,37 @@ fn cmd_rm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         ewln(io.err, "rm: missing operand");
         return 1;
     }
-    let cwd = interp.cwd.clone();
+    let cwd = system.cwd().to_string();
     let mut status = 0;
     for t in &ops {
+        let absolute = resolve_against(&cwd, t);
+        if recursive && absolute == "/" {
+            ewln(io.err, "rm: refusing to remove virtual root '/'");
+            status = 1;
+            continue;
+        }
         let r = if recursive {
-            interp.vfs.remove_all(&cwd, t)
+            system.walk(&cwd, t).and_then(|paths| {
+                for path in paths.into_iter().rev() {
+                    if !system.charge_cpu(1) {
+                        return Err(crate::syscalls::SyscallError::ResourceExhausted);
+                    }
+                    let node = system.metadata("/", &path, false)?;
+                    if node.kind == FileKind::Directory {
+                        system.rmdir("/", &path)?;
+                    } else {
+                        system.unlink("/", &path)?;
+                    }
+                }
+                Ok(())
+            })
         } else {
-            interp.vfs.remove_file(&cwd, t)
+            system.unlink(&cwd, t)
         };
         if let Err(e) = r {
+            if matches!(e, crate::syscalls::SyscallError::ResourceExhausted) {
+                return system.stop_status();
+            }
             if !force {
                 ewln(io.err, &format!("rm: cannot remove '{t}': {e}"));
                 status = 1;
@@ -475,6 +515,12 @@ fn run_mv(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 
 }
 
 fn cmd_touch(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    super::run_system_from_legacy(interp, args, io, run_touch)
+}
+
+fn run_touch(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     if args.iter().any(|arg| arg.starts_with('-') && arg != "--") {
         ewln(io.err, "touch: unimplemented option");
         return 2;
@@ -484,11 +530,11 @@ fn cmd_touch(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
         ewln(io.err, "touch: missing file operand");
         return 1;
     }
-    let cwd = interp.cwd.clone();
-    let now = interp.clock.unix_ms();
+    let cwd = system.cwd().to_string();
+    let now = system.wall_time_ms();
     let mut status = 0;
     for t in &ops {
-        if let Err(e) = interp.vfs.touch(&cwd, t, now) {
+        if let Err(e) = system.touch(&cwd, t, now) {
             ewln(io.err, &format!("touch: {e}"));
             status = 1;
         }
@@ -497,6 +543,12 @@ fn cmd_touch(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
 }
 
 fn cmd_ln(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    super::run_system_from_legacy(interp, args, io, run_ln)
+}
+
+fn run_ln(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let (flags, ops, long) = split_flags(args);
     if reject_options("ln", &flags, "sf", &long, io) {
         return 2;
@@ -506,13 +558,13 @@ fn cmd_ln(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         ewln(io.err, "ln: missing operand");
         return 1;
     }
-    let cwd = interp.cwd.clone();
+    let cwd = system.cwd().to_string();
     let (target, link) = (ops[0], ops[1]);
     if !symbolic {
         ewln(io.err, "ln: unimplemented hard links");
         return 2;
     }
-    let r = interp.vfs.symlink(&cwd, target, link);
+    let r = system.symlink(&cwd, target, link);
     if let Err(e) = r {
         ewln(io.err, &format!("ln: {e}"));
         1
@@ -629,23 +681,51 @@ fn run_chmod(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i
 }
 
 fn cmd_chown(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _l) = split_flags(args);
+    super::run_system_from_legacy(interp, args, io, run_chown)
+}
+
+fn run_chown(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
+    let (flags, ops, long) = split_flags(args);
+    if reject_options(context.command_name, &flags, "R", &long, io) {
+        return 2;
+    }
     let recursive = flags.contains(&'R');
     if ops.is_empty() {
-        return 0;
+        ewln(
+            io.err,
+            &format!("{}: missing operand", context.command_name),
+        );
+        return 1;
     }
     let spec = ops[0];
-    let (uid, gid) = parse_owner(spec);
-    let cwd = interp.cwd.clone();
+    let (uid, gid) = if context.command_name == "chgrp" {
+        if spec.contains(':') {
+            ewln(io.err, &format!("chgrp: invalid group '{spec}'"));
+            return 1;
+        }
+        (None, parse_owner(spec).0)
+    } else {
+        parse_owner(spec)
+    };
+    let cwd = system.cwd().to_string();
     let mut status = 0;
     for t in &ops[1..] {
         let paths = if recursive {
-            interp.vfs.walk(&crate::vfs::resolve_against(&cwd, t))
+            match system.walk(&cwd, t) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    ewln(io.err, &format!("chown: {error}"));
+                    status = 1;
+                    continue;
+                }
+            }
         } else {
             vec![crate::vfs::resolve_against(&cwd, t)]
         };
         for p in paths {
-            if let Err(e) = interp.vfs.chown("/", &p, uid, gid) {
+            if let Err(e) = system.chown("/", &p, uid, gid) {
                 ewln(io.err, &format!("chown: {e}"));
                 status = 1;
             }
@@ -713,14 +793,25 @@ fn run_dirname(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) ->
 }
 
 fn cmd_realpath(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    realpath_impl(interp, "realpath", args, io)
+    super::run_system_from_legacy(interp, args, io, run_realpath)
 }
 
 fn cmd_readlink(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    realpath_impl(interp, "readlink", args, io)
+    super::run_system_from_legacy(interp, args, io, run_readlink)
 }
 
-fn realpath_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i32 {
+fn run_realpath(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    realpath_impl(context, "realpath", io)
+}
+
+fn run_readlink(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    realpath_impl(context, "readlink", io)
+}
+
+fn realpath_impl(context: &mut crate::program::ProcessContext<'_>, cmd: &str, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
+    let cwd = system.cwd().to_string();
     let (flags, ops, long) = split_flags(args);
     let allowed = if cmd == "readlink" { "f" } else { "m" };
     if reject_options(cmd, &flags, allowed, &long, io) {
@@ -733,13 +824,12 @@ fn realpath_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -
     for p in &ops {
         if cmd == "readlink" {
             if flags.contains(&'f') {
-                let abs = crate::vfs::resolve_against(&interp.cwd, p);
-                match interp.fs_realpath("/", &abs, true) {
+                match system.canonicalize(&cwd, p, true) {
                     Ok(r) => wln(io.out, &r),
                     Err(_) => return 1,
                 }
             } else {
-                match interp.fs_read_link(&interp.cwd, p) {
+                match system.read_link(&cwd, p) {
                     Ok(t) => wln(io.out, &t),
                     Err(_) => {
                         ewln(io.err, &format!("readlink: {p}: Invalid argument"));
@@ -748,14 +838,7 @@ fn realpath_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -
                 }
             }
         } else {
-            let abs = crate::vfs::resolve_against(&interp.cwd, p);
-            let resolved = if flags.contains(&'m') {
-                // GNU `-m` permits missing components. The VFS resolver still follows every
-                // modeled symlink in an existing prefix and normalizes the untouched suffix.
-                interp.vfs.realpath(&abs, true)
-            } else {
-                interp.fs_realpath("/", &abs, true)
-            };
+            let resolved = system.canonicalize(&cwd, p, !flags.contains(&'m'));
             match resolved {
                 Ok(r) => wln(io.out, &r),
                 Err(error) => {
