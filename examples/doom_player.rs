@@ -157,8 +157,12 @@ fn handle(
     frame: Option<&DisplayFrame>,
     session: &mut WasmSession,
 ) -> Result<bool, String> {
+    // macOS inherits the listener's nonblocking mode; request I/O uses blocking timeouts.
     stream
-        .set_write_timeout(Some(Duration::from_secs(1)))
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
         .map_err(|error| error.to_string())?;
     let request = match read_request(&mut stream) {
         Ok(request) => request,
