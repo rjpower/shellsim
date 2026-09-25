@@ -6,56 +6,34 @@
 use std::collections::HashMap;
 
 use crate::commands::util::{ewln, split_flags, wln};
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandSpec, Io, Trust};
 use crate::syscalls::{FileKind, System};
 use crate::vfs::resolve_against;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_system};
-    reg_system(m, "/usr/bin/ls", Trust::Real, cmd_ls, run_ls);
-    reg_system(m, "/usr/bin/mkdir", Trust::Real, cmd_mkdir, run_mkdir);
-    reg_system(m, "/usr/bin/rmdir", Trust::Real, cmd_rmdir, run_rmdir);
-    reg_system(m, "/usr/bin/rm", Trust::Real, cmd_rm, run_rm);
-    reg(m, &["cp"], Trust::Real, cmd_cp);
-    reg_system(m, "/usr/bin/mv", Trust::Real, cmd_mv, run_mv);
-    reg_system(m, "/usr/bin/touch", Trust::Real, cmd_touch, run_touch);
-    reg_system(m, "/usr/bin/ln", Trust::Real, cmd_ln, run_ln);
-    reg_system(m, "/usr/bin/chmod", Trust::Real, cmd_chmod, run_chmod);
-    reg_system(m, "/usr/bin/chown", Trust::Real, cmd_chown, run_chown);
-    reg_system(m, "/usr/bin/chgrp", Trust::Real, cmd_chown, run_chown);
-    reg_system(
-        m,
-        "/usr/bin/basename",
-        Trust::Real,
-        cmd_basename,
-        run_basename,
-    );
-    reg_system(m, "/usr/bin/dirname", Trust::Real, cmd_dirname, run_dirname);
-    reg_system(
-        m,
-        "/usr/bin/realpath",
-        Trust::Real,
-        cmd_realpath,
-        run_realpath,
-    );
-    reg_system(
-        m,
-        "/usr/bin/readlink",
-        Trust::Real,
-        cmd_readlink,
-        run_readlink,
-    );
-    reg_system(m, "/usr/bin/stat", Trust::Real, cmd_stat, run_stat);
-    reg_system(m, "/usr/bin/du", Trust::Real, cmd_du, run_du);
-    reg(m, &["mktemp"], Trust::Real, cmd_mktemp);
-    reg(m, &["file"], Trust::Real, cmd_file);
-    reg(m, &["install"], Trust::Real, cmd_install);
-    reg(m, &["truncate"], Trust::Real, cmd_truncate);
-    reg_system(m, "/usr/bin/tree", Trust::Real, cmd_tree, run_tree);
-}
-
-fn cmd_ls(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_ls)
+    use super::reg_system;
+    reg_system(m, "/usr/bin/ls", Trust::Real, run_ls);
+    reg_system(m, "/usr/bin/mkdir", Trust::Real, run_mkdir);
+    reg_system(m, "/usr/bin/rmdir", Trust::Real, run_rmdir);
+    reg_system(m, "/usr/bin/rm", Trust::Real, run_rm);
+    reg_system(m, "/usr/bin/cp", Trust::Real, run_cp);
+    reg_system(m, "/usr/bin/mv", Trust::Real, run_mv);
+    reg_system(m, "/usr/bin/touch", Trust::Real, run_touch);
+    reg_system(m, "/usr/bin/ln", Trust::Real, run_ln);
+    reg_system(m, "/usr/bin/chmod", Trust::Real, run_chmod);
+    reg_system(m, "/usr/bin/chown", Trust::Real, run_chown);
+    reg_system(m, "/usr/bin/chgrp", Trust::Real, run_chown);
+    reg_system(m, "/usr/bin/basename", Trust::Real, run_basename);
+    reg_system(m, "/usr/bin/dirname", Trust::Real, run_dirname);
+    reg_system(m, "/usr/bin/realpath", Trust::Real, run_realpath);
+    reg_system(m, "/usr/bin/readlink", Trust::Real, run_readlink);
+    reg_system(m, "/usr/bin/stat", Trust::Real, run_stat);
+    reg_system(m, "/usr/bin/du", Trust::Real, run_du);
+    reg_system(m, "/usr/bin/mktemp", Trust::Real, run_mktemp);
+    reg_system(m, "/usr/bin/file", Trust::Real, run_file);
+    reg_system(m, "/usr/bin/install", Trust::Real, run_install);
+    reg_system(m, "/usr/bin/truncate", Trust::Real, run_truncate);
+    reg_system(m, "/usr/bin/tree", Trust::Real, run_tree);
 }
 
 fn run_ls(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
@@ -280,10 +258,6 @@ fn reject_options(
     false
 }
 
-fn cmd_mkdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_mkdir)
-}
-
 /// Execute directory creation through one process-scoped kernel handle.
 fn run_mkdir(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
     let args = context.args;
@@ -316,10 +290,6 @@ fn run_mkdir(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i
     status
 }
 
-fn cmd_rmdir(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_rmdir)
-}
-
 fn run_rmdir(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
     let args = context.args;
     let system = &mut *context.system;
@@ -340,10 +310,6 @@ fn run_rmdir(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i
         }
     }
     status
-}
-
-fn cmd_rm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_rm)
 }
 
 fn run_rm(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
@@ -402,7 +368,9 @@ fn run_rm(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 
     status
 }
 
-fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_cp(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let (flags, ops, long) = split_flags(args);
     if reject_options("cp", &flags, "rRafp", &long, io) {
         return 2;
@@ -413,13 +381,13 @@ fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         ewln(io.err, "cp: missing destination operand");
         return 1;
     }
-    let cwd = interp.cwd.clone();
+    let cwd = system.cwd().to_string();
     let dest = ops.last().unwrap();
     let sources = &ops[..ops.len() - 1];
     let destination_is_dir = matches!(
-        interp.fs_metadata(&cwd, dest, true),
-        Ok(crate::vfs::Node {
-            kind: crate::vfs::NodeKind::Dir,
+        system.metadata(&cwd, dest, true),
+        Ok(crate::syscalls::FileInfo {
+            kind: FileKind::Directory,
             ..
         })
     );
@@ -431,9 +399,9 @@ fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     for s in sources {
         if recursive
             && matches!(
-                interp.fs_metadata(&cwd, s, false),
-                Ok(crate::vfs::Node {
-                    kind: crate::vfs::NodeKind::Symlink(_),
+                system.metadata(&cwd, s, false),
+                Ok(crate::syscalls::FileInfo {
+                    kind: FileKind::Symlink,
                     ..
                 })
             )
@@ -448,15 +416,15 @@ fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             (*dest).clone()
         };
         let r = if recursive {
-            interp.vfs.copy_recursive(&cwd, s, &target, preserve)
+            system.copy_recursive(&cwd, s, &target, preserve)
         } else {
-            interp.vfs.copy_file(&cwd, s, &target)
+            system.copy_file(&cwd, s, &target)
         };
         let r = r.and_then(|()| {
             if preserve && !recursive {
-                let source = interp.vfs.metadata(&cwd, s, true)?;
-                interp.vfs.chmod(&cwd, &target, source.mode)?;
-                interp.vfs.touch(&cwd, &target, source.mtime)?;
+                let source = system.metadata(&cwd, s, true)?;
+                system.chmod(&cwd, &target, source.mode)?;
+                system.touch(&cwd, &target, source.mtime_ms)?;
             }
             Ok(())
         });
@@ -469,10 +437,6 @@ fn cmd_cp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         }
     }
     status
-}
-
-fn cmd_mv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_mv)
 }
 
 fn run_mv(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
@@ -514,10 +478,6 @@ fn run_mv(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 
     status
 }
 
-fn cmd_touch(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_touch)
-}
-
 fn run_touch(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
     let args = context.args;
     let system = &mut *context.system;
@@ -540,10 +500,6 @@ fn run_touch(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i
         }
     }
     status
-}
-
-fn cmd_ln(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_ln)
 }
 
 fn run_ln(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
@@ -623,10 +579,6 @@ fn parse_mode(s: &str, cur: u32) -> u32 {
     mode
 }
 
-fn cmd_chmod(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_chmod)
-}
-
 fn run_chmod(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
     let args = context.args;
     let system = &mut *context.system;
@@ -678,10 +630,6 @@ fn run_chmod(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i
         }
     }
     status
-}
-
-fn cmd_chown(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_chown)
 }
 
 fn run_chown(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
@@ -749,10 +697,6 @@ fn parse_owner(spec: &str) -> (Option<u32>, Option<u32>) {
     }
 }
 
-fn cmd_basename(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_basename)
-}
-
 fn run_basename(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
     let args = context.args;
     let Some(p) = args.first() else { return 1 };
@@ -771,10 +715,6 @@ fn run_basename(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -
     0
 }
 
-fn cmd_dirname(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_dirname)
-}
-
 fn run_dirname(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
     let args = context.args;
     let Some(p) = args.first() else { return 1 };
@@ -790,14 +730,6 @@ fn run_dirname(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) ->
     };
     wln(io.out, &d);
     0
-}
-
-fn cmd_realpath(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_realpath)
-}
-
-fn cmd_readlink(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_readlink)
 }
 
 fn run_realpath(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
@@ -849,10 +781,6 @@ fn realpath_impl(context: &mut crate::program::ProcessContext<'_>, cmd: &str, io
         }
     }
     0
-}
-
-fn cmd_stat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_stat)
 }
 
 fn run_stat(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
@@ -947,10 +875,6 @@ fn run_stat(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i3
     0
 }
 
-fn cmd_du(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_du)
-}
-
 fn run_du(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
     let args = context.args;
     let system = &mut *context.system;
@@ -996,7 +920,9 @@ fn run_du(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 
     status
 }
 
-fn cmd_mktemp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_mktemp(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let (flags, ops, long) = split_flags(args);
     if reject_options("mktemp", &flags, "d", &long, io) {
         return 2;
@@ -1005,7 +931,7 @@ fn cmd_mktemp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     let tmpl = ops.first().map(|s| s.as_str()).unwrap_or("tmp.XXXXXX");
     // Identity is deterministic but deliberately separate from time: creating a name is not a
     // temporal effect and must not perturb deadlines.
-    let Some(n) = interp.next_temp_id() else {
+    let Some(n) = system.allocate_temp_id() else {
         ewln(io.err, "mktemp: exhausted deterministic name space");
         return 1;
     };
@@ -1016,14 +942,31 @@ fn cmd_mktemp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     } else {
         format!("/tmp/{name}")
     };
-    if let Err(error) = interp.vfs.mkdir_all("/", "/tmp") {
+    if let Err(error) = system.mkdir_all("/", "/tmp") {
         ewln(io.err, &format!("mktemp: {error}"));
         return 1;
     }
     let result = if dir {
-        interp.vfs.mkdir("/", &path)
+        system.mkdir("/", &path)
     } else {
-        interp.vfs.write("/", &path, b"", 0o600)
+        system
+            .open_file(
+                "/",
+                &path,
+                crate::syscalls::OpenFile {
+                    readable: false,
+                    writable: true,
+                    create: true,
+                    exclusive: true,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .and_then(|fd| {
+                let result = system.chmod("/", &path, 0o600);
+                let close = system.close(fd);
+                result.and(close)
+            })
     };
     if let Err(error) = result {
         ewln(io.err, &format!("mktemp: {error}"));
@@ -1033,7 +976,9 @@ fn cmd_mktemp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     0
 }
 
-fn cmd_file(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_file(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let (flags, ops, long) = split_flags(args);
     if reject_options("file", &flags, "", &long, io) {
         return 2;
@@ -1042,9 +987,11 @@ fn cmd_file(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         ewln(io.err, "file: missing operand");
         return 1;
     }
+    let cwd = system.cwd().to_string();
+    let read_limit = system.limits().memory.min(64 * 1024 * 1024) as usize;
     let mut status = 0;
     for p in &ops {
-        let desc = match interp.fs_read(&interp.cwd, p) {
+        let desc = match system.read_file_limited(&cwd, p, read_limit) {
             Ok(d) if d.is_empty() => "empty".to_string(),
             Ok(d)
                 if d.iter().all(|b| b.is_ascii() || *b >= 0x80)
@@ -1055,9 +1002,9 @@ fn cmd_file(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             Ok(_) => "data".to_string(),
             Err(_)
                 if matches!(
-                    interp.fs_metadata(&interp.cwd, p, false),
-                    Ok(crate::vfs::Node {
-                        kind: crate::vfs::NodeKind::Dir,
+                    system.metadata(&cwd, p, false),
+                    Ok(crate::syscalls::FileInfo {
+                        kind: FileKind::Directory,
                         ..
                     })
                 ) =>
@@ -1074,7 +1021,9 @@ fn cmd_file(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     status
 }
 
-fn cmd_install(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_install(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let mut create_parents = false;
     let mut directories = false;
     let mut mode_arg: Option<String> = None;
@@ -1138,7 +1087,7 @@ fn cmd_install(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
         return 1;
     };
 
-    let cwd = interp.cwd.clone();
+    let cwd = system.cwd().to_string();
     if directories {
         if operands.is_empty() {
             ewln(io.err, "install: missing operand");
@@ -1146,13 +1095,12 @@ fn cmd_install(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
         }
         let mut status = 0;
         for path in operands {
-            if !interp.charge_cpu(1) {
-                return 137;
+            if !system.charge_cpu(1) {
+                return system.stop_status();
             }
-            if let Err(error) = interp
-                .vfs
+            if let Err(error) = system
                 .mkdir_all(&cwd, &path)
-                .and_then(|()| interp.vfs.chmod(&cwd, &path, mode))
+                .and_then(|()| system.chmod(&cwd, &path, mode))
             {
                 ewln(
                     io.err,
@@ -1170,9 +1118,9 @@ fn cmd_install(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
     }
     let destination = operands.last().expect("operand count checked");
     let destination_is_dir = matches!(
-        interp.fs_metadata(&cwd, destination, true),
-        Ok(crate::vfs::Node {
-            kind: crate::vfs::NodeKind::Dir,
+        system.metadata(&cwd, destination, true),
+        Ok(crate::syscalls::FileInfo {
+            kind: FileKind::Directory,
             ..
         })
     );
@@ -1196,7 +1144,8 @@ fn cmd_install(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
         } else {
             destination.clone()
         };
-        let data = match interp.fs_read(&cwd, source) {
+        let read_limit = system.limits().memory.min(64 * 1024 * 1024) as usize;
+        let data = match system.read_file_limited(&cwd, source, read_limit) {
             Ok(data) => data,
             Err(error) => {
                 ewln(io.err, &format!("install: cannot stat '{source}': {error}"));
@@ -1204,29 +1153,28 @@ fn cmd_install(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
                 continue;
             }
         };
-        if !interp.charge_cpu(data.len() as u64) {
-            return 137;
+        if !system.charge_cpu(data.len() as u64) {
+            return system.stop_status();
         }
         let result = if create_parents {
             let absolute = resolve_against(&cwd, &target);
             if matches!(
-                interp.fs_metadata("/", &absolute, false),
-                Ok(crate::vfs::Node {
-                    kind: crate::vfs::NodeKind::Dir,
+                system.metadata("/", &absolute, false),
+                Ok(crate::syscalls::FileInfo {
+                    kind: FileKind::Directory,
                     ..
                 })
             ) {
-                Err(crate::vfs::VfsError::IsADir(target.clone()))
+                Err(crate::syscalls::SyscallError::IsDirectory)
             } else {
                 // `put_file` plans the missing parent directories and the file replacement as
                 // one quota-checked mutation. A failed `install -D` therefore leaves no parents.
-                interp.vfs.put_file(&absolute, data, mode)
+                system.put_file_with_parents("/", &absolute, data, mode)
             }
         } else {
-            interp
-                .vfs
-                .write(&cwd, &target, &data, mode)
-                .and_then(|()| interp.vfs.chmod(&cwd, &target, mode))
+            system
+                .write_file(&cwd, &target, &data, mode)
+                .and_then(|()| system.chmod(&cwd, &target, mode))
         };
         if let Err(error) = result {
             ewln(
@@ -1260,7 +1208,9 @@ fn install_mode(value: &str, default: u32) -> Option<u32> {
     }
 }
 
-fn cmd_truncate(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_truncate(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let mut no_create = false;
     let mut size_arg = None;
     let mut files = Vec::new();
@@ -1304,12 +1254,12 @@ fn cmd_truncate(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
         return 1;
     }
 
-    let cwd = interp.cwd.clone();
+    let cwd = system.cwd().to_string();
     let mut status = 0;
     for file in files {
-        let (mut data, mode) = match interp.fs_metadata(&cwd, &file, true) {
+        let (existing_size, mode, existing) = match system.metadata(&cwd, &file, true) {
             Ok(node) => match node.kind {
-                crate::vfs::NodeKind::File(data) => (data, node.mode),
+                FileKind::File if !node.native_executable => (node.size, node.mode, true),
                 _ => {
                     ewln(
                         io.err,
@@ -1320,22 +1270,45 @@ fn cmd_truncate(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
                 }
             },
             Err(_) if no_create => continue,
-            Err(_) => (Vec::new(), 0o666),
+            Err(_) => (0, 0o666, false),
         };
-        let Some(new_len) = change.apply(data.len()) else {
+        let Ok(existing_size) = usize::try_from(existing_size) else {
+            ewln(
+                io.err,
+                &format!("truncate: cannot open '{file}': file too large"),
+            );
+            status = 1;
+            continue;
+        };
+        let Some(new_len) = change.apply(existing_size) else {
             ewln(io.err, &format!("truncate: invalid number: '{size_arg}'"));
             status = 1;
             continue;
         };
-        if !interp.charge_cpu(new_len.saturating_sub(data.len()) as u64) {
-            return 137;
+        if !system.charge_cpu(new_len.saturating_sub(existing_size) as u64) {
+            return system.stop_status();
         }
-        if !interp.reserve_memory(new_len as u64) {
-            return 137;
+        let reservation = existing_size.max(new_len) as u64;
+        if !system.reserve_memory(reservation) {
+            return system.stop_status();
         }
+        let data = if existing {
+            system.read_file_limited(&cwd, &file, existing_size)
+        } else {
+            Ok(Vec::new())
+        };
+        let mut data = match data {
+            Ok(data) => data,
+            Err(error) => {
+                system.release_memory(reservation);
+                ewln(io.err, &format!("truncate: cannot open '{file}': {error}"));
+                status = 1;
+                continue;
+            }
+        };
         data.resize(new_len, 0);
-        let result = interp.vfs.write(&cwd, &file, &data, mode);
-        interp.resources.release_memory(new_len as u64);
+        let result = system.write_file(&cwd, &file, &data, mode);
+        system.release_memory(reservation);
         if let Err(error) = result {
             ewln(io.err, &format!("truncate: cannot open '{file}': {error}"));
             status = 1;
@@ -1388,10 +1361,6 @@ fn parse_size_change(value: &str) -> Option<SizeChange> {
         2 => SizeChange::Decrease(size),
         _ => SizeChange::Absolute(size),
     })
-}
-
-fn cmd_tree(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    super::run_system_from_legacy(interp, args, io, run_tree)
 }
 
 fn run_tree(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {

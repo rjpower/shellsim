@@ -331,6 +331,35 @@ mod tests {
             unreachable!("native writer does not walk directories")
         }
 
+        fn read_file_limited(
+            &mut self,
+            _base: &str,
+            _path: &str,
+            _maximum: usize,
+        ) -> Result<Vec<u8>, SyscallError> {
+            unreachable!("native writer does not read files")
+        }
+
+        fn write_file(
+            &mut self,
+            _base: &str,
+            _path: &str,
+            _bytes: &[u8],
+            _mode: u32,
+        ) -> Result<(), SyscallError> {
+            unreachable!("native writer does not write files")
+        }
+
+        fn put_file_with_parents(
+            &mut self,
+            _base: &str,
+            _path: &str,
+            _bytes: Vec<u8>,
+            _mode: u32,
+        ) -> Result<(), SyscallError> {
+            unreachable!("native writer does not write files")
+        }
+
         fn read(&mut self, _fd: i32, _maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
             unreachable!("native writer does not read")
         }
@@ -391,6 +420,20 @@ mod tests {
             unreachable!("native writer does not rename files")
         }
 
+        fn copy_file(&mut self, _base: &str, _from: &str, _to: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not copy files")
+        }
+
+        fn copy_recursive(
+            &mut self,
+            _base: &str,
+            _from: &str,
+            _to: &str,
+            _preserve: bool,
+        ) -> Result<(), SyscallError> {
+            unreachable!("native writer does not copy trees")
+        }
+
         fn symlink(&mut self, _base: &str, _target: &str, _link: &str) -> Result<(), SyscallError> {
             unreachable!("native writer does not create links")
         }
@@ -426,6 +469,10 @@ mod tests {
             unreachable!("native writer does not inspect time")
         }
 
+        fn allocate_temp_id(&mut self) -> Option<u64> {
+            unreachable!("native writer does not allocate temporary names")
+        }
+
         fn display_open(
             &mut self,
             _width: u32,
@@ -458,6 +505,12 @@ mod tests {
         fn charge_cpu(&mut self, _units: u64) -> bool {
             true
         }
+
+        fn reserve_memory(&mut self, _bytes: u64) -> bool {
+            true
+        }
+
+        fn release_memory(&mut self, _bytes: u64) {}
 
         fn output_remaining(&self) -> u64 {
             self.remaining
