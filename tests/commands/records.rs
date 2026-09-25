@@ -129,3 +129,77 @@ fn typed_text_command_reports_closed_stdin() {
         "{stderr}"
     );
 }
+
+#[test]
+fn seq_and_comm_run_as_native_children_with_visible_file_errors() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/left", b"a\nc\n", 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .write("/", "/work/right", b"b\nc\n", 0o644)
+        .unwrap();
+    let (status, stdout, stderr) = run(&mut environment, "env -C /work comm left right; seq 1 3");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"a\n\tb\n\t\tc\n1\n2\n3\n");
+    let (status, stdout, stderr) = run(&mut environment, "comm /work/missing /work/right");
+    assert_eq!(status, 1);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("comm: /work/missing:"), "{stderr}");
+    for command in ["comm", "seq"] {
+        assert!(environment.invocations.events().iter().any(|event| {
+            event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == command)
+        }));
+    }
+}
+
+#[test]
+fn buffered_record_tools_are_native_children_and_read_pipes_to_eof() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/long", &vec![b'a'; 128 * 1024], 0o644)
+        .unwrap();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "cat /work/long | split -b 65536 - /work/part; wc -c /work/partaa /work/partab",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert!(String::from_utf8_lossy(&stdout).contains("65536 /work/partaa"));
+    assert!(String::from_utf8_lossy(&stdout).contains("65536 /work/partab"));
+    let (status, stdout, stderr) = run(&mut environment, "printf 'a 1\n' | join - /work/missing");
+    assert_eq!(status, 1);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("join: /work/missing:"), "{stderr}");
+    let _ = run(&mut environment, "printf 'a\nb\n' | shuf");
+    let _ = run(&mut environment, "printf 'a b\n' | tsort");
+    for command in ["join", "split", "shuf", "tsort"] {
+        assert!(environment.invocations.events().iter().any(|event| {
+            event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == command)
+        }));
+    }
+}
+
+#[test]
+fn sort_uses_child_cwd_and_reports_named_input_errors() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/unsorted", b"b\na\n", 0o644)
+        .unwrap();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "env -C /work sort -o sorted unsorted; cat /work/sorted; printf 'd\nc\n' | sort",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"a\nb\nc\nd\n");
+    let (status, stdout, stderr) = run(&mut environment, "sort /work/missing");
+    assert_eq!(status, 1);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("sort: /work/missing:"), "{stderr}");
+    assert!(environment.invocations.events().iter().any(|event| {
+        event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == "sort")
+    }));
+}

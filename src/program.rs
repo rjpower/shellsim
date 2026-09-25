@@ -134,6 +134,9 @@ pub(crate) struct SystemCommandProcess {
     run: crate::commands::SystemRun,
     base_cpu: u64,
     started: bool,
+    cpu_before: u64,
+    disk_before: u64,
+    usage_recorded: bool,
     stdin: Vec<u8>,
     stdin_complete: bool,
     reserved_input: u64,
@@ -157,6 +160,9 @@ impl SystemCommandProcess {
             run: command.run,
             base_cpu: command.base_cpu,
             started: false,
+            cpu_before: 0,
+            disk_before: 0,
+            usage_recorded: false,
             stdin: Vec::new(),
             stdin_complete: false,
             reserved_input: 0,
@@ -176,6 +182,8 @@ impl SystemCommandProcess {
                 None
             } else {
                 self.started = true;
+                self.cpu_before = system.cpu_used();
+                self.disk_before = system.disk_used();
                 (!system.charge_cpu(self.base_cpu.saturating_add(argument_bytes)))
                     .then(|| system.stop_status())
             };
@@ -244,13 +252,18 @@ impl SystemCommandProcess {
             ShellPoll::Ready(0) => {}
             other => return other,
         }
-        poll_write(
+        let completion = poll_write(
             system,
             2,
             &result.stderr,
             &mut result.stderr_offset,
             result.status,
-        )
+        );
+        if matches!(completion, ShellPoll::Ready(_)) && !self.usage_recorded {
+            system.record_command_usage(self.name, self.cpu_before, self.disk_before);
+            self.usage_recorded = true;
+        }
+        completion
     }
 }
 
@@ -425,6 +438,10 @@ mod tests {
             unreachable!("native writer does not inspect limits")
         }
 
+        fn cpu_used(&self) -> u64 {
+            0
+        }
+
         fn disk_used(&self) -> u64 {
             unreachable!("native writer does not inspect disk usage")
         }
@@ -432,6 +449,8 @@ mod tests {
         fn memory_used(&self) -> u64 {
             unreachable!("native writer does not inspect memory usage")
         }
+
+        fn record_command_usage(&mut self, _name: &str, _cpu_before: u64, _disk_before: u64) {}
 
         fn metadata(
             &mut self,
@@ -616,6 +635,42 @@ mod tests {
 
         fn allocate_temp_id(&mut self) -> Option<u64> {
             unreachable!("native writer does not allocate temporary names")
+        }
+
+        fn http_request(
+            &mut self,
+            _request: crate::net::HttpRequest,
+        ) -> Result<crate::net::HttpResponse, crate::net::RequestError> {
+            unreachable!("native writer does not make HTTP requests")
+        }
+
+        fn http_route_static(
+            &mut self,
+            _pattern: &str,
+            _status: u16,
+            _body: Vec<u8>,
+        ) -> Result<(), crate::net::RouteError> {
+            unreachable!("native writer does not register HTTP routes")
+        }
+
+        fn http_route_file(
+            &mut self,
+            _pattern: &str,
+            _path: &str,
+        ) -> Result<(), crate::net::RouteError> {
+            unreachable!("native writer does not register HTTP routes")
+        }
+
+        fn network_listen(&mut self, _host_port: &str) {
+            unreachable!("native writer does not listen on virtual network")
+        }
+
+        fn network_request_count(&self) -> usize {
+            unreachable!("native writer does not inspect network requests")
+        }
+
+        fn network_request_at(&self, _index: usize) -> Option<crate::net::NetworkRequest> {
+            unreachable!("native writer does not inspect network requests")
         }
 
         fn display_open(

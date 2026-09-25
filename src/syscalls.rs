@@ -29,8 +29,11 @@ pub(crate) trait System {
     fn umask(&self) -> u16;
     fn set_umask(&mut self, mask: u16) -> Result<(), SyscallError>;
     fn limits(&self) -> crate::resources::Limits;
+    fn cpu_used(&self) -> u64;
     fn disk_used(&self) -> u64;
     fn memory_used(&self) -> u64;
+    /// Record one completed native invocation against the shared resource meter.
+    fn record_command_usage(&mut self, name: &str, cpu_before: u64, disk_before: u64);
     fn metadata(&mut self, base: &str, path: &str, follow: bool) -> Result<FileInfo, SyscallError>;
     fn metadata_fd(&mut self, fd: Fd) -> Result<FileInfo, SyscallError>;
     fn list_dir(&mut self, base: &str, path: &str) -> Result<Vec<String>, SyscallError>;
@@ -191,12 +194,25 @@ impl System for ActiveSystem<'_> {
         self.interp.resources.limits()
     }
 
+    fn cpu_used(&self) -> u64 {
+        self.interp.resources.cpu_used()
+    }
+
     fn disk_used(&self) -> u64 {
         self.interp.vfs.disk_used()
     }
 
     fn memory_used(&self) -> u64 {
         self.interp.resources.memory_mark()
+    }
+
+    fn record_command_usage(&mut self, name: &str, cpu_before: u64, disk_before: u64) {
+        self.interp.resources.record_command(
+            name,
+            cpu_before,
+            disk_before,
+            self.interp.vfs.disk_used(),
+        );
     }
 
     fn metadata(&mut self, base: &str, path: &str, follow: bool) -> Result<FileInfo, SyscallError> {

@@ -6,14 +6,17 @@
 use std::collections::HashMap;
 
 use super::options::{parse_options_or_report, OptionSpec};
-use super::util::{ewln, read_inputs};
-use super::{reg_costed, CommandContext, CommandSpec, Io, Trust};
+use super::util::{ewln, read_inputs_system, uses_standard_input};
+use super::{reg_system_poll, CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
+use crate::program::ProcessContext;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    reg_costed(m, &["sort"], Trust::Real, 100, 16 * 1024, run);
+    reg_system_poll(m, "/usr/bin/sort", Trust::Real, run);
 }
 
-fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     #[derive(Clone, Copy, PartialEq)]
     enum Key {
         Numeric,
@@ -49,7 +52,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         io.err,
     ) {
         Ok(parsed) => parsed,
-        Err(status) => return status,
+        Err(status) => return ShellPoll::Ready(status),
     };
     let mut numeric = false;
     let mut reverse = false;
@@ -74,7 +77,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                             io.err,
                             &format!("sort: unsupported field specification '{value}'"),
                         );
-                        return 2;
+                        return ShellPoll::Ready(2);
                     }
                 };
             }
@@ -85,7 +88,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                     (Some(separator), None) => Some(separator),
                     _ => {
                         ewln(io.err, "sort: field separator must be one character");
-                        return 2;
+                        return ShellPoll::Ready(2);
                     }
                 };
             }
@@ -94,26 +97,36 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         }
     }
     let operands = parsed.operands.iter().collect::<Vec<_>>();
-    let (data, errors) = read_inputs(env, &operands, &io.stdin);
+    if uses_standard_input(&operands) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &operands, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("sort: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     let line_count = data
         .iter()
         .filter(|byte| **byte == b'\n')
         .count()
         .saturating_add(1) as u64;
-    let scratch = (data.len() as u64)
-        .saturating_mul(2)
-        .saturating_add(line_count.saturating_mul(24));
+    let scratch = 16_u64.saturating_mul(1024).saturating_add(
+        (data.len() as u64)
+            .saturating_mul(2)
+            .saturating_add(line_count.saturating_mul(24)),
+    );
     let comparisons = line_count.saturating_mul(line_count.max(1).ilog2() as u64);
-    if !env.reserve_memory(scratch) {
-        return 137;
+    if !context.system.reserve_memory(scratch) {
+        return ShellPoll::Ready(context.system.stop_status());
     }
-    if !env.charge_cpu(data.len() as u64 + comparisons) {
-        env.resources.release_memory(scratch);
-        return 137;
+    if !context
+        .system
+        .charge_cpu((data.len() as u64).saturating_add(comparisons))
+    {
+        context.system.release_memory(scratch);
+        return ShellPoll::Ready(context.system.stop_status());
     }
 
     let mut lines = data
@@ -168,8 +181,8 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     }
     let sorted = lines.into_iter().flatten().collect::<Vec<_>>();
     let status = if let Some(path) = output {
-        let cwd = env.cwd.clone();
-        match env.vfs.write(&cwd, &path, &sorted, 0o644) {
+        let cwd = context.system.cwd().to_string();
+        match context.system.write_file(&cwd, &path, &sorted, 0o644) {
             Ok(()) => 0,
             Err(error) => {
                 ewln(io.err, &format!("sort: {path}: {error}"));
@@ -180,8 +193,8 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         io.out.extend_from_slice(&sorted);
         0
     };
-    env.resources.release_memory(scratch);
-    status
+    context.system.release_memory(scratch);
+    ShellPoll::Ready(status)
 }
 
 #[derive(Clone, Copy)]
