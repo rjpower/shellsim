@@ -1160,6 +1160,13 @@ pub(crate) fn parse_shell_source(
     }
 }
 
+/// Whether `requested` names an external image that runs as its own process, so a subshell
+/// may exec it in place. Builtins and legacy bodies still run inside the shell image.
+pub(crate) fn execs_native_image(interp: &Interp, requested: &str) -> bool {
+    (requested.contains('/') || !builtins::is_shell_builtin_name(requested))
+        && resolved_native_image(interp, requested).is_some_and(runs_native_process)
+}
+
 fn resolved_native_image(interp: &Interp, requested: &str) -> Option<crate::vfs::NativeProgram> {
     let util::ExecutableLookup::Found(path) = util::resolve_executable(interp, requested) else {
         return None;

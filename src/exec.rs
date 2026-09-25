@@ -438,6 +438,8 @@ pub(crate) enum ShellPoll {
     Pending,
     Blocked(crate::scheduler::WaitReason),
     Switched,
+    /// The process image was replaced in place; the polled continuation must be discarded.
+    Replaced,
     Ready(i32),
 }
 
@@ -451,6 +453,10 @@ pub(crate) struct ShellContinuation {
     yielded: bool,
     blocked: Option<crate::scheduler::WaitReason>,
     exit_trap_started: bool,
+    /// A subshell process exits after its program, so its final external command may replace
+    /// the process image as Bash does, keeping `$!` and pipeline PIDs on the real program.
+    exec_tail: bool,
+    replaced: bool,
 }
 
 impl ShellContinuation {
@@ -463,6 +469,17 @@ impl ShellContinuation {
             yielded: false,
             blocked: None,
             exit_trap_started: false,
+            exec_tail: false,
+            replaced: false,
+        }
+    }
+
+    /// Program for a forked subshell whose process ends with it: a background job, pipeline
+    /// stage, or `sh -c` child.
+    pub(crate) fn subshell(node: &Node) -> Self {
+        Self {
+            exec_tail: true,
+            ..Self::new(node)
         }
     }
 
@@ -490,6 +507,9 @@ impl ShellContinuation {
             };
             self.step(interp, frame);
             interp.last_status = self.status;
+            if self.replaced {
+                return ShellPoll::Replaced;
+            }
             if self.switched {
                 return ShellPoll::Switched;
             }
@@ -1701,14 +1721,34 @@ impl ShellContinuation {
                     restore_command_variables(interp, variables);
                     return;
                 };
-                match interp.write_fd(fd, &bytes[*offset..]) {
+                match interp.write_fd_checked(fd, &bytes[*offset..]) {
                     Ok(IoPoll::Ready(0)) => {
                         *offset = bytes.len();
                         status = 1;
                     }
                     Ok(IoPoll::Ready(written)) => *offset = offset.saturating_add(written),
                     Ok(IoPoll::Blocked(wait)) => self.blocked = Some(io_wait_reason(wait)),
+                    // As with a kernel EPIPE, the writer receives SIGPIPE; its default action
+                    // ends the process silently with status 141.
+                    Err(crate::syscalls::SyscallError::Descriptor(
+                        crate::descriptors::DescriptorError::BrokenPipe,
+                    )) if !matches!(
+                        interp
+                            .signal_dispositions
+                            .get(&crate::process::Signal::Pipe),
+                        Some(crate::interp::ShellSignalDisposition::Ignore)
+                    ) =>
+                    {
+                        stdout_offset = stdout.len();
+                        stderr_offset = stderr.len();
+                        status = 128 + crate::process::Signal::Pipe.number();
+                        let pid = interp.process.pid;
+                        if let Err(error) = interp.send_signal(pid, crate::process::Signal::Pipe) {
+                            write_diagnostic(interp, &format!("shellsim: {error}\n"));
+                        }
+                    }
                     Err(error) => {
+                        let error = crate::interp::write_error_message(error);
                         *offset = bytes.len();
                         status = 1;
                         if fd == 1 {
@@ -2056,6 +2096,35 @@ impl ShellContinuation {
         }
     }
 
+    /// Replace this subshell's image with `argv` when nothing else remains to run in it.
+    /// Pending redirection restores are committed instead, since the process never returns to
+    /// the shell. A pending EXIT trap keeps the shell image alive.
+    fn exec_in_place(&mut self, interp: &mut Interp, argv: &[String]) -> bool {
+        if !self.exec_tail
+            || interp.exit_disposition.is_some()
+            || !self
+                .frames
+                .iter()
+                .all(|frame| matches!(frame, ShellFrame::RestoreRedirect(_)))
+            || !crate::commands::execs_native_image(interp, &argv[0])
+        {
+            return false;
+        }
+        for frame in std::mem::take(&mut self.frames) {
+            if let ShellFrame::RestoreRedirect(scope) = frame {
+                commit_redirects(interp, scope);
+            }
+        }
+        let pid = interp.process.pid;
+        if let Err(error) = interp.exec_argv_image(pid, argv.to_vec()) {
+            write_diagnostic(interp, &format!("shellsim: exec: {error}\n"));
+            self.status = 126;
+            return true;
+        }
+        self.replaced = true;
+        true
+    }
+
     fn eval_external_argv(
         &mut self,
         interp: &mut Interp,
@@ -2069,6 +2138,9 @@ impl ShellContinuation {
         }
         if record_trace {
             interp.cmd_trace.record(&argv[0]);
+        }
+        if self.exec_in_place(interp, &argv) {
+            return;
         }
         if crate::commands::starts_before_input(interp, &argv) {
             let mut stdout = Vec::new();
@@ -2213,7 +2285,7 @@ impl ShellContinuation {
                 }
                 interp
                     .process
-                    .set_continuation(pid, Some(ShellContinuation::new(stage)))
+                    .set_continuation(pid, Some(ShellContinuation::subshell(stage)))
             })();
             if let Err(error) = setup {
                 interp.cancel_unstarted_child(pid);
@@ -2604,6 +2676,7 @@ pub(crate) fn poll_machine(
             interp.process.set_program(owner_pid, Some(continuation))?;
             Ok(MachinePoll::Progress)
         }
+        ShellPoll::Replaced => Ok(MachinePoll::Progress),
         ShellPoll::Blocked(reason) => {
             interp.process.set_program(owner_pid, Some(continuation))?;
             interp
@@ -2779,6 +2852,7 @@ fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
         ShellPoll::Switched => {
             interp.process.set_program(owner, Some(continuation))?;
         }
+        ShellPoll::Replaced => {}
         ShellPoll::Blocked(reason) => {
             interp.process.set_program(owner, Some(continuation))?;
             interp
@@ -2921,7 +2995,7 @@ fn exec_background(interp: &mut Interp, node: &Node) -> i32 {
     };
     interp
         .process
-        .set_continuation(pid, Some(ShellContinuation::new(node)))
+        .set_continuation(pid, Some(ShellContinuation::subshell(node)))
         .expect("new background child state must exist");
     let Some(id) = interp.new_job(pid, command) else {
         interp.cancel_unstarted_child(pid);

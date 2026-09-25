@@ -1069,3 +1069,45 @@ fn trap_state_growth_is_bounded_before_installation() {
     assert_eq!(result.0, 2);
     assert!(result.2.contains("handler state exceeds"), "{}", result.2);
 }
+
+#[test]
+fn subshell_execs_its_final_native_command_in_place() {
+    let mut env = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut env,
+        "sleep 10 & echo bg=$!; ps -o pid,ppid,args | cat; kill $!",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines[0], "bg=1235");
+    // `$!` is the sleep process itself, and the `ps` pipeline stage is a direct shell child.
+    assert!(lines.contains(&"1235 1234 sleep 10"), "{stdout}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.ends_with(" 1234 ps -o pid,ppid,args")),
+        "{stdout}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains(" 1235 ")),
+        "background job spawned a grandchild: {stdout}"
+    );
+}
+
+#[test]
+fn builtin_writer_to_a_closed_pipe_dies_of_sigpipe() {
+    let mut env = Environment::new();
+    assert_eq!(
+        run(
+            &mut env,
+            "set -o pipefail; { sleep 1; printf x; } | /usr/bin/true; echo $?",
+        ),
+        (0, "141\n".into(), String::new())
+    );
+    let (status, stdout, stderr) = run(
+        &mut env,
+        "trap '' PIPE; { sleep 1; printf x; } | /usr/bin/true; echo $?",
+    );
+    assert_eq!((status, stdout.as_str()), (0, "1\n"));
+    assert!(stderr.contains("broken pipe"), "{stderr}");
+}

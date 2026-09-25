@@ -13,6 +13,7 @@ use crate::syscalls::{ActiveSystem, SyscallError, System};
 mod cat;
 mod env;
 mod head;
+mod sleep;
 mod tee;
 mod xargs;
 
@@ -138,6 +139,7 @@ pub(crate) enum NativeProcess {
     Head(head::HeadProcess),
     Xargs(xargs::XargsProcess),
     Env(env::EnvProcess),
+    Sleep(sleep::SleepProcess),
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -341,6 +343,10 @@ impl NativeProcess {
             crate::vfs::NativeProgram::Head => Self::Head(head::HeadProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Xargs => Self::Xargs(xargs::XargsProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Env => Self::Env(env::EnvProcess::new(&argv[1..])),
+            crate::vfs::NativeProgram::Sleep => Self::Sleep(sleep::SleepProcess::sleep(&argv[1..])),
+            crate::vfs::NativeProgram::Usleep => {
+                Self::Sleep(sleep::SleepProcess::usleep(&argv[1..]))
+            }
             crate::vfs::NativeProgram::Registered(path) => {
                 let Some(command) = crate::commands::system_command(path) else {
                     return Self::failure(
@@ -392,6 +398,7 @@ impl NativeProcess {
             Self::Head(head) => head.poll(syscalls),
             Self::Xargs(xargs) => xargs.poll(syscalls),
             Self::Env(env) => env.poll(syscalls),
+            Self::Sleep(sleep) => sleep.poll(syscalls),
             Self::Failure {
                 status,
                 message,
@@ -747,6 +754,10 @@ mod tests {
 
         fn listener_snapshot(&self) -> Vec<String> {
             unreachable!("native writer does not inspect listeners")
+        }
+
+        fn schedule_wake(&mut self, _duration_ns: u64) -> Result<u64, SyscallError> {
+            unreachable!("native writer does not sleep")
         }
 
         fn spawn_argv(

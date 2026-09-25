@@ -21,6 +21,11 @@ processes retain their complete state across typed waits. A single-threaded FIFO
 runnable work and advances virtual time only when all work is blocked. Equal-time events use
 stable insertion order.
 
+As in Bash, a forked subshell (background job, pipeline stage, or `sh -c` child) execs its final
+native command in place, so `$!` and pipeline PIDs name the program doing the work and signals
+reach it directly. A shell writer that hits a closed pipe receives `SIGPIPE` and exits silently
+with status 141 unless `SIGPIPE` is ignored.
+
 Pipes, file descriptions, PIDs, queued events, process state, output, and other input-driven
 growth are bounded. VFS mutations enforce disk capacity atomically. Resource accounting uses
 checked or saturating arithmetic at untrusted boundaries.

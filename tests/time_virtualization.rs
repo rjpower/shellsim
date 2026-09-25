@@ -411,3 +411,19 @@ print(wall > 0, wall_ns > 0, time.monotonic_ns() >= mono, time.perf_counter() >=
         assert_eq!(simulated.2.as_bytes(), reference.stderr);
     }
 }
+
+#[test]
+fn native_sleep_reports_invalid_operands_and_skips_zero_waits() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "sleep; echo $?; sleep 1x; echo $?; usleep; echo $?; sleep 0; usleep 1500; echo $?",
+    );
+    assert_eq!((status, stdout.as_str()), (0, "1\n1\n1\n0\n"));
+    assert_eq!(
+        stderr,
+        "sleep: missing operand\nsleep: invalid time interval '1x'\nusleep: missing operand\n"
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 1_500_000);
+    assert_eq!(environment.clock.pending_len(), 0);
+}

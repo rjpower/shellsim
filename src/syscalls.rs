@@ -128,6 +128,10 @@ pub(crate) trait System {
     /// Signed realtime for userland calendar tools; WASI clocks retain their unsigned ABI.
     fn wall_time_signed_ns(&self) -> Result<i128, SyscallError>;
     fn clock_time_ns(&self, clock: ClockId) -> Result<u64, SyscallError>;
+    /// Schedule a one-shot wake for this process after `duration_ns` of virtual monotonic time
+    /// and return the absolute deadline. The caller then blocks on `WaitReason::Timer`.
+    /// Terminating the process cancels the wake.
+    fn schedule_wake(&mut self, duration_ns: u64) -> Result<u64, SyscallError>;
     fn random_fill(&mut self, bytes: &mut [u8]) -> Result<(), SyscallError>;
     fn allocate_temp_id(&mut self) -> Option<u64>;
     /// Submit a request to the configured virtual route table, never to the host network.
@@ -498,6 +502,15 @@ impl System for ActiveSystem<'_> {
         self.interp
             .clock
             .wall_time_ns()
+            .map_err(|_| SyscallError::InvalidArgument)
+    }
+
+    fn schedule_wake(&mut self, duration_ns: u64) -> Result<u64, SyscallError> {
+        let pid = u64::from(self.interp.process.pid);
+        self.interp
+            .clock
+            .schedule_wake_after(pid, duration_ns)
+            .map(|event| event.deadline_ns())
             .map_err(|_| SyscallError::InvalidArgument)
     }
 
