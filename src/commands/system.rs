@@ -8,8 +8,8 @@ use crate::commands::{
     reg, reg_buffered_resumable, reg_system, ChildCommand, CommandContext, CommandPoll,
     CommandSpec, Io, Trust,
 };
-use crate::interp::Interp;
 use crate::process::ProcessStatus;
+use crate::syscalls::{FileKind, System};
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_buffered_resumable(m, &["env"], Trust::Real, cmd_env, start_env);
@@ -35,7 +35,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
 }
 
 fn cmd_env(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let action = match parse_env_action(interp, args) {
+    let action = match parse_env_action(&mut interp.system(), args) {
         Ok(action) => action,
         Err(error) => {
             ewln(io.err, &format!("env: {error}"));
@@ -69,7 +69,7 @@ fn cmd_env(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
 }
 
 fn start_env(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
-    let action = match parse_env_action(interp, args) {
+    let action = match parse_env_action(&mut interp.system(), args) {
         Ok(action) => action,
         Err(error) => {
             ewln(io.err, &format!("env: {error}"));
@@ -94,14 +94,17 @@ fn start_env(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> C
     )
 }
 
-struct EnvAction {
-    environment: BTreeMap<String, String>,
-    cwd: Option<String>,
-    argv: Vec<String>,
+pub(crate) struct EnvAction {
+    pub(crate) environment: BTreeMap<String, String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) argv: Vec<String>,
 }
 
-fn parse_env_action(interp: &Interp, args: &[String]) -> Result<EnvAction, String> {
-    let mut environment = interp.child_env().into_iter().collect::<BTreeMap<_, _>>();
+pub(crate) fn parse_env_action(
+    system: &mut dyn System,
+    args: &[String],
+) -> Result<EnvAction, String> {
+    let mut environment = system.environment();
     let mut cwd = None;
     let mut index = 0;
     let mut options = true;
@@ -126,11 +129,18 @@ fn parse_env_action(interp: &Interp, args: &[String]) -> Result<EnvAction, Strin
                 let directory = args
                     .get(index + 1)
                     .ok_or_else(|| "option requires an argument -- 'C'".to_string())?;
-                let resolved = crate::vfs::resolve_against(&interp.cwd, directory);
-                if !interp.vfs.is_dir("/", &resolved) {
+                let current = system.cwd().to_string();
+                if !matches!(
+                    system.metadata(&current, directory, true),
+                    Ok(info) if info.kind == FileKind::Directory
+                ) {
                     return Err(format!("cannot change directory to '{directory}'"));
                 }
-                cwd = Some(interp.vfs.realpath(&resolved, true).unwrap_or(resolved));
+                cwd = Some(
+                    system
+                        .canonicalize(&current, directory, true)
+                        .map_err(|_| format!("cannot change directory to '{directory}'"))?,
+                );
                 index += 2;
             }
             option if option.starts_with('-') => {

@@ -14,7 +14,7 @@ pub type ProcessId = u32;
 
 /// Maximum number of simultaneously retained logical process records.
 pub const MAX_PROCESSES: usize = 1_024;
-const MAX_COMMAND_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_COMMAND_BYTES: usize = 4 * 1024;
 
 /// Standard signals modeled by shellsim's process and shell-disposition layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

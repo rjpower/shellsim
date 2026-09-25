@@ -11,8 +11,10 @@ use crate::scheduler::WaitReason;
 use crate::syscalls::{ActiveSystem, SyscallError, System};
 
 mod cat;
+mod env;
 mod head;
 mod tee;
+mod xargs;
 
 /// Invocation view borrowed by a native command for one scheduler quantum.
 /// Only the owned command continuation survives a blocked operation.
@@ -83,6 +85,16 @@ impl ProgramContinuation {
             interp.resources.release_memory(command.base_reserved);
             command.base_reserved = 0;
         }
+        if let Self::Native(NativeProcess::Xargs(command)) = self {
+            interp
+                .resources
+                .release_memory(command.take_reserved_input());
+        }
+        if let Self::Native(NativeProcess::Env(command)) = self {
+            interp
+                .resources
+                .release_memory(command.take_reserved_output());
+        }
     }
 
     pub(crate) fn poll(&mut self, interp: &mut Interp, budget: usize) -> ShellPoll {
@@ -124,6 +136,8 @@ pub(crate) enum NativeProcess {
     Cat(cat::CatProcess),
     Tee(tee::TeeProcess),
     Head(head::HeadProcess),
+    Xargs(xargs::XargsProcess),
+    Env(env::EnvProcess),
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -325,6 +339,8 @@ impl NativeProcess {
             crate::vfs::NativeProgram::Cat => Self::Cat(cat::CatProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Tee => Self::Tee(tee::TeeProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Head => Self::Head(head::HeadProcess::new(&argv[1..])),
+            crate::vfs::NativeProgram::Xargs => Self::Xargs(xargs::XargsProcess::new(&argv[1..])),
+            crate::vfs::NativeProgram::Env => Self::Env(env::EnvProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Registered(path) => {
                 let Some(command) = crate::commands::system_command(path) else {
                     return Self::failure(
@@ -374,6 +390,8 @@ impl NativeProcess {
             Self::Cat(cat) => cat.poll(syscalls),
             Self::Tee(tee) => tee.poll(syscalls),
             Self::Head(head) => head.poll(syscalls),
+            Self::Xargs(xargs) => xargs.poll(syscalls),
+            Self::Env(env) => env.poll(syscalls),
             Self::Failure {
                 status,
                 message,
@@ -729,6 +747,24 @@ mod tests {
 
         fn listener_snapshot(&self) -> Vec<String> {
             unreachable!("native writer does not inspect listeners")
+        }
+
+        fn spawn_argv(
+            &mut self,
+            _spec: crate::syscalls::SpawnSpec,
+        ) -> Result<crate::process::ProcessId, SyscallError> {
+            unreachable!("native writer does not spawn processes")
+        }
+
+        fn child_status(
+            &self,
+            _pid: crate::process::ProcessId,
+        ) -> Result<Option<i32>, SyscallError> {
+            unreachable!("native writer does not inspect child processes")
+        }
+
+        fn reap_child(&mut self, _pid: crate::process::ProcessId) -> Result<i32, SyscallError> {
+            unreachable!("native writer does not reap child processes")
         }
 
         fn display_open(

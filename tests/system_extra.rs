@@ -44,6 +44,22 @@ fn envsubst_reads_child_environment_and_large_pipe() {
 }
 
 #[test]
+fn native_env_preserves_inherited_stdin_and_child_only_overrides() {
+    let mut environment = Environment::new();
+    let image = environment.vfs.metadata("/", "/usr/bin/env", true).unwrap();
+    assert!(matches!(
+        image.kind,
+        NodeKind::NativeExecutable(NativeProgram::Env)
+    ));
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "printf payload | env -i /usr/bin/cat; env -i KEY=value; env -C /work pwd; pwd",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "payloadKEY=value\n/work\n/\n");
+}
+
+#[test]
 fn umask_accepts_zero_with_any_octal_padding() {
     let mut environment = Environment::new();
     let (status, stdout, stderr) = run(&mut environment, "umask 0; umask; umask 000; umask");

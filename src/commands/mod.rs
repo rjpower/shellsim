@@ -42,14 +42,14 @@ mod rgcmd;
 mod sed;
 mod sort;
 pub(crate) mod streams;
-mod system;
+pub(crate) mod system;
 mod tarcmd;
 mod text;
 mod unavailable;
 pub mod util;
 mod wasm;
 pub use wasm::{SessionPoll, SessionResult, WasmSession};
-mod xargs;
+pub(crate) mod xargs;
 mod zipcmd;
 
 /// Bundled standard I/O for a command invocation.
@@ -182,15 +182,7 @@ pub(crate) enum CommandResume {
     TextStream(streams::TextStream),
 }
 
-/// One scheduler-owned argv invocation requested by a modeled native command.
-#[derive(Clone)]
-pub(crate) struct ChildCommand {
-    pub argv: Vec<String>,
-    /// `None` inherits fd 0; `Some` replaces it even when the byte stream is empty.
-    pub stdin: Option<Vec<u8>>,
-    pub cwd: Option<String>,
-    pub environment: Option<std::collections::BTreeMap<String, String>>,
-}
+pub(crate) use crate::syscalls::SpawnSpec as ChildCommand;
 
 type ResumableCmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> CommandPoll;
 
@@ -908,33 +900,7 @@ pub(crate) fn start_child_command(
     if command.argv.is_empty() {
         return Err(0);
     }
-    let input = command
-        .stdin
-        .map(|bytes| interp.descriptors.open_input(bytes))
-        .transpose()
-        .map_err(|_| 125)?;
-    let display = command.argv.join(" ");
-    let pid = match interp.start_child(&display, true) {
-        Ok(pid) => pid,
-        Err(_) => {
-            if let Some(input) = input {
-                let _ = interp.descriptors.discard_unreferenced(input);
-            }
-            return Err(125);
-        }
-    };
-    if let Some(input) = input {
-        interp
-            .install_process_description(pid, 0, input)
-            .expect("new child process must accept prepared standard input");
-    }
-    interp
-        .configure_process(pid, command.cwd, command.environment)
-        .expect("new child process must accept its launch configuration");
-    interp
-        .load_argv_program(pid, command.argv)
-        .expect("new child process must accept an argv continuation");
-    Ok(pid)
+    interp.spawn_argv_child(command).map_err(|_| 125)
 }
 
 fn dispatch(

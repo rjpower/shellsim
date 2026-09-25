@@ -626,6 +626,8 @@ impl Environment {
             ("cat", crate::vfs::NativeProgram::Cat),
             ("tee", crate::vfs::NativeProgram::Tee),
             ("head", crate::vfs::NativeProgram::Head),
+            ("xargs", crate::vfs::NativeProgram::Xargs),
+            ("env", crate::vfs::NativeProgram::Env),
         ] {
             vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
         }
@@ -742,6 +744,56 @@ impl Environment {
             false,
             crate::process::ChildPlacement::Inherit,
         )
+    }
+
+    /// Spawn and load one argv image using virtual process and descriptor state only.
+    pub(crate) fn spawn_argv_child(
+        &mut self,
+        spec: crate::syscalls::SpawnSpec,
+    ) -> Result<ProcessId, String> {
+        if spec.argv.is_empty() {
+            return Err("empty argv".into());
+        }
+        let input = spec
+            .stdin
+            .map(|bytes| self.descriptors.open_input(bytes))
+            .transpose()
+            .map_err(|error| format!("unable to prepare child input: {error:?}"))?;
+        let mut display = String::new();
+        'arguments: for (index, argument) in spec.argv.iter().enumerate() {
+            if index > 0 {
+                if display.len() == crate::process::MAX_COMMAND_BYTES {
+                    break;
+                }
+                display.push(' ');
+            }
+            for character in argument.chars() {
+                if display.len().saturating_add(character.len_utf8())
+                    > crate::process::MAX_COMMAND_BYTES
+                {
+                    break 'arguments;
+                }
+                display.push(character);
+            }
+        }
+        let pid = match self.start_child(&display, true) {
+            Ok(pid) => pid,
+            Err(error) => {
+                if let Some(input) = input {
+                    let _ = self.descriptors.discard_unreferenced(input);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(input) = input {
+            self.install_process_description(pid, 0, input)
+                .expect("new child process must accept prepared standard input");
+        }
+        self.configure_process(pid, spec.cwd, spec.environment)
+            .expect("new child process must accept its launch configuration");
+        self.load_argv_program(pid, spec.argv)
+            .expect("new child process must accept an argv continuation");
+        Ok(pid)
     }
 
     /// Load an argv child through one image boundary. Migrated native commands execute as
@@ -1472,6 +1524,7 @@ impl Environment {
                         |reason| reason.to_string(),
                     )
                 }
+                crate::syscalls::SyscallError::Process(error) => error,
             })
     }
 
@@ -1545,6 +1598,7 @@ impl Environment {
                 crate::syscalls::SyscallError::ResourceExhausted => {
                     "resource limit exceeded".to_string()
                 }
+                crate::syscalls::SyscallError::Process(error) => error,
             })
     }
 

@@ -16,6 +16,16 @@ pub(crate) enum ClockId {
     Monotonic,
 }
 
+/// Arguments and process-local overrides for one virtual argv child.
+#[derive(Clone)]
+pub(crate) struct SpawnSpec {
+    pub argv: Vec<String>,
+    /// `None` inherits fd 0; `Some` replaces it, including with an empty stream.
+    pub stdin: Option<Vec<u8>>,
+    pub cwd: Option<String>,
+    pub environment: Option<std::collections::BTreeMap<String, String>>,
+}
+
 /// PID-scoped virtual kernel operations available during one execution quantum.
 ///
 /// Native programs call this interface directly. A guest ABI adapter must translate its imports
@@ -136,6 +146,11 @@ pub(crate) trait System {
     fn process_snapshot(&mut self) -> Vec<crate::process::ProcessRecord>;
     /// Active virtual listener addresses in deterministic order.
     fn listener_snapshot(&self) -> Vec<String>;
+    /// Spawn a child using inherited virtual descriptors and switch execution to it.
+    fn spawn_argv(&mut self, spec: SpawnSpec) -> Result<crate::process::ProcessId, SyscallError>;
+    /// Observe only a direct child; an exited status remains available until reap.
+    fn child_status(&self, pid: crate::process::ProcessId) -> Result<Option<i32>, SyscallError>;
+    fn reap_child(&mut self, pid: crate::process::ProcessId) -> Result<i32, SyscallError>;
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError>;
     fn display_present(
         &mut self,
@@ -558,6 +573,36 @@ impl System for ActiveSystem<'_> {
             .collect()
     }
 
+    fn spawn_argv(&mut self, spec: SpawnSpec) -> Result<crate::process::ProcessId, SyscallError> {
+        self.interp
+            .spawn_argv_child(spec)
+            .map_err(SyscallError::Process)
+    }
+
+    fn child_status(&self, pid: crate::process::ProcessId) -> Result<Option<i32>, SyscallError> {
+        let child = self
+            .interp
+            .processes
+            .get(pid)
+            .ok_or(SyscallError::InvalidArgument)?;
+        if child.ppid != self.interp.process.pid {
+            return Err(SyscallError::Permission);
+        }
+        Ok(match child.status {
+            crate::process::ProcessStatus::Exited(status) => Some(status),
+            _ => None,
+        })
+    }
+
+    fn reap_child(&mut self, pid: crate::process::ProcessId) -> Result<i32, SyscallError> {
+        let status = self
+            .child_status(pid)?
+            .ok_or(SyscallError::InvalidArgument)?;
+        self.interp.processes.reap(pid);
+        let _ = self.interp.scheduler.reap(pid);
+        Ok(status)
+    }
+
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError> {
         display_open(self.interp, width, height, format)
     }
@@ -732,6 +777,7 @@ pub(crate) enum SyscallError {
     IsDirectory,
     Permission,
     ResourceExhausted,
+    Process(String),
 }
 
 impl std::fmt::Display for SyscallError {
@@ -743,6 +789,7 @@ impl std::fmt::Display for SyscallError {
             Self::IsDirectory => write!(formatter, "is a directory"),
             Self::Permission => write!(formatter, "permission denied"),
             Self::ResourceExhausted => write!(formatter, "resource exhausted"),
+            Self::Process(error) => write!(formatter, "{error}"),
         }
     }
 }
