@@ -77,6 +77,13 @@ pub type CmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> i32;
 /// A native command body limited to the active process's virtual kernel operations.
 pub(crate) type SystemCmdFn = fn(&mut crate::program::ProcessContext<'_>, &mut Io) -> i32;
 
+/// Process-scoped command body and its coarse launch cost.
+#[derive(Clone, Copy)]
+pub(crate) struct SystemCommand {
+    pub(crate) run: SystemCmdFn,
+    pub(crate) base_cpu: u64,
+}
+
 fn run_system_from_legacy(
     context: &mut CommandContext<'_>,
     args: &[String],
@@ -84,11 +91,13 @@ fn run_system_from_legacy(
     run: SystemCmdFn,
 ) -> i32 {
     let command_name = context.command_name().to_string();
+    let environment = context.child_env().into_iter().collect();
     let mut system = context.system();
     let mut process = crate::program::ProcessContext {
         system: &mut system,
         command_name: &command_name,
         args,
+        environment: &environment,
     };
     run(&mut process, io)
 }
@@ -248,9 +257,13 @@ pub(crate) fn registered_executables() -> Vec<(String, crate::vfs::NativeProgram
     entries
 }
 
-pub(crate) fn system_command(name: &str) -> Option<SystemCmdFn> {
-    match registry().get(name)?.body {
-        CommandBody::System(run) => Some(run),
+pub(crate) fn system_command(name: &str) -> Option<SystemCommand> {
+    let spec = registry().get(name)?;
+    match spec.body {
+        CommandBody::System(run) => Some(SystemCommand {
+            run,
+            base_cpu: spec.base_cpu,
+        }),
         CommandBody::Legacy(_) => None,
     }
 }
@@ -316,6 +329,17 @@ fn reg_system(
     trust: Trust,
     system: SystemCmdFn,
 ) {
+    reg_system_costed(map, path, trust, 100, system);
+}
+
+/// Register a process-scoped body with the command's existing launch cost.
+fn reg_system_costed(
+    map: &mut HashMap<&'static str, CommandSpec>,
+    path: &'static str,
+    trust: Trust,
+    base_cpu: u64,
+    system: SystemCmdFn,
+) {
     let name = path.rsplit('/').next().expect("executable has basename");
     map.insert(
         name,
@@ -325,7 +349,7 @@ fn reg_system(
             resume: None,
             resume_before_input: false,
             trust,
-            base_cpu: 100,
+            base_cpu,
             base_memory: 10 * 1024,
         },
     );

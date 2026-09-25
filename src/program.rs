@@ -18,6 +18,7 @@ pub(crate) struct ProcessContext<'a> {
     pub(crate) system: &'a mut dyn System,
     pub(crate) command_name: &'a str,
     pub(crate) args: &'a [String],
+    pub(crate) environment: &'a std::collections::BTreeMap<String, String>,
 }
 
 /// Owned state needed to resume one process after a scheduler turn.
@@ -84,6 +85,7 @@ pub(crate) struct SystemCommandProcess {
     name: &'static str,
     args: Vec<String>,
     run: crate::commands::SystemCmdFn,
+    base_cpu: u64,
     result: Option<SystemCommandOutput>,
 }
 
@@ -97,11 +99,12 @@ struct SystemCommandOutput {
 }
 
 impl SystemCommandProcess {
-    fn new(name: &'static str, run: crate::commands::SystemCmdFn, args: &[String]) -> Self {
+    fn new(name: &'static str, command: crate::commands::SystemCommand, args: &[String]) -> Self {
         Self {
             name,
             args: args.to_vec(),
-            run,
+            run: command.run,
+            base_cpu: command.base_cpu,
             result: None,
         }
     }
@@ -114,9 +117,10 @@ impl SystemCommandProcess {
                 .args
                 .iter()
                 .fold(0_u64, |total, arg| total.saturating_add(arg.len() as u64));
-            let status = if !system.charge_cpu(100_u64.saturating_add(argument_bytes)) {
+            let status = if !system.charge_cpu(self.base_cpu.saturating_add(argument_bytes)) {
                 system.stop_status()
             } else {
+                let environment = system.environment();
                 let mut io = crate::commands::Io {
                     stdin: Vec::new(),
                     out: &mut stdout,
@@ -126,6 +130,7 @@ impl SystemCommandProcess {
                     system,
                     command_name: self.name,
                     args: &self.args,
+                    environment: &environment,
                 };
                 (self.run)(&mut context, &mut io)
             };
@@ -182,13 +187,13 @@ impl NativeProcess {
             }
             crate::vfs::NativeProgram::Cat => Self::Cat(cat::CatProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Registered(name) => {
-                let Some(run) = crate::commands::system_command(name) else {
+                let Some(command) = crate::commands::system_command(name) else {
                     return Self::failure(
                         125,
                         "registered program needs a command continuation\n".into(),
                     );
                 };
-                Self::SystemCommand(SystemCommandProcess::new(name, run, &argv[1..]))
+                Self::SystemCommand(SystemCommandProcess::new(name, command, &argv[1..]))
             }
         }
     }
@@ -290,6 +295,14 @@ mod tests {
     }
 
     impl System for PartialWriter {
+        fn environment(&self) -> std::collections::BTreeMap<String, String> {
+            std::collections::BTreeMap::new()
+        }
+
+        fn uid(&self) -> u32 {
+            unreachable!("native writer does not inspect identity")
+        }
+
         fn cwd(&self) -> &str {
             "/work"
         }
@@ -308,6 +321,14 @@ mod tests {
 
         fn limits(&self) -> crate::resources::Limits {
             unreachable!("native writer does not inspect limits")
+        }
+
+        fn disk_used(&self) -> u64 {
+            unreachable!("native writer does not inspect disk usage")
+        }
+
+        fn memory_used(&self) -> u64 {
+            unreachable!("native writer does not inspect memory usage")
         }
 
         fn metadata(

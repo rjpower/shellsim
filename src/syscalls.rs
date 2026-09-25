@@ -14,11 +14,15 @@ use crate::vfs::{resolve_against, NodeKind, VfsError};
 /// to the same operations; neither path receives host capabilities or the owning `Environment`.
 /// The borrowed handle cannot outlive the quantum, so blocked programs retain only owned state.
 pub(crate) trait System {
+    fn environment(&self) -> std::collections::BTreeMap<String, String>;
+    fn uid(&self) -> u32;
     fn cwd(&self) -> &str;
     fn chdir(&mut self, path: &str) -> Result<(), SyscallError>;
     fn umask(&self) -> u16;
     fn set_umask(&mut self, mask: u16) -> Result<(), SyscallError>;
     fn limits(&self) -> crate::resources::Limits;
+    fn disk_used(&self) -> u64;
+    fn memory_used(&self) -> u64;
     fn metadata(&mut self, base: &str, path: &str, follow: bool) -> Result<FileInfo, SyscallError>;
     fn metadata_fd(&mut self, fd: Fd) -> Result<FileInfo, SyscallError>;
     fn list_dir(&mut self, base: &str, path: &str) -> Result<Vec<String>, SyscallError>;
@@ -113,6 +117,14 @@ impl<'a> ActiveSystem<'a> {
 }
 
 impl System for ActiveSystem<'_> {
+    fn environment(&self) -> std::collections::BTreeMap<String, String> {
+        self.interp.child_env().into_iter().collect()
+    }
+
+    fn uid(&self) -> u32 {
+        self.interp.uid
+    }
+
     fn cwd(&self) -> &str {
         &self.interp.process.cwd
     }
@@ -145,6 +157,14 @@ impl System for ActiveSystem<'_> {
 
     fn limits(&self) -> crate::resources::Limits {
         self.interp.resources.limits()
+    }
+
+    fn disk_used(&self) -> u64 {
+        self.interp.vfs.disk_used()
+    }
+
+    fn memory_used(&self) -> u64 {
+        self.interp.resources.memory_mark()
     }
 
     fn metadata(&mut self, base: &str, path: &str, follow: bool) -> Result<FileInfo, SyscallError> {
