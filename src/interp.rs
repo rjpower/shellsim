@@ -115,6 +115,8 @@ impl ShellExpansionError {
 #[derive(Clone)]
 pub struct Environment {
     pub vfs: Vfs,
+    /// Machine hostname, independent of process-local shell variables.
+    pub(crate) hostname: String,
     pub clock: Clock,
     /// Virtual framebuffer and input queue; guests never receive host device handles.
     pub display: crate::display::VirtualDisplay,
@@ -650,6 +652,7 @@ impl Environment {
         processes.update_descriptors(ROOT_PID, descriptor_snapshot);
         Environment {
             vfs,
+            hostname: "sandbox".to_string(),
             clock,
             display: crate::display::VirtualDisplay::default(),
             net: VirtualNet::new(),

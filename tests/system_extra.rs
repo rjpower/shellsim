@@ -2,7 +2,10 @@
 //!
 //! All observations come from shellsim's process, descriptor, resource, and listener stores.
 
-use shellsim::Environment;
+use shellsim::{
+    vfs::{NativeProgram, NodeKind},
+    Environment,
+};
 
 fn run(environment: &mut Environment, source: &str) -> (i32, String, String) {
     let (outcome, stdout, stderr) = environment.run_script_capture(source);
@@ -107,6 +110,19 @@ fn readonly_rejects_plain_and_temporary_assignments() {
 #[test]
 fn process_queries_use_the_modeled_process_table() {
     let mut environment = Environment::new();
+    for command in ["ps", "pgrep", "lsof", "ss", "netstat"] {
+        let node = environment
+            .vfs
+            .metadata("/", &format!("/usr/bin/{command}"), true)
+            .unwrap();
+        assert!(
+            matches!(
+                node.kind,
+                NodeKind::NativeExecutable(NativeProgram::Registered(_))
+            ),
+            "{command} did not use the native System boundary"
+        );
+    }
     let (status, stdout, stderr) = run(
         &mut environment,
         "ps -p $$ -o pid,ppid,stat,comm; ps $$ -o pid,comm; pgrep -x bash; lsof -p $$",
@@ -128,6 +144,24 @@ fn socket_queries_list_only_virtual_listeners() {
     let (status, stdout, stderr) = run(&mut environment, "ss -lnt; netstat -lnt");
     assert_eq!(status, 0, "{stderr}");
     assert_eq!(stdout.matches("127.0.0.1:8080").count(), 2);
+}
+
+#[test]
+fn hostname_is_machine_state_not_a_child_shell_assignment() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "hostname; hostname workshop; hostname; uname -n; printf '%s\\n' \"$HOSTNAME\"",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "sandbox\nworkshop\nworkshop\nsandbox\n");
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        &format!("hostname {}; hostname", "x".repeat(256)),
+    );
+    assert_eq!(status, 0);
+    assert_eq!(stdout, "workshop\n");
+    assert!(stderr.contains("hostname: invalid argument"), "{stderr}");
 }
 
 #[test]

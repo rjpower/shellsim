@@ -17,7 +17,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     super::reg_system_poll(m, "/usr/bin/envsubst", Trust::Partial, cmd_envsubst);
     reg_system(m, "/usr/bin/uname", Trust::Real, run_uname);
     reg_system(m, "/usr/bin/arch", Trust::Real, run_arch);
-    reg(m, &["hostname"], Trust::Real, cmd_hostname);
+    reg_system(m, "/usr/bin/hostname", Trust::Real, cmd_hostname);
     reg_system(m, "/usr/bin/whoami", Trust::Real, run_whoami);
     reg_system(m, "/usr/bin/logname", Trust::Real, run_whoami);
     reg_system(m, "/usr/bin/id", Trust::Real, run_id);
@@ -26,10 +26,11 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_system(m, "/usr/bin/getconf", Trust::Partial, run_getconf);
     reg_system(m, "/usr/bin/df", Trust::Real, run_df);
     reg_system(m, "/usr/bin/free", Trust::Real, run_free);
-    reg(m, &["ps"], Trust::Partial, cmd_ps);
-    reg(m, &["pgrep"], Trust::Partial, cmd_pgrep);
-    reg(m, &["lsof"], Trust::Partial, cmd_lsof);
-    reg(m, &["ss", "netstat"], Trust::Partial, cmd_sockets);
+    reg_system(m, "/usr/bin/ps", Trust::Partial, cmd_ps);
+    reg_system(m, "/usr/bin/pgrep", Trust::Partial, cmd_pgrep);
+    reg_system(m, "/usr/bin/lsof", Trust::Partial, cmd_lsof);
+    reg_system(m, "/usr/bin/ss", Trust::Partial, cmd_sockets);
+    reg_system(m, "/usr/bin/netstat", Trust::Partial, cmd_sockets);
     reg(m, &["nohup"], Trust::Partial, cmd_nohup);
 }
 
@@ -255,7 +256,7 @@ fn run_uname(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i
         if flags.contains(&flag) {
             values.push(match flag {
                 's' => "Linux",
-                'n' => "sandbox",
+                'n' => context.system.hostname(),
                 'r' => "6.6.0-shellsim",
                 'v' => "#1 SMP",
                 'm' => "x86_64",
@@ -278,21 +279,19 @@ fn run_arch(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i3
     0
 }
 
-fn cmd_hostname(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_hostname(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     if args.iter().any(|arg| arg.starts_with('-') && arg != "-f") {
         ewln(io.err, "hostname: unimplemented option");
         return 2;
     }
     if let Some(name) = args.iter().find(|arg| !arg.starts_with('-')) {
-        interp.set_var("HOSTNAME", name);
-        interp.export("HOSTNAME");
+        if let Err(error) = context.system.set_hostname(name) {
+            ewln(io.err, &format!("hostname: {error}"));
+            return 1;
+        }
     } else {
-        wln(
-            io.out,
-            &interp
-                .get_var("HOSTNAME")
-                .unwrap_or_else(|| "sandbox".to_string()),
-        );
+        wln(io.out, context.system.hostname());
     }
     0
 }
@@ -486,7 +485,8 @@ fn run_free(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i3
     0
 }
 
-fn cmd_ps(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_ps(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     let mut aux = false;
     let mut full = false;
     let mut columns: Option<Vec<&str>> = None;
@@ -557,10 +557,7 @@ fn cmd_ps(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         }
         index += 1;
     }
-    let pid = interp.pid;
-    let cwd = interp.cwd.clone();
-    let environment = interp.child_env().into_iter().collect();
-    interp.processes.update_current(pid, &cwd, environment);
+    let processes = context.system.process_snapshot();
     if let Some(columns) = &columns {
         wln(
             io.out,
@@ -583,7 +580,7 @@ fn cmd_ps(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     } else {
         wln(io.out, "    PID TTY          TIME CMD");
     }
-    for process in interp.processes.iter() {
+    for process in &processes {
         if selected_pids
             .as_ref()
             .is_some_and(|pids| !pids.contains(&process.pid))
@@ -677,7 +674,8 @@ fn ps_value(column: &str, process: &crate::process::ProcessRecord, state: &str) 
     }
 }
 
-fn cmd_pgrep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_pgrep(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     let mut full = false;
     let mut exact = false;
     let mut list_name = false;
@@ -713,8 +711,9 @@ fn cmd_pgrep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
         }
     };
     let mut found = false;
-    for process in interp
-        .processes
+    for process in context
+        .system
+        .process_snapshot()
         .iter()
         .filter(|process| !matches!(process.status, ProcessStatus::Exited(_)))
     {
@@ -752,7 +751,8 @@ fn cmd_pgrep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
     i32::from(!found)
 }
 
-fn cmd_lsof(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_lsof(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     let mut selected_pid = None;
     let mut selected_name = None;
     let mut index = 0;
@@ -776,7 +776,7 @@ fn cmd_lsof(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     }
     wln(io.out, "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME");
     let mut found = false;
-    for process in interp.processes.iter() {
+    for process in context.system.process_snapshot() {
         if selected_pid.is_some_and(|pid| process.pid != pid) {
             continue;
         }
@@ -805,7 +805,8 @@ fn cmd_lsof(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     i32::from(!found && (selected_pid.is_some() || selected_name.is_some()))
 }
 
-fn cmd_sockets(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_sockets(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     if args.iter().any(|argument| !argument.starts_with('-')) {
         ewln(io.err, "socket listing: operands are not supported");
         return 2;
@@ -822,13 +823,7 @@ fn cmd_sockets(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
         io.out,
         "State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process",
     );
-    let mut listeners = interp
-        .net
-        .listening
-        .iter()
-        .filter(|(_, active)| **active)
-        .map(|(address, _)| address)
-        .collect::<Vec<_>>();
+    let mut listeners = context.system.listener_snapshot();
     listeners.sort();
     for address in listeners {
         wln(

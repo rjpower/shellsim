@@ -444,6 +444,14 @@ mod tests {
             std::collections::BTreeMap::new()
         }
 
+        fn hostname(&self) -> &str {
+            unreachable!("native writer does not inspect hostname")
+        }
+
+        fn set_hostname(&mut self, _name: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not set hostname")
+        }
+
         fn uid(&self) -> u32 {
             unreachable!("native writer does not inspect identity")
         }
@@ -713,6 +721,14 @@ mod tests {
 
         fn network_request_at(&self, _index: usize) -> Option<crate::net::NetworkRequest> {
             unreachable!("native writer does not inspect network requests")
+        }
+
+        fn process_snapshot(&mut self) -> Vec<crate::process::ProcessRecord> {
+            unreachable!("native writer does not inspect processes")
+        }
+
+        fn listener_snapshot(&self) -> Vec<String> {
+            unreachable!("native writer does not inspect listeners")
         }
 
         fn display_open(

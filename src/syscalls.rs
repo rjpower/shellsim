@@ -23,6 +23,8 @@ pub(crate) enum ClockId {
 /// The borrowed handle cannot outlive the quantum, so blocked programs retain only owned state.
 pub(crate) trait System {
     fn environment(&self) -> std::collections::BTreeMap<String, String>;
+    fn hostname(&self) -> &str;
+    fn set_hostname(&mut self, name: &str) -> Result<(), SyscallError>;
     fn uid(&self) -> u32;
     fn cwd(&self) -> &str;
     fn chdir(&mut self, path: &str) -> Result<(), SyscallError>;
@@ -130,6 +132,10 @@ pub(crate) trait System {
     fn network_listen(&mut self, host_port: &str);
     fn network_request_count(&self) -> usize;
     fn network_request_at(&self, index: usize) -> Option<NetworkRequest>;
+    /// Stable, read-only view of retained logical processes and their descriptor labels.
+    fn process_snapshot(&mut self) -> Vec<crate::process::ProcessRecord>;
+    /// Active virtual listener addresses in deterministic order.
+    fn listener_snapshot(&self) -> Vec<String>;
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError>;
     fn display_present(
         &mut self,
@@ -164,6 +170,18 @@ impl<'a> ActiveSystem<'a> {
 impl System for ActiveSystem<'_> {
     fn environment(&self) -> std::collections::BTreeMap<String, String> {
         self.interp.child_env().into_iter().collect()
+    }
+
+    fn hostname(&self) -> &str {
+        &self.interp.hostname
+    }
+
+    fn set_hostname(&mut self, name: &str) -> Result<(), SyscallError> {
+        if name.is_empty() || name.len() > 255 || name.contains('\0') {
+            return Err(SyscallError::InvalidArgument);
+        }
+        self.interp.hostname = name.to_string();
+        Ok(())
     }
 
     fn uid(&self) -> u32 {
@@ -521,6 +539,23 @@ impl System for ActiveSystem<'_> {
 
     fn network_request_at(&self, index: usize) -> Option<NetworkRequest> {
         self.interp.net.log.get(index).cloned()
+    }
+
+    fn process_snapshot(&mut self) -> Vec<crate::process::ProcessRecord> {
+        let pid = self.interp.process.pid;
+        let cwd = self.interp.process.cwd.clone();
+        let environment = self.interp.child_env().into_iter().collect();
+        self.interp.processes.update_current(pid, &cwd, environment);
+        self.interp.processes.iter().cloned().collect()
+    }
+
+    fn listener_snapshot(&self) -> Vec<String> {
+        self.interp
+            .net
+            .listening
+            .iter()
+            .filter_map(|(address, active)| active.then_some(address.clone()))
+            .collect()
     }
 
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError> {
