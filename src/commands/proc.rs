@@ -515,7 +515,7 @@ pub(crate) fn start_shell_source(
         .expect("new child process state must retain positional arguments");
     interp
         .process
-        .set_continuation(pid, Some(crate::exec::ShellContinuation::new(&ast)))
+        .set_continuation(pid, Some(crate::exec::ShellContinuation::subshell(&ast)))
         .expect("new child process state must accept a continuation");
     CommandPoll::Switched(CommandResume::Child { pid, reap: true })
 }

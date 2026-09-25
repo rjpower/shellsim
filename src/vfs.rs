@@ -22,6 +22,8 @@ pub enum NativeProgram {
     Head,
     Xargs,
     Env,
+    Sleep,
+    Usleep,
     /// Process-scoped Rust entrypoint identified by its registered virtual path.
     Registered(&'static str),
     /// Older command body still executed through the shell dispatcher by basename.
@@ -40,6 +42,8 @@ impl NativeProgram {
             "head" => Some(Self::Head),
             "xargs" => Some(Self::Xargs),
             "env" => Some(Self::Env),
+            "sleep" => Some(Self::Sleep),
+            "usleep" => Some(Self::Usleep),
             _ => None,
         }
     }
@@ -55,6 +59,8 @@ impl NativeProgram {
             Self::Head => "head",
             Self::Xargs => "xargs",
             Self::Env => "env",
+            Self::Sleep => "sleep",
+            Self::Usleep => "usleep",
             Self::Registered(path) => path.rsplit('/').next().unwrap_or(path),
             Self::LegacyRegistered(name) => name,
         }

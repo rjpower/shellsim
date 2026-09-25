@@ -14,7 +14,28 @@ pub type ProcessId = u32;
 
 /// Maximum number of simultaneously retained logical process records.
 pub const MAX_PROCESSES: usize = 1_024;
-pub(crate) const MAX_COMMAND_BYTES: usize = 4 * 1024;
+const MAX_COMMAND_BYTES: usize = 4 * 1024;
+
+/// Join argv into a process-table label truncated at a character boundary to the label limit.
+/// The label is diagnostic only; the argv passed to the program is never truncated.
+pub(crate) fn command_label(argv: &[String]) -> String {
+    let mut label = String::new();
+    'arguments: for (index, argument) in argv.iter().enumerate() {
+        if index > 0 {
+            if label.len() == MAX_COMMAND_BYTES {
+                break;
+            }
+            label.push(' ');
+        }
+        for character in argument.chars() {
+            if label.len().saturating_add(character.len_utf8()) > MAX_COMMAND_BYTES {
+                break 'arguments;
+            }
+            label.push(character);
+        }
+    }
+    label
+}
 
 /// Standard signals modeled by shellsim's process and shell-disposition layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -277,6 +298,13 @@ impl ProcessTable {
             },
         );
         Some(pid)
+    }
+
+    /// Replace the label of a process whose image changed through exec.
+    pub(crate) fn set_command(&mut self, pid: ProcessId, command: String) {
+        if let Some(record) = self.records.get_mut(&pid) {
+            record.command = command;
+        }
     }
 
     /// Update the effective identity retained for one logical process.

@@ -337,8 +337,9 @@ fn persistent_protocol_polls_retained_actions_and_streams_input_output() {
         r#"{"id":13,"op":"drop_action","action_id":1}"#,
         r#"{"id":14,"op":"start_execute","source":"sleep 10"}"#,
         r#"{"id":15,"op":"poll_action","action_id":2,"work_quanta":100}"#,
-        r#"{"id":16,"op":"signal_process","pid":1234,"signal":"BOGUS"}"#,
-        r#"{"id":17,"op":"signal_process","pid":1234,"signal":"INT"}"#,
+        // `sleep` runs as its own child process; signal it, not the waiting session shell.
+        r#"{"id":16,"op":"signal_process","pid":1237,"signal":"BOGUS"}"#,
+        r#"{"id":17,"op":"signal_process","pid":1237,"signal":"INT"}"#,
         r#"{"id":18,"op":"poll_action","action_id":2,"work_quanta":100}"#,
     ]
     .join("\n")

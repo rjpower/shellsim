@@ -628,6 +628,8 @@ impl Environment {
             ("head", crate::vfs::NativeProgram::Head),
             ("xargs", crate::vfs::NativeProgram::Xargs),
             ("env", crate::vfs::NativeProgram::Env),
+            ("sleep", crate::vfs::NativeProgram::Sleep),
+            ("usleep", crate::vfs::NativeProgram::Usleep),
         ] {
             vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
         }
@@ -759,23 +761,7 @@ impl Environment {
             .map(|bytes| self.descriptors.open_input(bytes))
             .transpose()
             .map_err(|error| format!("unable to prepare child input: {error:?}"))?;
-        let mut display = String::new();
-        'arguments: for (index, argument) in spec.argv.iter().enumerate() {
-            if index > 0 {
-                if display.len() == crate::process::MAX_COMMAND_BYTES {
-                    break;
-                }
-                display.push(' ');
-            }
-            for character in argument.chars() {
-                if display.len().saturating_add(character.len_utf8())
-                    > crate::process::MAX_COMMAND_BYTES
-                {
-                    break 'arguments;
-                }
-                display.push(character);
-            }
-        }
+        let display = crate::process::command_label(&spec.argv);
         let pid = match self.start_child(&display, true) {
             Ok(pid) => pid,
             Err(error) => {
@@ -794,6 +780,20 @@ impl Environment {
         self.load_argv_program(pid, spec.argv)
             .expect("new child process must accept an argv continuation");
         Ok(pid)
+    }
+
+    /// Replace process `pid`'s program with an argv image, like `execve` after PATH lookup.
+    /// The PID, descriptors, cwd, and environment are retained; the process-table label
+    /// follows the new image.
+    pub(crate) fn exec_argv_image(
+        &mut self,
+        pid: ProcessId,
+        argv: Vec<String>,
+    ) -> Result<(), String> {
+        let label = crate::process::command_label(&argv);
+        self.load_argv_program(pid, argv)?;
+        self.processes.set_command(pid, label);
+        Ok(())
     }
 
     /// Load an argv child through one image boundary. Migrated native commands execute as
@@ -1585,21 +1585,7 @@ impl Environment {
     /// Write to an active process descriptor, routing file effects only through the VFS.
     pub(crate) fn write_fd(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, String> {
         self.write_fd_checked(fd, bytes)
-            .map_err(|error| match error {
-                crate::syscalls::SyscallError::Descriptor(error) => descriptor_message(error),
-                crate::syscalls::SyscallError::File(error) => error.to_string(),
-                crate::syscalls::SyscallError::Permission => {
-                    "descriptor is not open for writing".to_string()
-                }
-                crate::syscalls::SyscallError::InvalidArgument => {
-                    "file cursor exceeds addressable memory".to_string()
-                }
-                crate::syscalls::SyscallError::IsDirectory => "is a directory".to_string(),
-                crate::syscalls::SyscallError::ResourceExhausted => {
-                    "resource limit exceeded".to_string()
-                }
-                crate::syscalls::SyscallError::Process(error) => error,
-            })
+            .map_err(write_error_message)
     }
 
     /// Typed descriptor write used by native program images and guest syscall adapters.
@@ -2123,6 +2109,23 @@ impl Environment {
             .stop_reason()
             .map(crate::resources::StopReason::exit_status)
             .or(self.exiting)
+    }
+}
+
+/// Shell-facing text for a failed descriptor write.
+pub(crate) fn write_error_message(error: crate::syscalls::SyscallError) -> String {
+    match error {
+        crate::syscalls::SyscallError::Descriptor(error) => descriptor_message(error),
+        crate::syscalls::SyscallError::File(error) => error.to_string(),
+        crate::syscalls::SyscallError::Permission => {
+            "descriptor is not open for writing".to_string()
+        }
+        crate::syscalls::SyscallError::InvalidArgument => {
+            "file cursor exceeds addressable memory".to_string()
+        }
+        crate::syscalls::SyscallError::IsDirectory => "is a directory".to_string(),
+        crate::syscalls::SyscallError::ResourceExhausted => "resource limit exceeded".to_string(),
+        crate::syscalls::SyscallError::Process(error) => error,
     }
 }
 
