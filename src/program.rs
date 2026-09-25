@@ -10,6 +10,8 @@ use crate::interp::Interp;
 use crate::scheduler::WaitReason;
 use crate::syscalls::{ActiveSystem, SyscallError, System};
 
+mod cat;
+
 /// Owned state needed to resume one process after a scheduler turn.
 #[derive(Clone)]
 pub(crate) enum ProgramContinuation {
@@ -62,6 +64,7 @@ pub(crate) enum NativeProcess {
         result: Option<(i32, Vec<u8>)>,
         offset: usize,
     },
+    Cat(cat::CatProcess),
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -103,6 +106,7 @@ impl NativeProcess {
                 result: None,
                 offset: 0,
             },
+            crate::vfs::NativeProgram::Cat => Self::Cat(cat::CatProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Registered(_) => Self::failure(
                 125,
                 "registered program needs a command continuation\n".into(),
@@ -164,6 +168,7 @@ impl NativeProcess {
                 });
                 poll_write(syscalls, 2, diagnostic, offset, *status)
             }
+            Self::Cat(cat) => cat.poll(syscalls),
             Self::Failure {
                 status,
                 message,

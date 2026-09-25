@@ -357,6 +357,29 @@ fn open_file(
         .find(|&candidate| interp.process.fds.get(candidate).is_err())
         .ok_or(SyscallError::Descriptor(DescriptorError::DescriptorLimit))?;
     let absolute = resolve_against(cwd, path);
+    if absolute == "/dev/null" || crate::pseudo_fs::device_kind("/", &absolute).is_some() {
+        if options.create && options.exclusive {
+            return Err(SyscallError::File(VfsError::Exists(absolute)));
+        }
+        let description = match crate::pseudo_fs::device_kind("/", &absolute) {
+            Some(kind) => {
+                interp
+                    .descriptors
+                    .open_device(kind, options.readable, options.writable)?
+            }
+            None => interp.descriptors.open_null()?,
+        };
+        interp.install_new_description(fd, description)?;
+        return Ok(fd);
+    }
+    if let Some(contents) = crate::pseudo_fs::read(interp, "/", &absolute) {
+        if !options.readable || options.writable || options.create || options.truncate {
+            return Err(SyscallError::Permission);
+        }
+        let description = interp.descriptors.open_input(contents?)?;
+        interp.install_new_description(fd, description)?;
+        return Ok(fd);
+    }
     match interp.vfs.metadata("/", &absolute, true) {
         Ok(node) => {
             if matches!(node.kind, NodeKind::Dir) {

@@ -139,7 +139,8 @@ pub(crate) enum CommandResume {
 #[derive(Clone)]
 pub(crate) struct ChildCommand {
     pub argv: Vec<String>,
-    pub stdin: Vec<u8>,
+    /// `None` inherits fd 0; `Some` replaces it even when the byte stream is empty.
+    pub stdin: Option<Vec<u8>>,
     pub cwd: Option<String>,
     pub environment: Option<std::collections::BTreeMap<String, String>>,
 }
@@ -721,21 +722,26 @@ pub(crate) fn start_child_command(
     if command.argv.is_empty() {
         return Err(0);
     }
-    let input = interp
-        .descriptors
-        .open_input(command.stdin)
+    let input = command
+        .stdin
+        .map(|bytes| interp.descriptors.open_input(bytes))
+        .transpose()
         .map_err(|_| 125)?;
     let display = command.argv.join(" ");
     let pid = match interp.start_child(&display, true) {
         Ok(pid) => pid,
         Err(_) => {
-            let _ = interp.descriptors.discard_unreferenced(input);
+            if let Some(input) = input {
+                let _ = interp.descriptors.discard_unreferenced(input);
+            }
             return Err(125);
         }
     };
-    interp
-        .install_process_description(pid, 0, input)
-        .expect("new child process must accept prepared standard input");
+    if let Some(input) = input {
+        interp
+            .install_process_description(pid, 0, input)
+            .expect("new child process must accept prepared standard input");
+    }
     interp
         .configure_process(pid, command.cwd, command.environment)
         .expect("new child process must accept its launch configuration");
@@ -766,7 +772,7 @@ fn dispatch(
             interp,
             vec![ChildCommand {
                 argv: argv.to_vec(),
-                stdin,
+                stdin: (!stdin.is_empty()).then_some(stdin),
                 cwd: None,
                 environment: None,
             }],

@@ -330,7 +330,7 @@ pub(crate) fn try_exec_script(
                 interp,
                 vec![crate::commands::ChildCommand {
                     argv: a,
-                    stdin: stdin.to_vec(),
+                    stdin: Some(stdin.to_vec()),
                     cwd: None,
                     environment: None,
                 }],

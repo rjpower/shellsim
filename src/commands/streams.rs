@@ -433,7 +433,18 @@ pub(crate) fn resume_stream(interp: &mut Interp, continuation: TextStream) -> Co
 }
 
 fn cmd_cat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _long) = split_flags(args);
+    let (flags, ops, long) = split_flags(args);
+    if let Some(option) = long.first() {
+        ewln(
+            io.err,
+            &format!("cat: unimplemented option '--{}'", option.0),
+        );
+        return 2;
+    }
+    if let Some(flag) = flags.iter().find(|flag| **flag != 'n') {
+        ewln(io.err, &format!("cat: unimplemented option '-{flag}'"));
+        return 2;
+    }
     let number = flags.contains(&'n');
     let (data, errors) = read_inputs(interp, &ops, &io.stdin);
     if number {

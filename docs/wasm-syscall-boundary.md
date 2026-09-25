@@ -13,7 +13,7 @@ to the shell's process-scoped syscall interface.
 The current machine already creates a root process with descriptors and a scheduler entry, and
 program continuations belong to logical processes. A child argv loader can retain either a
 shell continuation or a native Rust image. The first images that use the scoped `System` handle
-are `pwd`, `true`, `false`, `yes`, and `mkdir`. All registered Rust commands now have opaque executable
+are `pwd`, `true`, `false`, `yes`, `mkdir`, and `cat`. All registered Rust commands now have opaque executable
 entries in the virtual `/usr/bin`, resolved through the same cwd and
 `PATH` search as Wasm files and scripts when launched as external commands. Bare names that are
 shell builtins still run in the shell process. The native images receive a
@@ -47,6 +47,10 @@ metadata, directory listing, and tree walking; external `mkdir` is a scheduler-o
 image that creates directories through its scoped handle. The shell still invokes `ls` through
 the legacy dispatcher, and WASI stdio buffering, clock, and process imports still need to move
 to this boundary.
+Native `cat` reads stdin, virtual files, and generated devices through process descriptors. It
+suspends on input and pipe readiness and retains only owned continuation state. The argv child
+launcher now distinguishes inherited fd 0 from an explicitly supplied empty input stream;
+retained actions report the child's blocking resource through the shell's child wait.
 
 The new `syscalls.rs` begins this boundary for regular files. It accepts typed open options,
 allocates descriptors in the active process, and owns close and seek. The WASI adapter now uses
@@ -81,8 +85,8 @@ point so both native and Wasm work count against the same budget.
 
 ## Current limits and next gate
 
-Extend `System` with the remaining typed process operations, then move a reader across it and
-load the filesystem-walking utility as a native process image. The legacy command registry still
+Extend `System` with the remaining typed process operations, then load the filesystem-walking
+utility as a native process image. The legacy command registry still
 hands most native bodies a `CommandContext` that dereferences to all of `Interp`; remove that
 access as commands migrate, rather than renaming it and retaining broad authority.
 Finally, give the Rust shell a process-scoped handle for execution, files, and process control;

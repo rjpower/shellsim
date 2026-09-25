@@ -21,13 +21,26 @@ fn run(env: &mut Environment, source: &str) -> (i32, String, String) {
 #[test]
 fn proc_self_describes_the_active_logical_shell() {
     let mut env = Environment::new();
-    let status = run(&mut env, "cat /proc/self/status");
+    let status = run(&mut env, "cat /proc/1234/status");
     assert_eq!(status.0, 0, "{}", status.2);
     assert!(status.1.contains("Name:\tbash\n"), "{}", status.1);
     assert!(status.1.contains("Pid:\t1234\n"), "{}", status.1);
     assert!(status.1.contains("PPid:\t0\n"), "{}", status.1);
     assert!(status.1.contains("NSpgid:\t1234\n"), "{}", status.1);
     assert!(status.1.contains("NSsid:\t1234\n"), "{}", status.1);
+
+    let child_status = run(&mut env, "cat /proc/self/status");
+    assert_eq!(child_status.0, 0, "{}", child_status.2);
+    assert!(
+        child_status.1.contains("PPid:\t1234\n"),
+        "{}",
+        child_status.1
+    );
+    assert!(
+        !child_status.1.lines().any(|line| line == "Pid:\t1234"),
+        "{}",
+        child_status.1
+    );
 
     assert_eq!(run(&mut env, "readlink /proc/self").1, "1234\n");
     assert_eq!(run(&mut env, "readlink /proc/self/cwd").1, "/\n");
@@ -119,6 +132,7 @@ fn native_mkdir_uses_the_child_system_handle() {
         "{}",
         unsupported.2
     );
+    assert!(run(&mut env, "cat --help").2.contains("--help"));
 }
 
 #[test]
@@ -181,7 +195,7 @@ fn registered_native_commands_resolve_only_from_executable_vfs_entries() {
     let node = env.vfs.metadata("/", "/usr/bin/cat", true).unwrap();
     assert!(matches!(
         node.kind,
-        NodeKind::NativeExecutable(NativeProgram::Registered("cat"))
+        NodeKind::NativeExecutable(NativeProgram::Cat)
     ));
     assert_eq!(run(&mut env, "which cat").1, "/usr/bin/cat\n");
     assert_eq!(run(&mut env, "env -i PATH=/missing cat /work/note").0, 127);
@@ -196,6 +210,71 @@ fn registered_native_commands_resolve_only_from_executable_vfs_entries() {
     assert_eq!(run(&mut env, "cat /work/note").0, 127);
     assert_eq!(run(&mut env, "which cat").0, 1);
     assert_eq!(run(&mut env, "/work/reader /work/note").1, "visible");
+}
+
+#[test]
+fn native_cat_streams_files_pipes_and_generated_devices() {
+    let mut env = Environment::new();
+    env.vfs.write("/", "/work/one", b"alpha\n", 0o644).unwrap();
+    env.vfs.write("/", "/work/two", b"beta\n", 0o644).unwrap();
+    assert_eq!(
+        run(&mut env, "cat -n /work/one /work/two"),
+        (0, "     1\talpha\n     2\tbeta\n".into(), String::new())
+    );
+    let missing = run(&mut env, "cat /work/one /work/missing /work/two");
+    assert_eq!(missing.0, 1);
+    assert_eq!(missing.1, "alpha\nbeta\n");
+    assert!(missing.2.contains("/work/missing"), "{}", missing.2);
+    assert_eq!(run(&mut env, "printf 'live\n' | cat").1, "live\n");
+    assert_eq!(run(&mut env, "cat /dev/zero | head -c 8192").1.len(), 8192);
+    assert_eq!(
+        run(&mut env, "cat /dev/null"),
+        (0, String::new(), String::new())
+    );
+    let unsupported = run(&mut env, "cat -z /work/one");
+    assert_eq!(unsupported.0, 2);
+    assert!(
+        unsupported.2.contains("unimplemented option"),
+        "{}",
+        unsupported.2
+    );
+    assert!(env
+        .invocations
+        .events()
+        .iter()
+        .any(|event| { event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == "cat") }));
+}
+
+#[test]
+fn native_cat_stops_at_the_virtual_output_limit() {
+    let mut env = Environment::with_limits(Limits {
+        cpu: 1_000_000,
+        memory: 16 * 1024 * 1024,
+        disk: 16 * 1024 * 1024,
+        output: 128,
+    });
+    env.vfs
+        .write("/", "/work/big", &[b'x'; 4096], 0o644)
+        .unwrap();
+    let (outcome, stdout, _) = env.run_script_capture("cat /work/big");
+    assert_eq!(outcome.exit_status, 137);
+    assert!(stdout.len() <= 128);
+    assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
+
+    let mut diagnostic_env = Environment::with_limits(Limits {
+        cpu: 1_000_000,
+        memory: 16 * 1024 * 1024,
+        disk: 16 * 1024 * 1024,
+        output: 8,
+    });
+    let (outcome, _, stderr) = diagnostic_env.run_script_capture("cat /work/missing");
+    assert_eq!(
+        outcome.exit_status,
+        137,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
 }
 
 #[test]

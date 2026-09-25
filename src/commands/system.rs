@@ -83,7 +83,7 @@ fn start_env(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> C
         interp,
         vec![ChildCommand {
             argv: action.argv,
-            stdin: std::mem::take(&mut io.stdin),
+            stdin: Some(std::mem::take(&mut io.stdin)),
             cwd: action.cwd,
             environment: Some(action.environment),
         }],
