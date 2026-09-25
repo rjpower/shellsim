@@ -19,8 +19,8 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_resumable(m, &["sleep"], Trust::Real, cmd_sleep, start_sleep);
     reg_resumable(m, &["usleep"], Trust::Real, cmd_usleep, start_usleep);
     reg_buffered_resumable(m, &["timeout"], Trust::Partial, cmd_timeout, start_timeout);
-    reg(m, &["date"], Trust::Real, cmd_date);
-    reg(m, &["sync"], Trust::Real, |_, _, _| 0);
+    super::reg_system(m, "/usr/bin/date", Trust::Real, cmd_date);
+    super::reg_system(m, "/usr/bin/sync", Trust::Real, |_, _| 0);
 
     // nested shells / uv-launched verifiers
     reg_resumable(
@@ -65,7 +65,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
         start_python314,
     );
     reg(m, &["pytest"], Trust::Partial, cmd_pytest);
-    reg(m, &["jq"], Trust::Partial, cmd_jq);
+    super::reg_system_poll(m, "/usr/bin/jq", Trust::Partial, cmd_jq);
 }
 
 fn start_sleep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
@@ -349,15 +349,15 @@ fn parse_timeout(args: &[String]) -> Result<TimeoutInvocation, String> {
     })
 }
 
-fn cmd_date(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let unix_ns = match interp.clock.wall_time_ns() {
+fn cmd_date(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let unix_ns = match context.system.wall_time_signed_ns() {
         Ok(value) => value,
         Err(error) => {
             ewln(io.err, &format!("date: {error}"));
             return 1;
         }
     };
-    let rendered = if let Some(fmt) = args.iter().find(|a| a.starts_with('+')) {
+    let rendered = if let Some(fmt) = context.args.iter().find(|a| a.starts_with('+')) {
         format_date(unix_ns, &fmt[1..])
     } else {
         format_date(unix_ns, "%a %b %e %H:%M:%S UTC %Y")
@@ -944,9 +944,20 @@ fn start_python_impl(interp: &mut Interp, name: &str, args: &[String], io: &mut 
     }
 }
 
-fn cmd_jq(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_jq(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> crate::exec::ShellPoll {
+    if crate::jqcmd::reads_standard_input(context.args) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
     let stdin = std::mem::take(&mut io.stdin);
-    crate::jqcmd::jq(interp, args, stdin, io.out, io.err)
+    crate::exec::ShellPoll::Ready(crate::jqcmd::jq(
+        context.system,
+        context.args,
+        stdin,
+        io.out,
+        io.err,
+    ))
 }
 
 #[cfg(test)]

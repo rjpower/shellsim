@@ -8,7 +8,9 @@ use std::collections::HashMap;
 
 use crate::commands::options::{parse_options_or_report, OptionSpec};
 use crate::commands::util::ewln;
-use crate::commands::{reg_costed, CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
+use crate::program::ProcessContext;
 
 mod ast;
 mod eval;
@@ -16,17 +18,18 @@ mod lexer;
 mod parser;
 
 pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
-    reg_costed(
-        commands,
-        &["awk", "gawk", "mawk", "nawk"],
-        Trust::Partial,
-        150,
-        24 * 1024,
-        run,
-    );
+    for name in ["awk", "gawk", "mawk", "nawk"] {
+        let path = match name {
+            "awk" => "/usr/bin/awk",
+            "gawk" => "/usr/bin/gawk",
+            "mawk" => "/usr/bin/mawk",
+            _ => "/usr/bin/nawk",
+        };
+        super::reg_system_poll_costed(commands, path, Trust::Partial, 150, 24 * 1024, run);
+    }
 }
 
-fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     #[derive(Clone, Copy, PartialEq)]
     enum Key {
         FieldSeparator,
@@ -42,7 +45,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     ];
     let parsed = match parse_options_or_report(
         "awk",
-        args,
+        context.args,
         OPTIONS,
         (
             Key::Help,
@@ -52,7 +55,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         io.err,
     ) {
         Ok(parsed) => parsed,
-        Err(status) => return status,
+        Err(status) => return ShellPoll::Ready(status),
     };
 
     let mut field_separator = " ".to_string();
@@ -68,23 +71,27 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                         io.err,
                         &format!("awk: invalid variable assignment '{value}'"),
                     );
-                    return 2;
+                    return ShellPoll::Ready(2);
                 };
                 variables.insert(name.to_string(), value.to_string());
             }
-            Key::ProgramFile => match env.vfs.read(&env.cwd, &value) {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(source) => sources.push(source),
-                    Err(_) => {
-                        ewln(io.err, &format!("awk: {value}: program is not valid UTF-8"));
-                        return 2;
+            Key::ProgramFile => {
+                let cwd = context.system.cwd().to_string();
+                let maximum = usize::try_from(context.system.limits().memory).unwrap_or(usize::MAX);
+                match context.system.read_file_limited(&cwd, &value, maximum) {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(source) => sources.push(source),
+                        Err(_) => {
+                            ewln(io.err, &format!("awk: {value}: program is not valid UTF-8"));
+                            return ShellPoll::Ready(2);
+                        }
+                    },
+                    Err(error) => {
+                        ewln(io.err, &format!("awk: {value}: {error}"));
+                        return ShellPoll::Ready(2);
                     }
-                },
-                Err(error) => {
-                    ewln(io.err, &format!("awk: {value}: {error}"));
-                    return 2;
                 }
-            },
+            }
             Key::Help => unreachable!("help is handled by the shared option parser"),
         }
     }
@@ -93,16 +100,13 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     if sources.is_empty() {
         let Some(source) = operands.next() else {
             ewln(io.err, "awk: missing program");
-            return 2;
+            return ShellPoll::Ready(2);
         };
         sources.push(source);
     }
     let source = sources.join("\n");
-    if !env.charge_cpu(source.len() as u64) {
-        return env
-            .resources
-            .stop_reason()
-            .map_or(137, |reason| reason.exit_status());
+    if !context.system.charge_cpu(source.len() as u64) {
+        return ShellPoll::Ready(context.system.stop_status());
     }
     let program = match parser::parse(&source).and_then(|program| {
         eval::validate(&program)?;
@@ -110,9 +114,9 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     }) {
         Ok(program) => program,
         Err(error) => {
-            env.note_unsupported(&format!("awk:{error}"));
+            context.system.note_unsupported(&format!("awk:{error}"));
             ewln(io.err, &format!("awk: {error}"));
-            return 2;
+            return ShellPoll::Ready(2);
         }
     };
 
@@ -133,7 +137,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             io.err,
             &format!("awk: assignment to '{name}' is not supported"),
         );
-        return 2;
+        return ShellPoll::Ready(2);
     }
 
     let effective_separator = variables
@@ -141,7 +145,13 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         .map_or(field_separator.as_str(), String::as_str);
     if let Err(error) = eval::validate_field_separator(effective_separator) {
         ewln(io.err, &format!("awk: {error}"));
-        return 2;
+        return ShellPoll::Ready(2);
+    }
+
+    if files.is_empty() || files.iter().any(|file| file == "-") {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
     }
 
     let inputs = if files.is_empty() {
@@ -149,7 +159,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             Ok(input) => vec![("-".to_string(), input)],
             Err(_) => {
                 ewln(io.err, "awk: input is not valid UTF-8");
-                return 2;
+                return ShellPoll::Ready(2);
             }
         }
     } else {
@@ -158,11 +168,13 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             let data = if file == "-" {
                 std::mem::take(&mut io.stdin)
             } else {
-                match env.vfs.read(&env.cwd, &file) {
+                let cwd = context.system.cwd().to_string();
+                let maximum = usize::try_from(context.system.limits().memory).unwrap_or(usize::MAX);
+                match context.system.read_file_limited(&cwd, &file, maximum) {
                     Ok(data) => data,
                     Err(error) => {
                         ewln(io.err, &format!("awk: {file}: {error}"));
-                        return 2;
+                        return ShellPoll::Ready(2);
                     }
                 }
             };
@@ -170,7 +182,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                 Ok(text) => text,
                 Err(_) => {
                     ewln(io.err, &format!("awk: {file}: input is not valid UTF-8"));
-                    return 2;
+                    return ShellPoll::Ready(2);
                 }
             };
             inputs.push((file, text));
@@ -183,12 +195,23 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         .map(|(_, input)| input.len() as u64)
         .sum::<u64>();
     let scratch = input_bytes.saturating_mul(2);
-    if !env.reserve_memory(scratch) || !env.charge_cpu(input_bytes) {
-        return 137;
+    if !context.system.reserve_memory(scratch) {
+        return ShellPoll::Ready(context.system.stop_status());
     }
-    let status = eval::execute(&program, env, io, variables, field_separator, inputs);
-    env.resources.release_memory(scratch);
-    status
+    if !context.system.charge_cpu(input_bytes) {
+        context.system.release_memory(scratch);
+        return ShellPoll::Ready(context.system.stop_status());
+    }
+    let status = eval::execute(
+        &program,
+        context.system,
+        io,
+        variables,
+        field_separator,
+        inputs,
+    );
+    context.system.release_memory(scratch);
+    ShellPoll::Ready(status)
 }
 
 fn assignment(value: &str) -> Option<(&str, &str)> {

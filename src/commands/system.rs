@@ -14,7 +14,7 @@ use crate::process::ProcessStatus;
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_buffered_resumable(m, &["env"], Trust::Real, cmd_env, start_env);
     reg_system(m, "/usr/bin/printenv", Trust::Real, run_printenv);
-    reg(m, &["envsubst"], Trust::Partial, cmd_envsubst);
+    super::reg_system_poll(m, "/usr/bin/envsubst", Trust::Partial, cmd_envsubst);
     reg_system(m, "/usr/bin/uname", Trust::Real, run_uname);
     reg_system(m, "/usr/bin/arch", Trust::Real, run_arch);
     reg(m, &["hostname"], Trust::Real, cmd_hostname);
@@ -175,7 +175,17 @@ fn run_printenv(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -
     status
 }
 
-fn cmd_envsubst(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
+fn cmd_envsubst(
+    context: &mut crate::program::ProcessContext<'_>,
+    io: &mut Io,
+) -> crate::exec::ShellPoll {
+    if !context.args.is_empty() {
+        ewln(io.err, "envsubst: unsupported operand");
+        return crate::exec::ShellPoll::Ready(2);
+    }
+    if let Err(poll) = context.read_standard_input(io) {
+        return poll;
+    }
     let source = String::from_utf8_lossy(&io.stdin);
     let chars = source.chars().collect::<Vec<_>>();
     let mut output = String::new();
@@ -202,11 +212,11 @@ fn cmd_envsubst(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) 
         if name.is_empty() {
             output.push('$');
         } else {
-            output.push_str(&interp.get_var(&name).unwrap_or_default());
+            output.push_str(context.environment.get(&name).map_or("", String::as_str));
         }
     }
     io.print(&output);
-    0
+    crate::exec::ShellPoll::Ready(0)
 }
 
 fn run_uname(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {

@@ -26,6 +26,21 @@ fn shell_state_builtins_have_deterministic_process_local_behavior() {
 }
 
 #[test]
+fn envsubst_reads_child_environment_and_large_pipe() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/template", &vec![b'x'; 128 * 1024], 0o644)
+        .unwrap();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "export ITEM=ready; printf '$ITEM ${ITEM}\\n' | envsubst; cat /work/template | envsubst | wc -c",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "ready ready\n131072\n");
+}
+
+#[test]
 fn umask_accepts_zero_with_any_octal_padding() {
     let mut environment = Environment::new();
     let (status, stdout, stderr) = run(&mut environment, "umask 0; umask; umask 000; umask");

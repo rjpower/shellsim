@@ -107,6 +107,8 @@ pub(crate) trait System {
         strict: bool,
     ) -> Result<String, SyscallError>;
     fn wall_time_ms(&self) -> u64;
+    /// Signed realtime for userland calendar tools; WASI clocks retain their unsigned ABI.
+    fn wall_time_signed_ns(&self) -> Result<i128, SyscallError>;
     fn clock_time_ns(&self, clock: ClockId) -> Result<u64, SyscallError>;
     fn random_fill(&mut self, bytes: &mut [u8]) -> Result<(), SyscallError>;
     fn allocate_temp_id(&mut self) -> Option<u64>;
@@ -404,6 +406,13 @@ impl System for ActiveSystem<'_> {
 
     fn wall_time_ms(&self) -> u64 {
         self.interp.clock.unix_ms()
+    }
+
+    fn wall_time_signed_ns(&self) -> Result<i128, SyscallError> {
+        self.interp
+            .clock
+            .wall_time_ns()
+            .map_err(|_| SyscallError::InvalidArgument)
     }
 
     fn clock_time_ns(&self, clock: ClockId) -> Result<u64, SyscallError> {

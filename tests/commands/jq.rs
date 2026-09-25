@@ -45,6 +45,33 @@ fn tasktrove_selection_construction_and_sorting_compose() {
 }
 
 #[test]
+fn jq_reads_large_pipe_and_uses_child_working_directory() {
+    let mut environment = Environment::new();
+    let payload = format!("{{\"value\":\"{}\"}}", "x".repeat(128 * 1024));
+    environment
+        .vfs
+        .write("/", "/work/input.json", payload.as_bytes(), 0o644)
+        .unwrap();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "cat /work/input.json | jq -r '.value' | wc -c",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"131073\n");
+
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "env -C /work jq -r '.value | length' input.json",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"131072\n");
+
+    let (status, stdout, stderr) = run(&mut environment, "yes | jq -n '1'");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"1\n");
+}
+
+#[test]
 fn variables_slurp_conditionals_and_summary_filters_compose() {
     let mut environment = Environment::new();
     environment

@@ -37,6 +37,34 @@ fn supports_basic_control_flow_arrays_and_functions() {
 }
 
 #[test]
+fn awk_reads_pipe_to_eof_and_resolves_child_files() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/long", &vec![b'a'; 128 * 1024], 0o644)
+        .unwrap();
+    let (outcome, stdout, stderr) =
+        environment.run_script_capture("cat /work/long | awk '{ print length($0) }'");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"131072\n");
+
+    let (outcome, stdout, stderr) =
+        environment.run_script_capture("env -C /work awk '{ print length($0) }' long");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"131072\n");
+}
+
+#[test]
 fn validates_the_whole_program_before_execution() {
     for (source, expected) in [
         (

@@ -18,3 +18,22 @@ fn yes_streams_until_downstream_closes_the_pipe() {
     assert_eq!(status, 0, "{stderr}");
     assert_eq!(stdout, b"ready\nready\nready\n");
 }
+
+#[test]
+fn tac_and_tail_read_pipes_to_eof_and_resolve_child_files() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/long", &vec![b'a'; 128 * 1024], 0o644)
+        .unwrap();
+    let (status, stdout, stderr) = run(&mut environment, "cat /work/long | tail -c 3");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"aaa");
+
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "env -C /work tail -c 3 long; printf 'one\ntwo\n' | tac",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"aaatwo\none\n");
+}

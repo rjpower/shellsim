@@ -647,6 +647,10 @@ mod tests {
             unreachable!("native writer does not inspect time")
         }
 
+        fn wall_time_signed_ns(&self) -> Result<i128, SyscallError> {
+            unreachable!("native writer does not inspect time")
+        }
+
         fn clock_time_ns(&self, _clock: crate::syscalls::ClockId) -> Result<u64, SyscallError> {
             unreachable!("native writer does not inspect time")
         }

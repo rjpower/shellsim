@@ -4,7 +4,8 @@ use std::collections::HashMap;
 
 use super::ast::{AssignOp, BinaryOp, Expr, LValue, Pattern, Program, Stmt, UnaryOp};
 use crate::commands::util::ewln;
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::System;
 
 const SUPPORTED_FUNCTIONS: &[&str] = &[
     "length", "substr", "index", "split", "sub", "gsub", "match", "tolower", "toupper", "int",
@@ -202,7 +203,7 @@ fn validate_expr(expression: &Expr) -> Result<(), String> {
 /// Execute an already parsed program over validated UTF-8 input files.
 pub(super) fn execute(
     program: &Program,
-    env: &mut CommandContext<'_>,
+    system: &mut dyn System,
     io: &mut Io,
     variables: HashMap<String, String>,
     fs: String,
@@ -225,7 +226,7 @@ pub(super) fn execute(
         }
     }
     let mut runtime = Runtime {
-        env,
+        system,
         io,
         state,
         literal_regexes: HashMap::new(),
@@ -267,14 +268,14 @@ pub(super) fn execute(
     }
 }
 
-struct Runtime<'a, 'env, 'io> {
-    env: &'a mut CommandContext<'env>,
+struct Runtime<'a, 'io> {
+    system: &'a mut dyn System,
     io: &'a mut Io<'io>,
     state: State,
     literal_regexes: HashMap<String, regex::Regex>,
 }
 
-impl Runtime<'_, '_, '_> {
+impl Runtime<'_, '_> {
     fn phase(&mut self, program: &Program, phase: Phase) -> Flow {
         for rule in &program.rules {
             let selected = match (&rule.pattern, phase) {
@@ -308,7 +309,7 @@ impl Runtime<'_, '_, '_> {
     }
 
     fn statement(&mut self, statement: &Stmt) -> Flow {
-        if !self.env.charge_cpu(1) {
+        if !self.system.charge_cpu(1) {
             return Flow::Exhausted;
         }
         match statement {
@@ -433,10 +434,9 @@ impl Runtime<'_, '_, '_> {
                     }
                 }
                 let limit = usize::try_from(
-                    self.env
-                        .resources
+                    self.system
                         .output_remaining()
-                        .min(self.env.resources.limits().memory),
+                        .min(self.system.limits().memory),
                 )
                 .unwrap_or(usize::MAX);
                 match format_printf(&evaluated[0].text, &evaluated[1..], limit) {
@@ -446,11 +446,8 @@ impl Runtime<'_, '_, '_> {
                     }
                     Err(FormatError::Invalid(error)) => Flow::Error(error),
                     Err(FormatError::Limit) => {
-                        let remaining = self.env.resources.output_remaining();
-                        let _ = self
-                            .env
-                            .resources
-                            .charge_output(remaining.saturating_add(1));
+                        let remaining = self.system.output_remaining();
+                        let _ = self.system.charge_output(remaining.saturating_add(1));
                         Flow::Exhausted
                     }
                 }
@@ -460,7 +457,7 @@ impl Runtime<'_, '_, '_> {
     }
 
     fn expr(&mut self, expression: &Expr) -> Result<Scalar, Flow> {
-        if !self.env.charge_cpu(1) {
+        if !self.system.charge_cpu(1) {
             return Err(Flow::Exhausted);
         }
         match expression {
@@ -468,7 +465,7 @@ impl Runtime<'_, '_, '_> {
             Expr::Number(value) => Ok(Scalar::number(*value)),
             Expr::Regex(pattern) => {
                 if !self.literal_regexes.contains_key(pattern) {
-                    if !self.env.charge_cpu(pattern.len() as u64) {
+                    if !self.system.charge_cpu(pattern.len() as u64) {
                         return Err(Flow::Exhausted);
                     }
                     let regex = regex::Regex::new(pattern).map_err(|error| {
@@ -638,17 +635,17 @@ impl Runtime<'_, '_, '_> {
 
     fn concatenate(&mut self, left: &str, right: &str) -> Result<Scalar, Flow> {
         let bytes = (left.len() as u64).saturating_add(right.len() as u64);
-        if !self.env.reserve_memory(bytes) {
+        if !self.system.reserve_memory(bytes) {
             return Err(Flow::Exhausted);
         }
-        if !self.env.charge_cpu(bytes) {
-            self.env.resources.release_memory(bytes);
+        if !self.system.charge_cpu(bytes) {
+            self.system.release_memory(bytes);
             return Err(Flow::Exhausted);
         }
         let mut output = String::with_capacity(bytes as usize);
         output.push_str(left);
         output.push_str(right);
-        self.env.resources.release_memory(bytes);
+        self.system.release_memory(bytes);
         Ok(Scalar::string(output))
     }
 
@@ -708,21 +705,20 @@ impl Runtime<'_, '_, '_> {
                 for argument in args {
                     values.push(self.expr(argument)?);
                 }
-                let limit =
-                    usize::try_from(self.env.resources.limits().memory).unwrap_or(usize::MAX);
+                let limit = usize::try_from(self.system.limits().memory).unwrap_or(usize::MAX);
                 match format_printf(&values[0].text, &values[1..], limit) {
                     Ok(output) => {
                         let bytes = output.len() as u64;
-                        if !self.env.reserve_memory(bytes) {
+                        if !self.system.reserve_memory(bytes) {
                             return Err(Flow::Exhausted);
                         }
-                        self.env.resources.release_memory(bytes);
+                        self.system.release_memory(bytes);
                         Ok(Scalar::string(output))
                     }
                     Err(FormatError::Invalid(error)) => Err(Flow::Error(error)),
                     Err(FormatError::Limit) => {
-                        let request = self.env.resources.limits().memory.saturating_add(1);
-                        let _ = self.env.reserve_memory(request);
+                        let request = self.system.limits().memory.saturating_add(1);
+                        let _ = self.system.reserve_memory(request);
                         Err(Flow::Exhausted)
                     }
                 }
@@ -923,11 +919,11 @@ impl Runtime<'_, '_, '_> {
                         ((index - 1) as u64).saturating_mul(self.state.ofs.len() as u64),
                     );
                     let scratch = vector_bytes.saturating_add(joined_bytes);
-                    if !self.env.reserve_memory(scratch) {
+                    if !self.system.reserve_memory(scratch) {
                         return Err(Flow::Exhausted);
                     }
-                    if !self.env.charge_cpu(scratch) {
-                        self.env.resources.release_memory(scratch);
+                    if !self.system.charge_cpu(scratch) {
+                        self.system.release_memory(scratch);
                         return Err(Flow::Exhausted);
                     }
                     if self.state.fields.len() < index {
@@ -935,7 +931,7 @@ impl Runtime<'_, '_, '_> {
                     }
                     self.state.fields[index - 1] = value.text;
                     self.state.record = self.state.fields.join(&self.state.ofs);
-                    self.env.resources.release_memory(scratch);
+                    self.system.release_memory(scratch);
                 }
             }
             LValue::Array { name, indices } => {
@@ -968,7 +964,7 @@ impl Runtime<'_, '_, '_> {
     fn finish_unexpected(&mut self, flow: Flow, context: &str) -> i32 {
         match flow {
             Flow::Error(error) => {
-                self.env.note_unsupported(&format!("awk:{error}"));
+                self.system.note_unsupported(&format!("awk:{error}"));
                 ewln(self.io.err, &format!("awk: {error}"));
                 2
             }

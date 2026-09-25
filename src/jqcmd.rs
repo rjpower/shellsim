@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::commands::options::{parse_options_or_report, OptionSpec};
-use crate::interp::Interp;
+use crate::syscalls::System;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -37,15 +37,40 @@ const OPTIONS: &[OptionSpec<Key>] = &[
     OptionSpec::flag(Key::Help, None, Some("help")),
 ];
 
+/// Decide descriptor use with the same option grammar as execution, before polling fd 0.
+pub(crate) fn reads_standard_input(args: &[String]) -> bool {
+    let Ok((args, _)) = extract_variables(args) else {
+        return false;
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let Ok(parsed) =
+        parse_options_or_report("jq", &args, OPTIONS, (Key::Help, ""), &mut out, &mut err)
+    else {
+        return false;
+    };
+    !parsed
+        .options
+        .iter()
+        .any(|option| option.key == Key::NullInput)
+        && parsed.operands.len() <= 1
+}
+
 /// Run the bounded jq interpreter over stdin or VFS files.
-pub fn jq(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err: Out) -> i32 {
-    let memory_mark = interp.resources.memory_mark();
-    let status = jq_inner(interp, args, stdin, out, err);
-    interp.resources.restore_memory(memory_mark);
+pub(crate) fn jq(
+    system: &mut dyn System,
+    args: &[String],
+    stdin: Vec<u8>,
+    out: Out,
+    err: Out,
+) -> i32 {
+    let memory_mark = system.memory_used();
+    let status = jq_inner(system, args, stdin, out, err);
+    system.release_memory(system.memory_used().saturating_sub(memory_mark));
     status
 }
 
-fn jq_inner(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err: Out) -> i32 {
+fn jq_inner(system: &mut dyn System, args: &[String], stdin: Vec<u8>, out: Out, err: Out) -> i32 {
     let (args, variables) = match extract_variables(args) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -96,13 +121,13 @@ fn jq_inner(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err:
 
     let mut operands = parsed.operands.into_iter();
     let filter = operands.next().unwrap_or_else(|| ".".to_string());
-    if !interp.resources.charge_cpu(filter.len() as u64) {
-        return 137;
+    if !system.charge_cpu(filter.len() as u64) {
+        return system.stop_status();
     }
     let expression = match Parser::parse(&filter) {
         Ok(expression) => expression,
         Err(error) => {
-            interp.note_unsupported(&format!("jq:{error}"));
+            system.note_unsupported(&format!("jq:{error}"));
             ewln(err, &format!("jq: unsupported filter: {error}"));
             return 3;
         }
@@ -120,7 +145,9 @@ fn jq_inner(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err:
             }
         } else {
             for file in files {
-                let bytes = match interp.vfs.read(&interp.cwd, &file) {
+                let cwd = system.cwd().to_string();
+                let maximum = usize::try_from(system.limits().memory).unwrap_or(usize::MAX);
+                let bytes = match system.read_file_limited(&cwd, &file, maximum) {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         ewln(err, &format!("jq: error: {error}"));
@@ -141,7 +168,7 @@ fn jq_inner(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err:
     };
 
     let mut evaluator = Evaluator {
-        interp,
+        system,
         variables,
         depth: 0,
     };
@@ -154,7 +181,7 @@ fn jq_inner(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err:
                 return 5;
             }
             Err(EvalError::Unsupported(error)) => {
-                evaluator.interp.note_unsupported(&format!("jq:{error}"));
+                evaluator.system.note_unsupported(&format!("jq:{error}"));
                 ewln(err, &format!("jq: unsupported filter: {error}"));
                 return 3;
             }
@@ -164,7 +191,7 @@ fn jq_inner(interp: &mut Interp, args: &[String], stdin: Vec<u8>, out: Out, err:
 
     for value in &results {
         if !emit(
-            evaluator.interp,
+            evaluator.system,
             value,
             raw,
             if compact { 0 } else { indent },
@@ -227,15 +254,15 @@ fn parse_values(bytes: &[u8], values: &mut Vec<Value>) -> Result<(), serde_json:
     Ok(())
 }
 
-fn emit(interp: &mut Interp, value: &Value, raw: bool, indent: usize, out: Out) -> bool {
+fn emit(system: &mut dyn System, value: &Value, raw: bool, indent: usize, out: Out) -> bool {
     let bound = render_bound(value, indent as u64, 0).saturating_add(1);
-    if bound > interp.resources.output_remaining()
-        || !interp.resources.reserve_memory(bound)
-        || !interp.resources.charge_cpu(bound)
+    if bound > system.output_remaining()
+        || !system.reserve_memory(bound)
+        || !system.charge_cpu(bound)
     {
-        if bound > interp.resources.output_remaining() {
-            let request = interp.resources.output_remaining().saturating_add(1);
-            let _ = interp.resources.charge_output(request);
+        if bound > system.output_remaining() {
+            let request = system.output_remaining().saturating_add(1);
+            let _ = system.charge_output(request);
         }
         return false;
     }
@@ -875,7 +902,7 @@ enum EvalError {
 }
 
 struct Evaluator<'a> {
-    interp: &'a mut Interp,
+    system: &'a mut dyn System,
     variables: HashMap<String, Value>,
     depth: usize,
 }
@@ -883,7 +910,7 @@ struct Evaluator<'a> {
 impl Evaluator<'_> {
     fn push(&mut self, output: &mut Vec<Value>, value: Value) -> Result<(), EvalError> {
         let bytes = render_bound(&value, 0, 0).saturating_add(32);
-        if !self.interp.resources.charge_cpu(1) || !self.interp.resources.reserve_memory(bytes) {
+        if !self.system.charge_cpu(1) || !self.system.reserve_memory(bytes) {
             return Err(EvalError::Exhausted);
         }
         output.push(value);
@@ -916,7 +943,7 @@ impl Evaluator<'_> {
     }
 
     fn eval_inner(&mut self, expression: &Expr, input: &Value) -> Result<Vec<Value>, EvalError> {
-        if !self.interp.resources.charge_cpu(1) {
+        if !self.system.charge_cpu(1) {
             return Err(EvalError::Exhausted);
         }
         match expression {
@@ -1056,9 +1083,7 @@ impl Evaluator<'_> {
                     object.insert(name.clone(), value.clone());
                     let value = Value::Object(object);
                     let bytes = render_bound(&value, 0, 0).saturating_add(32);
-                    if !self.interp.resources.charge_cpu(1)
-                        || !self.interp.resources.reserve_memory(bytes)
-                    {
+                    if !self.system.charge_cpu(1) || !self.system.reserve_memory(bytes) {
                         return Err(EvalError::Exhausted);
                     }
                     let Value::Object(object) = value else {
