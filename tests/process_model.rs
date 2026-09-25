@@ -369,6 +369,52 @@ fn remaining_filesystem_tools_run_as_registered_native_children() {
 }
 
 #[test]
+fn stateless_commands_read_child_process_state_through_system() {
+    let mut env = Environment::new();
+    assert_eq!(
+        run(&mut env, "/usr/bin/echo -n hello"),
+        (0, "hello".into(), "".into())
+    );
+    assert_eq!(
+        run(&mut env, "env -i ANSWER=42 printenv ANSWER"),
+        (0, "42\n".into(), "".into())
+    );
+    assert_eq!(run(&mut env, "whoami"), (0, "root\n".into(), "".into()));
+    assert_eq!(run(&mut env, "id -u"), (0, "0\n".into(), "".into()));
+    assert_eq!(run(&mut env, "groups"), (0, "root\n".into(), "".into()));
+    assert_eq!(run(&mut env, "uname -s"), (0, "Linux\n".into(), "".into()));
+    assert_eq!(run(&mut env, "arch"), (0, "x86_64\n".into(), "".into()));
+    assert_eq!(run(&mut env, "nproc"), (0, "1\n".into(), "".into()));
+    assert_eq!(
+        run(&mut env, "getconf PAGESIZE"),
+        (0, "4096\n".into(), "".into())
+    );
+    assert_eq!(run(&mut env, "cd /work; df .").0, 0);
+    assert_eq!(run(&mut env, "free -b").0, 0);
+    assert_eq!(run(&mut env, "arch extra").0, 2);
+    for command in [
+        "/usr/bin/echo",
+        "printenv",
+        "whoami",
+        "id",
+        "groups",
+        "uname",
+        "arch",
+        "nproc",
+        "getconf",
+        "df",
+        "free",
+    ] {
+        assert!(
+            env.invocations.events().iter().any(|event| {
+                event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == command)
+            }),
+            "{command} did not run in a child process"
+        );
+    }
+}
+
+#[test]
 fn native_images_are_opaque_vfs_executables_found_through_path() {
     let mut env = Environment::new();
     let node = env.vfs.metadata("/", "/usr/bin/pwd", true).unwrap();

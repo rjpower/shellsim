@@ -5,25 +5,27 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::commands::util::{ewln, wln};
 use crate::commands::{
-    reg, reg_buffered_resumable, ChildCommand, CommandContext, CommandPoll, CommandSpec, Io, Trust,
+    reg, reg_buffered_resumable, reg_system, ChildCommand, CommandContext, CommandPoll,
+    CommandSpec, Io, Trust,
 };
 use crate::interp::Interp;
 use crate::process::ProcessStatus;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_buffered_resumable(m, &["env"], Trust::Real, cmd_env, start_env);
-    reg(m, &["printenv"], Trust::Real, cmd_printenv);
+    reg_system(m, "/usr/bin/printenv", Trust::Real, run_printenv);
     reg(m, &["envsubst"], Trust::Partial, cmd_envsubst);
-    reg(m, &["uname"], Trust::Real, cmd_uname);
-    reg(m, &["arch"], Trust::Real, cmd_arch);
+    reg_system(m, "/usr/bin/uname", Trust::Real, run_uname);
+    reg_system(m, "/usr/bin/arch", Trust::Real, run_arch);
     reg(m, &["hostname"], Trust::Real, cmd_hostname);
-    reg(m, &["whoami", "logname"], Trust::Real, cmd_whoami);
-    reg(m, &["id"], Trust::Real, cmd_id);
-    reg(m, &["groups"], Trust::Real, cmd_groups);
-    reg(m, &["nproc"], Trust::Real, cmd_nproc);
-    reg(m, &["getconf"], Trust::Partial, cmd_getconf);
-    reg(m, &["df"], Trust::Real, cmd_df);
-    reg(m, &["free"], Trust::Real, cmd_free);
+    reg_system(m, "/usr/bin/whoami", Trust::Real, run_whoami);
+    reg_system(m, "/usr/bin/logname", Trust::Real, run_whoami);
+    reg_system(m, "/usr/bin/id", Trust::Real, run_id);
+    reg_system(m, "/usr/bin/groups", Trust::Real, run_groups);
+    reg_system(m, "/usr/bin/nproc", Trust::Real, run_nproc);
+    reg_system(m, "/usr/bin/getconf", Trust::Partial, run_getconf);
+    reg_system(m, "/usr/bin/df", Trust::Real, run_df);
+    reg_system(m, "/usr/bin/free", Trust::Real, run_free);
     reg(m, &["ps"], Trust::Partial, cmd_ps);
     reg(m, &["pgrep"], Trust::Partial, cmd_pgrep);
     reg(m, &["lsof"], Trust::Partial, cmd_lsof);
@@ -153,12 +155,11 @@ fn parse_env_action(interp: &Interp, args: &[String]) -> Result<EnvAction, Strin
     })
 }
 
-fn cmd_printenv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let env = interp.child_env();
+fn run_printenv(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let env = context.environment;
     if args.is_empty() {
-        let mut entries = env.into_iter().collect::<Vec<_>>();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, value) in entries {
+        for (name, value) in env {
             wln(io.out, &format!("{name}={value}"));
         }
         return 0;
@@ -208,7 +209,8 @@ fn cmd_envsubst(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) 
     0
 }
 
-fn cmd_uname(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_uname(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     let mut flags = Vec::new();
     for argument in args {
         if argument == "--all" {
@@ -256,7 +258,8 @@ fn cmd_uname(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     0
 }
 
-fn cmd_arch(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_arch(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     if !args.is_empty() {
         ewln(io.err, "arch: unimplemented option or operand");
         return 2;
@@ -284,16 +287,25 @@ fn cmd_hostname(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
     0
 }
 
-fn cmd_whoami(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_whoami(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     if !args.is_empty() {
         ewln(io.err, "whoami: unimplemented option or operand");
         return 2;
     }
-    wln(io.out, if interp.uid == 0 { "root" } else { "user" });
+    wln(
+        io.out,
+        if context.system.uid() == 0 {
+            "root"
+        } else {
+            "user"
+        },
+    );
     0
 }
 
-fn cmd_id(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_id(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     let mut user = false;
     let mut group = false;
     let mut name_output = false;
@@ -322,12 +334,13 @@ fn cmd_id(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         ewln(io.err, "id: option '-n' requires '-u' or '-g'");
         return 1;
     }
-    let name = if interp.uid == 0 { "root" } else { "user" };
+    let uid = context.system.uid();
+    let name = if uid == 0 { "root" } else { "user" };
     if user || group {
         let value = if name_output {
             name.to_string()
         } else {
-            interp.uid.to_string()
+            uid.to_string()
         };
         wln(io.out, &value);
     } else {
@@ -335,23 +348,32 @@ fn cmd_id(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
             io.out,
             &format!(
                 "uid={}({name}) gid={}({name}) groups={}({name})",
-                interp.uid, interp.uid, interp.uid
+                uid, uid, uid
             ),
         );
     }
     0
 }
 
-fn cmd_groups(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_groups(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     if !args.is_empty() {
         ewln(io.err, "groups: unimplemented user operand");
         return 2;
     }
-    wln(io.out, if interp.uid == 0 { "root" } else { "user" });
+    wln(
+        io.out,
+        if context.system.uid() == 0 {
+            "root"
+        } else {
+            "user"
+        },
+    );
     0
 }
 
-fn cmd_nproc(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_nproc(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     if !args.is_empty() {
         ewln(io.err, "nproc: unimplemented option");
         return 2;
@@ -360,7 +382,8 @@ fn cmd_nproc(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     0
 }
 
-fn cmd_getconf(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_getconf(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     let Some(name) = args.first() else { return 1 };
     let value = match name.as_str() {
         "_NPROCESSORS_ONLN" | "NPROCESSORS_ONLN" => "1",
@@ -377,7 +400,9 @@ fn cmd_getconf(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
     0
 }
 
-fn cmd_df(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_df(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     if args
         .iter()
         .any(|arg| arg.starts_with('-') && arg != "-h" && arg != "-k" && arg != "-P")
@@ -386,14 +411,15 @@ fn cmd_df(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         return 2;
     }
     let human = args.iter().any(|arg| arg.contains('h'));
+    let cwd = system.cwd().to_string();
     for path in args.iter().filter(|argument| !argument.starts_with('-')) {
-        if interp.fs_metadata(&interp.cwd, path, true).is_err() {
+        if system.metadata(&cwd, path, true).is_err() {
             ewln(io.err, &format!("df: {path}: No such file or directory"));
             return 1;
         }
     }
-    let limit = interp.resources.limits().disk;
-    let used = interp.vfs.disk_used();
+    let limit = system.limits().disk;
+    let used = system.disk_used();
     let available = limit.saturating_sub(used);
     wln(io.out, "Filesystem      Size  Used Avail Use% Mounted on");
     let percent = used.saturating_mul(100).checked_div(limit).unwrap_or(100);
@@ -421,15 +447,17 @@ fn cmd_df(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     0
 }
 
-fn cmd_free(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run_free(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     if args.iter().any(|arg| arg != "-b") {
         ewln(io.err, "free: unimplemented option or operand");
         return 2;
     }
     let bytes = args.iter().any(|arg| arg == "-b");
     let divisor = if bytes { 1 } else { 1024 };
-    let limit = interp.resources.limits().memory;
-    let used = interp.resources.memory_mark();
+    let limit = system.limits().memory;
+    let used = system.memory_used();
     wln(
         io.out,
         "              total        used        free      shared  buff/cache   available",
