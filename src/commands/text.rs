@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 
-use crate::commands::util::{ewln, lines_of, read_inputs, read_inputs_system, split_flags, w, wln};
+use crate::commands::util::{
+    ewln, lines_of, read_inputs, read_inputs_system, split_flags, uses_standard_input, w, wln,
+};
 use crate::commands::{CommandContext, CommandPoll, CommandSpec, Io, Trust};
 use crate::exec::ShellPoll;
 use crate::interp::Interp;
@@ -38,13 +40,6 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_unsupported(m, &["factor"]);
 }
 
-fn reads_file_or_stdin(operands: &[&String]) -> bool {
-    operands.is_empty()
-        || operands
-            .iter()
-            .any(|operand| matches!(operand.as_str(), "-" | "/dev/stdin"))
-}
-
 fn cmd_wc(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     let args = context.args;
     let (flags, ops, _l) = split_flags(args);
@@ -55,7 +50,7 @@ fn cmd_wc(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         ewln(io.err, "wc: unimplemented option");
         return ShellPoll::Ready(2);
     }
-    if reads_file_or_stdin(&ops) {
+    if uses_standard_input(&ops) {
         if let Err(poll) = context.read_standard_input(io) {
             return poll;
         }
@@ -201,7 +196,7 @@ fn cmd_uniq(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         ewln(io.err, "uniq: unimplemented output-file operand");
         return ShellPoll::Ready(2);
     }
-    if reads_file_or_stdin(&operands) {
+    if uses_standard_input(&operands) {
         if let Err(poll) = context.read_standard_input(io) {
             return poll;
         }
@@ -285,7 +280,7 @@ fn cmd_cut(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
             files.push(a);
         }
     }
-    if reads_file_or_stdin(&files) {
+    if uses_standard_input(&files) {
         if let Err(poll) = context.read_standard_input(io) {
             return poll;
         }
@@ -437,7 +432,7 @@ fn expand_tr_set(s: &str) -> Vec<char> {
 fn cmd_rev(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     let args = context.args;
     let (_f, ops, _l) = split_flags(args);
-    if reads_file_or_stdin(&ops) {
+    if uses_standard_input(&ops) {
         if let Err(poll) = context.read_standard_input(io) {
             return poll;
         }
@@ -469,7 +464,7 @@ fn cmd_rev(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
 fn cmd_nl(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     let args = context.args;
     let (_f, ops, _l) = split_flags(args);
-    if reads_file_or_stdin(&ops) {
+    if uses_standard_input(&ops) {
         if let Err(poll) = context.read_standard_input(io) {
             return poll;
         }

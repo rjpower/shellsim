@@ -1,55 +1,22 @@
 //! Line wrapping, tab expansion, and column-formatting commands.
 //!
-//! These transforms use buffered input so their output is deterministic and bounded by the
-//! interpreter's resource accounting.
+//! These transforms read process descriptors in bounded quanta and keep their input across
+//! scheduler turns when a pipe is temporarily empty.
 
 use std::collections::HashMap;
 
-use crate::commands::util::{ewln, read_inputs, w};
-use crate::commands::{CommandContext, CommandPoll, CommandSpec, Io, Trust};
+use crate::commands::util::{ewln, read_inputs_system, uses_standard_input, w};
+use crate::commands::{CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
+use crate::program::ProcessContext;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg_buffered_resumable;
-    reg_buffered_resumable(m, &["fold"], Trust::Real, cmd_fold, start_buffered_format);
-    reg_buffered_resumable(m, &["fmt"], Trust::Partial, cmd_fmt, start_buffered_format);
-    reg_buffered_resumable(
-        m,
-        &["expand"],
-        Trust::Real,
-        cmd_expand,
-        start_buffered_format,
-    );
-    reg_buffered_resumable(
-        m,
-        &["unexpand"],
-        Trust::Real,
-        cmd_unexpand,
-        start_buffered_format,
-    );
-    reg_buffered_resumable(
-        m,
-        &["column"],
-        Trust::Partial,
-        cmd_column,
-        start_buffered_format,
-    );
-}
-
-fn start_buffered_format(
-    interp: &mut CommandContext<'_>,
-    args: &[String],
-    io: &mut Io,
-) -> CommandPoll {
-    let command = interp.command_name().to_string();
-    let status = match command.as_str() {
-        "fold" => cmd_fold(interp, args, io),
-        "fmt" => cmd_fmt(interp, args, io),
-        "expand" => cmd_expand(interp, args, io),
-        "unexpand" => cmd_unexpand(interp, args, io),
-        "column" => cmd_column(interp, args, io),
-        _ => unreachable!("registered buffered formatting command"),
-    };
-    CommandPoll::Ready(status)
+    use super::reg_system_poll;
+    reg_system_poll(m, "/usr/bin/fold", Trust::Real, cmd_fold);
+    reg_system_poll(m, "/usr/bin/fmt", Trust::Partial, cmd_fmt);
+    reg_system_poll(m, "/usr/bin/expand", Trust::Real, cmd_expand);
+    reg_system_poll(m, "/usr/bin/unexpand", Trust::Real, cmd_unexpand);
+    reg_system_poll(m, "/usr/bin/column", Trust::Partial, cmd_column);
 }
 
 fn parse_width<'a>(
@@ -87,18 +54,24 @@ fn parse_width<'a>(
     Ok((width, files))
 }
 
-fn cmd_fold(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_fold(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let (width, files) = match parse_width("fold", args, 80) {
         Ok(value) => value,
         Err(error) => {
             ewln(io.err, &error);
-            return 1;
+            return ShellPoll::Ready(1);
         }
     };
-    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if uses_standard_input(&files) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &files, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("fold: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     for line in String::from_utf8_lossy(&data).split_inclusive('\n') {
         let (line, terminated) = line
@@ -117,21 +90,27 @@ fn cmd_fold(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             io.out.pop();
         }
     }
-    0
+    ShellPoll::Ready(0)
 }
 
-fn cmd_fmt(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_fmt(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let (width, files) = match parse_width("fmt", args, 75) {
         Ok(value) => value,
         Err(error) => {
             ewln(io.err, &error);
-            return 1;
+            return ShellPoll::Ready(1);
         }
     };
-    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if uses_standard_input(&files) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &files, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("fmt: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     let text = String::from_utf8_lossy(&data);
     let paragraphs = text.split("\n\n").collect::<Vec<_>>();
@@ -156,7 +135,7 @@ fn cmd_fmt(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             io.out.push(b'\n');
         }
     }
-    0
+    ShellPoll::Ready(0)
 }
 
 fn parse_tab_stop<'a>(
@@ -197,18 +176,24 @@ fn parse_tab_stop<'a>(
     Ok((stop, all, files))
 }
 
-fn cmd_expand(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_expand(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let (stop, _, files) = match parse_tab_stop("expand", args) {
         Ok(v) => v,
         Err(e) => {
             ewln(io.err, &e);
-            return 1;
+            return ShellPoll::Ready(1);
         }
     };
-    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if uses_standard_input(&files) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &files, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("expand: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     let mut column = 0usize;
     for character in String::from_utf8_lossy(&data).chars() {
@@ -228,21 +213,27 @@ fn cmd_expand(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
             }
         }
     }
-    0
+    ShellPoll::Ready(0)
 }
 
-fn cmd_unexpand(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_unexpand(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let (stop, all, files) = match parse_tab_stop("unexpand", args) {
         Ok(v) => v,
         Err(e) => {
             ewln(io.err, &e);
-            return 1;
+            return ShellPoll::Ready(1);
         }
     };
-    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if uses_standard_input(&files) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &files, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("unexpand: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     for line in String::from_utf8_lossy(&data).split_inclusive('\n') {
         let mut column = 0usize;
@@ -271,10 +262,11 @@ fn cmd_unexpand(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
         }
         io.out.extend(std::iter::repeat_n(b' ', spaces));
     }
-    0
+    ShellPoll::Ready(0)
 }
 
-fn cmd_column(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_column(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let mut separator = None;
     let mut table = false;
     let mut files = Vec::new();
@@ -287,25 +279,30 @@ fn cmd_column(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
                 separator = args.get(index).and_then(|v| v.chars().next());
                 if separator.is_none() {
                     ewln(io.err, "column: missing separator");
-                    return 1;
+                    return ShellPoll::Ready(1);
                 }
             }
             value if value.starts_with('-') && value != "-" => {
                 ewln(io.err, &format!("column: unsupported option '{value}'"));
-                return 1;
+                return ShellPoll::Ready(1);
             }
             _ => files.push(&args[index]),
         }
         index += 1;
     }
-    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if uses_standard_input(&files) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &files, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("column: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     if !table {
         io.out.extend_from_slice(&data);
-        return 0;
+        return ShellPoll::Ready(0);
     }
     let rows = String::from_utf8_lossy(&data)
         .lines()
@@ -338,5 +335,5 @@ fn cmd_column(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
         }
         io.out.push(b'\n');
     }
-    0
+    ShellPoll::Ready(0)
 }
