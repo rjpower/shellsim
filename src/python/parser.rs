@@ -1511,6 +1511,7 @@ impl Parser {
             TokenKind::Integer(value) => ExpressionKind::Constant(Constant::Integer(value)),
             TokenKind::BigInteger(value) => ExpressionKind::Constant(Constant::BigInteger(value)),
             TokenKind::Float(value) => ExpressionKind::Constant(Constant::Float(value)),
+            TokenKind::Imaginary(value) => ExpressionKind::Constant(Constant::Imaginary(value)),
             TokenKind::None => ExpressionKind::Constant(Constant::None),
             TokenKind::True => ExpressionKind::Constant(Constant::Bool(true)),
             TokenKind::False => ExpressionKind::Constant(Constant::Bool(false)),

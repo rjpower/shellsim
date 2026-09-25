@@ -635,6 +635,51 @@ impl Vm<'_> {
                 }
                 Ok(CallResult::Value(self.allocate_string(text)?))
             }
+            Builtin::Exec => {
+                expect_arity(&arguments, 1, 1)?;
+                let source =
+                    protocol::string_value(&self.state.heap, &arguments[0])?.ok_or_else(|| {
+                        self.record_native_error(PyError::type_error(
+                            "exec() argument must be a string",
+                        ))
+                    })?;
+                if self.bytecode_frames.len() >= 256 {
+                    return Err("maximum exec depth exceeded".into());
+                }
+                let parse_memory = source
+                    .len()
+                    .checked_mul(4)
+                    .ok_or("exec source is too large")?;
+                self.charge_cpu(u64::try_from(source.len()).unwrap_or(u64::MAX))?;
+                self.reserve_result(parse_memory)?;
+                let tokens = super::super::lexer::lex(&source).map_err(|error| {
+                    format!(
+                        "{} at line {}, column {}",
+                        error.message, error.span.line, error.span.column
+                    )
+                })?;
+                let program = super::super::parser::parse(tokens).map_err(|error| {
+                    format!(
+                        "{} at line {}, column {}",
+                        error.message, error.span.line, error.span.column
+                    )
+                })?;
+                let code = super::super::compiler::compile(program);
+                match self.execute_code(&code) {
+                    Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
+                    Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
+                    Ok(
+                        Execution::Pending
+                        | Execution::Blocked(_)
+                        | Execution::Return(_)
+                        | Execution::Yield(_, _),
+                    ) => Err("exec source did not finish normally".into()),
+                    Err((error, span)) => Err(format!(
+                        "{error} in exec source at line {}, column {}",
+                        span.line, span.column
+                    )),
+                }
+            }
             Builtin::Exit => {
                 expect_arity(&arguments, 0, 1)?;
                 let status = arguments

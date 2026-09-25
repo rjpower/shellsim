@@ -1496,6 +1496,7 @@ fn literal_source(expression: &ast::Expression) -> Result<String, String> {
         ast::ExpressionKind::Constant(ast::Constant::Integer(value)) => Ok(value.to_string()),
         ast::ExpressionKind::Constant(ast::Constant::BigInteger(value)) => Ok(value.clone()),
         ast::ExpressionKind::Constant(ast::Constant::Float(value)) => Ok(value.to_string()),
+        ast::ExpressionKind::Constant(ast::Constant::Imaginary(value)) => Ok(format!("{value}j")),
         ast::ExpressionKind::Constant(ast::Constant::String(value)) => Ok(format!("{value:?}")),
         ast::ExpressionKind::List(values) => Ok(format!(
             "[{}]",

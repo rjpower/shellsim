@@ -117,6 +117,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
         FunctionDef {
             module: "math",
+            name: "log2",
+            call: native_log2,
+        },
+        FunctionDef {
+            module: "math",
             name: "pow",
             call: native_pow,
         },
@@ -349,6 +354,10 @@ fn native_log10(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "log10")
 }
 
+fn native_log2(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "log2")
+}
+
 fn native_pow(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "pow")
 }
@@ -495,6 +504,7 @@ pub fn call(name: &str, args: &[f64]) -> MathResult {
             }),
         },
         "log10" => unary("log10", args, log10),
+        "log2" => unary("log2", args, log2),
         "pow" => binary("pow", args, pow),
         "radians" => unary("radians", args, |value| {
             Ok(MathValue::Float(value.to_radians()))
@@ -590,6 +600,14 @@ pub fn log10(value: f64) -> MathResult {
         return Err(MathError::ValueError("math domain error"));
     }
     Ok(MathValue::Float(value.log10()))
+}
+
+/// Return the base-two logarithm of a positive value.
+pub fn log2(value: f64) -> MathResult {
+    if value <= 0.0 {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    Ok(MathValue::Float(value.log2()))
 }
 
 /// Return `left**right` with Python's real-number domain and overflow errors.
@@ -702,6 +720,16 @@ mod tests {
     #[test]
     fn dispatcher_checks_names_and_arities() {
         assert_eq!(call("sqrt", &[16.0]), Ok(MathValue::Float(4.0)));
+        assert_eq!(call("log2", &[8.0]), Ok(MathValue::Float(3.0)));
+        assert_eq!(call("log10", &[100.0]), Ok(MathValue::Float(2.0)));
+        assert_eq!(
+            call("log2", &[]),
+            Err(MathError::Arity {
+                function: "log2",
+                expected: "exactly 1",
+                actual: 0
+            })
+        );
         assert_eq!(
             call("sqrt", &[]),
             Err(MathError::Arity {
@@ -718,6 +746,19 @@ mod tests {
 
     #[test]
     fn domain_and_overflow_errors_are_explicit() {
+        for name in ["log2", "log10"] {
+            for value in [0.0, -0.0, -1.0] {
+                assert_eq!(
+                    call(name, &[value]),
+                    Err(MathError::ValueError("math domain error"))
+                );
+            }
+            assert_eq!(
+                call(name, &[f64::INFINITY]),
+                Ok(MathValue::Float(f64::INFINITY))
+            );
+            assert!(float(call(name, &[f64::NAN]).unwrap()).is_nan());
+        }
         assert_eq!(
             sqrt(-1.0),
             Err(MathError::ValueError("expected a nonnegative input"))

@@ -9,6 +9,8 @@ pub enum TokenKind {
     BigInteger(String),
     /// A decimal floating-point literal validated by the lexer and stored as an f64.
     Float(f64),
+    /// The imaginary component of a decimal `j` literal.
+    Imaginary(f64),
     String(String),
     Bytes(Vec<u8>),
     FString {
