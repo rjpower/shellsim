@@ -160,6 +160,14 @@ pub fn read_inputs(interp: &Interp, files: &[&String], stdin: &[u8]) -> (Vec<u8>
     (data, errors)
 }
 
+/// Whether positional input operands select fd 0 rather than only named files.
+pub(crate) fn uses_standard_input(files: &[&String]) -> bool {
+    files.is_empty()
+        || files
+            .iter()
+            .any(|file| matches!(file.as_str(), "-" | "/dev/stdin"))
+}
+
 /// Gather bounded operand data through the active process's virtual filesystem.
 pub(crate) fn read_inputs_system(
     system: &mut dyn crate::syscalls::System,
