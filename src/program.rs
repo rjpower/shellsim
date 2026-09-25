@@ -507,6 +507,20 @@ mod tests {
             unreachable!("native writer does not open files")
         }
 
+        fn open_file_at(
+            &mut self,
+            _fd: i32,
+            _base: &str,
+            _path: &str,
+            _options: crate::syscalls::OpenFile,
+        ) -> Result<(), SyscallError> {
+            unreachable!("native writer does not open files")
+        }
+
+        fn duplicate(&mut self, _source: i32, _destination: i32) -> Result<(), SyscallError> {
+            unreachable!("native writer does not duplicate descriptors")
+        }
+
         fn file_state(&self, _fd: i32) -> Result<crate::descriptors::FileState, SyscallError> {
             unreachable!("native writer does not inspect files")
         }

@@ -3,6 +3,7 @@
 use crate::expand::{expand_word, expand_words};
 use crate::interp::Interp;
 use crate::shell::{Node, RedirOp, Redirect};
+use crate::syscalls::{ActiveSystem, OpenFile, System};
 use crate::{descriptors::IoPoll, vfs::resolve_against};
 
 /// Execute a node with finite input and capture its terminal output.
@@ -2992,67 +2993,16 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
             RedirOp::Read => {
                 let path = redirect_path(interp, &redirect.target)?;
                 if let Some(source) = device_fd(&path) {
-                    interp
-                        .process
-                        .fds
-                        .duplicate(source, redirect.fd, &mut interp.descriptors)
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                } else if let Some(kind) = crate::pseudo_fs::device_kind("/", &path) {
-                    let description = interp
-                        .descriptors
-                        .open_device(kind, true, false)
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                    interp
-                        .install_new_description(redirect.fd, description)
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                } else if path == "/dev/null" {
-                    let description = interp
-                        .descriptors
-                        .open_null()
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                    interp
-                        .install_new_description(redirect.fd, description)
-                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    ActiveSystem::new(interp)
+                        .duplicate(source, redirect.fd)
+                        .map_err(|error| format!("{path}: {error}"))?;
                 } else {
-                    interp
-                        .fs_metadata("/", &path, true)
-                        .map_err(|error| error.to_string())?;
-                    let description = interp
-                        .descriptors
-                        .open_file(path.clone(), 0, true, false, false)
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                    interp
-                        .install_new_description(redirect.fd, description)
-                        .map_err(|error| format!("{path}: {error:?}"))?;
+                    open_redirect_file(interp, redirect.fd, &path, &redirect.op)?;
                 }
             }
             RedirOp::ReadWrite => {
                 let path = redirect_path(interp, &redirect.target)?;
-                if path == "/dev/null" {
-                    let description = interp
-                        .descriptors
-                        .open_null()
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                    interp
-                        .install_new_description(redirect.fd, description)
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                    continue;
-                }
-                let created_by_open = !interp.vfs.lexists("/", &path);
-                if created_by_open {
-                    interp.sync_vfs_time();
-                    interp
-                        .vfs
-                        .write("/", &path, &[], 0o666 & !u32::from(interp.umask))
-                        .map_err(|error| error.to_string())?;
-                }
-                let description = interp
-                    .descriptors
-                    .open_file(path.clone(), 0, true, true, created_by_open)
-                    .map_err(|error| format!("{path}: {error:?}"))?;
-                interp
-                    .install_new_description(redirect.fd, description)
-                    .map_err(|error| format!("{path}: {error:?}"))?;
+                open_redirect_file(interp, redirect.fd, &path, &redirect.op)?;
             }
             RedirOp::Heredoc | RedirOp::HeredocRaw | RedirOp::HereString => {
                 let mut bytes = match redirect.op {
@@ -3084,58 +3034,12 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
             RedirOp::Write | RedirOp::Append => {
                 let path = redirect_path(interp, &redirect.target)?;
                 if let Some(source) = device_fd(&path) {
-                    interp
-                        .process
-                        .fds
-                        .duplicate(source, redirect.fd, &mut interp.descriptors)
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                    continue;
-                }
-                if path == "/dev/null" {
-                    let description = interp
-                        .descriptors
-                        .open_null()
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                    interp
-                        .install_new_description(redirect.fd, description)
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                    continue;
-                }
-                if let Some(kind) = crate::pseudo_fs::device_kind("/", &path) {
-                    let description = interp
-                        .descriptors
-                        .open_device(kind, false, true)
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                    interp
-                        .install_new_description(redirect.fd, description)
-                        .map_err(|error| format!("{path}: {error:?}"))?;
-                    continue;
-                }
-                let created_by_open = !interp.vfs.lexists("/", &path);
-                interp.sync_vfs_time();
-                let cursor = if redirect.op == RedirOp::Append {
-                    interp
-                        .vfs
-                        .append("/", &path, &[], 0o666 & !u32::from(interp.umask))
-                        .map_err(|error| error.to_string())?;
-                    interp
-                        .vfs
-                        .file_len("/", &path)
-                        .map_err(|error| error.to_string())? as u64
+                    ActiveSystem::new(interp)
+                        .duplicate(source, redirect.fd)
+                        .map_err(|error| format!("{path}: {error}"))?;
                 } else {
-                    interp
-                        .vfs
-                        .write("/", &path, &[], 0o666 & !u32::from(interp.umask))
-                        .map_err(|error| error.to_string())?;
-                    0
-                };
-                let description = interp
-                    .descriptors
-                    .open_file(path.clone(), cursor, false, true, created_by_open)
-                    .map_err(|error| format!("{path}: {error:?}"))?;
-                interp
-                    .install_new_description(redirect.fd, description)
-                    .map_err(|error| format!("{path}: {error:?}"))?;
+                    open_redirect_file(interp, redirect.fd, &path, &redirect.op)?;
+                }
             }
             RedirOp::DupOut => {
                 let source = redirect
@@ -3143,23 +3047,48 @@ fn apply_redirects(interp: &mut Interp, redirects: &[Redirect]) -> Result<(), St
                     .trim_start_matches('&')
                     .parse::<i32>()
                     .map_err(|_| format!("bad file descriptor: {}", redirect.target))?;
-                interp
-                    .process
-                    .fds
-                    .duplicate(source, redirect.fd, &mut interp.descriptors)
-                    .map_err(|error| format!("{}: {error:?}", redirect.target))?;
+                ActiveSystem::new(interp)
+                    .duplicate(source, redirect.fd)
+                    .map_err(|error| format!("{}: {error}", redirect.target))?;
             }
             RedirOp::Close => {
-                interp
-                    .process
-                    .fds
-                    .close(redirect.fd, &mut interp.descriptors)
-                    .map_err(|error| format!("{}: {error:?}", redirect.fd))?;
+                ActiveSystem::new(interp)
+                    .close(redirect.fd)
+                    .map_err(|error| format!("{}: {error}", redirect.fd))?;
             }
         }
-        interp.refresh_descriptor_snapshot(interp.process.pid);
     }
     Ok(())
+}
+
+fn open_redirect_file(
+    interp: &mut Interp,
+    fd: i32,
+    path: &str,
+    op: &RedirOp,
+) -> Result<(), String> {
+    let (readable, writable, create, truncate, append) = match op {
+        RedirOp::Read => (true, false, false, false, false),
+        RedirOp::ReadWrite => (true, true, true, false, false),
+        RedirOp::Write => (false, true, true, true, false),
+        RedirOp::Append => (false, true, true, false, true),
+        _ => unreachable!("only file-opening redirects reach this helper"),
+    };
+    ActiveSystem::new(interp)
+        .open_file_at(
+            fd,
+            "/",
+            path,
+            OpenFile {
+                readable,
+                writable,
+                create,
+                exclusive: false,
+                truncate,
+                append,
+            },
+        )
+        .map_err(|error| format!("{path}: {error}"))
 }
 
 fn redirect_path(interp: &mut Interp, word: &str) -> Result<String, String> {

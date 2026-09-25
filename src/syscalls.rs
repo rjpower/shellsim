@@ -57,6 +57,16 @@ pub(crate) trait System {
     fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError>;
     fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError>;
     fn open_file(&mut self, base: &str, path: &str, options: OpenFile) -> Result<Fd, SyscallError>;
+    /// Open a virtual file onto a chosen process descriptor, replacing its prior target.
+    fn open_file_at(
+        &mut self,
+        fd: Fd,
+        base: &str,
+        path: &str,
+        options: OpenFile,
+    ) -> Result<(), SyscallError>;
+    /// Duplicate a process descriptor, sharing its open description and cursor.
+    fn duplicate(&mut self, source: Fd, destination: Fd) -> Result<(), SyscallError>;
     fn file_state(&self, fd: Fd) -> Result<FileState, SyscallError>;
     fn close(&mut self, fd: Fd) -> Result<(), SyscallError>;
     fn seek(&mut self, fd: Fd, delta: i64, whence: u32) -> Result<u64, SyscallError>;
@@ -241,6 +251,26 @@ impl System for ActiveSystem<'_> {
 
     fn open_file(&mut self, base: &str, path: &str, options: OpenFile) -> Result<Fd, SyscallError> {
         open_file(self.interp, base, path, options)
+    }
+
+    fn open_file_at(
+        &mut self,
+        fd: Fd,
+        base: &str,
+        path: &str,
+        options: OpenFile,
+    ) -> Result<(), SyscallError> {
+        open_file_at(self.interp, fd, base, path, options)
+    }
+
+    fn duplicate(&mut self, source: Fd, destination: Fd) -> Result<(), SyscallError> {
+        self.interp
+            .process
+            .fds
+            .duplicate(source, destination, &mut self.interp.descriptors)?;
+        self.interp
+            .refresh_descriptor_snapshot(self.interp.process.pid);
+        Ok(())
     }
 
     fn file_state(&self, fd: Fd) -> Result<FileState, SyscallError> {
@@ -573,6 +603,26 @@ fn open_file(
     let fd = (5..MAX_FDS_PER_PROCESS as Fd + 5)
         .find(|&candidate| interp.process.fds.get(candidate).is_err())
         .ok_or(SyscallError::Descriptor(DescriptorError::DescriptorLimit))?;
+    open_file_at(interp, fd, cwd, path, options)?;
+    Ok(fd)
+}
+
+fn open_file_at(
+    interp: &mut Interp,
+    fd: Fd,
+    cwd: &str,
+    path: &str,
+    options: OpenFile,
+) -> Result<(), SyscallError> {
+    if fd < 0 || path.is_empty() || path.contains('\0') || (!options.readable && !options.writable)
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    if interp.process.fds.get(fd).is_err()
+        && interp.process.fds.iter().count() >= MAX_FDS_PER_PROCESS
+    {
+        return Err(SyscallError::Descriptor(DescriptorError::DescriptorLimit));
+    }
     let absolute = resolve_against(cwd, path);
     if absolute == "/dev/null" || crate::pseudo_fs::device_kind("/", &absolute).is_some() {
         if options.create && options.exclusive {
@@ -587,7 +637,7 @@ fn open_file(
             None => interp.descriptors.open_null()?,
         };
         interp.install_new_description(fd, description)?;
-        return Ok(fd);
+        return Ok(());
     }
     if let Some(contents) = crate::pseudo_fs::read(interp, "/", &absolute) {
         if !options.readable || options.writable || options.create || options.truncate {
@@ -595,9 +645,9 @@ fn open_file(
         }
         let description = interp.descriptors.open_input(contents?)?;
         interp.install_new_description(fd, description)?;
-        return Ok(fd);
+        return Ok(());
     }
-    match interp.vfs.metadata("/", &absolute, true) {
+    let created_by_open = match interp.vfs.metadata("/", &absolute, true) {
         Ok(node) => {
             if matches!(node.kind, NodeKind::Dir) {
                 return Err(SyscallError::IsDirectory);
@@ -612,13 +662,20 @@ fn open_file(
                 interp.sync_vfs_time();
                 interp.vfs.write("/", &absolute, &[], 0o666)?;
             }
+            false
         }
         Err(VfsError::NotFound(_)) if options.create && options.writable => {
             interp.sync_vfs_time();
-            interp.vfs.write("/", &absolute, &[], 0o666)?;
+            interp.vfs.write(
+                "/",
+                &absolute,
+                &[],
+                0o666 & !u32::from(interp.process.umask),
+            )?;
+            true
         }
         Err(error) => return Err(error.into()),
-    }
+    };
     let backing_path = interp.vfs.realpath(&absolute, true)?;
     let cursor = if options.append {
         interp.vfs.file_len("/", &backing_path)? as u64
@@ -630,10 +687,10 @@ fn open_file(
         cursor,
         options.readable,
         options.writable,
-        false,
+        created_by_open,
     )?;
     interp.install_new_description(fd, description)?;
-    Ok(fd)
+    Ok(())
 }
 
 /// Change virtual permission bits for a path owned by the active process.
@@ -773,6 +830,73 @@ mod tests {
         assert_eq!(system.read(fd, 3).unwrap(), IoPoll::Ready(b"sam".to_vec()));
         assert_eq!(system.read(fd, 3).unwrap(), IoPoll::Ready(b"ple".to_vec()));
         assert_eq!(system.read(fd, 3).unwrap(), IoPoll::Ready(Vec::new()));
+    }
+
+    #[test]
+    fn chosen_descriptors_share_cursors_and_file_creation_obeys_umask() {
+        let mut interp = Interp::new();
+        interp.vfs.write("/work", "source", b"abc", 0o644).unwrap();
+        let mut system = ActiveSystem::new(&mut interp);
+        system
+            .open_file_at(
+                8,
+                "/work",
+                "source",
+                OpenFile {
+                    readable: true,
+                    writable: false,
+                    create: false,
+                    exclusive: false,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .unwrap();
+        system.duplicate(8, 9).unwrap();
+        assert_eq!(system.read(9, 1).unwrap(), IoPoll::Ready(b"a".to_vec()));
+        assert_eq!(system.read(8, 1).unwrap(), IoPoll::Ready(b"b".to_vec()));
+        system.set_umask(0o077).unwrap();
+        system
+            .open_file_at(
+                9,
+                "/work",
+                "private",
+                OpenFile {
+                    readable: false,
+                    writable: true,
+                    create: true,
+                    exclusive: false,
+                    truncate: true,
+                    append: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(system.write(9, b"x").unwrap(), IoPoll::Ready(1));
+        assert_eq!(system.read(8, 1).unwrap(), IoPoll::Ready(b"c".to_vec()));
+        assert_eq!(
+            system.metadata("/work", "private", true).unwrap().mode & 0o777,
+            0o600
+        );
+        assert!(matches!(
+            system.duplicate(42, 9),
+            Err(SyscallError::Descriptor(DescriptorError::InvalidFd))
+        ));
+        assert!(matches!(
+            system.open_file_at(
+                -1,
+                "/work",
+                "invalid",
+                OpenFile {
+                    readable: true,
+                    writable: false,
+                    create: false,
+                    exclusive: false,
+                    truncate: false,
+                    append: false,
+                },
+            ),
+            Err(SyscallError::InvalidArgument)
+        ));
     }
 
     #[test]
