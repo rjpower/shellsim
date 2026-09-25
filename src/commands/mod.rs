@@ -41,7 +41,7 @@ mod regex_compat;
 mod rgcmd;
 mod sed;
 mod sort;
-mod streams;
+pub(crate) mod streams;
 mod system;
 mod tarcmd;
 mod text;

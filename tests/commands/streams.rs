@@ -59,3 +59,27 @@ fn tee_appends_and_resolves_child_paths() {
     assert_eq!(status, 0, "{stderr}");
     assert_eq!(stdout, b"firstsecondfirstsecond");
 }
+
+#[test]
+fn head_stops_infinite_input_and_reads_child_files() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(&mut environment, "yes ready | head -n 3");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"ready\nready\nready\n");
+
+    environment
+        .vfs
+        .write("/", "/work/long", &vec![b'a'; 128 * 1024], 0o644)
+        .unwrap();
+    let (status, stdout, stderr) = run(&mut environment, "env -C /work head -c 3 long");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"aaa");
+
+    environment
+        .vfs
+        .write("/", "/work/short", b"one\ntwo\n", 0o644)
+        .unwrap();
+    let (status, stdout, stderr) = run(&mut environment, "env -C /work head -n 1 short short");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"==> short <==\none\n\n==> short <==\none\n");
+}

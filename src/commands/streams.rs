@@ -59,13 +59,13 @@ pub(crate) struct YesStream {
 }
 
 #[derive(Clone)]
-struct HeadOptions {
-    lines: usize,
-    bytes: Option<usize>,
-    files: Vec<String>,
+pub(crate) struct HeadOptions {
+    pub(crate) lines: usize,
+    pub(crate) bytes: Option<usize>,
+    pub(crate) files: Vec<String>,
 }
 
-fn parse_head_options(args: &[String]) -> Result<HeadOptions, String> {
+pub(crate) fn parse_head_options(args: &[String]) -> Result<HeadOptions, String> {
     let mut lines = 10usize;
     let mut bytes = None;
     let mut files = Vec::new();
