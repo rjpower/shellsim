@@ -11,7 +11,7 @@ use flate2::read::MultiGzDecoder;
 use flate2::{Compression, GzBuilder};
 
 use crate::commands::util::ewln;
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandSpec, Io, Trust};
 use crate::exec::ShellPoll;
 use crate::program::ProcessContext;
 use crate::syscalls::{FileKind, System};
@@ -232,16 +232,13 @@ fn transform(
 }
 
 /// Compress a tar byte stream with shellsim's deterministic gzip envelope.
-pub(super) fn gzip_bytes(interp: &mut CommandContext<'_>, input: &[u8]) -> Result<Vec<u8>, String> {
-    transform(&mut interp.system(), Operation::Compress, 6, input)
+pub(super) fn gzip_bytes(system: &mut dyn System, input: &[u8]) -> Result<Vec<u8>, String> {
+    transform(system, Operation::Compress, 6, input)
 }
 
 /// Decompress a bounded gzip byte stream for another modeled archive command.
-pub(super) fn gunzip_bytes(
-    interp: &mut CommandContext<'_>,
-    input: &[u8],
-) -> Result<Vec<u8>, String> {
-    transform(&mut interp.system(), Operation::Decompress, 6, input)
+pub(super) fn gunzip_bytes(system: &mut dyn System, input: &[u8]) -> Result<Vec<u8>, String> {
+    transform(system, Operation::Decompress, 6, input)
 }
 
 fn output_name(path: &str, operation: Operation) -> Result<String, String> {

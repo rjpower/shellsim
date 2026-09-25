@@ -7,16 +7,18 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::commands::util::{ewln, wln};
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
-use crate::vfs::{parent_of, resolve_against, NodeKind};
+use crate::commands::{CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
+use crate::program::ProcessContext;
+use crate::syscalls::{FileChange, FileKind, System};
+use crate::vfs::{parent_of, resolve_against};
 
 const BLOCK: usize = 512;
 const MAX_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4_096;
 
 pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
-    reg(commands, &["tar"], Trust::Partial, cmd_tar);
+    super::reg_system_poll(commands, "/usr/bin/tar", Trust::Partial, cmd_tar);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,41 +50,58 @@ enum EntryKind {
     Directory,
 }
 
-fn cmd_tar(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let options = match parse_options(args) {
+fn cmd_tar(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let options = match parse_options(context.args) {
         Ok(options) => options,
         Err(message) => {
             ewln(io.err, &format!("tar: {message}"));
-            return 2;
+            return ShellPoll::Ready(2);
         }
     };
+    if options.mode != Mode::Create && matches!(options.archive.as_deref(), None | Some("-")) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let mark = context.system.memory_used();
+    let status = run_ready(context.system, &options, io);
+    context
+        .system
+        .release_memory(context.system.memory_used().saturating_sub(mark));
+    ShellPoll::Ready(status)
+}
+
+fn run_ready(system: &mut dyn System, options: &Options, io: &mut Io) -> i32 {
     let base = options.directory.as_deref().map_or_else(
-        || interp.cwd.clone(),
-        |path| resolve_against(&interp.cwd, path),
+        || system.cwd().to_string(),
+        |path| resolve_against(system.cwd(), path),
     );
-    if !interp.vfs.is_dir("/", &base) {
+    if !matches!(
+        system.metadata("/", &base, true).map(|info| info.kind),
+        Ok(FileKind::Directory)
+    ) {
         ewln(io.err, &format!("tar: {base}: not a directory"));
         return 2;
     }
     match options.mode {
-        Mode::Create => create(interp, &options, &base, io),
-        Mode::List | Mode::Extract => read_archive(interp, &options, &base, io),
+        Mode::Create => create(system, options, &base, io),
+        Mode::List | Mode::Extract => read_archive(system, options, &base, io),
     }
 }
 
-fn create(interp: &mut CommandContext<'_>, options: &Options, base: &str, io: &mut Io) -> i32 {
+fn create(system: &mut dyn System, options: &Options, base: &str, io: &mut Io) -> i32 {
     if options.files.is_empty() {
         ewln(io.err, "tar: refusing to create an empty archive");
         return 2;
     }
-    let entries = match collect_entries(interp, base, &options.files) {
+    let entries = match collect_entries(system, base, &options.files) {
         Ok(entries) => entries,
         Err(message) => {
             ewln(io.err, &format!("tar: {message}"));
             return 2;
         }
     };
-    let mut archive = match encode(interp, &entries) {
+    let mut archive = match encode(system, &entries) {
         Ok(archive) => archive,
         Err(message) => {
             ewln(io.err, &format!("tar: {message}"));
@@ -90,7 +109,7 @@ fn create(interp: &mut CommandContext<'_>, options: &Options, base: &str, io: &m
         }
     };
     if options.gzip {
-        archive = match super::archives::gzip_bytes(interp, &archive) {
+        archive = match super::archives::gzip_bytes(system, &archive) {
             Ok(archive) => archive,
             Err(message) => {
                 ewln(io.err, &format!("tar: {message}"));
@@ -106,8 +125,8 @@ fn create(interp: &mut CommandContext<'_>, options: &Options, base: &str, io: &m
     match options.archive.as_deref() {
         None | Some("-") => io.out.extend_from_slice(&archive),
         Some(path) => {
-            let cwd = interp.cwd.clone();
-            if let Err(error) = interp.vfs.write(&cwd, path, &archive, 0o644) {
+            let cwd = system.cwd().to_string();
+            if let Err(error) = system.write_file(&cwd, path, &archive, 0o644) {
                 ewln(io.err, &format!("tar: {path}: {error}"));
                 return 2;
             }
@@ -117,26 +136,29 @@ fn create(interp: &mut CommandContext<'_>, options: &Options, base: &str, io: &m
 }
 
 fn collect_entries(
-    interp: &mut CommandContext<'_>,
+    system: &mut dyn System,
     base: &str,
     operands: &[String],
 ) -> Result<Vec<Entry>, String> {
     let mut paths = BTreeSet::new();
     for operand in operands {
         let absolute = resolve_against(base, operand);
-        let metadata = interp
-            .vfs
+        let metadata = system
             .metadata("/", &absolute, false)
             .map_err(|error| format!("{operand}: {error}"))?;
         match metadata.kind {
-            NodeKind::Dir => paths.extend(interp.vfs.walk(&absolute)),
-            NodeKind::File(_) => {
+            FileKind::Directory => paths.extend(
+                system
+                    .walk("/", &absolute)
+                    .map_err(|error| error.to_string())?,
+            ),
+            FileKind::File if !metadata.native_executable => {
                 paths.insert(absolute);
             }
-            NodeKind::Symlink(_) => {
+            FileKind::Symlink => {
                 return Err(format!("{operand}: symbolic links are not supported"));
             }
-            NodeKind::NativeExecutable(_) => {
+            FileKind::File => {
                 return Err(format!("{operand}: native executables cannot be archived"));
             }
         }
@@ -146,18 +168,21 @@ fn collect_entries(
     }
     let mut entries = Vec::with_capacity(paths.len());
     for path in paths {
-        let metadata = interp
-            .vfs
+        let metadata = system
             .metadata("/", &path, false)
             .map_err(|error| error.to_string())?;
         let name = archive_name(base, &path)?;
         let kind = match metadata.kind {
-            NodeKind::Dir => EntryKind::Directory,
-            NodeKind::File(data) => EntryKind::File(data),
-            NodeKind::Symlink(_) => {
+            FileKind::Directory => EntryKind::Directory,
+            FileKind::File if !metadata.native_executable => EntryKind::File(
+                system
+                    .read_file_limited("/", &path, MAX_ARCHIVE_BYTES)
+                    .map_err(|error| error.to_string())?,
+            ),
+            FileKind::Symlink => {
                 return Err(format!("{path}: symbolic links are not supported"));
             }
-            NodeKind::NativeExecutable(_) => {
+            FileKind::File => {
                 return Err(format!("{path}: native executables cannot be archived"));
             }
         };
@@ -182,7 +207,7 @@ fn archive_name(base: &str, path: &str) -> Result<String, String> {
     Ok(relative.to_string())
 }
 
-fn encode(interp: &mut CommandContext<'_>, entries: &[Entry]) -> Result<Vec<u8>, String> {
+fn encode(system: &mut dyn System, entries: &[Entry]) -> Result<Vec<u8>, String> {
     let estimated = entries.iter().try_fold(BLOCK * 2, |total, entry| {
         let data = match &entry.kind {
             EntryKind::File(data) => data.len(),
@@ -194,10 +219,10 @@ fn encode(interp: &mut CommandContext<'_>, entries: &[Entry]) -> Result<Vec<u8>,
     if estimated > MAX_ARCHIVE_BYTES {
         return Err("archive exceeds the 16 MiB limit".to_string());
     }
-    if !interp.reserve_memory(estimated as u64) {
+    if !system.reserve_memory(estimated as u64) {
         return Err("memory limit exceeded".to_string());
     }
-    if !interp.charge_cpu(estimated as u64) {
+    if !system.charge_cpu(estimated as u64) {
         return Err("resource limit exceeded".to_string());
     }
     let mut output = Vec::with_capacity(estimated);
@@ -239,18 +264,11 @@ fn header(entry: &Entry, size: usize) -> Result<[u8; BLOCK], String> {
     Ok(header)
 }
 
-fn read_archive(
-    interp: &mut CommandContext<'_>,
-    options: &Options,
-    base: &str,
-    io: &mut Io,
-) -> i32 {
+fn read_archive(system: &mut dyn System, options: &Options, base: &str, io: &mut Io) -> i32 {
+    let cwd = system.cwd().to_string();
     let mut archive = match options.archive.as_deref() {
         None | Some("-") => io.stdin.clone(),
-        Some(path) => match interp
-            .vfs
-            .read_limited(&interp.cwd, path, MAX_ARCHIVE_BYTES)
-        {
+        Some(path) => match system.read_file_limited(&cwd, path, MAX_ARCHIVE_BYTES) {
             Ok(archive) => archive,
             Err(error) => {
                 ewln(io.err, &format!("tar: {path}: {error}"));
@@ -259,7 +277,7 @@ fn read_archive(
         },
     };
     if options.gzip {
-        archive = match super::archives::gunzip_bytes(interp, &archive) {
+        archive = match super::archives::gunzip_bytes(system, &archive) {
             Ok(archive) => archive,
             Err(message) => {
                 ewln(io.err, &format!("tar: {message}"));
@@ -267,7 +285,7 @@ fn read_archive(
             }
         };
     }
-    let entries = match decode(interp, &archive) {
+    let entries = match decode(system, &archive) {
         Ok(entries) => entries,
         Err(message) => {
             ewln(io.err, &format!("tar: {message}"));
@@ -280,49 +298,45 @@ fn read_archive(
         }
         return 0;
     }
-    let before = interp.vfs.clone();
+    let mut changes = Vec::new();
     for entry in &entries {
         if options.verbose {
             wln(io.out, &entry.name);
         }
         let destination = resolve_against(base, &entry.name);
-        if let Err(message) = validate_destination(interp, base, &destination) {
-            interp.vfs = before;
+        if let Err(message) = validate_destination(system, base, &destination) {
             ewln(io.err, &format!("tar: {message}"));
             return 2;
         }
-        let result = match &entry.kind {
-            EntryKind::Directory => interp.vfs.mkdir_all("/", &destination),
+        match &entry.kind {
+            EntryKind::Directory => changes.push(FileChange::MkdirAll(destination)),
             EntryKind::File(data) => {
                 if let Some(parent) = parent_of(&destination) {
-                    if let Err(error) = interp.vfs.mkdir_all("/", &parent) {
-                        Err(error)
-                    } else {
-                        interp.vfs.put_file(&destination, data.clone(), entry.mode)
-                    }
-                } else {
-                    interp.vfs.put_file(&destination, data.clone(), entry.mode)
+                    changes.push(FileChange::MkdirAll(parent));
                 }
+                changes.push(FileChange::PutFile {
+                    path: destination,
+                    bytes: data.clone(),
+                    mode: entry.mode,
+                });
             }
-        };
-        if let Err(error) = result {
-            interp.vfs = before;
-            ewln(io.err, &format!("tar: {}: {error}", entry.name));
-            return 2;
         }
+    }
+    if let Err(error) = system.apply_file_batch("/", changes) {
+        ewln(io.err, &format!("tar: extraction failed: {error}"));
+        return 2;
     }
     0
 }
 
 fn validate_destination(
-    interp: &CommandContext<'_>,
+    system: &mut dyn System,
     base: &str,
     destination: &str,
 ) -> Result<(), String> {
     let parent = parent_of(destination).unwrap_or_else(|| "/".to_string());
-    let real_parent = interp
-        .vfs
-        .realpath(&parent, true)
+    let real_parent = system
+        .canonicalize("/", &parent, false)
         .map_err(|error| error.to_string())?;
     if real_parent != parent {
         return Err(format!(
@@ -339,11 +353,11 @@ fn validate_destination(
     }
 }
 
-fn decode(interp: &mut CommandContext<'_>, archive: &[u8]) -> Result<Vec<Entry>, String> {
+fn decode(system: &mut dyn System, archive: &[u8]) -> Result<Vec<Entry>, String> {
     if archive.len() > MAX_ARCHIVE_BYTES {
         return Err("archive exceeds the 16 MiB limit".to_string());
     }
-    if !interp.reserve_memory(archive.len() as u64) || !interp.charge_cpu(archive.len() as u64) {
+    if !system.reserve_memory(archive.len() as u64) || !system.charge_cpu(archive.len() as u64) {
         return Err("resource limit exceeded".to_string());
     }
     let mut entries = Vec::new();

@@ -532,6 +532,14 @@ mod tests {
             unreachable!("native writer does not write files")
         }
 
+        fn apply_file_batch(
+            &mut self,
+            _base: &str,
+            _changes: Vec<crate::syscalls::FileChange>,
+        ) -> Result<(), SyscallError> {
+            unreachable!("native writer does not change files")
+        }
+
         fn read(&mut self, _fd: i32, _maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
             unreachable!("native writer does not read")
         }

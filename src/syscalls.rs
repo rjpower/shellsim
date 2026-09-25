@@ -58,6 +58,12 @@ pub(crate) trait System {
         bytes: Vec<u8>,
         mode: u32,
     ) -> Result<(), SyscallError>;
+    /// Commit a bounded set of virtual filesystem changes together, or keep the old tree.
+    fn apply_file_batch(
+        &mut self,
+        base: &str,
+        changes: Vec<FileChange>,
+    ) -> Result<(), SyscallError>;
     fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError>;
     fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError>;
     fn open_file(&mut self, base: &str, path: &str, options: OpenFile) -> Result<Fd, SyscallError>;
@@ -272,6 +278,51 @@ impl System for ActiveSystem<'_> {
         let absolute = resolve_against(base, path);
         self.interp.vfs.put_file(&absolute, bytes, mode)?;
         Ok(())
+    }
+
+    fn apply_file_batch(
+        &mut self,
+        base: &str,
+        changes: Vec<FileChange>,
+    ) -> Result<(), SyscallError> {
+        const MAX_CHANGES: usize = 10_000;
+        if changes.len() > MAX_CHANGES {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let work = changes.iter().fold(0_u64, |total, change| {
+            total.saturating_add(match change {
+                FileChange::MkdirAll(path) => path.len() as u64,
+                FileChange::PutFile { path, bytes, .. } => {
+                    (path.len() as u64).saturating_add(bytes.len() as u64)
+                }
+            })
+        });
+        let snapshot = self.interp.vfs.disk_used().saturating_mul(2);
+        if !self.interp.resources.reserve_memory(snapshot) {
+            return Err(SyscallError::ResourceExhausted);
+        }
+        if !self
+            .interp
+            .resources
+            .charge_cpu(snapshot.saturating_add(work))
+        {
+            self.interp.resources.release_memory(snapshot);
+            return Err(SyscallError::ResourceExhausted);
+        }
+        let mut staged = self.interp.vfs.clone();
+        staged.set_mutation_time(self.interp.clock.unix_ms());
+        let result = changes.into_iter().try_for_each(|change| match change {
+            FileChange::MkdirAll(path) => staged.mkdir_all(base, &path),
+            FileChange::PutFile { path, bytes, mode } => {
+                let absolute = resolve_against(base, &path);
+                staged.put_file(&absolute, bytes, mode)
+            }
+        });
+        if result.is_ok() {
+            self.interp.vfs = staged;
+        }
+        self.interp.resources.release_memory(snapshot);
+        result.map_err(Into::into)
     }
 
     fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
@@ -578,6 +629,17 @@ pub(crate) struct OpenFile {
     pub append: bool,
 }
 
+/// Ordered VFS changes applied against one clone before becoming visible to any process.
+#[derive(Clone, Debug)]
+pub(crate) enum FileChange {
+    MkdirAll(String),
+    PutFile {
+        path: String,
+        bytes: Vec<u8>,
+        mode: u32,
+    },
+}
+
 /// Data visible from `stat` without exposing file bytes or native program identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileInfo {
@@ -854,6 +916,29 @@ fn seek(interp: &mut Interp, fd: Fd, delta: i64, whence: u32) -> Result<u64, Sys
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_batch_rolls_back_every_change_on_failure() {
+        let mut interp = Interp::new();
+        let mut system = ActiveSystem::new(&mut interp);
+        let result = system.apply_file_batch(
+            "/",
+            vec![
+                FileChange::PutFile {
+                    path: "/work/first".into(),
+                    bytes: b"first".to_vec(),
+                    mode: 0o644,
+                },
+                FileChange::PutFile {
+                    path: "/proc/blocked".into(),
+                    bytes: b"blocked".to_vec(),
+                    mode: 0o644,
+                },
+            ],
+        );
+        assert!(result.is_err());
+        assert!(system.metadata("/", "/work/first", false).is_err());
+    }
 
     #[test]
     fn active_system_changes_only_the_current_process_directory_and_mask() {
