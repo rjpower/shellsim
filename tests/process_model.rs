@@ -116,6 +116,33 @@ fn native_yes_uses_path_and_process_scoped_pipe_backpressure() {
 }
 
 #[test]
+fn registered_native_commands_resolve_only_from_executable_vfs_entries() {
+    let mut env = Environment::new();
+    assert!(matches!(
+        env.vfs.metadata("/", "/usr/bin", true).unwrap().kind,
+        NodeKind::Dir
+    ));
+    let node = env.vfs.metadata("/", "/usr/bin/cat", true).unwrap();
+    assert!(matches!(
+        node.kind,
+        NodeKind::NativeExecutable(NativeProgram::Registered("cat"))
+    ));
+    assert_eq!(run(&mut env, "which cat").1, "/usr/bin/cat\n");
+    assert_eq!(run(&mut env, "env -i PATH=/missing cat /work/note").0, 127);
+
+    env.vfs.write("/", "/work/note", b"visible", 0o644).unwrap();
+    env.vfs
+        .copy_file("/", "/usr/bin/cat", "/work/reader")
+        .unwrap();
+    assert_eq!(run(&mut env, "/work/reader /work/note").1, "visible");
+
+    env.vfs.remove_file("/", "/usr/bin/cat").unwrap();
+    assert_eq!(run(&mut env, "cat /work/note").0, 127);
+    assert_eq!(run(&mut env, "which cat").0, 1);
+    assert_eq!(run(&mut env, "/work/reader /work/note").1, "visible");
+}
+
+#[test]
 fn independent_shell_sessions_share_files_but_keep_shell_state() {
     let mut env = Environment::new();
     let first = env.spawn_shell_session().unwrap();

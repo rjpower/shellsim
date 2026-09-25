@@ -40,6 +40,7 @@ fn toolchain_environment() -> Environment {
         .vfs
         .chmod("/", "/tcc/tcc-shellsim.wasm", 0o755)
         .unwrap();
+    environment.vfs.remove_file("/", "/usr/bin/cc").unwrap();
     environment
         .vfs
         .symlink("/", "/tcc/tcc-shellsim.wasm", "/usr/bin/cc")

@@ -12,15 +12,16 @@ to the shell's process-scoped syscall interface.
 
 The current machine already creates a root process with descriptors and a scheduler entry, and
 program continuations belong to logical processes. A child argv loader can retain either a
-shell continuation or a native Rust image. The first native images are `pwd`, `true`, `false`,
-and `yes`.
-They are opaque executable entries in the virtual `/usr/bin`, resolved through the same cwd and
+shell continuation or a native Rust image. The first images that use the scoped `System` handle
+are `pwd`, `true`, `false`, and `yes`. All registered Rust commands now have opaque executable
+entries in the virtual `/usr/bin`, resolved through the same cwd and
 `PATH` search as Wasm files and scripts when launched as external commands. Bare names that are
 shell builtins still run in the shell process. The native images receive a
 borrowed, process-scoped syscall handle for the current poll quantum; it provides cwd, descriptor
 write, and resource accounting, not `Environment` or host handles. Their owned state survives
-blocked and partial writes. The shell still boots as the root logical process, and most native
-commands still run through the existing dispatcher. It does not yet enforce the stronger boundary:
+blocked and partial writes. Registered commands not yet ported to `System` still run through the
+existing dispatcher after VFS resolution. The shell still boots as the root logical process.
+It does not yet enforce the stronger boundary:
 shell and most native-command code can still mutate `Environment` directly, the WASI adapter
 still holds `Interp` while translating imports, and some external native commands execute as
 functions in the active process. The target is a loader that starts `/bin/sh`
@@ -54,10 +55,10 @@ Native `yes` now runs as a VFS executable and resumes across pipe backpressure t
 process-scoped syscall handle. A typed broken-pipe result determines its exit status without
 matching an error message.
 
-For migration, an executable placed at a standard path such as `/usr/bin/wc` takes precedence
-over the synthetic native alias. A bare `wc` also resolves that executable through `PATH`; if
-no VFS entry exists, the native implementation remains available. This lets a harness opt in to
-the compiled command without changing the default base image.
+Replacing `/usr/bin/wc` with a Wasm file selects that file through ordinary VFS lookup. If a
+registered executable is removed or absent from `PATH`, shellsim reports command not found; it
+does not revive the Rust implementation by basename. This lets a harness opt in to compiled
+commands without changing unrelated entries in the base image.
 
 ## Contract to extend
 
@@ -77,9 +78,8 @@ point so both native and Wasm work count against the same budget.
 
 ## Current limits and next gate
 
-Make VFS program identity authoritative for external native commands, then remove the synthetic
-basename fallback. Extend `System` with the remaining typed filesystem and process operations,
-and move a reader and a filesystem-walking utility across it. The legacy command registry still
+Extend `System` with the remaining typed filesystem and process operations, then move a reader
+and a filesystem-walking utility across it. The legacy command registry still
 hands most native bodies a `CommandContext` that dereferences to all of `Interp`; remove that
 access as commands migrate, rather than renaming it and retaining broad authority.
 Finally, give the Rust shell a process-scoped handle for execution, files, and process control;

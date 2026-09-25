@@ -205,9 +205,15 @@ fn registry() -> &'static HashMap<&'static str, CommandSpec> {
     REGISTRY.get_or_init(build_registry)
 }
 
-/// Return whether a name is implemented by the native command registry.
-pub(crate) fn is_registered(name: &str) -> bool {
-    registry().contains_key(name)
+/// Names backed by legacy Rust command bodies and installed as opaque VFS executables.
+pub(crate) fn registered_executable_names() -> Vec<&'static str> {
+    let mut names = registry()
+        .keys()
+        .copied()
+        .filter(|name| !matches!(*name, "." | "..") && !name.contains('/'))
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names
 }
 
 /// Register `f` under every name in `names` with trust `t`.
@@ -384,11 +390,14 @@ pub(crate) fn starts_before_input(interp: &Interp, argv: &[String]) -> bool {
     }
     argv.first().is_some_and(|requested| {
         if !(builtins::is_shell_builtin_name(requested) && !requested.contains('/'))
-            && resolved_native_image(interp, requested).is_some()
+            && resolved_native_image(interp, requested)
+                .is_some_and(|image| !matches!(image, crate::vfs::NativeProgram::Registered(_)))
         {
             return true;
         }
-        let command = native_command_name(interp, requested);
+        let Some(command) = command_name_for_dispatch(interp, requested) else {
+            return false;
+        };
         if matches!(command, "cat" | "head") {
             return streams::streams_before_input(command, &argv[1..]);
         }
@@ -407,10 +416,28 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
     let Some(requested) = argv.first() else {
         return false;
     };
-    if resolved_native_image(interp, requested).is_some() {
+    if resolved_native_image(interp, requested)
+        .is_some_and(|image| !matches!(image, crate::vfs::NativeProgram::Registered(_)))
+    {
         return false;
     }
-    let command = native_command_name(interp, requested);
+    if !builtins::is_shell_builtin_name(requested) {
+        if let util::ExecutableLookup::Found(path) = util::resolve_executable(interp, requested) {
+            if matches!(
+                interp
+                    .vfs
+                    .metadata("/", &path, true)
+                    .ok()
+                    .map(|node| node.kind),
+                Some(crate::vfs::NodeKind::File(_))
+            ) {
+                return true;
+            }
+        }
+    }
+    let Some(command) = command_name_for_dispatch(interp, requested) else {
+        return false;
+    };
     if command == "git" {
         return git::reads_standard_input(&argv[1..]);
     }
@@ -466,10 +493,6 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
     ) || registry()
         .get(command)
         .is_some_and(|spec| spec.resume.is_some() && !spec.resume_before_input)
-        || matches!(
-            util::resolve_executable(interp, requested),
-            util::ExecutableLookup::Found(_)
-        )
 }
 
 /// Continue command-owned state after the scheduler wakes its process.
@@ -734,9 +757,11 @@ fn dispatch(
     // Bare shell builtins remain in the shell process. An explicit path always invokes the
     // corresponding external image, even if its basename is also a builtin.
     let builtin = !requested.contains('/') && builtins::is_shell_builtin_name(requested);
-    let lookup = util::resolve_executable(interp, requested);
     let native = resolved_native_image(interp, requested);
-    if !builtin && resumable && native.is_some() {
+    if !builtin
+        && resumable
+        && native.is_some_and(|image| !matches!(image, crate::vfs::NativeProgram::Registered(_)))
+    {
         return start_child_sequence(
             interp,
             vec![ChildCommand {
@@ -748,20 +773,13 @@ fn dispatch(
             true,
         );
     }
-    // Legacy synchronous nested dispatch still uses the old command bodies until migrated.
-    let cmd = if !builtin && !resumable {
-        native.map_or_else(
-            || native_command_name(interp, requested),
-            |image| image.name(),
-        )
-    } else {
-        native_command_name(interp, requested)
-    };
+    // Registered images still use their old bodies, but only after VFS path resolution.
+    let cmd = native.map_or(requested, |image| image.name());
     let args = &argv[1..];
-    let installed = !builtin
-        && !(native.is_some() && !resumable)
-        && matches!(lookup, util::ExecutableLookup::Found(_));
-    if let Some(spec) = (!installed).then(|| registry().get(cmd)).flatten() {
+    if let Some(spec) = (builtin || native.is_some())
+        .then(|| registry().get(cmd))
+        .flatten()
+    {
         let unsupported_reason =
             (spec.trust == Trust::Unsupported).then(|| "not implemented in shellsim".to_string());
         interp.invocations.begin(
@@ -974,18 +992,6 @@ pub(crate) fn parse_shell_source(
     }
 }
 
-fn standard_utility_name(path: &str) -> Option<&str> {
-    [
-        "/bin/",
-        "/sbin/",
-        "/usr/bin/",
-        "/usr/sbin/",
-        "/usr/local/bin/",
-    ]
-    .into_iter()
-    .find_map(|prefix| path.strip_prefix(prefix).filter(|name| !name.contains('/')))
-}
-
 fn resolved_native_image(interp: &Interp, requested: &str) -> Option<crate::vfs::NativeProgram> {
     let util::ExecutableLookup::Found(path) = util::resolve_executable(interp, requested) else {
         return None;
@@ -996,23 +1002,12 @@ fn resolved_native_image(interp: &Interp, requested: &str) -> Option<crate::vfs:
     }
 }
 
-/// A real VFS entry at an explicit path takes precedence over the synthetic utility alias.
-/// This lets an installed Wasm command replace one native utility without changing unrelated names.
-fn native_command_name<'a>(interp: &Interp, requested: &'a str) -> &'a str {
-    let Some(name) = standard_utility_name(requested) else {
-        return requested;
-    };
-    if crate::vfs::NativeProgram::from_name(name).is_some() {
-        return requested;
+/// Resolve a shell builtin or opaque native image to its registered command identity.
+fn command_name_for_dispatch<'a>(interp: &Interp, requested: &'a str) -> Option<&'a str> {
+    if !requested.contains('/') && builtins::is_shell_builtin_name(requested) {
+        return Some(requested);
     }
-    if matches!(
-        util::resolve_executable(interp, requested),
-        util::ExecutableLookup::NotFound
-    ) {
-        name
-    } else {
-        requested
-    }
+    resolved_native_image(interp, requested).map(crate::vfs::NativeProgram::name)
 }
 
 /// Provide `run_script_into` for nested execution (source, eval, scripts).

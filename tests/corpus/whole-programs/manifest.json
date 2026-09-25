@@ -226,6 +226,9 @@
       "args": [
         "/work/probes/BUG_HDOCBKSL.t"
       ],
+      "env": {
+        "DEFPATH": "/usr/bin"
+      },
       "fixtures": [
         {
           "source": "modernish/probe-driver.sh",
