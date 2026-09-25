@@ -226,6 +226,76 @@ mod tests {
             Ok(IoPoll::Ready(written))
         }
 
+        fn open_file(
+            &mut self,
+            _base: &str,
+            _path: &str,
+            _options: crate::syscalls::OpenFile,
+        ) -> Result<i32, SyscallError> {
+            unreachable!("native writer does not open files")
+        }
+
+        fn file_state(&self, _fd: i32) -> Result<crate::descriptors::FileState, SyscallError> {
+            unreachable!("native writer does not inspect files")
+        }
+
+        fn close(&mut self, _fd: i32) -> Result<(), SyscallError> {
+            unreachable!("native writer does not close files")
+        }
+
+        fn seek(&mut self, _fd: i32, _delta: i64, _whence: u32) -> Result<u64, SyscallError> {
+            unreachable!("native writer does not seek")
+        }
+
+        fn chmod(&mut self, _base: &str, _path: &str, _mode: u32) -> Result<(), SyscallError> {
+            unreachable!("native writer does not change file modes")
+        }
+
+        fn unlink(&mut self, _base: &str, _path: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not unlink files")
+        }
+
+        fn mkdir(&mut self, _base: &str, _path: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not create directories")
+        }
+
+        fn rmdir(&mut self, _base: &str, _path: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not remove directories")
+        }
+
+        fn rename(&mut self, _base: &str, _from: &str, _to: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not rename files")
+        }
+
+        fn display_open(
+            &mut self,
+            _width: u32,
+            _height: u32,
+            _format: u32,
+        ) -> Result<u32, crate::display::DisplayError> {
+            unreachable!("native writer does not open displays")
+        }
+
+        fn display_present(
+            &mut self,
+            _handle: u32,
+            _pixels: &[u8],
+            _stride: u32,
+        ) -> Result<(), crate::display::DisplayError> {
+            unreachable!("native writer does not present displays")
+        }
+
+        fn input_poll_key(
+            &mut self,
+            _handle: u32,
+        ) -> Result<Option<crate::display::KeyEvent>, crate::display::DisplayError> {
+            unreachable!("native writer does not read keys")
+        }
+
+        fn display_close(&mut self, _handle: u32) -> Result<(), crate::display::DisplayError> {
+            unreachable!("native writer does not close displays")
+        }
+
         fn charge_cpu(&mut self, _units: u64) -> bool {
             true
         }

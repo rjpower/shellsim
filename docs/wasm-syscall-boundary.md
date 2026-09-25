@@ -40,8 +40,9 @@ active PID's view of the virtual kernel, not shell state or a host capability. N
 receive it directly; the Wasm adapter should translate imports to the same operations. Shell
 `cd`/`pwd` and `umask` now use this interface for process cwd and creation mask. The shell keeps
 `PWD` and `OLDPWD` variables in its own userland state after a successful `chdir`.
-Descriptor reads and writes have typed results; the Wasm adapter uses the same operations for
-open virtual files. Its stdio buffering and other imports still need to move to this boundary.
+Descriptor and filesystem operations have typed results; the Wasm adapter uses `System` for
+open files, directory mutation, and the virtual display. Its stdio buffering and remaining
+metadata, clock, and process imports still need to move to this boundary.
 
 The new `syscalls.rs` begins this boundary for regular files. It accepts typed open options,
 allocates descriptors in the active process, and owns close and seek. The WASI adapter now uses
