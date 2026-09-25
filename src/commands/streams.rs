@@ -4,20 +4,23 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::commands::util::{ewln, lines_of, read_inputs, split_flags, w, wln};
+use crate::commands::util::{
+    ewln, lines_of, read_inputs, read_inputs_system, split_flags, uses_standard_input, w, wln,
+};
 use crate::commands::{CommandContext, CommandPoll, CommandSpec, Io, Trust};
 use crate::descriptors::{DeviceStream, IoPoll, IoWait, DEVICE_READ_QUANTUM};
+use crate::exec::ShellPoll;
 use crate::interp::Interp;
+use crate::program::ProcessContext;
 use crate::scheduler::WaitReason;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_resumable};
+    use super::{reg_resumable, reg_system_poll};
     reg_resumable(m, &["cat"], Trust::Real, cmd_cat, start_cat);
-    reg(m, &["tac"], Trust::Real, cmd_tac);
-    reg(m, &["tee"], Trust::Real, cmd_tee);
+    reg_system_poll(m, "/usr/bin/tac", Trust::Real, cmd_tac);
     reg_resumable(m, &["yes"], Trust::Real, cmd_yes, start_yes);
     reg_resumable(m, &["head"], Trust::Real, cmd_head, start_head);
-    reg(m, &["tail"], Trust::Real, cmd_tail);
+    reg_system_poll(m, "/usr/bin/tail", Trust::Real, cmd_tail);
 }
 
 #[derive(Clone)]
@@ -56,13 +59,13 @@ pub(crate) struct YesStream {
 }
 
 #[derive(Clone)]
-struct HeadOptions {
-    lines: usize,
-    bytes: Option<usize>,
-    files: Vec<String>,
+pub(crate) struct HeadOptions {
+    pub(crate) lines: usize,
+    pub(crate) bytes: Option<usize>,
+    pub(crate) files: Vec<String>,
 }
 
-fn parse_head_options(args: &[String]) -> Result<HeadOptions, String> {
+pub(crate) fn parse_head_options(args: &[String]) -> Result<HeadOptions, String> {
     let mut lines = 10usize;
     let mut bytes = None;
     let mut files = Vec::new();
@@ -465,38 +468,23 @@ fn cmd_cat(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
     }
 }
 
-fn cmd_tac(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (_f, ops, _l) = split_flags(args);
-    let (data, errors) = read_inputs(interp, &ops, &io.stdin);
+fn cmd_tac(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let (_f, ops, _l) = split_flags(context.args);
+    if uses_standard_input(&ops) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &ops, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("tac: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     let lines = lines_of(&data);
     for l in lines.iter().rev() {
         wln(io.out, l);
     }
-    0
-}
-
-fn cmd_tee(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, _l) = split_flags(args);
-    let append = flags.contains(&'a');
-    let cwd = interp.cwd.clone();
-    let mut status = 0;
-    for f in &ops {
-        let result = if append {
-            interp.vfs.append(&cwd, f, &io.stdin, 0o644)
-        } else {
-            interp.vfs.write(&cwd, f, &io.stdin, 0o644)
-        };
-        if let Err(error) = result {
-            ewln(io.err, &format!("tee: {f}: {error}"));
-            status = 1;
-        }
-    }
-    io.out.extend_from_slice(&io.stdin);
-    status
+    ShellPoll::Ready(0)
 }
 
 fn cmd_head(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
@@ -549,7 +537,8 @@ fn cmd_head(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     status
 }
 
-fn cmd_tail(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_tail(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let mut n = 10usize;
     let mut bytes = false;
     let mut from_start = false;
@@ -559,20 +548,20 @@ fn cmd_tail(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         if a == "-n" {
             let Some(v) = it.next().cloned() else {
                 ewln(io.err, "tail: option requires an argument -- 'n'");
-                return 1;
+                return ShellPoll::Ready(1);
             };
             from_start = v.starts_with('+');
             n = match v.trim_start_matches('+').trim_start_matches('-').parse() {
                 Ok(value) => value,
                 Err(_) => {
                     ewln(io.err, &format!("tail: invalid number of lines: {v}"));
-                    return 1;
+                    return ShellPoll::Ready(1);
                 }
             };
         } else if a == "-c" {
             let Some(v) = it.next().cloned() else {
                 ewln(io.err, "tail: option requires an argument -- 'c'");
-                return 1;
+                return ShellPoll::Ready(1);
             };
             bytes = true;
             from_start = v.starts_with('+');
@@ -580,7 +569,7 @@ fn cmd_tail(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                 Ok(value) => value,
                 Err(_) => {
                     ewln(io.err, &format!("tail: invalid number of bytes: {v}"));
-                    return 1;
+                    return ShellPoll::Ready(1);
                 }
             };
         } else if let Some(v) = a.strip_prefix("-c") {
@@ -590,7 +579,7 @@ fn cmd_tail(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                 Ok(value) => value,
                 Err(_) => {
                     ewln(io.err, &format!("tail: invalid number of bytes: {v}"));
-                    return 1;
+                    return ShellPoll::Ready(1);
                 }
             };
         } else if let Some(v) = a.strip_prefix('+').filter(|value| !value.is_empty()) {
@@ -599,7 +588,7 @@ fn cmd_tail(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                 Ok(value) => value,
                 Err(_) => {
                     ewln(io.err, &format!("tail: invalid number of lines: {a}"));
-                    return 1;
+                    return ShellPoll::Ready(1);
                 }
             };
         } else if let Some(v) = a.strip_prefix("-n") {
@@ -608,7 +597,7 @@ fn cmd_tail(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                 Ok(value) => value,
                 Err(_) => {
                     ewln(io.err, &format!("tail: invalid number of lines: {v}"));
-                    return 1;
+                    return ShellPoll::Ready(1);
                 }
             };
         } else if let Some(v) = a.strip_prefix('-').filter(|value| {
@@ -617,12 +606,17 @@ fn cmd_tail(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             n = v.parse().expect("validated decimal tail count");
         } else if a == "-f" || a == "-F" {
             ewln(io.err, "tail: unimplemented follow mode");
-            return 2;
+            return ShellPoll::Ready(2);
         } else if !a.starts_with('-') || a == "-" {
             files.push(a.clone());
         } else {
             ewln(io.err, &format!("tail: unimplemented option '{a}'"));
-            return 2;
+            return ShellPoll::Ready(2);
+        }
+    }
+    if files.is_empty() || files.iter().any(|file| file == "-") {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
         }
     }
     let multiple = files.len() > 1;
@@ -637,7 +631,9 @@ fn cmd_tail(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         let data = if file == "-" {
             io.stdin.clone()
         } else {
-            match interp.fs_read(&interp.cwd, &file) {
+            let cwd = context.system.cwd().to_string();
+            let maximum = usize::try_from(context.system.limits().memory).unwrap_or(usize::MAX);
+            match context.system.read_file_limited(&cwd, &file, maximum) {
                 Ok(data) => data,
                 Err(error) => {
                     ewln(io.err, &format!("tail: {file}: {error}"));
@@ -674,7 +670,7 @@ fn cmd_tail(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         }
         emitted = true;
     }
-    status
+    ShellPoll::Ready(status)
 }
 
 fn cmd_yes(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

@@ -6,6 +6,7 @@
 use crate::descriptors::{DescriptorError, Fd, FileState, IoPoll, MAX_FDS_PER_PROCESS};
 use crate::display::{DisplayError, KeyEvent};
 use crate::interp::Interp;
+use crate::net::{HttpRequest, HttpResponse, NetworkRequest, RequestError, RouteError};
 use crate::vfs::{resolve_against, NodeKind, VfsError};
 
 /// Virtual clock selected by a guest ABI or native process.
@@ -15,6 +16,16 @@ pub(crate) enum ClockId {
     Monotonic,
 }
 
+/// Arguments and process-local overrides for one virtual argv child.
+#[derive(Clone)]
+pub(crate) struct SpawnSpec {
+    pub argv: Vec<String>,
+    /// `None` inherits fd 0; `Some` replaces it, including with an empty stream.
+    pub stdin: Option<Vec<u8>>,
+    pub cwd: Option<String>,
+    pub environment: Option<std::collections::BTreeMap<String, String>>,
+}
+
 /// PID-scoped virtual kernel operations available during one execution quantum.
 ///
 /// Native programs call this interface directly. A guest ABI adapter must translate its imports
@@ -22,14 +33,19 @@ pub(crate) enum ClockId {
 /// The borrowed handle cannot outlive the quantum, so blocked programs retain only owned state.
 pub(crate) trait System {
     fn environment(&self) -> std::collections::BTreeMap<String, String>;
+    fn hostname(&self) -> &str;
+    fn set_hostname(&mut self, name: &str) -> Result<(), SyscallError>;
     fn uid(&self) -> u32;
     fn cwd(&self) -> &str;
     fn chdir(&mut self, path: &str) -> Result<(), SyscallError>;
     fn umask(&self) -> u16;
     fn set_umask(&mut self, mask: u16) -> Result<(), SyscallError>;
     fn limits(&self) -> crate::resources::Limits;
+    fn cpu_used(&self) -> u64;
     fn disk_used(&self) -> u64;
     fn memory_used(&self) -> u64;
+    /// Record one completed native invocation against the shared resource meter.
+    fn record_command_usage(&mut self, name: &str, cpu_before: u64, disk_before: u64);
     fn metadata(&mut self, base: &str, path: &str, follow: bool) -> Result<FileInfo, SyscallError>;
     fn metadata_fd(&mut self, fd: Fd) -> Result<FileInfo, SyscallError>;
     fn list_dir(&mut self, base: &str, path: &str) -> Result<Vec<String>, SyscallError>;
@@ -53,6 +69,12 @@ pub(crate) trait System {
         path: &str,
         bytes: Vec<u8>,
         mode: u32,
+    ) -> Result<(), SyscallError>;
+    /// Commit a bounded set of virtual filesystem changes together, or keep the old tree.
+    fn apply_file_batch(
+        &mut self,
+        base: &str,
+        changes: Vec<FileChange>,
     ) -> Result<(), SyscallError>;
     fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError>;
     fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError>;
@@ -103,9 +125,32 @@ pub(crate) trait System {
         strict: bool,
     ) -> Result<String, SyscallError>;
     fn wall_time_ms(&self) -> u64;
+    /// Signed realtime for userland calendar tools; WASI clocks retain their unsigned ABI.
+    fn wall_time_signed_ns(&self) -> Result<i128, SyscallError>;
     fn clock_time_ns(&self, clock: ClockId) -> Result<u64, SyscallError>;
     fn random_fill(&mut self, bytes: &mut [u8]) -> Result<(), SyscallError>;
     fn allocate_temp_id(&mut self) -> Option<u64>;
+    /// Submit a request to the configured virtual route table, never to the host network.
+    fn http_request(&mut self, request: HttpRequest) -> Result<HttpResponse, RequestError>;
+    fn http_route_static(
+        &mut self,
+        pattern: &str,
+        status: u16,
+        body: Vec<u8>,
+    ) -> Result<(), RouteError>;
+    fn http_route_file(&mut self, pattern: &str, path: &str) -> Result<(), RouteError>;
+    fn network_listen(&mut self, host_port: &str);
+    fn network_request_count(&self) -> usize;
+    fn network_request_at(&self, index: usize) -> Option<NetworkRequest>;
+    /// Stable, read-only view of retained logical processes and their descriptor labels.
+    fn process_snapshot(&mut self) -> Vec<crate::process::ProcessRecord>;
+    /// Active virtual listener addresses in deterministic order.
+    fn listener_snapshot(&self) -> Vec<String>;
+    /// Spawn a child using inherited virtual descriptors and switch execution to it.
+    fn spawn_argv(&mut self, spec: SpawnSpec) -> Result<crate::process::ProcessId, SyscallError>;
+    /// Observe only a direct child; an exited status remains available until reap.
+    fn child_status(&self, pid: crate::process::ProcessId) -> Result<Option<i32>, SyscallError>;
+    fn reap_child(&mut self, pid: crate::process::ProcessId) -> Result<i32, SyscallError>;
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError>;
     fn display_present(
         &mut self,
@@ -121,6 +166,8 @@ pub(crate) trait System {
     fn output_remaining(&self) -> u64;
     fn charge_output(&mut self, bytes: u64) -> bool;
     fn stop_status(&self) -> i32;
+    /// Record a rejected feature so callers can distinguish an unsupported surface.
+    fn note_unsupported(&mut self, feature: &str);
 }
 
 /// Active-PID adapter; native program bodies receive this handle, not `Interp`.
@@ -138,6 +185,18 @@ impl<'a> ActiveSystem<'a> {
 impl System for ActiveSystem<'_> {
     fn environment(&self) -> std::collections::BTreeMap<String, String> {
         self.interp.child_env().into_iter().collect()
+    }
+
+    fn hostname(&self) -> &str {
+        &self.interp.hostname
+    }
+
+    fn set_hostname(&mut self, name: &str) -> Result<(), SyscallError> {
+        if name.is_empty() || name.len() > 255 || name.contains('\0') {
+            return Err(SyscallError::InvalidArgument);
+        }
+        self.interp.hostname = name.to_string();
+        Ok(())
     }
 
     fn uid(&self) -> u32 {
@@ -178,12 +237,25 @@ impl System for ActiveSystem<'_> {
         self.interp.resources.limits()
     }
 
+    fn cpu_used(&self) -> u64 {
+        self.interp.resources.cpu_used()
+    }
+
     fn disk_used(&self) -> u64 {
         self.interp.vfs.disk_used()
     }
 
     fn memory_used(&self) -> u64 {
         self.interp.resources.memory_mark()
+    }
+
+    fn record_command_usage(&mut self, name: &str, cpu_before: u64, disk_before: u64) {
+        self.interp.resources.record_command(
+            name,
+            cpu_before,
+            disk_before,
+            self.interp.vfs.disk_used(),
+        );
     }
 
     fn metadata(&mut self, base: &str, path: &str, follow: bool) -> Result<FileInfo, SyscallError> {
@@ -239,6 +311,53 @@ impl System for ActiveSystem<'_> {
         let absolute = resolve_against(base, path);
         self.interp.vfs.put_file(&absolute, bytes, mode)?;
         Ok(())
+    }
+
+    fn apply_file_batch(
+        &mut self,
+        base: &str,
+        changes: Vec<FileChange>,
+    ) -> Result<(), SyscallError> {
+        const MAX_CHANGES: usize = 10_000;
+        if changes.len() > MAX_CHANGES {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let work = changes.iter().fold(0_u64, |total, change| {
+            total.saturating_add(match change {
+                FileChange::MkdirAll(path) => path.len() as u64,
+                FileChange::RemoveFile(path) => path.len() as u64,
+                FileChange::PutFile { path, bytes, .. } => {
+                    (path.len() as u64).saturating_add(bytes.len() as u64)
+                }
+            })
+        });
+        let snapshot = self.interp.vfs.disk_used().saturating_mul(2);
+        if !self.interp.resources.reserve_memory(snapshot) {
+            return Err(SyscallError::ResourceExhausted);
+        }
+        if !self
+            .interp
+            .resources
+            .charge_cpu(snapshot.saturating_add(work))
+        {
+            self.interp.resources.release_memory(snapshot);
+            return Err(SyscallError::ResourceExhausted);
+        }
+        let mut staged = self.interp.vfs.clone();
+        staged.set_mutation_time(self.interp.clock.unix_ms());
+        let result = changes.into_iter().try_for_each(|change| match change {
+            FileChange::MkdirAll(path) => staged.mkdir_all(base, &path),
+            FileChange::RemoveFile(path) => staged.remove_file(base, &path),
+            FileChange::PutFile { path, bytes, mode } => {
+                let absolute = resolve_against(base, &path);
+                staged.put_file(&absolute, bytes, mode)
+            }
+        });
+        if result.is_ok() {
+            self.interp.vfs = staged;
+        }
+        self.interp.resources.release_memory(snapshot);
+        result.map_err(Into::into)
     }
 
     fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
@@ -375,6 +494,13 @@ impl System for ActiveSystem<'_> {
         self.interp.clock.unix_ms()
     }
 
+    fn wall_time_signed_ns(&self) -> Result<i128, SyscallError> {
+        self.interp
+            .clock
+            .wall_time_ns()
+            .map_err(|_| SyscallError::InvalidArgument)
+    }
+
     fn clock_time_ns(&self, clock: ClockId) -> Result<u64, SyscallError> {
         match clock {
             ClockId::Realtime => self
@@ -399,6 +525,82 @@ impl System for ActiveSystem<'_> {
 
     fn allocate_temp_id(&mut self) -> Option<u64> {
         self.interp.next_temp_id()
+    }
+
+    fn http_request(&mut self, request: HttpRequest) -> Result<HttpResponse, RequestError> {
+        self.interp.net.request(request, &self.interp.vfs)
+    }
+
+    fn http_route_static(
+        &mut self,
+        pattern: &str,
+        status: u16,
+        body: Vec<u8>,
+    ) -> Result<(), RouteError> {
+        self.interp.net.route_static(pattern, status, body)
+    }
+
+    fn http_route_file(&mut self, pattern: &str, path: &str) -> Result<(), RouteError> {
+        self.interp.net.route_vfs(pattern, path)
+    }
+
+    fn network_listen(&mut self, host_port: &str) {
+        self.interp.net.listen(host_port);
+    }
+
+    fn network_request_count(&self) -> usize {
+        self.interp.net.log.len()
+    }
+
+    fn network_request_at(&self, index: usize) -> Option<NetworkRequest> {
+        self.interp.net.log.get(index).cloned()
+    }
+
+    fn process_snapshot(&mut self) -> Vec<crate::process::ProcessRecord> {
+        let pid = self.interp.process.pid;
+        let cwd = self.interp.process.cwd.clone();
+        let environment = self.interp.child_env().into_iter().collect();
+        self.interp.processes.update_current(pid, &cwd, environment);
+        self.interp.processes.iter().cloned().collect()
+    }
+
+    fn listener_snapshot(&self) -> Vec<String> {
+        self.interp
+            .net
+            .listening
+            .iter()
+            .filter_map(|(address, active)| active.then_some(address.clone()))
+            .collect()
+    }
+
+    fn spawn_argv(&mut self, spec: SpawnSpec) -> Result<crate::process::ProcessId, SyscallError> {
+        self.interp
+            .spawn_argv_child(spec)
+            .map_err(SyscallError::Process)
+    }
+
+    fn child_status(&self, pid: crate::process::ProcessId) -> Result<Option<i32>, SyscallError> {
+        let child = self
+            .interp
+            .processes
+            .get(pid)
+            .ok_or(SyscallError::InvalidArgument)?;
+        if child.ppid != self.interp.process.pid {
+            return Err(SyscallError::Permission);
+        }
+        Ok(match child.status {
+            crate::process::ProcessStatus::Exited(status) => Some(status),
+            _ => None,
+        })
+    }
+
+    fn reap_child(&mut self, pid: crate::process::ProcessId) -> Result<i32, SyscallError> {
+        let status = self
+            .child_status(pid)?
+            .ok_or(SyscallError::InvalidArgument)?;
+        self.interp.processes.reap(pid);
+        let _ = self.interp.scheduler.reap(pid);
+        Ok(status)
     }
 
     fn display_open(&mut self, width: u32, height: u32, format: u32) -> Result<u32, DisplayError> {
@@ -447,6 +649,10 @@ impl System for ActiveSystem<'_> {
             .resources
             .stop_reason()
             .map_or(137, |reason| reason.exit_status())
+    }
+
+    fn note_unsupported(&mut self, feature: &str) {
+        self.interp.note_unsupported(feature);
     }
 }
 
@@ -505,6 +711,18 @@ pub(crate) struct OpenFile {
     pub append: bool,
 }
 
+/// Ordered VFS changes applied against one clone before becoming visible to any process.
+#[derive(Clone, Debug)]
+pub(crate) enum FileChange {
+    MkdirAll(String),
+    RemoveFile(String),
+    PutFile {
+        path: String,
+        bytes: Vec<u8>,
+        mode: u32,
+    },
+}
+
 /// Data visible from `stat` without exposing file bytes or native program identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileInfo {
@@ -559,6 +777,7 @@ pub(crate) enum SyscallError {
     IsDirectory,
     Permission,
     ResourceExhausted,
+    Process(String),
 }
 
 impl std::fmt::Display for SyscallError {
@@ -570,6 +789,7 @@ impl std::fmt::Display for SyscallError {
             Self::IsDirectory => write!(formatter, "is a directory"),
             Self::Permission => write!(formatter, "permission denied"),
             Self::ResourceExhausted => write!(formatter, "resource exhausted"),
+            Self::Process(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -781,6 +1001,29 @@ fn seek(interp: &mut Interp, fd: Fd, delta: i64, whence: u32) -> Result<u64, Sys
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_batch_rolls_back_every_change_on_failure() {
+        let mut interp = Interp::new();
+        let mut system = ActiveSystem::new(&mut interp);
+        let result = system.apply_file_batch(
+            "/",
+            vec![
+                FileChange::PutFile {
+                    path: "/work/first".into(),
+                    bytes: b"first".to_vec(),
+                    mode: 0o644,
+                },
+                FileChange::PutFile {
+                    path: "/proc/blocked".into(),
+                    bytes: b"blocked".to_vec(),
+                    mode: 0o644,
+                },
+            ],
+        );
+        assert!(result.is_err());
+        assert!(system.metadata("/", "/work/first", false).is_err());
+    }
 
     #[test]
     fn active_system_changes_only_the_current_process_directory_and_mask() {

@@ -8,11 +8,14 @@
 use std::collections::HashMap;
 
 use crate::commands::util::ewln;
-use crate::commands::{reg, CommandContext, CommandSpec, Io, Trust};
-use crate::vfs::NodeKind;
+use crate::commands::{CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
+use crate::program::ProcessContext;
+use crate::syscalls::{FileKind, SyscallError, System};
+use crate::vfs::VfsError;
 
 pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
-    reg(commands, &["dd"], Trust::Partial, cmd_dd);
+    super::reg_system_poll(commands, "/usr/bin/dd", Trust::Partial, cmd_dd);
 }
 
 #[derive(Debug)]
@@ -51,18 +54,25 @@ impl Default for Options {
     }
 }
 
-fn cmd_dd(environment: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let memory_mark = environment.resources.memory_mark();
-    let status = run_dd(environment, args, io);
-    environment.resources.restore_memory(memory_mark);
-    status
+fn cmd_dd(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let options = match parse_options(context.args) {
+        Ok(options) => options,
+        Err(error) => return ShellPoll::Ready(fail(io, &error)),
+    };
+    if matches!(options.input.as_deref(), None | Some("-")) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let memory_mark = context.system.memory_used();
+    let status = run_dd(context.system, &options, io);
+    context
+        .system
+        .release_memory(context.system.memory_used().saturating_sub(memory_mark));
+    ShellPoll::Ready(status)
 }
 
-fn run_dd(environment: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let options = match parse_options(args) {
-        Ok(options) => options,
-        Err(error) => return fail(io, &error),
-    };
+fn run_dd(system: &mut dyn System, options: &Options, io: &mut Io) -> i32 {
     let offset = match options.skip.checked_mul(options.input_block) {
         Some(offset) => offset,
         None => return fail(io, "input offset is too large"),
@@ -75,7 +85,7 @@ fn run_dd(environment: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
         None => None,
     };
 
-    let input = match read_input(environment, io, &options, maximum) {
+    let input = match read_input(system, io, options, maximum) {
         Ok(input) => input,
         Err(error) => return fail(io, &error),
     };
@@ -89,21 +99,15 @@ fn run_dd(environment: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
             .min(input.len());
         &input[start..end]
     };
-    if !environment.charge_cpu(u64::try_from(selected.len()).unwrap_or(u64::MAX)) {
-        return 137;
+    if !system.charge_cpu(u64::try_from(selected.len()).unwrap_or(u64::MAX)) {
+        return system.stop_status();
     }
 
     let status = if let Some(path) = &options.output {
-        write_output(environment, path, selected, &options, io)
+        write_output(system, path, selected, options, io)
     } else if options.seek != 0 {
         fail(io, "seek requires an output file")
     } else {
-        if !environment
-            .resources
-            .charge_output(u64::try_from(selected.len()).unwrap_or(u64::MAX))
-        {
-            return 137;
-        }
         io.out.extend_from_slice(selected);
         0
     };
@@ -125,37 +129,39 @@ fn run_dd(environment: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
 }
 
 fn read_input(
-    environment: &mut CommandContext<'_>,
+    system: &mut dyn System,
     io: &Io,
     options: &Options,
     maximum: Option<usize>,
 ) -> Result<Vec<u8>, String> {
     match options.input.as_deref() {
         None | Some("-") => {
-            reserve_bytes(environment, io.stdin.len())?;
+            reserve_bytes(system, io.stdin.len())?;
             Ok(io.stdin.clone())
         }
         Some("/dev/zero") => {
             let length = maximum.ok_or_else(|| {
                 "reading /dev/zero requires count= to keep the operation bounded".to_string()
             })?;
-            reserve_bytes(environment, length)?;
+            reserve_bytes(system, length)?;
             Ok(vec![0; length])
         }
         Some(path) => {
-            let length = environment
-                .fs_file_len(&environment.cwd, path)
+            let cwd = system.cwd().to_string();
+            let length = system
+                .metadata(&cwd, path, true)
+                .map(|info| usize::try_from(info.size).unwrap_or(usize::MAX))
                 .map_err(|error| format!("failed to open {path}: {error}"))?;
-            reserve_bytes(environment, length)?;
-            environment
-                .fs_read(&environment.cwd, path)
+            reserve_bytes(system, length)?;
+            system
+                .read_file_limited(&cwd, path, length)
                 .map_err(|error| format!("failed to open {path}: {error}"))
         }
     }
 }
 
 fn write_output(
-    environment: &mut CommandContext<'_>,
+    system: &mut dyn System,
     path: &str,
     selected: &[u8],
     options: &Options,
@@ -172,31 +178,27 @@ fn write_output(
         Some(end) => end,
         None => return fail(io, "output size is too large"),
     };
-    let absolute = crate::vfs::resolve_against(&environment.cwd, path);
-    let real = environment
-        .vfs
-        .realpath(&absolute, true)
-        .unwrap_or(absolute);
-    let existing = environment.vfs.raw_get(&real).map(|node| match &node.kind {
-        NodeKind::File(bytes) => Ok((node.mode, bytes.len())),
-        _ => Err(()),
-    });
-    let (mode, existing_length) = match existing {
-        Some(Ok(metadata)) => metadata,
-        Some(Err(())) => return fail(io, &format!("failed to open {path}: Is a directory")),
-        None => (0o666, 0),
+    let cwd = system.cwd().to_string();
+    let existing = match system.metadata(&cwd, path, true) {
+        Ok(info) if info.kind == FileKind::File => Some(info),
+        Ok(_) => return fail(io, &format!("failed to open {path}: Is a directory")),
+        Err(SyscallError::File(VfsError::NotFound(_))) => None,
+        Err(error) => return fail(io, &format!("failed to open {path}: {error}")),
     };
+    let (mode, existing_length) = existing.as_ref().map_or((0o666, 0), |info| {
+        (info.mode, usize::try_from(info.size).unwrap_or(usize::MAX))
+    });
     let working_size = if options.notrunc {
         existing_length.max(end)
     } else {
         end
     };
-    if reserve_bytes(environment, working_size).is_err() {
-        return 137;
+    if reserve_bytes(system, working_size).is_err() {
+        return system.stop_status();
     }
     let mut output = if options.notrunc {
         if existing.is_some() {
-            match environment.vfs.read(&environment.cwd, path) {
+            match system.read_file_limited(&cwd, path, working_size) {
                 Ok(bytes) => bytes,
                 Err(error) => return fail(io, &format!("failed to open {path}: {error}")),
             }
@@ -210,16 +212,14 @@ fn write_output(
         output.resize(end, 0);
     }
     output[offset..end].copy_from_slice(selected);
-    environment.sync_vfs_time();
-    let cwd = environment.cwd.clone();
-    if let Err(error) = environment.vfs.write(&cwd, path, &output, mode) {
+    if let Err(error) = system.write_file(&cwd, path, &output, mode) {
         return fail(io, &format!("failed to open {path}: {error}"));
     }
     0
 }
 
-fn reserve_bytes(environment: &mut CommandContext<'_>, length: usize) -> Result<(), String> {
-    if environment.reserve_memory(u64::try_from(length).unwrap_or(u64::MAX)) {
+fn reserve_bytes(system: &mut dyn System, length: usize) -> Result<(), String> {
+    if system.reserve_memory(u64::try_from(length).unwrap_or(u64::MAX)) {
         Ok(())
     } else {
         Err("memory limit exceeded".into())

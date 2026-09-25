@@ -2,7 +2,10 @@
 //!
 //! All observations come from shellsim's process, descriptor, resource, and listener stores.
 
-use shellsim::Environment;
+use shellsim::{
+    vfs::{NativeProgram, NodeKind},
+    Environment,
+};
 
 fn run(environment: &mut Environment, source: &str) -> (i32, String, String) {
     let (outcome, stdout, stderr) = environment.run_script_capture(source);
@@ -23,6 +26,37 @@ fn shell_state_builtins_have_deterministic_process_local_behavior() {
     assert_eq!(status, 0, "{stderr}");
     assert!(stderr.contains("readonly variable"));
     assert_eq!(stdout, "0022\n0077\n/usr/bin/echo\n1024\n");
+}
+
+#[test]
+fn envsubst_reads_child_environment_and_large_pipe() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/template", &vec![b'x'; 128 * 1024], 0o644)
+        .unwrap();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "export ITEM=ready; printf '$ITEM ${ITEM}\\n' | envsubst; cat /work/template | envsubst | wc -c",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "ready ready\n131072\n");
+}
+
+#[test]
+fn native_env_preserves_inherited_stdin_and_child_only_overrides() {
+    let mut environment = Environment::new();
+    let image = environment.vfs.metadata("/", "/usr/bin/env", true).unwrap();
+    assert!(matches!(
+        image.kind,
+        NodeKind::NativeExecutable(NativeProgram::Env)
+    ));
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "printf payload | env -i /usr/bin/cat; env -i KEY=value; env -C /work pwd; pwd",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "payloadKEY=value\n/work\n/\n");
 }
 
 #[test]
@@ -92,6 +126,19 @@ fn readonly_rejects_plain_and_temporary_assignments() {
 #[test]
 fn process_queries_use_the_modeled_process_table() {
     let mut environment = Environment::new();
+    for command in ["ps", "pgrep", "lsof", "ss", "netstat"] {
+        let node = environment
+            .vfs
+            .metadata("/", &format!("/usr/bin/{command}"), true)
+            .unwrap();
+        assert!(
+            matches!(
+                node.kind,
+                NodeKind::NativeExecutable(NativeProgram::Registered(_))
+            ),
+            "{command} did not use the native System boundary"
+        );
+    }
     let (status, stdout, stderr) = run(
         &mut environment,
         "ps -p $$ -o pid,ppid,stat,comm; ps $$ -o pid,comm; pgrep -x bash; lsof -p $$",
@@ -113,6 +160,24 @@ fn socket_queries_list_only_virtual_listeners() {
     let (status, stdout, stderr) = run(&mut environment, "ss -lnt; netstat -lnt");
     assert_eq!(status, 0, "{stderr}");
     assert_eq!(stdout.matches("127.0.0.1:8080").count(), 2);
+}
+
+#[test]
+fn hostname_is_machine_state_not_a_child_shell_assignment() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "hostname; hostname workshop; hostname; uname -n; printf '%s\\n' \"$HOSTNAME\"",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "sandbox\nworkshop\nworkshop\nsandbox\n");
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        &format!("hostname {}; hostname", "x".repeat(256)),
+    );
+    assert_eq!(status, 0);
+    assert_eq!(stdout, "workshop\n");
+    assert!(stderr.contains("hostname: invalid argument"), "{stderr}");
 }
 
 #[test]

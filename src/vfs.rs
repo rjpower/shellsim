@@ -18,6 +18,10 @@ pub enum NativeProgram {
     Pwd,
     Yes,
     Cat,
+    Tee,
+    Head,
+    Xargs,
+    Env,
     /// Process-scoped Rust entrypoint identified by its registered virtual path.
     Registered(&'static str),
     /// Older command body still executed through the shell dispatcher by basename.
@@ -32,6 +36,10 @@ impl NativeProgram {
             "pwd" => Some(Self::Pwd),
             "yes" => Some(Self::Yes),
             "cat" => Some(Self::Cat),
+            "tee" => Some(Self::Tee),
+            "head" => Some(Self::Head),
+            "xargs" => Some(Self::Xargs),
+            "env" => Some(Self::Env),
             _ => None,
         }
     }
@@ -43,6 +51,10 @@ impl NativeProgram {
             Self::Pwd => "pwd",
             Self::Yes => "yes",
             Self::Cat => "cat",
+            Self::Tee => "tee",
+            Self::Head => "head",
+            Self::Xargs => "xargs",
+            Self::Env => "env",
             Self::Registered(path) => path.rsplit('/').next().unwrap_or(path),
             Self::LegacyRegistered(name) => name,
         }

@@ -6,15 +6,18 @@
 use std::collections::HashMap;
 
 use crate::commands::util::{ewln, split_flags, wln};
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandSpec, Io, Trust};
+use crate::program::ProcessContext;
+use crate::syscalls::{FileKind, System};
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
-    reg(m, &["diff"], Trust::Partial, cmd_diff);
-    reg(m, &["cmp"], Trust::Real, cmd_cmp);
+    super::reg_system(m, "/usr/bin/diff", Trust::Partial, cmd_diff);
+    super::reg_system(m, "/usr/bin/cmp", Trust::Real, cmd_cmp);
 }
 
-fn cmd_diff(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_diff(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let mut unified = false;
     let mut recursive = false;
     let mut brief = false;
@@ -73,23 +76,22 @@ fn cmd_diff(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         absent_empty,
         whitespace,
     };
-    let left_meta = interp.fs_metadata(&interp.cwd, operands[0], true);
-    let right_meta = interp.fs_metadata(&interp.cwd, operands[1], true);
-    let directories = matches!(
-        left_meta.as_ref().map(|n| &n.kind),
-        Ok(crate::vfs::NodeKind::Dir)
-    ) || matches!(
-        right_meta.as_ref().map(|n| &n.kind),
-        Ok(crate::vfs::NodeKind::Dir)
-    );
+    let cwd = system.cwd().to_string();
+    let left_meta = system.metadata(&cwd, operands[0], true);
+    let right_meta = system.metadata(&cwd, operands[1], true);
+    let directories = matches!(left_meta.as_ref().map(|n| &n.kind), Ok(FileKind::Directory))
+        || matches!(
+            right_meta.as_ref().map(|n| &n.kind),
+            Ok(FileKind::Directory)
+        );
     if directories {
         if !recursive {
             ewln(io.err, "diff: directory comparison requires -r");
             return 2;
         }
-        return diff_directories(interp, operands[0], operands[1], &options, io);
+        return diff_directories(system, operands[0], operands[1], &options, io);
     }
-    diff_files(interp, operands[0], operands[1], &options, io)
+    diff_files(system, operands[0], operands[1], &options, io)
 }
 
 struct DiffOptions {
@@ -114,14 +116,15 @@ enum DiffLine<'a> {
 }
 
 fn diff_files(
-    interp: &mut CommandContext<'_>,
+    system: &mut dyn System,
     left: &str,
     right: &str,
     options: &DiffOptions,
     io: &mut Io,
 ) -> i32 {
-    let read = |interp: &CommandContext<'_>, path: &str| interp.fs_read(&interp.cwd, path);
-    let left_data = match read(interp, left) {
+    let cwd = system.cwd().to_string();
+    let maximum = usize::try_from(system.limits().memory).unwrap_or(usize::MAX);
+    let left_data = match system.read_file_limited(&cwd, left, maximum) {
         Ok(v) => v,
         Err(_) if options.absent_empty => Vec::new(),
         Err(e) => {
@@ -129,7 +132,7 @@ fn diff_files(
             return 2;
         }
     };
-    let right_data = match read(interp, right) {
+    let right_data = match system.read_file_limited(&cwd, right, maximum) {
         Ok(v) => v,
         Err(_) if options.absent_empty => Vec::new(),
         Err(e) => {
@@ -167,17 +170,17 @@ fn diff_files(
         ewln(io.err, "diff: inputs are too large for line comparison");
         return 2;
     }
-    if !interp.charge_cpu(u64::try_from(cells).unwrap_or(u64::MAX)) {
-        return 137;
+    if !system.charge_cpu(u64::try_from(cells).unwrap_or(u64::MAX)) {
+        return system.stop_status();
     }
     let matrix_memory = u64::try_from(cells)
         .unwrap_or(u64::MAX)
         .saturating_mul(std::mem::size_of::<usize>() as u64);
-    if !interp.reserve_memory(matrix_memory) {
-        return 137;
+    if !system.reserve_memory(matrix_memory) {
+        return system.stop_status();
     }
     let edits = lcs_edits(&left_lines, &right_lines, &left_keys, &right_keys);
-    interp.resources.release_memory(matrix_memory);
+    system.release_memory(matrix_memory);
     if options.unified {
         wln(io.out, &format!("--- {left}"));
         wln(io.out, &format!("+++ {right}"));
@@ -268,35 +271,28 @@ fn lcs_edits<'a>(
 }
 
 fn diff_directories(
-    interp: &mut CommandContext<'_>,
+    system: &mut dyn System,
     left: &str,
     right: &str,
     options: &DiffOptions,
     io: &mut Io,
 ) -> i32 {
-    let left_abs = crate::vfs::resolve_against(&interp.cwd, left);
-    let right_abs = crate::vfs::resolve_against(&interp.cwd, right);
-    let relative_entries =
-        |interp: &CommandContext<'_>, root: &str| -> std::collections::BTreeMap<String, bool> {
-            interp
-                .fs_walk("/", root)
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|path| {
-                    let relative = path.strip_prefix(root)?.trim_start_matches('/');
-                    if relative.is_empty() {
-                        return None;
-                    }
-                    let directory = matches!(
-                        interp.fs_metadata("/", &path, true).map(|node| node.kind),
-                        Ok(crate::vfs::NodeKind::Dir)
-                    );
-                    Some((relative.to_string(), directory))
-                })
-                .collect()
-        };
-    let left_entries = relative_entries(interp, &left_abs);
-    let right_entries = relative_entries(interp, &right_abs);
+    let left_abs = crate::vfs::resolve_against(system.cwd(), left);
+    let right_abs = crate::vfs::resolve_against(system.cwd(), right);
+    let left_entries = match relative_entries(system, &left_abs) {
+        Ok(entries) => entries,
+        Err(error) => {
+            ewln(io.err, &format!("diff: {left}: {error}"));
+            return 2;
+        }
+    };
+    let right_entries = match relative_entries(system, &right_abs) {
+        Ok(entries) => entries,
+        Err(error) => {
+            ewln(io.err, &format!("diff: {right}: {error}"));
+            return 2;
+        }
+    };
     let names = left_entries
         .keys()
         .chain(right_entries.keys())
@@ -365,13 +361,32 @@ fn diff_directories(
         }
         let left_path = format!("{}/{name}", left.trim_end_matches('/'));
         let right_path = format!("{}/{name}", right.trim_end_matches('/'));
-        let file_status = diff_files(interp, &left_path, &right_path, options, io);
+        let file_status = diff_files(system, &left_path, &right_path, options, io);
         if file_status == 2 || file_status == 137 {
             return file_status;
         }
         status = status.max(file_status);
     }
     status
+}
+
+fn relative_entries(
+    system: &mut dyn System,
+    root: &str,
+) -> Result<std::collections::BTreeMap<String, bool>, crate::syscalls::SyscallError> {
+    let mut entries = std::collections::BTreeMap::new();
+    for path in system.walk("/", root)? {
+        let Some(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let relative = relative.trim_start_matches('/');
+        if relative.is_empty() {
+            continue;
+        }
+        let directory = system.metadata("/", &path, true)?.kind == FileKind::Directory;
+        entries.insert(relative.to_string(), directory);
+    }
+    Ok(entries)
 }
 
 fn print_only_in(output: &mut Vec<u8>, root: &str, relative: &str) {
@@ -382,19 +397,23 @@ fn print_only_in(output: &mut Vec<u8>, root: &str, relative: &str) {
     wln(output, &format!("Only in {parent}: {basename}"));
 }
 
-fn cmd_cmp(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_cmp(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let system = &mut *context.system;
     let (_f, ops, _l) = split_flags(args);
     if ops.len() < 2 {
         return 2;
     }
-    let a = match interp.fs_read(&interp.cwd, ops[0]) {
+    let cwd = system.cwd().to_string();
+    let maximum = usize::try_from(system.limits().memory).unwrap_or(usize::MAX);
+    let a = match system.read_file_limited(&cwd, ops[0], maximum) {
         Ok(data) => data,
         Err(error) => {
             ewln(io.err, &format!("cmp: {}: {error}", ops[0]));
             return 2;
         }
     };
-    let b = match interp.fs_read(&interp.cwd, ops[1]) {
+    let b = match system.read_file_limited(&cwd, ops[1], maximum) {
         Ok(data) => data,
         Err(error) => {
             ewln(io.err, &format!("cmp: {}: {error}", ops[1]));

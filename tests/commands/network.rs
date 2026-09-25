@@ -126,3 +126,24 @@ fn route_file_failure_and_invalid_route_configuration_are_explicit() {
     assert_eq!(outcome.exit_status, 2);
     assert!(String::from_utf8_lossy(&stderr).contains("invalid HTTP status 99"));
 }
+
+#[test]
+fn network_commands_share_virtual_routes_across_child_processes() {
+    let mut environment = Environment::new();
+    let (outcome, stdout, stderr) = environment.run_script_capture(
+        "net route https://files.test/item 200 payload; env -C /work curl -o saved https://files.test/item; cat /work/saved; net log",
+    );
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"payloadGET https://files.test/item\n");
+    assert!(stderr.is_empty());
+    for command in ["net", "curl"] {
+        assert!(environment.invocations.events().iter().any(|event| {
+            event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == command)
+        }));
+    }
+}

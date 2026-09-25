@@ -79,6 +79,28 @@ fn fixed_stdin_search_and_exit_codes_match_common_rg_contracts() {
 }
 
 #[test]
+fn rg_waits_for_large_pipe_input_and_uses_child_cwd() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/long", &vec![b'a'; 128 * 1024], 0o644)
+        .unwrap();
+    assert_eq!(
+        run(&mut environment, "cat /work/long | rg -c a"),
+        (0, "1\n".into(), String::new())
+    );
+    assert_eq!(
+        run(&mut environment, "env -C /work rg -c a long"),
+        (0, "1\n".into(), String::new())
+    );
+    assert!(environment
+        .invocations
+        .events()
+        .iter()
+        .any(|event| { event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == "rg") }));
+}
+
+#[test]
 fn files_mode_lists_only_selected_vfs_paths_in_stable_order() {
     let mut environment = fixture();
     assert_eq!(

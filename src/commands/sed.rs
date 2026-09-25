@@ -9,14 +9,17 @@ use std::collections::HashMap;
 
 use super::options::{parse_options_or_report, OptionSpec};
 use super::regex_compat::basic_regex_to_rust;
-use super::util::{ewln, read_inputs, w};
-use super::{reg, CommandContext, CommandSpec, Io, Trust};
+use super::util::{ewln, read_inputs_system, uses_standard_input, w};
+use super::{CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
+use crate::program::ProcessContext;
+use crate::syscalls::System;
 
 pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
-    reg(commands, &["sed"], Trust::Partial, run);
+    super::reg_system_poll(commands, "/usr/bin/sed", Trust::Partial, run);
 }
 
-fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     #[derive(Clone, Copy, PartialEq)]
     enum Key {
         InPlace,
@@ -38,7 +41,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     ];
     let parsed = match parse_options_or_report(
         "sed",
-        args,
+        context.args,
         OPTIONS,
         (
             Key::Help,
@@ -48,7 +51,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         io.err,
     ) {
         Ok(parsed) => parsed,
-        Err(status) => return status,
+        Err(status) => return ShellPoll::Ready(status),
     };
 
     let mut in_place = false;
@@ -61,7 +64,7 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                 in_place = true;
                 if option.value.is_some_and(|suffix| !suffix.is_empty()) {
                     ewln(io.err, "sed: unsupported in-place backup suffix");
-                    return 2;
+                    return ShellPoll::Ready(2);
                 }
             }
             Key::Quiet => quiet = true,
@@ -69,17 +72,19 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             Key::Expression => scripts.push(option.value.expect("required option value")),
             Key::File => {
                 let file = option.value.expect("required option value");
-                match env.vfs.read(&env.cwd, &file) {
+                let cwd = context.system.cwd().to_string();
+                let maximum = usize::try_from(context.system.limits().memory).unwrap_or(usize::MAX);
+                match context.system.read_file_limited(&cwd, &file, maximum) {
                     Ok(bytes) => match String::from_utf8(bytes) {
                         Ok(script) => scripts.push(script),
                         Err(_) => {
                             ewln(io.err, &format!("sed: {file}: script is not valid UTF-8"));
-                            return 2;
+                            return ShellPoll::Ready(2);
                         }
                     },
                     Err(error) => {
                         ewln(io.err, &format!("sed: {file}: {error}"));
-                        return 2;
+                        return ShellPoll::Ready(2);
                     }
                 }
             }
@@ -90,13 +95,13 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     if scripts.is_empty() {
         if operands.is_empty() {
             ewln(io.err, "sed: missing command");
-            return 1;
+            return ShellPoll::Ready(1);
         }
         scripts.push(operands.remove(0));
     }
     if in_place && operands.is_empty() {
         ewln(io.err, "sed: -i requires at least one file operand");
-        return 2;
+        return ShellPoll::Ready(2);
     }
 
     let mut commands = Vec::new();
@@ -104,66 +109,82 @@ fn run(env: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         match ScriptParser::new(&script, extended).parse() {
             Ok(parsed) => commands.extend(parsed),
             Err(error) => {
-                env.note_unsupported(&format!("sed:{error}"));
+                context.system.note_unsupported(&format!("sed:{error}"));
                 ewln(io.err, &format!("sed: {error}"));
-                return 2;
+                return ShellPoll::Ready(2);
             }
         }
     }
     if commands.is_empty() {
         ewln(io.err, "sed: empty command");
-        return 2;
+        return ShellPoll::Ready(2);
     }
 
     if in_place {
-        let cwd = env.cwd.clone();
+        let cwd = context.system.cwd().to_string();
         for file in operands {
-            let data = match env.fs_read(&cwd, &file) {
+            let maximum = usize::try_from(context.system.limits().memory).unwrap_or(usize::MAX);
+            let data = match context.system.read_file_limited(&cwd, &file, maximum) {
                 Ok(data) => data,
                 Err(error) => {
                     ewln(io.err, &format!("sed: can't read {file}: {error}"));
-                    return 1;
+                    return ShellPoll::Ready(1);
                 }
             };
             let text = match std::str::from_utf8(&data) {
                 Ok(text) => text,
                 Err(_) => {
                     ewln(io.err, &format!("sed: {file}: input is not valid UTF-8"));
-                    return 2;
+                    return ShellPoll::Ready(2);
                 }
             };
             let mut file_commands = commands.clone();
-            let output = match process(env, text, &mut file_commands, quiet) {
+            let output = match process(context.system, text, &mut file_commands, quiet) {
                 Ok(output) => output,
-                Err(status) => return status,
+                Err(status) => return ShellPoll::Ready(status),
             };
-            if let Err(error) = env.vfs.write(&cwd, &file, output.as_bytes(), 0o644) {
+            let mode = match context.system.metadata(&cwd, &file, true) {
+                Ok(info) => info.mode,
+                Err(error) => {
+                    ewln(io.err, &format!("sed: can't stat {file}: {error}"));
+                    return ShellPoll::Ready(1);
+                }
+            };
+            if let Err(error) = context
+                .system
+                .write_file(&cwd, &file, output.as_bytes(), mode)
+            {
                 ewln(io.err, &format!("sed: can't write {file}: {error}"));
-                return 1;
+                return ShellPoll::Ready(1);
             }
         }
-        return 0;
+        return ShellPoll::Ready(0);
     }
 
     let files = operands.iter().collect::<Vec<_>>();
-    let (data, errors) = read_inputs(env, &files, &io.stdin);
+    if uses_standard_input(&files) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &files, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("sed: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
     }
     let text = match std::str::from_utf8(&data) {
         Ok(text) => text,
         Err(_) => {
             ewln(io.err, "sed: input is not valid UTF-8");
-            return 2;
+            return ShellPoll::Ready(2);
         }
     };
-    match process(env, text, &mut commands, quiet) {
+    match process(context.system, text, &mut commands, quiet) {
         Ok(output) => {
             w(io.out, &output);
-            0
+            ShellPoll::Ready(0)
         }
-        Err(status) => status,
+        Err(status) => ShellPoll::Ready(status),
     }
 }
 
@@ -269,25 +290,25 @@ enum CommandKind {
 }
 
 fn process(
-    env: &mut CommandContext<'_>,
+    system: &mut dyn System,
     text: &str,
     commands: &mut [Command],
     quiet: bool,
 ) -> Result<String, i32> {
-    let memory_mark = env.resources.memory_mark();
+    let memory_mark = system.memory_used();
     let scratch = (text.len() as u64)
         .saturating_mul(2)
         .saturating_add((commands.len() as u64).saturating_mul(64));
-    if !env.reserve_memory(scratch) {
-        return Err(137);
+    if !system.reserve_memory(scratch) {
+        return Err(system.stop_status());
     }
-    let result = process_reserved(env, text, commands, quiet);
-    env.resources.restore_memory(memory_mark);
+    let result = process_reserved(system, text, commands, quiet);
+    system.release_memory(system.memory_used().saturating_sub(memory_mark));
     result
 }
 
 fn process_reserved(
-    env: &mut CommandContext<'_>,
+    system: &mut dyn System,
     text: &str,
     commands: &mut [Command],
     quiet: bool,
@@ -295,8 +316,8 @@ fn process_reserved(
     let lines = text.split_inclusive('\n').collect::<Vec<_>>();
     let mut output = String::new();
     for (index, raw_line) in lines.iter().enumerate() {
-        if !env.charge_cpu(raw_line.len() as u64 + commands.len() as u64) {
-            return Err(137);
+        if !system.charge_cpu(raw_line.len() as u64 + commands.len() as u64) {
+            return Err(system.stop_status());
         }
         let had_newline = raw_line.ends_with('\n');
         let mut pattern = raw_line.strip_suffix('\n').unwrap_or(raw_line).to_string();
@@ -320,34 +341,34 @@ fn process_reserved(
                     let bound = (pattern.len() as u64)
                         .saturating_mul((replacement.len() as u64).saturating_add(1))
                         .saturating_add(replacement.len() as u64);
-                    if !env.reserve_memory(bound) {
-                        return Err(137);
+                    if !system.reserve_memory(bound) {
+                        return Err(system.stop_status());
                     }
-                    if !env
+                    if !system
                         .charge_cpu((pattern.len() as u64).saturating_add(replacement.len() as u64))
                     {
-                        env.resources.release_memory(bound);
-                        return Err(137);
+                        system.release_memory(bound);
+                        return Err(system.stop_status());
                     }
                     let (result, substitutions) =
                         substitute(regex, replacement, &pattern, *global, *nth);
-                    env.resources.release_memory(bound);
+                    system.release_memory(bound);
                     pattern = result;
                     if *print && substitutions != 0 {
-                        push_line(env, &mut output, &pattern, true)?;
+                        push_line(system, &mut output, &pattern, true)?;
                     }
                 }
                 CommandKind::Delete => {
                     deleted = true;
                     break;
                 }
-                CommandKind::Print => push_line(env, &mut output, &pattern, true)?,
+                CommandKind::Print => push_line(system, &mut output, &pattern, true)?,
                 CommandKind::Quit => {
                     quit = true;
                     break;
                 }
                 CommandKind::Append(text) => after.push(text.clone()),
-                CommandKind::Insert(text) => push_line(env, &mut output, text, true)?,
+                CommandKind::Insert(text) => push_line(system, &mut output, text, true)?,
                 CommandKind::Change(text) => {
                     if selection != Selection::RangeBody {
                         pattern = text.clone();
@@ -369,17 +390,17 @@ fn process_reserved(
                         .collect();
                 }
                 CommandKind::LineNumber => {
-                    push_line(env, &mut output, &(index + 1).to_string(), true)?
+                    push_line(system, &mut output, &(index + 1).to_string(), true)?
                 }
             }
         }
         if changed {
-            push_line(env, &mut output, &pattern, true)?;
+            push_line(system, &mut output, &pattern, true)?;
         } else if !quiet && !deleted {
-            push_line(env, &mut output, &pattern, had_newline)?;
+            push_line(system, &mut output, &pattern, had_newline)?;
         }
         for text in after {
-            push_line(env, &mut output, &text, true)?;
+            push_line(system, &mut output, &text, true)?;
         }
         if quit {
             break;
@@ -389,20 +410,20 @@ fn process_reserved(
 }
 
 fn push_line(
-    env: &mut CommandContext<'_>,
+    system: &mut dyn System,
     output: &mut String,
     text: &str,
     newline: bool,
 ) -> Result<(), i32> {
     let bytes = (text.len() as u64).saturating_add(u64::from(newline));
     let projected = (output.len() as u64).saturating_add(bytes);
-    if projected > env.resources.output_remaining() {
-        let request = env.resources.output_remaining().saturating_add(1);
-        let _ = env.resources.charge_output(request);
-        return Err(137);
+    if projected > system.output_remaining() {
+        let request = system.output_remaining().saturating_add(1);
+        let _ = system.charge_output(request);
+        return Err(system.stop_status());
     }
-    if !env.reserve_memory(bytes) || !env.charge_cpu(bytes) {
-        return Err(137);
+    if !system.reserve_memory(bytes) || !system.charge_cpu(bytes) {
+        return Err(system.stop_status());
     }
     output.push_str(text);
     if newline {

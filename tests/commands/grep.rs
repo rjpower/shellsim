@@ -78,3 +78,35 @@ fn pattern_file_growth_obeys_memory_limits() {
     assert_eq!(outcome.exit_status, 137);
     assert_eq!(outcome.stop_reason, Some(StopReason::MemoryExhausted));
 }
+
+#[test]
+fn grep_uses_child_files_and_waits_for_pipe_eof() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/work/long", &vec![b'a'; 128 * 1024], 0o644)
+        .unwrap();
+    let (outcome, stdout, stderr) = environment.run_script_capture("cat /work/long | grep -c a");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"1\n");
+    let (outcome, stdout, stderr) = environment.run_script_capture("env -C /work grep -c a long");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"1\n");
+    let (outcome, stdout, stderr) = environment.run_script_capture("grep a /work/missing");
+    assert_eq!(outcome.exit_status, 2);
+    assert!(stdout.is_empty());
+    assert!(String::from_utf8_lossy(&stderr).contains("/work/missing"));
+    assert!(environment.invocations.events().iter().any(|event| {
+        event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == "grep")
+    }));
+}

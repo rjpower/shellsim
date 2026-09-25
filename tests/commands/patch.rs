@@ -90,3 +90,26 @@ PATCH"#;
     );
     assert!(!env.vfs.exists("/", "/delete-me"));
 }
+
+#[test]
+fn repeated_file_changes_share_one_atomic_batch() {
+    let mut env = Environment::new();
+    env.vfs
+        .put_file("/work/item", b"first\n".to_vec(), 0o644)
+        .unwrap();
+    let script = r#"env -C /work apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: item
+@@
+-first
++second
+*** Update File: item
+@@
+-second
++third
+*** End Patch
+PATCH"#;
+    let (status, stderr) = run(&mut env, script);
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(env.vfs.read("/", "/work/item").unwrap(), b"third\n");
+}

@@ -8,6 +8,9 @@ use std::collections::HashMap;
 use crate::commands::util::ewln;
 use crate::commands::{ChildCommand, CommandContext, CommandPoll, CommandSpec, Io, Trust};
 
+const MAX_TOKENS: usize = 65_536;
+const MAX_ARGUMENT_BYTES: usize = 16 * 1024 * 1024;
+
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     use super::reg_buffered_resumable;
     reg_buffered_resumable(m, &["xargs"], Trust::Real, cmd_xargs, start_xargs);
@@ -45,7 +48,7 @@ fn start_xargs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
     )
 }
 
-fn xargs_commands(
+pub(crate) fn xargs_commands(
     args: &[String],
     stdin: &[u8],
     err: &mut Vec<u8>,
@@ -121,12 +124,26 @@ fn xargs_commands(
         input
             .split('\0')
             .filter(|token| !token.is_empty())
+            .take(MAX_TOKENS + 1)
             .map(str::to_string)
             .collect()
     } else {
-        input.split_whitespace().map(str::to_string).collect()
+        input
+            .split_whitespace()
+            .take(MAX_TOKENS + 1)
+            .map(str::to_string)
+            .collect()
     };
+    if tokens.len() > MAX_TOKENS {
+        ewln(err, "xargs: too many input arguments");
+        return Err(1);
+    }
+    let base_bytes = cmd.iter().map(String::len).sum::<usize>();
     if tokens.is_empty() {
+        if base_bytes > MAX_ARGUMENT_BYTES {
+            ewln(err, "xargs: arguments exceed 16 MiB");
+            return Err(1);
+        }
         return Ok(if no_run_if_empty {
             Vec::new()
         } else {
@@ -134,14 +151,36 @@ fn xargs_commands(
         });
     }
     let mut commands = Vec::new();
+    let mut argument_bytes = 0usize;
     if let Some(ph) = replace {
+        if ph.is_empty() {
+            ewln(err, "xargs: empty replacement marker");
+            return Err(1);
+        }
         for token in &tokens {
+            let expanded_bytes = cmd.iter().try_fold(0usize, |total, arg| {
+                let count = arg.matches(&ph).count();
+                let removed = count.checked_mul(ph.len())?;
+                let inserted = count.checked_mul(token.len())?;
+                total.checked_add(arg.len().checked_sub(removed)?.checked_add(inserted)?)
+            });
+            argument_bytes = argument_bytes.saturating_add(expanded_bytes.unwrap_or(usize::MAX));
+            if argument_bytes > MAX_ARGUMENT_BYTES {
+                ewln(err, "xargs: arguments exceed 16 MiB");
+                return Err(1);
+            }
             let argv: Vec<String> = cmd.iter().map(|c| c.replace(&ph, token)).collect();
             commands.push(argv);
         }
     } else {
         let chunk = nper.unwrap_or(tokens.len().max(1));
         for batch in tokens.chunks(chunk.max(1)) {
+            argument_bytes = argument_bytes.saturating_add(base_bytes);
+            argument_bytes = argument_bytes.saturating_add(batch.iter().map(String::len).sum());
+            if argument_bytes > MAX_ARGUMENT_BYTES {
+                ewln(err, "xargs: arguments exceed 16 MiB");
+                return Err(1);
+            }
             let mut argv = cmd.clone();
             argv.extend(batch.iter().cloned());
             commands.push(argv);

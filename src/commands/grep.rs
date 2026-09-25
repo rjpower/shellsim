@@ -8,37 +8,50 @@ use std::collections::HashMap;
 use crate::commands::options::{parse_options_or_report, OptionSpec};
 use crate::commands::regex_compat::basic_regex_to_rust;
 use crate::commands::util::{ewln, glob_eq, wln};
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
-use crate::interp::Interp;
+use crate::commands::{CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
+use crate::program::ProcessContext;
+use crate::syscalls::{FileKind, SyscallError, System};
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
-    reg(m, &["grep"], Trust::Partial, cmd_grep);
-    reg(m, &["egrep"], Trust::Partial, cmd_egrep);
-    reg(m, &["fgrep"], Trust::Partial, cmd_fgrep);
+    use super::reg_system_poll;
+    reg_system_poll(m, "/usr/bin/grep", Trust::Partial, cmd_grep);
+    reg_system_poll(m, "/usr/bin/egrep", Trust::Partial, cmd_egrep);
+    reg_system_poll(m, "/usr/bin/fgrep", Trust::Partial, cmd_fgrep);
 }
 
-fn cmd_grep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    grep_impl(interp, "grep", args, io)
+fn cmd_grep(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    grep_impl(context, "grep", io)
 }
 
-fn cmd_egrep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    grep_impl(interp, "egrep", args, io)
+fn cmd_egrep(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    grep_impl(context, "egrep", io)
 }
 
-fn cmd_fgrep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    grep_impl(interp, "fgrep", args, io)
+fn cmd_fgrep(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    grep_impl(context, "fgrep", io)
 }
 
-/// grep with the command name available (egrep/fgrep change default regex flavor).
-fn grep_impl(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i32 {
-    let memory_mark = interp.resources.memory_mark();
-    let status = grep_impl_inner(interp, cmd, args, io);
-    interp.resources.restore_memory(memory_mark);
-    status
+fn read_named(system: &mut dyn System, base: &str, path: &str) -> Result<Vec<u8>, SyscallError> {
+    let maximum = usize::try_from(system.limits().memory).unwrap_or(usize::MAX);
+    system.read_file_limited(base, path, maximum)
 }
 
-fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -> i32 {
+/// Pattern-file reservations are released even when input pauses or a later option fails.
+fn grep_impl(context: &mut ProcessContext<'_>, cmd: &str, io: &mut Io) -> ShellPoll {
+    let mut reserved_patterns = 0_u64;
+    let result = grep_impl_inner(context, cmd, io, &mut reserved_patterns);
+    context.system.release_memory(reserved_patterns);
+    result
+}
+
+fn grep_impl_inner(
+    context: &mut ProcessContext<'_>,
+    cmd: &str,
+    io: &mut Io,
+    reserved_patterns: &mut u64,
+) -> ShellPoll {
+    let args = context.args;
     #[derive(Clone, Copy, PartialEq)]
     enum Key {
         IgnoreCase,
@@ -114,7 +127,7 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
         io.err,
     ) {
         Ok(parsed) => parsed,
-        Err(status) => return status,
+        Err(status) => return ShellPoll::Ready(status),
     };
     let mut ignore_case = false;
     let mut invert = false;
@@ -177,7 +190,7 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
                     Ok(value) => Some(value),
                     Err(_) => {
                         ewln(io.err, &format!("grep: invalid max count: {value}"));
-                        return 2;
+                        return ShellPoll::Ready(2);
                     }
                 };
             }
@@ -190,7 +203,7 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
                     Ok(value) => value,
                     Err(_) => {
                         ewln(io.err, &format!("grep: invalid context length: {value}"));
-                        return 2;
+                        return ShellPoll::Ready(2);
                     }
                 };
                 match option.key {
@@ -207,26 +220,28 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
                 "never" => {}
                 mode => {
                     ewln(io.err, &format!("grep: unsupported color mode '{mode}'"));
-                    return 2;
+                    return ShellPoll::Ready(2);
                 }
             },
             Key::Help => unreachable!("help is handled by the shared option parser"),
         }
     }
     for file in pattern_files {
-        let bytes = match interp.vfs.read(&interp.cwd, &file) {
+        let cwd = context.system.cwd().to_string();
+        let bytes = match read_named(context.system, &cwd, &file) {
             Ok(bytes) => bytes,
             Err(error) => {
                 ewln(io.err, &format!("grep: {file}: {error}"));
-                return 2;
+                return ShellPoll::Ready(2);
             }
         };
         let bytes_len = bytes.len() as u64;
-        if !interp.resources.reserve_memory(bytes_len) || !interp.resources.charge_cpu(bytes_len) {
-            return interp
-                .resources
-                .stop_reason()
-                .map_or(137, |reason| reason.exit_status());
+        if !context.system.reserve_memory(bytes_len) {
+            return ShellPoll::Ready(context.system.stop_status());
+        }
+        *reserved_patterns = reserved_patterns.saturating_add(bytes_len);
+        if !context.system.charge_cpu(bytes_len) {
+            return ShellPoll::Ready(context.system.stop_status());
         }
         let content = match String::from_utf8(bytes) {
             Ok(content) => content,
@@ -235,7 +250,7 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
                     io.err,
                     &format!("grep: {file}: pattern file is not valid UTF-8"),
                 );
-                return 2;
+                return ShellPoll::Ready(2);
             }
         };
         patterns.extend(content.lines().map(str::to_string));
@@ -247,7 +262,7 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
             io.err,
             "grep: context cannot be combined with count, file-list, only-match, or quiet modes",
         );
-        return 2;
+        return ShellPoll::Ready(2);
     }
     let mut operands = parsed.operands;
     let files = if !explicit_pattern && !operands.is_empty() {
@@ -258,7 +273,7 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
     };
     if patterns.is_empty() && !explicit_pattern {
         ewln(io.err, "grep: no pattern");
-        return 2;
+        return ShellPoll::Ready(2);
     }
     let mut pat_re = if patterns.is_empty() {
         r"[^\s\S]".to_string()
@@ -284,7 +299,7 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
                     io.err,
                     &format!("grep: unsupported regular expression: {error}"),
                 );
-                return 2;
+                return ShellPoll::Ready(2);
             }
         };
         patterns
@@ -309,9 +324,15 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
                 io.err,
                 &format!("grep: invalid regular expression: {error}"),
             );
-            return 2;
+            return ShellPoll::Ready(2);
         }
     };
+
+    if files.is_empty() || files.iter().any(|file| file == "-") {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
 
     // gather (label, data)
     let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
@@ -320,8 +341,12 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
         inputs.push((String::new(), std::mem::take(&mut io.stdin)));
     } else if recursive {
         for f in &files {
-            let abs = crate::vfs::resolve_against(&interp.cwd, f);
-            let paths = match interp.fs_walk("/", &abs) {
+            if f == "-" {
+                inputs.push((String::new(), io.stdin.clone()));
+                continue;
+            }
+            let abs = crate::vfs::resolve_against(context.system.cwd(), f);
+            let paths = match context.system.walk("/", &abs) {
                 Ok(paths) => paths,
                 Err(error) => {
                     if !suppress_errors {
@@ -333,13 +358,13 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
             };
             for p in paths {
                 if matches!(
-                    interp.fs_metadata("/", &p, false).map(|node| node.kind),
-                    Ok(crate::vfs::NodeKind::File(_))
+                    context.system.metadata("/", &p, false),
+                    Ok(info) if info.kind == FileKind::File && !info.native_executable
                 ) {
                     if !grep_path_selected(&p, &includes, &excludes, &exclude_dirs) {
                         continue;
                     }
-                    match interp.fs_read("/", &p) {
+                    match read_named(context.system, "/", &p) {
                         Ok(data) => inputs.push((p.clone(), data)),
                         Err(error) => {
                             if !suppress_errors {
@@ -356,7 +381,12 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
             if !grep_path_selected(f, &includes, &excludes, &[]) {
                 continue;
             }
-            match interp.fs_read(&interp.cwd, f) {
+            if f == "-" {
+                inputs.push((String::new(), io.stdin.clone()));
+                continue;
+            }
+            let cwd = context.system.cwd().to_string();
+            match read_named(context.system, &cwd, f) {
                 Ok(d) => inputs.push((f.clone(), d)),
                 Err(error) => {
                     if !suppress_errors {
@@ -371,8 +401,8 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
     let mut total_matches = 0;
     let mut selected_file = false;
     for (label, data) in &inputs {
-        if !interp.resources.charge_cpu(data.len() as u64) {
-            return 137;
+        if !context.system.charge_cpu(data.len() as u64) {
+            return ShellPoll::Ready(context.system.stop_status());
         }
         if !text_mode && data.contains(&0) {
             if !suppress_errors {
@@ -425,7 +455,7 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
                 file_count += 1;
                 total_matches += 1;
                 if quiet {
-                    return 0;
+                    return ShellPoll::Ready(0);
                 }
                 if count || files_with || files_without {
                     if files_with || max_count.is_some_and(|limit| file_count >= limit) {
@@ -472,7 +502,7 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
             selected_file |= matched_file;
         }
     }
-    if had_error {
+    ShellPoll::Ready(if had_error {
         2
     } else if if files_without {
         selected_file
@@ -482,7 +512,7 @@ fn grep_impl_inner(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io)
         0
     } else {
         1
-    }
+    })
 }
 
 fn parsed_text(data: &[u8]) -> Result<&str, ()> {

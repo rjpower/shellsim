@@ -11,6 +11,10 @@ use crate::scheduler::WaitReason;
 use crate::syscalls::{ActiveSystem, SyscallError, System};
 
 mod cat;
+mod env;
+mod head;
+mod tee;
+mod xargs;
 
 /// Invocation view borrowed by a native command for one scheduler quantum.
 /// Only the owned command continuation survives a blocked operation.
@@ -78,6 +82,18 @@ impl ProgramContinuation {
         if let Self::Native(NativeProcess::SystemCommand(command)) = self {
             interp.resources.release_memory(command.reserved_input);
             command.reserved_input = 0;
+            interp.resources.release_memory(command.base_reserved);
+            command.base_reserved = 0;
+        }
+        if let Self::Native(NativeProcess::Xargs(command)) = self {
+            interp
+                .resources
+                .release_memory(command.take_reserved_input());
+        }
+        if let Self::Native(NativeProcess::Env(command)) = self {
+            interp
+                .resources
+                .release_memory(command.take_reserved_output());
         }
     }
 
@@ -118,6 +134,10 @@ pub(crate) enum NativeProcess {
     },
     SystemCommand(SystemCommandProcess),
     Cat(cat::CatProcess),
+    Tee(tee::TeeProcess),
+    Head(head::HeadProcess),
+    Xargs(xargs::XargsProcess),
+    Env(env::EnvProcess),
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -133,7 +153,13 @@ pub(crate) struct SystemCommandProcess {
     args: Vec<String>,
     run: crate::commands::SystemRun,
     base_cpu: u64,
+    base_memory: u64,
+    trust: crate::telemetry::CommandTrust,
     started: bool,
+    base_reserved: u64,
+    cpu_before: u64,
+    disk_before: u64,
+    usage_recorded: bool,
     stdin: Vec<u8>,
     stdin_complete: bool,
     reserved_input: u64,
@@ -156,7 +182,13 @@ impl SystemCommandProcess {
             args: args.to_vec(),
             run: command.run,
             base_cpu: command.base_cpu,
+            base_memory: command.base_memory,
+            trust: command.trust,
             started: false,
+            base_reserved: 0,
+            cpu_before: 0,
+            disk_before: 0,
+            usage_recorded: false,
             stdin: Vec::new(),
             stdin_complete: false,
             reserved_input: 0,
@@ -176,8 +208,15 @@ impl SystemCommandProcess {
                 None
             } else {
                 self.started = true;
-                (!system.charge_cpu(self.base_cpu.saturating_add(argument_bytes)))
-                    .then(|| system.stop_status())
+                self.cpu_before = system.cpu_used();
+                self.disk_before = system.disk_used();
+                if !system.reserve_memory(self.base_memory) {
+                    Some(system.stop_status())
+                } else {
+                    self.base_reserved = self.base_memory;
+                    (!system.charge_cpu(self.base_cpu.saturating_add(argument_bytes)))
+                        .then(|| system.stop_status())
+                }
             };
             let outcome = if let Some(status) = start_status {
                 ShellPoll::Ready(status)
@@ -229,6 +268,8 @@ impl SystemCommandProcess {
             };
             system.release_memory(self.reserved_input);
             self.reserved_input = 0;
+            system.release_memory(self.base_reserved);
+            self.base_reserved = 0;
             if self.result.is_none() {
                 self.result = Some(SystemCommandOutput {
                     status,
@@ -244,17 +285,29 @@ impl SystemCommandProcess {
             ShellPoll::Ready(0) => {}
             other => return other,
         }
-        poll_write(
+        let completion = poll_write(
             system,
             2,
             &result.stderr,
             &mut result.stderr_offset,
             result.status,
-        )
+        );
+        if matches!(completion, ShellPoll::Ready(_)) && !self.usage_recorded {
+            system.record_command_usage(self.name, self.cpu_before, self.disk_before);
+            self.usage_recorded = true;
+        }
+        completion
     }
 }
 
 impl NativeProcess {
+    pub(crate) fn trust(&self) -> crate::telemetry::CommandTrust {
+        match self {
+            Self::SystemCommand(command) => command.trust,
+            _ => crate::telemetry::CommandTrust::Real,
+        }
+    }
+
     /// Construct an owned continuation from one VFS native program identity.
     pub(crate) fn from_image(image: crate::vfs::NativeProgram, argv: &[String]) -> Self {
         match image {
@@ -284,6 +337,10 @@ impl NativeProcess {
                 Self::Yes { output, offset: 0 }
             }
             crate::vfs::NativeProgram::Cat => Self::Cat(cat::CatProcess::new(&argv[1..])),
+            crate::vfs::NativeProgram::Tee => Self::Tee(tee::TeeProcess::new(&argv[1..])),
+            crate::vfs::NativeProgram::Head => Self::Head(head::HeadProcess::new(&argv[1..])),
+            crate::vfs::NativeProgram::Xargs => Self::Xargs(xargs::XargsProcess::new(&argv[1..])),
+            crate::vfs::NativeProgram::Env => Self::Env(env::EnvProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Registered(path) => {
                 let Some(command) = crate::commands::system_command(path) else {
                     return Self::failure(
@@ -331,6 +388,10 @@ impl NativeProcess {
             },
             Self::SystemCommand(command) => command.poll(syscalls),
             Self::Cat(cat) => cat.poll(syscalls),
+            Self::Tee(tee) => tee.poll(syscalls),
+            Self::Head(head) => head.poll(syscalls),
+            Self::Xargs(xargs) => xargs.poll(syscalls),
+            Self::Env(env) => env.poll(syscalls),
             Self::Failure {
                 status,
                 message,
@@ -401,6 +462,14 @@ mod tests {
             std::collections::BTreeMap::new()
         }
 
+        fn hostname(&self) -> &str {
+            unreachable!("native writer does not inspect hostname")
+        }
+
+        fn set_hostname(&mut self, _name: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not set hostname")
+        }
+
         fn uid(&self) -> u32 {
             unreachable!("native writer does not inspect identity")
         }
@@ -425,6 +494,10 @@ mod tests {
             unreachable!("native writer does not inspect limits")
         }
 
+        fn cpu_used(&self) -> u64 {
+            0
+        }
+
         fn disk_used(&self) -> u64 {
             unreachable!("native writer does not inspect disk usage")
         }
@@ -432,6 +505,8 @@ mod tests {
         fn memory_used(&self) -> u64 {
             unreachable!("native writer does not inspect memory usage")
         }
+
+        fn record_command_usage(&mut self, _name: &str, _cpu_before: u64, _disk_before: u64) {}
 
         fn metadata(
             &mut self,
@@ -481,6 +556,14 @@ mod tests {
             _mode: u32,
         ) -> Result<(), SyscallError> {
             unreachable!("native writer does not write files")
+        }
+
+        fn apply_file_batch(
+            &mut self,
+            _base: &str,
+            _changes: Vec<crate::syscalls::FileChange>,
+        ) -> Result<(), SyscallError> {
+            unreachable!("native writer does not change files")
         }
 
         fn read(&mut self, _fd: i32, _maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
@@ -606,6 +689,10 @@ mod tests {
             unreachable!("native writer does not inspect time")
         }
 
+        fn wall_time_signed_ns(&self) -> Result<i128, SyscallError> {
+            unreachable!("native writer does not inspect time")
+        }
+
         fn clock_time_ns(&self, _clock: crate::syscalls::ClockId) -> Result<u64, SyscallError> {
             unreachable!("native writer does not inspect time")
         }
@@ -616,6 +703,68 @@ mod tests {
 
         fn allocate_temp_id(&mut self) -> Option<u64> {
             unreachable!("native writer does not allocate temporary names")
+        }
+
+        fn http_request(
+            &mut self,
+            _request: crate::net::HttpRequest,
+        ) -> Result<crate::net::HttpResponse, crate::net::RequestError> {
+            unreachable!("native writer does not make HTTP requests")
+        }
+
+        fn http_route_static(
+            &mut self,
+            _pattern: &str,
+            _status: u16,
+            _body: Vec<u8>,
+        ) -> Result<(), crate::net::RouteError> {
+            unreachable!("native writer does not register HTTP routes")
+        }
+
+        fn http_route_file(
+            &mut self,
+            _pattern: &str,
+            _path: &str,
+        ) -> Result<(), crate::net::RouteError> {
+            unreachable!("native writer does not register HTTP routes")
+        }
+
+        fn network_listen(&mut self, _host_port: &str) {
+            unreachable!("native writer does not listen on virtual network")
+        }
+
+        fn network_request_count(&self) -> usize {
+            unreachable!("native writer does not inspect network requests")
+        }
+
+        fn network_request_at(&self, _index: usize) -> Option<crate::net::NetworkRequest> {
+            unreachable!("native writer does not inspect network requests")
+        }
+
+        fn process_snapshot(&mut self) -> Vec<crate::process::ProcessRecord> {
+            unreachable!("native writer does not inspect processes")
+        }
+
+        fn listener_snapshot(&self) -> Vec<String> {
+            unreachable!("native writer does not inspect listeners")
+        }
+
+        fn spawn_argv(
+            &mut self,
+            _spec: crate::syscalls::SpawnSpec,
+        ) -> Result<crate::process::ProcessId, SyscallError> {
+            unreachable!("native writer does not spawn processes")
+        }
+
+        fn child_status(
+            &self,
+            _pid: crate::process::ProcessId,
+        ) -> Result<Option<i32>, SyscallError> {
+            unreachable!("native writer does not inspect child processes")
+        }
+
+        fn reap_child(&mut self, _pid: crate::process::ProcessId) -> Result<i32, SyscallError> {
+            unreachable!("native writer does not reap child processes")
         }
 
         fn display_open(
@@ -672,6 +821,10 @@ mod tests {
 
         fn stop_status(&self) -> i32 {
             137
+        }
+
+        fn note_unsupported(&mut self, _feature: &str) {
+            unreachable!("native writer does not reject features")
         }
     }
 

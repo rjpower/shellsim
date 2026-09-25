@@ -6,35 +6,29 @@
 use std::collections::HashMap;
 
 use crate::commands::util::{
-    ewln, lines_of, read_inputs, read_inputs_system, split_flags, uses_standard_input, w, wln,
+    ewln, lines_of, read_inputs_system, split_flags, uses_standard_input, w, wln,
 };
-use crate::commands::{CommandContext, CommandPoll, CommandSpec, Io, Trust};
+use crate::commands::{CommandContext, CommandSpec, Io, Trust};
 use crate::exec::ShellPoll;
 use crate::interp::Interp;
 use crate::program::ProcessContext;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_buffered_resumable, reg_system_poll, reg_unsupported};
+    use super::{reg, reg_system, reg_system_poll, reg_unsupported};
     reg_system_poll(m, "/usr/bin/wc", Trust::Real, cmd_wc);
     reg_system_poll(m, "/usr/bin/uniq", Trust::Real, cmd_uniq);
     reg_system_poll(m, "/usr/bin/cut", Trust::Real, cmd_cut);
     reg_system_poll(m, "/usr/bin/tr", Trust::Real, cmd_tr);
     reg_system_poll(m, "/usr/bin/rev", Trust::Real, cmd_rev);
     reg_system_poll(m, "/usr/bin/nl", Trust::Real, cmd_nl);
-    reg(m, &["seq"], Trust::Real, cmd_seq);
+    reg_system(m, "/usr/bin/seq", Trust::Real, cmd_seq);
     reg_system_poll(m, "/usr/bin/paste", Trust::Real, cmd_paste);
     reg_unsupported(m, &["pr"]);
-    reg(m, &["comm"], Trust::Real, cmd_comm);
-    reg_buffered_resumable(m, &["join"], Trust::Partial, cmd_join, start_buffered_text);
-    reg_buffered_resumable(
-        m,
-        &["split"],
-        Trust::Partial,
-        cmd_split,
-        start_buffered_text,
-    );
-    reg_buffered_resumable(m, &["shuf"], Trust::Partial, cmd_shuf, start_buffered_text);
-    reg_buffered_resumable(m, &["tsort"], Trust::Real, cmd_tsort, start_buffered_text);
+    reg_system_poll(m, "/usr/bin/comm", Trust::Real, cmd_comm);
+    reg_system_poll(m, "/usr/bin/join", Trust::Partial, cmd_join);
+    reg_system_poll(m, "/usr/bin/split", Trust::Partial, cmd_split);
+    reg_system_poll(m, "/usr/bin/shuf", Trust::Partial, cmd_shuf);
+    reg_system_poll(m, "/usr/bin/tsort", Trust::Real, cmd_tsort);
     reg(m, &["expr"], Trust::Real, cmd_expr);
     reg(m, &["bc"], Trust::Real, cmd_bc);
     reg_unsupported(m, &["factor"]);
@@ -486,7 +480,8 @@ fn cmd_nl(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     ShellPoll::Ready(0)
 }
 
-fn cmd_seq(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_seq(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     if args
         .iter()
         .any(|argument| argument.starts_with('-') && argument.parse::<f64>().is_err())
@@ -512,14 +507,32 @@ fn cmd_seq(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     };
     let mut x = start;
     let int = start.fract() == 0.0 && step.fract() == 0.0 && end.fract() == 0.0;
+    let mut emit = |value| -> Result<(), i32> {
+        if !context.system.charge_cpu(1) {
+            return Err(context.system.stop_status());
+        }
+        let line = fmt_num(value, int);
+        let projected = io.out.len().saturating_add(line.len()).saturating_add(1);
+        if u64::try_from(projected).unwrap_or(u64::MAX) > context.system.output_remaining() {
+            let excess = context.system.output_remaining().saturating_add(1);
+            let _ = context.system.charge_output(excess);
+            return Err(context.system.stop_status());
+        }
+        wln(io.out, &line);
+        Ok(())
+    };
     if step > 0.0 {
         while x <= end + 1e-9 {
-            wln(io.out, &fmt_num(x, int));
+            if let Err(status) = emit(x) {
+                return status;
+            }
             x += step;
         }
     } else if step < 0.0 {
         while x >= end - 1e-9 {
-            wln(io.out, &fmt_num(x, int));
+            if let Err(status) = emit(x) {
+                return status;
+            }
             x += step;
         }
     } else {
@@ -597,38 +610,28 @@ fn cmd_paste(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     ShellPoll::Ready(0)
 }
 
-fn start_buffered_text(
-    interp: &mut CommandContext<'_>,
-    args: &[String],
-    io: &mut Io,
-) -> CommandPoll {
-    let command = interp.command_name().to_string();
-    let status = match command.as_str() {
-        "join" => cmd_join(interp, args, io),
-        "split" => cmd_split(interp, args, io),
-        "shuf" => cmd_shuf(interp, args, io),
-        "tsort" => cmd_tsort(interp, args, io),
-        _ => unreachable!("registered buffered text command"),
-    };
-    CommandPoll::Ready(status)
-}
-
-fn cmd_comm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_comm(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let (flags, ops, _l) = split_flags(args);
     if ops.len() < 2 {
         ewln(io.err, "comm: missing operand");
-        return 1;
+        return ShellPoll::Ready(1);
     }
-    let a = interp
-        .vfs
-        .read(&interp.cwd, ops[0])
-        .map(|d| lines_of(&d))
-        .unwrap_or_default();
-    let b = interp
-        .vfs
-        .read(&interp.cwd, ops[1])
-        .map(|d| lines_of(&d))
-        .unwrap_or_default();
+    if uses_standard_input(&ops[..2]) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let mut inputs = Vec::new();
+    for operand in &ops[..2] {
+        let (bytes, errors) = read_inputs_system(context.system, &[*operand], &io.stdin);
+        if let Some(error) = errors.first() {
+            ewln(io.err, &format!("comm: {error}"));
+            return ShellPoll::Ready(1);
+        }
+        inputs.push(lines_of(&bytes));
+    }
+    let [a, b] = <[Vec<String>; 2]>::try_from(inputs).expect("two comm inputs");
     let (s1, s2, s3) = (
         !flags.contains(&'1'),
         !flags.contains(&'2'),
@@ -654,10 +657,11 @@ fn cmd_comm(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             j += 1;
         }
     }
-    0
+    ShellPoll::Ready(0)
 }
 
-fn cmd_join(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_join(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let mut separator = None;
     let mut field1 = 0usize;
     let mut field2 = 0usize;
@@ -671,7 +675,7 @@ fn cmd_join(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                 separator = args.get(index).and_then(|value| value.chars().next());
                 if separator.is_none() {
                     ewln(io.err, "join: missing delimiter");
-                    return 1;
+                    return ShellPoll::Ready(1);
                 }
             }
             "-1" | "-2" => {
@@ -683,7 +687,7 @@ fn cmd_join(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                     .and_then(|v| v.checked_sub(1))
                 else {
                     ewln(io.err, "join: invalid field number");
-                    return 1;
+                    return ShellPoll::Ready(1);
                 };
                 if side == 0 {
                     field1 = value;
@@ -698,13 +702,13 @@ fn cmd_join(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                     Some("2") => include_unpaired[1] = true,
                     _ => {
                         ewln(io.err, "join: invalid file number");
-                        return 1;
+                        return ShellPoll::Ready(1);
                     }
                 }
             }
             value if value.starts_with('-') && value != "-" => {
                 ewln(io.err, &format!("join: unsupported option '{value}'"));
-                return 1;
+                return ShellPoll::Ready(1);
             }
             _ => files.push(&args[index]),
         }
@@ -712,21 +716,20 @@ fn cmd_join(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     }
     if files.len() != 2 {
         ewln(io.err, "join: expected two files");
-        return 1;
+        return ShellPoll::Ready(1);
+    }
+    if files.iter().any(|file| file.as_str() == "-") {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
     }
     let mut inputs = Vec::new();
     for file in files {
-        let data = if file == "-" {
-            io.stdin.clone()
-        } else {
-            match interp.fs_read(&interp.cwd, file) {
-                Ok(v) => v,
-                Err(e) => {
-                    ewln(io.err, &format!("join: {file}: {e}"));
-                    return 1;
-                }
-            }
-        };
+        let (data, errors) = read_inputs_system(context.system, &[file], &io.stdin);
+        if let Some(error) = errors.first() {
+            ewln(io.err, &format!("join: {error}"));
+            return ShellPoll::Ready(1);
+        }
         inputs.push(
             lines_of(&data)
                 .into_iter()
@@ -748,12 +751,15 @@ fn cmd_join(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         .map(String::len)
         .sum::<usize>()
         .saturating_add(inputs[1].len());
-    if !interp.charge_cpu(u64::try_from(comparison_work).unwrap_or(u64::MAX)) {
-        return 137;
+    if !context
+        .system
+        .charge_cpu(u64::try_from(comparison_work).unwrap_or(u64::MAX))
+    {
+        return ShellPoll::Ready(context.system.stop_status());
     }
     let retained_memory = u64::try_from(retained_memory).unwrap_or(u64::MAX);
-    if !interp.reserve_memory(retained_memory) {
-        return 137;
+    if !context.system.reserve_memory(retained_memory) {
+        return ShellPoll::Ready(context.system.stop_status());
     }
     let mut matched2 = vec![false; inputs[1].len()];
     for row1 in &inputs[0] {
@@ -790,11 +796,12 @@ fn cmd_join(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             }
         }
     }
-    interp.resources.release_memory(retained_memory);
-    0
+    context.system.release_memory(retained_memory);
+    ShellPoll::Ready(0)
 }
 
-fn cmd_split(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_split(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let mut line_count = 1000usize;
     let mut byte_count = None;
     let mut operands = Vec::new();
@@ -806,7 +813,7 @@ fn cmd_split(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
                 line_count = match args.get(index).and_then(|v| v.parse().ok()) {
                     Some(0) | None => {
                         ewln(io.err, "split: invalid line count");
-                        return 1;
+                        return ShellPoll::Ready(1);
                     }
                     Some(v) => v,
                 };
@@ -816,14 +823,14 @@ fn cmd_split(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
                 byte_count = match args.get(index).and_then(|v| v.parse::<usize>().ok()) {
                     Some(0) | None => {
                         ewln(io.err, "split: invalid byte count");
-                        return 1;
+                        return ShellPoll::Ready(1);
                     }
                     value => value,
                 };
             }
             value if value.starts_with('-') && value != "-" => {
                 ewln(io.err, &format!("split: unsupported option '{value}'"));
-                return 1;
+                return ShellPoll::Ready(1);
             }
             _ => operands.push(&args[index]),
         }
@@ -831,22 +838,34 @@ fn cmd_split(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
     }
     if operands.len() > 2 {
         ewln(io.err, "split: extra operand");
-        return 1;
+        return ShellPoll::Ready(1);
+    }
+    if operands.first().is_none_or(|value| value.as_str() == "-") {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
     }
     let data = match operands.first().map(|v| v.as_str()) {
         None | Some("-") => io.stdin.clone(),
-        Some(file) => match interp.fs_read(&interp.cwd, file) {
-            Ok(v) => v,
-            Err(e) => {
-                ewln(io.err, &format!("split: {file}: {e}"));
-                return 1;
+        Some(file) => {
+            let cwd = context.system.cwd().to_string();
+            let maximum = usize::try_from(context.system.limits().memory).unwrap_or(usize::MAX);
+            match context.system.read_file_limited(&cwd, file, maximum) {
+                Ok(v) => v,
+                Err(e) => {
+                    ewln(io.err, &format!("split: {file}: {e}"));
+                    return ShellPoll::Ready(1);
+                }
             }
-        },
+        }
     };
     let prefix = operands.get(1).map_or("x", |value| value.as_str());
     let data_len = data.len();
-    if !interp.charge_cpu(u64::try_from(data_len).unwrap_or(u64::MAX)) {
-        return 137;
+    if !context
+        .system
+        .charge_cpu(u64::try_from(data_len).unwrap_or(u64::MAX))
+    {
+        return ShellPoll::Ready(context.system.stop_status());
     }
     let chunk_memory = data_len.saturating_mul(2).saturating_add(
         data_len
@@ -854,8 +873,8 @@ fn cmd_split(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
             .saturating_mul(std::mem::size_of::<Vec<u8>>()),
     );
     let chunk_memory = u64::try_from(chunk_memory).unwrap_or(u64::MAX);
-    if !interp.reserve_memory(chunk_memory) {
-        return 137;
+    if !context.system.reserve_memory(chunk_memory) {
+        return ShellPoll::Ready(context.system.stop_status());
     }
     let chunks = if let Some(bytes) = byte_count {
         data.chunks(bytes).map(<[u8]>::to_vec).collect::<Vec<_>>()
@@ -881,27 +900,28 @@ fn cmd_split(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
     for (number, chunk) in chunks.iter().enumerate() {
         if number >= 26 * 26 {
             ewln(io.err, "split: output file suffixes exhausted");
-            interp.resources.release_memory(chunk_memory);
-            return 1;
+            context.system.release_memory(chunk_memory);
+            return ShellPoll::Ready(1);
         }
         let name = format!(
             "{prefix}{}{}",
             char::from(b'a' + (number / 26) as u8),
             char::from(b'a' + (number % 26) as u8)
         );
-        let cwd = interp.cwd.clone();
-        let mode = 0o666 & !u32::from(interp.umask);
-        if let Err(error) = interp.vfs.write(&cwd, &name, chunk, mode) {
+        let cwd = context.system.cwd().to_string();
+        let mode = 0o666 & !u32::from(context.system.umask());
+        if let Err(error) = context.system.write_file(&cwd, &name, chunk, mode) {
             ewln(io.err, &format!("split: {name}: {error}"));
-            interp.resources.release_memory(chunk_memory);
-            return 1;
+            context.system.release_memory(chunk_memory);
+            return ShellPoll::Ready(1);
         }
     }
-    interp.resources.release_memory(chunk_memory);
-    0
+    context.system.release_memory(chunk_memory);
+    ShellPoll::Ready(0)
 }
 
-fn cmd_shuf(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_shuf(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     let mut count = None;
     let mut files = Vec::new();
     let mut index = 0;
@@ -911,14 +931,14 @@ fn cmd_shuf(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             count = args.get(index).and_then(|v| v.parse::<usize>().ok());
             if count.is_none() {
                 ewln(io.err, "shuf: invalid line count");
-                return 1;
+                return ShellPoll::Ready(1);
             }
         } else if args[index].starts_with('-') && args[index] != "-" {
             ewln(
                 io.err,
                 &format!("shuf: unsupported option '{}'", args[index]),
             );
-            return 1;
+            return ShellPoll::Ready(1);
         } else {
             files.push(&args[index]);
         }
@@ -926,12 +946,23 @@ fn cmd_shuf(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     }
     if files.len() > 1 {
         ewln(io.err, "shuf: extra operand");
-        return 1;
+        return ShellPoll::Ready(1);
     }
-    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if uses_standard_input(&files) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &files, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("shuf: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
+    }
+    if !context
+        .system
+        .charge_cpu(u64::try_from(data.len()).unwrap_or(u64::MAX))
+    {
+        return ShellPoll::Ready(context.system.stop_status());
     }
     let mut lines = lines_of(&data);
     // A fixed generator makes simulations reproducible while retaining permutation semantics.
@@ -945,19 +976,31 @@ fn cmd_shuf(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     for line in &lines[..take] {
         wln(io.out, line);
     }
-    0
+    ShellPoll::Ready(0)
 }
 
-fn cmd_tsort(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_tsort(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
+    let args = context.args;
     if args.len() > 1 {
         ewln(io.err, "tsort: extra operand");
-        return 1;
+        return ShellPoll::Ready(1);
     }
     let files = args.iter().collect::<Vec<_>>();
-    let (data, errors) = read_inputs(interp, &files, &io.stdin);
+    if uses_standard_input(&files) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    let (data, errors) = read_inputs_system(context.system, &files, &io.stdin);
     if let Some(error) = errors.first() {
         ewln(io.err, &format!("tsort: {error}"));
-        return 1;
+        return ShellPoll::Ready(1);
+    }
+    if !context
+        .system
+        .charge_cpu(u64::try_from(data.len()).unwrap_or(u64::MAX))
+    {
+        return ShellPoll::Ready(context.system.stop_status());
     }
     let words = String::from_utf8_lossy(&data)
         .split_whitespace()
@@ -965,7 +1008,7 @@ fn cmd_tsort(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
         .collect::<Vec<_>>();
     if words.len() % 2 != 0 {
         ewln(io.err, "tsort: input contains an odd number of tokens");
-        return 1;
+        return ShellPoll::Ready(1);
     }
     let mut edges = std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
     let mut indegree = std::collections::BTreeMap::<String, usize>::new();
@@ -1002,9 +1045,9 @@ fn cmd_tsort(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
     }
     if emitted != indegree.len() {
         ewln(io.err, "tsort: input contains a loop");
-        return 1;
+        return ShellPoll::Ready(1);
     }
-    0
+    ShellPoll::Ready(0)
 }
 
 fn cmd_expr(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

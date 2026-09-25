@@ -41,15 +41,15 @@ mod regex_compat;
 mod rgcmd;
 mod sed;
 mod sort;
-mod streams;
-mod system;
+pub(crate) mod streams;
+pub(crate) mod system;
 mod tarcmd;
 mod text;
 mod unavailable;
 pub mod util;
 mod wasm;
 pub use wasm::{SessionPoll, SessionResult, WasmSession};
-mod xargs;
+pub(crate) mod xargs;
 mod zipcmd;
 
 /// Bundled standard I/O for a command invocation.
@@ -91,6 +91,8 @@ pub(crate) enum SystemRun {
 pub(crate) struct SystemCommand {
     pub(crate) run: SystemRun,
     pub(crate) base_cpu: u64,
+    pub(crate) base_memory: u64,
+    pub(crate) trust: Trust,
 }
 
 fn run_system_from_legacy(
@@ -180,15 +182,7 @@ pub(crate) enum CommandResume {
     TextStream(streams::TextStream),
 }
 
-/// One scheduler-owned argv invocation requested by a modeled native command.
-#[derive(Clone)]
-pub(crate) struct ChildCommand {
-    pub argv: Vec<String>,
-    /// `None` inherits fd 0; `Some` replaces it even when the byte stream is empty.
-    pub stdin: Option<Vec<u8>>,
-    pub cwd: Option<String>,
-    pub environment: Option<std::collections::BTreeMap<String, String>>,
-}
+pub(crate) use crate::syscalls::SpawnSpec as ChildCommand;
 
 type ResumableCmdFn = fn(&mut CommandContext<'_>, &[String], &mut Io) -> CommandPoll;
 
@@ -300,10 +294,14 @@ pub(crate) fn system_command(path: &str) -> Option<SystemCommand> {
         CommandBody::System(run) => Some(SystemCommand {
             run: SystemRun::Once(run),
             base_cpu: spec.base_cpu,
+            base_memory: spec.base_memory,
+            trust: spec.trust,
         }),
         CommandBody::SystemPoll(run) => Some(SystemCommand {
             run: SystemRun::Poll(run),
             base_cpu: spec.base_cpu,
+            base_memory: spec.base_memory,
+            trust: spec.trust,
         }),
         CommandBody::Legacy(_) => None,
     }
@@ -381,7 +379,14 @@ fn reg_system_costed(
     base_cpu: u64,
     system: SystemCmdFn,
 ) {
-    reg_system_input(map, path, trust, base_cpu, CommandBody::System(system));
+    reg_system_input(
+        map,
+        path,
+        trust,
+        base_cpu,
+        10 * 1024,
+        CommandBody::System(system),
+    );
 }
 
 /// Register a native command that can suspend on descriptor I/O.
@@ -391,7 +396,25 @@ fn reg_system_poll(
     trust: Trust,
     system: SystemPollFn,
 ) {
-    reg_system_input(map, path, trust, 100, CommandBody::SystemPoll(system));
+    reg_system_poll_costed(map, path, trust, 100, 10 * 1024, system);
+}
+
+fn reg_system_poll_costed(
+    map: &mut HashMap<&'static str, CommandSpec>,
+    path: &'static str,
+    trust: Trust,
+    base_cpu: u64,
+    base_memory: u64,
+    system: SystemPollFn,
+) {
+    reg_system_input(
+        map,
+        path,
+        trust,
+        base_cpu,
+        base_memory,
+        CommandBody::SystemPoll(system),
+    );
 }
 
 fn reg_system_input(
@@ -399,6 +422,7 @@ fn reg_system_input(
     path: &'static str,
     trust: Trust,
     base_cpu: u64,
+    base_memory: u64,
     body: CommandBody,
 ) {
     assert!(path.starts_with('/') && !path.ends_with('/'));
@@ -409,7 +433,7 @@ fn reg_system_input(
         resume_before_input: false,
         trust,
         base_cpu,
-        base_memory: 10 * 1024,
+        base_memory,
     };
     assert!(
         map.insert(path, spec).is_none(),
@@ -876,33 +900,7 @@ pub(crate) fn start_child_command(
     if command.argv.is_empty() {
         return Err(0);
     }
-    let input = command
-        .stdin
-        .map(|bytes| interp.descriptors.open_input(bytes))
-        .transpose()
-        .map_err(|_| 125)?;
-    let display = command.argv.join(" ");
-    let pid = match interp.start_child(&display, true) {
-        Ok(pid) => pid,
-        Err(_) => {
-            if let Some(input) = input {
-                let _ = interp.descriptors.discard_unreferenced(input);
-            }
-            return Err(125);
-        }
-    };
-    if let Some(input) = input {
-        interp
-            .install_process_description(pid, 0, input)
-            .expect("new child process must accept prepared standard input");
-    }
-    interp
-        .configure_process(pid, command.cwd, command.environment)
-        .expect("new child process must accept its launch configuration");
-    interp
-        .load_argv_program(pid, command.argv)
-        .expect("new child process must accept an argv continuation");
-    Ok(pid)
+    interp.spawn_argv_child(command).map_err(|_| 125)
 }
 
 fn dispatch(

@@ -4,21 +4,22 @@
 use std::collections::HashMap;
 
 use crate::commands::util::{ewln, wln};
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandSpec, Io, Trust};
+use crate::program::ProcessContext;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg;
-    reg(m, &["curl"], Trust::Real, cmd_curl);
-    reg(m, &["wget"], Trust::Real, cmd_wget);
-    reg(m, &["net"], Trust::Real, cmd_net);
+    use super::reg_system;
+    reg_system(m, "/usr/bin/curl", Trust::Real, cmd_curl);
+    reg_system(m, "/usr/bin/wget", Trust::Real, cmd_wget);
+    reg_system(m, "/usr/bin/net", Trust::Real, cmd_net);
 }
 
-fn cmd_curl(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    crate::netcmd::curl(interp, args, io.out, io.err)
+fn cmd_curl(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
+    crate::netcmd::curl(context.system, context.args, io.out, io.err)
 }
 
-fn cmd_wget(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    crate::netcmd::wget(interp, args, io.out, io.err)
+fn cmd_wget(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
+    crate::netcmd::wget(context.system, context.args, io.out, io.err)
 }
 
 /// `net` — register fake URLs / probe the virtual network from a script.
@@ -26,7 +27,8 @@ fn cmd_wget(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
 ///   net route-file <url-pattern> <vfs-path>      serve a VFS file as the response body
 ///   net listen <host:port>                       mark a service as up
 ///   net log                                      print the request log
-fn cmd_net(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_net(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
     match args.first().map(|s| s.as_str()) {
         Some("route") => {
             let Some(pattern) = args.get(1) else {
@@ -42,7 +44,10 @@ fn cmd_net(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             } else {
                 String::new()
             };
-            match interp.net.route_static(pattern, status, body.into_bytes()) {
+            match context
+                .system
+                .http_route_static(pattern, status, body.into_bytes())
+            {
                 Ok(()) => 0,
                 Err(error) => {
                     ewln(io.err, &format!("net route: {error}"));
@@ -52,8 +57,8 @@ fn cmd_net(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
         }
         Some("route-file") => match (args.get(1), args.get(2)) {
             (Some(pattern), Some(path)) => {
-                let abs = crate::vfs::resolve_against(&interp.cwd, path);
-                match interp.net.route_vfs(pattern, &abs) {
+                let abs = crate::vfs::resolve_against(context.system.cwd(), path);
+                match context.system.http_route_file(pattern, &abs) {
                     Ok(()) => 0,
                     Err(error) => {
                         ewln(io.err, &format!("net route-file: {error}"));
@@ -71,13 +76,15 @@ fn cmd_net(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
         },
         Some("listen") => {
             if let Some(hp) = args.get(1) {
-                interp.net.listen(hp);
+                context.system.network_listen(hp);
             }
             0
         }
         Some("log") => {
-            for request in &interp.net.log {
-                wln(io.out, &format!("{} {}", request.method, request.url));
+            for index in 0..context.system.network_request_count() {
+                if let Some(request) = context.system.network_request_at(index) {
+                    wln(io.out, &format!("{} {}", request.method, request.url));
+                }
             }
             0
         }

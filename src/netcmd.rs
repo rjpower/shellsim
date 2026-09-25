@@ -1,19 +1,19 @@
 //! `curl` and `wget` clients for the typed virtual HTTP broker.
 //!
-//! Both clients use the shared option scanner, submit typed requests to [`crate::net::VirtualNet`],
-//! and never acquire host networking. Their supported option tables are closed: unknown flags
+//! Both clients use the shared option scanner and submit typed requests through the active
+//! process's virtual-kernel interface. Their supported option tables are closed: unknown flags
 //! fail instead of silently changing the request.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
 use crate::commands::options::{parse_options_or_report, OptionSpec};
-use crate::interp::Interp;
 use crate::net::{HttpRequest, HttpResponse, RequestError};
+use crate::syscalls::System;
 
 type Out<'a> = &'a mut Vec<u8>;
 
-pub fn curl(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
+pub(crate) fn curl(system: &mut dyn System, args: &[String], out: Out, err: Out) -> i32 {
     #[derive(Clone, Copy, PartialEq)]
     enum Key {
         Request,
@@ -127,7 +127,7 @@ pub fn curl(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
     }
     let url = request.url.clone();
     let report_errors = !silent || show_error;
-    let response = match interp.net.request(request, &interp.vfs) {
+    let response = match system.http_request(request) {
         Ok(response) => response,
         Err(RequestError::NoRoute) => {
             if report_errors {
@@ -158,8 +158,8 @@ pub fn curl(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
     let payload = response_payload(&response, include_headers || head_only, head_only);
     if output_file.is_some() || remote_name {
         let name = output_file.unwrap_or_else(|| request_filename(&response, &url));
-        let cwd = interp.cwd.clone();
-        if let Err(error) = interp.vfs.write(&cwd, &name, &payload, 0o644) {
+        let cwd = system.cwd().to_string();
+        if let Err(error) = system.write_file(&cwd, &name, &payload, 0o644) {
             ewln(err, &format!("curl: (23) {error}"));
             return 23;
         }
@@ -169,7 +169,7 @@ pub fn curl(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
     0
 }
 
-pub fn wget(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
+pub(crate) fn wget(system: &mut dyn System, args: &[String], out: Out, err: Out) -> i32 {
     #[derive(Clone, Copy, PartialEq)]
     enum Key {
         Output,
@@ -237,7 +237,7 @@ pub fn wget(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
         }
     }
     let url = request.url.clone();
-    let response = match interp.net.request(request, &interp.vfs) {
+    let response = match system.http_request(request) {
         Ok(response) => response,
         Err(RequestError::NoRoute) => {
             if !quiet {
@@ -272,8 +272,8 @@ pub fn wget(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
     if name == "-" {
         out.extend_from_slice(&response.body);
     } else {
-        let cwd = interp.cwd.clone();
-        if let Err(error) = interp.vfs.write(&cwd, &name, &response.body, 0o644) {
+        let cwd = system.cwd().to_string();
+        if let Err(error) = system.write_file(&cwd, &name, &response.body, 0o644) {
             ewln(err, &format!("wget: {error}"));
             return 3;
         }

@@ -21,6 +21,8 @@ mod formatting;
 mod git;
 #[path = "commands/grep.rs"]
 mod grep;
+#[path = "commands/hashing.rs"]
+mod hashing;
 #[path = "commands/jq.rs"]
 mod jq;
 #[path = "commands/make.rs"]
