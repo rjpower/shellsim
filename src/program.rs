@@ -16,6 +16,7 @@ mod cat;
 /// Only the owned command continuation survives a blocked operation.
 pub(crate) struct ProcessContext<'a> {
     pub(crate) system: &'a mut dyn System,
+    pub(crate) command_name: &'a str,
     pub(crate) args: &'a [String],
 }
 
@@ -80,6 +81,7 @@ pub(crate) enum NativeProcess {
 /// continuation instead.
 #[derive(Clone)]
 pub(crate) struct SystemCommandProcess {
+    name: &'static str,
     args: Vec<String>,
     run: crate::commands::SystemCmdFn,
     result: Option<SystemCommandOutput>,
@@ -95,8 +97,9 @@ struct SystemCommandOutput {
 }
 
 impl SystemCommandProcess {
-    fn new(run: crate::commands::SystemCmdFn, args: &[String]) -> Self {
+    fn new(name: &'static str, run: crate::commands::SystemCmdFn, args: &[String]) -> Self {
         Self {
+            name,
             args: args.to_vec(),
             run,
             result: None,
@@ -121,6 +124,7 @@ impl SystemCommandProcess {
                 };
                 let mut context = ProcessContext {
                     system,
+                    command_name: self.name,
                     args: &self.args,
                 };
                 (self.run)(&mut context, &mut io)
@@ -184,7 +188,7 @@ impl NativeProcess {
                         "registered program needs a command continuation\n".into(),
                     );
                 };
-                Self::SystemCommand(SystemCommandProcess::new(run, &argv[1..]))
+                Self::SystemCommand(SystemCommandProcess::new(name, run, &argv[1..]))
             }
         }
     }
@@ -385,6 +389,41 @@ mod tests {
 
         fn rename(&mut self, _base: &str, _from: &str, _to: &str) -> Result<(), SyscallError> {
             unreachable!("native writer does not rename files")
+        }
+
+        fn symlink(&mut self, _base: &str, _target: &str, _link: &str) -> Result<(), SyscallError> {
+            unreachable!("native writer does not create links")
+        }
+
+        fn chown(
+            &mut self,
+            _base: &str,
+            _path: &str,
+            _uid: Option<u32>,
+            _gid: Option<u32>,
+        ) -> Result<(), SyscallError> {
+            unreachable!("native writer does not change ownership")
+        }
+
+        fn touch(&mut self, _base: &str, _path: &str, _mtime_ms: u64) -> Result<(), SyscallError> {
+            unreachable!("native writer does not touch files")
+        }
+
+        fn read_link(&mut self, _base: &str, _path: &str) -> Result<String, SyscallError> {
+            unreachable!("native writer does not read links")
+        }
+
+        fn canonicalize(
+            &mut self,
+            _base: &str,
+            _path: &str,
+            _strict: bool,
+        ) -> Result<String, SyscallError> {
+            unreachable!("native writer does not resolve paths")
+        }
+
+        fn wall_time_ms(&self) -> u64 {
+            unreachable!("native writer does not inspect time")
         }
 
         fn display_open(

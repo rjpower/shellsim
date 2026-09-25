@@ -85,9 +85,11 @@ fn run_system_from_legacy(
     io: &mut Io,
     run: SystemCmdFn,
 ) -> i32 {
+    let command_name = context.command_name().to_string();
     let mut system = context.system();
     let mut process = crate::program::ProcessContext {
         system: &mut system,
+        command_name: &command_name,
         args,
     };
     run(&mut process, io)

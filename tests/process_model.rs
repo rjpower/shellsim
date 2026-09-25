@@ -42,7 +42,14 @@ fn proc_self_describes_the_active_logical_shell() {
         child_status.1
     );
 
-    assert_eq!(run(&mut env, "readlink /proc/self").1, "1234\n");
+    let readlink_pid = run(&mut env, "readlink /proc/self").1;
+    let readlink_pid = readlink_pid.trim().parse::<u32>().unwrap();
+    assert_ne!(readlink_pid, 1_234);
+    assert!(env
+        .invocations
+        .events()
+        .iter()
+        .any(|event| { event.pid == readlink_pid && event.argv == ["readlink", "/proc/self"] }));
     assert_eq!(run(&mut env, "readlink /proc/self/cwd").1, "/\n");
     assert_eq!(
         run(&mut env, "ls /proc/self/fd")
@@ -99,7 +106,14 @@ fn native_argv_children_use_process_cwd_and_leave_the_shell_unchanged() {
     assert_eq!(run(&mut env, "pwd"), (0, "/\n".into(), "".into()));
     assert_eq!(run(&mut env, "env false").0, 1);
     assert_eq!(run(&mut env, "env true").0, 0);
-    assert_eq!(run(&mut env, "readlink /proc/self").1, "1234\n");
+    let readlink_pid = run(&mut env, "readlink /proc/self").1;
+    let readlink_pid = readlink_pid.trim().parse::<u32>().unwrap();
+    assert_ne!(readlink_pid, 1_234);
+    assert!(env
+        .invocations
+        .events()
+        .iter()
+        .any(|event| { event.pid == readlink_pid && event.argv == ["readlink", "/proc/self"] }));
 }
 
 #[test]
@@ -225,6 +239,55 @@ fn typed_registered_output_resumes_across_pipe_backpressure() {
         run(&mut env, "ls /work/many | wc -l"),
         (0, "800\n".into(), "".into())
     );
+}
+
+#[test]
+fn typed_rm_removes_trees_without_crossing_the_virtual_root() {
+    let mut env = Environment::new();
+    env.vfs.mkdir_all("/", "/work/remove/sub").unwrap();
+    env.vfs
+        .write("/", "/work/remove/sub/file", b"data", 0o644)
+        .unwrap();
+    assert_eq!(run(&mut env, "rm -r /work/remove").0, 0);
+    assert!(env.vfs.metadata("/", "/work/remove", false).is_err());
+    assert_eq!(run(&mut env, "rm -f /work/missing").0, 0);
+    let root = run(&mut env, "rm -rf /");
+    assert_eq!(root.0, 1, "{}", root.2);
+    assert!(root.2.contains("refusing to remove virtual root"));
+    assert!(env.vfs.metadata("/", "/work", false).is_ok());
+}
+
+#[test]
+fn typed_file_metadata_commands_use_child_cwd_and_identity() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "env -C /work touch target").0, 0);
+    assert_eq!(run(&mut env, "env -C /work ln -s target link").0, 0);
+    assert_eq!(run(&mut env, "env -C /work readlink link").1, "target\n");
+    assert_eq!(
+        run(&mut env, "env -C /work realpath link").1,
+        "/work/target\n"
+    );
+    assert_eq!(
+        run(&mut env, "env -C /work realpath -m absent").1,
+        "/work/absent\n"
+    );
+    assert_eq!(run(&mut env, "env -C /work chown 42 target").0, 0);
+    assert_eq!(run(&mut env, "env -C /work chgrp 7 target").0, 0);
+    assert_eq!(run(&mut env, "chgrp --unknown 7 /work/target").0, 2);
+    assert_eq!(run(&mut env, "chgrp root:7 /work/target").0, 1);
+    let target = env.vfs.metadata("/", "/work/target", false).unwrap();
+    assert_eq!((target.uid, target.gid), (42, 7));
+    assert_eq!(run(&mut env, "readlink /work/target").0, 1);
+    for command in ["touch", "ln", "readlink", "realpath", "chown", "chgrp"] {
+        assert!(
+            env.invocations.events().iter().any(|event| {
+                event.pid != 1_234
+                    && event.argv.first().is_some_and(|arg| arg == command)
+                    && event.status.is_some()
+            }),
+            "{command} did not run in a child process"
+        );
+    }
 }
 
 #[test]
