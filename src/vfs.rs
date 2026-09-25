@@ -18,8 +18,10 @@ pub enum NativeProgram {
     Pwd,
     Yes,
     Cat,
-    /// Existing Rust command body pending migration to the scoped `System` interface.
+    /// Process-scoped Rust entrypoint identified by its registered virtual path.
     Registered(&'static str),
+    /// Older command body still executed through the shell dispatcher by basename.
+    LegacyRegistered(&'static str),
 }
 
 impl NativeProgram {
@@ -41,7 +43,8 @@ impl NativeProgram {
             Self::Pwd => "pwd",
             Self::Yes => "yes",
             Self::Cat => "cat",
-            Self::Registered(name) => name,
+            Self::Registered(path) => path.rsplit('/').next().unwrap_or(path),
+            Self::LegacyRegistered(name) => name,
         }
     }
 }

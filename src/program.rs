@@ -186,14 +186,18 @@ impl NativeProcess {
                 Self::Yes { output, offset: 0 }
             }
             crate::vfs::NativeProgram::Cat => Self::Cat(cat::CatProcess::new(&argv[1..])),
-            crate::vfs::NativeProgram::Registered(name) => {
-                let Some(command) = crate::commands::system_command(name) else {
+            crate::vfs::NativeProgram::Registered(path) => {
+                let Some(command) = crate::commands::system_command(path) else {
                     return Self::failure(
                         125,
                         "registered program needs a command continuation\n".into(),
                     );
                 };
+                let name = path.rsplit('/').next().unwrap_or(path);
                 Self::SystemCommand(SystemCommandProcess::new(name, command, &argv[1..]))
+            }
+            crate::vfs::NativeProgram::LegacyRegistered(_) => {
+                Self::failure(125, "legacy command has no native continuation\n".into())
             }
         }
     }

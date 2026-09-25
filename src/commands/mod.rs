@@ -217,9 +217,9 @@ impl DerefMut for CommandContext<'_> {
 }
 
 /// A registered command: its implementation and trust level.
+#[derive(Clone, Copy)]
 pub struct CommandSpec {
     body: CommandBody,
-    native_path: Option<&'static str>,
     resume: Option<ResumableCmdFn>,
     resume_before_input: bool,
     pub trust: Trust,
@@ -244,12 +244,22 @@ fn registry() -> &'static HashMap<&'static str, CommandSpec> {
 pub(crate) fn registered_executables() -> Vec<(String, crate::vfs::NativeProgram)> {
     let mut entries = registry()
         .iter()
-        .filter(|(name, _)| !matches!(**name, "." | "..") && !name.contains('/'))
-        .map(|(name, spec)| {
-            (
-                spec.native_path
-                    .map_or_else(|| format!("/usr/bin/{name}"), str::to_string),
-                crate::vfs::NativeProgram::Registered(name),
+        .filter_map(|(key, spec)| {
+            if key.starts_with('/') {
+                return matches!(spec.body, CommandBody::System(_)).then(|| {
+                    (
+                        (*key).to_string(),
+                        crate::vfs::NativeProgram::Registered(key),
+                    )
+                });
+            }
+            (!matches!(*key, "." | "..") && matches!(spec.body, CommandBody::Legacy(_))).then(
+                || {
+                    (
+                        format!("/usr/bin/{key}"),
+                        crate::vfs::NativeProgram::LegacyRegistered(key),
+                    )
+                },
             )
         })
         .collect::<Vec<_>>();
@@ -257,8 +267,11 @@ pub(crate) fn registered_executables() -> Vec<(String, crate::vfs::NativeProgram
     entries
 }
 
-pub(crate) fn system_command(name: &str) -> Option<SystemCommand> {
-    let spec = registry().get(name)?;
+pub(crate) fn system_command(path: &str) -> Option<SystemCommand> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let spec = registry().get(path)?;
     match spec.body {
         CommandBody::System(run) => Some(SystemCommand {
             run,
@@ -270,7 +283,8 @@ pub(crate) fn system_command(name: &str) -> Option<SystemCommand> {
 
 fn runs_native_process(image: crate::vfs::NativeProgram) -> bool {
     match image {
-        crate::vfs::NativeProgram::Registered(name) => system_command(name).is_some(),
+        crate::vfs::NativeProgram::Registered(path) => system_command(path).is_some(),
+        crate::vfs::NativeProgram::LegacyRegistered(_) => false,
         _ => true,
     }
 }
@@ -311,7 +325,6 @@ fn reg_costed(
             n,
             CommandSpec {
                 body: CommandBody::Legacy(f),
-                native_path: None,
                 resume: None,
                 resume_before_input: false,
                 trust: t,
@@ -340,19 +353,23 @@ fn reg_system_costed(
     base_cpu: u64,
     system: SystemCmdFn,
 ) {
+    assert!(path.starts_with('/') && !path.ends_with('/'));
     let name = path.rsplit('/').next().expect("executable has basename");
-    map.insert(
-        name,
-        CommandSpec {
-            body: CommandBody::System(system),
-            native_path: Some(path),
-            resume: None,
-            resume_before_input: false,
-            trust,
-            base_cpu,
-            base_memory: 10 * 1024,
-        },
+    let spec = CommandSpec {
+        body: CommandBody::System(system),
+        resume: None,
+        resume_before_input: false,
+        trust,
+        base_cpu,
+        base_memory: 10 * 1024,
+    };
+    assert!(
+        map.insert(path, spec).is_none(),
+        "duplicate native path: {path}"
     );
+    // Bare shell builtins and nested legacy dispatch still look up a basename. The VFS image
+    // itself selects the path entry, so a copied or renamed executable keeps its identity.
+    map.insert(name, spec);
 }
 
 /// Register a command that can suspend when called by the shell while retaining a synchronous
@@ -369,7 +386,6 @@ fn reg_resumable(
             name,
             CommandSpec {
                 body: CommandBody::Legacy(run),
-                native_path: None,
                 resume: Some(resume),
                 resume_before_input: true,
                 trust,
@@ -866,11 +882,16 @@ fn dispatch(
             true,
         );
     }
-    // Registered images still use their old bodies, but only after VFS path resolution.
+    // A typed native image keeps the registration path that selected its entrypoint even when
+    // the VFS node is copied or renamed. Legacy bodies still use their basename table.
     let cmd = native.map_or(requested, |image| image.name());
+    let lookup_key = match native {
+        Some(crate::vfs::NativeProgram::Registered(path)) => path,
+        _ => cmd,
+    };
     let args = &argv[1..];
     if let Some(spec) = (builtin || native.is_some())
-        .then(|| registry().get(cmd))
+        .then(|| registry().get(lookup_key))
         .flatten()
     {
         let unsupported_reason =
@@ -1124,5 +1145,33 @@ impl Interp {
             self.returning = r;
         }
         code
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    fn first(_context: &mut crate::program::ProcessContext<'_>, _io: &mut Io) -> i32 {
+        1
+    }
+
+    fn second(_context: &mut crate::program::ProcessContext<'_>, _io: &mut Io) -> i32 {
+        2
+    }
+
+    #[test]
+    fn distinct_paths_with_one_basename_keep_distinct_entrypoints() {
+        let mut registry = HashMap::new();
+        reg_system(&mut registry, "/bin/tool", Trust::Real, first);
+        reg_system(&mut registry, "/opt/bin/tool", Trust::Real, second);
+        let CommandBody::System(bin) = registry["/bin/tool"].body else {
+            panic!("/bin/tool must be a system command");
+        };
+        let CommandBody::System(opt) = registry["/opt/bin/tool"].body else {
+            panic!("/opt/bin/tool must be a system command");
+        };
+        assert!(std::ptr::fn_addr_eq(bin, first as SystemCmdFn));
+        assert!(std::ptr::fn_addr_eq(opt, second as SystemCmdFn));
     }
 }
