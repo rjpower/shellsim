@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use shellsim::{host_ingest::mount_host_tree, Environment, Limits};
+use shellsim::{host_ingest::mount_host_tree, realtime::ClockMode, Environment, Limits};
 
 const TINYCC: &[u8] = include_bytes!("../../tests/fixtures/tinycc/tcc-shellsim-package.tar.gz");
 const SYSROOT: &[u8] = include_bytes!("../../tests/fixtures/wasi-libc/sysroot-34.tar.gz");
@@ -26,7 +26,8 @@ fn command(environment: &mut Environment, script: &str) -> Result<(), String> {
 }
 
 /// Build external Doomgeneric entirely inside the VFS and install separately supplied WAD data.
-pub fn build(source: &Path, wad: &Path) -> Result<Environment, String> {
+/// `clock` selects virtual time for headless probes or real time for interactive play.
+pub fn build(source: &Path, wad: &Path, clock: ClockMode) -> Result<Environment, String> {
     let makefile = std::fs::read_to_string(source.join("Makefile.soso"))
         .map_err(|error| format!("read Doomgeneric source list: {error}"))?;
     let objects = makefile
@@ -38,12 +39,15 @@ pub fn build(source: &Path, wad: &Path) -> Result<Environment, String> {
         .filter(|name| *name != "doomgeneric_soso.o")
         .map(|name| format!("/work/doom/{}", name.replace(".o", ".c")))
         .collect();
-    let mut environment = Environment::with_limits(Limits {
-        cpu: 400_000_000_000,
-        memory: 512 * 1024 * 1024,
-        disk: 512 * 1024 * 1024,
-        output: 32 * 1024 * 1024,
-    });
+    let mut environment = Environment::with_limits_and_clock(
+        Limits {
+            cpu: 400_000_000_000,
+            memory: 512 * 1024 * 1024,
+            disk: 512 * 1024 * 1024,
+            output: 32 * 1024 * 1024,
+        },
+        clock,
+    );
     for directory in ["/work", "/tcc", "/wasi-sysroot"] {
         environment
             .vfs

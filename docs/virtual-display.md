@@ -79,6 +79,7 @@ and exits when its Stop button is pressed. The external [Freedoom release](https
 provides a playable WAD; only the opt-in launcher downloads it.
 
 The probe and demo select Doomgeneric's console-error path instead of its optional Zenity
-`system()` call. The platform adapter still uses a deterministic, adapter-local tick
-approximation. Audio and networking are outside this single-player proof. The original Doom/Quake
+`system()` call. The platform adapter times the game with libc `clock_gettime` and `usleep`.
+The probe runs on virtual time, so it is fast and reproducible; the player boots its machine in
+real-time clock mode, so the game runs at normal speed. Audio and networking are outside this single-player proof. The original Doom/Quake
 engines and assets are not bundled.

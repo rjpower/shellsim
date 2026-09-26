@@ -11,6 +11,7 @@ mod doom_support;
 use shellsim::{
     commands::{SessionPoll, WasmSession},
     display::KeyEvent,
+    realtime::ClockMode,
 };
 
 #[test]
@@ -19,7 +20,7 @@ fn external_doomgeneric_builds_and_reacts_to_input_in_virtual_environment() {
     let source =
         PathBuf::from(std::env::var_os("SHELLSIM_DOOM_SOURCE").expect("set SHELLSIM_DOOM_SOURCE"));
     let wad = PathBuf::from(std::env::var_os("SHELLSIM_DOOM_WAD").expect("set SHELLSIM_DOOM_WAD"));
-    let environment = doom_support::build(&source, &wad).unwrap();
+    let environment = doom_support::build(&source, &wad, ClockMode::Virtual).unwrap();
     let mut session = WasmSession::start(
         environment,
         doom_support::PROGRAM,
@@ -38,7 +39,7 @@ fn external_doomgeneric_builds_and_reacts_to_input_in_virtual_environment() {
             SessionPoll::Ready(status) => {
                 panic!("Doom exited before first interactive frame: {status}")
             }
-            SessionPoll::Running => {}
+            SessionPoll::Running | SessionPoll::Sleeping(_) => {}
         }
     }
     assert!(
@@ -71,7 +72,7 @@ fn external_doomgeneric_builds_and_reacts_to_input_in_virtual_environment() {
                 }
             }
             SessionPoll::Ready(status) => panic!("Doom exited before handling input: {status}"),
-            SessionPoll::Running => {}
+            SessionPoll::Running | SessionPoll::Sleeping(_) => {}
         }
     }
     assert!(changed > 0, "injected key did not change the final frame");

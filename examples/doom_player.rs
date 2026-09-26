@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use shellsim::{
     commands::{SessionPoll, WasmSession},
     display::{DisplayFrame, KeyEvent},
+    realtime::ClockMode,
 };
 
 const HTML: &str = r#"<!doctype html>
@@ -236,7 +237,8 @@ fn run() -> Result<(), String> {
         return Err("expected exactly two paths".into());
     }
     eprintln!("Building external Doomgeneric inside shellsim...");
-    let environment = doom_support::build(&source, &wad)?;
+    // Real-time clock mode makes the game's libc clock and sleeps follow physical time.
+    let environment = doom_support::build(&source, &wad, ClockMode::RealTime)?;
     let mut session = WasmSession::start(
         environment,
         doom_support::PROGRAM,
@@ -252,7 +254,7 @@ fn run() -> Result<(), String> {
     );
     eprintln!("Open {origin} in a browser. The guest has no host network access.");
     let mut frame = None;
-    let mut next_frame = Instant::now();
+    let mut resume_at = Instant::now();
     let mut stopping = false;
     loop {
         loop {
@@ -267,15 +269,15 @@ fn run() -> Result<(), String> {
                 Err(error) => return Err(error.to_string()),
             }
         }
-        if Instant::now() < next_frame && !stopping {
-            thread::sleep(Duration::from_millis(2));
+        // While the guest sleeps, wait in short steps so browser requests stay responsive.
+        let now = Instant::now();
+        if now < resume_at && !stopping {
+            thread::sleep((resume_at - now).min(Duration::from_millis(2)));
             continue;
         }
         match session.poll() {
-            SessionPoll::Frame(_) => {
-                frame = session.frame();
-                next_frame = Instant::now() + Duration::from_millis(28);
-            }
+            SessionPoll::Frame(_) => frame = session.frame(),
+            SessionPoll::Sleeping(wait) => resume_at = Instant::now() + wait,
             SessionPoll::Running => {}
             SessionPoll::Ready(status) => {
                 let result = session.into_result().expect("ready session has result");
