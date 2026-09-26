@@ -21,7 +21,7 @@ print(9223372036854775807 + 1)"#;
 #[test]
 fn exact_division_by_zero_retains_the_python_error() {
     let (status, stdout, stderr) = run_python("1 // 0");
-    assert_eq!(status, 2);
+    assert_eq!(status, 1);
     assert!(stdout.is_empty());
     assert!(String::from_utf8_lossy(&stderr).contains("ZeroDivisionError"));
 }

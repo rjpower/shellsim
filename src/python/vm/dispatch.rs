@@ -3,7 +3,7 @@
 use super::{
     dispatch_next, protocol, BytecodeFrame, CallId, CallMode, CallResult, CodeRef, DispatchControl,
     DispatchCursor, ExceptionType, Execution, ForIterOutcome, FunctionReturn, NativeValue, Opcode,
-    RaisedException, SequenceKind, Value, Vm, VM_POLL_QUANTUM,
+    RaisedException, SequenceKind, TracebackFrame, Value, Vm, VM_POLL_QUANTUM,
 };
 
 impl Vm<'_> {
@@ -659,13 +659,29 @@ impl Vm<'_> {
         mut error: String,
         mut span: super::super::source::Span,
     ) -> Result<bool, (String, super::super::source::Span)> {
+        // Rebuilt from scratch on every call: a handler found partway through means the
+        // in-progress frame list here is irrelevant, and a fully uncaught error overwrites
+        // whatever an earlier, since-discarded unwind (e.g. inside a generator sub-frame) left
+        // behind. `render_execution` only ever reads the list left by the unwind that actually
+        // reaches the top of the program.
+        let mut frames = Vec::new();
         loop {
             if self.enter_exception_handler() {
                 return Ok(true);
             }
             let Some(function_return) = self.unwind_deferred_frame() else {
+                frames.push(TracebackFrame {
+                    name: "<module>".to_string(),
+                    span,
+                });
+                frames.reverse();
+                self.traceback_frames = frames;
                 return Err((error, span));
             };
+            frames.push(TracebackFrame {
+                name: function_return.name.clone(),
+                span,
+            });
             error = format!(
                 "{error} in {} at line {}, column {}",
                 function_return.name, span.line, span.column

@@ -1117,315 +1117,75 @@ fn run_capture(interp: &mut Interp, src: &str) -> String {
     String::new()
 }
 
-pub fn eval_arith(interp: &mut Interp, expr: &str) -> i64 {
-    let expr = expr.trim();
-    if expr.is_empty() {
-        return 0;
-    }
-    // Bash arithmetic commands commonly mutate a loop variable. Handle the useful assignment
-    // and increment forms before handing pure expressions to the precedence parser below.
-    if let Some(name) = expr.strip_suffix("++").map(str::trim) {
-        if is_name(name) {
-            let old = interp
-                .get_var(name)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0i64);
-            interp.set_var(name, old.saturating_add(1).to_string());
-            return old;
+/// Largest indexed-array subscript arithmetic may assign. Indexed arrays are stored densely, so
+/// this bounds the allocation a single assignment can request.
+const MAX_ARITH_ARRAY_INDEX: i64 = 1 << 20;
+
+impl crate::arith::ArithVars for Interp {
+    fn arith_get(&mut self, name: &str) -> Result<Option<String>, String> {
+        match self.get_var(name) {
+            None if self.opt_nounset => Err(format!("{name}: unbound variable")),
+            value => Ok(value),
         }
     }
-    if let Some(name) = expr.strip_suffix("--").map(str::trim) {
-        if is_name(name) {
-            let old = interp
-                .get_var(name)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0i64);
-            interp.set_var(name, old.saturating_sub(1).to_string());
-            return old;
+
+    fn arith_get_element(&mut self, name: &str, index: i64) -> Result<Option<String>, String> {
+        let index = self.resolve_array_index(name, index)?;
+        match self.array_get(name, &index.to_string()) {
+            None if self.opt_nounset => Err(format!("{name}[{index}]: unbound variable")),
+            value => Ok(value),
         }
     }
-    for (prefix, delta) in [("++", 1i64), ("--", -1i64)] {
-        if let Some(name) = expr.strip_prefix(prefix).map(str::trim) {
-            if is_name(name) {
-                let old = interp
-                    .get_var(name)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0i64);
-                let value = old.saturating_add(delta);
-                interp.set_var(name, value.to_string());
-                return value;
-            }
+
+    fn arith_set(&mut self, name: &str, value: i64) -> Result<(), String> {
+        if self.readonly.contains(name) {
+            return Err(format!("{name}: readonly variable"));
         }
+        self.set_var(name, value.to_string());
+        Ok(())
     }
-    if let Some((name, op, rhs)) = arithmetic_assignment(expr) {
-        let rhs = eval_arith(interp, rhs);
-        let old = interp
-            .get_var(name)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0i64);
-        let value = match op {
-            "=" => rhs,
-            "+=" => old.saturating_add(rhs),
-            "-=" => old.saturating_sub(rhs),
-            "*=" => old.saturating_mul(rhs),
-            "/=" if rhs != 0 => old / rhs,
-            "%=" if rhs != 0 => old % rhs,
-            _ => old,
+
+    fn arith_set_element(&mut self, name: &str, index: i64, value: i64) -> Result<(), String> {
+        if self.readonly.contains(name) {
+            return Err(format!("{name}: readonly variable"));
+        }
+        let index = self.resolve_array_index(name, index)?;
+        if index > MAX_ARITH_ARRAY_INDEX {
+            return Err(format!("{name}[{index}]: array subscript too large"));
+        }
+        self.array_set(name, &index.to_string(), value.to_string());
+        Ok(())
+    }
+}
+
+impl Interp {
+    /// Map a negative subscript to a position from the end of an indexed array, as Bash does.
+    fn resolve_array_index(&self, name: &str, index: i64) -> Result<i64, String> {
+        if index >= 0 {
+            return Ok(index);
+        }
+        let length = match self.arrays.get(name) {
+            Some(crate::interp::ArrayVal::Indexed(values)) => values.len() as i64,
+            _ => i64::from(self.get_var(name).is_some()),
         };
-        interp.set_var(name, value.to_string());
-        return value;
+        let resolved = length.saturating_add(index);
+        if resolved < 0 {
+            return Err(format!("{name}[{index}]: bad array subscript"));
+        }
+        Ok(resolved)
     }
-    let mut p = ArithParser {
-        interp,
-        chars: expr.chars().collect(),
-        i: 0,
-    };
-    p.expr()
 }
 
-fn arithmetic_assignment(expr: &str) -> Option<(&str, &str, &str)> {
-    let bytes = expr.as_bytes();
-    let mut depth = 0usize;
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => depth = depth.saturating_sub(1),
-            _ if depth != 0 => continue,
-            _ => {}
-        }
-        for op in ["+=", "-=", "*=", "/=", "%=", "="] {
-            if expr[i..].starts_with(op) {
-                if op == "="
-                    && (i > 0 && matches!(bytes[i - 1], b'!' | b'<' | b'>' | b'=')
-                        || bytes.get(i + 1) == Some(&b'='))
-                {
-                    continue;
-                }
-                let name = expr[..i].trim();
-                if is_name(name) {
-                    return Some((name, op, expr[i + op.len()..].trim()));
-                }
-            }
-        }
-    }
-    None
-}
-
-struct ArithParser<'a> {
-    interp: &'a mut Interp,
-    chars: Vec<char>,
-    i: usize,
-}
-
-impl ArithParser<'_> {
-    fn skip_ws(&mut self) {
-        while self.i < self.chars.len() && self.chars[self.i].is_whitespace() {
-            self.i += 1;
-        }
-    }
-    fn peek(&mut self) -> Option<char> {
-        self.skip_ws();
-        self.chars.get(self.i).copied()
-    }
-    fn expr(&mut self) -> i64 {
-        self.ternary()
-    }
-    fn ternary(&mut self) -> i64 {
-        let c = self.logical_or();
-        if self.peek() == Some('?') {
-            self.i += 1;
-            let a = self.logical_or();
-            self.skip_ws();
-            if self.peek() == Some(':') {
-                self.i += 1;
-            }
-            let b = self.logical_or();
-            if c != 0 {
-                a
-            } else {
-                b
-            }
-        } else {
-            c
-        }
-    }
-
-    fn logical_or(&mut self) -> i64 {
-        let mut value = self.logical_and();
-        while self.consume("||") {
-            let right = self.logical_and();
-            value = i64::from(value != 0 || right != 0);
-        }
-        value
-    }
-
-    fn logical_and(&mut self) -> i64 {
-        let mut value = self.comparison();
-        while self.consume("&&") {
-            let right = self.comparison();
-            value = i64::from(value != 0 && right != 0);
-        }
-        value
-    }
-
-    fn comparison(&mut self) -> i64 {
-        let mut value = self.add_sub();
-        loop {
-            let op = ["==", "!=", "<=", ">=", "<", ">"]
-                .into_iter()
-                .find(|op| self.starts_with(op));
-            let Some(op) = op else { break };
-            self.i += op.len();
-            let right = self.add_sub();
-            value = i64::from(match op {
-                "==" => value == right,
-                "!=" => value != right,
-                "<=" => value <= right,
-                ">=" => value >= right,
-                "<" => value < right,
-                ">" => value > right,
-                _ => false,
+/// Evaluate `expr` as shell arithmetic. On failure, record an expansion error that aborts a
+/// non-interactive shell, as Bash does for `$(( ))` and substring offsets, and yield 0.
+pub fn eval_arith(interp: &mut Interp, expr: &str) -> i64 {
+    match crate::arith::evaluate(interp, expr) {
+        Ok(value) => value,
+        Err(error) => {
+            interp.expansion_error.get_or_insert_with(|| {
+                ShellExpansionError::parameter(format!("shellsim: {}\n", error.describe(expr)))
             });
-        }
-        value
-    }
-
-    fn starts_with(&mut self, value: &str) -> bool {
-        self.skip_ws();
-        let wanted: Vec<char> = value.chars().collect();
-        self.chars.get(self.i..self.i + wanted.len()) == Some(wanted.as_slice())
-    }
-
-    fn consume(&mut self, value: &str) -> bool {
-        if self.starts_with(value) {
-            self.i += value.chars().count();
-            true
-        } else {
-            false
-        }
-    }
-    fn add_sub(&mut self) -> i64 {
-        let mut v = self.mul_div();
-        loop {
-            match self.peek() {
-                Some('+') => {
-                    self.i += 1;
-                    v += self.mul_div();
-                }
-                Some('-') => {
-                    self.i += 1;
-                    v -= self.mul_div();
-                }
-                _ => break,
-            }
-        }
-        v
-    }
-    fn mul_div(&mut self) -> i64 {
-        let mut v = self.unary();
-        loop {
-            match self.peek() {
-                Some('*') => {
-                    self.i += 1;
-                    v *= self.unary();
-                }
-                Some('/') => {
-                    self.i += 1;
-                    let d = self.unary();
-                    if d != 0 {
-                        v /= d;
-                    }
-                }
-                Some('%') => {
-                    self.i += 1;
-                    let d = self.unary();
-                    if d != 0 {
-                        v %= d;
-                    }
-                }
-                _ => break,
-            }
-        }
-        v
-    }
-    fn unary(&mut self) -> i64 {
-        match self.peek() {
-            Some('-') => {
-                self.i += 1;
-                -self.unary()
-            }
-            Some('+') => {
-                self.i += 1;
-                self.unary()
-            }
-            Some('!') => {
-                self.i += 1;
-                if self.unary() == 0 {
-                    1
-                } else {
-                    0
-                }
-            }
-            _ => self.atom(),
-        }
-    }
-    fn atom(&mut self) -> i64 {
-        self.skip_ws();
-        match self.peek() {
-            Some('(') => {
-                self.i += 1;
-                let v = self.expr();
-                self.skip_ws();
-                if self.peek() == Some(')') {
-                    self.i += 1;
-                }
-                v
-            }
-            Some(c) if c.is_ascii_digit() => {
-                let mut n = String::new();
-                while let Some(d) = self.chars.get(self.i) {
-                    if d.is_ascii_digit() {
-                        n.push(*d);
-                        self.i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                n.parse().unwrap_or(0)
-            }
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                let mut name = String::new();
-                while let Some(d) = self.chars.get(self.i) {
-                    if d.is_ascii_alphanumeric() || *d == '_' {
-                        name.push(*d);
-                        self.i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                // bare array subscript inside arithmetic: name[index]
-                if self.chars.get(self.i) == Some(&'[') {
-                    self.i += 1;
-                    let idx = self.expr();
-                    if self.peek() == Some(']') {
-                        self.i += 1;
-                    }
-                    return self
-                        .interp
-                        .array_get(&name, &idx.to_string())
-                        .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(0);
-                }
-                self.interp
-                    .get_var(&name)
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(0)
-            }
-            Some('$') => {
-                self.i += 1;
-                self.atom()
-            }
-            _ => 0,
+            0
         }
     }
 }

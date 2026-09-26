@@ -188,7 +188,8 @@ fn typed_registered_commands_run_in_child_processes() {
         run(&mut env, "stat -c '%a:%s' /work/typed/moved"),
         (0, "600:7\n".into(), "".into())
     );
-    assert_eq!(run(&mut env, "du -b /work/typed").1, "7\t/work/typed\n");
+    // GNU du on ext4 counts the directory's own 4096-byte size.
+    assert_eq!(run(&mut env, "du -b /work/typed").1, "4103\t/work/typed\n");
     assert!(run(&mut env, "tree /work/typed").1.contains("└── moved"));
     assert_eq!(run(&mut env, "basename /work/typed/moved").1, "moved\n");
     assert_eq!(

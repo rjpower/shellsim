@@ -33,6 +33,7 @@ use super::native::{
 use super::number;
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
 use super::slice::SlicePlan;
+use super::source::Span;
 use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
 
 mod calls;
@@ -224,6 +225,20 @@ pub(super) struct ExceptionType(pub &'static str);
 struct RaisedException {
     kind: String,
     value: Value,
+}
+
+/// One call-chain entry captured while an uncaught exception unwinds the frame stack, rendered
+/// as a CPython-style `File "...", line N, in <scope>` line.
+///
+/// [`Vm::propagate_error`] rebuilds this list from scratch on every unwind attempt, so a nested
+/// unwind that is later discarded (for example inside a generator or `exec` sub-frame) never
+/// leaks into the traceback that is finally reported for the real, uncaught error.
+#[derive(Clone, Debug)]
+struct TracebackFrame {
+    /// Function name active at this call level, or `<module>` for the top-level frame.
+    name: String,
+    /// Source location this frame was executing when the exception passed through it.
+    span: Span,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -460,6 +475,9 @@ struct VmState {
     class_bindings: Vec<Vec<String>>,
     call_depth: usize,
     pending_exception: Option<RaisedException>,
+    /// Frames collected by the most recent [`Vm::propagate_error`] unwind, freshest overwrites
+    /// stale. Consumed by `render_execution` when reporting an uncaught exception's traceback.
+    traceback_frames: Vec<TracebackFrame>,
     pending_wait: Option<crate::scheduler::WaitReason>,
     async_timer_deadlines: BTreeSet<u64>,
     native_suspend_allowed: bool,
@@ -777,13 +795,8 @@ impl<'a> Vm<'a> {
                         1
                     });
                     ExecResult::Exit(status)
-                } else if let Some(exception) = &self.pending_exception {
-                    let rendered = protocol::display(&self.state.heap, &exception.value)
-                        .unwrap_or_else(|_| exception.kind.clone());
-                    ExecResult::Unsupported(format!(
-                        "{}: {} at line {}, column {}",
-                        exception.kind, rendered, span.line, span.column
-                    ))
+                } else if let Some(exception) = self.pending_exception.clone() {
+                    ExecResult::Exit(self.render_uncaught_exception(&exception, span))
                 } else {
                     ExecResult::Unsupported(format!(
                         "{} at line {}, column {}",
@@ -791,6 +804,62 @@ impl<'a> Vm<'a> {
                     ))
                 }
             }
+        }
+    }
+
+    /// Report an uncaught, genuine Python exception the way CPython does: a traceback on stderr
+    /// and exit status 1. This is distinct from [`super::unsupported`], which stays reserved for
+    /// syntax, modules, or builtins shellsim does not model at all.
+    fn render_uncaught_exception(&mut self, exception: &RaisedException, fallback: Span) -> i32 {
+        // `protocol::display` renders a message-less builtin exception as its type name (to match
+        // `print(exc)` elsewhere), which would duplicate the type name we print explicitly below.
+        // Read the raw message instead so an empty `ValueError()` prints as bare `ValueError`.
+        let message = match protocol::exception_parts(&self.state.heap, &exception.value) {
+            Ok(Some((_, message))) => message,
+            _ => protocol::display(&self.state.heap, &exception.value)
+                .unwrap_or_else(|_| String::new()),
+        };
+        let filename = self.traceback_filename();
+        let frames = std::mem::take(&mut self.traceback_frames);
+        self.err
+            .extend_from_slice(b"Traceback (most recent call last):\n");
+        if frames.is_empty() {
+            // `propagate_error` always populates this when it runs, but fall back to the
+            // location `render_execution` already has so a traceback is never frame-less.
+            self.err.extend_from_slice(
+                format!(
+                    "  File \"{filename}\", line {}, in <module>\n",
+                    fallback.line
+                )
+                .as_bytes(),
+            );
+        }
+        for frame in &frames {
+            self.err.extend_from_slice(
+                format!(
+                    "  File \"{filename}\", line {}, in {}\n",
+                    frame.span.line, frame.name
+                )
+                .as_bytes(),
+            );
+        }
+        let summary = if message.is_empty() {
+            format!("{}\n", exception.kind)
+        } else {
+            format!("{}: {message}\n", exception.kind)
+        };
+        self.err.extend_from_slice(summary.as_bytes());
+        1
+    }
+
+    /// The `File "..."` name CPython would use for this process's source: `<string>` for `-c`,
+    /// `<stdin>` for a piped or REPL script, otherwise the script path as given on the command
+    /// line.
+    fn traceback_filename(&self) -> String {
+        match self.argv.first().map(String::as_str) {
+            Some("-c") => "<string>".to_string(),
+            Some("-" | "") | None => "<stdin>".to_string(),
+            Some(other) => other.to_string(),
         }
     }
 

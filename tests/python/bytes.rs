@@ -9,7 +9,7 @@ fn bytes_reject_non_ascii_literals_and_invalid_utf8_decoding() {
     assert!(error.contains("ASCII"));
 
     let (status, _, error) = run_python_text("b'\\xff'.decode()");
-    assert_eq!(status, 2);
+    assert_eq!(status, 1);
     assert!(error.contains("invalid UTF-8"));
 }
 

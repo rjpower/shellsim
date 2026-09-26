@@ -53,9 +53,9 @@ fn break_and_continue_run_finally() {
 fn exception_in_handler_runs_finally_and_propagates_new_exception() {
     let source = "try:\n    raise ValueError('first')\nexcept ValueError:\n    print('handler')\n    raise TypeError('second')\nfinally:\n    print('cleanup')";
     let (status, out, err) = run(source);
-    assert_eq!(status, 2, "out={out:?} err={err:?}");
+    assert_eq!(status, 1, "out={out:?} err={err:?}");
     assert_eq!(out, "handler\ncleanup\n");
-    assert!(err.contains("TypeError"), "{err}");
+    assert!(err.contains("TypeError: second"), "{err}");
     if let Some((reference_status, reference_out, reference_err)) = cpython(source) {
         assert_eq!(reference_status, 1);
         assert_eq!(reference_out, out);

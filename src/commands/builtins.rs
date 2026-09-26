@@ -2142,20 +2142,20 @@ fn start_command(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) 
     }
 }
 
-fn cmd_let(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
+fn cmd_let(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    if args.is_empty() {
+        ewln(io.err, "let: expression expected");
+        return 1;
+    }
     let mut last = 0i64;
-    for a in args {
-        if let Some((name, expr)) = a.split_once('=') {
-            let v = crate::expand::eval_arith(interp, expr);
-            interp.set_var(name, v.to_string());
-            last = v;
-        } else {
-            last = crate::expand::eval_arith(interp, a);
+    for expression in args {
+        match crate::arith::evaluate(&mut **interp, expression) {
+            Ok(value) => last = value,
+            Err(error) => {
+                ewln(io.err, &format!("let: {}", error.describe(expression)));
+                return 1;
+            }
         }
     }
-    if last == 0 {
-        1
-    } else {
-        0
-    }
+    i32::from(last == 0)
 }
