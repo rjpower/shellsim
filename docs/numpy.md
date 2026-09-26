@@ -59,7 +59,8 @@ The supported surface includes:
   `ravel`;
 - elementwise `+`, `-`, `*`, `/`, rich comparisons, unary operators, common floating-point
   functions, `minimum`, `maximum`, `clip`, and `where`, all with scalar and array broadcasting;
-- `concatenate`, `stack`, `vstack`, and `hstack`;
+- `concatenate`, `stack`, `vstack`, `hstack`, `kron`, and nested-list `block`;
+- `round` (also `around` and `ndarray.round`) with decimal scaling and ties to even;
 - `sum`, `prod`, `mean`, `min`, `max`, `var`, `std`, `median`, `all`, `any`, `dot`, and
   `argmin`, `argmax`, cumulative sums and products, `inner`, `outer`, and two-dimensional
   `matmul`;
@@ -104,10 +105,17 @@ writable views because an element has no addressable component storage.
 Operations that need a real value domain check the dtype once at entry and raise `TypeError` for
 complex operands: ordering comparisons, `min`, `max`, `argmin`, `argmax`, `argsort`, `minimum`,
 `maximum`, `clip`, `var`, `std`, `median`, `percentile`, `allclose`, `linspace`, `isnan`,
-`isinf`, `sign`, bitwise invert, and every transcendental or rounding function. NumPy defines
+`isinf`, `sign`, bitwise invert, and every transcendental function and `rint`. NumPy defines
 several of these for complex input; shellsim rejects them rather than approximating them. Casting
 complex values to a real dtype also raises `TypeError` instead of discarding the imaginary part
 with a warning.
+
+`round` retains the input dtype, rounds complex components independently, and accepts integer
+`decimals` from -308 to 308. It uses NumPy's fast scale/rint/unscale algorithm, including its
+floating-point rounding limitations. Boolean rounding and the `out` argument are unsupported.
+`kron` promotes operand ranks with leading singleton axes. `block` accepts nonempty nested lists
+with consistent leaf depth and joins along successive trailing axes; tuples are rejected.
+Both composition operations support complex values and reserve storage before output growth.
 
 Explicitly unsupported are `float16`, `complex64`, NumPy's C ABI, buffers,
 structured/object/string dtypes, masked arrays, arrays above 64 dimensions, multidimensional slice

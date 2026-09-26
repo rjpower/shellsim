@@ -433,3 +433,42 @@ fn complex_arrays_reserve_element_storage_before_allocation() {
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn numeric_composition_reserves_output_and_meters_nested_work() {
+    for source in [
+        "import numpy as np; a = np.ones(100); np.kron(a, a)",
+        "import numpy as np; a = np.ones(100); np.block([a] * 100)",
+        "print(f'{1j:.1000000f}')",
+    ] {
+        let (status, stdout, _, usage) = run_with_limits(
+            source,
+            Limits {
+                memory: 64 * 1024,
+                ..Limits::unlimited()
+            },
+        );
+        assert_eq!(status, 137);
+        assert!(stdout.is_empty());
+        assert!(usage.memory_peak <= 64 * 1024);
+    }
+}
+
+#[test]
+fn block_selection_work_is_cpu_bounded_and_cycles_are_rejected() {
+    let (status, stdout, _, _) = run_with_limits(
+        "import numpy as np; a=np.ones(1); np.block([a]*600)",
+        Limits {
+            cpu: 20_000,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(stdout.is_empty());
+    let (status, _, stderr, _) = run_with_limits(
+        "import numpy as np; a=[]; a.append(a); np.block(a)",
+        Limits::unlimited(),
+    );
+    assert_ne!(status, 0);
+    assert!(String::from_utf8_lossy(&stderr).contains("block nesting"));
+}

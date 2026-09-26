@@ -348,6 +348,10 @@ const fn scalar_slots() -> ValueKindSlots {
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "numpy",
     functions: &[
+        function("round", round),
+        function("around", round),
+        function("kron", kron),
+        function("block", block),
         function("array", array),
         function("asarray", asarray),
         function("zeros", zeros),
@@ -905,6 +909,7 @@ const fn function(
 pub(crate) static ARRAY_TYPE: NativeTypeDef = NativeTypeDef {
     name: "numpy.ndarray",
     methods: &[
+        method("round", method_round),
         method("tolist", method_tolist),
         method("copy", method_copy),
         method("astype", method_astype),
@@ -3805,6 +3810,7 @@ fn concatenate_arrays(
     for_each_index(&shape, |output_index| {
         let mut selected = output_index[axis];
         for (array, (layout, _)) in arrays.iter().zip(&layouts) {
+            runtime.charge_cpu(1)?;
             if selected < layout.shape[axis] {
                 let mut input_index = output_index.to_vec();
                 input_index[axis] = selected;
@@ -5041,9 +5047,291 @@ fn for_each_index(
     }
 }
 
+/// Round decimal places using NumPy's scale/rint/unscale algorithm, rather than Python round.
+/// Integer inputs retain exact bits for nonnegative decimals; negative decimals use float64
+/// scaling, as in NumPy. Float32 rounds in its own precision; complex components round separately.
+fn round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.round", 1, 2)?;
+    args.reject_unknown_keywords("numpy.round", &["decimals"])?;
+    let keyword = args.keyword("numpy.round", "decimals")?.copied();
+    if args.positional().len() == 2 && keyword.is_some() {
+        return Err(PyError::type_error(
+            "numpy.round got multiple values for decimals",
+        ));
+    }
+    let decimals = args
+        .positional()
+        .get(1)
+        .copied()
+        .or(keyword)
+        .unwrap_or(Value::Int(0));
+    let PyIndex(decimals) = decimals.cast(runtime)?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    round_array(runtime, array, decimals)
+}
+fn method_round(runtime: &mut dyn PyRuntime, owner: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("ndarray.round", 0, 1)?;
+    args.reject_unknown_keywords("ndarray.round", &["decimals"])?;
+    let keyword = args.keyword("ndarray.round", "decimals")?.copied();
+    if !args.positional().is_empty() && keyword.is_some() {
+        return Err(PyError::type_error(
+            "ndarray.round got multiple values for decimals",
+        ));
+    }
+    let decimals = args
+        .positional()
+        .first()
+        .copied()
+        .or(keyword)
+        .unwrap_or(Value::Int(0));
+    let PyIndex(decimals) = decimals.cast(runtime)?;
+    let array = owner.cast(runtime)?;
+    round_array(runtime, array, decimals)
+}
+
+fn round_array(runtime: &mut dyn PyRuntime, array: PyArray, decimals: i64) -> PyResult {
+    let (layout, dtype) = runtime.array_layout(array)?;
+    if !(-308..=308).contains(&decimals) {
+        return Err(PyError::value_error(
+            "numpy.round supports decimals from -308 to 308",
+        ));
+    }
+    if dtype == PyArrayDtype::Bool {
+        return Err(PyError::type_error(
+            "numpy.round does not support boolean arrays",
+        ));
+    }
+    let count = element_count(&layout.shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&layout.shape, |index| {
+        runtime.charge_cpu(1)?;
+        let raw = runtime.array_get(array, index)?;
+        let value = scalar(runtime, raw)?;
+        let mapped = match value.value {
+            ScalarValue::Signed(value) => ScalarValue::Signed(if decimals >= 0 {
+                value
+            } else {
+                round_decimal(value as f64, decimals, false) as i64 as i128
+            }),
+            ScalarValue::Unsigned(value) => ScalarValue::Unsigned(if decimals >= 0 {
+                value
+            } else {
+                round_decimal(value as f64, decimals, false) as u64 as u128
+            }),
+            ScalarValue::Float(value) => ScalarValue::Float(round_decimal(
+                value,
+                decimals,
+                dtype == PyArrayDtype::Float32,
+            )),
+            ScalarValue::Complex(real, imag) => ScalarValue::Complex(
+                round_decimal(real, decimals, false),
+                round_decimal(imag, decimals, false),
+            ),
+            ScalarValue::Bool(_) => unreachable!("bool rejected at entry"),
+        };
+        values.push(pack_scalar(
+            runtime,
+            Scalar {
+                dtype,
+                value: mapped,
+            },
+            dtype,
+        )?);
+        Ok(())
+    })?;
+    if layout.shape.is_empty() {
+        return Ok(values[0]);
+    }
+    runtime.new_array(values, layout.shape, dtype)
+}
+
+fn round_decimal(value: f64, decimals: i64, single: bool) -> f64 {
+    let power = decimals.unsigned_abs().min(309) as i32;
+    let factor = 10_f64.powi(power);
+    if single {
+        let value = value as f32;
+        let factor = factor as f32;
+        return if decimals >= 0 {
+            (value * factor).round_ties_even() / factor
+        } else {
+            (value / factor).round_ties_even() * factor
+        } as f64;
+    }
+    if decimals >= 0 {
+        (value * factor).round_ties_even() / factor
+    } else {
+        (value / factor).round_ties_even() * factor
+    }
+}
+
+/// Kronecker products prepend singleton dimensions to the lower-rank operand and multiply
+/// every pair through the metered scalar protocol. Checked output dimensions precede allocation.
+fn kron(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.kron", 2, 2)?;
+    args.reject_keywords("numpy.kron")?;
+    let left = coerce_array(runtime, args.positional()[0])?;
+    let right = coerce_array(runtime, args.positional()[1])?;
+    let (left_layout, left_dtype) = runtime.array_layout(left)?;
+    let (right_layout, right_dtype) = runtime.array_layout(right)?;
+    let rank = left_layout.shape.len().max(right_layout.shape.len());
+    let left_padding = rank - left_layout.shape.len();
+    let right_padding = rank - right_layout.shape.len();
+    let mut left_shape = vec![1; left_padding];
+    left_shape.extend(&left_layout.shape);
+    let mut right_shape = vec![1; right_padding];
+    right_shape.extend(&right_layout.shape);
+    let shape = left_shape
+        .iter()
+        .zip(&right_shape)
+        .map(|(left, right)| {
+            left.checked_mul(*right)
+                .ok_or_else(|| PyError::value_error("array is too large"))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let count = element_count(&shape)?;
+    reserve_values(runtime, count)?;
+    let dtype = promote_dtype(left_dtype, right_dtype);
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&shape, |index| {
+        runtime.charge_cpu(1)?;
+        let left_index = index
+            .iter()
+            .zip(&right_shape)
+            .skip(left_padding)
+            .map(|(index, right)| index / right)
+            .collect::<Vec<_>>();
+        let right_index = index
+            .iter()
+            .zip(&right_shape)
+            .skip(right_padding)
+            .map(|(index, right)| index % right)
+            .collect::<Vec<_>>();
+        let left_value = runtime.array_get(left, &left_index)?;
+        let right_value = runtime.array_get(right, &right_index)?;
+        let left_value = convert(runtime, left_value, dtype)?;
+        let right_value = convert(runtime, right_value, dtype)?;
+        let value = runtime.binary_op(PyBinaryOp::Multiply, left_value, right_value)?;
+        values.push(value);
+        Ok(())
+    })?;
+    if rank == 0 {
+        return Ok(values[0]);
+    }
+    runtime.new_array(values, shape, dtype)
+}
+
+/// A validated block list tree. Lists must be nonempty and all leaves occur at the same depth.
+enum BlockNode {
+    Array(PyArray),
+    List(Vec<BlockNode>),
+}
+
+fn block(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.block", 1, 1)?;
+    args.reject_keywords("numpy.block")?;
+    let (tree, depth, rank) = block_tree(runtime, args.positional()[0], 0)?;
+    assemble_block(runtime, tree, depth, rank.max(depth))
+}
+
+/// Reserve tree metadata and bound recursion before walking user-controlled lists.
+fn block_tree(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+    nesting: usize,
+) -> PyResult<(BlockNode, usize, usize)> {
+    runtime.charge_cpu(1)?;
+    if nesting > MAX_ARRAY_RANK {
+        return Err(PyError::value_error(
+            "block nesting exceeds supported array rank",
+        ));
+    }
+    match runtime.kind(&value)? {
+        PyKind::Tuple => Err(PyError::type_error(
+            "numpy.block requires lists, not tuples",
+        )),
+        PyKind::List => {
+            let items = value.cast::<PySequence>(runtime)?.items(runtime)?;
+            if items.is_empty() {
+                return Err(PyError::value_error("numpy.block lists cannot be empty"));
+            }
+            runtime.reserve_memory(
+                items
+                    .len()
+                    .checked_mul(std::mem::size_of::<BlockNode>())
+                    .ok_or_else(|| PyError::value_error("block tree is too large"))?,
+            )?;
+            let mut children = Vec::with_capacity(items.len());
+            let mut depth = None;
+            let mut rank = 0;
+            for value in items {
+                let (child, child_depth, child_rank) = block_tree(runtime, value, nesting + 1)?;
+                if depth.is_some_and(|depth| depth != child_depth) {
+                    return Err(PyError::value_error(
+                        "numpy.block lists have mismatched depths",
+                    ));
+                }
+                depth = Some(child_depth);
+                rank = rank.max(child_rank);
+                children.push(child);
+            }
+            Ok((BlockNode::List(children), depth.unwrap_or(0) + 1, rank))
+        }
+        _ => {
+            let array = coerce_array(runtime, value)?;
+            let rank = runtime.array_layout(array)?.0.shape.len();
+            Ok((BlockNode::Array(array), 0, rank))
+        }
+    }
+}
+
+/// Prepend singleton axes at leaves, then concatenate each list along its corresponding axis.
+fn assemble_block(
+    runtime: &mut dyn PyRuntime,
+    tree: BlockNode,
+    depth: usize,
+    rank: usize,
+) -> PyResult {
+    runtime.charge_cpu(1)?;
+    match tree {
+        BlockNode::Array(array) => {
+            let (mut layout, _) = runtime.array_layout(array)?;
+            while layout.shape.len() < rank {
+                layout.shape.insert(0, 1);
+                layout.strides.insert(0, 0);
+            }
+            runtime.new_array_view(array, layout)
+        }
+        BlockNode::List(children) => {
+            runtime.reserve_memory(
+                children
+                    .len()
+                    .checked_mul(std::mem::size_of::<PyArray>())
+                    .ok_or_else(|| PyError::value_error("block tree is too large"))?,
+            )?;
+            let mut arrays = Vec::with_capacity(children.len());
+            for child in children {
+                let array = assemble_block(runtime, child, depth - 1, rank)?;
+                arrays.push(array.cast(runtime)?);
+            }
+            concatenate_arrays(runtime, &arrays, Value::Int((rank - depth) as i64))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decimal_rounding_uses_even_ties_and_preserves_signed_zero() {
+        assert_eq!(round_decimal(1.25, 1, false), 1.2);
+        assert_eq!(round_decimal(1.75, 1, false), 1.8);
+        assert_eq!(round_decimal(25.0, -1, false), 20.0);
+        assert_eq!(round_decimal(35.0, -1, false), 40.0);
+        assert!(round_decimal(-0.5, 0, false).is_sign_negative());
+        assert_eq!(round_decimal(1.25, 1, true), 1.2_f32 as f64);
+    }
 
     #[test]
     fn broadcasting_aligns_dimensions_from_the_right() {

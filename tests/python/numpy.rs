@@ -689,3 +689,69 @@ fn complex_operations_without_a_real_value_domain_fail_explicitly() {
         assert_fails_with(&format!("{prelude}{operation}"), expected);
     }
 }
+
+#[test]
+fn round_kron_and_block_compose_generic_arrays() {
+    let source = r#"import numpy as np
+print(np.round(np.array([1.234, 5.678]), 1))
+print(np.kron(np.array([1, 2]), np.array([3, 4])))
+print(np.block([[np.array([[1, 2]]), np.array([[3]])]]))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"array([1.2, 5.7])\narray([3, 4, 6, 8])\narray([[1, 2, 3]])\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
+fn rounding_and_array_composition_preserve_dtype_and_shape() {
+    let source = r#"import numpy as np
+assert np.round([0.5, 1.5, 2.5, -0.5, -1.5]).tolist() == [0.0, 2.0, 2.0, -0.0, -2.0]
+assert np.round([15, 25, 35, -15, -25], -1).tolist() == [20, 20, 40, -20, -20]
+assert np.round(np.array([127], dtype=np.int8), -1).tolist() == [-126]
+a = np.array([1.25, 2.75], dtype=np.float32)
+assert a.round(decimals=1).dtype == 'float32'
+assert np.around(a, 1).tolist() == a.round(1).tolist()
+assert np.round(2.5) == 2.0
+assert np.round(np.array([9007199254740993], dtype=np.uint64), 1).tolist() == [9007199254740993]
+assert np.round(np.array([1.25+2.75j]), 1)[0] == 1.2+2.8j
+assert np.kron([[1, 2], [3, 4]], [[0, 5], [6, 7]]).tolist() == [[0, 5, 0, 10], [6, 7, 12, 14], [0, 15, 0, 20], [18, 21, 24, 28]]
+assert np.kron([1, 2], [[3], [4]]).shape == (2, 2)
+assert np.kron(2, [3, 4]).tolist() == [6, 8]
+assert np.kron([1j], [2j])[0] == -2+0j
+assert np.kron(np.zeros((0, 2)), np.ones((3, 1))).shape == (0, 2)
+assert np.block([[1, 2], [3, 4]]).tolist() == [[1, 2], [3, 4]]
+assert np.block([1, np.array([2.5])]).tolist() == [1.0, 2.5]
+assert np.block([[[1]], [[2]]]).shape == (2, 1, 1)
+assert np.block([[1j, 2]]).tolist() == [[1j, 2+0j]]
+assert np.block([[np.zeros((1, 0)), np.ones((1, 1))]]).tolist() == [[1.0]]
+assert np.round(np.zeros(0), 1).shape == (0,)
+print('ok')
+"#;
+    assert_eq!(run(source), (0, b"ok\n".to_vec(), Vec::new()));
+}
+
+#[test]
+fn array_composition_and_rounding_reject_invalid_inputs() {
+    for (source, expected) in [
+        ("np.block([])", "empty"),
+        ("np.block([1, [2]])", "depth"),
+        ("np.block((1, 2))", "tuples"),
+        (
+            "np.block([[np.ones((1, 2))], [np.ones((1, 3))]])",
+            "matching dimensions",
+        ),
+        ("np.round([1], 0.5)", "integer"),
+        ("np.round([1], 1, decimals=2)", "multiple values"),
+        ("np.round([1], out=np.zeros(1))", "out"),
+        ("np.round([True])", "boolean"),
+        ("np.round([1], 1000)", "decimals"),
+        ("np.kron([1], [2], out=None)", "keyword arguments"),
+    ] {
+        assert_fails_with(&format!("import numpy as np\n{source}"), expected);
+    }
+}

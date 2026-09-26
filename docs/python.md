@@ -38,7 +38,9 @@ cleanup code.
 `complex` is a native arena type. Its arithmetic, string parsing, `repr`, and error messages
 follow CPython 3.14, including the mixed-mode rules for real operands. Ordering, floor division,
 modulo, `int()`, `float()`, `round()`, and `math` functions reject complex values with
-`TypeError`. Format specifications on complex values are not implemented. NumPy `complex128`
+`TypeError`. Complex format specifications support the default presentation and `f`, `e`, `E`, `g`, and `G`,
+including signs, precision, decimal grouping, and alignment of the complete value. Zero padding
+and percentage presentation are rejected. NumPy `complex128`
 arrays store these values directly, and `numpy.complex128` is the builtin `complex` type.
 
 The core collection surface includes mutable sets and immutable `frozenset` values with mixed

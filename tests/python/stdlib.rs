@@ -498,3 +498,55 @@ print(re.search(r"(a)\1", "aa"))
         );
     }
 }
+
+#[test]
+fn hyperbolic_math_functions_match_cpython() {
+    let source = r#"import math
+print(math.sinh(1), math.cosh(1), math.tanh(1))
+print(math.asinh(1), math.acosh(2), math.atanh(0.5))"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"1.1752011936438014 1.5430806348152437 0.7615941559557649\n0.881373587019543 1.3169578969248166 0.5493061443340549\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
+fn hyperbolic_functions_preserve_special_values_and_report_domain_errors() {
+    let source = r#"import math
+for name in ['sinh', 'cosh', 'tanh', 'asinh', 'acosh', 'atanh']:
+    f = getattr(math, name)
+    assert math.isnan(f(math.nan))
+    try:
+        f(1j)
+    except TypeError:
+        pass
+    else:
+        assert False
+assert math.sinh(math.inf) == math.inf
+assert math.sinh(-math.inf) == -math.inf
+assert math.cosh(-math.inf) == math.inf
+assert math.tanh(-math.inf) == -1.0
+assert math.asinh(-math.inf) == -math.inf
+assert math.acosh(math.inf) == math.inf
+assert str(math.sinh(-0.0)) == '-0.0'
+for f, x in [(math.acosh, 0), (math.atanh, 1), (math.atanh, -1), (math.atanh, math.inf)]:
+    try:
+        f(x)
+    except ValueError as error:
+        print(error)
+for f in [math.sinh, math.cosh]:
+    try:
+        f(1000)
+    except OverflowError as error:
+        print(error)
+try:
+    math.sinh(1, 2)
+except TypeError:
+    print('arity')
+"#;
+    assert_eq!(run(source), (0, b"math domain error\nmath domain error\nmath domain error\nmath domain error\nmath range error\nmath range error\narity\n".to_vec(), Vec::new()));
+}

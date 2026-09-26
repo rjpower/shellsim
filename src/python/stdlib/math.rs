@@ -22,6 +22,36 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     functions: &[
         FunctionDef {
             module: "math",
+            name: "atanh",
+            call: native_atanh,
+        },
+        FunctionDef {
+            module: "math",
+            name: "acosh",
+            call: native_acosh,
+        },
+        FunctionDef {
+            module: "math",
+            name: "asinh",
+            call: native_asinh,
+        },
+        FunctionDef {
+            module: "math",
+            name: "tanh",
+            call: native_tanh,
+        },
+        FunctionDef {
+            module: "math",
+            name: "cosh",
+            call: native_cosh,
+        },
+        FunctionDef {
+            module: "math",
+            name: "sinh",
+            call: native_sinh,
+        },
+        FunctionDef {
+            module: "math",
             name: "acos",
             call: native_acos,
         },
@@ -179,6 +209,30 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
     ],
 };
+
+fn native_sinh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "sinh")
+}
+
+fn native_cosh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "cosh")
+}
+
+fn native_tanh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "tanh")
+}
+
+fn native_asinh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "asinh")
+}
+
+fn native_acosh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "acosh")
+}
+
+fn native_atanh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "atanh")
+}
 
 fn native_acos(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "acos")
@@ -518,6 +572,12 @@ pub fn constant(name: &str) -> Option<MathValue> {
 /// Dispatch one of the observed/reviewer-requested `math` functions.
 pub fn call(name: &str, args: &[f64]) -> MathResult {
     match name {
+        "sinh" => unary("sinh", args, sinh),
+        "cosh" => unary("cosh", args, cosh),
+        "tanh" => unary("tanh", args, tanh),
+        "asinh" => unary("asinh", args, asinh),
+        "acosh" => unary("acosh", args, acosh),
+        "atanh" => unary("atanh", args, atanh),
         "acos" => unary("acos", args, acos),
         "asin" => unary("asin", args, asin),
         "atan" => unary("atan", args, |value| Ok(MathValue::Float(value.atan()))),
@@ -557,6 +617,40 @@ pub fn call(name: &str, args: &[f64]) -> MathResult {
         "tan" => unary("tan", args, tan),
         _ => Err(MathError::UnknownFunction(name.to_string())),
     }
+}
+
+/// Hyperbolic functions preserve IEEE infinities and NaNs; finite overflow is a Python error.
+fn hyperbolic_result(input: f64, result: f64) -> MathResult {
+    if input.is_finite() && result.is_infinite() {
+        return Err(MathError::OverflowError("math range error"));
+    }
+    Ok(MathValue::Float(result))
+}
+fn sinh(value: f64) -> MathResult {
+    hyperbolic_result(value, value.sinh())
+}
+fn cosh(value: f64) -> MathResult {
+    hyperbolic_result(value, value.cosh())
+}
+fn tanh(value: f64) -> MathResult {
+    Ok(MathValue::Float(value.tanh()))
+}
+fn asinh(value: f64) -> MathResult {
+    Ok(MathValue::Float(value.asinh()))
+}
+/// The real inverse hyperbolic cosine has domain [1, infinity); NaNs propagate.
+fn acosh(value: f64) -> MathResult {
+    if value < 1.0 {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    Ok(MathValue::Float(value.acosh()))
+}
+/// The real inverse hyperbolic tangent has open domain (-1, 1); NaNs propagate.
+fn atanh(value: f64) -> MathResult {
+    if value.abs() >= 1.0 {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    Ok(MathValue::Float(value.atanh()))
 }
 
 fn binary(
@@ -738,6 +832,29 @@ mod tests {
             MathValue::Float(value) => value,
             other => panic!("expected float, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn hyperbolic_domains_and_finite_overflow_match_python() {
+        for name in ["sinh", "cosh", "tanh", "asinh", "acosh", "atanh"] {
+            assert!(float(call(name, &[f64::NAN]).unwrap()).is_nan());
+        }
+        assert_eq!(
+            call("acosh", &[0.0]),
+            Err(MathError::ValueError("math domain error"))
+        );
+        assert_eq!(
+            call("atanh", &[1.0]),
+            Err(MathError::ValueError("math domain error"))
+        );
+        assert_eq!(
+            call("sinh", &[1000.0]),
+            Err(MathError::OverflowError("math range error"))
+        );
+        assert_eq!(
+            float(call("sinh", &[f64::INFINITY]).unwrap()),
+            f64::INFINITY
+        );
     }
 
     #[test]

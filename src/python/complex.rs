@@ -340,7 +340,7 @@ pub(super) fn repr(value: Complex) -> String {
 ///
 /// Unlike `float.__repr__`, integral components carry no `.0`. `signed` forces a leading `+`
 /// for non-negative values and NaN, matching `Py_DTSF_SIGN`.
-fn repr_component(value: f64, signed: bool) -> String {
+pub(super) fn repr_component(value: f64, signed: bool) -> String {
     let sign = if value.is_sign_negative() && !value.is_nan() {
         "-"
     } else if signed {
