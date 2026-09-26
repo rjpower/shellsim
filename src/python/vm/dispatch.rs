@@ -160,6 +160,7 @@ impl Vm<'_> {
                 Opcode::Import { name, bind_root } => {
                     dispatch_next(self.import(code.name(name), bind_root))
                 }
+                Opcode::ImportFrom(name) => dispatch_next(self.import_from(code.name(name))),
                 Opcode::LoadAttribute(name) => {
                     let symbol = self
                         .symbol_for(code, code_cache, name)
@@ -184,8 +185,11 @@ impl Vm<'_> {
                 Opcode::BuildTuple(count) => {
                     dispatch_next(self.build_sequence(count, SequenceKind::Tuple))
                 }
-                Opcode::BuildDict(dict) => dispatch_next(self.build_dict(code.dict_entries(dict))),
+                Opcode::BuildDict(dict) => dispatch_next(self.build_dict(code.unpack_flags(dict))),
                 Opcode::BuildSet(count) => dispatch_next(self.build_set(count)),
+                Opcode::BuildUnpacked { kind, starred } => {
+                    dispatch_next(self.build_unpacked(kind, code.unpack_flags(starred)))
+                }
                 Opcode::UnpackSequence { count, star_index } => {
                     dispatch_next(self.unpack_sequence(count, star_index))
                 }

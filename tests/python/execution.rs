@@ -171,9 +171,10 @@ fn chr_builds_unicode_scalars_and_rejects_out_of_range_values() {
         (0, "A 🙂\n".as_bytes().to_vec(), Vec::new())
     );
     let (status, _, stderr) = run_shell("python -c 'chr(0x110000)' ");
-    assert_eq!(status, 2);
+    assert_eq!(status, 1);
     assert!(
-        String::from_utf8_lossy(&stderr).contains("not in range"),
+        String::from_utf8_lossy(&stderr)
+            .ends_with("ValueError: chr() arg not in range(0x110000)\n"),
         "{}",
         String::from_utf8_lossy(&stderr)
     );

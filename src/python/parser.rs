@@ -6,6 +6,7 @@ use super::ast::{
     ExpressionKind, FStringPart, Parameter, ParameterKind, Program, Statement, StatementKind,
     UnaryOperator,
 };
+use super::lexer::{text_escape, TextEscape};
 use super::source::Span;
 use super::token::{Token, TokenKind};
 
@@ -794,18 +795,20 @@ impl Parser {
                         span,
                     });
                 }
-                '\\' if !raw && index + 1 < chars.len() => {
-                    let escaped = match chars[index + 1] {
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        '\\' => '\\',
-                        '\'' => '\'',
-                        '"' => '"',
-                        other => other,
-                    };
-                    text.push(escaped);
-                    index += 2;
+                '\\' if !raw => {
+                    let (escape, used) =
+                        text_escape(chars[index + 1..].iter().copied()).map_err(|message| {
+                            ParseError {
+                                message: message.into(),
+                                span,
+                            }
+                        })?;
+                    match escape {
+                        TextEscape::Character(ch) => text.push(ch),
+                        TextEscape::LineContinuation => {}
+                        TextEscape::Verbatim => text.push('\\'),
+                    }
+                    index += 1 + used;
                 }
                 ch => {
                     text.push(ch);
@@ -1764,8 +1767,10 @@ impl Parser {
                 kind: ExpressionKind::Dict(entries),
             });
         }
-        let first = self.expression()?;
-        if self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {
+        let first = self.expression_item()?;
+        // A starred first item can only begin a set display, never a key or comprehension.
+        let starred = matches!(first.kind, ExpressionKind::Starred(_));
+        if !starred && self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {
             let value = self.expression()?;
             if self.take(|kind| matches!(kind, TokenKind::For)).is_some() {
                 let (clauses, _) = self.comprehension_clauses(first.span)?;
@@ -1797,7 +1802,7 @@ impl Parser {
                 kind: ExpressionKind::Dict(entries),
             })
         } else {
-            if self.take(|kind| matches!(kind, TokenKind::For)).is_some() {
+            if !starred && self.take(|kind| matches!(kind, TokenKind::For)).is_some() {
                 let (clauses, _) = self.comprehension_clauses(first.span)?;
                 let end = self.expect(
                     |kind| matches!(kind, TokenKind::RightBrace),
@@ -1815,7 +1820,7 @@ impl Parser {
             while self.take(|kind| matches!(kind, TokenKind::Comma)).is_some()
                 && !self.at(|kind| matches!(kind, TokenKind::RightBrace))
             {
-                values.push(self.expression()?);
+                values.push(self.expression_item()?);
             }
             self.expect(
                 |kind| matches!(kind, TokenKind::RightBrace),
@@ -2127,6 +2132,14 @@ mod tests {
         let error = parse(lex("values[1,,2]").unwrap())
             .expect_err("a tuple subscript cannot contain an empty member");
         assert!(error.message.contains("expected an expression"));
+    }
+
+    #[test]
+    fn starred_items_begin_only_set_displays() {
+        parse(lex("values = {*left, 1, *right}").unwrap()).unwrap();
+        for source in ["{*left: 1}", "{*left for left in right}"] {
+            parse(lex(source).unwrap()).expect_err("a starred item cannot begin a key");
+        }
     }
 
     #[test]

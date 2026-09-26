@@ -1,9 +1,10 @@
 //! Bounded assertion methods for the capability-free :mod:`unittest` compatibility surface.
 
+use super::super::exception_types;
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, MethodDef, ModuleDef, NativeTypeDef, PyError, PyExceptionType, PyMarker, PyResult,
-    PyRuntime, PyValueCast, ValueDef,
+    CallArgs, MethodDef, ModuleDef, NativeTypeDef, PyError, PyExceptionType, PyMarker,
+    PyRaisesContext, PyResult, PyRuntime, PyValueCast, ValueDef,
 };
 
 pub(crate) static TEST_CASE_TYPE: NativeTypeDef = NativeTypeDef {
@@ -128,4 +129,43 @@ fn assert_raises(runtime: &mut dyn PyRuntime, _receiver: Value, args: CallArgs) 
     args.reject_keywords("assertRaises")?;
     let PyExceptionType(expected) = args.positional()[0].cast(runtime)?;
     runtime.new_raises_context(expected.to_string())
+}
+
+pub(crate) static RAISES_CONTEXT_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "pytest.raises",
+    methods: &[
+        MethodDef {
+            type_name: "pytest.raises",
+            name: "__enter__",
+            call: raises_enter,
+        },
+        MethodDef {
+            type_name: "pytest.raises",
+            name: "__exit__",
+            call: raises_exit,
+        },
+    ],
+    getters: &[],
+};
+
+fn raises_enter(_runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    args.expect_positional("pytest.raises.__enter__", 0, 0)?;
+    args.reject_keywords("pytest.raises.__enter__")?;
+    Ok(receiver)
+}
+
+fn raises_exit(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    args.expect_positional("pytest.raises.__exit__", 3, 3)?;
+    args.reject_keywords("pytest.raises.__exit__")?;
+    let context = receiver.cast::<PyRaisesContext>(runtime)?;
+    let expected = runtime.raises_expected(context)?;
+    if args.positional()[0].is_none() {
+        return Err(PyError::exception("Failed", "DID NOT RAISE"));
+    }
+    let kind = runtime
+        .exception_type_name(&args.positional()[0])
+        .ok_or_else(|| PyError::type_error("invalid exception context"))?;
+    Ok(Value::Bool(exception_types::exception_is_subclass(
+        kind, &expected,
+    )))
 }

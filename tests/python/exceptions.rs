@@ -78,11 +78,58 @@ fn system_exit_keeps_its_status_and_message_semantics() {
 }
 
 #[test]
-fn unsupported_syntax_still_reports_the_minimal_shim_diagnostic() {
-    let (status, stdout, stderr) = run_python_text("print(1 @ 2)");
+fn unmodeled_builtins_still_report_the_minimal_shim_diagnostic() {
+    let (status, stdout, stderr) = run_python_text("print(eval('1'))");
     assert_eq!(status, 2);
     assert!(stdout.is_empty());
     assert!(stderr.contains("unsupported by minimal shim"), "{stderr}");
+    assert!(
+        stderr.contains("builtin \"eval\" is not implemented"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn missing_methods_on_builtin_values_report_the_minimal_shim_diagnostic() {
+    // A missing method on a builtin value is far more likely a shellsim gap than a program
+    // probing for absence, so it is not catchable as AttributeError.
+    let (status, _, stderr) =
+        run_python_text("try:\n    (1).missing\nexcept AttributeError:\n    print('caught')");
+    assert_eq!(status, 2);
+    assert!(
+        stderr.contains("attribute \"missing\" is not implemented"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn unmodeled_standard_modules_report_the_minimal_shim_diagnostic() {
+    // CPython always has `threading`, so an ImportError fallback would take a path CPython never
+    // takes. A module outside the standard library is absent, as it is in bare CPython.
+    let (status, _, stderr) =
+        run_python_text("try:\n    import threading\nexcept ImportError:\n    print('caught')");
+    assert_eq!(status, 2);
+    assert!(
+        stderr.contains("standard-library module \"threading\" is not implemented"),
+        "{stderr}"
+    );
+
+    let (status, stdout, _) = run_python_text(
+        "try:\n    import requests\nexcept ModuleNotFoundError as error:\n    print(error)",
+    );
+    assert_eq!(status, 0);
+    assert_eq!(stdout, "No module named 'requests'\n");
+}
+
+#[test]
+fn builtin_operation_errors_exit_one_with_a_traceback() {
+    let (status, stdout, stderr) = run_python_text("print(1 @ 2)");
+    assert_eq!(status, 1);
+    assert!(stdout.is_empty());
+    assert!(
+        stderr.ends_with("TypeError: unsupported operand type(s) for @: 'int' and 'int'\n"),
+        "{stderr}"
+    );
 }
 
 #[test]

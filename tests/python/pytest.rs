@@ -210,3 +210,58 @@ fn caps_generated_pytest_wrapper_before_execution() {
     assert!(stdout.is_empty());
     assert!(String::from_utf8_lossy(&stderr).contains("generated wrapper"));
 }
+
+#[test]
+fn raises_matches_subclasses_and_exposes_the_caught_error() {
+    let source = r#"import pytest
+
+class AppError(ValueError):
+    pass
+
+def test_subclass():
+    with pytest.raises(ValueError) as info:
+        raise AppError("detail")
+    assert info.type is AppError
+    assert str(info.value) == "detail"
+
+def test_tuple_and_match():
+    with pytest.raises((KeyError, TypeError)):
+        raise TypeError("either")
+    with pytest.raises(ValueError, match="de+tail"):
+        raise ValueError("detail")
+
+def test_other_types_propagate():
+    try:
+        with pytest.raises(KeyError):
+            raise TypeError("x")
+    except TypeError:
+        return
+    raise AssertionError("TypeError was swallowed")
+
+def test_missing_exception_fails():
+    with pytest.raises(KeyError):
+        pass
+"#;
+    let (status, stdout, stderr) = run_pytest(source, "python3.14 -m pytest /test_sample.py");
+    assert_eq!(status, 1, "{stderr:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "/test_sample.py::test_subclass PASSED\n/test_sample.py::test_tuple_and_match PASSED\n/test_sample.py::test_other_types_propagate PASSED\n/test_sample.py::test_missing_exception_fails FAILED DID NOT RAISE <class 'KeyError'>\n"
+    );
+}
+
+#[test]
+fn parametrize_rows_keep_signed_float_and_complex_literals() {
+    let source = r#"import pytest
+
+@pytest.mark.parametrize(("value", "expected"), [(-3, "int"), (2.0, "float"), (-1.5, "float"), (1e20, "float"), (1 + 2j, "complex"), (-2j, "complex")])
+def test_type(value, expected):
+    assert type(value).__name__ == expected
+
+@pytest.mark.parametrize("value", [-3, 2.0, 1e20, 1 - 2j])
+def test_round_trip(value):
+    assert value in (-3, 2.0, 1e20, 1 - 2j)
+"#;
+    let (status, stdout, stderr) = run_pytest(source, "python3.14 -m pytest /test_sample.py");
+    assert_eq!(status, 0, "{stderr:?} {stdout:?}");
+}

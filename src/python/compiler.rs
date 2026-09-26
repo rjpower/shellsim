@@ -6,7 +6,7 @@ use super::ast::{
     StatementKind,
 };
 use super::bytecode::{
-    ClassField, CodeBuilder, CodeRef, Instruction, Operation, Parameter,
+    ClassField, CodeBuilder, CodeRef, DisplayKind, Instruction, Operation, Parameter,
     ParameterKind as BytecodeParameterKind,
 };
 use super::source::Span;
@@ -219,8 +219,7 @@ impl Compiler {
                     span,
                 );
                 for (imported, binding) in names {
-                    self.emit(Operation::Copy(1), span);
-                    self.emit(Operation::LoadAttribute(imported), span);
+                    self.emit(Operation::ImportFrom(imported), span);
                     self.emit(Operation::StoreName(binding), span);
                 }
                 self.emit(Operation::PopTop, span);
@@ -1014,20 +1013,8 @@ impl Compiler {
                     }
                 }
             }
-            ExpressionKind::List(values) => {
-                let count = values.len();
-                for value in values {
-                    self.expression(value);
-                }
-                self.emit(Operation::BuildList(count), span);
-            }
-            ExpressionKind::Tuple(values) => {
-                let count = values.len();
-                for value in values {
-                    self.expression(value);
-                }
-                self.emit(Operation::BuildTuple(count), span);
-            }
+            ExpressionKind::List(values) => self.display(DisplayKind::List, values, span),
+            ExpressionKind::Tuple(values) => self.display(DisplayKind::Tuple, values, span),
             ExpressionKind::Dict(entries) => {
                 let mut unpacked = Vec::with_capacity(entries.len());
                 for entry in entries {
@@ -1045,13 +1032,7 @@ impl Compiler {
                 }
                 self.emit(Operation::BuildDict(unpacked), span);
             }
-            ExpressionKind::Set(values) => {
-                let count = values.len();
-                for value in values {
-                    self.expression(value);
-                }
-                self.emit(Operation::BuildSet(count), span);
-            }
+            ExpressionKind::Set(values) => self.display(DisplayKind::Set, values, span),
             ExpressionKind::ListComprehension { element, clauses } => {
                 self.emit_comprehension(ComprehensionKind::List, *element, clauses, span);
             }
@@ -1328,6 +1309,35 @@ impl Compiler {
             globals,
             nonlocals,
         }
+    }
+
+    /// Compile a list, tuple, or set display. Displays without `*iterable` operands keep the
+    /// fixed-count build operations.
+    fn display(&mut self, kind: DisplayKind, values: Vec<Expression>, span: Span) {
+        let count = values.len();
+        let mut starred = Vec::with_capacity(count);
+        for value in values {
+            match value.kind {
+                ExpressionKind::Starred(iterable) => {
+                    self.expression(*iterable);
+                    starred.push(true);
+                }
+                kind => {
+                    self.expression(Expression {
+                        kind,
+                        span: value.span,
+                    });
+                    starred.push(false);
+                }
+            }
+        }
+        let operation = match kind {
+            _ if starred.contains(&true) => Operation::BuildUnpacked { kind, starred },
+            DisplayKind::List => Operation::BuildList(count),
+            DisplayKind::Tuple => Operation::BuildTuple(count),
+            DisplayKind::Set => Operation::BuildSet(count),
+        };
+        self.emit(operation, span);
     }
 
     fn emit_comprehension(

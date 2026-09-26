@@ -247,7 +247,7 @@ impl Vm<'_> {
                 Object::Instance { class, .. } => {
                     let type_id = self.state.heap.type_id(id)?;
                     if self.state.types.slot(type_id, Slot::Call)?.is_none() {
-                        return Err("object is not callable".into());
+                        return Err(self.raise_object_type_error(&function, "is not callable"));
                     }
                     let (defining_class, descriptor) = self
                         .class_attribute_entry(class, "__call__")?
@@ -513,8 +513,7 @@ impl Vm<'_> {
                     }
                     Ok(CallResult::Value(instance))
                 }
-                Object::Module { .. } => Err("module object is not callable".into()),
-                _ => Err("object is not callable".into()),
+                _ => Err(self.raise_object_type_error(&function, "is not callable")),
             };
         }
         if let Some(NativeValue::BuiltinType(builtin_type)) = function.native_value() {
@@ -604,7 +603,7 @@ impl Vm<'_> {
             };
         }
         let Some(NativeValue::Function(function)) = function.native_value() else {
-            return Err("object is not callable".into());
+            return Err(self.raise_object_type_error(&function, "is not callable"));
         };
         if !keyword_arguments.is_empty() && !matches!(function, Builtin::Print | Builtin::Sorted) {
             return Err("this builtin does not accept keyword arguments".into());
@@ -735,10 +734,11 @@ impl Vm<'_> {
                 expect_arity(&arguments, 1, 1)?;
                 let value = protocol::int_value(&self.state.heap, &arguments[0])
                     .ok_or("an integer is required for chr()")?;
-                let codepoint = u32::try_from(value)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .ok_or("chr() arg not in range(0x110000)")?;
+                let Some(codepoint) = u32::try_from(value).ok().and_then(char::from_u32) else {
+                    return Err(
+                        self.raise_exception("ValueError", "chr() arg not in range(0x110000)")
+                    );
+                };
                 Ok(CallResult::Value(
                     self.allocate_string(codepoint.to_string())?,
                 ))
@@ -865,16 +865,18 @@ impl Vm<'_> {
                 let length = if let Some(length) =
                     protocol::string_length(&self.state.heap, &arguments[0])?
                 {
-                    length
+                    Some(length)
                 } else if let Some(id) = arguments[0].object_id() {
                     match self.state.heap.get(id)? {
                         Object::List(values)
                         | Object::Tuple(values)
                         | Object::Set(values)
-                        | Object::FrozenSet(values) => values.len(),
-                        Object::Range { start, stop, step } => range_length(*start, *stop, *step)?,
+                        | Object::FrozenSet(values) => Some(values.len()),
+                        Object::Range { start, stop, step } => {
+                            Some(range_length(*start, *stop, *step)?)
+                        }
                         Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                            entries.len()
+                            Some(entries.len())
                         }
                         Object::BigInt(_)
                         | Object::Complex { .. }
@@ -900,16 +902,23 @@ impl Vm<'_> {
                         | Object::Regex { .. }
                         | Object::Match { .. }
                         | Object::ArgumentParser { .. }
-                        | Object::Namespace { .. } => return Err("object has no len()".into()),
-                        Object::EnumMember { .. } => return Err("object has no len()".into()),
-                        Object::RaisesContext { .. } => return Err("object has no len()".into()),
-                        Object::Property { .. }
+                        | Object::Namespace { .. }
+                        | Object::EnumMember { .. }
+                        | Object::RaisesContext { .. }
+                        | Object::Property { .. }
                         | Object::StaticMethod { .. }
                         | Object::ClassMethod { .. }
-                        | Object::Super { .. } => return Err("object has no len()".into()),
+                        | Object::Super { .. } => None,
                     }
                 } else {
-                    return Err("object has no len()".into());
+                    None
+                };
+                let Some(length) = length else {
+                    let message = format!(
+                        "object of type '{}' has no len()",
+                        self.type_name_of(&arguments[0])?
+                    );
+                    return Err(self.raise_exception("TypeError", message));
                 };
                 Ok(CallResult::Value(Value::Int(length as i64)))
             }
@@ -960,7 +969,7 @@ impl Vm<'_> {
                     let mut current = index;
                     while current > 0 {
                         self.charge_cpu(1)?;
-                        if self.compare_values(&keyed[current].0, &keyed[current - 1].0)?
+                        if self.sort_order(&keyed[current].0, &keyed[current - 1].0)?
                             != if reverse {
                                 Ordering::Greater
                             } else {
@@ -991,7 +1000,7 @@ impl Vm<'_> {
                 let mut selected = values.next().ok_or("argument is an empty sequence")?;
                 for value in values {
                     self.charge_cpu(1)?;
-                    let ordering = self.compare_values(&value, &selected)?;
+                    let ordering = self.sort_order(&value, &selected)?;
                     let replace = match function {
                         Builtin::Minimum => ordering == Ordering::Less,
                         Builtin::Maximum => ordering == Ordering::Greater,
@@ -1015,9 +1024,15 @@ impl Vm<'_> {
             }
             Builtin::Absolute => {
                 expect_arity(&arguments, 1, 1)?;
-                let value = self
-                    .invoke_slot(&arguments[0], Slot::Absolute, "__abs__", Vec::new())?
-                    .ok_or("bad operand type for abs()")?;
+                let Some(value) =
+                    self.invoke_slot(&arguments[0], Slot::Absolute, "__abs__", Vec::new())?
+                else {
+                    let message = format!(
+                        "bad operand type for abs(): '{}'",
+                        self.type_name_of(&arguments[0])?
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                };
                 Ok(CallResult::Value(value))
             }
             Builtin::Power => {
@@ -1099,72 +1114,20 @@ impl Vm<'_> {
             }
             Builtin::Next => {
                 expect_arity(&arguments, 1, 2)?;
-                let Some(id) = arguments[0].object_id() else {
-                    return Err("next() argument is not an iterator".into());
-                };
-                let value = match self.state.heap.get(id)?.clone() {
-                    Object::CallableIterator {
-                        callable,
-                        sentinel,
-                        exhausted,
-                    } => {
-                        if exhausted {
-                            None
-                        } else {
-                            self.charge_cpu(1)?;
-                            let value = <Self as PyRuntime>::call_value(
-                                self,
-                                callable,
-                                CallArgs::new(Vec::new(), Vec::new()),
-                            )
-                            .map_err(|error| error.to_string())?;
-                            if protocol::equals(&self.state.heap, &value, &sentinel)? {
-                                if let Object::CallableIterator { exhausted, .. } =
-                                    self.state.heap.get_mut(id)?
-                                {
-                                    *exhausted = true;
-                                }
-                                None
-                            } else {
-                                Some(value)
-                            }
-                        }
+                let value = match self.iterator_next(&arguments[0]) {
+                    Ok(value) => value,
+                    Err(_) if arguments.len() == 2 && self.pending_stop_iteration() => {
+                        self.pending_exception = None;
+                        None
                     }
-                    Object::CountIterator { current, step } => {
-                        let next = super::super::stdlib::itertools::count_next(current, step)
-                            .map_err(str::to_string)?;
-                        if let Object::CountIterator { current, .. } =
-                            self.state.heap.get_mut(id)?
-                        {
-                            *current = next;
-                        }
-                        Some(Value::Int(current))
-                    }
-                    Object::Generator { .. } => self.resume_generator(id)?,
-                    Object::Iterator { .. }
-                    | Object::SequenceIterator { .. }
-                    | Object::RangeIterator { .. } => self.next_stored_iterator(id)?,
-                    _ => {
-                        match self.invoke_slot(&arguments[0], Slot::Next, "__next__", Vec::new()) {
-                            Ok(Some(value)) => Some(value),
-                            Ok(None) => return Err("next() argument is not an iterator".into()),
-                            Err(_error)
-                                if self
-                                    .pending_exception
-                                    .as_ref()
-                                    .is_some_and(|exception| exception.kind == "StopIteration")
-                                    && arguments.len() == 2 =>
-                            {
-                                self.pending_exception = None;
-                                arguments.get(1).copied()
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    }
+                    Err(error) => return Err(error),
                 };
                 let value = match value {
                     Some(value) => value,
-                    None => arguments.get(1).cloned().ok_or("StopIteration")?,
+                    None => match arguments.get(1) {
+                        Some(default) => *default,
+                        None => return Err(self.raise_exception("StopIteration", "")),
+                    },
                 };
                 Ok(CallResult::Value(value))
             }
@@ -1181,7 +1144,9 @@ impl Vm<'_> {
                     _ => unreachable!(),
                 };
                 if step == 0 {
-                    return Err("range() arg 3 must not be zero".into());
+                    return Err(
+                        self.raise_exception("ValueError", "range() arg 3 must not be zero")
+                    );
                 }
                 Ok(CallResult::Value(self.allocate_object(Object::Range {
                     start,
@@ -1321,7 +1286,7 @@ impl Vm<'_> {
         }
         const MAX_CALL_DEPTH: usize = 256;
         if self.call_depth == MAX_CALL_DEPTH {
-            return Err("maximum recursion depth exceeded".into());
+            return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
         }
         let scope =
             self.bind_function_scope(name, code, closure, defaults, arguments, keyword_arguments)?;
@@ -1400,11 +1365,44 @@ impl Vm<'_> {
     ) -> Result<ScopeId, String> {
         let signature = &code.call_signature;
         if signature.variadic_slot.is_none() && arguments.len() > signature.positional_count {
-            return Err(format!(
-                "{name}() takes {} positional arguments but {} were given",
-                signature.positional_count,
-                arguments.len()
-            ));
+            let required = code.parameters[..signature.positional_count]
+                .iter()
+                .filter(|parameter| !parameter.has_default)
+                .count();
+            let takes = match (required, signature.positional_count) {
+                (required, count) if required == count => format!(
+                    "{count} positional argument{}",
+                    if count == 1 { "" } else { "s" }
+                ),
+                (required, count) => format!("from {required} to {count} positional arguments"),
+            };
+            let given = arguments.len();
+            let keyword_only = keyword_arguments
+                .iter()
+                .filter(|(keyword, _)| {
+                    code.parameters.iter().any(|parameter| {
+                        parameter.name == *keyword
+                            && parameter.kind == super::super::bytecode::ParameterKind::KeywordOnly
+                    })
+                })
+                .count();
+            let keyword_detail = if keyword_only == 0 {
+                String::new()
+            } else {
+                format!(
+                    " positional argument{} (and {keyword_only} keyword-only argument{})",
+                    if given == 1 { "" } else { "s" },
+                    if keyword_only == 1 { "" } else { "s" }
+                )
+            };
+            let verb = if given == 1 && keyword_only == 0 {
+                "was"
+            } else {
+                "were"
+            };
+            let message =
+                format!("{name}() takes {takes} but {given}{keyword_detail} {verb} given");
+            return Err(self.raise_exception("TypeError", message));
         }
         let extra_positional =
             if signature.variadic_slot.is_some() && arguments.len() > signature.positional_count {
@@ -1436,14 +1434,12 @@ impl Vm<'_> {
                     extra_keywords.push((key, value));
                     continue;
                 }
-                return Err(format!(
-                    "{name}() got an unexpected keyword argument {keyword:?}"
-                ));
+                let message = format!("{name}() got an unexpected keyword argument '{keyword}'");
+                return Err(self.raise_exception("TypeError", message));
             };
             if locals[slot].replace(value).is_some() {
-                return Err(format!(
-                    "{name}() got multiple values for argument {keyword:?}"
-                ));
+                let message = format!("{name}() got multiple values for argument '{keyword}'");
+                return Err(self.raise_exception("TypeError", message));
             }
         }
         if let Some(slot) = signature.keyword_variadic_slot {
@@ -1457,25 +1453,37 @@ impl Vm<'_> {
                 locals[slot] = Some(*default);
             }
         }
-        if let Some((slot, parameter)) =
+        let missing = |kind: super::super::bytecode::ParameterKind| {
             code.parameters
                 .iter()
                 .enumerate()
-                .find(|(slot, parameter)| {
-                    locals[*slot].is_none()
-                        && !parameter.has_default
-                        && !matches!(
-                            parameter.kind,
-                            super::super::bytecode::ParameterKind::Variadic
-                                | super::super::bytecode::ParameterKind::KeywordVariadic
-                        )
+                .filter(|(slot, parameter)| {
+                    locals[*slot].is_none() && !parameter.has_default && parameter.kind == kind
                 })
-        {
-            debug_assert!(slot < locals.len());
-            return Err(format!(
-                "{name}() missing required argument {:?}",
-                parameter.name
-            ));
+                .map(|(_, parameter)| format!("'{}'", parameter.name))
+                .collect::<Vec<_>>()
+        };
+        for (kind, description) in [
+            (
+                super::super::bytecode::ParameterKind::Positional,
+                "positional",
+            ),
+            (
+                super::super::bytecode::ParameterKind::KeywordOnly,
+                "keyword-only",
+            ),
+        ] {
+            let names = missing(kind);
+            if names.is_empty() {
+                continue;
+            }
+            let plural = if names.len() == 1 { "" } else { "s" };
+            let message = format!(
+                "{name}() missing {} required {description} argument{plural}: {}",
+                names.len(),
+                english_list(&names)
+            );
+            return Err(self.raise_exception("TypeError", message));
         }
         let uses_repl_globals = closure
             .map(|scope| self.state.heap.scope_uses_repl_globals(scope))
@@ -1491,7 +1499,74 @@ impl Vm<'_> {
         )
     }
 
+    /// Advance any Python iterator by one item; `Ok(None)` means a builtin iterator is exhausted.
+    /// A user iterator's `StopIteration` stays pending as an error, so callers that treat it as
+    /// exhaustion check [`Self::pending_stop_iteration`].
+    pub(super) fn iterator_next(&mut self, iterator: &Value) -> Result<Option<Value>, String> {
+        let Some(id) = iterator.object_id() else {
+            return Err(self.raise_object_type_error(iterator, "is not an iterator"));
+        };
+        Ok(match self.state.heap.get(id)?.clone() {
+            Object::CallableIterator {
+                callable,
+                sentinel,
+                exhausted,
+            } => {
+                if exhausted {
+                    None
+                } else {
+                    self.charge_cpu(1)?;
+                    let value = <Self as PyRuntime>::call_value(
+                        self,
+                        callable,
+                        CallArgs::new(Vec::new(), Vec::new()),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    if protocol::equals(&self.state.heap, &value, &sentinel)? {
+                        if let Object::CallableIterator { exhausted, .. } =
+                            self.state.heap.get_mut(id)?
+                        {
+                            *exhausted = true;
+                        }
+                        None
+                    } else {
+                        Some(value)
+                    }
+                }
+            }
+            Object::CountIterator { current, step } => {
+                let next = super::super::stdlib::itertools::count_next(current, step)
+                    .map_err(str::to_string)?;
+                if let Object::CountIterator { current, .. } = self.state.heap.get_mut(id)? {
+                    *current = next;
+                }
+                Some(Value::Int(current))
+            }
+            Object::Generator { .. } => self.resume_generator(id)?,
+            Object::Iterator { .. }
+            | Object::SequenceIterator { .. }
+            | Object::RangeIterator { .. } => self.next_stored_iterator(id)?,
+            _ => match self.invoke_slot(iterator, Slot::Next, "__next__", Vec::new())? {
+                Some(value) => Some(value),
+                None => return Err(self.raise_object_type_error(iterator, "is not an iterator")),
+            },
+        })
+    }
+
+    /// Whether the error being propagated is a `StopIteration`.
+    pub(super) fn pending_stop_iteration(&self) -> bool {
+        self.pending_exception
+            .as_ref()
+            .is_some_and(|exception| exception.kind == "StopIteration")
+    }
+
     pub(super) fn record_native_error(&mut self, error: PyError) -> String {
+        // Native code converts VM failures with `PyError::runtime_error`. When the VM already
+        // raised a Python exception for that failure, it is the one propagating; a generic
+        // RuntimeError must not replace it.
+        if matches!(error.kind, PyErrorKind::Runtime) && self.pending_exception.is_some() {
+            return error.message;
+        }
         let kind = match error.kind {
             PyErrorKind::Type => Some("TypeError"),
             PyErrorKind::Value => Some("ValueError"),
@@ -1599,5 +1674,15 @@ impl Vm<'_> {
             }
         }
         self.allocate_string(text)
+    }
+}
+
+/// Join names the way CPython's argument errors do: `'a'`, `'a' and 'b'`, `'a', 'b', and 'c'`.
+fn english_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
     }
 }

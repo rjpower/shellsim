@@ -1,9 +1,9 @@
 //! Name, scope, import, and per-code cache operations used by bytecode execution.
 
 use super::{
-    is_os_error, protocol, Arc, Builtin, BuiltinType, CodeRef, ExceptionType, Execution, HashMap,
-    NameId, NativeValue, Object, PyModuleLoader, PyRuntime, RaisedException, ScopeId, SymbolId,
-    Value, Vm,
+    cpython_names, exception_types, protocol, Arc, Builtin, BuiltinType, CodeRef, ExceptionType,
+    Execution, HashMap, NameId, NativeValue, Object, PyModuleLoader, PyRuntime, RaisedException,
+    ScopeId, SymbolId, Value, Vm,
 };
 
 impl Vm<'_> {
@@ -142,132 +142,25 @@ impl Vm<'_> {
                 "staticmethod" => Builtin::StaticMethod,
                 "classmethod" => Builtin::ClassMethod,
                 "super" => Builtin::Super,
-                "Exception" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "Exception",
-                    ))))
+                _ => {
+                    return exception_types::exception_type(name)
+                        .filter(|definition| definition.builtin)
+                        .map(|definition| {
+                            Value::Native(NativeValue::ExceptionType(ExceptionType(
+                                definition.name,
+                            )))
+                        })
                 }
-                "BaseException" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "BaseException",
-                    ))))
-                }
-                "RuntimeError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "RuntimeError",
-                    ))))
-                }
-                "ValueError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "ValueError",
-                    ))))
-                }
-                "TypeError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "TypeError",
-                    ))))
-                }
-                "OverflowError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "OverflowError",
-                    ))))
-                }
-                "ZeroDivisionError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "ZeroDivisionError",
-                    ))))
-                }
-                "KeyError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "KeyError",
-                    ))))
-                }
-                "AttributeError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "AttributeError",
-                    ))))
-                }
-                "IndexError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "IndexError",
-                    ))))
-                }
-                "StopIteration" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "StopIteration",
-                    ))))
-                }
-                "StopAsyncIteration" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "StopAsyncIteration",
-                    ))))
-                }
-                "EOFError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "EOFError",
-                    ))))
-                }
-                "OSError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "OSError",
-                    ))))
-                }
-                "FileNotFoundError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "FileNotFoundError",
-                    ))))
-                }
-                "FileExistsError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "FileExistsError",
-                    ))))
-                }
-                "IsADirectoryError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "IsADirectoryError",
-                    ))))
-                }
-                "NotADirectoryError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "NotADirectoryError",
-                    ))))
-                }
-                "PermissionError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "PermissionError",
-                    ))))
-                }
-                "ProcessLookupError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "ProcessLookupError",
-                    ))))
-                }
-                "SystemExit" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "SystemExit",
-                    ))))
-                }
-                "TimeoutError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "TimeoutError",
-                    ))))
-                }
-                "AssertionError" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "AssertionError",
-                    ))))
-                }
-                "Skipped" => {
-                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        "Skipped",
-                    ))))
-                }
-                _ => return None,
             };
             Some(Value::Native(NativeValue::Function(builtin)))
         })();
-        self.stack
-            .push(value.ok_or_else(|| format!("name {name:?} is not defined"))?);
+        let Some(value) = value else {
+            if cpython_names::is_cpython_builtin(name) {
+                return Err(format!("builtin {name:?} is not implemented"));
+            }
+            return Err(self.raise_exception("NameError", format!("name '{name}' is not defined")));
+        };
+        self.stack.push(value);
         Ok(())
     }
 
@@ -375,39 +268,11 @@ impl Vm<'_> {
         actual: &RaisedException,
     ) -> Result<bool, String> {
         if let Some(NativeValue::ExceptionType(ExceptionType(name))) = expected.native_value() {
-            let custom_base = actual.value.object_id().and_then(|id| {
-                let Object::Instance { class, .. } = self.state.heap.get(id).ok()? else {
-                    return None;
-                };
-                let Object::Class { exception_base, .. } = self.state.heap.get(*class).ok()? else {
-                    return None;
-                };
-                *exception_base
-            });
-            if let Some(custom_base) = custom_base {
-                return Ok(name == "BaseException"
-                    || (name == "Exception"
-                        && custom_base != "BaseException"
-                        && custom_base != "SystemExit")
-                    || name == custom_base
-                    || (name == "OSError" && is_os_error(custom_base)));
-            }
-            let os_error = matches!(
-                actual.kind.as_str(),
-                "OSError"
-                    | "FileNotFoundError"
-                    | "FileExistsError"
-                    | "IsADirectoryError"
-                    | "NotADirectoryError"
-                    | "PermissionError"
-                    | "ProcessLookupError"
-            );
-            return Ok(name == "BaseException"
-                || (name == "Exception"
-                    && actual.kind != "BaseException"
-                    && actual.kind != "SystemExit")
-                || name == actual.kind
-                || (name == "OSError" && os_error));
+            let kind = match self.user_exception_base(&actual.value)? {
+                Some(base) => base,
+                None => actual.kind.as_str(),
+            };
+            return Ok(exception_types::exception_is_subclass(kind, name));
         }
         let Some(id) = expected.object_id() else {
             return Err(
@@ -454,6 +319,23 @@ impl Vm<'_> {
             return Ok(None);
         };
         Ok(exception_base.map(|_| name.clone()))
+    }
+
+    /// The modeled exception class a user exception instance derives from, if `value` is one.
+    pub(super) fn user_exception_base(
+        &self,
+        value: &Value,
+    ) -> Result<Option<&'static str>, String> {
+        let Some(id) = value.object_id() else {
+            return Ok(None);
+        };
+        let Object::Instance { class, .. } = self.state.heap.get(id)? else {
+            return Ok(None);
+        };
+        let Object::Class { exception_base, .. } = self.state.heap.get(*class)? else {
+            return Ok(None);
+        };
+        Ok(*exception_base)
     }
 
     #[inline(always)]
@@ -573,9 +455,20 @@ impl Vm<'_> {
                 .map_err(|error| self.record_native_error(error))?
         };
         let Some((path, source)) = source else {
-            return Err(format!(
-                "no module named {name:?} in the virtual filesystem"
-            ));
+            // A standard package that shellsim does not provide at all is unsupported. A missing
+            // submodule of a provided package is absent, like a missing module attribute.
+            let top_level = name.split('.').next().unwrap_or(&name);
+            let provided = super::super::stdlib::native_module(top_level).is_some()
+                || super::super::stdlib::frozen_module(top_level).is_some()
+                || self.state.modules.contains_key(top_level);
+            if !provided && cpython_names::is_cpython_stdlib_module(top_level) {
+                return Err(format!(
+                    "standard-library module {name:?} is not implemented"
+                ));
+            }
+            return Err(
+                self.raise_exception("ModuleNotFoundError", format!("No module named '{name}'"))
+            );
         };
         let parse_memory = u64::try_from(source.len())
             .ok()
@@ -721,6 +614,41 @@ impl Vm<'_> {
             self.stack.pop().ok_or("parent import produced no value")?;
         }
         Ok(())
+    }
+
+    /// `from module import name` with the module on top of the stack: push the module attribute,
+    /// else the submodule `module.name`, else raise CPython's `ImportError`.
+    pub(super) fn import_from(&mut self, name: &str) -> Result<(), String> {
+        let module = *self.stack.last().ok_or("import stack underflow")?;
+        if let Some(value) = self.resolve_attribute(module, name)? {
+            self.stack.push(value);
+            return Ok(());
+        }
+        let module_name = match module.native_value() {
+            Some(NativeValue::Module(definition)) => definition.name.to_string(),
+            _ => match module
+                .object_id()
+                .map(|id| self.state.heap.get(id))
+                .transpose()?
+            {
+                Some(Object::Module { name, .. }) => name.clone(),
+                _ => return Err(self.missing_attribute(&module, name)),
+            },
+        };
+        match self.import(&format!("{module_name}.{name}"), false) {
+            Err(_)
+                if self
+                    .pending_exception
+                    .as_ref()
+                    .is_some_and(|exception| exception.kind == "ModuleNotFoundError") =>
+            {
+                self.pending_exception = None;
+                let message =
+                    format!("cannot import name '{name}' from '{module_name}' (unknown location)");
+                Err(self.raise_exception("ImportError", message))
+            }
+            result => result,
+        }
     }
 
     /// Install synthetic package parents for a dotted import and push the value selected by

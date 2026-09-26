@@ -2,8 +2,8 @@
 
 use super::format::{format_float, format_integer, format_text, FormatSpec};
 use super::{
-    number, protocol, BigInt, BinaryOperator, ComparisonOperator, Object, Ordering, SequenceKind,
-    Slot, ToPrimitive, UnaryOperator, Value, Vm,
+    number, protocol, BigInt, BinaryOperator, ComparisonOperator, DisplayKind, Object, Ordering,
+    SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
 };
 
 impl Vm<'_> {
@@ -14,15 +14,19 @@ impl Vm<'_> {
             self.stack.push(value);
             return Ok(());
         };
-        let (slot, name) = match operator {
-            UnaryOperator::Positive => (Slot::Positive, "__pos__"),
-            UnaryOperator::Negative => (Slot::Negative, "__neg__"),
-            UnaryOperator::Invert => (Slot::Invert, "__invert__"),
+        let (slot, name, symbol) = match operator {
+            UnaryOperator::Positive => (Slot::Positive, "__pos__", "+"),
+            UnaryOperator::Negative => (Slot::Negative, "__neg__", "-"),
+            UnaryOperator::Invert => (Slot::Invert, "__invert__", "~"),
             UnaryOperator::Not => unreachable!("handled above"),
         };
-        let result = self
-            .invoke_slot(&value, slot, name, Vec::new())?
-            .ok_or("bad operand type for unary arithmetic")?;
+        let Some(result) = self.invoke_slot(&value, slot, name, Vec::new())? else {
+            let message = format!(
+                "bad operand type for unary {symbol}: '{}'",
+                self.type_name_of(&value)?
+            );
+            return Err(self.raise_exception("TypeError", message));
+        };
         self.stack.push(result);
         Ok(())
     }
@@ -98,20 +102,49 @@ impl Vm<'_> {
         Ok(())
     }
 
+    /// Build a display whose `true` operands are iterables expanded in place, as in
+    /// `[first, *rest]`.
+    pub(super) fn build_unpacked(
+        &mut self,
+        kind: DisplayKind,
+        starred: &[bool],
+    ) -> Result<(), String> {
+        let operands = self.take(starred.len())?;
+        let mut values = Vec::with_capacity(operands.len());
+        for (operand, expanded) in operands.into_iter().zip(starred) {
+            if *expanded {
+                for value in self.iterable_values(&operand)? {
+                    self.push_materialized(&mut values, value)?;
+                }
+            } else {
+                self.push_materialized(&mut values, operand)?;
+            }
+        }
+        let object = match kind {
+            DisplayKind::List => Object::List(values),
+            DisplayKind::Tuple => Object::Tuple(values),
+            DisplayKind::Set => return self.push_set(values),
+        };
+        let value = self
+            .state
+            .heap
+            .allocate(object, &mut self.interp.resources)?;
+        self.stack.push(value);
+        Ok(())
+    }
+
     pub(super) fn build_set(&mut self, count: usize) -> Result<(), String> {
         let candidates = self.take(count)?;
-        let mut values = Vec::with_capacity(count);
+        self.push_set(candidates)
+    }
+
+    /// Push a set of the distinct `candidates`, metering each membership comparison as the `set`
+    /// constructor does.
+    fn push_set(&mut self, candidates: Vec<Value>) -> Result<(), String> {
+        let mut values = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let mut exists = false;
-            for value in &values {
-                if protocol::identical(value, &candidate)
-                    || protocol::equals(&self.state.heap, value, &candidate)?
-                {
-                    exists = true;
-                    break;
-                }
-            }
-            if !exists {
+            self.charge_cpu(1)?;
+            if self.find_value(&values, &candidate)?.is_none() {
                 values.push(candidate);
             }
         }
@@ -189,21 +222,99 @@ impl Vm<'_> {
         let result = match operator {
             ComparisonOperator::Equal => protocol::equals(&self.state.heap, &left, &right)?,
             ComparisonOperator::NotEqual => !protocol::equals(&self.state.heap, &left, &right)?,
-            ComparisonOperator::Less => self.compare_values(&left, &right)? == Ordering::Less,
-            ComparisonOperator::LessEqual => {
-                self.compare_values(&left, &right)? != Ordering::Greater
+            ComparisonOperator::Less
+            | ComparisonOperator::LessEqual
+            | ComparisonOperator::Greater
+            | ComparisonOperator::GreaterEqual => {
+                let (symbol, accepted): (&str, &[Ordering]) = match operator {
+                    ComparisonOperator::Less => ("<", &[Ordering::Less]),
+                    ComparisonOperator::LessEqual => ("<=", &[Ordering::Less, Ordering::Equal]),
+                    ComparisonOperator::Greater => (">", &[Ordering::Greater]),
+                    _ => (">=", &[Ordering::Greater, Ordering::Equal]),
+                };
+                match self.compare_values(&left, &right)? {
+                    protocol::Comparison::Ordered(ordering) => accepted.contains(&ordering),
+                    protocol::Comparison::Unordered => false,
+                    protocol::Comparison::Unsupported => {
+                        return Err(self.raise_unorderable(symbol, &left, &right))
+                    }
+                }
             }
-            ComparisonOperator::Greater => self.compare_values(&left, &right)? == Ordering::Greater,
-            ComparisonOperator::GreaterEqual => {
-                self.compare_values(&left, &right)? != Ordering::Less
-            }
-            ComparisonOperator::In => protocol::contains(&self.state.heap, &right, &left)?,
-            ComparisonOperator::NotIn => !protocol::contains(&self.state.heap, &right, &left)?,
+            ComparisonOperator::In => self.contains_value(&right, &left)?,
+            ComparisonOperator::NotIn => !self.contains_value(&right, &left)?,
             ComparisonOperator::Is => protocol::identical(&left, &right),
             ComparisonOperator::IsNot => !protocol::identical(&left, &right),
         };
         self.stack.push(Value::Bool(result));
         Ok(())
+    }
+
+    /// Answer `needle in container` once `__contains__` has declined. Builtin containers answer
+    /// directly; any other iterable is searched item by item, stopping at the first match, as
+    /// CPython does.
+    fn contains_value(&mut self, container: &Value, needle: &Value) -> Result<bool, String> {
+        if protocol::string_ref(&self.state.heap, container)?.is_some() {
+            if protocol::string_ref(&self.state.heap, needle)?.is_none() {
+                let message = format!(
+                    "'in <string>' requires string as left operand, not {}",
+                    self.type_name_of(needle)?
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
+            return protocol::contains(&self.state.heap, container, needle);
+        }
+        let Some(id) = container.object_id() else {
+            let message = format!(
+                "argument of type '{}' is not a container or iterable",
+                self.type_name_of(container)?
+            );
+            return Err(self.raise_exception("TypeError", message));
+        };
+        let direct = match self.state.heap.get(id)? {
+            Object::Bytes(_)
+            | Object::ByteArray(_)
+            | Object::List(_)
+            | Object::Tuple(_)
+            | Object::Set(_)
+            | Object::FrozenSet(_)
+            | Object::Dict(_)
+            | Object::DefaultDict { .. } => true,
+            Object::Range { .. } => protocol::int_value(&self.state.heap, needle).is_some(),
+            _ => false,
+        };
+        if direct {
+            return protocol::contains(&self.state.heap, container, needle);
+        }
+        let iterator = self.make_iterator(*container)?;
+        loop {
+            self.charge_cpu(1)?;
+            let item = match self.iterator_next(&iterator) {
+                Ok(Some(item)) => item,
+                Ok(None) => return Ok(false),
+                Err(_) if self.pending_stop_iteration() => {
+                    self.pending_exception = None;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+            if self.item_equals(&item, needle)? {
+                return Ok(true);
+            }
+        }
+    }
+
+    /// `item == needle` with user `__eq__` on either side, as membership tests use it.
+    fn item_equals(&mut self, item: &Value, needle: &Value) -> Result<bool, String> {
+        if protocol::identical(item, needle) {
+            return Ok(true);
+        }
+        if let Some(result) = self.invoke_slot(item, Slot::Equal, "__eq__", vec![*needle])? {
+            return self.truth_value(&result);
+        }
+        if let Some(result) = self.invoke_slot(needle, Slot::Equal, "__eq__", vec![*item])? {
+            return self.truth_value(&result);
+        }
+        protocol::equals(&self.state.heap, item, needle)
     }
 
     pub(super) fn binary(&mut self, operator: BinaryOperator) -> Result<(), String> {
@@ -335,7 +446,13 @@ impl Vm<'_> {
         if let Some(value) = self.invoke_slot(&right, reflected_slot, reflected_name, vec![left])? {
             return Ok(value);
         }
-        Err("unsupported arithmetic operands".into())
+        let message = format!(
+            "unsupported operand type(s) for {}: '{}' and '{}'",
+            binary_operator_symbol(operator),
+            self.type_name_of(&left)?,
+            self.type_name_of(&right)?
+        );
+        Err(self.raise_exception("TypeError", message))
     }
 
     pub(super) fn format_value(
@@ -448,6 +565,7 @@ impl Vm<'_> {
             if let Object::BigInt(value) = self.state.heap.get(id)? {
                 return value
                     .to_f64()
+                    .filter(|value| value.is_finite())
                     .ok_or_else(|| "int too large to convert to float".into());
             }
         }
@@ -457,5 +575,24 @@ impl Vm<'_> {
 
     pub(super) fn add_numbers(&mut self, left: Value, right: Value) -> Result<Value, String> {
         self.binary_value(BinaryOperator::Add, left, right)
+    }
+}
+
+/// The source spelling of a binary operator, as CPython prints it in `TypeError` messages.
+fn binary_operator_symbol(operator: BinaryOperator) -> &'static str {
+    match operator {
+        BinaryOperator::Add => "+",
+        BinaryOperator::Subtract => "-",
+        BinaryOperator::Multiply => "*",
+        BinaryOperator::MatrixMultiply => "@",
+        BinaryOperator::Power => "** or pow()",
+        BinaryOperator::Divide => "/",
+        BinaryOperator::FloorDivide => "//",
+        BinaryOperator::Remainder => "%",
+        BinaryOperator::LeftShift => "<<",
+        BinaryOperator::RightShift => ">>",
+        BinaryOperator::BitwiseAnd => "&",
+        BinaryOperator::BitwiseXor => "^",
+        BinaryOperator::BitwiseOr => "|",
     }
 }

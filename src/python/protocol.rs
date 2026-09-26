@@ -56,18 +56,30 @@ pub fn int_value(heap: &Heap, value: &Value) -> Option<i64> {
     }
 }
 
+/// The outcome of `owner[index]` when `owner` may be a string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StringIndex {
+    NotString,
+    Character(char),
+    /// CPython raises `TypeError` for a non-integer index.
+    NotInteger,
+    /// CPython raises `IndexError`.
+    OutOfRange,
+}
+
 /// Return one Python string code point without materializing the complete string as characters.
 ///
 /// ASCII strings, including the large text buffers used by the frozen I/O layer, support direct
 /// byte indexing. Non-ASCII strings still index by Unicode code point to match Python semantics.
-pub fn string_index(heap: &Heap, owner: &Value, index: &Value) -> Result<Option<char>, String> {
+pub fn string_index(heap: &Heap, owner: &Value, index: &Value) -> Result<StringIndex, String> {
     let Some(text) = string_ref(heap, owner)? else {
-        return Ok(None);
+        return Ok(StringIndex::NotString);
     };
-    let index = index.as_int().ok_or("string index must be an integer")?;
-    indexed_char(text.as_str(), index, text.is_ascii())
-        .ok_or_else(|| "string index out of range".to_string())
-        .map(Some)
+    let Some(index) = index.as_int() else {
+        return Ok(StringIndex::NotInteger);
+    };
+    Ok(indexed_char(text.as_str(), index, text.is_ascii())
+        .map_or(StringIndex::OutOfRange, StringIndex::Character))
 }
 
 /// Return a string's Python length without cloning its arena payload.
@@ -726,13 +738,32 @@ fn sequence_equal(
     Ok(true)
 }
 
-pub fn compare(heap: &Heap, left: &Value, right: &Value) -> Result<Ordering, String> {
+/// How two values order under Python's rich comparisons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Comparison {
+    Ordered(Ordering),
+    /// A NaN is involved, so `<`, `<=`, `>` and `>=` are all false.
+    Unordered,
+    /// The types define no ordering; CPython raises `TypeError`.
+    Unsupported,
+}
+
+impl Comparison {
+    fn reverse(self) -> Self {
+        match self {
+            Self::Ordered(ordering) => Self::Ordered(ordering.reverse()),
+            other => other,
+        }
+    }
+}
+
+pub fn compare(heap: &Heap, left: &Value, right: &Value) -> Result<Comparison, String> {
     if let Some(left) = bigint_value(heap, left) {
         if let Some(right) = bigint_value(heap, right) {
-            return Ok(left.cmp(right));
+            return Ok(Comparison::Ordered(left.cmp(right)));
         }
         if let Some(right) = int_value(heap, right) {
-            return Ok(left.cmp(&BigInt::from(right)));
+            return Ok(Comparison::Ordered(left.cmp(&BigInt::from(right))));
         }
         if let Some(right) = right.float_value() {
             return compare_bigint_float(left, right);
@@ -740,74 +771,74 @@ pub fn compare(heap: &Heap, left: &Value, right: &Value) -> Result<Ordering, Str
     }
     if let Some(right) = bigint_value(heap, right) {
         if let Some(left) = int_value(heap, left) {
-            return Ok(BigInt::from(left).cmp(right));
+            return Ok(Comparison::Ordered(BigInt::from(left).cmp(right)));
         }
         if let Some(left) = left.float_value() {
-            return compare_bigint_float(right, left).map(Ordering::reverse);
+            return compare_bigint_float(right, left).map(Comparison::reverse);
         }
     }
     if let Some(left) = int_value(heap, left) {
         if let Some(right) = int_value(heap, right) {
-            return Ok(left.cmp(&right));
+            return Ok(Comparison::Ordered(left.cmp(&right)));
         }
         if let Some(right) = right.float_value() {
             return compare_bigint_float(&BigInt::from(left), right);
         }
     }
     if let (Some(left), Some(right)) = (left.float_value(), int_value(heap, right)) {
-        return compare_bigint_float(&BigInt::from(right), left).map(Ordering::reverse);
+        return compare_bigint_float(&BigInt::from(right), left).map(Comparison::reverse);
     }
     if let (Some(left), Some(right)) = (left.float_value(), right.float_value()) {
-        return left
+        return Ok(left
             .partial_cmp(&right)
-            .ok_or_else(|| "comparison with NaN is unordered".into());
+            .map_or(Comparison::Unordered, Comparison::Ordered));
     }
     if let (Some(left), Some(right)) = (string_value(heap, left)?, string_value(heap, right)?) {
-        return Ok(left.cmp(&right));
+        return Ok(Comparison::Ordered(left.cmp(&right)));
     }
     if let (Some(left), Some(right)) = (bytes_value(heap, left)?, bytes_value(heap, right)?) {
-        return Ok(left.cmp(&right));
+        return Ok(Comparison::Ordered(left.cmp(&right)));
     }
     match (left.object_id(), right.object_id()) {
         (Some(left), Some(right)) => match (heap.get(left)?, heap.get(right)?) {
             (Object::List(left), Object::List(right))
             | (Object::Tuple(left), Object::Tuple(right)) => sequence_compare(heap, left, right),
-            _ => Err("objects do not define ordering".into()),
+            _ => Ok(Comparison::Unsupported),
         },
-        _ => Err("objects do not define ordering".into()),
+        _ => Ok(Comparison::Unsupported),
     }
 }
 
-fn compare_bigint_float(integer: &BigInt, float: f64) -> Result<Ordering, String> {
+fn compare_bigint_float(integer: &BigInt, float: f64) -> Result<Comparison, String> {
     if float.is_nan() {
-        return Err("comparison with NaN is unordered".into());
+        return Ok(Comparison::Unordered);
     }
     if float == f64::INFINITY {
-        return Ok(Ordering::Less);
+        return Ok(Comparison::Ordered(Ordering::Less));
     }
     if float == f64::NEG_INFINITY {
-        return Ok(Ordering::Greater);
+        return Ok(Comparison::Ordered(Ordering::Greater));
     }
     let truncated = BigInt::from_f64(float).ok_or("float cannot be converted for comparison")?;
     let ordering = integer.cmp(&truncated);
     if ordering != Ordering::Equal || float.fract() == 0.0 {
-        return Ok(ordering);
+        return Ok(Comparison::Ordered(ordering));
     }
-    Ok(if float.is_sign_positive() {
+    Ok(Comparison::Ordered(if float.is_sign_positive() {
         Ordering::Less
     } else {
         Ordering::Greater
-    })
+    }))
 }
 
-fn sequence_compare(heap: &Heap, left: &[Value], right: &[Value]) -> Result<Ordering, String> {
+fn sequence_compare(heap: &Heap, left: &[Value], right: &[Value]) -> Result<Comparison, String> {
     for (left, right) in left.iter().zip(right) {
         if identical(left, right) || equals(heap, left, right)? {
             continue;
         }
         return compare(heap, left, right);
     }
-    Ok(left.len().cmp(&right.len()))
+    Ok(Comparison::Ordered(left.len().cmp(&right.len())))
 }
 
 pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, String> {
@@ -884,16 +915,54 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
     }
 }
 
-fn quote_string(value: &str) -> String {
-    format!(
-        "'{}'",
-        value
-            .replace('\\', "\\\\")
-            .replace('\'', "\\'")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\t', "\\t")
-    )
+/// CPython's `repr(str)`: single quotes unless the text contains a single quote and no double
+/// quote, with backslash escapes for the quote, backslash, control characters and characters
+/// Python does not consider printable.
+pub(super) fn quote_string(value: &str) -> String {
+    let quote = if value.contains('\'') && !value.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut rendered = String::with_capacity(value.len() + 2);
+    rendered.push(quote);
+    for character in value.chars() {
+        match character {
+            '\\' => rendered.push_str("\\\\"),
+            '\n' => rendered.push_str("\\n"),
+            '\r' => rendered.push_str("\\r"),
+            '\t' => rendered.push_str("\\t"),
+            character if character == quote => {
+                rendered.push('\\');
+                rendered.push(character);
+            }
+            character if is_printable(character) => rendered.push(character),
+            character => {
+                let code = u32::from(character);
+                if code <= 0xff {
+                    rendered.push_str(&format!("\\x{code:02x}"));
+                } else if code <= 0xffff {
+                    rendered.push_str(&format!("\\u{code:04x}"));
+                } else {
+                    rendered.push_str(&format!("\\U{code:08x}"));
+                }
+            }
+        }
+    }
+    rendered.push(quote);
+    rendered
+}
+
+/// Python's `str.isprintable` for one character, approximated without Unicode category tables:
+/// controls, separators other than the ASCII space, and the common format characters are not
+/// printable.
+fn is_printable(character: char) -> bool {
+    !(character.is_control()
+        || (character.is_whitespace() && character != ' ')
+        || matches!(
+            character,
+            '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{feff}'
+        ))
 }
 
 fn quote_bytes(value: &[u8]) -> String {
@@ -987,34 +1056,34 @@ mod tests {
         assert!(ascii_ref.is_ascii());
         assert_eq!(
             string_index(&heap, &inline, &Value::Int(3)).unwrap(),
-            Some('é')
+            StringIndex::Character('é')
         );
         assert_eq!(
             string_index(&heap, &inline, &Value::Int(-4)).unwrap(),
-            Some('c')
+            StringIndex::Character('c')
         );
         assert_eq!(
             string_index(&heap, &ascii, &Value::Int(7)).unwrap(),
-            Some('A')
+            StringIndex::Character('A')
         );
         assert_eq!(
             string_index(&heap, &unicode, &Value::Int(-6)).unwrap(),
-            Some('☃')
+            StringIndex::Character('☃')
         );
         assert_eq!(string_length(&heap, &inline).unwrap(), Some(4));
         assert_eq!(string_length(&heap, &ascii).unwrap(), Some(19));
         assert_eq!(string_length(&heap, &unicode).unwrap(), Some(6));
         assert_eq!(
             string_index(&heap, &Value::Int(1), &Value::Int(0)).unwrap(),
-            None
+            StringIndex::NotString
         );
         assert_eq!(
-            string_index(&heap, &ascii, &Value::Int(99)).unwrap_err(),
-            "string index out of range"
+            string_index(&heap, &ascii, &Value::Int(99)).unwrap(),
+            StringIndex::OutOfRange
         );
         assert_eq!(
-            string_index(&heap, &ascii, &Value::None).unwrap_err(),
-            "string index must be an integer"
+            string_index(&heap, &ascii, &Value::None).unwrap(),
+            StringIndex::NotInteger
         );
     }
 }
