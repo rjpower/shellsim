@@ -186,8 +186,48 @@ fn restore_fds(interp: &mut Interp, saved: crate::descriptors::FdTable) {
 const MAX_SHELL_FRAMES: usize = 4_096;
 const SHELL_POLL_QUANTUM: usize = 1;
 
+/// Clock readings taken when a `time` pipeline starts.
+#[derive(Clone, Copy)]
+struct TimeStart {
+    monotonic_ns: u64,
+    cpu_ns: u64,
+    posix: bool,
+}
+
+/// Bash's default `time` report (`TIMEFORMAT` is not consulted), or the POSIX `-p` form.
+/// User time is the machine CPU consumed while the pipeline ran; system time is not modeled.
+fn time_report(start: TimeStart, monotonic_ns: u64, cpu_ns: u64) -> String {
+    let real = monotonic_ns.saturating_sub(start.monotonic_ns);
+    let user = cpu_ns.saturating_sub(start.cpu_ns);
+    if start.posix {
+        let seconds = |ns: u64| {
+            let centis = ns / 10_000_000;
+            format!("{}.{:02}", centis / 100, centis % 100)
+        };
+        format!(
+            "real {}\nuser {}\nsys {}\n",
+            seconds(real),
+            seconds(user),
+            seconds(0)
+        )
+    } else {
+        let clock = |ns: u64| {
+            let millis = ns / 1_000_000;
+            let seconds = millis / 1_000;
+            format!("{}m{}.{:03}s", seconds / 60, seconds % 60, millis % 1_000)
+        };
+        format!(
+            "\nreal\t{}\nuser\t{}\nsys\t{}\n",
+            clock(real),
+            clock(user),
+            clock(0)
+        )
+    }
+}
+
 #[derive(Clone)]
 enum ShellFrame {
+    FinishTime(TimeStart),
     Eval(Node),
     PrepareCommand(PreparedCommand),
     RunCommand {
@@ -1261,6 +1301,14 @@ impl ShellContinuation {
                     self.errexit_exempt = true;
                 }
             }
+            ShellFrame::FinishTime(start) => {
+                let report = time_report(
+                    start,
+                    interp.clock.monotonic_ns(),
+                    interp.resources.process_time_ns(),
+                );
+                write_diagnostic(interp, &report);
+            }
             ShellFrame::Negate => {
                 interp.cond_depth = interp.cond_depth.saturating_sub(1);
                 self.status = i32::from(self.status == 0);
@@ -1897,6 +1945,16 @@ impl ShellContinuation {
                     },
                 ) {
                     self.push(interp, ShellFrame::Eval(*lhs));
+                }
+            }
+            Node::Timed { inner, posix } => {
+                let start = TimeStart {
+                    monotonic_ns: interp.clock.monotonic_ns(),
+                    cpu_ns: interp.resources.process_time_ns(),
+                    posix,
+                };
+                if self.push(interp, ShellFrame::FinishTime(start)) {
+                    self.push(interp, ShellFrame::Eval(*inner));
                 }
             }
             Node::Not(inner) => {

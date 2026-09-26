@@ -13,6 +13,7 @@ use crate::syscalls::{ActiveSystem, SyscallError, System};
 mod cat;
 mod env;
 mod head;
+mod nice;
 mod nohup;
 mod sleep;
 mod tee;
@@ -140,6 +141,7 @@ pub(crate) enum NativeProcess {
     Sleep(sleep::SleepProcess),
     Timeout(timeout::TimeoutProcess),
     Nohup(nohup::NohupProcess),
+    Nice(nice::NiceProcess),
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -351,6 +353,7 @@ impl NativeProcess {
                 Self::Timeout(timeout::TimeoutProcess::new(&argv[1..]))
             }
             crate::vfs::NativeProgram::Nohup => Self::Nohup(nohup::NohupProcess::new(&argv[1..])),
+            crate::vfs::NativeProgram::Nice => Self::Nice(nice::NiceProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Registered(path) => {
                 let Some(command) = crate::commands::system_command(path) else {
                     return Self::failure(
@@ -405,6 +408,7 @@ impl NativeProcess {
             Self::Sleep(sleep) => sleep.poll(syscalls),
             Self::Timeout(timeout) => timeout.poll(syscalls),
             Self::Nohup(nohup) => nohup.poll(syscalls),
+            Self::Nice(nice) => nice.poll(syscalls),
             Self::Failure {
                 status,
                 message,

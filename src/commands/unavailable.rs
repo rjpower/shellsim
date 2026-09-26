@@ -31,6 +31,9 @@ pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
             "wstest",
             // Interfaces whose real semantics require host process or socket capabilities.
             "openssl",
+            // Scheduling priorities and full-screen terminals are not modeled.
+            "renice",
+            "watch",
         ],
     );
 }
