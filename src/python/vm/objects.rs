@@ -229,6 +229,9 @@ impl Vm<'_> {
         }
         if let Some(NativeValue::BuiltinType(builtin)) = owner.native_value() {
             if let Some(value) = self.state.types.attribute(builtin.id(), name)? {
+                if let Some(NativeValue::NativeClassMethod(method)) = value.native_value() {
+                    return self.bind_native_class_method(owner, method).map(Some);
+                }
                 return Ok(Some(value));
             }
         }
@@ -256,6 +259,10 @@ impl Vm<'_> {
                     owner: None,
                 })?;
                 return Ok(Some(bound));
+            }
+            Some(NativeValue::NativeClassMethod(method)) => {
+                let class = self.state.types.value(owner_type)?;
+                return self.bind_native_class_method(class, method).map(Some);
             }
             // Native getters are data descriptors. Builtin receivers have no instance
             // dictionary, so reaching the type table first already gives CPython precedence.
@@ -1428,6 +1435,19 @@ impl Vm<'_> {
                     || self.class_attribute(class, "__delete__")?.is_some()
             }
             _ => false,
+        })
+    }
+
+    /// Bind a native class method to `class`, which the method receives in place of an instance.
+    fn bind_native_class_method(
+        &mut self,
+        class: Value,
+        method: &'static super::super::native::MethodDef,
+    ) -> Result<Value, String> {
+        self.allocate_object(Object::DescriptorBoundMethod {
+            receiver: class,
+            descriptor: Value::Native(NativeValue::NativeMethod(method)),
+            owner: None,
         })
     }
 

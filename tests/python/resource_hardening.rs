@@ -433,3 +433,77 @@ fn complex_arrays_reserve_element_storage_before_allocation() {
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn set_algebra_consumes_cpu_per_membership_test() {
+    // Building the 200-member set costs about half this budget. Each operation below compares
+    // all 200 members with 200 operand items and must stop at the limit.
+    let limits = Limits {
+        cpu: 40_000,
+        ..Limits::unlimited()
+    };
+    let setup = "members = set(range(200))\n";
+    let (status, stdout, _, _) = run_with_limits(&format!("{setup}print('built')"), limits);
+    assert_eq!((status, stdout), (0, b"built\n".to_vec()));
+    for operation in [
+        "members.intersection(range(200, 400))",
+        "members.difference(range(200, 400))",
+        "members.symmetric_difference(range(200, 400))",
+        "members.difference_update(range(200, 400))",
+        "members.isdisjoint(range(200, 400))",
+    ] {
+        let (status, stdout, stderr, usage) =
+            run_with_limits(&format!("{setup}{operation}\nprint('done')"), limits);
+        assert_eq!(status, 137, "{operation}");
+        assert_eq!(usage.cpu_used, 40_000, "{operation}");
+        assert!(stdout.is_empty(), "{operation}");
+        assert!(stderr.is_empty(), "{operation}");
+    }
+}
+
+#[test]
+fn container_methods_reserve_before_materializing_iterables() {
+    let limits = Limits {
+        memory: 32 * 1024,
+        ..Limits::unlimited()
+    };
+    for operation in [
+        "dict.fromkeys(range(100000))",
+        "set().update(range(100000))",
+        "{0}.symmetric_difference(range(100000))",
+        "{0}.issubset(range(100000))",
+    ] {
+        let (status, stdout, stderr, usage) =
+            run_with_limits(&format!("{operation}\nprint('done')"), limits);
+        assert_eq!(status, 137, "{operation}");
+        assert!(usage.memory_peak <= 32 * 1024, "{operation}");
+        assert!(stdout.is_empty(), "{operation}");
+        assert!(stderr.is_empty(), "{operation}");
+    }
+}
+
+#[test]
+fn bytes_methods_reserve_before_building_results() {
+    // The heap models each byte as one value slot, so the 10,000-byte setup uses about half of
+    // this budget. Each operation below would build a result of at least one megabyte.
+    let limits = Limits {
+        memory: 512 * 1024,
+        ..Limits::unlimited()
+    };
+    let setup = "part = b'x' * 10000\n";
+    let (status, stdout, _, _) = run_with_limits(&format!("{setup}print(len(part))"), limits);
+    assert_eq!((status, stdout), (0, b"10000\n".to_vec()));
+    for operation in [
+        "(b'a' * 100).replace(b'', part)",
+        "part.replace(b'x', b'y' * 100)",
+        "b''.join([part] * 100)",
+        "bytearray(b',' * 20000).split(b',')",
+    ] {
+        let (status, stdout, stderr, usage) =
+            run_with_limits(&format!("{setup}{operation}\nprint('done')"), limits);
+        assert_eq!(status, 137, "{operation}");
+        assert!(usage.memory_peak <= 512 * 1024, "{operation}");
+        assert!(stdout.is_empty(), "{operation}");
+        assert!(stderr.is_empty(), "{operation}");
+    }
+}
