@@ -8,13 +8,12 @@ use std::collections::HashMap;
 use crate::commands::util::{
     ewln, lines_of, read_inputs_system, split_flags, uses_standard_input, w, wln,
 };
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandSpec, Io, Trust};
 use crate::exec::ShellPoll;
-use crate::interp::Interp;
 use crate::program::ProcessContext;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_system, reg_system_poll, reg_unsupported};
+    use super::{reg_system, reg_system_poll, reg_unsupported};
     reg_system_poll(m, "/usr/bin/wc", Trust::Real, cmd_wc);
     reg_system_poll(m, "/usr/bin/uniq", Trust::Real, cmd_uniq);
     reg_system_poll(m, "/usr/bin/cut", Trust::Real, cmd_cut);
@@ -29,8 +28,6 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_system_poll(m, "/usr/bin/split", Trust::Partial, cmd_split);
     reg_system_poll(m, "/usr/bin/shuf", Trust::Partial, cmd_shuf);
     reg_system_poll(m, "/usr/bin/tsort", Trust::Real, cmd_tsort);
-    reg(m, &["expr"], Trust::Real, cmd_expr);
-    reg(m, &["bc"], Trust::Real, cmd_bc);
     reg_unsupported(m, &["factor"]);
 }
 
@@ -1048,33 +1045,4 @@ fn cmd_tsort(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         return ShellPoll::Ready(1);
     }
     ShellPoll::Ready(0)
-}
-
-fn cmd_expr(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    // minimal: arithmetic and string length
-    if args.len() == 2 && args[0] == "length" {
-        wln(io.out, &args[1].chars().count().to_string());
-        return 0;
-    }
-    let joined = args.join(" ");
-    // try arithmetic
-    let mut i = Interp::new();
-    let v = crate::expand::eval_arith(&mut i, &joined);
-    wln(io.out, &v.to_string());
-    if v == 0 {
-        1
-    } else {
-        0
-    }
-}
-
-fn cmd_bc(interp: &mut CommandContext<'_>, _args: &[String], io: &mut Io) -> i32 {
-    for line in String::from_utf8_lossy(&io.stdin).lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let v = crate::expand::eval_arith(interp, line);
-        wln(io.out, &v.to_string());
-    }
-    0
 }
