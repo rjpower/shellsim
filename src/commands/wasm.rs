@@ -1174,8 +1174,8 @@ fn clock_waits(
 /// Sleep until the earliest clock subscription expires, then report every expired one.
 ///
 /// A scheduled process blocks on a virtual timer like native `sleep`, so other processes run and
-/// a signal can end the wait. A display session has no other processes, so it advances its own
-/// virtual clock to the deadline.
+/// a signal can end the wait. A display session has no other processes, so on virtual time it
+/// advances its own clock to the deadline; on real time it suspends until physical time passes.
 async fn poll_oneoff(
     mut caller: Caller<'_, Host>,
     (input, output, count, result): (u32, u32, u32, u32),
@@ -1199,12 +1199,15 @@ async fn poll_oneoff(
             break now;
         }
         if buffered {
-            if interp.clock.advance_to(deadline).is_err() {
-                return Ok(ERRNO_INVAL);
+            // A virtual session is the only process on its clock, so it jumps to the deadline.
+            // A real-time session waits for physical time, which the session poll syncs.
+            if interp.real_time.is_none() {
+                if interp.clock.advance_to(deadline).is_err() {
+                    return Ok(ERRNO_INVAL);
+                }
+                continue;
             }
-            continue;
-        }
-        if !scheduled {
+        } else if !scheduled {
             if let Err(error) = ActiveSystem::new(interp).schedule_wake(deadline - now) {
                 return Ok(syscall_errno(&error));
             }
@@ -1883,6 +1886,9 @@ pub enum SessionPoll {
     Frame(u64),
     /// Guest exited or exhausted its virtual resource budget.
     Ready(i32),
+    /// A real-time session's guest is sleeping. Poll again after this host duration; polling
+    /// earlier is harmless. Virtual-time sessions never report this.
+    Sleeping(std::time::Duration),
 }
 
 /// Completed guest output and the virtual environment returned to its caller.
@@ -1949,9 +1955,18 @@ impl WasmSession {
         let Some((environment, guest)) = &mut self.running else {
             return SessionPoll::Ready(self.result.as_ref().expect("finished session").status);
         };
+        // Advancing to physical time cannot rewind, and the clock horizon is centuries away.
+        let _ = environment.sync_host_time();
         let outcome = match guest.poll(environment) {
             GuestPoll::Ready(outcome) => Some(outcome),
             GuestPoll::Exhausted => None,
+            GuestPoll::Blocked(WaitReason::Timer(deadline)) => {
+                return SessionPoll::Sleeping(
+                    environment
+                        .host_time_until(deadline)
+                        .unwrap_or(std::time::Duration::ZERO),
+                );
+            }
             GuestPoll::Pending | GuestPoll::Blocked(_) => {
                 let generation = self
                     .interaction

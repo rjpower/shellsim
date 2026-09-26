@@ -28,6 +28,10 @@ pub fn exec(
         match execution.poll(interp, true) {
             Ok(MachinePoll::Progress) => {}
             Ok(MachinePoll::Blocked) => {
+                if let Some(wait) = interp.host_wait_until() {
+                    std::thread::sleep(wait);
+                    continue;
+                }
                 err.extend_from_slice(b"shellsim: all processes are blocked without an event\n");
                 break 125;
             }
@@ -2944,6 +2948,9 @@ pub(crate) fn poll_machine(
 }
 
 fn dispatch_available(interp: &mut Interp, advance_time: bool) -> Result<bool, String> {
+    // Physical time passes whether or not the caller asked to advance time.
+    interp.sync_host_time()?;
+    handle_ready_events(interp)?;
     loop {
         if let Some(pid) = interp
             .scheduler
@@ -2953,7 +2960,8 @@ fn dispatch_available(interp: &mut Interp, advance_time: bool) -> Result<bool, S
             interp.process.activate(pid)?;
             return Ok(true);
         }
-        if !advance_time {
+        // A real-time clock cannot jump; the driver waits for the next deadline instead.
+        if !advance_time || interp.real_time.is_some() {
             return Ok(false);
         }
         let fired = interp
@@ -3002,17 +3010,11 @@ pub(crate) fn drive_scheduler_step(
                 return Err("all child processes are blocked without a pending event".to_string());
             };
             if advance_until.is_some_and(|limit| next > limit) {
-                interp
-                    .clock
-                    .advance_to(advance_until.expect("limit was checked"))
-                    .map_err(|error| error.to_string())?;
+                interp.wait_for_time(advance_until.expect("limit was checked"))?;
                 restore_nested_caller(interp, caller)?;
                 return Ok(false);
             }
-            interp
-                .clock
-                .advance_to_next()
-                .map_err(|error| error.to_string())?;
+            interp.wait_for_time(next)?;
             handle_ready_events(interp)?;
             interp
                 .scheduler
@@ -3144,6 +3146,7 @@ fn restore_nested_caller(
 }
 
 fn wake_due_events(interp: &mut Interp) -> Result<(), String> {
+    interp.sync_host_time()?;
     interp
         .clock
         .advance_to(interp.clock.monotonic_ns())

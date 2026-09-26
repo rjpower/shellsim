@@ -118,6 +118,8 @@ pub struct Environment {
     /// Machine hostname, independent of process-local shell variables.
     pub(crate) hostname: String,
     pub clock: Clock,
+    /// Host anchor for a machine booted in real-time clock mode; `None` for virtual time.
+    pub(crate) real_time: Option<crate::realtime::HostAnchor>,
     /// Virtual framebuffer and input queue; guests never receive host device handles.
     pub display: crate::display::VirtualDisplay,
     pub net: VirtualNet,
@@ -598,6 +600,17 @@ impl Environment {
         self.display.inject_key(&mut self.resources, event)
     }
 
+    /// Boot a machine whose clock follows `mode`. See [`crate::realtime`].
+    pub fn with_limits_and_clock(limits: Limits, mode: crate::realtime::ClockMode) -> Self {
+        let mut environment = Self::with_limits(limits);
+        if mode == crate::realtime::ClockMode::RealTime {
+            environment.real_time = Some(crate::realtime::HostAnchor::now(
+                environment.clock.monotonic_ns(),
+            ));
+        }
+        environment
+    }
+
     pub fn with_limits(limits: Limits) -> Self {
         let mut vars: HashMap<String, String> = HashMap::new();
         vars.insert("HOME".into(), "/root".into());
@@ -687,6 +700,7 @@ impl Environment {
             vfs,
             hostname: "sandbox".to_string(),
             clock,
+            real_time: None,
             display: crate::display::VirtualDisplay::default(),
             net: VirtualNet::new(),
             resources: Resources::new(limits),

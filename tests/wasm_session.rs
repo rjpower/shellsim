@@ -112,7 +112,7 @@ fn cpu_bound_guest_stops_at_the_virtual_fuel_limit() {
     let status = (0..100)
         .find_map(|_| match session.poll() {
             SessionPoll::Ready(status) => Some(status),
-            SessionPoll::Running | SessionPoll::Frame(_) => None,
+            SessionPoll::Running | SessionPoll::Frame(_) | SessionPoll::Sleeping(_) => None,
         })
         .expect("fuel bound must terminate the guest");
     assert_eq!(status, 137);
