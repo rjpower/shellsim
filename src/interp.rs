@@ -649,6 +649,7 @@ impl Environment {
             ("timeout", crate::vfs::NativeProgram::Timeout),
             ("nohup", crate::vfs::NativeProgram::Nohup),
             ("nice", crate::vfs::NativeProgram::Nice),
+            ("make", crate::vfs::NativeProgram::Make),
         ] {
             vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
         }

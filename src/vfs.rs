@@ -27,6 +27,7 @@ pub enum NativeProgram {
     Timeout,
     Nohup,
     Nice,
+    Make,
     /// Process-scoped Rust entrypoint identified by its registered virtual path.
     Registered(&'static str),
     /// Older command body still executed through the shell dispatcher by basename.
@@ -50,6 +51,7 @@ impl NativeProgram {
             "timeout" => Some(Self::Timeout),
             "nohup" => Some(Self::Nohup),
             "nice" => Some(Self::Nice),
+            "make" => Some(Self::Make),
             _ => None,
         }
     }
@@ -70,6 +72,7 @@ impl NativeProgram {
             Self::Timeout => "timeout",
             Self::Nohup => "nohup",
             Self::Nice => "nice",
+            Self::Make => "make",
             Self::Registered(path) => path.rsplit('/').next().unwrap_or(path),
             Self::LegacyRegistered(name) => name,
         }

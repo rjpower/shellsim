@@ -1,180 +1,165 @@
-//! A bounded, deterministic Makefile runner for shell-only recipes.
+//! Parsing and variable expansion for the bounded, deterministic `make` command.
 //!
-//! This module intentionally implements a small graph evaluator rather than a build system:
-//! rules, prerequisites, variables, timestamps, and tab-indented recipes are supported, while
-//! pattern rules, includes, implicit search, parallelism, and host execution are rejected. Every
-//! recipe is dispatched through shellsim's own interpreter against the VFS.
+//! This module owns only the text-level concerns: option parsing, Makefile parsing (variables,
+//! rules, prerequisites, tab-indented recipes, `.PHONY`), and `$(VAR)`/automatic-variable
+//! expansion. It never touches the virtual filesystem or spawns anything; the resumable process
+//! image in `crate::program::make` drives execution against `System` and calls back into this
+//! module for parsing. Pattern rules, includes, implicit search, order-only prerequisites, and
+//! line continuations outside recipes are rejected explicitly rather than approximated.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::commands::util::{ewln, wln};
-use crate::commands::{ChildCommand, CommandContext, CommandPoll, CommandSpec, Io, Trust};
-use crate::interp::Interp;
+use crate::syscalls::System;
 
-const MAX_MAKEFILE_BYTES: usize = 1024 * 1024;
-const MAX_LINES: usize = 20_000;
-const MAX_TARGETS: usize = 4_096;
-const MAX_RECIPES: usize = 20_000;
-const MAX_EXPANSION_DEPTH: usize = 16;
-const MAX_EXPANDED_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_MAKEFILE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_LINES: usize = 20_000;
+pub(crate) const MAX_TARGETS: usize = 4_096;
+pub(crate) const MAX_RECIPES: usize = 20_000;
+pub(crate) const MAX_EXPANSION_DEPTH: usize = 16;
+pub(crate) const MAX_EXPANDED_BYTES: usize = 4 * 1024 * 1024;
 
-/// Register the modeled `make` command. The central command registry calls this function when
-/// the module is enabled; it is kept public so the registry can remain a thin composition layer.
-pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    super::reg_buffered_resumable(m, &["make"], Trust::Partial, cmd_make, start_make);
+/// One recipe line together with its source line number, needed for GNU-style
+/// `Makefile:LINE: target` failure diagnostics.
+#[derive(Clone, Debug)]
+pub(crate) struct RecipeLine {
+    pub(crate) line: usize,
+    pub(crate) text: String,
 }
 
 #[derive(Clone, Debug)]
-struct Rule {
-    prerequisites: Vec<String>,
-    recipes: Vec<String>,
+pub(crate) struct Rule {
+    pub(crate) prerequisites: Vec<String>,
+    pub(crate) recipes: Vec<RecipeLine>,
 }
 
-#[derive(Default)]
-struct Makefile {
-    vars: BTreeMap<String, String>,
-    rules: BTreeMap<String, Rule>,
-    order: Vec<String>,
-    phony: BTreeSet<String>,
+#[derive(Default, Debug)]
+pub(crate) struct Makefile {
+    pub(crate) vars: BTreeMap<String, String>,
+    pub(crate) rules: BTreeMap<String, Rule>,
+    pub(crate) order: Vec<String>,
+    pub(crate) phony: BTreeSet<String>,
+    /// Explicit `export`/`unexport` directives, keyed by variable name and keeping only the
+    /// last directive seen for that name (later lines win, as in GNU make). `true` forces the
+    /// variable into recipe environments; `false` forces it out even if it came from the
+    /// process environment. Names never mentioned by an `export`/`unexport` line are exported
+    /// only if they were already present in the process environment; see
+    /// `crate::program::make` for how this combines with command-line `VAR=value` overrides,
+    /// which are always exported regardless of this map.
+    pub(crate) export_state: BTreeMap<String, bool>,
 }
 
-struct MakeRun<'a, 'b> {
-    interp: &'a mut Interp,
-    out: &'b mut Vec<u8>,
-    err: &'b mut Vec<u8>,
-    vars: BTreeMap<String, String>,
-    phony: BTreeSet<String>,
-    rules: BTreeMap<String, Rule>,
-    visiting: BTreeSet<String>,
-    visited: BTreeSet<String>,
-    dry_run: bool,
-    recipe_count: usize,
+/// Parsed command-line options shared by the native `make` image.
+#[derive(Default, Clone)]
+pub(crate) struct Options {
+    pub(crate) file: Option<String>,
+    pub(crate) directory: Option<String>,
+    pub(crate) dry_run: bool,
+    pub(crate) silent: bool,
+    pub(crate) keep_going: bool,
+    /// `-j` is parsed and accepted for compatibility; recipes always run one at a time, so the
+    /// requested job count has no observable effect beyond validation. See module docs on
+    /// `crate::program::make` for the determinism rationale.
+    pub(crate) jobs: Option<u32>,
+    pub(crate) targets: Vec<String>,
+    pub(crate) command_vars: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Copy)]
-struct PlannedTarget {
-    mtime: u64,
-    rebuilt: bool,
-}
-
-struct PlannedRecipe {
-    source: String,
-    display: String,
-}
-
-struct MakePlan<'a> {
-    interp: &'a mut Interp,
-    cwd: String,
-    vars: BTreeMap<String, String>,
-    phony: BTreeSet<String>,
-    rules: BTreeMap<String, Rule>,
-    visiting: BTreeSet<String>,
-    visited: BTreeMap<String, PlannedTarget>,
-    recipes: Vec<PlannedRecipe>,
-    recipe_count: usize,
-}
-
-fn cmd_make(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(options) = parse_args(args) else {
-        ewln(io.err, "make: unsupported option or malformed argument");
-        return 2;
-    };
-    let Some(makefile_path) = options.file.clone() else {
-        // GNU make's default is Makefile, then makefile. Keep lookup deterministic and VFS-only.
-        let default = if interp.vfs.is_file(&interp.cwd, "Makefile") {
-            "Makefile"
-        } else {
-            "makefile"
-        };
-        if !interp.vfs.is_file(&interp.cwd, default) {
-            ewln(
-                io.err,
-                "make: *** No targets specified and no makefile found.  Stop.",
-            );
-            return 2;
-        }
-        return run_make(interp, io, options, default);
-    };
-    if makefile_path == "-" {
-        ewln(io.err, "make: reading makefiles from stdin is unsupported");
-        return 2;
-    }
-    run_make(interp, io, options, &makefile_path)
-}
-
-fn start_make(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
-    let Some(options) = parse_args(args) else {
-        ewln(io.err, "make: unsupported option or malformed argument");
-        return CommandPoll::Ready(2);
-    };
-    let cwd = match options.directory.as_deref() {
-        Some(directory) => {
-            let resolved = crate::vfs::resolve_against(&interp.cwd, directory);
-            if !interp.vfs.is_dir("/", &resolved) {
-                ewln(io.err, &format!("make: {resolved}: No such directory"));
-                return CommandPoll::Ready(2);
-            }
-            interp.vfs.realpath(&resolved, true).unwrap_or(resolved)
-        }
-        None => interp.cwd.clone(),
-    };
-    let makefile_path = match options.file.as_deref() {
-        Some("-") => {
-            ewln(io.err, "make: reading makefiles from stdin is unsupported");
-            return CommandPoll::Ready(2);
-        }
-        Some(path) => path.to_string(),
-        None if interp.vfs.is_file(&cwd, "Makefile") => "Makefile".to_string(),
-        None if interp.vfs.is_file(&cwd, "makefile") => "makefile".to_string(),
-        None => {
-            ewln(
-                io.err,
-                "make: *** No targets specified and no makefile found.  Stop.",
-            );
-            return CommandPoll::Ready(2);
-        }
-    };
-    let recipes = match plan_make(interp, options, &cwd, &makefile_path) {
-        Ok(recipes) => recipes,
-        Err(error) => {
-            ewln(io.err, &format!("make: {error}"));
-            return CommandPoll::Ready(2);
-        }
-    };
-    if recipes.is_empty() {
-        return CommandPoll::Ready(0);
-    }
-    let mut commands = Vec::with_capacity(recipes.len());
-    for recipe in recipes {
-        if recipe.source.is_empty() {
-            wln(io.out, &recipe.display);
+/// Parse `make`'s argv. Returns `None` for malformed or unrecognized options, which the caller
+/// reports as `make: unsupported option or malformed argument`.
+pub(crate) fn parse_args(args: &[String]) -> Option<Options> {
+    let mut options = Options::default();
+    let mut end_options = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if !end_options && arg == "--" {
+            end_options = true;
+            i += 1;
             continue;
         }
-        let source = if recipe.display.is_empty() {
-            format!("{} || exit 2", recipe.source)
+        if !end_options && (arg == "-f" || arg == "--file") {
+            i += 1;
+            options.file = Some(args.get(i)?.clone());
+            i += 1;
+            continue;
+        }
+        if !end_options && (arg == "-C" || arg == "--directory") {
+            i += 1;
+            options.directory = Some(args.get(i)?.clone());
+            i += 1;
+            continue;
+        }
+        if !end_options && (arg == "-j" || arg == "--jobs") {
+            i += 1;
+            let value = args.get(i)?;
+            options.jobs = Some(value.parse().ok()?);
+            i += 1;
+            continue;
+        }
+        if !end_options {
+            if let Some(value) = arg.strip_prefix("--jobs=") {
+                options.jobs = Some(value.parse().ok()?);
+                i += 1;
+                continue;
+            }
+        }
+        if !end_options && arg.starts_with("-j") {
+            if let Some(value) = arg.strip_prefix("-j") {
+                if value.is_empty() {
+                    options.jobs = None;
+                } else {
+                    options.jobs = Some(value.parse().ok()?);
+                }
+                i += 1;
+                continue;
+            }
+        }
+        if !end_options && arg == "--dry-run" {
+            options.dry_run = true;
+            i += 1;
+            continue;
+        }
+        if !end_options && arg == "--silent" {
+            options.silent = true;
+            i += 1;
+            continue;
+        }
+        if !end_options && arg == "--keep-going" {
+            options.keep_going = true;
+            i += 1;
+            continue;
+        }
+        if !end_options && arg.starts_with('-') && arg != "-" {
+            // Cluster of single-character boolean flags, e.g. `-nk` or `-ns`.
+            let rest = &arg[1..];
+            if !rest.is_empty() && rest.chars().all(|c| matches!(c, 'n' | 's' | 'k')) {
+                for c in rest.chars() {
+                    match c {
+                        'n' => options.dry_run = true,
+                        's' => options.silent = true,
+                        'k' => options.keep_going = true,
+                        _ => unreachable!(),
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            return None;
+        }
+        if let Some((name, value)) = parse_assignment(arg) {
+            options.command_vars.insert(name, value);
         } else {
-            format!(
-                "printf '%s\\n' {}; {} || exit 2",
-                shell_quote(&recipe.display),
-                recipe.source
-            )
-        };
-        commands.push(ChildCommand {
-            argv: vec!["bash".to_string(), "-c".to_string(), source],
-            stdin: Some(Vec::new()),
-            cwd: Some(cwd.clone()),
-            environment: None,
-            ..Default::default()
-        });
+            if arg.contains('=') && !arg.starts_with('-') {
+                return None;
+            }
+            options.targets.push(arg.clone());
+        }
+        i += 1;
     }
-    crate::commands::start_child_sequence(interp, commands, true)
+    Some(options)
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn recipe_prefixes(recipe: &str) -> (bool, bool, &str) {
+pub(crate) fn recipe_prefixes(recipe: &str) -> (bool, bool, &str) {
     let mut command = recipe.trim_start();
     let mut silent = false;
     let mut ignore_error = false;
@@ -192,325 +177,9 @@ fn recipe_prefixes(recipe: &str) -> (bool, bool, &str) {
     (silent, ignore_error, command.trim_start())
 }
 
-#[derive(Default)]
-struct Options {
-    file: Option<String>,
-    directory: Option<String>,
-    dry_run: bool,
-    targets: Vec<String>,
-    command_vars: BTreeMap<String, String>,
-}
-
-fn parse_args(args: &[String]) -> Option<Options> {
-    let mut options = Options::default();
-    let mut end_options = false;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if !end_options && arg == "--" {
-            end_options = true;
-            i += 1;
-            continue;
-        }
-        if !end_options && arg == "-n" {
-            options.dry_run = true;
-            i += 1;
-            continue;
-        }
-        if !end_options && (arg == "-f" || arg == "--file") {
-            i += 1;
-            options.file = Some(args.get(i)?.clone());
-            i += 1;
-            continue;
-        }
-        if !end_options && (arg == "-C" || arg == "--directory") {
-            i += 1;
-            options.directory = Some(args.get(i)?.clone());
-            i += 1;
-            continue;
-        }
-        if !end_options && arg.starts_with('-') {
-            return None;
-        }
-        if let Some((name, value)) = parse_assignment(arg) {
-            options.command_vars.insert(name, value);
-        } else {
-            if arg.contains('=') && !arg.starts_with('-') {
-                return None;
-            }
-            options.targets.push(arg.clone());
-        }
-        i += 1;
-    }
-    Some(options)
-}
-
-fn run_make(
-    interp: &mut CommandContext<'_>,
-    io: &mut Io<'_>,
-    options: Options,
-    makefile_path: &str,
-) -> i32 {
-    let original_cwd = interp.cwd.clone();
-    if let Some(directory) = options.directory.as_deref() {
-        let directory = crate::vfs::resolve_against(&original_cwd, directory);
-        if !interp.vfs.is_dir("/", &directory) {
-            ewln(io.err, &format!("make: {directory}: No such directory"));
-            return 2;
-        }
-        interp.cwd = interp.vfs.realpath(&directory, true).unwrap_or(directory);
-        let cwd = interp.cwd.clone();
-        interp.set_var("PWD", cwd);
-    }
-
-    let result = execute_make(interp, io, options, makefile_path);
-    interp.cwd = original_cwd.clone();
-    interp.set_var("PWD", original_cwd);
-    match result {
-        Ok(()) => 0,
-        Err(error) => {
-            ewln(io.err, &format!("make: {error}"));
-            2
-        }
-    }
-}
-
-fn execute_make(
-    interp: &mut CommandContext<'_>,
-    io: &mut Io<'_>,
-    options: Options,
-    makefile_path: &str,
-) -> Result<(), String> {
-    let path = crate::vfs::resolve_against(&interp.cwd, makefile_path);
-    let size = interp.vfs.file_len("/", &path).map_err(|e| e.to_string())?;
-    if size > MAX_MAKEFILE_BYTES {
-        return Err(format!(
-            "makefile exceeds the {MAX_MAKEFILE_BYTES}-byte limit"
-        ));
-    }
-    let source = interp
-        .vfs
-        .read_string_limited("/", &path, MAX_MAKEFILE_BYTES)
-        .map_err(|e| e.to_string())?;
-    let mut makefile = parse_makefile(interp, &source)?;
-    for (name, value) in options.command_vars {
-        makefile.vars.insert(name, value);
-    }
-    let target = options
-        .targets
-        .first()
-        .cloned()
-        .or_else(|| makefile.order.first().cloned())
-        .ok_or_else(|| "no targets specified".to_string())?;
-    let targets = if options.targets.is_empty() {
-        vec![target]
-    } else {
-        options.targets
-    };
-    let mut runner = MakeRun {
-        interp,
-        out: io.out,
-        err: io.err,
-        vars: makefile.vars,
-        phony: makefile.phony,
-        rules: makefile.rules,
-        visiting: BTreeSet::new(),
-        visited: BTreeSet::new(),
-        dry_run: options.dry_run,
-        recipe_count: 0,
-    };
-    for target in targets {
-        runner.build(&target, None)?;
-    }
-    Ok(())
-}
-
-fn plan_make(
-    interp: &mut Interp,
-    options: Options,
-    cwd: &str,
-    makefile_path: &str,
-) -> Result<Vec<PlannedRecipe>, String> {
-    let path = crate::vfs::resolve_against(cwd, makefile_path);
-    let size = interp.vfs.file_len("/", &path).map_err(|e| e.to_string())?;
-    if size > MAX_MAKEFILE_BYTES {
-        return Err(format!(
-            "makefile exceeds the {MAX_MAKEFILE_BYTES}-byte limit"
-        ));
-    }
-    let source = interp
-        .vfs
-        .read_string_limited("/", &path, MAX_MAKEFILE_BYTES)
-        .map_err(|e| e.to_string())?;
-    let mut makefile = parse_makefile(interp, &source)?;
-    for (name, value) in options.command_vars {
-        makefile.vars.insert(name, value);
-    }
-    let targets = if options.targets.is_empty() {
-        vec![makefile
-            .order
-            .first()
-            .cloned()
-            .ok_or_else(|| "no targets specified".to_string())?]
-    } else {
-        options.targets
-    };
-    let mut planner = MakePlan {
-        interp,
-        cwd: cwd.to_string(),
-        vars: makefile.vars,
-        phony: makefile.phony,
-        rules: makefile.rules,
-        visiting: BTreeSet::new(),
-        visited: BTreeMap::new(),
-        recipes: Vec::new(),
-        recipe_count: 0,
-    };
-    for target in targets {
-        planner.build(&target, None, options.dry_run)?;
-    }
-    Ok(planner.recipes)
-}
-
-impl MakePlan<'_> {
-    fn build(
-        &mut self,
-        target: &str,
-        parent: Option<&str>,
-        dry_run: bool,
-    ) -> Result<PlannedTarget, String> {
-        if self.visiting.contains(target) {
-            return Err(format!("circular dependency involving '{target}'"));
-        }
-        if let Some(result) = self.visited.get(target) {
-            return Ok(*result);
-        }
-        self.visiting.insert(target.to_string());
-        let rule = self.rules.get(target).cloned();
-        let exists = self.interp.vfs.exists(&self.cwd, target);
-        if rule.is_none() {
-            self.visiting.remove(target);
-            if exists {
-                let result = PlannedTarget {
-                    mtime: self.mtime(target),
-                    rebuilt: false,
-                };
-                self.visited.insert(target.to_string(), result);
-                return Ok(result);
-            }
-            return Err(format!("No rule to make target '{target}'"));
-        }
-        let rule = rule.expect("rule presence was checked");
-        let prerequisites = self.expand_prerequisites(target, &rule.prerequisites)?;
-        let mut prerequisite_results = Vec::with_capacity(prerequisites.len());
-        for prerequisite in &prerequisites {
-            prerequisite_results.push(self.build(prerequisite, Some(target), dry_run)?);
-        }
-        let target_mtime = self.mtime(target);
-        let needs = self.phony.contains(target)
-            || !exists
-            || prerequisite_results
-                .iter()
-                .any(|result| result.rebuilt || result.mtime > target_mtime);
-        if needs {
-            for recipe in &rule.recipes {
-                self.recipe_count = self.recipe_count.saturating_add(1);
-                if self.recipe_count > MAX_RECIPES {
-                    return Err(format!("recipe limit exceeded ({MAX_RECIPES})"));
-                }
-                let expanded = self.expand(recipe, target, parent, &prerequisites)?;
-                if expanded.trim().is_empty() {
-                    continue;
-                }
-                let (silent, ignore_error, command) = recipe_prefixes(&expanded);
-                self.recipes.push(PlannedRecipe {
-                    source: if dry_run {
-                        String::new()
-                    } else if ignore_error {
-                        format!("( {command} ) || true")
-                    } else {
-                        command.to_string()
-                    },
-                    display: if silent && !dry_run {
-                        String::new()
-                    } else {
-                        command.to_string()
-                    },
-                });
-            }
-        }
-        self.visiting.remove(target);
-        let result = PlannedTarget {
-            mtime: target_mtime,
-            rebuilt: needs,
-        };
-        self.visited.insert(target.to_string(), result);
-        Ok(result)
-    }
-
-    fn mtime(&self, target: &str) -> u64 {
-        self.interp
-            .vfs
-            .metadata(&self.cwd, target, true)
-            .map(|node| node.mtime)
-            .unwrap_or(0)
-    }
-
-    fn expand(
-        &mut self,
-        recipe: &str,
-        target: &str,
-        _parent: Option<&str>,
-        prerequisites: &[String],
-    ) -> Result<String, String> {
-        if !self.interp.resources.charge_cpu(recipe.len() as u64) {
-            return Err("resource limit exceeded while expanding recipe".to_string());
-        }
-        expand_vars(
-            recipe,
-            &self.vars,
-            target,
-            prerequisites,
-            MAX_EXPANSION_DEPTH,
-        )
-    }
-
-    fn expand_prerequisites(
-        &mut self,
-        target: &str,
-        raw_prerequisites: &[String],
-    ) -> Result<Vec<String>, String> {
-        let source_bytes = raw_prerequisites
-            .iter()
-            .try_fold(0_u64, |total, value| total.checked_add(value.len() as u64))
-            .ok_or_else(|| "prerequisite expansion is too large".to_string())?;
-        if !self.interp.resources.charge_cpu(source_bytes) {
-            return Err("resource limit exceeded while expanding prerequisites".to_string());
-        }
-        let mut expanded = Vec::new();
-        for prerequisite in raw_prerequisites {
-            let value = expand_vars(prerequisite, &self.vars, target, &[], MAX_EXPANSION_DEPTH)?;
-            for name in value.split_whitespace() {
-                if expanded.len() >= MAX_TARGETS {
-                    return Err(format!(
-                        "expanded prerequisite limit exceeded ({MAX_TARGETS})"
-                    ));
-                }
-                validate_name(name, 0)
-                    .map_err(|_| format!("variable produced unsupported prerequisite '{name}'"))?;
-                expanded.push(name.to_string());
-            }
-        }
-        Ok(expanded)
-    }
-}
-
-fn parse_makefile(interp: &mut Interp, source: &str) -> Result<Makefile, String> {
+pub(crate) fn parse_makefile(system: &mut impl System, source: &str) -> Result<Makefile, String> {
     let bytes = source.len();
-    if !interp.resources.charge_cpu(bytes as u64)
-        || !interp
-            .resources
-            .reserve_memory((bytes as u64).saturating_mul(2))
+    if !system.charge_cpu(bytes as u64) || !system.reserve_memory((bytes as u64).saturating_mul(2))
     {
         return Err("resource limit exceeded while reading makefile".to_string());
     }
@@ -528,17 +197,20 @@ fn parse_makefile(interp: &mut Interp, source: &str) -> Result<Makefile, String>
                     "target has multiple recipe definitions at line {line_no}"
                 ));
             }
-            let recipe = recipe.to_string();
             recipe_count = recipe_count.saturating_add(1);
             if recipe_count > MAX_RECIPES {
                 return Err(format!("recipe limit exceeded ({MAX_RECIPES})"));
             }
+            let recipe_line = RecipeLine {
+                line: line_no,
+                text: recipe.to_string(),
+            };
             for target in &current_targets {
                 out.rules
                     .get_mut(target)
                     .ok_or_else(|| "internal rule state error".to_string())?
                     .recipes
-                    .push(recipe.clone());
+                    .push(recipe_line.clone());
             }
             continue;
         }
@@ -557,6 +229,51 @@ fn parse_makefile(interp: &mut Interp, source: &str) -> Result<Makefile, String>
             current_targets.clear();
             current_has_prior_recipe = false;
             continue;
+        }
+        if let Some(rest) = line.strip_prefix("export") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                let rest = rest.trim_start();
+                if rest.is_empty() {
+                    // Bare `export` (export every variable from here on) is unsupported; this
+                    // subset only tracks explicitly named variables.
+                    return Err(format!("unsupported directive at line {line_no}"));
+                }
+                if let Some((name, value)) = parse_assignment(rest) {
+                    out.vars.insert(name.clone(), value);
+                    out.export_state.insert(name, true);
+                } else {
+                    for name in rest.split_whitespace() {
+                        if !is_valid_var_name(name) {
+                            return Err(format!(
+                                "unsupported export target '{name}' at line {line_no}"
+                            ));
+                        }
+                        out.export_state.insert(name.to_string(), true);
+                    }
+                }
+                current_targets.clear();
+                current_has_prior_recipe = false;
+                continue;
+            }
+        }
+        if let Some(rest) = line.strip_prefix("unexport") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                let rest = rest.trim_start();
+                if rest.is_empty() {
+                    return Err(format!("unsupported directive at line {line_no}"));
+                }
+                for name in rest.split_whitespace() {
+                    if !is_valid_var_name(name) {
+                        return Err(format!(
+                            "unsupported export target '{name}' at line {line_no}"
+                        ));
+                    }
+                    out.export_state.insert(name.to_string(), false);
+                }
+                current_targets.clear();
+                current_has_prior_recipe = false;
+                continue;
+            }
         }
         if let Some((name, value)) = parse_assignment(line) {
             out.vars.insert(name, value);
@@ -652,7 +369,7 @@ fn logical_make_lines(source: &str) -> Result<Vec<(usize, String)>, String> {
     Ok(lines)
 }
 
-fn validate_name(name: &str, line: usize) -> Result<(), String> {
+pub(crate) fn validate_name(name: &str, line: usize) -> Result<(), String> {
     if name.is_empty() || name.contains('%') || name.contains('$') {
         return Err(format!(
             "unsupported target or prerequisite '{name}' at line {line}"
@@ -661,147 +378,27 @@ fn validate_name(name: &str, line: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_assignment(value: &str) -> Option<(String, String)> {
-    let (name, value) = value.split_once('=')?;
-    let name = name.trim();
-    if name.is_empty()
-        || !name
-            .chars()
-            .enumerate()
-            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
-    {
+/// Parse a `NAME=value` or `NAME:=value` assignment. This bounded subset does not distinguish
+/// recursive (`=`) from simple (`:=`) expansion; both store the right-hand side immediately.
+pub(crate) fn parse_assignment(value: &str) -> Option<(String, String)> {
+    let (raw_name, value) = value.split_once('=')?;
+    let name = raw_name.strip_suffix(':').unwrap_or(raw_name).trim();
+    if !is_valid_var_name(name) {
         return None;
     }
     Some((name.to_string(), value.trim().to_string()))
 }
 
-impl MakeRun<'_, '_> {
-    fn build(&mut self, target: &str, parent: Option<&str>) -> Result<u64, String> {
-        if self.visiting.contains(target) {
-            return Err(format!("circular dependency involving '{target}'"));
-        }
-        if self.visited.contains(target) {
-            return Ok(self.mtime(target));
-        }
-        self.visiting.insert(target.to_string());
-        let rule = self.rules.get(target).cloned();
-        let exists = self.exists(target);
-        if rule.is_none() {
-            self.visiting.remove(target);
-            if exists {
-                self.visited.insert(target.to_string());
-                return Ok(self.mtime(target));
-            }
-            return Err(format!("No rule to make target '{target}'"));
-        }
-        let rule = rule.unwrap();
-        let prerequisites = self.expand_prerequisites(target, &rule.prerequisites)?;
-        let mut prereq_mtimes = Vec::with_capacity(prerequisites.len());
-        for prerequisite in &prerequisites {
-            let mtime = self.build(prerequisite, Some(target))?;
-            prereq_mtimes.push(mtime);
-        }
-        let target_mtime = self.mtime(target);
-        let needs = self.phony.contains(target)
-            || !exists
-            || prereq_mtimes.iter().any(|mtime| *mtime > target_mtime);
-        if needs {
-            for recipe in &rule.recipes {
-                self.recipe_count = self.recipe_count.saturating_add(1);
-                let expanded = self.expand(recipe, target, parent, &prerequisites)?;
-                if expanded.trim().is_empty() {
-                    continue;
-                }
-                let (silent, ignore_error, command) = recipe_prefixes(&expanded);
-                if self.dry_run || !silent {
-                    wln(self.out, command);
-                }
-                if self.dry_run {
-                    continue;
-                }
-                let saved_cwd = self.interp.cwd.clone();
-                let mut command_out = Vec::new();
-                let mut command_err = Vec::new();
-                let status =
-                    self.interp
-                        .run_script_into(command, &mut command_out, &mut command_err);
-                self.interp.cwd = saved_cwd.clone();
-                self.interp.set_var("PWD", saved_cwd);
-                self.out.extend_from_slice(&command_out);
-                self.err.extend_from_slice(&command_err);
-                if status != 0 && !ignore_error {
-                    self.visiting.remove(target);
-                    return Err(format!("recipe for '{target}' failed with status {status}"));
-                }
-            }
-        }
-        self.visiting.remove(target);
-        self.visited.insert(target.to_string());
-        Ok(self.mtime(target))
-    }
-
-    fn exists(&self, target: &str) -> bool {
-        self.interp.vfs.exists(&self.interp.cwd, target)
-    }
-
-    fn mtime(&self, target: &str) -> u64 {
-        self.interp
-            .vfs
-            .metadata(&self.interp.cwd, target, true)
-            .map(|node| node.mtime)
-            .unwrap_or(0)
-    }
-
-    fn expand(
-        &mut self,
-        recipe: &str,
-        target: &str,
-        _parent: Option<&str>,
-        prerequisites: &[String],
-    ) -> Result<String, String> {
-        if !self.interp.resources.charge_cpu(recipe.len() as u64) {
-            return Err("resource limit exceeded while expanding recipe".to_string());
-        }
-        expand_vars(
-            recipe,
-            &self.vars,
-            target,
-            prerequisites,
-            MAX_EXPANSION_DEPTH,
-        )
-    }
-
-    fn expand_prerequisites(
-        &mut self,
-        target: &str,
-        raw_prerequisites: &[String],
-    ) -> Result<Vec<String>, String> {
-        let source_bytes = raw_prerequisites
-            .iter()
-            .try_fold(0_u64, |total, value| total.checked_add(value.len() as u64))
-            .ok_or_else(|| "prerequisite expansion is too large".to_string())?;
-        if !self.interp.resources.charge_cpu(source_bytes) {
-            return Err("resource limit exceeded while expanding prerequisites".to_string());
-        }
-        let mut expanded = Vec::new();
-        for prerequisite in raw_prerequisites {
-            let value = expand_vars(prerequisite, &self.vars, target, &[], MAX_EXPANSION_DEPTH)?;
-            for name in value.split_whitespace() {
-                if expanded.len() >= MAX_TARGETS {
-                    return Err(format!(
-                        "expanded prerequisite limit exceeded ({MAX_TARGETS})"
-                    ));
-                }
-                validate_name(name, 0)
-                    .map_err(|_| format!("variable produced unsupported prerequisite '{name}'"))?;
-                expanded.push(name.to_string());
-            }
-        }
-        Ok(expanded)
-    }
+/// A variable name make would accept: non-empty, `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_valid_var_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
 }
 
-fn expand_vars(
+pub(crate) fn expand_vars(
     source: &str,
     vars: &BTreeMap<String, String>,
     target: &str,
@@ -885,18 +482,22 @@ fn ensure_expansion_size(output: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interp::Interp;
+    use crate::syscalls::ActiveSystem;
 
     #[test]
     fn parses_assignments_rules_and_recipes() {
         let mut interp = Interp::new();
+        let mut system = ActiveSystem::new(&mut interp);
         let parsed = parse_makefile(
-            &mut interp,
+            &mut system,
             "OUT = result.txt\n.PHONY: all\nall: $(OUT)\n\t@echo $(OUT)\n",
         )
         .unwrap();
         assert_eq!(parsed.vars["OUT"], "result.txt");
         assert!(parsed.phony.contains("all"));
         assert_eq!(parsed.rules["all"].prerequisites, vec!["result.txt"]);
+        assert_eq!(parsed.rules["all"].recipes[0].line, 4);
     }
 
     #[test]
@@ -907,5 +508,43 @@ mod tests {
             expand_vars("$(NAME) $@ $< $$HOME", &vars, "out", &["in".into()], 4).unwrap(),
             "value out in $HOME"
         );
+    }
+
+    #[test]
+    fn parse_args_accepts_clustered_short_flags_and_jobs() {
+        let options = parse_args(&["-nk".to_string(), "-j4".to_string(), "all".to_string()])
+            .expect("valid options");
+        assert!(options.dry_run);
+        assert!(options.keep_going);
+        assert_eq!(options.jobs, Some(4));
+        assert_eq!(options.targets, vec!["all".to_string()]);
+    }
+
+    #[test]
+    fn export_and_unexport_directives_are_recorded() {
+        let mut interp = Interp::new();
+        let mut system = ActiveSystem::new(&mut interp);
+        let parsed = parse_makefile(
+            &mut system,
+            "A=1\nexport B=2\nexport C := 3\nexport A\nunexport D\nall:\n\t@true\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.vars["A"], "1");
+        assert_eq!(parsed.vars["B"], "2");
+        assert_eq!(parsed.vars["C"], "3");
+        assert_eq!(parsed.export_state.get("A"), Some(&true));
+        assert_eq!(parsed.export_state.get("B"), Some(&true));
+        assert_eq!(parsed.export_state.get("C"), Some(&true));
+        assert_eq!(parsed.export_state.get("D"), Some(&false));
+        // A plain assignment does not export by itself.
+        assert!(!parsed.export_state.contains_key("nonexistent"));
+    }
+
+    #[test]
+    fn bare_export_directive_is_unsupported() {
+        let mut interp = Interp::new();
+        let mut system = ActiveSystem::new(&mut interp);
+        let error = parse_makefile(&mut system, "export\nall:\n\t@true\n").unwrap_err();
+        assert!(error.contains("unsupported"), "{error}");
     }
 }
