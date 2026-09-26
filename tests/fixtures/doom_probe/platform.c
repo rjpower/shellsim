@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 
 extern int shellsim_display_open(unsigned, unsigned, unsigned)
     __asm__("shellsim.display_open");
@@ -20,9 +22,6 @@ struct key_event {
 
 static int display_handle;
 static unsigned char frame_rgba[DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4];
-/* The opt-in headless probe advances one deterministic 35 Hz tic per clock read. Real
-   interactive scheduling belongs in shellsim's virtual clock/process interface. */
-static uint32_t probe_ms;
 
 void DG_Init(void) {
     display_handle = shellsim_display_open(DOOMGENERIC_RESX, DOOMGENERIC_RESY, 1);
@@ -49,13 +48,15 @@ void DG_DrawFrame(void) {
     }
 }
 
+/* Timing uses shellsim's virtual clock through ordinary libc calls. */
 void DG_SleepMs(uint32_t ms) {
-    probe_ms += ms;
+    usleep(ms * 1000);
 }
 
 uint32_t DG_GetTicksMs(void) {
-    probe_ms += 29;
-    return probe_ms;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint32_t)(now.tv_sec * 1000 + now.tv_nsec / 1000000);
 }
 
 int DG_GetKey(int *pressed, unsigned char *key) {
