@@ -109,7 +109,7 @@ fn find_rejects_unsupported_and_malformed_predicates() {
     }
     let (status, _, stderr) = text("find /missing");
     assert_eq!(status, 1);
-    assert!(stderr.contains("find:"), "{stderr}");
+    assert_eq!(stderr, "find: '/missing': No such file or directory\n");
 }
 
 #[test]

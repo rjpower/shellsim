@@ -256,20 +256,54 @@ fn execdir_batching_is_rejected_as_unsupported() {
 }
 
 #[test]
-fn exec_batches_flush_early_once_the_argument_byte_cap_is_reached() {
-    // 500 four-byte names comfortably exceed the 32 KiB batch cap, so this must flush more than
-    // one child; confirm the `+` form still runs every match exactly once across those children.
+fn exec_plus_packs_matches_like_gnu_find() {
+    // GNU find's `-exec ... +` packs as many matches as fit under its argument-byte budget into
+    // one invocation. 300 short names are nowhere near that budget, so a real system's `find`
+    // (and this native image, sized to match) runs exactly one `echo`, producing one `wc -l` line.
     let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/many").unwrap();
+    for i in 0..300 {
+        environment
+            .vfs
+            .write("/", &format!("/many/f_long_name_number_{i}"), b"", 0o644)
+            .unwrap();
+    }
     let (status, stdout, stderr) = run(
         &mut environment,
-        "mkdir many; touch many/f{1..500}; find many -type f -exec echo {} +",
+        "find many -name 'f_*' -exec echo {} + | wc -l",
     );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&stdout).trim(), "1");
+}
+
+#[test]
+fn exec_batches_flush_early_once_the_argument_byte_cap_is_reached() {
+    // 300 names of just over 500 bytes each add up to comfortably more than the 128 KiB batch
+    // cap, so this must flush more than one child; confirm the `+` form still runs every match
+    // exactly once across those children. Files are seeded directly through the VFS so the test
+    // does not need a single enormous shell command line to create them.
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/many").unwrap();
+    let mut expected_names = Vec::new();
+    for i in 0..300 {
+        let name = format!("f_{i}_{}", "x".repeat(500));
+        environment
+            .vfs
+            .write("/", &format!("/many/{name}"), b"", 0o644)
+            .unwrap();
+        expected_names.push(format!("many/{name}"));
+    }
+    let (status, stdout, stderr) = run(&mut environment, "find many -type f -exec echo {} +");
     assert_eq!(status, 0, "{stderr}");
     let printed = String::from_utf8_lossy(&stdout);
     let mut names: Vec<&str> = printed.split_whitespace().collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 500, "every match must be echoed exactly once");
+    expected_names.sort_unstable();
+    assert_eq!(
+        names, expected_names,
+        "every match must be echoed exactly once"
+    );
     let echo_invocations = environment
         .invocations
         .events()

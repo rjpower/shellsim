@@ -40,12 +40,14 @@ use crate::vfs::resolve_against;
 
 use super::poll_write;
 
-/// Conservative cap on accumulated `-exec ... +` argument bytes before a batch is flushed early,
-/// analogous to a real system's `ARG_MAX` headroom. Order-of-magnitude, not exact, and kept
-/// comfortably below the process table's own 4 KiB command-length ceiling (`MAX_COMMAND_BYTES`
-/// in `src/process.rs`), since a batch that grows past that ceiling would otherwise fail to spawn
-/// at all with a resource-exhaustion error instead of running in more than one child.
-const EXEC_BATCH_BYTES: usize = 3 * 1024;
+/// Cap on accumulated `-exec ... +` argument bytes (each argument plus its NUL terminator, as
+/// argv is actually laid out) before a batch is flushed early. GNU find packs matches into each
+/// invocation up to a fraction of the host's `ARG_MAX`; 128 KiB is the same order of magnitude
+/// and reproduces its "pack as many matches into as few children as possible" behavior. The
+/// process table (`src/process.rs`) only truncates its diagnostic label past its own 4 KiB
+/// ceiling rather than rejecting long commands, so a batch this size spawns without a separate
+/// process-table limit coming into play first.
+const EXEC_BATCH_BYTES: usize = 128 * 1024;
 
 /// Bound on directory entries visited per `poll` call, so a large tree yields control instead of
 /// running to completion in one scheduler turn.
@@ -314,7 +316,8 @@ impl FindProcess {
                 };
                 if let Err(error) = system.metadata("/", &start.absolute, false) {
                     self.status = self.status.max(1);
-                    self.push_stderr(format!("find: '{}': {error}\n", start.token));
+                    let reason = start_path_error_reason(&error, &start.absolute);
+                    self.push_stderr(format!("find: '{}': {reason}\n", start.token));
                     continue;
                 }
                 let post_order = self.parsed().delete;
@@ -667,6 +670,19 @@ fn exec_target(path: &str, display: &str, dir: bool) -> (Option<String>, String)
     } else {
         (None, display.to_string())
     }
+}
+
+/// Render a starting-point lookup failure the way GNU find does: the bare reason, without the
+/// path repeated a second time. Every `VfsError`/`SyscallError` variant used here formats as
+/// `"<reason>: <path>"`, so stripping the exact `absolute` path we looked up as a suffix recovers
+/// the reason alone; an error that does not end that way (unexpected, but not fatal) is reported
+/// unmodified rather than mangled.
+fn start_path_error_reason(error: &crate::syscalls::SyscallError, absolute: &str) -> String {
+    let text = error.to_string();
+    let suffix = format!(": {absolute}");
+    text.strip_suffix(suffix.as_str())
+        .map(str::to_string)
+        .unwrap_or(text)
 }
 
 fn pid_of(waiting: Waiting) -> ProcessId {
