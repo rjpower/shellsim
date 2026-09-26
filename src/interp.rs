@@ -192,6 +192,8 @@ pub struct ProcessState {
     random_state: Cell<u32>,
     /// Process-local entropy for guest and native virtual-kernel random calls.
     syscall_random_state: u64,
+    /// `$0`: the shell or script name given when a shell image was loaded.
+    pub(crate) arg0: String,
     /// positional parameters `$1 $2 ... $@`
     pub positional: Vec<String>,
     pub(crate) getopts: GetoptsState,
@@ -243,6 +245,19 @@ pub struct ProcessState {
     /// Memory reserved for this forked context and released independently at exit.
     fork_allocation_bytes: u64,
     detached_output: bool,
+}
+
+/// Program, parameters, and options of a shell loaded as a process image.
+#[derive(Default)]
+struct ShellImage {
+    /// Parsed `-c` or script source; `None` reads the program from standard input.
+    program: Option<crate::shell::Node>,
+    arg0: String,
+    positional: Vec<String>,
+    errexit: bool,
+    nounset: bool,
+    xtrace: bool,
+    pipefail: bool,
 }
 
 /// Machine-owned process contexts.
@@ -395,6 +410,7 @@ impl ProcessState {
             last_status: self.last_status,
             random_state: Cell::new(self.random_state.get()),
             syscall_random_state: self.syscall_random_state,
+            arg0: self.arg0.clone(),
             positional: self.positional.clone(),
             getopts: self.getopts.clone(),
             opt_errexit: self.opt_errexit,
@@ -688,6 +704,7 @@ impl Environment {
                 last_status: 0,
                 random_state: Cell::new(1),
                 syscall_random_state: 0x5eed_5eed_5eed_5eed,
+                arg0: "shellsim".to_string(),
                 positional: Vec::new(),
                 getopts: GetoptsState {
                     optind: 1,
@@ -831,14 +848,9 @@ impl Environment {
                 {
                     Some(crate::vfs::NodeKind::NativeExecutable(
                         crate::vfs::NativeProgram::LegacyRegistered("sh" | "bash" | "dash" | "zsh"),
-                    )) => match self.shell_image_program(pid, &argv[1..])? {
-                        Some(Ok((program, positional))) => {
-                            self.reset_for_exec(pid)?;
-                            self.set_process_positional(pid, positional)?;
-                            self.process.set_continuation(
-                                pid,
-                                Some(crate::exec::ShellContinuation::subshell(&program)),
-                            )?;
+                    )) => match self.shell_image(pid, &argv[0], &argv[1..])? {
+                        Ok(image) => {
+                            self.load_shell_image(pid, image)?;
                             self.invocations.begin(
                                 pid,
                                 &argv,
@@ -849,12 +861,8 @@ impl Environment {
                             );
                             return Ok(());
                         }
-                        Some(Err((status, message))) => {
+                        Err((status, message)) => {
                             Some(crate::program::NativeProcess::failure(status, message))
-                        }
-                        None => {
-                            argv[0] = path;
-                            None
                         }
                     },
                     Some(crate::vfs::NodeKind::NativeExecutable(
@@ -931,59 +939,148 @@ impl Environment {
         Ok(())
     }
 
-    /// Program for a shell image loaded by argv: `sh -c SOURCE [NAME [ARG...]]` or
-    /// `sh SCRIPT [ARG...]`, parsed so the shell runs in the loading process itself. `None`
-    /// means the shell reads its program from standard input, which still runs through the
-    /// shell dispatcher. A missing script or syntax error becomes an exit status and message.
-    #[allow(clippy::type_complexity)]
-    fn shell_image_program(
+    /// Parse a shell image's argv the way `bash`/`sh` do: short option clusters (`-c`, `-s`,
+    /// `-e`, `-u`, `-x`, `-o NAME`), then `-c SOURCE [NAME [ARG...]]`, `SCRIPT [ARG...]`, or,
+    /// with `-s` or no operand, a program read from standard input. A missing script or a
+    /// syntax error in `-c`/script source becomes an exit status and diagnostic.
+    fn shell_image(
         &mut self,
         pid: ProcessId,
+        name: &str,
         args: &[String],
-    ) -> Result<Option<Result<(crate::shell::Node, Vec<String>), (i32, String)>>, String> {
+    ) -> Result<Result<ShellImage, (i32, String)>, String> {
+        let mut image = ShellImage {
+            arg0: name.to_string(),
+            ..ShellImage::default()
+        };
+        let mut command = false;
+        let mut from_stdin = false;
         let mut index = 0;
-        let (source, positional) = loop {
-            let Some(argument) = args.get(index) else {
-                return Ok(None);
+        while let Some(argument) = args.get(index) {
+            if argument == "--" || argument == "-" {
+                index += 1;
+                break;
+            }
+            if argument.starts_with("--") {
+                // Startup-file and mode switches such as --norc and --posix have no effect here.
+                index += 1;
+                continue;
+            }
+            let Some(flags) = argument
+                .strip_prefix('-')
+                .or_else(|| argument.strip_prefix('+'))
+                .filter(|flags| !flags.is_empty())
+            else {
+                break;
             };
-            match argument.as_str() {
-                "-c" => {
-                    let Some(source) = args.get(index + 1) else {
-                        return Ok(Some(Err((
-                            2,
-                            "bash: -c: option requires an argument\n".to_string(),
-                        ))));
-                    };
-                    let positional = args.get(index + 3..).unwrap_or_default().to_vec();
-                    break (source.clone(), positional);
-                }
-                "-o" => index += 2,
-                option if option.starts_with('-') => index += 1,
-                script => {
-                    let cwd = self
-                        .process
-                        .states
-                        .get(&pid)
-                        .ok_or_else(|| format!("process state does not exist for PID {pid}"))?
-                        .cwd
-                        .clone();
-                    let Ok(source) = self.vfs.read_string(&cwd, script) else {
-                        return Ok(Some(Err((
-                            127,
-                            format!("bash: {script}: No such file or directory\n"),
-                        ))));
-                    };
-                    break (source, args[index + 1..].to_vec());
+            let enable = argument.starts_with('-');
+            index += 1;
+            for flag in flags.chars() {
+                match flag {
+                    'c' => command = true,
+                    's' => from_stdin = true,
+                    'e' => image.errexit = enable,
+                    'u' => image.nounset = enable,
+                    'x' => image.xtrace = enable,
+                    // Interactive and login shells are not modeled; the flags are accepted.
+                    'i' | 'l' => {}
+                    'o' => {
+                        let Some(name) = args.get(index) else {
+                            return Ok(Err((2, "bash: -o: option requires an argument\n".into())));
+                        };
+                        index += 1;
+                        match name.as_str() {
+                            "errexit" => image.errexit = enable,
+                            "nounset" => image.nounset = enable,
+                            "xtrace" => image.xtrace = enable,
+                            "pipefail" => image.pipefail = enable,
+                            other => {
+                                return Ok(Err((
+                                    2,
+                                    format!("bash: {other}: invalid option name\n"),
+                                )))
+                            }
+                        }
+                    }
+                    other => return Ok(Err((2, format!("bash: -{other}: invalid option\n")))),
                 }
             }
+        }
+        let operands = &args[index..];
+        let source = if command {
+            let Some(source) = operands.first() else {
+                return Ok(Err((2, "bash: -c: option requires an argument\n".into())));
+            };
+            if let Some(name) = operands.get(1) {
+                image.arg0 = name.clone();
+            }
+            image.positional = operands.get(2..).unwrap_or_default().to_vec();
+            source.clone()
+        } else if from_stdin || operands.is_empty() {
+            image.positional = operands.to_vec();
+            return Ok(Ok(image));
+        } else {
+            let script = &operands[0];
+            let cwd = self
+                .process
+                .states
+                .get(&pid)
+                .ok_or_else(|| format!("process state does not exist for PID {pid}"))?
+                .cwd
+                .clone();
+            let Ok(source) = self.vfs.read_string(&cwd, script) else {
+                return Ok(Err((
+                    127,
+                    format!("bash: {script}: No such file or directory\n"),
+                )));
+            };
+            image.arg0 = script.clone();
+            image.positional = operands[1..].to_vec();
+            source
         };
         let mut error = Vec::new();
-        Ok(Some(
+        Ok(
             match crate::commands::parse_shell_source(self, &source, &mut error) {
-                Ok(program) => Ok((program, positional)),
+                Ok(program) => {
+                    image.program = Some(program);
+                    Ok(image)
+                }
                 Err(status) => Err((status, String::from_utf8_lossy(&error).into_owned())),
             },
-        ))
+        )
+    }
+
+    /// Install a parsed [`ShellImage`] as the program of process `pid`.
+    fn load_shell_image(&mut self, pid: ProcessId, image: ShellImage) -> Result<(), String> {
+        self.reset_for_exec(pid)?;
+        let state = self
+            .process
+            .states
+            .get_mut(&pid)
+            .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
+        // A new program image keeps only the environment: unexported variables, arrays,
+        // functions, aliases, and other shell-local state belong to the replaced shell.
+        let exported = std::mem::take(&mut state.exported);
+        state.vars.retain(|name, _| exported.contains(name));
+        state.exported = exported;
+        state.arrays.clear();
+        state.readonly.clear();
+        state.funcs.clear();
+        state.aliases.clear();
+        state.command_hash.clear();
+        state.directory_stack.clear();
+        state.local_scopes.clear();
+        state.arg0 = image.arg0;
+        state.positional = image.positional;
+        state.opt_errexit = image.errexit;
+        state.opt_nounset = image.nounset;
+        state.opt_xtrace = image.xtrace;
+        state.opt_pipefail = image.pipefail;
+        let continuation = match &image.program {
+            Some(program) => crate::exec::ShellContinuation::subshell(program),
+            None => crate::exec::ShellContinuation::standard_input_program(),
+        };
+        self.process.set_continuation(pid, Some(continuation))
     }
 
     /// Create a runnable child without blocking or switching away from the active parent.
@@ -1935,7 +2032,7 @@ impl Environment {
             _ => {
                 if let Ok(n) = name.parse::<usize>() {
                     if n == 0 {
-                        return Some("shellsim".to_string());
+                        return Some(self.arg0.clone());
                     }
                     return self.positional.get(n - 1).cloned();
                 }

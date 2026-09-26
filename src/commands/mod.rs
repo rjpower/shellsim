@@ -310,7 +310,11 @@ pub(crate) fn system_command(path: &str) -> Option<SystemCommand> {
 fn runs_native_process(image: crate::vfs::NativeProgram) -> bool {
     match image {
         crate::vfs::NativeProgram::Registered(path) => system_command(path).is_some(),
-        crate::vfs::NativeProgram::LegacyRegistered(_) => false,
+        // Shells load as process images that parse their own program; see
+        // `Interp::shell_image`.
+        crate::vfs::NativeProgram::LegacyRegistered(name) => {
+            matches!(name, "sh" | "bash" | "dash" | "zsh")
+        }
         _ => true,
     }
 }
@@ -563,13 +567,6 @@ pub(crate) fn poll(
 /// Whether the command has a continuation-aware entry point that does not consume standard
 /// input before it can suspend.
 pub(crate) fn starts_before_input(interp: &Interp, argv: &[String]) -> bool {
-    if argv.len() == 1
-        && argv
-            .first()
-            .is_some_and(|command| matches!(command.as_str(), "sh" | "bash" | "dash" | "zsh"))
-    {
-        return false;
-    }
     argv.first().is_some_and(|requested| {
         if !(builtins::is_shell_builtin_name(requested) && !requested.contains('/'))
             && resolved_native_image(interp, requested).is_some_and(runs_native_process)
@@ -1166,13 +1163,7 @@ pub(crate) fn parse_shell_source(
 /// builtins still run inside the calling shell image.
 pub(crate) fn execs_native_image(interp: &Interp, requested: &str) -> bool {
     (requested.contains('/') || !builtins::is_shell_builtin_name(requested))
-        && resolved_native_image(interp, requested).is_some_and(|image| {
-            runs_native_process(image)
-                || matches!(
-                    image,
-                    crate::vfs::NativeProgram::LegacyRegistered("sh" | "bash" | "dash" | "zsh")
-                )
-        })
+        && resolved_native_image(interp, requested).is_some_and(runs_native_process)
 }
 
 fn resolved_native_image(interp: &Interp, requested: &str) -> Option<crate::vfs::NativeProgram> {

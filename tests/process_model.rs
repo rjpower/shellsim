@@ -1120,3 +1120,58 @@ fn pipeline_stage_with_long_command_text_runs() {
     assert_eq!(status, 0, "{}", &stderr[..stderr.len().min(200)]);
     assert_eq!(stdout, "10000\n");
 }
+
+#[test]
+fn shell_reads_its_program_from_stdin_one_command_at_a_time() {
+    let mut env = Environment::new();
+    // Each command runs before the next line is read, so `read` consumes the following line,
+    // `exit` leaves the rest unread, and an endless producer is consumed incrementally.
+    let (status, stdout, stderr) = run(
+        &mut env,
+        "printf 'read x\\nhello\\necho \"got $x\"\\n' | bash; \
+         printf 'echo one\\nexit 3\\necho never\\n' | sh; echo s=$?; \
+         yes 'echo y' | sh | head -n 2; \
+         printf 'if true; then\\n echo multi\\nfi\\n' | sh",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "got hello\none\ns=3\ny\ny\nmulti\n");
+}
+
+#[test]
+fn shell_image_options_set_parameters_and_drop_unexported_state() {
+    let mut env = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut env,
+        "f() { :; }; A=1; export B=2; \
+         bash -c 'echo \"$0 a=$A b=$B\"; type f >/dev/null 2>&1 || echo nofn'; \
+         sh -c 'echo $0 $1 $#' name one two; \
+         echo 'echo \"$0 [$*]\"' | bash -s p q; \
+         printf 'echo \"$0:$1\"\\n' > /script.sh; bash /script.sh arg; \
+         bash -o pipefail -c 'false | true; echo pf=$?'; \
+         bash -e -c 'false; echo unreachable'; echo e=$?",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        "bash a= b=2\nnofn\nname one 2\nbash [p q]\n/script.sh:arg\npf=1\ne=1\n"
+    );
+}
+
+#[test]
+fn shell_image_rejects_invalid_invocations_and_oversized_stdin_commands() {
+    let mut env = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut env,
+        "bash -z -c true; echo opt=$?; bash /missing; echo missing=$?; \
+         bash -c 'if'; echo syntax=$?; echo 'echo \"a' | sh; echo quote=$?; \
+         head -c 300000 /dev/zero | tr '\\0' a | sh; echo long=$?",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "opt=2\nmissing=127\nsyntax=2\nquote=2\nlong=2\n");
+    assert!(stderr.contains("bash: -z: invalid option"), "{stderr}");
+    assert!(stderr.contains("bash: /missing: No such file"), "{stderr}");
+    assert!(
+        stderr.contains("standard input command too long"),
+        "{stderr}"
+    );
+}

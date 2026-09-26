@@ -185,10 +185,17 @@ fn restore_fds(interp: &mut Interp, saved: crate::descriptors::FdTable) {
 
 const MAX_SHELL_FRAMES: usize = 4_096;
 const SHELL_POLL_QUANTUM: usize = 1;
+/// Longest single command a shell reads from standard input before rejecting it.
+const MAX_STDIN_PROGRAM_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 enum ShellFrame {
     Eval(Node),
+    /// Read the next complete command from fd 0, as a shell with no `-c` or script operand
+    /// does. `pending` holds a partial command that needs more lines.
+    ReadProgram {
+        pending: Vec<u8>,
+    },
     PrepareCommand(PreparedCommand),
     RunCommand {
         assigns: Vec<(String, String)>,
@@ -483,6 +490,18 @@ impl ShellContinuation {
         }
     }
 
+    /// Program for a shell that reads commands from standard input. It reads one line at a
+    /// time and runs each complete command before reading more, so commands observe input
+    /// that follows them and a streaming producer is consumed incrementally.
+    pub(crate) fn standard_input_program() -> Self {
+        Self {
+            frames: vec![ShellFrame::ReadProgram {
+                pending: Vec::new(),
+            }],
+            ..Self::new(&Node::Empty)
+        }
+    }
+
     pub(crate) fn poll(&mut self, interp: &mut Interp, budget: usize) -> ShellPoll {
         self.switched = false;
         self.yielded = false;
@@ -599,6 +618,65 @@ impl ShellContinuation {
                     interp.cond_depth = interp.cond_depth.saturating_sub(1);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    fn read_program(&mut self, interp: &mut Interp, mut pending: Vec<u8>) {
+        if should_unwind(interp) {
+            return;
+        }
+        // Read a byte at a time so input after the current command stays in the pipe or file
+        // for the commands that run next, as a shell reading an unseekable stdin must.
+        let eof = match interp.read_fd(0, 1) {
+            Ok(IoPoll::Ready(bytes)) if bytes.is_empty() => true,
+            Ok(IoPoll::Ready(bytes)) => {
+                pending.extend_from_slice(&bytes);
+                if pending.len() > MAX_STDIN_PROGRAM_BYTES {
+                    write_diagnostic(interp, "shellsim: standard input command too long\n");
+                    self.status = 2;
+                    return;
+                }
+                if bytes != b"\n" {
+                    self.frames.push(ShellFrame::ReadProgram { pending });
+                    return;
+                }
+                false
+            }
+            Ok(IoPoll::Blocked(wait)) => {
+                self.frames.push(ShellFrame::ReadProgram { pending });
+                self.blocked = Some(io_wait_reason(wait));
+                return;
+            }
+            // A closed or unreadable stdin ends the program as EOF does.
+            Err(_) => true,
+        };
+        let source = String::from_utf8_lossy(&pending).into_owned();
+        if !eof && crate::shell::needs_more_input(&source) {
+            self.frames.push(ShellFrame::ReadProgram { pending });
+            return;
+        }
+        if source.trim().is_empty() {
+            if !eof {
+                self.frames.push(ShellFrame::ReadProgram {
+                    pending: Vec::new(),
+                });
+            }
+            return;
+        }
+        let mut diagnostic = Vec::new();
+        match crate::commands::parse_shell_source(interp, &source, &mut diagnostic) {
+            Ok(program) => {
+                if !eof {
+                    self.frames.push(ShellFrame::ReadProgram {
+                        pending: Vec::new(),
+                    });
+                }
+                self.push(interp, ShellFrame::Eval(program));
+            }
+            Err(status) => {
+                write_diagnostic(interp, &String::from_utf8_lossy(&diagnostic));
+                self.status = status;
             }
         }
     }
@@ -1057,6 +1135,7 @@ impl ShellContinuation {
     fn step(&mut self, interp: &mut Interp, frame: ShellFrame) {
         match frame {
             ShellFrame::Eval(node) => self.eval(interp, node),
+            ShellFrame::ReadProgram { pending } => self.read_program(interp, pending),
             ShellFrame::PrepareCommand(command) => self.prepare_command(interp, command),
             ShellFrame::RunCommand {
                 assigns,

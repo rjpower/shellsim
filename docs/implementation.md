@@ -25,7 +25,9 @@ As in Bash, a forked subshell (background job, pipeline stage, or `sh -c` child)
 native command in place, so `$!` and pipeline PIDs name the program doing the work and signals
 reach it directly. Native images use the same exec through `System::exec_argv`: `env` and
 `nohup` replace themselves with their command, and a shell started by argv runs its `-c`
-source or script in that process. Exec keeps ignored signals ignored and resets caught ones.
+source or script in that process. With no `-c` or script operand, or with `-s`, the shell reads
+its program from standard input one command at a time, so each command sees the input after it.
+Loading a shell image keeps only exported variables, as a real `execve` does. Exec keeps ignored signals ignored and resets caught ones.
 `timeout` runs its command in a new process group and signals the whole group. A shell writer that hits a closed pipe receives `SIGPIPE` and exits silently
 with status 141 unless `SIGPIPE` is ignored.
 
