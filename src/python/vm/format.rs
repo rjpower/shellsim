@@ -1,8 +1,8 @@
 //! Python's format-specification mini-language for f-strings, `format`, and `str.format`.
 //!
-//! A specification is parsed once into [`FormatSpec`], then rendered for an integer, float, or
-//! string. The supported grammar is `[align][sign][#][0][width][,][.precision][type]` with the
-//! default space fill. Custom fill characters, `=` alignment, the space sign, `_` grouping, and
+//! A specification is parsed once into [`FormatSpec`], then rendered for an integer, float,
+//! string, or complex number. The supported grammar is
+//! `[align][sign][#][0][width][,][.precision][type]` with the default space fill. Custom fill characters, `=` alignment, the space sign, `_` grouping, and
 //! the `n`/`c` presentations are rejected explicitly rather than approximated.
 
 use super::BigInt;
@@ -189,6 +189,50 @@ pub(super) fn format_float(value: f64, repr: &str, spec: &FormatSpec) -> Result<
     Ok(spec.pad_number(spec.sign(value.is_sign_negative()), body))
 }
 
+/// Format both complex components with the float grammar and align the combined value.
+/// The default presentation preserves complex repr's parentheses and pure-imaginary shortcut.
+/// Explicit numeric presentations always include both components. Zero padding and percent
+/// presentation are invalid for complex values, as in CPython.
+pub(super) fn format_complex(real: f64, imag: f64, spec: &FormatSpec) -> Result<String, String> {
+    if spec.zero {
+        return Err("Zero padding is not allowed in complex format specifier".into());
+    }
+    if !matches!(spec.presentation, None | Some('f' | 'e' | 'E' | 'g' | 'G')) {
+        return Err(format!(
+            "Unknown format code '{}' for object of type 'complex'",
+            spec.presentation.unwrap_or_default()
+        ));
+    }
+    let mut component = *spec;
+    component.width = 0;
+    component.align = None;
+    if component.presentation.is_none() && component.precision.is_some() {
+        component.presentation = Some('g');
+    }
+    let render = |value: f64, plus: bool| {
+        let value = if value.is_nan() { f64::NAN } else { value };
+        let mut component = component;
+        component.plus = plus;
+        format_float(
+            value,
+            &super::super::complex::repr_component(value, false),
+            &component,
+        )
+    };
+    let default_type = spec.presentation.is_none();
+    let body = if default_type && real == 0.0 && !real.is_sign_negative() {
+        format!("{}j", render(imag, spec.plus)?)
+    } else {
+        let body = format!("{}{}j", render(real, spec.plus)?, render(imag, true)?);
+        if default_type {
+            format!("({body})")
+        } else {
+            body
+        }
+    };
+    Ok(align(&body, spec.width, spec.align.unwrap_or(Align::Right)))
+}
+
 /// Format a string with the `s` or default presentation.
 pub(super) fn format_text(value: &str, spec: &FormatSpec) -> Result<String, String> {
     if spec.plus || spec.alternate || spec.zero || spec.grouping || spec.precision.is_some() {
@@ -308,6 +352,19 @@ mod tests {
 
     fn integer(value: i64, spec: &str) -> Result<String, String> {
         format_integer(value.into(), &FormatSpec::parse(spec)?)
+    }
+
+    #[test]
+    fn complex_format_aligns_the_whole_number_and_rejects_zero_fill() {
+        assert_eq!(
+            format_complex(1.0, 2.0, &FormatSpec::parse(">12.1f").unwrap()).unwrap(),
+            "    1.0+2.0j"
+        );
+        assert_eq!(
+            format_complex(0.0, 2.0, &FormatSpec::parse("+").unwrap()).unwrap(),
+            "+2j"
+        );
+        assert!(format_complex(1.0, 2.0, &FormatSpec::parse("010.1f").unwrap()).is_err());
     }
 
     #[test]

@@ -84,10 +84,6 @@ fn real_only_operations_reject_complex_explicitly() {
         ),
         ("round(1j)", "expected a real number, got complex"),
         (
-            "f'{1j:.2f}'",
-            "format specifications for complex numbers are not implemented",
-        ),
-        (
             "max(1j, 2j)",
             "not supported between instances of 'complex' and 'complex'",
         ),
@@ -100,4 +96,52 @@ fn real_only_operations_reject_complex_explicitly() {
         assert_ne!(status, 0, "{source} unexpectedly succeeded");
         assert!(stderr.contains(expected), "{source}: {stderr}");
     }
+}
+
+#[test]
+fn complex_values_support_string_format_specifications() {
+    let source = r#"z = 3.14159 + 2.71828j
+print(f"{z:.2f}")
+print("{:.1f}".format(1 + 2j))
+"#;
+    assert_eq!(
+        run(source),
+        (0, "3.14+2.72j\n1.0+2.0j\n".into(), String::new())
+    );
+}
+
+#[test]
+fn complex_formats_preserve_default_repr_and_format_components() {
+    // Checked against CPython: default presentation keeps parentheses and suppresses +0 real.
+    let source = r#"z = 1234.5-5678.5j
+print(f'{z:.2}', f'{z:.2g}', f'{z:+.2f}', f'{z:,.1f}')
+print(f'{1+2j:>14.1f}', f'{2j:.1f}', f'{complex(-0.0, -0.0):.1f}')
+print(f'{1+2j:10}', f'{2j:+}', f'{1+2j:.1e}')
+for spec in ['010.2f', '.2%', 'd', '#.2f']:
+    try:
+        ('{:' + spec + '}').format(1j)
+    except ValueError:
+        print('ValueError')
+"#;
+    assert_eq!(run(source), (0, "(1.2e+03-5.7e+03j) 1.2e+03-5.7e+03j +1234.50-5678.50j 1,234.5-5,678.5j\n      1.0+2.0j 0.0+2.0j -0.0-0.0j\n    (1+2j) +2j 1.0e+00+2.0e+00j\nValueError\nValueError\nValueError\nValueError\n".into(), String::new()));
+}
+
+#[test]
+fn conj_alias_matches_conjugate_for_complex_and_numpy_scalars() {
+    // Builtin complex.conj is a shellsim extension; NumPy scalars use the same alias.
+    let source = r#"import numpy as np
+for value in [1+2j, 2j, complex(1, -0.0), np.complex128(3+4j), np.float64(2), np.int32(3)]:
+    assert repr(value.conj()) == repr(value.conjugate())
+    assert type(value.conj()) is type(value.conjugate())
+assert (1+2j).conj().conj() == 1+2j
+for call in [lambda: (1j).conj(1), lambda: (1j).conj(x=1), lambda: np.float64(2).conj(1)]:
+    try:
+        call()
+    except TypeError:
+        pass
+    else:
+        assert False
+print('ok')
+"#;
+    assert_eq!(run(source), (0, "ok\n".into(), String::new()));
 }

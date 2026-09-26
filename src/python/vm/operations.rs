@@ -1,6 +1,6 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
-use super::format::{format_float, format_integer, format_text, FormatSpec};
+use super::format::{format_complex, format_float, format_integer, format_text, FormatSpec};
 use super::{
     number, protocol, BigInt, BinaryOperator, ComparisonOperator, Object, Ordering, SequenceKind,
     Slot, ToPrimitive, UnaryOperator, Value, Vm,
@@ -397,10 +397,12 @@ impl Vm<'_> {
     }
 
     fn format_unconverted_value(&self, value: &Value, text: &str) -> Result<String, String> {
-        if super::number::is_complex(&self.state.heap, value) {
-            return Err("format specifications for complex numbers are not implemented".into());
-        }
         let spec = FormatSpec::parse(text)?;
+        if let Some(number::NumberRef::Complex(real, imag)) =
+            super::number::view(&self.state.heap, value)
+        {
+            return format_complex(real, imag, &spec);
+        }
         let number = super::number::view(&self.state.heap, value);
         match (spec.presentation, number) {
             (Some('f' | 'e' | 'E' | 'g' | 'G' | '%'), Some(_))
