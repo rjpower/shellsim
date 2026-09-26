@@ -559,3 +559,14 @@ fn python_repl_persists_and_returns_to_shell() {
     let (_, shell_out, _) = env.run_script_capture("echo shell");
     assert_eq!(String::from_utf8_lossy(&shell_out), "shell\n");
 }
+
+#[test]
+fn empty_double_quoted_word_is_one_empty_field() {
+    // Only an empty quoted array or `"$@"` expansion disappears; `""` and `"$empty"` remain.
+    assert_eq!(
+        run("f(){ printf '%s,' \"$#\"; }; e=; a=(); set --; \
+             f \"\" x; f \"\"; f \"$e\"; f $e; f \"$@\"; f \"${a[@]}\"; f \"x${a[@]}\"; \
+             printf '[%s]' \"\" x"),
+        (0, "2,1,1,0,0,0,1,[][x]".into(), String::new())
+    );
+}
