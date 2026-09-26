@@ -1574,6 +1574,73 @@ mod tests {
     }
 
     #[test]
+    fn wasm_guest_answers_streaming_stdin_and_snapshots_fail_explicitly() {
+        // Echoes each read back to stdout until EOF.
+        let guest = wat::parse_str(
+            r#"(module
+                (import "wasi_snapshot_preview1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))
+                (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (func (export "_start")
+                    (loop $echo
+                        (i32.store (i32.const 0) (i32.const 64))
+                        (i32.store (i32.const 4) (i32.const 64))
+                        (drop (call $read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8)))
+                        (if (i32.eqz (i32.load (i32.const 8))) (then return))
+                        (i32.store (i32.const 4) (i32.load (i32.const 8)))
+                        (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 12)))
+                        (br $echo))))"#,
+        )
+        .unwrap();
+        let mut session = HarnessSession::new(Limits::default());
+        session
+            .environment
+            .vfs
+            .write("/", "/work/echo", &guest, 0o755)
+            .unwrap();
+        let action_id = session
+            .start_action("./echo", &[], false)
+            .unwrap()
+            .action_id;
+        let blocked = session.poll_action(action_id, 100, false).unwrap();
+        assert!(matches!(
+            blocked.state,
+            ActionState::Blocked {
+                reason: Some(WaitReasonView::InputReadable { .. })
+            }
+        ));
+        session.write_action_stdin(action_id, b"hello\n").unwrap();
+        let blocked = session.poll_action(action_id, 100, false).unwrap();
+        assert!(matches!(blocked.state, ActionState::Blocked { .. }));
+        let reply = session.read_action_output(action_id).unwrap();
+        assert_eq!(STANDARD.decode(reply.stdout_base64).unwrap(), b"hello\n");
+
+        // A snapshot cannot carry the live Wasmtime stack; its copy of the guest fails when
+        // it is next scheduled.
+        let mut branch = session.fork().unwrap();
+        branch.close_action_stdin(action_id).unwrap();
+        let failed = branch.poll_action(action_id, 100, false).unwrap();
+        assert_eq!(failed.state, ActionState::Complete { status: 126 });
+        let diagnostic = branch.read_action_output(action_id).unwrap();
+        assert!(
+            String::from_utf8(STANDARD.decode(diagnostic.stderr_base64).unwrap())
+                .unwrap()
+                .contains("cannot snapshot a running wasm process")
+        );
+
+        session.write_action_stdin(action_id, b"again\n").unwrap();
+        session.close_action_stdin(action_id).unwrap();
+        let complete = session.poll_action(action_id, 100, false).unwrap();
+        assert_eq!(complete.state, ActionState::Complete { status: 0 });
+        let output = session.read_action_output(action_id).unwrap();
+        assert_eq!(STANDARD.decode(output.stdout_base64).unwrap(), b"again\n");
+        assert_eq!(
+            session.environment.resources.memory_mark(),
+            branch.environment.resources.memory_mark()
+        );
+    }
+
+    #[test]
     fn retained_action_accepts_bounded_streaming_stdin() {
         let mut session = HarnessSession::new(Limits::default());
         let action_id = session.start_action("cat", &[], false).unwrap().action_id;

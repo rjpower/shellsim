@@ -50,6 +50,7 @@ mod text;
 mod unavailable;
 pub mod util;
 mod wasm;
+pub(crate) use wasm::{is_wasm_executable, WasmProcess};
 pub use wasm::{SessionPoll, SessionResult, WasmSession};
 pub(crate) mod xargs;
 mod zipcmd;
@@ -510,9 +511,7 @@ pub(crate) fn poll(
 /// input before it can suspend.
 pub(crate) fn starts_before_input(interp: &Interp, argv: &[String]) -> bool {
     argv.first().is_some_and(|requested| {
-        if !(builtins::is_shell_builtin_name(requested) && !requested.contains('/'))
-            && resolved_native_image(interp, requested).is_some_and(runs_native_process)
-        {
+        if execs_native_image(interp, requested) {
             return true;
         }
         let Some(command) = command_name_for_dispatch(interp, requested) else {
@@ -533,7 +532,7 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
     let Some(requested) = argv.first() else {
         return false;
     };
-    if resolved_native_image(interp, requested).is_some_and(runs_native_process) {
+    if resolves_to_process_image(interp, requested) {
         return false;
     }
     if !builtins::is_shell_builtin_name(requested) {
@@ -783,7 +782,7 @@ fn dispatch(
     // corresponding external image, even if its basename is also a builtin.
     let builtin = !requested.contains('/') && builtins::is_shell_builtin_name(requested);
     let native = resolved_native_image(interp, requested);
-    if !builtin && native.is_some_and(runs_native_process) {
+    if execs_native_image(interp, requested) {
         return start_child_sequence(
             interp,
             vec![ChildCommand {
@@ -929,7 +928,7 @@ fn dispatch(
                 interp.resources.cpu_used(),
                 interp.vfs.disk_used(),
             );
-            if let Some(result) = util::try_exec_script(interp, &path, args, &stdin, out, err) {
+            if let Some(result) = util::try_exec_script(interp, &path, args, &stdin, err) {
                 finish_ready_invocation(interp, &result);
                 return result;
             }
@@ -1035,7 +1034,20 @@ pub(crate) fn parse_shell_source(
 /// builtins still run inside the calling shell image.
 pub(crate) fn execs_native_image(interp: &Interp, requested: &str) -> bool {
     (requested.contains('/') || !builtins::is_shell_builtin_name(requested))
-        && resolved_native_image(interp, requested).is_some_and(runs_native_process)
+        && resolves_to_process_image(interp, requested)
+}
+
+/// Whether `requested` names an image the process loader runs directly: a native program with
+/// a process continuation, or a Wasm executable.
+fn resolves_to_process_image(interp: &Interp, requested: &str) -> bool {
+    let util::ExecutableLookup::Found(path) = util::resolve_executable(interp, requested) else {
+        return false;
+    };
+    match interp.vfs.metadata("/", &path, true).map(|node| node.kind) {
+        Ok(crate::vfs::NodeKind::NativeExecutable(image)) => runs_native_process(image),
+        Ok(crate::vfs::NodeKind::File(_)) => wasm::is_wasm_executable(&interp.vfs, &path),
+        _ => false,
+    }
 }
 
 fn resolved_native_image(interp: &Interp, requested: &str) -> Option<crate::vfs::NativeProgram> {

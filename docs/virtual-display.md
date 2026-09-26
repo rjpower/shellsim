@@ -25,6 +25,6 @@ the host, which can inspect the copied frame, inject bounded key events, then re
 also stop the session at a frame boundary. The session owns its environment until it stops; live
 Wasmtime state is never copied by `Environment::clone()`.
 
-This is not yet a scheduler-owned Wasm process. Live pipe waits and virtual timer sleeps still
-need integration with the process table and scheduler. The interface supplies a display and keys,
-not audio or networking.
+A session buffers the guest's standard streams instead of using process descriptors; a Wasm
+executable started from the shell runs as a scheduled process instead. The interface supplies a
+display and keys, not audio or networking.

@@ -32,8 +32,8 @@ receive it directly; the Wasm adapter should translate imports to the same opera
 `PWD` and `OLDPWD` variables in its own userland state after a successful `chdir`.
 Descriptor and filesystem operations have typed results; the Wasm adapter uses `System` for
 open files, file metadata, directory mutation, and the virtual display. A shared native command
-adapter now runs typed command bodies as scheduled processes. WASI stdio buffering, clock, and
-process imports still need to move to this boundary.
+adapter now runs typed command bodies as scheduled processes. Wasm executables load as their own
+process image, and WASI stdio uses the process's descriptors through this boundary.
 
 The new `syscalls.rs` begins this boundary for regular files. It accepts typed open options,
 allocates descriptors in the active process, and owns close and seek. The WASI adapter now uses
@@ -73,19 +73,17 @@ leave `cd`, variables, and other state-changing builtins in its own PID. Only th
 default shell be loaded from `/bin/sh` like any other native program image. Native Rust commands
 need not become Wasm binaries to use this boundary.
 
-Wasm stdin/stdout/stderr are still buffered at command dispatch. The shell drains a producer's
-pipe before starting a Wasm consumer, so a compiled `wc` can count input larger than pipe
-capacity and pass its result to another command. It does not prove suspension on a live pipe:
-an interactive producer-consumer exchange still cannot run. The next slice should move
-stdio onto process descriptors and define a Wasmtime suspension mechanism when a descriptor
-returns `IoPoll::Blocked`. A guest continuation must resume at the blocked instruction, not
-restart `_start` or treat temporary absence of input as EOF. Before enabling Wasm by default,
-resolve how an active Wasmtime continuation can be independently cloned for harness forks, or
-reject that fork explicitly. The Rust shell implementation and native `wc` should remain until
-those gates pass.
+A Wasm executable is a scheduled process image. Its guest runs on a Wasmtime async stack; when
+`fd_read` or `fd_write` returns `IoPoll::Blocked`, the host call suspends that stack and the
+process blocks on the same wait reason a native image would report. The guest resumes at the
+blocked call rather than restarting `_start` or seeing a temporary absence of input as EOF.
+Fuel yields end a quantum for compute-bound guests. Fuel is charged to the machine before each
+host call and at each yield, so concurrent guests share one CPU budget. A harness fork cannot
+clone a live Wasmtime stack; the fork's copy of a running guest fails with status 126 and a
+diagnostic, while the original continues.
 
-Only after live pipe behavior is sound should shellsim consider a default Wasm `wc`, then a
-streaming command and a filesystem walker. WASI Preview 1 alone does not supply Unix
+With live pipe behavior in place, shellsim can consider a default Wasm `wc`, then a streaming
+command and a filesystem walker. WASI Preview 1 alone does not supply Unix
 `exec`/`wait` semantics.
 
 ## Compiler execution and a future process extension
@@ -95,8 +93,6 @@ resolved the compiler as a VFS executable, and it read source and wrote a Wasm b
 ordinary virtual file descriptors. That fixture is no longer shipped. The preferred next compiler
 is TinyCC. Its pinned package and a wasi-libc subset compile and run C programs inside shellsim;
 additional libc behavior still requires corresponding virtual WASI operations.
-The current Wasm command path is still buffered, not yet a separately
-scheduled guest program image.
 
 If a compiler driver or a Wasm-hosted shell must launch separate tools, add a versioned
 `shellsim_process_v1` guest import adapter over typed kernel operations, not a compiler-specific
@@ -106,7 +102,6 @@ wait for that PID's exit status. `exec` replacement can be a distinct operation 
 works. The native shell would call the same typed kernel operations directly. The adapter must
 reject unsupported flags and paths rather than trying the host.
 
-The blocking `wait` operation is gated on a resumable Wasm continuation. When a child is running,
-the caller must suspend on a scheduler wait reason while the child makes progress; a blocking host
-call or a permanent `EAGAIN` retry loop would deadlock programs that work on Unix. This is why
-the extension should follow live Wasm process scheduling, not precede it.
+The blocking `wait` operation must suspend on a scheduler wait reason while the child makes
+progress; a blocking host call or a permanent `EAGAIN` retry loop would deadlock programs that
+work on Unix. The async host calls used for `fd_read` and `fd_write` provide that mechanism.

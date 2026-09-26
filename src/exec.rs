@@ -3017,6 +3017,9 @@ fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
         match delivery {
             crate::interp::SignalDelivery::Terminate(signal) => {
                 let status = 128 + signal.number();
+                if let Some(mut program) = interp.process.program.take() {
+                    program.release_owned_memory(interp);
+                }
                 interp.invocations.finish_process(
                     owner,
                     status,

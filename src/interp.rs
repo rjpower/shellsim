@@ -409,7 +409,10 @@ impl ProcessState {
             aliases: self.aliases.clone(),
             last_status: self.last_status,
             random_state: Cell::new(self.random_state.get()),
-            syscall_random_state: self.syscall_random_state,
+            // Kernel entropy is never shared between processes. Mixing in the child PID keeps
+            // it deterministic while giving each child its own stream.
+            syscall_random_state: self.syscall_random_state
+                ^ u64::from(identity.pid).wrapping_mul(0x9e37_79b9_7f4a_7c15),
             arg0: self.arg0.clone(),
             positional: self.positional.clone(),
             getopts: self.getopts.clone(),
@@ -881,6 +884,13 @@ impl Environment {
                     }
                     Some(crate::vfs::NodeKind::NativeExecutable(image)) => {
                         Some(crate::program::NativeProcess::from_image(image, &argv))
+                    }
+                    Some(crate::vfs::NodeKind::File(_))
+                        if crate::commands::is_wasm_executable(&self.vfs, &path) =>
+                    {
+                        Some(crate::program::NativeProcess::Wasm(
+                            crate::commands::WasmProcess::new(path, argv.clone()),
+                        ))
                     }
                     _ => {
                         argv[0] = path;
