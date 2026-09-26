@@ -346,7 +346,6 @@ pub(crate) fn try_exec_script(
     stdin: &[u8],
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
-    resumable: bool,
 ) -> Option<crate::commands::CommandPoll> {
     let data = interp.vfs.read("/", path).ok()?;
     if data.starts_with(b"\0asm") {
@@ -356,56 +355,36 @@ pub(crate) fn try_exec_script(
     }
     let text = String::from_utf8_lossy(&data);
     let first = text.lines().next().unwrap_or("");
-    let code = if first.starts_with("#!") && first.contains("python") {
-        let mut a = vec!["python3.14".to_string()];
+    // Interpreted scripts run as a child that loads the interpreter image with the script
+    // path as its operand, as the kernel does for a `#!` line.
+    let mut argv = if first.starts_with("#!") && first.contains("python") {
+        let mut argv = vec!["/usr/bin/python3.14".to_string()];
         if first != "#!shellsim-python" {
-            a.push(path.to_string());
+            argv.push(path.to_string());
         }
-        a.extend(args.iter().cloned());
-        if resumable {
-            crate::commands::start_child_sequence(
-                interp,
-                vec![crate::commands::ChildCommand {
-                    argv: a,
-                    stdin: Some(stdin.to_vec()),
-                    cwd: None,
-                    environment: None,
-                    ..Default::default()
-                }],
-                true,
-            )
-        } else {
-            crate::commands::CommandPoll::Ready(crate::python::run_python(
-                interp,
-                &a,
-                stdin.to_vec(),
-                out,
-                err,
-            ))
-        }
+        argv
     } else if !first.starts_with("#!")
         || first.split_whitespace().next().is_some_and(|interpreter| {
             matches!(interpreter, "#!/bin/sh" | "#!/bin/bash" | "#!/usr/bin/bash")
         })
     {
-        if resumable {
-            super::proc::start_shell_source(
-                interp,
-                &text,
-                args.to_vec(),
-                (!stdin.is_empty()).then(|| stdin.to_vec()),
-                err,
-            )
-        } else {
-            let saved_pos = std::mem::replace(&mut interp.positional, args.to_vec());
-            let status = interp.run_script_into(&text, out, err);
-            interp.positional = saved_pos;
-            crate::commands::CommandPoll::Ready(status)
-        }
+        vec!["/usr/bin/sh".to_string(), path.to_string()]
     } else {
         ewln(err, &format!("{path}: unsupported script interpreter"));
-        crate::commands::CommandPoll::Ready(126)
+        return Some(crate::commands::CommandPoll::Ready(126));
     };
+    argv.extend(args.iter().cloned());
+    let code = crate::commands::start_child_sequence(
+        interp,
+        vec![crate::commands::ChildCommand {
+            argv,
+            stdin: (!stdin.is_empty()).then(|| stdin.to_vec()),
+            cwd: None,
+            environment: None,
+            ..Default::default()
+        }],
+        true,
+    );
     Some(code)
 }
 

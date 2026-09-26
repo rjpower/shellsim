@@ -236,6 +236,8 @@ enum ShellFrame {
     ReadProgram {
         pending: Vec<u8>,
     },
+    /// End the shell with the current status once an `exec`'d child finishes.
+    ExitWithStatus,
     PrepareCommand(PreparedCommand),
     RunCommand {
         assigns: Vec<(String, String)>,
@@ -1176,6 +1178,7 @@ impl ShellContinuation {
         match frame {
             ShellFrame::Eval(node) => self.eval(interp, node),
             ShellFrame::ReadProgram { pending } => self.read_program(interp, pending),
+            ShellFrame::ExitWithStatus => interp.exiting = Some(self.status),
             ShellFrame::PrepareCommand(command) => self.prepare_command(interp, command),
             ShellFrame::RunCommand {
                 assigns,
@@ -2215,7 +2218,9 @@ impl ShellContinuation {
         }
         restore_command_variables(interp, temporary_variables);
         interp.cmd_trace.record(&argv[0]);
-        if let Some(body) = interp.funcs.get(&argv[0]).cloned() {
+        if argv[0] == "exec" && !interp.funcs.contains_key("exec") {
+            self.exec_builtin(interp, argv, variables);
+        } else if let Some(body) = interp.funcs.get(&argv[0]).cloned() {
             let positional = std::mem::replace(&mut interp.positional, argv[1..].to_vec());
             if !self.ensure_capacity(interp, 2) {
                 interp.positional = positional;
@@ -2231,6 +2236,91 @@ impl ShellContinuation {
         } else {
             self.eval_external_argv(interp, argv, variables, false);
         }
+    }
+
+    /// Run the `exec` builtin with a command operand. A native image replaces this process,
+    /// keeping its PID and committing every pending redirection; the rest of the program and
+    /// any EXIT trap are discarded, as with `execve`. Programs that cannot be loaded as an image
+    /// (scripts and legacy bodies) run as a child, and the shell then exits with their status.
+    /// `exec` with only redirections is handled when its command is prepared.
+    fn exec_builtin(
+        &mut self,
+        interp: &mut Interp,
+        mut argv: Vec<String>,
+        variables: Vec<(String, Option<String>)>,
+    ) {
+        argv.remove(0);
+        if argv.first().is_some_and(|argument| argument == "--") {
+            argv.remove(0);
+        }
+        if let Some(option) = argv
+            .first()
+            .filter(|argument| argument.len() > 1 && argument.starts_with('-'))
+        {
+            let message = if matches!(option.as_str(), "-a" | "-c" | "-l") {
+                format!("shellsim: exec: {option}: unsupported option\n")
+            } else {
+                format!("shellsim: exec: {option}: invalid option\n")
+            };
+            write_diagnostic(interp, &message);
+            restore_command_variables(interp, variables);
+            self.status = 2;
+            return;
+        }
+        if argv.is_empty() {
+            restore_command_variables(interp, variables);
+            self.status = 0;
+            return;
+        }
+        // `exec` bypasses builtins and functions: `exec printf` loads /usr/bin/printf.
+        let image = match crate::commands::util::resolve_executable(interp, &argv[0]) {
+            crate::commands::util::ExecutableLookup::Found(path) => path,
+            // A failed exec leaves the shell in place, so its EXIT trap still runs.
+            crate::commands::util::ExecutableLookup::NotExecutable(path) => {
+                write_diagnostic(
+                    interp,
+                    &format!("shellsim: exec: {path}: Permission denied\n"),
+                );
+                restore_command_variables(interp, variables);
+                self.status = 126;
+                interp.exiting = Some(126);
+                return;
+            }
+            crate::commands::util::ExecutableLookup::NotFound => {
+                write_diagnostic(interp, &format!("shellsim: exec: {}: not found\n", argv[0]));
+                restore_command_variables(interp, variables);
+                self.status = 127;
+                interp.exiting = Some(127);
+                return;
+            }
+        };
+        interp.exit_disposition = None;
+        if !crate::commands::execs_native_image(interp, &image) {
+            if !self.ensure_capacity(interp, 1) {
+                restore_command_variables(interp, variables);
+                return;
+            }
+            self.frames.push(ShellFrame::ExitWithStatus);
+            self.eval_external_argv(interp, argv, variables, false);
+            return;
+        }
+        let mut remaining = Vec::new();
+        for frame in std::mem::take(&mut self.frames) {
+            match frame {
+                ShellFrame::RestoreRedirect(scope) => commit_redirects(interp, scope),
+                frame => remaining.push(frame),
+            }
+        }
+        self.frames = remaining;
+        self.abort(interp);
+        let pid = interp.process.pid;
+        if let Err(error) = interp.exec_argv_image(pid, argv) {
+            write_diagnostic(interp, &format!("shellsim: exec: {error}\n"));
+            self.status = 126;
+            interp.exiting = Some(126);
+            return;
+        }
+        self.replaced = true;
     }
 
     /// Replace this subshell's image with `argv` when nothing else remains to run in it.

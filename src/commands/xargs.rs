@@ -3,51 +3,10 @@
 //! Shell execution uses scheduler-owned logical children. Direct native dispatch retains the
 //! synchronous entry point used by command composition outside a shell continuation.
 
-use std::collections::HashMap;
-
 use crate::commands::util::ewln;
-use crate::commands::{ChildCommand, CommandContext, CommandPoll, CommandSpec, Io, Trust};
 
 const MAX_TOKENS: usize = 65_536;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024 * 1024;
-
-pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg_buffered_resumable;
-    reg_buffered_resumable(m, &["xargs"], Trust::Real, cmd_xargs, start_xargs);
-}
-
-fn cmd_xargs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let commands = match xargs_commands(args, &io.stdin, io.err) {
-        Ok(commands) => commands,
-        Err(status) => return status,
-    };
-    let mut status = 0;
-    for argv in commands {
-        status = crate::commands::run(interp, &argv, Vec::new(), io.out, io.err);
-    }
-    status
-}
-
-fn start_xargs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
-    let commands = match xargs_commands(args, &io.stdin, io.err) {
-        Ok(commands) => commands,
-        Err(status) => return CommandPoll::Ready(status),
-    };
-    crate::commands::start_child_sequence(
-        interp,
-        commands
-            .into_iter()
-            .map(|argv| ChildCommand {
-                argv,
-                stdin: Some(Vec::new()),
-                cwd: None,
-                environment: None,
-                ..Default::default()
-            })
-            .collect(),
-        false,
-    )
-}
 
 pub(crate) fn xargs_commands(
     args: &[String],

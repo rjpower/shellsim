@@ -1,293 +1,34 @@
-//! "Process-ish" commands: virtual-clock time/scheduling (sleep/usleep/timeout/date/sync),
-//! nested shells (sh/bash/dash/zsh), uv launchers, the Python shim, and jq.
+//! "Process-ish" commands: date/sync, `timeout` argument parsing shared with the native image,
+//! uv launchers, the Python shim, and jq.
 
 use std::collections::HashMap;
 
-use crate::clock::{
-    BlockOutcome, EventKind, MAIN_TASK_ID, NANOS_PER_MICROSECOND, NANOS_PER_SECOND,
-};
+use crate::clock::NANOS_PER_SECOND;
 use crate::commands::util::{ewln, parse_duration_ns, wln};
-use crate::commands::{
-    ChildCommand, CommandContext, CommandPoll, CommandResume, CommandSpec, Io, Trust,
-};
+use crate::commands::{CommandContext, CommandPoll, CommandResume, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 use crate::scheduler::WaitReason;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::{reg, reg_buffered_resumable, reg_resumable, reg_unsupported};
+    use super::{reg, reg_resumable, reg_unsupported};
     // time / scheduling (virtual clock, never blocks)
-    reg_resumable(m, &["sleep"], Trust::Real, cmd_sleep, start_sleep);
-    reg_resumable(m, &["usleep"], Trust::Real, cmd_usleep, start_usleep);
-    reg_buffered_resumable(m, &["timeout"], Trust::Partial, cmd_timeout, start_timeout);
     super::reg_system(m, "/usr/bin/date", Trust::Real, cmd_date);
     super::reg_system(m, "/usr/bin/sync", Trust::Real, |_, _| 0);
 
-    // nested shells / uv-launched verifiers
-    // Programs load these as shell images (`Interp::shell_image`); `cmd_sh` serves the
-    // remaining synchronous nested-command callers.
-    reg(m, &["sh", "bash", "dash", "zsh"], Trust::Real, cmd_sh);
+    // uv-launched verifiers
     reg(m, &["uv", "uvx"], Trust::Partial, cmd_uv);
     reg_unsupported(m, &["uvenv"]);
 
     // interpreters. Python reads its own standard input lazily through the descriptor layer
     // (see `start_python_impl`), so it is registered without eager stdin buffering.
-    reg_resumable(m, &["python3"], Trust::Partial, cmd_python3, start_python3);
-    reg_resumable(m, &["python"], Trust::Partial, cmd_python, start_python);
-    reg_resumable(
-        m,
-        &["python3.11"],
-        Trust::Partial,
-        cmd_python311,
-        start_python311,
-    );
-    reg_resumable(
-        m,
-        &["python3.12"],
-        Trust::Partial,
-        cmd_python312,
-        start_python312,
-    );
-    reg_resumable(
-        m,
-        &["python3.13"],
-        Trust::Partial,
-        cmd_python313,
-        start_python313,
-    );
-    reg_resumable(
-        m,
-        &["python3.14"],
-        Trust::Partial,
-        cmd_python314,
-        start_python314,
-    );
+    reg_resumable(m, &["python3"], Trust::Partial, start_python3);
+    reg_resumable(m, &["python"], Trust::Partial, start_python);
+    reg_resumable(m, &["python3.11"], Trust::Partial, start_python311);
+    reg_resumable(m, &["python3.12"], Trust::Partial, start_python312);
+    reg_resumable(m, &["python3.13"], Trust::Partial, start_python313);
+    reg_resumable(m, &["python3.14"], Trust::Partial, start_python314);
     reg(m, &["pytest"], Trust::Partial, cmd_pytest);
     super::reg_system_poll(m, "/usr/bin/jq", Trust::Partial, cmd_jq);
-}
-
-fn start_sleep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
-    if args.is_empty() {
-        return CommandPoll::Ready(1);
-    }
-    let duration = args.iter().try_fold(0_u64, |total, argument| {
-        parse_duration_ns(argument).and_then(|part| {
-            total
-                .checked_add(part)
-                .ok_or_else(|| "duration is too large".to_string())
-        })
-    });
-    start_timer(interp, duration, "sleep", io)
-}
-
-fn start_usleep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
-    let Some(argument) = args.first() else {
-        ewln(io.err, "usleep: missing operand");
-        return CommandPoll::Ready(1);
-    };
-    let duration = argument
-        .parse::<u64>()
-        .ok()
-        .and_then(|micros| micros.checked_mul(NANOS_PER_MICROSECOND))
-        .ok_or_else(|| format!("invalid time interval {argument:?}"));
-    start_timer(interp, duration, "usleep", io)
-}
-
-fn start_timer(
-    interp: &mut CommandContext<'_>,
-    duration: Result<u64, String>,
-    command: &str,
-    io: &mut Io,
-) -> CommandPoll {
-    let duration = match duration {
-        Ok(duration) => duration,
-        Err(error) => {
-            ewln(io.err, &format!("{command}: {error}"));
-            return CommandPoll::Ready(1);
-        }
-    };
-    let pid = interp.process.pid;
-    match interp.clock.schedule_wake_after(u64::from(pid), duration) {
-        Ok(event) => CommandPoll::Blocked(
-            WaitReason::Timer(event.deadline_ns()),
-            CommandResume::Timer {
-                deadline_ns: event.deadline_ns(),
-                status: 0,
-            },
-        ),
-        Err(error) => {
-            ewln(io.err, &format!("{command}: {error}"));
-            CommandPoll::Ready(1)
-        }
-    }
-}
-
-fn cmd_sleep(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> i32 {
-    if args.is_empty() {
-        return 1;
-    }
-    let duration = args.iter().try_fold(0_u64, |total, argument| {
-        parse_duration_ns(argument).and_then(|part| {
-            total
-                .checked_add(part)
-                .ok_or_else(|| "duration is too large".to_string())
-        })
-    });
-    let duration = match duration {
-        Ok(duration) => duration,
-        Err(error) => {
-            ewln(_io.err, &format!("sleep: {error}"));
-            return 1;
-        }
-    };
-    match interp.clock.block_task(MAIN_TASK_ID, duration) {
-        Ok(BlockOutcome::Completed) => 0,
-        Ok(BlockOutcome::Interrupted(event)) => {
-            interp.deadline_interrupt = Some(event.id);
-            124
-        }
-        Err(error) => {
-            ewln(_io.err, &format!("sleep: {error}"));
-            1
-        }
-    }
-}
-
-fn cmd_usleep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(argument) = args.first() else {
-        ewln(io.err, "usleep: missing operand");
-        return 1;
-    };
-    let duration = match argument
-        .parse::<u64>()
-        .ok()
-        .and_then(|micros| micros.checked_mul(NANOS_PER_MICROSECOND))
-    {
-        Some(duration) => duration,
-        None => {
-            ewln(
-                io.err,
-                &format!("usleep: invalid time interval {argument:?}"),
-            );
-            return 1;
-        }
-    };
-    match interp.clock.block_task(MAIN_TASK_ID, duration) {
-        Ok(BlockOutcome::Completed) => 0,
-        Ok(BlockOutcome::Interrupted(event)) => {
-            interp.deadline_interrupt = Some(event.id);
-            124
-        }
-        Err(error) => {
-            ewln(io.err, &format!("usleep: {error}"));
-            1
-        }
-    }
-}
-
-fn cmd_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let invocation = match parse_timeout(args).and_then(reject_kill_after) {
-        Ok(invocation) => invocation,
-        Err(error) => {
-            ewln(io.err, &format!("timeout: {error}"));
-            return 125;
-        }
-    };
-    // This entry remains for synchronous native callers. Ordinary shell execution uses
-    // `start_timeout`, which delivers a signal to a scheduler-owned child.
-    let deadline = if invocation.duration == 0 {
-        None
-    } else {
-        match interp.clock.schedule_after(
-            invocation.duration,
-            EventKind::Deadline { task: MAIN_TASK_ID },
-        ) {
-            Ok(event) => Some(event),
-            Err(error) => {
-                ewln(io.err, &format!("timeout: {error}"));
-                return 125;
-            }
-        }
-    };
-    let status = crate::commands::run(
-        interp,
-        &invocation.argv,
-        std::mem::take(&mut io.stdin),
-        io.out,
-        io.err,
-    );
-    let interrupted = interp.deadline_interrupt;
-    if let Some(deadline) = deadline {
-        interp.clock.cancel(deadline);
-        if interrupted == Some(deadline) {
-            interp.deadline_interrupt = None;
-            return if invocation.preserve_status {
-                status
-            } else {
-                124
-            };
-        }
-    }
-    if interrupted.is_some() {
-        124
-    } else {
-        status
-    }
-}
-
-fn start_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
-    let invocation = match parse_timeout(args).and_then(reject_kill_after) {
-        Ok(invocation) => invocation,
-        Err(error) => {
-            ewln(io.err, &format!("timeout: {error}"));
-            return CommandPoll::Ready(125);
-        }
-    };
-    let pid = match crate::commands::start_child_command(
-        interp,
-        ChildCommand {
-            argv: invocation.argv,
-            stdin: Some(std::mem::take(&mut io.stdin)),
-            cwd: None,
-            environment: None,
-            ..Default::default()
-        },
-    ) {
-        Ok(pid) => pid,
-        Err(status) => return CommandPoll::Ready(status),
-    };
-    let (deadline, result_override) = if invocation.duration == 0 {
-        (None, None)
-    } else {
-        match interp.clock.schedule_after(
-            invocation.duration,
-            EventKind::SignalTask {
-                task: u64::from(pid),
-                signal: invocation.signal,
-                descendants: true,
-            },
-        ) {
-            Ok(event) => (Some(event), None),
-            Err(_) => {
-                let _ = interp.send_signal(pid, crate::process::Signal::Kill);
-                (None, Some(125))
-            }
-        }
-    };
-    CommandPoll::Switched(CommandResume::Timeout {
-        pid,
-        deadline,
-        preserve_status: invocation.preserve_status,
-        result_override,
-    })
-}
-
-/// Nested synchronous callers have no second deadline; only the native image supports `-k`.
-fn reject_kill_after(invocation: TimeoutInvocation) -> Result<TimeoutInvocation, String> {
-    if invocation.kill_after.is_some() {
-        Err("--kill-after is unsupported here".to_string())
-    } else {
-        Ok(invocation)
-    }
 }
 
 pub(crate) struct TimeoutInvocation {
@@ -480,121 +221,6 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-/// `sh`/`bash -c "…"` or a script file — run it through our own interpreter.
-fn cmd_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some((source, positional)) = shell_invocation(interp, args, io) else {
-        return 127;
-    };
-    run_shell_child(interp, &source, positional, io)
-}
-
-/// Start a nested shell as an ordinary scheduled child instead of recursively executing it.
-/// Parse and launch one shell source as a scheduler-owned child.
-pub(crate) fn start_shell_source(
-    interp: &mut Interp,
-    source: &str,
-    positional: Vec<String>,
-    stdin: Option<Vec<u8>>,
-    err: &mut Vec<u8>,
-) -> CommandPoll {
-    let ast = match crate::commands::parse_shell_source(interp, source, err) {
-        Ok(ast) => ast,
-        Err(status) => return CommandPoll::Ready(status),
-    };
-    let input = match stdin {
-        Some(stdin) => match interp.descriptors.open_input(stdin) {
-            Ok(input) => Some(input),
-            Err(error) => {
-                ewln(err, &format!("bash: unable to prepare stdin: {error:?}"));
-                return CommandPoll::Ready(125);
-            }
-        },
-        None => None,
-    };
-    let pid = match interp.start_child("bash", true) {
-        Ok(pid) => pid,
-        Err(error) => {
-            if let Some(input) = input {
-                let _ = interp.descriptors.discard_unreferenced(input);
-            }
-            ewln(err, &format!("bash: {error}"));
-            return CommandPoll::Ready(125);
-        }
-    };
-    if let Some(input) = input {
-        interp
-            .install_process_description(pid, 0, input)
-            .expect("new child process must accept a valid stdin description");
-    }
-    interp
-        .set_process_positional(pid, positional)
-        .expect("new child process state must retain positional arguments");
-    interp
-        .process
-        .set_continuation(pid, Some(crate::exec::ShellContinuation::subshell(&ast)))
-        .expect("new child process state must accept a continuation");
-    CommandPoll::Switched(CommandResume::Child { pid, reap: true })
-}
-
-fn shell_invocation(
-    interp: &mut CommandContext<'_>,
-    args: &[String],
-    io: &mut Io,
-) -> Option<(String, Vec<String>)> {
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-c" => {
-                let src = args.get(i + 1).cloned().unwrap_or_default();
-                // `sh -c SCRIPT [name [args…]]`: name is $0, the rest are $1+
-                let extra = args.get(i + 3..).map(|s| s.to_vec()).unwrap_or_default();
-                return Some((src, extra));
-            }
-            "-o" => {
-                i += 2;
-            }
-            s if s.starts_with('-') => {
-                i += 1;
-            }
-            s => {
-                if let Ok(src) = interp.vfs.read_string(&interp.cwd, s) {
-                    let extra = args.get(i + 1..).map(|x| x.to_vec()).unwrap_or_default();
-                    return Some((src, extra));
-                }
-                crate::commands::util::ewln(
-                    io.err,
-                    &format!("bash: {s}: No such file or directory"),
-                );
-                return None;
-            }
-        }
-    }
-    // no -c and no file → run stdin as a script
-    let src = String::from_utf8_lossy(&io.stdin).into_owned();
-    Some((src, Vec::new()))
-}
-
-fn run_shell_child(
-    interp: &mut CommandContext<'_>,
-    source: &str,
-    positional: Vec<String>,
-    io: &mut Io,
-) -> i32 {
-    let pid = match interp.start_child("bash", true) {
-        Ok(child) => child,
-        Err(error) => {
-            ewln(io.err, &format!("bash: {error}"));
-            return 125;
-        }
-    };
-    interp.positional = positional;
-    let status = interp.run_script_into(source, io.out, io.err);
-    interp.finish_child(pid, status);
-    interp.processes.reap(pid);
-    let _ = interp.scheduler.reap(pid);
-    status
 }
 
 /// `uv` / `uvx` / `uv run` / `uv tool run`: package-management subcommands update the simulated
@@ -881,38 +507,20 @@ fn extract_dep_specs(toml_src: &str) -> Vec<String> {
     out
 }
 
-fn cmd_python3(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    python_impl(interp, "python3", args, io)
-}
 fn start_python3(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
     start_python_impl(interp, "python3", args, io)
-}
-fn cmd_python(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    python_impl(interp, "python", args, io)
 }
 fn start_python(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
     start_python_impl(interp, "python", args, io)
 }
-fn cmd_python311(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    python_impl(interp, "python3.11", args, io)
-}
 fn start_python311(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
     start_python_impl(interp, "python3.11", args, io)
-}
-fn cmd_python312(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    python_impl(interp, "python3.12", args, io)
 }
 fn start_python312(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
     start_python_impl(interp, "python3.12", args, io)
 }
-fn cmd_python313(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    python_impl(interp, "python3.13", args, io)
-}
 fn start_python313(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
     start_python_impl(interp, "python3.13", args, io)
-}
-fn cmd_python314(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    python_impl(interp, "python3.14", args, io)
 }
 fn start_python314(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
     start_python_impl(interp, "python3.14", args, io)
@@ -920,14 +528,6 @@ fn start_python314(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io
 
 fn cmd_pytest(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     crate::python::run_pytest(interp, args, io.out, io.err)
-}
-
-fn python_impl(interp: &mut Interp, name: &str, args: &[String], io: &mut Io) -> i32 {
-    // run_python expects argv[0] to be the program name (it skips it).
-    let mut argv = vec![name.to_string()];
-    argv.extend(args.iter().cloned());
-    let stdin = std::mem::take(&mut io.stdin);
-    crate::python::run_python(interp, &argv, stdin, io.out, io.err)
 }
 
 /// Start a scheduled Python invocation without pre-draining fd 0.

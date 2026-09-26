@@ -651,6 +651,11 @@ impl Environment {
             ("nohup", crate::vfs::NativeProgram::Nohup),
             ("nice", crate::vfs::NativeProgram::Nice),
             ("make", crate::vfs::NativeProgram::Make),
+            // Shells parse and run their own program; see `Interp::shell_image`.
+            ("sh", crate::vfs::NativeProgram::LegacyRegistered("sh")),
+            ("bash", crate::vfs::NativeProgram::LegacyRegistered("bash")),
+            ("dash", crate::vfs::NativeProgram::LegacyRegistered("dash")),
+            ("zsh", crate::vfs::NativeProgram::LegacyRegistered("zsh")),
         ] {
             vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
         }
@@ -1378,21 +1383,6 @@ impl Environment {
             })
             .collect();
         self.processes.update_current(pid, &state.cwd, exported);
-        Ok(())
-    }
-
-    /// Set positional parameters on a retained child without assuming it is currently active.
-    pub(crate) fn set_process_positional(
-        &mut self,
-        pid: ProcessId,
-        positional: Vec<String>,
-    ) -> Result<(), String> {
-        let state = self
-            .process
-            .states
-            .get_mut(&pid)
-            .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
-        state.positional = positional;
         Ok(())
     }
 
