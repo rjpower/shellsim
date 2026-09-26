@@ -578,3 +578,26 @@ fn heredocs_and_here_strings_redirect_compound_commands() {
         (0, "s v\nsub\nh v\nraw $x\nfn\n".into(), String::new())
     );
 }
+
+#[test]
+fn arithmetic_matches_bash_operators_errors_and_loops() {
+    // Expected values come from GNU Bash 5.2.
+    let (status, stdout, stderr) = run(
+        "echo $((2**10)) $(((1<<4)|3)) $((5&3)) $((5^3)) $((~5)) $((0x1f+010+2#101)); \
+         y=1; echo $((y++ + ++y)) $y; a=3+4; echo $((a*2)); \
+         ((1/0)); echo cmd=$?; let 'q=1/0'; echo let=$?; let 'j=5*2' 'k=j+1'; echo $j $k; \
+         for ((i=0;i<10000;i++)); do :; done; n=0; while [ $n -lt 6000 ]; do n=$((n+1)); done; \
+         echo $i $n; echo $((1/0)); echo unreachable",
+    );
+    assert_eq!(status, 1);
+    assert_eq!(
+        stdout,
+        "1024 19 1 6 -6 44\n4 3\n14\ncmd=1\nlet=1\n10 11\n10000 6000\n"
+    );
+    assert_eq!(
+        stderr
+            .matches("division by 0 (error token is \"0\")")
+            .count(),
+        3
+    );
+}

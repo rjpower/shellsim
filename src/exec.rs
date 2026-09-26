@@ -315,21 +315,18 @@ enum ShellFrame {
         cond: Node,
         body: Node,
         until: bool,
-        iterations: usize,
         body_status: i32,
     },
     WhileAfterCondition {
         cond: Node,
         body: Node,
         until: bool,
-        iterations: usize,
         body_status: i32,
     },
     WhileAfterBody {
         cond: Node,
         body: Node,
         until: bool,
-        iterations: usize,
     },
     ForNext {
         var: String,
@@ -348,14 +345,12 @@ enum ShellFrame {
         cond: String,
         update: String,
         body: Node,
-        iterations: usize,
         body_status: i32,
     },
     CForAfterBody {
         cond: String,
         update: String,
         body: Node,
-        iterations: usize,
     },
     FinishLoop,
     RestoreRedirect(RedirectScope),
@@ -462,14 +457,12 @@ enum ArithmeticContinuation {
         cond: String,
         update: String,
         body: Node,
-        iterations: usize,
         body_status: i32,
     },
     CForUpdate {
         cond: String,
         update: String,
         body: Node,
-        iterations: usize,
         body_status: i32,
     },
 }
@@ -1113,7 +1106,19 @@ impl ShellContinuation {
         {
             1
         } else {
-            crate::expand::eval_arith(interp, &state.expression)
+            // Unlike `$(( ))`, a failed `(( ))` or arithmetic `for` clause only fails the
+            // command; the enclosing loop stops with status 1.
+            match crate::arith::evaluate(interp, &state.expression) {
+                Ok(value) => value,
+                Err(error) => {
+                    write_diagnostic(
+                        interp,
+                        &format!("shellsim: ((: {}\n", error.describe(&state.expression)),
+                    );
+                    self.status = 1;
+                    return;
+                }
+            }
         };
         match state.continuation {
             ArithmeticContinuation::Command => {
@@ -1127,7 +1132,6 @@ impl ShellContinuation {
                         cond,
                         update,
                         body,
-                        iterations: 0,
                         body_status: 0,
                     },
                 );
@@ -1136,10 +1140,9 @@ impl ShellContinuation {
                 cond,
                 update,
                 body,
-                iterations,
                 body_status,
             } => {
-                if should_unwind(interp) || iterations >= 5_000 || value == 0 {
+                if should_unwind(interp) || value == 0 {
                     self.status = body_status;
                 } else if self.push(
                     interp,
@@ -1147,7 +1150,6 @@ impl ShellContinuation {
                         cond,
                         update,
                         body: body.clone(),
-                        iterations: iterations + 1,
                     },
                 ) {
                     self.push(interp, ShellFrame::Eval(body));
@@ -1157,7 +1159,6 @@ impl ShellContinuation {
                 cond,
                 update,
                 body,
-                iterations,
                 body_status,
             } => {
                 self.push(
@@ -1166,7 +1167,6 @@ impl ShellContinuation {
                         cond,
                         update,
                         body,
-                        iterations,
                         body_status,
                     },
                 );
@@ -1442,10 +1442,9 @@ impl ShellContinuation {
                 cond,
                 body,
                 until,
-                iterations,
                 body_status,
             } => {
-                if should_unwind(interp) || iterations >= 5_000 {
+                if should_unwind(interp) {
                     self.status = body_status;
                     return;
                 }
@@ -1456,7 +1455,6 @@ impl ShellContinuation {
                         cond: cond.clone(),
                         body,
                         until,
-                        iterations,
                         body_status,
                     },
                 ) {
@@ -1467,7 +1465,6 @@ impl ShellContinuation {
                 cond,
                 body,
                 until,
-                iterations,
                 body_status,
             } => {
                 interp.cond_depth = interp.cond_depth.saturating_sub(1);
@@ -1483,7 +1480,6 @@ impl ShellContinuation {
                             cond,
                             body: body.clone(),
                             until,
-                            iterations: iterations + 1,
                         },
                     ) {
                         self.push(interp, ShellFrame::Eval(body));
@@ -1492,12 +1488,7 @@ impl ShellContinuation {
                     self.status = body_status;
                 }
             }
-            ShellFrame::WhileAfterBody {
-                cond,
-                body,
-                until,
-                iterations,
-            } => {
+            ShellFrame::WhileAfterBody { cond, body, until } => {
                 if interp.loop_break > 0 {
                     interp.loop_break -= 1;
                     return;
@@ -1512,7 +1503,6 @@ impl ShellContinuation {
                             cond,
                             body,
                             until,
-                            iterations,
                             body_status: self.status,
                         },
                     );
@@ -1574,10 +1564,9 @@ impl ShellContinuation {
                 cond,
                 update,
                 body,
-                iterations,
                 body_status,
             } => {
-                if should_unwind(interp) || iterations >= 5_000 {
+                if should_unwind(interp) {
                     self.status = body_status;
                 } else {
                     self.push(
@@ -1588,19 +1577,13 @@ impl ShellContinuation {
                                 cond,
                                 update,
                                 body,
-                                iterations,
                                 body_status,
                             },
                         }),
                     );
                 }
             }
-            ShellFrame::CForAfterBody {
-                cond,
-                update,
-                body,
-                iterations,
-            } => {
+            ShellFrame::CForAfterBody { cond, update, body } => {
                 if interp.loop_break > 0 {
                     interp.loop_break -= 1;
                     return;
@@ -1617,7 +1600,6 @@ impl ShellContinuation {
                                 cond,
                                 update,
                                 body,
-                                iterations,
                                 body_status: self.status,
                             },
                         }),
@@ -2097,7 +2079,6 @@ impl ShellContinuation {
                     cond: *cond,
                     body: *body,
                     until,
-                    iterations: 0,
                     body_status: 0,
                 });
             }

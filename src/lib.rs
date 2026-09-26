@@ -10,6 +10,7 @@
 //!   * [`commands`] — native coreutils + builtins
 //!   * [`python`] — metered Python 3.14 source-to-bytecode compatibility engine
 
+pub(crate) mod arith;
 pub mod clock;
 pub mod commands;
 pub mod corpus;
