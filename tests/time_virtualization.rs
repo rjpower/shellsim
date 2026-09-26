@@ -465,3 +465,25 @@ fn timeout_streams_standard_input_and_reports_its_own_failures() {
     );
     assert_eq!(environment.clock.monotonic_ns(), 0);
 }
+
+#[test]
+fn time_keyword_reports_virtual_elapsed_time_on_stderr() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "time sleep 1; time -p sleep 1.5; echo status:$?"
+        ),
+        (
+            0,
+            "status:0\n".into(),
+            "\nreal\t0m1.000s\nuser\t0m0.000s\nsys\t0m0.000s\nreal 1.50\nuser 0.00\nsys 0.00\n"
+                .into(),
+        )
+    );
+    // `time` keeps the pipeline's status, including a negated one.
+    assert_eq!(
+        run(&mut environment, "time ! true 2>/dev/null; echo $?").1,
+        "1\n"
+    );
+}

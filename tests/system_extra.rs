@@ -240,3 +240,14 @@ fn pkill_and_killall_signal_other_virtual_processes() {
     );
     assert_eq!(stderr, "missing: no process found\n");
 }
+
+#[test]
+fn nice_validates_its_adjustment_and_execs_the_command() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "nice; nice -n 5 printf ok; nice -10 printf ' ok'; echo; nice -n x true; echo status:$?",
+    );
+    assert_eq!((status, stdout.as_str()), (0, "0\nok ok\nstatus:125\n"));
+    assert_eq!(stderr, "nice: invalid adjustment 'x'\n");
+}

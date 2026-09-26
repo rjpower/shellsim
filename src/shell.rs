@@ -88,6 +88,11 @@ pub enum Node {
     },
     Arithmetic(String),
     Not(Box<Node>),
+    /// `time [-p] pipeline`: run the pipeline, then report elapsed virtual time on stderr.
+    Timed {
+        inner: Box<Node>,
+        posix: bool,
+    },
     Redirected(Box<Node>, Vec<Redirect>),
     Empty,
 }
@@ -135,6 +140,7 @@ impl Node {
             Self::Background(node) | Self::Subshell(node) | Self::Group(node) | Self::Not(node) => {
                 node.estimated_bytes()
             }
+            Self::Timed { inner, .. } => inner.estimated_bytes(),
             Self::If {
                 cond,
                 then,
@@ -1040,6 +1046,29 @@ impl Parser {
     }
 
     fn parse_pipeline(&mut self) -> Node {
+        // `time [-p] [!] pipeline`, as a reserved word in command position.
+        if self.word_is("time") {
+            self.i += 1;
+            let posix = self.word_is("-p");
+            if posix {
+                self.i += 1;
+            }
+            // A bare `time` at the end of a command times nothing, as in Bash.
+            let empty = match self.peek() {
+                Tok::Eof => true,
+                Tok::Op(op) => op != "(",
+                _ => false,
+            };
+            let inner = if empty {
+                Node::Seq(Vec::new())
+            } else {
+                self.parse_pipeline()
+            };
+            return Node::Timed {
+                inner: Box::new(inner),
+                posix,
+            };
+        }
         // optional leading !
         let mut negate = false;
         if self.word_is("!") {
