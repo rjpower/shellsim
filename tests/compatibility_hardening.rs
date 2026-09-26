@@ -99,7 +99,7 @@ fn realpath_missing_mode_resolves_symlinks_and_normalizes_absent_suffixes() {
 #[test]
 fn find_rejects_unsupported_and_malformed_predicates() {
     for source in [
-        "find /proc -execdir echo {} \\;",
+        "find /proc -ok echo {} \\;",
         "find /proc -type z",
         "find /proc -name",
     ] {
