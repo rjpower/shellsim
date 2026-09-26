@@ -399,17 +399,24 @@ impl Parser {
             .take(|kind| matches!(kind, TokenKind::Import))
             .is_some()
         {
-            let module = self.module_name("expected a module name after 'import'")?;
-            let binding = if self.take(|kind| matches!(kind, TokenKind::As)).is_some() {
-                self.name("expected a binding after 'as'")?
-            } else {
-                module
-                    .split('.')
-                    .next()
-                    .expect("module is not empty")
-                    .to_string()
-            };
-            StatementKind::Import { module, binding }
+            let mut modules = Vec::new();
+            loop {
+                let module = self.module_name("expected a module name after 'import'")?;
+                let binding = if self.take(|kind| matches!(kind, TokenKind::As)).is_some() {
+                    self.name("expected a binding after 'as'")?
+                } else {
+                    module
+                        .split('.')
+                        .next()
+                        .expect("module is not empty")
+                        .to_string()
+                };
+                modules.push((module, binding));
+                if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
+                    break;
+                }
+            }
+            StatementKind::Import { modules }
         } else if self.take(|kind| matches!(kind, TokenKind::Del)).is_some() {
             StatementKind::Delete(assignment_target(self.postfix()?)?)
         } else if self

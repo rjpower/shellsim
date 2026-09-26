@@ -225,7 +225,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
                 | Object::RangeIterator { .. } => "<iterator ...>",
-                Object::CountIterator { .. } => "<iterator ...>",
+                Object::CountIterator { .. } | Object::StreamIterator { .. } => "<iterator ...>",
                 Object::CallableIterator { .. } => "<callable_iterator ...>",
                 Object::Generator { .. } => "<generator ...>",
                 Object::Module { .. } => "<module ...>",
@@ -321,7 +321,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::Iterator { .. }
             | Object::SequenceIterator { .. }
             | Object::RangeIterator { .. } => "<iterator>".into(),
-            Object::CountIterator { .. } => "<iterator>".into(),
+            Object::CountIterator { .. } | Object::StreamIterator { .. } => "<iterator>".into(),
             Object::CallableIterator { .. } => "<callable_iterator>".into(),
             Object::Generator { .. } => "<generator>".into(),
             Object::Module { name, .. } => format!("<module '{name}'>"),
@@ -425,6 +425,7 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         | Object::SequenceIterator { .. }
         | Object::RangeIterator { .. }
         | Object::CountIterator { .. }
+        | Object::StreamIterator { .. }
         | Object::CallableIterator { .. }
         | Object::Generator { .. }
         | Object::Module { .. }
@@ -823,6 +824,7 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::SequenceIterator { .. }
             | Object::RangeIterator { .. }
             | Object::CountIterator { .. }
+            | Object::StreamIterator { .. }
             | Object::CallableIterator { .. }
             | Object::Generator { .. }
             | Object::Module { .. }

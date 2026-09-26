@@ -196,16 +196,19 @@ impl Compiler {
     fn statement_inner(&mut self, statement: Statement) {
         let span = statement.span;
         match statement.kind {
-            StatementKind::Import { module, binding } => {
-                let bind_root = module.split('.').next().is_some_and(|root| root == binding);
-                self.emit(
-                    Operation::Import {
-                        name: module,
-                        bind_root,
-                    },
-                    span,
-                );
-                self.emit(Operation::StoreName(binding), span);
+            StatementKind::Import { modules } => {
+                for (module, binding) in modules {
+                    let bind_root =
+                        module.split('.').next().is_some_and(|root| root == binding);
+                    self.emit(
+                        Operation::Import {
+                            name: module,
+                            bind_root,
+                        },
+                        span,
+                    );
+                    self.emit(Operation::StoreName(binding), span);
+                }
             }
             StatementKind::ImportFrom { module, names: _ } if module == "__future__" => {}
             StatementKind::ImportFrom { module, names } => {

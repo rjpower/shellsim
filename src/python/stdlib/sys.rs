@@ -3,7 +3,7 @@
 use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyConstant, PyError, PyMarker,
-    PyResult, PyRuntime, ValueDef,
+    PyResult, PyRuntime, PyStreamRead, ValueDef,
 };
 
 pub(crate) static STREAM_TYPE: NativeTypeDef = NativeTypeDef {
@@ -23,6 +23,11 @@ pub(crate) static STREAM_TYPE: NativeTypeDef = NativeTypeDef {
             type_name: "shellsim.stream",
             name: "readline",
             call: readline,
+        },
+        MethodDef {
+            type_name: "shellsim.stream",
+            name: "readlines",
+            call: readlines,
         },
         MethodDef {
             type_name: "shellsim.stream",
@@ -134,6 +139,22 @@ fn readline(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyR
     read_inner(runtime, receiver, args, true)
 }
 
+/// Read every remaining line eagerly. Bounded by the same memory accounting as `read()`, since a
+/// caller that wants line-by-line backpressure should iterate the stream instead.
+fn readlines(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
+    args.expect_positional("stream.readlines", 0, 1)?;
+    args.reject_keywords("stream.readlines")?;
+    let mut lines = Vec::new();
+    loop {
+        let read = runtime.read_stream(&receiver, None, true)?;
+        if read.is_empty() {
+            break;
+        }
+        lines.push(package_read(runtime, read)?);
+    }
+    runtime.new_list(lines)
+}
+
 fn iter(_runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("stream.__iter__", 0, 0)?;
     args.reject_keywords("stream.__iter__")?;
@@ -151,11 +172,11 @@ pub(crate) fn slot_iter(_runtime: &mut dyn PyRuntime, receiver: Value) -> PyResu
 }
 
 pub(crate) fn slot_next(runtime: &mut dyn PyRuntime, receiver: Value) -> PyResult<Option<Value>> {
-    let text = runtime.read_stream(&receiver, None, true)?;
-    if text.is_empty() {
+    let read = runtime.read_stream(&receiver, None, true)?;
+    if read.is_empty() {
         Err(PyError::exception("StopIteration", ""))
     } else {
-        runtime.new_string(text).map(Some)
+        package_read(runtime, read).map(Some)
     }
 }
 
@@ -178,6 +199,14 @@ fn read_inner(
             None => return Err(PyError::type_error("stream size must be an integer")),
         },
     };
-    let text = runtime.read_stream(&receiver, size, line)?;
-    runtime.new_string(text)
+    let read = runtime.read_stream(&receiver, size, line)?;
+    package_read(runtime, read)
+}
+
+/// Package one stream read into its Python representation: `str` for text, `bytes` for `.buffer`.
+fn package_read(runtime: &mut dyn PyRuntime, read: PyStreamRead) -> PyResult {
+    match read {
+        PyStreamRead::Text(text) => runtime.new_string(text),
+        PyStreamRead::Bytes(bytes) => runtime.new_bytes(bytes),
+    }
 }

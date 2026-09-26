@@ -322,6 +322,22 @@ pub(super) struct PyProcessHandle {
     pub pid: u32,
 }
 
+/// Result of a modeled stream read: decoded text for `sys.stdin`, raw bytes for its `.buffer`.
+pub(super) enum PyStreamRead {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl PyStreamRead {
+    /// Whether the read produced no data, the exhaustion signal used by `readline`/iteration.
+    pub(super) fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(text) => text.is_empty(),
+            Self::Bytes(bytes) => bytes.is_empty(),
+        }
+    }
+}
+
 /// Explicit process-launch capability. Implementations must dispatch only modeled commands and
 /// VFS scripts and must never fall back to an ambient host process.
 pub(super) trait PyProcessRunner {
@@ -420,13 +436,16 @@ pub(super) trait PyRuntime {
     fn integer_text(&self, value: &PyValue) -> PyResult<Option<String>>;
     /// Write only to an interpreter-owned simulated stream marker.
     fn write_stream(&mut self, stream: &PyValue, text: &str) -> PyResult<usize>;
-    /// Read text only from the invocation's modeled standard-input stream.
+    /// Read from the invocation's modeled standard-input stream, incrementally through the
+    /// process's fd 0. `sys.stdin` decodes text; `sys.stdin.buffer` returns raw bytes. A read that
+    /// would block on an empty, not-yet-closed pipe suspends the calling process (see
+    /// [`PyError::suspend`]) rather than draining the producer eagerly.
     fn read_stream(
         &mut self,
         stream: &PyValue,
         size: Option<usize>,
         line: bool,
-    ) -> PyResult<String>;
+    ) -> PyResult<PyStreamRead>;
     fn truth(&mut self, value: &PyValue) -> PyResult<bool>;
     fn display(&mut self, value: &PyValue) -> PyResult<String>;
     fn repr(&mut self, value: &PyValue) -> PyResult<String>;
@@ -591,6 +610,12 @@ pub(super) trait PyRuntime {
     fn filesystem(&mut self) -> &mut dyn PyFilesystem;
     fn http(&mut self) -> &mut dyn PyHttpClient;
     fn processes(&mut self) -> &mut dyn PyProcessRunner;
+    /// PID of the logical process running this Python interpreter.
+    fn current_pid(&self) -> u32;
+    /// PID of the logical parent of the process running this Python interpreter.
+    fn current_ppid(&self) -> u32;
+    /// Deliver a signal to an arbitrary modeled process, not only an owned subprocess handle.
+    fn send_os_signal(&mut self, pid: u32, signal: crate::process::Signal) -> PyResult<()>;
 
     fn type_name(&self, value: &PyValue) -> PyResult<&'static str> {
         Ok(match self.kind(value)? {

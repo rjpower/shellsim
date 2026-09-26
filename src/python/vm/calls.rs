@@ -4,7 +4,8 @@ use super::{
     expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BytecodeFrame, CallArgs,
     CallMode, CallResult, ClassLayout, CodeRef, Execution, FunctionInvocation, FunctionReturn,
     HashMap, InstanceAttributes, InstancePayload, NativeValue, Object, Ordering, PendingNativeCall,
-    PyError, PyErrorKind, PyRuntime, RaisedException, ScopeId, Slot, Stream, Value, Vm,
+    PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, ScopeId, Slot, Stream, Value,
+    Vm,
 };
 use num_traits::{Signed, Zero};
 
@@ -210,12 +211,33 @@ impl Vm<'_> {
                         descriptor.native_value()
                     {
                         let call = CallArgs::new(arguments, keyword_arguments);
-                        match (method.call)(self, receiver, call) {
+                        let retry = match mode {
+                            CallMode::Deferred(call_span) => Some(PendingNativeCall::Method {
+                                method,
+                                receiver,
+                                arguments: call.clone(),
+                                call_span,
+                            }),
+                            CallMode::Immediate => None,
+                        };
+                        let previous_suspend = self.native_suspend_allowed;
+                        self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+                        let result = (method.call)(self, receiver, call);
+                        self.native_suspend_allowed = previous_suspend;
+                        match result {
                             Ok(value) => Ok(CallResult::Value(value)),
                             Err(PyError {
                                 kind: PyErrorKind::Exit(status),
                                 ..
                             }) => Ok(CallResult::Exit(status)),
+                            Err(PyError {
+                                kind: PyErrorKind::Suspend(reason),
+                                ..
+                            }) => retry
+                                .map(|pending| CallResult::Retry(reason, pending))
+                                .ok_or_else(|| {
+                                    "native call suspended outside scheduler dispatch".into()
+                                }),
                             Err(error) => Err(self.record_native_error(error)),
                         }
                     } else {
@@ -521,19 +543,38 @@ impl Vm<'_> {
             }
             let receiver = arguments.remove(0);
             let call = CallArgs::new(arguments, keyword_arguments);
-            return match (method.call)(self, receiver, call) {
+            let retry = match mode {
+                CallMode::Deferred(call_span) => Some(PendingNativeCall::Method {
+                    method,
+                    receiver,
+                    arguments: call.clone(),
+                    call_span,
+                }),
+                CallMode::Immediate => None,
+            };
+            let previous_suspend = self.native_suspend_allowed;
+            self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+            let result = (method.call)(self, receiver, call);
+            self.native_suspend_allowed = previous_suspend;
+            return match result {
                 Ok(value) => Ok(CallResult::Value(value)),
                 Err(PyError {
                     kind: PyErrorKind::Exit(status),
                     ..
                 }) => Ok(CallResult::Exit(status)),
+                Err(PyError {
+                    kind: PyErrorKind::Suspend(reason),
+                    ..
+                }) => retry
+                    .map(|pending| CallResult::Retry(reason, pending))
+                    .ok_or_else(|| "native call suspended outside scheduler dispatch".into()),
                 Err(error) => Err(self.record_native_error(error)),
             };
         }
         if let Some(NativeValue::NativeFunction(function)) = function.native_value() {
             let call = CallArgs::new(arguments, keyword_arguments);
             let retry = match mode {
-                CallMode::Deferred(call_span) => Some(PendingNativeCall {
+                CallMode::Deferred(call_span) => Some(PendingNativeCall::Function {
                     function,
                     arguments: call.clone(),
                     call_span,
@@ -617,23 +658,25 @@ impl Vm<'_> {
                     let prompt = self.display_value(prompt)?;
                     self.write_output(Stream::Stdout, prompt.as_bytes());
                 }
+                let retry = match mode {
+                    CallMode::Deferred(call_span) => Some(PendingNativeCall::Input { call_span }),
+                    CallMode::Immediate => None,
+                };
                 let marker = Value::Native(NativeValue::Stream(Stream::Stdin));
-                let mut text = self
-                    .read_stream(&marker, None, true)
-                    .map_err(|error| self.record_native_error(error))?;
-                if text.is_empty() {
-                    return Err(self.record_native_error(PyError::exception(
-                        "EOFError",
-                        "EOF when reading a line",
-                    )));
+                let previous_suspend = self.native_suspend_allowed;
+                self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+                let result = self.read_stream(&marker, None, true);
+                self.native_suspend_allowed = previous_suspend;
+                match result {
+                    Ok(read) => self.finish_input(read).map(CallResult::Value),
+                    Err(PyError {
+                        kind: PyErrorKind::Suspend(reason),
+                        ..
+                    }) => retry
+                        .map(|pending| CallResult::Retry(reason, pending))
+                        .ok_or_else(|| "native call suspended outside scheduler dispatch".into()),
+                    Err(error) => Err(self.record_native_error(error)),
                 }
-                if text.ends_with('\n') {
-                    text.pop();
-                    if text.ends_with('\r') {
-                        text.pop();
-                    }
-                }
-                Ok(CallResult::Value(self.allocate_string(text)?))
             }
             Builtin::Exec => {
                 expect_arity(&arguments, 1, 1)?;
@@ -847,6 +890,7 @@ impl Vm<'_> {
                         | Object::SequenceIterator { .. }
                         | Object::RangeIterator { .. }
                         | Object::CountIterator { .. }
+                        | Object::StreamIterator { .. }
                         | Object::CallableIterator { .. }
                         | Object::Generator { .. }
                         | Object::Module { .. }
@@ -1474,14 +1518,26 @@ impl Vm<'_> {
         &mut self,
         pending: PendingNativeCall,
     ) -> Result<CallResult, String> {
-        let retry = PendingNativeCall {
-            function: pending.function,
-            arguments: pending.arguments.clone(),
-            call_span: pending.call_span,
-        };
+        if matches!(pending, PendingNativeCall::Input { .. }) {
+            return self.resume_input(pending);
+        }
+        let retry = pending.clone();
         let previous_suspend = self.native_suspend_allowed;
         self.native_suspend_allowed = true;
-        let result = (pending.function.call)(self, pending.arguments);
+        let result = match pending {
+            PendingNativeCall::Function {
+                function,
+                arguments,
+                ..
+            } => (function.call)(self, arguments),
+            PendingNativeCall::Method {
+                method,
+                receiver,
+                arguments,
+                ..
+            } => (method.call)(self, receiver, arguments),
+            PendingNativeCall::Input { .. } => unreachable!("handled above"),
+        };
         self.native_suspend_allowed = previous_suspend;
         match result {
             Ok(value) => match self.pending_wait.take() {
@@ -1498,5 +1554,47 @@ impl Vm<'_> {
             }) => Ok(CallResult::Retry(reason, retry)),
             Err(error) => Err(self.record_native_error(error)),
         }
+    }
+
+    fn resume_input(&mut self, pending: PendingNativeCall) -> Result<CallResult, String> {
+        let PendingNativeCall::Input { call_span } = pending else {
+            unreachable!("caller checked the variant");
+        };
+        let marker = Value::Native(NativeValue::Stream(Stream::Stdin));
+        let previous_suspend = self.native_suspend_allowed;
+        self.native_suspend_allowed = true;
+        let result = self.read_stream(&marker, None, true);
+        self.native_suspend_allowed = previous_suspend;
+        match result {
+            Ok(read) => self.finish_input(read).map(CallResult::Value),
+            Err(PyError {
+                kind: PyErrorKind::Suspend(reason),
+                ..
+            }) => Ok(CallResult::Retry(reason, PendingNativeCall::Input { call_span })),
+            Err(error) => Err(self.record_native_error(error)),
+        }
+    }
+
+    /// Strip the trailing newline `input()` reads and raise `EOFError` on an empty read.
+    fn finish_input(&mut self, read: PyStreamRead) -> Result<Value, String> {
+        let mut text = match read {
+            PyStreamRead::Text(text) => text,
+            PyStreamRead::Bytes(_) => {
+                unreachable!("input() only reads the modeled text stdin stream")
+            }
+        };
+        if text.is_empty() {
+            return Err(self.record_native_error(PyError::exception(
+                "EOFError",
+                "EOF when reading a line",
+            )));
+        }
+        if text.ends_with('\n') {
+            text.pop();
+            if text.ends_with('\r') {
+                text.pop();
+            }
+        }
+        self.allocate_string(text)
     }
 }

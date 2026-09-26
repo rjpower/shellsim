@@ -33,6 +33,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "pytest" => Some(include_str!("source/pytest.py")),
         "random" => Some(include_str!("source/random.py")),
         "shutil" => Some(include_str!("source/shutil.py")),
+        "signal" => Some(include_str!("source/signal.py")),
         "statistics" => Some(include_str!("source/statistics.py")),
         "struct" => Some(include_str!("source/struct.py")),
         "subprocess" => Some(include_str!("source/subprocess.py")),

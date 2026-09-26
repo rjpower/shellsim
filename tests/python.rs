@@ -39,6 +39,8 @@ mod resource_hardening;
 mod runtime;
 #[path = "python/source_suites.rs"]
 mod source_suites;
+#[path = "python/stdin_streaming.rs"]
+mod stdin_streaming;
 #[path = "python/stdlib.rs"]
 mod stdlib;
 #[path = "python/stdlib_differential.rs"]

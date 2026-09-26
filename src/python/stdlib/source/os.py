@@ -1,6 +1,6 @@
 """Process and path helpers over shellsim's modeled environment and VFS."""
 
-from _os import chdir, environ, getenv, getcwd
+from _os import chdir, environ, getenv, getcwd, getpid, getppid, kill
 import _shellsim_vfs
 
 

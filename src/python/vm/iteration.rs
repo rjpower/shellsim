@@ -1,6 +1,16 @@
 //! Iteration, generator suspension, and sequence unpacking.
 
-use super::{protocol, CallArgs, Execution, IteratorAdvance, Object, PyRuntime, Value, Vm};
+use super::{
+    protocol, CallArgs, Execution, ForIterOutcome, IteratorAdvance, NativeValue, Object, PyError,
+    PyErrorKind, PyRuntime, PyStreamRead, Stream, Value, Vm,
+};
+
+/// An iterator classified by [`Vm::advance_iterator`] whose advance needs a second, unborrowed
+/// pass over `self` (a heap lookup for a sequence, or a descriptor read for a stream).
+enum SlowPathAdvance {
+    Sequence(super::super::heap::ObjectId, usize),
+    Stream(bool),
+}
 
 impl Vm<'_> {
     pub(super) fn get_iterator(&mut self) -> Result<(), String> {
@@ -11,6 +21,17 @@ impl Vm<'_> {
     }
 
     pub(super) fn make_iterator(&mut self, iterable: Value) -> Result<Value, String> {
+        if let Some(NativeValue::Stream(stream)) = iterable.native_value() {
+            if matches!(stream, Stream::Stdin | Stream::StdinBuffer) {
+                // `for line in sys.stdin` needs a heap-object iterator (not the generic
+                // `__iter__`/`__next__` dispatch materialized below): only a heap-object iterator
+                // can suspend a `for` loop, and this one can block on fd 0. See
+                // `advance_iterator`'s `Object::StreamIterator` arm.
+                return self.allocate_object(Object::StreamIterator {
+                    binary: matches!(stream, Stream::StdinBuffer),
+                });
+            }
+        }
         if let Some(id) = iterable.object_id() {
             match self.state.heap.get(id)? {
                 Object::List(_) | Object::Tuple(_) => {
@@ -32,6 +53,7 @@ impl Vm<'_> {
                 | Object::SequenceIterator { .. }
                 | Object::RangeIterator { .. }
                 | Object::CountIterator { .. }
+                | Object::StreamIterator { .. }
                 | Object::CallableIterator { .. }
                 | Object::Generator { .. } => {
                     // These iterators remain lazy; materializing either one here would permit an
@@ -94,7 +116,9 @@ impl Vm<'_> {
                     .map_err(str::to_string)?;
                 return Ok(IteratorAdvance::Yield(Value::Int(value)));
             }
-            Object::SequenceIterator { owner, position } => Some((*owner, *position)),
+            Object::SequenceIterator { owner, position } => {
+                SlowPathAdvance::Sequence(*owner, *position)
+            }
             Object::CallableIterator {
                 callable,
                 sentinel,
@@ -110,21 +134,55 @@ impl Vm<'_> {
                 });
             }
             Object::Generator { .. } => return Ok(IteratorAdvance::Generator),
+            Object::StreamIterator { binary } => SlowPathAdvance::Stream(*binary),
             _ => return Ok(IteratorAdvance::Invalid),
         };
-        let (owner, position) = sequence.expect("only sequence iterators reach the slow path");
-        let value = match self.state.heap.get(owner)? {
-            Object::List(values) | Object::Tuple(values) => values.get(position).copied(),
-            _ => return Err("iterator source changed object kind".into()),
+        match sequence {
+            SlowPathAdvance::Sequence(owner, position) => {
+                let value = match self.state.heap.get(owner)? {
+                    Object::List(values) | Object::Tuple(values) => values.get(position).copied(),
+                    _ => return Err("iterator source changed object kind".into()),
+                };
+                let Some(value) = value else {
+                    return Ok(IteratorAdvance::Exhausted);
+                };
+                let Object::SequenceIterator { position, .. } = self.state.heap.get_mut(iterator)?
+                else {
+                    unreachable!("iterator kind was checked above")
+                };
+                *position += 1;
+                Ok(IteratorAdvance::Yield(value))
+            }
+            SlowPathAdvance::Stream(binary) => self.advance_stream_iterator(binary),
+        }
+    }
+
+    /// Read one line from `sys.stdin`/`sys.stdin.buffer` for a `for` loop, suspending on the same
+    /// `WaitReason` a direct `readline()` call would produce.
+    fn advance_stream_iterator(&mut self, binary: bool) -> Result<IteratorAdvance, String> {
+        let stream = if binary {
+            Stream::StdinBuffer
+        } else {
+            Stream::Stdin
         };
-        let Some(value) = value else {
-            return Ok(IteratorAdvance::Exhausted);
-        };
-        let Object::SequenceIterator { position, .. } = self.state.heap.get_mut(iterator)? else {
-            unreachable!("iterator kind was checked above")
-        };
-        *position += 1;
-        Ok(IteratorAdvance::Yield(value))
+        let marker = Value::Native(NativeValue::Stream(stream));
+        match self.read_stream(&marker, None, true) {
+            Ok(read) if read.is_empty() => Ok(IteratorAdvance::Exhausted),
+            Ok(PyStreamRead::Text(text)) => {
+                Ok(IteratorAdvance::Yield(self.allocate_string(text)?))
+            }
+            Ok(PyStreamRead::Bytes(bytes)) => {
+                let value = self.new_bytes(bytes).map_err(|error| {
+                    self.record_native_error(error)
+                })?;
+                Ok(IteratorAdvance::Yield(value))
+            }
+            Err(PyError {
+                kind: PyErrorKind::Suspend(reason),
+                ..
+            }) => Ok(IteratorAdvance::Blocked(reason)),
+            Err(error) => Err(self.record_native_error(error)),
+        }
     }
 
     pub(super) fn next_stored_iterator(
@@ -137,6 +195,11 @@ impl Vm<'_> {
             IteratorAdvance::Callable { .. }
             | IteratorAdvance::Generator
             | IteratorAdvance::Invalid => Err("object is not a stored iterator".into()),
+            // `next(sys.stdin)` and unpacking outside a `for` loop cannot suspend the way the
+            // `ForIterator` opcode can; this is a narrower surface than CPython's `next()`.
+            IteratorAdvance::Blocked(_) => Err(
+                "reading standard input would block outside a for loop".into(),
+            ),
         }
     }
 
@@ -203,7 +266,11 @@ impl Vm<'_> {
 
     /// Advance the iterator kept at the top of the operand stack. The iterator remains below the
     /// yielded value until exhaustion, which gives `for` a small and explicit stack contract.
-    pub(super) fn for_iterator(&mut self) -> Result<bool, String> {
+    ///
+    /// A [`ForIterOutcome::Blocked`] result leaves the iterator on the stack untouched: retrying
+    /// the same `ForIterator` opcode next quantum re-advances the same iterator object, which is
+    /// safe because [`Vm::advance_stream_iterator`] only mutates position after a successful read.
+    pub(super) fn for_iterator(&mut self) -> Result<ForIterOutcome, String> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
@@ -219,11 +286,11 @@ impl Vm<'_> {
         match self.advance_iterator(id)? {
             IteratorAdvance::Yield(value) => {
                 self.stack.push(value);
-                Ok(true)
+                Ok(ForIterOutcome::Yielded)
             }
             IteratorAdvance::Exhausted => {
                 self.stack.pop();
-                Ok(false)
+                Ok(ForIterOutcome::Exhausted)
             }
             IteratorAdvance::Callable { callable, sentinel } => {
                 self.charge_cpu(1)?;
@@ -236,22 +303,23 @@ impl Vm<'_> {
                 if protocol::equals(&self.state.heap, &value, &sentinel)? {
                     self.exhaust_callable_iterator(id)?;
                     self.stack.pop();
-                    return Ok(false);
+                    return Ok(ForIterOutcome::Exhausted);
                 }
                 self.stack.push(value);
-                Ok(true)
+                Ok(ForIterOutcome::Yielded)
             }
             IteratorAdvance::Generator => match self.resume_generator(id)? {
                 Some(value) => {
                     self.stack.push(value);
-                    Ok(true)
+                    Ok(ForIterOutcome::Yielded)
                 }
                 None => {
                     self.stack.pop();
-                    Ok(false)
+                    Ok(ForIterOutcome::Exhausted)
                 }
             },
             IteratorAdvance::Invalid => Err("for-loop stack does not contain an iterator".into()),
+            IteratorAdvance::Blocked(reason) => Ok(ForIterOutcome::Blocked(reason)),
         }
     }
 

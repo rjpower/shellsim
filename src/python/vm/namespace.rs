@@ -231,6 +231,11 @@ impl Vm<'_> {
                         "PermissionError",
                     ))))
                 }
+                "ProcessLookupError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "ProcessLookupError",
+                    ))))
+                }
                 "SystemExit" => {
                     return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
                         "SystemExit",
@@ -389,6 +394,7 @@ impl Vm<'_> {
                     | "IsADirectoryError"
                     | "NotADirectoryError"
                     | "PermissionError"
+                    | "ProcessLookupError"
             );
             return Ok(name == "BaseException"
                 || (name == "Exception"

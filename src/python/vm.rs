@@ -27,8 +27,8 @@ use super::native::{
     PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity,
     PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
     PyProcessHandle, PyProcessOutput, PyProcessPoll, PyProcessRunner, PyProcessStartRequest,
-    PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PySubcommandSpec,
-    PySubparsersSpec, PyTuple, PyValueCast,
+    PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyStreamRead,
+    PySubcommandSpec, PySubparsersSpec, PyTuple, PyValueCast,
 };
 use super::number;
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
@@ -134,7 +134,8 @@ impl NativeValue {
             Self::STREAM => Self::Stream(match payload {
                 0 => Stream::Stdin,
                 1 => Stream::Stdout,
-                _ => Stream::Stderr,
+                2 => Stream::Stderr,
+                _ => Stream::StdinBuffer,
             }),
             Self::ENVIRONMENT => Self::Environment,
             Self::EXCEPTION_TYPE => {
@@ -154,7 +155,7 @@ impl NativeValue {
     }
 }
 
-const EXCEPTION_TYPES: [&str; 25] = [
+const EXCEPTION_TYPES: [&str; 26] = [
     "Exception",
     "BaseException",
     "AssertionError",
@@ -177,6 +178,7 @@ const EXCEPTION_TYPES: [&str; 25] = [
     "IsADirectoryError",
     "NotADirectoryError",
     "PermissionError",
+    "ProcessLookupError",
     "SystemExit",
     "TimeoutError",
     "StopAsyncIteration",
@@ -230,6 +232,8 @@ pub(super) enum Stream {
     Stdin,
     Stdout,
     Stderr,
+    /// `sys.stdin.buffer`: the same descriptor as `Stdin`, read as raw bytes instead of text.
+    StdinBuffer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -465,6 +469,15 @@ struct VmState {
     code_caches: Vec<CodeCaches>,
     stdin_position: usize,
     stdin_text: Option<String>,
+    /// Bytes read from fd 0 but not yet consumed by a completed `read`/`readline`, kept across
+    /// scheduler quanta so a retry after [`WaitReason`](crate::scheduler::WaitReason) does not
+    /// lose data already drained from the pipe. Only used in scheduler-owned (streaming) mode;
+    /// synchronous execution still uses `stdin_text`/`stdin_position` over the fully supplied
+    /// `ProcessInput::stdin` slice.
+    stdin_stream_pending: Vec<u8>,
+    /// Whether fd 0 has reported end-of-file. Once set, further reads only drain
+    /// `stdin_stream_pending` and never touch the descriptor again.
+    stdin_stream_eof: bool,
     transient_memory: u64,
     retained_memory: u64,
 }
@@ -520,6 +533,16 @@ enum IteratorAdvance {
     Callable { callable: Value, sentinel: Value },
     Generator,
     Invalid,
+    /// Advancing a `StreamIterator` would block on fd 0; suspend the enclosing `for` loop.
+    Blocked(crate::scheduler::WaitReason),
+}
+
+/// Outcome of one `ForIterator` opcode: advance and jump into the loop body, fall through past
+/// it, or suspend the whole process because the iterator's next value isn't available yet.
+pub(super) enum ForIterOutcome {
+    Yielded,
+    Exhausted,
+    Blocked(crate::scheduler::WaitReason),
 }
 
 enum BuiltinSubscript {
@@ -573,11 +596,35 @@ impl DispatchCursor {
 ///
 /// Starred arguments have already been expanded and the calling instruction has advanced, so a
 /// wake retries exactly the native operation without repeating Python-visible argument work.
+/// Both module-level functions and bound methods (e.g. `sys.stdin.readline()`) can suspend, so
+/// this covers either shape of native call.
 #[derive(Clone)]
-struct PendingNativeCall {
-    function: &'static FunctionDef,
-    arguments: CallArgs,
-    call_span: super::source::Span,
+enum PendingNativeCall {
+    Function {
+        function: &'static FunctionDef,
+        arguments: CallArgs,
+        call_span: super::source::Span,
+    },
+    Method {
+        method: &'static super::native::MethodDef,
+        receiver: Value,
+        arguments: CallArgs,
+        call_span: super::source::Span,
+    },
+    /// `input()`: not a table-driven native call, but it reads the same modeled stdin stream and
+    /// so can suspend the same way. The prompt (if any) is already written by the time this is
+    /// installed, so retrying only re-attempts the read.
+    Input { call_span: super::source::Span },
+}
+
+impl PendingNativeCall {
+    fn call_span(&self) -> super::source::Span {
+        match self {
+            Self::Function { call_span, .. }
+            | Self::Method { call_span, .. }
+            | Self::Input { call_span } => *call_span,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -646,8 +693,20 @@ impl<'a> Vm<'a> {
         }
         for frame in &self.bytecode_frames {
             if let Some(pending) = &frame.pending_native_call {
-                values.extend(pending.arguments.positional().iter().copied());
-                values.extend(pending.arguments.keywords().iter().map(|(_, value)| *value));
+                let arguments = match pending {
+                    PendingNativeCall::Function { arguments, .. } => arguments,
+                    PendingNativeCall::Method {
+                        receiver,
+                        arguments,
+                        ..
+                    } => {
+                        values.push(*receiver);
+                        arguments
+                    }
+                    PendingNativeCall::Input { .. } => continue,
+                };
+                values.extend(arguments.positional().iter().copied());
+                values.extend(arguments.keywords().iter().map(|(_, value)| *value));
             }
         }
         let mut scopes = self.local_scopes.clone();
@@ -1068,7 +1127,7 @@ impl<'a> Vm<'a> {
             return;
         }
         match stream {
-            Stream::Stdin => {}
+            Stream::Stdin | Stream::StdinBuffer => {}
             Stream::Stdout => self.out.extend_from_slice(&bytes[..allowed]),
             Stream::Stderr => self.err.extend_from_slice(&bytes[..allowed]),
         }
@@ -1139,6 +1198,7 @@ fn is_os_error(name: &str) -> bool {
             | "IsADirectoryError"
             | "NotADirectoryError"
             | "PermissionError"
+            | "ProcessLookupError"
     )
 }
 

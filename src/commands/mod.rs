@@ -181,6 +181,13 @@ pub(crate) enum CommandResume {
         command: String,
         continuation: Box<crate::python::PythonContinuation>,
     },
+    /// `python -`/bare `python`: draining fd 0 to EOF to obtain the program source before it can
+    /// be compiled and started as a [`CommandResume::Python`] continuation.
+    PythonSource {
+        argv: Vec<String>,
+        buffer: Vec<u8>,
+        reserved: u64,
+    },
     TextStream(streams::TextStream),
 }
 
@@ -852,6 +859,11 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
             ),
         },
         CommandResume::TextStream(continuation) => streams::resume_stream(interp, continuation),
+        CommandResume::PythonSource {
+            argv,
+            buffer,
+            reserved,
+        } => proc::resume_python_source(interp, argv, buffer, reserved),
     };
     finish_ready_invocation(interp, &result);
     result

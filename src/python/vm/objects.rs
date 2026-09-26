@@ -4,8 +4,8 @@ use super::{
     expect_arity, protocol, range_length, select_string_slice, Arc, BuiltinSubscript, BuiltinType,
     CallMode, CallResult, ClassDefinition, ClassField, ClassLayout, CodeCaches, CodeRef,
     ExceptionType, Execution, HashMap, LoadAttributeCache, NameId, NativeValue, Object, Ordering,
-    PyArray, PyError, PyRuntime, PyValueCast, SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value,
-    ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    PyArray, PyError, PyRuntime, PyValueCast, SlicePlan, Slot, SlotValue, Stream, SymbolId, TypeId,
+    Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 impl Vm<'_> {
@@ -199,6 +199,12 @@ impl Vm<'_> {
                 let value = value.get(self).map_err(|error| error.to_string())?;
                 return Ok(Some(value));
             }
+        }
+        // `sys.stdin.buffer` reads the same descriptor as raw bytes instead of decoded text.
+        // There is no general native-attribute mechanism for a data field (only methods), so this
+        // one well-known accessor is special-cased the same way module and class lookups are above.
+        if owner.native_value() == Some(NativeValue::Stream(Stream::Stdin)) && name == "buffer" {
+            return Ok(Some(Value::Native(NativeValue::Stream(Stream::StdinBuffer))));
         }
         if let Some(NativeValue::BuiltinType(builtin)) = owner.native_value() {
             if let Some(value) = self.state.types.attribute(builtin.id(), name)? {
@@ -524,6 +530,7 @@ impl Vm<'_> {
                 | Object::SequenceIterator { .. }
                 | Object::RangeIterator { .. }
                 | Object::CountIterator { .. }
+                | Object::StreamIterator { .. }
                 | Object::CallableIterator { .. }
                 | Object::Generator { .. }
                 | Object::Module { .. }
@@ -737,6 +744,7 @@ impl Vm<'_> {
             | Object::SequenceIterator { .. }
             | Object::RangeIterator { .. }
             | Object::CountIterator { .. }
+            | Object::StreamIterator { .. }
             | Object::CallableIterator { .. }
             | Object::Generator { .. }
             | Object::Module { .. }
@@ -2003,6 +2011,7 @@ impl Vm<'_> {
                     | "IsADirectoryError"
                     | "NotADirectoryError"
                     | "PermissionError"
+                    | "ProcessLookupError"
             );
             return Ok(expected == "BaseException"
                 || (expected == "Exception"
