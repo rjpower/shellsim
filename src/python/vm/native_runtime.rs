@@ -1,63 +1,70 @@
 //! Native-module runtime bridge backed by the metered Python VM.
 
 use super::{
-    protocol, Arc, BigInt, BinaryOperator, BuiltinType, CallArgs, CallMode, CallResult,
+    protocol, Arc, BigInt, BuiltinType, CallArgs, CallMode, CallResult,
     ClassDefinition, ClassLayout, ExceptionType, Execution, HashMap, NativeValue, Object, Ordering,
-    PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray, PyArrayDtype, PyArrayLayout,
-    PyBinaryOp, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError,
+    PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray, PyArrayBuffer, PyArrayData,
+    PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef, PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError,
     PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker,
-    PyMatch, PyMatchData, PyModule, PyNativeKind, PyProcessRunner, PyProperty, PyRaisesContext,
+    PyMatch, PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessRunner, PyTypeObject, PyProperty, PyRaisesContext,
     PyRegex, PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple,
     PyValueCast, RaisedException, Stream, ToPrimitive, Value, ValueTag, Vm,
     MODELED_MAPPING_ENTRY_BYTES, MODELED_VALUE_BYTES,
 };
 
-fn array_offset(layout: &PyArrayLayout, index: &[usize]) -> PyResult<usize> {
-    if index.len() != layout.shape.len() {
-        return Err(PyError::value_error("array index has the wrong rank"));
+/// C-order byte strides for `shape`.
+fn contiguous_strides(shape: &[usize], itemsize: usize) -> PyResult<Vec<isize>> {
+    let mut strides = vec![0isize; shape.len()];
+    let mut stride = itemsize;
+    for (axis, dimension) in shape.iter().enumerate().rev() {
+        strides[axis] =
+            isize::try_from(stride).map_err(|_| PyError::value_error("array is too big."))?;
+        stride = stride
+            .checked_mul((*dimension).max(1))
+            .ok_or_else(|| PyError::value_error("array is too big."))?;
     }
-    let mut offset = layout.offset;
-    for (axis, selected) in index.iter().enumerate() {
-        if *selected >= layout.shape[axis] {
-            return Err(PyError::value_error("array index is out of bounds"));
-        }
-        let selected = isize::try_from(*selected)
-            .map_err(|_| PyError::value_error("array offset overflow"))?;
-        offset = offset
-            .checked_add(
-                layout.strides[axis]
-                    .checked_mul(selected)
-                    .ok_or_else(|| PyError::value_error("array offset overflow"))?,
-            )
-            .ok_or_else(|| PyError::value_error("array offset overflow"))?;
-    }
-    usize::try_from(offset).map_err(|_| PyError::runtime_error("array offset is negative"))
+    Ok(strides)
 }
 
-fn validate_array_layout(layout: &PyArrayLayout, storage_len: usize) -> PyResult<()> {
-    super::super::stdlib::numpy::validate_rank(&layout.shape)?;
-    if layout.shape.contains(&0) {
-        return Ok(());
+/// Check that every element `view` addresses lies inside `buffer` and suits its element kind.
+fn validate_array_view(view: &PyArrayView, buffer: &PyArrayBuffer) -> PyResult<()> {
+    let invalid = |message: &str| Err(PyError::runtime_error(message.to_string()));
+    if view.shape.len() != view.strides.len() {
+        return invalid("array shape and strides have different ranks");
     }
-    let mut minimum = layout.offset;
-    let mut maximum = layout.offset;
-    for (length, stride) in layout.shape.iter().zip(&layout.strides) {
-        let span = isize::try_from(length.saturating_sub(1))
-            .ok()
-            .and_then(|length| stride.checked_mul(length))
-            .ok_or_else(|| PyError::value_error("array offset overflow"))?;
-        if span < 0 {
-            minimum = minimum
-                .checked_add(span)
-                .ok_or_else(|| PyError::value_error("array offset overflow"))?;
-        } else {
-            maximum = maximum
-                .checked_add(span)
-                .ok_or_else(|| PyError::value_error("array offset overflow"))?;
+    if view.dtype.is_values() != matches!(buffer, PyArrayBuffer::Values(_)) {
+        return invalid("array view dtype does not match its storage");
+    }
+    if view.dtype.is_values() {
+        let aligned = |value: isize| value % PyArrayDtype::VALUE_ITEMSIZE as isize == 0;
+        if view.offset % PyArrayDtype::VALUE_ITEMSIZE != 0
+            || !view.strides.iter().all(|stride| aligned(*stride))
+        {
+            return invalid("object array view is not aligned to its elements");
         }
     }
-    if minimum < 0 || usize::try_from(maximum).map_or(true, |value| value >= storage_len) {
-        return Err(PyError::runtime_error("array view is outside storage"));
+    if view.shape.contains(&0) {
+        return Ok(());
+    }
+    let overflow = || PyError::value_error("array is too big.");
+    let mut minimum = isize::try_from(view.offset).map_err(|_| overflow())?;
+    let mut maximum = minimum;
+    for (length, stride) in view.shape.iter().zip(&view.strides) {
+        let span = isize::try_from(length - 1)
+            .ok()
+            .and_then(|length| stride.checked_mul(length))
+            .ok_or_else(overflow)?;
+        if span < 0 {
+            minimum = minimum.checked_add(span).ok_or_else(overflow)?;
+        } else {
+            maximum = maximum.checked_add(span).ok_or_else(overflow)?;
+        }
+    }
+    let end = usize::try_from(maximum)
+        .ok()
+        .and_then(|maximum| maximum.checked_add(view.dtype.itemsize()));
+    if minimum < 0 || end.is_none_or(|end| end > buffer.byte_len()) {
+        return invalid("array view is outside storage");
     }
     Ok(())
 }
@@ -108,6 +115,33 @@ fn stdin_wait_reason(wait: crate::descriptors::IoWait) -> crate::scheduler::Wait
 }
 
 impl Vm<'_> {
+    /// The registered kind of an inline or wide registered value.
+    pub(super) fn registered_kind(
+        &self,
+        value: &Value,
+    ) -> Option<&'static super::super::native::ValueKindDef> {
+        if let Some((index, _)) = value.registered_parts() {
+            return self.state.types.value_kind(index);
+        }
+        match self.state.heap.get(value.object_id()?).ok()? {
+            Object::WideValue { kind, .. } => self.state.types.value_kind(*kind),
+            _ => None,
+        }
+    }
+
+    /// The heap view object behind a checked array handle.
+    fn array_object(&self, array: PyArray) -> PyResult<&Object> {
+        let object = self
+            .state
+            .heap
+            .get(array.object_id())
+            .map_err(PyError::runtime_error)?;
+        match object {
+            Object::Array { .. } => Ok(object),
+            _ => Err(PyError::runtime_error("array handle changed object kind")),
+        }
+    }
+
     /// Read `sys.stdin`/`sys.stdin.buffer` from the fully-supplied `ProcessInput::stdin` slice.
     ///
     /// Used by synchronous execution: the interactive REPL, nested/legacy command dispatch (a
@@ -409,7 +443,7 @@ impl PyRuntime for Vm<'_> {
                 Object::Generator { .. } => PyKind::Generator,
                 Object::Module { .. } => PyKind::Module,
                 Object::Array { .. } => PyKind::Array,
-                Object::ArrayStorage(_) => PyKind::Native,
+                Object::ArrayStorage(_) | Object::WideValue { .. } => PyKind::Native,
                 Object::Regex { .. }
                 | Object::Match { .. }
                 | Object::ArgumentParser { .. }
@@ -1190,7 +1224,10 @@ impl PyRuntime for Vm<'_> {
                         | NativeValue::NativeFunction(_)
                         | NativeValue::ExceptionType(_)
                 )
-            ) {
+            ) || self
+                .registered_kind(value)
+                .is_some_and(|kind| kind.call.is_some())
+            {
                 true
             } else if let Some(id) = value.object_id() {
                 matches!(
@@ -1486,6 +1523,64 @@ impl PyRuntime for Vm<'_> {
         std::ptr::eq(self.state.types.value_kind(index)?, kind).then_some(payload)
     }
 
+    fn new_wide_value_kind(
+        &mut self,
+        kind: &'static super::super::native::ValueKindDef,
+        payload: [u64; 2],
+    ) -> PyResult<Value> {
+        let index = self
+            .state
+            .types
+            .value_kind_index(kind)
+            .ok_or_else(|| PyError::runtime_error("value kind is not registered"))?;
+        let type_id = self
+            .state
+            .types
+            .value_kind_type_id_by_index(index)
+            .ok_or_else(|| PyError::runtime_error("value kind is not registered"))?;
+        Vm::allocate_object(
+            self,
+            Object::WideValue {
+                type_id,
+                kind: index,
+                payload,
+            },
+        )
+        .map_err(PyError::resource_error)
+    }
+
+    fn wide_value_kind_payload(
+        &self,
+        value: &Value,
+        kind: &'static super::super::native::ValueKindDef,
+    ) -> Option<[u64; 2]> {
+        let Object::WideValue { kind: index, payload, .. } =
+            self.state.heap.get(value.object_id()?).ok()?
+        else {
+            return None;
+        };
+        std::ptr::eq(self.state.types.value_kind(*index)?, kind).then_some(*payload)
+    }
+
+    fn value_kind_of(&self, value: &Value) -> Option<&'static super::super::native::ValueKindDef> {
+        self.registered_kind(value)
+    }
+
+    fn builtin_type(&self, name: &str) -> Option<Value> {
+        BuiltinType::ALL
+            .iter()
+            .find(|builtin| builtin.name() == name)
+            .map(|builtin| Value::Native(NativeValue::BuiltinType(*builtin)))
+    }
+
+    fn type_object(&self, value: &Value) -> Option<PyTypeObject> {
+        match value.native_value()? {
+            NativeValue::BuiltinType(builtin) => Some(PyTypeObject::Builtin(builtin.name())),
+            NativeValue::ValueKind(kind) => Some(PyTypeObject::Kind(kind)),
+            _ => None,
+        }
+    }
+
     fn value_kind_type(
         &self,
         kind: &'static super::super::native::ValueKindDef,
@@ -1504,21 +1599,30 @@ impl PyRuntime for Vm<'_> {
 
     fn new_array(
         &mut self,
-        items: Vec<Value>,
-        shape: Vec<usize>,
+        buffer: PyArrayBuffer,
         dtype: PyArrayDtype,
+        shape: Vec<usize>,
     ) -> PyResult<Value> {
         let count = shape
             .iter()
             .try_fold(1usize, |total, dimension| total.checked_mul(*dimension))
-            .ok_or_else(|| PyError::value_error("array is too large"))?;
-        if count != items.len() {
+            .and_then(|count| count.checked_mul(dtype.itemsize()))
+            .ok_or_else(|| PyError::value_error("array is too big."))?;
+        if count != buffer.byte_len()
+            || dtype.is_values() != matches!(buffer, PyArrayBuffer::Values(_))
+        {
             return Err(PyError::runtime_error(
-                "array storage does not match its shape",
+                "array storage does not match its shape and dtype",
             ));
         }
-        let strides = super::super::stdlib::numpy::contiguous_strides(&shape)?;
-        let storage = Vm::allocate_object(self, Object::ArrayStorage(items))
+        let view = PyArrayView {
+            strides: contiguous_strides(&shape, dtype.itemsize())?,
+            dtype,
+            shape,
+            offset: 0,
+            writeable: true,
+        };
+        let storage = Vm::allocate_object(self, Object::ArrayStorage(buffer))
             .map_err(PyError::resource_error)?
             .object_id()
             .expect("allocated storage is an object");
@@ -1526,139 +1630,156 @@ impl PyRuntime for Vm<'_> {
             self,
             Object::Array {
                 storage,
-                layout: PyArrayLayout {
-                    shape,
-                    strides,
-                    offset: 0,
-                },
-                dtype,
+                view,
+                base: None,
             },
         )
         .map_err(PyError::resource_error)
     }
 
-    fn new_array_view(&mut self, array: PyArray, layout: PyArrayLayout) -> PyResult<Value> {
-        if layout.shape.len() != layout.strides.len() {
+    fn new_array_view(&mut self, base: PyArray, view: PyArrayView) -> PyResult<Value> {
+        let (storage, base_writeable, owner) = match self.array_object(base)? {
+            Object::Array {
+                storage,
+                view,
+                base: owner,
+            } => (*storage, view.writeable, owner.unwrap_or(base.object_id())),
+            _ => unreachable!("array_object checks the kind"),
+        };
+        if view.writeable && !base_writeable {
             return Err(PyError::runtime_error(
-                "array shape and strides have different ranks",
+                "a view of a read-only array cannot be writeable",
             ));
         }
-        let (storage, dtype) = match self
-            .state
-            .heap
-            .get(array.object_id())
-            .map_err(PyError::runtime_error)?
-        {
-            Object::Array { storage, dtype, .. } => (*storage, *dtype),
-            _ => return Err(PyError::runtime_error("array handle changed object kind")),
-        };
-        let storage_len = match self
+        match self
             .state
             .heap
             .get(storage)
             .map_err(PyError::runtime_error)?
         {
-            Object::ArrayStorage(values) => values.len(),
+            Object::ArrayStorage(buffer) => validate_array_view(&view, buffer)?,
             _ => return Err(PyError::runtime_error("array storage changed object kind")),
-        };
-        validate_array_layout(&layout, storage_len)?;
+        }
         Vm::allocate_object(
             self,
             Object::Array {
                 storage,
-                layout,
-                dtype,
+                view,
+                base: Some(owner),
             },
         )
         .map_err(PyError::resource_error)
     }
 
-    fn array_layout(&self, array: PyArray) -> PyResult<(PyArrayLayout, PyArrayDtype)> {
+    fn array_view(&self, array: PyArray) -> PyResult<PyArrayView> {
+        match self.array_object(array)? {
+            Object::Array { view, .. } => Ok(view.clone()),
+            _ => unreachable!("array_object checks the kind"),
+        }
+    }
+
+    fn array_storage(&self, array: PyArray) -> PyResult<PyIdentity> {
+        match self.array_object(array)? {
+            Object::Array { storage, .. } => Ok(PyIdentity(*storage)),
+            _ => unreachable!("array_object checks the kind"),
+        }
+    }
+
+    fn array_base(&self, array: PyArray) -> PyResult<Option<Value>> {
+        match self.array_object(array)? {
+            Object::Array { base, .. } => Ok(base.map(Value::Object)),
+            _ => unreachable!("array_object checks the kind"),
+        }
+    }
+
+    fn set_array_writeable(&mut self, array: PyArray, writeable: bool) -> PyResult<()> {
         match self
             .state
             .heap
-            .get(array.object_id())
+            .get_mut(array.object_id())
             .map_err(PyError::runtime_error)?
         {
-            Object::Array { layout, dtype, .. } => Ok((layout.clone(), *dtype)),
+            Object::Array { view, .. } => {
+                view.writeable = writeable;
+                Ok(())
+            }
             _ => Err(PyError::runtime_error("array handle changed object kind")),
         }
     }
 
-    fn array_get(&mut self, array: PyArray, index: &[usize]) -> PyResult<Value> {
-        self.charge_cpu(1).map_err(PyError::resource_error)?;
-        let (storage, layout) = match self
-            .state
-            .heap
-            .get(array.object_id())
-            .map_err(PyError::runtime_error)?
-        {
-            Object::Array {
-                storage, layout, ..
-            } => (*storage, layout.clone()),
-            _ => return Err(PyError::runtime_error("array handle changed object kind")),
-        };
-        let offset = array_offset(&layout, index)?;
-        match self
-            .state
-            .heap
-            .get(storage)
-            .map_err(PyError::runtime_error)?
-        {
-            Object::ArrayStorage(values) => values
-                .get(offset)
-                .copied()
-                .ok_or_else(|| PyError::runtime_error("array offset is outside storage")),
-            _ => Err(PyError::runtime_error("array storage changed object kind")),
+    fn read_arrays(
+        &self,
+        arrays: &[PyArray],
+        read: &mut dyn FnMut(&[PyArrayRef<'_>]) -> PyResult<()>,
+    ) -> PyResult<()> {
+        let mut lent = Vec::with_capacity(arrays.len());
+        for array in arrays {
+            let Object::Array { storage, view, .. } = self.array_object(*array)? else {
+                unreachable!("array_object checks the kind");
+            };
+            let data = match self
+                .state
+                .heap
+                .get(*storage)
+                .map_err(PyError::runtime_error)?
+            {
+                Object::ArrayStorage(PyArrayBuffer::Bytes(bytes)) => PyArrayData::Bytes(bytes),
+                Object::ArrayStorage(PyArrayBuffer::Values(values)) => PyArrayData::Values(values),
+                _ => return Err(PyError::runtime_error("array storage changed object kind")),
+            };
+            lent.push(PyArrayRef { view, data });
         }
+        read(&lent)
     }
 
-    fn array_set(&mut self, array: PyArray, index: &[usize], value: Value) -> PyResult<()> {
-        self.charge_cpu(1).map_err(PyError::resource_error)?;
-        let (storage, layout) = match self
-            .state
-            .heap
-            .get(array.object_id())
-            .map_err(PyError::runtime_error)?
-        {
-            Object::Array {
-                storage, layout, ..
-            } => (*storage, layout.clone()),
-            _ => return Err(PyError::runtime_error("array handle changed object kind")),
+    fn write_array(
+        &mut self,
+        array: PyArray,
+        write: &mut dyn FnMut(PyArrayMut<'_>) -> PyResult<()>,
+    ) -> PyResult<()> {
+        let Object::Array { storage, view, .. } = self.array_object(array)? else {
+            unreachable!("array_object checks the kind");
         };
-        let offset = array_offset(&layout, index)?;
-        match self
+        if !view.writeable {
+            return Err(PyError::value_error("assignment destination is read-only"));
+        }
+        let (storage, view) = (*storage, view.clone());
+        let data = match self
             .state
             .heap
             .get_mut(storage)
             .map_err(PyError::runtime_error)?
         {
-            Object::ArrayStorage(values) => {
-                let destination = values
-                    .get_mut(offset)
-                    .ok_or_else(|| PyError::runtime_error("array offset is outside storage"))?;
-                *destination = value;
-                Ok(())
-            }
-            _ => Err(PyError::runtime_error("array storage changed object kind")),
-        }
+            Object::ArrayStorage(PyArrayBuffer::Bytes(bytes)) => PyArrayDataMut::Bytes(bytes),
+            Object::ArrayStorage(PyArrayBuffer::Values(values)) => PyArrayDataMut::Values(values),
+            _ => return Err(PyError::runtime_error("array storage changed object kind")),
+        };
+        write(PyArrayMut { view: &view, data })
     }
 
-    fn binary_op(&mut self, operation: PyBinaryOp, left: Value, right: Value) -> PyResult<Value> {
-        let operation = match operation {
-            PyBinaryOp::Add => BinaryOperator::Add,
-            PyBinaryOp::Subtract => BinaryOperator::Subtract,
-            PyBinaryOp::Multiply => BinaryOperator::Multiply,
-            PyBinaryOp::Divide => BinaryOperator::Divide,
+    fn apply_operator(&mut self, operator: PyOperator, operands: &[Value]) -> PyResult<Value> {
+        let result = match (operator, operands) {
+            (PyOperator::Binary(operator), [left, right]) => {
+                self.binary_value(operator, *left, *right)
+            }
+            (PyOperator::Unary(operator), [operand]) => {
+                self.stack.push(*operand);
+                self.unary(operator).and_then(|()| self.pop())
+            }
+            (PyOperator::Compare(operator), [left, right]) => {
+                self.stack.push(*left);
+                self.stack.push(*right);
+                self.compare(operator).and_then(|()| self.pop())
+            }
+            _ => return Err(PyError::runtime_error("operator received the wrong arity")),
         };
-        self.binary_value(operation, left, right)
-            .map_err(|message| {
-                if self.pending_exception.is_some() {
-                    PyError::new(PyErrorKind::Raised, message)
-                } else {
-                    PyError::type_error(message)
-                }
-            })
+        result.map_err(|message| {
+            if self.pending_exception.is_some() {
+                PyError::new(PyErrorKind::Raised, message)
+            } else {
+                PyError::type_error(message)
+            }
+        })
     }
 
     fn new_integer(&mut self, decimal: &str) -> PyResult<Value> {
@@ -1762,7 +1883,6 @@ impl PyRuntime for Vm<'_> {
             PyMarker::Stdout => NativeValue::Stream(Stream::Stdout),
             PyMarker::Stderr => NativeValue::Stream(Stream::Stderr),
             PyMarker::ArrayType => NativeValue::BuiltinType(BuiltinType::Array),
-            PyMarker::ComplexType => NativeValue::BuiltinType(BuiltinType::Complex),
         })
     }
 

@@ -656,6 +656,89 @@ impl Vm<'_> {
         }
     }
 
+    /// `from module import *` with the module on top of the stack: bind every name in the
+    /// module's `__all__`, or else every name without a leading underscore, in the current scope.
+    pub(super) fn import_star(&mut self) -> Result<(), String> {
+        let module = self.pop()?;
+        let names = match module.native_value() {
+            Some(NativeValue::Module(definition)) => definition
+                .functions
+                .iter()
+                .map(|function| function.name)
+                .chain(definition.values.iter().map(|value| value.name()))
+                .filter(|name| !name.starts_with('_'))
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            _ => {
+                let Some(Object::Module { scope, name }) = module
+                    .object_id()
+                    .map(|id| self.state.heap.get(id))
+                    .transpose()?
+                else {
+                    return Err(self.missing_attribute(&module, "__all__"));
+                };
+                let (scope, module_name) = (*scope, name.clone());
+                match self.state.heap.scope_get(scope, "__all__").copied() {
+                    Some(all) => {
+                        let items = match all
+                            .object_id()
+                            .map(|id| self.state.heap.get(id))
+                            .transpose()?
+                        {
+                            Some(Object::List(items) | Object::Tuple(items)) => items.clone(),
+                            _ => return Err("module __all__ must be a list or tuple".into()),
+                        };
+                        let mut names = Vec::with_capacity(items.len());
+                        for item in items {
+                            let Some(name) = protocol::string_value(&self.state.heap, &item)?
+                            else {
+                                let message = format!(
+                                    "Item in {module_name}.__all__ must be str, not {}",
+                                    self.type_name_of(&item)?
+                                );
+                                return Err(self.raise_exception("TypeError", message));
+                            };
+                            names.push(name);
+                        }
+                        names
+                    }
+                    None => {
+                        let mut names = self
+                            .state
+                            .heap
+                            .scope_values(scope)?
+                            .into_keys()
+                            .filter(|name| !name.starts_with('_'))
+                            .collect::<Vec<_>>();
+                        // Bind in a stable order so later metering and errors are deterministic.
+                        names.sort_unstable();
+                        names
+                    }
+                }
+            }
+        };
+        for name in names {
+            self.charge_cpu(1)?;
+            let Some(value) = self.resolve_attribute(module, &name)? else {
+                return Err(self.missing_attribute(&module, &name));
+            };
+            if let Some(scope) = self.local_scopes.last().copied() {
+                self.state
+                    .heap
+                    .scope_insert(scope, name, value, &mut self.interp.resources)?;
+            } else {
+                let symbol = self
+                    .state
+                    .heap
+                    .intern_symbol(&name, &mut self.interp.resources)?;
+                self.state
+                    .globals
+                    .insert(symbol, value, &mut self.interp.resources)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Install synthetic package parents for a dotted import and push the value selected by
     /// Python's ordinary import binding rule. Package objects contain only VM module references.
     fn finish_import(&mut self, name: &str, leaf: Value, bind_root: bool) -> Result<(), String> {

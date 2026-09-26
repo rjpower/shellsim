@@ -141,6 +141,11 @@ impl Vm<'_> {
             }
         }
         let function = self.pop()?;
+        if let Some(call) = self.registered_kind(&function).and_then(|kind| kind.call) {
+            return call(self, function, CallArgs::new(arguments, keyword_arguments))
+                .map(CallResult::Value)
+                .map_err(|error| self.record_native_error(error));
+        }
         if let Some(id) = function.object_id() {
             return match self.state.heap.get(id)?.clone() {
                 Object::Function {
@@ -899,6 +904,7 @@ impl Vm<'_> {
                         | Object::Module { .. }
                         | Object::ArrayStorage(_)
                         | Object::Array { .. }
+                        | Object::WideValue { .. }
                         | Object::Regex { .. }
                         | Object::Match { .. }
                         | Object::ArgumentParser { .. }
@@ -1583,6 +1589,7 @@ impl Vm<'_> {
             PyErrorKind::Runtime => Some("RuntimeError"),
             PyErrorKind::Exception(kind) => Some(kind),
             PyErrorKind::Resource
+            | PyErrorKind::Unsupported
             | PyErrorKind::Raised
             | PyErrorKind::Exit(_)
             | PyErrorKind::Suspend(_) => None,

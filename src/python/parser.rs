@@ -22,6 +22,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<Program, ParseError> {
         current: 0,
         expression_depth: 0,
         compound_depth: 0,
+        function_depth: 0,
     }
     .program()
 }
@@ -31,6 +32,8 @@ struct Parser {
     current: usize,
     expression_depth: usize,
     compound_depth: usize,
+    /// Number of enclosing `def` bodies, which forbid `from module import *`.
+    function_depth: usize,
 }
 
 enum ParsedSubscript {
@@ -304,10 +307,13 @@ impl Parser {
             if self.take(|kind| matches!(kind, TokenKind::Arrow)).is_some() {
                 self.skip_annotation(|kind| matches!(kind, TokenKind::Colon))?;
             }
+            self.function_depth += 1;
+            let body = self.suite();
+            self.function_depth -= 1;
             StatementKind::Function {
                 name,
                 parameters,
-                body: self.suite()?,
+                body: body?,
                 is_async,
             }
         } else if self.take(|kind| matches!(kind, TokenKind::Class)).is_some() {
@@ -385,32 +391,39 @@ impl Parser {
                 |kind| matches!(kind, TokenKind::Import),
                 "expected 'import' after module name",
             )?;
-            let mut names = Vec::new();
-            let parenthesized = self
-                .take(|kind| matches!(kind, TokenKind::LeftParen))
-                .is_some();
-            loop {
-                let imported = self.name("expected a name to import")?;
-                let binding = if self.take(|kind| matches!(kind, TokenKind::As)).is_some() {
-                    self.name("expected a binding after 'as'")?
-                } else {
-                    imported.clone()
-                };
-                names.push((imported, binding));
-                if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
-                    break;
+            if self.take(|kind| matches!(kind, TokenKind::Star)).is_some() {
+                if self.function_depth > 0 {
+                    return Err(self.error("import * only allowed at module level"));
                 }
-                if parenthesized && self.at(|kind| matches!(kind, TokenKind::RightParen)) {
-                    break;
+                StatementKind::ImportStar { module }
+            } else {
+                let mut names = Vec::new();
+                let parenthesized = self
+                    .take(|kind| matches!(kind, TokenKind::LeftParen))
+                    .is_some();
+                loop {
+                    let imported = self.name("expected a name to import")?;
+                    let binding = if self.take(|kind| matches!(kind, TokenKind::As)).is_some() {
+                        self.name("expected a binding after 'as'")?
+                    } else {
+                        imported.clone()
+                    };
+                    names.push((imported, binding));
+                    if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
+                        break;
+                    }
+                    if parenthesized && self.at(|kind| matches!(kind, TokenKind::RightParen)) {
+                        break;
+                    }
                 }
+                if parenthesized {
+                    self.expect(
+                        |kind| matches!(kind, TokenKind::RightParen),
+                        "expected ')' after imported names",
+                    )?;
+                }
+                StatementKind::ImportFrom { module, names }
             }
-            if parenthesized {
-                self.expect(
-                    |kind| matches!(kind, TokenKind::RightParen),
-                    "expected ')' after imported names",
-                )?;
-            }
-            StatementKind::ImportFrom { module, names }
         } else if self
             .take(|kind| matches!(kind, TokenKind::Import))
             .is_some()

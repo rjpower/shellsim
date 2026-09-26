@@ -225,6 +225,16 @@ impl Compiler {
                 }
                 self.emit(Operation::PopTop, span);
             }
+            StatementKind::ImportStar { module } => {
+                self.emit(
+                    Operation::Import {
+                        name: module,
+                        bind_root: false,
+                    },
+                    span,
+                );
+                self.emit(Operation::ImportStar, span);
+            }
             StatementKind::Assign { targets, value } => {
                 self.expression(value);
                 let last = targets.len().saturating_sub(1);

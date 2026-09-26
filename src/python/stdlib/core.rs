@@ -143,6 +143,7 @@ pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
         method("dict", "update", dict_update),
         method("dict", "pop", dict_pop),
         method("dict", "copy", dict_copy),
+        method("dict", "clear", dict_clear),
     ],
     getters: &[],
 };
@@ -1945,6 +1946,17 @@ fn dict_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     // CPython's KeyError carries the key, and `str()` shows its repr.
     let key = runtime.repr(&args.positional()[0])?;
     Err(PyError::exception("KeyError", key))
+}
+
+fn dict_clear(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.clear", 0, 0)?;
+    args.reject_keywords("dict.clear")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    for (key, _) in runtime.dict_items(dict)? {
+        runtime.charge_cpu(1)?;
+        runtime.dict_remove(dict, &key)?;
+    }
+    Ok(PyValue::None)
 }
 
 fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

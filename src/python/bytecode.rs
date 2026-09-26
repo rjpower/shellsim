@@ -193,6 +193,8 @@ pub enum Opcode {
     },
     /// `from module import name`, with the module on top of the stack; it stays there.
     ImportFrom(NameId),
+    /// `from module import *`: pop the module and bind its public names in the current scope.
+    ImportStar,
     LoadAttribute(NameId),
     LoadSubscript,
     BuildSlice {
@@ -280,6 +282,7 @@ pub enum Operation {
         bind_root: bool,
     },
     ImportFrom(String),
+    ImportStar,
     LoadAttribute(String),
     LoadSubscript,
     BuildSlice {
@@ -431,6 +434,7 @@ impl CodeBuilder {
                 bind_root,
             },
             Operation::ImportFrom(name) => Opcode::ImportFrom(self.name(name)),
+            Operation::ImportStar => Opcode::ImportStar,
             Operation::LoadAttribute(name) => Opcode::LoadAttribute(self.name(name)),
             Operation::LoadSubscript => Opcode::LoadSubscript,
             Operation::BuildSlice {

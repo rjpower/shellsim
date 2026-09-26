@@ -244,6 +244,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::Generator { .. } => "<generator ...>",
                 Object::Module { .. } => "<module ...>",
                 Object::ArrayStorage(_) => "<array storage ...>",
+                Object::WideValue { .. } => "<value ...>",
                 Object::Array { .. } => "array(...)",
                 Object::Regex { .. } => "re.compile(...) ",
                 Object::Match { .. } => "<re.Match ...>",
@@ -341,9 +342,8 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::Generator { .. } => "<generator>".into(),
             Object::Module { name, .. } => format!("<module '{name}'>"),
             Object::ArrayStorage(_) => "<array storage>".into(),
-            Object::Array { layout, dtype, .. } => {
-                format!("array(shape={:?}, dtype={})", layout.shape, dtype.name())
-            }
+            Object::WideValue { .. } => "<value>".into(),
+            Object::Array { view, .. } => format!("array(shape={:?})", view.shape),
             Object::Regex { pattern, .. } => format!("re.compile({})", quote_string(pattern)),
             Object::Match {
                 text, start, end, ..
@@ -450,6 +450,7 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         | Object::Module { .. }
         | Object::ArrayStorage(_)
         | Object::Array { .. }
+        | Object::WideValue { .. }
         | Object::Regex { .. }
         | Object::Match { .. }
         | Object::ArgumentParser { .. }
@@ -899,6 +900,7 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::Module { .. }
             | Object::ArrayStorage(_)
             | Object::Array { .. }
+            | Object::WideValue { .. }
             | Object::Regex { .. }
             | Object::Match { .. }
             | Object::ArgumentParser { .. }

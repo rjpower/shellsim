@@ -23,6 +23,10 @@ pub enum StatementKind {
         module: String,
         names: Vec<(String, String)>,
     },
+    /// `from module import *` binds the module's public names; only valid at module level.
+    ImportStar {
+        module: String,
+    },
     Assign {
         targets: Vec<AssignmentTarget>,
         value: Expression,

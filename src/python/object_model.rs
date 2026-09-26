@@ -666,10 +666,9 @@ impl Default for TypeRegistry {
             &mut types[BuiltinType::RaisesContext as usize],
             &super::stdlib::unittest::RAISES_CONTEXT_TYPE,
         );
-        install_native_attributes(
-            &mut types[BuiltinType::Array as usize],
-            &super::stdlib::numpy::ARRAY_TYPE,
-        );
+        for definition in super::stdlib::numpy::array_types() {
+            install_native_attributes(&mut types[BuiltinType::Array as usize], definition);
+        }
         install_number_attributes(&mut types);
         install_builtin_slots(&mut types);
         let mut registry = Self {
@@ -777,18 +776,64 @@ impl TypeRegistry {
         Ok(self.get(type_id)?.attributes.get(name).cloned())
     }
 
+    /// Register a module-owned value kind after its bases, linearizing them with C3 as a class
+    /// statement would. Slots and attributes not defined by the kind are inherited through the
+    /// MRO, so `np.float64` finds `float` methods.
     fn register_value_kind(&mut self, kind: &'static super::native::ValueKindDef) {
+        use super::native::KindBase;
         let object = BuiltinType::Object.id();
         let type_id = TypeId(u32::try_from(self.types.len()).expect("too many registered types"));
+        let bases = if kind.bases.is_empty() {
+            vec![object]
+        } else {
+            kind.bases
+                .iter()
+                .map(|base| match base {
+                    KindBase::Kind(base) => self
+                        .value_kind_type_id(base)
+                        .expect("value kind bases are registered first"),
+                    KindBase::Float => BuiltinType::Float.id(),
+                    KindBase::Complex => BuiltinType::Complex.id(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut sequences = bases
+            .iter()
+            .map(|base| {
+                let mut sequence = vec![*base];
+                sequence.extend(&self.types[base.0 as usize].mro);
+                sequence
+            })
+            .collect::<Vec<_>>();
+        sequences.push(bases.clone());
+        let mro = c3_merge(sequences).expect("value kind bases have a consistent MRO");
+        let mut slots = value_kind_slots(kind.slots);
+        for slot in Slot::ALL {
+            if slots.get(slot).is_none() {
+                if let Some(value) = mro
+                    .iter()
+                    .find_map(|ancestor| self.types[ancestor.0 as usize].slots.get(slot).cloned())
+                {
+                    slots.set(slot, value);
+                }
+            }
+        }
         let mut ty = PyType {
             name: kind.name.into(),
-            bases: vec![object],
-            mro: vec![object],
+            bases,
+            mro,
             attributes: HashMap::new(),
-            slots: value_kind_slots(kind.slots),
+            slots,
             value: Some(Value::Native(super::vm::NativeValue::ValueKind(kind))),
         };
         insert_native_attributes(&mut ty, kind.methods, kind.getters);
+        // Builtin attribute lookup reads only the receiver's own table, so copy inherited
+        // attributes down once at registration.
+        for ancestor in &ty.mro {
+            for (name, value) in &self.types[ancestor.0 as usize].attributes {
+                ty.attributes.entry(name.clone()).or_insert(*value);
+            }
+        }
         self.types.push(ty);
         self.value_kinds.push(kind);
         debug_assert_eq!(self.value_kind_type_id(kind), Some(type_id));
@@ -823,11 +868,34 @@ impl TypeRegistry {
     }
 }
 
+/// C3 linearization of `sequences`, each a base followed by its MRO, plus the base list itself.
+fn c3_merge(mut sequences: Vec<Vec<TypeId>>) -> Option<Vec<TypeId>> {
+    let mut merged = Vec::new();
+    loop {
+        sequences.retain(|sequence| !sequence.is_empty());
+        if sequences.is_empty() {
+            return Some(merged);
+        }
+        let head = sequences.iter().map(|sequence| sequence[0]).find(|candidate| {
+            sequences
+                .iter()
+                .all(|sequence| !sequence[1..].contains(candidate))
+        })?;
+        merged.push(head);
+        for sequence in &mut sequences {
+            if sequence[0] == head {
+                sequence.remove(0);
+            }
+        }
+    }
+}
+
 fn value_kind_slots(slots: super::native::ValueKindSlots) -> TypeSlots {
     let binary = SlotValue::NativeBinary;
     let unary = SlotValue::NativeUnary;
     TypeSlots {
         repr: slots.repr.map(unary),
+        str_: slots.str_.map(unary),
         bool_: slots.bool_.map(unary),
         add: slots.add.map(binary),
         reflected_add: slots.reflected_add.map(binary),
@@ -1010,36 +1078,52 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.reflected_multiply = Some(intrinsic(super::stdlib::core::slot_tuple_multiply));
 
     let slots = &mut types[BuiltinType::Array as usize].slots;
-    slots.repr = Some(unary(super::stdlib::numpy::slot_repr));
-    slots.bool_ = Some(unary(super::stdlib::numpy::slot_bool));
-    slots.iter = Some(unary(super::stdlib::numpy::slot_iter));
-    slots.length = Some(unary(super::stdlib::numpy::slot_length));
-    slots.get_item = Some(intrinsic(super::stdlib::numpy::slot_get_item));
-    slots.set_item = Some(SlotValue::NativeTernary(
-        super::stdlib::numpy::slot_set_item,
-    ));
-    slots.add = Some(intrinsic(super::stdlib::numpy::slot_add));
-    slots.reflected_add = Some(intrinsic(super::stdlib::numpy::slot_reflected_add));
-    slots.subtract = Some(intrinsic(super::stdlib::numpy::slot_subtract));
-    slots.reflected_subtract = Some(intrinsic(super::stdlib::numpy::slot_reflected_subtract));
-    slots.multiply = Some(intrinsic(super::stdlib::numpy::slot_multiply));
-    slots.reflected_multiply = Some(intrinsic(super::stdlib::numpy::slot_reflected_multiply));
-    slots.matrix_multiply = Some(intrinsic(super::stdlib::numpy::slot_matrix_multiply));
-    slots.reflected_matrix_multiply = Some(intrinsic(
-        super::stdlib::numpy::slot_reflected_matrix_multiply,
-    ));
-    slots.divide = Some(intrinsic(super::stdlib::numpy::slot_divide));
-    slots.reflected_divide = Some(intrinsic(super::stdlib::numpy::slot_reflected_divide));
-    slots.positive = Some(unary(super::stdlib::numpy::slot_positive));
-    slots.negative = Some(unary(super::stdlib::numpy::slot_negative));
-    slots.invert = Some(unary(super::stdlib::numpy::slot_invert));
-    slots.absolute = Some(unary(super::stdlib::numpy::slot_absolute));
-    slots.equal = Some(intrinsic(super::stdlib::numpy::slot_equal));
-    slots.not_equal = Some(intrinsic(super::stdlib::numpy::slot_not_equal));
-    slots.less_than = Some(intrinsic(super::stdlib::numpy::slot_less_than));
-    slots.less_equal = Some(intrinsic(super::stdlib::numpy::slot_less_equal));
-    slots.greater_than = Some(intrinsic(super::stdlib::numpy::slot_greater_than));
-    slots.greater_equal = Some(intrinsic(super::stdlib::numpy::slot_greater_equal));
+    {
+        use super::stdlib::numpy as np;
+        slots.repr = Some(unary(np::slot_repr));
+        slots.str_ = Some(unary(np::slot_str));
+        slots.bool_ = Some(unary(np::slot_bool));
+        slots.iter = Some(unary(np::slot_iter));
+        slots.length = Some(unary(np::slot_length));
+        slots.get_item = Some(intrinsic(np::slot_get_item));
+        slots.set_item = Some(SlotValue::NativeTernary(np::slot_set_item));
+        slots.positive = Some(unary(np::slot_positive));
+        slots.negative = Some(unary(np::slot_negative));
+        slots.invert = Some(unary(np::slot_invert));
+        slots.absolute = Some(unary(np::slot_absolute));
+        slots.add = Some(intrinsic(np::slot_add));
+        slots.reflected_add = Some(intrinsic(np::slot_reflected_add));
+        slots.subtract = Some(intrinsic(np::slot_subtract));
+        slots.reflected_subtract = Some(intrinsic(np::slot_reflected_subtract));
+        slots.multiply = Some(intrinsic(np::slot_multiply));
+        slots.reflected_multiply = Some(intrinsic(np::slot_reflected_multiply));
+        slots.matrix_multiply = Some(intrinsic(np::slot_matrix_multiply));
+        slots.reflected_matrix_multiply = Some(intrinsic(np::slot_reflected_matrix_multiply));
+        slots.power = Some(intrinsic(np::slot_power));
+        slots.reflected_power = Some(intrinsic(np::slot_reflected_power));
+        slots.divide = Some(intrinsic(np::slot_divide));
+        slots.reflected_divide = Some(intrinsic(np::slot_reflected_divide));
+        slots.floor_divide = Some(intrinsic(np::slot_floor_divide));
+        slots.reflected_floor_divide = Some(intrinsic(np::slot_reflected_floor_divide));
+        slots.remainder = Some(intrinsic(np::slot_remainder));
+        slots.reflected_remainder = Some(intrinsic(np::slot_reflected_remainder));
+        slots.left_shift = Some(intrinsic(np::slot_left_shift));
+        slots.reflected_left_shift = Some(intrinsic(np::slot_reflected_left_shift));
+        slots.right_shift = Some(intrinsic(np::slot_right_shift));
+        slots.reflected_right_shift = Some(intrinsic(np::slot_reflected_right_shift));
+        slots.bitwise_and = Some(intrinsic(np::slot_bitwise_and));
+        slots.reflected_bitwise_and = Some(intrinsic(np::slot_reflected_bitwise_and));
+        slots.bitwise_xor = Some(intrinsic(np::slot_bitwise_xor));
+        slots.reflected_bitwise_xor = Some(intrinsic(np::slot_reflected_bitwise_xor));
+        slots.bitwise_or = Some(intrinsic(np::slot_bitwise_or));
+        slots.reflected_bitwise_or = Some(intrinsic(np::slot_reflected_bitwise_or));
+        slots.equal = Some(intrinsic(np::slot_equal));
+        slots.not_equal = Some(intrinsic(np::slot_not_equal));
+        slots.less_than = Some(intrinsic(np::slot_less_than));
+        slots.less_equal = Some(intrinsic(np::slot_less_equal));
+        slots.greater_than = Some(intrinsic(np::slot_greater_than));
+        slots.greater_equal = Some(intrinsic(np::slot_greater_equal));
+    }
 
     let slots = &mut types[BuiltinType::Complex as usize].slots;
     slots.positive = Some(unary(super::complex::slot_positive));

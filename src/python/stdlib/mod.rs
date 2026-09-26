@@ -75,7 +75,6 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "_functools" => Some(&functools::MODULE),
         "itertools" => Some(&itertools::MODULE),
         "math" => Some(&math::MODULE),
-        "numpy" => Some(&numpy::MODULE),
         "_os" => Some(&os::MODULE),
         "_pytest" => Some(&pytest::MODULE),
         "re" => Some(&re::MODULE),
@@ -87,6 +86,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "typing" => Some(&typing::MODULE),
         "unittest" => Some(&unittest::MODULE),
         "_shellsim_warnings" => Some(&warnings::MODULE),
+        _ if name.starts_with("_numpy") => numpy::native_module(name),
         _ => None,
     }
 }

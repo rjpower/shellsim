@@ -92,7 +92,6 @@ macro_rules! numpy_suites {
 }
 
 numpy_suites! {
-    #[ignore = "pending: typed NumPy core (phase 2)"]
     construction => "test_construction.py";
     #[ignore = "pending: typed NumPy core (phase 2)"]
     dtypes => "test_dtypes.py";

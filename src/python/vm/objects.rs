@@ -595,6 +595,7 @@ impl Vm<'_> {
                 | Object::Module { .. }
                 | Object::ArrayStorage(_)
                 | Object::Array { .. }
+                | Object::WideValue { .. }
                 | Object::Regex { .. }
                 | Object::Match { .. }
                 | Object::ArgumentParser { .. }
@@ -720,39 +721,29 @@ impl Vm<'_> {
         Err("object is not sliceable".into())
     }
 
+    /// Pop one slice bound. An explicit `None` bound is the same as an omitted one.
+    fn pop_slice_bound(&mut self, present: bool, name: &str) -> Result<Option<i64>, String> {
+        if !present {
+            return Ok(None);
+        }
+        let value = self.pop()?;
+        if value.is_none() {
+            return Ok(None);
+        }
+        protocol::int_value(&self.state.heap, &value)
+            .map(Some)
+            .ok_or_else(|| format!("slice {name} must be an integer"))
+    }
+
     pub(super) fn build_slice(
         &mut self,
         has_start: bool,
         has_stop: bool,
         has_step: bool,
     ) -> Result<(), String> {
-        let step = if has_step {
-            Some(
-                self.pop()?
-                    .as_int()
-                    .ok_or("slice step must be an integer")?,
-            )
-        } else {
-            None
-        };
-        let stop = if has_stop {
-            Some(
-                self.pop()?
-                    .as_int()
-                    .ok_or("slice stop must be an integer")?,
-            )
-        } else {
-            None
-        };
-        let start = if has_start {
-            Some(
-                self.pop()?
-                    .as_int()
-                    .ok_or("slice start must be an integer")?,
-            )
-        } else {
-            None
-        };
+        let step = self.pop_slice_bound(has_step, "step")?;
+        let stop = self.pop_slice_bound(has_stop, "stop")?;
+        let start = self.pop_slice_bound(has_start, "start")?;
         let value = self.allocate_object(Object::Slice { start, stop, step })?;
         self.stack.push(value);
         Ok(())
