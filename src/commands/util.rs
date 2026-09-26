@@ -344,20 +344,17 @@ pub(crate) fn try_exec_script(
     path: &str,
     args: &[String],
     stdin: &[u8],
-    out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> Option<crate::commands::CommandPoll> {
     let data = interp.vfs.read("/", path).ok()?;
-    if data.starts_with(b"\0asm") {
-        return Some(crate::commands::wasm::run(
-            interp, path, &data, args, stdin, out, err,
-        ));
-    }
     let text = String::from_utf8_lossy(&data);
     let first = text.lines().next().unwrap_or("");
-    // Interpreted scripts run as a child that loads the interpreter image with the script
-    // path as its operand, as the kernel does for a `#!` line.
-    let mut argv = if first.starts_with("#!") && first.contains("python") {
+    // Wasm executables load as their own process image. Interpreted scripts run as a child that
+    // loads the interpreter image with the script path as its operand, as the kernel does for a
+    // `#!` line.
+    let mut argv = if data.starts_with(b"\0asm") {
+        vec![path.to_string()]
+    } else if first.starts_with("#!") && first.contains("python") {
         let mut argv = vec!["/usr/bin/python3.14".to_string()];
         if first != "#!shellsim-python" {
             argv.push(path.to_string());

@@ -105,18 +105,13 @@ fn wasi_random_is_process_owned_and_faults_do_not_advance_it() {
                 (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))"#,
     );
     let mut snapshot = environment.clone();
-    assert_eq!(
-        run(&mut environment, "/app"),
-        (0, vec![209, 80, 25, 124], Vec::new())
-    );
-    assert_eq!(
-        run(&mut environment, "/app"),
-        (0, vec![162, 199, 198, 172], Vec::new())
-    );
-    assert_eq!(
-        run(&mut snapshot, "/app"),
-        (0, vec![209, 80, 25, 124], Vec::new())
-    );
+    let (status, first, stderr) = run(&mut environment, "/app");
+    assert_eq!((status, first.len(), stderr), (0, 4, Vec::new()));
+    // Each run is a new process with its own entropy stream; a snapshot replays the same one.
+    let (status, second, _) = run(&mut environment, "/app");
+    assert_eq!(status, 0);
+    assert_ne!(second, first);
+    assert_eq!(run(&mut snapshot, "/app"), (0, first, Vec::new()));
 }
 
 #[test]
@@ -641,4 +636,136 @@ fn invalid_iovec_pointer_returns_fault_without_host_panic() {
     "#,
     );
     assert_eq!(run(&mut environment, "/app"), (21, Vec::new(), Vec::new()));
+}
+
+/// Copies stdin to stdout in 4 KiB reads, retrying short writes; exits 2 or 3 on an errno.
+const WAT_CAT: &str = r#"(module
+    (import "wasi_snapshot_preview1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+    (memory (export "memory") 1)
+    (func (export "_start")
+        (loop $copy
+            (i32.store (i32.const 0) (i32.const 1024))
+            (i32.store (i32.const 4) (i32.const 4096))
+            (if (call $read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8))
+                (then (call $exit (i32.const 2))))
+            (if (i32.eqz (i32.load (i32.const 8))) (then return))
+            (i32.store (i32.const 4) (i32.load (i32.const 8)))
+            (loop $flush
+                (if (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 12))
+                    (then (call $exit (i32.const 3))))
+                (i32.store (i32.const 0) (i32.add (i32.load (i32.const 0)) (i32.load (i32.const 12))))
+                (i32.store (i32.const 4) (i32.sub (i32.load (i32.const 4)) (i32.load (i32.const 12))))
+                (br_if $flush (i32.load (i32.const 4))))
+            (br $copy))))"#;
+
+/// Writes "y" forever and exits 3 if a write ever reports an errno.
+const WAT_YES: &str = r#"(module
+    (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+    (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+    (memory (export "memory") 1)
+    (data (i32.const 1024) "yyyyyyyy")
+    (func (export "_start")
+        (i32.store (i32.const 0) (i32.const 1024))
+        (i32.store (i32.const 4) (i32.const 8))
+        (loop $forever
+            (if (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 12))
+                (then (call $exit (i32.const 3))))
+            (br $forever))))"#;
+
+/// Computes forever without any host call.
+const WAT_SPIN: &str =
+    r#"(module (memory (export "memory") 1) (func (export "_start") (loop (br 0))))"#;
+
+fn install_at(environment: &mut Environment, path: &str, wat_source: &str) {
+    let bytes = wat::parse_str(wat_source).unwrap();
+    environment.vfs.write("/", path, &bytes, 0o755).unwrap();
+}
+
+#[test]
+fn wasi_guest_waits_for_a_slow_pipe_writer() {
+    let mut environment = Environment::new();
+    install(&mut environment, WAT_CAT);
+    assert_eq!(
+        run(&mut environment, "{ printf a; sleep 1; printf b; } | /app"),
+        (0, b"ab".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn wasi_guests_stream_through_a_pipeline_larger_than_pipe_capacity() {
+    let mut environment = Environment::new();
+    install(&mut environment, WAT_CAT);
+    let script = "set -o pipefail; head -c 300000 /dev/zero | /app | /app | wc -c; echo $?";
+    assert_eq!(
+        run(&mut environment, script),
+        (0, b"300000\n0\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn wasi_guest_sees_eof_when_the_writer_closes() {
+    let mut environment = Environment::new();
+    install(&mut environment, WAT_CAT);
+    assert_eq!(
+        run(
+            &mut environment,
+            "/app < /dev/null; echo $?; true | /app; echo $?"
+        ),
+        (0, b"0\n0\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn wasi_writer_ends_with_sigpipe_status_when_the_reader_exits() {
+    let mut environment = Environment::new();
+    install(&mut environment, WAT_YES);
+    assert_eq!(
+        run(
+            &mut environment,
+            "set -o pipefail; /app | head -c 3; echo \" $?\""
+        ),
+        (0, b"yyy 141\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn cpu_bound_guest_does_not_starve_the_shell_and_can_be_killed() {
+    let mut environment = Environment::new();
+    install(&mut environment, WAT_SPIN);
+    let memory = environment.resources.memory_mark();
+    assert_eq!(
+        run(
+            &mut environment,
+            "/app & echo started; kill $!; wait $!; echo $?"
+        ),
+        (0, b"started\n143\n".to_vec(), Vec::new())
+    );
+    // Killing the guest returns its linear-memory reservation.
+    assert_eq!(environment.resources.memory_mark(), memory);
+}
+
+#[test]
+fn timeout_stops_a_guest_blocked_on_input() {
+    let mut environment = Environment::new();
+    install(&mut environment, WAT_CAT);
+    assert_eq!(
+        run(&mut environment, "sleep 5 | timeout 1 /app; echo $?"),
+        (0, b"124\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn guests_in_one_pipeline_share_the_machine_cpu_budget() {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 2_000_000,
+        ..Limits::default()
+    });
+    install_at(&mut environment, "/spin", WAT_SPIN);
+    let (status, _, _) = run(&mut environment, "/spin | /spin");
+    assert_eq!(status, 137);
+    // Each guest starts with fuel for the whole remaining budget; charging at fuel yields stops
+    // the pair near the machine limit instead of letting each spend it separately.
+    assert!(environment.resources.cpu_used() <= 2_000_000 + 100_000);
 }

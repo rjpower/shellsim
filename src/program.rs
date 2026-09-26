@@ -97,11 +97,16 @@ impl ProgramContinuation {
                 .resources
                 .release_memory(command.take_reserved_output());
         }
+        if let Self::Native(NativeProcess::Wasm(guest)) = self {
+            guest.release_owned_memory(interp);
+        }
     }
 
     pub(crate) fn poll(&mut self, interp: &mut Interp, budget: usize) -> ShellPoll {
         match self {
             Self::Shell(shell) => shell.poll(interp, budget),
+            // A Wasm guest's host calls need the whole machine for the length of the poll.
+            Self::Native(NativeProcess::Wasm(guest)) => guest.poll(interp),
             Self::Native(native) => native.poll(&mut ActiveSystem::new(interp)),
         }
     }
@@ -146,6 +151,7 @@ pub(crate) enum NativeProcess {
     Nohup(nohup::NohupProcess),
     Nice(nice::NiceProcess),
     Make(Box<make::MakeProcess>),
+    Wasm(crate::commands::WasmProcess),
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -424,6 +430,7 @@ impl NativeProcess {
             Self::Nohup(nohup) => nohup.poll(syscalls),
             Self::Nice(nice) => nice.poll(syscalls),
             Self::Make(make) => make.poll(syscalls),
+            Self::Wasm(_) => unreachable!("ProgramContinuation polls Wasm images directly"),
             Self::Failure {
                 status,
                 message,
@@ -433,7 +440,7 @@ impl NativeProcess {
     }
 }
 
-fn poll_write(
+pub(crate) fn poll_write(
     syscalls: &mut impl System,
     fd: i32,
     bytes: &[u8],
@@ -470,7 +477,7 @@ fn poll_write(
     ShellPoll::Ready(status)
 }
 
-fn wait_reason(wait: IoWait) -> WaitReason {
+pub(crate) fn wait_reason(wait: IoWait) -> WaitReason {
     match wait {
         IoWait::InputReadable(description) => WaitReason::InputReadable(description),
         IoWait::PipeReadable(pipe) => WaitReason::PipeReadable(pipe),
