@@ -1922,7 +1922,16 @@ impl Environment {
             }
             "#" => Some(self.positional.len().to_string()),
             "PWD" => Some(self.cwd.clone()),
-            "@" | "*" => Some(self.positional.join(" ")),
+            "@" => Some(self.positional.join(" ")),
+            // POSIX joins `$*` with the first IFS character: a space when IFS is unset and
+            // nothing when IFS is empty.
+            "*" => {
+                let separator = match self.vars.get("IFS") {
+                    Some(ifs) => ifs.chars().next().map(String::from).unwrap_or_default(),
+                    None => " ".to_string(),
+                };
+                Some(self.positional.join(&separator))
+            }
             _ => {
                 if let Ok(n) = name.parse::<usize>() {
                     if n == 0 {

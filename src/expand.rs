@@ -504,8 +504,9 @@ fn expand_double(interp: &mut Interp, chars: &[char]) -> (Vec<Part>, usize) {
     let mut out = String::new();
     let mut i = 0;
     // Track whether the quoted string ever contributed literal text or an array element, so a
-    // sole empty `"${arr[@]}"` yields zero fields (rather than one empty field).
+    // sole empty `"${arr[@]}"` yields zero fields. A plain `""` still yields one empty field.
     let mut any_content = false;
+    let mut array_expansion = false;
     // Whether the field currently accumulating in `out` should start a new word.
     let mut cur_break = false;
     while i < chars.len() {
@@ -534,6 +535,7 @@ fn expand_double(interp: &mut Interp, chars: &[char]) -> (Vec<Part>, usize) {
                 // preceding text joined to the first element and following text to the last.
                 if let Some((words, consumed)) = try_array_words(interp, &chars[i..], true) {
                     i += consumed;
+                    array_expansion = true;
                     if !words.is_empty() {
                         any_content = true;
                         for (k, wv) in words.into_iter().enumerate() {
@@ -577,7 +579,7 @@ fn expand_double(interp: &mut Interp, chars: &[char]) -> (Vec<Part>, usize) {
             }
         }
     }
-    if !any_content && parts.is_empty() && out.is_empty() {
+    if array_expansion && !any_content && parts.is_empty() && out.is_empty() {
         // sole empty array expansion → zero fields
         return (Vec::new(), i);
     }

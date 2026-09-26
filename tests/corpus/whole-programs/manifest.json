@@ -532,7 +532,7 @@
       ],
       "expect": {
         "disposition": "frontier",
-        "exit_status": 1,
+        "exit_status": 0,
         "class": "unknown_command",
         "unsupported": [
           "nm"
