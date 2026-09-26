@@ -42,6 +42,7 @@ modulo, `int()`, `float()`, `round()`, and `math` functions reject complex value
 including signs, precision, decimal grouping, and alignment of the complete value. Zero padding
 and percentage presentation are rejected. NumPy `complex128`
 arrays store these values directly, and `numpy.complex128` is the builtin `complex` type.
+The `conj()` method aliases `conjugate()` on complex values and NumPy scalars.
 
 The core collection surface includes mutable sets and immutable `frozenset` values with mixed
 comparison and set algebra. VFS-backed text and binary files support read, write, append, and

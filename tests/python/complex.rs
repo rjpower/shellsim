@@ -125,3 +125,23 @@ for spec in ['010.2f', '.2%', 'd', '#.2f']:
 "#;
     assert_eq!(run(source), (0, "(1.2e+03-5.7e+03j) 1.2e+03-5.7e+03j +1234.50-5678.50j 1,234.5-5,678.5j\n      1.0+2.0j 0.0+2.0j -0.0-0.0j\n    (1+2j) +2j 1.0e+00+2.0e+00j\nValueError\nValueError\nValueError\nValueError\n".into(), String::new()));
 }
+
+#[test]
+fn conj_alias_matches_conjugate_for_complex_and_numpy_scalars() {
+    // Builtin complex.conj is a shellsim extension; NumPy scalars use the same alias.
+    let source = r#"import numpy as np
+for value in [1+2j, 2j, complex(1, -0.0), np.complex128(3+4j), np.float64(2), np.int32(3)]:
+    assert repr(value.conj()) == repr(value.conjugate())
+    assert type(value.conj()) is type(value.conjugate())
+assert (1+2j).conj().conj() == 1+2j
+for call in [lambda: (1j).conj(1), lambda: (1j).conj(x=1), lambda: np.float64(2).conj(1)]:
+    try:
+        call()
+    except TypeError:
+        pass
+    else:
+        assert False
+print('ok')
+"#;
+    assert_eq!(run(source), (0, "ok\n".into(), String::new()));
+}

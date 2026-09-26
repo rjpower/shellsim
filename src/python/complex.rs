@@ -8,7 +8,8 @@
 //!
 //! Operations that are undefined for complex numbers (ordering, floor division, modulo, and the
 //! real-only conversions elsewhere in the runtime) raise `TypeError` explicitly. Format
-//! specifications are not implemented for complex values.
+//! specifications are rendered by the shared VM format grammar. The `conj` method is a
+//! shellsim alias for `conjugate`, also used by NumPy complex scalars.
 
 use num_traits::ToPrimitive;
 
@@ -19,11 +20,18 @@ use super::number::NumberRef;
 
 pub(super) static COMPLEX_TYPE: NativeTypeDef = NativeTypeDef {
     name: "complex",
-    methods: &[MethodDef {
-        type_name: "complex",
-        name: "conjugate",
-        call: conjugate,
-    }],
+    methods: &[
+        MethodDef {
+            type_name: "complex",
+            name: "conjugate",
+            call: conjugate,
+        },
+        MethodDef {
+            type_name: "complex",
+            name: "conj",
+            call: conjugate,
+        },
+    ],
     getters: &[
         GetterDef {
             owner: "complex",

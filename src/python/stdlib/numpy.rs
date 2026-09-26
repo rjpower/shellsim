@@ -290,11 +290,18 @@ pub(super) fn value_kinds() -> impl Iterator<Item = &'static ValueKindDef> {
 
 /// Numeric-tower accessors shared by every NumPy scalar type. Real scalars are their own real
 /// part and conjugate; the imaginary part is zero of the same dtype, as in NumPy.
-static SCALAR_METHODS: &[MethodDef] = &[MethodDef {
-    type_name: "numpy.generic",
-    name: "conjugate",
-    call: scalar_conjugate,
-}];
+static SCALAR_METHODS: &[MethodDef] = &[
+    MethodDef {
+        type_name: "numpy.generic",
+        name: "conjugate",
+        call: scalar_conjugate,
+    },
+    MethodDef {
+        type_name: "numpy.generic",
+        name: "conj",
+        call: scalar_conjugate,
+    },
+];
 
 static SCALAR_GETTERS: &[GetterDef] = &[
     GetterDef {
