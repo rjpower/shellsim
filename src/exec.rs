@@ -231,6 +231,9 @@ fn time_report(start: TimeStart, monotonic_ns: u64, cpu_ns: u64) -> String {
 enum ShellFrame {
     FinishTime(TimeStart),
     Eval(Node),
+    /// Set `PIPESTATUS` to the status of the simple command, subshell, or arithmetic command
+    /// that just finished, as bash does for a pipeline of one.
+    RecordPipeStatus,
     /// Read the next complete command from fd 0, as a shell with no `-c` or script operand
     /// does. `pending` holds a partial command that needs more lines.
     ReadProgram {
@@ -560,6 +563,12 @@ impl ShellContinuation {
                 return ShellPoll::Ready(self.status);
             };
             self.step(interp, frame);
+            // Record a finished command's PIPESTATUS in the same step, so bookkeeping does not
+            // change how much work fits in a scheduler quantum.
+            while matches!(self.frames.last(), Some(ShellFrame::RecordPipeStatus)) {
+                self.frames.pop();
+                interp.set_array("PIPESTATUS", vec![self.status.to_string()]);
+            }
             interp.last_status = self.status;
             if self.replaced {
                 return ShellPoll::Replaced;
@@ -1610,6 +1619,9 @@ impl ShellContinuation {
                 interp.loop_depth = interp.loop_depth.saturating_sub(1);
             }
             ShellFrame::RestoreRedirect(scope) => end_redirects(interp, scope),
+            ShellFrame::RecordPipeStatus => {
+                interp.set_array("PIPESTATUS", vec![self.status.to_string()]);
+            }
             ShellFrame::FinishFunction {
                 positional,
                 variables,
@@ -1929,6 +1941,7 @@ impl ShellContinuation {
                     }
                 }
                 let last = statuses.last().copied().unwrap_or(0);
+                interp.set_array("PIPESTATUS", statuses.iter().map(i32::to_string).collect());
                 self.status = if pipefail {
                     statuses
                         .into_iter()
@@ -1956,6 +1969,13 @@ impl ShellContinuation {
             } else {
                 interp.last_status
             };
+            return;
+        }
+        if matches!(
+            node,
+            Node::Command { .. } | Node::ArgvCommand(_) | Node::Subshell(_) | Node::Arithmetic(_)
+        ) && !self.push(interp, ShellFrame::RecordPipeStatus)
+        {
             return;
         }
         match node {
@@ -2310,10 +2330,12 @@ impl ShellContinuation {
     fn exec_in_place(&mut self, interp: &mut Interp, argv: &[String]) -> bool {
         if !self.exec_tail
             || interp.exit_disposition.is_some()
-            || !self
-                .frames
-                .iter()
-                .all(|frame| matches!(frame, ShellFrame::RestoreRedirect(_)))
+            || !self.frames.iter().all(|frame| {
+                matches!(
+                    frame,
+                    ShellFrame::RestoreRedirect(_) | ShellFrame::RecordPipeStatus
+                )
+            })
             || !crate::commands::execs_native_image(interp, &argv[0])
         {
             return false;

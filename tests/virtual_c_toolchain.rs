@@ -129,3 +129,35 @@ int main(void) {
         environment.run_script_capture("chmod +x /work/read.wasm && /work/read.wasm");
     assert_eq!(run.exit_status, 0, "{}", String::from_utf8_lossy(&stderr));
 }
+
+#[test]
+fn c_sleep_and_nanosleep_wait_on_virtual_time() {
+    let mut environment = toolchain_environment();
+    environment
+        .vfs
+        .write(
+            "/",
+            "/work/nap.c",
+            br#"
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+int main(void) {
+    struct timespec half = {0, 500000000};
+    if (sleep(2) != 0) return 1;
+    if (nanosleep(&half, NULL) != 0) return 2;
+    puts("awake");
+    return 0;
+}
+"#,
+            0o644,
+        )
+        .unwrap();
+    let (result, stdout, stderr) = environment
+        .run_script_capture("cd /work && cc -o nap nap.c && ./nap & sleep 1; echo first; wait");
+    assert_eq!(
+        (result.exit_status, stdout, stderr),
+        (0, b"first\nawake\n".to_vec(), Vec::new())
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 2_500_000_000);
+}
