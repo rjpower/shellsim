@@ -1,8 +1,11 @@
 """Standard operators as functions, following CPython 3.14's ``operator`` module.
 
 Every function delegates to the ordinary operator syntax, so user-defined dunder methods and
-builtin type rules apply exactly as they do in expressions.
+builtin type rules apply exactly as they do in expressions. ``index`` comes from the native
+``_operator`` module because its error names types as the interpreter does.
 """
+
+from _operator import index
 
 
 def lt(a, b):
@@ -71,15 +74,6 @@ def and_(a, b):
 
 def floordiv(a, b):
     return a // b
-
-
-def index(a):
-    if isinstance(a, int):
-        return int(a)
-    method = getattr(type(a), "__index__", None)
-    if method is None:
-        raise TypeError(f"'{type(a).__name__}' object cannot be interpreted as an integer")
-    return method(a)
 
 
 def inv(a):

@@ -615,3 +615,59 @@ def test_container_repr_uses_item_repr_and_marks_self_references():
     mapping = {}
     mapping["self"] = mapping
     assert repr(mapping) == "{'self': {...}}"
+
+
+def test_hash_follows_cpython_numeric_and_container_rules():
+    # Numeric and numeric-tuple hashes are fixed by CPython's specification, independent of
+    # PYTHONHASHSEED; string hashes are only required to be consistent.
+    assert hash(-1) == -2
+    assert hash(2**61) == 1
+    assert hash(2**100) == 549755813888
+    assert hash(2.0) == hash(2) == hash(2 + 0j)
+    assert hash(1.5) == 1152921504606846977
+    assert hash(float("inf")) == 314159
+    assert hash(1 + 2j) == 2000007
+    assert hash(None) == 4238894112
+    assert hash((1, 2)) == -3550055125485641917
+    assert hash(()) == 5740354900026072187
+    assert hash(frozenset({1, 2, 3})) == -272375401224217160
+    assert hash("text") == hash("te" + "xt")
+    assert hash(b"abc") == hash(b"abc")
+    assert hash(range(0, 10, 2)) == hash(range(0, 9, 2))
+
+    class Eq:
+        def __eq__(self, other):
+            return True
+
+    class Wide:
+        def __hash__(self):
+            return 2**64
+
+    class MinusOne:
+        def __hash__(self):
+            return -1
+
+    class Unhashable:
+        __hash__ = None
+
+    class Plain:
+        pass
+
+    assert hash(Wide()) == 8
+    assert hash(MinusOne()) == -2
+    plain = Plain()
+    assert hash(plain) == hash(plain)
+    for value, name in [
+        ([], "list"),
+        ({}, "dict"),
+        (set(), "set"),
+        (Eq(), "Eq"),
+        (Unhashable(), "Unhashable"),
+        ((1, [2]), "list"),
+    ]:
+        try:
+            hash(value)
+        except TypeError as error:
+            assert str(error) == f"unhashable type: '{name}'"
+        else:
+            raise AssertionError(f"hash({value!r}) did not raise")

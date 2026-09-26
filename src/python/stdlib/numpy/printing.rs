@@ -52,11 +52,22 @@ fn nested(
     let mut parts = Vec::with_capacity(length);
     for position in 0..length {
         let offset = (offset as isize + position as isize * stride) as usize;
-        parts.push(nested(runtime, array, axis + 1, offset, separator, indent + 1)?);
+        parts.push(nested(
+            runtime,
+            array,
+            axis + 1,
+            offset,
+            separator,
+            indent + 1,
+        )?);
     }
     let rows_separator = if axis + 1 < array.ndim() {
         let blank_lines = "\n".repeat(array.ndim() - axis - 1);
-        format!("{}{blank_lines}{}", separator.trim_end(), " ".repeat(indent + 1))
+        format!(
+            "{}{blank_lines}{}",
+            separator.trim_end(),
+            " ".repeat(indent + 1)
+        )
     } else {
         separator.to_string()
     };
@@ -71,7 +82,10 @@ fn implicit_dtype(dtype: DType) -> bool {
     )
 }
 
-pub(in crate::python) fn array_repr(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<String> {
+pub(in crate::python) fn array_repr(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+) -> PyResult<String> {
     runtime.charge_cpu(array.size() as u64 + 1)?;
     let prefix = "array(";
     let body = nested(runtime, array, 0, array.view.offset, ", ", prefix.len())?;

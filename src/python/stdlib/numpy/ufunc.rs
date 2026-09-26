@@ -23,12 +23,13 @@ use super::super::super::native::{
 };
 use super::super::super::Value;
 use super::array::{
-    broadcast_shapes, broadcast_strides, element_count, new_array, reserve_elements, Array,
-    Offsets,
+    broadcast_shapes, broadcast_strides, element_count, new_array, reserve_elements, Array, Offsets,
 };
 use super::convert::{self, Leaf};
 use super::dtype::{self, Casting, Category, DType, Kind, Weak};
-use super::element::{dispatch_complex, dispatch_integer, dispatch_numeric, dispatch_real, Element};
+use super::element::{
+    dispatch_complex, dispatch_integer, dispatch_numeric, dispatch_real, Element,
+};
 use super::ops::{ComplexParts, FpFlags, Integer, Numeric, Real};
 use super::scalar::NO_SLOTS;
 
@@ -206,7 +207,13 @@ const BOOL_SUBTRACT: &str = "numpy boolean subtract, the `-` operator, is not su
 const BOOL_NEGATIVE: &str = "The numpy boolean negative, the `-` operator, is not supported, \
                              use the `~` operator or the logical_not function instead.";
 
-const fn arith(name: &'static str, op: ArithOp, bools: BoolLoop, complex: bool, object: Option<PyOperator>) -> UfuncDef {
+const fn arith(
+    name: &'static str,
+    op: ArithOp,
+    bools: BoolLoop,
+    complex: bool,
+    object: Option<PyOperator>,
+) -> UfuncDef {
     UfuncDef {
         name,
         family: Family::Arith { op, bools, complex },
@@ -234,7 +241,13 @@ const fn float(name: &'static str, op: FloatOp, complex: bool) -> UfuncDef {
     }
 }
 
-const fn unary_def(name: &'static str, op: UnaryOp, bools: BoolLoop, complex: bool, object: Option<PyOperator>) -> UfuncDef {
+const fn unary_def(
+    name: &'static str,
+    op: UnaryOp,
+    bools: BoolLoop,
+    complex: bool,
+    object: Option<PyOperator>,
+) -> UfuncDef {
     UfuncDef {
         name,
         family: Family::Unary { op, bools, complex },
@@ -252,7 +265,13 @@ const fn simple(name: &'static str, family: Family, object: Option<PyOperator>) 
 
 /// Every ufunc; a `numpy.ufunc` value's payload is its index here.
 pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
-    arith("add", ArithOp::Add, BoolLoop::Keep, true, binary_operator(BinaryOperator::Add)),
+    arith(
+        "add",
+        ArithOp::Add,
+        BoolLoop::Keep,
+        true,
+        binary_operator(BinaryOperator::Add),
+    ),
     arith(
         "subtract",
         ArithOp::Subtract,
@@ -260,8 +279,18 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
         true,
         binary_operator(BinaryOperator::Subtract),
     ),
-    arith("multiply", ArithOp::Multiply, BoolLoop::Keep, true, binary_operator(BinaryOperator::Multiply)),
-    simple("divide", Family::TrueDivide, binary_operator(BinaryOperator::Divide)),
+    arith(
+        "multiply",
+        ArithOp::Multiply,
+        BoolLoop::Keep,
+        true,
+        binary_operator(BinaryOperator::Multiply),
+    ),
+    simple(
+        "divide",
+        Family::TrueDivide,
+        binary_operator(BinaryOperator::Divide),
+    ),
     arith(
         "floor_divide",
         ArithOp::FloorDivide,
@@ -277,24 +306,58 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
         binary_operator(BinaryOperator::Remainder),
     ),
     arith("fmod", ArithOp::Fmod, BoolLoop::Int8, false, None),
-    arith("power", ArithOp::Power, BoolLoop::Int8, true, binary_operator(BinaryOperator::Power)),
+    arith(
+        "power",
+        ArithOp::Power,
+        BoolLoop::Int8,
+        true,
+        binary_operator(BinaryOperator::Power),
+    ),
     arith("maximum", ArithOp::Maximum, BoolLoop::Keep, true, None),
     arith("minimum", ArithOp::Minimum, BoolLoop::Keep, true, None),
     arith("fmax", ArithOp::Fmax, BoolLoop::Keep, true, None),
     arith("fmin", ArithOp::Fmin, BoolLoop::Keep, true, None),
     compare("equal", CompareOp::Equal, ComparisonOperator::Equal),
-    compare("not_equal", CompareOp::NotEqual, ComparisonOperator::NotEqual),
+    compare(
+        "not_equal",
+        CompareOp::NotEqual,
+        ComparisonOperator::NotEqual,
+    ),
     compare("less", CompareOp::Less, ComparisonOperator::Less),
-    compare("less_equal", CompareOp::LessEqual, ComparisonOperator::LessEqual),
+    compare(
+        "less_equal",
+        CompareOp::LessEqual,
+        ComparisonOperator::LessEqual,
+    ),
     compare("greater", CompareOp::Greater, ComparisonOperator::Greater),
-    compare("greater_equal", CompareOp::GreaterEqual, ComparisonOperator::GreaterEqual),
+    compare(
+        "greater_equal",
+        CompareOp::GreaterEqual,
+        ComparisonOperator::GreaterEqual,
+    ),
     simple("logical_and", Family::Logical(LogicalOp::And), None),
     simple("logical_or", Family::Logical(LogicalOp::Or), None),
     simple("logical_xor", Family::Logical(LogicalOp::Xor), None),
-    simple("bitwise_and", Family::Bitwise(BitOp::And), binary_operator(BinaryOperator::BitwiseAnd)),
-    simple("bitwise_or", Family::Bitwise(BitOp::Or), binary_operator(BinaryOperator::BitwiseOr)),
-    simple("bitwise_xor", Family::Bitwise(BitOp::Xor), binary_operator(BinaryOperator::BitwiseXor)),
-    simple("left_shift", Family::Bitwise(BitOp::LeftShift), binary_operator(BinaryOperator::LeftShift)),
+    simple(
+        "bitwise_and",
+        Family::Bitwise(BitOp::And),
+        binary_operator(BinaryOperator::BitwiseAnd),
+    ),
+    simple(
+        "bitwise_or",
+        Family::Bitwise(BitOp::Or),
+        binary_operator(BinaryOperator::BitwiseOr),
+    ),
+    simple(
+        "bitwise_xor",
+        Family::Bitwise(BitOp::Xor),
+        binary_operator(BinaryOperator::BitwiseXor),
+    ),
+    simple(
+        "left_shift",
+        Family::Bitwise(BitOp::LeftShift),
+        binary_operator(BinaryOperator::LeftShift),
+    ),
     simple(
         "right_shift",
         Family::Bitwise(BitOp::RightShift),
@@ -322,13 +385,23 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
     ),
     unary_def("absolute", UnaryOp::Absolute, BoolLoop::Keep, true, None),
     unary_def("square", UnaryOp::Square, BoolLoop::Int8, true, None),
-    unary_def("reciprocal", UnaryOp::Reciprocal, BoolLoop::Int8, true, None),
+    unary_def(
+        "reciprocal",
+        UnaryOp::Reciprocal,
+        BoolLoop::Int8,
+        true,
+        None,
+    ),
     unary_def("sign", UnaryOp::Sign, BoolLoop::Missing, true, None),
     unary_def("conjugate", UnaryOp::Conjugate, BoolLoop::Int8, true, None),
     unary_def("floor", UnaryOp::Floor, BoolLoop::Keep, false, None),
     unary_def("ceil", UnaryOp::Ceil, BoolLoop::Keep, false, None),
     unary_def("trunc", UnaryOp::Trunc, BoolLoop::Keep, false, None),
-    simple("invert", Family::Invert, Some(PyOperator::Unary(UnaryOperator::Invert))),
+    simple(
+        "invert",
+        Family::Invert,
+        Some(PyOperator::Unary(UnaryOperator::Invert)),
+    ),
     simple("logical_not", Family::LogicalNot, None),
     float("sqrt", FloatOp::Sqrt, true),
     float("cbrt", FloatOp::Cbrt, false),
@@ -467,7 +540,10 @@ const fn ufunc_method(
     }
 }
 
-const fn ufunc_getter(name: &'static str, get: fn(&mut dyn PyRuntime, PyValue) -> PyResult) -> GetterDef {
+const fn ufunc_getter(
+    name: &'static str,
+    get: fn(&mut dyn PyRuntime, PyValue) -> PyResult,
+) -> GetterDef {
     GetterDef {
         owner: "numpy.ufunc",
         name,
@@ -508,7 +584,9 @@ fn get_nout(_runtime: &mut dyn PyRuntime, _value: PyValue) -> PyResult {
 }
 
 fn get_nargs(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
-    Ok(Value::Int(UFUNCS[receiver(runtime, &value)].nin() as i64 + 1))
+    Ok(Value::Int(
+        UFUNCS[receiver(runtime, &value)].nin() as i64 + 1,
+    ))
 }
 
 fn get_identity(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
@@ -529,7 +607,11 @@ fn get_identity(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
     })
 }
 
-fn call_ufunc_value(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+fn call_ufunc_value(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
     let index = receiver(runtime, &receiver_value);
     call(runtime, index, args)
 }
@@ -539,7 +621,11 @@ fn method_reduce(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: Cal
     super::reduce::ufunc_reduce(runtime, index, args)
 }
 
-fn method_accumulate(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+fn method_accumulate(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
     let index = receiver(runtime, &receiver_value);
     super::reduce::ufunc_accumulate(runtime, index, args)
 }
@@ -561,7 +647,8 @@ fn method_outer(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: Call
     shape.extend(std::iter::repeat_n(1, right.ndim()));
     let mut strides = left.strides().to_vec();
     strides.extend(std::iter::repeat_n(0, right.ndim()));
-    let expanded = super::array::new_view(runtime, &left, left.dtype, shape, strides, left.view.offset)?;
+    let expanded =
+        super::array::new_view(runtime, &left, left.dtype, shape, strides, left.view.offset)?;
     apply(
         runtime,
         index,
@@ -591,7 +678,11 @@ impl Options {
 }
 
 /// `np.<ufunc>(*inputs, out=None, dtype=None, casting='same_kind')`.
-pub(in crate::python) fn call(runtime: &mut dyn PyRuntime, index: usize, args: CallArgs) -> PyResult {
+pub(in crate::python) fn call(
+    runtime: &mut dyn PyRuntime,
+    index: usize,
+    args: CallArgs,
+) -> PyResult {
     let ufunc = &UFUNCS[index];
     let nin = ufunc.nin();
     let positional = args.positional();
@@ -705,7 +796,10 @@ fn operand(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<(Operand, bo
 
 /// The dtype operands promote to under NEP 50.
 fn common_dtype(operands: &[Operand]) -> PyResult<DType> {
-    let strong = operands.iter().filter_map(Operand::dtype).collect::<Vec<_>>();
+    let strong = operands
+        .iter()
+        .filter_map(Operand::dtype)
+        .collect::<Vec<_>>();
     let weak = operands
         .iter()
         .filter_map(|operand| match operand {
@@ -728,9 +822,12 @@ fn no_loop(name: &str, inputs: &[DType]) -> PyError {
     } else {
         format!("({types})")
     };
-    PyError::exception("UFuncTypeError", format!(
+    PyError::exception(
+        "UFuncTypeError",
+        format!(
         "ufunc '{name}' did not contain a loop with signature matching types {rendered} -> None"
-    ))
+    ),
+    )
 }
 
 fn class_name(dtype: DType) -> String {
@@ -746,10 +843,13 @@ fn class_name(dtype: DType) -> String {
 }
 
 fn not_supported(name: &str) -> PyError {
-    PyError::exception("UFuncTypeError", format!(
-        "ufunc '{name}' not supported for the input types, and the inputs could not be safely \
+    PyError::exception(
+        "UFuncTypeError",
+        format!(
+            "ufunc '{name}' not supported for the input types, and the inputs could not be safely \
          coerced to any supported types according to the casting rule ''safe''"
-    ))
+        ),
+    )
 }
 
 /// Loop and output dtypes chosen for one call.
@@ -772,7 +872,9 @@ fn resolve(
     };
     let object = common.kind() == Kind::Object;
     if object {
-        if ufunc.object.is_none() && !matches!(ufunc.family, Family::Logical(_) | Family::LogicalNot) {
+        if ufunc.object.is_none()
+            && !matches!(ufunc.family, Family::Logical(_) | Family::LogicalNot)
+        {
             return Err(PyError::type_error(format!(
                 "loop of ufunc does not support argument 0 of type object which has no callable \
                  {name} method"
@@ -807,7 +909,9 @@ fn resolve(
             if string {
                 return Err(no_loop(name, inputs));
             }
-            Ok(same(requested.unwrap_or_else(|| dtype::true_divide_dtype(common))))
+            Ok(same(
+                requested.unwrap_or_else(|| dtype::true_divide_dtype(common)),
+            ))
         }
         Family::Compare(_) => Ok(Resolved {
             input: common,
@@ -913,13 +1017,16 @@ pub(in crate::python) fn apply(
     if options.dtype.is_some() {
         for (position, dtype) in input_dtypes.iter().enumerate() {
             if !dtype::can_cast(*dtype, resolved.input, casting) {
-                return Err(PyError::exception("UFuncTypeError", format!(
+                return Err(PyError::exception(
+                    "UFuncTypeError",
+                    format!(
                     "Cannot cast ufunc '{}' input {position} from {} to {} with casting rule '{}'",
                     ufunc.name,
                     dtype.repr(),
                     resolved.input.repr(),
                     casting.name()
-                )));
+                ),
+                ));
             }
         }
     }
@@ -938,20 +1045,29 @@ pub(in crate::python) fn apply(
             }
         }
         if !dtype::can_cast(resolved.output, out.dtype, casting) {
-            return Err(PyError::exception("UFuncTypeError", format!(
-                "Cannot cast ufunc '{}' output from {} to {} with casting rule '{}'",
-                ufunc.name,
-                resolved.output.repr(),
-                out.dtype.repr(),
-                casting.name()
-            )));
+            return Err(PyError::exception(
+                "UFuncTypeError",
+                format!(
+                    "Cannot cast ufunc '{}' output from {} to {} with casting rule '{}'",
+                    ufunc.name,
+                    resolved.output.repr(),
+                    out.dtype.repr(),
+                    casting.name()
+                ),
+            ));
         }
     }
     let shape = match &options.out {
         Some(out) => out.shape().to_vec(),
         None => shape,
     };
-    if let (Family::Arith { op: ArithOp::Power, .. }, true) = (ufunc.family, resolved.input.is_integer()) {
+    if let (
+        Family::Arith {
+            op: ArithOp::Power, ..
+        },
+        true,
+    ) = (ufunc.family, resolved.input.is_integer())
+    {
         reject_negative_exponent(runtime, &operands[1])?;
     }
     let prepared = operands
@@ -1005,11 +1121,13 @@ fn comparison_safe_common(ufunc: &UfuncDef, operands: &[Operand]) -> PyResult<DT
     if !out_of_range {
         return Ok(common);
     }
-    Ok(if common.category() == Category::Unsigned && common.kind() == Kind::UInt64 {
-        DType::FLOAT64
-    } else {
-        DType::INT64
-    })
+    Ok(
+        if common.category() == Category::Unsigned && common.kind() == Kind::UInt64 {
+            DType::FLOAT64
+        } else {
+            DType::INT64
+        },
+    )
 }
 
 fn reject_negative_exponent(runtime: &mut dyn PyRuntime, exponent: &Operand) -> PyResult<()> {
@@ -1111,7 +1229,11 @@ fn numeric_loop(
     output: &mut [u8],
     flags: &mut FpFlags,
 ) -> PyResult<()> {
-    let unsupported = || Err(PyError::runtime_error("ufunc loop has no kernel for its dtype"));
+    let unsupported = || {
+        Err(PyError::runtime_error(
+            "ufunc loop has no kernel for its dtype",
+        ))
+    };
     match family {
         Family::Arith { op, .. } => dispatch_numeric!(kind, T => {
             let operation = arith_fn::<T>(op);
@@ -1130,9 +1252,13 @@ fn numeric_loop(
                 LogicalOp::Or => |a, b| a || b,
                 LogicalOp::Xor => |a, b| a != b,
             };
-            binary_loop::<bool, bool>(data, &mut offsets, output, flags, move |a, b, _| operation(a, b))
+            binary_loop::<bool, bool>(data, &mut offsets, output, flags, move |a, b, _| {
+                operation(a, b)
+            })
         }
-        Family::LogicalNot => unary_loop::<bool, bool>(data, &mut offsets, output, flags, |a, _| !a),
+        Family::LogicalNot => {
+            unary_loop::<bool, bool>(data, &mut offsets, output, flags, |a, _| !a)
+        }
         Family::Bitwise(op) => dispatch_integer!(kind, T => {
             let operation: fn(T, T) -> T = match op {
                 BitOp::And => |a: T, b: T| a.bit_and(b),
@@ -1150,7 +1276,8 @@ fn numeric_loop(
             if op == UnaryOp::Absolute {
                 if let Some(result) = dispatch_complex!(kind, T => Some({
                     unary_loop::<T, <T as ComplexMagnitude>::Real>(data, &mut offsets, output, flags, |a: T, _| a.magnitude())
-                }), _ => None) {
+                }), _ => None)
+                {
                     return result;
                 }
             }
@@ -1167,7 +1294,8 @@ fn numeric_loop(
                     float_unary_flags(a.to_f64(), result.to_f64(), pole, flags);
                     result
                 })
-            }), _ => None) {
+            }), _ => None)
+            {
                 return result;
             }
             dispatch_complex!(kind, T => {
@@ -1257,7 +1385,10 @@ pub(in crate::python) fn arith_fn<T: Numeric>(op: ArithOp) -> fn(T, T, &mut FpFl
         ArithOp::Fmod => |a: T, b: T, flags: &mut FpFlags| {
             // C `fmod`: the result takes the dividend's sign.
             let remainder = a.remainder(b, flags);
-            if remainder != T::zero() && (remainder.compare(T::zero()) == Some(Ordering::Less)) != (a.compare(T::zero()) == Some(Ordering::Less)) {
+            if remainder != T::zero()
+                && (remainder.compare(T::zero()) == Some(Ordering::Less))
+                    != (a.compare(T::zero()) == Some(Ordering::Less))
+            {
                 remainder.subtract(b, flags)
             } else {
                 remainder
@@ -1311,7 +1442,9 @@ fn unary_fn<T: Numeric>(op: UnaryOp) -> fn(T, &mut FpFlags) -> T {
                     return T::zero();
                 }
                 T::one().floor_divide(a, flags).add(
-                    if a.compare(T::zero()) == Some(Ordering::Less) && a != T::zero().subtract(T::one(), flags) {
+                    if a.compare(T::zero()) == Some(Ordering::Less)
+                        && a != T::zero().subtract(T::one(), flags)
+                    {
                         T::one()
                     } else {
                         T::zero()
@@ -1323,10 +1456,22 @@ fn unary_fn<T: Numeric>(op: UnaryOp) -> fn(T, &mut FpFlags) -> T {
             }
         },
         UnaryOp::Sign => |a: T, _: &mut FpFlags| a.sign(),
-        UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Trunc if T::IS_INTEGER => |a: T, _: &mut FpFlags| a,
-        UnaryOp::Floor => |a: T, _: &mut FpFlags| T::from_number(super::element::Number::Float(a.to_number().as_f64().floor())),
-        UnaryOp::Ceil => |a: T, _: &mut FpFlags| T::from_number(super::element::Number::Float(a.to_number().as_f64().ceil())),
-        UnaryOp::Trunc => |a: T, _: &mut FpFlags| T::from_number(super::element::Number::Float(a.to_number().as_f64().trunc())),
+        UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Trunc if T::IS_INTEGER => {
+            |a: T, _: &mut FpFlags| a
+        }
+        UnaryOp::Floor => |a: T, _: &mut FpFlags| {
+            T::from_number(super::element::Number::Float(
+                a.to_number().as_f64().floor(),
+            ))
+        },
+        UnaryOp::Ceil => |a: T, _: &mut FpFlags| {
+            T::from_number(super::element::Number::Float(a.to_number().as_f64().ceil()))
+        },
+        UnaryOp::Trunc => |a: T, _: &mut FpFlags| {
+            T::from_number(super::element::Number::Float(
+                a.to_number().as_f64().trunc(),
+            ))
+        },
     }
 }
 
@@ -1527,7 +1672,14 @@ fn object_loop(
         .iter()
         .map(|input| {
             let strides = broadcast_strides(&input.view, shape)?;
-            super::array::new_view(runtime, input, input.dtype, shape.to_vec(), strides, input.view.offset)
+            super::array::new_view(
+                runtime,
+                input,
+                input.dtype,
+                shape.to_vec(),
+                strides,
+                input.view.offset,
+            )
         })
         .collect::<PyResult<Vec<_>>>()?;
     let columns = broadcast
@@ -1538,7 +1690,10 @@ fn object_loop(
     reserve_elements(runtime, resolved.output, count)?;
     let mut values = Vec::with_capacity(count);
     for index in 0..count {
-        let operands = columns.iter().map(|column| column[index]).collect::<Vec<_>>();
+        let operands = columns
+            .iter()
+            .map(|column| column[index])
+            .collect::<Vec<_>>();
         values.push(object_element(runtime, ufunc, &operands)?);
     }
     if resolved.output.kind() == Kind::Bool {
@@ -1548,7 +1703,11 @@ fn object_loop(
         }
         return Ok((PyArrayBuffer::Bytes(bytes), DType::BOOL, FpFlags::default()));
     }
-    Ok((PyArrayBuffer::Values(values), DType::OBJECT, FpFlags::default()))
+    Ok((
+        PyArrayBuffer::Values(values),
+        DType::OBJECT,
+        FpFlags::default(),
+    ))
 }
 
 fn object_element(runtime: &mut dyn PyRuntime, ufunc: &UfuncDef, operands: &[PyValue]) -> PyResult {
@@ -1627,7 +1786,10 @@ fn string_loop(
             }
             Ok((PyArrayBuffer::Bytes(bytes), dtype, FpFlags::default()))
         }
-        _ => Err(no_loop(ufunc.name, &inputs.iter().map(|input| input.dtype).collect::<Vec<_>>())),
+        _ => Err(no_loop(
+            ufunc.name,
+            &inputs.iter().map(|input| input.dtype).collect::<Vec<_>>(),
+        )),
     }
 }
 

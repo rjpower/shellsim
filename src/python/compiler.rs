@@ -959,13 +959,13 @@ impl Compiler {
                             self.emit(Operation::LoadConstant(Constant::String(text)), span);
                         }
                         FStringPart::Expression(expression) => {
-                            self.emit(Operation::LoadName("str".into()), span);
+                            // `f"{x}"` is `format(x, "")`, which honors `__format__` and does
+                            // not depend on the name `str`.
                             self.expression(expression);
                             self.emit(
-                                Operation::Call {
-                                    positional: 1,
-                                    keywords: Vec::new(),
-                                    starred: vec![false],
+                                Operation::FormatValue {
+                                    conversion: None,
+                                    format_spec: String::new(),
                                 },
                                 span,
                             );

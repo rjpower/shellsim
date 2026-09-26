@@ -12,7 +12,11 @@ use super::ops::FpFlags;
 
 /// Report the flags raised by ufunc `name`. `name` is the text NumPy prints after
 /// "encountered in", such as `divide` or `scalar add`.
-pub(in crate::python) fn report(runtime: &mut dyn PyRuntime, name: &str, flags: FpFlags) -> PyResult<()> {
+pub(in crate::python) fn report(
+    runtime: &mut dyn PyRuntime,
+    name: &str,
+    flags: FpFlags,
+) -> PyResult<()> {
     if !flags.any() {
         return Ok(());
     }
@@ -34,5 +38,18 @@ pub(in crate::python) fn report(runtime: &mut dyn PyRuntime, name: &str, flags: 
             Vec::new(),
         ),
     )?;
+    Ok(())
+}
+
+/// Warn that a complex value lost its imaginary part in a conversion to a real type, as NumPy
+/// does with `ComplexWarning` for `float(np.complex128(1+2j))`.
+pub(in crate::python) fn warn_complex_discard(runtime: &mut dyn PyRuntime) -> PyResult<()> {
+    let module = runtime.import_module("numpy._errstate")?;
+    let warn = runtime
+        .get_attribute(module, "_warn_complex_discard")?
+        .ok_or_else(|| {
+            PyError::runtime_error("numpy._errstate._warn_complex_discard is missing")
+        })?;
+    runtime.call_value(warn, CallArgs::new(Vec::new(), Vec::new()))?;
     Ok(())
 }

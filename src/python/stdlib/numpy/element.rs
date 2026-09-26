@@ -46,7 +46,11 @@ impl F16 {
         } else {
             return Self(sign);
         };
-        let full = if half_exponent > 0 { mantissa } else { mantissa | (1 << 52) };
+        let full = if half_exponent > 0 {
+            mantissa
+        } else {
+            mantissa | (1 << 52)
+        };
         let remainder = full & ((1 << shift) - 1);
         let halfway = 1u64 << (shift - 1);
         let round_up = remainder > halfway || (remainder == halfway && half & 1 == 1);
@@ -167,7 +171,9 @@ fn float_to_i64(value: f64) -> i64 {
 }
 
 /// One byte-backed element type.
-pub(in crate::python) trait Element: Copy + PartialEq + fmt::Debug + 'static {
+pub(in crate::python) trait Element:
+    Copy + PartialEq + fmt::Debug + 'static
+{
     /// Bytes per element.
     const SIZE: usize;
 
@@ -578,7 +584,10 @@ mod tests {
         assert_eq!(u64::from_number(Number::Int(-1)), u64::MAX);
         assert_eq!(i64::from_number(Number::Float(-1.9)), -1);
         assert_eq!(i8::from_number(Number::Float(2.5)), 2);
-        assert_eq!(u64::from_number(Number::Float(1e19)), 10_000_000_000_000_000_000);
+        assert_eq!(
+            u64::from_number(Number::Float(1e19)),
+            10_000_000_000_000_000_000
+        );
     }
 
     #[test]

@@ -7,6 +7,8 @@ flag is ignored, reported as a ``RuntimeWarning``, or raised as ``FloatingPointE
 
 import warnings
 
+from _numpy import _ComplexWarning as ComplexWarning
+
 _MODES = ("ignore", "warn", "raise", "call", "print", "log")
 _CATEGORIES = ("divide", "over", "under", "invalid")
 _MESSAGES = {
@@ -86,3 +88,10 @@ def _report(name, divide, over, under, invalid):
         if mode == "raise":
             raise FloatingPointError(message)
         warnings.warn(message, RuntimeWarning, stacklevel=2)
+
+
+def _warn_complex_discard():
+    """Warn that a conversion to a real type dropped an imaginary part."""
+    warnings.warn(
+        "Casting complex values to real discards the imaginary part", ComplexWarning, stacklevel=2
+    )

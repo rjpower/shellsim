@@ -157,7 +157,7 @@ print(np.array([1], dtype=np.int64).dtype)
         (
             0,
             b"<class 'numpy.int64'> True -9223372036854775808\n<class 'numpy.float64'> 3.5\nint64 [2, 3]\nint64\n".to_vec(),
-            Vec::new(),
+            b"<string>:3: RuntimeWarning: overflow encountered in scalar add\n".to_vec(),
         )
     );
 
@@ -262,12 +262,8 @@ fn fixed_width_conversions_reject_values_outside_the_declared_dtype() {
     }
 
     assert_fails_with(
-        "import numpy as np\nnp.array([1], dtype='float16')",
-        "unsupported numpy dtype",
-    );
-    assert_fails_with(
         "import numpy as np\nnp.array([1], dtype='numpy.int8')",
-        "unsupported numpy dtype",
+        "TypeError: data type 'numpy.int8' not understood",
     );
 }
 

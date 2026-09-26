@@ -554,7 +554,7 @@ impl Vm<'_> {
                     } else {
                         "tuple"
                     };
-                    let Some(index) = index.as_int() else {
+                    let Some(index) = protocol::int_value(&self.state.heap, &index) else {
                         let message = format!(
                             "{sequence} indices must be integers or slices, not {}",
                             self.type_name_of(&index)?
@@ -578,7 +578,13 @@ impl Vm<'_> {
                 }
                 Object::Range { start, stop, step } => {
                     let length = range_length(*start, *stop, *step)?;
-                    let index = index.as_int().ok_or("range index must be an integer")?;
+                    let Some(index) = protocol::int_value(&self.state.heap, &index) else {
+                        let message = format!(
+                            "range indices must be integers or slices, not {}",
+                            self.type_name_of(&index)?
+                        );
+                        return Err(self.raise_exception("TypeError", message));
+                    };
                     let index = if index < 0 {
                         i128::try_from(length).map_err(|_| "range is too large")?
                             + i128::from(index)
@@ -755,6 +761,71 @@ impl Vm<'_> {
         Err("object is not sliceable".into())
     }
 
+    /// An integer argument read through `__index__`, such as a `range()` bound. Anything else
+    /// raises CPython's `TypeError`.
+    pub(super) fn index_argument(&mut self, value: &Value) -> Result<i64, String> {
+        if let Some(index) = protocol::int_value(&self.state.heap, value) {
+            return Ok(index);
+        }
+        let message = format!(
+            "'{}' object cannot be interpreted as an integer",
+            self.type_name_of(value)?
+        );
+        Err(self.raise_exception("TypeError", message))
+    }
+
+    /// Convert a registered value, such as a NumPy scalar, with its type's conversion method
+    /// (`__int__` or `__float__`), as CPython's `int()` and `float()` do. `None` means the value
+    /// is not registered or its type has no such method.
+    fn registered_conversion(
+        &mut self,
+        value: &Value,
+        method: &str,
+    ) -> Result<Option<Value>, String> {
+        if self.registered_kind(value).is_none() {
+            return Ok(None);
+        }
+        let Some(method) = self.resolve_attribute(*value, method)? else {
+            return Ok(None);
+        };
+        self.invoke_value(method, Vec::new()).map(Some)
+    }
+
+    /// `int(value)` for a number: integers stay exact and floats truncate toward zero, as
+    /// `int.__new__` does through `__index__` and `__trunc__`.
+    fn truncate_to_int(&mut self, value: &Value) -> Result<Value, String> {
+        use super::number::NumberRef;
+        let number = super::number::view(&self.state.heap, value);
+        let float = match number {
+            Some(NumberRef::Float(float)) => float,
+            Some(number @ (NumberRef::Int(_) | NumberRef::BigInt(_) | NumberRef::UInt(_))) => {
+                let text = number.to_bigint().expect("integer view").to_string();
+                return self
+                    .new_integer(&text)
+                    .map_err(|error| self.record_native_error(error));
+            }
+            Some(NumberRef::Complex(..)) => {
+                let message = format!(
+                    "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+                    self.type_name_of(value)?
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
+            None => return Err("int() argument is not supported".into()),
+        };
+        if float.is_nan() {
+            return Err(self.raise_exception("ValueError", "cannot convert float NaN to integer"));
+        }
+        if float.is_infinite() {
+            return Err(
+                self.raise_exception("OverflowError", "cannot convert float infinity to integer")
+            );
+        }
+        let text = format!("{:.0}", float.trunc());
+        self.new_integer(&text)
+            .map_err(|error| self.record_native_error(error))
+    }
+
     /// Pop one slice bound. An explicit `None` bound is the same as an omitted one.
     fn pop_slice_bound(&mut self, present: bool, name: &str) -> Result<Option<i64>, String> {
         if !present {
@@ -798,7 +869,7 @@ impl Vm<'_> {
         };
         match self.state.heap.get(id)? {
             Object::List(values) => {
-                let Some(index) = index.as_int() else {
+                let Some(index) = protocol::int_value(&self.state.heap, &index) else {
                     let message = format!(
                         "list indices must be integers or slices, not {}",
                         self.type_name_of(&index)?
@@ -1998,16 +2069,20 @@ impl Vm<'_> {
                             self.new_integer(&decimal)
                                 .map_err(|error| self.record_native_error(error))?
                         }
-                        Some(value) => Value::Int(
-                            protocol::int_value(&self.state.heap, value)
-                                .or_else(|| value.as_int())
-                                .ok_or("int() argument is not supported")?,
-                        ),
+                        Some(value) => match self.registered_conversion(value, "__int__")? {
+                            Some(converted) => converted,
+                            None => self.truncate_to_int(value)?,
+                        },
                     }
                 }
             }
             BuiltinType::Float => {
                 expect_arity(&arguments, 0, 1)?;
+                if let Some(value) = arguments.first() {
+                    if let Some(converted) = self.registered_conversion(value, "__float__")? {
+                        return Ok(CallResult::Value(converted));
+                    }
+                }
                 let converted = match arguments.first() {
                     None => 0.0,
                     Some(value)

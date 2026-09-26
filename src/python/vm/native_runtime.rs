@@ -1,15 +1,16 @@
 //! Native-module runtime bridge backed by the metered Python VM.
 
 use super::{
-    protocol, Arc, BigInt, BuiltinType, CallArgs, CallMode, CallResult,
-    ClassDefinition, ClassLayout, ExceptionType, Execution, HashMap, NativeValue, Object, Ordering,
+    protocol, Arc, BigInt, BuiltinType, CallArgs, CallMode, CallResult, ClassDefinition,
+    ClassLayout, ExceptionType, Execution, HashMap, NativeValue, Object, Ordering,
     PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray, PyArrayBuffer, PyArrayData,
-    PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef, PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError,
-    PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker,
-    PyMatch, PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessRunner, PyTypeObject, PyProperty, PyRaisesContext,
-    PyRegex, PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple,
-    PyValueCast, RaisedException, Stream, ToPrimitive, Value, ValueTag, Vm,
-    MODELED_MAPPING_ENTRY_BYTES, MODELED_VALUE_BYTES,
+    PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef, PyArrayView, PyByteArray, PyCallable,
+    PyClass, PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyHttpClient,
+    PyIdentity, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
+    PyOperator, PyProcessRunner, PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet,
+    PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple, PyTypeObject, PyValueCast,
+    RaisedException, Stream, ToPrimitive, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    MODELED_VALUE_BYTES,
 };
 
 /// C-order byte strides for `shape`.
@@ -518,6 +519,10 @@ impl PyRuntime for Vm<'_> {
         )
     }
 
+    fn type_name(&self, value: &Value) -> PyResult<String> {
+        self.type_name_of(value).map_err(PyError::runtime_error)
+    }
+
     fn is_ellipsis(&self, value: &Value) -> bool {
         value.native_value() == Some(NativeValue::Ellipsis)
     }
@@ -535,6 +540,7 @@ impl PyRuntime for Vm<'_> {
         Ok(match super::number::view(&self.state.heap, value) {
             Some(super::number::NumberRef::Int(value)) => Some(value.to_string()),
             Some(super::number::NumberRef::BigInt(value)) => Some(value.to_string()),
+            Some(super::number::NumberRef::UInt(value)) => Some(value.to_string()),
             Some(super::number::NumberRef::Float(_) | super::number::NumberRef::Complex(..))
             | None => None,
         })
@@ -1554,8 +1560,11 @@ impl PyRuntime for Vm<'_> {
         value: &Value,
         kind: &'static super::super::native::ValueKindDef,
     ) -> Option<[u64; 2]> {
-        let Object::WideValue { kind: index, payload, .. } =
-            self.state.heap.get(value.object_id()?).ok()?
+        let Object::WideValue {
+            kind: index,
+            payload,
+            ..
+        } = self.state.heap.get(value.object_id()?).ok()?
         else {
             return None;
         };

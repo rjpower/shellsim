@@ -24,9 +24,12 @@ pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
-
 /// `ufunc.reduce(array, axis=0, dtype=None, out=None, keepdims=False, initial, where)`.
-pub(in crate::python) fn ufunc_reduce(_runtime: &mut dyn PyRuntime, index: usize, _args: CallArgs) -> PyResult {
+pub(in crate::python) fn ufunc_reduce(
+    _runtime: &mut dyn PyRuntime,
+    index: usize,
+    _args: CallArgs,
+) -> PyResult {
     Err(PyError::unsupported(format!(
         "{}.reduce is not implemented yet",
         super::ufunc::UFUNCS[index].name
@@ -34,7 +37,11 @@ pub(in crate::python) fn ufunc_reduce(_runtime: &mut dyn PyRuntime, index: usize
 }
 
 /// `ufunc.accumulate(array, axis=0, dtype=None, out=None)`.
-pub(in crate::python) fn ufunc_accumulate(_runtime: &mut dyn PyRuntime, index: usize, _args: CallArgs) -> PyResult {
+pub(in crate::python) fn ufunc_accumulate(
+    _runtime: &mut dyn PyRuntime,
+    index: usize,
+    _args: CallArgs,
+) -> PyResult {
     Err(PyError::unsupported(format!(
         "{}.accumulate is not implemented yet",
         super::ufunc::UFUNCS[index].name

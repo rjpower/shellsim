@@ -13,7 +13,7 @@
 use num_traits::ToPrimitive;
 
 use super::native::{
-    CallArgs, GetterDef, MethodDef, NativeTypeDef, PyError, PyResult, PyRuntime, PyValue,
+    CallArgs, GetterDef, MethodDef, NativeTypeDef, PyError, PyKind, PyResult, PyRuntime, PyValue,
 };
 use super::number::NumberRef;
 
@@ -73,9 +73,23 @@ impl Operand {
 
 /// Read one builtin number as a complex operand, or `None` for a non-numeric value.
 fn operand(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
+    Ok(match super::number::complex_operand(runtime, value) {
+        Some(NumberRef::Int(value)) => Some(Operand::Real(value as f64)),
+        Some(NumberRef::BigInt(value)) => Some(Operand::Real(bigint_to_f64(value)?)),
+        Some(NumberRef::UInt(value)) => Some(Operand::Real(value as f64)),
+        Some(NumberRef::Float(value)) => Some(Operand::Real(value)),
+        Some(NumberRef::Complex(real, imag)) => Some(Operand::Complex(Complex::new(real, imag))),
+        None => None,
+    })
+}
+
+/// Read any number as a `complex()` argument, including registered numbers such as NumPy
+/// scalars, which CPython reads through `__complex__`, `__float__` and `__index__`.
+fn constructor_operand(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
     Ok(match runtime.number(value) {
         Some(NumberRef::Int(value)) => Some(Operand::Real(value as f64)),
         Some(NumberRef::BigInt(value)) => Some(Operand::Real(bigint_to_f64(value)?)),
+        Some(NumberRef::UInt(value)) => Some(Operand::Real(value as f64)),
         Some(NumberRef::Float(value)) => Some(Operand::Real(value)),
         Some(NumberRef::Complex(real, imag)) => Some(Operand::Complex(Complex::new(real, imag))),
         None => None,
@@ -149,8 +163,12 @@ pub(super) fn construct(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult
         return runtime.new_complex(value.real, value.imag);
     }
     let real = match real {
-        Some(value) => match operand(runtime, &value)? {
-            Some(Operand::Complex(_)) if imag.is_none() => return Ok(value),
+        Some(value) => match constructor_operand(runtime, &value)? {
+            Some(Operand::Complex(_))
+                if imag.is_none() && runtime.kind(&value)? == PyKind::Complex =>
+            {
+                return Ok(value)
+            }
             Some(operand) => operand,
             None => {
                 let actual = runtime.type_name(&value)?;
@@ -162,7 +180,7 @@ pub(super) fn construct(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult
         None => Operand::Real(0.0),
     };
     let imag = match imag {
-        Some(value) => match operand(runtime, &value)? {
+        Some(value) => match constructor_operand(runtime, &value)? {
             Some(operand) => Some(operand),
             None => {
                 let actual = runtime.type_name(&value)?;
@@ -181,7 +199,9 @@ pub(super) fn construct(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult
             result.real -= imag.imag;
             result.imag = imag.real;
         }
-        None => {}
+        // A complex `real` argument that is not an exact `complex`, such as a NumPy complex
+        // scalar, keeps its imaginary part.
+        None => result.imag = real.widen().imag,
     }
     if let (Operand::Complex(real), Some(_)) = (real, imag) {
         result.imag += real.imag;
@@ -384,82 +404,9 @@ fn repr_component(value: f64, signed: bool) -> String {
     format!("{sign}{body}")
 }
 
-const HASH_BITS: u32 = 61;
-const HASH_MODULUS: u64 = (1 << HASH_BITS) - 1;
-const HASH_INF: i64 = 314_159;
-const HASH_IMAG: u64 = 1_000_003;
-
 /// CPython's `hash(complex)`: `hash(real) + 1000003 * hash(imag)` with wrapping arithmetic.
-///
-/// CPython hashes NaN by object identity; this runtime has no `hash()` builtin that could
-/// observe that, so NaN components hash as `0`, CPython's pre-3.10 behavior.
 pub(super) fn hash(value: Complex) -> i64 {
-    let real = hash_float(value.real) as u64;
-    let imag = hash_float(value.imag) as u64;
-    let combined = real.wrapping_add(HASH_IMAG.wrapping_mul(imag)) as i64;
-    if combined == -1 {
-        -2
-    } else {
-        combined
-    }
-}
-
-/// CPython's `_Py_HashDouble`: reduce a finite double modulo the Mersenne prime `2**61 - 1`.
-fn hash_float(value: f64) -> i64 {
-    if value.is_nan() {
-        return 0;
-    }
-    if value.is_infinite() {
-        return if value > 0.0 { HASH_INF } else { -HASH_INF };
-    }
-    let (mut mantissa, mut exponent) = frexp(value);
-    let negative = mantissa < 0.0;
-    mantissa = mantissa.abs();
-    let mut hashed = 0u64;
-    while mantissa != 0.0 {
-        hashed = ((hashed << 28) & HASH_MODULUS) | hashed >> (HASH_BITS - 28);
-        mantissa *= 268_435_456.0;
-        exponent -= 28;
-        let integer = mantissa as u64;
-        mantissa -= integer as f64;
-        hashed += integer;
-        if hashed >= HASH_MODULUS {
-            hashed -= HASH_MODULUS;
-        }
-    }
-    let bits = HASH_BITS as i32;
-    let exponent = if exponent >= 0 {
-        exponent % bits
-    } else {
-        bits - 1 - ((-1 - exponent) % bits)
-    } as u32;
-    hashed = ((hashed << exponent) & HASH_MODULUS) | hashed >> (HASH_BITS - exponent);
-    let hashed = if negative {
-        (hashed as i64).wrapping_neg()
-    } else {
-        hashed as i64
-    };
-    if hashed == -1 {
-        -2
-    } else {
-        hashed
-    }
-}
-
-/// Split a finite, nonzero-or-zero double into a mantissa in `[0.5, 1)` and a power of two.
-fn frexp(value: f64) -> (f64, i32) {
-    if value == 0.0 {
-        return (value, 0);
-    }
-    let bits = value.to_bits();
-    let biased = ((bits >> 52) & 0x7ff) as i32;
-    if biased == 0 {
-        // Subnormal: scale into the normal range first.
-        let (mantissa, exponent) = frexp(value * 2f64.powi(54));
-        return (mantissa, exponent - 54);
-    }
-    let mantissa = f64::from_bits((bits & !(0x7ff << 52)) | (1022 << 52));
-    (mantissa, biased - 1022)
+    super::hash::complex(value.real, value.imag)
 }
 
 /// CPython's `_Py_c_prod`, including C11 Annex G recovery of infinities.
@@ -898,9 +845,6 @@ mod tests {
         assert_eq!(hash(Complex::new(0.0, 2.0)), 2_000_006);
         assert_eq!(hash(Complex::new(0.0, 1.0)), 1_000_003);
         assert_eq!(hash(Complex::new(1.5, -2.25)), -576_460_752_305_423_493);
-        assert_eq!(hash_float(-1.0), -2);
-        assert_eq!(hash_float(f64::INFINITY), 314_159);
-        assert_eq!(hash_float(0.5), 1 << 60);
     }
 
     #[test]

@@ -61,8 +61,15 @@ pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
 
 /// Resolve a requested shape, which may contain one `-1`, against `size` elements.
 pub(in crate::python) fn resolve_shape(requested: &[i64], size: usize) -> PyResult<Vec<usize>> {
-    if requested.iter().filter(|dimension| **dimension == -1).count() > 1 {
-        return Err(PyError::value_error("can only specify one unknown dimension"));
+    if requested
+        .iter()
+        .filter(|dimension| **dimension == -1)
+        .count()
+        > 1
+    {
+        return Err(PyError::value_error(
+            "can only specify one unknown dimension",
+        ));
     }
     if requested.iter().any(|dimension| *dimension < -1) {
         return Err(PyError::value_error("negative dimensions not allowed"));
@@ -76,7 +83,9 @@ pub(in crate::python) fn resolve_shape(requested: &[i64], size: usize) -> PyResu
     let known = requested
         .iter()
         .filter(|dimension| **dimension != -1)
-        .try_fold(1usize, |total, dimension| total.checked_mul(*dimension as usize))
+        .try_fold(1usize, |total, dimension| {
+            total.checked_mul(*dimension as usize)
+        })
         .ok_or_else(mismatch)?;
     let shape = requested
         .iter()
@@ -162,7 +171,9 @@ fn module_reshape(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let shape = bound
         .value("shape")
         .or_else(|| bound.value("newshape"))
-        .ok_or_else(|| PyError::type_error("reshape() missing required argument 'shape' (pos 2)"))?;
+        .ok_or_else(|| {
+            PyError::type_error("reshape() missing required argument 'shape' (pos 2)")
+        })?;
     let requested = requested_shape(runtime, &[shape])?;
     Ok(reshape(runtime, &array, &requested)?.value())
 }
@@ -218,7 +229,14 @@ pub(in crate::python) fn transpose(
     };
     let shape = order.iter().map(|axis| array.shape()[*axis]).collect();
     let strides = order.iter().map(|axis| array.strides()[*axis]).collect();
-    array::new_view(runtime, array, array.dtype, shape, strides, array.view.offset)
+    array::new_view(
+        runtime,
+        array,
+        array.dtype,
+        shape,
+        strides,
+        array.view.offset,
+    )
 }
 
 fn transpose_axes(runtime: &mut dyn PyRuntime, values: &[PyValue]) -> PyResult<Option<Vec<i64>>> {

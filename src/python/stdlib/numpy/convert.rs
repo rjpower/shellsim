@@ -7,11 +7,11 @@
 //! `object`), then each leaf is written with the target dtype's conversion rules. Python ints
 //! that do not fit an integer dtype raise NumPy's `OverflowError`.
 
-use super::super::super::protocol::quote_string;
 use super::super::super::native::{
     PyArrayBuffer, PyArrayData, PyArrayDtype, PyError, PyKind, PyNativeKind, PyResult, PyRuntime,
     PyValue, PyValueCast,
 };
+use super::super::super::protocol::quote_string;
 use super::array::{
     buffer_with_capacity, contiguous_buffer, element_count, gather_into, new_array,
     reserve_elements, Array,
@@ -158,15 +158,17 @@ fn discover(
         let arrays = nodes
             .iter()
             .map(|node| {
-                (runtime.native_kind(node).ok().flatten()
-                    == Some(PyNativeKind::Array))
-                .then(|| Array::from_value(runtime, *node))
-                .transpose()
+                (runtime.native_kind(node).ok().flatten() == Some(PyNativeKind::Array))
+                    .then(|| Array::from_value(runtime, *node))
+                    .transpose()
             })
             .collect::<PyResult<Vec<_>>>()?;
         if !nodes.is_empty() && arrays.iter().all(Option::is_some) {
             let blocks = arrays.into_iter().map(Option::unwrap).collect::<Vec<_>>();
-            if blocks.iter().all(|block| block.shape() == blocks[0].shape()) {
+            if blocks
+                .iter()
+                .all(|block| block.shape() == blocks[0].shape())
+            {
                 shape.extend_from_slice(blocks[0].shape());
                 super::array::element_count(&shape)?;
                 return Ok((shape, Level::Blocks(blocks)));
@@ -177,9 +179,7 @@ fn discover(
         let mut sequences = 0usize;
         for node in &nodes {
             runtime.charge_cpu(1)?;
-            let items = if runtime.native_kind(node)?
-                == Some(PyNativeKind::Array)
-            {
+            let items = if runtime.native_kind(node)? == Some(PyNativeKind::Array) {
                 let array = Array::from_value(runtime, *node)?;
                 if array.ndim() == 0 {
                     None
@@ -263,7 +263,9 @@ pub(in crate::python) fn array_from_python(
                 None => blocks
                     .iter()
                     .skip(1)
-                    .try_fold(blocks[0].dtype, |acc, block| infer_promote(acc, block.dtype))?,
+                    .try_fold(blocks[0].dtype, |acc, block| {
+                        infer_promote(acc, block.dtype)
+                    })?,
             };
             let target = widen_unsized_str(runtime, target, &blocks)?;
             let count = element_count(&shape)?;
@@ -312,7 +314,11 @@ pub(in crate::python) fn array_from_python(
 }
 
 /// `np.array(arrays, dtype=str)` sizes the strings from the widest block.
-fn widen_unsized_str(runtime: &mut dyn PyRuntime, target: DType, blocks: &[Array]) -> PyResult<DType> {
+fn widen_unsized_str(
+    runtime: &mut dyn PyRuntime,
+    target: DType,
+    blocks: &[Array],
+) -> PyResult<DType> {
     if target.kind() != Kind::Str || target.chars() != 0 {
         return Ok(target);
     }
@@ -417,9 +423,8 @@ pub(in crate::python) fn parse_number(text: &str, target: DType) -> PyResult<Num
             checked_int(value, target)
         }
         Category::Complex => {
-            let parsed = parse_float(trimmed).map_err(|_| {
-                PyError::value_error("complex() arg is a malformed string")
-            })?;
+            let parsed = parse_float(trimmed)
+                .map_err(|_| PyError::value_error("complex() arg is a malformed string"))?;
             Ok(Number::Complex(parsed, 0.0))
         }
         _ => parse_float(trimmed).map(Number::Float).map_err(|_| {
@@ -435,7 +440,9 @@ fn parse_float(text: &str) -> Result<f64, ()> {
     let lower = text.to_ascii_lowercase();
     match lower.trim_start_matches(['+', '-']) {
         "inf" | "infinity" | "nan" => {}
-        body if body.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | '+' | '-' | '_')) => {}
+        body if body
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | '+' | '-' | '_')) => {}
         _ => return Err(()),
     }
     lower.replace('_', "").parse::<f64>().map_err(|_| ())
@@ -591,13 +598,14 @@ pub(in crate::python) fn cast_array(
     target: DType,
     copy: bool,
 ) -> PyResult<Array> {
-    let target = if target.kind() == Kind::Str && target.chars() == 0 && array.dtype.kind() != Kind::Str {
-        DType::str(dtype::str_width_for(array.dtype).max(1))?
-    } else if target.kind() == Kind::Str && target.chars() == 0 {
-        array.dtype
-    } else {
-        target
-    };
+    let target =
+        if target.kind() == Kind::Str && target.chars() == 0 && array.dtype.kind() != Kind::Str {
+            DType::str(dtype::str_width_for(array.dtype).max(1))?
+        } else if target.kind() == Kind::Str && target.chars() == 0 {
+            array.dtype
+        } else {
+            target
+        };
     if target == array.dtype {
         return if copy {
             super::array::copy_array(runtime, array)
@@ -610,7 +618,11 @@ pub(in crate::python) fn cast_array(
 }
 
 /// Convert every element of `array`, in C order, into new storage of `target`.
-fn cast_buffer(runtime: &mut dyn PyRuntime, array: &Array, target: DType) -> PyResult<PyArrayBuffer> {
+fn cast_buffer(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+    target: DType,
+) -> PyResult<PyArrayBuffer> {
     let count = array.size();
     let source = array.dtype;
     if source.is_numeric() && target.is_numeric() {
@@ -661,7 +673,10 @@ fn cast_buffer(runtime: &mut dyn PyRuntime, array: &Array, target: DType) -> PyR
 }
 
 /// Whether `value` is a Python number usable as a weak scalar, and which kind.
-pub(in crate::python) fn weak_scalar(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Option<(dtype::Weak, Leaf)>> {
+pub(in crate::python) fn weak_scalar(
+    runtime: &dyn PyRuntime,
+    value: &PyValue,
+) -> PyResult<Option<(dtype::Weak, Leaf)>> {
     if scalar::unbox(runtime, value).is_some() {
         return Ok(None);
     }

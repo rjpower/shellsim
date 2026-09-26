@@ -809,6 +809,29 @@ impl Vm<'_> {
                 let value = self.repr_value(&arguments[0])?;
                 Ok(CallResult::Value(self.allocate_string(value)?))
             }
+            Builtin::Format => {
+                expect_arity(&arguments, 1, 2)?;
+                let spec = match arguments.get(1) {
+                    Some(spec) => {
+                        protocol::string_value(&self.state.heap, spec)?.ok_or_else(|| {
+                            let message = format!(
+                                "format() argument 2 must be str, not {}",
+                                self.type_name_of(spec).unwrap_or_default()
+                            );
+                            self.raise_exception("TypeError", message)
+                        })?
+                    }
+                    None => String::new(),
+                };
+                self.reserve_format_spec(&spec)?;
+                let value = self.format_object(&arguments[0], &spec)?;
+                Ok(CallResult::Value(self.allocate_string(value)?))
+            }
+            Builtin::Hash => {
+                expect_arity(&arguments, 1, 1)?;
+                let hash = self.hash_value(&arguments[0])?;
+                Ok(CallResult::Value(Value::Int(hash)))
+            }
             Builtin::Dir => {
                 expect_arity(&arguments, 0, 1)?;
                 let mut names = if let Some(value) = arguments.first() {
@@ -861,7 +884,8 @@ impl Vm<'_> {
                 if let Some(value) =
                     self.invoke_slot(&arguments[0], Slot::Length, "__len__", Vec::new())?
                 {
-                    let length = value.as_int().ok_or("__len__() should return an integer")?;
+                    let length = protocol::int_value(&self.state.heap, &value)
+                        .ok_or("__len__() should return an integer")?;
                     if length < 0 {
                         return Err("__len__() should return >= 0".into());
                     }
@@ -1139,10 +1163,10 @@ impl Vm<'_> {
             }
             Builtin::Range => {
                 expect_arity(&arguments, 1, 3)?;
-                let integers = arguments
-                    .iter()
-                    .map(|value| value.as_int().ok_or("range arguments must be integers"))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut integers = Vec::with_capacity(arguments.len());
+                for value in &arguments {
+                    integers.push(self.index_argument(value)?);
+                }
                 let (start, stop, step) = match integers.as_slice() {
                     [stop] => (0, *stop, 1),
                     [start, stop] => (*start, *stop, 1),
@@ -1163,9 +1187,10 @@ impl Vm<'_> {
             Builtin::Enumerate => {
                 expect_arity(&arguments, 1, 2)?;
                 let values = self.iterable_values(&arguments[0])?;
-                let start = arguments.get(1).map_or(Ok(0), |value| {
-                    value.as_int().ok_or("enumerate start must be an integer")
-                })?;
+                let start = match arguments.get(1) {
+                    Some(value) => self.index_argument(value)?,
+                    None => 0,
+                };
                 let mut result = Vec::new();
                 for (offset, value) in values.into_iter().enumerate() {
                     self.reserve_result(64)?;

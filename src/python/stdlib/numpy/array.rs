@@ -35,7 +35,10 @@ impl Array {
         Self::from_handle(runtime, handle)
     }
 
-    pub(in crate::python) fn from_handle(runtime: &dyn PyRuntime, handle: PyArray) -> PyResult<Self> {
+    pub(in crate::python) fn from_handle(
+        runtime: &dyn PyRuntime,
+        handle: PyArray,
+    ) -> PyResult<Self> {
         let view = runtime.array_view(handle)?;
         let dtype = DType::from_storage(view.dtype);
         Ok(Self {
@@ -87,7 +90,11 @@ impl Array {
 }
 
 /// Whether `strides` describe a C-contiguous layout of `shape`.
-pub(in crate::python) fn is_c_contiguous(shape: &[usize], strides: &[isize], itemsize: usize) -> bool {
+pub(in crate::python) fn is_c_contiguous(
+    shape: &[usize],
+    strides: &[isize],
+    itemsize: usize,
+) -> bool {
     if shape.contains(&0) {
         return true;
     }
@@ -212,7 +219,10 @@ pub(in crate::python) fn broadcast_shapes(shapes: &[&[usize]]) -> PyResult<Vec<u
 }
 
 /// Strides that read `view` as if it had `shape`, repeating broadcast axes with stride 0.
-pub(in crate::python) fn broadcast_strides(view: &PyArrayView, shape: &[usize]) -> PyResult<Vec<isize>> {
+pub(in crate::python) fn broadcast_strides(
+    view: &PyArrayView,
+    shape: &[usize],
+) -> PyResult<Vec<isize>> {
     let extra = shape
         .len()
         .checked_sub(view.shape.len())
@@ -378,7 +388,14 @@ pub(in crate::python) fn ravel(runtime: &mut dyn PyRuntime, array: &Array) -> Py
     let size = array.size();
     if array.is_c_contiguous() {
         let stride = array.itemsize() as isize;
-        return new_view(runtime, array, array.dtype, vec![size], vec![stride], array.view.offset);
+        return new_view(
+            runtime,
+            array,
+            array.dtype,
+            vec![size],
+            vec![stride],
+            array.view.offset,
+        );
     }
     let buffer = contiguous_buffer(runtime, array)?;
     new_array(runtime, buffer, array.dtype, vec![size])

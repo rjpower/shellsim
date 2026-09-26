@@ -2334,7 +2334,19 @@ fn builtin_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         )?),
         Some(_) | None => None,
     };
-    match args.positional()[0].cast::<PyNumber>(runtime)? {
+    let value = args.positional()[0];
+    if runtime.value_kind_of(&value).is_some() {
+        // Like CPython, defer to the type's `__round__`, so a NumPy scalar keeps its dtype.
+        let method = runtime
+            .get_attribute(value, "__round__")?
+            .ok_or_else(|| PyError::type_error("type doesn't define __round__ method"))?;
+        let arguments = args.positional().get(1).or(keyword_digits).copied();
+        return runtime.call_value(
+            method,
+            CallArgs::new(arguments.into_iter().collect(), Vec::new()),
+        );
+    }
+    match value.cast::<PyNumber>(runtime)? {
         PyNumber::Int(value) => round_integer(runtime, BigInt::from(value), digits),
         PyNumber::BigInt(value) => {
             let value = value

@@ -4,13 +4,13 @@
 //! the native-module boundary through this owned, representation-independent view.
 
 use num_bigint::BigInt;
-use num_traits::{Signed, ToPrimitive, Zero};
+use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
 use super::ast::{BinaryOperator, ComparisonOperator};
 use super::heap::{Heap, InstancePayload, Object};
 use super::native::{
-    CallArgs, FromPyValue, GetterDef, MethodDef, NativeTypeDef, PyError, PyResult, PyRuntime,
-    PyValue,
+    CallArgs, FromPyValue, GetterDef, KindNumber, MethodDef, NativeTypeDef, PyError, PyResult,
+    PyRuntime, PyValue, ValueKindDef,
 };
 use super::ValueTag;
 
@@ -19,13 +19,80 @@ use super::ValueTag;
 pub(super) enum NumberRef<'a> {
     Int(i64),
     BigInt(&'a BigInt),
+    /// An unsigned integer above `i64::MAX`, such as a large NumPy `uint64`.
+    UInt(u64),
     Float(f64),
     /// Real and imaginary components of a builtin `complex`.
     Complex(f64, f64),
 }
 
+impl NumberRef<'_> {
+    /// The exact integer this number holds, if it is an integer.
+    pub(super) fn to_bigint(self) -> Option<BigInt> {
+        match self {
+            Self::Int(value) => Some(BigInt::from(value)),
+            Self::BigInt(value) => Some(value.clone()),
+            Self::UInt(value) => Some(BigInt::from(value)),
+            Self::Float(_) | Self::Complex(..) => None,
+        }
+    }
+}
+
+/// Python's `==` between two numbers of any representation. An integer equals a float only when
+/// the float is integral with the same value, so the comparison stays exact beyond 2**53.
+pub(super) fn numbers_equal(left: NumberRef<'_>, right: NumberRef<'_>) -> bool {
+    let split = |number| match number {
+        NumberRef::Complex(real, imag) => (NumberRef::Float(real), imag),
+        number => (number, 0.0),
+    };
+    let ((left, left_imag), (right, right_imag)) = (split(left), split(right));
+    if left_imag != right_imag {
+        return false;
+    }
+    match (left, right) {
+        (NumberRef::Float(left), NumberRef::Float(right)) => left == right,
+        (NumberRef::Float(float), integer) | (integer, NumberRef::Float(float)) => {
+            float.is_finite()
+                && float.fract() == 0.0
+                && BigInt::from_f64(float) == integer.to_bigint()
+        }
+        (left, right) => left.to_bigint() == right.to_bigint(),
+    }
+}
+
+/// The kind and number of a registered value with a numeric view, such as a NumPy scalar.
+pub(super) fn registered_number(
+    heap: &Heap,
+    value: &PyValue,
+) -> Option<(&'static ValueKindDef, KindNumber)> {
+    let (index, payload) = match value.registered_parts() {
+        Some((index, payload)) => (index, [payload, 0]),
+        None => match heap.get(value.object_id()?).ok()? {
+            Object::WideValue { kind, payload, .. } => (*kind, *payload),
+            _ => return None,
+        },
+    };
+    let kind = super::stdlib::value_kind(index)?;
+    Some((kind, (kind.numeric?)(kind, payload)?))
+}
+
 /// Resolve Python numeric storage into one semantic numeric view.
+///
+/// Registered values with a numeric view take part as the Python number they stand for, so a
+/// NumPy `int64` indexes a list and a NumPy `float64` formats like a float.
 pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>> {
+    if let Some((_, number)) = registered_number(heap, value) {
+        return Some(match number {
+            KindNumber::Bool(value) => NumberRef::Int(i64::from(value)),
+            KindNumber::Int(value) => NumberRef::Int(value),
+            KindNumber::UInt(value) => match i64::try_from(value) {
+                Ok(value) => NumberRef::Int(value),
+                Err(_) => NumberRef::UInt(value),
+            },
+            KindNumber::Float(value) => NumberRef::Float(value),
+            KindNumber::Complex(real, imag) => NumberRef::Complex(real, imag),
+        });
+    }
     if let Some(value) = value.float_value() {
         return Some(NumberRef::Float(value));
     }
@@ -109,7 +176,84 @@ macro_rules! real_number_type {
 
 pub(super) static BOOL_TYPE: NativeTypeDef = real_number_type!("bool", rational);
 pub(super) static INT_TYPE: NativeTypeDef = real_number_type!("int", rational);
-pub(super) static FLOAT_TYPE: NativeTypeDef = real_number_type!("float");
+pub(super) static FLOAT_TYPE: NativeTypeDef = NativeTypeDef {
+    methods: &[
+        MethodDef {
+            type_name: "float",
+            name: "conjugate",
+            call: real_conjugate,
+        },
+        MethodDef {
+            type_name: "float",
+            name: "is_integer",
+            call: float_is_integer,
+        },
+        MethodDef {
+            type_name: "float",
+            name: "as_integer_ratio",
+            call: float_as_integer_ratio,
+        },
+    ],
+    ..real_number_type!("float")
+};
+
+/// `float.as_integer_ratio()`: the exact fraction in lowest terms with a positive denominator.
+fn float_as_integer_ratio(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("float.as_integer_ratio", 0, 0)?;
+    let Some(NumberRef::Float(value)) = runtime.number(&value) else {
+        return Err(PyError::type_error(
+            "descriptor 'as_integer_ratio' requires a 'float' object",
+        ));
+    };
+    if value.is_nan() {
+        return Err(PyError::value_error("cannot convert NaN to integer ratio"));
+    }
+    if value.is_infinite() {
+        return Err(PyError::overflow_error(
+            "cannot convert Infinity to integer ratio",
+        ));
+    }
+    // A finite double is `mantissa * 2**exponent` with an integer mantissa below 2**53.
+    let bits = value.to_bits();
+    let biased = i32::try_from((bits >> 52) & 0x7ff).expect("eleven-bit exponent");
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (mut mantissa, mut exponent) = if biased == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1u64 << 52), biased - 1075)
+    };
+    if mantissa == 0 {
+        exponent = 0;
+    }
+    while mantissa != 0 && mantissa % 2 == 0 && exponent < 0 {
+        mantissa /= 2;
+        exponent += 1;
+    }
+    let mut numerator = BigInt::from(mantissa);
+    let mut denominator = BigInt::from(1u8);
+    if exponent >= 0 {
+        numerator <<= usize::try_from(exponent).expect("non-negative exponent");
+    } else {
+        denominator <<= usize::try_from(-exponent).expect("positive exponent");
+    }
+    if value.is_sign_negative() {
+        numerator = -numerator;
+    }
+    let numerator = runtime.new_integer(&numerator.to_string())?;
+    let denominator = runtime.new_integer(&denominator.to_string())?;
+    runtime.new_tuple(vec![numerator, denominator])
+}
+
+/// `float.is_integer()`: whether a finite float has no fractional part.
+fn float_is_integer(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("float.is_integer", 0, 0)?;
+    let Some(NumberRef::Float(value)) = runtime.number(&value) else {
+        return Err(PyError::type_error(
+            "descriptor 'is_integer' requires a 'float' object",
+        ));
+    };
+    Ok(PyValue::Bool(value.is_finite() && value.fract() == 0.0))
+}
 
 /// Return a real number as itself, normalizing `bool` to the equal `int`.
 fn real_part(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
@@ -138,12 +282,33 @@ fn real_conjugate(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -
     real_part(runtime, value)
 }
 
-/// Return the exact index value accepted by sequence protocols.
+/// Return the exact index value accepted by sequence protocols. A registered boolean, like
+/// NumPy's `bool`, converts with `int()` but is not an index.
 pub(super) fn index<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>> {
+    if let Some((_, KindNumber::Bool(_))) = registered_number(heap, value) {
+        return None;
+    }
     match view(heap, value)? {
-        value @ (NumberRef::Int(_) | NumberRef::BigInt(_)) => Some(value),
+        value @ (NumberRef::Int(_) | NumberRef::BigInt(_) | NumberRef::UInt(_)) => Some(value),
         NumberRef::Float(_) | NumberRef::Complex(..) => None,
     }
+}
+
+/// The number a builtin `complex` operator accepts as its other operand.
+///
+/// Like CPython's `complex` slots, it accepts registered `float` and `complex` subclasses such
+/// as NumPy's `float64`, and declines other registered numbers so that their own reflected
+/// operators run.
+pub(super) fn complex_operand<'a>(
+    runtime: &'a dyn PyRuntime,
+    value: &PyValue,
+) -> Option<NumberRef<'a>> {
+    if let Some(kind) = runtime.value_kind_of(value) {
+        if !(kind.is_float_subclass() || kind.is_complex_subclass()) {
+            return None;
+        }
+    }
+    runtime.number(value)
 }
 
 /// Coerce a real numeric value to `f64`, rejecting complex and non-numeric storage.
@@ -151,6 +316,7 @@ pub(super) fn as_f64(heap: &Heap, value: &PyValue) -> Option<f64> {
     match view(heap, value)? {
         NumberRef::Int(value) => Some(value as f64),
         NumberRef::BigInt(value) => num_traits::ToPrimitive::to_f64(value),
+        NumberRef::UInt(value) => Some(value as f64),
         NumberRef::Float(value) => Some(value),
         NumberRef::Complex(..) => None,
     }
@@ -158,7 +324,8 @@ pub(super) fn as_f64(heap: &Heap, value: &PyValue) -> Option<f64> {
 
 /// Whether a value is a builtin `complex`, for real-only paths that reject it explicitly.
 pub(super) fn is_complex(heap: &Heap, value: &PyValue) -> bool {
-    matches!(view(heap, value), Some(NumberRef::Complex(..)))
+    registered_number(heap, value).is_none()
+        && matches!(view(heap, value), Some(NumberRef::Complex(..)))
 }
 
 /// Allocate a builtin complex value, e.g. for an imaginary literal or a negative base raised
@@ -241,22 +408,17 @@ pub(super) enum PyNumber {
     Float(f64),
 }
 
+/// Any real number, including registered numbers such as NumPy scalars, as functions like
+/// `math.sqrt` accept through `__float__` and `__index__`.
 impl FromPyValue for PyNumber {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        if let Some(value) = runtime.int_value(&value) {
-            return Ok(Self::Int(value));
+        if let Some(number) = runtime.number(&value).and_then(real_number) {
+            return Ok(number);
         }
-        if let Some(value) = runtime.integer_text(&value)? {
-            return Ok(Self::BigInt(value));
-        }
-        if let Some(value) = value.float_value() {
-            Ok(Self::Float(value))
-        } else {
-            let actual = runtime.type_name(&value)?;
-            Err(PyError::type_error(format!(
-                "expected a real number, got {actual}"
-            )))
-        }
+        let actual = runtime.type_name(&value)?;
+        Err(PyError::type_error(format!(
+            "expected a real number, got {actual}"
+        )))
     }
 }
 
@@ -866,14 +1028,26 @@ fn bigint_floor_div(left: &BigInt, right: &BigInt) -> BigInt {
     quotient
 }
 
+/// The operand of a builtin `int` or `float` operator. Registered numbers decline, as CPython's
+/// `int.__add__` declines anything but `int`, so `1 + np.int8(127)` reaches NumPy's reflected
+/// operator and keeps int8 wrapping.
 fn try_number(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Option<PyNumber>> {
-    if let Some(value) = runtime.int_value(&value) {
-        return Ok(Some(PyNumber::Int(value)));
+    if runtime.value_kind_of(&value).is_some() {
+        return Ok(None);
     }
-    if let Some(value) = runtime.integer_text(&value)? {
-        return Ok(Some(PyNumber::BigInt(value)));
+    Ok(runtime.number(&value).and_then(real_number))
+}
+
+/// A real number as the owned [`PyNumber`] builtin arithmetic computes with.
+fn real_number(number: NumberRef<'_>) -> Option<PyNumber> {
+    match number {
+        NumberRef::Int(value) => Some(PyNumber::Int(value)),
+        NumberRef::Float(value) => Some(PyNumber::Float(value)),
+        NumberRef::BigInt(_) | NumberRef::UInt(_) => number
+            .to_bigint()
+            .map(|value| PyNumber::BigInt(value.to_string())),
+        NumberRef::Complex(..) => None,
     }
-    Ok(value.float_value().map(PyNumber::Float))
 }
 
 fn integer_decimal(value: PyNumber) -> String {

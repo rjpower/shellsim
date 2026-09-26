@@ -876,11 +876,14 @@ fn c3_merge(mut sequences: Vec<Vec<TypeId>>) -> Option<Vec<TypeId>> {
         if sequences.is_empty() {
             return Some(merged);
         }
-        let head = sequences.iter().map(|sequence| sequence[0]).find(|candidate| {
-            sequences
-                .iter()
-                .all(|sequence| !sequence[1..].contains(candidate))
-        })?;
+        let head = sequences
+            .iter()
+            .map(|sequence| sequence[0])
+            .find(|candidate| {
+                sequences
+                    .iter()
+                    .all(|sequence| !sequence[1..].contains(candidate))
+            })?;
         merged.push(head);
         for sequence in &mut sequences {
             if sequence[0] == head {
@@ -897,6 +900,11 @@ fn value_kind_slots(slots: super::native::ValueKindSlots) -> TypeSlots {
         repr: slots.repr.map(unary),
         str_: slots.str_.map(unary),
         bool_: slots.bool_.map(unary),
+        get_item: slots.get_item.map(binary),
+        positive: slots.positive.map(unary),
+        negative: slots.negative.map(unary),
+        invert: slots.invert.map(unary),
+        absolute: slots.absolute.map(unary),
         add: slots.add.map(binary),
         reflected_add: slots.reflected_add.map(binary),
         subtract: slots.subtract.map(binary),
@@ -905,6 +913,22 @@ fn value_kind_slots(slots: super::native::ValueKindSlots) -> TypeSlots {
         reflected_multiply: slots.reflected_multiply.map(binary),
         divide: slots.divide.map(binary),
         reflected_divide: slots.reflected_divide.map(binary),
+        floor_divide: slots.floor_divide.map(binary),
+        reflected_floor_divide: slots.reflected_floor_divide.map(binary),
+        remainder: slots.remainder.map(binary),
+        reflected_remainder: slots.reflected_remainder.map(binary),
+        power: slots.power.map(binary),
+        reflected_power: slots.reflected_power.map(binary),
+        left_shift: slots.left_shift.map(binary),
+        reflected_left_shift: slots.reflected_left_shift.map(binary),
+        right_shift: slots.right_shift.map(binary),
+        reflected_right_shift: slots.reflected_right_shift.map(binary),
+        bitwise_and: slots.bitwise_and.map(binary),
+        reflected_bitwise_and: slots.reflected_bitwise_and.map(binary),
+        bitwise_xor: slots.bitwise_xor.map(binary),
+        reflected_bitwise_xor: slots.reflected_bitwise_xor.map(binary),
+        bitwise_or: slots.bitwise_or.map(binary),
+        reflected_bitwise_or: slots.reflected_bitwise_or.map(binary),
         equal: slots.equal.map(binary),
         not_equal: slots.not_equal.map(binary),
         less_than: slots.less_than.map(binary),

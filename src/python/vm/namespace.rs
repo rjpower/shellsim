@@ -124,6 +124,8 @@ impl Vm<'_> {
                 "oct" => Builtin::Octal,
                 "hex" => Builtin::Hexadecimal,
                 "repr" => Builtin::Repr,
+                "format" => Builtin::Format,
+                "hash" => Builtin::Hash,
                 "dir" => Builtin::Dir,
                 "isinstance" => Builtin::IsInstance,
                 "issubclass" => Builtin::IsSubclass,

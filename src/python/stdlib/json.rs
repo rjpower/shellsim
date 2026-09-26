@@ -9,7 +9,7 @@ use super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyDict, PyError, PyIdentity, PyKind, PyList, PyResult,
     PyRuntime, PyTuple, PyValue, PyValueCast,
 };
-use super::super::number::PyNumber;
+use super::super::number::{NumberRef, PyNumber};
 
 const MAX_JSON_INPUT: usize = 1024 * 1024;
 const MAX_JSON_DEPTH: usize = 128;
@@ -220,6 +220,37 @@ fn encode_string(value: &str, ensure_ascii: bool) -> PyResult<String> {
     Ok(ascii)
 }
 
+fn encode_float(number: f64) -> PyResult<String> {
+    if number.is_finite() {
+        serde_json::to_string(&number).map_err(|error| PyError::value_error(error.to_string()))
+    } else {
+        Err(PyError::value_error(
+            "non-finite float is not JSON serializable",
+        ))
+    }
+}
+
+/// The value of a registered `float` subclass such as NumPy's `float64`, which `json` encodes
+/// like any float, as CPython's encoder does through `float.__repr__`.
+fn float_subclass_value(runtime: &dyn PyRuntime, value: &PyValue) -> Option<f64> {
+    if !runtime.value_kind_of(value)?.is_float_subclass() {
+        return None;
+    }
+    match runtime.number(value)? {
+        NumberRef::Float(number) => Some(number),
+        _ => None,
+    }
+}
+
+/// CPython's error for a value `json` cannot encode, naming the type as `__name__` does.
+fn not_serializable(runtime: &dyn PyRuntime, value: &PyValue) -> PyError {
+    let name = runtime
+        .type_name(value)
+        .unwrap_or_else(|_| "object".to_string());
+    let short = name.rsplit('.').next().unwrap_or(&name);
+    PyError::type_error(format!("Object of type {short} is not JSON serializable"))
+}
+
 fn dump_value(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
@@ -231,6 +262,9 @@ fn dump_value(
         return Err(PyError::value_error("maximum JSON nesting depth exceeded"));
     }
     runtime.charge_cpu(1)?;
+    if let Some(number) = float_subclass_value(runtime, &value) {
+        return encode_float(number);
+    }
     let kind = runtime.kind(&value)?;
     match kind {
         PyKind::None => return Ok("null".into()),
@@ -246,14 +280,7 @@ fn dump_value(
                     "float changed numeric representation",
                 ));
             };
-            return if number.is_finite() {
-                serde_json::to_string(&number)
-                    .map_err(|error| PyError::value_error(error.to_string()))
-            } else {
-                Err(PyError::value_error(
-                    "non-finite float is not JSON serializable",
-                ))
-            };
+            return encode_float(number);
         }
         PyKind::String => {
             let value = runtime
@@ -343,10 +370,10 @@ fn dump_value(
                     depth,
                 ))
             }
-            _ => Err(PyError::type_error("object is not JSON serializable")),
+            _ => Err(not_serializable(runtime, &value)),
         };
     }
-    Err(PyError::type_error("object is not JSON serializable"))
+    Err(not_serializable(runtime, &value))
 }
 
 fn join_json_container(
@@ -385,6 +412,15 @@ fn size_bound(
         size.checked_add(64)
             .ok_or_else(|| PyError::resource_error("json result is too large"))
     };
+    if let Some(number) = float_subclass_value(runtime, &value) {
+        return if number.is_finite() {
+            scalar(64)
+        } else {
+            Err(PyError::value_error(
+                "non-finite float is not JSON serializable",
+            ))
+        };
+    }
     let kind = runtime.kind(&value)?;
     match kind {
         PyKind::None => return scalar(4),
@@ -479,11 +515,11 @@ fn size_bound(
                 }
                 Ok(size)
             }
-            _ => Err(PyError::type_error("object is not JSON serializable")),
+            _ => Err(not_serializable(runtime, &value)),
         };
         active.pop();
         result
     } else {
-        Err(PyError::type_error("object is not JSON serializable"))
+        Err(not_serializable(runtime, &value))
     }
 }

@@ -625,7 +625,6 @@ pub(in crate::python) fn true_divide_dtype(dtype: DType) -> DType {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,7 +644,10 @@ mod tests {
         assert_eq!(dtype("O").repr(), "dtype('O')");
         assert_eq!(dtype("F").name(), "complex64");
         for kind in KINDS {
-            assert_eq!(kind as usize, KINDS.iter().position(|k| *k == kind).unwrap());
+            assert_eq!(
+                kind as usize,
+                KINDS.iter().position(|k| *k == kind).unwrap()
+            );
         }
     }
 
@@ -698,9 +700,18 @@ mod tests {
     fn weak_scalars_follow_nep_50() {
         assert_eq!(promote_weak(DType::INT8, Weak::Int).unwrap(), DType::INT8);
         assert_eq!(promote_weak(DType::BOOL, Weak::Int).unwrap(), DType::INT64);
-        assert_eq!(promote_weak(DType::INT8, Weak::Float).unwrap(), DType::FLOAT64);
-        assert_eq!(promote_weak(DType::FLOAT32, Weak::Complex).unwrap(), DType::COMPLEX64);
-        assert_eq!(promote_weak(DType::FLOAT16, Weak::Float).unwrap(), DType::FLOAT16);
+        assert_eq!(
+            promote_weak(DType::INT8, Weak::Float).unwrap(),
+            DType::FLOAT64
+        );
+        assert_eq!(
+            promote_weak(DType::FLOAT32, Weak::Complex).unwrap(),
+            DType::COMPLEX64
+        );
+        assert_eq!(
+            promote_weak(DType::FLOAT16, Weak::Float).unwrap(),
+            DType::FLOAT16
+        );
     }
 
     #[test]

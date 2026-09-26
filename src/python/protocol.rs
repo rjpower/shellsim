@@ -51,6 +51,7 @@ pub fn int_value(heap: &Heap, value: &Value) -> Option<i64> {
     match super::number::index(heap, value)? {
         super::number::NumberRef::Int(value) => Some(value),
         super::number::NumberRef::BigInt(_)
+        | super::number::NumberRef::UInt(_)
         | super::number::NumberRef::Float(_)
         | super::number::NumberRef::Complex(..) => None,
     }
@@ -75,7 +76,7 @@ pub fn string_index(heap: &Heap, owner: &Value, index: &Value) -> Result<StringI
     let Some(text) = string_ref(heap, owner)? else {
         return Ok(StringIndex::NotString);
     };
-    let Some(index) = index.as_int() else {
+    let Some(index) = int_value(heap, index) else {
         return Ok(StringIndex::NotInteger);
     };
     Ok(indexed_char(text.as_str(), index, text.is_ascii())
@@ -634,6 +635,16 @@ fn equals_inner(
 }
 
 fn scalar_equality(heap: &Heap, left: &Value, right: &Value) -> Result<Option<bool>, String> {
+    use super::number;
+    // Registered numbers such as NumPy scalars equal the Python number with the same value, so
+    // `np.int64(1)` finds the key `1` in a dict or list.
+    if number::registered_number(heap, left).is_some()
+        || number::registered_number(heap, right).is_some()
+    {
+        if let (Some(left), Some(right)) = (number::view(heap, left), number::view(heap, right)) {
+            return Ok(Some(number::numbers_equal(left, right)));
+        }
+    }
     if let Some(equal) = complex_equality(heap, left, right) {
         return Ok(Some(equal));
     }
@@ -722,6 +733,7 @@ fn complex_equality(heap: &Heap, left: &Value, right: &Value) -> Option<bool> {
         Some(NumberRef::Float(other)) => imag == 0.0 && real == other,
         Some(NumberRef::Int(other)) => exact_integer(BigInt::from(other)),
         Some(NumberRef::BigInt(other)) => exact_integer(other.clone()),
+        Some(NumberRef::UInt(other)) => exact_integer(BigInt::from(other)),
         None => false,
     })
 }

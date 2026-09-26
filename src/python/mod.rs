@@ -11,6 +11,7 @@ mod complex;
 mod cpython_names;
 mod exception_types;
 mod filesystem;
+mod hash;
 mod heap;
 mod http;
 mod lexer;

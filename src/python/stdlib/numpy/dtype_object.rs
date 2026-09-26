@@ -96,7 +96,11 @@ fn coerced(runtime: &mut dyn PyRuntime, value: PyValue) -> Option<DType> {
     super::args::dtype(runtime, value).ok()
 }
 
-fn slot_equal(runtime: &mut dyn PyRuntime, left: PyValue, right: PyValue) -> PyResult<Option<PyValue>> {
+fn slot_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
     let dtype = receiver(runtime, &left);
     Ok(Some(Value::Bool(coerced(runtime, right) == Some(dtype))))
 }
@@ -159,7 +163,11 @@ fn get_type(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
         // `str` and `object` elements box to builtin values, so their scalar types are the
         // builtin types.
         None => {
-            let name = if dtype.kind() == Kind::Str { "str" } else { "object" };
+            let name = if dtype.kind() == Kind::Str {
+                "str"
+            } else {
+                "object"
+            };
             runtime.builtin_type(name).ok_or_else(|| {
                 super::super::super::native::PyError::runtime_error("builtin type missing")
             })
@@ -188,11 +196,15 @@ fn get_isbuiltin(_runtime: &mut dyn PyRuntime, _value: PyValue) -> PyResult {
 }
 
 fn get_hasobject(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
-    Ok(Value::Bool(receiver(runtime, &value).kind() == Kind::Object))
+    Ok(Value::Bool(
+        receiver(runtime, &value).kind() == Kind::Object,
+    ))
 }
 
 fn get_num(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
     // NumPy's type numbers for the supported kinds.
     const NUMBERS: [i64; 16] = [0, 1, 3, 5, 7, 2, 4, 6, 8, 23, 11, 12, 14, 15, 19, 17];
-    Ok(Value::Int(NUMBERS[receiver(runtime, &value).kind() as usize]))
+    Ok(Value::Int(
+        NUMBERS[receiver(runtime, &value).kind() as usize],
+    ))
 }

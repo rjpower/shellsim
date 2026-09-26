@@ -17,7 +17,8 @@
 //! behave as if the source were copied, and with repeated indices the last write wins.
 
 use super::super::super::native::{
-    PyArrayBuffer, PyArrayView, PyError, PyKind, PyNativeKind, PyResult, PyRuntime, PyValue, PyValueCast,
+    PyArrayBuffer, PyArrayView, PyError, PyKind, PyNativeKind, PyResult, PyRuntime, PyValue,
+    PyValueCast,
 };
 use super::super::super::slice::SlicePlan;
 use super::array::{
@@ -138,7 +139,10 @@ pub(in crate::python) enum Selection {
     /// returns an element instead of a 0-d array.
     View { view: Array, scalar: bool },
     /// Byte offsets of the selected elements in C order of `shape`.
-    Gather { shape: Vec<usize>, offsets: Vec<usize> },
+    Gather {
+        shape: Vec<usize>,
+        offsets: Vec<usize>,
+    },
 }
 
 /// Resolve `index` against `array`.
@@ -154,7 +158,9 @@ pub(in crate::python) fn select(
         .filter(|item| matches!(item, Item::Ellipsis))
         .count();
     if ellipses > 1 {
-        return Err(index_error("an index can only have a single ellipsis ('...')"));
+        return Err(index_error(
+            "an index can only have a single ellipsis ('...')",
+        ));
     }
     let consumed: usize = items.iter().map(Item::consumes).sum();
     if consumed > ndim {
@@ -162,9 +168,8 @@ pub(in crate::python) fn select(
             "too many indices for array: array is {ndim}-dimensional, but {consumed} were indexed"
         )));
     }
-    let scalar = ellipses == 0
-        && consumed == ndim
-        && items.iter().all(|item| matches!(item, Item::Int(_)));
+    let scalar =
+        ellipses == 0 && consumed == ndim && items.iter().all(|item| matches!(item, Item::Int(_)));
     let mut expanded = Vec::with_capacity(items.len() + ndim);
     let mut axis = 0;
     for item in items {
@@ -191,13 +196,16 @@ pub(in crate::python) fn select(
         expanded.push(Item::Slice(None, None, None));
         axis += 1;
     }
-    let advanced = expanded
-        .iter()
-        .any(|item| matches!(item, Item::Array(_)));
+    let advanced = expanded.iter().any(|item| matches!(item, Item::Array(_)));
     if advanced {
         for item in &mut expanded {
             if let Item::Int(value) = item {
-                let zero_d = super::array::array_from_elements(runtime, DType::INT64, Vec::new(), &[*value])?;
+                let zero_d = super::array::array_from_elements(
+                    runtime,
+                    DType::INT64,
+                    Vec::new(),
+                    &[*value],
+                )?;
                 *item = Item::Array(zero_d);
             }
         }
@@ -224,7 +232,8 @@ pub(in crate::python) fn select(
             Item::Slice(start, stop, step) => {
                 let length = array.shape()[source_axis];
                 let stride = array.strides()[source_axis];
-                let plan = SlicePlan::new(length, start, stop, step).map_err(PyError::value_error)?;
+                let plan =
+                    SlicePlan::new(length, start, stop, step).map_err(PyError::value_error)?;
                 if plan.len() > 0 {
                     offset += plan.first() * stride;
                 }
@@ -290,7 +299,10 @@ fn mask_indices(
 
 /// Coordinates of the true elements of `array`, one vector per axis, in C order. A 0-d array
 /// yields one coordinate list per axis of a 1-d view, as `np.nonzero` does for `atleast_1d`.
-pub(in crate::python) fn nonzero(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Vec<Vec<i64>>> {
+pub(in crate::python) fn nonzero(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+) -> PyResult<Vec<Vec<i64>>> {
     let truth = truth_values(runtime, array)?;
     let ndim = array.ndim().max(1);
     let shape = if array.ndim() == 0 {
@@ -320,7 +332,10 @@ pub(in crate::python) fn nonzero(runtime: &mut dyn PyRuntime, array: &Array) -> 
 }
 
 /// The truth value of every element in C order.
-pub(in crate::python) fn truth_values(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Vec<bool>> {
+pub(in crate::python) fn truth_values(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+) -> PyResult<Vec<bool>> {
     match array.dtype.kind() {
         Kind::Object => {
             let values = super::array::read_objects(runtime, array)?;
@@ -533,9 +548,9 @@ pub(in crate::python) fn flat_positions(
                 Ok(position as usize)
             } else {
                 Err(index_error(match axis {
-                    Some(axis) => format!(
-                        "index {value} is out of bounds for axis {axis} with size {size}"
-                    ),
+                    Some(axis) => {
+                        format!("index {value} is out of bounds for axis {axis} with size {size}")
+                    }
                     None => format!("index {value} is out of bounds for size {size}"),
                 }))
             }
@@ -544,7 +559,10 @@ pub(in crate::python) fn flat_positions(
 }
 
 /// An int64 index array from any integer array-like.
-pub(in crate::python) fn index_array(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Array> {
+pub(in crate::python) fn index_array(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Array> {
     let array = convert::array_from_python(runtime, value, None, false)?;
     if array.size() == 0 {
         return convert::cast_array(runtime, &array, DType::INT64, false);

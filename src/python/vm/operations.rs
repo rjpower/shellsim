@@ -1,5 +1,6 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
+use super::super::native::KindNumber;
 use super::format::{format_float, format_integer, format_text, FormatSpec};
 use super::{
     number, protocol, BigInt, BinaryOperator, ComparisonOperator, DisplayKind, NativeValue, Object,
@@ -576,13 +577,29 @@ impl Vm<'_> {
                 "__ror__",
             ),
         };
+        // As in CPython, a right operand whose type is a proper subclass of the left operand's
+        // type gets its reflected method first, so `1.0 + np.float64(2)` stays a NumPy scalar.
+        let left_type = self.type_id(&left)?;
+        let right_type = self.type_id(&right)?;
+        let right_first = left_type != right_type
+            && self.state.types.is_subclass(right_type, left_type)?
+            && self.state.types.slot(right_type, reflected_slot)?.is_some();
+        if right_first {
+            if let Some(value) =
+                self.invoke_operator_slot(&right, reflected_slot, reflected_name, vec![left])?
+            {
+                return Ok(value);
+            }
+        }
         if let Some(value) = self.invoke_operator_slot(&left, slot, name, vec![right])? {
             return Ok(value);
         }
-        if let Some(value) =
-            self.invoke_operator_slot(&right, reflected_slot, reflected_name, vec![left])?
-        {
-            return Ok(value);
+        if !right_first {
+            if let Some(value) =
+                self.invoke_operator_slot(&right, reflected_slot, reflected_name, vec![left])?
+            {
+                return Ok(value);
+            }
         }
         let symbol = match (operator, inplace) {
             (BinaryOperator::Power, true) => "**=".to_string(),
@@ -617,26 +634,64 @@ impl Vm<'_> {
         format_spec: &str,
     ) -> Result<String, String> {
         self.reserve_format_spec(format_spec)?;
-        let converted = match conversion {
-            Some('r' | 'a') => Some(protocol::repr(&self.state.heap, value)?),
-            Some('s') => Some(protocol::display(&self.state.heap, value)?),
-            Some(other) => return Err(format!("unsupported f-string conversion !{other}")),
-            None => None,
-        };
-        let rendered = if format_spec.is_empty() {
-            converted.unwrap_or(protocol::display(&self.state.heap, value)?)
-        } else if format_spec.contains(['{', '}']) {
+        if format_spec.contains(['{', '}']) {
             return Err("nested f-string format specifications are not implemented".into());
-        } else if let Some(converted) = converted {
-            format_text(&converted, &FormatSpec::parse(format_spec)?)?
-        } else {
-            self.format_unconverted_value(value, format_spec)?
+        }
+        let converted = match conversion {
+            Some('r' | 'a') => self.repr_value(value)?,
+            Some('s') => self.display_value(value)?,
+            Some(other) => return Err(format!("unsupported f-string conversion !{other}")),
+            None => return self.format_object(value, format_spec),
         };
-        Ok(rendered)
+        if format_spec.is_empty() {
+            Ok(converted)
+        } else {
+            format_text(&converted, &FormatSpec::parse(format_spec)?)
+        }
+    }
+
+    /// `format(value, spec)`, which CPython defines as `type(value).__format__(value, spec)`.
+    /// A user class's `__format__` runs as written. Registered numbers such as NumPy scalars
+    /// format as the Python number they stand for, as NumPy's `__format__` does. Other values
+    /// accept only the empty spec, which gives `str(value)`.
+    pub(super) fn format_object(
+        &mut self,
+        value: &Value,
+        format_spec: &str,
+    ) -> Result<String, String> {
+        if let Some(id) = value.object_id() {
+            if matches!(self.state.heap.get(id)?, Object::Instance { .. }) {
+                if let Some(method) = self.resolve_attribute(*value, "__format__")? {
+                    let spec = self.allocate_string(format_spec.to_string())?;
+                    let result = self.invoke_value(method, vec![spec])?;
+                    return protocol::string_value(&self.state.heap, &result)?.ok_or_else(|| {
+                        self.raise_exception("TypeError", "__format__ must return a str")
+                    });
+                }
+            }
+        }
+        if let Some((_, number)) = super::number::registered_number(&self.state.heap, value) {
+            let number = match number {
+                KindNumber::Bool(value) => Value::Bool(value),
+                KindNumber::Int(value) => Value::Int(value),
+                KindNumber::UInt(value) => {
+                    self.allocate_object(Object::BigInt(BigInt::from(value)))?
+                }
+                KindNumber::Float(value) => Value::Float(value),
+                KindNumber::Complex(real, imag) => {
+                    self.allocate_object(Object::Complex { real, imag })?
+                }
+            };
+            return self.format_object(&number, format_spec);
+        }
+        if format_spec.is_empty() {
+            return self.display_value(value);
+        }
+        self.format_unconverted_value(value, format_spec)
     }
 
     /// Reserve the largest width or precision before formatting can allocate padding.
-    fn reserve_format_spec(&mut self, spec: &str) -> Result<(), String> {
+    pub(super) fn reserve_format_spec(&mut self, spec: &str) -> Result<(), String> {
         let mut largest = 0_usize;
         let mut digits = None::<usize>;
         for byte in spec.bytes() {
@@ -694,12 +749,9 @@ impl Vm<'_> {
     }
 
     fn bigint_operand(&self, value: &Value) -> Result<BigInt, String> {
-        match super::number::view(&self.state.heap, value) {
-            Some(super::number::NumberRef::Int(value)) => Ok(BigInt::from(value)),
-            Some(super::number::NumberRef::BigInt(value)) => Ok(value.clone()),
-            Some(super::number::NumberRef::Float(_) | super::number::NumberRef::Complex(..))
-            | None => Err("unsupported arithmetic operands".into()),
-        }
+        super::number::view(&self.state.heap, value)
+            .and_then(super::number::NumberRef::to_bigint)
+            .ok_or_else(|| "unsupported arithmetic operands".into())
     }
 
     pub(super) fn numeric_float(&self, value: &Value) -> Result<f64, String> {

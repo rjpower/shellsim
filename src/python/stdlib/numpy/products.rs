@@ -23,8 +23,13 @@ pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
-
 /// `a @ b` and `np.matmul(a, b)`.
-pub(in crate::python) fn matmul(_runtime: &mut dyn PyRuntime, _left: PyValue, _right: PyValue) -> PyResult {
-    Err(PyError::unsupported("matrix multiplication is not implemented yet"))
+pub(in crate::python) fn matmul(
+    _runtime: &mut dyn PyRuntime,
+    _left: PyValue,
+    _right: PyValue,
+) -> PyResult {
+    Err(PyError::unsupported(
+        "matrix multiplication is not implemented yet",
+    ))
 }

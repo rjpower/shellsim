@@ -26,12 +26,12 @@ use super::heap::{
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
     PyArray, PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef,
-    PyArrayView, PyByteArray, PyCallable, PyClass, PyClock,
-    PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity,
-    PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
-    PyOperator, PyProcessHandle, PyTypeObject, PyProcessOutput, PyProcessPoll, PyProcessRunner, PyProcessStartRequest,
-    PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyStreamRead,
-    PySubcommandSpec, PySubparsersSpec, PyTuple, PyValueCast,
+    PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError,
+    PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker,
+    PyMatch, PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessHandle, PyProcessOutput,
+    PyProcessPoll, PyProcessRunner, PyProcessStartRequest, PyProperty, PyRaisesContext, PyRegex,
+    PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple,
+    PyTypeObject, PyValueCast,
 };
 use super::number;
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
@@ -42,6 +42,7 @@ use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
 mod calls;
 mod dispatch;
 mod format;
+mod hashing;
 mod host;
 mod iteration;
 mod namespace;
@@ -267,6 +268,8 @@ pub(super) enum Builtin {
     Octal,
     Hexadecimal,
     Repr,
+    Format,
+    Hash,
     Dir,
     IsInstance,
     IsSubclass,

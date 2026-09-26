@@ -277,7 +277,11 @@ macro_rules! signed {
             }
             fn right_shift(self, other: Self) -> Self {
                 if other < 0 || other as u32 >= <$type>::BITS {
-                    if self < 0 { -1 } else { 0 }
+                    if self < 0 {
+                        -1
+                    } else {
+                        0
+                    }
                 } else {
                     self >> other
                 }
@@ -526,7 +530,12 @@ trait RealBinary: Sized {
     type Wide;
 
     /// Apply `operation` to both operands at working precision, round, and record flags.
-    fn binary(self, other: Self, flags: &mut FpFlags, operation: fn(Self::Wide, Self::Wide) -> Self::Wide) -> Self;
+    fn binary(
+        self,
+        other: Self,
+        flags: &mut FpFlags,
+        operation: fn(Self::Wide, Self::Wide) -> Self::Wide,
+    ) -> Self;
 }
 
 macro_rules! real {
@@ -559,7 +568,9 @@ macro_rules! real {
                     }
                     return Self::from_f64(a / b);
                 }
-                self.binary(other, flags, |a, b| floor_divide_f64(a.into(), b.into()) as $wide)
+                self.binary(other, flags, |a, b| {
+                    floor_divide_f64(a.into(), b.into()) as $wide
+                })
             }
             fn remainder(self, other: Self, flags: &mut FpFlags) -> Self {
                 let (a, b) = (self.to_f64(), other.to_f64());
@@ -569,7 +580,9 @@ macro_rules! real {
                     }
                     return Self::from_f64(f64::NAN);
                 }
-                self.binary(other, flags, |a, b| remainder_f64(a.into(), b.into()) as $wide)
+                self.binary(other, flags, |a, b| {
+                    remainder_f64(a.into(), b.into()) as $wide
+                })
             }
             fn power(self, other: Self, flags: &mut FpFlags) -> Self {
                 self.binary(other, flags, |a, b| a.powf(b))
@@ -606,7 +619,12 @@ macro_rules! real {
         impl RealBinary for $type {
             type Wide = $wide;
 
-            fn binary(self, other: Self, flags: &mut FpFlags, operation: fn($wide, $wide) -> $wide) -> Self {
+            fn binary(
+                self,
+                other: Self,
+                flags: &mut FpFlags,
+                operation: fn($wide, $wide) -> $wide,
+            ) -> Self {
                 let a: $wide = $to(self);
                 let b: $wide = $to(other);
                 let result = Self::from_f64(f64::from(operation(a, b)));
@@ -619,7 +637,9 @@ macro_rules! real {
 
 real!(f64, f64, |value: f64| value, |value: f64| value);
 real!(f32, f32, |value: f32| value, |value: f32| value);
-real!(F16, f32, |value: F16| value.to_f32(), |value: f32| F16::from_f32(value));
+real!(F16, f32, |value: F16| value.to_f32(), |value: f32| {
+    F16::from_f32(value)
+});
 
 impl Real for f64 {
     fn to_f64(self) -> f64 {
@@ -702,11 +722,17 @@ pub(in crate::python) fn complex_divide(a: (f64, f64), b: (f64, f64)) -> (f64, f
         }
         let ratio = bi / br;
         let denominator = br + bi * ratio;
-        ((ar + ai * ratio) / denominator, (ai - ar * ratio) / denominator)
+        (
+            (ar + ai * ratio) / denominator,
+            (ai - ar * ratio) / denominator,
+        )
     } else {
         let ratio = br / bi;
         let denominator = br * ratio + bi;
-        ((ar * ratio + ai) / denominator, (ai * ratio - ar) / denominator)
+        (
+            (ar * ratio + ai) / denominator,
+            (ai * ratio - ar) / denominator,
+        )
     }
 }
 
@@ -888,9 +914,14 @@ mod tests {
     #[test]
     fn half_and_single_precision_round_every_result() {
         let mut flags = FpFlags::default();
-        assert_eq!(F16::from_f32(2048.0).add(F16::from_f32(1.0), &mut flags).to_f32(), 2048.0);
+        assert_eq!(
+            F16::from_f32(2048.0)
+                .add(F16::from_f32(1.0), &mut flags)
+                .to_f32(),
+            2048.0
+        );
         assert_eq!(16_777_216f32.add(1.0, &mut flags), 16_777_216.0);
-        assert_eq!(f64::NAN.maximum(1.0).is_nan(), true);
+        assert!(Numeric::maximum(f64::NAN, 1.0).is_nan());
         assert_eq!(f64::NAN.fmax(1.0), 1.0);
     }
 
@@ -900,6 +931,7 @@ mod tests {
         let b = C128 { re: 1.0, im: 3.0 };
         assert_eq!(a.compare(b), Some(Ordering::Less));
         let quotient = a.divide(b, &mut FpFlags::default());
-        assert!((quotient.re - 0.8).abs() < 1e-12 && (quotient.im + 0.1).abs() < 1e-12);
+        // (1+2j)/(1+3j) = (1+2j)(1-3j)/10 = 0.7-0.1j
+        assert!((quotient.re - 0.7).abs() < 1e-12 && (quotient.im + 0.1).abs() < 1e-12);
     }
 }

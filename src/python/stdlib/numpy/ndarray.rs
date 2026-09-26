@@ -101,7 +101,10 @@ pub(in crate::python) fn int_tuple(
 
 fn get_shape(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
     let array = receiver(runtime, value)?;
-    int_tuple(runtime, array.shape().iter().map(|dimension| *dimension as i64))
+    int_tuple(
+        runtime,
+        array.shape().iter().map(|dimension| *dimension as i64),
+    )
 }
 
 fn get_ndim(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
@@ -136,7 +139,14 @@ fn get_transposed(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
     let array = receiver(runtime, value)?;
     let shape = array.shape().iter().rev().copied().collect();
     let strides = array.strides().iter().rev().copied().collect();
-    let view = array::new_view(runtime, &array, array.dtype, shape, strides, array.view.offset)?;
+    let view = array::new_view(
+        runtime,
+        &array,
+        array.dtype,
+        shape,
+        strides,
+        array.view.offset,
+    )?;
     Ok(view.value())
 }
 
@@ -176,7 +186,9 @@ fn get_imag(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
         return Ok(view.value());
     }
     if array.dtype.kind() == Kind::Object {
-        return Err(PyError::unsupported("ndarray.imag of object arrays is not supported"));
+        return Err(PyError::unsupported(
+            "ndarray.imag of object arrays is not supported",
+        ));
     }
     let buffer = array::zeroed_buffer(runtime, array.dtype, array.size())?;
     let zeros = array::new_array(runtime, buffer, array.dtype, array.shape().to_vec())?;
@@ -207,7 +219,11 @@ fn get_flat(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
 }
 
 /// `a.setflags(write=None, align=None, uic=None)`. Only `write` is modeled.
-fn method_setflags(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+fn method_setflags(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
     static SIGNATURE: Signature = Signature::new("setflags", &["write", "align", "uic"], 0);
     let bound = SIGNATURE.bind(&args)?;
     let array = receiver(runtime, receiver_value)?;
@@ -284,17 +300,25 @@ fn method_item(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallA
                 values.to_vec()
             };
             if values.len() != array.ndim() {
-                return Err(PyError::value_error("incorrect number of indices for array"));
+                return Err(PyError::value_error(
+                    "incorrect number of indices for array",
+                ));
             }
             let mut index = Vec::with_capacity(values.len());
             for (axis, value) in values.iter().enumerate() {
                 let position = args::index_int(runtime, value)?;
                 let length = array.shape()[axis] as i64;
-                let normalized = if position < 0 { position + length } else { position };
+                let normalized = if position < 0 {
+                    position + length
+                } else {
+                    position
+                };
                 if !(0..length).contains(&normalized) {
                     return Err(PyError::exception(
                         "IndexError",
-                        format!("index {position} is out of bounds for axis {axis} with size {length}"),
+                        format!(
+                            "index {position} is out of bounds for axis {axis} with size {length}"
+                        ),
                     ));
                 }
                 index.push(normalized as usize);
@@ -308,7 +332,11 @@ fn method_item(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallA
 /// Byte offset of the element at C-order flat `position`.
 pub(in crate::python) fn flat_offset(array: &Array, position: i64) -> PyResult<usize> {
     let size = array.size() as i64;
-    let normalized = if position < 0 { position + size } else { position };
+    let normalized = if position < 0 {
+        position + size
+    } else {
+        position
+    };
     if !(0..size).contains(&normalized) {
         return Err(PyError::exception(
             "IndexError",
@@ -332,7 +360,11 @@ fn method_copy(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallA
 }
 
 /// `copy.deepcopy(a)`: object elements are deep-copied through the `copy` module.
-fn method_deepcopy(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+fn method_deepcopy(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
     args.expect_positional("__deepcopy__", 1, 1)?;
     let array = receiver(runtime, receiver_value)?;
     let copy = array::copy_array(runtime, &array)?;
@@ -402,7 +434,9 @@ fn method_view(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallA
     if dtype != array.dtype {
         let objects = dtype.kind() == Kind::Object || array.dtype.kind() == Kind::Object;
         if objects {
-            return Err(PyError::type_error("Cannot change data-type for array of references."));
+            return Err(PyError::type_error(
+                "Cannot change data-type for array of references.",
+            ));
         }
         if dtype.itemsize() != array.itemsize() {
             return Err(PyError::unsupported(
@@ -421,13 +455,22 @@ fn method_view(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallA
     Ok(view.value())
 }
 
-fn method_conjugate(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+fn method_conjugate(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
     args.expect_positional("conjugate", 0, 0)?;
     let index = ufunc::find("conjugate").expect("conjugate is a ufunc");
     if receiver(runtime, receiver_value)?.dtype.category() != Category::Complex {
         return Ok(receiver_value);
     }
-    ufunc::apply(runtime, index, &[receiver_value], &ufunc::Options::default())
+    ufunc::apply(
+        runtime,
+        index,
+        &[receiver_value],
+        &ufunc::Options::default(),
+    )
 }
 
 /// `np.take(a, indices, axis=None)` and `a.take(indices, axis=None)`.
@@ -437,13 +480,16 @@ pub(in crate::python) fn take(
     indices: PyValue,
     axis: Option<PyValue>,
 ) -> PyResult {
-    let scalar_index = runtime.int_value(&indices).is_some()
-        || super::scalar::unbox(runtime, &indices).is_some();
+    let scalar_index =
+        runtime.int_value(&indices).is_some() || super::scalar::unbox(runtime, &indices).is_some();
     let positions = index::index_array(runtime, indices)?;
     let Some(axis) = args::axis(runtime, axis, array.ndim())? else {
         let flat = index::flat_positions(runtime, &positions, array.size(), None)?;
         let all = array.offsets().collect::<Vec<_>>();
-        let offsets = flat.iter().map(|position| all[*position]).collect::<Vec<_>>();
+        let offsets = flat
+            .iter()
+            .map(|position| all[*position])
+            .collect::<Vec<_>>();
         let result = index::gather(runtime, array, &offsets, positions.shape().to_vec())?;
         if scalar_index {
             return convert::element_to_scalar(runtime, &result, result.view.offset);
@@ -481,7 +527,12 @@ fn method_take(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallA
     let bound = SIGNATURE.bind(&args)?;
     reject_out_and_mode(&bound)?;
     let array = receiver(runtime, receiver_value)?;
-    take(runtime, &array, bound.required("indices"), bound.value("axis"))
+    take(
+        runtime,
+        &array,
+        bound.required("indices"),
+        bound.value("axis"),
+    )
 }
 
 pub(in crate::python) fn reject_out_and_mode(bound: &args::Bound) -> PyResult<()> {
@@ -519,18 +570,28 @@ pub(in crate::python) fn put(
         return Ok(Value::None);
     }
     if source.size() == 0 {
-        return Err(PyError::value_error("cannot put with an empty values array"));
+        return Err(PyError::value_error(
+            "cannot put with an empty values array",
+        ));
     }
     let buffer = array::contiguous_buffer(runtime, &source)?;
     let all = array.offsets().collect::<Vec<_>>();
-    let offsets = flat.iter().map(|position| all[*position]).collect::<Vec<_>>();
+    let offsets = flat
+        .iter()
+        .map(|position| all[*position])
+        .collect::<Vec<_>>();
     let cycled = cycle_buffer(buffer, source.itemsize(), source.size(), offsets.len());
     array::scatter(runtime, array, &offsets, &cycled)?;
     Ok(Value::None)
 }
 
 /// Repeat a buffer of `count` elements cyclically to `length` elements.
-fn cycle_buffer(buffer: PyArrayBuffer, itemsize: usize, count: usize, length: usize) -> PyArrayBuffer {
+fn cycle_buffer(
+    buffer: PyArrayBuffer,
+    itemsize: usize,
+    count: usize,
+    length: usize,
+) -> PyArrayBuffer {
     match buffer {
         PyArrayBuffer::Bytes(bytes) => PyArrayBuffer::Bytes(
             (0..length)
@@ -553,7 +614,12 @@ fn method_put(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallAr
         return Err(PyError::unsupported("put() with mode= is not supported"));
     }
     let array = receiver(runtime, receiver_value)?;
-    put(runtime, &array, bound.required("indices"), bound.required("values"))
+    put(
+        runtime,
+        &array,
+        bound.required("indices"),
+        bound.required("values"),
+    )
 }
 
 macro_rules! inplace_methods {
@@ -586,19 +652,28 @@ inplace_methods! {
     method_irshift => "right_shift";
 }
 
-pub(in crate::python) fn slot_repr(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+pub(in crate::python) fn slot_repr(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
     let array = receiver(runtime, value)?;
     let text = super::printing::array_repr(runtime, &array)?;
     runtime.new_string(text).map(Some)
 }
 
-pub(in crate::python) fn slot_str(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+pub(in crate::python) fn slot_str(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
     let array = receiver(runtime, value)?;
     let text = super::printing::array_str(runtime, &array)?;
     runtime.new_string(text).map(Some)
 }
 
-pub(in crate::python) fn slot_bool(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+pub(in crate::python) fn slot_bool(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
     let array = receiver(runtime, value)?;
     match array.size() {
         1 => {
@@ -616,7 +691,10 @@ pub(in crate::python) fn slot_bool(runtime: &mut dyn PyRuntime, value: PyValue) 
     }
 }
 
-pub(in crate::python) fn slot_length(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+pub(in crate::python) fn slot_length(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
     let array = receiver(runtime, value)?;
     match array.shape().first() {
         Some(length) => Ok(Some(Value::Int(*length as i64))),
@@ -625,7 +703,10 @@ pub(in crate::python) fn slot_length(runtime: &mut dyn PyRuntime, value: PyValue
 }
 
 /// Rows along the first axis: views for n-d arrays, scalars for 1-d arrays.
-pub(in crate::python) fn rows(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Vec<PyValue>> {
+pub(in crate::python) fn rows(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+) -> PyResult<Vec<PyValue>> {
     let length = array.shape()[0];
     runtime.charge_cpu(length as u64 + 1)?;
     let mut rows = Vec::with_capacity(length);
@@ -648,7 +729,10 @@ pub(in crate::python) fn rows(runtime: &mut dyn PyRuntime, array: &Array) -> PyR
     Ok(rows)
 }
 
-pub(in crate::python) fn slot_iter(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+pub(in crate::python) fn slot_iter(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
     let array = receiver(runtime, value)?;
     if array.ndim() == 0 {
         return Err(PyError::type_error("iteration over a 0-d array"));

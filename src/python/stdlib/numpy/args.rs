@@ -125,7 +125,8 @@ impl Bound {
 
     /// A required argument.
     pub(in crate::python) fn required(&self, name: &str) -> PyValue {
-        self.get(name).expect("required arguments are checked when binding")
+        self.get(name)
+            .expect("required arguments are checked when binding")
     }
 
     pub(in crate::python) fn function(&self) -> &'static str {
@@ -230,7 +231,9 @@ pub(in crate::python) fn float_arg(runtime: &mut dyn PyRuntime, value: &PyValue)
     }
     match runtime.number(value) {
         Some(NumberRef::Int(value)) => Ok(value as f64),
-        Some(NumberRef::BigInt(value)) => Ok(num_traits::ToPrimitive::to_f64(value).unwrap_or(f64::INFINITY)),
+        Some(NumberRef::BigInt(value)) => {
+            Ok(num_traits::ToPrimitive::to_f64(value).unwrap_or(f64::INFINITY))
+        }
         Some(NumberRef::Float(value)) => Ok(value),
         _ => Err(PyError::type_error(format!(
             "must be real number, not {}",
@@ -252,7 +255,10 @@ pub(in crate::python) fn flag(
 }
 
 /// A shape given as an int or a sequence of ints, with NumPy's negative-dimension error.
-pub(in crate::python) fn shape(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<usize>> {
+pub(in crate::python) fn shape(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Vec<usize>> {
     let dimensions = match runtime.kind(&value)? {
         PyKind::Tuple => {
             let tuple = value.cast(runtime)?;
@@ -268,9 +274,8 @@ pub(in crate::python) fn shape(runtime: &mut dyn PyRuntime, value: PyValue) -> P
         .iter()
         .map(|dimension| {
             let dimension = index_int(runtime, dimension)?;
-            usize::try_from(dimension).map_err(|_| {
-                PyError::value_error("negative dimensions are not allowed")
-            })
+            usize::try_from(dimension)
+                .map_err(|_| PyError::value_error("negative dimensions are not allowed"))
         })
         .collect::<PyResult<Vec<_>>>()?;
     super::array::element_count(&shape)?;

@@ -134,7 +134,7 @@ fn venv_exposes_offline_python_and_pip_entrypoints() {
         run_shell(
             "printf 'numpy==2.1.3\\n' > /work/requirements.txt; python -m venv /tmp/example; /tmp/example/bin/pip install --no-cache-dir -r /work/requirements.txt; /tmp/example/bin/python -c 'import numpy; print(numpy.__version__)'"
         ),
-        (0, b"2.0.0-shellsim\n".to_vec(), Vec::new())
+        (0, b"2.5.3\n".to_vec(), Vec::new())
     );
 }
 

@@ -41,6 +41,11 @@ pub(super) struct ValueKindSlots {
     pub repr: Option<UnarySlotFn>,
     pub str_: Option<UnarySlotFn>,
     pub bool_: Option<UnarySlotFn>,
+    pub get_item: Option<BinarySlotFn>,
+    pub positive: Option<UnarySlotFn>,
+    pub negative: Option<UnarySlotFn>,
+    pub invert: Option<UnarySlotFn>,
+    pub absolute: Option<UnarySlotFn>,
     pub add: Option<BinarySlotFn>,
     pub reflected_add: Option<BinarySlotFn>,
     pub subtract: Option<BinarySlotFn>,
@@ -49,6 +54,22 @@ pub(super) struct ValueKindSlots {
     pub reflected_multiply: Option<BinarySlotFn>,
     pub divide: Option<BinarySlotFn>,
     pub reflected_divide: Option<BinarySlotFn>,
+    pub floor_divide: Option<BinarySlotFn>,
+    pub reflected_floor_divide: Option<BinarySlotFn>,
+    pub remainder: Option<BinarySlotFn>,
+    pub reflected_remainder: Option<BinarySlotFn>,
+    pub power: Option<BinarySlotFn>,
+    pub reflected_power: Option<BinarySlotFn>,
+    pub left_shift: Option<BinarySlotFn>,
+    pub reflected_left_shift: Option<BinarySlotFn>,
+    pub right_shift: Option<BinarySlotFn>,
+    pub reflected_right_shift: Option<BinarySlotFn>,
+    pub bitwise_and: Option<BinarySlotFn>,
+    pub reflected_bitwise_and: Option<BinarySlotFn>,
+    pub bitwise_xor: Option<BinarySlotFn>,
+    pub reflected_bitwise_xor: Option<BinarySlotFn>,
+    pub bitwise_or: Option<BinarySlotFn>,
+    pub reflected_bitwise_or: Option<BinarySlotFn>,
     pub equal: Option<BinarySlotFn>,
     pub not_equal: Option<BinarySlotFn>,
     pub less_than: Option<BinarySlotFn>,
@@ -77,9 +98,35 @@ pub(super) struct ValueKindDef {
     pub bases: &'static [KindBase],
     /// Calls an instance, e.g. a NumPy ufunc, with the instance as receiver.
     pub call: Option<NativeMethodFn>,
-    /// The Python number an instance stands for, used by `int()`, `float()`, `complex()`,
-    /// `operator.index`, hashing, formatting, and mixed comparisons with builtin numbers.
-    pub numeric: Option<fn(&dyn PyRuntime, &PyValue) -> Option<KindNumber>>,
+    /// The Python number an instance stands for, such as the value of a NumPy scalar. It backs
+    /// `int()`, `float()`, `complex()`, `__index__` (integers only), formatting, and equality
+    /// with builtin numbers, including inside containers where no runtime is at hand.
+    pub numeric: Option<KindNumericFn>,
+}
+
+/// Pure numeric view of one registered instance, given its kind and payload. Inline kinds pass
+/// `[payload, 0]`; wide kinds pass both words.
+pub(super) type KindNumericFn = fn(&'static ValueKindDef, [u64; 2]) -> Option<KindNumber>;
+
+impl ValueKindDef {
+    /// Whether instances are builtin `float`s too, directly or through a registered base, as
+    /// NumPy's `float64` is.
+    pub(super) fn is_float_subclass(&self) -> bool {
+        self.bases.iter().any(|base| match base {
+            KindBase::Float => true,
+            KindBase::Kind(kind) => kind.is_float_subclass(),
+            KindBase::Complex => false,
+        })
+    }
+
+    /// Whether instances are builtin `complex`es too, as NumPy's `complex128` is.
+    pub(super) fn is_complex_subclass(&self) -> bool {
+        self.bases.iter().any(|base| match base {
+            KindBase::Complex => true,
+            KindBase::Kind(kind) => kind.is_complex_subclass(),
+            KindBase::Float => false,
+        })
+    }
 }
 
 /// One direct base of a registered value kind.
@@ -92,8 +139,8 @@ pub(super) enum KindBase {
 
 /// The builtin Python number a registered value stands for.
 ///
-/// `UInt` keeps unsigned 64-bit values above `i64::MAX` exact. Only `Bool`, `Int`, and `UInt`
-/// support `__index__`.
+/// `UInt` keeps unsigned 64-bit values above `i64::MAX` exact. Only `Int` and `UInt` support
+/// `__index__`; like NumPy's `bool`, a `Bool` converts with `int()` but is not an index.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum KindNumber {
     Bool(bool),
@@ -798,30 +845,9 @@ pub(super) trait PyRuntime {
     /// Deliver a signal to an arbitrary modeled process, not only an owned subprocess handle.
     fn send_os_signal(&mut self, pid: u32, signal: crate::process::Signal) -> PyResult<()>;
 
-    fn type_name(&self, value: &PyValue) -> PyResult<&'static str> {
-        Ok(match self.kind(value)? {
-            PyKind::None => "NoneType",
-            PyKind::Bool => "bool",
-            PyKind::Int => "int",
-            PyKind::Float => "float",
-            PyKind::String => "str",
-            PyKind::Bytes => "bytes",
-            PyKind::ByteArray => "bytearray",
-            PyKind::List => "list",
-            PyKind::Tuple => "tuple",
-            PyKind::Dict => "dict",
-            PyKind::Set => "set",
-            PyKind::Function => "function",
-            PyKind::Class => "type",
-            PyKind::Instance => "object",
-            PyKind::Iterator => "iterator",
-            PyKind::Generator => "generator",
-            PyKind::Module => "module",
-            PyKind::Array => "numpy.ndarray",
-            PyKind::Complex => "complex",
-            PyKind::Native => "object",
-        })
-    }
+    /// The name CPython prints for a value's type in error messages, such as `int`,
+    /// `float32` or a user class name.
+    fn type_name(&self, value: &PyValue) -> PyResult<String>;
 }
 
 /// Checked handle to an interpreter-owned array view.
