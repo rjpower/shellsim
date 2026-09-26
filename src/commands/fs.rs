@@ -76,7 +76,14 @@ fn run_ls(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 
     for p in &paths {
         if directory_as_file {
             if system.metadata(&cwd, p, false).is_ok() {
-                emit_listing(system, ".", std::slice::from_ref(p), long, io.out);
+                emit_listing(
+                    system,
+                    ".",
+                    std::slice::from_ref(p),
+                    long,
+                    ListingTotal::Omit,
+                    io.out,
+                );
             } else {
                 ewln(
                     io.err,
@@ -110,7 +117,7 @@ fn run_ls(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 
             if paths.len() > 1 || recursive {
                 wln(io.out, &format!("{p}:"));
             }
-            emit_listing(system, p, &entries, long, io.out);
+            emit_listing(system, p, &entries, long, ListingTotal::Show, io.out);
             if recursive {
                 let base = resolve_against(&cwd, p);
                 let Ok(all_paths) = system.walk(&cwd, p) else {
@@ -147,12 +154,19 @@ fn run_ls(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 
                     }
                     wln(io.out, "");
                     wln(io.out, &format!("{label}:"));
-                    emit_listing(system, &sub, &sub_entries, long, io.out);
+                    emit_listing(system, &sub, &sub_entries, long, ListingTotal::Show, io.out);
                 }
             }
         } else if system.metadata(&cwd, p, false).is_ok() {
             // A file operand is listed the same way an entry of a directory is.
-            emit_listing(system, ".", std::slice::from_ref(p), long, io.out);
+            emit_listing(
+                system,
+                ".",
+                std::slice::from_ref(p),
+                long,
+                ListingTotal::Omit,
+                io.out,
+            );
         } else {
             ewln(
                 io.err,
@@ -164,17 +178,31 @@ fn run_ls(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 
     status
 }
 
+/// Whether a long listing starts with GNU's `total N` line: directory contents do, file
+/// operands do not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListingTotal {
+    Show,
+    Omit,
+}
+
 fn emit_listing(
     system: &mut dyn System,
     dir: &str,
     entries: &[String],
     long: bool,
+    total: ListingTotal,
     out: &mut Vec<u8>,
 ) {
     let cwd = system.cwd().to_string();
     if long {
+        let mut lines = Vec::with_capacity(entries.len());
+        // `total` counts allocated space in 1 KiB units; `blocks` is in 512-byte units.
+        let mut total_kib = 0u64;
         for e in entries {
-            let full = if e == "." {
+            let full = if e.starts_with('/') {
+                e.clone()
+            } else if e == "." {
                 dir.to_string()
             } else if e == ".." {
                 crate::vfs::parent_of(&crate::vfs::resolve_against(&cwd, dir))
@@ -193,21 +221,25 @@ fn emit_listing(
                     let target = n
                         .link_target
                         .map_or_else(String::new, |target| format!(" -> {target}"));
+                    total_kib = total_kib.saturating_add(n.blocks.div_ceil(2));
                     (t, n.mode, n.size, target)
                 }
                 Err(_) => ('-', 0o644, 0, String::new()),
             };
-            wln(
-                out,
-                &format!(
-                    "{}{} 1 root root {:>6} Jan  1 00:00 {}{}",
-                    typ,
-                    mode_str(mode),
-                    size,
-                    e,
-                    target
-                ),
-            );
+            lines.push(format!(
+                "{}{} 1 root root {:>6} Jan  1 00:00 {}{}",
+                typ,
+                mode_str(mode),
+                size,
+                e,
+                target
+            ));
+        }
+        if total == ListingTotal::Show {
+            wln(out, &format!("total {total_kib}"));
+        }
+        for line in lines {
+            wln(out, &line);
         }
     } else {
         // Nothing here writes to a terminal, and `ls` writing to a pipe emits one name per line,
@@ -825,7 +857,7 @@ fn run_stat(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i3
                 let Some(code) = chars.next() else { break };
                 if !matches!(
                     code,
-                    '%' | 's' | 'n' | 'a' | 'U' | 'u' | 'g' | 'Y' | 'F' | 'N'
+                    '%' | 's' | 'n' | 'a' | 'U' | 'u' | 'g' | 'Y' | 'F' | 'N' | 'b' | 'B' | 'o'
                 ) {
                     ewln(
                         io.err,
@@ -839,11 +871,14 @@ fn run_stat(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i3
     for f in &files {
         match system.metadata(&cwd, f, follow) {
             Ok(n) => {
-                let size = if n.kind == FileKind::File { n.size } else { 0 };
+                let size = n.size;
                 if let Some(fmt) = &format {
                     let s = fmt
                         .replace("%%", "\0")
                         .replace("%s", &size.to_string())
+                        .replace("%b", &n.blocks.to_string())
+                        .replace("%B", "512")
+                        .replace("%o", "4096")
                         .replace("%n", f)
                         .replace("%a", &format!("{:o}", n.mode))
                         .replace("%U", "root")
@@ -875,47 +910,276 @@ fn run_stat(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i3
     0
 }
 
+/// Output units for `du`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DuUnits {
+    Kibibytes,
+    Bytes,
+    Human,
+}
+
+/// Options for `du`, following GNU coreutils.
+struct DuOptions {
+    all: bool,
+    summarize: bool,
+    grand_total: bool,
+    apparent: bool,
+    units: DuUnits,
+    max_depth: Option<usize>,
+}
+
+fn parse_du_options(args: &[String]) -> Result<(DuOptions, Vec<String>), String> {
+    let mut options = DuOptions {
+        all: false,
+        summarize: false,
+        grand_total: false,
+        apparent: false,
+        units: DuUnits::Kibibytes,
+        max_depth: None,
+    };
+    let mut operands = Vec::new();
+    let mut arguments = args.iter();
+    let parse_depth = |value: &str| {
+        value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid maximum depth '{value}'"))
+    };
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            operands.extend(arguments.by_ref().cloned());
+            break;
+        }
+        if let Some(long) = argument.strip_prefix("--") {
+            match long.split_once('=') {
+                Some(("max-depth", value)) => options.max_depth = Some(parse_depth(value)?),
+                None if long == "all" => options.all = true,
+                None if long == "summarize" => options.summarize = true,
+                None if long == "total" => options.grand_total = true,
+                None if long == "apparent-size" => options.apparent = true,
+                None if long == "bytes" => {
+                    options.apparent = true;
+                    options.units = DuUnits::Bytes;
+                }
+                None if long == "human-readable" => options.units = DuUnits::Human,
+                _ => return Err(format!("unrecognized option '{argument}'")),
+            }
+            continue;
+        }
+        let Some(flags) = argument.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            operands.push(argument.clone());
+            continue;
+        };
+        for (index, flag) in flags.char_indices() {
+            match flag {
+                'a' => options.all = true,
+                's' => options.summarize = true,
+                'c' => options.grand_total = true,
+                'k' => options.units = DuUnits::Kibibytes,
+                'h' => options.units = DuUnits::Human,
+                'b' => {
+                    options.apparent = true;
+                    options.units = DuUnits::Bytes;
+                }
+                'd' => {
+                    let rest = &flags[index + 1..];
+                    let value = if rest.is_empty() {
+                        arguments
+                            .next()
+                            .ok_or_else(|| "option requires an argument -- 'd'".to_string())?
+                            .clone()
+                    } else {
+                        rest.to_string()
+                    };
+                    options.max_depth = Some(parse_depth(&value)?);
+                    break;
+                }
+                other => return Err(format!("invalid option -- '{other}'")),
+            }
+        }
+    }
+    if options.summarize && options.all {
+        return Err("cannot both summarize and show all entries".to_string());
+    }
+    if operands.is_empty() {
+        operands.push(".".to_string());
+    }
+    Ok((options, operands))
+}
+
+/// Format a byte count the way GNU `du -h` does: bare below 1 KiB, one decimal rounded up
+/// below 10 units, otherwise a whole number rounded up.
+fn du_human(bytes: u64) -> String {
+    if bytes < 1024 {
+        return bytes.to_string();
+    }
+    let units = ['K', 'M', 'G', 'T', 'P', 'E'];
+    let mut scale = 1024u64;
+    for (index, unit) in units.iter().enumerate() {
+        let next = scale.saturating_mul(1024);
+        if bytes >= next && index + 1 < units.len() {
+            scale = next;
+            continue;
+        }
+        let tenths = u128::from(bytes)
+            .saturating_mul(10)
+            .div_ceil(u128::from(scale));
+        if tenths < 100 {
+            return format!("{}.{}{unit}", tenths / 10, tenths % 10);
+        }
+        let whole = u128::from(bytes).div_ceil(u128::from(scale));
+        if whole >= 1024 && index + 1 < units.len() {
+            scale = next;
+            continue;
+        }
+        return format!("{whole}{unit}");
+    }
+    unreachable!("the last unit always formats")
+}
+
+fn du_amount(bytes: u64, units: DuUnits) -> String {
+    match units {
+        DuUnits::Bytes => bytes.to_string(),
+        DuUnits::Kibibytes => bytes.div_ceil(1024).to_string(),
+        DuUnits::Human => du_human(bytes),
+    }
+}
+
+/// Usage of one node in bytes: allocated blocks by default, `st_size` for `--apparent-size`.
+fn du_usage(info: &crate::syscalls::FileInfo, apparent: bool) -> u64 {
+    if apparent {
+        info.size
+    } else {
+        info.blocks.saturating_mul(512)
+    }
+}
+
+/// A directory whose children are still being summed during `du`'s post-order walk.
+struct DuDirectory {
+    path: String,
+    depth: usize,
+    total: u64,
+    pending: std::collections::VecDeque<String>,
+}
+
 fn run_du(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
     let args = context.args;
     let system = &mut *context.system;
     let cwd = system.cwd().to_string();
-    let (flags, ops, long) = split_flags(args);
-    if flags.iter().any(|flag| !matches!(flag, 's' | 'b')) || !long.is_empty() {
-        ewln(io.err, "du: unimplemented option");
-        return 2;
-    }
-    let bytes = flags.contains(&'b');
-    let paths = if ops.is_empty() {
-        vec!["."]
-    } else {
-        ops.iter().map(|path| path.as_str()).collect()
+    let (options, operands) = match parse_du_options(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            ewln(io.err, &format!("du: {message}"));
+            return 1;
+        }
+    };
+    let shows = |depth: usize, directory: bool| {
+        let within = options.max_depth.is_none_or(|limit| depth <= limit);
+        if options.summarize {
+            depth == 0
+        } else {
+            within && (directory || options.all || depth == 0)
+        }
     };
     let mut status = 0;
-    for path in paths {
-        match system.walk(&cwd, path) {
-            Ok(nodes) => {
-                let total = nodes.into_iter().fold(0u64, |sum, node| {
-                    sum.saturating_add(match system.metadata("/", &node, false) {
-                        Ok(crate::syscalls::FileInfo {
-                            kind: FileKind::File,
-                            size,
-                            ..
-                        }) => size,
-                        _ => 0,
-                    })
-                });
-                let amount = if bytes {
-                    total
-                } else {
-                    total.saturating_add(1023) / 1024
-                };
-                wln(io.out, &format!("{amount}\t{path}"));
-            }
+    let mut grand_total = 0u64;
+    for operand in &operands {
+        let info = match system.metadata(&cwd, operand, false) {
+            Ok(info) => info,
             Err(error) => {
-                ewln(io.err, &format!("du: {error}"));
+                let reason = match &error {
+                    crate::syscalls::SyscallError::File(error) => error.reason().to_string(),
+                    other => other.to_string(),
+                };
+                ewln(io.err, &format!("du: cannot access '{operand}': {reason}"));
+                status = 1;
+                continue;
+            }
+        };
+        if info.kind != FileKind::Directory {
+            let usage = du_usage(&info, options.apparent);
+            grand_total = grand_total.saturating_add(usage);
+            wln(
+                io.out,
+                &format!("{}\t{operand}", du_amount(usage, options.units)),
+            );
+            continue;
+        }
+        // An explicit stack gives the post-order output GNU du uses (children before their
+        // directory) without host recursion over untrusted tree depth.
+        let mut stack = vec![DuDirectory {
+            path: operand.clone(),
+            depth: 0,
+            total: du_usage(&info, options.apparent),
+            pending: Vec::new().into(),
+        }];
+        match system.list_dir(&cwd, operand) {
+            Ok(entries) => stack[0].pending = entries.into(),
+            Err(error) => {
+                ewln(
+                    io.err,
+                    &format!("du: cannot read directory '{operand}': {error}"),
+                );
                 status = 1;
             }
         }
+        while let Some(top) = stack.last_mut() {
+            let Some(name) = top.pending.pop_front() else {
+                let done = stack.pop().expect("stack has a top entry");
+                if shows(done.depth, true) {
+                    wln(
+                        io.out,
+                        &format!("{}\t{}", du_amount(done.total, options.units), done.path),
+                    );
+                }
+                match stack.last_mut() {
+                    Some(parent) => parent.total = parent.total.saturating_add(done.total),
+                    None => grand_total = grand_total.saturating_add(done.total),
+                }
+                continue;
+            };
+            if !system.charge_cpu(1) {
+                return 137;
+            }
+            let path = format!("{}/{name}", top.path.trim_end_matches('/'));
+            let depth = top.depth + 1;
+            let Ok(child) = system.metadata(&cwd, &path, false) else {
+                continue;
+            };
+            let usage = du_usage(&child, options.apparent);
+            if child.kind == FileKind::Directory {
+                let pending = match system.list_dir(&cwd, &path) {
+                    Ok(entries) => entries.into(),
+                    Err(error) => {
+                        ewln(
+                            io.err,
+                            &format!("du: cannot read directory '{path}': {error}"),
+                        );
+                        status = 1;
+                        Vec::new().into()
+                    }
+                };
+                stack.push(DuDirectory {
+                    path,
+                    depth,
+                    total: usage,
+                    pending,
+                });
+            } else {
+                top.total = top.total.saturating_add(usage);
+                if shows(depth, false) {
+                    wln(
+                        io.out,
+                        &format!("{}\t{path}", du_amount(usage, options.units)),
+                    );
+                }
+            }
+        }
+    }
+    if options.grand_total {
+        wln(
+            io.out,
+            &format!("{}\ttotal", du_amount(grand_total, options.units)),
+        );
     }
     status
 }

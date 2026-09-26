@@ -300,14 +300,28 @@ impl System for ActiveSystem<'_> {
     }
 
     fn metadata(&mut self, base: &str, path: &str, follow: bool) -> Result<FileInfo, SyscallError> {
-        Ok(FileInfo::from(self.interp.fs_metadata(base, path, follow)?))
+        // Pseudo paths (/proc, /dev) are generated on the fly rather than allocated on the
+        // simulated disk, so they never carry ext4-style block accounting even though the
+        // generic `Node` -> `FileInfo` conversion below would otherwise charge a directory or
+        // file a nonzero size and block count.
+        if let Some(node) = crate::pseudo_fs::metadata(self.interp, base, path, follow) {
+            return Ok(FileInfo::pseudo_from(node?));
+        }
+        Ok(FileInfo::from(
+            self.interp.vfs.metadata(base, path, follow)?,
+        ))
     }
 
     fn metadata_fd(&mut self, fd: Fd) -> Result<FileInfo, SyscallError> {
         let file = file_state(self.interp, fd)?;
         let node = match file.orphan {
             Some(id) => self.interp.vfs.orphan_metadata(id)?,
-            None => self.interp.fs_metadata("/", &file.path, true)?,
+            None => {
+                if let Some(node) = crate::pseudo_fs::metadata(self.interp, "/", &file.path, true) {
+                    return Ok(FileInfo::pseudo_from(node?));
+                }
+                self.interp.vfs.metadata("/", &file.path, true)?
+            }
         };
         Ok(FileInfo::from(node))
     }
@@ -837,11 +851,16 @@ pub(crate) enum FileChange {
 }
 
 /// Data visible from `stat` without exposing file bytes or native program identity.
+///
+/// `size` and `blocks` model allocation the way ext4 does with its default 4 KiB block size, so
+/// that `ls`, `du`, and `stat` can share one accounting source instead of each guessing at a
+/// number. `blocks` is reported in 512-byte units, matching POSIX `st_blocks` and `stat`'s `%b`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileInfo {
     pub kind: FileKind,
     pub mode: u32,
     pub size: u64,
+    pub blocks: u64,
     pub link_target: Option<String>,
     pub mtime_ms: u64,
     pub uid: u32,
@@ -857,27 +876,66 @@ pub(crate) enum FileKind {
     Symlink,
 }
 
+/// Bytes in one ext4 block under the default (and only, here) 4 KiB block size.
+const BLOCK_BYTES: u64 = 4096;
+/// A directory's reported size in bytes: ext4 allocates one block for a small directory.
+const DIRECTORY_SIZE_BYTES: u64 = BLOCK_BYTES;
+
+/// Round a byte length up to whole 4 KiB blocks and report the count in 512-byte units, as
+/// `stat`'s `st_blocks` does. A zero-byte file therefore costs zero blocks, and any nonzero
+/// length costs a full 4 KiB (8 512-byte units), matching ext4 with default settings.
+fn allocated_blocks(size_bytes: u64) -> u64 {
+    const UNITS_PER_BLOCK: u64 = BLOCK_BYTES / 512;
+    size_bytes
+        .div_ceil(BLOCK_BYTES)
+        .saturating_mul(UNITS_PER_BLOCK)
+}
+
 impl From<crate::vfs::Node> for FileInfo {
     fn from(node: crate::vfs::Node) -> Self {
-        let (kind, size, link_target, native_executable) = match node.kind {
-            NodeKind::File(data) => (FileKind::File, data.len() as u64, None, false),
-            NodeKind::Dir => (FileKind::Directory, 0, None, false),
+        let (kind, size, blocks, link_target, native_executable) = match node.kind {
+            NodeKind::File(data) => {
+                let size = data.len() as u64;
+                (FileKind::File, size, allocated_blocks(size), None, false)
+            }
+            // ext4 reports one 4 KiB block (8 512-byte units) for a small directory; larger
+            // directories that would need more blocks are out of scope for this simulator.
+            NodeKind::Dir => (FileKind::Directory, DIRECTORY_SIZE_BYTES, 8, None, false),
             NodeKind::Symlink(target) => {
                 let size = target.len() as u64;
-                (FileKind::Symlink, size, Some(target), false)
+                // A symlink's target is stored inline rather than in an allocated data block.
+                (FileKind::Symlink, size, 0, Some(target), false)
             }
-            NodeKind::NativeExecutable(_) => (FileKind::File, 0, None, true),
+            // Native executables are not backed by simulated disk bytes; keep the historical
+            // zero size (the process image lives outside the VFS quota) and charge no blocks.
+            NodeKind::NativeExecutable(_) => (FileKind::File, 0, 0, None, true),
         };
         Self {
             kind,
             mode: node.mode,
             size,
+            blocks,
             link_target,
             mtime_ms: node.mtime,
             uid: node.uid,
             gid: node.gid,
             native_executable,
         }
+    }
+}
+
+impl FileInfo {
+    /// Convert a pseudo-filesystem node (`/proc`, `/dev`) to `FileInfo`, forcing the block
+    /// accounting the generic conversion would otherwise infer for a `Dir`/`File` node back to
+    /// what a real pseudo filesystem reports: no allocated blocks, and a zero-size directory.
+    /// Generated file content (e.g. `/proc/meminfo`) keeps its real content length.
+    fn pseudo_from(node: crate::vfs::Node) -> Self {
+        let mut info = Self::from(node);
+        info.blocks = 0;
+        if info.kind == FileKind::Directory {
+            info.size = 0;
+        }
+        info
     }
 }
 

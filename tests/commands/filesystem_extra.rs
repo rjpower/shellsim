@@ -208,3 +208,44 @@ fn tree_rejects_invalid_options_and_obeys_output_limits() {
     assert_eq!(outcome.exit_status, 137);
     assert_eq!(outcome.stop_reason, Some(StopReason::OutputLimitExceeded));
 }
+
+/// Expected output follows GNU coreutils on ext4 with 4 KiB blocks: a nonempty file allocates
+/// whole blocks, a small directory is one 4096-byte block, and an empty file allocates none.
+#[test]
+fn ls_du_and_stat_share_ext4_block_accounting() {
+    let mut environment = Environment::new();
+    let setup = "mkdir -p /t/a/b; head -c 5000 /dev/zero > /t/a/f; printf x > /t/a/b/g; \
+                 head -c 20000 /dev/zero > /t/big; : > /t/empty; cd /t; ";
+    let cases = [
+        ("du", "8\t./a/b\n20\t./a\n44\t.\n"),
+        (
+            "du -ah",
+            "4.0K\t./a/b/g\n8.0K\t./a/b\n8.0K\t./a/f\n20K\t./a\n20K\t./big\n0\t./empty\n44K\t.\n",
+        ),
+        ("du -sb .", "37289\t.\n"),
+        ("du -d 1", "20\t./a\n44\t.\n"),
+        ("du -c a big", "8\ta/b\n20\ta\n20\tbig\n40\ttotal\n"),
+        ("du -s --apparent-size .", "37\t.\n"),
+        (
+            "stat -c '%s %b %B' /t /t/big /t/empty",
+            "4096 8 512\n20000 40 512\n0 0 512\n",
+        ),
+        (
+            "ls -l | head -1; ls -l /t/big; ls -l /usr/bin/sh",
+            "total 24\n-rw-r--r-- 1 root root  20000 Jan  1 00:00 /t/big\n\
+             -rwxr-xr-x 1 root root      0 Jan  1 00:00 /usr/bin/sh\n",
+        ),
+    ];
+    for (command, expected) in cases {
+        let (status, stdout, stderr) = run(&mut environment, &format!("{setup}{command}"));
+        assert_eq!(status, 0, "{command}: {stderr}");
+        assert_eq!(String::from_utf8_lossy(&stdout), expected, "{command}");
+    }
+    let (status, _, stderr) = run(&mut environment, "du -z /t; du /missing");
+    assert_eq!(status, 1);
+    assert!(stderr.contains("du: invalid option -- 'z'"), "{stderr}");
+    assert!(
+        stderr.contains("du: cannot access '/missing': No such file or directory"),
+        "{stderr}"
+    );
+}
