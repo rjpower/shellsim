@@ -316,7 +316,7 @@ impl FindProcess {
                 };
                 if let Err(error) = system.metadata("/", &start.absolute, false) {
                     self.status = self.status.max(1);
-                    let reason = start_path_error_reason(&error, &start.absolute);
+                    let reason = start_path_error_reason(&error);
                     self.push_stderr(format!("find: '{}': {reason}\n", start.token));
                     continue;
                 }
@@ -677,12 +677,11 @@ fn exec_target(path: &str, display: &str, dir: bool) -> (Option<String>, String)
 /// `"<reason>: <path>"`, so stripping the exact `absolute` path we looked up as a suffix recovers
 /// the reason alone; an error that does not end that way (unexpected, but not fatal) is reported
 /// unmodified rather than mangled.
-fn start_path_error_reason(error: &crate::syscalls::SyscallError, absolute: &str) -> String {
-    let text = error.to_string();
-    let suffix = format!(": {absolute}");
-    text.strip_suffix(suffix.as_str())
-        .map(str::to_string)
-        .unwrap_or(text)
+fn start_path_error_reason(error: &crate::syscalls::SyscallError) -> String {
+    match error {
+        crate::syscalls::SyscallError::File(error) => error.reason().to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn pid_of(waiting: Waiting) -> ProcessId {

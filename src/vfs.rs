@@ -135,6 +135,25 @@ pub enum VfsError {
     ReadOnly(String),
 }
 
+impl VfsError {
+    /// The `strerror`-style reason without the path, for diagnostics that name the operand
+    /// themselves, such as `find: 'missing': No such file or directory`.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            VfsError::NotFound(_) => "No such file or directory",
+            VfsError::NotADir(_) => "Not a directory",
+            VfsError::IsADir(_) => "Is a directory",
+            VfsError::NotEmpty(_) => "Directory not empty",
+            VfsError::Exists(_) => "File exists",
+            VfsError::Loop(_) => "Too many levels of symbolic links",
+            VfsError::Invalid(_) => "Invalid argument",
+            VfsError::NoSpace => "No space left on device",
+            VfsError::TooLarge { .. } => "File too large",
+            VfsError::ReadOnly(_) => "Read-only filesystem",
+        }
+    }
+}
+
 impl std::fmt::Display for VfsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
