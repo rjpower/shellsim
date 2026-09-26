@@ -29,31 +29,32 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["uv", "uvx"], Trust::Partial, cmd_uv);
     reg_unsupported(m, &["uvenv"]);
 
-    // interpreters
-    reg_buffered_resumable(m, &["python3"], Trust::Partial, cmd_python3, start_python3);
-    reg_buffered_resumable(m, &["python"], Trust::Partial, cmd_python, start_python);
-    reg_buffered_resumable(
+    // interpreters. Python reads its own standard input lazily through the descriptor layer
+    // (see `start_python_impl`), so it is registered without eager stdin buffering.
+    reg_resumable(m, &["python3"], Trust::Partial, cmd_python3, start_python3);
+    reg_resumable(m, &["python"], Trust::Partial, cmd_python, start_python);
+    reg_resumable(
         m,
         &["python3.11"],
         Trust::Partial,
         cmd_python311,
         start_python311,
     );
-    reg_buffered_resumable(
+    reg_resumable(
         m,
         &["python3.12"],
         Trust::Partial,
         cmd_python312,
         start_python312,
     );
-    reg_buffered_resumable(
+    reg_resumable(
         m,
         &["python3.13"],
         Trust::Partial,
         cmd_python313,
         start_python313,
     );
-    reg_buffered_resumable(
+    reg_resumable(
         m,
         &["python3.14"],
         Trust::Partial,
@@ -929,10 +930,107 @@ fn python_impl(interp: &mut Interp, name: &str, args: &[String], io: &mut Io) ->
     crate::python::run_python(interp, &argv, stdin, io.out, io.err)
 }
 
+/// Start a scheduled Python invocation without pre-draining fd 0.
+///
+/// `python -` and bare `python` (with no `-c`/script argument) read their *program source* from
+/// standard input, so that specific byte stream must still be captured in full before compiling.
+/// Every other invocation (`-c`, a script path) never needs the pre-read: `sys.stdin` itself is
+/// read lazily, one bounded quantum at a time, straight from the process's fd 0 while the
+/// compiled program runs (see [`crate::python::vm`]'s streaming `read_stream`).
 fn start_python_impl(interp: &mut Interp, name: &str, args: &[String], io: &mut Io) -> CommandPoll {
     let mut argv = vec![name.to_string()];
     argv.extend(args.iter().cloned());
-    let stdin = std::mem::take(&mut io.stdin);
+    if reads_program_from_stdin(args) {
+        return CommandPoll::Yielded(CommandResume::PythonSource {
+            argv,
+            buffer: Vec::new(),
+            reserved: 0,
+        });
+    }
+    finish_start_python(interp, argv, Vec::new(), io)
+}
+
+/// Whether this invocation reads its own program text from stdin rather than `-c`/a script path.
+fn reads_program_from_stdin(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("-") || args.is_empty()
+}
+
+/// Drain fd 0 to end-of-file, one bounded quantum per scheduler pass, before compiling the
+/// program it carries. Mirrors the accounting in `commands::streams`: charge memory for retained
+/// bytes and suspend on the same [`WaitReason`] a pipe read would produce.
+pub(crate) fn resume_python_source(
+    interp: &mut Interp,
+    argv: Vec<String>,
+    mut buffer: Vec<u8>,
+    mut reserved: u64,
+) -> CommandPoll {
+    match interp.read_fd(0, crate::descriptors::DEVICE_READ_QUANTUM) {
+        Ok(crate::descriptors::IoPoll::Ready(bytes)) if bytes.is_empty() => {
+            interp.resources.release_memory(reserved);
+            let name = argv[0].clone();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut io = Io {
+                stdin: Vec::new(),
+                out: &mut stdout,
+                err: &mut stderr,
+            };
+            match finish_start_python(interp, argv, buffer, &mut io) {
+                CommandPoll::Ready(status) => CommandPoll::ReadyOutput {
+                    command: name,
+                    status,
+                    stdout,
+                    stderr,
+                },
+                other => other,
+            }
+        }
+        Ok(crate::descriptors::IoPoll::Ready(bytes)) => {
+            let grown = bytes.len() as u64;
+            if !interp.resources.reserve_memory(grown) {
+                interp.resources.release_memory(reserved);
+                return CommandPoll::Ready(137);
+            }
+            reserved = reserved.saturating_add(grown);
+            buffer.extend_from_slice(&bytes);
+            CommandPoll::Yielded(CommandResume::PythonSource {
+                argv,
+                buffer,
+                reserved,
+            })
+        }
+        Ok(crate::descriptors::IoPoll::Blocked(wait)) => CommandPoll::Blocked(
+            python_source_wait_reason(wait),
+            CommandResume::PythonSource {
+                argv,
+                buffer,
+                reserved,
+            },
+        ),
+        Err(_) => {
+            interp.resources.release_memory(reserved);
+            CommandPoll::Ready(1)
+        }
+    }
+}
+
+fn python_source_wait_reason(wait: crate::descriptors::IoWait) -> WaitReason {
+    match wait {
+        crate::descriptors::IoWait::InputReadable(description) => {
+            WaitReason::InputReadable(description)
+        }
+        crate::descriptors::IoWait::PipeReadable(pipe) => WaitReason::PipeReadable(pipe),
+        crate::descriptors::IoWait::PipeWritable(pipe) => WaitReason::PipeWritable(pipe),
+    }
+}
+
+fn finish_start_python(
+    interp: &mut Interp,
+    argv: Vec<String>,
+    stdin: Vec<u8>,
+    io: &mut Io,
+) -> CommandPoll {
+    let name = argv[0].clone();
     match crate::python::start_python(interp, &argv, stdin, io.out, io.err) {
         crate::python::PythonCommandStart::Ready(status) => CommandPoll::Ready(status),
         crate::python::PythonCommandStart::Running(mut continuation) => {
@@ -945,14 +1043,14 @@ fn start_python_impl(interp: &mut Interp, name: &str, args: &[String], io: &mut 
                 }
                 crate::python::PythonPoll::Runnable => {
                     CommandPoll::Yielded(CommandResume::Python {
-                        command: name.to_string(),
+                        command: name,
                         continuation,
                     })
                 }
                 crate::python::PythonPoll::Blocked(reason) => CommandPoll::Blocked(
                     reason,
                     CommandResume::Python {
-                        command: name.to_string(),
+                        command: name,
                         continuation,
                     },
                 ),

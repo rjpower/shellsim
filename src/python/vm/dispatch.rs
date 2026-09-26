@@ -2,8 +2,8 @@
 
 use super::{
     dispatch_next, protocol, BytecodeFrame, CallId, CallMode, CallResult, CodeRef, DispatchControl,
-    DispatchCursor, ExceptionType, Execution, FunctionReturn, NativeValue, Opcode, RaisedException,
-    SequenceKind, Value, Vm, VM_POLL_QUANTUM,
+    DispatchCursor, ExceptionType, Execution, ForIterOutcome, FunctionReturn, NativeValue, Opcode,
+    RaisedException, SequenceKind, Value, Vm, VM_POLL_QUANTUM,
 };
 
 impl Vm<'_> {
@@ -209,8 +209,15 @@ impl Vm<'_> {
                 }
                 Opcode::GetIterator => dispatch_next(self.get_iterator()),
                 Opcode::ForIterator(target) => match self.for_iterator() {
-                    Ok(true) => Ok(DispatchControl::Next),
-                    Ok(false) => Ok(DispatchControl::Jump(target)),
+                    Ok(ForIterOutcome::Yielded) => Ok(DispatchControl::Next),
+                    Ok(ForIterOutcome::Exhausted) => Ok(DispatchControl::Jump(target)),
+                    Ok(ForIterOutcome::Blocked(reason)) => {
+                        // The iterator is still on the stack, unconsumed; leaving the frame's
+                        // instruction pointer at this same opcode makes the next quantum retry
+                        // the identical advance instead of skipping or repeating a yielded value.
+                        self.active_frame_mut().instruction_pointer = instruction_pointer;
+                        Ok(DispatchControl::Complete(Execution::Blocked(reason)))
+                    }
                     Err(error) => Err(error),
                 },
                 Opcode::Unary(operator) => dispatch_next(self.unary(operator)),
@@ -613,7 +620,7 @@ impl Vm<'_> {
         let Some(pending) = self.active_frame_mut().pending_native_call.take() else {
             return Ok(None);
         };
-        let span = pending.call_span;
+        let span = pending.call_span();
         match self.resume_native_call(pending) {
             Ok(CallResult::Value(value)) => {
                 self.stack.push(value);

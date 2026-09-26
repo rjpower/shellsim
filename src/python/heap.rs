@@ -202,6 +202,13 @@ pub enum Object {
         sentinel: Value,
         exhausted: bool,
     },
+    /// `for line in sys.stdin` (or `sys.stdin.buffer`). Kept as its own iterator object, rather
+    /// than the generic native-value `__iter__`/`__next__` dispatch, because only a heap-object
+    /// iterator can suspend a `for` loop: `ForIterator` requires an `ObjectId` to advance, and
+    /// advancing this one can block on fd 0 (see `vm::iteration::advance_iterator`).
+    StreamIterator {
+        binary: bool,
+    },
     /// A suspended Python generator frame. The bytecode is immutable; the instruction pointer,
     /// exception state, and lexical scope are the complete resumable state.
     Generator {
@@ -1135,7 +1142,8 @@ impl Heap {
             | Object::SequenceIterator { .. }
             | Object::RangeIterator { .. }
             | Object::CountIterator { .. }
-            | Object::CallableIterator { .. } => BuiltinType::Iterator.id(),
+            | Object::CallableIterator { .. }
+            | Object::StreamIterator { .. } => BuiltinType::Iterator.id(),
             Object::Generator { .. } => BuiltinType::Generator.id(),
             Object::Module { .. } => BuiltinType::Module.id(),
             Object::ArrayStorage(_) => BuiltinType::Native.id(),
@@ -1494,6 +1502,7 @@ fn trace_object(
         | Object::Range { .. }
         | Object::RangeIterator { .. }
         | Object::CountIterator { .. }
+        | Object::StreamIterator { .. }
         | Object::Regex { .. }
         | Object::Match { .. }
         | Object::RaisesContext { .. } => {}
@@ -1572,6 +1581,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::RangeIterator { .. } => 4,
         Object::CountIterator { .. } => 2,
         Object::CallableIterator { .. } => 3,
+        Object::StreamIterator { .. } => 1,
         Object::Generator {
             name,
             code,

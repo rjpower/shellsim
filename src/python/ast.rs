@@ -15,9 +15,9 @@ pub struct Statement {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StatementKind {
+    /// `import a, b as c` binds every comma-separated module in one statement.
     Import {
-        module: String,
-        binding: String,
+        modules: Vec<(String, String)>,
     },
     ImportFrom {
         module: String,
