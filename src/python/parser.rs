@@ -2102,6 +2102,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_comma_separated_imports_and_rejects_a_missing_module() {
+        let program = parse(lex("import math, urllib.error as errors, random").unwrap()).unwrap();
+        let StatementKind::Import { modules } = &program.statements[0].kind else {
+            panic!("expected import statement")
+        };
+        assert_eq!(
+            modules,
+            &[
+                ("math".into(), "math".into()),
+                ("urllib.error".into(), "errors".into()),
+                ("random".into(), "random".into())
+            ]
+        );
+        for source in ["import math,", "import , math"] {
+            let error = parse(lex(source).unwrap()).expect_err("missing module must fail");
+            assert!(error.message.contains("expected a module name"));
+        }
+    }
+
+    #[test]
     fn parses_tuple_subscripts_and_rejects_empty_tuple_members() {
         parse(lex("pair = values[1, 2]\nsingle = values[1,]").unwrap()).unwrap();
         let error = parse(lex("values[1,,2]").unwrap())

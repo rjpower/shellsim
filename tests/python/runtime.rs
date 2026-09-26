@@ -81,6 +81,37 @@ print(helpers.add(5), plus(6), add_ten(3))
 }
 
 #[test]
+fn comma_separated_imports_bind_each_module_and_alias_in_order() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .put_file("/app/first.py", b"value = 10\n".to_vec(), 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .put_file("/app/second.py", b"value = 32\n".to_vec(), 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .put_file(
+            "/app/main.py",
+            b"import first, second as other\nif True: import math, first as again\nprint(first.value + other.value, again is first, math.sqrt(9))\n"
+                .to_vec(),
+            0o644,
+        )
+        .unwrap();
+    let (outcome, stdout, stderr) = environment.run_script_capture("python3.14 /app/main.py");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"42 True 3.0\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn package_initializers_and_relative_imports_share_module_identity() {
     let mut environment = Environment::new();
     for (path, source) in [

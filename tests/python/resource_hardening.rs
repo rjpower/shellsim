@@ -115,6 +115,21 @@ fn exec_source_consumes_cpu_before_parsing() {
 }
 
 #[test]
+fn math_comb_reserves_result_before_large_multiplications() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import math\nprint(math.comb(100000, 50000))",
+        Limits {
+            memory: 64 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 64 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn native_sorting_consumes_cpu_fuel() {
     let (status, stdout, stderr, usage) = run_with_limits(
         "print(sorted(range(100, 0, -1)))",
@@ -360,4 +375,18 @@ fn completed_python_processes_release_owned_memory() {
         assert!(stdout.is_empty());
         assert_eq!(outcome.usage.memory_current, 0);
     }
+}
+
+#[test]
+fn grouped_formats_reserve_before_growth() {
+    let (status, stdout, stderr, _) = run_with_limits(
+        "print(f'{1.5:01000000,.2f}')",
+        Limits {
+            memory: 64 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
 }

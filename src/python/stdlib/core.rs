@@ -19,6 +19,7 @@ use super::super::number::PyNumber;
 use super::super::slice::SlicePlan;
 
 static BUILTINS: &[FunctionDef] = &[
+    builtin("__import__", builtin_import),
     builtin("map", builtin_map),
     builtin("filter", builtin_filter),
     builtin("reversed", builtin_reversed),
@@ -2898,4 +2899,36 @@ fn slot_sequence_multiply(
         PyKind::Tuple => runtime.new_tuple(repeated).map(Some),
         _ => unreachable!("only concrete sequence slots call this helper"),
     }
+}
+
+/// Import only through the simulated module loader, preserving dotted-import return behavior.
+fn builtin_import(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("__import__", 1, 5)?;
+    args.reject_unknown_keywords("__import__", &["globals", "locals", "fromlist", "level"])?;
+    let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
+    let level = args
+        .positional()
+        .get(4)
+        .copied()
+        .or(args.keyword("__import__", "level")?.copied());
+    if let Some(level) = level {
+        if !matches!(
+            integer_argument(runtime, &level, "level must be an integer")?,
+            IntegerArgument::Finite(0)
+        ) {
+            return Err(PyError::value_error("relative __import__ is not supported"));
+        }
+    }
+    let fromlist = args
+        .positional()
+        .get(3)
+        .copied()
+        .or(args.keyword("__import__", "fromlist")?.copied());
+    let module = runtime.import_module(&name)?;
+    if let Some(fromlist) = fromlist {
+        if runtime.truth(&fromlist)? {
+            return Ok(module);
+        }
+    }
+    runtime.import_module(name.split('.').next().unwrap_or(&name))
 }

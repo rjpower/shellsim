@@ -45,7 +45,9 @@ keys, and non-mapping `**` operands are rejected explicitly.
 
 Text formatting uses one protocol for f-strings and `str.format`, including conversions,
 alignment, width and precision, and decimal, binary, octal, and hexadecimal integer formats.
-It also handles signed fixed-point output and general floating-point precision. The `exec`
+It also handles signed fixed-point output, general floating-point precision, and decimal comma
+grouping. The `__import__` builtin uses the simulated loader for absolute imports; relative
+`__import__` calls are explicitly unsupported. The `exec`
 builtin accepts one source string and executes it in the simulated namespace. Code objects and
 explicit globals or locals mappings are not supported.
 The frozen `functools` module provides `reduce` and positional and keyword argument binding with

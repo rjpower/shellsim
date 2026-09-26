@@ -440,6 +440,29 @@ except ValueError:
 }
 
 #[test]
+fn frozen_random_gauss_reuses_the_second_box_muller_sample() {
+    let source = r#"import math
+import random
+
+first = random.Random(7)
+reference = random.Random(7)
+angle = math.tau * reference.random()
+radius = math.sqrt(-2.0 * math.log(1.0 - reference.random()))
+print(abs(first.gauss(3.0, 2.0) - (3.0 + 2.0 * math.cos(angle) * radius)) < 1e-12)
+print(abs(first.gauss() - math.sin(angle) * radius) < 1e-12)
+print(first.random() == reference.random())
+first.seed(7)
+print(abs(first.gauss() - math.cos(angle) * radius) < 1e-12)
+random.seed(7)
+print(isinstance(random.gauss(), float))
+"#;
+    assert_eq!(
+        run(source),
+        (0, "True\nTrue\nTrue\nTrue\nTrue\n".into(), String::new())
+    );
+}
+
+#[test]
 fn frozen_zipfile_reads_writes_and_extracts_vfs_archives() {
     let source = r#"import io
 import zipfile

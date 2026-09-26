@@ -1,9 +1,9 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
+use super::format::{format_float, format_integer, format_text, FormatSpec};
 use super::{
-    align_rendered, format_default_float, format_float, format_integer, format_text, number,
-    pad_rendered_number, parse_alignment, protocol, BigInt, BinaryOperator, ComparisonOperator,
-    Object, Ordering, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
+    number, protocol, BigInt, BinaryOperator, ComparisonOperator, Object, Ordering, SequenceKind,
+    Slot, ToPrimitive, UnaryOperator, Value, Vm,
 };
 
 impl Vm<'_> {
@@ -369,7 +369,7 @@ impl Vm<'_> {
         } else if format_spec.contains(['{', '}']) {
             return Err("nested f-string format specifications are not implemented".into());
         } else if let Some(converted) = converted {
-            format_text(&converted, format_spec)?
+            format_text(&converted, &FormatSpec::parse(format_spec)?)?
         } else {
             self.format_unconverted_value(value, format_spec)?
         };
@@ -392,45 +392,36 @@ impl Vm<'_> {
                 digits = None;
             }
         }
-        self.charge_cpu(u64::try_from(largest).unwrap_or(u64::MAX))?;
-        self.reserve_result(largest)
+        self.charge_cpu(u64::try_from(largest.max(spec.len())).unwrap_or(u64::MAX))?;
+        self.reserve_result(largest.saturating_add(spec.len()).saturating_mul(2))
     }
 
-    fn format_unconverted_value(&self, value: &Value, spec: &str) -> Result<String, String> {
-        let presentation = spec.chars().last().unwrap_or(' ');
-        if matches!(presentation, 'f' | 'e' | 'E' | 'g' | 'G') {
-            let number = super::number::as_f64(&self.state.heap, value)
-                .ok_or("floating-point format requires a number")?;
-            return format_float(number, spec);
-        }
-        if matches!(presentation, 'd' | 'b' | 'o' | 'x' | 'X') {
-            let integer = self
-                .bigint_operand(value)
-                .map_err(|_| "integer format requires an integer")?;
-            return format_integer(integer, spec);
-        }
-        if presentation.is_ascii_digit() && super::number::view(&self.state.heap, value).is_some() {
-            if spec.contains(['.', '+']) {
-                let number = match super::number::view(&self.state.heap, value) {
-                    Some(number::NumberRef::Float(number)) => number,
-                    _ => return Err("precision is not allowed in integer format".into()),
-                };
-                return format_default_float(number, spec);
+    fn format_unconverted_value(&self, value: &Value, text: &str) -> Result<String, String> {
+        let spec = FormatSpec::parse(text)?;
+        let number = super::number::view(&self.state.heap, value);
+        match (spec.presentation, number) {
+            (Some('f' | 'e' | 'E' | 'g' | 'G' | '%'), Some(_))
+            | (None, Some(number::NumberRef::Float(_))) => {
+                let float = super::number::as_f64(&self.state.heap, value)
+                    .ok_or("floating-point format requires a number")?;
+                format_float(
+                    float,
+                    &protocol::repr(&self.state.heap, &Value::Float(float))?,
+                    &spec,
+                )
             }
-            let (alignment, width_text) = parse_alignment(spec);
-            let width = width_text
-                .parse::<usize>()
-                .map_err(|_| format!("unsupported numeric format {spec:?}"))?;
-            let rendered = protocol::display(&self.state.heap, value)?;
-            return Ok(match alignment {
-                Some(alignment) => align_rendered(&rendered, width, alignment),
-                None => pad_rendered_number(rendered, width, false),
-            });
+            (Some('d' | 'b' | 'o' | 'x' | 'X') | None, Some(_)) => {
+                let integer = self
+                    .bigint_operand(value)
+                    .map_err(|_| "integer format requires an integer")?;
+                format_integer(integer, &spec)
+            }
+            (_, Some(_)) => Err(format!("unsupported numeric format {text:?}")),
+            (_, None) => match protocol::string_value(&self.state.heap, value)? {
+                Some(text) => format_text(&text, &spec),
+                None => Err(format!("unsupported format specification {text:?}")),
+            },
         }
-        if let Some(text) = protocol::string_value(&self.state.heap, value)? {
-            return format_text(&text, spec);
-        }
-        Err(format!("unsupported format specification {spec:?}"))
     }
 
     pub(super) fn is_bigint(&self, value: &Value) -> Result<bool, String> {

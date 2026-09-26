@@ -11,6 +11,7 @@ class Random:
         if not isinstance(value, int):
             raise TypeError("shellsim random seeds must be integers or None")
         self._state = value % 2147483648
+        self._gauss_next = None
 
     def _next(self):
         self._state = (self._state * 1103515245 + 12345) % 2147483648
@@ -39,6 +40,18 @@ class Random:
 
     def uniform(self, left, right):
         return left + (right - left) * self.random()
+
+    def gauss(self, mu=0.0, sigma=1.0):
+        import math
+
+        value = self._gauss_next
+        self._gauss_next = None
+        if value is None:
+            angle = math.tau * self.random()
+            radius = math.sqrt(-2.0 * math.log(1.0 - self.random()))
+            value = math.cos(angle) * radius
+            self._gauss_next = math.sin(angle) * radius
+        return mu + value * sigma
 
     def choice(self, population):
         if len(population) == 0:
@@ -83,6 +96,10 @@ def randint(left, right):
 
 def uniform(left, right):
     return _default.uniform(left, right)
+
+
+def gauss(mu=0.0, sigma=1.0):
+    return _default.gauss(mu, sigma)
 
 
 def choice(population):

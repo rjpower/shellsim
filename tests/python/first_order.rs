@@ -297,15 +297,37 @@ for value in (0.0, 1.0, 12.34567, 12345.67, 0.000012345):
 }
 
 #[test]
+fn percentage_formatting_accepts_precision_sign_and_alignment() {
+    let source = r#"
+print("|{:.1%}|{:+.2%}|{:>10.1%}|".format(0.125, 0.125, -0.125))
+print(f"{0.5:.0%} {float('inf'):.1%} {float('nan'):+.2%}")
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "|12.5%|+12.50%|    -12.5%|\n50% inf% +nan%\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
 fn imaginary_literals_and_fractional_negative_powers_produce_complex_values() {
     let source = r#"
 print(1j, 2j, 1 + 1j, 1j * 1j)
+values = [1j, (2j), 1 + 3j]
+print(values[0], values[1], values[2])
 value = (-1) ** 0.5
 print(abs(value.real) < 1e-12, round(value.imag, 6))
 "#;
     assert_eq!(
         run(source),
-        (0, "1j 2j (1+1j) (-1+0j)\nTrue 1.0\n".into(), String::new())
+        (
+            0,
+            "1j 2j (1+1j) (-1+0j)\n1j 2j (1+3j)\nTrue 1.0\n".into(),
+            String::new()
+        )
     );
 }
 
@@ -457,4 +479,54 @@ print(bag.deleted)
             String::new()
         )
     );
+}
+
+#[test]
+fn import_builtin_and_grouping_execute() {
+    let source = r#"
+math = __import__('math')
+assert math.sqrt(4) == 2
+import numpy.random
+assert __import__('numpy.random') is __import__('numpy')
+assert __import__('numpy.random', fromlist=['RandomState']) is numpy.random
+print(f'{1234567:,.0f}', f'{-1234567:,.2f}', f'{1234567:,d}')
+print(f'{12345.0:,.0}', f'{1234.5:>14,.2f}')
+try:
+    assert False
+except AssertionError as error:
+    assert str(error) == ''
+print('ok')
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "1,234,567 -1,234,567.00 1,234,567\n1e+04       1,234.50\nok\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn bare_assertion_error_is_not_duplicated() {
+    let (status, _, error) = run("assert False");
+    assert_ne!(status, 0);
+    assert!(error.contains("AssertionError"));
+    assert!(!error.contains("AssertionError: AssertionError"));
+}
+
+#[test]
+fn import_builtin_rejects_relative_and_unavailable_imports() {
+    for (source, expected) in [
+        ("__import__('math', level=1)", "relative __import__"),
+        (
+            "__import__('missing_shellsim_module')",
+            "missing_shellsim_module",
+        ),
+        ("__import__(42)", "str"),
+    ] {
+        let (status, _, error) = run(source);
+        assert_ne!(status, 0);
+        assert!(error.contains(expected), "{error}");
+    }
 }
