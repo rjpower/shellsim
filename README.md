@@ -173,6 +173,12 @@ The [virtual display](docs/virtual-display.md) lets a Wasm guest present RGBA fr
 bounded key events. A host-driven session can resume the guest between frames without granting it
 ambient display, input, or network access.
 
+An opt-in [Doom browser demo](docs/virtual-display.md#external-doom-end-to-end-probe) builds
+separately supplied Doomgeneric source and Freedoom data inside the VFS, then presents live frames
+through a host-driven resumable Wasm session. It does not bundle the game or expose a host display
+or network device to the guest. Run `./examples/play-doom.sh` to fetch the pinned external inputs
+and start the local player.
+
 ## Agent harness
 
 `shellsim serve --root ./project` runs a persistent newline-delimited JSON session. It supports

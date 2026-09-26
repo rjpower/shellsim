@@ -28,3 +28,59 @@ Wasmtime state is never copied by `Environment::clone()`.
 A session buffers the guest's standard streams instead of using process descriptors; a Wasm
 executable started from the shell runs as a scheduled process instead. The interface supplies a
 display and keys, not audio or networking.
+
+## External Doom end-to-end probe
+
+The ignored `tests/doom_probe.rs` test builds Doomgeneric from source with the virtual TinyCC
+toolchain, links a small shellsim platform adapter, loads a separately supplied Freedoom WAD,
+yields 640×400 frames, and checks that an Escape key injected between frames changes the image. Neither the
+GPL engine nor game data is included in the repository. The test harness alone imports the
+trusted host inputs into the VFS before simulated execution; the guest cannot reach those host
+paths.
+
+The proven inputs were:
+
+- [Doomgeneric](https://github.com/ozkl/doomgeneric) commit
+  `dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284`, with
+  `SHELLSIM_DOOM_SOURCE` pointing to its `doomgeneric/` source directory.
+- [Freedoom 0.13.0](https://github.com/freedoom/freedoom/releases/tag/v0.13.0)
+  `freedoom1.wad`, SHA-256
+  `7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d`, with
+  `SHELLSIM_DOOM_WAD` pointing to that file.
+
+Run the opt-in probe with both variables set:
+
+```sh
+SHELLSIM_DOOM_SOURCE=/path/to/doomgeneric/doomgeneric \
+SHELLSIM_DOOM_WAD=/path/to/freedoom1.wad \
+cargo test --test doom_probe -- --ignored
+```
+
+To fetch the pinned external inputs and play from the repository root, run:
+
+```sh
+./examples/play-doom.sh
+```
+
+The launcher requires `curl`, `tar`, `unzip`, `sha256sum`, and the pinned Rust toolchain. It
+downloads into a temporary directory, verifies the WAD hash, and removes the downloads when the
+player exits. The engine and game data remain external to the repository. To use source and a WAD
+you obtained separately, run the browser demo directly:
+
+```sh
+cargo run --release --example doom_player -- /path/to/doomgeneric/doomgeneric /path/to/freedoom1.wad
+```
+
+The launch compiles Doomgeneric inside shellsim's VFS. Open the loopback URL printed by the
+example. Click the game to capture keyboard input. WASD or arrow keys move, J or Ctrl fires,
+K or Space uses, Shift runs, and Esc opens the menu. The browser only sees copied RGBA frames
+and sends bounded key events to a host demo process; the guest has no host network access. The
+demo binds an ephemeral `127.0.0.1` port
+and exits when its Stop button is pressed. The external [Freedoom release](https://github.com/freedoom/freedoom/releases/tag/v0.13.0)
+provides a playable WAD; only the opt-in launcher downloads it.
+
+The probe and demo select Doomgeneric's console-error path instead of its optional Zenity
+`system()` call. The platform adapter times the game with libc `clock_gettime` and `usleep`.
+The probe runs on virtual time, so it is fast and reproducible; the player boots its machine in
+real-time clock mode, so the game runs at normal speed. Audio and networking are outside this single-player proof. The original Doom/Quake
+engines and assets are not bundled.
