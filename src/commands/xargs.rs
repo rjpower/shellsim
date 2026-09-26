@@ -42,6 +42,7 @@ fn start_xargs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
                 stdin: Some(Vec::new()),
                 cwd: None,
                 environment: None,
+                ..Default::default()
             })
             .collect(),
         false,

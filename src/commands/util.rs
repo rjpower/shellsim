@@ -370,6 +370,7 @@ pub(crate) fn try_exec_script(
                     stdin: Some(stdin.to_vec()),
                     cwd: None,
                     environment: None,
+                    ..Default::default()
                 }],
                 true,
             )

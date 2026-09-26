@@ -36,7 +36,7 @@ pub(crate) mod options;
 pub(crate) mod patch;
 pub(crate) mod pkg;
 mod printf;
-mod proc;
+pub(crate) mod proc;
 mod regex_compat;
 mod rgcmd;
 mod sed;
@@ -924,6 +924,7 @@ fn dispatch(
                 stdin: (!stdin.is_empty()).then_some(stdin),
                 cwd: None,
                 environment: None,
+                ..Default::default()
             }],
             true,
         );
@@ -1161,10 +1162,17 @@ pub(crate) fn parse_shell_source(
 }
 
 /// Whether `requested` names an external image that runs as its own process, so a subshell
-/// may exec it in place. Builtins and legacy bodies still run inside the shell image.
+/// may exec it in place. Shells load their program directly; other legacy bodies and
+/// builtins still run inside the calling shell image.
 pub(crate) fn execs_native_image(interp: &Interp, requested: &str) -> bool {
     (requested.contains('/') || !builtins::is_shell_builtin_name(requested))
-        && resolved_native_image(interp, requested).is_some_and(runs_native_process)
+        && resolved_native_image(interp, requested).is_some_and(|image| {
+            runs_native_process(image)
+                || matches!(
+                    image,
+                    crate::vfs::NativeProgram::LegacyRegistered("sh" | "bash" | "dash" | "zsh")
+                )
+        })
 }
 
 fn resolved_native_image(interp: &Interp, requested: &str) -> Option<crate::vfs::NativeProgram> {

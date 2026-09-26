@@ -13,8 +13,10 @@ use crate::syscalls::{ActiveSystem, SyscallError, System};
 mod cat;
 mod env;
 mod head;
+mod nohup;
 mod sleep;
 mod tee;
+mod timeout;
 mod xargs;
 
 /// Invocation view borrowed by a native command for one scheduler quantum.
@@ -74,10 +76,6 @@ pub(crate) enum ProgramContinuation {
 }
 
 impl ProgramContinuation {
-    pub(crate) fn is_native(&self) -> bool {
-        matches!(self, Self::Native(_))
-    }
-
     /// Return outstanding input reservations when a process exits before consuming EOF.
     pub(crate) fn release_owned_memory(&mut self, interp: &mut Interp) {
         if let Self::Native(NativeProcess::SystemCommand(command)) = self {
@@ -140,6 +138,8 @@ pub(crate) enum NativeProcess {
     Xargs(xargs::XargsProcess),
     Env(env::EnvProcess),
     Sleep(sleep::SleepProcess),
+    Timeout(timeout::TimeoutProcess),
+    Nohup(nohup::NohupProcess),
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -347,6 +347,10 @@ impl NativeProcess {
             crate::vfs::NativeProgram::Usleep => {
                 Self::Sleep(sleep::SleepProcess::usleep(&argv[1..]))
             }
+            crate::vfs::NativeProgram::Timeout => {
+                Self::Timeout(timeout::TimeoutProcess::new(&argv[1..]))
+            }
+            crate::vfs::NativeProgram::Nohup => Self::Nohup(nohup::NohupProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Registered(path) => {
                 let Some(command) = crate::commands::system_command(path) else {
                     return Self::failure(
@@ -399,6 +403,8 @@ impl NativeProcess {
             Self::Xargs(xargs) => xargs.poll(syscalls),
             Self::Env(env) => env.poll(syscalls),
             Self::Sleep(sleep) => sleep.poll(syscalls),
+            Self::Timeout(timeout) => timeout.poll(syscalls),
+            Self::Nohup(nohup) => nohup.poll(syscalls),
             Self::Failure {
                 status,
                 message,
@@ -754,6 +760,30 @@ mod tests {
 
         fn listener_snapshot(&self) -> Vec<String> {
             unreachable!("native writer does not inspect listeners")
+        }
+
+        fn pid(&self) -> crate::process::ProcessId {
+            unreachable!("native writer does not inspect its PID")
+        }
+
+        fn exec_argv(
+            &mut self,
+            _argv: Vec<String>,
+            _environment: Option<std::collections::BTreeMap<String, String>>,
+        ) -> Result<(), SyscallError> {
+            unreachable!("native writer does not exec")
+        }
+
+        fn kill(
+            &mut self,
+            _target: crate::syscalls::SignalTarget,
+            _signal: crate::process::Signal,
+        ) -> Result<(), SyscallError> {
+            unreachable!("native writer does not send signals")
+        }
+
+        fn ignore_signal(&mut self, _signal: crate::process::Signal) -> Result<(), SyscallError> {
+            unreachable!("native writer does not change signal dispositions")
         }
 
         fn schedule_wake(&mut self, _duration_ns: u64) -> Result<u64, SyscallError> {

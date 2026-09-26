@@ -188,7 +188,7 @@ fn cmd_usleep(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
 }
 
 fn cmd_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let invocation = match parse_timeout(args) {
+    let invocation = match parse_timeout(args).and_then(reject_kill_after) {
         Ok(invocation) => invocation,
         Err(error) => {
             ewln(io.err, &format!("timeout: {error}"));
@@ -238,7 +238,7 @@ fn cmd_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
 }
 
 fn start_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
-    let invocation = match parse_timeout(args) {
+    let invocation = match parse_timeout(args).and_then(reject_kill_after) {
         Ok(invocation) => invocation,
         Err(error) => {
             ewln(io.err, &format!("timeout: {error}"));
@@ -252,6 +252,7 @@ fn start_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) 
             stdin: Some(std::mem::take(&mut io.stdin)),
             cwd: None,
             environment: None,
+            ..Default::default()
         },
     ) {
         Ok(pid) => pid,
@@ -283,16 +284,31 @@ fn start_timeout(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) 
     })
 }
 
-struct TimeoutInvocation {
-    duration: u64,
-    preserve_status: bool,
-    signal: crate::process::Signal,
-    argv: Vec<String>,
+/// Nested synchronous callers have no second deadline; only the native image supports `-k`.
+fn reject_kill_after(invocation: TimeoutInvocation) -> Result<TimeoutInvocation, String> {
+    if invocation.kill_after.is_some() {
+        Err("--kill-after is unsupported here".to_string())
+    } else {
+        Ok(invocation)
+    }
 }
 
-fn parse_timeout(args: &[String]) -> Result<TimeoutInvocation, String> {
+pub(crate) struct TimeoutInvocation {
+    pub(crate) duration: u64,
+    pub(crate) preserve_status: bool,
+    /// Keep the child in timeout's process group and signal only the child.
+    pub(crate) foreground: bool,
+    pub(crate) signal: crate::process::Signal,
+    /// Send KILL this long after the first signal if the command is still running.
+    pub(crate) kill_after: Option<u64>,
+    pub(crate) argv: Vec<String>,
+}
+
+pub(crate) fn parse_timeout(args: &[String]) -> Result<TimeoutInvocation, String> {
     let mut index = 0;
     let mut preserve_status = false;
+    let mut foreground = false;
+    let mut kill_after = None;
     let mut signal = crate::process::Signal::Terminate;
     while index < args.len() {
         match args[index].as_str() {
@@ -300,7 +316,10 @@ fn parse_timeout(args: &[String]) -> Result<TimeoutInvocation, String> {
                 preserve_status = true;
                 index += 1;
             }
-            "--foreground" => index += 1,
+            "--foreground" => {
+                foreground = true;
+                index += 1;
+            }
             "-s" | "--signal" => {
                 let value = args
                     .get(index + 1)
@@ -318,10 +337,17 @@ fn parse_timeout(args: &[String]) -> Result<TimeoutInvocation, String> {
                 index += 1;
             }
             "-k" | "--kill-after" => {
-                return Err("--kill-after is unsupported".to_string());
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "option requires an argument -- 'k'".to_string())?;
+                kill_after = Some(parse_duration_ns(value)?);
+                index += 2;
             }
             option if option.starts_with("--kill-after=") => {
-                return Err("--kill-after is unsupported".to_string());
+                kill_after = Some(parse_duration_ns(
+                    option.trim_start_matches("--kill-after="),
+                )?);
+                index += 1;
             }
             "--" => {
                 index += 1;
@@ -344,7 +370,9 @@ fn parse_timeout(args: &[String]) -> Result<TimeoutInvocation, String> {
     Ok(TimeoutInvocation {
         duration,
         preserve_status,
+        foreground,
         signal,
+        kill_after,
         argv,
     })
 }

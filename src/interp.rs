@@ -630,6 +630,8 @@ impl Environment {
             ("env", crate::vfs::NativeProgram::Env),
             ("sleep", crate::vfs::NativeProgram::Sleep),
             ("usleep", crate::vfs::NativeProgram::Usleep),
+            ("timeout", crate::vfs::NativeProgram::Timeout),
+            ("nohup", crate::vfs::NativeProgram::Nohup),
         ] {
             vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
         }
@@ -762,7 +764,12 @@ impl Environment {
             .transpose()
             .map_err(|error| format!("unable to prepare child input: {error:?}"))?;
         let display = crate::process::command_label(&spec.argv);
-        let pid = match self.start_child(&display, true) {
+        let placement = if spec.new_process_group {
+            crate::process::ChildPlacement::NewProcessGroup
+        } else {
+            crate::process::ChildPlacement::Inherit
+        };
+        let pid = match self.create_child(&display, true, !spec.detach, false, placement) {
             Ok(pid) => pid,
             Err(error) => {
                 if let Some(input) = input {
@@ -823,6 +830,34 @@ impl Environment {
                     .map(|node| node.kind)
                 {
                     Some(crate::vfs::NodeKind::NativeExecutable(
+                        crate::vfs::NativeProgram::LegacyRegistered("sh" | "bash" | "dash" | "zsh"),
+                    )) => match self.shell_image_program(pid, &argv[1..])? {
+                        Some(Ok((program, positional))) => {
+                            self.reset_for_exec(pid)?;
+                            self.set_process_positional(pid, positional)?;
+                            self.process.set_continuation(
+                                pid,
+                                Some(crate::exec::ShellContinuation::subshell(&program)),
+                            )?;
+                            self.invocations.begin(
+                                pid,
+                                &argv,
+                                crate::commands::Trust::Real,
+                                None,
+                                self.resources.cpu_used(),
+                                self.vfs.disk_used(),
+                            );
+                            return Ok(());
+                        }
+                        Some(Err((status, message))) => {
+                            Some(crate::program::NativeProcess::failure(status, message))
+                        }
+                        None => {
+                            argv[0] = path;
+                            None
+                        }
+                    },
+                    Some(crate::vfs::NodeKind::NativeExecutable(
                         crate::vfs::NativeProgram::LegacyRegistered(_),
                     )) => {
                         argv[0] = path;
@@ -857,15 +892,7 @@ impl Environment {
         };
         if let Some(native) = native {
             let trust = native.trust();
-            let state = self
-                .process
-                .states
-                .get_mut(&pid)
-                .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
-            // Caught shell traps do not survive replacement with an executable image.
-            state.signal_dispositions.clear();
-            state.exit_disposition = None;
-            state.handling_signal = false;
+            self.reset_for_exec(pid)?;
             self.process.set_program(
                 pid,
                 Some(crate::program::ProgramContinuation::Native(native)),
@@ -886,6 +913,77 @@ impl Environment {
                 &crate::shell::Node::ArgvCommand(argv),
             )),
         )
+    }
+
+    /// Caught shell traps reset to the default action when a process loads a new image; ignored
+    /// signals stay ignored, as POSIX requires.
+    fn reset_for_exec(&mut self, pid: ProcessId) -> Result<(), String> {
+        let state = self
+            .process
+            .states
+            .get_mut(&pid)
+            .ok_or_else(|| format!("process state does not exist for PID {pid}"))?;
+        state
+            .signal_dispositions
+            .retain(|_, disposition| matches!(disposition, ShellSignalDisposition::Ignore));
+        state.exit_disposition = None;
+        state.handling_signal = false;
+        Ok(())
+    }
+
+    /// Program for a shell image loaded by argv: `sh -c SOURCE [NAME [ARG...]]` or
+    /// `sh SCRIPT [ARG...]`, parsed so the shell runs in the loading process itself. `None`
+    /// means the shell reads its program from standard input, which still runs through the
+    /// shell dispatcher. A missing script or syntax error becomes an exit status and message.
+    #[allow(clippy::type_complexity)]
+    fn shell_image_program(
+        &mut self,
+        pid: ProcessId,
+        args: &[String],
+    ) -> Result<Option<Result<(crate::shell::Node, Vec<String>), (i32, String)>>, String> {
+        let mut index = 0;
+        let (source, positional) = loop {
+            let Some(argument) = args.get(index) else {
+                return Ok(None);
+            };
+            match argument.as_str() {
+                "-c" => {
+                    let Some(source) = args.get(index + 1) else {
+                        return Ok(Some(Err((
+                            2,
+                            "bash: -c: option requires an argument\n".to_string(),
+                        ))));
+                    };
+                    let positional = args.get(index + 3..).unwrap_or_default().to_vec();
+                    break (source.clone(), positional);
+                }
+                "-o" => index += 2,
+                option if option.starts_with('-') => index += 1,
+                script => {
+                    let cwd = self
+                        .process
+                        .states
+                        .get(&pid)
+                        .ok_or_else(|| format!("process state does not exist for PID {pid}"))?
+                        .cwd
+                        .clone();
+                    let Ok(source) = self.vfs.read_string(&cwd, script) else {
+                        return Ok(Some(Err((
+                            127,
+                            format!("bash: {script}: No such file or directory\n"),
+                        ))));
+                    };
+                    break (source, args[index + 1..].to_vec());
+                }
+            }
+        };
+        let mut error = Vec::new();
+        Ok(Some(
+            match crate::commands::parse_shell_source(self, &source, &mut error) {
+                Ok(program) => Ok((program, positional)),
+                Err(status) => Err((status, String::from_utf8_lossy(&error).into_owned())),
+            },
+        ))
     }
 
     /// Create a runnable child without blocking or switching away from the active parent.
@@ -1524,6 +1622,7 @@ impl Environment {
                         |reason| reason.to_string(),
                     )
                 }
+                crate::syscalls::SyscallError::NoSuchProcess => "no such process".to_string(),
                 crate::syscalls::SyscallError::Process(error) => error,
             })
     }
@@ -2125,6 +2224,7 @@ pub(crate) fn write_error_message(error: crate::syscalls::SyscallError) -> Strin
         }
         crate::syscalls::SyscallError::IsDirectory => "is a directory".to_string(),
         crate::syscalls::SyscallError::ResourceExhausted => "resource limit exceeded".to_string(),
+        crate::syscalls::SyscallError::NoSuchProcess => "no such process".to_string(),
         crate::syscalls::SyscallError::Process(error) => error,
     }
 }
