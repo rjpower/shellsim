@@ -181,6 +181,11 @@ impl Vm<'_> {
                         "KeyError",
                     ))))
                 }
+                "AttributeError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "AttributeError",
+                    ))))
+                }
                 "IndexError" => {
                     return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
                         "IndexError",

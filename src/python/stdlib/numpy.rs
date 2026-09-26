@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 
 use super::super::native::{
-    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, OwnedPyString, PyArray,
+    CallArgs, FunctionDef, GetterDef, MethodDef, ModuleDef, NativeTypeDef, OwnedPyString, PyArray,
     PyArrayDtype, PyArrayLayout, PyBinaryOp, PyConstant, PyError, PyIndex, PyKind, PyMarker,
     PyResult, PyRuntime, PySequence, PyValue, PyValueCast, ValueDef, ValueKindDef, ValueKindSlots,
 };
@@ -73,6 +73,8 @@ macro_rules! numeric_kind {
                 name: concat!("numpy.", $python_name),
                 construct: $constructor,
                 slots: scalar_slots(),
+                methods: SCALAR_METHODS,
+                getters: SCALAR_GETTERS,
             },
             dtype: PyArrayDtype::$dtype,
             class: NumericClass::$class,
@@ -246,6 +248,42 @@ numeric_kinds!(
 
 pub(super) fn value_kinds() -> impl Iterator<Item = &'static ValueKindDef> {
     NUMERIC_KINDS.iter().map(|kind| &kind.definition)
+}
+
+/// Numeric-tower accessors shared by every NumPy scalar type. Real scalars are their own real
+/// part and conjugate; the imaginary part is zero of the same dtype, as in NumPy.
+static SCALAR_METHODS: &[MethodDef] = &[MethodDef {
+    type_name: "numpy.generic",
+    name: "conjugate",
+    call: scalar_conjugate,
+}];
+
+static SCALAR_GETTERS: &[GetterDef] = &[
+    GetterDef {
+        owner: "numpy.generic",
+        name: "real",
+        get: scalar_real,
+    },
+    GetterDef {
+        owner: "numpy.generic",
+        name: "imag",
+        get: scalar_imag,
+    },
+];
+
+fn scalar_real(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+    Ok(value)
+}
+
+fn scalar_imag(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+    let dtype = scalar(runtime, value)?.dtype;
+    numeric_identity(runtime, dtype, false)
+}
+
+fn scalar_conjugate(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("conjugate", 0, 0)?;
+    args.reject_keywords("conjugate")?;
+    scalar_real(runtime, value)
 }
 
 const fn scalar_slots() -> ValueKindSlots {
@@ -835,7 +873,59 @@ pub(crate) static ARRAY_TYPE: NativeTypeDef = NativeTypeDef {
         method("cumsum", method_cumsum),
         method("cumprod", method_cumprod),
     ],
+    getters: &[
+        getter("shape", array_shape),
+        getter("ndim", array_ndim),
+        getter("size", array_size),
+        getter("dtype", array_dtype),
+        getter("T", array_transposed),
+    ],
 };
+
+const fn getter(name: &'static str, get: fn(&mut dyn PyRuntime, PyValue) -> PyResult) -> GetterDef {
+    GetterDef {
+        owner: "numpy.ndarray",
+        name,
+        get,
+    }
+}
+
+fn array_shape(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    let (layout, _) = runtime.array_layout(receiver.cast(runtime)?)?;
+    let dimensions = layout
+        .shape
+        .iter()
+        .map(|dimension| {
+            i64::try_from(*dimension)
+                .map(Value::Int)
+                .map_err(|_| PyError::overflow_error("array dimension overflow"))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    runtime.new_tuple(dimensions)
+}
+
+fn array_ndim(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    let (layout, _) = runtime.array_layout(receiver.cast(runtime)?)?;
+    Ok(Value::Int(layout.shape.len() as i64))
+}
+
+fn array_size(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    let (layout, _) = runtime.array_layout(receiver.cast(runtime)?)?;
+    let size = element_count(&layout.shape)?;
+    i64::try_from(size)
+        .map(Value::Int)
+        .map_err(|_| PyError::overflow_error("array size overflow"))
+}
+
+fn array_dtype(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    let (_, dtype) = runtime.array_layout(receiver.cast(runtime)?)?;
+    runtime.new_string(dtype.name().to_string())
+}
+
+fn array_transposed(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    transpose(runtime, array, None)
+}
 
 const fn method(
     name: &'static str,
@@ -3175,11 +3265,7 @@ fn method_transpose(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallAr
     transpose(runtime, array, axes)
 }
 
-pub(in crate::python) fn transpose(
-    runtime: &mut dyn PyRuntime,
-    array: PyArray,
-    axes: Option<Vec<usize>>,
-) -> PyResult {
+fn transpose(runtime: &mut dyn PyRuntime, array: PyArray, axes: Option<Vec<usize>>) -> PyResult {
     let (layout, _) = runtime.array_layout(array)?;
     let axes = axes.unwrap_or_else(|| (0..layout.shape.len()).rev().collect());
     if axes.len() != layout.shape.len() {

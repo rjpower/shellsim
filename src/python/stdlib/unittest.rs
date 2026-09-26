@@ -35,6 +35,7 @@ pub(crate) static TEST_CASE_TYPE: NativeTypeDef = NativeTypeDef {
             call: assert_raises,
         },
     ],
+    getters: &[],
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {

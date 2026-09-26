@@ -105,7 +105,10 @@ A pure algorithm cannot acquire VFS, process, clock, or network access accidenta
 
 Use a frozen Python module when the behavior composes naturally from supported Python. Use a Rust
 native module for compact algorithms, interpreter-owned objects, or an explicit modeled
-capability. Native definitions use declarative function, method, type, and value tables.
+capability. Native definitions use declarative function, method, getter, type, and value tables.
+A getter is a read-only data descriptor such as `int.real` or `ndarray.shape`: instance lookup
+calls it, lookup through the type object returns the descriptor, and assignment raises
+`AttributeError`.
 
 For either form:
 

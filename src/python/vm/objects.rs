@@ -4,8 +4,8 @@ use super::{
     expect_arity, protocol, range_length, select_string_slice, Arc, BuiltinSubscript, BuiltinType,
     CallMode, CallResult, ClassDefinition, ClassField, ClassLayout, CodeCaches, CodeRef,
     ExceptionType, Execution, HashMap, LoadAttributeCache, NameId, NativeValue, Object, Ordering,
-    PyArray, PyError, PyRuntime, PyValueCast, SlicePlan, Slot, SlotValue, Stream, SymbolId, TypeId,
-    Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    PyError, PyErrorKind, PyRuntime, SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, ValueTag,
+    Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 impl Vm<'_> {
@@ -200,38 +200,51 @@ impl Vm<'_> {
                 return Ok(Some(value));
             }
         }
-        // `sys.stdin.buffer` reads the same descriptor as raw bytes instead of decoded text.
-        // There is no general native-attribute mechanism for a data field (only methods), so this
-        // one well-known accessor is special-cased the same way module and class lookups are above.
-        if owner.native_value() == Some(NativeValue::Stream(Stream::Stdin)) && name == "buffer" {
-            return Ok(Some(Value::Native(NativeValue::Stream(
-                Stream::StdinBuffer,
-            ))));
-        }
         if let Some(NativeValue::BuiltinType(builtin)) = owner.native_value() {
             if let Some(value) = self.state.types.attribute(builtin.id(), name)? {
                 return Ok(Some(value));
             }
         }
+        if let Some(NativeValue::ValueKind(kind)) = owner.native_value() {
+            if let Some(type_id) = self.state.types.value_kind_type_id(kind) {
+                if let Some(value) = self.state.types.attribute(type_id, name)? {
+                    return Ok(Some(value));
+                }
+            }
+        }
         let owner_type = self.type_id(&owner)?;
-        if let Some(method) = self
+        match self
             .state
             .types
             .attribute(owner_type, name)?
-            .and_then(|value| match value.native_value() {
-                Some(NativeValue::NativeMethod(method)) => Some(method),
-                _ => None,
-            })
+            .and_then(|value| value.native_value())
         {
-            if method.name == "__new__" {
-                return Ok(Some(Value::Native(NativeValue::NativeMethod(method))));
+            Some(NativeValue::NativeMethod(method)) => {
+                if method.name == "__new__" {
+                    return Ok(Some(Value::Native(NativeValue::NativeMethod(method))));
+                }
+                let bound = self.allocate_object(Object::DescriptorBoundMethod {
+                    receiver: owner,
+                    descriptor: Value::Native(NativeValue::NativeMethod(method)),
+                    owner: None,
+                })?;
+                return Ok(Some(bound));
             }
-            let bound = self.allocate_object(Object::DescriptorBoundMethod {
-                receiver: owner,
-                descriptor: Value::Native(NativeValue::NativeMethod(method)),
-                owner: None,
-            })?;
-            return Ok(Some(bound));
+            // Native getters are data descriptors. Builtin receivers have no instance
+            // dictionary, so reaching the type table first already gives CPython precedence.
+            Some(NativeValue::NativeGetter(getter)) => {
+                return match (getter.get)(self, owner) {
+                    Ok(value) => Ok(Some(value)),
+                    // As in CPython, a getter's AttributeError means the attribute is absent for
+                    // this receiver, which `getattr` defaults and `hasattr` observe.
+                    Err(PyError {
+                        kind: PyErrorKind::Exception("AttributeError"),
+                        ..
+                    }) => Ok(None),
+                    Err(error) => Err(self.record_native_error(error)),
+                };
+            }
+            _ => {}
         }
         if let Some(id) = owner.object_id() {
             match self.state.heap.get(id)?.clone() {
@@ -335,39 +348,6 @@ impl Vm<'_> {
                     };
                     return Ok(Some(component.map_or(Value::None, Value::Int)));
                 }
-                Object::Array { layout, dtype, .. } => {
-                    let value = match name {
-                        "shape" => Some(
-                            self.allocate_object(Object::Tuple(
-                                layout
-                                    .shape
-                                    .iter()
-                                    .map(|value| Value::Int(*value as i64))
-                                    .collect(),
-                            ))?,
-                        ),
-                        "ndim" => Some(Value::Int(layout.shape.len() as i64)),
-                        "size" => Some(Value::Int(
-                            layout
-                                .shape
-                                .iter()
-                                .try_fold(1usize, |total, dimension| total.checked_mul(*dimension))
-                                .ok_or("array size overflow")? as i64,
-                        )),
-                        "dtype" => Some(self.allocate_string(dtype.name().to_string())?),
-                        "T" => {
-                            let array = owner
-                                .cast::<PyArray>(self)
-                                .map_err(|error| error.to_string())?;
-                            Some(
-                                super::super::stdlib::numpy::transpose(self, array, None)
-                                    .map_err(|error| error.to_string())?,
-                            )
-                        }
-                        _ => None,
-                    };
-                    return Ok(value);
-                }
                 _ => {}
             }
         }
@@ -394,13 +374,16 @@ impl Vm<'_> {
         name: &str,
         value: Value,
     ) -> Result<(), String> {
-        let Some(id) = owner.object_id() else {
-            return Err("object does not support attribute assignment".into());
+        let class = match owner.object_id() {
+            Some(id) => match self.state.heap.get(id)? {
+                Object::Instance { class, .. } => Some((id, *class)),
+                _ => None,
+            },
+            None => None,
         };
-        let Object::Instance { class, .. } = self.state.heap.get(id)? else {
-            return Err("object does not support attribute assignment".into());
+        let Some((id, class)) = class else {
+            return Err(self.reject_builtin_attribute_store(owner, name));
         };
-        let class = *class;
         if let Some((_, descriptor)) = self.class_attribute_entry(class, name)? {
             if let Some(descriptor_id) = descriptor.object_id() {
                 match self.state.heap.get(descriptor_id)?.clone() {
@@ -442,6 +425,28 @@ impl Vm<'_> {
             &mut self.interp.resources,
         )?;
         Ok(())
+    }
+
+    /// Explain why a receiver without an instance dictionary rejects an attribute store.
+    fn reject_builtin_attribute_store(&mut self, owner: Value, name: &str) -> String {
+        let getter = self
+            .type_id(&owner)
+            .and_then(|owner_type| self.state.types.attribute(owner_type, name))
+            .ok()
+            .flatten()
+            .and_then(|value| value.native_value());
+        match getter {
+            Some(NativeValue::NativeGetter(getter)) => {
+                self.record_native_error(PyError::exception(
+                    "AttributeError",
+                    format!(
+                        "attribute '{}' of '{}' objects is not writable",
+                        getter.name, getter.owner
+                    ),
+                ))
+            }
+            _ => "object does not support attribute assignment".into(),
+        }
     }
 
     pub(super) fn load_subscript(&mut self) -> Result<(), String> {

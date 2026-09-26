@@ -54,6 +54,8 @@ pub(super) enum NativeValue {
     BuiltinType(BuiltinType),
     NativeFunction(&'static FunctionDef),
     NativeMethod(&'static super::native::MethodDef),
+    /// Read-only data descriptor stored in a native type's attribute table.
+    NativeGetter(&'static super::native::GetterDef),
     ValueKind(&'static super::native::ValueKindDef),
     Stream(Stream),
     Environment,
@@ -79,6 +81,7 @@ impl NativeValue {
     const ENUM_BASE: u8 = 9;
     const UNITTEST_BASE: u8 = 10;
     const VALUE_KIND: u8 = 11;
+    const NATIVE_GETTER: u8 = 12;
 
     pub(super) fn encode(self) -> (u64, u8) {
         match self {
@@ -92,6 +95,10 @@ impl NativeValue {
             Self::NativeMethod(value) => (
                 value as *const super::native::MethodDef as usize as u64,
                 Self::NATIVE_METHOD,
+            ),
+            Self::NativeGetter(value) => (
+                value as *const super::native::GetterDef as usize as u64,
+                Self::NATIVE_GETTER,
             ),
             Self::ValueKind(value) => (
                 value as *const super::native::ValueKindDef as usize as u64,
@@ -133,6 +140,12 @@ impl NativeValue {
                     &*(payload as usize as *const super::native::MethodDef)
                 })
             }
+            Self::NATIVE_GETTER => {
+                // SAFETY: `encode` stores a non-null pointer to a static `GetterDef`.
+                Self::NativeGetter(unsafe {
+                    &*(payload as usize as *const super::native::GetterDef)
+                })
+            }
             Self::STREAM => Self::Stream(match payload {
                 0 => Stream::Stdin,
                 1 => Stream::Stdout,
@@ -157,7 +170,7 @@ impl NativeValue {
     }
 }
 
-const EXCEPTION_TYPES: [&str; 26] = [
+const EXCEPTION_TYPES: [&str; 27] = [
     "Exception",
     "BaseException",
     "AssertionError",
@@ -184,6 +197,7 @@ const EXCEPTION_TYPES: [&str; 26] = [
     "SystemExit",
     "TimeoutError",
     "StopAsyncIteration",
+    "AttributeError",
 ];
 
 fn known_exception_type(name: &str) -> Option<&'static str> {
@@ -214,6 +228,7 @@ impl NativeValue {
         match self {
             Self::BuiltinType(builtin_type) => format!("<class '{}'>", builtin_type.name()),
             Self::ValueKind(kind) => format!("<class '{}'>", kind.name),
+            Self::NativeGetter(getter) => format!("{getter:?}"),
             _ => "<native object>".into(),
         }
     }

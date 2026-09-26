@@ -2,8 +2,8 @@
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyConstant, PyError, PyMarker,
-    PyResult, PyRuntime, PyStreamRead, ValueDef,
+    CallArgs, FunctionDef, GetterDef, MethodDef, ModuleDef, NativeTypeDef, PyConstant, PyError,
+    PyMarker, PyResult, PyRuntime, PyStreamRead, ValueDef,
 };
 
 pub(crate) static STREAM_TYPE: NativeTypeDef = NativeTypeDef {
@@ -40,7 +40,24 @@ pub(crate) static STREAM_TYPE: NativeTypeDef = NativeTypeDef {
             call: next,
         },
     ],
+    getters: &[GetterDef {
+        owner: "shellsim.stream",
+        name: "buffer",
+        get: buffer,
+    }],
 };
+
+/// `sys.stdin.buffer` reads the same descriptor as raw bytes instead of decoded text. Binary
+/// views of the output streams are not modeled.
+fn buffer(runtime: &mut dyn PyRuntime, stream: Value) -> PyResult {
+    if stream == runtime.marker(PyMarker::Stdin) {
+        return Ok(runtime.marker(PyMarker::StdinBuffer));
+    }
+    Err(PyError::exception(
+        "AttributeError",
+        "only sys.stdin models a binary buffer",
+    ))
+}
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "sys",

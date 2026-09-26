@@ -591,74 +591,75 @@ impl Default for TypeRegistry {
                 value: Some(Value::Native(super::vm::NativeValue::BuiltinType(builtin))),
             });
         }
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::Type as usize],
             &super::stdlib::core::TYPE_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::String as usize],
             &super::stdlib::core::STRING_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::Bytes as usize],
             &super::stdlib::core::BYTES_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::ByteArray as usize],
             &super::stdlib::core::BYTEARRAY_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::List as usize],
             &super::stdlib::core::LIST_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::Dict as usize],
             &super::stdlib::core::DICT_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::Set as usize],
             &super::stdlib::core::SET_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::FrozenSet as usize],
             &super::stdlib::core::FROZENSET_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::Generator as usize],
             &super::stdlib::core::GENERATOR_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::Property as usize],
             &super::stdlib::core::PROPERTY_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::Regex as usize],
             &super::stdlib::re::PATTERN_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::Match as usize],
             &super::stdlib::re::MATCH_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::Stream as usize],
             &super::stdlib::sys::STREAM_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::Environment as usize],
             &super::stdlib::os::ENVIRONMENT_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::ArgumentParser as usize],
             &super::stdlib::argparse::ARGUMENT_PARSER_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::RaisesContext as usize],
             &super::stdlib::pytest::RAISES_CONTEXT_TYPE,
         );
-        install_native_methods(
+        install_native_attributes(
             &mut types[BuiltinType::Array as usize],
             &super::stdlib::numpy::ARRAY_TYPE,
         );
+        install_number_attributes(&mut types);
         install_builtin_slots(&mut types);
         let mut registry = Self {
             types,
@@ -768,14 +769,16 @@ impl TypeRegistry {
     fn register_value_kind(&mut self, kind: &'static super::native::ValueKindDef) {
         let object = BuiltinType::Object.id();
         let type_id = TypeId(u32::try_from(self.types.len()).expect("too many registered types"));
-        self.types.push(PyType {
+        let mut ty = PyType {
             name: kind.name.into(),
             bases: vec![object],
             mro: vec![object],
             attributes: HashMap::new(),
             slots: value_kind_slots(kind.slots),
             value: Some(Value::Native(super::vm::NativeValue::ValueKind(kind))),
-        });
+        };
+        insert_native_attributes(&mut ty, kind.methods, kind.getters);
+        self.types.push(ty);
         self.value_kinds.push(kind);
         debug_assert_eq!(self.value_kind_type_id(kind), Some(type_id));
     }
@@ -845,15 +848,56 @@ fn builtin_metadata(builtin: BuiltinType) -> (Vec<TypeId>, Vec<TypeId>) {
     }
 }
 
-fn install_native_methods(ty: &mut PyType, definition: &'static super::native::NativeTypeDef) {
+fn install_native_attributes(ty: &mut PyType, definition: &'static super::native::NativeTypeDef) {
     debug_assert_eq!(ty.name, definition.name);
-    for method in definition.methods {
-        debug_assert_eq!(method.type_name, definition.name);
+    debug_assert!(definition
+        .methods
+        .iter()
+        .all(|method| method.type_name == definition.name));
+    debug_assert!(definition
+        .getters
+        .iter()
+        .all(|getter| getter.owner == definition.name));
+    insert_native_attributes(ty, definition.methods, definition.getters);
+}
+
+fn insert_native_attributes(
+    ty: &mut PyType,
+    methods: &'static [super::native::MethodDef],
+    getters: &'static [super::native::GetterDef],
+) {
+    for method in methods {
         ty.attributes.insert(
             method.name.into(),
             Value::Native(super::vm::NativeValue::NativeMethod(method)),
         );
     }
+    for getter in getters {
+        ty.attributes.insert(
+            getter.name.into(),
+            Value::Native(super::vm::NativeValue::NativeGetter(getter)),
+        );
+    }
+}
+
+/// Install the numeric-tower accessors (`real`, `imag`, `conjugate`, and the rational
+/// accessors on integers) on the builtin number types.
+///
+/// Attribute lookup on builtin types does not walk the MRO, so `bool` receives its own table
+/// rather than inheriting the one installed on `int`.
+fn install_number_attributes(types: &mut [PyType]) {
+    install_native_attributes(
+        &mut types[BuiltinType::Bool as usize],
+        &super::number::BOOL_TYPE,
+    );
+    install_native_attributes(
+        &mut types[BuiltinType::Int as usize],
+        &super::number::INT_TYPE,
+    );
+    install_native_attributes(
+        &mut types[BuiltinType::Float as usize],
+        &super::number::FLOAT_TYPE,
+    );
 }
 
 fn install_builtin_slots(types: &mut [PyType]) {

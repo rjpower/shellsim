@@ -509,3 +509,28 @@ fn array_allocation_obeys_the_modeled_memory_limit() {
     assert_eq!(status, 137);
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn array_and_scalar_attributes_are_native_getters() {
+    // Expected output was recorded from NumPy 2.5 on CPython 3.14.
+    let source = r#"import numpy as np
+a = np.array([[1, 2], [3, 4]], dtype=np.int16)
+print(a.shape, a.ndim, a.size, a.dtype, a.T.tolist())
+print(np.ndarray.shape)
+try:
+    a.T = a
+except AttributeError as error:
+    print(error)
+x = np.float64(2.5)
+print(x.real, x.imag, x.conjugate(), type(x.imag) is np.float64)
+print(np.int8(3).real, np.int8(3).imag, type(np.int8(3).imag) is np.int8)
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"(2, 2) 2 4 int16 [[1, 3], [2, 4]]\n<attribute 'shape' of 'numpy.ndarray' objects>\nattribute 'T' of 'numpy.ndarray' objects is not writable\n2.5 0.0 2.5 True\n3 0 True\n".to_vec(),
+            Vec::new()
+        )
+    );
+}

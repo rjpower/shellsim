@@ -2,7 +2,7 @@
 
 use shellsim::Environment;
 
-use super::support::run_shell;
+use super::support::{run_python_text, run_shell};
 
 #[test]
 fn user_classes_bind_methods_and_keep_instance_attributes() {
@@ -263,5 +263,31 @@ fn class_body_functions_capture_their_defining_class() {
             "python3.14 -c 'class Owner:\n    def defining_class(self):\n        return __class__\nprint(Owner().defining_class() is Owner)'",
         ),
         (0, b"True\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn native_getters_are_readonly_data_descriptors() {
+    let source = r#"print(repr(True.real), repr((2.5).imag), repr((3).imag), repr(True.imag))
+print((7).conjugate(), (2.5).conjugate(), True.conjugate(), (6).numerator, (6).denominator)
+print((2**70).real == 2**70, (2**70).imag)
+print(int.real, float.imag, hasattr(int, 'real'), hasattr(1.5, 'numerator'))
+print(getattr(int, 'imag') is int.imag)
+for target in (5, 2.5):
+    try:
+        target.real = 1
+    except AttributeError as error:
+        print(error)
+import sys
+print(hasattr(sys.stdin, 'buffer'))
+"#;
+    // Expected output was recorded from CPython 3.14.
+    assert_eq!(
+        run_python_text(source),
+        (
+            0,
+            "1 0.0 0 0\n7 2.5 1 6 1\nTrue 0\n<attribute 'real' of 'int' objects> <attribute 'imag' of 'float' objects> True False\nTrue\nattribute 'real' of 'int' objects is not writable\nattribute 'real' of 'float' objects is not writable\nTrue\n".into(),
+            String::new()
+        )
     );
 }

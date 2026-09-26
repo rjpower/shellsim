@@ -8,7 +8,10 @@ use num_traits::{Signed, ToPrimitive, Zero};
 
 use super::ast::{BinaryOperator, ComparisonOperator};
 use super::heap::{Heap, InstancePayload, Object};
-use super::native::{CallArgs, FromPyValue, PyError, PyResult, PyRuntime, PyValue};
+use super::native::{
+    CallArgs, FromPyValue, GetterDef, MethodDef, NativeTypeDef, PyError, PyResult, PyRuntime,
+    PyValue,
+};
 use super::ValueTag;
 
 /// Borrowed numeric payload used by VM protocols without exposing physical value tags.
@@ -38,6 +41,98 @@ pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>>
         } => Some(NumberRef::Int(*value)),
         _ => None,
     }
+}
+
+/// Numeric-tower attributes shared by one builtin real number type.
+///
+/// `int` and `bool` also expose the `numbers.Rational` accessors. Results follow CPython:
+/// `True.real` is the integer `1`, `(3).imag` is `0`, and `(1.5).imag` is `0.0`.
+macro_rules! real_number_type {
+    ($name:literal, rational) => {
+        NativeTypeDef {
+            name: $name,
+            methods: &[MethodDef {
+                type_name: $name,
+                name: "conjugate",
+                call: real_conjugate,
+            }],
+            getters: &[
+                GetterDef {
+                    owner: $name,
+                    name: "real",
+                    get: real_part,
+                },
+                GetterDef {
+                    owner: $name,
+                    name: "imag",
+                    get: real_imaginary_part,
+                },
+                GetterDef {
+                    owner: $name,
+                    name: "numerator",
+                    get: real_part,
+                },
+                GetterDef {
+                    owner: $name,
+                    name: "denominator",
+                    get: integer_denominator,
+                },
+            ],
+        }
+    };
+    ($name:literal) => {
+        NativeTypeDef {
+            name: $name,
+            methods: &[MethodDef {
+                type_name: $name,
+                name: "conjugate",
+                call: real_conjugate,
+            }],
+            getters: &[
+                GetterDef {
+                    owner: $name,
+                    name: "real",
+                    get: real_part,
+                },
+                GetterDef {
+                    owner: $name,
+                    name: "imag",
+                    get: real_imaginary_part,
+                },
+            ],
+        }
+    };
+}
+
+pub(super) static BOOL_TYPE: NativeTypeDef = real_number_type!("bool", rational);
+pub(super) static INT_TYPE: NativeTypeDef = real_number_type!("int", rational);
+pub(super) static FLOAT_TYPE: NativeTypeDef = real_number_type!("float");
+
+/// Return a real number as itself, normalizing `bool` to the equal `int`.
+fn real_part(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+    Ok(match value.bool_value() {
+        Some(value) => PyValue::Int(i64::from(value)),
+        None => value,
+    })
+}
+
+/// Return the zero imaginary component with the receiver's int-or-float result type.
+fn real_imaginary_part(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+    Ok(if value.float_value().is_some() {
+        PyValue::Float(0.0)
+    } else {
+        PyValue::Int(0)
+    })
+}
+
+fn integer_denominator(_runtime: &mut dyn PyRuntime, _value: PyValue) -> PyResult {
+    Ok(PyValue::Int(1))
+}
+
+fn real_conjugate(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("conjugate", 0, 0)?;
+    args.reject_keywords("conjugate")?;
+    real_part(runtime, value)
 }
 
 /// Return the exact index value accepted by sequence protocols.
