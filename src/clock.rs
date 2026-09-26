@@ -1,6 +1,7 @@
 //! Deterministic virtual time and event ordering.
 //!
-//! Shellsim never reads the host clock and never blocks a host thread.  A [`Timeline`] owns
+//! A timeline never reads the host clock and never blocks a host thread; the opt-in real-time
+//! mode in [`crate::realtime`] moves it forward from outside.  A [`Timeline`] owns
 //! three deliberately separate notions of time:
 //!
 //! * monotonic time orders effects and deadlines;

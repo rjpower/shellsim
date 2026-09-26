@@ -2119,9 +2119,8 @@ impl PyRuntime for Vm<'_> {
                     .map_err(PyError::runtime_error)?;
             } else if let Some(deadline) = deadline {
                 self.interp
-                    .clock
-                    .advance_to(deadline)
-                    .map_err(|error| PyError::resource_error(error.to_string()))?;
+                    .wait_for_time(deadline)
+                    .map_err(PyError::resource_error)?;
             } else {
                 return Err(PyError::runtime_error(
                     "asyncio resource wait has no live modeled child",

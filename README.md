@@ -131,6 +131,17 @@ environment = shellsim.Environment()
 result = environment.run_python("print('persistent VFS, fresh Python interpreter')")
 ```
 
+## Clock modes
+
+A machine runs on virtual time by default: when every process waits on a timer, the scheduler
+jumps the clock to the next deadline, so `sleep 3600` costs no host time and runs are
+reproducible. An embedder can boot a machine with
+`Environment::with_limits_and_clock(limits, ClockMode::RealTime)` for interactive demos. Its
+clock then follows physical time from boot: shell, Python, and Wasm sleeps take real time, and
+clock reads report elapsed time. Polling never blocks in either mode. An idle real-time machine
+reports that it is blocked, and `Environment::host_wait_until` says how long to wait. Simulated
+programs cannot choose the mode, and a snapshot of a real-time machine is not reproducible.
+
 ## Experimental Wasm executables
 
 An executable VFS file beginning with the WebAssembly magic bytes runs through a fuel-metered
