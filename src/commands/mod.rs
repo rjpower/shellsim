@@ -26,7 +26,7 @@ mod dd;
 mod diff;
 mod echo;
 mod expr;
-mod find;
+pub(crate) mod find;
 mod format;
 pub(crate) mod fs;
 pub(crate) mod git;

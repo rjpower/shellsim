@@ -12,6 +12,7 @@ use crate::syscalls::{ActiveSystem, SyscallError, System};
 
 mod cat;
 mod env;
+mod find;
 mod head;
 mod make;
 mod nice;
@@ -138,6 +139,7 @@ pub(crate) enum NativeProcess {
     Tee(tee::TeeProcess),
     Head(head::HeadProcess),
     Xargs(xargs::XargsProcess),
+    Find(Box<find::FindProcess>),
     Env(env::EnvProcess),
     Sleep(sleep::SleepProcess),
     Timeout(timeout::TimeoutProcess),
@@ -349,6 +351,9 @@ impl NativeProcess {
             crate::vfs::NativeProgram::Tee => Self::Tee(tee::TeeProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Head => Self::Head(head::HeadProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Xargs => Self::Xargs(xargs::XargsProcess::new(&argv[1..])),
+            crate::vfs::NativeProgram::Find => {
+                Self::Find(Box::new(find::FindProcess::new(&argv[1..])))
+            }
             crate::vfs::NativeProgram::Env => Self::Env(env::EnvProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Sleep => Self::Sleep(sleep::SleepProcess::sleep(&argv[1..])),
             crate::vfs::NativeProgram::Usleep => {
@@ -412,6 +417,7 @@ impl NativeProcess {
             Self::Tee(tee) => tee.poll(syscalls),
             Self::Head(head) => head.poll(syscalls),
             Self::Xargs(xargs) => xargs.poll(syscalls),
+            Self::Find(find) => find.poll(syscalls),
             Self::Env(env) => env.poll(syscalls),
             Self::Sleep(sleep) => sleep.poll(syscalls),
             Self::Timeout(timeout) => timeout.poll(syscalls),

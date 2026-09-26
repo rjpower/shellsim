@@ -99,7 +99,7 @@ fn realpath_missing_mode_resolves_symlinks_and_normalizes_absent_suffixes() {
 #[test]
 fn find_rejects_unsupported_and_malformed_predicates() {
     for source in [
-        "find /proc -execdir echo {} \\;",
+        "find /proc -ok echo {} \\;",
         "find /proc -type z",
         "find /proc -name",
     ] {
@@ -109,7 +109,7 @@ fn find_rejects_unsupported_and_malformed_predicates() {
     }
     let (status, _, stderr) = text("find /missing");
     assert_eq!(status, 1);
-    assert!(stderr.contains("find:"), "{stderr}");
+    assert_eq!(stderr, "find: '/missing': No such file or directory\n");
 }
 
 #[test]

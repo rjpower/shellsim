@@ -643,6 +643,7 @@ impl Environment {
             ("tee", crate::vfs::NativeProgram::Tee),
             ("head", crate::vfs::NativeProgram::Head),
             ("xargs", crate::vfs::NativeProgram::Xargs),
+            ("find", crate::vfs::NativeProgram::Find),
             ("env", crate::vfs::NativeProgram::Env),
             ("sleep", crate::vfs::NativeProgram::Sleep),
             ("usleep", crate::vfs::NativeProgram::Usleep),

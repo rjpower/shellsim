@@ -1,8 +1,16 @@
 //! Typed evaluator for ordinary `find` path predicates.
 //!
 //! Boolean expressions are parsed before the VFS walk. Supported predicates are deliberately
-//! closed: metadata tests, boolean composition, printing, and deletion. Unknown predicates fail
-//! rather than being treated as paths or delegated to the host.
+//! closed: metadata tests, boolean composition, printing, deletion, and `-exec`/`-execdir`.
+//! Unknown predicates fail rather than being treated as paths or delegated to the host.
+//!
+//! [`Expr`] and [`Parser`] are shared with [`crate::program::find`], the resumable native process
+//! image seeded at `/usr/bin/find`. This module keeps the original synchronous body (registered
+//! under the bare name `find`) for nested callers that dispatch commands in-process, such as
+//! `xargs` invoking `find` recursively; `-exec` there still runs through synchronous nested
+//! dispatch rather than a real child process. The native image is the one real shell scripts
+//! reach when they run `find` as an external command, and it spawns one virtual child per
+//! `-exec`/`-execdir` invocation.
 
 use std::collections::HashMap;
 
@@ -15,7 +23,7 @@ pub fn register(commands: &mut HashMap<&'static str, CommandSpec>) {
 }
 
 #[derive(Clone, Debug)]
-enum Expr {
+pub(crate) enum Expr {
     True,
     Type(char),
     Name(String),
@@ -30,6 +38,9 @@ enum Expr {
     Exec {
         argv: Vec<String>,
         batch: Option<usize>,
+        /// `-execdir`: run with the file's directory as the child's cwd and substitute `{}`
+        /// with `./basename` instead of the display path.
+        dir: bool,
     },
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
@@ -37,14 +48,14 @@ enum Expr {
 }
 
 #[derive(Clone, Debug)]
-struct SizeComparison {
+pub(crate) struct SizeComparison {
     ordering: std::cmp::Ordering,
     units: u64,
     unit_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
-struct PermComparison {
+pub(crate) struct PermComparison {
     mode: u32,
     kind: PermKind,
 }
@@ -57,24 +68,24 @@ enum PermKind {
 }
 
 #[derive(Clone, Debug)]
-struct AgeComparison {
+pub(crate) struct AgeComparison {
     ordering: std::cmp::Ordering,
     value: u64,
     unit_ms: u64,
 }
 
-#[derive(Debug)]
-struct Parsed {
-    paths: Vec<String>,
-    expression: Expr,
-    min_depth: usize,
-    max_depth: Option<usize>,
-    explicit_action: bool,
-    delete: bool,
-    exec_batches: usize,
+#[derive(Clone, Debug)]
+pub(crate) struct Parsed {
+    pub(crate) paths: Vec<String>,
+    pub(crate) expression: Expr,
+    pub(crate) min_depth: usize,
+    pub(crate) max_depth: Option<usize>,
+    pub(crate) explicit_action: bool,
+    pub(crate) delete: bool,
+    pub(crate) exec_batches: usize,
 }
 
-struct Parser<'a> {
+pub(crate) struct Parser<'a> {
     arguments: &'a [String],
     offset: usize,
     min_depth: usize,
@@ -85,7 +96,7 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn parse(arguments: &'a [String]) -> Result<Parsed, String> {
+    pub(crate) fn parse(arguments: &'a [String]) -> Result<Parsed, String> {
         let mut paths = Vec::new();
         let mut offset = 0;
         while arguments.get(offset).is_some_and(|argument| {
@@ -202,25 +213,30 @@ impl<'a> Parser<'a> {
                 self.delete = true;
                 Ok(Expr::Delete)
             }
-            "-exec" => self.parse_exec(),
+            "-exec" => self.parse_exec("-exec", false),
+            "-execdir" => self.parse_exec("-execdir", true),
+            "-ok" | "-okdir" => Err(format!(
+                "'{argument}' is unsupported: it requires an interactive terminal, which the \
+                 simulator does not provide"
+            )),
             value if value.starts_with('-') => Err(format!("unsupported predicate '{value}'")),
             value => Err(format!("unexpected path or expression '{value}'")),
         }
     }
 
-    fn parse_exec(&mut self) -> Result<Expr, String> {
+    fn parse_exec(&mut self, name: &str, dir: bool) -> Result<Expr, String> {
         let mut argv = Vec::new();
         let batch = loop {
             let Some(argument) = self.advance() else {
-                return Err("missing terminator for '-exec'".to_string());
+                return Err(format!("missing terminator for '{name}'"));
             };
             match argument {
                 ";" => break None,
                 "+" => {
                     if argv.last().map(String::as_str) != Some("{}") {
-                        return Err(
-                            "'-exec ... +' requires '{}' immediately before '+'".to_string()
-                        );
+                        return Err(format!(
+                            "'{name} ... +' requires '{{}}' immediately before '+'"
+                        ));
                     }
                     argv.pop();
                     let id = self.exec_batches;
@@ -231,10 +247,17 @@ impl<'a> Parser<'a> {
             }
         };
         if argv.is_empty() {
-            return Err("missing command for '-exec'".to_string());
+            return Err(format!("missing command for '{name}'"));
+        }
+        if dir && batch.is_some() {
+            return Err(
+                "'-execdir ... +' is unsupported: batching would require grouping matches by \
+                 directory"
+                    .to_string(),
+            );
         }
         self.explicit_action = true;
-        Ok(Expr::Exec { argv, batch })
+        Ok(Expr::Exec { argv, batch, dir })
     }
 
     fn required(&mut self, predicate: &str) -> Result<&'a str, String> {
@@ -413,6 +436,7 @@ fn run_exec_batches(
         Expr::Exec {
             argv,
             batch: Some(id),
+            ..
         } => {
             let paths = std::mem::take(&mut batches[*id]);
             if paths.is_empty() {
@@ -539,10 +563,21 @@ fn evaluate(
             })?;
             Ok(true)
         }
-        Expr::Exec { argv, batch } => {
+        Expr::Exec { argv, batch, dir } => {
             if let Some(id) = batch {
                 exec_batches[*id].push(display.to_string());
                 Ok(true)
+            } else if *dir {
+                let (parent, base) = split_dir(path);
+                let substituted = format!("./{base}");
+                let command = argv
+                    .iter()
+                    .map(|argument| argument.replace("{}", &substituted))
+                    .collect::<Vec<_>>();
+                let saved_cwd = std::mem::replace(&mut env.cwd, parent);
+                let status = crate::commands::run(env, &command, Vec::new(), io.out, io.err);
+                env.cwd = saved_cwd;
+                Ok(status == 0)
             } else {
                 let command = argv
                     .iter()
@@ -556,6 +591,116 @@ fn evaluate(
             && evaluate(right, env, path, display, io, exec_batches)?),
         Expr::Or(left, right) => Ok(evaluate(left, env, path, display, io, exec_batches)?
             || evaluate(right, env, path, display, io, exec_batches)?),
+    }
+}
+
+/// Evaluate one metadata-only predicate leaf against the typed [`crate::syscalls::System`]
+/// boundary, for the resumable native image in [`crate::program::find`].
+///
+/// `True`, `Print`, `Exec`, and the boolean combinators are handled by each caller instead: their
+/// side effects (writing bytes, spawning children, short-circuit recursion) differ between the
+/// synchronous [`evaluate`] above and the native image's suspend-capable evaluator, so only the
+/// metadata comparisons that read the same [`crate::syscalls::FileInfo`] shape are shared here.
+/// Semantics are kept bit-for-bit identical to `evaluate`'s handling of the same predicates,
+/// including treating a native executable as a non-empty file for `-empty`.
+pub(crate) fn evaluate_metadata_leaf(
+    system: &mut dyn crate::syscalls::System,
+    expr: &Expr,
+    path: &str,
+    display: &str,
+) -> Result<bool, String> {
+    use crate::syscalls::FileKind;
+    match expr {
+        Expr::Type(expected) => {
+            let info = system
+                .metadata("/", path, false)
+                .map_err(|error| format!("{display}: {error}"))?;
+            Ok(matches!(
+                (expected, info.kind),
+                ('f', FileKind::File) | ('d', FileKind::Directory) | ('l', FileKind::Symlink)
+            ))
+        }
+        Expr::Name(pattern) => Ok(glob_eq(pattern, crate::vfs::basename(path))),
+        Expr::Path(pattern) => Ok(glob_eq(pattern, display)),
+        Expr::Empty => {
+            let info = system
+                .metadata("/", path, false)
+                .map_err(|error| format!("{display}: {error}"))?;
+            Ok(match info.kind {
+                FileKind::File if info.native_executable => false,
+                FileKind::File => info.size == 0,
+                FileKind::Directory => system
+                    .list_dir("/", path)
+                    .map_err(|error| format!("{display}: {error}"))?
+                    .is_empty(),
+                FileKind::Symlink => false,
+            })
+        }
+        Expr::Newer(reference) => {
+            let modified = system
+                .metadata("/", path, false)
+                .map_err(|error| format!("{display}: {error}"))?
+                .mtime_ms;
+            let base = system.cwd().to_string();
+            let reference_mtime = system
+                .metadata(&base, reference, true)
+                .map_err(|error| format!("{reference}: {error}"))?
+                .mtime_ms;
+            Ok(modified > reference_mtime)
+        }
+        Expr::Size(comparison) => {
+            let info = system
+                .metadata("/", path, false)
+                .map_err(|error| format!("{display}: {error}"))?;
+            let size = if matches!(info.kind, FileKind::Directory) {
+                0
+            } else {
+                info.size
+            };
+            let units = size.saturating_add(comparison.unit_bytes.saturating_sub(1))
+                / comparison.unit_bytes;
+            Ok(units.cmp(&comparison.units) == comparison.ordering)
+        }
+        Expr::Perm(comparison) => {
+            let mode = system
+                .metadata("/", path, false)
+                .map_err(|error| format!("{display}: {error}"))?
+                .mode
+                & 0o7777;
+            Ok(match comparison.kind {
+                PermKind::Exact => mode == comparison.mode,
+                PermKind::All => mode & comparison.mode == comparison.mode,
+                PermKind::Any => mode & comparison.mode != 0,
+            })
+        }
+        Expr::Age(comparison) => {
+            let modified = system
+                .metadata("/", path, false)
+                .map_err(|error| format!("{display}: {error}"))?
+                .mtime_ms;
+            let age = system.wall_time_ms().saturating_sub(modified) / comparison.unit_ms;
+            Ok(age.cmp(&comparison.value) == comparison.ordering)
+        }
+        Expr::Delete => {
+            let info = system
+                .metadata("/", path, false)
+                .map_err(|error| format!("{display}: {error}"))?;
+            let result = if matches!(info.kind, FileKind::Directory) {
+                system.rmdir("/", path)
+            } else {
+                system.unlink("/", path)
+            };
+            result.map_err(|error| format!("cannot delete '{display}': {error}"))?;
+            Ok(true)
+        }
+        Expr::True
+        | Expr::Print(_)
+        | Expr::Exec { .. }
+        | Expr::Not(_)
+        | Expr::And(_, _)
+        | Expr::Or(_, _) => {
+            unreachable!("evaluate_metadata_leaf only handles metadata predicates")
+        }
     }
 }
 
@@ -574,7 +719,17 @@ fn push_path(
     Ok(())
 }
 
-fn display_path(cwd: &str, start: &str, absolute: &str, path: &str) -> String {
+/// Split an absolute path into its parent directory and basename, for `-execdir`'s `cwd`
+/// substitution. The root path has itself as its own parent.
+pub(crate) fn split_dir(path: &str) -> (String, String) {
+    match path.rsplit_once('/') {
+        Some(("", base)) => ("/".to_string(), base.to_string()),
+        Some((parent, base)) => (parent.to_string(), base.to_string()),
+        None => ("/".to_string(), path.to_string()),
+    }
+}
+
+pub(crate) fn display_path(cwd: &str, start: &str, absolute: &str, path: &str) -> String {
     if start == "." {
         if path == absolute {
             ".".to_string()
@@ -593,7 +748,7 @@ fn display_path(cwd: &str, start: &str, absolute: &str, path: &str) -> String {
     }
 }
 
-fn path_depth(path: &str) -> usize {
+pub(crate) fn path_depth(path: &str) -> usize {
     path.split('/').filter(|part| !part.is_empty()).count()
 }
 
