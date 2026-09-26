@@ -1,0 +1,5 @@
+# Reference versions for the portable scientific suites under tests/python/numpy.
+# The suites' literal expectations were checked against exactly these releases on CPython 3.14.
+numpy==2.5.3
+scipy==1.18.1
+pytest==9.1.1
