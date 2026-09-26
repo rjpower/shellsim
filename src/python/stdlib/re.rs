@@ -13,6 +13,7 @@ use super::super::native::{
 
 pub(super) const IGNORECASE: u32 = 2;
 pub(super) const MULTILINE: u32 = 8;
+pub(super) const DOTALL: u32 = 16;
 const MAX_PATTERN: usize = 4096;
 const MAX_INPUT: usize = 1_048_576;
 const MAX_MATCHES: usize = 100_000;
@@ -286,8 +287,24 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             value: PyConstant::Int(IGNORECASE as i64),
         },
         ValueDef::Constant {
+            name: "I",
+            value: PyConstant::Int(IGNORECASE as i64),
+        },
+        ValueDef::Constant {
             name: "MULTILINE",
             value: PyConstant::Int(MULTILINE as i64),
+        },
+        ValueDef::Constant {
+            name: "M",
+            value: PyConstant::Int(MULTILINE as i64),
+        },
+        ValueDef::Constant {
+            name: "DOTALL",
+            value: PyConstant::Int(DOTALL as i64),
+        },
+        ValueDef::Constant {
+            name: "S",
+            value: PyConstant::Int(DOTALL as i64),
         },
     ],
 };
@@ -486,9 +503,9 @@ fn flags_arg(
         .unwrap_or(0);
     let flags =
         u32::try_from(value).map_err(|_| PyError::value_error("regex flags are out of range"))?;
-    if flags & !(IGNORECASE | MULTILINE) != 0 {
+    if flags & !(IGNORECASE | MULTILINE | DOTALL) != 0 {
         return Err(PyError::value_error(
-            "regex flags are limited to IGNORECASE and MULTILINE",
+            "regex flags are limited to IGNORECASE, MULTILINE and DOTALL",
         ));
     }
     Ok(flags)
@@ -519,6 +536,7 @@ pub(in crate::python) fn build_regex(pattern: &str, flags: u32) -> PyResult<Rege
     RegexBuilder::new(pattern)
         .case_insensitive(flags & IGNORECASE != 0)
         .multi_line(flags & MULTILINE != 0)
+        .dot_matches_new_line(flags & DOTALL != 0)
         .build()
         .map_err(|error| PyError::value_error(format!("unsupported regex pattern: {error}")))
 }

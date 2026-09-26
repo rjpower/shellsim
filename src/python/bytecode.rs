@@ -120,6 +120,7 @@ pub struct Parameter {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParameterKind {
+    PositionalOnly,
     Positional,
     Variadic,
     KeywordOnly,
@@ -218,6 +219,8 @@ pub enum Opcode {
     ForIterator(usize),
     Unary(UnaryOperator),
     Binary(BinaryOperator),
+    /// Augmented assignment: the left operand's in-place method, else the binary operator.
+    InPlaceBinary(BinaryOperator),
     FormatValue(FormatId),
     Compare(ComparisonOperator),
     Call(CallId),
@@ -315,6 +318,8 @@ pub enum Operation {
     ForIterator(usize),
     Unary(UnaryOperator),
     Binary(BinaryOperator),
+    /// Augmented assignment: the left operand's in-place method, else the binary operator.
+    InPlaceBinary(BinaryOperator),
     FormatValue {
         conversion: Option<char>,
         format_spec: String,
@@ -484,6 +489,7 @@ impl CodeBuilder {
             Operation::ForIterator(target) => Opcode::ForIterator(target),
             Operation::Unary(operator) => Opcode::Unary(operator),
             Operation::Binary(operator) => Opcode::Binary(operator),
+            Operation::InPlaceBinary(operator) => Opcode::InPlaceBinary(operator),
             Operation::FormatValue {
                 conversion,
                 format_spec,
@@ -555,7 +561,12 @@ impl CodeBuilder {
     ) -> CodeRef {
         let positional_count = parameters
             .iter()
-            .take_while(|parameter| parameter.kind == ParameterKind::Positional)
+            .take_while(|parameter| {
+                matches!(
+                    parameter.kind,
+                    ParameterKind::PositionalOnly | ParameterKind::Positional
+                )
+            })
             .count();
         let call_signature = CallSignature {
             is_generator: instructions

@@ -286,6 +286,8 @@ pub struct Parameter {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParameterKind {
+    /// A parameter before a `/` marker, which callers cannot pass by keyword.
+    PositionalOnly,
     Positional,
     Variadic,
     KeywordOnly,

@@ -226,6 +226,7 @@ impl Vm<'_> {
                 },
                 Opcode::Unary(operator) => dispatch_next(self.unary(operator)),
                 Opcode::Binary(operator) => dispatch_next(self.binary(operator)),
+                Opcode::InPlaceBinary(operator) => dispatch_next(self.inplace_binary(operator)),
                 Opcode::FormatValue(format) => {
                     let format = code.format(format);
                     dispatch_next(self.format_value(format.conversion, &format.format_spec))
@@ -370,6 +371,9 @@ impl Vm<'_> {
         op_index: usize,
         span: super::super::source::Span,
     ) -> Result<DispatchControl, String> {
+        // Record the executing call so native code can attribute work to this line, as
+        // `warnings.warn` does for its caller.
+        self.active_frame_mut().instruction_pointer = op_index + 1;
         let call = code.call(call);
         let keywords = call
             .keywords

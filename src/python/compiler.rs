@@ -95,6 +95,7 @@ enum Cleanup {
 
 fn compile_parameter_kind(kind: AstParameterKind) -> BytecodeParameterKind {
     match kind {
+        AstParameterKind::PositionalOnly => BytecodeParameterKind::PositionalOnly,
         AstParameterKind::Positional => BytecodeParameterKind::Positional,
         AstParameterKind::Variadic => BytecodeParameterKind::Variadic,
         AstParameterKind::KeywordOnly => BytecodeParameterKind::KeywordOnly,
@@ -879,7 +880,7 @@ impl Compiler {
             AssignmentTarget::Name(name) => {
                 self.emit(Operation::LoadName(name.clone()), span);
                 self.expression(value);
-                self.emit(Operation::Binary(operator), span);
+                self.emit(Operation::InPlaceBinary(operator), span);
                 self.store_name(name, span);
             }
             AssignmentTarget::Subscript {
@@ -892,7 +893,7 @@ impl Compiler {
                 self.emit(Operation::Copy(2), span);
                 self.emit(Operation::LoadSubscript, span);
                 self.expression(value);
-                self.emit(Operation::Binary(operator), span);
+                self.emit(Operation::InPlaceBinary(operator), span);
                 self.emit(Operation::Swap(3), span);
                 self.emit(Operation::Swap(2), span);
                 self.emit(Operation::StoreSubscript, span);
@@ -902,7 +903,7 @@ impl Compiler {
                 self.emit(Operation::Copy(1), span);
                 self.emit(Operation::LoadAttribute(name.clone()), span);
                 self.expression(value);
-                self.emit(Operation::Binary(operator), span);
+                self.emit(Operation::InPlaceBinary(operator), span);
                 self.emit(Operation::Swap(2), span);
                 self.emit(Operation::StoreAttribute(name), span);
             }

@@ -417,3 +417,74 @@ def test_generators_keep_active_exceptions_isolated_while_suspended():
         assert str(error) == "preserved"
     else:
         raise AssertionError("bare raise lost the generator's active exception")
+
+
+def test_augmented_assignment_updates_mutable_operands_in_place():
+    items = [1]
+    alias = items
+    items += "ab"
+    items *= 2
+    assert alias == [1, "a", "b", 1, "a", "b"]
+    members = {1, 2}
+    same = members
+    members |= {3}
+    members -= {1}
+    assert same == {2, 3}
+    mapping = {"a": 1}
+    view = mapping
+    mapping |= [("b", 2)]
+    assert view == {"a": 1, "b": 2}
+    pair = (1,)
+    original = pair
+    pair += (2,)
+    assert original == (1,) and pair == (1, 2)
+
+
+def test_augmented_assignment_prefers_in_place_methods():
+    class Accumulator:
+        def __init__(self):
+            self.calls = []
+
+        def __iadd__(self, other):
+            self.calls.append(("iadd", other))
+            return self
+
+        def __matmul__(self, other):
+            return ("matmul", other)
+
+    accumulator = Accumulator()
+    alias = accumulator
+    accumulator += 5
+    assert accumulator is alias and alias.calls == [("iadd", 5)]
+    accumulator @= 2
+    assert accumulator == ("matmul", 2)
+    nothing = None
+    try:
+        nothing **= 2
+    except TypeError as error:
+        assert str(error) == "unsupported operand type(s) for **=: 'NoneType' and 'int'"
+    else:
+        raise AssertionError("None **= 2 succeeded")
+
+
+def positional_only(first, second=2, /, third=3, *, fourth=4):
+    return first, second, third, fourth
+
+
+def positional_only_with_keywords(name, /, **options):
+    return name, options
+
+
+def test_positional_only_parameters_reject_keywords():
+    assert positional_only(1) == (1, 2, 3, 4)
+    assert positional_only(1, 5, third=6, fourth=7) == (1, 5, 6, 7)
+    assert positional_only_with_keywords("x", name="y") == ("x", {"name": "y"})
+    assert (lambda value, /: value * 2)(4) == 8
+    try:
+        positional_only(first=1)
+    except TypeError as error:
+        assert str(error) == (
+            "positional_only() got some positional-only arguments passed as keyword arguments: 'first'"
+        )
+    else:
+        raise AssertionError("a positional-only parameter was bound by keyword")

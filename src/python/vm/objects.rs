@@ -1503,7 +1503,11 @@ impl Vm<'_> {
         }
     }
 
-    fn invoke_value(&mut self, callable: Value, arguments: Vec<Value>) -> Result<Value, String> {
+    pub(super) fn invoke_value(
+        &mut self,
+        callable: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, String> {
         match self.invoke_call(callable, arguments, Vec::new())? {
             CallResult::Value(value) => Ok(value),
             CallResult::Exit(status) => Err(format!("callable exited with status {status}")),
@@ -2079,7 +2083,9 @@ impl Vm<'_> {
                 .value_kind_type_id_by_index(value.registered_parts().expect("tag checked").0)
                 .ok_or("invalid registered value kind")?,
             ValueTag::Native => match value.native_value().expect("native tag checked") {
-                NativeValue::BuiltinType(_) | NativeValue::ValueKind(_) => BuiltinType::Type.id(),
+                NativeValue::BuiltinType(_)
+                | NativeValue::ValueKind(_)
+                | NativeValue::ExceptionType(_) => BuiltinType::Type.id(),
                 NativeValue::Function(_)
                 | NativeValue::NativeFunction(_)
                 | NativeValue::NativeMethod(_) => BuiltinType::Function.id(),
