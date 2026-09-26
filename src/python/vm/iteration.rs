@@ -146,7 +146,8 @@ impl Vm<'_> {
                 let Some(value) = value else {
                     return Ok(IteratorAdvance::Exhausted);
                 };
-                let Object::SequenceIterator { position, .. } = self.state.heap.get_mut(iterator)?
+                let Object::SequenceIterator { position, .. } =
+                    self.state.heap.get_mut(iterator)?
                 else {
                     unreachable!("iterator kind was checked above")
                 };
@@ -168,13 +169,11 @@ impl Vm<'_> {
         let marker = Value::Native(NativeValue::Stream(stream));
         match self.read_stream(&marker, None, true) {
             Ok(read) if read.is_empty() => Ok(IteratorAdvance::Exhausted),
-            Ok(PyStreamRead::Text(text)) => {
-                Ok(IteratorAdvance::Yield(self.allocate_string(text)?))
-            }
+            Ok(PyStreamRead::Text(text)) => Ok(IteratorAdvance::Yield(self.allocate_string(text)?)),
             Ok(PyStreamRead::Bytes(bytes)) => {
-                let value = self.new_bytes(bytes).map_err(|error| {
-                    self.record_native_error(error)
-                })?;
+                let value = self
+                    .new_bytes(bytes)
+                    .map_err(|error| self.record_native_error(error))?;
                 Ok(IteratorAdvance::Yield(value))
             }
             Err(PyError {
@@ -197,9 +196,9 @@ impl Vm<'_> {
             | IteratorAdvance::Invalid => Err("object is not a stored iterator".into()),
             // `next(sys.stdin)` and unpacking outside a `for` loop cannot suspend the way the
             // `ForIterator` opcode can; this is a narrower surface than CPython's `next()`.
-            IteratorAdvance::Blocked(_) => Err(
-                "reading standard input would block outside a for loop".into(),
-            ),
+            IteratorAdvance::Blocked(_) => {
+                Err("reading standard input would block outside a for loop".into())
+            }
         }
     }
 

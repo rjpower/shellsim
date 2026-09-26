@@ -103,7 +103,8 @@ fn kill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let pid = runtime
         .int_value(&args.positional()[0])
         .ok_or_else(|| PyError::type_error("os.kill pid must be an integer"))?;
-    let pid = u32::try_from(pid).map_err(|_| PyError::value_error("os.kill pid is out of range"))?;
+    let pid =
+        u32::try_from(pid).map_err(|_| PyError::value_error("os.kill pid is out of range"))?;
     let number = runtime
         .int_value(&args.positional()[1])
         .ok_or_else(|| PyError::type_error("os.kill signal must be an integer"))?;

@@ -21,9 +21,8 @@ fn run_shell(source: &str) -> (i32, String, String) {
 
 #[test]
 fn readline_returns_the_first_line_of_an_infinite_producer() {
-    let (status, stdout, stderr) = run_shell(
-        "yes | python3 -c 'import sys; print(sys.stdin.readline().strip())'",
-    );
+    let (status, stdout, stderr) =
+        run_shell("yes | python3 -c 'import sys; print(sys.stdin.readline().strip())'");
     assert_eq!(status, 0, "stderr: {stderr}");
     assert_eq!(stdout, "y\n");
 }
@@ -52,6 +51,22 @@ try:\n    input()\nexcept EOFError:\n    print(\"eof\")\n'",
     );
     assert_eq!(status, 0, "stderr: {stderr}");
     assert_eq!(stdout, "eof\n");
+}
+
+#[test]
+fn sized_reads_stay_on_character_boundaries_for_multi_byte_utf8() {
+    // "\u{e9}" (e-acute) is a two-byte UTF-8 sequence. `read(1)` must consume one *character*
+    // (both bytes), not one byte, so the streaming reader must not split it even though it reads
+    // fd 0 in raw byte quanta.
+    let source = "printf '\u{e9}a\\nb\\n' | python3 -c '\
+import sys
+print(sys.stdin.read(1))
+for line in sys.stdin:
+    print(repr(line))
+'";
+    let (status, stdout, stderr) = run_shell(source);
+    assert_eq!(status, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "\u{e9}\n'a\\n'\n'b\\n'\n");
 }
 
 #[test]

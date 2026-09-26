@@ -1570,7 +1570,10 @@ impl Vm<'_> {
             Err(PyError {
                 kind: PyErrorKind::Suspend(reason),
                 ..
-            }) => Ok(CallResult::Retry(reason, PendingNativeCall::Input { call_span })),
+            }) => Ok(CallResult::Retry(
+                reason,
+                PendingNativeCall::Input { call_span },
+            )),
             Err(error) => Err(self.record_native_error(error)),
         }
     }
@@ -1584,10 +1587,9 @@ impl Vm<'_> {
             }
         };
         if text.is_empty() {
-            return Err(self.record_native_error(PyError::exception(
-                "EOFError",
-                "EOF when reading a line",
-            )));
+            return Err(
+                self.record_native_error(PyError::exception("EOFError", "EOF when reading a line"))
+            );
         }
         if text.ends_with('\n') {
             text.pop();

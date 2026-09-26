@@ -234,43 +234,120 @@ impl Vm<'_> {
 
     /// Try to satisfy one read from bytes already buffered from fd 0. Returns `None` when more
     /// input is required (and end-of-file has not yet been observed).
+    ///
+    /// `size` counts bytes in binary mode and *characters* in text mode, matching
+    /// [`Vm::read_stream_buffered`]. Binary reads slice the pending bytes directly; text reads go
+    /// through [`Vm::take_pending_stdin_text`], which only ever consumes complete UTF-8
+    /// characters so a multi-byte codepoint split across two `read_fd` quanta is not mistaken for
+    /// invalid input.
     fn take_pending_stdin(
         &mut self,
         size: Option<usize>,
         line: bool,
         binary: bool,
     ) -> PyResult<Option<PyStreamRead>> {
-        let cap = size.unwrap_or(usize::MAX);
-        let length = if line {
-            let bound = self.stdin_stream_pending.len().min(cap);
-            if let Some(newline) = self.stdin_stream_pending[..bound]
-                .iter()
-                .position(|byte| *byte == b'\n')
-            {
-                Some(newline + 1)
-            } else if bound == cap && cap != usize::MAX {
-                Some(cap)
-            } else if self.stdin_stream_eof {
-                Some(bound)
-            } else {
-                None
-            }
-        } else if let Some(cap) = size {
-            if self.stdin_stream_pending.len() >= cap {
-                Some(cap)
+        if binary {
+            let cap = size.unwrap_or(usize::MAX);
+            let length = if line {
+                let bound = self.stdin_stream_pending.len().min(cap);
+                if let Some(newline) = self.stdin_stream_pending[..bound]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                {
+                    Some(newline + 1)
+                } else if bound == cap && cap != usize::MAX {
+                    Some(cap)
+                } else if self.stdin_stream_eof {
+                    Some(bound)
+                } else {
+                    None
+                }
+            } else if let Some(cap) = size {
+                if self.stdin_stream_pending.len() >= cap {
+                    Some(cap)
+                } else if self.stdin_stream_eof {
+                    Some(self.stdin_stream_pending.len())
+                } else {
+                    None
+                }
             } else if self.stdin_stream_eof {
                 Some(self.stdin_stream_pending.len())
             } else {
                 None
+            };
+            let Some(length) = length else {
+                return Ok(None);
+            };
+            return Ok(Some(PyStreamRead::Bytes(self.drain_pending_stdin(length))));
+        }
+        self.take_pending_stdin_text(size, line)
+    }
+
+    /// Text-mode counterpart of [`Vm::take_pending_stdin`]'s binary branch.
+    ///
+    /// A partial multi-byte sequence at the tail of the buffered bytes is a pipe-quantum
+    /// boundary artifact, not malformed input, so it is treated as "more data needed" rather than
+    /// a decoding error unless end-of-file has already been observed (in which case no further
+    /// byte can ever arrive to complete it, and CPython's own `UnicodeDecodeError` behavior is
+    /// approximated with the same `ValueError` the fully-buffered path raises).
+    fn take_pending_stdin_text(
+        &mut self,
+        size: Option<usize>,
+        line: bool,
+    ) -> PyResult<Option<PyStreamRead>> {
+        let valid_len = match std::str::from_utf8(&self.stdin_stream_pending) {
+            Ok(text) => text.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(_) => return Err(PyError::value_error("standard input is not valid UTF-8")),
+        };
+        if self.stdin_stream_eof && valid_len < self.stdin_stream_pending.len() {
+            // Bytes past `valid_len` will never be completed by a later read.
+            return Err(PyError::value_error("standard input is not valid UTF-8"));
+        }
+        let valid_text = std::str::from_utf8(&self.stdin_stream_pending[..valid_len])
+            .expect("validated as UTF-8 immediately above");
+        let requested_chars_available =
+            size.is_none_or(|characters| valid_text.chars().count() >= characters);
+        let size_end = size.map_or(valid_text.len(), |characters| {
+            valid_text
+                .char_indices()
+                .nth(characters)
+                .map_or(valid_text.len(), |(offset, _)| offset)
+        });
+        let length = if line {
+            if let Some(newline) = valid_text.as_bytes()[..size_end]
+                .iter()
+                .position(|byte| *byte == b'\n')
+            {
+                newline + 1
+            } else if size.is_some() && requested_chars_available {
+                size_end
+            } else if self.stdin_stream_eof {
+                valid_len
+            } else {
+                return Ok(None);
+            }
+        } else if size.is_some() {
+            if requested_chars_available {
+                size_end
+            } else if self.stdin_stream_eof {
+                valid_len
+            } else {
+                return Ok(None);
             }
         } else if self.stdin_stream_eof {
-            Some(self.stdin_stream_pending.len())
+            valid_len
         } else {
-            None
-        };
-        let Some(length) = length else {
             return Ok(None);
         };
+        let bytes = self.drain_pending_stdin(length);
+        let text = String::from_utf8(bytes).expect("length only spans the validated prefix");
+        Ok(Some(PyStreamRead::Text(text)))
+    }
+
+    /// Remove and account for `length` bytes at the front of the buffered, not-yet-consumed fd 0
+    /// bytes retained by [`Vm::read_stream_streaming`].
+    fn drain_pending_stdin(&mut self, length: usize) -> Vec<u8> {
         let bytes = self
             .stdin_stream_pending
             .drain(..length)
@@ -278,13 +355,7 @@ impl Vm<'_> {
         let released = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         self.retained_memory = self.retained_memory.saturating_sub(released);
         self.interp.resources.release_memory(released);
-        if binary {
-            Ok(Some(PyStreamRead::Bytes(bytes)))
-        } else {
-            let text = String::from_utf8(bytes)
-                .map_err(|_| PyError::value_error("standard input is not valid UTF-8"))?;
-            Ok(Some(PyStreamRead::Text(text)))
-        }
+        bytes
     }
 }
 
@@ -431,7 +502,12 @@ impl PyRuntime for Vm<'_> {
         Ok(text.chars().count())
     }
 
-    fn read_stream(&mut self, stream: &Value, size: Option<usize>, line: bool) -> PyResult<PyStreamRead> {
+    fn read_stream(
+        &mut self,
+        stream: &Value,
+        size: Option<usize>,
+        line: bool,
+    ) -> PyResult<PyStreamRead> {
         let binary = match stream.native_value() {
             Some(NativeValue::Stream(Stream::Stdin)) => false,
             Some(NativeValue::Stream(Stream::StdinBuffer)) => true,

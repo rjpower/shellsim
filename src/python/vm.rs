@@ -530,7 +530,10 @@ enum DispatchControl {
 enum IteratorAdvance {
     Yield(Value),
     Exhausted,
-    Callable { callable: Value, sentinel: Value },
+    Callable {
+        callable: Value,
+        sentinel: Value,
+    },
     Generator,
     Invalid,
     /// Advancing a `StreamIterator` would block on fd 0; suspend the enclosing `for` loop.

@@ -206,7 +206,9 @@ pub enum Object {
     /// than the generic native-value `__iter__`/`__next__` dispatch, because only a heap-object
     /// iterator can suspend a `for` loop: `ForIterator` requires an `ObjectId` to advance, and
     /// advancing this one can block on fd 0 (see `vm::iteration::advance_iterator`).
-    StreamIterator { binary: bool },
+    StreamIterator {
+        binary: bool,
+    },
     /// A suspended Python generator frame. The bytecode is immutable; the instruction pointer,
     /// exception state, and lexical scope are the complete resumable state.
     Generator {

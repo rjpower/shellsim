@@ -198,8 +198,7 @@ impl Compiler {
         match statement.kind {
             StatementKind::Import { modules } => {
                 for (module, binding) in modules {
-                    let bind_root =
-                        module.split('.').next().is_some_and(|root| root == binding);
+                    let bind_root = module.split('.').next().is_some_and(|root| root == binding);
                     self.emit(
                         Operation::Import {
                             name: module,

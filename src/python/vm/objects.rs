@@ -204,7 +204,9 @@ impl Vm<'_> {
         // There is no general native-attribute mechanism for a data field (only methods), so this
         // one well-known accessor is special-cased the same way module and class lookups are above.
         if owner.native_value() == Some(NativeValue::Stream(Stream::Stdin)) && name == "buffer" {
-            return Ok(Some(Value::Native(NativeValue::Stream(Stream::StdinBuffer))));
+            return Ok(Some(Value::Native(NativeValue::Stream(
+                Stream::StdinBuffer,
+            ))));
         }
         if let Some(NativeValue::BuiltinType(builtin)) = owner.native_value() {
             if let Some(value) = self.state.types.attribute(builtin.id(), name)? {
