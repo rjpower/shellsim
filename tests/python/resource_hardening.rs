@@ -390,3 +390,46 @@ fn grouped_formats_reserve_before_growth() {
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn complex_values_are_metered_heap_allocations() {
+    // The same list of inline floats fits; each complex adds a metered arena object.
+    let limits = Limits {
+        memory: 1024 * 1024,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, _, _) = run_with_limits(
+        "values = [float(i) for i in range(20000)]\nprint(len(values))",
+        limits,
+    );
+    assert_eq!((status, stdout), (0, b"20000\n".to_vec()));
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "values = [complex(i, i) for i in range(20000)]\nprint(len(values))",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 1024 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn complex_arrays_reserve_element_storage_before_allocation() {
+    let limits = Limits {
+        memory: 64 * 1024,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, _, _) = run_with_limits(
+        "import numpy as np\nprint(np.zeros(100, dtype=complex).sum())",
+        limits,
+    );
+    assert_eq!((status, stdout), (0, b"0j\n".to_vec()));
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\nnp.zeros(100000, dtype=complex)",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 64 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}

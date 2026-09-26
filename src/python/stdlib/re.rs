@@ -51,6 +51,7 @@ pub(in crate::python) static PATTERN_TYPE: NativeTypeDef = NativeTypeDef {
             call: pattern_sub,
         },
     ],
+    getters: &[],
 };
 
 pub(in crate::python) static MATCH_TYPE: NativeTypeDef = NativeTypeDef {
@@ -77,6 +78,7 @@ pub(in crate::python) static MATCH_TYPE: NativeTypeDef = NativeTypeDef {
             call: match_end,
         },
     ],
+    getters: &[],
 };
 
 fn pattern_search(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

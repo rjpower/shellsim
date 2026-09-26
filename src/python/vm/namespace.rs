@@ -91,6 +91,7 @@ impl Vm<'_> {
                 "bool" => Some(BuiltinType::Bool),
                 "int" => Some(BuiltinType::Int),
                 "float" => Some(BuiltinType::Float),
+                "complex" => Some(BuiltinType::Complex),
                 "str" => Some(BuiltinType::String),
                 "bytes" => Some(BuiltinType::Bytes),
                 "bytearray" => Some(BuiltinType::ByteArray),
@@ -179,6 +180,11 @@ impl Vm<'_> {
                 "KeyError" => {
                     return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
                         "KeyError",
+                    ))))
+                }
+                "AttributeError" => {
+                    return Some(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                        "AttributeError",
                     ))))
                 }
                 "IndexError" => {

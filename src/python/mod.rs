@@ -7,6 +7,7 @@
 mod ast;
 mod bytecode;
 mod compiler;
+mod complex;
 mod filesystem;
 mod heap;
 mod http;

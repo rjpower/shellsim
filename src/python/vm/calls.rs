@@ -877,6 +877,7 @@ impl Vm<'_> {
                             entries.len()
                         }
                         Object::BigInt(_)
+                        | Object::Complex { .. }
                         | Object::String(_)
                         | Object::Bytes(_)
                         | Object::ByteArray(_)

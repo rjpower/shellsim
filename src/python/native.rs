@@ -57,10 +57,15 @@ pub(super) struct ValueKindSlots {
 }
 
 /// Static registration for a type-erased, inline Python value.
+///
+/// `methods` and `getters` are installed on the registered Python type exactly like the tables of
+/// a [`NativeTypeDef`]; the payload stays opaque to the runtime.
 pub(super) struct ValueKindDef {
     pub name: &'static str,
     pub construct: NativeFn,
     pub slots: ValueKindSlots,
+    pub methods: &'static [MethodDef],
+    pub getters: &'static [GetterDef],
 }
 
 impl PartialEq for ValueKindDef {
@@ -178,6 +183,7 @@ pub(super) enum PyKind {
     Generator,
     Module,
     Array,
+    Complex,
     Native,
 }
 
@@ -234,9 +240,13 @@ pub(super) enum PyMarker {
     UnitTestBase,
     Environment,
     Stdin,
+    /// `sys.stdin.buffer`: the standard-input descriptor read as raw bytes.
+    StdinBuffer,
     Stdout,
     Stderr,
     ArrayType,
+    /// The builtin `complex` type, re-exported as `numpy.complex128`.
+    ComplexType,
 }
 
 /// Explicit access to shellsim's virtual clock and CPU-time counters.
@@ -432,6 +442,10 @@ pub(super) trait PyRuntime {
     fn replace_bytearray_items(&mut self, value: PyByteArray, items: Vec<u8>) -> PyResult<()>;
     fn is_integer_type(&self, value: &PyValue) -> bool;
     fn is_string_type(&self, value: &PyValue) -> bool;
+    /// View a builtin `bool`, `int`, `float`, or `complex` without copying its storage.
+    fn number(&self, value: &PyValue) -> Option<super::number::NumberRef<'_>>;
+    /// Allocate a builtin `complex` in the metered object arena.
+    fn new_complex(&mut self, real: f64, imag: f64) -> PyResult<PyValue>;
     /// Return an exact decimal rendering for any Python integer representation.
     fn integer_text(&self, value: &PyValue) -> PyResult<Option<String>>;
     /// Write only to an interpreter-owned simulated stream marker.
@@ -637,6 +651,7 @@ pub(super) trait PyRuntime {
             PyKind::Generator => "generator",
             PyKind::Module => "module",
             PyKind::Array => "numpy.ndarray",
+            PyKind::Complex => "complex",
             PyKind::Native => "object",
         })
     }
@@ -1294,10 +1309,44 @@ impl PartialEq for MethodDef {
 
 impl Eq for MethodDef {}
 
-/// Method table for an interpreter-defined native object type.
+/// Uniform implementation type for a native data attribute read from its receiver.
+pub(super) type NativeGetterFn = fn(&mut dyn PyRuntime, PyValue) -> PyResult;
+
+/// A read-only data attribute computed from its receiver, e.g. `int.real` or `ndarray.shape`.
+///
+/// Getters are data descriptors: attribute lookup on an instance calls `get` with the instance
+/// before consulting any instance attributes, lookup through the type object returns the
+/// descriptor itself, and assignment raises `AttributeError`. There are no native setters.
+pub(super) struct GetterDef {
+    /// Python type name used in descriptor reprs and error messages.
+    pub owner: &'static str,
+    pub name: &'static str,
+    pub get: NativeGetterFn,
+}
+
+impl fmt::Debug for GetterDef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "<attribute '{}' of '{}' objects>",
+            self.name, self.owner
+        )
+    }
+}
+
+impl PartialEq for GetterDef {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner && self.name == other.name
+    }
+}
+
+impl Eq for GetterDef {}
+
+/// Method and data-attribute tables for an interpreter-defined native object type.
 pub(super) struct NativeTypeDef {
     pub name: &'static str,
     pub methods: &'static [MethodDef],
+    pub getters: &'static [GetterDef],
 }
 
 /// Static values supported directly by declarative module definitions.

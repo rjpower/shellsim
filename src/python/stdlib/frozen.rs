@@ -11,7 +11,6 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "abc" => Some(include_str!("source/abc.py")),
         "base64" => Some(include_str!("source/base64.py")),
         "codecs" => Some(include_str!("source/codecs.py")),
-        "_complex" => Some(include_str!("source/complex.py")),
         "cmath" => Some(include_str!("source/cmath.py")),
         "csv" => Some(include_str!("source/csv.py")),
         "datetime" => Some(include_str!("source/datetime.py")),

@@ -78,6 +78,7 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "islower", string_islower),
         method("str", "isupper", string_isupper),
     ],
+    getters: &[],
 };
 
 pub(crate) static BYTES_TYPE: NativeTypeDef = NativeTypeDef {
@@ -93,6 +94,7 @@ pub(crate) static BYTES_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytes", "rpartition", bytes_rpartition),
         method("bytes", "center", bytes_center),
     ],
+    getters: &[],
 };
 
 pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
@@ -109,6 +111,7 @@ pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytearray", "center", bytes_center),
         method("bytearray", "reverse", bytearray_reverse),
     ],
+    getters: &[],
 };
 
 pub(crate) static LIST_TYPE: NativeTypeDef = NativeTypeDef {
@@ -126,6 +129,7 @@ pub(crate) static LIST_TYPE: NativeTypeDef = NativeTypeDef {
         method("list", "sort", list_sort),
         method("list", "copy", list_copy),
     ],
+    getters: &[],
 };
 
 pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
@@ -140,6 +144,7 @@ pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
         method("dict", "pop", dict_pop),
         method("dict", "copy", dict_copy),
     ],
+    getters: &[],
 };
 
 pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
@@ -152,6 +157,7 @@ pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
         method("set", "union", set_union),
         method("set", "copy", set_copy),
     ],
+    getters: &[],
 };
 
 pub(crate) static FROZENSET_TYPE: NativeTypeDef = NativeTypeDef {
@@ -160,16 +166,19 @@ pub(crate) static FROZENSET_TYPE: NativeTypeDef = NativeTypeDef {
         method("frozenset", "union", set_union),
         method("frozenset", "copy", set_copy),
     ],
+    getters: &[],
 };
 
 pub(crate) static PROPERTY_TYPE: NativeTypeDef = NativeTypeDef {
     name: "property",
     methods: &[method("property", "setter", property_setter)],
+    getters: &[],
 };
 
 pub(crate) static TYPE_TYPE: NativeTypeDef = NativeTypeDef {
     name: "type",
     methods: &[method("type", "__new__", type_new)],
+    getters: &[],
 };
 
 pub(crate) static GENERATOR_TYPE: NativeTypeDef = NativeTypeDef {
@@ -180,6 +189,7 @@ pub(crate) static GENERATOR_TYPE: NativeTypeDef = NativeTypeDef {
         method("generator", "throw", generator_throw),
         method("generator", "close", generator_close),
     ],
+    getters: &[],
 };
 
 const fn method(

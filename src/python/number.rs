@@ -8,7 +8,10 @@ use num_traits::{Signed, ToPrimitive, Zero};
 
 use super::ast::{BinaryOperator, ComparisonOperator};
 use super::heap::{Heap, InstancePayload, Object};
-use super::native::{CallArgs, FromPyValue, PyError, PyResult, PyRuntime, PyValue};
+use super::native::{
+    CallArgs, FromPyValue, GetterDef, MethodDef, NativeTypeDef, PyError, PyResult, PyRuntime,
+    PyValue,
+};
 use super::ValueTag;
 
 /// Borrowed numeric payload used by VM protocols without exposing physical value tags.
@@ -17,6 +20,8 @@ pub(super) enum NumberRef<'a> {
     Int(i64),
     BigInt(&'a BigInt),
     Float(f64),
+    /// Real and imaginary components of a builtin `complex`.
+    Complex(f64, f64),
 }
 
 /// Resolve Python numeric storage into one semantic numeric view.
@@ -32,6 +37,7 @@ pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>>
     }
     match value.object_id().and_then(|id| heap.get(id).ok())? {
         Object::BigInt(value) => Some(NumberRef::BigInt(value)),
+        Object::Complex { real, imag } => Some(NumberRef::Complex(*real, *imag)),
         Object::Instance {
             payload: InstancePayload::Int(value),
             ..
@@ -40,40 +46,129 @@ pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>>
     }
 }
 
+/// Numeric-tower attributes shared by one builtin real number type.
+///
+/// `int` and `bool` also expose the `numbers.Rational` accessors. Results follow CPython:
+/// `True.real` is the integer `1`, `(3).imag` is `0`, and `(1.5).imag` is `0.0`.
+macro_rules! real_number_type {
+    ($name:literal, rational) => {
+        NativeTypeDef {
+            name: $name,
+            methods: &[MethodDef {
+                type_name: $name,
+                name: "conjugate",
+                call: real_conjugate,
+            }],
+            getters: &[
+                GetterDef {
+                    owner: $name,
+                    name: "real",
+                    get: real_part,
+                },
+                GetterDef {
+                    owner: $name,
+                    name: "imag",
+                    get: real_imaginary_part,
+                },
+                GetterDef {
+                    owner: $name,
+                    name: "numerator",
+                    get: real_part,
+                },
+                GetterDef {
+                    owner: $name,
+                    name: "denominator",
+                    get: integer_denominator,
+                },
+            ],
+        }
+    };
+    ($name:literal) => {
+        NativeTypeDef {
+            name: $name,
+            methods: &[MethodDef {
+                type_name: $name,
+                name: "conjugate",
+                call: real_conjugate,
+            }],
+            getters: &[
+                GetterDef {
+                    owner: $name,
+                    name: "real",
+                    get: real_part,
+                },
+                GetterDef {
+                    owner: $name,
+                    name: "imag",
+                    get: real_imaginary_part,
+                },
+            ],
+        }
+    };
+}
+
+pub(super) static BOOL_TYPE: NativeTypeDef = real_number_type!("bool", rational);
+pub(super) static INT_TYPE: NativeTypeDef = real_number_type!("int", rational);
+pub(super) static FLOAT_TYPE: NativeTypeDef = real_number_type!("float");
+
+/// Return a real number as itself, normalizing `bool` to the equal `int`.
+fn real_part(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+    Ok(match value.bool_value() {
+        Some(value) => PyValue::Int(i64::from(value)),
+        None => value,
+    })
+}
+
+/// Return the zero imaginary component with the receiver's int-or-float result type.
+fn real_imaginary_part(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+    Ok(if value.float_value().is_some() {
+        PyValue::Float(0.0)
+    } else {
+        PyValue::Int(0)
+    })
+}
+
+fn integer_denominator(_runtime: &mut dyn PyRuntime, _value: PyValue) -> PyResult {
+    Ok(PyValue::Int(1))
+}
+
+fn real_conjugate(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("conjugate", 0, 0)?;
+    args.reject_keywords("conjugate")?;
+    real_part(runtime, value)
+}
+
 /// Return the exact index value accepted by sequence protocols.
 pub(super) fn index<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>> {
     match view(heap, value)? {
         value @ (NumberRef::Int(_) | NumberRef::BigInt(_)) => Some(value),
-        NumberRef::Float(_) => None,
+        NumberRef::Float(_) | NumberRef::Complex(..) => None,
     }
 }
 
-/// Coerce a real numeric value to `f64`, rejecting non-numeric storage.
+/// Coerce a real numeric value to `f64`, rejecting complex and non-numeric storage.
 pub(super) fn as_f64(heap: &Heap, value: &PyValue) -> Option<f64> {
     match view(heap, value)? {
         NumberRef::Int(value) => Some(value as f64),
         NumberRef::BigInt(value) => num_traits::ToPrimitive::to_f64(value),
         NumberRef::Float(value) => Some(value),
+        NumberRef::Complex(..) => None,
     }
 }
 
-/// Construct a capability-free complex value through the frozen Python class.
+/// Whether a value is a builtin `complex`, for real-only paths that reject it explicitly.
+pub(super) fn is_complex(heap: &Heap, value: &PyValue) -> bool {
+    matches!(view(heap, value), Some(NumberRef::Complex(..)))
+}
+
+/// Allocate a builtin complex value, e.g. for an imaginary literal or a negative base raised
+/// to a fractional power.
 pub(super) fn create_complex(
     runtime: &mut dyn PyRuntime,
     real: f64,
     imaginary: f64,
 ) -> PyResult<PyValue> {
-    let module = runtime.import_module("_complex")?;
-    let constructor = runtime
-        .get_attribute(module, "complex")?
-        .ok_or_else(|| PyError::runtime_error("complex type is unavailable"))?;
-    runtime.call_value(
-        constructor,
-        CallArgs::new(
-            vec![PyValue::Float(real), PyValue::Float(imaginary)],
-            Vec::new(),
-        ),
-    )
+    runtime.new_complex(real, imaginary)
 }
 
 /// Parse the textual forms accepted by the bounded `int` constructor.

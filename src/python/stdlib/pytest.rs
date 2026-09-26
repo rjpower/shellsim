@@ -20,6 +20,7 @@ pub(crate) static RAISES_CONTEXT_TYPE: NativeTypeDef = NativeTypeDef {
             call: raises_exit,
         },
     ],
+    getters: &[],
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {

@@ -54,6 +54,7 @@ pub(crate) static ARGUMENT_PARSER_TYPE: NativeTypeDef = NativeTypeDef {
             call: print_help,
         },
     ],
+    getters: &[],
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {

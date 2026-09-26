@@ -17,6 +17,7 @@ pub(crate) static ENVIRONMENT_TYPE: NativeTypeDef = NativeTypeDef {
         name: "get",
         call: environment_get,
     }],
+    getters: &[],
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {

@@ -50,7 +50,9 @@ pub fn repr(heap: &Heap, value: &Value) -> Result<String, String> {
 pub fn int_value(heap: &Heap, value: &Value) -> Option<i64> {
     match super::number::index(heap, value)? {
         super::number::NumberRef::Int(value) => Some(value),
-        super::number::NumberRef::BigInt(_) | super::number::NumberRef::Float(_) => None,
+        super::number::NumberRef::BigInt(_)
+        | super::number::NumberRef::Float(_)
+        | super::number::NumberRef::Complex(..) => None,
     }
 }
 
@@ -242,6 +244,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::ClassMethod { .. } => "<classmethod ...>",
                 Object::Super { .. } => "<super ...>",
                 Object::BigInt(_) => "<int ...>",
+                Object::Complex { .. } => "<complex ...>",
             }
             .into());
         }
@@ -355,6 +358,9 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::ClassMethod { .. } => "<classmethod>".into(),
             Object::Super { .. } => "<super>".into(),
             Object::BigInt(value) => value.to_string(),
+            Object::Complex { real, imag } => {
+                super::complex::repr(super::complex::Complex::new(*real, *imag))
+            }
         };
         active.remove(&id);
         return Ok(rendered);
@@ -407,6 +413,7 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         Object::Slice { .. } => true,
         Object::Dict(entries) | Object::DefaultDict { entries, .. } => !entries.is_empty(),
         Object::BigInt(value) => !value.is_zero(),
+        Object::Complex { real, imag } => *real != 0.0 || *imag != 0.0,
         Object::Range { start, stop, step } => {
             (*step > 0 && *start < *stop) || (*step < 0 && *start > *stop)
         }
@@ -610,6 +617,9 @@ fn equals_inner(
 }
 
 fn scalar_equality(heap: &Heap, left: &Value, right: &Value) -> Result<Option<bool>, String> {
+    if let Some(equal) = complex_equality(heap, left, right) {
+        return Ok(Some(equal));
+    }
     if let Some(left) = bigint_value(heap, left) {
         if let Some(right) = bigint_value(heap, right) {
             return Ok(Some(left == right));
@@ -669,6 +679,34 @@ fn scalar_equality(heap: &Heap, left: &Value, right: &Value) -> Result<Option<bo
         return Ok(Some(left == right));
     }
     Ok(None)
+}
+
+/// Compare a builtin `complex` with any value. Real numbers compare equal only to a zero
+/// imaginary part and an exactly equal real part, as in CPython. Returns `None` when neither
+/// operand is complex.
+fn complex_equality(heap: &Heap, left: &Value, right: &Value) -> Option<bool> {
+    use super::number::{view, NumberRef};
+    let (left, right) = (view(heap, left), view(heap, right));
+    let ((real, imag), other) = match (left, right) {
+        (Some(NumberRef::Complex(real, imag)), other)
+        | (other, Some(NumberRef::Complex(real, imag))) => ((real, imag), other),
+        _ => return None,
+    };
+    let exact_integer = |integer: BigInt| {
+        imag == 0.0
+            && real.is_finite()
+            && real.fract() == 0.0
+            && BigInt::from_f64(real).is_some_and(|real| real == integer)
+    };
+    Some(match other {
+        Some(NumberRef::Complex(other_real, other_imag)) => {
+            real == other_real && imag == other_imag
+        }
+        Some(NumberRef::Float(other)) => imag == 0.0 && real == other,
+        Some(NumberRef::Int(other)) => exact_integer(BigInt::from(other)),
+        Some(NumberRef::BigInt(other)) => exact_integer(other.clone()),
+        None => false,
+    })
 }
 
 fn sequence_equal(
@@ -840,7 +878,7 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::StaticMethod { .. }
             | Object::ClassMethod { .. }
             | Object::Super { .. } => Err("object is not a container".into()),
-            Object::BigInt(_) => Err("object is not a container".into()),
+            Object::BigInt(_) | Object::Complex { .. } => Err("object is not a container".into()),
         },
         None => Err("object is not a container".into()),
     }
