@@ -601,3 +601,33 @@ fn arithmetic_matches_bash_operators_errors_and_loops() {
         3
     );
 }
+
+#[test]
+fn pipestatus_follows_the_last_pipeline_like_bash() {
+    // Expected values recorded from GNU bash 5.3. Compound commands do not set PIPESTATUS
+    // themselves; the last simple command, subshell, arithmetic command, or pipeline does.
+    let cases = [
+        ("false | true", "1 0"),
+        ("false | true; true", "0"),
+        ("{ false | true; }", "1 0"),
+        ("(exit 3) | (exit 4)", "3 4"),
+        ("! false | false", "1 1"),
+        ("if false | true; then :; fi", "0"),
+        ("x=$(exit 5)", "5"),
+        ("for i in 1; do false | true; done", "1 0"),
+        ("f() { false | true; }; f", "0"),
+        ("(exit 3)", "3"),
+        ("while false; do :; done", "1"),
+        ("[[ 1 == 2 ]]", "1"),
+        ("(( 0 ))", "1"),
+        ("true | { false | true; }", "0 0"),
+    ];
+    for (script, expected) in cases {
+        let (_, stdout, stderr) = run(&format!("{script}; echo \"${{PIPESTATUS[@]}}\""));
+        assert_eq!(
+            (stdout.trim_end(), stderr.as_str()),
+            (expected, ""),
+            "{script}"
+        );
+    }
+}

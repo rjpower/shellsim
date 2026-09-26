@@ -139,3 +139,32 @@ fn unsupported_host_import_is_rejected_before_execution() {
         "{error}"
     );
 }
+
+#[test]
+fn session_guest_clock_wait_advances_the_session_clock() {
+    let mut environment = Environment::with_limits(Limits::default());
+    let guest = wat::parse_str(
+        r#"(module
+            (import "wasi_snapshot_preview1" "poll_oneoff" (func $poll (param i32 i32 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+            (memory (export "memory") 1)
+            (func (export "_start")
+                (i32.store (i32.const 16) (i32.const 1))
+                (i64.store (i32.const 24) (i64.const 3000000000))
+                (call $exit (call $poll (i32.const 0) (i32.const 100) (i32.const 1) (i32.const 200)))))"#,
+    )
+    .unwrap();
+    environment
+        .vfs
+        .write("/", "/sleeper", &guest, 0o755)
+        .unwrap();
+    let mut session = WasmSession::start(environment, "/sleeper", &[]).unwrap();
+    let status = loop {
+        if let SessionPoll::Ready(status) = session.poll() {
+            break status;
+        }
+    };
+    assert_eq!(status, 0);
+    let result = session.into_result().unwrap();
+    assert_eq!(result.environment.clock.monotonic_ns(), 3_000_000_000);
+}

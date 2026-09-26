@@ -147,9 +147,11 @@ write to a pipe with no reader ends the guest with status 141. Fuel yields keep 
 guest from starving other processes, and consumed fuel counts against the machine's CPU budget
 while the guest runs. A harness fork taken while a guest is running gets a copy of that process
 that fails with status 126 and a diagnostic, since a live Wasmtime stack cannot be cloned.
+Clock subscriptions to `poll_oneoff`, which back libc `sleep` and `nanosleep`, block the guest on
+virtual time like the native `sleep` command.
 
-This is not full WASI process support. `poll_oneoff`, sockets, and guest process creation remain
-unsupported. No C compiler is installed by default. The engine accepts Wasm
+This is not full WASI process support. Descriptor subscriptions to `poll_oneoff` fail with
+`ENOTSUP`; sockets and guest process creation remain unsupported. No C compiler is installed by default. The engine accepts Wasm
 exception instructions. A pinned external TinyCC package and permissively licensed wasi-libc
 sysroot can be installed into the VFS by a caller; integration tests compile and run C programs
 through that virtual toolchain. This is a tested subset of libc, not full POSIX support. A prebuilt

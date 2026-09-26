@@ -769,3 +769,66 @@ fn guests_in_one_pipeline_share_the_machine_cpu_budget() {
     // the pair near the machine limit instead of letting each spend it separately.
     assert!(environment.resources.cpu_used() <= 2_000_000 + 100_000);
 }
+
+/// Polls two monotonic clock subscriptions (userdata 7 after `first_ns`, userdata 9 after five
+/// seconds), prints "done", and exits with `10 * nevents + first userdata`, or with the errno.
+/// `tag` sets the first subscription's type, so 1 requests fd readiness instead of a clock.
+fn sleeper(tag: u8, first_ns: u64) -> String {
+    format!(
+        r#"(module
+            (import "wasi_snapshot_preview1" "poll_oneoff" (func $poll (param i32 i32 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 400) "done\n")
+            (func (export "_start") (local $errno i32)
+                (i64.store (i32.const 0) (i64.const 7))
+                (i32.store8 (i32.const 8) (i32.const {tag}))
+                (i32.store (i32.const 16) (i32.const 1))
+                (i64.store (i32.const 24) (i64.const {first_ns}))
+                (i64.store (i32.const 48) (i64.const 9))
+                (i32.store (i32.const 64) (i32.const 1))
+                (i64.store (i32.const 72) (i64.const 5000000000))
+                (local.set $errno (call $poll (i32.const 0) (i32.const 200) (i32.const 2) (i32.const 300)))
+                (if (local.get $errno) (then (call $exit (local.get $errno))))
+                (i32.store (i32.const 500) (i32.const 400))
+                (i32.store (i32.const 504) (i32.const 5))
+                (drop (call $write (i32.const 1) (i32.const 500) (i32.const 1) (i32.const 508)))
+                (call $exit (i32.add
+                    (i32.mul (i32.load (i32.const 300)) (i32.const 10))
+                    (i32.load (i32.const 200))))))"#
+    )
+}
+
+#[test]
+fn guest_clock_wait_blocks_on_virtual_time_while_the_shell_runs() {
+    let mut environment = Environment::new();
+    install(&mut environment, &sleeper(0, 2_000_000_000));
+    assert_eq!(
+        run(
+            &mut environment,
+            "/app & sleep 1; echo mid; wait $!; echo $?"
+        ),
+        (0, b"mid\ndone\n17\n".to_vec(), Vec::new())
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 2_000_000_000);
+}
+
+#[test]
+fn timeout_interrupts_a_guest_clock_wait() {
+    let mut environment = Environment::new();
+    install(&mut environment, &sleeper(0, 10_000_000_000));
+    assert_eq!(
+        run(&mut environment, "timeout 1 /app; echo $?"),
+        (0, b"124\n".to_vec(), Vec::new())
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 1_000_000_000);
+}
+
+#[test]
+fn guest_descriptor_poll_is_explicitly_unsupported() {
+    let mut environment = Environment::new();
+    install(&mut environment, &sleeper(1, 0));
+    // WASI errno 58 is ENOTSUP.
+    assert_eq!(run(&mut environment, "/app"), (58, Vec::new(), Vec::new()));
+}

@@ -57,6 +57,10 @@ const ERRNO_NOENT: i32 = 44;
 const ERRNO_NOTDIR: i32 = 54;
 const ERRNO_NOTEMPTY: i32 = 55;
 const ERRNO_PERM: i32 = 63;
+const ERRNO_NOTSUP: i32 = 58;
+const MAX_POLL_SUBSCRIPTIONS: u32 = 64;
+const SUBSCRIPTION_BYTES: u32 = 48;
+const EVENT_BYTES: u32 = 32;
 /// Fuel a guest may consume between cooperative yields to the scheduler.
 const FUEL_YIELD_INTERVAL: u64 = 100_000;
 const ERRNO_NOSPC: i32 = 51;
@@ -1108,6 +1112,130 @@ fn fd_read(
     ))
 }
 
+/// A `poll_oneoff` clock subscription resolved to a monotonic deadline.
+struct ClockWait {
+    userdata: u64,
+    deadline: u64,
+}
+
+/// Decode `poll_oneoff` subscriptions. Only clock subscriptions are supported; descriptor
+/// readiness subscriptions fail with `ENOTSUP` rather than reporting readiness they cannot know.
+fn clock_waits(
+    caller: &mut Caller<'_, Host>,
+    input: u32,
+    count: u32,
+) -> Result<Vec<ClockWait>, i32> {
+    if count == 0 || count > MAX_POLL_SUBSCRIPTIONS {
+        return Err(ERRNO_INVAL);
+    }
+    let memory = memory(caller).ok_or(ERRNO_FAULT)?;
+    let mut bytes = vec![0; (count * SUBSCRIPTION_BYTES) as usize];
+    memory
+        .read(&*caller, input as usize, &mut bytes)
+        .map_err(|_| ERRNO_FAULT)?;
+    let system = ActiveSystem::new(caller.data_mut().machine.get());
+    let now = system
+        .clock_time_ns(ClockId::Monotonic)
+        .map_err(|error| syscall_errno(&error))?;
+    let field = |record: &[u8], offset: usize, width: usize| {
+        let mut value = [0; 8];
+        value[..width].copy_from_slice(&record[offset..offset + width]);
+        u64::from_le_bytes(value)
+    };
+    bytes
+        .chunks_exact(SUBSCRIPTION_BYTES as usize)
+        .map(|record| {
+            match record[8] {
+                0 => {}
+                1 | 2 => return Err(ERRNO_NOTSUP),
+                _ => return Err(ERRNO_INVAL),
+            }
+            let timeout = field(record, 24, 8);
+            let absolute = field(record, 40, 2) & 1 != 0;
+            let deadline = match (field(record, 16, 4), absolute) {
+                (0 | 1, false) => now.saturating_add(timeout),
+                (1, true) => timeout,
+                (0, true) => {
+                    let realtime = system
+                        .clock_time_ns(ClockId::Realtime)
+                        .map_err(|error| syscall_errno(&error))?;
+                    now.saturating_add(timeout.saturating_sub(realtime))
+                }
+                _ => return Err(ERRNO_INVAL),
+            };
+            Ok(ClockWait {
+                userdata: field(record, 0, 8),
+                deadline,
+            })
+        })
+        .collect()
+}
+
+/// Sleep until the earliest clock subscription expires, then report every expired one.
+///
+/// A scheduled process blocks on a virtual timer like native `sleep`, so other processes run and
+/// a signal can end the wait. A display session has no other processes, so it advances its own
+/// virtual clock to the deadline.
+async fn poll_oneoff(
+    mut caller: Caller<'_, Host>,
+    (input, output, count, result): (u32, u32, u32, u32),
+) -> Result<i32, Error> {
+    let waits = match clock_waits(&mut caller, input, count) {
+        Ok(waits) => waits,
+        Err(error) => return Ok(error),
+    };
+    let deadline = waits
+        .iter()
+        .map(|wait| wait.deadline)
+        .min()
+        .expect("count > 0");
+    let mut scheduled = false;
+    let now = loop {
+        let host = caller.data_mut();
+        let buffered = matches!(host.stdio, Stdio::Buffered { .. });
+        let interp = host.machine.get();
+        let now = interp.clock.monotonic_ns();
+        if now >= deadline {
+            break now;
+        }
+        if buffered {
+            if interp.clock.advance_to(deadline).is_err() {
+                return Ok(ERRNO_INVAL);
+            }
+            continue;
+        }
+        if !scheduled {
+            if let Err(error) = ActiveSystem::new(interp).schedule_wake(deadline - now) {
+                return Ok(syscall_errno(&error));
+            }
+            scheduled = true;
+        }
+        let machine = host.machine.clone();
+        machine
+            .suspend(Suspension::Blocked(WaitReason::Timer(deadline)))
+            .await;
+    };
+    let Some(memory) = memory(&mut caller) else {
+        return Ok(ERRNO_FAULT);
+    };
+    let mut events = 0u32;
+    for wait in waits.iter().filter(|wait| wait.deadline <= now) {
+        // Event layout: userdata, errno (0), and event type (0 = clock); the rest is zero.
+        let mut event = [0; EVENT_BYTES as usize];
+        event[..8].copy_from_slice(&wait.userdata.to_le_bytes());
+        let address = output as usize + (events * EVENT_BYTES) as usize;
+        if memory.write(&mut caller, address, &event).is_err() {
+            return Ok(ERRNO_FAULT);
+        }
+        events += 1;
+    }
+    Ok(if write_u32(&mut caller, result, events) {
+        ERRNO_SUCCESS
+    } else {
+        ERRNO_FAULT
+    })
+}
+
 /// `fd_read` or `fd_write`: descriptor, iovec array, iovec count, and result address.
 type StreamFn = fn(&mut Caller<'_, Host>, i32, u32, u32, u32) -> Result<StreamCall, Error>;
 
@@ -1343,6 +1471,11 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
                 })
             },
         )
+        .expect("unique WASI import");
+    linker
+        .func_wrap_async("wasi_snapshot_preview1", "poll_oneoff", |caller, params| {
+            Box::new(poll_oneoff(caller, params))
+        })
         .expect("unique WASI import");
     linker
 }
