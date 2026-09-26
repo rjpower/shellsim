@@ -13,6 +13,7 @@ use crate::syscalls::{ActiveSystem, SyscallError, System};
 mod cat;
 mod env;
 mod head;
+mod make;
 mod nice;
 mod nohup;
 mod sleep;
@@ -142,6 +143,7 @@ pub(crate) enum NativeProcess {
     Timeout(timeout::TimeoutProcess),
     Nohup(nohup::NohupProcess),
     Nice(nice::NiceProcess),
+    Make(Box<make::MakeProcess>),
     Failure {
         status: i32,
         message: Vec<u8>,
@@ -308,6 +310,9 @@ impl NativeProcess {
     pub(crate) fn trust(&self) -> crate::telemetry::CommandTrust {
         match self {
             Self::SystemCommand(command) => command.trust,
+            // `make` deliberately supports only a documented subset: no pattern rules, no
+            // includes, no order-only prerequisites, and recipes always run serially.
+            Self::Make(_) => crate::telemetry::CommandTrust::Partial,
             _ => crate::telemetry::CommandTrust::Real,
         }
     }
@@ -354,6 +359,9 @@ impl NativeProcess {
             }
             crate::vfs::NativeProgram::Nohup => Self::Nohup(nohup::NohupProcess::new(&argv[1..])),
             crate::vfs::NativeProgram::Nice => Self::Nice(nice::NiceProcess::new(&argv[1..])),
+            crate::vfs::NativeProgram::Make => {
+                Self::Make(Box::new(make::MakeProcess::new(&argv[1..])))
+            }
             crate::vfs::NativeProgram::Registered(path) => {
                 let Some(command) = crate::commands::system_command(path) else {
                     return Self::failure(
@@ -409,6 +417,7 @@ impl NativeProcess {
             Self::Timeout(timeout) => timeout.poll(syscalls),
             Self::Nohup(nohup) => nohup.poll(syscalls),
             Self::Nice(nice) => nice.poll(syscalls),
+            Self::Make(make) => make.poll(syscalls),
             Self::Failure {
                 status,
                 message,

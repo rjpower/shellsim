@@ -32,7 +32,7 @@ pub(crate) mod fs;
 pub(crate) mod git;
 mod grep;
 mod hashing;
-mod makecmd;
+pub(crate) mod makecmd;
 mod net;
 pub(crate) mod options;
 pub(crate) mod patch;
@@ -511,7 +511,6 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     fs::register(&mut m);
     git::register(&mut m);
     hashing::register(&mut m);
-    makecmd::register(&mut m);
     net::register(&mut m);
     patch::register(&mut m);
     proc::register(&mut m);
