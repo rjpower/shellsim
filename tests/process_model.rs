@@ -1111,3 +1111,12 @@ fn builtin_writer_to_a_closed_pipe_dies_of_sigpipe() {
     assert_eq!((status, stdout.as_str()), (0, "1\n"));
     assert!(stderr.contains("broken pipe"), "{stderr}");
 }
+
+#[test]
+fn pipeline_stage_with_long_command_text_runs() {
+    let mut env = Environment::new();
+    let literal = "a".repeat(10_000);
+    let (status, stdout, stderr) = run(&mut env, &format!("printf %s {literal} | wc -c"));
+    assert_eq!(status, 0, "{}", &stderr[..stderr.len().min(200)]);
+    assert_eq!(stdout, "10000\n");
+}

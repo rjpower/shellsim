@@ -37,6 +37,18 @@ pub(crate) fn command_label(argv: &[String]) -> String {
     label
 }
 
+/// Truncate a diagnostic process label to the label limit at a character boundary.
+fn truncate_label(command: &str) -> &str {
+    if command.len() <= MAX_COMMAND_BYTES {
+        return command;
+    }
+    let mut end = MAX_COMMAND_BYTES;
+    while !command.is_char_boundary(end) {
+        end -= 1;
+    }
+    &command[..end]
+}
+
 /// Standard signals modeled by shellsim's process and shell-disposition layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Signal {
@@ -270,9 +282,10 @@ impl ProcessTable {
         cwd: &str,
         environment: BTreeMap<String, String>,
     ) -> Option<ProcessId> {
-        if self.records.len() >= MAX_PROCESSES || command.len() > MAX_COMMAND_BYTES {
+        if self.records.len() >= MAX_PROCESSES {
             return None;
         }
+        let command = truncate_label(command);
         let pid = self.next_pid;
         self.next_pid = self.next_pid.checked_add(1)?;
         let parent = self.records.get(&ppid)?;
@@ -436,6 +449,19 @@ impl ProcessTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_truncates_long_labels_at_a_character_boundary() {
+        let mut table = ProcessTable::new(1, "/".to_string(), BTreeMap::new());
+        let command = format!("{}é", "a".repeat(MAX_COMMAND_BYTES - 1));
+        let pid = table
+            .spawn(1, ChildPlacement::Inherit, &command, "/", BTreeMap::new())
+            .expect("a long label must not prevent process creation");
+        assert_eq!(
+            table.get(pid).unwrap().command,
+            "a".repeat(MAX_COMMAND_BYTES - 1)
+        );
+    }
 
     #[test]
     fn user_signals_accept_names_prefixes_and_numbers() {
