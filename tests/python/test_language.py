@@ -597,3 +597,21 @@ def test_positional_only_parameters_reject_keywords():
         )
     else:
         raise AssertionError("a positional-only parameter was bound by keyword")
+
+
+def test_container_repr_uses_item_repr_and_marks_self_references():
+    class Item:
+        def __repr__(self):
+            return "Item()"
+
+        def __str__(self):
+            return "item"
+
+    values = [Item(), (Item(),), {Item(): [Item()]}, frozenset(), set()]
+    values.append(values)
+    assert repr(values) == "[Item(), (Item(),), {Item(): [Item()]}, frozenset(), set(), [...]]"
+    assert str([Item()]) == "[Item()]"
+    assert f"{(Item(), 1)}" == "(Item(), 1)"
+    mapping = {}
+    mapping["self"] = mapping
+    assert repr(mapping) == "{'self': {...}}"

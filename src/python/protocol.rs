@@ -284,7 +284,11 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 }
             }
             Object::Slice { start, stop, step } => {
-                format!("slice({start:?}, {stop:?}, {step:?})")
+                let bound = |bound: &Option<i64>| match bound {
+                    Some(value) => value.to_string(),
+                    None => "None".to_string(),
+                };
+                format!("slice({}, {}, {})", bound(start), bound(stop), bound(step))
             }
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 let mut rendered = Vec::with_capacity(entries.len());

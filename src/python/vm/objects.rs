@@ -1,5 +1,8 @@
 //! Runtime object operations for attributes, subscription, descriptors, classes, and types.
 
+use std::collections::BTreeSet;
+
+use super::super::heap::ObjectId;
 use super::{
     exception_types, expect_arity, protocol, range_length, select_string_slice, Arc,
     BuiltinSubscript, BuiltinType, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout,
@@ -7,6 +10,37 @@ use super::{
     NativeValue, Object, Ordering, PyError, PyErrorKind, PyRuntime, SlicePlan, Slot, SlotValue,
     SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
+
+/// Items of a builtin container whose `repr` the VM renders item by item.
+enum ContainerItems {
+    List(Vec<Value>),
+    Tuple(Vec<Value>),
+    Set(Vec<Value>),
+    FrozenSet(Vec<Value>),
+    Dict(Vec<(Value, Value)>),
+}
+
+impl ContainerItems {
+    fn len(&self) -> usize {
+        match self {
+            Self::List(items) | Self::Tuple(items) | Self::Set(items) | Self::FrozenSet(items) => {
+                items.len()
+            }
+            Self::Dict(entries) => entries.len(),
+        }
+    }
+
+    /// CPython's text for a container met again while rendering itself.
+    fn placeholder(&self) -> &'static str {
+        match self {
+            Self::List(_) => "[...]",
+            Self::Tuple(_) => "(...)",
+            Self::Set(_) => "set(...)",
+            Self::FrozenSet(_) => "frozenset(...)",
+            Self::Dict(_) => "{...}",
+        }
+    }
+}
 
 impl Vm<'_> {
     pub(super) fn load_attribute(&mut self, name: &str) -> Result<(), String> {
@@ -1621,11 +1655,82 @@ impl Vm<'_> {
     }
 
     pub(super) fn repr_value(&mut self, value: &Value) -> Result<String, String> {
+        self.repr_nested(value, &mut BTreeSet::new())
+    }
+
+    /// `repr()` that renders container items through their own `__repr__` and protocol slots,
+    /// as CPython does. `active` holds the containers being rendered, so a container that
+    /// contains itself prints as `[...]`.
+    fn repr_nested(
+        &mut self,
+        value: &Value,
+        active: &mut BTreeSet<ObjectId>,
+    ) -> Result<String, String> {
         if let Some(result) = self.invoke_slot(value, Slot::Repr, "__repr__", Vec::new())? {
             return protocol::string_value(&self.state.heap, &result)?
                 .ok_or_else(|| "__repr__ should return str".into());
         }
-        protocol::repr(&self.state.heap, value)
+        let Some((id, container)) = self.container_items(value)? else {
+            return protocol::repr(&self.state.heap, value);
+        };
+        if !active.insert(id) {
+            return Ok(container.placeholder().into());
+        }
+        self.charge_cpu(u64::try_from(container.len()).unwrap_or(u64::MAX))?;
+        let rendered = match container {
+            ContainerItems::List(items) => format!("[{}]", self.repr_items(&items, active)?),
+            ContainerItems::Tuple(items) => match items.as_slice() {
+                [only] => format!("({},)", self.repr_nested(only, active)?),
+                _ => format!("({})", self.repr_items(&items, active)?),
+            },
+            ContainerItems::Set(items) if items.is_empty() => "set()".into(),
+            ContainerItems::Set(items) => format!("{{{}}}", self.repr_items(&items, active)?),
+            ContainerItems::FrozenSet(items) if items.is_empty() => "frozenset()".into(),
+            ContainerItems::FrozenSet(items) => {
+                format!("frozenset({{{}}})", self.repr_items(&items, active)?)
+            }
+            ContainerItems::Dict(entries) => {
+                let mut parts = Vec::with_capacity(entries.len());
+                for (key, item) in &entries {
+                    let key = self.repr_nested(key, active)?;
+                    let item = self.repr_nested(item, active)?;
+                    parts.push(format!("{key}: {item}"));
+                }
+                format!("{{{}}}", parts.join(", "))
+            }
+        };
+        active.remove(&id);
+        Ok(rendered)
+    }
+
+    fn repr_items(
+        &mut self,
+        items: &[Value],
+        active: &mut BTreeSet<ObjectId>,
+    ) -> Result<String, String> {
+        let mut parts = Vec::with_capacity(items.len());
+        for item in items {
+            parts.push(self.repr_nested(item, active)?);
+        }
+        Ok(parts.join(", "))
+    }
+
+    /// A snapshot of a builtin container's items, for rendering them through the VM.
+    fn container_items(&self, value: &Value) -> Result<Option<(ObjectId, ContainerItems)>, String> {
+        let Some(id) = value.object_id() else {
+            return Ok(None);
+        };
+        let items = match self.state.heap.get(id)? {
+            Object::List(items) => ContainerItems::List(items.clone()),
+            Object::Tuple(items) => ContainerItems::Tuple(items.clone()),
+            Object::Set(items) => ContainerItems::Set(items.clone()),
+            Object::FrozenSet(items) => ContainerItems::FrozenSet(items.clone()),
+            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
+                ContainerItems::Dict(entries.iter().copied().collect())
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some((id, items)))
     }
 
     pub(super) fn display_value(&mut self, value: &Value) -> Result<String, String> {
@@ -1638,6 +1743,7 @@ impl Vm<'_> {
             .types
             .slot(self.type_id(value)?, Slot::Repr)?
             .is_some()
+            || self.container_items(value)?.is_some()
         {
             return self.repr_value(value);
         }
