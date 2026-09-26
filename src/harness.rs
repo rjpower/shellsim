@@ -509,7 +509,12 @@ impl RetainedAction {
 impl HarnessSession {
     /// Create an empty `/work` session and checkpoint its initial filesystem.
     pub fn new(limits: Limits) -> Self {
-        let mut environment = Environment::with_limits(limits);
+        Self::with_clock(limits, crate::realtime::ClockMode::Virtual)
+    }
+
+    /// Like [`HarnessSession::new`], booting the machine with the given clock mode.
+    pub fn with_clock(limits: Limits, clock: crate::realtime::ClockMode) -> Self {
+        let mut environment = Environment::with_limits_and_clock(limits, clock);
         let _ = environment.vfs.put_dir("/work", 0o755);
         environment.cwd = "/work".to_string();
         environment.set_var("PWD", "/work");

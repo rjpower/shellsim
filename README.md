@@ -136,7 +136,8 @@ result = environment.run_python("print('persistent VFS, fresh Python interpreter
 A machine runs on virtual time by default: when every process waits on a timer, the scheduler
 jumps the clock to the next deadline, so `sleep 3600` costs no host time and runs are
 reproducible. An embedder can boot a machine with
-`Environment::with_limits_and_clock(limits, ClockMode::RealTime)` for interactive demos. Its
+`Environment::with_limits_and_clock(limits, ClockMode::RealTime)`, or with the CLI's
+`--real-time` option, for interactive demos. Its
 clock then follows physical time from boot: shell, Python, and Wasm sleeps take real time, and
 clock reads report elapsed time. Polling never blocks in either mode. An idle real-time machine
 reports that it is blocked, and `Environment::host_wait_until` says how long to wait. Simulated
@@ -197,6 +198,11 @@ usage, and output bounds materialized stdout and stderr. The defaults are 10,000
 be correct within an order of magnitude. They bound runaway work and make runs comparable; they
 do not model allocator layouts or instruction timing exactly. Exhaustion is observable and never
 falls back to an ambient host implementation.
+
+Every CLI command that boots a machine accepts the same options: `--cpu`, `--memory`, `--disk`,
+and `--output` (counts accept `k`, `m`, or `g` suffixes), and `--real-time`. They may precede the
+command, as in `shellsim --cpu 1m -c 'make'`. Commands without script arguments (`shell`, `eval`,
+`serve`, `mcp`, `replay`) also accept them after the command name.
 
 For internals and contribution workflow, see [implementation](docs/implementation.md),
 [Python](docs/python.md), and [CONTRIBUTING.md](CONTRIBUTING.md).

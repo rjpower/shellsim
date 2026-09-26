@@ -1,46 +1,86 @@
 //! Resource-constrained shell simulator CLI.
 //!
 //! Usage:
-//!   shellsim -c '<command>'
-//!   shellsim run <script.sh> [args...]
-//!   shellsim shell [limits]
-//!   shellsim eval [--cpu N] [--memory N] [--disk N] [--output N] -c '<command>'
-//!   shellsim serve [--cpu N] [--memory N] [--disk N] [--output N]
-//!   shellsim mcp [--root PATH] [limits]
-//!   shellsim replay SCENARIO.ndjson [--root PATH] [--transcript PATH] [limits]
+//!   shellsim [MACHINE] -c '<command>' [args...]
+//!   shellsim [MACHINE] run <script.sh> [args...]
+//!   shellsim [MACHINE] shell [MACHINE]
+//!   shellsim [MACHINE] eval [MACHINE] -c '<command>'
+//!   shellsim [MACHINE] serve [MACHINE] [--root PATH]
+//!   shellsim [MACHINE] mcp [MACHINE] [--root PATH]
+//!   shellsim [MACHINE] replay SCENARIO.ndjson [MACHINE] [--root PATH] [--transcript PATH]
 //!   shellsim corpus MANIFEST.json
+//!
+//! MACHINE options configure the simulated machine and are parsed by [`MachineOptions`] for
+//! every command: `--cpu N`, `--memory N`, `--disk N`, `--output N` (counts accept k, m, or g
+//! suffixes), and `--real-time`, which boots the machine on the physical-time clock. They may
+//! precede the command; commands without script arguments also accept them afterwards.
 
 use std::process::exit;
 
-use shellsim::{Environment, Limits, RunOutcome};
+use shellsim::{realtime::ClockMode, Environment, Limits, RunOutcome};
+
+/// Configuration of the simulated machine, shared by every command that boots one.
+#[derive(Clone, Copy, Default)]
+struct MachineOptions {
+    limits: Limits,
+    clock: ClockMode,
+}
+
+impl MachineOptions {
+    /// Consume the machine option at `args[*index]` and any value it takes, leaving `index` on
+    /// the last consumed argument. Returns false, consuming nothing, for any other argument.
+    fn accept(&mut self, args: &[String], index: &mut usize) -> bool {
+        match args[*index].as_str() {
+            "--cpu" => self.limits.cpu = limit_value(args, index, "--cpu"),
+            "--memory" => self.limits.memory = limit_value(args, index, "--memory"),
+            "--disk" => self.limits.disk = limit_value(args, index, "--disk"),
+            "--output" => self.limits.output = limit_value(args, index, "--output"),
+            "--real-time" => self.clock = ClockMode::RealTime,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Consume leading machine options and return the index of the first other argument.
+    fn accept_leading(&mut self, args: &[String]) -> usize {
+        let mut index = 0;
+        while index < args.len() && self.accept(args, &mut index) {
+            index += 1;
+        }
+        index
+    }
+}
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        run_script(&read_stdin(), &[]);
-    }
-    match args[1].as_str() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut machine = MachineOptions::default();
+    let args = &args[machine.accept_leading(&args)..];
+    let Some(command) = args.first() else {
+        run_script_with_stdin(machine, &read_stdin(), &[], &[]);
+    };
+    match command.as_str() {
         "-c" => run_script_with_stdin(
-            args.get(2).map(String::as_str).unwrap_or_default(),
-            &args[3..],
+            machine,
+            args.get(1).map(String::as_str).unwrap_or_default(),
+            args.get(2..).unwrap_or_default(),
             &read_stdin_bytes(),
         ),
         "run" => {
-            let Some(path) = args.get(2) else {
+            let Some(path) = args.get(1) else {
                 usage_error("run requires a script path");
             };
             let source = std::fs::read_to_string(path).unwrap_or_else(|error| {
                 eprintln!("shellsim: cannot read {path}: {error}");
                 exit(2);
             });
-            run_script_with_stdin(&source, &args[3..], &read_stdin_bytes());
+            run_script_with_stdin(machine, &source, &args[2..], &read_stdin_bytes());
         }
-        "shell" => interactive_shell(&args[2..]),
-        "eval" => evaluate(&args[2..]),
-        "serve" => serve(&args[2..]),
-        "mcp" => mcp(&args[2..]),
-        "replay" => replay(&args[2..]),
-        "corpus" => corpus(&args[2..]),
+        "shell" => interactive_shell(machine, &args[1..]),
+        "eval" => evaluate(machine, &args[1..]),
+        "serve" => serve(machine, &args[1..]),
+        "mcp" => mcp(machine, &args[1..]),
+        "replay" => replay(machine, &args[1..]),
+        "corpus" => corpus(&args[1..]),
         command => usage_error(&format!("unknown command: {command}")),
     }
 }
@@ -81,8 +121,8 @@ fn corpus(args: &[String]) -> ! {
     exit(i32::from(failed));
 }
 
-fn fresh_environment(limits: Limits, positional: &[String]) -> Environment {
-    let mut env = Environment::with_limits(limits);
+fn fresh_environment(machine: MachineOptions, positional: &[String]) -> Environment {
+    let mut env = Environment::with_limits_and_clock(machine.limits, machine.clock);
     env.positional = positional.to_vec();
     if env.vfs.put_dir("/work", 0o755).is_ok() {
         env.cwd = "/work".to_string();
@@ -91,13 +131,14 @@ fn fresh_environment(limits: Limits, positional: &[String]) -> Environment {
     env
 }
 
-fn run_script(source: &str, positional: &[String]) -> ! {
-    run_script_with_stdin(source, positional, &[])
-}
-
-fn run_script_with_stdin(source: &str, positional: &[String], stdin: &[u8]) -> ! {
+fn run_script_with_stdin(
+    machine: MachineOptions,
+    source: &str,
+    positional: &[String],
+    stdin: &[u8],
+) -> ! {
     shellsim::sandbox::apply();
-    let mut env = fresh_environment(Limits::default(), positional);
+    let mut env = fresh_environment(machine, positional);
     let (outcome, out, err) = env.run_script_capture_with_stdin(source, stdin);
     use std::io::Write;
     let _ = std::io::stdout().write_all(&out);
@@ -120,17 +161,16 @@ struct EvalReport {
     dropped_invocations: u64,
 }
 
-fn evaluate(args: &[String]) -> ! {
-    let mut limits = Limits::default();
+fn evaluate(mut machine: MachineOptions, args: &[String]) -> ! {
     let mut source = None;
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
+        if machine.accept(args, &mut i) {
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
-            "--cpu" => limits.cpu = limit_value(args, &mut i, "--cpu"),
-            "--memory" => limits.memory = limit_value(args, &mut i, "--memory"),
-            "--disk" => limits.disk = limit_value(args, &mut i, "--disk"),
-            "--output" => limits.output = limit_value(args, &mut i, "--output"),
             "-c" => {
                 i += 1;
                 source = Some(
@@ -153,7 +193,7 @@ fn evaluate(args: &[String]) -> ! {
         None => (read_stdin(), Vec::new()),
     };
     shellsim::sandbox::apply();
-    let mut env = fresh_environment(limits, &positional);
+    let mut env = fresh_environment(machine, &positional);
     let (outcome, stdout, stderr) = env.run_script_capture_with_stdin(&source, &stdin);
     let status = outcome.exit_status;
     let invocations = env.invocations.events();
@@ -189,29 +229,27 @@ fn invocation_names(
         .collect()
 }
 
-fn interactive_shell(args: &[String]) -> ! {
+fn interactive_shell(mut machine: MachineOptions, args: &[String]) -> ! {
     use std::io::{BufRead, IsTerminal, Write};
 
-    let mut limits = Limits::default();
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
+        if machine.accept(args, &mut i) {
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
-            "--cpu" => limits.cpu = limit_value(args, &mut i, "--cpu"),
-            "--memory" => limits.memory = limit_value(args, &mut i, "--memory"),
-            "--disk" => limits.disk = limit_value(args, &mut i, "--disk"),
-            "--output" => limits.output = limit_value(args, &mut i, "--output"),
             "--" => {
                 positional.extend_from_slice(&args[i + 1..]);
                 break;
             }
             value => usage_error(&format!("unexpected shell argument: {value}")),
         }
-        i += 1;
     }
 
     shellsim::sandbox::apply();
-    let mut env = fresh_environment(limits, &positional);
+    let mut env = fresh_environment(machine, &positional);
     let stdin = std::io::stdin();
     let show_prompt = stdin.is_terminal();
     let mut input = stdin.lock();
@@ -272,20 +310,19 @@ const MAX_SCENARIO_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SCENARIO_ACTIONS: usize = 4_096;
 
 struct HarnessOptions {
-    limits: Limits,
+    machine: MachineOptions,
     host_root: Option<String>,
 }
 
-fn harness_options(args: &[String], command: &str) -> HarnessOptions {
-    let mut limits = Limits::default();
+fn harness_options(mut machine: MachineOptions, args: &[String], command: &str) -> HarnessOptions {
     let mut host_root = None;
     let mut index = 0usize;
     while index < args.len() {
+        if machine.accept(args, &mut index) {
+            index += 1;
+            continue;
+        }
         match args[index].as_str() {
-            "--cpu" => limits.cpu = limit_value(args, &mut index, "--cpu"),
-            "--memory" => limits.memory = limit_value(args, &mut index, "--memory"),
-            "--disk" => limits.disk = limit_value(args, &mut index, "--disk"),
-            "--output" => limits.output = limit_value(args, &mut index, "--output"),
             "--root" => {
                 index += 1;
                 host_root = Some(
@@ -298,11 +335,14 @@ fn harness_options(args: &[String], command: &str) -> HarnessOptions {
         }
         index += 1;
     }
-    HarnessOptions { limits, host_root }
+    HarnessOptions { machine, host_root }
 }
 
 fn harness_session(options: HarnessOptions, command: &str) -> shellsim::harness::HarnessSession {
-    let mut session = shellsim::harness::HarnessSession::new(options.limits);
+    let mut session = shellsim::harness::HarnessSession::with_clock(
+        options.machine.limits,
+        options.machine.clock,
+    );
     if let Some(host_root) = options.host_root {
         shellsim::host_ingest::mount_host_tree(
             &mut session.environment,
@@ -319,13 +359,13 @@ fn harness_session(options: HarnessOptions, command: &str) -> shellsim::harness:
     session
 }
 
-fn serve(args: &[String]) -> ! {
+fn serve(machine: MachineOptions, args: &[String]) -> ! {
     use std::io::Write;
 
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut output = std::io::stdout().lock();
-    let session = harness_session(harness_options(args, "serve"), "serve");
+    let session = harness_session(harness_options(machine, args, "serve"), "serve");
     let mut manager = shellsim::harness_manager::HarnessManager::new(session);
     while let Some(line) = read_bounded_protocol_line(&mut input).unwrap_or_else(|error| {
         eprintln!("shellsim serve: input error: {error}");
@@ -348,13 +388,13 @@ fn serve(args: &[String]) -> ! {
     exit(0);
 }
 
-fn mcp(args: &[String]) -> ! {
+fn mcp(machine: MachineOptions, args: &[String]) -> ! {
     use std::io::BufReader;
 
     let stdin = std::io::stdin();
     let mut input = BufReader::new(stdin.lock());
     let mut output = std::io::stdout().lock();
-    let session = harness_session(harness_options(args, "mcp"), "mcp");
+    let session = harness_session(harness_options(machine, args, "mcp"), "mcp");
     let mut manager = shellsim::harness_manager::HarnessManager::new(session);
     if let Err(error) = shellsim::mcp::serve(&mut input, &mut output, &mut manager) {
         eprintln!("shellsim mcp: {error}");
@@ -389,7 +429,7 @@ fn emit_transcript_record(
     Ok(())
 }
 
-fn replay(args: &[String]) -> ! {
+fn replay(machine: MachineOptions, args: &[String]) -> ! {
     use std::io::BufReader;
 
     use shellsim::scenario::{self, Action, FinalExpectation, Header};
@@ -439,7 +479,7 @@ fn replay(args: &[String]) -> ! {
         None => (None, None),
     };
     let mut output = std::io::stdout().lock();
-    let session = harness_session(harness_options(&harness_args, "replay"), "replay");
+    let session = harness_session(harness_options(machine, &harness_args, "replay"), "replay");
     let mut manager = shellsim::harness_manager::HarnessManager::new(session);
     let mut transcript_bytes = 0usize;
     let mut retained_transcript = transcript_path.as_ref().map(|_| Vec::new());
@@ -748,7 +788,7 @@ fn read_stdin_bytes() -> Vec<u8> {
 fn usage_error(message: &str) -> ! {
     eprintln!("shellsim: {message}");
     eprintln!(
-        "usage: shellsim -c SOURCE | run SCRIPT [ARGS...] | shell [LIMITS] | eval [LIMITS] -c SOURCE | serve [LIMITS] | replay SCENARIO.ndjson [--transcript PATH] [LIMITS] | corpus MANIFEST.json"
+        "usage: shellsim [MACHINE] (-c SOURCE [ARGS...] | run SCRIPT [ARGS...] | shell | eval -c SOURCE | serve [--root PATH] | mcp [--root PATH] | replay SCENARIO.ndjson [--root PATH] [--transcript PATH]) | shellsim corpus MANIFEST.json\nMACHINE: [--cpu N] [--memory N] [--disk N] [--output N] [--real-time]; commands without script arguments also accept MACHINE after the command"
     );
     exit(2);
 }
