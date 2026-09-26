@@ -297,6 +297,8 @@ pub enum ParameterKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Constant {
     None,
+    /// The `...` literal, which evaluates to the `Ellipsis` singleton.
+    Ellipsis,
     Bool(bool),
     Integer(i64),
     BigInteger(String),

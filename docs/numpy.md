@@ -52,8 +52,8 @@ The supported surface includes:
 
 - construction with `array`, `asarray`, `zeros`, `ones`, `full`, and `arange`;
 - like-constructors, `linspace`, `eye`, and `identity`;
-- `shape`, `ndim`, `size`, `T`, signed-stride slices on the first axis, basic indexing,
-  integer-array gathers, boolean expressions and masks, full-coordinate and advanced-index
+- `shape`, `ndim`, `size`, `T`, signed-stride slices on the first axis, basic indexing with
+  one `...` standing for the unindexed axes, integer-array gathers, boolean expressions and masks, full-coordinate and advanced-index
   assignment, iteration, `tolist`, `copy`,
   `reshape`, `transpose`, `squeeze`, `expand_dims`, `swapaxes`, `broadcast_to`, `flatten`, and
   `ravel`;

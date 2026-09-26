@@ -2,8 +2,8 @@
 
 use super::format::{format_float, format_integer, format_text, FormatSpec};
 use super::{
-    number, protocol, BigInt, BinaryOperator, ComparisonOperator, DisplayKind, Object, Ordering,
-    SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
+    number, protocol, BigInt, BinaryOperator, ComparisonOperator, DisplayKind, NativeValue, Object,
+    Ordering, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
 };
 
 impl Vm<'_> {
@@ -165,22 +165,22 @@ impl Vm<'_> {
         }
         let mut slot_result = match operator {
             ComparisonOperator::Equal => {
-                self.invoke_slot(&left, Slot::Equal, "__eq__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::Equal, "__eq__", vec![right])?
             }
             ComparisonOperator::NotEqual => {
-                self.invoke_slot(&left, Slot::NotEqual, "__ne__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::NotEqual, "__ne__", vec![right])?
             }
             ComparisonOperator::Less => {
-                self.invoke_slot(&left, Slot::LessThan, "__lt__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::LessThan, "__lt__", vec![right])?
             }
             ComparisonOperator::LessEqual => {
-                self.invoke_slot(&left, Slot::LessEqual, "__le__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::LessEqual, "__le__", vec![right])?
             }
             ComparisonOperator::Greater => {
-                self.invoke_slot(&left, Slot::GreaterThan, "__gt__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::GreaterThan, "__gt__", vec![right])?
             }
             ComparisonOperator::GreaterEqual => {
-                self.invoke_slot(&left, Slot::GreaterEqual, "__ge__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::GreaterEqual, "__ge__", vec![right])?
             }
             ComparisonOperator::In | ComparisonOperator::NotIn => {
                 self.invoke_slot(&right, Slot::Contains, "__contains__", vec![left])?
@@ -198,13 +198,14 @@ impl Vm<'_> {
                 _ => None,
             };
             if let Some((slot, name)) = reflected {
-                slot_result = self.invoke_slot(&right, slot, name, vec![left])?;
+                slot_result = self.invoke_operator_slot(&right, slot, name, vec![left])?;
             }
         }
         if slot_result.is_none() && matches!(operator, ComparisonOperator::NotEqual) {
-            let mut equality = self.invoke_slot(&left, Slot::Equal, "__eq__", vec![right])?;
+            let mut equality =
+                self.invoke_operator_slot(&left, Slot::Equal, "__eq__", vec![right])?;
             if equality.is_none() {
-                equality = self.invoke_slot(&right, Slot::Equal, "__eq__", vec![left])?;
+                equality = self.invoke_operator_slot(&right, Slot::Equal, "__eq__", vec![left])?;
             }
             if let Some(value) = equality {
                 slot_result = Some(Value::Bool(!self.truth_value(&value)?));
@@ -308,10 +309,14 @@ impl Vm<'_> {
         if protocol::identical(item, needle) {
             return Ok(true);
         }
-        if let Some(result) = self.invoke_slot(item, Slot::Equal, "__eq__", vec![*needle])? {
+        if let Some(result) =
+            self.invoke_operator_slot(item, Slot::Equal, "__eq__", vec![*needle])?
+        {
             return self.truth_value(&result);
         }
-        if let Some(result) = self.invoke_slot(needle, Slot::Equal, "__eq__", vec![*item])? {
+        if let Some(result) =
+            self.invoke_operator_slot(needle, Slot::Equal, "__eq__", vec![*item])?
+        {
             return self.truth_value(&result);
         }
         protocol::equals(&self.state.heap, item, needle)
@@ -435,7 +440,8 @@ impl Vm<'_> {
         Ok(Some(left))
     }
 
-    /// Call the left operand's in-place method, looked up on its type as CPython does.
+    /// Call the left operand's in-place method, looked up on its type as CPython does. A method
+    /// that returns `NotImplemented` declines, and the caller falls back to the binary operator.
     fn inplace_method(
         &mut self,
         operator: BinaryOperator,
@@ -465,7 +471,10 @@ impl Vm<'_> {
                     return Ok(None);
                 };
                 let method = self.bind_descriptor(descriptor, Some(left), class, defining_class)?;
-                return self.invoke_value(method, vec![right]).map(Some);
+                let result = self.invoke_value(method, vec![right])?;
+                return Ok(
+                    (result.native_value() != Some(NativeValue::NotImplemented)).then_some(result)
+                );
             }
         }
         let type_id = self.type_id(&left)?;
@@ -567,10 +576,12 @@ impl Vm<'_> {
                 "__ror__",
             ),
         };
-        if let Some(value) = self.invoke_slot(&left, slot, name, vec![right])? {
+        if let Some(value) = self.invoke_operator_slot(&left, slot, name, vec![right])? {
             return Ok(value);
         }
-        if let Some(value) = self.invoke_slot(&right, reflected_slot, reflected_name, vec![left])? {
+        if let Some(value) =
+            self.invoke_operator_slot(&right, reflected_slot, reflected_name, vec![left])?
+        {
             return Ok(value);
         }
         let symbol = match (operator, inplace) {

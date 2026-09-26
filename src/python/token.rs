@@ -63,6 +63,8 @@ pub enum TokenKind {
     RightShiftEqual,
     GreaterEqual,
     Dot,
+    /// `...`, which is one token in CPython: the `Ellipsis` literal or three relative-import dots.
+    Ellipsis,
     At,
     AtEqual,
     Comma,

@@ -105,6 +105,11 @@ impl Vm<'_> {
             if let Some(builtin_type) = builtin_type {
                 return Some(Value::Native(NativeValue::BuiltinType(builtin_type)));
             }
+            match name {
+                "Ellipsis" => return Some(Value::Native(NativeValue::Ellipsis)),
+                "NotImplemented" => return Some(Value::Native(NativeValue::NotImplemented)),
+                _ => {}
+            }
             if let Some(function) = super::super::stdlib::core::builtin_function(name) {
                 return Some(Value::Native(NativeValue::NativeFunction(function)));
             }

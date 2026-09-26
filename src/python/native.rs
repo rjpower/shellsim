@@ -442,6 +442,11 @@ pub(super) trait PyRuntime {
     fn replace_bytearray_items(&mut self, value: PyByteArray, items: Vec<u8>) -> PyResult<()>;
     fn is_integer_type(&self, value: &PyValue) -> bool;
     fn is_string_type(&self, value: &PyValue) -> bool;
+    /// Return whether `value` is the `Ellipsis` singleton that the `...` literal evaluates to.
+    ///
+    /// Native subscript handlers need this because `array[..., 0]` reaches `__getitem__` as the
+    /// tuple `(Ellipsis, 0)`, and the singleton has no other checked view.
+    fn is_ellipsis(&self, value: &PyValue) -> bool;
     /// View a builtin `bool`, `int`, `float`, or `complex` without copying its storage.
     fn number(&self, value: &PyValue) -> Option<super::number::NumberRef<'_>>;
     /// Allocate a builtin `complex` in the metered object arena.

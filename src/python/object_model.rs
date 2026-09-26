@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::native::{BinarySlotFn, TernarySlotFn, UnarySlotFn};
+use super::native::{BinarySlotFn, PyError, PyResult, PyRuntime, TernarySlotFn, UnarySlotFn};
 use super::Value;
 
 // Builtins and native value kinds are immutable process metadata. A fixed charge keeps their
@@ -30,6 +30,10 @@ pub(super) enum BuiltinType {
     Object,
     Type,
     None,
+    /// The type of the `Ellipsis` singleton, which CPython names `ellipsis`.
+    Ellipsis,
+    /// The type of the `NotImplemented` singleton.
+    NotImplemented,
     Bool,
     Int,
     Float,
@@ -60,10 +64,12 @@ pub(super) enum BuiltinType {
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 30] = [
+    pub(super) const ALL: [Self; 32] = [
         Self::Object,
         Self::Type,
         Self::None,
+        Self::Ellipsis,
+        Self::NotImplemented,
         Self::Bool,
         Self::Int,
         Self::Float,
@@ -102,6 +108,8 @@ impl BuiltinType {
             Self::Object => "object",
             Self::Type => "type",
             Self::None => "NoneType",
+            Self::Ellipsis => "ellipsis",
+            Self::NotImplemented => "NotImplementedType",
             Self::Bool => "bool",
             Self::Int => "int",
             Self::Float => "float",
@@ -1060,6 +1068,16 @@ fn install_builtin_slots(types: &mut [PyType]) {
     let stream = &mut types[BuiltinType::Stream as usize].slots;
     stream.iter = Some(unary(super::stdlib::sys::slot_iter));
     stream.next = Some(unary(super::stdlib::sys::slot_next));
+
+    types[BuiltinType::NotImplemented as usize].slots.bool_ = Some(unary(not_implemented_bool));
+}
+
+/// CPython 3.14 rejects `NotImplemented` in a boolean context. Truth-testing it usually means an
+/// operator method's result was used without checking whether the method declined.
+fn not_implemented_bool(_: &mut dyn PyRuntime, _: Value) -> PyResult<Option<Value>> {
+    Err(PyError::type_error(
+        "NotImplemented should not be used in a boolean context",
+    ))
 }
 
 #[cfg(test)]

@@ -375,6 +375,34 @@ print(values.tolist())
 }
 
 #[test]
+fn ellipsis_indices_keep_every_unindexed_axis_for_reads_and_writes() {
+    let source = r#"import numpy as np
+a = np.arange(24).reshape(2, 3, 4)
+print(a[..., 0].tolist(), a[0, ...].shape, a[...].shape)
+print(a[..., 1, 2].tolist(), a[1, ..., 3].tolist(), a[..., 1:3].shape)
+b = np.zeros((2, 2, 2), dtype=np.int64)
+b[..., 0] = 1
+print(b.tolist())
+z = np.array(5)
+view = z[...]
+view[...] = 7
+print(view.shape, z.tolist(), a[1, 2, 3, ...].shape)
+try:
+    a[..., 0, ...]
+except IndexError as error:
+    print(error)
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"[[0, 4, 8], [12, 16, 20]] (3, 4) (2, 3, 4)\n[6, 18] [15, 19, 23] (2, 3, 2)\n[[[1, 0], [1, 0]], [[1, 0], [1, 0]]]\n() 7 ()\nan index can only have a single ellipsis ('...')\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
 fn shape_views_constructors_and_joining_use_shared_kernels() {
     let source = r#"import numpy as np
 a = np.array([[[1], [2]]])

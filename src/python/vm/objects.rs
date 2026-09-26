@@ -1597,6 +1597,21 @@ impl Vm<'_> {
         self.invoke_value(callable, arguments).map(Some)
     }
 
+    /// Invoke a binary-operator or rich-comparison slot. A method that returns `NotImplemented`
+    /// declines the operation, so the result is `None` exactly as if the slot were absent and the
+    /// caller goes on to the reflected method or the default behavior, as CPython does.
+    pub(super) fn invoke_operator_slot(
+        &mut self,
+        receiver: &Value,
+        slot: Slot,
+        method_name: &str,
+        arguments: Vec<Value>,
+    ) -> Result<Option<Value>, String> {
+        Ok(self
+            .invoke_slot(receiver, slot, method_name, arguments)?
+            .filter(|value| value.native_value() != Some(NativeValue::NotImplemented)))
+    }
+
     pub(super) fn truth_value(&mut self, value: &Value) -> Result<bool, String> {
         if let Some(result) = self.invoke_slot(value, Slot::Bool, "__bool__", Vec::new())? {
             return result
@@ -1669,17 +1684,21 @@ impl Vm<'_> {
                 return Ok(protocol::Comparison::Ordered(left.len().cmp(&right.len())));
             }
         }
-        if let Some(equal) = self.invoke_slot(left, Slot::Equal, "__eq__", vec![*right])? {
+        if let Some(equal) = self.invoke_operator_slot(left, Slot::Equal, "__eq__", vec![*right])? {
             if self.truth_value(&equal)? {
                 return Ok(protocol::Comparison::Ordered(Ordering::Equal));
             }
         }
-        if let Some(less) = self.invoke_slot(left, Slot::LessThan, "__lt__", vec![*right])? {
+        if let Some(less) =
+            self.invoke_operator_slot(left, Slot::LessThan, "__lt__", vec![*right])?
+        {
             if self.truth_value(&less)? {
                 return Ok(protocol::Comparison::Ordered(Ordering::Less));
             }
         }
-        if let Some(less) = self.invoke_slot(right, Slot::LessThan, "__lt__", vec![*left])? {
+        if let Some(less) =
+            self.invoke_operator_slot(right, Slot::LessThan, "__lt__", vec![*left])?
+        {
             if self.truth_value(&less)? {
                 return Ok(protocol::Comparison::Ordered(Ordering::Greater));
             }
@@ -1832,6 +1851,14 @@ impl Vm<'_> {
             BuiltinType::None => {
                 expect_arity(&arguments, 0, 0)?;
                 Value::None
+            }
+            BuiltinType::Ellipsis => {
+                expect_arity(&arguments, 0, 0)?;
+                Value::Native(NativeValue::Ellipsis)
+            }
+            BuiltinType::NotImplemented => {
+                expect_arity(&arguments, 0, 0)?;
+                Value::Native(NativeValue::NotImplemented)
             }
             BuiltinType::Bool => {
                 expect_arity(&arguments, 0, 1)?;
@@ -2092,6 +2119,8 @@ impl Vm<'_> {
                 NativeValue::Module(_) => BuiltinType::Module.id(),
                 NativeValue::Stream(_) => BuiltinType::Stream.id(),
                 NativeValue::Environment => BuiltinType::Environment.id(),
+                NativeValue::Ellipsis => BuiltinType::Ellipsis.id(),
+                NativeValue::NotImplemented => BuiltinType::NotImplemented.id(),
                 _ => BuiltinType::Native.id(),
             },
             ValueTag::Object => self

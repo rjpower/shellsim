@@ -68,6 +68,11 @@ pub(super) enum NativeValue {
     EnumBase,
     /// Marker used as the only supported base for the capability-free unittest slice.
     UnitTestBase,
+    /// The `Ellipsis` singleton written as `...`. An immediate marker keeps identity, equality,
+    /// and dictionary hashing canonical without allocating an arena object.
+    Ellipsis,
+    /// The `NotImplemented` singleton returned by binary and comparison methods that decline.
+    NotImplemented,
 }
 
 impl NativeValue {
@@ -84,6 +89,8 @@ impl NativeValue {
     const UNITTEST_BASE: u8 = 10;
     const VALUE_KIND: u8 = 11;
     const NATIVE_GETTER: u8 = 12;
+    const ELLIPSIS: u8 = 13;
+    const NOT_IMPLEMENTED: u8 = 14;
 
     pub(super) fn encode(self) -> (u64, u8) {
         match self {
@@ -112,6 +119,8 @@ impl NativeValue {
             Self::TypingList => (0, Self::TYPING_LIST),
             Self::EnumBase => (0, Self::ENUM_BASE),
             Self::UnitTestBase => (0, Self::UNITTEST_BASE),
+            Self::Ellipsis => (0, Self::ELLIPSIS),
+            Self::NotImplemented => (0, Self::NOT_IMPLEMENTED),
         }
     }
 
@@ -161,6 +170,8 @@ impl NativeValue {
             Self::TYPING_LIST => Self::TypingList,
             Self::ENUM_BASE => Self::EnumBase,
             Self::UNITTEST_BASE => Self::UnitTestBase,
+            Self::ELLIPSIS => Self::Ellipsis,
+            Self::NOT_IMPLEMENTED => Self::NotImplemented,
             Self::VALUE_KIND => {
                 // SAFETY: `encode` stores a non-null pointer to a static `ValueKindDef`.
                 Self::ValueKind(unsafe {
@@ -199,6 +210,8 @@ impl NativeValue {
             Self::ValueKind(kind) => format!("<class '{}'>", kind.name),
             Self::ExceptionType(ExceptionType(name)) => format!("<class '{name}'>"),
             Self::NativeGetter(getter) => format!("{getter:?}"),
+            Self::Ellipsis => "Ellipsis".into(),
+            Self::NotImplemented => "NotImplemented".into(),
             _ => "<native object>".into(),
         }
     }
@@ -899,6 +912,7 @@ impl<'a> Vm<'a> {
     fn value_from_constant(&mut self, value: &Constant) -> Result<Value, String> {
         Ok(match value {
             Constant::None => Value::None,
+            Constant::Ellipsis => Value::Native(NativeValue::Ellipsis),
             Constant::Bool(value) => Value::Bool(*value),
             Constant::Integer(value) => Value::Int(*value),
             Constant::BigInteger(value) => {

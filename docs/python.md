@@ -50,6 +50,12 @@ keyword-variadic parameters, including bounded `*iterable` and `**mapping` expan
 keywords, non-string mapping keys, and non-mapping `**` operands are rejected explicitly. List,
 tuple, and set displays expand `*iterable` items in place.
 
+The `...` literal evaluates to the `Ellipsis` singleton, so `obj[..., 0]` passes the tuple
+`(Ellipsis, 0)` to `__getitem__`. Binary-operator and rich-comparison methods may return
+`NotImplemented` to decline. The runtime then tries the reflected method and then the default:
+identity for `==` and `!=`, and `TypeError` for ordering and arithmetic. As in CPython 3.14,
+testing `NotImplemented` for truth raises `TypeError`.
+
 Augmented assignment updates mutable operands in place, as in CPython: `list +=` extends with any
 iterable, `set |=` and its siblings mutate the set, `dict |=` updates the mapping, and user classes
 may define `__iadd__` and the other in-place methods. Other operands fall back to the binary

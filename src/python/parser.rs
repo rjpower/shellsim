@@ -366,8 +366,15 @@ impl Parser {
             }
         } else if self.take(|kind| matches!(kind, TokenKind::From)).is_some() {
             let mut module = String::new();
-            while self.take(|kind| matches!(kind, TokenKind::Dot)).is_some() {
-                module.push('.');
+            // The lexer emits `...` as one token, so `from ....pkg` arrives as `...` then `.`.
+            while let Some(token) =
+                self.take(|kind| matches!(kind, TokenKind::Dot | TokenKind::Ellipsis))
+            {
+                module.push_str(if token.kind == TokenKind::Ellipsis {
+                    "..."
+                } else {
+                    "."
+                });
             }
             if !self.at(|kind| matches!(kind, TokenKind::Import)) {
                 module.push_str(&self.module_name("expected a module name after 'from'")?);
@@ -1567,6 +1574,7 @@ impl Parser {
             TokenKind::Float(value) => ExpressionKind::Constant(Constant::Float(value)),
             TokenKind::Imaginary(value) => ExpressionKind::Constant(Constant::Imaginary(value)),
             TokenKind::None => ExpressionKind::Constant(Constant::None),
+            TokenKind::Ellipsis => ExpressionKind::Constant(Constant::Ellipsis),
             TokenKind::True => ExpressionKind::Constant(Constant::Bool(true)),
             TokenKind::False => ExpressionKind::Constant(Constant::Bool(false)),
             TokenKind::Name(name) => ExpressionKind::Name(name),
@@ -2176,6 +2184,44 @@ mod tests {
         let error = parse(lex("values[1,,2]").unwrap())
             .expect_err("a tuple subscript cannot contain an empty member");
         assert!(error.message.contains("expected an expression"));
+    }
+
+    #[test]
+    fn ellipsis_is_an_atom_and_three_relative_import_dots() {
+        for source in [
+            "x = ...",
+            "a[..., 0]",
+            "a[1, ...]",
+            "a[...]",
+            "def f(): ...",
+            "[..., 1]",
+            "f(...)",
+        ] {
+            parse(lex(source).unwrap()).expect(source);
+        }
+        let program = parse(lex("a[..., 0]").unwrap()).unwrap();
+        let StatementKind::Expression(Expression {
+            kind: ExpressionKind::Subscript { index, .. },
+            ..
+        }) = &program.statements[0].kind
+        else {
+            panic!("expected a subscript")
+        };
+        let ExpressionKind::Tuple(items) = &index.kind else {
+            panic!("expected a tuple index")
+        };
+        assert_eq!(items[0].kind, ExpressionKind::Constant(Constant::Ellipsis));
+
+        let program = parse(lex("from ... import a\nfrom ....pkg import b").unwrap()).unwrap();
+        let modules = program
+            .statements
+            .iter()
+            .map(|statement| match &statement.kind {
+                StatementKind::ImportFrom { module, .. } => module.as_str(),
+                _ => panic!("expected an import"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(modules, ["...", "....pkg"]);
     }
 
     #[test]

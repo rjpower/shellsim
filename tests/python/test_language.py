@@ -382,6 +382,64 @@ def test_user_subscript_methods_receive_ordinary_slice_values():
     ]
 
 
+def test_ellipsis_literal_is_the_builtin_singleton():
+    value = ...
+    assert value is Ellipsis
+    assert repr(...) == "Ellipsis"
+    assert str(Ellipsis) == "Ellipsis"
+    assert f"{...}" == "Ellipsis"
+    assert type(...).__name__ == "ellipsis"
+    assert type(...)() is ...
+    assert isinstance(Ellipsis, type(...))
+    assert bool(...)
+    assert ... == Ellipsis
+    assert ... != 0
+    assert ... != "..."
+    assert ... is not None
+
+
+def test_ellipsis_is_hashable_and_survives_containers():
+    assert [..., 1] == [Ellipsis, 1]
+    assert (1, ...)[1] is Ellipsis
+    assert {...: "key", None: "none"}[Ellipsis] == "key"
+    members = {...}
+    members.add(Ellipsis)
+    assert members == {Ellipsis}
+    assert {(..., 1): "pair"}[(Ellipsis, 1)] == "pair"
+    assert ... in (1, Ellipsis)
+    assert list({...: 1}) == [Ellipsis]
+
+
+def test_ellipsis_serves_as_a_body_and_an_argument():
+    def placeholder(): ...
+
+    def identity(value):
+        return value
+
+    assert placeholder() is None
+    assert identity(...) is Ellipsis
+
+
+def test_user_subscripts_receive_ellipsis_inside_tuple_keys():
+    class Capture:
+        def __getitem__(self, key):
+            return key
+
+    capture = Capture()
+    assert capture[...] is Ellipsis
+    assert capture[..., 0] == (Ellipsis, 0)
+    assert capture[1, ...] == (1, Ellipsis)
+    first, second = capture[..., 1:2]
+    assert first is Ellipsis and (second.start, second.stop) == (1, 2)
+    items = [1, 2]
+    try:
+        items[...]
+    except TypeError as error:
+        assert str(error) == "list indices must be integers or slices, not ellipsis"
+    else:
+        raise AssertionError("a list accepted an Ellipsis index")
+
+
 def test_except_then_finally_runs_cleanup_once():
     events = []
 
@@ -465,6 +523,57 @@ def test_augmented_assignment_prefers_in_place_methods():
         assert str(error) == "unsupported operand type(s) for **=: 'NoneType' and 'int'"
     else:
         raise AssertionError("None **= 2 succeeded")
+
+
+def test_not_implemented_declines_binary_and_comparison_operators():
+    assert repr(NotImplemented) == "NotImplemented"
+    assert type(NotImplemented).__name__ == "NotImplementedType"
+    assert type(NotImplemented)() is NotImplemented
+
+    class Declines:
+        def __eq__(self, other):
+            return NotImplemented
+
+        def __lt__(self, other):
+            return NotImplemented
+
+        def __add__(self, other):
+            return NotImplemented
+
+        def __iadd__(self, other):
+            return NotImplemented
+
+    class Reflects:
+        def __radd__(self, other):
+            return "radd"
+
+        def __gt__(self, other):
+            return "gt"
+
+    declines = Declines()
+    assert (declines == 1) is False
+    assert (declines != 1) is True
+    assert (declines == declines) is True
+    assert declines + Reflects() == "radd"
+    assert (declines < Reflects()) == "gt"
+    try:
+        declines < 1  # noqa: B015
+    except TypeError as error:
+        assert str(error) == "'<' not supported between instances of 'Declines' and 'int'"
+    else:
+        raise AssertionError("a declined ordering succeeded")
+    try:
+        declines += 1
+    except TypeError as error:
+        assert str(error) == "unsupported operand type(s) for +=: 'Declines' and 'int'"
+    else:
+        raise AssertionError("a declined in-place addition succeeded")
+    try:
+        bool(NotImplemented)
+    except TypeError as error:
+        assert str(error) == "NotImplemented should not be used in a boolean context"
+    else:
+        raise AssertionError("NotImplemented was used as a truth value")
 
 
 def positional_only(first, second=2, /, third=3, *, fourth=4):

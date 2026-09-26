@@ -484,6 +484,10 @@ impl PyRuntime for Vm<'_> {
         )
     }
 
+    fn is_ellipsis(&self, value: &Value) -> bool {
+        value.native_value() == Some(NativeValue::Ellipsis)
+    }
+
     fn number(&self, value: &Value) -> Option<super::number::NumberRef<'_>> {
         super::number::view(&self.state.heap, value)
     }

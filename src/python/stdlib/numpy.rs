@@ -2211,13 +2211,13 @@ pub(crate) fn slot_get_item(
 
 fn get_item(runtime: &mut dyn PyRuntime, array: PyArray, index: PyValue) -> PyResult<PyValue> {
     let (layout, _) = runtime.array_layout(array)?;
-    if runtime.slice_parts(&index).is_some() {
+    if is_view_component(runtime, &index) {
         let layout = basic_slice_layout(runtime, &layout, &[index])?;
         return runtime.new_array_view(array, layout);
     }
     if runtime.kind(&index)? == PyKind::Tuple {
         let raw = index.cast::<PySequence>(runtime)?.items(runtime)?;
-        if raw.iter().any(|value| runtime.slice_parts(value).is_some()) {
+        if raw.iter().any(|value| is_view_component(runtime, value)) {
             let layout = basic_slice_layout(runtime, &layout, &raw)?;
             return runtime.new_array_view(array, layout);
         }
@@ -2327,13 +2327,15 @@ pub(crate) fn slot_set_item(
     let (layout, dtype) = runtime.array_layout(array)?;
     let basic_components = if runtime.kind(&index)? == PyKind::Tuple {
         Some(index.cast::<PySequence>(runtime)?.items(runtime)?)
-    } else if runtime.int_value(&index).is_some() && layout.shape.len() > 1 {
+    } else if (runtime.int_value(&index).is_some() && layout.shape.len() > 1)
+        || runtime.is_ellipsis(&index)
+    {
         Some(vec![index])
     } else {
         None
     };
     if let Some(raw) = basic_components {
-        if raw.iter().any(|value| runtime.slice_parts(value).is_some())
+        if raw.iter().any(|value| is_view_component(runtime, value))
             || raw.len() < layout.shape.len()
         {
             let selection = basic_slice_layout(runtime, &layout, &raw)?;
@@ -2415,18 +2417,45 @@ pub(crate) fn slot_set_item(
     Ok(Some(Value::None))
 }
 
+/// Whether an index component makes basic indexing return a view: a slice, or `...`.
+fn is_view_component(runtime: &dyn PyRuntime, value: &PyValue) -> bool {
+    runtime.slice_parts(value).is_some() || runtime.is_ellipsis(value)
+}
+
+/// Compute the view selected by integer, slice, and `...` components, as NumPy's basic indexing
+/// does. One `...` keeps every axis that the other components leave unindexed, so on a
+/// `(2, 3, 4)` array `[..., 0]` selects the same `(2, 3)` view as `[:, :, 0]`.
 fn basic_slice_layout(
     runtime: &dyn PyRuntime,
     layout: &PyArrayLayout,
     components: &[PyValue],
 ) -> PyResult<PyArrayLayout> {
-    if components.len() > layout.shape.len() {
+    let ellipses = components
+        .iter()
+        .filter(|component| runtime.is_ellipsis(component))
+        .count();
+    if ellipses > 1 {
+        return Err(PyError::exception(
+            "IndexError",
+            "an index can only have a single ellipsis ('...')",
+        ));
+    }
+    let indexed = components.len() - ellipses;
+    if indexed > layout.shape.len() {
         return Err(PyError::value_error("too many indices for array"));
     }
     let mut offset = layout.offset;
     let mut shape = Vec::with_capacity(layout.shape.len());
     let mut strides = Vec::with_capacity(layout.strides.len());
-    for (axis, component) in components.iter().enumerate() {
+    let mut axis = 0;
+    for component in components {
+        if runtime.is_ellipsis(component) {
+            let end = axis + (layout.shape.len() - indexed);
+            shape.extend_from_slice(&layout.shape[axis..end]);
+            strides.extend_from_slice(&layout.strides[axis..end]);
+            axis = end;
+            continue;
+        }
         if let Some((start, stop, step)) = runtime.slice_parts(component) {
             let plan = SlicePlan::new(layout.shape[axis], start, stop, step)
                 .map_err(PyError::value_error)?;
@@ -2456,9 +2485,10 @@ fn basic_slice_layout(
                 )
                 .ok_or_else(|| PyError::value_error("array offset overflow"))?;
         }
+        axis += 1;
     }
-    shape.extend_from_slice(&layout.shape[components.len()..]);
-    strides.extend_from_slice(&layout.strides[components.len()..]);
+    shape.extend_from_slice(&layout.shape[axis..]);
+    strides.extend_from_slice(&layout.strides[axis..]);
     Ok(PyArrayLayout {
         shape,
         strides,
