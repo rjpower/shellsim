@@ -464,7 +464,7 @@ fn unsupported_or_invalid_array_operations_fail_explicitly() {
             "negative dimensions are not allowed",
         ),
         (
-            "import numpy as np\nnp.array([1], dtype='complex128')",
+            "import numpy as np\nnp.array([1], dtype='complex64')",
             "unsupported numpy dtype",
         ),
         (
@@ -533,4 +533,159 @@ print(np.int8(3).real, np.int8(3).imag, type(np.int8(3).imag) is np.int8)
             Vec::new()
         )
     );
+}
+
+#[test]
+fn complex_arrays_support_arithmetic_components_and_reductions() {
+    // Every assertion also holds under NumPy 2.5 on CPython 3.14.
+    let source = r#"import numpy as np
+x = np.array([1+2j, 3-4j], dtype=complex)
+assert x.dtype == 'complex128'
+assert np.array([1, 2j]).dtype == 'complex128'
+assert np.array([1, 2], dtype='cdouble').dtype == 'complex128'
+assert np.ones(2, dtype='c16')[0] == 1+0j
+assert np.zeros(2, dtype=np.complex128)[0] == 0j
+assert isinstance(np.complex128(1j), np.complex128)
+assert isinstance(x[0], complex) and x[1] == 3-4j
+assert x.tolist() == [1+2j, 3-4j]
+assert x.real.tolist() == [1.0, 3.0] and x.real.dtype == 'float64'
+assert x.imag.tolist() == [2.0, -4.0] and x.imag.dtype == 'float64'
+assert np.real(x).tolist() == [1.0, 3.0]
+assert np.imag(x).tolist() == [2.0, -4.0]
+assert np.array([1, 2]).imag.tolist() == [0, 0]
+assert np.array([1.5]).real.tolist() == [1.5]
+y = x.conjugate()
+assert y.tolist() == [1-2j, 3+4j]
+assert np.array_equal(x.conj(), y) and np.array_equal(np.conj(x), y)
+assert np.array_equal(np.conjugate(x), y)
+assert np.array([1, 2]).conj().tolist() == [1, 2]
+assert (x + x).tolist() == [2+4j, 6-8j]
+assert (x - 1).tolist() == [2j, 2-4j]
+assert (x * y).tolist() == [5+0j, 25+0j]
+assert (x / 2).tolist() == [0.5+1j, 1.5-2j]
+assert (x / x).tolist() == [1+0j, 1+0j]
+assert (-x).tolist() == [-1-2j, -3+4j]
+assert (np.array([1, 2]) + 1j).dtype == 'complex128'
+assert np.abs(x).dtype == 'float64'
+assert np.abs(x).tolist() == [5 ** 0.5, 5.0] and abs(x).tolist() == [5 ** 0.5, 5.0]
+assert np.sum(x) == 4-2j and x.sum() == 4-2j
+assert np.prod(x) == 11+2j
+assert np.mean(x) == 2-1j and x.mean() == 2-1j
+m = np.array([[1+1j, 2], [3, 4j]])
+assert np.sum(m, axis=1).tolist() == [3+1j, 3+4j]
+assert np.mean(m, axis=0).tolist() == [2+0.5j, 1+2j]
+assert np.cumsum(x).tolist() == [1+2j, 4-2j]
+assert np.dot(x, y) == 30+0j
+assert (m @ np.array([[1], [1j]])).tolist() == [[1+3j], [-1+0j]]
+assert (x == np.array([1+2j, 3+4j])).tolist() == [True, False]
+assert (x != (1+2j)).tolist() == [False, True]
+assert np.float64(2).real == 2 and np.float64(2).imag == 0
+assert np.int8(3).conjugate() == 3
+assert np.float64(2) * 1j == 2j and 1j * np.float64(2) == 2j
+assert np.array(1j) == 1j
+print('ok')
+"#;
+    assert_eq!(run(source), (0, b"ok\n".to_vec(), Vec::new()));
+}
+
+#[test]
+fn complex_arrays_round_trip_through_npy_files() {
+    // `reference` is the file NumPy 2.5 writes for np.array([1+2j, -0.5j]). NumPy pads the header
+    // to 64 bytes and shellsim to 16; both are valid version 1.0 files, so only the payload is
+    // compared byte for byte.
+    let source = r#"import numpy as np
+payload = (b"\x00\x00\x00\x00\x00\x00\xf0?\x00\x00\x00\x00\x00\x00\x00@"
+    + b"\x00\x00\x00\x00\x00\x00\x00\x80\x00\x00\x00\x00\x00\x00\xe0\xbf")
+reference = (b"\x93NUMPY\x01\x00v\x00{'descr': '<c16', 'fortran_order': False, 'shape': (2,), }"
+    + b" " * 59 + b"\n" + payload)
+np.save('complex.npy', np.array([1+2j, -0.5j]))
+with open('complex.npy', 'rb') as handle:
+    saved = handle.read()
+assert "'descr': '<c16'" in saved[:64].decode('latin-1')
+assert saved[-32:] == payload
+with open('reference.npy', 'wb') as handle:
+    handle.write(reference)
+loaded = np.load('reference.npy')
+assert loaded.dtype == 'complex128' and loaded.tolist() == [1+2j, -0.5j]
+print('ok')
+"#;
+    assert_eq!(run(source), (0, b"ok\n".to_vec(), Vec::new()));
+}
+
+#[test]
+fn complex_operations_without_a_real_value_domain_fail_explicitly() {
+    let prelude = "import numpy as np\nx = np.array([1+2j, 3-4j])\n";
+    for (operation, expected) in [
+        (
+            "x < x",
+            "ordering comparison is not supported for complex values",
+        ),
+        (
+            "x >= 1",
+            "ordering comparison is not supported for complex values",
+        ),
+        (
+            "np.float64(1) < 1j",
+            "ordering comparison is not supported for complex values",
+        ),
+        ("x.min()", "ndarray.min is not supported for complex values"),
+        ("np.max(x)", "numpy.max is not supported for complex values"),
+        (
+            "np.argmax(x)",
+            "numpy.argmax is not supported for complex values",
+        ),
+        (
+            "np.argsort(x)",
+            "numpy.argsort is not supported for complex values",
+        ),
+        (
+            "np.minimum(x, 1)",
+            "numpy.minimum is not supported for complex values",
+        ),
+        (
+            "np.sqrt(x)",
+            "numpy.sqrt is not supported for complex values",
+        ),
+        ("np.exp(x)", "numpy.exp is not supported for complex values"),
+        (
+            "np.floor(x)",
+            "numpy.floor is not supported for complex values",
+        ),
+        (
+            "np.isnan(x)",
+            "numpy.isnan is not supported for complex values",
+        ),
+        (
+            "np.isinf(x)",
+            "numpy.isinf is not supported for complex values",
+        ),
+        ("~x", "numpy.invert is not supported for complex values"),
+        (
+            "np.percentile(x, 50)",
+            "numpy.percentile is not supported for complex values",
+        ),
+        (
+            "np.allclose(x, x)",
+            "numpy.allclose is not supported for complex values",
+        ),
+        (
+            "np.linspace(0, 1j, 3)",
+            "numpy.linspace is not supported for complex values",
+        ),
+        ("np.var(x)", "numpy.var is not supported for complex values"),
+        (
+            "np.median(x)",
+            "numpy.median is not supported for complex values",
+        ),
+        (
+            "x.astype(float)",
+            "cannot convert complex to numpy.float64 without discarding the imaginary part",
+        ),
+        (
+            "np.array([1j], dtype=np.int32)",
+            "cannot convert complex to numpy.int32 without discarding the imaginary part",
+        ),
+    ] {
+        assert_fails_with(&format!("{prelude}{operation}"), expected);
+    }
 }

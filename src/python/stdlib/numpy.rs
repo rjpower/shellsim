@@ -2,7 +2,9 @@
 //!
 //! Kernels deliberately use logical index iteration and runtime scalar operations. This keeps
 //! arrays type-erased, deterministic, and easy to meter; no host BLAS, native pointer, or dtype
-//! implementation crosses the interpreter boundary.
+//! implementation crosses the interpreter boundary. Real dtypes store registered inline value
+//! kinds; `complex128` stores builtin `complex` objects, and kernels that need a real value domain
+//! reject complex dtypes at entry.
 
 use std::cmp::Ordering;
 
@@ -11,7 +13,7 @@ use super::super::native::{
     PyArrayDtype, PyArrayLayout, PyBinaryOp, PyConstant, PyError, PyIndex, PyKind, PyMarker,
     PyResult, PyRuntime, PySequence, PyValue, PyValueCast, ValueDef, ValueKindDef, ValueKindSlots,
 };
-use super::super::number::{PyNumber, PyNumber as Number};
+use super::super::number::{NumberRef, PyNumber, PyNumber as Number};
 use super::super::slice::SlicePlan;
 use super::super::Value;
 
@@ -23,10 +25,22 @@ enum NumericClass {
     Signed,
     Unsigned,
     Float,
+    Complex,
 }
 
+/// How elements of one dtype are represented as interpreter values.
+///
+/// Real dtypes store inline registered value kinds whose payload encodes the element. `complex128`
+/// has no NumPy-specific scalar: its elements are builtin `complex` heap objects, so
+/// `numpy.complex128` is the builtin type and indexing returns an ordinary `complex`.
+enum ScalarRepr {
+    ValueKind(ValueKindDef),
+    Complex,
+}
+
+/// Dtype metadata plus the scalar representation used for its elements.
 struct NumericKind {
-    definition: ValueKindDef,
+    repr: ScalarRepr,
     dtype: PyArrayDtype,
     class: NumericClass,
     bits: u8,
@@ -34,8 +48,15 @@ struct NumericKind {
 }
 
 impl NumericKind {
+    fn value_kind(&'static self) -> Option<&'static ValueKindDef> {
+        match &self.repr {
+            ScalarRepr::ValueKind(definition) => Some(definition),
+            ScalarRepr::Complex => None,
+        }
+    }
+
     fn unpack(&'static self, runtime: &dyn PyRuntime, value: &PyValue) -> Option<Scalar> {
-        let payload = runtime.value_kind_payload(value, &self.definition)?;
+        let payload = runtime.value_kind_payload(value, self.value_kind()?)?;
         let value = match self.class {
             NumericClass::Bool => ScalarValue::Bool(payload != 0),
             NumericClass::Signed => {
@@ -49,15 +70,12 @@ impl NumericKind {
                 ScalarValue::Float(f32::from_bits(payload as u32) as f64)
             }
             NumericClass::Float => ScalarValue::Float(f64::from_bits(payload)),
+            NumericClass::Complex => unreachable!("complex128 has no value kind"),
         };
         Some(Scalar {
             dtype: self.dtype,
             value,
         })
-    }
-
-    fn pack_payload(&'static self, runtime: &dyn PyRuntime, payload: u64) -> PyResult {
-        runtime.new_value_kind(&self.definition, payload & bit_mask(self.bits))
     }
 }
 
@@ -69,13 +87,13 @@ macro_rules! numeric_kind {
         }
 
         static $static_name: NumericKind = NumericKind {
-            definition: ValueKindDef {
+            repr: ScalarRepr::ValueKind(ValueKindDef {
                 name: concat!("numpy.", $python_name),
                 construct: $constructor,
                 slots: scalar_slots(),
                 methods: SCALAR_METHODS,
                 getters: SCALAR_GETTERS,
-            },
+            }),
             dtype: PyArrayDtype::$dtype,
             class: NumericClass::$class,
             bits: $bits,
@@ -87,13 +105,13 @@ macro_rules! numeric_kind {
         }
 
         fn $getter(runtime: &mut dyn PyRuntime) -> PyResult {
-            runtime.value_kind_type(&$static_name.definition)
+            runtime.value_kind_type($static_name.value_kind().expect("real dtypes are value kinds"))
         }
     };
 }
 
 macro_rules! numeric_kinds {
-    ($(($static_name:ident, $constructor:ident, $getter:ident, $dtype:ident, $id:literal, $class:ident, $bits:literal, $dtype_name:literal, $python_name:literal, [$($alias:literal),+ $(,)?])),+ $(,)?) => {
+    ([$($other:ident),*], $(($static_name:ident, $constructor:ident, $getter:ident, $dtype:ident, $id:literal, $class:ident, $bits:literal, $dtype_name:literal, $python_name:literal, [$($alias:literal),+ $(,)?])),+ $(,)?) => {
         $(numeric_kind!(
             $static_name,
             $constructor,
@@ -107,11 +125,14 @@ macro_rules! numeric_kinds {
             [$($alias),+]
         );)+
 
-        static NUMERIC_KINDS: &[&NumericKind] = &[$(&$static_name),+];
+        static NUMERIC_KINDS: &[&NumericKind] = &[$(&$static_name,)+ $(&$other),*];
     };
 }
 
+// The bracketed list names dtype rows defined outside the value-kind macro; they join the dtype
+// table without registering a NumPy scalar kind.
 numeric_kinds!(
+    [COMPLEX128],
     (
         BOOL,
         construct_bool,
@@ -246,8 +267,25 @@ numeric_kinds!(
     ),
 );
 
+impl PyArrayDtype {
+    #[allow(non_upper_case_globals)]
+    const Complex128: Self = Self::new(11, "complex128");
+}
+
+static COMPLEX128: NumericKind = NumericKind {
+    repr: ScalarRepr::Complex,
+    dtype: PyArrayDtype::Complex128,
+    class: NumericClass::Complex,
+    bits: 128,
+    aliases: &["complex", "complex128", "cdouble", "c16"],
+};
+
+fn complex_type(runtime: &mut dyn PyRuntime) -> PyResult {
+    Ok(runtime.marker(PyMarker::ComplexType))
+}
+
 pub(super) fn value_kinds() -> impl Iterator<Item = &'static ValueKindDef> {
-    NUMERIC_KINDS.iter().map(|kind| &kind.definition)
+    NUMERIC_KINDS.iter().filter_map(|kind| kind.value_kind())
 }
 
 /// Numeric-tower accessors shared by every NumPy scalar type. Real scalars are their own real
@@ -352,6 +390,10 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         function("sign", sign),
         function("isnan", isnan),
         function("isinf", isinf),
+        function("conjugate", conjugate),
+        function("conj", conjugate),
+        function("real", real),
+        function("imag", imag),
         function("sum", module_sum),
         function("prod", module_prod),
         function("mean", module_mean),
@@ -430,6 +472,8 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         dtype_value("single", float32_type),
         dtype_value("float64", float64_type),
         dtype_value("double", float64_type),
+        dtype_value("complex128", complex_type),
+        dtype_value("cdouble", complex_type),
     ],
 };
 
@@ -703,6 +747,7 @@ fn dtype_descriptor(dtype: PyArrayDtype) -> &'static str {
         },
         NumericClass::Float if dtype_kind(dtype).bits == 32 => "<f4",
         NumericClass::Float => "<f8",
+        NumericClass::Complex => "<c16",
     }
 }
 
@@ -719,6 +764,7 @@ fn descriptor_dtype(descriptor: &str) -> PyResult<PyArrayDtype> {
         "<u8" => Ok(PyArrayDtype::UInt64),
         "<f4" => Ok(PyArrayDtype::Float32),
         "<f8" => Ok(PyArrayDtype::Float64),
+        "<c16" => Ok(PyArrayDtype::Complex128),
         _ => Err(PyError::value_error(format!(
             "unsupported NumPy file dtype {descriptor:?}"
         ))),
@@ -753,6 +799,11 @@ fn append_scalar_bytes(output: &mut Vec<u8>, value: Scalar, dtype: PyArrayDtype)
             output.extend_from_slice(&(value.as_f64() as f32).to_le_bytes())
         }
         (NumericClass::Float, _) => output.extend_from_slice(&value.as_f64().to_le_bytes()),
+        (NumericClass::Complex, _) => {
+            let (real, imag) = value.components();
+            output.extend_from_slice(&real.to_le_bytes());
+            output.extend_from_slice(&imag.to_le_bytes());
+        }
     }
 }
 
@@ -786,6 +837,10 @@ fn decode_scalar(bytes: &[u8], dtype: PyArrayDtype) -> Scalar {
         (NumericClass::Float, _) => {
             ScalarValue::Float(f64::from_le_bytes(bytes.try_into().unwrap()))
         }
+        (NumericClass::Complex, _) => ScalarValue::Complex(
+            f64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            f64::from_le_bytes(bytes[8..].try_into().unwrap()),
+        ),
     };
     Scalar { dtype, value }
 }
@@ -872,6 +927,8 @@ pub(crate) static ARRAY_TYPE: NativeTypeDef = NativeTypeDef {
         method("argmax", method_argmax),
         method("cumsum", method_cumsum),
         method("cumprod", method_cumprod),
+        method("conjugate", method_conjugate),
+        method("conj", method_conjugate),
     ],
     getters: &[
         getter("shape", array_shape),
@@ -879,6 +936,8 @@ pub(crate) static ARRAY_TYPE: NativeTypeDef = NativeTypeDef {
         getter("size", array_size),
         getter("dtype", array_dtype),
         getter("T", array_transposed),
+        getter("real", array_real),
+        getter("imag", array_imag),
     ],
 };
 
@@ -925,6 +984,26 @@ fn array_dtype(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
 fn array_transposed(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     let array = receiver.cast(runtime)?;
     transpose(runtime, array, None)
+}
+
+/// `ndarray.real`. NumPy returns a writable view; shellsim returns a copy because arrays store one
+/// value per element and complex elements have no addressable component storage.
+fn array_real(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    unary_array(runtime, array, UnaryMap::Real)
+}
+
+/// `ndarray.imag`, returned as a copy for the same reason as `ndarray.real`.
+fn array_imag(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    unary_array(runtime, array, UnaryMap::Imag)
+}
+
+fn method_conjugate(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("ndarray.conjugate", 0, 0)?;
+    args.reject_keywords("ndarray.conjugate")?;
+    let array = receiver.cast(runtime)?;
+    unary_array(runtime, array, UnaryMap::Conjugate)
 }
 
 const fn method(
@@ -1033,7 +1112,7 @@ fn flatten(
             })?;
             Ok(layout.shape)
         }
-        PyKind::Bool | PyKind::Int | PyKind::Float => {
+        PyKind::Bool | PyKind::Int | PyKind::Float | PyKind::Complex => {
             push_value(runtime, output, value)?;
             Ok(Vec::new())
         }
@@ -1066,6 +1145,7 @@ fn promote_dtype(left: PyArrayDtype, right: PyArrayDtype) -> PyArrayDtype {
     let left = dtype_kind(left);
     let right = dtype_kind(right);
     match (left.class, right.class) {
+        (NumericClass::Complex, _) | (_, NumericClass::Complex) => PyArrayDtype::Complex128,
         (NumericClass::Bool, _) => right.dtype,
         (_, NumericClass::Bool) => left.dtype,
         (NumericClass::Float, NumericClass::Float) => {
@@ -1132,6 +1212,7 @@ fn promote_operands(
 
 fn promote_weak_scalar(strong: PyArrayDtype, weak: PyArrayDtype) -> PyArrayDtype {
     match (dtype_kind(strong).class, dtype_kind(weak).class) {
+        (NumericClass::Complex, _) | (_, NumericClass::Complex) => PyArrayDtype::Complex128,
         (_, NumericClass::Bool) => strong,
         (NumericClass::Bool, NumericClass::Signed | NumericClass::Unsigned) => weak,
         (NumericClass::Float, NumericClass::Signed | NumericClass::Unsigned) => strong,
@@ -1209,12 +1290,16 @@ fn construct_scalar(
     args: CallArgs,
     kind: &'static NumericKind,
 ) -> PyResult {
-    args.expect_positional(kind.definition.name, 0, 1)?;
-    args.reject_keywords(kind.definition.name)?;
+    let name = kind
+        .value_kind()
+        .expect("scalar constructors exist only for value kinds")
+        .name;
+    args.expect_positional(name, 0, 1)?;
+    args.reject_keywords(name)?;
     let default = match kind.class {
         NumericClass::Bool => Value::Bool(false),
         NumericClass::Signed | NumericClass::Unsigned => Value::Int(0),
-        NumericClass::Float => Value::Float(0.0),
+        NumericClass::Float | NumericClass::Complex => Value::Float(0.0),
     };
     convert(
         runtime,
@@ -1229,6 +1314,7 @@ enum ScalarValue {
     Signed(i128),
     Unsigned(u128),
     Float(f64),
+    Complex(f64, f64),
 }
 
 #[derive(Clone, Copy)]
@@ -1238,13 +1324,27 @@ struct Scalar {
 }
 
 impl Scalar {
+    /// Real value of the scalar. A complex scalar yields its real part; every kernel that would
+    /// silently discard an imaginary part rejects complex operands at entry instead.
     fn as_f64(self) -> f64 {
         match self.value {
             ScalarValue::Bool(value) => i64::from(value) as f64,
             ScalarValue::Signed(value) => value as f64,
             ScalarValue::Unsigned(value) => value as f64,
-            ScalarValue::Float(value) => value,
+            ScalarValue::Float(value) | ScalarValue::Complex(value, _) => value,
         }
+    }
+
+    /// Real and imaginary components; real scalars have a zero imaginary part.
+    fn components(self) -> (f64, f64) {
+        match self.value {
+            ScalarValue::Complex(real, imag) => (real, imag),
+            _ => (self.as_f64(), 0.0),
+        }
+    }
+
+    fn is_complex(self) -> bool {
+        matches!(self.value, ScalarValue::Complex(..))
     }
 
     fn as_i128(self) -> i128 {
@@ -1252,7 +1352,9 @@ impl Scalar {
             ScalarValue::Bool(value) => i128::from(value),
             ScalarValue::Signed(value) => value,
             ScalarValue::Unsigned(value) => value as i128,
-            ScalarValue::Float(_) => unreachable!("float is not an integer operand"),
+            ScalarValue::Float(_) | ScalarValue::Complex(..) => {
+                unreachable!("inexact values are not integer operands")
+            }
         }
     }
 
@@ -1261,7 +1363,9 @@ impl Scalar {
             ScalarValue::Bool(value) => u128::from(value),
             ScalarValue::Unsigned(value) => value,
             ScalarValue::Signed(value) => value as u128,
-            ScalarValue::Float(_) => unreachable!("float is not an integer operand"),
+            ScalarValue::Float(_) | ScalarValue::Complex(..) => {
+                unreachable!("inexact values are not integer operands")
+            }
         }
     }
 
@@ -1271,14 +1375,24 @@ impl Scalar {
             ScalarValue::Signed(value) => value != 0,
             ScalarValue::Unsigned(value) => value != 0,
             ScalarValue::Float(value) => value != 0.0,
+            ScalarValue::Complex(real, imag) => real != 0.0 || imag != 0.0,
         }
     }
 
     fn is_nan(self) -> bool {
-        matches!(self.value, ScalarValue::Float(value) if value.is_nan())
+        match self.value {
+            ScalarValue::Float(value) => value.is_nan(),
+            ScalarValue::Complex(real, imag) => real.is_nan() || imag.is_nan(),
+            _ => false,
+        }
     }
 
+    /// Order two scalars. Complex values are only equal or unordered, so callers that need a
+    /// total order must reject complex operands before comparing.
     fn compare(self, other: Self) -> Option<Ordering> {
+        if self.is_complex() || other.is_complex() {
+            return (self.components() == other.components()).then_some(Ordering::Equal);
+        }
         if matches!(self.value, ScalarValue::Float(_))
             || matches!(other.value, ScalarValue::Float(_))
         {
@@ -1313,6 +1427,12 @@ fn registered_scalar(runtime: &dyn PyRuntime, value: &PyValue) -> Option<Scalar>
 fn scalar(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Scalar> {
     if let Some(value) = registered_scalar(runtime, &value) {
         return Ok(value);
+    }
+    if let Some(NumberRef::Complex(real, imag)) = runtime.number(&value) {
+        return Ok(Scalar {
+            dtype: PyArrayDtype::Complex128,
+            value: ScalarValue::Complex(real, imag),
+        });
     }
     if runtime.kind(&value)? == PyKind::Bool {
         return Ok(Scalar {
@@ -1361,11 +1481,23 @@ fn convert(runtime: &mut dyn PyRuntime, value: PyValue, dtype: PyArrayDtype) -> 
     pack_checked(runtime, value, dtype)
 }
 
-fn pack_checked(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult {
+/// Convert a scalar to `dtype` with NumPy's checked casting rules: out-of-range integers raise
+/// OverflowError and complex values never narrow to a real dtype.
+fn cast_scalar(value: Scalar, dtype: PyArrayDtype) -> PyResult<Scalar> {
     let kind = dtype_kind(dtype);
+    if value.is_complex() && !matches!(kind.class, NumericClass::Bool | NumericClass::Complex) {
+        return Err(PyError::type_error(format!(
+            "cannot convert complex to numpy.{} without discarding the imaginary part",
+            dtype.name()
+        )));
+    }
     let converted = match kind.class {
         NumericClass::Bool => ScalarValue::Bool(value.truth()),
         NumericClass::Float => ScalarValue::Float(value.as_f64()),
+        NumericClass::Complex => {
+            let (real, imag) = value.components();
+            ScalarValue::Complex(real, imag)
+        }
         NumericClass::Signed => {
             let minimum = -(1i128 << (kind.bits - 1));
             let maximum = (1i128 << (kind.bits - 1)) - 1;
@@ -1380,7 +1512,9 @@ fn pack_checked(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> 
                     }
                     value.trunc() as i128
                 }
-                ScalarValue::Float(_) => return Err(dtype_overflow(dtype)),
+                ScalarValue::Float(_) | ScalarValue::Complex(..) => {
+                    return Err(dtype_overflow(dtype))
+                }
             };
             if !(minimum..=maximum).contains(&value) {
                 return Err(dtype_overflow(dtype));
@@ -1401,7 +1535,9 @@ fn pack_checked(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> 
                     }
                     value.trunc() as u128
                 }
-                ScalarValue::Float(_) => return Err(dtype_overflow(dtype)),
+                ScalarValue::Float(_) | ScalarValue::Complex(..) => {
+                    return Err(dtype_overflow(dtype))
+                }
             };
             if value > maximum {
                 return Err(dtype_overflow(dtype));
@@ -1409,17 +1545,19 @@ fn pack_checked(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> 
             ScalarValue::Unsigned(value)
         }
     };
-    pack_wrapping(
-        runtime,
-        Scalar {
-            dtype,
-            value: converted,
-        },
+    Ok(Scalar {
         dtype,
-    )
+        value: converted,
+    })
 }
 
-fn pack_wrapping(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult {
+fn pack_checked(runtime: &mut dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult {
+    let value = cast_scalar(value, dtype)?;
+    pack_wrapping(runtime, value, dtype)
+}
+
+/// Materialize a scalar as an element value of `dtype`, wrapping integers to the dtype width.
+fn pack_wrapping(runtime: &mut dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult {
     let kind = dtype_kind(dtype);
     let payload = match kind.class {
         NumericClass::Bool => u64::from(value.truth()),
@@ -1427,17 +1565,29 @@ fn pack_wrapping(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) ->
         NumericClass::Unsigned => value.as_u128() as u64,
         NumericClass::Float if kind.bits == 32 => (value.as_f64() as f32).to_bits() as u64,
         NumericClass::Float => value.as_f64().to_bits(),
+        NumericClass::Complex => {
+            let (real, imag) = value.components();
+            return runtime.new_complex(real, imag);
+        }
     };
-    kind.pack_payload(runtime, payload)
+    let definition = kind.value_kind().expect("real dtypes are value kinds");
+    runtime.new_value_kind(definition, payload & bit_mask(kind.bits))
 }
 
-fn cast_scalar(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult<Scalar> {
-    let packed = pack_checked(runtime, value, dtype)?;
-    registered_scalar(runtime, &packed)
-        .ok_or_else(|| PyError::runtime_error("numeric cast produced an unregistered scalar"))
+/// Reject a kernel that needs a real value domain, such as ordering or a transcendental
+/// function, before it performs any per-element work.
+fn reject_complex(dtype: PyArrayDtype, operation: &str) -> PyResult<()> {
+    if dtype_kind(dtype).class == NumericClass::Complex {
+        return Err(complex_unsupported(operation));
+    }
+    Ok(())
 }
 
-fn pack_bool(runtime: &dyn PyRuntime, value: bool) -> PyResult {
+fn complex_unsupported(operation: &str) -> PyError {
+    PyError::type_error(format!("{operation} is not supported for complex values"))
+}
+
+fn pack_bool(runtime: &mut dyn PyRuntime, value: bool) -> PyResult {
     pack_wrapping(
         runtime,
         Scalar {
@@ -1448,7 +1598,7 @@ fn pack_bool(runtime: &dyn PyRuntime, value: bool) -> PyResult {
     )
 }
 
-fn pack_index(runtime: &dyn PyRuntime, value: usize) -> PyResult {
+fn pack_index(runtime: &mut dyn PyRuntime, value: usize) -> PyResult {
     let value = i128::try_from(value)
         .map_err(|_| PyError::overflow_error("array index exceeds numpy.int64"))?;
     pack_wrapping(
@@ -1461,7 +1611,7 @@ fn pack_index(runtime: &dyn PyRuntime, value: usize) -> PyResult {
     )
 }
 
-fn pack_float(runtime: &dyn PyRuntime, value: f64, dtype: PyArrayDtype) -> PyResult {
+fn pack_float(runtime: &mut dyn PyRuntime, value: f64, dtype: PyArrayDtype) -> PyResult {
     pack_wrapping(
         runtime,
         Scalar {
@@ -1511,14 +1661,21 @@ fn scalar_binary(
         .map(Some);
     }
     let mut dtype = promote_operands(left.dtype, right.dtype, left_is_weak, right_is_weak);
+    if dtype_kind(dtype).class == NumericClass::Complex {
+        // Mixed real/complex scalar arithmetic uses the builtin complex implementation so NumPy
+        // scalars and Python complex values share one set of IEEE and error semantics.
+        let left = pack_wrapping(runtime, left, dtype)?;
+        let right = pack_wrapping(runtime, right, dtype)?;
+        return runtime.binary_op(operation, left, right).map(Some);
+    }
     if matches!(operation, PyBinaryOp::Divide) && dtype_kind(dtype).class != NumericClass::Float {
         dtype = PyArrayDtype::Float64;
     }
     if left_is_weak {
-        left = cast_scalar(runtime, left, dtype)?;
+        left = cast_scalar(left, dtype)?;
     }
     if right_is_weak {
-        right = cast_scalar(runtime, right, dtype)?;
+        right = cast_scalar(right, dtype)?;
     }
     let class = dtype_kind(dtype).class;
     let value = match class {
@@ -1568,6 +1725,7 @@ fn scalar_binary(
             })
         }
         NumericClass::Bool => unreachable!("boolean pairs returned above"),
+        NumericClass::Complex => unreachable!("complex arithmetic returned above"),
     };
     pack_wrapping(runtime, Scalar { dtype, value }, dtype).map(Some)
 }
@@ -1638,6 +1796,7 @@ fn slot_scalar_repr(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Opt
                 format!("{text}.0")
             }
         }
+        ScalarValue::Complex(..) => unreachable!("NumPy value kinds are real"),
     };
     runtime.new_string(text).map(Some)
 }
@@ -1656,13 +1815,27 @@ fn slot_scalar_equal(
     )))
 }
 
+/// Order a NumPy scalar against another number, rejecting complex operands as NumPy does.
+fn scalar_ordering(
+    runtime: &dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<Ordering>> {
+    let left = scalar(runtime, left)?;
+    let right = scalar(runtime, right)?;
+    if left.is_complex() || right.is_complex() {
+        return Err(complex_unsupported("ordering comparison"));
+    }
+    Ok(left.compare(right))
+}
+
 fn slot_scalar_less_than(
     runtime: &mut dyn PyRuntime,
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
     Ok(Some(Value::Bool(
-        scalar(runtime, left)?.compare(scalar(runtime, right)?) == Some(Ordering::Less),
+        scalar_ordering(runtime, left, right)? == Some(Ordering::Less),
     )))
 }
 
@@ -1682,7 +1855,7 @@ fn slot_scalar_less_equal(
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
     Ok(Some(Value::Bool(matches!(
-        scalar(runtime, left)?.compare(scalar(runtime, right)?),
+        scalar_ordering(runtime, left, right)?,
         Some(Ordering::Less | Ordering::Equal)
     ))))
 }
@@ -1693,7 +1866,7 @@ fn slot_scalar_greater_than(
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
     Ok(Some(Value::Bool(
-        scalar(runtime, left)?.compare(scalar(runtime, right)?) == Some(Ordering::Greater),
+        scalar_ordering(runtime, left, right)? == Some(Ordering::Greater),
     )))
 }
 
@@ -1703,7 +1876,7 @@ fn slot_scalar_greater_equal(
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
     Ok(Some(Value::Bool(matches!(
-        scalar(runtime, left)?.compare(scalar(runtime, right)?),
+        scalar_ordering(runtime, left, right)?,
         Some(Ordering::Greater | Ordering::Equal)
     ))))
 }
@@ -1885,8 +2058,10 @@ fn arange(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 fn linspace(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("numpy.linspace", 2, 3)?;
     args.reject_unknown_keywords("numpy.linspace", &["num", "endpoint", "dtype"])?;
-    let start = scalar(runtime, args.positional()[0])?.as_f64();
-    let stop = scalar(runtime, args.positional()[1])?.as_f64();
+    let start = scalar(runtime, args.positional()[0])?;
+    let stop = scalar(runtime, args.positional()[1])?;
+    reject_complex(promote_dtype(start.dtype, stop.dtype), "numpy.linspace")?;
+    let (start, stop) = (start.as_f64(), stop.as_f64());
     let num_value = args
         .positional()
         .get(2)
@@ -1900,6 +2075,7 @@ fn linspace(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         None => true,
     };
     let dtype = dtype_keyword(runtime, &args, "numpy.linspace")?.unwrap_or(PyArrayDtype::Float64);
+    reject_complex(dtype, "numpy.linspace")?;
     reserve_values(runtime, num)?;
     let mut values = Vec::with_capacity(num);
     let denominator = if endpoint { num.saturating_sub(1) } else { num };
@@ -2445,12 +2621,15 @@ fn binary(
     let left_is_weak = left_array.is_none() && registered_scalar(runtime, &left).is_none();
     let right_is_weak = right_array.is_none() && registered_scalar(runtime, &right).is_none();
     let promoted = promote_operands(left_dtype, right_dtype, left_is_weak, right_is_weak);
-    let dtype =
-        if operation == PyBinaryOp::Divide && dtype_kind(promoted).class != NumericClass::Float {
-            PyArrayDtype::Float64
-        } else {
-            promoted
-        };
+    let inexact = matches!(
+        dtype_kind(promoted).class,
+        NumericClass::Float | NumericClass::Complex
+    );
+    let dtype = if operation == PyBinaryOp::Divide && !inexact {
+        PyArrayDtype::Float64
+    } else {
+        promoted
+    };
     let count = element_count(&shape)?;
     reserve_values(runtime, count)?;
     let mut values = Vec::with_capacity(count);
@@ -2493,6 +2672,7 @@ fn operand_dtype(
         PyKind::Bool => Ok(PyArrayDtype::Bool),
         PyKind::Int => Ok(PyArrayDtype::Int64),
         PyKind::Float => Ok(PyArrayDtype::Float64),
+        PyKind::Complex => Ok(PyArrayDtype::Complex128),
         _ => Err(PyError::type_error("numpy operand is not numeric")),
     }
 }
@@ -2633,6 +2813,16 @@ fn comparison(
             .as_ref()
             .map_or(&[], |value| value.shape.as_slice()),
     )?;
+    if !matches!(operation, CompareMap::Equal | CompareMap::NotEqual) {
+        for operand in [left, right] {
+            let dtype = if runtime.kind(&operand)? == PyKind::Array {
+                runtime.array_layout(operand.cast(runtime)?)?.1
+            } else {
+                scalar(runtime, operand)?.dtype
+            };
+            reject_complex(dtype, "ordering comparison")?;
+        }
+    }
     let count = element_count(&shape)?;
     reserve_values(runtime, count)?;
     let mut values = Vec::with_capacity(count);
@@ -2702,6 +2892,36 @@ enum UnaryMap {
     Sign,
     IsNan,
     IsInf,
+    Conjugate,
+    Real,
+    Imag,
+}
+
+impl UnaryMap {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Positive => "numpy.positive",
+            Self::Negative => "numpy.negative",
+            Self::Invert => "numpy.invert",
+            Self::Absolute => "numpy.absolute",
+            Self::Sqrt => "numpy.sqrt",
+            Self::Exp => "numpy.exp",
+            Self::Log => "numpy.log",
+            Self::Log2 => "numpy.log2",
+            Self::Sin => "numpy.sin",
+            Self::Cos => "numpy.cos",
+            Self::Tan => "numpy.tan",
+            Self::Floor => "numpy.floor",
+            Self::Ceil => "numpy.ceil",
+            Self::Rint => "numpy.rint",
+            Self::Sign => "numpy.sign",
+            Self::IsNan => "numpy.isnan",
+            Self::IsInf => "numpy.isinf",
+            Self::Conjugate => "numpy.conjugate",
+            Self::Real => "numpy.real",
+            Self::Imag => "numpy.imag",
+        }
+    }
 }
 
 fn unary_function(
@@ -2736,8 +2956,29 @@ fn unary_array(runtime: &mut dyn PyRuntime, array: PyArray, operation: UnaryMap)
             "this unary operation is not defined for boolean arrays",
         ));
     }
+    let complex_input = dtype_kind(input_dtype).class == NumericClass::Complex;
+    if complex_input
+        && !matches!(
+            operation,
+            UnaryMap::Positive
+                | UnaryMap::Negative
+                | UnaryMap::Absolute
+                | UnaryMap::Conjugate
+                | UnaryMap::Real
+                | UnaryMap::Imag
+        )
+    {
+        return Err(complex_unsupported(operation.name()));
+    }
     let dtype = if matches!(operation, UnaryMap::IsNan | UnaryMap::IsInf) {
         PyArrayDtype::Bool
+    } else if complex_input
+        && matches!(
+            operation,
+            UnaryMap::Absolute | UnaryMap::Real | UnaryMap::Imag
+        )
+    {
+        PyArrayDtype::Float64
     } else if float_output {
         if input_dtype == PyArrayDtype::Float32 {
             PyArrayDtype::Float32
@@ -2768,6 +3009,10 @@ fn unary_array(runtime: &mut dyn PyRuntime, array: PyArray, operation: UnaryMap)
                     dtype,
                     value: ScalarValue::Float(-value),
                 },
+                ScalarValue::Complex(real, imag) => Scalar {
+                    dtype,
+                    value: ScalarValue::Complex(-real, -imag),
+                },
                 ScalarValue::Bool(_) => unreachable!(),
             },
             UnaryMap::Invert => match value.value {
@@ -2783,7 +3028,7 @@ fn unary_array(runtime: &mut dyn PyRuntime, array: PyArray, operation: UnaryMap)
                     dtype,
                     value: ScalarValue::Unsigned(!value),
                 },
-                ScalarValue::Float(_) => {
+                ScalarValue::Float(_) | ScalarValue::Complex(..) => {
                     return Err(PyError::type_error(
                         "bitwise invert is not defined for floating arrays",
                     ))
@@ -2798,7 +3043,29 @@ fn unary_array(runtime: &mut dyn PyRuntime, array: PyArray, operation: UnaryMap)
                     dtype,
                     value: ScalarValue::Float(value.abs()),
                 },
+                ScalarValue::Complex(real, imag) => float_scalar(dtype, real.hypot(imag)),
                 ScalarValue::Bool(_) | ScalarValue::Unsigned(_) => value,
+            },
+            UnaryMap::Conjugate => match value.value {
+                ScalarValue::Complex(real, imag) => Scalar {
+                    dtype,
+                    value: ScalarValue::Complex(real, -imag),
+                },
+                _ => value,
+            },
+            UnaryMap::Real => match value.value {
+                ScalarValue::Complex(real, _) => float_scalar(dtype, real),
+                _ => value,
+            },
+            UnaryMap::Imag => match value.value {
+                ScalarValue::Complex(_, imag) => float_scalar(dtype, imag),
+                _ => cast_scalar(
+                    Scalar {
+                        dtype: PyArrayDtype::Bool,
+                        value: ScalarValue::Bool(false),
+                    },
+                    dtype,
+                )?,
             },
             UnaryMap::Sqrt => float_scalar(dtype, value.as_f64().sqrt()),
             UnaryMap::Exp => float_scalar(dtype, value.as_f64().exp()),
@@ -2821,7 +3088,7 @@ fn unary_array(runtime: &mut dyn PyRuntime, array: PyArray, operation: UnaryMap)
                 } else {
                     signed
                 };
-                cast_scalar(runtime, float_scalar(PyArrayDtype::Float64, sign), dtype)?
+                cast_scalar(float_scalar(PyArrayDtype::Float64, sign), dtype)?
             }
             UnaryMap::IsNan => Scalar {
                 dtype,
@@ -2870,7 +3137,11 @@ pub(crate) fn slot_absolute(
     unary_array(runtime, array, UnaryMap::Absolute).map(Some)
 }
 
-fn pack_scalar(runtime: &dyn PyRuntime, value: Scalar, dtype: PyArrayDtype) -> PyResult<PyValue> {
+fn pack_scalar(
+    runtime: &mut dyn PyRuntime,
+    value: Scalar,
+    dtype: PyArrayDtype,
+) -> PyResult<PyValue> {
     pack_wrapping(runtime, value, dtype)
 }
 
@@ -2905,6 +3176,9 @@ unary_functions!(
     (sign, UnaryMap::Sign),
     (isnan, UnaryMap::IsNan),
     (isinf, UnaryMap::IsInf),
+    (conjugate, UnaryMap::Conjugate),
+    (real, UnaryMap::Real),
+    (imag, UnaryMap::Imag),
 );
 
 fn minimum(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -2955,6 +3229,14 @@ fn elementwise_extreme(
         left_info.is_none() && registered_scalar(runtime, &left).is_none(),
         right_info.is_none() && registered_scalar(runtime, &right).is_none(),
     );
+    reject_complex(
+        dtype,
+        if maximum {
+            "numpy.maximum"
+        } else {
+            "numpy.minimum"
+        },
+    )?;
     let count = element_count(&shape)?;
     reserve_values(runtime, count)?;
     let mut values = Vec::with_capacity(count);
@@ -3099,6 +3381,7 @@ fn scalar_to_python(runtime: &mut dyn PyRuntime, value: Scalar) -> PyResult {
             Err(_) => runtime.new_integer(&value.to_string()),
         },
         ScalarValue::Float(value) => Ok(Value::Float(value)),
+        ScalarValue::Complex(real, imag) => runtime.new_complex(real, imag),
     }
 }
 
@@ -3733,7 +4016,9 @@ fn arg_reduce(
 ) -> PyResult {
     args.expect_positional(name, 0, 1)?;
     args.reject_unknown_keywords(name, &["axis"])?;
-    let shape = runtime.array_layout(array)?.0.shape;
+    let (layout, dtype) = runtime.array_layout(array)?;
+    reject_complex(dtype, name)?;
+    let shape = layout.shape;
     let axis_value = args
         .positional()
         .first()
@@ -3898,6 +4183,9 @@ fn statistic(
     args.expect_positional(name, 0, 1)?;
     args.reject_unknown_keywords(name, &["axis"])?;
     let (layout, input_dtype) = runtime.array_layout(array)?;
+    if !matches!(statistic_kind, Statistic::All | Statistic::Any) {
+        reject_complex(input_dtype, name)?;
+    }
     let shape = layout.shape;
     let output_dtype = statistic_dtype(input_dtype, statistic_kind);
     let axis_value = args
@@ -4094,6 +4382,9 @@ fn reduce(
         args.keyword(name, "axis")?.copied()
     };
     let (layout, dtype) = runtime.array_layout(array)?;
+    if matches!(reduction, Reduction::Min | Reduction::Max) {
+        reject_complex(dtype, name)?;
+    }
     if let Some(axis_value) = axis_value {
         let PyIndex(axis) = axis_value.cast(runtime)?;
         let axis = normalize_axis(axis, layout.shape.len())?;
@@ -4242,7 +4533,11 @@ fn reduce_axis(
 fn reduction_dtype(dtype: PyArrayDtype, reduction: Reduction) -> PyArrayDtype {
     let kind = dtype_kind(dtype);
     match reduction {
-        Reduction::Mean if dtype == PyArrayDtype::Float32 => PyArrayDtype::Float32,
+        Reduction::Mean
+            if dtype == PyArrayDtype::Float32 || kind.class == NumericClass::Complex =>
+        {
+            dtype
+        }
         Reduction::Mean => PyArrayDtype::Float64,
         Reduction::Sum | Reduction::Product
             if matches!(kind.class, NumericClass::Bool | NumericClass::Signed)
@@ -4260,7 +4555,7 @@ fn reduction_dtype(dtype: PyArrayDtype, reduction: Reduction) -> PyArrayDtype {
 }
 
 fn reduction_identity(
-    runtime: &dyn PyRuntime,
+    runtime: &mut dyn PyRuntime,
     dtype: PyArrayDtype,
     reduction: Reduction,
 ) -> PyResult<PyValue> {
@@ -4269,12 +4564,17 @@ fn reduction_identity(
     numeric_identity(runtime, dtype, one)
 }
 
-fn numeric_identity(runtime: &dyn PyRuntime, dtype: PyArrayDtype, one: bool) -> PyResult<PyValue> {
+fn numeric_identity(
+    runtime: &mut dyn PyRuntime,
+    dtype: PyArrayDtype,
+    one: bool,
+) -> PyResult<PyValue> {
     let value = match dtype_kind(dtype).class {
         NumericClass::Bool => ScalarValue::Bool(one),
         NumericClass::Signed => ScalarValue::Signed(i128::from(one)),
         NumericClass::Unsigned => ScalarValue::Unsigned(u128::from(one)),
         NumericClass::Float => ScalarValue::Float(f64::from(one)),
+        NumericClass::Complex => ScalarValue::Complex(f64::from(one), 0.0),
     };
     pack_wrapping(runtime, Scalar { dtype, value }, dtype)
 }
@@ -4518,8 +4818,10 @@ fn allclose(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         .map(|value| runtime.truth(value))
         .transpose()?
         .unwrap_or(false);
-    let (left_layout, _) = runtime.array_layout(left)?;
-    let (right_layout, _) = runtime.array_layout(right)?;
+    let (left_layout, left_dtype) = runtime.array_layout(left)?;
+    let (right_layout, right_dtype) = runtime.array_layout(right)?;
+    reject_complex(left_dtype, "numpy.allclose")?;
+    reject_complex(right_dtype, "numpy.allclose")?;
     let shape = broadcast_shape(&left_layout.shape, &right_layout.shape)?;
     let mut close = true;
     for_each_index(&shape, |index| {
@@ -4564,7 +4866,8 @@ fn argsort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         }
     }
     let array = coerce_array(runtime, args.positional()[0])?;
-    let (layout, _) = runtime.array_layout(array)?;
+    let (layout, dtype) = runtime.array_layout(array)?;
+    reject_complex(dtype, "numpy.argsort")?;
     let axis_value = args.keyword("numpy.argsort", "axis")?.copied();
     if axis_value.is_some_and(|value| value.is_none()) {
         let count = element_count(&layout.shape)?;
@@ -4656,13 +4959,16 @@ fn percentile(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         ));
     }
     let array = coerce_array(runtime, args.positional()[0])?;
-    let quantile = scalar(runtime, args.positional()[1])?.as_f64();
+    let (layout, dtype) = runtime.array_layout(array)?;
+    reject_complex(dtype, "numpy.percentile")?;
+    let quantile = scalar(runtime, args.positional()[1])?;
+    reject_complex(quantile.dtype, "numpy.percentile")?;
+    let quantile = quantile.as_f64();
     if !(0.0..=100.0).contains(&quantile) {
         return Err(PyError::value_error(
             "percentile must be in the range [0, 100]",
         ));
     }
-    let (layout, _) = runtime.array_layout(array)?;
     let count = element_count(&layout.shape)?;
     runtime.reserve_memory(
         count

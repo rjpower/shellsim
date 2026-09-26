@@ -1751,6 +1751,7 @@ impl PyRuntime for Vm<'_> {
             PyMarker::Stdout => NativeValue::Stream(Stream::Stdout),
             PyMarker::Stderr => NativeValue::Stream(Stream::Stderr),
             PyMarker::ArrayType => NativeValue::BuiltinType(BuiltinType::Array),
+            PyMarker::ComplexType => NativeValue::BuiltinType(BuiltinType::Complex),
         })
     }
 

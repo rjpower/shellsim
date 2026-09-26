@@ -245,6 +245,8 @@ pub(super) enum PyMarker {
     Stdout,
     Stderr,
     ArrayType,
+    /// The builtin `complex` type, re-exported as `numpy.complex128`.
+    ComplexType,
 }
 
 /// Explicit access to shellsim's virtual clock and CPU-time counters.
