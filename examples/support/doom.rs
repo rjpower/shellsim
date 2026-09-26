@@ -68,6 +68,11 @@ pub fn build(source: &Path, wad: &Path) -> Result<Environment, String> {
         .vfs
         .chmod("/", "/tcc/tcc-shellsim.wasm", 0o755)
         .map_err(|error| error.to_string())?;
+    // Replace the base image's `cc` entry with the virtual TinyCC package.
+    environment
+        .vfs
+        .remove_file("/", "/usr/bin/cc")
+        .map_err(|error| error.to_string())?;
     environment
         .vfs
         .symlink("/", "/tcc/tcc-shellsim.wasm", "/usr/bin/cc")
