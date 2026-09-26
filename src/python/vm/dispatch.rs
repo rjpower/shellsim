@@ -678,10 +678,12 @@ impl Vm<'_> {
             if self.enter_exception_handler() {
                 return Ok(true);
             }
+            let file = self.imported_module_file();
             let Some(function_return) = self.unwind_deferred_frame() else {
                 frames.push(TracebackFrame {
                     name: "<module>".to_string(),
                     span,
+                    file,
                 });
                 frames.reverse();
                 self.traceback_frames = frames;
@@ -690,6 +692,7 @@ impl Vm<'_> {
             frames.push(TracebackFrame {
                 name: function_return.name.clone(),
                 span,
+                file,
             });
             error = format!(
                 "{error} in {} at line {}, column {}",
@@ -711,6 +714,16 @@ impl Vm<'_> {
             .expect("deferred function frame was checked above");
         self.stack.push(value);
         true
+    }
+
+    /// `__file__` of the module whose code the active frame runs, when that module was imported.
+    /// Imported code runs under the module's scope; the main program keeps its globals outside
+    /// the scope chain, so its frames find no `__file__` here.
+    fn imported_module_file(&self) -> Option<String> {
+        let heap = &self.state.heap;
+        let root = heap.scope_root(*self.local_scopes.last()?).ok()?;
+        let file = heap.scope_get(root, "__file__")?;
+        protocol::string_value(heap, file).ok().flatten()
     }
 
     fn unwind_deferred_frame(&mut self) -> Option<FunctionReturn> {

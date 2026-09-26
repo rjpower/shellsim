@@ -239,6 +239,9 @@ struct TracebackFrame {
     name: String,
     /// Source location this frame was executing when the exception passed through it.
     span: Span,
+    /// `__file__` of the imported module that owns this frame's code, or `None` for the main
+    /// program, whose name depends on how it was started.
+    file: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -837,8 +840,10 @@ impl<'a> Vm<'a> {
         for frame in &frames {
             self.err.extend_from_slice(
                 format!(
-                    "  File \"{filename}\", line {}, in {}\n",
-                    frame.span.line, frame.name
+                    "  File \"{}\", line {}, in {}\n",
+                    frame.file.as_deref().unwrap_or(&filename),
+                    frame.span.line,
+                    frame.name
                 )
                 .as_bytes(),
             );
