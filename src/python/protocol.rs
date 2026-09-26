@@ -17,8 +17,8 @@ pub fn display(heap: &Heap, value: &Value) -> Result<String, String> {
     if let Some(value) = string_value(heap, value)? {
         return Ok(value);
     }
-    if let Some((kind, message)) = exception_parts(heap, value)? {
-        return Ok(if message.is_empty() { kind } else { message });
+    if let Some((_, message)) = exception_parts(heap, value)? {
+        return Ok(message);
     }
     if let Some((_, args)) = user_exception_parts(heap, value)? {
         return match args.as_slice() {

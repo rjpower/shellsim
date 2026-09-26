@@ -47,6 +47,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
         FunctionDef {
             module: "math",
+            name: "comb",
+            call: native_comb,
+        },
+        FunctionDef {
+            module: "math",
             name: "cos",
             call: native_cos,
         },
@@ -193,6 +198,44 @@ fn native_atan2(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 
 fn native_ceil(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "ceil")
+}
+
+/// Compute exact combinations with work and result storage bounded before multiplication.
+fn native_comb(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("math.comb", 2, 2)?;
+    args.reject_keywords("math.comb")?;
+    let n = integer_argument(runtime, &args.positional()[0], "comb")?;
+    let k = integer_argument(runtime, &args.positional()[1], "comb")?;
+    if n.is_negative() {
+        return Err(PyError::value_error("n must be a non-negative integer"));
+    }
+    if k.is_negative() {
+        return Err(PyError::value_error("k must be a non-negative integer"));
+    }
+    if k > n {
+        return runtime.new_integer("0");
+    }
+    let complement = &n - &k;
+    let selected = if k <= complement { k } else { complement };
+    let count = selected
+        .to_usize()
+        .ok_or_else(|| PyError::resource_error("combination length is too large"))?;
+    if count > 100_000 {
+        return Err(PyError::resource_error("combination length is too large"));
+    }
+    if count == 0 {
+        return runtime.new_integer("1");
+    }
+    let bytes = bigint_bytes(&n)?
+        .checked_mul(count.saturating_add(1))
+        .ok_or_else(|| PyError::resource_error("combination result is too large"))?;
+    runtime.reserve_memory(bytes)?;
+    let mut result = BigInt::from(1_u8);
+    for index in 1..=count {
+        runtime.charge_cpu(result.bits().div_ceil(64).saturating_add(1))?;
+        result = result * (&n - &selected + index) / index;
+    }
+    runtime.new_integer(&result.to_string())
 }
 
 fn native_cos(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
