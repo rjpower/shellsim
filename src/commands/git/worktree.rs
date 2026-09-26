@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use crate::commands::Io;
-use crate::syscalls::System;
+use crate::syscalls::{FileChange, FileKind, System};
 use crate::vfs::resolve_against;
 
 use super::compare;
@@ -948,24 +948,27 @@ pub(crate) fn git_rm(system: &mut dyn System, args: &[String], io: &mut Io) -> i
     if !system.reserve_memory(reserved) {
         return repo::resource_error(system);
     }
-    let before = system.vfs_snapshot();
-    let result = (|| -> Result<(), String> {
-        for (absolute, relative) in &selected {
-            if !cached && repo::is_file(system, "/", absolute) {
-                system
-                    .unlink("/", absolute)
-                    .map_err(|error| error.to_string())?;
-                repo::prune_empty_parents(system, &root, absolute);
-            }
-            index.remove(relative);
+    // Every removal and the new index are computed first, then committed together in one
+    // transaction: a failing unlink or a full disk leaves both the working tree and the index
+    // exactly as they were.
+    let mut changes = Vec::new();
+    for (absolute, relative) in &selected {
+        if !cached && repo::is_file(system, "/", absolute) {
+            changes.push(FileChange::RemoveFile(absolute.clone()));
         }
-        repo::store_index(system, &root, &index).map_err(|error| error.to_string())
-    })();
+        index.remove(relative);
+    }
+    changes.push(repo::store_index_change(&root, &index));
+    let result = system.apply_file_batch("/", changes);
     system.release_memory(reserved);
     if let Err(error) = result {
-        system.restore_vfs_snapshot(before);
         io.print_err(&format!("git rm: {error}\n"));
         return 1;
+    }
+    for (absolute, _) in &selected {
+        if !cached {
+            repo::prune_empty_parents(system, &root, absolute);
+        }
     }
     conflict::resolve(system, &root, selected.iter().map(|(_, path)| path));
     if !quiet {
@@ -1081,9 +1084,15 @@ pub(crate) fn git_mv(system: &mut dyn System, args: &[String], io: &mut Io) -> i
     if !system.reserve_memory(reserved) {
         return repo::resource_error(system);
     }
-    let before = system.vfs_snapshot();
-    let result = (|| -> Result<(), String> {
+    // Every move's blob, its new index entry, and the resulting index are computed first, then
+    // committed together in one transaction: a failing read or a full disk leaves both the
+    // working tree and the index exactly as they were.
+    let mut changes = Vec::new();
+    let build = (|| -> Result<(), String> {
         for (source_absolute, source_relative, target_absolute, target_relative) in &moves {
+            let info = system
+                .metadata("/", source_absolute, false)
+                .map_err(|error| error.to_string())?;
             // Read the link itself rather than what it points at, so moving a symbolic link
             // stages its target text and not the contents of the file at the end of it.
             let data = repo::read_work_file(system, &root, source_relative)
@@ -1091,33 +1100,45 @@ pub(crate) fn git_mv(system: &mut dyn System, args: &[String], io: &mut Io) -> i
             if !system.charge_cpu(data.len() as u64) {
                 return Err("cpu limit exceeded".to_string());
             }
-            let hash = repo::write_blob(system, &root, &data).map_err(|error| error.to_string())?;
             // A move keeps the file's mode along with its content.
             let recorded = index.get(source_relative).cloned().unwrap_or_default();
+            let (hash, blob) = repo::blob_change(&root, data.clone());
+            changes.push(blob);
             index.remove(source_relative);
             index.insert(target_relative.clone(), repo::Entry { hash, ..recorded });
-            if repo::exists(system, "/", target_absolute) {
-                system
-                    .unlink("/", target_absolute)
-                    .map_err(|error| error.to_string())?;
-            }
+            changes.push(FileChange::RemoveFile(source_absolute.clone()));
             if let Some(parent) = crate::vfs::parent_of(target_absolute) {
-                system
-                    .mkdir_all("/", &parent)
-                    .map_err(|error| error.to_string())?;
+                changes.push(FileChange::MkdirAll(parent));
             }
-            system
-                .rename("/", source_absolute, target_absolute)
-                .map_err(|error| error.to_string())?;
-            repo::prune_empty_parents(system, &root, source_absolute);
+            if info.kind == FileKind::Symlink {
+                changes.push(FileChange::PutSymlink {
+                    link: target_absolute.clone(),
+                    target: info.link_target.clone().unwrap_or_default(),
+                });
+            } else {
+                changes.push(FileChange::PutFile {
+                    path: target_absolute.clone(),
+                    bytes: data,
+                    mode: info.mode,
+                });
+            }
         }
-        repo::store_index(system, &root, &index).map_err(|error| error.to_string())
+        Ok(())
     })();
-    system.release_memory(reserved);
-    if let Err(error) = result {
-        system.restore_vfs_snapshot(before);
+    if let Err(error) = build {
+        system.release_memory(reserved);
         io.print_err(&format!("git mv: {error}\n"));
         return 1;
+    }
+    changes.push(repo::store_index_change(&root, &index));
+    let result = system.apply_file_batch("/", changes);
+    system.release_memory(reserved);
+    if let Err(error) = result {
+        io.print_err(&format!("git mv: {error}\n"));
+        return 1;
+    }
+    for (source_absolute, _, _, _) in &moves {
+        repo::prune_empty_parents(system, &root, source_absolute);
     }
     0
 }

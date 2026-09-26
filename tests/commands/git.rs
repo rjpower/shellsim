@@ -1446,6 +1446,63 @@ fn apply_can_record_a_patch_in_the_index() {
 }
 
 #[test]
+fn a_failed_cached_apply_leaves_the_index_and_worktree_unchanged() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/f1.txt", b"a\n".to_vec(), 0o644).unwrap();
+    env.vfs.put_file("/f2.txt", b"x\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    let index_before = env.vfs.read("/", "/.git/index").unwrap();
+
+    // The whole patch is computed and checked before anything commits: the first file's hunk
+    // matches, but the second's context does not, so applying it must change neither.
+    let script = r#"cat > /p.diff <<'PATCH'
+--- a/f1.txt
++++ b/f1.txt
+@@ -1 +1 @@
+-a
++A
+--- a/f2.txt
++++ b/f2.txt
+@@ -1 +1 @@
+-y
++Y
+PATCH
+git apply --cached /p.diff"#;
+    let failed = run(&mut env, script);
+    assert_ne!(failed.0, 0);
+    assert!(failed.2.contains("does not apply"), "{}", failed.2);
+
+    assert_eq!(env.vfs.read("/", "/f1.txt").unwrap(), b"a\n");
+    assert_eq!(env.vfs.read("/", "/f2.txt").unwrap(), b"x\n");
+    assert_eq!(env.vfs.read("/", "/.git/index").unwrap(), index_before);
+    assert_eq!(run(&mut env, "git status --short").1, "?? p.diff\n");
+}
+
+#[test]
+fn a_failed_git_rm_leaves_the_worktree_and_index_unchanged() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    env.vfs.put_file("/b.txt", b"b\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    let index_before = env.vfs.read("/", "/.git/index").unwrap();
+
+    // Starve the command so its one commit transaction cannot complete; nothing it would have
+    // removed, and no index it would have written, may take effect.
+    env.resources = shellsim::resources::Resources::new(shellsim::Limits {
+        cpu: 20,
+        ..shellsim::Limits::unlimited()
+    });
+    let failed = run(&mut env, "git rm a.txt b.txt");
+    assert_ne!(failed.0, 0);
+
+    assert!(env.vfs.exists("/", "/a.txt"));
+    assert!(env.vfs.exists("/", "/b.txt"));
+    assert_eq!(env.vfs.read("/", "/.git/index").unwrap(), index_before);
+}
+
+#[test]
 fn status_names_paths_relative_to_the_working_directory() {
     let mut env = Environment::new();
     assert_eq!(run(&mut env, "git init -q").0, 0);

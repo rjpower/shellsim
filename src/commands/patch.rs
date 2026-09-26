@@ -570,10 +570,66 @@ fn apply_file_patch(
         return Err("resource limit exceeded".to_string());
     }
     let directive_delete = destination.is_none() && patch.hunks.is_empty();
-    let mut lines = split_bytes_lines(&source_bytes)?;
+    let output = apply_hunks(&source_bytes, patch.hunks)?;
+    if destination.is_none() {
+        let path = source.expect("deletion has a source");
+        if !directive_delete && !output.is_empty() {
+            return Err(format!(
+                "deletion patch for '{path}' does not remove all content"
+            ));
+        }
+        let absolute = resolve_against(cwd, path);
+        staged.insert(absolute.clone(), None);
+        changes.push(FileChange::RemoveFile(absolute));
+        return Ok(());
+    }
+    let path = destination.expect("non-deletion has a destination");
+    let absolute = resolve_against(cwd, path);
+    if matches!(
+        system.metadata("/", &absolute, false).map(|info| info.kind),
+        Ok(FileKind::Symlink)
+    ) {
+        return Err(format!(
+            "{path}: symbolic-link destinations are not supported"
+        ));
+    }
+    if let Some(parent) = parent_of(&absolute) {
+        changes.push(FileChange::MkdirAll(parent));
+    }
+    let mode = source
+        .and_then(|path| {
+            let absolute = resolve_against(cwd, path);
+            match staged.get(&absolute) {
+                Some(Some((_, mode))) => Some(*mode),
+                Some(None) => None,
+                None => system.metadata(cwd, path, true).ok().and_then(|metadata| {
+                    (metadata.kind == FileKind::File).then_some(metadata.mode)
+                }),
+            }
+        })
+        .unwrap_or(0o644);
+    changes.push(FileChange::PutFile {
+        path: absolute.clone(),
+        bytes: output.clone(),
+        mode,
+    });
+    staged.insert(absolute, Some((output, mode)));
+    if source.is_some_and(|source| source != path) {
+        let old = resolve_against(cwd, source.expect("rename has a source"));
+        staged.insert(old.clone(), None);
+        changes.push(FileChange::RemoveFile(old));
+    }
+    Ok(())
+}
+
+/// Splice a patch's hunks into its source content, matching each one at its declared position or,
+/// failing that, the next place its context and lines fit; used against real files by
+/// [`apply_file_patch`] and, purely in memory, by [`apply_patch_in_memory`].
+fn apply_hunks(source_bytes: &[u8], hunks: Vec<Hunk>) -> Result<Vec<u8>, String> {
+    let mut lines = split_bytes_lines(source_bytes)?;
     let mut offset = 0_isize;
     let mut search_from = 0;
-    for hunk in patch.hunks {
+    for hunk in hunks {
         let old = hunk
             .lines
             .iter()
@@ -639,56 +695,80 @@ fn apply_file_patch(
         offset = offset.saturating_add(new_len as isize - old_len as isize);
         search_from = position.saturating_add(new_len);
     }
-    let output = lines.concat().into_bytes();
-    if destination.is_none() {
-        let path = source.expect("deletion has a source");
-        if !directive_delete && !output.is_empty() {
-            return Err(format!(
-                "deletion patch for '{path}' does not remove all content"
-            ));
+    Ok(lines.concat().into_bytes())
+}
+
+/// Where [`apply_patch_in_memory`] reads a patched path's prior content from.
+///
+/// `git apply --cached` implements this against staged blob content, so it can validate and
+/// compute a patch's full result without writing anything to the working tree.
+pub(crate) trait PatchSource {
+    fn read(&mut self, path: &str) -> Result<Vec<u8>, String>;
+}
+
+/// One patched path's outcome: new content, or `None` for a deletion.
+pub(crate) struct ContentPatch {
+    pub path: String,
+    pub content: Option<Vec<u8>>,
+}
+
+/// Parse a patch and apply it purely in memory against `source`, without touching `System` or a
+/// working tree. Returns every patched path in patch order; a source-and-destination rename that
+/// changes path yields both the deletion of the old path and the content at the new one.
+///
+/// The whole patch is validated before anything is returned: a single failing hunk fails the
+/// call, and the caller commits nothing.
+pub(crate) fn apply_patch_in_memory(
+    text: &str,
+    strip: usize,
+    source: &mut dyn PatchSource,
+) -> Result<Vec<ContentPatch>, String> {
+    let patches = if text.starts_with("*** Begin Patch") {
+        parse_agent_patch(text)?
+    } else {
+        parse_unified_patch(text, strip)?
+    };
+    let mut results = Vec::new();
+    for patch in patches {
+        let old_path = patch.old_path.as_deref();
+        let new_path = patch.new_path.as_deref();
+        if old_path.is_none() && new_path.is_none() {
+            return Err("patch has neither source nor destination".to_string());
         }
-        let absolute = resolve_against(cwd, path);
-        staged.insert(absolute.clone(), None);
-        changes.push(FileChange::RemoveFile(absolute));
-        return Ok(());
-    }
-    let path = destination.expect("non-deletion has a destination");
-    let absolute = resolve_against(cwd, path);
-    if matches!(
-        system.metadata("/", &absolute, false).map(|info| info.kind),
-        Ok(FileKind::Symlink)
-    ) {
-        return Err(format!(
-            "{path}: symbolic-link destinations are not supported"
-        ));
-    }
-    if let Some(parent) = parent_of(&absolute) {
-        changes.push(FileChange::MkdirAll(parent));
-    }
-    let mode = source
-        .and_then(|path| {
-            let absolute = resolve_against(cwd, path);
-            match staged.get(&absolute) {
-                Some(Some((_, mode))) => Some(*mode),
-                Some(None) => None,
-                None => system.metadata(cwd, path, true).ok().and_then(|metadata| {
-                    (metadata.kind == FileKind::File).then_some(metadata.mode)
-                }),
+        let source_bytes = match old_path {
+            Some(path) => source.read(path)?,
+            None => Vec::new(),
+        };
+        let directive_delete = new_path.is_none() && patch.hunks.is_empty();
+        let output = apply_hunks(&source_bytes, patch.hunks)?;
+        match new_path {
+            None => {
+                let path = old_path.expect("deletion has a source");
+                if !directive_delete && !output.is_empty() {
+                    return Err(format!(
+                        "deletion patch for '{path}' does not remove all content"
+                    ));
+                }
+                results.push(ContentPatch {
+                    path: path.to_string(),
+                    content: None,
+                });
             }
-        })
-        .unwrap_or(0o644);
-    changes.push(FileChange::PutFile {
-        path: absolute.clone(),
-        bytes: output.clone(),
-        mode,
-    });
-    staged.insert(absolute, Some((output, mode)));
-    if source.is_some_and(|source| source != path) {
-        let old = resolve_against(cwd, source.expect("rename has a source"));
-        staged.insert(old.clone(), None);
-        changes.push(FileChange::RemoveFile(old));
+            Some(path) => {
+                results.push(ContentPatch {
+                    path: path.to_string(),
+                    content: Some(output),
+                });
+                if old_path.is_some_and(|old| old != path) {
+                    results.push(ContentPatch {
+                        path: old_path.expect("rename has a source").to_string(),
+                        content: None,
+                    });
+                }
+            }
+        }
     }
-    Ok(())
+    Ok(results)
 }
 
 fn split_bytes_lines(bytes: &[u8]) -> Result<Vec<String>, String> {

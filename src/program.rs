@@ -871,14 +871,6 @@ mod tests {
         fn note_unsupported(&mut self, _feature: &str) {
             unreachable!("native writer does not reject features")
         }
-
-        fn vfs_snapshot(&mut self) -> crate::syscalls::VfsSnapshot {
-            unreachable!("native writer does not snapshot files")
-        }
-
-        fn restore_vfs_snapshot(&mut self, _snapshot: crate::syscalls::VfsSnapshot) {
-            unreachable!("native writer does not restore files")
-        }
     }
 
     #[test]

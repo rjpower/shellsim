@@ -321,6 +321,16 @@ pub(crate) fn store_index(system: &mut dyn System, root: &str, index: &Tree) -> 
     write_vfs(system, &git_path(root, INDEX), &serialize_tree(index))
 }
 
+/// The index write as a [`FileChange`], so a caller can commit it in the same
+/// [`System::apply_file_batch`] transaction as the working-tree changes it goes with.
+pub(crate) fn store_index_change(root: &str, index: &Tree) -> FileChange {
+    FileChange::PutFile {
+        path: git_path(root, INDEX),
+        bytes: serialize_tree(index),
+        mode: 0o644,
+    }
+}
+
 pub(crate) fn read_blob(system: &mut dyn System, root: &str, hash: &str) -> Option<Vec<u8>> {
     read_all(system, &git_path(root, &format!("objects/{hash}")))
 }
@@ -329,6 +339,19 @@ pub(crate) fn write_blob(system: &mut dyn System, root: &str, data: &[u8]) -> Vf
     let hash = blob_hash(data);
     write_vfs(system, &git_path(root, &format!("objects/{hash}")), data)?;
     Ok(hash)
+}
+
+/// A blob write as a [`FileChange`], so a caller can commit several object writes together with
+/// the working-tree and index changes that reference them in one [`System::apply_file_batch`]
+/// transaction, rather than writing objects immediately and possibly outliving a later failure.
+pub(crate) fn blob_change(root: &str, data: Vec<u8>) -> (String, FileChange) {
+    let hash = blob_hash(&data);
+    let change = FileChange::PutFile {
+        path: git_path(root, &format!("objects/{hash}")),
+        bytes: data,
+        mode: 0o644,
+    };
+    (hash, change)
 }
 
 /// The bytes Git records for one working-tree node, or `None` for something it does not track.
