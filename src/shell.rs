@@ -1146,9 +1146,7 @@ impl Parser {
         if self.word_is("{") {
             self.i += 1;
             let body = self.parse_program();
-            if self.word_is("}") {
-                self.i += 1;
-            }
+            self.expect_word("}");
             return self.attach_redirects(Node::Group(Box::new(body)));
         }
         // function def:  name () { ... }
@@ -1755,6 +1753,16 @@ pub fn parse(src: &str) -> Result<Node, ShellError> {
     p.error.map_or(Ok(node), Err)
 }
 
+/// Return whether `src` ends inside a construct that more input could complete: an open
+/// quote, an unterminated heredoc, or a compound command, list, or pipeline cut off at the end.
+pub fn needs_more_input(src: &str) -> bool {
+    !heredocs_complete(src)
+        || matches!(
+            parse(src),
+            Err(ShellError::UnexpectedEof { .. } | ShellError::UnclosedQuote(_))
+        )
+}
+
 /// Return whether every heredoc opened in `src` has its terminating delimiter.
 ///
 /// The action console uses this narrow completeness check to collect a standard pasted heredoc
@@ -1890,7 +1898,23 @@ impl Interp {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, ShellError};
+    use super::{needs_more_input, parse, ShellError};
+
+    #[test]
+    fn stdin_programs_wait_for_complete_commands() {
+        for partial in [
+            "if true; then",
+            "echo \"a",
+            "cat <<EOF\nbody",
+            "true &&",
+            "f() {",
+        ] {
+            assert!(needs_more_input(partial), "{partial:?}");
+        }
+        for complete in ["echo a", "{ echo a; }", "cat <<EOF\nbody\nEOF\n", "fi"] {
+            assert!(!needs_more_input(complete), "{complete:?}");
+        }
+    }
 
     #[test]
     fn incomplete_compound_commands_are_parse_errors() {

@@ -23,13 +23,9 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     super::reg_system(m, "/usr/bin/sync", Trust::Real, |_, _| 0);
 
     // nested shells / uv-launched verifiers
-    reg_resumable(
-        m,
-        &["sh", "bash", "dash", "zsh"],
-        Trust::Real,
-        cmd_sh,
-        start_sh,
-    );
+    // Programs load these as shell images (`Interp::shell_image`); `cmd_sh` serves the
+    // remaining synchronous nested-command callers.
+    reg(m, &["sh", "bash", "dash", "zsh"], Trust::Real, cmd_sh);
     reg(m, &["uv", "uvx"], Trust::Partial, cmd_uv);
     reg_unsupported(m, &["uvenv"]);
 
@@ -494,13 +490,6 @@ fn cmd_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
 }
 
 /// Start a nested shell as an ordinary scheduled child instead of recursively executing it.
-fn start_sh(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
-    let Some((source, positional)) = shell_invocation(interp, args, io) else {
-        return CommandPoll::Ready(127);
-    };
-    start_shell_source(interp, &source, positional, None, io.err)
-}
-
 /// Parse and launch one shell source as a scheduler-owned child.
 pub(crate) fn start_shell_source(
     interp: &mut Interp,
