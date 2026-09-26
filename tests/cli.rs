@@ -915,3 +915,63 @@ fn versioned_scenario_rejects_unknown_versions_and_final_mismatches() {
         .iter()
         .any(|failure| failure.as_str().unwrap().contains("output_bytes")));
 }
+
+#[test]
+fn machine_options_configure_every_command_before_or_after_it() {
+    let script = TestDirectory::new();
+    let path = script.path().join("hello.sh");
+    std::fs::write(&path, "echo hello\n").unwrap();
+    let path = path.to_str().unwrap();
+    let cases: [(&[&str], &[u8]); 6] = [
+        (&["--output", "3", "-c", "echo hello"], b""),
+        (&["--output", "3", "run", path], b""),
+        (&["--output", "3", "shell"], b"echo hello\n"),
+        (&["shell", "--output", "3"], b"echo hello\n"),
+        (&["--output", "3", "eval", "-c", "echo hello"], b""),
+        (&["eval", "-c", "echo hello", "--output", "3"], b""),
+    ];
+    for (args, stdin) in cases {
+        let output = run_with_stdin(args, stdin);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // eval reports the truncated stream and status in JSON; the others stream it directly.
+        if args.contains(&"eval") {
+            assert!(stdout.contains("\"stdout\": \"hel\""), "{args:?}: {stdout}");
+            assert!(
+                stdout.contains("\"exit_status\": 137"),
+                "{args:?}: {stdout}"
+            );
+        } else {
+            assert_eq!(stdout, "hel", "{args:?}");
+        }
+    }
+    let output = run_with_stdin(
+        &["serve", "--output", "3"],
+        b"{\"id\":1,\"op\":\"execute\",\"source\":\"echo hello\"}\n",
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"output\":3"));
+}
+
+#[test]
+fn script_arguments_are_not_parsed_as_machine_options() {
+    let output = run_with_stdin(&["-c", "echo \"$1 $2\"", "--cpu", "--real-time"], b"");
+    assert_eq!(output.stdout, b"--cpu --real-time\n");
+}
+
+#[test]
+fn unknown_leading_option_is_a_usage_error() {
+    let output = run_with_stdin(&["--bogus", "-c", "true"], b"");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("MACHINE: [--cpu N]"));
+}
+
+#[test]
+fn real_time_option_boots_the_physical_time_clock() {
+    // Host time is unavoidable here; only a lower bound is asserted, which a slow host cannot
+    // violate. The virtual default must not spend an hour of host time on `sleep 3600`.
+    let started = std::time::Instant::now();
+    let output = run_with_stdin(&["--real-time", "-c", "sleep 0.05; echo done"], b"");
+    assert_eq!(output.stdout, b"done\n");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+    let output = run_with_stdin(&["-c", "sleep 3600; echo done"], b"");
+    assert_eq!(output.stdout, b"done\n");
+}
