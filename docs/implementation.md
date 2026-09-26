@@ -27,7 +27,11 @@ reach it directly. Native images use the same exec through `System::exec_argv`: 
 `nohup` replace themselves with their command, and a shell started by argv runs its `-c`
 source or script in that process. With no `-c` or script operand, or with `-s`, the shell reads
 its program from standard input one command at a time, so each command sees the input after it.
-Loading a shell image keeps only exported variables, as a real `execve` does. Exec keeps ignored signals ignored and resets caught ones.
+Loading a shell image keeps only exported variables, as a real `execve` does. The `exec` builtin
+with a command replaces the calling process the same way, keeping its PID and any pending
+redirections; a script or other program without a native image runs as a child, after which the
+shell exits with its status. Every command started from shell syntax goes through the resumable
+dispatcher, so no command body runs a nested command synchronously. Exec keeps ignored signals ignored and resets caught ones.
 `timeout` runs its command in a new process group and signals the whole group. A shell writer that hits a closed pipe receives `SIGPIPE` and exits silently
 with status 141 unless `SIGPIPE` is ignored.
 

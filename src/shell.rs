@@ -1449,6 +1449,26 @@ impl Parser {
                     };
                     redirs.push(Redirect { fd, op, target });
                 }
+                Tok::Heredoc(body, quoted) => {
+                    self.i += 1;
+                    redirs.push(Redirect {
+                        fd: 0,
+                        op: if quoted {
+                            RedirOp::HeredocRaw
+                        } else {
+                            RedirOp::Heredoc
+                        },
+                        target: body,
+                    });
+                }
+                Tok::HereString(target) => {
+                    self.i += 1;
+                    redirs.push(Redirect {
+                        fd: 0,
+                        op: RedirOp::HereString,
+                        target,
+                    });
+                }
                 _ => break,
             }
         }

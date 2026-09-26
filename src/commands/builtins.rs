@@ -19,8 +19,8 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["declare", "typeset"], Trust::Real, cmd_declare);
     reg(m, &["local"], Trust::Real, cmd_local);
     reg(m, &["readonly"], Trust::Real, cmd_readonly);
-    reg_resumable(m, &["source", "."], Trust::Real, cmd_source, start_source);
-    reg_resumable(m, &["eval"], Trust::Real, cmd_eval, start_eval);
+    reg_resumable(m, &["source", "."], Trust::Real, start_source);
+    reg_resumable(m, &["eval"], Trust::Real, start_eval);
     reg(m, &["exit"], Trust::Real, cmd_exit);
     reg(m, &["return"], Trust::Real, cmd_return);
     reg(m, &["break"], Trust::Real, cmd_break);
@@ -32,9 +32,9 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["["], Trust::Real, cmd_bracket);
     reg(m, &["[["], Trust::Real, cmd_dbracket);
     reg(m, &["read"], Trust::Real, cmd_read);
-    reg_resumable(m, &["wait"], Trust::Real, cmd_wait, start_wait);
+    reg_resumable(m, &["wait"], Trust::Real, start_wait);
     reg(m, &["jobs"], Trust::Real, cmd_jobs);
-    reg_resumable(m, &["fg"], Trust::Real, cmd_fg, start_fg);
+    reg_resumable(m, &["fg"], Trust::Real, start_fg);
     reg(m, &["bg"], Trust::Real, cmd_bg);
     reg(m, &["trap"], Trust::Real, cmd_trap);
     reg(m, &["flock"], Trust::Partial, cmd_flock);
@@ -48,7 +48,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg(m, &["kill"], Trust::Real, cmd_kill);
     reg(m, &["which"], Trust::Real, cmd_which);
     reg(m, &["type"], Trust::Real, cmd_type);
-    reg_resumable(m, &["command"], Trust::Real, cmd_command, start_command);
+    reg_resumable(m, &["command"], Trust::Real, start_command);
     reg(m, &["alias"], Trust::Partial, cmd_alias);
     reg(m, &["unalias"], Trust::Real, cmd_unalias);
     reg(m, &["getopts"], Trust::Real, cmd_getopts);
@@ -303,21 +303,17 @@ fn cmd_disown(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     0
 }
 
-fn cmd_exec(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+/// `exec` with a command replaces the process in the shell executor (`exec_builtin`); this
+/// body is reached only indirectly, as in `command exec cmd`, which is not modeled.
+fn cmd_exec(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     if args.is_empty() {
         return 0;
     }
-    let argv = if args.first().map(String::as_str) == Some("--") {
-        &args[1..]
-    } else {
-        args
-    };
-    if argv.is_empty() {
-        return 0;
-    }
-    let status = crate::commands::run(interp, argv, std::mem::take(&mut io.stdin), io.out, io.err);
-    interp.exiting = Some(status);
-    status
+    ewln(
+        io.err,
+        "exec: indirect invocation is not supported in shellsim",
+    );
+    2
 }
 
 const MAX_TRAP_STATE_BYTES: u64 = 1024 * 1024;
@@ -550,27 +546,6 @@ fn cmd_jobs(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     0
 }
 
-fn cmd_fg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let position = match foreground_job_position(interp, args) {
-        Ok(position) => position,
-        Err(error) => {
-            ewln(io.err, &format!("fg: {error}"));
-            return 1;
-        }
-    };
-    if !matches!(
-        interp.jobs[position].state,
-        crate::interp::JobState::Done(_)
-    ) {
-        ewln(
-            io.err,
-            "fg: job is not complete in synchronous command context",
-        );
-        return 127;
-    }
-    reap_job(interp, position)
-}
-
 fn start_fg(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
     let position = match foreground_job_position(interp, args) {
         Ok(position) => position,
@@ -794,60 +769,6 @@ fn list_signal(argument: Option<&String>, io: &mut Io) -> i32 {
     };
     wln(io.out, signal.name());
     0
-}
-
-fn cmd_wait(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    if args.is_empty() {
-        let pids = interp.jobs.iter().map(|job| job.pid).collect::<Vec<_>>();
-        interp.jobs.clear();
-        for pid in pids {
-            interp.processes.reap(pid);
-            let _ = interp.scheduler.reap(pid);
-        }
-        return 0;
-    }
-    let mut status = 0;
-    for argument in args {
-        let parsed = argument
-            .strip_prefix('%')
-            .unwrap_or(argument)
-            .parse::<u32>();
-        let Ok(identifier) = parsed else {
-            ewln(io.err, &format!("wait: {argument}: invalid job id"));
-            status = 127;
-            continue;
-        };
-        let position = if argument.starts_with('%') {
-            interp.jobs.iter().position(|job| job.id == identifier)
-        } else {
-            interp.jobs.iter().position(|job| job.pid == identifier)
-        };
-        match position {
-            Some(position)
-                if matches!(
-                    interp.jobs[position].state,
-                    crate::interp::JobState::Done(_)
-                ) =>
-            {
-                let job = interp.jobs.remove(position);
-                status = match job.state {
-                    crate::interp::JobState::Done(status) => status,
-                    _ => unreachable!("matched a completed job"),
-                };
-                interp.processes.reap(job.pid);
-                let _ = interp.scheduler.reap(job.pid);
-            }
-            Some(_) => {
-                ewln(io.err, &format!("wait: {argument}: job is not complete"));
-                status = 127;
-            }
-            None => {
-                ewln(io.err, &format!("wait: {argument}: no such job"));
-                status = 127;
-            }
-        }
-    }
-    status
 }
 
 fn start_wait(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
@@ -1361,28 +1282,6 @@ fn print_declared(interp: &Interp, name: &str, io: &mut Io) {
     }
 }
 
-fn cmd_source(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(path) = args.first() else {
-        ewln(io.err, "source: filename argument required");
-        return 2;
-    };
-    match interp.fs_read(&interp.cwd, path) {
-        Ok(src) => {
-            interp.source_depth = interp.source_depth.saturating_add(1);
-            let status = interp.run_script_into(&String::from_utf8_lossy(&src), io.out, io.err);
-            interp.source_depth = interp.source_depth.saturating_sub(1);
-            interp.returning.take().unwrap_or(status)
-        }
-        Err(_) => {
-            ewln(
-                io.err,
-                &format!("source: {path}: No such file or directory"),
-            );
-            1
-        }
-    }
-}
-
 fn start_source(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
     let Some(path) = args.first() else {
         ewln(io.err, "source: filename argument required");
@@ -1402,11 +1301,6 @@ fn start_source(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -
         Ok(ast) => CommandPoll::InlineSource(ast),
         Err(status) => CommandPoll::Ready(status),
     }
-}
-
-fn cmd_eval(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let src = args.join(" ");
-    interp.run_script_into(&src, io.out, io.err)
 }
 
 fn start_eval(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
@@ -2221,24 +2115,6 @@ pub(crate) fn is_shell_builtin_name(name: &str) -> bool {
             | "unset"
             | "wait"
     )
-}
-
-fn cmd_command(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    if args.is_empty() {
-        return 0;
-    }
-    if matches!(args.first().map(String::as_str), Some("-v" | "-V")) {
-        return command_lookup(interp, &args[1..], io, args[0] == "-V", true);
-    }
-    let argv = if args.first().map(String::as_str) == Some("--") {
-        &args[1..]
-    } else {
-        args
-    };
-    if argv.is_empty() {
-        return 0;
-    }
-    crate::commands::run(interp, argv, io.stdin.clone(), io.out, io.err)
 }
 
 fn start_command(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {

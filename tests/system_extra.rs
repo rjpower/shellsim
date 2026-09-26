@@ -251,3 +251,40 @@ fn nice_validates_its_adjustment_and_execs_the_command() {
     assert_eq!((status, stdout.as_str()), (0, "0\nok ok\nstatus:125\n"));
     assert_eq!(stderr, "nice: invalid adjustment 'x'\n");
 }
+
+#[test]
+fn exec_builtin_replaces_the_shell_process_image() {
+    let mut environment = Environment::new();
+    // The replacement keeps the PID, inherits pending redirections and stdin, skips builtins
+    // and the EXIT trap, and never returns to the rest of the program.
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "echo pid=$$; exec env X=1 sh -c 'echo \"x=$X pid=$$\"'; echo unreachable",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "pid=1234\nx=1 pid=1234\n");
+
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "echo hi | exec cat; sh -c 'trap \"echo trap\" EXIT; exec printf \"%s\\n\" image'; \
+         sh -c '{ exec cat; } > /captured <<< data; echo unreachable'; cat /captured; \
+         sh -c 'exec xargs echo' <<< 'a b'",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "hi\nimage\ndata\na b\n");
+}
+
+#[test]
+fn exec_builtin_failures_leave_the_shell_to_exit() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "sh -c 'trap \"echo trap\" EXIT; exec missing; echo unreachable'; echo s=$?; \
+         sh -c 'exec -z true'; echo s=$?; sh -c 'exec -a name true'; echo s=$?",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "trap\ns=127\ns=2\ns=2\n");
+    assert!(stderr.contains("exec: missing: not found"), "{stderr}");
+    assert!(stderr.contains("exec: -z: invalid option"), "{stderr}");
+    assert!(stderr.contains("exec: -a: unsupported option"), "{stderr}");
+}

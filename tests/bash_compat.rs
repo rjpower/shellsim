@@ -570,3 +570,11 @@ fn empty_double_quoted_word_is_one_empty_field() {
         (0, "2,1,1,0,0,0,1,[][x]".into(), String::new())
     );
 }
+
+#[test]
+fn heredocs_and_here_strings_redirect_compound_commands() {
+    assert_eq!(
+        run("x=v; { cat; } <<< \"s $x\"; (cat) <<< sub; if true; then cat; fi <<EOF\nh $x\nEOF\n{ cat; } <<'EOF'\nraw $x\nEOF\nf() { cat; }; f <<< fn"),
+        (0, "s v\nsub\nh v\nraw $x\nfn\n".into(), String::new())
+    );
+}

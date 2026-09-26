@@ -149,14 +149,6 @@ pub(crate) enum CommandPoll {
 /// Command-owned state retained by the shell while a native command is suspended.
 #[derive(Clone)]
 pub(crate) enum CommandResume {
-    Timer {
-        deadline_ns: u64,
-        status: i32,
-    },
-    Child {
-        pid: crate::process::ProcessId,
-        reap: bool,
-    },
     Wait {
         pids: Vec<crate::process::ProcessId>,
         status: i32,
@@ -171,12 +163,6 @@ pub(crate) enum CommandResume {
         status: i32,
         stop_on_error: bool,
     },
-    Timeout {
-        pid: crate::process::ProcessId,
-        deadline: Option<crate::clock::EventId>,
-        preserve_status: bool,
-        result_override: Option<i32>,
-    },
     Python {
         command: String,
         continuation: Box<crate::python::PythonContinuation>,
@@ -188,7 +174,6 @@ pub(crate) enum CommandResume {
         buffer: Vec<u8>,
         reserved: u64,
     },
-    TextStream(streams::TextStream),
 }
 
 pub(crate) use crate::syscalls::SpawnSpec as ChildCommand;
@@ -242,8 +227,6 @@ impl DerefMut for CommandContext<'_> {
 #[derive(Clone, Copy)]
 pub struct CommandSpec {
     body: CommandBody,
-    resume: Option<ResumableCmdFn>,
-    resume_before_input: bool,
     pub trust: Trust,
     pub base_cpu: u64,
     pub base_memory: u64,
@@ -252,6 +235,8 @@ pub struct CommandSpec {
 #[derive(Clone, Copy)]
 enum CommandBody {
     Legacy(CmdFn),
+    /// A legacy in-shell body that may suspend, switch to a child, or yield.
+    Resumable(ResumableCmdFn),
     System(SystemCmdFn),
     SystemPoll(SystemPollFn),
 }
@@ -280,14 +265,17 @@ pub(crate) fn registered_executables() -> Vec<(String, crate::vfs::NativeProgram
                     )
                 });
             }
-            (!matches!(*key, "." | "..") && matches!(spec.body, CommandBody::Legacy(_))).then(
-                || {
-                    (
-                        format!("/usr/bin/{key}"),
-                        crate::vfs::NativeProgram::LegacyRegistered(key),
-                    )
-                },
-            )
+            (!matches!(*key, "." | "..")
+                && matches!(
+                    spec.body,
+                    CommandBody::Legacy(_) | CommandBody::Resumable(_)
+                ))
+            .then(|| {
+                (
+                    format!("/usr/bin/{key}"),
+                    crate::vfs::NativeProgram::LegacyRegistered(key),
+                )
+            })
         })
         .collect::<Vec<_>>();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -312,7 +300,7 @@ pub(crate) fn system_command(path: &str) -> Option<SystemCommand> {
             base_memory: spec.base_memory,
             trust: spec.trust,
         }),
-        CommandBody::Legacy(_) => None,
+        CommandBody::Legacy(_) | CommandBody::Resumable(_) => None,
     }
 }
 
@@ -364,8 +352,6 @@ fn reg_costed(
             n,
             CommandSpec {
                 body: CommandBody::Legacy(f),
-                resume: None,
-                resume_before_input: false,
                 trust: t,
                 base_cpu,
                 base_memory,
@@ -442,8 +428,6 @@ fn reg_system_input(
     let name = path.rsplit('/').next().expect("executable has basename");
     let spec = CommandSpec {
         body,
-        resume: None,
-        resume_before_input: false,
         trust,
         base_cpu,
         base_memory,
@@ -463,37 +447,18 @@ fn reg_resumable(
     map: &mut HashMap<&'static str, CommandSpec>,
     names: &[&'static str],
     trust: Trust,
-    run: CmdFn,
     resume: ResumableCmdFn,
 ) {
     for &name in names {
         map.insert(
             name,
             CommandSpec {
-                body: CommandBody::Legacy(run),
-                resume: Some(resume),
-                resume_before_input: true,
+                body: CommandBody::Resumable(resume),
                 trust,
                 base_cpu: 100,
                 base_memory: 10 * 1024,
             },
         );
-    }
-}
-
-/// Register a resumable command whose continuation needs the command's complete bounded input.
-fn reg_buffered_resumable(
-    map: &mut HashMap<&'static str, CommandSpec>,
-    names: &[&'static str],
-    trust: Trust,
-    run: CmdFn,
-    resume: ResumableCmdFn,
-) {
-    reg_resumable(map, names, trust, run, resume);
-    for name in names {
-        map.get_mut(name)
-            .expect("newly registered command must exist")
-            .resume_before_input = false;
     }
 }
 
@@ -507,7 +472,6 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     diff::register(&mut m);
     echo::register(&mut m);
     expr::register(&mut m);
-    find::register(&mut m);
     format::register(&mut m);
     grep::register(&mut m);
     printf::register(&mut m);
@@ -518,7 +482,6 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     arcmd::register(&mut m);
     text::register(&mut m);
     unavailable::register(&mut m);
-    xargs::register(&mut m);
     fs::register(&mut m);
     git::register(&mut m);
     hashing::register(&mut m);
@@ -532,37 +495,6 @@ fn build_registry() -> HashMap<&'static str, CommandSpec> {
     m
 }
 
-/// Dispatch entry point: look up `argv[0]`, record its trust, and run it.
-///
-/// Unknown commands fall through to the legacy fallback: try to execute a script that lives
-/// in the VFS (shell or `#!`-python), otherwise record it as unsupported and return 127.
-pub fn run(
-    interp: &mut Interp,
-    argv: &[String],
-    stdin: Vec<u8>,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
-) -> i32 {
-    match dispatch(interp, argv, stdin, out, err, false) {
-        CommandPoll::Ready(status) => status,
-        CommandPoll::ReadyOutput { .. } => {
-            unreachable!("synchronous command output must use its borrowed buffers")
-        }
-        CommandPoll::Yielded(_) => {
-            unreachable!("synchronous command dispatch cannot yield")
-        }
-        CommandPoll::Blocked(_, _) => {
-            unreachable!("synchronous command dispatch cannot suspend")
-        }
-        CommandPoll::Switched(_) => {
-            unreachable!("synchronous command dispatch cannot switch processes")
-        }
-        CommandPoll::Inline(_) | CommandPoll::InlineSource(_) => {
-            unreachable!("synchronous command dispatch cannot inject shell frames")
-        }
-    }
-}
-
 /// Start a command from a shell continuation, allowing registered blocking commands to suspend.
 pub(crate) fn poll(
     interp: &mut Interp,
@@ -571,7 +503,7 @@ pub(crate) fn poll(
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> CommandPoll {
-    dispatch(interp, argv, stdin, out, err, true)
+    dispatch(interp, argv, stdin, out, err)
 }
 
 /// Whether the command has a continuation-aware entry point that does not consume standard
@@ -586,12 +518,9 @@ pub(crate) fn starts_before_input(interp: &Interp, argv: &[String]) -> bool {
         let Some(command) = command_name_for_dispatch(interp, requested) else {
             return false;
         };
-        if matches!(command, "cat" | "head") {
-            return streams::streams_before_input(command, &argv[1..]);
-        }
         registry()
             .get(command)
-            .is_some_and(|spec| spec.resume.is_some() && spec.resume_before_input)
+            .is_some_and(|spec| matches!(spec.body, CommandBody::Resumable(_)))
     })
 }
 
@@ -599,7 +528,7 @@ pub(crate) fn starts_before_input(interp: &Interp, argv: &[String]) -> bool {
 ///
 /// Most shell builtins and filesystem/system utilities do not read fd 0. Keeping that distinction
 /// explicit prevents an unrelated command in a redirected loop body from draining the loop's
-/// input. Streaming commands (`cat` and `head`) bypass this path through `starts_before_input`.
+/// input. Native images and resumable bodies bypass this path through `starts_before_input`.
 pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
     let Some(requested) = argv.first() else {
         return false;
@@ -676,44 +605,12 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
             | "xargs"
             | "xxd"
             | "zcat"
-    ) || registry()
-        .get(command)
-        .is_some_and(|spec| spec.resume.is_some() && !spec.resume_before_input)
+    )
 }
 
 /// Continue command-owned state after the scheduler wakes its process.
 pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> CommandPoll {
     let result = match continuation {
-        CommandResume::Timer {
-            deadline_ns,
-            status,
-        } => {
-            if interp.clock.monotonic_ns() >= deadline_ns {
-                CommandPoll::Ready(status)
-            } else {
-                CommandPoll::Blocked(
-                    WaitReason::Timer(deadline_ns),
-                    CommandResume::Timer {
-                        deadline_ns,
-                        status,
-                    },
-                )
-            }
-        }
-        CommandResume::Child { pid, reap } => {
-            match interp.processes.get(pid).map(|record| record.status) {
-                Some(crate::process::ProcessStatus::Exited(status)) => {
-                    if reap {
-                        interp.processes.reap(pid);
-                        let _ = interp.scheduler.reap(pid);
-                    }
-                    CommandPoll::Ready(status)
-                }
-                _ => {
-                    CommandPoll::Blocked(WaitReason::Child(pid), CommandResume::Child { pid, reap })
-                }
-            }
-        }
         CommandResume::Wait {
             mut pids,
             mut status,
@@ -793,46 +690,6 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
                 },
             ),
         },
-        CommandResume::Timeout {
-            pid,
-            deadline,
-            preserve_status,
-            result_override,
-        } => match interp.processes.get(pid).map(|record| record.status) {
-            Some(crate::process::ProcessStatus::Exited(status)) => {
-                let timed_out = deadline
-                    .is_some_and(|event| interp.clock.monotonic_ns() >= event.deadline_ns());
-                if let Some(deadline) = deadline {
-                    interp.clock.cancel(deadline);
-                }
-                if timed_out {
-                    for descendant in interp.processes.process_tree(pid).into_iter().rev() {
-                        if descendant != pid {
-                            interp.processes.reap(descendant);
-                            let _ = interp.scheduler.reap(descendant);
-                        }
-                    }
-                }
-                interp.processes.reap(pid);
-                let _ = interp.scheduler.reap(pid);
-                CommandPoll::Ready(result_override.unwrap_or({
-                    if timed_out && !preserve_status {
-                        124
-                    } else {
-                        status
-                    }
-                }))
-            }
-            _ => CommandPoll::Blocked(
-                WaitReason::Child(pid),
-                CommandResume::Timeout {
-                    pid,
-                    deadline,
-                    preserve_status,
-                    result_override,
-                },
-            ),
-        },
         CommandResume::Python {
             command,
             mut continuation,
@@ -858,7 +715,6 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
                 },
             ),
         },
-        CommandResume::TextStream(continuation) => streams::resume_stream(interp, continuation),
         CommandResume::PythonSource {
             argv,
             buffer,
@@ -921,14 +777,13 @@ fn dispatch(
     stdin: Vec<u8>,
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
-    resumable: bool,
 ) -> CommandPoll {
     let requested = argv[0].as_str();
     // Bare shell builtins remain in the shell process. An explicit path always invokes the
     // corresponding external image, even if its basename is also a builtin.
     let builtin = !requested.contains('/') && builtins::is_shell_builtin_name(requested);
     let native = resolved_native_image(interp, requested);
-    if !builtin && resumable && native.is_some_and(runs_native_process) {
+    if !builtin && native.is_some_and(runs_native_process) {
         return start_child_sequence(
             interp,
             vec![ChildCommand {
@@ -1009,17 +864,21 @@ fn dispatch(
             env: interp,
             command_name: cmd,
         };
-        let mut result = match (resumable, spec.resume) {
-            (true, Some(start)) => start(&mut context, args, &mut io),
-            _ => CommandPoll::Ready(match spec.body {
-                CommandBody::Legacy(run) => run(&mut context, args, &mut io),
-                CommandBody::System(run) => {
-                    run_system_from_legacy(&mut context, args, &mut io, SystemRun::Once(run))
-                }
-                CommandBody::SystemPoll(run) => {
-                    run_system_from_legacy(&mut context, args, &mut io, SystemRun::Poll(run))
-                }
-            }),
+        let mut result = match spec.body {
+            CommandBody::Resumable(start) => start(&mut context, args, &mut io),
+            CommandBody::Legacy(run) => CommandPoll::Ready(run(&mut context, args, &mut io)),
+            CommandBody::System(run) => CommandPoll::Ready(run_system_from_legacy(
+                &mut context,
+                args,
+                &mut io,
+                SystemRun::Once(run),
+            )),
+            CommandBody::SystemPoll(run) => CommandPoll::Ready(run_system_from_legacy(
+                &mut context,
+                args,
+                &mut io,
+                SystemRun::Poll(run),
+            )),
         };
         let out_bytes = io.out.len().saturating_sub(out_before);
         let err_bytes = io.err.len().saturating_sub(err_before);
@@ -1070,9 +929,7 @@ fn dispatch(
                 interp.resources.cpu_used(),
                 interp.vfs.disk_used(),
             );
-            if let Some(result) =
-                util::try_exec_script(interp, &path, args, &stdin, out, err, resumable)
-            {
+            if let Some(result) = util::try_exec_script(interp, &path, args, &stdin, out, err) {
                 finish_ready_invocation(interp, &result);
                 return result;
             }
@@ -1197,25 +1054,6 @@ fn command_name_for_dispatch<'a>(interp: &Interp, requested: &'a str) -> Option<
         return Some(requested);
     }
     resolved_native_image(interp, requested).map(crate::vfs::NativeProgram::name)
-}
-
-/// Provide `run_script_into` for nested execution (source, eval, scripts).
-impl Interp {
-    pub fn run_script_into(&mut self, src: &str, out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
-        let ast = match parse_shell_source(self, src, err) {
-            Ok(ast) => ast,
-            Err(status) => {
-                self.last_status = status;
-                return status;
-            }
-        };
-        let r = self.returning.take();
-        let code = crate::exec::exec(self, &ast, Vec::new(), out, err);
-        if r.is_some() {
-            self.returning = r;
-        }
-        code
-    }
 }
 
 #[cfg(test)]

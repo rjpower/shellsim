@@ -4,15 +4,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::commands::util::{ewln, wln};
-use crate::commands::{
-    reg, reg_buffered_resumable, reg_system, ChildCommand, CommandContext, CommandPoll,
-    CommandSpec, Io, Trust,
-};
+use crate::commands::{reg_system, CommandSpec, Io, Trust};
 use crate::process::ProcessStatus;
 use crate::syscalls::{FileKind, System};
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    reg_buffered_resumable(m, &["env"], Trust::Real, cmd_env, start_env);
     reg_system(m, "/usr/bin/printenv", Trust::Real, run_printenv);
     super::reg_system_poll(m, "/usr/bin/envsubst", Trust::Partial, cmd_envsubst);
     reg_system(m, "/usr/bin/uname", Trust::Real, run_uname);
@@ -33,68 +29,6 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_system(m, "/usr/bin/lsof", Trust::Partial, cmd_lsof);
     reg_system(m, "/usr/bin/ss", Trust::Partial, cmd_sockets);
     reg_system(m, "/usr/bin/netstat", Trust::Partial, cmd_sockets);
-    reg(m, &["nohup"], Trust::Partial, cmd_nohup);
-}
-
-fn cmd_env(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let action = match parse_env_action(&mut interp.system(), args) {
-        Ok(action) => action,
-        Err(error) => {
-            ewln(io.err, &format!("env: {error}"));
-            return 125;
-        }
-    };
-    let saved_vars = interp.vars.clone();
-    let saved_arrays = interp.arrays.clone();
-    let saved_exported = interp.exported.clone();
-    let saved_cwd = interp.cwd.clone();
-    interp.vars = action.environment.clone().into_iter().collect();
-    interp.arrays.clear();
-    interp.exported = action.environment.keys().cloned().collect();
-    if let Some(cwd) = &action.cwd {
-        interp.cwd = cwd.clone();
-    }
-
-    let status = if action.argv.is_empty() {
-        for (name, value) in &action.environment {
-            wln(io.out, &format!("{name}={value}"));
-        }
-        0
-    } else {
-        crate::commands::run(interp, &action.argv, io.stdin.clone(), io.out, io.err)
-    };
-    interp.vars = saved_vars;
-    interp.arrays = saved_arrays;
-    interp.exported = saved_exported;
-    interp.cwd = saved_cwd;
-    status
-}
-
-fn start_env(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
-    let action = match parse_env_action(&mut interp.system(), args) {
-        Ok(action) => action,
-        Err(error) => {
-            ewln(io.err, &format!("env: {error}"));
-            return CommandPoll::Ready(125);
-        }
-    };
-    if action.argv.is_empty() {
-        for (name, value) in action.environment {
-            wln(io.out, &format!("{name}={value}"));
-        }
-        return CommandPoll::Ready(0);
-    }
-    crate::commands::start_child_sequence(
-        interp,
-        vec![ChildCommand {
-            argv: action.argv,
-            stdin: Some(std::mem::take(&mut io.stdin)),
-            cwd: action.cwd,
-            environment: Some(action.environment),
-            ..Default::default()
-        }],
-        true,
-    )
 }
 
 pub(crate) struct EnvAction {
@@ -982,21 +916,6 @@ fn cmd_sockets(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) ->
         );
     }
     0
-}
-
-fn cmd_nohup(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let argv = if args.first().map(String::as_str) == Some("--") {
-        &args[1..]
-    } else {
-        args
-    };
-    if argv.is_empty() {
-        ewln(io.err, "nohup: missing operand");
-        return 125;
-    }
-    // Captured shellsim streams are not terminals, so GNU nohup's nohup.out redirection does not
-    // apply. Signal disposition is process-local; the delegated command runs synchronously here.
-    crate::commands::run(interp, argv, std::mem::take(&mut io.stdin), io.out, io.err)
 }
 
 fn human_size(bytes: u64) -> String {
