@@ -183,6 +183,7 @@ pub(super) enum PyKind {
     Generator,
     Module,
     Array,
+    Complex,
     Native,
 }
 
@@ -439,6 +440,10 @@ pub(super) trait PyRuntime {
     fn replace_bytearray_items(&mut self, value: PyByteArray, items: Vec<u8>) -> PyResult<()>;
     fn is_integer_type(&self, value: &PyValue) -> bool;
     fn is_string_type(&self, value: &PyValue) -> bool;
+    /// View a builtin `bool`, `int`, `float`, or `complex` without copying its storage.
+    fn number(&self, value: &PyValue) -> Option<super::number::NumberRef<'_>>;
+    /// Allocate a builtin `complex` in the metered object arena.
+    fn new_complex(&mut self, real: f64, imag: f64) -> PyResult<PyValue>;
     /// Return an exact decimal rendering for any Python integer representation.
     fn integer_text(&self, value: &PyValue) -> PyResult<Option<String>>;
     /// Write only to an interpreter-owned simulated stream marker.
@@ -644,6 +649,7 @@ pub(super) trait PyRuntime {
             PyKind::Generator => "generator",
             PyKind::Module => "module",
             PyKind::Array => "numpy.ndarray",
+            PyKind::Complex => "complex",
             PyKind::Native => "object",
         })
     }

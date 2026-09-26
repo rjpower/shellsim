@@ -20,6 +20,8 @@ pub(super) enum NumberRef<'a> {
     Int(i64),
     BigInt(&'a BigInt),
     Float(f64),
+    /// Real and imaginary components of a builtin `complex`.
+    Complex(f64, f64),
 }
 
 /// Resolve Python numeric storage into one semantic numeric view.
@@ -35,6 +37,7 @@ pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>>
     }
     match value.object_id().and_then(|id| heap.get(id).ok())? {
         Object::BigInt(value) => Some(NumberRef::BigInt(value)),
+        Object::Complex { real, imag } => Some(NumberRef::Complex(*real, *imag)),
         Object::Instance {
             payload: InstancePayload::Int(value),
             ..
@@ -139,36 +142,33 @@ fn real_conjugate(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -
 pub(super) fn index<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>> {
     match view(heap, value)? {
         value @ (NumberRef::Int(_) | NumberRef::BigInt(_)) => Some(value),
-        NumberRef::Float(_) => None,
+        NumberRef::Float(_) | NumberRef::Complex(..) => None,
     }
 }
 
-/// Coerce a real numeric value to `f64`, rejecting non-numeric storage.
+/// Coerce a real numeric value to `f64`, rejecting complex and non-numeric storage.
 pub(super) fn as_f64(heap: &Heap, value: &PyValue) -> Option<f64> {
     match view(heap, value)? {
         NumberRef::Int(value) => Some(value as f64),
         NumberRef::BigInt(value) => num_traits::ToPrimitive::to_f64(value),
         NumberRef::Float(value) => Some(value),
+        NumberRef::Complex(..) => None,
     }
 }
 
-/// Construct a capability-free complex value through the frozen Python class.
+/// Whether a value is a builtin `complex`, for real-only paths that reject it explicitly.
+pub(super) fn is_complex(heap: &Heap, value: &PyValue) -> bool {
+    matches!(view(heap, value), Some(NumberRef::Complex(..)))
+}
+
+/// Allocate a builtin complex value, e.g. for an imaginary literal or a negative base raised
+/// to a fractional power.
 pub(super) fn create_complex(
     runtime: &mut dyn PyRuntime,
     real: f64,
     imaginary: f64,
 ) -> PyResult<PyValue> {
-    let module = runtime.import_module("_complex")?;
-    let constructor = runtime
-        .get_attribute(module, "complex")?
-        .ok_or_else(|| PyError::runtime_error("complex type is unavailable"))?;
-    runtime.call_value(
-        constructor,
-        CallArgs::new(
-            vec![PyValue::Float(real), PyValue::Float(imaginary)],
-            Vec::new(),
-        ),
-    )
+    runtime.new_complex(real, imaginary)
 }
 
 /// Parse the textual forms accepted by the bounded `int` constructor.

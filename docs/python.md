@@ -35,6 +35,11 @@ support `yield`, `yield from`, `send`, `throw`, and `close`, including suspensio
 `with` regions. Generator shutdown uses a deliberately simple bounded drain through pending
 cleanup code.
 
+`complex` is a native arena type. Its arithmetic, string parsing, `repr`, and error messages
+follow CPython 3.14, including the mixed-mode rules for real operands. Ordering, floor division,
+modulo, `int()`, `float()`, `round()`, and `math` functions reject complex values with
+`TypeError`. Format specifications on complex values are not implemented.
+
 The core collection surface includes mutable sets and immutable `frozenset` values with mixed
 comparison and set algebra. VFS-backed text and binary files support read, write, append, and
 their `+` update variants with a shared seekable cursor.

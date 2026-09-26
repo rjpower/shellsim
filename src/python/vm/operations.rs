@@ -397,6 +397,9 @@ impl Vm<'_> {
     }
 
     fn format_unconverted_value(&self, value: &Value, text: &str) -> Result<String, String> {
+        if super::number::is_complex(&self.state.heap, value) {
+            return Err("format specifications for complex numbers are not implemented".into());
+        }
         let spec = FormatSpec::parse(text)?;
         let number = super::number::view(&self.state.heap, value);
         match (spec.presentation, number) {
@@ -435,9 +438,8 @@ impl Vm<'_> {
         match super::number::view(&self.state.heap, value) {
             Some(super::number::NumberRef::Int(value)) => Ok(BigInt::from(value)),
             Some(super::number::NumberRef::BigInt(value)) => Ok(value.clone()),
-            Some(super::number::NumberRef::Float(_)) | None => {
-                Err("unsupported arithmetic operands".into())
-            }
+            Some(super::number::NumberRef::Float(_) | super::number::NumberRef::Complex(..))
+            | None => Err("unsupported arithmetic operands".into()),
         }
     }
 

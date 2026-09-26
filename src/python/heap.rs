@@ -128,6 +128,12 @@ pub enum Object {
     Set(Vec<Value>),
     FrozenSet(Vec<Value>),
     BigInt(BigInt),
+    /// Immutable builtin `complex`. Two doubles exceed the inline value payload, so complex
+    /// numbers are arena objects like arbitrary-precision integers.
+    Complex {
+        real: f64,
+        imag: f64,
+    },
     /// Reusable arithmetic sequence. Iteration state lives in a separate iterator object.
     Range {
         start: i64,
@@ -1120,6 +1126,7 @@ impl Heap {
             Object::Set(_) => BuiltinType::Set.id(),
             Object::FrozenSet(_) => BuiltinType::FrozenSet.id(),
             Object::BigInt(_) => BuiltinType::Int.id(),
+            Object::Complex { .. } => BuiltinType::Complex.id(),
             Object::Range { .. } => BuiltinType::Range.id(),
             Object::Function { .. } | Object::DescriptorBoundMethod { .. } => {
                 BuiltinType::Function.id()
@@ -1499,6 +1506,7 @@ fn trace_object(
         | Object::Exception { .. }
         | Object::Slice { .. }
         | Object::BigInt(_)
+        | Object::Complex { .. }
         | Object::Range { .. }
         | Object::RangeIterator { .. }
         | Object::CountIterator { .. }
@@ -1527,6 +1535,8 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::Slice { .. } => 3,
         Object::BigInt(value) => usize::try_from(value.bits().saturating_add(7) / 8)
             .map_err(|_| "modeled big integer size overflow")?,
+        // Sixteen bytes of payload rounded up to one modeled value slot.
+        Object::Complex { .. } => 1,
         Object::Range { .. } => 3,
         Object::Dict(entries) => entries
             .len()

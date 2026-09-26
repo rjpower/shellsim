@@ -56,10 +56,11 @@ pub(super) enum BuiltinType {
     RaisesContext,
     Property,
     Array,
+    Complex,
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 29] = [
+    pub(super) const ALL: [Self; 30] = [
         Self::Object,
         Self::Type,
         Self::None,
@@ -89,6 +90,7 @@ impl BuiltinType {
         Self::RaisesContext,
         Self::Property,
         Self::Array,
+        Self::Complex,
     ];
 
     pub(super) const fn id(self) -> TypeId {
@@ -126,6 +128,7 @@ impl BuiltinType {
             Self::RaisesContext => "pytest.raises",
             Self::Property => "property",
             Self::Array => "numpy.ndarray",
+            Self::Complex => "complex",
         }
     }
 }
@@ -881,7 +884,7 @@ fn insert_native_attributes(
 }
 
 /// Install the numeric-tower accessors (`real`, `imag`, `conjugate`, and the rational
-/// accessors on integers) on the builtin number types.
+/// accessors on integers) on the builtin number types, including `complex`.
 ///
 /// Attribute lookup on builtin types does not walk the MRO, so `bool` receives its own table
 /// rather than inheriting the one installed on `int`.
@@ -897,6 +900,10 @@ fn install_number_attributes(types: &mut [PyType]) {
     install_native_attributes(
         &mut types[BuiltinType::Float as usize],
         &super::number::FLOAT_TYPE,
+    );
+    install_native_attributes(
+        &mut types[BuiltinType::Complex as usize],
+        &super::complex::COMPLEX_TYPE,
     );
 }
 
@@ -1025,6 +1032,30 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.less_equal = Some(intrinsic(super::stdlib::numpy::slot_less_equal));
     slots.greater_than = Some(intrinsic(super::stdlib::numpy::slot_greater_than));
     slots.greater_equal = Some(intrinsic(super::stdlib::numpy::slot_greater_equal));
+
+    let slots = &mut types[BuiltinType::Complex as usize].slots;
+    slots.positive = Some(unary(super::complex::slot_positive));
+    slots.negative = Some(unary(super::complex::slot_negative));
+    slots.absolute = Some(unary(super::complex::slot_absolute));
+    slots.hash = Some(unary(super::complex::slot_hash));
+    slots.add = Some(intrinsic(super::complex::slot_add));
+    slots.reflected_add = Some(intrinsic(super::complex::slot_add));
+    slots.subtract = Some(intrinsic(super::complex::slot_subtract));
+    slots.reflected_subtract = Some(intrinsic(super::complex::slot_reflected_subtract));
+    slots.multiply = Some(intrinsic(super::complex::slot_multiply));
+    slots.reflected_multiply = Some(intrinsic(super::complex::slot_multiply));
+    slots.divide = Some(intrinsic(super::complex::slot_divide));
+    slots.reflected_divide = Some(intrinsic(super::complex::slot_reflected_divide));
+    slots.power = Some(intrinsic(super::complex::slot_power));
+    slots.reflected_power = Some(intrinsic(super::complex::slot_reflected_power));
+    slots.floor_divide = Some(intrinsic(super::complex::slot_floor_divide));
+    slots.reflected_floor_divide = Some(intrinsic(super::complex::slot_reflected_floor_divide));
+    slots.remainder = Some(intrinsic(super::complex::slot_remainder));
+    slots.reflected_remainder = Some(intrinsic(super::complex::slot_reflected_remainder));
+    slots.less_than = Some(intrinsic(super::complex::slot_less_than));
+    slots.less_equal = Some(intrinsic(super::complex::slot_less_equal));
+    slots.greater_than = Some(intrinsic(super::complex::slot_greater_than));
+    slots.greater_equal = Some(intrinsic(super::complex::slot_greater_equal));
 
     let stream = &mut types[BuiltinType::Stream as usize].slots;
     stream.iter = Some(unary(super::stdlib::sys::slot_iter));

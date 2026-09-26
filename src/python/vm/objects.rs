@@ -529,6 +529,7 @@ impl Vm<'_> {
                 | Object::Exception { .. }
                 | Object::FrozenSet(_)
                 | Object::BigInt(_)
+                | Object::Complex { .. }
                 | Object::Function { .. }
                 | Object::Class { .. }
                 | Object::Instance { .. }
@@ -742,6 +743,7 @@ impl Vm<'_> {
             | Object::Exception { .. }
             | Object::Set(_)
             | Object::BigInt(_)
+            | Object::Complex { .. }
             | Object::Range { .. }
             | Object::Function { .. }
             | Object::Class { .. }
@@ -1705,6 +1707,24 @@ impl Vm<'_> {
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
     ) -> Result<CallResult, String> {
+        if builtin_type == BuiltinType::Complex {
+            let arguments = super::CallArgs::new(arguments, keyword_arguments);
+            let value = super::super::complex::construct(self, arguments)
+                .map_err(|error| self.record_native_error(error))?;
+            return Ok(CallResult::Value(value));
+        }
+        if matches!(builtin_type, BuiltinType::Int | BuiltinType::Float)
+            && arguments
+                .first()
+                .is_some_and(|value| super::number::is_complex(&self.state.heap, value))
+        {
+            let error = PyError::type_error(if builtin_type == BuiltinType::Int {
+                "int() argument must be a string, a bytes-like object or a real number, not 'complex'"
+            } else {
+                "float() argument must be a string or a real number, not 'complex'"
+            });
+            return Err(self.record_native_error(error));
+        }
         if !keyword_arguments.is_empty() {
             return Err(format!(
                 "{}() does not accept keyword arguments in this slice",
@@ -1929,6 +1949,7 @@ impl Vm<'_> {
             | BuiltinType::Array => {
                 return Err(format!("cannot create '{}' instances", builtin_type.name()));
             }
+            BuiltinType::Complex => unreachable!("complex construction returned above"),
         };
         Ok(CallResult::Value(value))
     }

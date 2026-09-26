@@ -391,6 +391,7 @@ impl PyRuntime for Vm<'_> {
                 Object::Exception { .. } => PyKind::Native,
                 Object::List(_) => PyKind::List,
                 Object::BigInt(_) => PyKind::Int,
+                Object::Complex { .. } => PyKind::Complex,
                 Object::Tuple(_) => PyKind::Tuple,
                 Object::Slice { .. } => PyKind::Native,
                 Object::Dict(_) | Object::DefaultDict { .. } => PyKind::Dict,
@@ -483,11 +484,21 @@ impl PyRuntime for Vm<'_> {
         )
     }
 
+    fn number(&self, value: &Value) -> Option<super::number::NumberRef<'_>> {
+        super::number::view(&self.state.heap, value)
+    }
+
+    fn new_complex(&mut self, real: f64, imag: f64) -> PyResult<Value> {
+        self.allocate_object(Object::Complex { real, imag })
+            .map_err(PyError::resource_error)
+    }
+
     fn integer_text(&self, value: &Value) -> PyResult<Option<String>> {
         Ok(match super::number::view(&self.state.heap, value) {
             Some(super::number::NumberRef::Int(value)) => Some(value.to_string()),
             Some(super::number::NumberRef::BigInt(value)) => Some(value.to_string()),
-            Some(super::number::NumberRef::Float(_)) | None => None,
+            Some(super::number::NumberRef::Float(_) | super::number::NumberRef::Complex(..))
+            | None => None,
         })
     }
 

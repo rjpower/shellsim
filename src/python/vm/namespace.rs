@@ -91,6 +91,7 @@ impl Vm<'_> {
                 "bool" => Some(BuiltinType::Bool),
                 "int" => Some(BuiltinType::Int),
                 "float" => Some(BuiltinType::Float),
+                "complex" => Some(BuiltinType::Complex),
                 "str" => Some(BuiltinType::String),
                 "bytes" => Some(BuiltinType::Bytes),
                 "bytearray" => Some(BuiltinType::ByteArray),
