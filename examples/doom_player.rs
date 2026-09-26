@@ -23,11 +23,12 @@ const HTML: &str = r#"<!doctype html>
 <style>
 body{background:#151515;color:#eee;font:16px system-ui;text-align:center;margin:2rem}
 canvas{width:min(95vw,1280px);image-rendering:pixelated;border:1px solid #555}
+canvas:focus{outline:2px solid #eee;outline-offset:2px}
 p{margin:.7rem}button{font:inherit;padding:.4rem .9rem}
 </style>
 <h1>Doom in shellsim</h1>
-<canvas id="screen" width="640" height="400"></canvas>
-<p>Arrow keys move, Ctrl fires, Space uses, Shift runs, Esc opens the menu. Click the page to focus.</p>
+<canvas id="screen" width="640" height="400" tabindex="0" aria-label="Doom game"></canvas>
+<p>WASD or arrow keys move, J or Ctrl fires, K or Space uses, Shift runs, Esc opens the menu. Click the game to capture keys.</p>
 <p id="status">Waiting for the first frame…</p><button id="quit">Stop guest</button>
 <script>
 const canvas = document.getElementById('screen');
@@ -35,26 +36,59 @@ const ctx = canvas.getContext('2d', {alpha:false});
 const status = document.getElementById('status');
 const keycodes = {ArrowRight:0xae,ArrowLeft:0xac,ArrowUp:0xad,ArrowDown:0xaf,
   Escape:27,Enter:13,Tab:9,Control:0xa3,' ':0xa2,Shift:0xb6,Alt:0xb8};
-function code(event) {
+const gameKeys = {KeyW:0xad,KeyA:0xac,KeyS:0xaf,KeyD:0xae,
+  KeyJ:0xa3,KeyK:0xa2};
+const held = new Map();
+const counts = new Map();
+let pending = Promise.resolve();
+function gameCode(event) {
+  if (gameKeys[event.code] !== undefined) return gameKeys[event.code];
   if (keycodes[event.key] !== undefined) return keycodes[event.key];
   if (event.key.length === 1) return event.key.toLowerCase().charCodeAt(0);
   return null;
 }
-function sendKey(event, pressed) {
-  const key = code(event);
-  if (key === null || (pressed && event.repeat)) return;
-  event.preventDefault();
+function postKey(key, pressed) {
   const data = new ArrayBuffer(8);
   const view = new DataView(data);
   view.setUint32(0,key,true); view.setUint32(4,pressed ? 1 : 0,true);
-  fetch('/key',{method:'POST',body:data}).catch(() => { status.textContent='Connection lost'; });
+  pending = pending.then(() => fetch('/key',{method:'POST',body:data}))
+    .catch(() => { status.textContent='Connection lost'; });
 }
-addEventListener('keydown',event => sendKey(event,true));
-addEventListener('keyup',event => sendKey(event,false));
-addEventListener('blur',() => { for (const code of [0xad,0xaf,0xac,0xae,0xa3,0xa2,0xb6]) {
-  const data=new ArrayBuffer(8); const view=new DataView(data); view.setUint32(0,code,true);
-  fetch('/key',{method:'POST',body:data}).catch(() => {});
-}});
+function physicalKey(event) { return event.code && event.code !== 'Unidentified' ? event.code : event.key; }
+canvas.addEventListener('keydown',event => {
+  const key = gameCode(event);
+  if (key === null) return;
+  event.preventDefault();
+  const physical = physicalKey(event);
+  if (held.has(physical)) return;
+  held.set(physical,key);
+  const count = counts.get(key) || 0;
+  counts.set(key,count+1);
+  if (count === 0) postKey(key,true);
+});
+canvas.addEventListener('keyup',event => {
+  const physical = physicalKey(event);
+  const key = held.get(physical);
+  if (key === undefined) {
+    if (gameCode(event) !== null) event.preventDefault();
+    return;
+  }
+  event.preventDefault();
+  held.delete(physical);
+  const count = counts.get(key)-1;
+  if (count === 0) { counts.delete(key); postKey(key,false); }
+  else counts.set(key,count);
+});
+function releaseKeys() {
+  held.clear();
+  for (const key of counts.keys()) postKey(key,false);
+  counts.clear();
+}
+canvas.addEventListener('blur',releaseKeys);
+addEventListener('blur',releaseKeys);
+document.addEventListener('visibilitychange',() => { if (document.hidden) releaseKeys(); });
+canvas.addEventListener('pointerdown',() => canvas.focus());
+canvas.focus();
 document.getElementById('quit').onclick=() => fetch('/quit',{method:'POST'});
 async function draw() {
   try {

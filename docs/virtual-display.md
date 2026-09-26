@@ -72,9 +72,10 @@ cargo run --release --example doom_player -- /path/to/doomgeneric/doomgeneric /p
 ```
 
 The launch compiles Doomgeneric inside shellsim's VFS. Open the loopback URL printed by the
-example. Arrow keys move, Ctrl fires, Space uses, Shift runs, and Esc
-opens the menu. The browser only sees copied RGBA frames and sends bounded key events to a host
-demo process; the guest has no host network access. The demo binds an ephemeral `127.0.0.1` port
+example. Click the game to capture keyboard input. WASD or arrow keys move, J or Ctrl fires,
+K or Space uses, Shift runs, and Esc opens the menu. The browser only sees copied RGBA frames
+and sends bounded key events to a host demo process; the guest has no host network access. The
+demo binds an ephemeral `127.0.0.1` port
 and exits when its Stop button is pressed. The external [Freedoom release](https://github.com/freedoom/freedoom/releases/tag/v0.13.0)
 provides a playable WAD; only the opt-in launcher downloads it.
 
