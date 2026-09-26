@@ -1363,6 +1363,50 @@ fn configuration_keeps_every_value_and_expands_aliases() {
 }
 
 #[test]
+fn commit_identity_from_the_environment_needs_an_exported_variable() {
+    // `git` now runs as a genuine child process, so it sees exported variables only, the same
+    // as any other external command. A shell variable that was never exported does not reach it;
+    // an inline prefix assignment or an explicit `export` does, because both put the variable in
+    // the command's environment.
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/one.txt", b"one\n".to_vec(), 0o644)
+        .unwrap();
+
+    assert_eq!(
+        run(
+            &mut env,
+            "GIT_AUTHOR_NAME=Nobody; git add -A; git commit -m unexported"
+        )
+        .0,
+        0
+    );
+    let unexported = run(&mut env, "git cat-file -p HEAD").1;
+    assert!(
+        unexported.contains("\nauthor shellsim <shellsim@localhost>"),
+        "{unexported}"
+    );
+
+    env.vfs
+        .put_file("/two.txt", b"two\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(
+        run(
+            &mut env,
+            "git add -A; GIT_AUTHOR_NAME=Ada GIT_AUTHOR_EMAIL=ada@example.com git commit -m prefixed"
+        )
+        .0,
+        0
+    );
+    let prefixed = run(&mut env, "git cat-file -p HEAD").1;
+    assert!(
+        prefixed.contains("\nauthor Ada <ada@example.com>"),
+        "{prefixed}"
+    );
+}
+
+#[test]
 fn apply_can_record_a_patch_in_the_index() {
     let mut env = Environment::new();
     assert_eq!(run(&mut env, "git init -q").0, 0);

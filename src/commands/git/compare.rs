@@ -7,7 +7,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::System;
 
 use super::conflict;
 use super::diff::{self, DEFAULT_CONTEXT};
@@ -84,7 +85,7 @@ pub(crate) fn selected(paths: &[String], path: &str) -> bool {
 }
 
 fn content(
-    ctx: &CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     tree: &Tree,
     path: &str,
@@ -93,17 +94,17 @@ fn content(
     match side {
         RightSide::Stored => tree
             .get(path)
-            .and_then(|entry| repo::read_blob(ctx, root, &entry.hash)),
+            .and_then(|entry| repo::read_blob(system, root, &entry.hash)),
         RightSide::WorkingTree => {
             tree.get(path)?;
-            repo::read_work_file(ctx, root, path)
+            repo::read_work_file(system, root, path)
         }
     }
 }
 
 /// Render the difference between two trees. Returns true when a `--check` violation was found.
 pub(crate) fn emit(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     old: &Tree,
     new: &Tree,
@@ -135,11 +136,10 @@ pub(crate) fn emit(
     }
     if options.whitespace != diff::Whitespace::Significant {
         // Under `-w` or `-b` a file whose only difference is whitespace is not a change at all.
-        let context = &*ctx;
         changed.retain(|path| {
             match (
-                content(context, root, old, path, RightSide::Stored),
-                content(context, root, new, path, options.right),
+                content(system, root, old, path, RightSide::Stored),
+                content(system, root, new, path, options.right),
             ) {
                 (Some(before), Some(after)) => {
                     diff::change_counts(Some(&before), Some(&after), options.whitespace) != (0, 0)
@@ -209,8 +209,8 @@ pub(crate) fn emit(
         }
     }
     for path in &changed {
-        let before = content(ctx, root, old, path, RightSide::Stored);
-        let after = content(ctx, root, new, path, options.right);
+        let before = content(system, root, old, path, RightSide::Stored);
+        let after = content(system, root, new, path, options.right);
         match options.format {
             Format::Check => {
                 let report = diff::whitespace_errors(path, before.as_deref(), after.as_deref());
@@ -475,7 +475,7 @@ pub(crate) const DIFF_VALUED: &str = "UM";
 /// Compare two files directly, as `git diff --no-index` does.
 ///
 /// Exits 1 when the files differ, which is how the command is usually used as a plain differ.
-fn diff_no_index(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn diff_no_index(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
     let mut options = Options::default();
     let mut operands: Vec<String> = Vec::new();
     let mut flags = Flags::new(args).valued(DIFF_VALUED);
@@ -497,9 +497,11 @@ fn diff_no_index(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
     let [left, right] = operands.as_slice() else {
         return super::usage(io, "usage: git diff --no-index PATH PATH");
     };
-    let read = |path: &str| -> Option<Vec<u8>> {
-        let absolute = crate::vfs::resolve_against(&ctx.cwd, path);
-        ctx.fs_read_limited("/", &absolute, 16 * 1024 * 1024).ok()
+    let mut read = |path: &str| -> Option<Vec<u8>> {
+        let absolute = crate::vfs::resolve_against(system.cwd(), path);
+        system
+            .read_file_limited("/", &absolute, 16 * 1024 * 1024)
+            .ok()
     };
     let (Some(before), Some(after)) = (read(left), read(right)) else {
         io.print_err(&format!(
@@ -546,19 +548,19 @@ fn split_range(revision: &str) -> Option<(&str, &str, bool)> {
         .map(|(left, right)| (left, right, false))
 }
 
-pub(crate) fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+pub(crate) fn git_diff(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
     // `--no-index` compares two files on their own and needs no repository.
     if args.iter().any(|argument| argument == "--no-index") {
-        return diff_no_index(ctx, args, io);
+        return diff_no_index(system, args, io);
     }
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return super::repo_error(io);
     };
     let mut options = Options::default();
     let mut cached = false;
     let mut exit_code = false;
     let mut revisions: Vec<String> = Vec::new();
-    let cwd = ctx.cwd.clone();
+    let cwd = system.cwd().to_string();
     let mut flags = Flags::new(args).valued(DIFF_VALUED);
     while let Some(argument) = flags.next() {
         let (name, attached) = match argument {
@@ -568,17 +570,17 @@ pub(crate) fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             }
             Arg::Operand(value) => {
                 let revision = revisions.len() < 2
-                    && (repo::resolve_revision(ctx, &root, &value).is_some()
+                    && (repo::resolve_revision(system, &root, &value).is_some()
                         || (revisions.is_empty()
                             && split_range(&value).is_some_and(|(left, right, _)| {
-                                repo::resolve_revision(ctx, &root, left).is_some()
-                                    && repo::resolve_revision(ctx, &root, right).is_some()
+                                repo::resolve_revision(system, &root, left).is_some()
+                                    && repo::resolve_revision(system, &root, right).is_some()
                             })));
                 if revision {
                     revisions.push(value);
                     continue;
                 }
-                if !super::names_a_path(ctx, &root, &value) {
+                if !super::names_a_path(system, &root, &value) {
                     return super::ambiguous_argument(io, &value);
                 }
                 options.paths.push(super::pathspec(&cwd, &root, &value));
@@ -602,60 +604,68 @@ pub(crate) fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
         options.quiet = false;
     }
 
-    let index = repo::load_index(ctx, &root).unwrap_or_default();
+    let index = repo::load_index(system, &root).unwrap_or_default();
     // Resolve the two sides. Ranges expand into both endpoints.
     if let Some(range) = revisions.first().and_then(|value| split_range(value)) {
         let (left, right, merge_base) = range;
         let (Some(mut left_commit), Some(right_commit)) = (
-            repo::resolve_revision(ctx, &root, left),
-            repo::resolve_revision(ctx, &root, right),
+            repo::resolve_revision(system, &root, left),
+            repo::resolve_revision(system, &root, right),
         ) else {
             return fatal(io, "unknown revision range");
         };
         if merge_base {
-            let Some(base) = repo::merge_base(ctx, &root, &left_commit, &right_commit) else {
+            let Some(base) = repo::merge_base(system, &root, &left_commit, &right_commit) else {
                 return fatal(io, "the revisions have no common ancestor");
             };
             left_commit = base;
         }
-        let old = repo::commit_tree(ctx, &root, &left_commit).unwrap_or_default();
-        let new = repo::commit_tree(ctx, &root, &right_commit).unwrap_or_default();
-        return finish(ctx, &root, &old, &new, &options, exit_code, io);
+        let old = repo::commit_tree(system, &root, &left_commit).unwrap_or_default();
+        let new = repo::commit_tree(system, &root, &right_commit).unwrap_or_default();
+        return finish(system, &root, &old, &new, &options, exit_code, io);
     }
 
     match revisions.len() {
         2 => {
-            let old = tree_of(ctx, &root, &revisions[0]);
-            let new = tree_of(ctx, &root, &revisions[1]);
-            finish(ctx, &root, &old, &new, &options, exit_code, io)
+            let old = tree_of(system, &root, &revisions[0]);
+            let new = tree_of(system, &root, &revisions[1]);
+            finish(system, &root, &old, &new, &options, exit_code, io)
         }
         1 if cached => {
-            let old = tree_of(ctx, &root, &revisions[0]);
-            finish(ctx, &root, &old, &index.clone(), &options, exit_code, io)
+            let old = tree_of(system, &root, &revisions[0]);
+            finish(system, &root, &old, &index.clone(), &options, exit_code, io)
         }
         1 => {
             // `git diff REVISION` compares the revision against the working tree.
-            let old = tree_of(ctx, &root, &revisions[0]);
+            let old = tree_of(system, &root, &revisions[0]);
             options.right = RightSide::WorkingTree;
-            let Some(work) = tracked_working_tree(ctx, &root, &index) else {
-                return repo::resource_error(ctx);
+            let Some(work) = tracked_working_tree(system, &root, &index) else {
+                return repo::resource_error(system);
             };
-            finish(ctx, &root, &old, &work, &options, exit_code, io)
+            finish(system, &root, &old, &work, &options, exit_code, io)
         }
         _ if cached => {
-            let head = repo::head_tree(ctx, &root);
-            finish(ctx, &root, &head, &index.clone(), &options, exit_code, io)
+            let head = repo::head_tree(system, &root);
+            finish(
+                system,
+                &root,
+                &head,
+                &index.clone(),
+                &options,
+                exit_code,
+                io,
+            )
         }
         _ => {
             options.right = RightSide::WorkingTree;
-            let Some(work) = tracked_working_tree(ctx, &root, &index) else {
-                return repo::resource_error(ctx);
+            let Some(work) = tracked_working_tree(system, &root, &index) else {
+                return repo::resource_error(system);
             };
             // An unmerged path has no settled index entry to compare against, so the side that
             // was ours going into the merge stands in for it; otherwise the conflict markers the
             // merge wrote would compare equal and the tree would look clean.
             let mut index = index;
-            for (path, entry) in conflict::load_stages(ctx, &root) {
+            for (path, entry) in conflict::load_stages(system, &root) {
                 options.unmerged.insert(path.clone());
                 match entry.ours {
                     Some(hash) => {
@@ -667,7 +677,7 @@ pub(crate) fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
                     }
                 }
             }
-            finish(ctx, &root, &index, &work, &options, exit_code, io)
+            finish(system, &root, &index, &work, &options, exit_code, io)
         }
     }
 }
@@ -677,23 +687,23 @@ pub(crate) fn git_diff(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
 /// `git diff` never reports untracked files, so limiting the snapshot here keeps build output and
 /// ignored files out of every diff format.
 pub(crate) fn tracked_working_tree(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     index: &Tree,
 ) -> Option<Tree> {
-    let mut work = repo::collect_working_tree(ctx, root).ok()?;
+    let mut work = repo::collect_working_tree(system, root).ok()?;
     work.retain(|path, _| index.contains_key(path));
     Some(work)
 }
 
-fn tree_of(ctx: &mut CommandContext<'_>, root: &str, revision: &str) -> Tree {
-    repo::resolve_revision(ctx, root, revision)
-        .and_then(|commit| repo::commit_tree(ctx, root, &commit))
+fn tree_of(system: &mut dyn System, root: &str, revision: &str) -> Tree {
+    repo::resolve_revision(system, root, revision)
+        .and_then(|commit| repo::commit_tree(system, root, &commit))
         .unwrap_or_default()
 }
 
 fn finish(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     old: &Tree,
     new: &Tree,
@@ -711,8 +721,8 @@ fn finish(
                 return true;
             }
             match (
-                content(ctx, root, old, path, RightSide::Stored),
-                content(ctx, root, new, path, options.right),
+                content(system, root, old, path, RightSide::Stored),
+                content(system, root, new, path, options.right),
             ) {
                 (Some(before), Some(after)) => {
                     diff::change_counts(Some(&before), Some(&after), options.whitespace) != (0, 0)
@@ -724,7 +734,7 @@ fn finish(
         return i32::from(differs);
     }
     // `git diff --check` reports whitespace problems with exit status 2.
-    if emit(ctx, root, old, new, options, io) {
+    if emit(system, root, old, new, options, io) {
         return 2;
     }
     i32::from(exit_code && differs)

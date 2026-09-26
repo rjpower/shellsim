@@ -13,12 +13,14 @@
 //!
 //! Real Git's zlib-compressed loose objects, packfiles, modes, and index extensions are
 //! deliberately absent: nothing outside this module observes the layout.
+//!
+//! Every function here takes `&mut dyn System`, the PID-scoped virtual-kernel interface, rather
+//! than `Interp` or `CommandContext`: git must not gain ambient access to the owning process.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::commands::CommandContext;
-use crate::interp::Interp;
-use crate::vfs::{parent_of, NodeKind, Result as VfsResult};
+use crate::syscalls::{FileChange, FileKind, System};
+use crate::vfs::{parent_of, Result as VfsResult, VfsError};
 
 use super::Globals;
 
@@ -76,6 +78,67 @@ pub(crate) fn config_value<'a>(config: &'a Config, key: &str) -> Option<&'a str>
 /// The most files one command will examine in a working tree.
 const MAX_WORKING_FILES: u64 = 100_000;
 
+// -- VFS helpers ----------------------------------------------------------------------------------
+//
+// `System` exposes only `metadata`, not Git's `is_dir`/`is_file`/`exists` convenience queries, so
+// this module rebuilds the ones it needs on top of it.
+
+fn node_kind(system: &mut dyn System, base: &str, path: &str, follow: bool) -> Option<FileKind> {
+    system
+        .metadata(base, path, follow)
+        .ok()
+        .map(|info| info.kind)
+}
+
+pub(crate) fn is_dir(system: &mut dyn System, base: &str, path: &str) -> bool {
+    matches!(
+        node_kind(system, base, path, true),
+        Some(FileKind::Directory)
+    )
+}
+
+pub(crate) fn is_file(system: &mut dyn System, base: &str, path: &str) -> bool {
+    matches!(node_kind(system, base, path, true), Some(FileKind::File))
+}
+
+pub(crate) fn exists(system: &mut dyn System, base: &str, path: &str) -> bool {
+    system.metadata(base, path, true).is_ok()
+}
+
+/// Remove a file, or a directory and everything below it.
+///
+/// `System` exposes `unlink` for one file and `rmdir` for one empty directory, so a whole subtree
+/// is removed deepest-first: `walk` returns each path before its children, so reversing it visits
+/// every descendant before the directory that holds it, which is what lets each `rmdir` see an
+/// already-empty directory.
+pub(crate) fn remove_tree(system: &mut dyn System, base: &str, path: &str) -> bool {
+    let Ok(mut paths) = system.walk(base, path) else {
+        return false;
+    };
+    paths.reverse();
+    for entry in paths {
+        let result = if is_dir(system, base, &entry) {
+            system.rmdir(base, &entry)
+        } else {
+            system.unlink(base, &entry)
+        };
+        if result.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Read a whole file, bounded by the caller's memory limit rather than an arbitrary constant.
+///
+/// Git objects can be as large as any file a user committed, so there is no small fixed bound
+/// that is both safe and correct; the process memory limit is the same bound every other read of
+/// an unbounded file in this codebase uses.
+pub(crate) fn read_all(system: &mut dyn System, path: &str) -> Option<Vec<u8>> {
+    let maximum = usize::try_from(system.limits().memory).unwrap_or(usize::MAX);
+    system.read_file_limited("/", path, maximum).ok()
+}
+
 // -- path helpers -------------------------------------------------------------------------------
 
 pub(crate) fn path_join(root: &str, suffix: &str) -> String {
@@ -92,10 +155,10 @@ pub(crate) fn git_path(root: &str, suffix: &str) -> String {
 }
 
 /// Find the nearest ancestor of the working directory that contains a `.git` directory.
-pub(crate) fn find_repo_root(interp: &Interp) -> Option<String> {
-    let mut current = interp.cwd.clone();
+pub(crate) fn find_repo_root(system: &mut dyn System) -> Option<String> {
+    let mut current = system.cwd().to_string();
     loop {
-        if interp.vfs.is_dir("/", &path_join(&current, GIT_DIR)) {
+        if is_dir(system, "/", &path_join(&current, GIT_DIR)) {
             return Some(current);
         }
         if current == "/" {
@@ -216,84 +279,81 @@ pub(crate) fn parse_tree(bytes: &[u8]) -> Option<Tree> {
     Some(tree)
 }
 
-fn read_tree(interp: &Interp, path: &str) -> Option<Tree> {
-    parse_tree(&interp.vfs.read("/", path).ok()?)
+fn read_tree(system: &mut dyn System, path: &str) -> Option<Tree> {
+    parse_tree(&read_all(system, path)?)
 }
 
-/// Write to the VFS with the simulated clock applied to the file's timestamps.
-pub(crate) fn write_vfs(interp: &mut Interp, path: &str, bytes: &[u8]) -> VfsResult<()> {
-    interp.sync_vfs_time();
-    if let Some(parent) = parent_of(path) {
-        interp.vfs.mkdir_all("/", &parent)?;
-    }
-    interp.vfs.write("/", path, bytes, 0o644)
+/// Write to the VFS, creating any missing parent directories.
+///
+/// `System::put_file_with_parents` stamps the write with the simulated clock and always applies
+/// the given mode, matching what every caller here needs.
+pub(crate) fn write_vfs(system: &mut dyn System, path: &str, bytes: &[u8]) -> VfsResult<()> {
+    system
+        .put_file_with_parents("/", path, bytes.to_vec(), 0o644)
+        .map_err(to_vfs_error)
 }
 
-/// Write a checked-out file, giving it the permissions its recorded mode calls for.
-fn write_work_file(interp: &mut Interp, path: &str, bytes: &[u8], entry: &Entry) -> VfsResult<()> {
-    interp.sync_vfs_time();
-    if let Some(parent) = parent_of(path) {
-        interp.vfs.mkdir_all("/", &parent)?;
+/// Translate a syscall failure back to the `VfsError` this module's callers expect.
+///
+/// Every caller of a `System` write already carries a `VfsError`-shaped result from before the
+/// port; a resource limit has no `VfsError` counterpart; a full disk is the closest match, since
+/// both mean "the write could not be made."
+fn to_vfs_error(error: crate::syscalls::SyscallError) -> VfsError {
+    match error {
+        crate::syscalls::SyscallError::File(inner) => inner,
+        crate::syscalls::SyscallError::ResourceExhausted => VfsError::NoSpace,
+        other => VfsError::NotFound(other.to_string()),
     }
-    if entry.symlink {
-        // Writing over an existing node first, since a link cannot be created on top of one.
-        let _ = interp.vfs.remove_file("/", path);
-        return interp
-            .vfs
-            .symlink("/", &String::from_utf8_lossy(bytes), path);
-    }
-    let mode = work_mode(entry.executable);
-    interp.vfs.write("/", path, bytes, mode)?;
-    interp.vfs.chmod("/", path, mode)
 }
 
 /// The staged tree, or `None` when the index cannot be read.
 ///
 /// A repository with no index file has nothing staged, which is what Git makes of one; `None`
 /// means the file is there and unreadable, which is worth saying out loud.
-pub(crate) fn load_index(interp: &Interp, root: &str) -> Option<Tree> {
-    match interp.vfs.read("/", &git_path(root, INDEX)) {
-        Ok(bytes) => parse_tree(&bytes),
-        Err(_) => Some(Tree::new()),
+pub(crate) fn load_index(system: &mut dyn System, root: &str) -> Option<Tree> {
+    match read_all(system, &git_path(root, INDEX)) {
+        Some(bytes) => parse_tree(&bytes),
+        None => Some(Tree::new()),
     }
 }
 
-pub(crate) fn store_index(ctx: &mut Interp, root: &str, index: &Tree) -> VfsResult<()> {
-    write_vfs(ctx, &git_path(root, INDEX), &serialize_tree(index))
+pub(crate) fn store_index(system: &mut dyn System, root: &str, index: &Tree) -> VfsResult<()> {
+    write_vfs(system, &git_path(root, INDEX), &serialize_tree(index))
 }
 
-pub(crate) fn read_blob(interp: &Interp, root: &str, hash: &str) -> Option<Vec<u8>> {
-    interp
-        .vfs
-        .read("/", &git_path(root, &format!("objects/{hash}")))
-        .ok()
+pub(crate) fn read_blob(system: &mut dyn System, root: &str, hash: &str) -> Option<Vec<u8>> {
+    read_all(system, &git_path(root, &format!("objects/{hash}")))
 }
 
-pub(crate) fn write_blob(ctx: &mut Interp, root: &str, data: &[u8]) -> VfsResult<String> {
+pub(crate) fn write_blob(system: &mut dyn System, root: &str, data: &[u8]) -> VfsResult<String> {
     let hash = blob_hash(data);
-    write_vfs(ctx, &git_path(root, &format!("objects/{hash}")), data)?;
+    write_vfs(system, &git_path(root, &format!("objects/{hash}")), data)?;
     Ok(hash)
 }
 
 /// The bytes Git records for one working-tree node, or `None` for something it does not track.
 ///
-/// A symbolic link is stored as a blob holding its target, which is how Git records one.
-fn tracked_content(kind: &NodeKind) -> Option<Vec<u8>> {
-    match kind {
-        NodeKind::File(data) => Some(data.clone()),
-        NodeKind::Symlink(target) => Some(target.as_bytes().to_vec()),
-        NodeKind::Dir | NodeKind::NativeExecutable(_) => None,
+/// A symbolic link is stored as its target, which is how Git records one. A directory or a native
+/// executable is not tracked at all.
+fn tracked_content(system: &mut dyn System, base: &str, path: &str) -> Option<Vec<u8>> {
+    let info = system.metadata(base, path, false).ok()?;
+    if info.native_executable {
+        return None;
+    }
+    match info.kind {
+        FileKind::File => {
+            let maximum = usize::try_from(system.limits().memory).unwrap_or(usize::MAX);
+            system.read_file_limited(base, path, maximum).ok()
+        }
+        FileKind::Symlink => info.link_target.map(String::into_bytes),
+        FileKind::Directory => None,
     }
 }
 
 /// Read a tracked file from the working tree.
-pub(crate) fn read_work_file(interp: &Interp, root: &str, path: &str) -> Option<Vec<u8>> {
+pub(crate) fn read_work_file(system: &mut dyn System, root: &str, path: &str) -> Option<Vec<u8>> {
     let absolute = path_join(root, path);
-    // A symbolic link is read as its target, not as whatever it points at.
-    match interp.vfs.metadata("/", &absolute, false) {
-        Ok(node) => tracked_content(&node.kind),
-        Err(_) => None,
-    }
+    tracked_content(system, "/", &absolute)
 }
 
 // -- commits ------------------------------------------------------------------------------------
@@ -362,8 +422,8 @@ fn tree_file(root: &str, id: &str) -> String {
     git_path(root, &format!("commits/{id}.tree"))
 }
 
-pub(crate) fn load_commit(interp: &Interp, root: &str, id: &str) -> Option<Commit> {
-    Commit::parse(&interp.vfs.read("/", &commit_file(root, id)).ok()?)
+pub(crate) fn load_commit(system: &mut dyn System, root: &str, id: &str) -> Option<Commit> {
+    Commit::parse(&read_all(system, &commit_file(root, id))?)
 }
 
 /// A stable identifier for a tree.
@@ -375,8 +435,8 @@ pub(crate) fn tree_hash(tree: &Tree) -> String {
     sha1(&[format!("tree {}\0", body.len()).as_bytes(), &body].concat())
 }
 
-pub(crate) fn commit_tree(interp: &Interp, root: &str, id: &str) -> Option<Tree> {
-    read_tree(interp, &tree_file(root, id))
+pub(crate) fn commit_tree(system: &mut dyn System, root: &str, id: &str) -> Option<Tree> {
+    read_tree(system, &tree_file(root, id))
 }
 
 /// Store a commit and its tree, returning the new commit id.
@@ -384,7 +444,7 @@ pub(crate) fn commit_tree(interp: &Interp, root: &str, id: &str) -> Option<Tree>
 /// The id is the SHA-1 of a Git-shaped header, so two commits differ whenever their tree,
 /// parents, author, timestamp, or message differ.
 pub(crate) fn store_commit(
-    ctx: &mut Interp,
+    system: &mut dyn System,
     root: &str,
     commit: &Commit,
     tree: &Tree,
@@ -393,30 +453,30 @@ pub(crate) fn store_commit(
     let mut identity = format!("tree {}\n", sha1(&tree_bytes));
     identity.push_str(&String::from_utf8_lossy(&commit.serialize()));
     let id = sha1(identity.as_bytes());
-    write_vfs(ctx, &tree_file(root, &id), &tree_bytes)?;
-    write_vfs(ctx, &commit_file(root, &id), &commit.serialize())?;
+    write_vfs(system, &tree_file(root, &id), &tree_bytes)?;
+    write_vfs(system, &commit_file(root, &id), &commit.serialize())?;
     Ok(id)
 }
 
 /// Read an annotated tag's record, which reuses the commit header shape for tagger and message.
-pub(crate) fn read_annotation(interp: &Interp, root: &str, name: &str) -> Option<Commit> {
+pub(crate) fn read_annotation(system: &mut dyn System, root: &str, name: &str) -> Option<Commit> {
     let path = git_path(root, &format!("tags/{name}.annotation"));
-    Commit::parse(&interp.vfs.read("/", &path).ok()?)
+    Commit::parse(&read_all(system, &path)?)
 }
 
 pub(crate) fn write_annotation(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     name: &str,
     annotation: &Commit,
 ) -> VfsResult<()> {
     let path = git_path(root, &format!("tags/{name}.annotation"));
-    write_vfs(ctx, &path, &annotation.serialize())
+    write_vfs(system, &path, &annotation.serialize())
 }
 
 /// Walk first parents from `start`, most recent first, up to `limit` commits.
 pub(crate) fn first_parent_history(
-    interp: &Interp,
+    system: &mut dyn System,
     root: &str,
     start: &str,
     limit: usize,
@@ -428,7 +488,7 @@ pub(crate) fn first_parent_history(
         if out.len() >= limit || !seen.insert(id.clone()) {
             break;
         }
-        let Some(commit) = load_commit(interp, root, &id) else {
+        let Some(commit) = load_commit(system, root, &id) else {
             break;
         };
         current = commit.parents.first().cloned();
@@ -443,7 +503,7 @@ pub(crate) fn first_parent_history(
 /// ties broken by author timestamp and then by discovery order. Merge commits contribute both
 /// parents, so nothing merged into the history disappears from `git log`.
 pub(crate) fn reachable_history(
-    interp: &Interp,
+    system: &mut dyn System,
     root: &str,
     starts: &[String],
     limit: usize,
@@ -455,7 +515,7 @@ pub(crate) fn reachable_history(
         if commits.len() >= limit || commits.contains_key(&id) {
             continue;
         }
-        let Some(commit) = load_commit(interp, root, &id) else {
+        let Some(commit) = load_commit(system, root, &id) else {
             continue;
         };
         queue.extend(commit.parents.iter().cloned());
@@ -504,14 +564,14 @@ pub(crate) fn reachable_history(
 }
 
 /// Every ancestor of `commit`, including itself.
-pub(crate) fn ancestors(interp: &Interp, root: &str, commit: &str) -> BTreeSet<String> {
+pub(crate) fn ancestors(system: &mut dyn System, root: &str, commit: &str) -> BTreeSet<String> {
     let mut seen = BTreeSet::new();
     let mut queue = vec![commit.to_string()];
     while let Some(id) = queue.pop() {
         if seen.len() >= 10_000 || !seen.insert(id.clone()) {
             continue;
         }
-        if let Some(commit) = load_commit(interp, root, &id) {
+        if let Some(commit) = load_commit(system, root, &id) {
             queue.extend(commit.parents);
         }
     }
@@ -519,8 +579,13 @@ pub(crate) fn ancestors(interp: &Interp, root: &str, commit: &str) -> BTreeSet<S
 }
 
 /// The best common ancestor of two commits, preferring the one nearest `left`.
-pub(crate) fn merge_base(interp: &Interp, root: &str, left: &str, right: &str) -> Option<String> {
-    let right_ancestors = ancestors(interp, root, right);
+pub(crate) fn merge_base(
+    system: &mut dyn System,
+    root: &str,
+    left: &str,
+    right: &str,
+) -> Option<String> {
+    let right_ancestors = ancestors(system, root, right);
     let mut queue = vec![left.to_string()];
     let mut seen = BTreeSet::new();
     while let Some(id) = queue.pop() {
@@ -530,7 +595,7 @@ pub(crate) fn merge_base(interp: &Interp, root: &str, left: &str, right: &str) -
         if right_ancestors.contains(&id) {
             return Some(id);
         }
-        if let Some(commit) = load_commit(interp, root, &id) {
+        if let Some(commit) = load_commit(system, root, &id) {
             queue.extend(commit.parents);
         }
     }
@@ -540,19 +605,15 @@ pub(crate) fn merge_base(interp: &Interp, root: &str, left: &str, right: &str) -
 // -- commit identity and dates ------------------------------------------------------------------
 
 pub(crate) fn author_identity(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     globals: &Globals,
 ) -> (String, String) {
-    super::config::identity(ctx, root, globals)
+    super::config::identity(system, root, globals)
 }
 
-pub(crate) fn now_seconds(ctx: &CommandContext<'_>) -> i64 {
-    ctx.clock
-        .wall_time_seconds_floor()
-        .ok()
-        .and_then(|seconds| i64::try_from(seconds).ok())
-        .unwrap_or_default()
+pub(crate) fn now_seconds(system: &dyn System) -> i64 {
+    i64::try_from(system.wall_time_ms() / 1000).unwrap_or_default()
 }
 
 /// Format a commit timestamp the way `git log` prints author dates.
@@ -567,133 +628,142 @@ pub(crate) fn format_date(timestamp: i64) -> String {
 // -- references ---------------------------------------------------------------------------------
 
 /// Read the raw contents of `.git/HEAD`.
-fn head_contents(interp: &Interp, root: &str) -> Option<String> {
+fn head_contents(system: &mut dyn System, root: &str) -> Option<String> {
     Some(
-        String::from_utf8_lossy(&interp.vfs.read("/", &git_path(root, HEAD)).ok()?)
+        String::from_utf8_lossy(&read_all(system, &git_path(root, HEAD))?)
             .trim()
             .to_string(),
     )
 }
 
 /// The reference HEAD points at, or `None` when HEAD is detached.
-pub(crate) fn head_reference(interp: &Interp, root: &str) -> Option<String> {
-    head_contents(interp, root)?
+pub(crate) fn head_reference(system: &mut dyn System, root: &str) -> Option<String> {
+    head_contents(system, root)?
         .strip_prefix("ref: ")
         .map(str::to_string)
 }
 
-pub(crate) fn head_commit(interp: &Interp, root: &str) -> Option<String> {
-    let head = head_contents(interp, root)?;
+pub(crate) fn head_commit(system: &mut dyn System, root: &str) -> Option<String> {
+    let head = head_contents(system, root)?;
     let commit = match head.strip_prefix("ref: ") {
-        Some(reference) => read_reference(interp, root, reference)?,
+        Some(reference) => read_reference(system, root, reference)?,
         None => head,
     };
     (!commit.is_empty()).then_some(commit)
 }
 
-pub(crate) fn current_branch(interp: &Interp, root: &str) -> Option<String> {
-    head_reference(interp, root)?
+pub(crate) fn current_branch(system: &mut dyn System, root: &str) -> Option<String> {
+    head_reference(system, root)?
         .strip_prefix("refs/heads/")
         .map(str::to_string)
 }
 
-pub(crate) fn read_reference(interp: &Interp, root: &str, reference: &str) -> Option<String> {
-    let value = String::from_utf8_lossy(&interp.vfs.read("/", &git_path(root, reference)).ok()?)
+pub(crate) fn read_reference(
+    system: &mut dyn System,
+    root: &str,
+    reference: &str,
+) -> Option<String> {
+    let value = String::from_utf8_lossy(&read_all(system, &git_path(root, reference))?)
         .trim()
         .to_string();
     (!value.is_empty()).then_some(value)
 }
 
 pub(crate) fn write_reference(
-    ctx: &mut Interp,
+    system: &mut dyn System,
     root: &str,
     reference: &str,
     commit: &str,
 ) -> VfsResult<()> {
     write_vfs(
-        ctx,
+        system,
         &git_path(root, reference),
         format!("{commit}\n").as_bytes(),
     )
 }
 
 pub(crate) fn delete_reference(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     reference: &str,
 ) -> VfsResult<()> {
-    ctx.vfs.remove_file("/", &git_path(root, reference))
+    system
+        .unlink("/", &git_path(root, reference))
+        .map_err(to_vfs_error)
 }
 
 /// Point HEAD at `commit`, following the current branch when HEAD is not detached.
 pub(crate) fn update_head(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     commit: &str,
     action: &str,
 ) -> VfsResult<()> {
-    let before = head_commit(ctx, root);
-    let destination = head_reference(ctx, root).unwrap_or_else(|| HEAD.to_string());
-    write_reference(ctx, root, &destination, commit)?;
-    log_head_move(ctx, root, before.as_deref(), commit, action);
+    let before = head_commit(system, root);
+    let destination = head_reference(system, root).unwrap_or_else(|| HEAD.to_string());
+    write_reference(system, root, &destination, commit)?;
+    log_head_move(system, root, before.as_deref(), commit, action);
     Ok(())
 }
 
-/// Remember where HEAD was before an operation that moves it a long way.
-///
-/// Git writes `ORIG_HEAD` for reset, merge, rebase and the like, which is what makes
-/// `git reset --hard ORIG_HEAD` the usual way to undo one.
 /// Split a `REVISION:PATH` operand into the tree it names and the path within it.
 ///
 /// An empty revision names the index, so `:file` and `:0:file` read what is staged rather than
 /// what is committed, as they do in Git.
 pub(crate) fn tree_and_path(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     operand: &str,
 ) -> Option<(Tree, String)> {
     let (revision, path) = operand.split_once(':')?;
     if revision.is_empty() {
         let path = path.strip_prefix("0:").unwrap_or(path);
-        return Some((load_index(ctx, root).unwrap_or_default(), path.to_string()));
+        return Some((
+            load_index(system, root).unwrap_or_default(),
+            path.to_string(),
+        ));
     }
-    let commit = resolve_revision(ctx, root, revision)?;
-    Some((commit_tree(ctx, root, &commit)?, path.to_string()))
+    let commit = resolve_revision(system, root, revision)?;
+    Some((commit_tree(system, root, &commit)?, path.to_string()))
 }
 
-pub(crate) fn record_orig_head(ctx: &mut CommandContext<'_>, root: &str) {
-    if let Some(commit) = head_commit(ctx, root) {
-        let _ = write_reference(ctx, root, "ORIG_HEAD", &commit);
+pub(crate) fn record_orig_head(system: &mut dyn System, root: &str) {
+    if let Some(commit) = head_commit(system, root) {
+        let _ = write_reference(system, root, "ORIG_HEAD", &commit);
     }
 }
 
 pub(crate) fn set_head_to_branch(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     branch: &str,
     action: &str,
 ) -> VfsResult<()> {
-    let before = head_commit(ctx, root);
+    let before = head_commit(system, root);
     write_vfs(
-        ctx,
+        system,
         &git_path(root, HEAD),
         format!("ref: refs/heads/{branch}\n").as_bytes(),
     )?;
-    if let Some(commit) = head_commit(ctx, root) {
-        log_head_move(ctx, root, before.as_deref(), &commit, action);
+    if let Some(commit) = head_commit(system, root) {
+        log_head_move(system, root, before.as_deref(), &commit, action);
     }
     Ok(())
 }
 
 pub(crate) fn set_head_detached(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     commit: &str,
     action: &str,
 ) -> VfsResult<()> {
-    let before = head_commit(ctx, root);
-    write_vfs(ctx, &git_path(root, HEAD), format!("{commit}\n").as_bytes())?;
-    log_head_move(ctx, root, before.as_deref(), commit, action);
+    let before = head_commit(system, root);
+    write_vfs(
+        system,
+        &git_path(root, HEAD),
+        format!("{commit}\n").as_bytes(),
+    )?;
+    log_head_move(system, root, before.as_deref(), commit, action);
     Ok(())
 }
 
@@ -709,7 +779,7 @@ pub(crate) struct HeadMove {
 
 /// Record a move of HEAD, which is what `git reflog` reads and `HEAD@{N}` names.
 fn log_head_move(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     before: Option<&str>,
     after: &str,
@@ -719,7 +789,7 @@ fn log_head_move(
     // Git logs every move, including one that leaves HEAD where it was, so the numbering of
     // `HEAD@{N}` counts moves rather than distinct commits.
     let before = before.unwrap_or(MISSING);
-    let mut moves = read_head_log(ctx, root);
+    let mut moves = read_head_log(system, root);
     // Oldest first in the file, as Git writes it.
     moves.reverse();
     moves.push(HeadMove {
@@ -734,12 +804,12 @@ fn log_head_move(
         .iter()
         .map(|entry| format!("{}\t{}\t{}\n", entry.before, entry.after, entry.action))
         .collect();
-    let _ = write_vfs(ctx, &git_path(root, "logs/HEAD"), text.as_bytes());
+    let _ = write_vfs(system, &git_path(root, "logs/HEAD"), text.as_bytes());
 }
 
 /// Every recorded move of HEAD, newest first, which is the order `git reflog` prints.
-pub(crate) fn read_head_log(interp: &Interp, root: &str) -> Vec<HeadMove> {
-    let Ok(bytes) = interp.vfs.read("/", &git_path(root, "logs/HEAD")) else {
+pub(crate) fn read_head_log(system: &mut dyn System, root: &str) -> Vec<HeadMove> {
+    let Some(bytes) = read_all(system, &git_path(root, "logs/HEAD")) else {
         return Vec::new();
     };
     let mut moves: Vec<HeadMove> = String::from_utf8_lossy(&bytes)
@@ -758,47 +828,51 @@ pub(crate) fn read_head_log(interp: &Interp, root: &str) -> Vec<HeadMove> {
 }
 
 /// Sorted names of the references below `.git/refs/<kind>`.
-pub(crate) fn reference_names(interp: &Interp, root: &str, kind: &str) -> Vec<String> {
+pub(crate) fn reference_names(system: &mut dyn System, root: &str, kind: &str) -> Vec<String> {
     let prefix = git_path(root, &format!("refs/{kind}"));
-    let mut names = interp
-        .vfs
-        .walk(&prefix)
+    let mut names = system
+        .walk("/", &prefix)
+        .unwrap_or_default()
         .into_iter()
-        .filter(|path| interp.vfs.is_file("/", path))
+        .filter(|path| is_file(system, "/", path))
         .filter_map(|path| path.strip_prefix(&format!("{prefix}/")).map(str::to_string))
         .collect::<Vec<_>>();
     names.sort();
     names
 }
 
-pub(crate) fn branch_names(interp: &Interp, root: &str) -> Vec<String> {
-    reference_names(interp, root, "heads")
+pub(crate) fn branch_names(system: &mut dyn System, root: &str) -> Vec<String> {
+    reference_names(system, root, "heads")
 }
 
-pub(crate) fn head_tree(interp: &Interp, root: &str) -> Tree {
-    head_commit(interp, root)
-        .and_then(|commit| commit_tree(interp, root, &commit))
+pub(crate) fn head_tree(system: &mut dyn System, root: &str) -> Tree {
+    head_commit(system, root)
+        .and_then(|commit| commit_tree(system, root, &commit))
         .unwrap_or_default()
 }
 
 // -- revisions ----------------------------------------------------------------------------------
+
+/// The branch the last branch switch moved away from, which `-` and `@{-1}` both name.
+pub(crate) fn previous_branch(system: &mut dyn System, root: &str) -> Option<String> {
+    let bytes = read_all(system, &git_path(root, "PREV_HEAD"))?;
+    let previous = String::from_utf8_lossy(&bytes).trim().to_string();
+    (!previous.is_empty()).then_some(previous)
+}
 
 /// Resolve a revision expression to a commit id.
 ///
 /// Supported forms are `HEAD`, `@`, a branch or tag name, a full ref path, a full or abbreviated
 /// commit id, and the `~N` and `^N` ancestry suffixes. Ranges and reflog selectors are not
 /// supported; callers split ranges before calling.
-/// The branch the last branch switch moved away from, which `-` and `@{-1}` both name.
-pub(crate) fn previous_branch(interp: &Interp, root: &str) -> Option<String> {
-    let bytes = interp.vfs.read("/", &git_path(root, "PREV_HEAD")).ok()?;
-    let previous = String::from_utf8_lossy(&bytes).trim().to_string();
-    (!previous.is_empty()).then_some(previous)
-}
-
-pub(crate) fn resolve_revision(interp: &Interp, root: &str, revision: &str) -> Option<String> {
+pub(crate) fn resolve_revision(
+    system: &mut dyn System,
+    root: &str,
+    revision: &str,
+) -> Option<String> {
     let boundary = revision.find(['~', '^']).unwrap_or(revision.len());
     let (base, suffix) = revision.split_at(boundary);
-    let mut commit = resolve_base_revision(interp, root, base)?;
+    let mut commit = resolve_base_revision(system, root, base)?;
     let mut rest = suffix;
     while !rest.is_empty() {
         let (operator, remainder) = rest.split_at(1);
@@ -812,7 +886,7 @@ pub(crate) fn resolve_revision(interp: &Interp, root: &str, revision: &str) -> O
                     digits.parse().ok()?
                 };
                 for _ in 0..steps {
-                    commit = load_commit(interp, root, &commit)?.parents.first()?.clone();
+                    commit = load_commit(system, root, &commit)?.parents.first()?.clone();
                 }
             }
             "^" => {
@@ -824,7 +898,7 @@ pub(crate) fn resolve_revision(interp: &Interp, root: &str, revision: &str) -> O
                 if index == 0 {
                     continue;
                 }
-                commit = load_commit(interp, root, &commit)?
+                commit = load_commit(system, root, &commit)?
                     .parents
                     .get(index - 1)?
                     .clone();
@@ -835,9 +909,9 @@ pub(crate) fn resolve_revision(interp: &Interp, root: &str, revision: &str) -> O
     Some(commit)
 }
 
-fn resolve_base_revision(interp: &Interp, root: &str, revision: &str) -> Option<String> {
+fn resolve_base_revision(system: &mut dyn System, root: &str, revision: &str) -> Option<String> {
     if revision.is_empty() || revision == "HEAD" || revision == "@" {
-        return head_commit(interp, root);
+        return head_commit(system, root);
     }
     if let Some(position) = revision
         .strip_prefix("HEAD@{")
@@ -846,31 +920,31 @@ fn resolve_base_revision(interp: &Interp, root: &str, revision: &str) -> Option<
         .and_then(|digits| digits.parse::<usize>().ok())
     {
         // `HEAD@{0}` is where HEAD is now; each step back is the state before one recorded move.
-        let moves = read_head_log(interp, root);
+        let moves = read_head_log(system, root);
         return match position {
-            0 => head_commit(interp, root),
+            0 => head_commit(system, root),
             _ => moves.get(position - 1).map(|entry| entry.before.clone()),
         };
     }
     if revision == "@{-1}" {
-        let previous = previous_branch(interp, root)?;
-        return read_reference(interp, root, &format!("refs/heads/{previous}"));
+        let previous = previous_branch(system, root)?;
+        return read_reference(system, root, &format!("refs/heads/{previous}"));
     }
     for candidate in [
         format!("refs/heads/{revision}"),
         format!("refs/tags/{revision}"),
         revision.to_string(),
     ] {
-        if let Some(commit) = read_reference(interp, root, &candidate) {
+        if let Some(commit) = read_reference(system, root, &candidate) {
             return Some(commit);
         }
     }
     if revision.len() < 4 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    let mut matches = interp
-        .vfs
-        .walk(&git_path(root, "commits"))
+    let mut matches = system
+        .walk("/", &git_path(root, "commits"))
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|path| {
             let id = crate::vfs::basename(&path)
@@ -964,27 +1038,35 @@ fn split_config_key(key: &str) -> (String, &str) {
 }
 
 /// The path of the per-user configuration file inside the simulated filesystem.
-pub(crate) fn global_config_path(interp: &Interp) -> String {
-    let home = interp.get_var("HOME").unwrap_or_else(|| "/root".into());
+///
+/// `HOME` comes from the process's exported environment, the same as a real child process would
+/// see: an unexported shell variable of that name is not visible here.
+pub(crate) fn global_config_path(system: &dyn System) -> String {
+    let home = system
+        .environment()
+        .get("HOME")
+        .cloned()
+        .unwrap_or_else(|| "/root".into());
     path_join(&home, ".gitconfig")
 }
 
-fn read_config_file(ctx: &mut CommandContext<'_>, path: &str) -> Config {
-    ctx.fs_read_limited("/", path, 256 * 1024)
+fn read_config_file(system: &mut dyn System, path: &str) -> Config {
+    system
+        .read_file_limited("/", path, 256 * 1024)
         .ok()
         .map(|bytes| parse_config(&String::from_utf8_lossy(&bytes)))
         .unwrap_or_default()
 }
 
 /// Repository-local configuration.
-pub(crate) fn load_config(ctx: &mut CommandContext<'_>, root: &str) -> Config {
-    read_config_file(ctx, &git_path(root, CONFIG))
+pub(crate) fn load_config(system: &mut dyn System, root: &str) -> Config {
+    read_config_file(system, &git_path(root, CONFIG))
 }
 
 /// Per-user configuration, which the repository's own settings override.
-pub(crate) fn load_global_config(ctx: &mut CommandContext<'_>) -> Config {
-    let path = global_config_path(ctx);
-    read_config_file(ctx, &path)
+pub(crate) fn load_global_config(system: &mut dyn System) -> Config {
+    let path = global_config_path(system);
+    read_config_file(system, &path)
 }
 
 pub(crate) fn valid_config_key(key: &str) -> bool {
@@ -997,12 +1079,8 @@ pub(crate) fn valid_config_key(key: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
-pub(crate) fn write_config(
-    ctx: &mut CommandContext<'_>,
-    path: &str,
-    config: &Config,
-) -> VfsResult<()> {
-    write_vfs(ctx, path, &serialize_config(config))
+pub(crate) fn write_config(system: &mut dyn System, path: &str, config: &Config) -> VfsResult<()> {
+    write_vfs(system, path, &serialize_config(config))
 }
 
 // -- working tree -------------------------------------------------------------------------------
@@ -1011,139 +1089,146 @@ pub(crate) fn write_config(
 ///
 /// The memory the walk reserves is given back before returning, because every caller wants the
 /// tree and nothing else.
-pub(crate) fn collect_working_tree(ctx: &mut CommandContext<'_>, root: &str) -> Result<Tree, i32> {
+pub(crate) fn collect_working_tree(system: &mut dyn System, root: &str) -> Result<Tree, i32> {
+    let paths = system.walk("/", root).unwrap_or_default();
     let mut file_count = 0_u64;
     let mut path_bytes = 0_u64;
     let mut content_bytes = 0_u64;
-    for (path, node) in ctx.vfs.all_paths() {
+    let mut tracked: Vec<(String, String, bool)> = Vec::new(); // (absolute, relative, symlink)
+    for path in &paths {
         if is_git_path(root, path) || !within(root, path) {
             continue;
         }
-        if let Some(data) = tracked_content(&node.kind) {
-            let Some(relative) = relative_path(root, path) else {
-                continue;
-            };
-            let Some(next_file_count) = file_count.checked_add(1) else {
-                return Err(137);
-            };
-            let Some(next_path_bytes) = path_bytes.checked_add(relative.len() as u64) else {
-                return Err(137);
-            };
-            let Some(next_content_bytes) = content_bytes.checked_add(data.len() as u64) else {
-                return Err(137);
-            };
-            file_count = next_file_count;
-            path_bytes = next_path_bytes;
-            content_bytes = next_content_bytes;
+        let Ok(info) = system.metadata("/", path, false) else {
+            continue;
+        };
+        if info.native_executable || matches!(info.kind, FileKind::Directory) {
+            continue;
         }
+        let Some(relative) = relative_path(root, path) else {
+            continue;
+        };
+        let Some(next_file_count) = file_count.checked_add(1) else {
+            return Err(137);
+        };
+        let Some(next_path_bytes) = path_bytes.checked_add(relative.len() as u64) else {
+            return Err(137);
+        };
+        let Some(next_content_bytes) = content_bytes.checked_add(info.size) else {
+            return Err(137);
+        };
+        file_count = next_file_count;
+        path_bytes = next_path_bytes;
+        content_bytes = next_content_bytes;
+        tracked.push((
+            path.clone(),
+            relative,
+            matches!(info.kind, FileKind::Symlink),
+        ));
     }
     if file_count > MAX_WORKING_FILES {
-        return Err(resource_error(ctx));
+        return Err(resource_error(system));
     }
     let reserved_memory = path_bytes.saturating_add(file_count.saturating_mul(64));
-    if !ctx.reserve_memory(reserved_memory) {
-        return Err(resource_error(ctx));
+    if !system.reserve_memory(reserved_memory) {
+        return Err(resource_error(system));
     }
-    if !ctx.charge_cpu(path_bytes.saturating_add(content_bytes)) {
-        ctx.resources.release_memory(reserved_memory);
-        return Err(resource_error(ctx));
+    if !system.charge_cpu(path_bytes.saturating_add(content_bytes)) {
+        system.release_memory(reserved_memory);
+        return Err(resource_error(system));
     }
     let mut files = Tree::new();
-    for (path, node) in ctx.vfs.all_paths() {
-        if is_git_path(root, path) || !within(root, path) {
-            continue;
-        }
-        if let Some(data) = tracked_content(&node.kind) {
-            if let Some(relative) = relative_path(root, path) {
-                let symlink = matches!(node.kind, NodeKind::Symlink(_));
-                files.insert(
-                    relative,
-                    Entry {
-                        hash: blob_hash(&data),
-                        executable: !symlink && is_executable(node.mode),
-                        symlink,
-                    },
-                );
-            }
+    for (absolute, relative, symlink) in tracked {
+        if let Some(data) = tracked_content(system, "/", &absolute) {
+            let mode = system
+                .metadata("/", &absolute, false)
+                .map(|info| info.mode)
+                .unwrap_or(0o644);
+            files.insert(
+                relative,
+                Entry {
+                    hash: blob_hash(&data),
+                    executable: !symlink && is_executable(mode),
+                    symlink,
+                },
+            );
         }
     }
-    ctx.resources.release_memory(reserved_memory);
+    system.release_memory(reserved_memory);
     Ok(files)
 }
 
 /// Hash one working-tree file, charging the read against the caller's limits.
 pub(crate) fn metered_file_hash(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     path: &str,
 ) -> Result<Option<String>, i32> {
     // A symbolic link hashes to its target, so it must not be followed here.
-    if let Ok(node) = ctx.vfs.metadata("/", path, false) {
-        if let NodeKind::Symlink(target) = &node.kind {
-            let target = target.clone();
-            if !ctx.charge_cpu(target.len() as u64) {
-                return Err(resource_error(ctx));
+    if let Ok(info) = system.metadata("/", path, false) {
+        if info.kind == FileKind::Symlink {
+            let target = info.link_target.unwrap_or_default();
+            if !system.charge_cpu(target.len() as u64) {
+                return Err(resource_error(system));
             }
             return Ok(Some(blob_hash(target.as_bytes())));
         }
     }
-    if !ctx.vfs.is_file("/", path) {
+    if !is_file(system, "/", path) {
         return Ok(None);
     }
-    let length = ctx.fs_file_len("/", path).map_err(|_| 1)?;
-    if !ctx.reserve_memory(length as u64) {
-        return Err(resource_error(ctx));
+    let length = system
+        .metadata("/", path, true)
+        .map(|info| info.size)
+        .map_err(|_| 1)?;
+    if !system.reserve_memory(length) {
+        return Err(resource_error(system));
     }
-    if !ctx.charge_cpu(length as u64) {
-        ctx.resources.release_memory(length as u64);
-        return Err(resource_error(ctx));
+    if !system.charge_cpu(length) {
+        system.release_memory(length);
+        return Err(resource_error(system));
     }
-    let data = ctx.fs_read_limited("/", path, length);
-    ctx.resources.release_memory(length as u64);
+    let data = system.read_file_limited("/", path, length as usize);
+    system.release_memory(length);
     data.map(|bytes| Some(blob_hash(&bytes))).map_err(|_| 1)
 }
 
 /// Exit status to report when a resource limit stopped the command.
-pub(crate) fn resource_error(ctx: &CommandContext<'_>) -> i32 {
-    ctx.resources
-        .stop_reason()
-        .map_or(137, |reason| reason.exit_status())
+pub(crate) fn resource_error(system: &dyn System) -> i32 {
+    system.stop_status()
 }
 
-/// Replace the working-tree files named by `old` with the contents named by `new`.
-///
-/// The whole update is applied to a VFS copy so that a failure part-way through leaves the
-/// working tree untouched.
-/// Move the working tree from `old` to `new`, rewriting every path `new` names.
-///
-/// This discards uncommitted edits, which is what `git restore` and `git reset --hard` are for.
 /// Remove the directories a deletion left empty, stopping at the repository root.
 ///
 /// Git tracks files rather than directories, so removing the last file in a directory removes the
 /// directory too.
-pub(crate) fn prune_empty_parents(ctx: &mut CommandContext<'_>, root: &str, absolute: &str) {
+pub(crate) fn prune_empty_parents(system: &mut dyn System, root: &str, absolute: &str) {
     let mut current = parent_of(absolute);
     while let Some(directory) = current {
         if directory == root || !within(root, &directory) || is_git_path(root, &directory) {
             return;
         }
-        match ctx.vfs.list_dir("/", &directory) {
+        match system.list_dir("/", &directory) {
             Ok(entries) if entries.is_empty() => {}
             _ => return,
         }
-        if ctx.vfs.remove_all("/", &directory).is_err() {
+        if system.rmdir("/", &directory).is_err() {
             return;
         }
         current = parent_of(&directory);
     }
 }
 
+/// Replace the working-tree files named by `old` with the contents named by `new`.
+///
+/// The whole update is applied atomically: a failure part-way through (a missing blob, or a
+/// resource limit) leaves the working tree untouched.
 pub(crate) fn replace_work_tree(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     old: &Tree,
     new: &Tree,
 ) -> Result<(), String> {
-    write_work_tree(ctx, root, old, new, true)
+    write_work_tree(system, root, old, new, true)
 }
 
 /// Move the working tree from `old` to `new`, leaving unchanged paths alone.
@@ -1151,56 +1236,73 @@ pub(crate) fn replace_work_tree(
 /// Checkout, merge, and stash reapplication go through here so that an uncommitted edit to a file
 /// the move does not touch survives, as it does in Git.
 pub(crate) fn update_work_tree(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     old: &Tree,
     new: &Tree,
 ) -> Result<(), String> {
-    write_work_tree(ctx, root, old, new, false)
+    write_work_tree(system, root, old, new, false)
 }
 
 fn write_work_tree(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     old: &Tree,
     new: &Tree,
     force: bool,
 ) -> Result<(), String> {
-    let reserved = ctx.vfs.disk_used().saturating_add(4 * 1024);
-    if !ctx.reserve_memory(reserved) {
+    let reserved = system.disk_used().saturating_add(4 * 1024);
+    if !system.reserve_memory(reserved) {
         return Err("memory limit exceeded".to_string());
     }
-    let before = ctx.vfs.clone();
-    let result = (|| {
-        for path in old.keys().filter(|path| !new.contains_key(*path)) {
-            let absolute = path_join(root, path);
-            if ctx.vfs.is_file("/", &absolute) {
-                ctx.vfs
-                    .remove_file("/", &absolute)
-                    .map_err(|error| error.to_string())?;
-                prune_empty_parents(ctx, root, &absolute);
-            }
-        }
-        for (path, entry) in new {
-            // A path the move does not change keeps whatever the working tree holds, but a
-            // missing file is still restored.
-            if !force
-                && old.get(path) == Some(entry)
-                && ctx.vfs.is_file("/", &path_join(root, path))
-            {
-                continue;
-            }
-            let hash = &entry.hash;
-            let data = read_blob(ctx, root, hash)
-                .ok_or_else(|| format!("missing blob {hash} for {path}"))?;
-            write_work_file(ctx, &path_join(root, path), &data, entry)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        ctx.vfs = before;
-    }
-    ctx.resources.release_memory(reserved);
+    let result = write_work_tree_changes(system, root, old, new, force);
+    system.release_memory(reserved);
     result
+}
+
+fn write_work_tree_changes(
+    system: &mut dyn System,
+    root: &str,
+    old: &Tree,
+    new: &Tree,
+    force: bool,
+) -> Result<(), String> {
+    let mut changes = Vec::new();
+    for path in old.keys().filter(|path| !new.contains_key(*path)) {
+        let absolute = path_join(root, path);
+        if is_file(system, "/", &absolute) {
+            changes.push(FileChange::RemoveFile(absolute));
+        }
+    }
+    for (path, entry) in new {
+        // A path the move does not change keeps whatever the working tree holds, but a missing
+        // file is still restored.
+        let absolute = path_join(root, path);
+        if !force && old.get(path) == Some(entry) && is_file(system, "/", &absolute) {
+            continue;
+        }
+        let hash = &entry.hash;
+        let data = read_blob(system, root, hash)
+            .ok_or_else(|| format!("missing blob {hash} for {path}"))?;
+        if entry.symlink {
+            changes.push(FileChange::PutSymlink {
+                link: absolute,
+                target: String::from_utf8_lossy(&data).into_owned(),
+            });
+        } else {
+            changes.push(FileChange::PutFile {
+                path: absolute,
+                bytes: data,
+                mode: work_mode(entry.executable),
+            });
+        }
+    }
+    system
+        .apply_file_batch("/", changes)
+        .map_err(|error| error.to_string())?;
+    // Removing a file can leave its directory empty; a batch does not prune those on its own.
+    for path in old.keys().filter(|path| !new.contains_key(*path)) {
+        prune_empty_parents(system, root, &path_join(root, path));
+    }
+    Ok(())
 }

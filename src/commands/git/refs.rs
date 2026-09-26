@@ -3,14 +3,15 @@
 //! These commands turn names into commit ids and list, create, delete, or rename the branch and
 //! tag references kept under `.git/refs`.
 
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::System;
 
 use super::log;
 use super::repo::{self, Commit};
 use super::{fatal, repo_error, usage, Arg, Flags, Globals};
 
-pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_rev_parse(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut abbreviate: Option<usize> = None;
@@ -36,13 +37,13 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
                 return 0;
             }
             "--is-inside-git-dir" => {
-                let inside = repo::is_git_path(&root, &ctx.cwd);
+                let inside = repo::is_git_path(&root, system.cwd());
                 io.print(if inside { "true\n" } else { "false\n" });
                 return 0;
             }
             "--git-dir" => {
                 // Git prints a path relative to the working directory when it can.
-                let rendered = if ctx.cwd == root {
+                let rendered = if system.cwd() == root {
                     repo::GIT_DIR.to_string()
                 } else {
                     repo::path_join(&root, repo::GIT_DIR)
@@ -59,13 +60,13 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
                 return 0;
             }
             "--show-cdup" => {
-                let depth = repo::relative_path(&root, &ctx.cwd)
+                let depth = repo::relative_path(&root, system.cwd())
                     .map_or(0, |prefix| prefix.split('/').count());
                 io.print(&format!("{}\n", "../".repeat(depth)));
                 return 0;
             }
             "--show-prefix" => {
-                let prefix = repo::relative_path(&root, &ctx.cwd).unwrap_or_default();
+                let prefix = repo::relative_path(&root, system.cwd()).unwrap_or_default();
                 if prefix.is_empty() {
                     io.out.push(b'\n');
                 } else {
@@ -95,15 +96,15 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
     for revision in &revisions {
         if full_name {
             let name = if revision == "HEAD" {
-                repo::current_branch(ctx, &root).map_or_else(
+                repo::current_branch(system, &root).map_or_else(
                     || "HEAD".to_string(),
                     |branch| format!("refs/heads/{branch}"),
                 )
             } else if revision.starts_with("refs/") {
                 revision.clone()
-            } else if repo::branch_names(ctx, &root).contains(revision) {
+            } else if repo::branch_names(system, &root).contains(revision) {
                 format!("refs/heads/{revision}")
-            } else if repo::reference_names(ctx, &root, "tags").contains(revision) {
+            } else if repo::reference_names(system, &root, "tags").contains(revision) {
                 format!("refs/tags/{revision}")
             } else {
                 String::new()
@@ -113,14 +114,14 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
         }
         if abbrev_ref {
             let name = if revision == "HEAD" {
-                repo::current_branch(ctx, &root).unwrap_or_else(|| "HEAD".to_string())
+                repo::current_branch(system, &root).unwrap_or_else(|| "HEAD".to_string())
             } else {
                 revision.rsplit('/').next().unwrap_or(revision).to_string()
             };
             io.print(&format!("{name}\n"));
             continue;
         }
-        let Some(commit) = rev_parse_object(ctx, &root, revision) else {
+        let Some(commit) = rev_parse_object(system, &root, revision) else {
             if quiet {
                 // `--quiet --verify` is the usual "does this reference exist?" probe.
                 return 1;
@@ -137,28 +138,28 @@ pub(crate) fn git_rev_parse(ctx: &mut CommandContext<'_>, args: &[String], io: &
 }
 
 /// Resolve one `rev-parse` operand, which may name a commit, a tree, or a blob.
-fn rev_parse_object(ctx: &mut CommandContext<'_>, root: &str, revision: &str) -> Option<String> {
+fn rev_parse_object(system: &mut dyn System, root: &str, revision: &str) -> Option<String> {
     if revision.contains(':') {
-        let (tree, path) = repo::tree_and_path(ctx, root, revision)?;
+        let (tree, path) = repo::tree_and_path(system, root, revision)?;
         if path.is_empty() {
             return Some(repo::tree_hash(&tree));
         }
         return tree.get(&path).map(|entry| entry.hash.clone());
     }
     if let Some(base) = revision.strip_suffix("^{tree}") {
-        let commit = repo::resolve_revision(ctx, root, base)?;
-        return Some(repo::tree_hash(&repo::commit_tree(ctx, root, &commit)?));
+        let commit = repo::resolve_revision(system, root, base)?;
+        return Some(repo::tree_hash(&repo::commit_tree(system, root, &commit)?));
     }
     // `^{commit}` and `^{}` peel a tag to the commit it points at, which this subset already does.
     let revision = revision
         .strip_suffix("^{commit}")
         .or_else(|| revision.strip_suffix("^{}"))
         .unwrap_or(revision);
-    repo::resolve_revision(ctx, root, revision)
+    repo::resolve_revision(system, root, revision)
 }
 
-pub(crate) fn git_rev_list(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_rev_list(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut count = false;
@@ -190,12 +191,12 @@ pub(crate) fn git_rev_list(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         }
     }
     if all_references {
-        revisions.extend(log::all_reference_tips(ctx, &root));
+        revisions.extend(log::all_reference_tips(system, &root));
     }
     if revisions.is_empty() {
         revisions.push("HEAD".to_string());
     }
-    let Some(mut history) = log::history_for(ctx, &root, &revisions, false) else {
+    let Some(mut history) = log::history_for(system, &root, &revisions, false) else {
         return super::ambiguous_argument(io, &revisions.join(" "));
     };
     history.truncate(limit);
@@ -219,8 +220,8 @@ fn valid_reference_name(name: &str) -> bool {
         && !name.contains(['~', '^', ':', '?', '*', '[', '\\'])
 }
 
-pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_branch(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut verbose = false;
@@ -242,7 +243,7 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         };
         match name.as_str() {
             "--show-current" => {
-                if let Some(branch) = repo::current_branch(ctx, &root) {
+                if let Some(branch) = repo::current_branch(system, &root) {
                     io.print(&format!("{branch}\n"));
                 }
                 return 0;
@@ -290,12 +291,12 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         if operands.is_empty() {
             return usage(io, "usage: git branch (-d|-D) NAME...");
         }
-        return delete_branches(ctx, &root, &operands, force, io);
+        return delete_branches(system, &root, &operands, force, io);
     }
     if rename {
         let (from, to) = match operands.as_slice() {
             [to] => (
-                match repo::current_branch(ctx, &root) {
+                match repo::current_branch(system, &root) {
                     Some(branch) => branch,
                     None => return fatal(io, "cannot rename a detached HEAD"),
                 },
@@ -304,32 +305,32 @@ pub(crate) fn git_branch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             [from, to] => (from.clone(), to.clone()),
             _ => return usage(io, "usage: git branch -m [OLD] NEW"),
         };
-        return rename_branch(ctx, &root, &from, &to, force, io);
+        return rename_branch(system, &root, &from, &to, force, io);
     }
     if operands.is_empty() || list {
         let pattern = operands.first().map(String::as_str);
         if let Some(format) = &format {
-            return list_formatted_branches(ctx, &root, pattern, format, io);
+            return list_formatted_branches(system, &root, pattern, format, io);
         }
-        return list_branches(ctx, &root, pattern, contains.as_ref(), verbose, io);
+        return list_branches(system, &root, pattern, contains.as_ref(), verbose, io);
     }
     if operands.len() > 2 || !valid_reference_name(&operands[0]) {
         return usage(io, "usage: git branch NAME [START_POINT]");
     }
     let start = operands.get(1).map_or("HEAD", String::as_str);
-    let Some(commit) = repo::resolve_revision(ctx, &root, start) else {
+    let Some(commit) = repo::resolve_revision(system, &root, start) else {
         io.print_err(&format!("fatal: not a valid object name: '{start}'\n"));
         return 128;
     };
     let reference = format!("refs/heads/{}", operands[0]);
-    if !force && repo::read_reference(ctx, &root, &reference).is_some() {
+    if !force && repo::read_reference(system, &root, &reference).is_some() {
         io.print_err(&format!(
             "fatal: a branch named '{}' already exists\n",
             operands[0]
         ));
         return 128;
     }
-    repo::write_reference(ctx, &root, &reference, &commit).map_or_else(
+    repo::write_reference(system, &root, &reference, &commit).map_or_else(
         |error| {
             io.print_err(&format!("git branch: {error}\n"));
             1
@@ -359,7 +360,7 @@ fn branch_filter(option: &str) -> BranchFilter {
 
 /// Whether a branch survives `--merged`, `--no-merged`, or `--contains`.
 fn branch_selected(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     branch: &str,
     filter: Option<&(BranchFilter, String)>,
@@ -367,34 +368,34 @@ fn branch_selected(
     let Some((filter, revision)) = filter else {
         return true;
     };
-    let Some(target) = repo::resolve_revision(ctx, root, revision) else {
+    let Some(target) = repo::resolve_revision(system, root, revision) else {
         return false;
     };
-    let Some(tip) = repo::read_reference(ctx, root, &format!("refs/heads/{branch}")) else {
+    let Some(tip) = repo::read_reference(system, root, &format!("refs/heads/{branch}")) else {
         return false;
     };
     match filter {
-        BranchFilter::Merged => repo::ancestors(ctx, root, &target).contains(&tip),
-        BranchFilter::NotMerged => !repo::ancestors(ctx, root, &target).contains(&tip),
-        BranchFilter::Contains => repo::ancestors(ctx, root, &tip).contains(&target),
+        BranchFilter::Merged => repo::ancestors(system, root, &target).contains(&tip),
+        BranchFilter::NotMerged => !repo::ancestors(system, root, &target).contains(&tip),
+        BranchFilter::Contains => repo::ancestors(system, root, &tip).contains(&target),
     }
 }
 
 fn list_branches(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     pattern: Option<&str>,
     contains: Option<&(BranchFilter, String)>,
     verbose: bool,
     io: &mut Io,
 ) -> i32 {
-    let current = repo::current_branch(ctx, root);
+    let current = repo::current_branch(system, root);
     // A detached HEAD is listed first, as the checked-out "branch" it stands in for.
-    let detached = match (&current, repo::head_commit(ctx, root)) {
+    let detached = match (&current, repo::head_commit(system, root)) {
         (None, Some(commit)) => Some(format!("(HEAD detached at {})", repo::short(&commit))),
         _ => None,
     };
-    let branches = repo::branch_names(ctx, root);
+    let branches = repo::branch_names(system, root);
     let width = branches
         .iter()
         .map(String::len)
@@ -404,8 +405,8 @@ fn list_branches(
     if let Some(label) = &detached {
         if pattern.is_none() {
             if verbose {
-                let commit = repo::head_commit(ctx, root).unwrap_or_default();
-                let subject = repo::load_commit(ctx, root, &commit)
+                let commit = repo::head_commit(system, root).unwrap_or_default();
+                let subject = repo::load_commit(system, root, &commit)
                     .map(|commit| commit.subject().to_string())
                     .unwrap_or_default();
                 io.print(&format!(
@@ -423,7 +424,7 @@ fn list_branches(
                 continue;
             }
         }
-        if !branch_selected(ctx, root, &branch, contains) {
+        if !branch_selected(system, root, &branch, contains) {
             continue;
         }
         let marker = if current.as_deref() == Some(branch.as_str()) {
@@ -435,9 +436,9 @@ fn list_branches(
             io.print(&format!("{marker} {branch}\n"));
             continue;
         }
-        let summary = repo::read_reference(ctx, root, &format!("refs/heads/{branch}"))
+        let summary = repo::read_reference(system, root, &format!("refs/heads/{branch}"))
             .map(|commit| {
-                let subject = repo::load_commit(ctx, root, &commit)
+                let subject = repo::load_commit(system, root, &commit)
                     .map(|commit| commit.subject().to_string())
                     .unwrap_or_default();
                 format!("{} {subject}", repo::short(&commit))
@@ -450,20 +451,20 @@ fn list_branches(
 
 /// List branches through a `--format` template.
 fn list_formatted_branches(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     pattern: Option<&str>,
     format: &str,
     io: &mut Io,
 ) -> i32 {
-    for branch in repo::branch_names(ctx, root) {
+    for branch in repo::branch_names(system, root) {
         if let Some(pattern) = pattern {
             if !crate::commands::util::glob_eq(pattern, &branch) {
                 continue;
             }
         }
         let name = format!("refs/heads/{branch}");
-        let Some(commit) = repo::read_reference(ctx, root, &name) else {
+        let Some(commit) = repo::read_reference(system, root, &name) else {
             continue;
         };
         let Some(line) = super::plumbing::expand_ref_format(format, &name, &commit) else {
@@ -475,13 +476,13 @@ fn list_formatted_branches(
 }
 
 fn delete_branches(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     names: &[String],
     force: bool,
     io: &mut Io,
 ) -> i32 {
-    let current = repo::current_branch(ctx, root);
+    let current = repo::current_branch(system, root);
     for name in names {
         if current.as_deref() == Some(name.as_str()) {
             io.print_err(&format!(
@@ -490,14 +491,14 @@ fn delete_branches(
             return 1;
         }
         let reference = format!("refs/heads/{name}");
-        let Some(commit) = repo::read_reference(ctx, root, &reference) else {
+        let Some(commit) = repo::read_reference(system, root, &reference) else {
             io.print_err(&format!("error: branch '{name}' not found\n"));
             return 1;
         };
         if !force {
             // Refuse to drop work that HEAD cannot reach, as Git's `-d` does.
-            let reachable = repo::head_commit(ctx, root)
-                .map(|head| repo::ancestors(ctx, root, &head))
+            let reachable = repo::head_commit(system, root)
+                .map(|head| repo::ancestors(system, root, &head))
                 .unwrap_or_default();
             if !reachable.contains(&commit) {
                 io.print_err(&format!(
@@ -506,7 +507,7 @@ fn delete_branches(
                 return 1;
             }
         }
-        if repo::delete_reference(ctx, root, &reference).is_err() {
+        if repo::delete_reference(system, root, &reference).is_err() {
             io.print_err(&format!("error: branch '{name}' not found\n"));
             return 1;
         }
@@ -519,7 +520,7 @@ fn delete_branches(
 }
 
 fn rename_branch(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     from: &str,
     to: &str,
@@ -529,23 +530,23 @@ fn rename_branch(
     if !valid_reference_name(to) {
         return fatal(io, &format!("invalid branch name: {to}"));
     }
-    let Some(commit) = repo::read_reference(ctx, root, &format!("refs/heads/{from}")) else {
+    let Some(commit) = repo::read_reference(system, root, &format!("refs/heads/{from}")) else {
         io.print_err(&format!("error: branch '{from}' not found\n"));
         return 1;
     };
-    if !force && repo::read_reference(ctx, root, &format!("refs/heads/{to}")).is_some() {
+    if !force && repo::read_reference(system, root, &format!("refs/heads/{to}")).is_some() {
         io.print_err(&format!("fatal: a branch named '{to}' already exists\n"));
         return 128;
     }
-    if let Err(error) = repo::write_reference(ctx, root, &format!("refs/heads/{to}"), &commit) {
+    if let Err(error) = repo::write_reference(system, root, &format!("refs/heads/{to}"), &commit) {
         return super::cannot_write(io, &format!("refs/heads/{to}"), &error);
     }
-    if let Err(error) = repo::delete_reference(ctx, root, &format!("refs/heads/{from}")) {
+    if let Err(error) = repo::delete_reference(system, root, &format!("refs/heads/{from}")) {
         return super::cannot_write(io, &format!("refs/heads/{from}"), &error);
     }
-    if repo::current_branch(ctx, root).as_deref() == Some(from) {
+    if repo::current_branch(system, root).as_deref() == Some(from) {
         let action = format!("branch: renamed to {to}");
-        if let Err(error) = repo::set_head_to_branch(ctx, root, to, &action) {
+        if let Err(error) = repo::set_head_to_branch(system, root, to, &action) {
             return super::cannot_write(io, "HEAD", &error);
         }
     }
@@ -553,12 +554,12 @@ fn rename_branch(
 }
 
 pub(crate) fn git_tag(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     globals: &Globals,
     args: &[String],
     io: &mut Io,
 ) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut list = false;
@@ -614,9 +615,9 @@ pub(crate) fn git_tag(
     }
     if delete {
         for name in &operands {
-            let was =
-                repo::read_reference(ctx, &root, &format!("refs/tags/{name}")).unwrap_or_default();
-            if repo::delete_reference(ctx, &root, &format!("refs/tags/{name}")).is_err() {
+            let was = repo::read_reference(system, &root, &format!("refs/tags/{name}"))
+                .unwrap_or_default();
+            if repo::delete_reference(system, &root, &format!("refs/tags/{name}")).is_err() {
                 io.print_err(&format!("error: tag '{name}' not found.\n"));
                 return 1;
             }
@@ -630,20 +631,20 @@ pub(crate) fn git_tag(
     if operands.is_empty() || list {
         // `--points-at` keeps only the tags on one commit.
         let target = match points_at {
-            Some(revision) => match repo::resolve_revision(ctx, &root, &revision) {
+            Some(revision) => match repo::resolve_revision(system, &root, &revision) {
                 Some(commit) => Some(commit),
                 None => return super::ambiguous_argument(io, &revision),
             },
             None => None,
         };
-        for name in repo::reference_names(ctx, &root, "tags") {
+        for name in repo::reference_names(system, &root, "tags") {
             if let Some(pattern) = operands.first() {
                 if !crate::commands::util::glob_eq(pattern, &name) {
                     continue;
                 }
             }
             let reference = format!("refs/tags/{name}");
-            let commit = repo::read_reference(ctx, &root, &reference).unwrap_or_default();
+            let commit = repo::read_reference(system, &root, &reference).unwrap_or_default();
             if target.as_ref().is_some_and(|target| *target != commit) {
                 continue;
             }
@@ -655,7 +656,7 @@ pub(crate) fn git_tag(
                 io.print(&format!("{line}\n"));
                 continue;
             }
-            match repo::read_annotation(ctx, &root, &name).filter(|_| annotations) {
+            match repo::read_annotation(system, &root, &name).filter(|_| annotations) {
                 Some(annotation) => io
                     .out
                     .extend_from_slice(format!("{name:<15} {}\n", annotation.subject()).as_bytes()),
@@ -669,29 +670,29 @@ pub(crate) fn git_tag(
         return fatal(io, &format!("invalid tag name: {name}"));
     }
     let start = operands.get(1).map_or("HEAD", String::as_str);
-    let Some(commit) = repo::resolve_revision(ctx, &root, start) else {
+    let Some(commit) = repo::resolve_revision(system, &root, start) else {
         io.print_err(&format!("fatal: not a valid object name: '{start}'\n"));
         return 128;
     };
     let reference = format!("refs/tags/{name}");
-    if !force && repo::read_reference(ctx, &root, &reference).is_some() {
+    if !force && repo::read_reference(system, &root, &reference).is_some() {
         io.print_err(&format!("fatal: tag '{name}' already exists\n"));
         return 128;
     }
-    if let Err(error) = repo::write_reference(ctx, &root, &reference, &commit) {
+    if let Err(error) = repo::write_reference(system, &root, &reference, &commit) {
         return super::cannot_write(io, &reference, &error);
     }
     if let Some(message) = message {
         // The annotation is stored beside the ref; the ref itself stays lightweight.
-        let (author_name, author_email) = repo::author_identity(ctx, &root, globals);
+        let (author_name, author_email) = repo::author_identity(system, &root, globals);
         let annotation = Commit {
             parents: Vec::new(),
             author_name,
             author_email,
-            timestamp: repo::now_seconds(ctx),
+            timestamp: repo::now_seconds(system),
             message,
         };
-        if let Err(error) = repo::write_annotation(ctx, &root, name, &annotation) {
+        if let Err(error) = repo::write_annotation(system, &root, name, &annotation) {
             return super::cannot_write(io, "the tag annotation", &error);
         }
     }

@@ -117,6 +117,18 @@ fn native_argv_children_use_process_cwd_and_leave_the_shell_unchanged() {
 }
 
 #[test]
+fn git_runs_as_a_native_child_process() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init").0, 0);
+    assert_eq!(run(&mut env, "git status").0, 0);
+    assert!(env.invocations.events().iter().any(|event| {
+        event.pid != 1_234
+            && event.argv.first().is_some_and(|arg| arg == "git")
+            && event.status == Some(0)
+    }));
+}
+
+#[test]
 fn native_mkdir_uses_the_child_system_handle() {
     let mut env = Environment::new();
     assert_eq!(run(&mut env, "env -C /work mkdir -p nested/leaf").0, 0);

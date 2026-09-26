@@ -5,7 +5,8 @@
 //! by another tool is read back correctly. There is no system scope and no network, so remotes
 //! are recorded but never contacted.
 
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::System;
 
 use super::repo::{self, Config};
 use super::{fatal, repo_error, usage, Globals};
@@ -19,13 +20,9 @@ enum Scope {
 
 /// Configuration as a command sees it: user settings, then repository settings, then `-c`
 /// overrides, each layer overriding the one before.
-pub(crate) fn effective_config(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    globals: &Globals,
-) -> Config {
-    let mut config = repo::load_global_config(ctx);
-    config.extend(repo::load_config(ctx, root));
+pub(crate) fn effective_config(system: &mut dyn System, root: &str, globals: &Globals) -> Config {
+    let mut config = repo::load_global_config(system);
+    config.extend(repo::load_config(system, root));
     config.extend(
         globals
             .overrides
@@ -41,15 +38,14 @@ fn value_of(config: &Config, key: &str) -> Option<String> {
 }
 
 /// Identity for new commits, preferring the environment as Git does.
-pub(crate) fn identity(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    globals: &Globals,
-) -> (String, String) {
-    let config = effective_config(ctx, root, globals);
+pub(crate) fn identity(system: &mut dyn System, root: &str, globals: &Globals) -> (String, String) {
+    let config = effective_config(system, root, globals);
+    let environment = system.environment();
     let pick = |variable: &str, key: &str, fallback: &str| {
-        ctx.get_var(variable)
+        environment
+            .get(variable)
             .filter(|value| !value.is_empty())
+            .cloned()
             .or_else(|| value_of(&config, key))
             .unwrap_or_else(|| fallback.to_string())
     };
@@ -60,7 +56,7 @@ pub(crate) fn identity(
 }
 
 pub(crate) fn git_config(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     globals: &Globals,
     args: &[String],
     io: &mut Io,
@@ -102,24 +98,24 @@ pub(crate) fn git_config(
         }
     }
     // Only the local scope needs a repository; `--global` works anywhere.
-    let root = match repo::find_repo_root(ctx) {
+    let root = match repo::find_repo_root(system) {
         Some(root) => root,
         None if scope == Scope::Global => String::new(),
         None => return repo_error(io),
     };
     let file = match scope {
         Scope::Local => repo::git_path(&root, repo::CONFIG),
-        Scope::Global => repo::global_config_path(ctx),
+        Scope::Global => repo::global_config_path(system),
     };
     let mut stored = match scope {
-        Scope::Local => repo::load_config(ctx, &root),
-        Scope::Global => repo::load_global_config(ctx),
+        Scope::Local => repo::load_config(system, &root),
+        Scope::Global => repo::load_global_config(system),
     };
     // An explicit scope reads only that file; otherwise every layer is visible.
     let readable = if explicit_scope || root.is_empty() {
         stored.clone()
     } else {
-        effective_config(ctx, &root, globals)
+        effective_config(system, &root, globals)
     };
     let operands: Vec<&str> = operands.iter().map(String::as_str).collect();
     // `--show-origin` prefixes each line with the file the value came from.
@@ -175,7 +171,7 @@ pub(crate) fn git_config(
             if stored.remove(&key.to_ascii_lowercase()).is_none() {
                 return 5;
             }
-            repo::write_config(ctx, &file, &stored).map_or(1, |()| 0)
+            repo::write_config(system, &file, &stored).map_or(1, |()| 0)
         }
         ["--add", key, value] | [key, value] if !key.starts_with('-') => {
             let adding = operands[0] == "--add";
@@ -194,7 +190,7 @@ pub(crate) fn git_config(
                 entry.clear();
             }
             entry.push((*value).to_string());
-            repo::write_config(ctx, &file, &stored).map_or(1, |()| 0)
+            repo::write_config(system, &file, &stored).map_or(1, |()| 0)
         }
         _ => usage(
             io,
@@ -218,13 +214,9 @@ fn emit_one(origin: &str, value: &str, as_boolean: bool, io: &mut Io) {
 }
 
 /// The command an alias expands to, split into words.
-pub(crate) fn alias(
-    ctx: &mut CommandContext<'_>,
-    globals: &Globals,
-    name: &str,
-) -> Option<Vec<String>> {
-    let root = repo::find_repo_root(ctx).unwrap_or_default();
-    let config = effective_config(ctx, &root, globals);
+pub(crate) fn alias(system: &mut dyn System, globals: &Globals, name: &str) -> Option<Vec<String>> {
+    let root = repo::find_repo_root(system).unwrap_or_default();
+    let config = effective_config(system, &root, globals);
     let expansion = repo::config_value(&config, &format!("alias.{}", name.to_ascii_lowercase()))?;
     // Shell aliases (`!cmd`) would need host execution, which this simulation does not provide.
     if expansion.starts_with('!') {
@@ -241,12 +233,12 @@ pub(crate) fn alias(
 
 /// Record and report remotes. Nothing here contacts a network.
 pub(crate) fn git_remote(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     globals: &Globals,
     args: &[String],
     io: &mut Io,
 ) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let verbose = args.iter().any(|argument| argument == "-v");
@@ -255,11 +247,11 @@ pub(crate) fn git_remote(
         .filter(|argument| !argument.starts_with('-'))
         .map(String::as_str)
         .collect();
-    let mut config = repo::load_config(ctx, &root);
+    let mut config = repo::load_config(system, &root);
     let file = repo::git_path(&root, repo::CONFIG);
     match operands.as_slice() {
         [] => {
-            for (name, url) in remotes(&effective_config(ctx, &root, globals)) {
+            for (name, url) in remotes(&effective_config(system, &root, globals)) {
                 if verbose {
                     io.print(&format!("{name}\t{url} (fetch)\n"));
                     io.print(&format!("{name}\t{url} (push)\n"));
@@ -275,7 +267,7 @@ pub(crate) fn git_remote(
                 return fatal(io, &format!("invalid remote name: {name}"));
             }
             config.insert(key, vec![(*url).to_string()]);
-            repo::write_config(ctx, &file, &config).map_or(1, |()| 0)
+            repo::write_config(system, &file, &config).map_or(1, |()| 0)
         }
         ["remove" | "rm", name] => {
             let key = format!("remote.{}.url", name.to_ascii_lowercase());
@@ -283,7 +275,7 @@ pub(crate) fn git_remote(
                 io.print_err(&format!("error: No such remote: '{name}'\n"));
                 return 2;
             }
-            repo::write_config(ctx, &file, &config).map_or(1, |()| 0)
+            repo::write_config(system, &file, &config).map_or(1, |()| 0)
         }
         ["get-url", name] => match repo::config_value(
             &config,
@@ -305,7 +297,7 @@ pub(crate) fn git_remote(
                 return 2;
             }
             config.insert(key, vec![(*url).to_string()]);
-            repo::write_config(ctx, &file, &config).map_or(1, |()| 0)
+            repo::write_config(system, &file, &config).map_or(1, |()| 0)
         }
         _ => usage(
             io,

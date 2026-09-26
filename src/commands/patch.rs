@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::commands::{CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandSpec, Io, Trust};
 use crate::exec::ShellPoll;
 use crate::program::ProcessContext;
 use crate::syscalls::{FileChange, FileKind, System};
@@ -144,11 +144,7 @@ fn run_patch(
 ///
 /// Git strips one leading path component by default, and `--check` verifies the patch without
 /// keeping the result, which is done here by restoring the filesystem snapshot afterwards.
-pub(crate) fn apply_unified_diff(
-    ctx: &mut CommandContext<'_>,
-    args: &[String],
-    io: &mut Io,
-) -> i32 {
+pub(crate) fn apply_unified_diff(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
     let mut check = false;
     let mut strip = "-p1".to_string();
     let mut forwarded: Vec<String> = Vec::new();
@@ -168,7 +164,7 @@ pub(crate) fn apply_unified_diff(
         }
     }
     forwarded.insert(0, strip);
-    let cwd = ctx.cwd.clone();
+    let cwd = system.cwd().to_string();
     // A failure is reported in Git's words, since that is what callers match on.
     let mut errors = Vec::new();
     let status = {
@@ -177,14 +173,7 @@ pub(crate) fn apply_unified_diff(
             out: io.out,
             err: &mut errors,
         };
-        let status = run_patch(
-            &mut ctx.system(),
-            &forwarded,
-            &mut inner,
-            false,
-            &cwd,
-            check,
-        );
+        let status = run_patch(system, &forwarded, &mut inner, false, &cwd, check);
         io.stdin = std::mem::take(&mut inner.stdin);
         status
     };

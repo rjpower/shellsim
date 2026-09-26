@@ -6,8 +6,7 @@
 //! Pattern files are read once per command and bounded so that a hostile tree cannot make
 //! matching unbounded.
 
-use crate::interp::Interp;
-use crate::vfs::NodeKind;
+use crate::syscalls::{FileKind, System};
 
 /// The most pattern files and patterns one command will consider.
 const MAX_FILES: usize = 64;
@@ -248,13 +247,11 @@ fn widen(spec: &str) -> String {
 }
 
 /// Read `.git/info/exclude` and every `.gitignore` file in the working tree below `root`.
-pub(crate) fn load(interp: &Interp, root: &str) -> IgnoreRules {
+pub(crate) fn load(system: &mut dyn System, root: &str) -> IgnoreRules {
     let mut rules = IgnoreRules::default();
     let mut files = 0;
     // Repository-local excludes rank below every `.gitignore`, so they are read first.
-    if let Ok(data) = interp
-        .vfs
-        .read("/", &super::repo::git_path(root, "info/exclude"))
+    if let Some(data) = super::repo::read_all(system, &super::repo::git_path(root, "info/exclude"))
     {
         files += 1;
         add_patterns(
@@ -264,31 +261,36 @@ pub(crate) fn load(interp: &Interp, root: &str) -> IgnoreRules {
             &String::from_utf8_lossy(&data),
         );
     }
-    for (path, node) in interp.vfs.all_paths() {
+    for path in system.walk("/", root).unwrap_or_default() {
         if files >= MAX_FILES || rules.patterns.len() >= MAX_PATTERNS {
             break;
         }
-        if !matches!(node.kind, NodeKind::File(_)) || !path.ends_with(".gitignore") {
+        if !path.ends_with(".gitignore") || super::repo::is_git_path(root, &path) {
             continue;
         }
-        let Some(relative) = super::repo::relative_path(root, path) else {
+        let Some(relative) = super::repo::relative_path(root, &path) else {
             continue;
         };
-        if super::repo::is_git_path(root, path) {
+        let Ok(info) = system.metadata("/", &path, false) else {
+            continue;
+        };
+        if info.kind != FileKind::File || info.native_executable || info.size > 64 * 1024 {
             continue;
         }
         let base = relative
             .strip_suffix(".gitignore")
             .unwrap_or_default()
             .to_string();
-        let NodeKind::File(data) = &node.kind else {
+        let Ok(data) = system.read_file_limited("/", &path, 64 * 1024) else {
             continue;
         };
-        if data.len() > 64 * 1024 {
-            continue;
-        }
         files += 1;
-        add_patterns(&mut rules, &base, &relative, &String::from_utf8_lossy(data));
+        add_patterns(
+            &mut rules,
+            &base,
+            &relative,
+            &String::from_utf8_lossy(&data),
+        );
     }
     rules
 }

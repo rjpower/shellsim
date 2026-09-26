@@ -7,8 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::commands::CommandContext;
-use crate::interp::Interp;
+use crate::syscalls::System;
 use crate::vfs::VfsError;
 
 use super::diff::{self, Op};
@@ -59,8 +58,8 @@ impl Unmerged {
 
 pub(crate) type Stages = BTreeMap<String, Unmerged>;
 
-pub(crate) fn load_stages(interp: &Interp, root: &str) -> Stages {
-    let Ok(bytes) = interp.vfs.read("/", &repo::git_path(root, MERGE_STAGES)) else {
+pub(crate) fn load_stages(system: &mut dyn System, root: &str) -> Stages {
+    let Some(bytes) = repo::read_all(system, &repo::git_path(root, MERGE_STAGES)) else {
         return Stages::new();
     };
     let mut stages = Stages::new();
@@ -82,11 +81,9 @@ pub(crate) fn load_stages(interp: &Interp, root: &str) -> Stages {
     stages
 }
 
-pub(crate) fn store_stages(ctx: &mut CommandContext<'_>, root: &str, stages: &Stages) -> bool {
+pub(crate) fn store_stages(system: &mut dyn System, root: &str, stages: &Stages) -> bool {
     if stages.is_empty() {
-        let _ = ctx
-            .vfs
-            .remove_file("/", &repo::git_path(root, MERGE_STAGES));
+        let _ = system.unlink("/", &repo::git_path(root, MERGE_STAGES));
         return true;
     }
     let mut text = String::new();
@@ -97,12 +94,12 @@ pub(crate) fn store_stages(ctx: &mut CommandContext<'_>, root: &str, stages: &St
             }
         }
     }
-    repo::write_vfs(ctx, &repo::git_path(root, MERGE_STAGES), text.as_bytes()).is_ok()
+    repo::write_vfs(system, &repo::git_path(root, MERGE_STAGES), text.as_bytes()).is_ok()
 }
 
 /// The commit an unfinished merge, cherry-pick, or revert is bringing in.
-pub(crate) fn in_progress(interp: &Interp, root: &str, kind: &str) -> Option<String> {
-    let bytes = interp.vfs.read("/", &repo::git_path(root, kind)).ok()?;
+pub(crate) fn in_progress(system: &mut dyn System, root: &str, kind: &str) -> Option<String> {
+    let bytes = repo::read_all(system, &repo::git_path(root, kind))?;
     let text = String::from_utf8_lossy(&bytes).trim().to_string();
     (!text.is_empty()).then_some(text)
 }
@@ -113,48 +110,45 @@ pub(crate) fn in_progress(interp: &Interp, root: &str, kind: &str) -> Option<Str
 /// the working tree, and without `MERGE_HEAD` the repository looks settled, so the caller must say
 /// so rather than report an ordinary conflict.
 pub(crate) fn begin(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     kind: &str,
     commit: &str,
     message: &str,
 ) -> bool {
     repo::write_vfs(
-        ctx,
+        system,
         &repo::git_path(root, kind),
         format!("{commit}\n").as_bytes(),
     )
     .is_ok()
-        && repo::write_vfs(ctx, &repo::git_path(root, MERGE_MSG), message.as_bytes()).is_ok()
+        && repo::write_vfs(system, &repo::git_path(root, MERGE_MSG), message.as_bytes()).is_ok()
 }
 
 /// The message recorded for the operation in progress.
-pub(crate) fn pending_message(interp: &Interp, root: &str) -> Option<String> {
-    let bytes = interp
-        .vfs
-        .read("/", &repo::git_path(root, MERGE_MSG))
-        .ok()?;
+pub(crate) fn pending_message(system: &mut dyn System, root: &str) -> Option<String> {
+    let bytes = repo::read_all(system, &repo::git_path(root, MERGE_MSG))?;
     Some(String::from_utf8_lossy(&bytes).trim_end().to_string())
 }
 
 /// Mark the named paths resolved, leaving any other conflict untouched.
 pub(crate) fn resolve<'a>(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     paths: impl IntoIterator<Item = &'a String>,
 ) {
-    let mut stages = load_stages(ctx, root);
+    let mut stages = load_stages(system, root);
     if stages.is_empty() {
         return;
     }
     for path in paths {
         stages.remove(path);
     }
-    store_stages(ctx, root, &stages);
+    store_stages(system, root, &stages);
 }
 
 /// Forget every record of an operation in progress.
-pub(crate) fn clear(ctx: &mut CommandContext<'_>, root: &str) {
+pub(crate) fn clear(system: &mut dyn System, root: &str) {
     for name in [
         MERGE_HEAD,
         CHERRY_PICK_HEAD,
@@ -162,7 +156,7 @@ pub(crate) fn clear(ctx: &mut CommandContext<'_>, root: &str) {
         MERGE_STAGES,
         MERGE_MSG,
     ] {
-        let _ = ctx.vfs.remove_file("/", &repo::git_path(root, name));
+        let _ = system.unlink("/", &repo::git_path(root, name));
     }
 }
 
@@ -182,7 +176,7 @@ pub(crate) struct Combined {
 
 /// Combine `ours` and `theirs` against `base`, merging file content where both sides changed.
 pub(crate) fn combine(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     base: &Tree,
     ours: &Tree,
@@ -239,9 +233,9 @@ pub(crate) fn combine(
             stages.insert(path, sides(original, mine, yours));
             continue;
         }
-        let read = |entry: Option<&repo::Entry>| {
+        let mut read = |entry: Option<&repo::Entry>| {
             entry
-                .and_then(|entry| repo::read_blob(ctx, root, &entry.hash))
+                .and_then(|entry| repo::read_blob(system, root, &entry.hash))
                 .unwrap_or_default()
         };
         let (original_text, mine_text, yours_text) = (read(original), read(mine), read(yours));
@@ -263,7 +257,7 @@ pub(crate) fn combine(
             ours_label,
             theirs_label,
         );
-        let hash = match repo::write_blob(ctx, root, &merged) {
+        let hash = match repo::write_blob(system, root, &merged) {
             Ok(hash) => hash,
             // Dropping the path here would leave it out of the merged tree, and the caller would
             // then take that as "delete it".

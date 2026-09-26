@@ -5,7 +5,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::System;
 
 use super::compare::{self, Format, Options};
 use super::conflict;
@@ -16,7 +17,7 @@ use super::worktree;
 use super::{repo_error, usage, Arg, Flags, Globals};
 
 pub(crate) fn git_commit(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     globals: &Globals,
     args: &[String],
     io: &mut Io,
@@ -69,14 +70,14 @@ pub(crate) fn git_commit(
             _ => return usage(io, &format!("unsupported commit option: {name}")),
         }
     }
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     if stage_tracked && !paths.is_empty() {
         return usage(io, "-a cannot be combined with paths");
     }
     if stage_tracked {
-        if let Err(status) = worktree::stage_tracked_changes(ctx, &root, io) {
+        if let Err(status) = worktree::stage_tracked_changes(system, &root, io) {
             return status;
         }
     }
@@ -86,14 +87,14 @@ pub(crate) fn git_commit(
         let operands: Vec<String> = std::iter::once("--".to_string())
             .chain(paths.iter().cloned())
             .collect();
-        let status = worktree::git_add(ctx, &operands, io);
+        let status = worktree::git_add(system, &operands, io);
         if status != 0 {
             return status;
         }
     }
     // A merge, cherry-pick, or revert waiting on the user supplies the message and the parents.
-    let pending = merge::pending_operation(ctx, &root);
-    if !conflict::load_stages(ctx, &root).is_empty() {
+    let pending = merge::pending_operation(system, &root);
+    if !conflict::load_stages(system, &root).is_empty() {
         io.print_err(
             "error: Committing is not possible because you have unmerged files.\n\
               hint: Fix them up in the work tree, and then use 'git add/rm <file>'\n\
@@ -102,8 +103,8 @@ pub(crate) fn git_commit(
         );
         return 1;
     }
-    let previous = repo::head_commit(ctx, &root)
-        .and_then(|id| repo::load_commit(ctx, &root, &id).map(|commit| (id, commit)));
+    let previous = repo::head_commit(system, &root)
+        .and_then(|id| repo::load_commit(system, &root, &id).map(|commit| (id, commit)));
     if amend && previous.is_none() {
         io.print_err("fatal: You have nothing to amend.\n");
         return 128;
@@ -114,8 +115,8 @@ pub(crate) fn git_commit(
         let bytes = if path == "-" {
             Ok(io.stdin.clone())
         } else {
-            let absolute = crate::vfs::resolve_against(&ctx.cwd, path);
-            ctx.fs_read_limited("/", &absolute, 1024 * 1024)
+            let absolute = crate::vfs::resolve_against(system.cwd(), path);
+            system.read_file_limited("/", &absolute, 1024 * 1024)
         };
         let Ok(bytes) = bytes else {
             io.print_err(&format!(
@@ -138,7 +139,7 @@ pub(crate) fn git_commit(
     if message.is_empty() {
         if let Some(recorded) = pending
             .as_ref()
-            .and_then(|_| conflict::pending_message(ctx, &root))
+            .and_then(|_| conflict::pending_message(system, &root))
         {
             message = recorded;
         }
@@ -146,24 +147,24 @@ pub(crate) fn git_commit(
     if dry_run {
         // Git reports what a commit would record, stops before asking for a message, and fails
         // when there is nothing staged to record.
-        let staged = match super::require_index(ctx, &root, io) {
-            Ok(index) => index != repo::head_tree(ctx, &root),
+        let staged = match super::require_index(system, &root, io) {
+            Ok(index) => index != repo::head_tree(system, &root),
             Err(status) => return status,
         };
-        let status = super::worktree::git_status(ctx, &[], io);
+        let status = super::worktree::git_status(system, &[], io);
         return if status == 0 && !staged { 1 } else { status };
     }
     if message.is_empty() && !allow_empty {
         return usage(io, "a non-empty -m MESSAGE is required");
     }
-    let index_tree = match super::require_index(ctx, &root, io) {
+    let index_tree = match super::require_index(system, &root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
     // Amending replaces the previous commit, so the comparison tree is its parent's.
     let (parents, baseline) = match (amend, &previous) {
         (true, Some((_, commit))) => {
-            let baseline = match super::parent_tree(ctx, &root, commit.parents.first(), io) {
+            let baseline = match super::parent_tree(system, &root, commit.parents.first(), io) {
                 Ok(tree) => tree,
                 Err(status) => return status,
             };
@@ -175,7 +176,7 @@ pub(crate) fn git_commit(
             if let Some((conflict::MERGE_HEAD, other)) = pending.as_ref().map(|(k, c)| (*k, c)) {
                 parents.push(other.clone());
             }
-            let baseline = match super::require_tree(ctx, &root, id, io) {
+            let baseline = match super::require_tree(system, &root, id, io) {
                 Ok(tree) => tree,
                 Err(status) => return status,
             };
@@ -187,7 +188,7 @@ pub(crate) fn git_commit(
     let index_tree = if paths.is_empty() {
         index_tree
     } else {
-        let cwd = ctx.cwd.clone();
+        let cwd = system.cwd().to_string();
         let specs: Vec<String> = paths
             .iter()
             .map(|path| super::pathspec(&cwd, &root, path))
@@ -208,14 +209,14 @@ pub(crate) fn git_commit(
     };
     // Finishing a merge records a commit even when the merge changed nothing.
     if index_tree == baseline && !allow_empty && pending.is_none() {
-        emit_nothing_to_commit(ctx, io);
+        emit_nothing_to_commit(system, io);
         return 1;
     }
     if signoff {
-        let (name, email) = repo::author_identity(ctx, &root, globals);
+        let (name, email) = repo::author_identity(system, &root, globals);
         message.push_str(&format!("\n\nSigned-off-by: {name} <{email}>"));
     }
-    let (default_name, default_email) = repo::author_identity(ctx, &root, globals);
+    let (default_name, default_email) = repo::author_identity(system, &root, globals);
     let (author_name, author_email) = match author.as_deref().and_then(parse_author) {
         Some(parsed) => parsed,
         None => (default_name, default_email),
@@ -227,10 +228,10 @@ pub(crate) fn git_commit(
         timestamp: previous
             .as_ref()
             .filter(|_| amend)
-            .map_or_else(|| log::author_date(ctx), |(_, commit)| commit.timestamp),
+            .map_or_else(|| log::author_date(system), |(_, commit)| commit.timestamp),
         message: message.clone(),
     };
-    let id = match repo::store_commit(ctx, &root, &commit, &index_tree) {
+    let id = match repo::store_commit(system, &root, &commit, &index_tree) {
         Ok(id) => id,
         Err(error) => {
             io.print_err(&format!("git commit: {error}\n"));
@@ -244,16 +245,16 @@ pub(crate) fn git_commit(
         (false, false) => "commit",
     };
     let action = format!("{what}: {}", commit.subject());
-    if let Err(error) = repo::update_head(ctx, &root, &id, &action) {
+    if let Err(error) = repo::update_head(system, &root, &id, &action) {
         return super::cannot_write(io, "HEAD", &error);
     }
     if pending.is_some() {
-        conflict::clear(ctx, &root);
+        conflict::clear(system, &root);
     }
     if quiet {
         return 0;
     }
-    let label = repo::current_branch(ctx, &root)
+    let label = repo::current_branch(system, &root)
         .unwrap_or_else(|| format!("detached HEAD {}", repo::short(&id)));
     // An amended root commit is not announced as one, since it is not a new commit.
     let root_commit = if commit.parents.is_empty() && !amend {
@@ -270,7 +271,7 @@ pub(crate) fn git_commit(
         // Amending keeps the original author date, which Git points out.
         io.print(&format!(" Date: {}\n", repo::format_date(commit.timestamp)));
     }
-    emit_commit_summary(ctx, &root, &baseline, &index_tree, io);
+    emit_commit_summary(system, &root, &baseline, &index_tree, io);
     0
 }
 
@@ -282,7 +283,7 @@ fn parse_author(value: &str) -> Option<(String, String)> {
 
 /// Print the ` N files changed ...` line and the per-file mode lines Git shows after a commit.
 pub(crate) fn emit_commit_summary(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     old: &Tree,
     new: &Tree,
@@ -302,10 +303,10 @@ pub(crate) fn emit_commit_summary(
     for path in &changed {
         let before = old
             .get(*path)
-            .and_then(|entry| repo::read_blob(ctx, root, &entry.hash));
+            .and_then(|entry| repo::read_blob(system, root, &entry.hash));
         let after = new
             .get(*path)
-            .and_then(|entry| repo::read_blob(ctx, root, &entry.hash));
+            .and_then(|entry| repo::read_blob(system, root, &entry.hash));
         let (added, removed) = super::diff::change_counts(
             before.as_deref(),
             after.as_deref(),
@@ -315,12 +316,12 @@ pub(crate) fn emit_commit_summary(
         deletions += removed;
     }
     io.print(&compare::summary_line(changed.len(), insertions, deletions));
-    emit_mode_lines(ctx, root, old, new, io);
+    emit_mode_lines(system, root, old, new, io);
 }
 
 /// Print the ` create mode`, ` delete mode` and ` rename` lines that follow a change summary.
 pub(crate) fn emit_mode_lines(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     old: &Tree,
     new: &Tree,
@@ -330,10 +331,10 @@ pub(crate) fn emit_mode_lines(
         format: Format::Summary,
         ..Options::default()
     };
-    compare::emit(ctx, root, old, new, &summary, io);
+    compare::emit(system, root, old, new, &summary, io);
 }
 
 /// Report that nothing is staged, using the same wording as `git status`.
-fn emit_nothing_to_commit(ctx: &mut CommandContext<'_>, io: &mut Io) {
-    super::worktree::git_status(ctx, &[], io);
+fn emit_nothing_to_commit(system: &mut dyn System, io: &mut Io) {
+    super::worktree::git_status(system, &[], io);
 }

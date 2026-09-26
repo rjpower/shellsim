@@ -6,7 +6,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::System;
 
 use super::conflict;
 use super::merge;
@@ -29,14 +30,10 @@ pub(crate) struct Snapshot {
     pub work: Tree,
 }
 
-pub(crate) fn snapshot(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    io: &mut Io,
-) -> Result<Snapshot, i32> {
-    let head = repo::head_tree(ctx, root);
-    let index = super::require_index(ctx, root, io)?;
-    let work = repo::collect_working_tree(ctx, root)?;
+pub(crate) fn snapshot(system: &mut dyn System, root: &str, io: &mut Io) -> Result<Snapshot, i32> {
+    let head = repo::head_tree(system, root);
+    let index = super::require_index(system, root, io)?;
+    let work = repo::collect_working_tree(system, root)?;
     Ok(Snapshot { head, index, work })
 }
 
@@ -117,24 +114,24 @@ pub(crate) fn only_staged(snapshot: &Snapshot, paths: &[String]) -> bool {
 
 /// Move HEAD and the working tree to `commit`.
 pub(crate) fn checkout_commit(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     commit: &str,
     io: &mut Io,
 ) -> Result<(), i32> {
-    if let Some(reason) = unfinished_operation(ctx, root) {
+    if let Some(reason) = unfinished_operation(system, root) {
         io.print_err(&reason);
         return Err(if reason.starts_with("fatal") { 128 } else { 1 });
     }
-    if let Some(previous) = repo::current_branch(ctx, root) {
+    if let Some(previous) = repo::current_branch(system, root) {
         let _ = repo::write_vfs(
-            ctx,
+            system,
             &repo::git_path(root, "PREV_HEAD"),
             format!("{previous}\n").as_bytes(),
         );
     }
-    let new = super::require_tree(ctx, root, commit, io)?;
-    let snapshot = snapshot(ctx, root, io)?;
+    let new = super::require_tree(system, root, commit, io)?;
+    let snapshot = snapshot(system, root, io)?;
     let old = &snapshot.head;
     let blocked = blocking_changes(&snapshot, &new);
     if !blocked.is_empty() {
@@ -152,12 +149,12 @@ pub(crate) fn checkout_commit(
     if refuse_untracked_overwrite(&snapshot, &new, "checkout", "switch branches", io) {
         return Err(1);
     }
-    if let Err(error) = repo::update_work_tree(ctx, root, old, &new) {
+    if let Err(error) = repo::update_work_tree(system, root, old, &new) {
         io.print_err(&format!("git switch: {error}\n"));
         return Err(1);
     }
     let index = carried_index(&snapshot, &new);
-    if let Err(error) = repo::store_index(ctx, root, &index) {
+    if let Err(error) = repo::store_index(system, root, &index) {
         return Err(super::cannot_write(io, "the index", &error));
     }
     Ok(())
@@ -188,14 +185,14 @@ fn carried_index(snapshot: &Snapshot, target: &Tree) -> Tree {
 ///
 /// A rebase holds HEAD detached and a half-replayed history, and unresolved conflicts have
 /// nowhere to go, so Git refuses to move in both cases rather than lose either.
-fn unfinished_operation(ctx: &mut CommandContext<'_>, root: &str) -> Option<String> {
-    if rebase::in_progress(ctx, root) {
+fn unfinished_operation(system: &mut dyn System, root: &str) -> Option<String> {
+    if rebase::in_progress(system, root) {
         return Some(
             "fatal: cannot switch branch while rebasing\nConsider \"git rebase --abort\" or \"git rebase --continue\".\n"
                 .to_string(),
         );
     }
-    let (kind, doing) = match merge::pending_operation(ctx, root)? {
+    let (kind, doing) = match merge::pending_operation(system, root)? {
         (conflict::REVERT_HEAD, _) => ("revert", "reverting"),
         (conflict::CHERRY_PICK_HEAD, _) => ("cherry-pick", "cherry-picking"),
         _ => ("merge", "merging"),
@@ -208,26 +205,26 @@ fn unfinished_operation(ctx: &mut CommandContext<'_>, root: &str) -> Option<Stri
 /// Move HEAD to `branch`, saying so unless the caller is only passing through on its way
 /// somewhere else, as `git rebase UPSTREAM BRANCH` does.
 pub(crate) fn switch_to_branch(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     branch: &str,
     announce: bool,
     io: &mut Io,
 ) -> i32 {
-    let Some(commit) = repo::read_reference(ctx, root, &format!("refs/heads/{branch}")) else {
+    let Some(commit) = repo::read_reference(system, root, &format!("refs/heads/{branch}")) else {
         io.print_err(&format!("fatal: invalid reference: {branch}\n"));
         return 128;
     };
-    if repo::current_branch(ctx, root).as_deref() == Some(branch) {
+    if repo::current_branch(system, root).as_deref() == Some(branch) {
         io.print_err(&format!("Already on '{branch}'\n"));
         return 0;
     }
-    if let Err(status) = checkout_commit(ctx, root, &commit, io) {
+    if let Err(status) = checkout_commit(system, root, &commit, io) {
         return status;
     }
-    let from = repo::current_branch(ctx, root).unwrap_or_else(|| "HEAD".to_string());
+    let from = repo::current_branch(system, root).unwrap_or_else(|| "HEAD".to_string());
     let action = format!("checkout: moving from {from} to {branch}");
-    if let Err(error) = repo::set_head_to_branch(ctx, root, branch, &action) {
+    if let Err(error) = repo::set_head_to_branch(system, root, branch, &action) {
         return super::cannot_write(io, "HEAD", &error);
     }
     if announce {
@@ -236,22 +233,22 @@ pub(crate) fn switch_to_branch(
     0
 }
 
-fn switch_detached(ctx: &mut CommandContext<'_>, root: &str, revision: &str, io: &mut Io) -> i32 {
-    let Some(commit) = repo::resolve_revision(ctx, root, revision) else {
+fn switch_detached(system: &mut dyn System, root: &str, revision: &str, io: &mut Io) -> i32 {
+    let Some(commit) = repo::resolve_revision(system, root, revision) else {
         io.print_err(&format!("fatal: invalid reference: {revision}\n"));
         return 128;
     };
-    if let Err(status) = checkout_commit(ctx, root, &commit, io) {
+    if let Err(status) = checkout_commit(system, root, &commit, io) {
         return status;
     }
     let action = format!("checkout: moving to {revision}");
-    if let Err(error) = repo::set_head_detached(ctx, root, &commit, &action) {
+    if let Err(error) = repo::set_head_detached(system, root, &commit, &action) {
         return super::cannot_write(io, "HEAD", &error);
     }
     io.print_err(&format!(
         "Note: switching to '{revision}'.\nHEAD is now at {} {}\n",
         repo::short(&commit),
-        repo::load_commit(ctx, root, &commit)
+        repo::load_commit(system, root, &commit)
             .map(|commit| commit.subject().to_string())
             .unwrap_or_default()
     ));
@@ -260,7 +257,7 @@ fn switch_detached(ctx: &mut CommandContext<'_>, root: &str, revision: &str, io:
 
 /// Create `branch` at `start` and switch to it.
 fn create_and_switch(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     branch: &str,
     start: Option<&str>,
@@ -275,11 +272,11 @@ fn create_and_switch(
     if let Some(start) = start {
         arguments.push(start.to_string());
     }
-    let status = refs::git_branch(ctx, &arguments, io);
+    let status = refs::git_branch(system, &arguments, io);
     if status != 0 {
         return status;
     }
-    let status = switch_to_branch(ctx, root, branch, true, io);
+    let status = switch_to_branch(system, root, branch, true, io);
     if status == 0 {
         // Git reports creation rather than a plain switch.
         let switched = format!("Switched to branch '{branch}'\n");
@@ -296,8 +293,8 @@ fn replace_tail(buffer: &mut Vec<u8>, from: &str, to: &str) {
     }
 }
 
-pub(crate) fn git_switch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_switch(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut create = false;
@@ -325,13 +322,15 @@ pub(crate) fn git_switch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         }
     }
     match operands.as_slice() {
-        [branch] if create => create_and_switch(ctx, &root, branch, None, force, io),
-        [branch, start] if create => create_and_switch(ctx, &root, branch, Some(start), force, io),
-        [revision] if detach => switch_detached(ctx, &root, revision, io),
+        [branch] if create => create_and_switch(system, &root, branch, None, force, io),
+        [branch, start] if create => {
+            create_and_switch(system, &root, branch, Some(start), force, io)
+        }
+        [revision] if detach => switch_detached(system, &root, revision, io),
         [branch] => {
-            let branch = resolve_previous(ctx, &root, branch);
+            let branch = resolve_previous(system, &root, branch);
             match branch {
-                Some(branch) => switch_to_branch(ctx, &root, &branch, true, io),
+                Some(branch) => switch_to_branch(system, &root, &branch, true, io),
                 None => {
                     io.print_err("fatal: no previous branch to switch to\n");
                     128
@@ -343,15 +342,15 @@ pub(crate) fn git_switch(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
 }
 
 /// Expand `-` into the branch that was checked out before the current one.
-fn resolve_previous(ctx: &CommandContext<'_>, root: &str, branch: &str) -> Option<String> {
+fn resolve_previous(system: &mut dyn System, root: &str, branch: &str) -> Option<String> {
     if branch != "-" {
         return Some(branch.to_string());
     }
-    repo::previous_branch(ctx, root)
+    repo::previous_branch(system, root)
 }
 
-pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_checkout(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut create = false;
@@ -390,27 +389,29 @@ pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     }
     if let Some(side) = side {
         let named = if paths.is_empty() { &operands } else { &paths };
-        return checkout_side(ctx, &root, side, named, io);
+        return checkout_side(system, &root, side, named, io);
     }
     if !paths.is_empty() {
         // `git checkout [REVISION] -- PATH...` restores files without moving HEAD.
         let source = operands.first().map(String::as_str);
-        return super::worktree::git_restore(ctx, &restore_arguments(source, &paths), io);
+        return super::worktree::git_restore(system, &restore_arguments(source, &paths), io);
     }
     match operands.as_slice() {
-        [branch] if create => create_and_switch(ctx, &root, branch, None, force, io),
-        [branch, start] if create => create_and_switch(ctx, &root, branch, Some(start), force, io),
-        [revision] if detach => switch_detached(ctx, &root, revision, io),
+        [branch] if create => create_and_switch(system, &root, branch, None, force, io),
+        [branch, start] if create => {
+            create_and_switch(system, &root, branch, Some(start), force, io)
+        }
+        [revision] if detach => switch_detached(system, &root, revision, io),
         [target] => {
-            if let Some(branch) = resolve_previous(ctx, &root, target) {
-                if repo::read_reference(ctx, &root, &format!("refs/heads/{branch}")).is_some() {
-                    return switch_to_branch(ctx, &root, &branch, true, io);
+            if let Some(branch) = resolve_previous(system, &root, target) {
+                if repo::read_reference(system, &root, &format!("refs/heads/{branch}")).is_some() {
+                    return switch_to_branch(system, &root, &branch, true, io);
                 }
             }
-            if repo::resolve_revision(ctx, &root, target).is_some() {
-                return switch_detached(ctx, &root, target, io);
+            if repo::resolve_revision(system, &root, target).is_some() {
+                return switch_detached(system, &root, target, io);
             }
-            if !super::names_a_path(ctx, &root, target) {
+            if !super::names_a_path(system, &root, target) {
                 io.print_err(&format!(
                     "error: pathspec '{target}' did not match any file(s) known to git\n"
                 ));
@@ -418,7 +419,7 @@ pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             }
             // A bare path argument means "discard my changes to that path".
             super::worktree::git_restore(
-                ctx,
+                system,
                 &restore_arguments(None, std::slice::from_ref(target)),
                 io,
             )
@@ -432,16 +433,16 @@ pub(crate) fn git_checkout(ctx: &mut CommandContext<'_>, args: &[String], io: &m
 
 /// Take one side of a conflict for the named paths, as `git checkout --ours` does.
 pub(crate) fn restore_side(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     theirs: bool,
     named: &[String],
     io: &mut Io,
 ) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let side = if theirs { Side::Theirs } else { Side::Ours };
-    checkout_side(ctx, &root, side, named, io)
+    checkout_side(system, &root, side, named, io)
 }
 
 /// Which recorded side of a conflict `git checkout --ours` and `--theirs` take.
@@ -455,17 +456,17 @@ enum Side {
 ///
 /// As in Git the path stays unmerged until it is staged, so the user can look before committing.
 fn checkout_side(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     side: Side,
     named: &[String],
     io: &mut Io,
 ) -> i32 {
-    let stages = conflict::load_stages(ctx, root);
+    let stages = conflict::load_stages(system, root);
     if named.is_empty() {
         return usage(io, "usage: git checkout --ours|--theirs PATH...");
     }
-    let cwd = ctx.cwd.clone();
+    let cwd = system.cwd().to_string();
     let mut chosen: Vec<(String, String)> = Vec::new();
     for operand in named {
         let path = super::pathspec(&cwd, root, operand);
@@ -490,11 +491,11 @@ fn checkout_side(
     }
     let count = chosen.len();
     for (path, hash) in chosen {
-        let Some(data) = repo::read_blob(ctx, root, &hash) else {
+        let Some(data) = repo::read_blob(system, root, &hash) else {
             io.print_err(&format!("error: missing blob for '{path}'\n"));
             return 1;
         };
-        if repo::write_vfs(ctx, &repo::path_join(root, &path), &data).is_err() {
+        if repo::write_vfs(system, &repo::path_join(root, &path), &data).is_err() {
             io.print_err(&format!("error: cannot write '{path}'\n"));
             return 1;
         }

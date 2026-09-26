@@ -3,7 +3,8 @@
 //! All three replay one tree onto another, so they share a sequencer that records the commits
 //! still to apply, pauses on conflicts, and lets the operation be continued or aborted.
 
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::System;
 
 use super::commit;
 use super::compare::{self, Format, Options};
@@ -13,12 +14,12 @@ use super::switch;
 use super::{repo_error, usage, Arg, Flags, Globals};
 
 pub(crate) fn git_merge(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     globals: &Globals,
     args: &[String],
     io: &mut Io,
 ) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut no_fast_forward = false;
@@ -38,8 +39,8 @@ pub(crate) fn git_merge(
             "--no-ff" => no_fast_forward = true,
             "--ff-only" => fast_forward_only = true,
             "--ff" | "--no-edit" | "-q" | "--quiet" => {}
-            "--abort" => return abort_pending(ctx, &root, "merge", io),
-            "--continue" => return continue_pending(ctx, &root, globals, "merge", io),
+            "--abort" => return abort_pending(system, &root, "merge", io),
+            "--continue" => return continue_pending(system, &root, globals, "merge", io),
             "-m" | "--message" => message = flags.value(attached),
             _ => return usage(io, &format!("unsupported merge option: {name}")),
         }
@@ -47,23 +48,23 @@ pub(crate) fn git_merge(
     let [target] = operands.as_slice() else {
         return usage(io, "usage: git merge [--no-ff|--ff-only] BRANCH");
     };
-    let Some(other) = repo::resolve_revision(ctx, &root, target) else {
+    let Some(other) = repo::resolve_revision(system, &root, target) else {
         io.print_err(&format!("merge: {target} - not something we can merge\n"));
         return 1;
     };
-    let Some(head) = repo::head_commit(ctx, &root) else {
+    let Some(head) = repo::head_commit(system, &root) else {
         io.print_err("fatal: no commit on the current branch to merge into\n");
         return 128;
     };
-    if repo::ancestors(ctx, &root, &head).contains(&other) {
+    if repo::ancestors(system, &root, &head).contains(&other) {
         io.print("Already up to date.\n");
         return 0;
     }
-    let incoming = match super::require_tree(ctx, &root, &other, io) {
+    let incoming = match super::require_tree(system, &root, &other, io) {
         Ok(tree) => tree,
         Err(status) => return status,
     };
-    let snapshot = match switch::snapshot(ctx, &root, io) {
+    let snapshot = match switch::snapshot(system, &root, io) {
         Ok(snapshot) => snapshot,
         Err(status) => return status,
     };
@@ -74,15 +75,15 @@ pub(crate) fn git_merge(
     if switch::refuse_untracked_overwrite(&snapshot, &incoming, "merge", "merge", io) {
         return 1;
     }
-    repo::record_orig_head(ctx, &root);
-    let base = repo::merge_base(ctx, &root, &head, &other);
+    repo::record_orig_head(system, &root);
+    let base = repo::merge_base(system, &root, &head, &other);
     let fast_forward = base.as_deref() == Some(head.as_str());
     if fast_forward && !no_fast_forward {
-        if let Err(status) = switch::checkout_commit(ctx, &root, &other, io) {
+        if let Err(status) = switch::checkout_commit(system, &root, &other, io) {
             return status;
         }
         let action = format!("merge {target}: Fast-forward");
-        if let Err(error) = repo::update_head(ctx, &root, &other, &action) {
+        if let Err(error) = repo::update_head(system, &root, &other, &action) {
             return super::cannot_write(io, "HEAD", &error);
         }
         io.print(&format!(
@@ -90,38 +91,38 @@ pub(crate) fn git_merge(
             repo::short(&head),
             repo::short(&other)
         ));
-        let before = repo::commit_tree(ctx, &root, &head).unwrap_or_default();
-        let after = repo::commit_tree(ctx, &root, &other).unwrap_or_default();
+        let before = repo::commit_tree(system, &root, &head).unwrap_or_default();
+        let after = repo::commit_tree(system, &root, &other).unwrap_or_default();
         let options = Options {
             format: Format::Stat,
             ..Options::default()
         };
-        compare::emit(ctx, &root, &before, &after, &options, io);
-        commit::emit_mode_lines(ctx, &root, &before, &after, io);
+        compare::emit(system, &root, &before, &after, &options, io);
+        commit::emit_mode_lines(system, &root, &before, &after, io);
         return 0;
     }
     if fast_forward_only {
         io.print_err("fatal: Not possible to fast-forward, aborting.\n");
         return 128;
     }
-    let base_tree = match super::parent_tree(ctx, &root, base.as_ref(), io) {
+    let base_tree = match super::parent_tree(system, &root, base.as_ref(), io) {
         Ok(tree) => tree,
         Err(status) => return status,
     };
-    let head_tree = match super::require_tree(ctx, &root, &head, io) {
+    let head_tree = match super::require_tree(system, &root, &head, io) {
         Ok(tree) => tree,
         Err(status) => return status,
     };
     let other_tree = incoming;
     let subject = message.unwrap_or_else(|| {
         // Git names the branch merged into unless it is the repository's default.
-        match repo::current_branch(ctx, &root).filter(|branch| branch != repo::DEFAULT_BRANCH) {
+        match repo::current_branch(system, &root).filter(|branch| branch != repo::DEFAULT_BRANCH) {
             Some(branch) => format!("Merge branch '{target}' into {branch}"),
             None => format!("Merge branch '{target}'"),
         }
     });
     let combined = conflict::combine(
-        ctx,
+        system,
         &root,
         &base_tree,
         &head_tree,
@@ -134,16 +135,16 @@ pub(crate) fn git_merge(
         Err(failed) => return super::cannot_write(io, &failed.path, &failed.error),
     };
     let merged = combined.tree;
-    if let Err(error) = repo::update_work_tree(ctx, &root, &head_tree, &merged) {
+    if let Err(error) = repo::update_work_tree(system, &root, &head_tree, &merged) {
         io.print_err(&format!("git merge: {error}\n"));
         return 1;
     }
-    if let Err(error) = repo::store_index(ctx, &root, &merged) {
+    if let Err(error) = repo::store_index(system, &root, &merged) {
         return super::cannot_write(io, "the index", &error);
     }
     if !combined.stages.is_empty() {
         return pause_for_conflicts(
-            ctx,
+            system,
             &root,
             &Paused {
                 kind: conflict::MERGE_HEAD,
@@ -156,19 +157,19 @@ pub(crate) fn git_merge(
             io,
         );
     }
-    let (author_name, author_email) = repo::author_identity(ctx, &root, globals);
+    let (author_name, author_email) = repo::author_identity(system, &root, globals);
     let commit = Commit {
         parents: vec![head.clone(), other.clone()],
         author_name,
         author_email,
-        timestamp: repo::now_seconds(ctx),
+        timestamp: repo::now_seconds(system),
         message: subject,
     };
-    let id = match repo::store_commit(ctx, &root, &commit, &merged) {
+    let id = match repo::store_commit(system, &root, &commit, &merged) {
         Ok(id) => id,
         Err(error) => return super::cannot_write(io, "the merge commit", &error),
     };
-    if let Err(error) = repo::update_head(ctx, &root, &id, &format!("merge {target}")) {
+    if let Err(error) = repo::update_head(system, &root, &id, &format!("merge {target}")) {
         return super::cannot_write(io, "HEAD", &error);
     }
     io.print("Merge made by the 'ort' strategy.\n");
@@ -177,8 +178,8 @@ pub(crate) fn git_merge(
         format: Format::Stat,
         ..Default::default()
     };
-    compare::emit(ctx, &root, &head_tree, &merged, &stat, io);
-    commit::emit_mode_lines(ctx, &root, &head_tree, &merged, io);
+    compare::emit(system, &root, &head_tree, &merged, &stat, io);
+    commit::emit_mode_lines(system, &root, &head_tree, &merged, io);
     0
 }
 
@@ -190,14 +191,14 @@ pub(crate) fn git_merge(
 /// commit's parent as the base and the commit as the incoming side, and a revert swaps those two,
 /// which turns replaying a change into undoing it.
 pub(crate) fn git_replay(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     globals: &Globals,
     revert: bool,
     args: &[String],
     io: &mut Io,
 ) -> i32 {
     let name = if revert { "revert" } else { "cherry-pick" };
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut no_commit = false;
@@ -225,20 +226,20 @@ pub(crate) fn git_replay(
             }
             "-n" | "--no-commit" => no_commit = true,
             "-e" | "--edit" | "--no-edit" | "-q" | "--quiet" => {}
-            "--abort" | "--quit" => return abort_sequence(ctx, &root, name, io),
+            "--abort" | "--quit" => return abort_sequence(system, &root, name, io),
             // Skipping abandons the commit in flight, then the rest of the list carries on.
             "--skip" => {
-                let status = abort_pending(ctx, &root, name, io);
+                let status = abort_pending(system, &root, name, io);
                 return if status == 0 {
-                    resume_sequence(ctx, globals, &root, io)
+                    resume_sequence(system, globals, &root, io)
                 } else {
                     status
                 };
             }
             "--continue" => {
-                let status = continue_pending(ctx, &root, globals, name, io);
+                let status = continue_pending(system, &root, globals, name, io);
                 return if status == 0 {
-                    resume_sequence(ctx, globals, &root, io)
+                    resume_sequence(system, globals, &root, io)
                 } else {
                     status
                 };
@@ -249,20 +250,20 @@ pub(crate) fn git_replay(
     if operands.is_empty() {
         return usage(io, &format!("usage: git {name} [-n] [-m PARENT] COMMIT..."));
     }
-    let Some(original) = repo::head_commit(ctx, &root) else {
+    let Some(original) = repo::head_commit(system, &root) else {
         io.print_err(&format!("fatal: {name} needs a commit to apply onto\n"));
         return 128;
     };
     let mut todo = Vec::new();
     for revision in &operands {
-        let Some(id) = repo::resolve_revision(ctx, &root, revision) else {
+        let Some(id) = repo::resolve_revision(system, &root, revision) else {
             io.print_err(&format!("fatal: bad revision '{revision}'\n"));
             return 128;
         };
         todo.push(id);
     }
     run_sequence(
-        ctx,
+        system,
         globals,
         &root,
         Sequence {
@@ -299,11 +300,8 @@ fn replay_name(revert: bool) -> &'static str {
 
 const SEQUENCER: &str = "SEQUENCER";
 
-fn load_sequence(interp: &crate::interp::Interp, root: &str) -> Option<Sequence> {
-    let bytes = interp
-        .vfs
-        .read("/", &repo::git_path(root, SEQUENCER))
-        .ok()?;
+fn load_sequence(system: &mut dyn System, root: &str) -> Option<Sequence> {
+    let bytes = repo::read_all(system, &repo::git_path(root, SEQUENCER))?;
     let text = String::from_utf8_lossy(&bytes).to_string();
     let mut sequence = Sequence {
         revert: false,
@@ -328,7 +326,7 @@ fn load_sequence(interp: &crate::interp::Interp, root: &str) -> Option<Sequence>
     (!sequence.original.is_empty()).then_some(sequence)
 }
 
-fn store_sequence(ctx: &mut CommandContext<'_>, root: &str, sequence: &Sequence) -> bool {
+fn store_sequence(system: &mut dyn System, root: &str, sequence: &Sequence) -> bool {
     let mut text = format!(
         "revert {}\nnocommit {}\nmainline {}\norig {}\n",
         u8::from(sequence.revert),
@@ -339,16 +337,16 @@ fn store_sequence(ctx: &mut CommandContext<'_>, root: &str, sequence: &Sequence)
     for id in &sequence.todo {
         text.push_str(&format!("todo {id}\n"));
     }
-    repo::write_vfs(ctx, &repo::git_path(root, SEQUENCER), text.as_bytes()).is_ok()
+    repo::write_vfs(system, &repo::git_path(root, SEQUENCER), text.as_bytes()).is_ok()
 }
 
-fn clear_sequence(ctx: &mut CommandContext<'_>, root: &str) {
-    let _ = ctx.vfs.remove_file("/", &repo::git_path(root, SEQUENCER));
+fn clear_sequence(system: &mut dyn System, root: &str) {
+    let _ = system.unlink("/", &repo::git_path(root, SEQUENCER));
 }
 
 /// Replay each commit in turn, remembering what is left if one of them stops.
 fn run_sequence(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     globals: &Globals,
     root: &str,
     mut sequence: Sequence,
@@ -356,40 +354,35 @@ fn run_sequence(
 ) -> i32 {
     while !sequence.todo.is_empty() {
         let id = sequence.todo.remove(0);
-        let status = replay_one(ctx, globals, root, &sequence, &id, io);
+        let status = replay_one(system, globals, root, &sequence, &id, io);
         if status != 0 {
-            store_sequence(ctx, root, &sequence);
+            store_sequence(system, root, &sequence);
             return status;
         }
     }
-    clear_sequence(ctx, root);
+    clear_sequence(system, root);
     0
 }
 
 /// Carry on with the commits a stopped cherry-pick or revert had left.
-fn resume_sequence(
-    ctx: &mut CommandContext<'_>,
-    globals: &Globals,
-    root: &str,
-    io: &mut Io,
-) -> i32 {
-    match load_sequence(ctx, root) {
-        Some(sequence) => run_sequence(ctx, globals, root, sequence, io),
+fn resume_sequence(system: &mut dyn System, globals: &Globals, root: &str, io: &mut Io) -> i32 {
+    match load_sequence(system, root) {
+        Some(sequence) => run_sequence(system, globals, root, sequence, io),
         None => 0,
     }
 }
 
 /// Abandon the whole sequence, putting the branch back where it started.
-fn abort_sequence(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut Io) -> i32 {
-    let Some(sequence) = load_sequence(ctx, root) else {
-        return abort_pending(ctx, root, name, io);
+fn abort_sequence(system: &mut dyn System, root: &str, name: &str, io: &mut Io) -> i32 {
+    let Some(sequence) = load_sequence(system, root) else {
+        return abort_pending(system, root, name, io);
     };
-    let head = repo::head_tree(ctx, root);
-    let target = match super::require_tree(ctx, root, &sequence.original, io) {
+    let head = repo::head_tree(system, root);
+    let target = match super::require_tree(system, root, &sequence.original, io) {
         Ok(tree) => tree,
         Err(status) => return status,
     };
-    let mut previous = match super::require_index(ctx, root, io) {
+    let mut previous = match super::require_index(system, root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
@@ -398,24 +391,24 @@ fn abort_sequence(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut
             .entry(path.clone())
             .or_insert_with(|| entry.clone());
     }
-    if let Err(error) = repo::replace_work_tree(ctx, root, &previous, &target) {
+    if let Err(error) = repo::replace_work_tree(system, root, &previous, &target) {
         io.print_err(&format!("git {name}: {error}\n"));
         return 1;
     }
-    if let Err(error) = repo::store_index(ctx, root, &target) {
+    if let Err(error) = repo::store_index(system, root, &target) {
         return super::cannot_write(io, "the index", &error);
     }
     let action = format!("{name}: aborted");
-    if let Err(error) = repo::update_head(ctx, root, &sequence.original, &action) {
+    if let Err(error) = repo::update_head(system, root, &sequence.original, &action) {
         return super::cannot_write(io, "HEAD", &error);
     }
-    conflict::clear(ctx, root);
-    clear_sequence(ctx, root);
+    conflict::clear(system, root);
+    clear_sequence(system, root);
     0
 }
 
 fn replay_one(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     globals: &Globals,
     root: &str,
     sequence: &Sequence,
@@ -429,17 +422,17 @@ fn replay_one(
         ..
     } = *sequence;
     let name = replay_name(revert);
-    if pending_operation(ctx, root).is_some() {
+    if pending_operation(system, root).is_some() {
         io.print_err(&format!(
                 "error: a {name} is already in progress\nhint: try \"git {name} --continue\" or \"git {name} --abort\"\n"
             ));
         return 128;
     }
-    let Some(id) = repo::resolve_revision(ctx, root, revision) else {
+    let Some(id) = repo::resolve_revision(system, root, revision) else {
         io.print_err(&format!("fatal: bad revision '{revision}'\n"));
         return 128;
     };
-    let Some(commit) = repo::load_commit(ctx, root, &id) else {
+    let Some(commit) = repo::load_commit(system, root, &id) else {
         io.print_err(&format!("fatal: bad object {revision}\n"));
         return 128;
     };
@@ -465,19 +458,19 @@ fn replay_one(
         ));
         return 128;
     }
-    let Some(head) = repo::head_commit(ctx, root) else {
+    let Some(head) = repo::head_commit(system, root) else {
         io.print_err(&format!("fatal: {name} needs a commit to apply onto\n"));
         return 128;
     };
-    let commit_tree = match super::require_tree(ctx, root, &id, io) {
+    let commit_tree = match super::require_tree(system, root, &id, io) {
         Ok(tree) => tree,
         Err(status) => return status,
     };
-    let parent_tree = match super::parent_tree(ctx, root, commit.parents.get(against - 1), io) {
+    let parent_tree = match super::parent_tree(system, root, commit.parents.get(against - 1), io) {
         Ok(tree) => tree,
         Err(status) => return status,
     };
-    let head_tree = match super::require_tree(ctx, root, &head, io) {
+    let head_tree = match super::require_tree(system, root, &head, io) {
         Ok(tree) => tree,
         Err(status) => return status,
     };
@@ -488,7 +481,7 @@ fn replay_one(
     };
     // Committing the replay would fold anything already staged into it, which is why Git wants
     // a settled index first. `-n` leaves the commit to the user, so it can go ahead.
-    let snapshot = match switch::snapshot(ctx, root, io) {
+    let snapshot = match switch::snapshot(system, root, io) {
         Ok(snapshot) => snapshot,
         Err(status) => return status,
     };
@@ -508,13 +501,13 @@ fn replay_one(
         commit.message.clone()
     };
     let label = format!("{} ({})", repo::short(&id), commit.subject());
-    let combined = conflict::combine(ctx, root, base, &head_tree, theirs, "HEAD", &label);
+    let combined = conflict::combine(system, root, base, &head_tree, theirs, "HEAD", &label);
     let combined = match combined {
         Ok(combined) => combined,
         Err(failed) => return super::cannot_write(io, &failed.path, &failed.error),
     };
     let applied = combined.tree;
-    if let Err(error) = repo::update_work_tree(ctx, root, &head_tree, &applied) {
+    if let Err(error) = repo::update_work_tree(system, root, &head_tree, &applied) {
         io.print_err(&format!("git {name}: {error}\n"));
         return 1;
     }
@@ -529,7 +522,7 @@ fn replay_one(
             None => index.remove(path),
         };
     }
-    if let Err(error) = repo::store_index(ctx, root, &index) {
+    if let Err(error) = repo::store_index(system, root, &index) {
         return super::cannot_write(io, "the index", &error);
     }
     let kind = if revert {
@@ -549,7 +542,7 @@ fn replay_one(
              hint: run \"git {name} --abort\"."
         );
         return pause_for_conflicts(
-            ctx,
+            system,
             root,
             &Paused {
                 kind,
@@ -572,7 +565,7 @@ fn replay_one(
     }
     // A cherry-pick keeps the original author; a revert is the work of whoever ran it.
     let (author_name, author_email) = if revert {
-        repo::author_identity(ctx, root, globals)
+        repo::author_identity(system, root, globals)
     } else {
         (commit.author_name.clone(), commit.author_email.clone())
     };
@@ -580,24 +573,24 @@ fn replay_one(
         parents: vec![head.clone()],
         author_name,
         author_email,
-        timestamp: repo::now_seconds(ctx),
+        timestamp: repo::now_seconds(system),
         message,
     };
-    let new_id = match repo::store_commit(ctx, root, &replayed, &applied) {
+    let new_id = match repo::store_commit(system, root, &replayed, &applied) {
         Ok(id) => id,
         Err(error) => return super::cannot_write(io, "the commit", &error),
     };
     let action = format!("{name}: {}", replayed.subject());
-    if let Err(error) = repo::update_head(ctx, root, &new_id, &action) {
+    if let Err(error) = repo::update_head(system, root, &new_id, &action) {
         return super::cannot_write(io, "HEAD", &error);
     }
-    let branch = repo::current_branch(ctx, root).unwrap_or_else(|| "detached HEAD".to_string());
+    let branch = repo::current_branch(system, root).unwrap_or_else(|| "detached HEAD".to_string());
     io.print(&format!(
         "[{branch} {}] {}\n",
         repo::short(&new_id),
         replayed.subject()
     ));
-    commit::emit_commit_summary(ctx, root, &head_tree, &applied, io);
+    commit::emit_commit_summary(system, root, &head_tree, &applied, io);
     0
 }
 
@@ -617,7 +610,7 @@ struct Paused<'a> {
 }
 
 fn pause_for_conflicts(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     paused: &Paused<'_>,
     stages: &Stages,
@@ -645,8 +638,8 @@ fn pause_for_conflicts(
         };
         io.print_err(&line);
     }
-    if !conflict::begin(ctx, root, kind, commit, message)
-        || !conflict::store_stages(ctx, root, stages)
+    if !conflict::begin(system, root, kind, commit, message)
+        || !conflict::store_stages(system, root, stages)
     {
         io.print_err("fatal: unable to record the conflicted state\n");
         return 128;
@@ -657,7 +650,7 @@ fn pause_for_conflicts(
 
 /// The operation waiting to be finished, if any.
 pub(crate) fn pending_operation(
-    ctx: &CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
 ) -> Option<(&'static str, String)> {
     for kind in [
@@ -665,7 +658,7 @@ pub(crate) fn pending_operation(
         conflict::CHERRY_PICK_HEAD,
         conflict::REVERT_HEAD,
     ] {
-        if let Some(commit) = conflict::in_progress(ctx, root, kind) {
+        if let Some(commit) = conflict::in_progress(system, root, kind) {
             return Some((kind, commit));
         }
     }
@@ -673,50 +666,50 @@ pub(crate) fn pending_operation(
 }
 
 /// Throw away an unfinished merge, cherry-pick, or revert.
-fn abort_pending(ctx: &mut CommandContext<'_>, root: &str, name: &str, io: &mut Io) -> i32 {
-    if pending_operation(ctx, root).is_none() {
+fn abort_pending(system: &mut dyn System, root: &str, name: &str, io: &mut Io) -> i32 {
+    if pending_operation(system, root).is_none() {
         io.print_err(&format!(
             "fatal: There is no {name} in progress ({name} --abort).\n"
         ));
         return 128;
     }
-    let head = repo::head_tree(ctx, root);
+    let head = repo::head_tree(system, root);
     // Only paths the merge could have touched are restored; untracked files are left alone.
-    let mut previous = match super::require_index(ctx, root, io) {
+    let mut previous = match super::require_index(system, root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
     for (path, hash) in &head {
         previous.entry(path.clone()).or_insert_with(|| hash.clone());
     }
-    if let Err(error) = repo::replace_work_tree(ctx, root, &previous, &head) {
+    if let Err(error) = repo::replace_work_tree(system, root, &previous, &head) {
         io.print_err(&format!("git {name}: {error}\n"));
         return 1;
     }
-    if let Err(error) = repo::store_index(ctx, root, &head) {
+    if let Err(error) = repo::store_index(system, root, &head) {
         return super::cannot_write(io, "the index", &error);
     }
-    conflict::clear(ctx, root);
+    conflict::clear(system, root);
     0
 }
 
 /// Finish an operation whose conflicts the user has resolved.
 fn continue_pending(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     globals: &Globals,
     name: &str,
     io: &mut Io,
 ) -> i32 {
-    if pending_operation(ctx, root).is_none() {
+    if pending_operation(system, root).is_none() {
         io.print_err(&format!(
             "fatal: There is no {name} in progress ({name} --continue).\n"
         ));
         return 128;
     }
-    if !conflict::load_stages(ctx, root).is_empty() {
+    if !conflict::load_stages(system, root).is_empty() {
         io.print_err("error: Committing is not possible because you have unmerged files.\n");
         return 1;
     }
-    commit::git_commit(ctx, globals, &["--no-edit".to_string()], io)
+    commit::git_commit(system, globals, &["--no-edit".to_string()], io)
 }

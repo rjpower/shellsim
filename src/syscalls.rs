@@ -205,6 +205,16 @@ pub(crate) trait System {
     fn stop_status(&self) -> i32;
     /// Record a rejected feature so callers can distinguish an unsupported surface.
     fn note_unsupported(&mut self, feature: &str);
+    /// Capture the whole virtual filesystem so a multi-step change can be undone.
+    ///
+    /// `apply_file_batch` covers ordinary all-or-nothing writes, but a few git operations (for
+    /// example `git apply --cached`) must run several ordinary mutations, inspect the result to
+    /// decide what to keep, and then put the working tree back exactly as it was; that needs a
+    /// snapshot to restore rather than a single batch to commit. The snapshot is opaque so a
+    /// caller can only capture and restore it, never inspect or edit it directly.
+    fn vfs_snapshot(&mut self) -> VfsSnapshot;
+    /// Replace the whole virtual filesystem with an earlier [`VfsSnapshot`].
+    fn restore_vfs_snapshot(&mut self, snapshot: VfsSnapshot);
 }
 
 /// Active-PID adapter; native program bodies receive this handle, not `Interp`.
@@ -370,6 +380,9 @@ impl System for ActiveSystem<'_> {
                 FileChange::PutFile { path, bytes, .. } => {
                     (path.len() as u64).saturating_add(bytes.len() as u64)
                 }
+                FileChange::PutSymlink { link, target } => {
+                    (link.len() as u64).saturating_add(target.len() as u64)
+                }
             })
         });
         let snapshot = self.interp.vfs.disk_used().saturating_mul(2);
@@ -392,6 +405,16 @@ impl System for ActiveSystem<'_> {
             FileChange::PutFile { path, bytes, mode } => {
                 let absolute = resolve_against(base, &path);
                 staged.put_file(&absolute, bytes, mode)
+            }
+            FileChange::PutSymlink { link, target } => {
+                let absolute = resolve_against(base, &link);
+                if let Some(parent) = crate::vfs::parent_of(&absolute) {
+                    staged.mkdir_all(base, &parent)?;
+                }
+                // A symlink cannot be created on top of an existing node, so clear it first;
+                // a missing node is not an error here.
+                let _ = staged.remove_file(base, &absolute);
+                staged.symlink(base, &target, &absolute)
             }
         });
         if result.is_ok() {
@@ -749,6 +772,14 @@ impl System for ActiveSystem<'_> {
     fn note_unsupported(&mut self, feature: &str) {
         self.interp.note_unsupported(feature);
     }
+
+    fn vfs_snapshot(&mut self) -> VfsSnapshot {
+        VfsSnapshot(self.interp.vfs.clone())
+    }
+
+    fn restore_vfs_snapshot(&mut self, snapshot: VfsSnapshot) {
+        self.interp.vfs = snapshot.0;
+    }
 }
 
 /// Open the single virtual display for the active process.
@@ -816,7 +847,15 @@ pub(crate) enum FileChange {
         bytes: Vec<u8>,
         mode: u32,
     },
+    /// Replace whatever is at `link` (if anything) with a symlink to `target`.
+    PutSymlink {
+        link: String,
+        target: String,
+    },
 }
+
+/// Opaque virtual filesystem snapshot; see [`System::vfs_snapshot`].
+pub(crate) struct VfsSnapshot(crate::vfs::Vfs);
 
 /// Data visible from `stat` without exposing file bytes or native program identity.
 #[derive(Clone, Debug, PartialEq, Eq)]

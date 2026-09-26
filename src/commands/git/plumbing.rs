@@ -6,7 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::System;
 use crate::vfs::resolve_against;
 
 use super::diff;
@@ -17,8 +18,8 @@ use super::{cannot_write, fatal, repo_error, usage, Arg, Flags};
 /// The most files `git grep` will search in one invocation.
 const MAX_GREP_FILES: usize = 10_000;
 
-pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_cat_file(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut mode = None;
@@ -41,13 +42,13 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     };
     // An object is either a blob hash or a revision, optionally with a `:PATH` suffix.
     let blob = match object.contains(':') {
-        true => repo::tree_and_path(ctx, &root, &object)
+        true => repo::tree_and_path(system, &root, &object)
             .and_then(|(tree, path)| tree.get(&path).map(|entry| entry.hash.clone())),
         false => Some(object.clone()),
     };
     if let Some(data) = blob
         .as_deref()
-        .and_then(|hash| repo::read_blob(ctx, &root, hash))
+        .and_then(|hash| repo::read_blob(system, &root, hash))
     {
         return match mode.as_str() {
             "-t" => {
@@ -65,15 +66,15 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             }
         };
     }
-    let Some(id) = repo::resolve_revision(ctx, &root, &object) else {
+    let Some(id) = repo::resolve_revision(system, &root, &object) else {
         io.print_err(&format!("fatal: Not a valid object name {object}\n"));
         return 128;
     };
-    let Some(commit) = repo::load_commit(ctx, &root, &id) else {
+    let Some(commit) = repo::load_commit(system, &root, &id) else {
         io.print_err(&format!("fatal: Not a valid object name {object}\n"));
         return 128;
     };
-    let tree = repo::commit_tree(ctx, &root, &id).unwrap_or_default();
+    let tree = repo::commit_tree(system, &root, &id).unwrap_or_default();
     let mut body = format!("tree {}\n", repo::tree_hash(&tree));
     for parent in &commit.parents {
         body.push_str(&format!("parent {parent}\n"));
@@ -90,7 +91,7 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         .strip_prefix("refs/tags/")
         .map(str::to_string)
         .or_else(|| Some(object.clone()))
-        .filter(|name| repo::read_annotation(ctx, &root, name).is_some())
+        .filter(|name| repo::read_annotation(system, &root, name).is_some())
         .is_some();
     match mode.as_str() {
         "-t" if annotated => io.print("tag\n"),
@@ -104,7 +105,7 @@ pub(crate) fn git_cat_file(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     0
 }
 
-pub(crate) fn git_hash_object(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+pub(crate) fn git_hash_object(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
     let mut write = false;
     let mut stdin = false;
     let mut files = Vec::new();
@@ -138,8 +139,8 @@ pub(crate) fn git_hash_object(ctx: &mut CommandContext<'_>, args: &[String], io:
         contents.push(io.stdin.clone());
     }
     for file in &files {
-        let absolute = resolve_against(&ctx.cwd, file);
-        match ctx.fs_read_limited("/", &absolute, 16 * 1024 * 1024) {
+        let absolute = resolve_against(system.cwd(), file);
+        match system.read_file_limited("/", &absolute, 16 * 1024 * 1024) {
             Ok(data) => contents.push(data),
             Err(_) => {
                 io.print_err(&format!("fatal: could not open '{file}' for reading\n"));
@@ -150,14 +151,14 @@ pub(crate) fn git_hash_object(ctx: &mut CommandContext<'_>, args: &[String], io:
     if contents.is_empty() {
         return usage(io, "usage: git hash-object [-w] [--stdin] [FILE...]");
     }
-    let root = repo::find_repo_root(ctx);
+    let root = repo::find_repo_root(system);
     for data in contents {
         let hash = repo::blob_hash(&data);
         if write {
             let Some(root) = root.as_deref() else {
                 return repo_error(io);
             };
-            if let Err(error) = repo::write_blob(ctx, root, &data) {
+            if let Err(error) = repo::write_blob(system, root, &data) {
                 return cannot_write(io, "the object", &error);
             }
         }
@@ -166,8 +167,8 @@ pub(crate) fn git_hash_object(ctx: &mut CommandContext<'_>, args: &[String], io:
     0
 }
 
-pub(crate) fn git_ls_tree(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_ls_tree(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut name_only = false;
@@ -196,10 +197,10 @@ pub(crate) fn git_ls_tree(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
             "usage: git ls-tree [-r] [--name-only] REVISION [PATH...]",
         );
     };
-    let Some(commit) = repo::resolve_revision(ctx, &root, revision) else {
+    let Some(commit) = repo::resolve_revision(system, &root, revision) else {
         return super::ambiguous_argument(io, revision);
     };
-    let tree = repo::commit_tree(ctx, &root, &commit).unwrap_or_default();
+    let tree = repo::commit_tree(system, &root, &commit).unwrap_or_default();
     let prefix = paths
         .first()
         .map(|path| path.trim_end_matches('/').to_string())
@@ -256,8 +257,8 @@ fn subtree_hash(tree: &repo::Tree, directory: &str) -> String {
     repo::tree_hash(&subtree)
 }
 
-pub(crate) fn git_check_ignore(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_check_ignore(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut paths = Vec::new();
@@ -295,8 +296,8 @@ pub(crate) fn git_check_ignore(ctx: &mut CommandContext<'_>, args: &[String], io
     if non_matching && !verbose {
         return usage(io, "check-ignore: -n requires -v");
     }
-    let rules = ignore::load(ctx, &root);
-    let cwd = ctx.cwd.clone();
+    let rules = ignore::load(system, &root);
+    let cwd = system.cwd().to_string();
     let mut any = false;
     for path in &paths {
         let relative = super::pathspec(&cwd, &root, path);
@@ -318,8 +319,8 @@ pub(crate) fn git_check_ignore(ctx: &mut CommandContext<'_>, args: &[String], io
     i32::from(!any)
 }
 
-pub(crate) fn git_merge_base(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_merge_base(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut is_ancestor = false;
@@ -344,15 +345,15 @@ pub(crate) fn git_merge_base(ctx: &mut CommandContext<'_>, args: &[String], io: 
         );
     };
     let (Some(left), Some(right)) = (
-        repo::resolve_revision(ctx, &root, left),
-        repo::resolve_revision(ctx, &root, right),
+        repo::resolve_revision(system, &root, left),
+        repo::resolve_revision(system, &root, right),
     ) else {
         return super::ambiguous_argument(io, &revisions.join(" "));
     };
     if is_ancestor {
-        return i32::from(!repo::ancestors(ctx, &root, &right).contains(&left));
+        return i32::from(!repo::ancestors(system, &root, &right).contains(&left));
     }
-    match repo::merge_base(ctx, &root, &left, &right) {
+    match repo::merge_base(system, &root, &left, &right) {
         Some(base) => {
             io.print(&format!("{base}\n"));
             0
@@ -361,8 +362,8 @@ pub(crate) fn git_merge_base(ctx: &mut CommandContext<'_>, args: &[String], io: 
     }
 }
 
-pub(crate) fn git_describe(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_describe(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut always = false;
@@ -383,18 +384,19 @@ pub(crate) fn git_describe(ctx: &mut CommandContext<'_>, args: &[String], io: &m
             _ => return usage(io, &format!("unsupported describe option: {name}")),
         }
     }
-    let Some(start) = repo::resolve_revision(ctx, &root, &revision) else {
+    let Some(start) = repo::resolve_revision(system, &root, &revision) else {
         return super::ambiguous_argument(io, &revision);
     };
-    let tags: BTreeMap<String, String> = repo::reference_names(ctx, &root, "tags")
-        .into_iter()
-        .filter(|tag| lightweight || repo::read_annotation(ctx, &root, tag).is_some())
-        .filter_map(|tag| {
-            let commit = repo::read_reference(ctx, &root, &format!("refs/tags/{tag}"))?;
-            Some((commit, tag))
-        })
-        .collect();
-    for (distance, (id, _)) in repo::first_parent_history(ctx, &root, &start, 10_000)
+    let mut tags: BTreeMap<String, String> = BTreeMap::new();
+    for tag in repo::reference_names(system, &root, "tags") {
+        if !lightweight && repo::read_annotation(system, &root, &tag).is_none() {
+            continue;
+        }
+        if let Some(commit) = repo::read_reference(system, &root, &format!("refs/tags/{tag}")) {
+            tags.insert(commit, tag);
+        }
+    }
+    for (distance, (id, _)) in repo::first_parent_history(system, &root, &start, 10_000)
         .into_iter()
         .enumerate()
     {
@@ -416,14 +418,14 @@ pub(crate) fn git_describe(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     io.print_err(&format!(
         "fatal: No annotated tags can describe '{start}'.\n"
     ));
-    if !repo::reference_names(ctx, &root, "tags").is_empty() {
+    if !repo::reference_names(system, &root, "tags").is_empty() {
         io.print_err("However, there were unannotated tags: try --tags.\n");
     }
     128
 }
 
-pub(crate) fn git_shortlog(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_shortlog(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut summary = false;
@@ -447,11 +449,11 @@ pub(crate) fn git_shortlog(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         }
     }
     let starts: Vec<String> = if revisions.is_empty() {
-        repo::head_commit(ctx, &root).into_iter().collect()
+        repo::head_commit(system, &root).into_iter().collect()
     } else {
         let mut resolved = Vec::new();
         for revision in &revisions {
-            let Some(commit) = repo::resolve_revision(ctx, &root, revision) else {
+            let Some(commit) = repo::resolve_revision(system, &root, revision) else {
                 return super::ambiguous_argument(io, revision);
             };
             resolved.push(commit);
@@ -462,7 +464,7 @@ pub(crate) fn git_shortlog(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         return 0;
     }
     let mut counts: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (_, commit) in repo::reachable_history(ctx, &root, &starts, 10_000) {
+    for (_, commit) in repo::reachable_history(system, &root, &starts, 10_000) {
         let author = if with_email {
             format!("{} <{}>", commit.author_name, commit.author_email)
         } else {
@@ -492,8 +494,8 @@ pub(crate) fn git_shortlog(ctx: &mut CommandContext<'_>, args: &[String], io: &m
 }
 
 /// Search tracked files, as `git grep` does.
-pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_grep(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut line_numbers = false;
@@ -558,14 +560,15 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
         io.print_err(&format!("fatal: invalid pattern: {pattern}\n"));
         return 128;
     };
-    let cwd = ctx.cwd.clone();
+    let cwd = system.cwd().to_string();
     // An operand before `--` that names no file but does resolve is a revision to search.
     let revision = paths
         .first()
         .filter(|_| before_separator.min(paths.len()) > 0)
-        .filter(|candidate| !super::names_a_path(ctx, &root, candidate))
+        .filter(|candidate| !super::names_a_path(system, &root, candidate))
         .and_then(|candidate| {
-            repo::resolve_revision(ctx, &root, candidate).map(|commit| (candidate.clone(), commit))
+            repo::resolve_revision(system, &root, candidate)
+                .map(|commit| (candidate.clone(), commit))
         });
     if revision.is_some() {
         paths.remove(0);
@@ -579,8 +582,8 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
         .filter(|prefix| !prefix.is_empty())
         .map(|prefix| format!("{prefix}/"));
     let tree = match &revision {
-        Some((_, commit)) => repo::commit_tree(ctx, &root, commit).unwrap_or_default(),
-        None => repo::load_index(ctx, &root).unwrap_or_default(),
+        Some((_, commit)) => repo::commit_tree(system, &root, commit).unwrap_or_default(),
+        None => repo::load_index(system, &root).unwrap_or_default(),
     };
     let mut found = false;
     for (searched, (path, blob)) in tree.iter().enumerate() {
@@ -602,14 +605,14 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             None => displayed.to_string(),
         };
         let data = match &revision {
-            Some(_) => repo::read_blob(ctx, &root, &blob.hash),
-            None => repo::read_work_file(ctx, &root, path),
+            Some(_) => repo::read_blob(system, &root, &blob.hash),
+            None => repo::read_work_file(system, &root, path),
         };
         let Some(data) = data else {
             continue;
         };
-        if !ctx.charge_cpu(data.len() as u64) {
-            return repo::resource_error(ctx);
+        if !system.charge_cpu(data.len() as u64) {
+            return repo::resource_error(system);
         }
         if super::diff::is_binary(&data) {
             continue;
@@ -653,12 +656,12 @@ pub(crate) fn git_grep(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
 }
 
 /// Every reference in the repository, as `refs/...` names paired with the commit they point at.
-fn all_references(ctx: &CommandContext<'_>, root: &str) -> Vec<(String, String)> {
+fn all_references(system: &mut dyn System, root: &str) -> Vec<(String, String)> {
     let mut references = Vec::new();
     for kind in ["heads", "tags"] {
-        for name in repo::reference_names(ctx, root, kind) {
+        for name in repo::reference_names(system, root, kind) {
             let full = format!("refs/{kind}/{name}");
-            if let Some(commit) = repo::read_reference(ctx, root, &full) {
+            if let Some(commit) = repo::read_reference(system, root, &full) {
                 references.push((full, commit));
             }
         }
@@ -667,8 +670,8 @@ fn all_references(ctx: &CommandContext<'_>, root: &str) -> Vec<(String, String)>
     references
 }
 
-pub(crate) fn git_show_ref(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_show_ref(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut heads_only = false;
@@ -692,7 +695,7 @@ pub(crate) fn git_show_ref(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         }
     }
     let mut matched = false;
-    for (name, commit) in all_references(ctx, &root) {
+    for (name, commit) in all_references(system, &root) {
         if heads_only && !name.starts_with("refs/heads/") {
             continue;
         }
@@ -717,8 +720,8 @@ pub(crate) fn git_show_ref(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     i32::from(!matched)
 }
 
-pub(crate) fn git_symbolic_ref(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_symbolic_ref(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut short = false;
@@ -738,7 +741,7 @@ pub(crate) fn git_symbolic_ref(ctx: &mut CommandContext<'_>, args: &[String], io
         }
     }
     match operands.as_slice() {
-        [name] if name == repo::HEAD => match repo::head_reference(ctx, &root) {
+        [name] if name == repo::HEAD => match repo::head_reference(system, &root) {
             Some(reference) => {
                 let rendered = if short {
                     reference
@@ -761,14 +764,15 @@ pub(crate) fn git_symbolic_ref(ctx: &mut CommandContext<'_>, args: &[String], io
             let Some(branch) = target.strip_prefix("refs/heads/") else {
                 return fatal(io, "only refs/heads/* can be pointed at by HEAD");
             };
-            repo::set_head_to_branch(ctx, &root, branch, "symbolic-ref: update").map_or(1, |()| 0)
+            repo::set_head_to_branch(system, &root, branch, "symbolic-ref: update")
+                .map_or(1, |()| 0)
         }
         _ => usage(io, "usage: git symbolic-ref [--short] HEAD [REF]"),
     }
 }
 
-pub(crate) fn git_for_each_ref(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_for_each_ref(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut format = None;
@@ -792,7 +796,7 @@ pub(crate) fn git_for_each_ref(ctx: &mut CommandContext<'_>, args: &[String], io
         }
     }
     let format = format.unwrap_or_else(|| "%(objectname) %(objecttype)\t%(refname)".to_string());
-    for (name, commit) in all_references(ctx, &root) {
+    for (name, commit) in all_references(system, &root) {
         if !prefixes.is_empty() && !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
             continue;
         }
@@ -841,8 +845,8 @@ const MAX_BLAME_COMMITS: usize = 2000;
 /// version of the file is diffed against the child's: a line both versions keep carries on to the
 /// parent, and a line only the child has belongs to the child. Whatever is left when the file runs
 /// out of history belongs to the commit that introduced it.
-pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_blame(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut suppress = false;
@@ -884,7 +888,7 @@ pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         .or_else(|| {
             operands
                 .iter()
-                .rposition(|operand| super::names_a_path(ctx, &root, operand))
+                .rposition(|operand| super::names_a_path(system, &root, operand))
         });
     let Some(position) = found else {
         return usage(io, "usage: git blame [-s] [-L RANGE] [REVISION] FILE");
@@ -894,21 +898,21 @@ pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         .first()
         .cloned()
         .unwrap_or_else(|| "HEAD".to_string());
-    let Some(start) = repo::resolve_revision(ctx, &root, &revision) else {
+    let Some(start) = repo::resolve_revision(system, &root, &revision) else {
         return super::ambiguous_argument(io, &revision);
     };
-    let path = super::pathspec(&ctx.cwd, &root, &file);
-    let tip = repo::commit_tree(ctx, &root, &start).unwrap_or_default();
+    let path = super::pathspec(system.cwd(), &root, &file);
+    let tip = repo::commit_tree(system, &root, &start).unwrap_or_default();
     let Some(content) = tip
         .get(&path)
-        .and_then(|entry| repo::read_blob(ctx, &root, &entry.hash))
+        .and_then(|entry| repo::read_blob(system, &root, &entry.hash))
     else {
         io.print_err(&format!("fatal: no such path {file} in {revision}\n"));
         return 128;
     };
     // Blaming the checked-out file, as Git does, means a local edit shows up as uncommitted work.
     let pending = (operands.is_empty() || revision == "HEAD")
-        .then(|| repo::read_work_file(ctx, &root, &path))
+        .then(|| repo::read_work_file(system, &root, &path))
         .flatten()
         .filter(|work| *work != content);
     let content = pending.clone().unwrap_or(content);
@@ -916,20 +920,20 @@ pub(crate) fn git_blame(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         .into_iter()
         .map(|line| line.trim_end_matches('\n').to_string())
         .collect();
-    if !ctx.charge_cpu((lines.len() as u64).saturating_mul(64)) {
-        return repo::resource_error(ctx);
+    if !system.charge_cpu((lines.len() as u64).saturating_mul(64)) {
+        return repo::resource_error(system);
     }
     let stored = pending.map(|_| tip[&path].hash.clone());
-    let Some(origins) = trace_lines(ctx, &root, &start, &path, &content, stored, lines.len())
+    let Some(origins) = trace_lines(system, &root, &start, &path, &content, stored, lines.len())
     else {
-        return repo::resource_error(ctx);
+        return repo::resource_error(system);
     };
     let format = BlameFormat {
         range: range.as_deref(),
         suppress,
         long,
     };
-    emit_blame(ctx, &root, &lines, &origins, &format, io)
+    emit_blame(system, &root, &lines, &origins, &format, io)
 }
 
 /// The name blame gives lines that are only in the working tree.
@@ -979,7 +983,7 @@ struct Origin {
 }
 
 fn trace_lines(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     start: &str,
     path: &str,
@@ -996,7 +1000,7 @@ fn trace_lines(
     // The name the file had in the version being examined, which a rename moves.
     let mut path = path.to_string();
     if let Some(hash) = stored {
-        let committed = repo::read_blob(ctx, root, &hash)?;
+        let committed = repo::read_blob(system, root, &hash)?;
         mapping = carry_lines(
             &committed,
             &current_content,
@@ -1007,15 +1011,15 @@ fn trace_lines(
         current_content = committed;
     }
     for _ in 0..MAX_BLAME_COMMITS {
-        let commit = repo::load_commit(ctx, root, &current)?;
+        let commit = repo::load_commit(system, root, &current)?;
         let parent_tree = commit
             .parents
             .first()
-            .and_then(|parent| repo::commit_tree(ctx, root, parent));
+            .and_then(|parent| repo::commit_tree(system, root, parent));
         let entry = parent_tree.as_ref().and_then(|parent| {
             parent.get(&path).cloned().or_else(|| {
                 // The file was renamed here, so look for the same blob under its old name.
-                let here = repo::commit_tree(ctx, root, &current)?;
+                let here = repo::commit_tree(system, root, &current)?;
                 let moved = here.get(&path)?;
                 let (was, before) = parent
                     .iter()
@@ -1024,7 +1028,7 @@ fn trace_lines(
                 Some(before.clone())
             })
         });
-        let parent_content = entry.and_then(|entry| repo::read_blob(ctx, root, &entry.hash));
+        let parent_content = entry.and_then(|entry| repo::read_blob(system, root, &entry.hash));
         let Some(parent_content) = parent_content else {
             // The file starts here, so every line still unclaimed is this commit's.
             for slot in mapping.into_iter().flatten() {
@@ -1035,7 +1039,7 @@ fn trace_lines(
             }
             break;
         };
-        if !ctx.charge_cpu((current_content.len() + parent_content.len()) as u64) {
+        if !system.charge_cpu((current_content.len() + parent_content.len()) as u64) {
             return None;
         }
         let carried = carry_lines(
@@ -1078,7 +1082,7 @@ struct BlameFormat<'a> {
 }
 
 fn emit_blame(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     lines: &[String],
     origins: &[Origin],
@@ -1101,7 +1105,7 @@ fn emit_blame(
     // Git lines the columns up by padding every author name to the widest one shown.
     let author_width = (from..=to)
         .filter_map(|number| origins.get(number - 1))
-        .map(|origin| author_of(ctx, root, origin).len())
+        .map(|origin| author_of(system, root, origin).len())
         .max()
         .unwrap_or(0);
     for number in from..=to {
@@ -1119,11 +1123,11 @@ fn emit_blame(
         let described = if suppress {
             String::new()
         } else {
-            let author = author_of(ctx, root, origin);
-            let when = match repo::load_commit(ctx, root, &origin.commit) {
+            let author = author_of(system, root, origin);
+            let when = match repo::load_commit(system, root, &origin.commit) {
                 Some(commit) => commit.timestamp,
                 // Work that is not committed yet is dated now, as Git dates it.
-                None => super::repo::now_seconds(ctx),
+                None => super::repo::now_seconds(system),
             };
             format!(
                 "({author:<author_width$} {} ",
@@ -1140,8 +1144,8 @@ fn emit_blame(
 }
 
 /// The name shown for the commit a line came from.
-fn author_of(ctx: &CommandContext<'_>, root: &str, origin: &Origin) -> String {
-    match repo::load_commit(ctx, root, &origin.commit) {
+fn author_of(system: &mut dyn System, root: &str, origin: &Origin) -> String {
+    match repo::load_commit(system, root, &origin.commit) {
         Some(commit) => commit.author_name,
         None => "Not Committed Yet".to_string(),
     }
@@ -1174,8 +1178,8 @@ pub(crate) fn count_option(name: &str) -> Option<usize> {
 }
 
 /// List where HEAD has been, which is what makes a bad reset recoverable.
-pub(crate) fn git_reflog(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_reflog(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut limit = usize::MAX;
@@ -1200,7 +1204,7 @@ pub(crate) fn git_reflog(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             _ => return usage(io, &format!("unsupported reflog option: {name}")),
         }
     }
-    for (position, entry) in repo::read_head_log(ctx, &root)
+    for (position, entry) in repo::read_head_log(system, &root)
         .iter()
         .enumerate()
         .take(limit)

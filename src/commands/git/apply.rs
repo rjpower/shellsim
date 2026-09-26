@@ -5,12 +5,13 @@
 
 use std::collections::BTreeSet;
 
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::System;
 
 use super::repo;
 use super::{cannot_write, repo_error, require_index};
 
-pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+pub(crate) fn git_apply(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
     let mut stage = false;
     let mut cached = false;
     let mut reverse = false;
@@ -30,40 +31,40 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     }
     // These read the patch and report on it without touching anything.
     if let Some(report) = report {
-        let Some(text) = patch_text(ctx, &forwarded, io) else {
+        let Some(text) = patch_text(system, &forwarded, io) else {
             return 128;
         };
         return describe(&text, &report, io);
     }
     if reverse {
-        let Some(text) = patch_text(ctx, &forwarded, io) else {
+        let Some(text) = patch_text(system, &forwarded, io) else {
             return 128;
         };
         io.stdin = reverse_patch(&text).into_bytes();
         forwarded.retain(|value| value.starts_with('-'));
     }
     if !stage {
-        return crate::commands::patch::apply_unified_diff(ctx, &forwarded, io);
+        return crate::commands::patch::apply_unified_diff(system, &forwarded, io);
     }
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
-    let work = match repo::collect_working_tree(ctx, &root) {
+    let work = match repo::collect_working_tree(system, &root) {
         Ok(work) => work,
         Err(status) => return status,
     };
-    let unpatched = ctx.vfs.clone();
+    let unpatched = system.vfs_snapshot();
     // `--cached` patches what is staged, so the index content is laid down to be worked on and
     // the working tree is put back afterwards.
     let before = if cached {
-        let staged = match require_index(ctx, &root, io) {
+        let staged = match require_index(system, &root, io) {
             Ok(index) => index,
             Err(status) => return status,
         };
         // Only tracked paths are laid down; an untracked file, the patch itself included, stays.
-        let mut tracked = repo::head_tree(ctx, &root);
+        let mut tracked = repo::head_tree(system, &root);
         tracked.extend(staged.clone());
-        if let Err(error) = repo::replace_work_tree(ctx, &root, &tracked, &staged) {
+        if let Err(error) = repo::replace_work_tree(system, &root, &tracked, &staged) {
             io.print_err(&format!("git apply: {error}\n"));
             return 1;
         }
@@ -75,12 +76,12 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     } else {
         work
     };
-    let status = crate::commands::patch::apply_unified_diff(ctx, &forwarded, io);
+    let status = crate::commands::patch::apply_unified_diff(system, &forwarded, io);
     if status != 0 {
-        ctx.vfs = unpatched;
+        system.restore_vfs_snapshot(unpatched);
         return status;
     }
-    let after = match repo::collect_working_tree(ctx, &root) {
+    let after = match repo::collect_working_tree(system, &root) {
         Ok(work) => work,
         Err(status) => return status,
     };
@@ -93,20 +94,20 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         .map(|path| {
             let content = after
                 .get(&path)
-                .and_then(|_| repo::read_work_file(ctx, &root, &path));
+                .and_then(|_| repo::read_work_file(system, &root, &path));
             (path, content)
         })
         .collect();
     if cached {
-        ctx.vfs = unpatched;
+        system.restore_vfs_snapshot(unpatched);
     }
-    let mut index = match require_index(ctx, &root, io) {
+    let mut index = match require_index(system, &root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
     for (path, content) in changed {
         match content {
-            Some(data) => match repo::write_blob(ctx, &root, &data) {
+            Some(data) => match repo::write_blob(system, &root, &data) {
                 Ok(hash) => {
                     // A patch changes content, never the mode the index already records.
                     let recorded = index.get(&path).cloned().unwrap_or_default();
@@ -122,14 +123,14 @@ pub(crate) fn git_apply(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
             }
         }
     }
-    if let Err(error) = repo::store_index(ctx, &root, &index) {
+    if let Err(error) = repo::store_index(system, &root, &index) {
         return cannot_write(io, "the index", &error);
     }
     0
 }
 
 /// The patch text, from the first file operand or from standard input.
-fn patch_text(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> Option<String> {
+fn patch_text(system: &mut dyn System, args: &[String], io: &mut Io) -> Option<String> {
     let Some(file) = args
         .iter()
         .find(|value| !value.starts_with('-'))
@@ -137,8 +138,8 @@ fn patch_text(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> Opt
     else {
         return Some(String::from_utf8_lossy(&io.stdin).into_owned());
     };
-    let absolute = crate::vfs::resolve_against(&ctx.cwd, file);
-    match ctx.fs_read_limited("/", &absolute, 16 * 1024 * 1024) {
+    let absolute = crate::vfs::resolve_against(system.cwd(), file);
+    match system.read_file_limited("/", &absolute, 16 * 1024 * 1024) {
         Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
         Err(_) => {
             io.print_err(&format!(
