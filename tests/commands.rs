@@ -7,10 +7,14 @@
 mod archive;
 #[path = "commands/awk.rs"]
 mod awk;
+#[path = "commands/bc.rs"]
+mod bc;
 #[path = "commands/dd.rs"]
 mod dd;
 #[path = "commands/diff.rs"]
 mod diff;
+#[path = "commands/expr.rs"]
+mod expr;
 #[path = "commands/filesystem_extra.rs"]
 mod filesystem_extra;
 #[path = "commands/find.rs"]
