@@ -17,13 +17,28 @@ pub(crate) enum ClockId {
 }
 
 /// Arguments and process-local overrides for one virtual argv child.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct SpawnSpec {
     pub argv: Vec<String>,
     /// `None` inherits fd 0; `Some` replaces it, including with an empty stream.
     pub stdin: Option<Vec<u8>>,
     pub cwd: Option<String>,
     pub environment: Option<std::collections::BTreeMap<String, String>>,
+    /// Leave caller and child both runnable so the caller can choose its own wait, such as a
+    /// child wait bounded by a deadline. By default the caller blocks on the child, which
+    /// runs immediately.
+    pub detach: bool,
+    /// Make the child lead a new process group in the caller's session, so one group signal
+    /// reaches it and its descendants.
+    pub new_process_group: bool,
+}
+
+/// Recipient of a signal sent through [`System::kill`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignalTarget {
+    Process(crate::process::ProcessId),
+    /// Every live member of a process group.
+    Group(crate::process::ProcessId),
 }
 
 /// PID-scoped virtual kernel operations available during one execution quantum.
@@ -32,6 +47,7 @@ pub(crate) struct SpawnSpec {
 /// to the same operations; neither path receives host capabilities or the owning `Environment`.
 /// The borrowed handle cannot outlive the quantum, so blocked programs retain only owned state.
 pub(crate) trait System {
+    fn pid(&self) -> crate::process::ProcessId;
     fn environment(&self) -> std::collections::BTreeMap<String, String>;
     fn hostname(&self) -> &str;
     fn set_hostname(&mut self, name: &str) -> Result<(), SyscallError>;
@@ -150,8 +166,25 @@ pub(crate) trait System {
     fn process_snapshot(&mut self) -> Vec<crate::process::ProcessRecord>;
     /// Active virtual listener addresses in deterministic order.
     fn listener_snapshot(&self) -> Vec<String>;
-    /// Spawn a child using inherited virtual descriptors and switch execution to it.
+    /// Spawn a child using inherited virtual descriptors. Unless `spec.detach` is set, the
+    /// caller blocks on the child, which runs next.
     fn spawn_argv(&mut self, spec: SpawnSpec) -> Result<crate::process::ProcessId, SyscallError>;
+    /// Replace this process's image with `argv` after PATH lookup, like `execvp`. The PID,
+    /// descriptors, cwd, and ignored signals are retained; `environment` replaces the exported
+    /// environment when given. On success the caller must return `ShellPoll::Replaced`.
+    fn exec_argv(
+        &mut self,
+        argv: Vec<String>,
+        environment: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<(), SyscallError>;
+    /// Queue `signal` for delivery at the recipients' next scheduler boundary.
+    fn kill(
+        &mut self,
+        target: SignalTarget,
+        signal: crate::process::Signal,
+    ) -> Result<(), SyscallError>;
+    /// Ignore `signal` in this process. The disposition survives exec, as POSIX requires.
+    fn ignore_signal(&mut self, signal: crate::process::Signal) -> Result<(), SyscallError>;
     /// Observe only a direct child; an exited status remains available until reap.
     fn child_status(&self, pid: crate::process::ProcessId) -> Result<Option<i32>, SyscallError>;
     fn reap_child(&mut self, pid: crate::process::ProcessId) -> Result<i32, SyscallError>;
@@ -187,6 +220,10 @@ impl<'a> ActiveSystem<'a> {
 }
 
 impl System for ActiveSystem<'_> {
+    fn pid(&self) -> crate::process::ProcessId {
+        self.interp.process.pid
+    }
+
     fn environment(&self) -> std::collections::BTreeMap<String, String> {
         self.interp.child_env().into_iter().collect()
     }
@@ -592,6 +629,51 @@ impl System for ActiveSystem<'_> {
             .map_err(SyscallError::Process)
     }
 
+    fn exec_argv(
+        &mut self,
+        argv: Vec<String>,
+        environment: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<(), SyscallError> {
+        if argv.is_empty() {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let pid = self.interp.process.pid;
+        if environment.is_some() {
+            self.interp
+                .configure_process(pid, None, environment)
+                .map_err(SyscallError::Process)?;
+        }
+        self.interp
+            .exec_argv_image(pid, argv)
+            .map_err(SyscallError::Process)
+    }
+
+    fn kill(
+        &mut self,
+        target: SignalTarget,
+        signal: crate::process::Signal,
+    ) -> Result<(), SyscallError> {
+        match target {
+            SignalTarget::Process(pid) => self.interp.send_signal(pid, signal),
+            SignalTarget::Group(group) => self.interp.send_signal_group(group, signal),
+        }
+        .map_err(|_| SyscallError::NoSuchProcess)
+    }
+
+    fn ignore_signal(&mut self, signal: crate::process::Signal) -> Result<(), SyscallError> {
+        if matches!(
+            signal,
+            crate::process::Signal::Kill | crate::process::Signal::Stop
+        ) {
+            return Err(SyscallError::InvalidArgument);
+        }
+        self.interp
+            .process
+            .signal_dispositions
+            .insert(signal, crate::interp::ShellSignalDisposition::Ignore);
+        Ok(())
+    }
+
     fn child_status(&self, pid: crate::process::ProcessId) -> Result<Option<i32>, SyscallError> {
         let child = self
             .interp
@@ -790,6 +872,7 @@ pub(crate) enum SyscallError {
     IsDirectory,
     Permission,
     ResourceExhausted,
+    NoSuchProcess,
     Process(String),
 }
 
@@ -802,6 +885,7 @@ impl std::fmt::Display for SyscallError {
             Self::IsDirectory => write!(formatter, "is a directory"),
             Self::Permission => write!(formatter, "permission denied"),
             Self::ResourceExhausted => write!(formatter, "resource exhausted"),
+            Self::NoSuchProcess => write!(formatter, "no such process"),
             Self::Process(error) => write!(formatter, "{error}"),
         }
     }

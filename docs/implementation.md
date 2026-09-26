@@ -23,7 +23,10 @@ stable insertion order.
 
 As in Bash, a forked subshell (background job, pipeline stage, or `sh -c` child) execs its final
 native command in place, so `$!` and pipeline PIDs name the program doing the work and signals
-reach it directly. A shell writer that hits a closed pipe receives `SIGPIPE` and exits silently
+reach it directly. Native images use the same exec through `System::exec_argv`: `env` and
+`nohup` replace themselves with their command, and a shell started by argv runs its `-c`
+source or script in that process. Exec keeps ignored signals ignored and resets caught ones.
+`timeout` runs its command in a new process group and signals the whole group. A shell writer that hits a closed pipe receives `SIGPIPE` and exits silently
 with status 141 unless `SIGPIPE` is ignored.
 
 Pipes, file descriptions, PIDs, queued events, process state, output, and other input-driven

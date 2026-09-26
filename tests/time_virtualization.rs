@@ -427,3 +427,41 @@ fn native_sleep_reports_invalid_operands_and_skips_zero_waits() {
     assert_eq!(environment.clock.monotonic_ns(), 1_500_000);
     assert_eq!(environment.clock.pending_len(), 0);
 }
+
+#[test]
+fn timeout_kill_after_escalates_when_the_group_ignores_the_first_signal() {
+    let mut environment = Environment::new();
+    assert_eq!(
+        run(
+            &mut environment,
+            "timeout -k 1 1 sh -c \"trap '' TERM; sleep 5\"; echo status:$?",
+        ),
+        (0, "status:137\n".into(), String::new())
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
+    assert_eq!(environment.clock.pending_len(), 0);
+}
+
+#[test]
+fn timeout_streams_standard_input_and_reports_its_own_failures() {
+    let mut environment = Environment::new();
+    // Input is inherited, not buffered, so an infinite producer does not stall timeout.
+    assert_eq!(
+        run(
+            &mut environment,
+            "yes | timeout 5 head -n 2; echo status:$?"
+        ),
+        (0, "y\ny\nstatus:0\n".into(), String::new())
+    );
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "timeout; echo status:$?; timeout 1 missing-command; echo status:$?",
+    );
+    assert_eq!((status, stdout.as_str()), (0, "status:125\nstatus:127\n"));
+    assert!(stderr.contains("timeout: missing operand"), "{stderr}");
+    assert!(
+        stderr.contains("missing-command: command not found"),
+        "{stderr}"
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 0);
+}

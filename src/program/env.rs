@@ -1,17 +1,20 @@
-//! Resumable `env` image with process-local overrides and typed child execution.
+//! Resumable `env` image: print the environment, or exec a command with a modified one.
+//!
+//! Like `execvp`, running a command replaces this process, so the command keeps env's PID,
+//! descriptors, and ignored signals, and `-C` and `KEY=value` apply only to it.
 
 use crate::exec::ShellPoll;
-use crate::process::ProcessId;
-use crate::scheduler::WaitReason;
-use crate::syscalls::{SpawnSpec, System};
+use crate::syscalls::System;
 
 use super::poll_write;
+
+/// Status when env cannot run its command, as GNU env reports.
+const ENV_FAILED: i32 = 125;
 
 #[derive(Clone)]
 pub(crate) struct EnvProcess {
     args: Vec<String>,
     started: bool,
-    waiting: Option<ProcessId>,
     output: Vec<u8>,
     output_offset: usize,
     output_fd: i32,
@@ -24,7 +27,6 @@ impl EnvProcess {
         Self {
             args: args.to_vec(),
             started: false,
-            waiting: None,
             output: Vec::new(),
             output_offset: 0,
             output_fd: 1,
@@ -60,53 +62,17 @@ impl EnvProcess {
                     }
                 }
                 Ok(action) => {
-                    return match system.spawn_argv(SpawnSpec {
-                        argv: action.argv,
-                        stdin: None,
-                        cwd: action.cwd,
-                        environment: Some(action.environment),
-                    }) {
-                        Ok(pid) => {
-                            self.waiting = Some(pid);
-                            ShellPoll::Switched
-                        }
-                        Err(error) => {
-                            self.status = 125;
-                            self.output_fd = 2;
-                            self.output =
-                                format!("env: cannot spawn child: {error}\n").into_bytes();
-                            ShellPoll::Pending
-                        }
-                    };
-                }
-                Err(error) => {
-                    self.status = 125;
-                    self.output_fd = 2;
-                    self.output = format!("env: {error}\n").into_bytes();
-                }
-            }
-        }
-        if let Some(pid) = self.waiting {
-            match system.child_status(pid) {
-                Ok(None) => return ShellPoll::Blocked(WaitReason::Child(pid)),
-                Ok(Some(_)) => match system.reap_child(pid) {
-                    Ok(status) => {
-                        self.status = status;
-                        self.waiting = None;
+                    let result = match &action.cwd {
+                        Some(cwd) => system.chdir(cwd),
+                        None => Ok(()),
                     }
-                    Err(error) => {
-                        self.status = 125;
-                        self.waiting = None;
-                        self.output_fd = 2;
-                        self.output = format!("env: cannot reap child: {error}\n").into_bytes();
+                    .and_then(|()| system.exec_argv(action.argv, Some(action.environment)));
+                    match result {
+                        Ok(()) => return ShellPoll::Replaced,
+                        Err(error) => self.fail(format!("env: cannot run command: {error}")),
                     }
-                },
-                Err(error) => {
-                    self.status = 125;
-                    self.waiting = None;
-                    self.output_fd = 2;
-                    self.output = format!("env: cannot wait for child: {error}\n").into_bytes();
                 }
+                Err(error) => self.fail(format!("env: {error}")),
             }
         }
         let outcome = poll_write(
@@ -120,5 +86,11 @@ impl EnvProcess {
             system.release_memory(self.take_reserved_output());
         }
         outcome
+    }
+
+    fn fail(&mut self, message: String) {
+        self.status = ENV_FAILED;
+        self.output_fd = 2;
+        self.output = format!("{message}\n").into_bytes();
     }
 }

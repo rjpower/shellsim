@@ -143,6 +143,7 @@ impl XargsProcess {
             stdin: Some(Vec::new()),
             cwd: None,
             environment: None,
+            ..Default::default()
         }) {
             Ok(pid) => {
                 self.waiting = Some(pid);

@@ -180,7 +180,7 @@ fn syscall_errno(error: &SyscallError) -> i32 {
         SyscallError::IsDirectory => ERRNO_ISDIR,
         SyscallError::Permission => ERRNO_PERM,
         SyscallError::ResourceExhausted => ERRNO_INVAL,
-        SyscallError::Process(_) => ERRNO_INVAL,
+        SyscallError::NoSuchProcess | SyscallError::Process(_) => ERRNO_INVAL,
     }
 }
 

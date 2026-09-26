@@ -164,6 +164,7 @@ fn start_make(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> 
             stdin: Some(Vec::new()),
             cwd: Some(cwd.clone()),
             environment: None,
+            ..Default::default()
         });
     }
     crate::commands::start_child_sequence(interp, commands, true)

@@ -28,6 +28,8 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_system(m, "/usr/bin/free", Trust::Real, run_free);
     reg_system(m, "/usr/bin/ps", Trust::Partial, cmd_ps);
     reg_system(m, "/usr/bin/pgrep", Trust::Partial, cmd_pgrep);
+    reg_system(m, "/usr/bin/pkill", Trust::Partial, cmd_pkill);
+    reg_system(m, "/usr/bin/killall", Trust::Partial, cmd_killall);
     reg_system(m, "/usr/bin/lsof", Trust::Partial, cmd_lsof);
     reg_system(m, "/usr/bin/ss", Trust::Partial, cmd_sockets);
     reg_system(m, "/usr/bin/netstat", Trust::Partial, cmd_sockets);
@@ -89,6 +91,7 @@ fn start_env(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> C
             stdin: Some(std::mem::take(&mut io.stdin)),
             cwd: action.cwd,
             environment: Some(action.environment),
+            ..Default::default()
         }],
         true,
     )
@@ -684,6 +687,55 @@ fn ps_value(column: &str, process: &crate::process::ProcessRecord, state: &str) 
     }
 }
 
+/// Short process name: the basename of the first word of the process-table label.
+fn process_name(command: &str) -> &str {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+}
+
+/// Live processes other than the caller whose name (or full label with `full`) matches
+/// `pattern`, as `pgrep` and `pkill` select them.
+fn matching_processes(
+    system: &mut dyn System,
+    pattern: &str,
+    full: bool,
+    exact: bool,
+) -> Result<Vec<crate::process::ProcessRecord>, String> {
+    let regex = regex::Regex::new(pattern).map_err(|error| format!("invalid pattern: {error}"))?;
+    let caller = system.pid();
+    Ok(system
+        .process_snapshot()
+        .into_iter()
+        .filter(|process| {
+            process.pid != caller && !matches!(process.status, ProcessStatus::Exited(_))
+        })
+        .filter(|process| {
+            let candidate = if full {
+                process.command.as_str()
+            } else {
+                process_name(&process.command)
+            };
+            if exact {
+                regex
+                    .find(candidate)
+                    .is_some_and(|found| found.as_str() == candidate)
+            } else {
+                regex.is_match(candidate)
+            }
+        })
+        .collect())
+}
+
+/// Parse a signal name or number as `kill -SIGNAL` and `pkill -SIGNAL` accept it.
+fn parse_signal_operand(value: &str) -> Option<crate::process::Signal> {
+    crate::process::Signal::parse(value)
+}
+
 fn cmd_pgrep(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
     let args = context.args;
     let mut full = false;
@@ -713,52 +765,140 @@ fn cmd_pgrep(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i
         ewln(io.err, "pgrep: too many patterns");
         return 2;
     }
-    let regex = match regex::Regex::new(pattern) {
-        Ok(regex) => regex,
+    let processes = match matching_processes(context.system, pattern, full, exact) {
+        Ok(processes) => processes,
         Err(error) => {
-            ewln(io.err, &format!("pgrep: invalid pattern: {error}"));
+            ewln(io.err, &format!("pgrep: {error}"));
             return 2;
         }
     };
-    let mut found = false;
-    for process in context
-        .system
-        .process_snapshot()
-        .iter()
-        .filter(|process| !matches!(process.status, ProcessStatus::Exited(_)))
-    {
-        let short = process
-            .command
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .rsplit('/')
-            .next()
-            .unwrap_or("");
-        let candidate = if full {
-            process.command.as_str()
+    for process in &processes {
+        if list_full {
+            wln(io.out, &format!("{} {}", process.pid, process.command));
+        } else if list_name {
+            wln(
+                io.out,
+                &format!("{} {}", process.pid, process_name(&process.command)),
+            );
         } else {
-            short
-        };
-        let matched = if exact {
-            regex
-                .find(candidate)
-                .is_some_and(|found| found.as_str() == candidate)
-        } else {
-            regex.is_match(candidate)
-        };
-        if matched {
-            found = true;
-            if list_full {
-                wln(io.out, &format!("{} {}", process.pid, process.command));
-            } else if list_name {
-                wln(io.out, &format!("{} {short}", process.pid));
-            } else {
-                wln(io.out, &process.pid.to_string());
-            }
+            wln(io.out, &process.pid.to_string());
         }
     }
-    i32::from(!found)
+    i32::from(processes.is_empty())
+}
+
+fn cmd_pkill(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let mut signal = crate::process::Signal::Terminate;
+    let mut full = false;
+    let mut exact = false;
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        match argument.as_str() {
+            "-f" => full = true,
+            "-x" => exact = true,
+            "-s" | "--signal" => {
+                index += 1;
+                let Some(parsed) = args
+                    .get(index)
+                    .and_then(|value| parse_signal_operand(value))
+                else {
+                    ewln(io.err, "pkill: invalid or missing signal");
+                    return 2;
+                };
+                signal = parsed;
+            }
+            value if value.starts_with('-') && value.len() > 1 => {
+                let Some(parsed) = parse_signal_operand(&value[1..]) else {
+                    ewln(io.err, &format!("pkill: unsupported option {value}"));
+                    return 2;
+                };
+                signal = parsed;
+            }
+            _ => break,
+        }
+        index += 1;
+    }
+    let Some(pattern) = args.get(index) else {
+        ewln(io.err, "pkill: pattern required");
+        return 2;
+    };
+    if index + 1 != args.len() {
+        ewln(io.err, "pkill: too many patterns");
+        return 2;
+    }
+    let processes = match matching_processes(context.system, pattern, full, exact) {
+        Ok(processes) => processes,
+        Err(error) => {
+            ewln(io.err, &format!("pkill: {error}"));
+            return 2;
+        }
+    };
+    let mut signalled = false;
+    for process in &processes {
+        // A process can exit between the snapshot and the signal; pkill skips it silently.
+        signalled |= context
+            .system
+            .kill(crate::syscalls::SignalTarget::Process(process.pid), signal)
+            .is_ok();
+    }
+    i32::from(!signalled)
+}
+
+fn cmd_killall(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
+    let args = context.args;
+    let mut signal = crate::process::Signal::Terminate;
+    let mut names = Vec::new();
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        match argument.as_str() {
+            "-s" | "--signal" => {
+                index += 1;
+                let Some(parsed) = args
+                    .get(index)
+                    .and_then(|value| parse_signal_operand(value))
+                else {
+                    ewln(io.err, "killall: invalid or missing signal");
+                    return 2;
+                };
+                signal = parsed;
+            }
+            value if value.starts_with('-') && value.len() > 1 => {
+                let Some(parsed) = parse_signal_operand(&value[1..]) else {
+                    ewln(io.err, &format!("killall: unsupported option {value}"));
+                    return 2;
+                };
+                signal = parsed;
+            }
+            name => names.push(name),
+        }
+        index += 1;
+    }
+    if names.is_empty() {
+        ewln(io.err, "killall: process name required");
+        return 2;
+    }
+    let caller = context.system.pid();
+    let processes = context.system.process_snapshot();
+    let mut status = 0;
+    for name in names {
+        let mut signalled = false;
+        for process in processes.iter().filter(|process| {
+            process.pid != caller
+                && !matches!(process.status, ProcessStatus::Exited(_))
+                && process_name(&process.command) == name
+        }) {
+            signalled |= context
+                .system
+                .kill(crate::syscalls::SignalTarget::Process(process.pid), signal)
+                .is_ok();
+        }
+        if !signalled {
+            ewln(io.err, &format!("{name}: no process found"));
+            status = 1;
+        }
+    }
+    status
 }
 
 fn cmd_lsof(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {

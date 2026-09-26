@@ -2620,7 +2620,7 @@ pub(crate) fn poll_machine(
                 if let Some(mut program) = interp.process.program.take() {
                     program.release_owned_memory(interp);
                 }
-                interp.invocations.finish_latest(
+                interp.invocations.finish_process(
                     owner_pid,
                     status,
                     interp.resources.cpu_used(),
@@ -2659,7 +2659,6 @@ pub(crate) fn poll_machine(
         .program
         .take()
         .ok_or_else(|| format!("active process {owner_pid} has no program"))?;
-    let is_native = continuation.is_native();
     match continuation.poll(interp, SHELL_POLL_QUANTUM) {
         ShellPoll::Pending => {
             interp.process.set_program(owner_pid, Some(continuation))?;
@@ -2676,7 +2675,10 @@ pub(crate) fn poll_machine(
             interp.process.set_program(owner_pid, Some(continuation))?;
             Ok(MachinePoll::Progress)
         }
-        ShellPoll::Replaced => Ok(MachinePoll::Progress),
+        ShellPoll::Replaced => {
+            continuation.release_owned_memory(interp);
+            Ok(MachinePoll::Progress)
+        }
         ShellPoll::Blocked(reason) => {
             interp.process.set_program(owner_pid, Some(continuation))?;
             interp
@@ -2690,25 +2692,21 @@ pub(crate) fn poll_machine(
             }
         }
         ShellPoll::Ready(status) if owner_pid == target_pid => {
-            if is_native {
-                interp.invocations.finish_latest(
-                    owner_pid,
-                    status,
-                    interp.resources.cpu_used(),
-                    interp.vfs.disk_used(),
-                );
-            }
+            interp.invocations.finish_process(
+                owner_pid,
+                status,
+                interp.resources.cpu_used(),
+                interp.vfs.disk_used(),
+            );
             Ok(MachinePoll::Ready(status))
         }
         ShellPoll::Ready(status) => {
-            if is_native {
-                interp.invocations.finish_latest(
-                    owner_pid,
-                    status,
-                    interp.resources.cpu_used(),
-                    interp.vfs.disk_used(),
-                );
-            }
+            interp.invocations.finish_process(
+                owner_pid,
+                status,
+                interp.resources.cpu_used(),
+                interp.vfs.disk_used(),
+            );
             interp.finish_child(owner_pid, status);
             Ok(MachinePoll::Progress)
         }
@@ -2811,7 +2809,7 @@ fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
         match delivery {
             crate::interp::SignalDelivery::Terminate(signal) => {
                 let status = 128 + signal.number();
-                interp.invocations.finish_latest(
+                interp.invocations.finish_process(
                     owner,
                     status,
                     interp.resources.cpu_used(),
@@ -2840,7 +2838,6 @@ fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
         .program
         .take()
         .ok_or_else(|| format!("scheduled process {owner} has no program"))?;
-    let is_native = continuation.is_native();
     match continuation.poll(interp, SHELL_POLL_QUANTUM) {
         ShellPoll::Pending => {
             interp.process.set_program(owner, Some(continuation))?;
@@ -2852,7 +2849,7 @@ fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
         ShellPoll::Switched => {
             interp.process.set_program(owner, Some(continuation))?;
         }
-        ShellPoll::Replaced => {}
+        ShellPoll::Replaced => continuation.release_owned_memory(interp),
         ShellPoll::Blocked(reason) => {
             interp.process.set_program(owner, Some(continuation))?;
             interp
@@ -2861,14 +2858,12 @@ fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
                 .map_err(|error| format!("{error:?}"))?;
         }
         ShellPoll::Ready(status) => {
-            if is_native {
-                interp.invocations.finish_latest(
-                    owner,
-                    status,
-                    interp.resources.cpu_used(),
-                    interp.vfs.disk_used(),
-                );
-            }
+            interp.invocations.finish_process(
+                owner,
+                status,
+                interp.resources.cpu_used(),
+                interp.vfs.disk_used(),
+            );
             interp.finish_child(owner, status);
         }
     }

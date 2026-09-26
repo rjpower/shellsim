@@ -196,6 +196,20 @@ impl InvocationLog {
         invocation.event.disk_delta = Some(signed_delta(disk_after, invocation.disk_before));
     }
 
+    /// Complete every open invocation of `pid`. A native process that exec'd another image
+    /// leaves one open record per image, and they all end with the process.
+    pub fn finish_process(&mut self, pid: ProcessId, status: i32, cpu_after: u64, disk_after: u64) {
+        for invocation in self
+            .events
+            .iter_mut()
+            .filter(|invocation| invocation.event.pid == pid && invocation.event.status.is_none())
+        {
+            invocation.event.status = Some(status);
+            invocation.event.cpu = Some(cpu_after.saturating_sub(invocation.cpu_before));
+            invocation.event.disk_delta = Some(signed_delta(disk_after, invocation.disk_before));
+        }
+    }
+
     /// Sequence marker suitable for a later [`InvocationLog::events_since`] query.
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence

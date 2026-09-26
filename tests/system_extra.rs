@@ -188,3 +188,55 @@ fn nohup_delegates_without_host_process_or_terminal_access() {
         (0, "ok".into(), String::new())
     );
 }
+
+#[test]
+fn nohup_ignores_hangup_across_exec() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "nohup sh -c 'kill -HUP $$; echo survived'; echo status:$?; nohup; echo status:$?",
+    );
+    assert_eq!(
+        (status, stdout.as_str()),
+        (0, "survived\nstatus:0\nstatus:125\n")
+    );
+    assert_eq!(stderr, "nohup: missing operand\n");
+}
+
+#[test]
+fn env_and_shell_images_exec_in_the_launching_process() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "env sleep 5 & echo bg=$!; sh -c 'ps -o pid,ppid,args'; kill $!",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert!(stdout.starts_with("bg=1235\n"), "{stdout}");
+    assert!(stdout.contains("\n1235 1234 sleep 5\n"), "{stdout}");
+    assert!(
+        stdout.contains(" 1234 ps -o pid,ppid,args\n"),
+        "sh -c did not exec its only command: {stdout}"
+    );
+    // Every image that ran under one PID is complete once that process exits.
+    assert!(environment
+        .invocations
+        .events()
+        .iter()
+        .all(|event| event.status.is_some()));
+}
+
+#[test]
+fn pkill_and_killall_signal_other_virtual_processes() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "sleep 5 & pkill sleep; wait $!; echo pkill:$?; \
+         sleep 5 & killall -KILL sleep; wait $!; echo killall:$?; \
+         killall missing; echo missing:$?; pgrep pgrep; echo self:$?",
+    );
+    assert_eq!(
+        (status, stdout.as_str()),
+        (0, "pkill:143\nkillall:137\nmissing:1\nself:1\n")
+    );
+    assert_eq!(stderr, "missing: no process found\n");
+}
