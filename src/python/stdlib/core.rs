@@ -1695,7 +1695,7 @@ fn list_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     let list = receiver.cast::<PyList>(runtime)?;
     let length = runtime.list_len(list)?;
     if length == 0 {
-        return Err(PyError::value_error("pop from empty list"));
+        return Err(PyError::exception("IndexError", "pop from empty list"));
     }
     let raw = args.positional().first().map_or(Ok(-1), |value| {
         runtime
@@ -1942,7 +1942,9 @@ fn dict_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     if let Some(default) = args.positional().get(1) {
         return Ok(*default);
     }
-    Err(PyError::exception("KeyError", "key not found"))
+    // CPython's KeyError carries the key, and `str()` shows its repr.
+    let key = runtime.repr(&args.positional()[0])?;
+    Err(PyError::exception("KeyError", key))
 }
 
 fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -2001,7 +2003,8 @@ fn set_modify(
             }
             SetOperation::Remove => {
                 if !runtime.set_remove(set, &value)? {
-                    return Err(PyError::value_error("set element not found"));
+                    let element = runtime.repr(&value)?;
+                    return Err(PyError::exception("KeyError", element));
                 }
             }
             SetOperation::Discard => {
@@ -2875,7 +2878,10 @@ pub(crate) fn slot_dict_delete_item(
             break;
         }
     }
-    let index = found.ok_or_else(|| PyError::exception("KeyError", "key not found"))?;
+    let Some(index) = found else {
+        let key = runtime.repr(&key)?;
+        return Err(PyError::exception("KeyError", key));
+    };
     items.remove(index);
     runtime.replace_dict_items(dict, items)?;
     Ok(Some(PyValue::None))

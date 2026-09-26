@@ -15,7 +15,9 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
-use super::bytecode::{CallId, ClassField, CodeRef, NameId, Opcode};
+use super::bytecode::{CallId, ClassField, CodeRef, DisplayKind, NameId, Opcode};
+use super::cpython_names;
+use super::exception_types;
 use super::filesystem::PyModuleLoader;
 use super::heap::{
     ClassLayout, InstanceAttributeSlot, InstanceAttributes, InstancePayload, Object, ObjectId,
@@ -170,56 +172,23 @@ impl NativeValue {
     }
 }
 
-const EXCEPTION_TYPES: [&str; 27] = [
-    "Exception",
-    "BaseException",
-    "AssertionError",
-    "TypeError",
-    "ValueError",
-    "RuntimeError",
-    "ZeroDivisionError",
-    "OverflowError",
-    "KeyError",
-    "IndexError",
-    "StopIteration",
-    "Skipped",
-    "Failed",
-    "CalledProcessError",
-    "TimeoutExpired",
-    "EOFError",
-    "OSError",
-    "FileNotFoundError",
-    "FileExistsError",
-    "IsADirectoryError",
-    "NotADirectoryError",
-    "PermissionError",
-    "ProcessLookupError",
-    "SystemExit",
-    "TimeoutError",
-    "StopAsyncIteration",
-    "AttributeError",
-];
-
 fn known_exception_type(name: &str) -> Option<&'static str> {
-    EXCEPTION_TYPES
-        .iter()
-        .copied()
-        .find(|candidate| *candidate == name)
+    exception_types::exception_type(name).map(|definition| definition.name)
 }
 
 fn exception_type_code(name: &str) -> u64 {
-    EXCEPTION_TYPES
+    exception_types::EXCEPTION_TYPES
         .iter()
-        .position(|candidate| *candidate == name)
+        .position(|definition| definition.name == name)
         .and_then(|index| u64::try_from(index).ok())
-        .expect("exception type must come from the closed builtin table")
+        .expect("exception type must come from the closed exception table")
 }
 
 fn exception_type_name(code: u64) -> &'static str {
     usize::try_from(code)
         .ok()
-        .and_then(|index| EXCEPTION_TYPES.get(index))
-        .copied()
+        .and_then(|index| exception_types::EXCEPTION_TYPES.get(index))
+        .map(|definition| definition.name)
         .expect("invalid private exception-type handle")
 }
 
@@ -228,6 +197,7 @@ impl NativeValue {
         match self {
             Self::BuiltinType(builtin_type) => format!("<class '{}'>", builtin_type.name()),
             Self::ValueKind(kind) => format!("<class '{}'>", kind.name),
+            Self::ExceptionType(ExceptionType(name)) => format!("<class '{name}'>"),
             Self::NativeGetter(getter) => format!("{getter:?}"),
             _ => "<native object>".into(),
         }
@@ -903,6 +873,29 @@ impl<'a> Vm<'a> {
         self.allocate_object(Object::Exception { kind, message })
     }
 
+    /// Raise a builtin Python exception from VM code and return the error string that carries
+    /// it. The pending exception makes the error catchable by `except`; uncaught, it prints a
+    /// CPython traceback rather than an unsupported-feature report.
+    fn raise_exception(&mut self, kind: &'static str, message: impl Into<String>) -> String {
+        self.record_native_error(PyError::exception(kind, message))
+    }
+
+    /// Raise CPython's `TypeError: '<type>' object <complaint>`, as in "is not callable".
+    fn raise_object_type_error(&mut self, value: &Value, complaint: &str) -> String {
+        match self.type_name_of(value) {
+            Ok(name) => self.raise_exception("TypeError", format!("'{name}' object {complaint}")),
+            Err(error) => error,
+        }
+    }
+
+    /// The type name CPython prints in error messages, such as `int` or a user class name.
+    fn type_name_of(&self, value: &Value) -> Result<String, String> {
+        if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, value)? {
+            return Ok(kind);
+        }
+        Ok(self.state.types.get(self.type_id(value)?)?.name.clone())
+    }
+
     fn value_from_constant(&mut self, value: &Constant) -> Result<Value, String> {
         Ok(match value {
             Constant::None => Value::None,
@@ -1051,11 +1044,10 @@ impl<'a> Vm<'a> {
                         self.push_materialized(&mut result, value)?;
                     }
                 }
-                Object::Module { .. } => return Err("module object is not iterable".into()),
-                _ => return Err("object is not iterable".into()),
+                _ => return Err(self.raise_object_type_error(value, "is not iterable")),
             }
         } else {
-            return Err("object is not iterable".into());
+            return Err(self.raise_object_type_error(value, "is not iterable"));
         }
         Ok(result)
     }
@@ -1275,19 +1267,6 @@ struct ClassDefinition {
     attributes: HashMap<String, Value>,
     dataclass_fields: Vec<(String, Option<Value>)>,
     enum_members: Vec<Value>,
-}
-
-fn is_os_error(name: &str) -> bool {
-    matches!(
-        name,
-        "OSError"
-            | "FileNotFoundError"
-            | "FileExistsError"
-            | "IsADirectoryError"
-            | "NotADirectoryError"
-            | "PermissionError"
-            | "ProcessLookupError"
-    )
 }
 
 fn select_string_slice(

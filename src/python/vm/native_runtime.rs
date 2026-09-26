@@ -558,8 +558,13 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn compare(&mut self, left: &Value, right: &Value) -> PyResult<Ordering> {
-        self.compare_values(left, right)
-            .map_err(PyError::type_error)
+        self.sort_order(left, right).map_err(|message| {
+            if self.pending_exception.is_some() {
+                PyError::new(PyErrorKind::Raised, message)
+            } else {
+                PyError::type_error(message)
+            }
+        })
     }
 
     fn get_attribute(&mut self, value: Value, name: &str) -> PyResult<Option<Value>> {
@@ -669,7 +674,9 @@ impl PyRuntime for Vm<'_> {
             .map_err(PyError::runtime_error)?
         {
             Object::List(items) if index < items.len() => items.remove(index),
-            Object::List(_) => return Err(PyError::value_error("pop index out of range")),
+            Object::List(_) => {
+                return Err(PyError::exception("IndexError", "pop index out of range"))
+            }
             _ => return Err(PyError::runtime_error("list handle changed object kind")),
         };
         self.state

@@ -8,6 +8,8 @@ mod ast;
 mod bytecode;
 mod compiler;
 mod complex;
+mod cpython_names;
+mod exception_types;
 mod filesystem;
 mod heap;
 mod http;
@@ -1496,8 +1498,43 @@ fn literal_source(expression: &ast::Expression) -> Result<String, String> {
         }),
         ast::ExpressionKind::Constant(ast::Constant::Integer(value)) => Ok(value.to_string()),
         ast::ExpressionKind::Constant(ast::Constant::BigInteger(value)) => Ok(value.clone()),
-        ast::ExpressionKind::Constant(ast::Constant::Float(value)) => Ok(value.to_string()),
-        ast::ExpressionKind::Constant(ast::Constant::Imaginary(value)) => Ok(format!("{value}j")),
+        // Debug formatting keeps a float spelling (`3.0`, `1e-7`) that Python parses back to the
+        // same value; Display would turn `3.0` into the int `3`.
+        ast::ExpressionKind::Constant(ast::Constant::Float(value)) => Ok(format!("{value:?}")),
+        ast::ExpressionKind::Constant(ast::Constant::Imaginary(value)) => Ok(format!("{value:?}j")),
+        // Like `ast.literal_eval`, accept signed numbers and `real ± imaginary` complex literals.
+        ast::ExpressionKind::Unary {
+            operator: operator @ (ast::UnaryOperator::Positive | ast::UnaryOperator::Negative),
+            operand,
+        } if is_numeric_literal(operand) => {
+            let sign = if *operator == ast::UnaryOperator::Negative {
+                "-"
+            } else {
+                "+"
+            };
+            Ok(format!("({sign}{})", literal_source(operand)?))
+        }
+        ast::ExpressionKind::Binary {
+            left,
+            operator: operator @ (ast::BinaryOperator::Add | ast::BinaryOperator::Subtract),
+            right,
+        } if is_real_literal(left)
+            && matches!(
+                right.kind,
+                ast::ExpressionKind::Constant(ast::Constant::Imaginary(_))
+            ) =>
+        {
+            let sign = if *operator == ast::BinaryOperator::Subtract {
+                "-"
+            } else {
+                "+"
+            };
+            Ok(format!(
+                "({} {sign} {})",
+                literal_source(left)?,
+                literal_source(right)?
+            ))
+        }
         ast::ExpressionKind::Constant(ast::Constant::String(value)) => Ok(format!("{value:?}")),
         ast::ExpressionKind::List(values) => Ok(format!(
             "[{}]",
@@ -1530,6 +1567,37 @@ fn literal_source(expression: &ast::Expression) -> Result<String, String> {
             Ok(format!("{{{}}}", rendered.join(", ")))
         }
         _ => Err("parametrize values must contain only literals".into()),
+    }
+}
+
+fn is_numeric_literal(expression: &ast::Expression) -> bool {
+    matches!(
+        expression.kind,
+        ast::ExpressionKind::Constant(
+            ast::Constant::Integer(_)
+                | ast::Constant::BigInteger(_)
+                | ast::Constant::Float(_)
+                | ast::Constant::Imaginary(_)
+        )
+    )
+}
+
+/// A real part of a complex literal: an int or float, optionally signed.
+fn is_real_literal(expression: &ast::Expression) -> bool {
+    match &expression.kind {
+        ast::ExpressionKind::Constant(
+            ast::Constant::Integer(_) | ast::Constant::BigInteger(_) | ast::Constant::Float(_),
+        ) => true,
+        ast::ExpressionKind::Unary {
+            operator: ast::UnaryOperator::Positive | ast::UnaryOperator::Negative,
+            operand,
+        } => matches!(
+            operand.kind,
+            ast::ExpressionKind::Constant(
+                ast::Constant::Integer(_) | ast::Constant::BigInteger(_) | ast::Constant::Float(_)
+            )
+        ),
+        _ => false,
     }
 }
 
@@ -1737,7 +1805,7 @@ mod tests {
 
     #[test]
     fn unsupported_python_fails_loudly() {
-        let (status, _, err) = run("print(1 @ 2)");
+        let (status, _, err) = run("print(eval('1'))");
         assert_eq!(status, 2);
         assert!(err.contains("unsupported"));
     }
@@ -1749,8 +1817,9 @@ mod tests {
             (0, "1 [2, 3, 4]\n".into(), String::new())
         );
         let (status, _, error) = run("head, *tail, last = [1]\n");
-        assert_eq!(status, 2);
-        assert!(error.contains("not enough values"));
+        assert_eq!(status, 1);
+        assert!(error
+            .ends_with("ValueError: not enough values to unpack (expected at least 2, got 1)\n"));
     }
 
     #[test]

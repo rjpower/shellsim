@@ -190,6 +190,26 @@ def test_sequence_operations_create_new_values():
     assert repeated == ("x", "x", "x")
 
 
+def test_displays_expand_starred_iterables_in_order():
+    def letters():
+        yield "a"
+        yield "b"
+
+    values = [1, 2]
+    assert [*values, 3, *range(2)] == [1, 2, 3, 0, 1]
+    assert (0, *letters()) == (0, "a", "b")
+    assert {*values, 2, *"ab"} == {1, 2, "a", "b"}
+    pair = *values, 5
+    assert pair == (1, 2, 5)
+    number = 5
+    try:
+        expanded = [*number]
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"expanded a non-iterable into {expanded}")
+
+
 def test_generators_suspend_with_persistent_lexical_state():
     def values(limit):
         current = 0

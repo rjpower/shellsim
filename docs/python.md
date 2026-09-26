@@ -47,7 +47,8 @@ their `+` update variants with a shared seekable cursor.
 
 Function calls support positional, variadic, keyword-only, and keyword-variadic parameters,
 including bounded `*iterable` and `**mapping` expansion. Duplicate keywords, non-string mapping
-keys, and non-mapping `**` operands are rejected explicitly.
+keys, and non-mapping `**` operands are rejected explicitly. List, tuple, and set displays expand
+`*iterable` items in place.
 
 Text formatting uses one protocol for f-strings and `str.format`, including conversions,
 alignment, width and precision, and decimal, binary, octal, and hexadecimal integer formats.
@@ -61,6 +62,19 @@ The frozen `functools` module provides `reduce` and positional and keyword argum
 
 User-defined exception subclasses preserve inherited constructor arguments, including compatible
 `args`, `str`, and `repr` behavior.
+
+Builtin operations raise ordinary Python exceptions with CPython 3.14's types, hierarchy, and
+messages, so `except LookupError` catches a missing dictionary key and an uncaught error exits with
+status 1 and a traceback. A missing name raises `NameError`, a module outside the standard library
+raises `ModuleNotFoundError`, a failed `from module import name` raises `ImportError`, and a missing
+attribute of a module, class, or instance raises `AttributeError`. Argument-binding errors name the
+function by `__name__`; CPython uses the qualified name for nested functions and methods.
+
+CPython behavior that shellsim does not model fails differently. An unimplemented builtin such as
+`eval`, an unimplemented standard-library module such as `threading`, or a missing method of a
+builtin value stops the program with exit status 2 and an "unsupported by minimal shim" diagnostic.
+These failures cannot be caught, so an `except ImportError` fallback cannot mistake a shellsim gap
+for functionality that is really absent.
 
 `async def`, `await`, `async with`, and `async for` run on a deterministic cooperative scheduler.
 The bundled `asyncio` surface includes task creation and introspection, `gather`, `wait`,
@@ -83,8 +97,8 @@ executors, host threads, text-mode subprocess streams, and custom event loops ar
 synchronous calls made inside a coroutine retain their usual blocking behavior.
 
 The bounded `pytest` runner supports ordinary and yield fixtures, fixture dependencies, literal
-`@pytest.mark.parametrize` cases, `tmp_path`/`tmpdir`, skip markers, `pytest.raises`, and explicit
-test files. Fixture scopes and dynamic parametrization remain outside this small runner. `unittest`
+`@pytest.mark.parametrize` cases, `tmp_path`/`tmpdir`, skip markers, `pytest.raises` with exception
+tuples and `match`, and explicit test files. Fixture scopes and dynamic parametrization remain outside this small runner. `unittest`
 supports straightforward test classes. Unsupported syntax and runner features produce an error
 rather than a false passing result.
 

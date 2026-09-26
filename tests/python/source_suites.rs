@@ -12,6 +12,7 @@ use shellsim::{Environment, Limits};
 const BUILTINS: &[u8] = include_bytes!("test_builtins.py");
 const ASYNCIO: &[u8] = include_bytes!("test_asyncio.py");
 const LANGUAGE: &[u8] = include_bytes!("test_language.py");
+const EXCEPTIONS: &[u8] = include_bytes!("test_exceptions.py");
 const OBJECT_MODEL: &[u8] = include_bytes!("test_object_model.py");
 const COUNT_10_MILLION: &[u8] = include_bytes!("performance/test_count_10_million.py");
 
@@ -69,6 +70,11 @@ fn asyncio() {
 #[test]
 fn language() {
     assert_source_suite("test_language.py", LANGUAGE);
+}
+
+#[test]
+fn exceptions() {
+    assert_source_suite("test_exceptions.py", EXCEPTIONS);
 }
 
 #[test]

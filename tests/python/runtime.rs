@@ -247,10 +247,11 @@ fn recursive_python_calls_stop_on_the_owned_frame_limit() {
     let (status, stdout, stderr) = run_shell(
         "python3.14 -c 'def recurse():\n    recurse()\nrecurse()\nprint(\"unreachable\")'",
     );
-    assert_eq!(status, 2);
+    assert_eq!(status, 1);
     assert!(stdout.is_empty());
     assert!(
-        String::from_utf8_lossy(&stderr).contains("maximum recursion depth exceeded"),
+        String::from_utf8_lossy(&stderr)
+            .ends_with("RecursionError: maximum recursion depth exceeded\n"),
         "{}",
         String::from_utf8_lossy(&stderr)
     );

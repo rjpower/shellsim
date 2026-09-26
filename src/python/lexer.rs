@@ -432,29 +432,16 @@ impl<'a> Lexer<'a> {
                 ch if ch == quote && self.consume_triple_end(quote, triple) => break,
                 '\n' if !triple => return Err(self.error(start, "unterminated string literal")),
                 '\\' => {
-                    let Some(escaped) = self.bump() else {
-                        return Err(self.error(start, "unterminated escape sequence"));
-                    };
-                    if escaped == '\n' {
-                        continue;
+                    let (escape, used) = text_escape(self.source[self.offset..].chars())
+                        .map_err(|message| self.error(start, message))?;
+                    for _ in 0..used {
+                        self.bump();
                     }
-                    let decoded = match escaped {
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        'b' => '\u{0008}',
-                        'f' => '\u{000c}',
-                        'v' => '\u{000b}',
-                        '\\' => '\\',
-                        '\'' => '\'',
-                        '"' => '"',
-                        '0' => '\0',
-                        other => {
-                            value.push('\\');
-                            other
-                        }
-                    };
-                    value.push(decoded);
+                    match escape {
+                        TextEscape::Character(ch) => value.push(ch),
+                        TextEscape::LineContinuation => {}
+                        TextEscape::Verbatim => value.push('\\'),
+                    }
                 }
                 other => value.push(other),
             }
@@ -803,6 +790,76 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// One decoded backslash escape in a non-raw text literal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TextEscape {
+    Character(char),
+    /// A backslash before a newline, which contributes nothing.
+    LineContinuation,
+    /// An unrecognized escape, which Python keeps verbatim, backslash included.
+    Verbatim,
+}
+
+/// Decode the text escape whose characters follow a backslash, returning the escape and how many
+/// of those characters it consumed. String literals and f-string text share this decoder.
+///
+/// ```text
+/// x41 -> (Character('A'), 3)      d -> (Verbatim, 0)
+/// ```
+pub(super) fn text_escape(
+    rest: impl Iterator<Item = char>,
+) -> Result<(TextEscape, usize), &'static str> {
+    let mut rest = rest.peekable();
+    let escaped = rest.next().ok_or("unterminated escape sequence")?;
+    let simple = match escaped {
+        '\n' => return Ok((TextEscape::LineContinuation, 1)),
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        'a' => '\u{0007}',
+        'b' => '\u{0008}',
+        'f' => '\u{000c}',
+        'v' => '\u{000b}',
+        '\\' | '\'' | '"' => escaped,
+        'x' | 'u' | 'U' => {
+            let digits = match escaped {
+                'x' => 2,
+                'u' => 4,
+                _ => 8,
+            };
+            let mut code = 0u32;
+            for _ in 0..digits {
+                let digit = rest
+                    .next()
+                    .and_then(|ch| ch.to_digit(16))
+                    .ok_or("truncated hexadecimal string escape")?;
+                code = code * 16 + digit;
+            }
+            // Rust text cannot hold a lone surrogate, which CPython's `str` can.
+            let character =
+                char::from_u32(code).ok_or("string escape is not a Unicode scalar value")?;
+            return Ok((TextEscape::Character(character), 1 + digits));
+        }
+        '0'..='7' => {
+            let mut code = escaped.to_digit(8).expect("matched octal digit");
+            let mut used = 1;
+            while used < 3 {
+                let Some(digit) = rest.peek().and_then(|ch| ch.to_digit(8)) else {
+                    break;
+                };
+                rest.next();
+                code = code * 8 + digit;
+                used += 1;
+            }
+            let character = char::from_u32(code).expect("three octal digits are a scalar value");
+            return Ok((TextEscape::Character(character), used));
+        }
+        'N' => return Err("\\N{...} escapes are not supported"),
+        _ => return Ok((TextEscape::Verbatim, 0)),
+    };
+    Ok((TextEscape::Character(simple), 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,6 +870,25 @@ mod tests {
         assert_eq!(tokens[0].kind, TokenKind::Name("name".into()));
         assert_eq!(tokens[2].kind, TokenKind::String("café\n".into()));
         assert_eq!(tokens[3].kind, TokenKind::Newline);
+    }
+
+    #[test]
+    fn text_escapes_decode_numeric_forms_and_keep_unknown_ones() {
+        let decode = |source: &str| text_escape(source.chars());
+        assert_eq!(decode("x41!"), Ok((TextEscape::Character('A'), 3)));
+        assert_eq!(decode("u00e9"), Ok((TextEscape::Character('é'), 5)));
+        assert_eq!(decode("U0001F642"), Ok((TextEscape::Character('🙂'), 9)));
+        assert_eq!(decode("1011"), Ok((TextEscape::Character('A'), 3)));
+        assert_eq!(decode("08"), Ok((TextEscape::Character('\0'), 1)));
+        assert_eq!(decode("\nrest"), Ok((TextEscape::LineContinuation, 1)));
+        assert_eq!(decode("d"), Ok((TextEscape::Verbatim, 0)));
+        assert!(decode("x4").is_err());
+        assert!(decode("ud800").is_err());
+        assert!(decode("N{BULLET}").is_err());
+        assert_eq!(
+            lex(r#""\x00\101\d""#).unwrap()[0].kind,
+            TokenKind::String("\0A\\d".into())
+        );
     }
 
     #[test]

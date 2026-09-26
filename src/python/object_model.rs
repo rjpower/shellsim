@@ -656,7 +656,7 @@ impl Default for TypeRegistry {
         );
         install_native_attributes(
             &mut types[BuiltinType::RaisesContext as usize],
-            &super::stdlib::pytest::RAISES_CONTEXT_TYPE,
+            &super::stdlib::unittest::RAISES_CONTEXT_TYPE,
         );
         install_native_attributes(
             &mut types[BuiltinType::Array as usize],

@@ -181,13 +181,19 @@ pub(super) fn parse_integer_text(text: &str, requested_base: i64) -> PyResult<St
             "int() base must be >= 2 and <= 36, or 0",
         ));
     }
+    let invalid = || {
+        PyError::value_error(format!(
+            "invalid literal for int() with base {requested_base}: {}",
+            super::protocol::quote_string(text)
+        ))
+    };
     let mut text = text.trim();
     let negative = text.starts_with('-');
     if text.starts_with(['-', '+']) {
         text = &text[1..];
     }
     if text.is_empty() {
-        return Err(PyError::value_error("invalid literal for int()"));
+        return Err(invalid());
     }
 
     let prefixed = text.len() >= 2 && text.as_bytes()[0] == b'0';
@@ -215,14 +221,13 @@ pub(super) fn parse_integer_text(text: &str, requested_base: i64) -> PyResult<St
         || text.contains("__")
         || (text.starts_with('_') && !had_prefix)
     {
-        return Err(PyError::value_error("invalid literal for int()"));
+        return Err(invalid());
     }
     let digits = text.strip_prefix('_').unwrap_or(text).replace('_', "");
     if digits.is_empty() || !digits.chars().all(|character| character.is_digit(base)) {
-        return Err(PyError::value_error("invalid literal for int()"));
+        return Err(invalid());
     }
-    let mut value = BigInt::parse_bytes(digits.as_bytes(), base)
-        .ok_or_else(|| PyError::value_error("invalid literal for int()"))?;
+    let mut value = BigInt::parse_bytes(digits.as_bytes(), base).ok_or_else(invalid)?;
     if negative {
         value = -value;
     }
@@ -567,6 +572,11 @@ fn binary_numbers(
                         "negative number cannot be raised to a fractional power",
                     ));
                 }
+                if value.is_infinite() && left.is_finite() && right.is_finite() {
+                    return Err(PyError::overflow_error(
+                        "(34, 'Numerical result out of range')",
+                    ));
+                }
                 value
             }
             BinaryOperator::Divide => left / right,
@@ -699,9 +709,7 @@ fn binary_numbers(
             BinaryOperator::FloorDivide | BinaryOperator::Remainder
         )
     {
-        return Err(PyError::zero_division_error(
-            "integer division or modulo by zero",
-        ));
+        return Err(PyError::zero_division_error("division by zero"));
     }
     let result = match operation {
         BinaryOperator::Add => left + right,

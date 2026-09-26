@@ -1,21 +1,48 @@
 //! Runtime object operations for attributes, subscription, descriptors, classes, and types.
 
 use super::{
-    expect_arity, protocol, range_length, select_string_slice, Arc, BuiltinSubscript, BuiltinType,
-    CallMode, CallResult, ClassDefinition, ClassField, ClassLayout, CodeCaches, CodeRef,
-    ExceptionType, Execution, HashMap, LoadAttributeCache, NameId, NativeValue, Object, Ordering,
-    PyError, PyErrorKind, PyRuntime, SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, ValueTag,
-    Vm, MODELED_MAPPING_ENTRY_BYTES,
+    exception_types, expect_arity, protocol, range_length, select_string_slice, Arc,
+    BuiltinSubscript, BuiltinType, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout,
+    CodeCaches, CodeRef, ExceptionType, Execution, HashMap, LoadAttributeCache, NameId,
+    NativeValue, Object, Ordering, PyError, PyErrorKind, PyRuntime, SlicePlan, Slot, SlotValue,
+    SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 impl Vm<'_> {
     pub(super) fn load_attribute(&mut self, name: &str) -> Result<(), String> {
         let owner = self.pop()?;
-        let value = self
-            .resolve_attribute(owner, name)?
-            .ok_or_else(|| format!("attribute {name:?} is not implemented"))?;
+        let Some(value) = self.resolve_attribute(owner, name)? else {
+            return Err(self.missing_attribute(&owner, name));
+        };
         self.stack.push(value);
         Ok(())
+    }
+
+    /// Report an attribute lookup that found nothing. Modules, user classes and their instances
+    /// raise CPython's `AttributeError`, so `try`/`except` fallbacks for a missing module member
+    /// work. On a builtin value a missing name is almost always a method shellsim does not model,
+    /// so it stays an unsupported-feature error that user code cannot catch and misread as
+    /// absence; `hasattr` and `getattr` defaults still observe the absence without raising.
+    pub(super) fn missing_attribute(&mut self, owner: &Value, name: &str) -> String {
+        if let Some(NativeValue::Module(module)) = owner.native_value() {
+            let message = format!("module '{}' has no attribute '{name}'", module.name);
+            return self.raise_exception("AttributeError", message);
+        }
+        let message = match owner.object_id().map(|id| self.state.heap.get(id)) {
+            Some(Ok(Object::Module { name: module, .. })) => {
+                format!("module '{module}' has no attribute '{name}'")
+            }
+            Some(Ok(Object::Class {
+                name: class_name, ..
+            })) => format!("type object '{class_name}' has no attribute '{name}'"),
+            Some(Ok(Object::Instance { .. })) => match self.type_name_of(owner) {
+                Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
+                Err(error) => return error,
+            },
+            Some(Err(error)) => return error,
+            _ => return format!("attribute {name:?} is not implemented"),
+        };
+        self.raise_exception("AttributeError", message)
     }
 
     pub(super) fn load_attribute_at(
@@ -38,9 +65,9 @@ impl Vm<'_> {
                 return Ok(());
             }
         }
-        let value = self
-            .resolve_attribute_by_symbol(owner, symbol, name)?
-            .ok_or_else(|| format!("attribute {name:?} is not implemented"))?;
+        let Some(value) = self.resolve_attribute_by_symbol(owner, symbol, name)? else {
+            return Err(self.missing_attribute(&owner, name));
+        };
         if let Some(cache) = self.cacheable_instance_attribute(owner, symbol, name)? {
             self.remember_attribute_cache(code, code_cache, site, cache)?;
         }
@@ -353,6 +380,11 @@ impl Vm<'_> {
         }
         let native_name = match owner.native_value() {
             Some(NativeValue::UnitTestBase) if name == "__name__" => Some("TestCase"),
+            Some(NativeValue::BuiltinType(builtin)) if name == "__name__" => Some(builtin.name()),
+            // Native value kinds record their qualified name, as `repr` shows it.
+            Some(NativeValue::ValueKind(kind)) if name == "__name__" => {
+                kind.name.rsplit('.').next()
+            }
             Some(NativeValue::ExceptionType(ExceptionType(exception_name)))
                 if name == "__name__" =>
             {
@@ -478,20 +510,37 @@ impl Vm<'_> {
                 .get_var(&name)
                 .ok_or_else(|| format!("environment key not found: {name}"))?;
             self.allocate_string(value)?
-        } else if let Some(character) = protocol::string_index(&self.state.heap, &owner, &index)? {
+        } else if let Some(character) = self.string_subscript(&owner, &index)? {
             self.allocate_string(character.to_string())?
         } else if let Some(id) = owner.object_id() {
             let target = match self.state.heap.get(id)? {
                 Object::List(values) | Object::Tuple(values) => {
-                    let index = index.as_int().ok_or("sequence index must be an integer")?;
+                    let sequence = if matches!(self.state.heap.get(id)?, Object::List(_)) {
+                        "list"
+                    } else {
+                        "tuple"
+                    };
+                    let Some(index) = index.as_int() else {
+                        let message = format!(
+                            "{sequence} indices must be integers or slices, not {}",
+                            self.type_name_of(&index)?
+                        );
+                        return Err(self.raise_exception("TypeError", message));
+                    };
                     let len = values.len() as i64;
                     let index = if index < 0 { len + index } else { index };
-                    BuiltinSubscript::Value(
-                        values
-                            .get(usize::try_from(index).map_err(|_| "index out of range")?)
-                            .copied()
-                            .ok_or("index out of range")?,
-                    )
+                    match usize::try_from(index)
+                        .ok()
+                        .and_then(|index| values.get(index))
+                    {
+                        Some(value) => BuiltinSubscript::Value(*value),
+                        None => {
+                            return Err(self.raise_exception(
+                                "IndexError",
+                                format!("{sequence} index out of range"),
+                            ))
+                        }
+                    }
                 }
                 Object::Range { start, stop, step } => {
                     let length = range_length(*start, *stop, *step)?;
@@ -503,7 +552,9 @@ impl Vm<'_> {
                         i128::from(index)
                     };
                     if index < 0 || index >= i128::try_from(length).unwrap_or(i128::MAX) {
-                        return Err("range index out of range".into());
+                        return Err(
+                            self.raise_exception("IndexError", "range object index out of range")
+                        );
                     }
                     let value = i128::from(*start)
                         .checked_add(
@@ -591,17 +642,39 @@ impl Vm<'_> {
                         entries.push((index, value));
                         value
                     } else {
-                        return Err("key not found".into());
+                        // CPython's KeyError carries the key, and `str()` shows its repr.
+                        let key = protocol::repr(&self.state.heap, &index)?;
+                        return Err(self.raise_exception("KeyError", key));
                     }
                 }
-                BuiltinSubscript::Set => return Err("set object is not subscriptable".into()),
-                BuiltinSubscript::Unsupported => return Err("object is not subscriptable".into()),
+                BuiltinSubscript::Set | BuiltinSubscript::Unsupported => {
+                    return Err(self.raise_object_type_error(&owner, "is not subscriptable"))
+                }
             }
         } else {
-            return Err("object is not subscriptable".into());
+            return Err(self.raise_object_type_error(&owner, "is not subscriptable"));
         };
         self.stack.push(value);
         Ok(())
+    }
+
+    /// Index a string, raising CPython's errors for a bad index. `None` means `owner` is not a
+    /// string.
+    fn string_subscript(&mut self, owner: &Value, index: &Value) -> Result<Option<char>, String> {
+        match protocol::string_index(&self.state.heap, owner, index)? {
+            protocol::StringIndex::NotString => Ok(None),
+            protocol::StringIndex::Character(character) => Ok(Some(character)),
+            protocol::StringIndex::NotInteger => {
+                let message = format!(
+                    "string indices must be integers, not '{}'",
+                    self.type_name_of(index)?
+                );
+                Err(self.raise_exception("TypeError", message))
+            }
+            protocol::StringIndex::OutOfRange => {
+                Err(self.raise_exception("IndexError", "string index out of range"))
+            }
+        }
     }
 
     fn load_builtin_slice(
@@ -696,22 +769,31 @@ impl Vm<'_> {
             return Ok(());
         }
         let Some(id) = owner.object_id() else {
-            return Err("object does not support item assignment".into());
+            return Err(self.raise_object_type_error(&owner, "does not support item assignment"));
         };
         match self.state.heap.get(id)? {
             Object::List(values) => {
-                let index = index.as_int().ok_or("list index must be an integer")?;
+                let Some(index) = index.as_int() else {
+                    let message = format!(
+                        "list indices must be integers or slices, not {}",
+                        self.type_name_of(&index)?
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                };
                 let len = values.len() as i64;
                 let index = if index < 0 { len + index } else { index };
-                let index =
-                    usize::try_from(index).map_err(|_| "list assignment index out of range")?;
+                let Some(index) = usize::try_from(index)
+                    .ok()
+                    .filter(|index| *index < values.len())
+                else {
+                    return Err(
+                        self.raise_exception("IndexError", "list assignment index out of range")
+                    );
+                };
                 let Object::List(values) = self.state.heap.get_mut(id)? else {
                     unreachable!()
                 };
-                let slot = values
-                    .get_mut(index)
-                    .ok_or("list assignment index out of range")?;
-                *slot = value;
+                values[index] = value;
             }
             Object::Dict(_) | Object::DefaultDict { .. } => {
                 if let Some(position) = self.find_mapping_entry(id, &index)? {
@@ -733,48 +815,13 @@ impl Vm<'_> {
                     entries.push((index, value));
                 }
             }
-            Object::Tuple(_) | Object::FrozenSet(_) => {
-                return Err("immutable object does not support item assignment".into())
-            }
-            Object::String(_)
-            | Object::Bytes(_)
-            | Object::ByteArray(_)
-            | Object::Slice { .. }
-            | Object::Exception { .. }
-            | Object::Set(_)
-            | Object::BigInt(_)
-            | Object::Complex { .. }
-            | Object::Range { .. }
-            | Object::Function { .. }
-            | Object::Class { .. }
-            | Object::Instance { .. }
-            | Object::DescriptorBoundMethod { .. }
-            | Object::Iterator { .. }
-            | Object::SequenceIterator { .. }
-            | Object::RangeIterator { .. }
-            | Object::CountIterator { .. }
-            | Object::StreamIterator { .. }
-            | Object::CallableIterator { .. }
-            | Object::Generator { .. }
-            | Object::Module { .. }
-            | Object::ArrayStorage(_)
-            | Object::Array { .. }
-            | Object::Regex { .. }
-            | Object::Match { .. }
-            | Object::ArgumentParser { .. }
-            | Object::Namespace { .. } => {
+            // Item assignment on these would be a shellsim gap, not a CPython TypeError.
+            Object::ByteArray(_) | Object::ArrayStorage(_) | Object::Array { .. } => {
                 return Err("object does not support item assignment".into())
             }
-            Object::EnumMember { .. } => {
-                return Err("object does not support item assignment".into())
+            _ => {
+                return Err(self.raise_object_type_error(&owner, "does not support item assignment"))
             }
-            Object::RaisesContext { .. } => {
-                return Err("object does not support item assignment".into())
-            }
-            Object::Property { .. }
-            | Object::StaticMethod { .. }
-            | Object::ClassMethod { .. }
-            | Object::Super { .. } => return Err("object does not support item assignment".into()),
         }
         Ok(())
     }
@@ -1587,11 +1634,12 @@ impl Vm<'_> {
         protocol::display(&self.state.heap, value)
     }
 
+    /// Order two values by Python's rich comparisons, including user `__eq__` and `__lt__`.
     pub(super) fn compare_values(
         &mut self,
         left: &Value,
         right: &Value,
-    ) -> Result<Ordering, String> {
+    ) -> Result<protocol::Comparison, String> {
         if let (Some(left_id), Some(right_id)) = (left.object_id(), right.object_id()) {
             let sequences = match (
                 self.state.heap.get(left_id)?,
@@ -1609,30 +1657,56 @@ impl Vm<'_> {
                     if protocol::identical(left, right) {
                         continue;
                     }
-                    let ordering = self.compare_values(left, right)?;
-                    if ordering != Ordering::Equal {
-                        return Ok(ordering);
+                    let comparison = self.compare_values(left, right)?;
+                    if comparison != protocol::Comparison::Ordered(Ordering::Equal) {
+                        return Ok(comparison);
                     }
                 }
-                return Ok(left.len().cmp(&right.len()));
+                return Ok(protocol::Comparison::Ordered(left.len().cmp(&right.len())));
             }
         }
         if let Some(equal) = self.invoke_slot(left, Slot::Equal, "__eq__", vec![*right])? {
             if self.truth_value(&equal)? {
-                return Ok(Ordering::Equal);
+                return Ok(protocol::Comparison::Ordered(Ordering::Equal));
             }
         }
         if let Some(less) = self.invoke_slot(left, Slot::LessThan, "__lt__", vec![*right])? {
             if self.truth_value(&less)? {
-                return Ok(Ordering::Less);
+                return Ok(protocol::Comparison::Ordered(Ordering::Less));
             }
         }
         if let Some(less) = self.invoke_slot(right, Slot::LessThan, "__lt__", vec![*left])? {
             if self.truth_value(&less)? {
-                return Ok(Ordering::Greater);
+                return Ok(protocol::Comparison::Ordered(Ordering::Greater));
             }
         }
         protocol::compare(&self.state.heap, left, right)
+    }
+
+    /// Order two values for `sorted`, `min` and `max`, which compare with `<` as CPython does.
+    /// A NaN orders as equal, so the earlier value stays in place.
+    pub(super) fn sort_order(&mut self, left: &Value, right: &Value) -> Result<Ordering, String> {
+        match self.compare_values(left, right)? {
+            protocol::Comparison::Ordered(ordering) => Ok(ordering),
+            protocol::Comparison::Unordered => Ok(Ordering::Equal),
+            protocol::Comparison::Unsupported => Err(self.raise_unorderable("<", left, right)),
+        }
+    }
+
+    /// Raise CPython's `TypeError` for an ordering comparison between unrelated types.
+    pub(super) fn raise_unorderable(
+        &mut self,
+        symbol: &str,
+        left: &Value,
+        right: &Value,
+    ) -> String {
+        let message = match (self.type_name_of(left), self.type_name_of(right)) {
+            (Ok(left), Ok(right)) => {
+                format!("'{symbol}' not supported between instances of '{left}' and '{right}'")
+            }
+            (Err(error), _) | (_, Err(error)) => return error,
+        };
+        self.raise_exception("TypeError", message)
     }
 
     fn super_attribute(
@@ -1822,14 +1896,35 @@ impl Vm<'_> {
                         value
                     }
                     Some(value) if protocol::string_value(&self.state.heap, value)?.is_some() => {
-                        protocol::string_value(&self.state.heap, value)?
-                            .expect("guarded")
-                            .parse::<f64>()
-                            .map_err(|_| "could not convert string to float")?
+                        let text =
+                            protocol::string_value(&self.state.heap, value)?.expect("guarded");
+                        match text.trim().parse::<f64>() {
+                            Ok(parsed) => parsed,
+                            Err(_) => {
+                                let message = format!(
+                                    "could not convert string to float: {}",
+                                    protocol::quote_string(&text)
+                                );
+                                return Err(self.raise_exception("ValueError", message));
+                            }
+                        }
                     }
-                    Some(value) => self
-                        .numeric_float(value)
-                        .map_err(|_| "float() argument is not supported")?,
+                    Some(value) => match self.numeric_float(value) {
+                        Ok(converted) => converted,
+                        Err(_) if self.is_bigint(value)? => {
+                            return Err(self.raise_exception(
+                                "OverflowError",
+                                "int too large to convert to float",
+                            ))
+                        }
+                        Err(_) => {
+                            let message = format!(
+                                "float() argument must be a string or a real number, not '{}'",
+                                self.type_name_of(value)?
+                            );
+                            return Err(self.raise_exception("TypeError", message));
+                        }
+                    },
                 };
                 Value::Float(converted)
             }
@@ -2017,6 +2112,15 @@ impl Vm<'_> {
     }
 
     pub(super) fn type_of(&self, value: &Value) -> Result<Value, String> {
+        // Builtin exception instances share one heap type; their class is the modeled
+        // exception type, so `type(error) is ValueError` and `type(error).__name__` work.
+        if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, value)? {
+            if let Some(definition) = exception_types::exception_type(&kind) {
+                return Ok(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                    definition.name,
+                ))));
+            }
+        }
         self.state.types.value(self.type_id(value)?)
     }
 
@@ -2024,29 +2128,13 @@ impl Vm<'_> {
         if let Some(NativeValue::ExceptionType(ExceptionType(expected))) = class.native_value() {
             let actual =
                 if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, value)? {
-                    Some(kind)
+                    kind
+                } else if let Some(base) = self.user_exception_base(value)? {
+                    base.to_string()
                 } else {
-                    self.user_exception_kind(value)?
+                    return Ok(false);
                 };
-            let Some(actual) = actual else {
-                return Ok(false);
-            };
-            let os_error = matches!(
-                actual.as_str(),
-                "OSError"
-                    | "FileNotFoundError"
-                    | "FileExistsError"
-                    | "IsADirectoryError"
-                    | "NotADirectoryError"
-                    | "PermissionError"
-                    | "ProcessLookupError"
-            );
-            return Ok(expected == "BaseException"
-                || (expected == "Exception"
-                    && actual != "BaseException"
-                    && actual != "SystemExit")
-                || expected == actual
-                || (expected == "OSError" && os_error));
+            return Ok(exception_types::exception_is_subclass(&actual, expected));
         }
         if let Some(class_id) = class.object_id() {
             if let Object::Tuple(classes) = self.state.heap.get(class_id)? {
@@ -2079,6 +2167,22 @@ impl Vm<'_> {
                 return Ok(false);
             }
         }
+        if let Some(NativeValue::ExceptionType(ExceptionType(base))) = base.native_value() {
+            if let Some(kind) = self.exception_class_base(class)? {
+                return Ok(exception_types::exception_is_subclass(kind, base));
+            }
+            self.class_type_id(class)?
+                .ok_or("issubclass() requires a class argument")?;
+            return Ok(false);
+        }
+        if let Some(NativeValue::ExceptionType(_)) = class.native_value() {
+            // A builtin exception class is never a subclass of a user class, and its only
+            // non-exception ancestor is `object`.
+            return Ok(matches!(
+                base.native_value(),
+                Some(NativeValue::BuiltinType(BuiltinType::Object))
+            ));
+        }
         let class = self
             .class_type_id(class)?
             .ok_or("issubclass() requires a class argument")?;
@@ -2086,5 +2190,21 @@ impl Vm<'_> {
             .class_type_id(base)?
             .ok_or("issubclass() requires a class argument")?;
         self.state.types.is_subclass(class, base)
+    }
+
+    /// The modeled exception class that `class` is or derives from: the class itself for a
+    /// builtin exception type, the recorded exception base for a user exception class, and
+    /// `None` for anything else.
+    fn exception_class_base(&self, class: &Value) -> Result<Option<&'static str>, String> {
+        if let Some(NativeValue::ExceptionType(ExceptionType(name))) = class.native_value() {
+            return Ok(Some(name));
+        }
+        let Some(id) = class.object_id() else {
+            return Ok(None);
+        };
+        Ok(match self.state.heap.get(id)? {
+            Object::Class { exception_base, .. } => *exception_base,
+            _ => None,
+        })
     }
 }

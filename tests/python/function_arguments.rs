@@ -7,26 +7,26 @@ fn argument_binding_reports_python_style_errors() {
     for (source, expected) in [
         (
             "def f(a, b=2):\n    return a + b\nprint(f())",
-            "missing required argument",
+            "TypeError: f() missing 1 required positional argument: 'a'\n",
         ),
         (
             "def f(a, b=2):\n    return a + b\nprint(f(1, 2, 3))",
-            "takes 2 positional arguments",
+            "TypeError: f() takes from 1 to 2 positional arguments but 3 were given\n",
         ),
         (
             "def f(a, b=2):\n    return a + b\nprint(f(1, c=3))",
-            "unexpected keyword argument",
+            "TypeError: f() got an unexpected keyword argument 'c'\n",
         ),
         (
             "def f(a, b=2):\n    return a + b\nprint(f(1, a=3))",
-            "multiple values for argument",
+            "TypeError: f() got multiple values for argument 'a'\n",
         ),
     ] {
         let (status, stdout, stderr) = run_python(source);
-        assert_eq!(status, 2, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(status, 1, "{}", String::from_utf8_lossy(&stderr));
         assert!(stdout.is_empty());
         assert!(
-            String::from_utf8_lossy(&stderr).contains(expected),
+            String::from_utf8_lossy(&stderr).ends_with(expected),
             "expected {expected:?} in {}",
             String::from_utf8_lossy(&stderr)
         );
@@ -36,9 +36,10 @@ fn argument_binding_reports_python_style_errors() {
 #[test]
 fn keyword_only_arguments_reject_positional_values() {
     let (status, stdout, stderr) = run_python("def f(*, value): return value\nf(1)");
-    assert_eq!(status, 2);
+    assert_eq!(status, 1);
     assert!(stdout.is_empty());
-    assert!(String::from_utf8_lossy(&stderr).contains("takes 0 positional arguments"));
+    assert!(String::from_utf8_lossy(&stderr)
+        .ends_with("TypeError: f() takes 0 positional arguments but 1 was given\n"));
 }
 
 #[test]

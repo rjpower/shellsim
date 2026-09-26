@@ -223,10 +223,13 @@ impl Vm<'_> {
         let mut outputs = Vec::new();
         if let Some(star_index) = star_index {
             if star_index >= expected || values.len() < expected.saturating_sub(1) {
-                return Err(format!(
-                    "not enough values to unpack (expected at least {}, got {})",
-                    expected.saturating_sub(1),
-                    values.len()
+                return Err(self.raise_exception(
+                    "ValueError",
+                    format!(
+                        "not enough values to unpack (expected at least {}, got {})",
+                        expected.saturating_sub(1),
+                        values.len()
+                    ),
                 ));
             }
             let tail_start = star_index;
@@ -249,9 +252,17 @@ impl Vm<'_> {
             }
         } else {
             if values.len() != expected {
-                return Err(format!(
-                    "cannot unpack sequence of length {} into {expected} targets",
-                    values.len()
+                let problem = if values.len() > expected {
+                    "too many"
+                } else {
+                    "not enough"
+                };
+                return Err(self.raise_exception(
+                    "ValueError",
+                    format!(
+                        "{problem} values to unpack (expected {expected}, got {})",
+                        values.len()
+                    ),
                 ));
             }
             for value in values {
@@ -339,7 +350,7 @@ impl Vm<'_> {
     ) -> Result<Option<Value>, String> {
         const MAX_GENERATOR_DEPTH: usize = 256;
         if self.call_depth >= MAX_GENERATOR_DEPTH {
-            return Err("maximum recursion depth exceeded".into());
+            return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
         }
         let (
             code,

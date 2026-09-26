@@ -39,7 +39,7 @@ side_table_id!(CallId);
 side_table_id!(FunctionId);
 side_table_id!(ClassId);
 side_table_id!(FormatId);
-side_table_id!(DictId);
+side_table_id!(UnpackId);
 side_table_id!(ErrorId);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,7 +57,8 @@ pub struct Code {
     functions: Box<[FunctionSpec]>,
     classes: Box<[ClassSpec]>,
     formats: Box<[FormatSpec]>,
-    dicts: Box<[Box<[bool]>]>,
+    /// Per-operand unpacking flags shared by dictionary and starred sequence displays.
+    unpack_flags: Box<[Box<[bool]>]>,
     errors: Box<[String]>,
 }
 
@@ -101,8 +102,8 @@ impl Code {
         &self.formats[id.index()]
     }
 
-    pub fn dict_entries(&self, id: DictId) -> &[bool] {
-        &self.dicts[id.index()]
+    pub fn unpack_flags(&self, id: UnpackId) -> &[bool] {
+        &self.unpack_flags[id.index()]
     }
 
     pub fn error(&self, id: ErrorId) -> &str {
@@ -189,6 +190,8 @@ pub enum Opcode {
         name: NameId,
         bind_root: bool,
     },
+    /// `from module import name`, with the module on top of the stack; it stays there.
+    ImportFrom(NameId),
     LoadAttribute(NameId),
     LoadSubscript,
     BuildSlice {
@@ -198,8 +201,13 @@ pub enum Opcode {
     },
     BuildList(usize),
     BuildTuple(usize),
-    BuildDict(DictId),
+    BuildDict(UnpackId),
     BuildSet(usize),
+    /// A list, tuple, or set display with at least one `*iterable` operand.
+    BuildUnpacked {
+        kind: DisplayKind,
+        starred: UnpackId,
+    },
     UnpackSequence {
         count: usize,
         star_index: Option<usize>,
@@ -268,6 +276,7 @@ pub enum Operation {
         name: String,
         bind_root: bool,
     },
+    ImportFrom(String),
     LoadAttribute(String),
     LoadSubscript,
     BuildSlice {
@@ -281,6 +290,11 @@ pub enum Operation {
     /// consumes one key/value pair.
     BuildDict(Vec<bool>),
     BuildSet(usize),
+    /// Build a list, tuple, or set from source-ordered operands; `true` expands an iterable.
+    BuildUnpacked {
+        kind: DisplayKind,
+        starred: Vec<bool>,
+    },
     UnpackSequence {
         count: usize,
         star_index: Option<usize>,
@@ -344,6 +358,14 @@ pub enum Operation {
     Halt,
 }
 
+/// The container a sequence display builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayKind {
+    List,
+    Tuple,
+    Set,
+}
+
 #[derive(Default)]
 pub struct CodeBuilder {
     names: Vec<Arc<str>>,
@@ -353,7 +375,7 @@ pub struct CodeBuilder {
     functions: Vec<FunctionSpec>,
     classes: Vec<ClassSpec>,
     formats: Vec<FormatSpec>,
-    dicts: Vec<Box<[bool]>>,
+    unpack_flags: Vec<Box<[bool]>>,
     errors: Vec<String>,
 }
 
@@ -366,6 +388,12 @@ impl CodeBuilder {
         let name: Arc<str> = name.into();
         self.name_ids.insert(name.clone(), id);
         self.names.push(name);
+        id
+    }
+
+    fn unpack_flags(&mut self, flags: Vec<bool>) -> UnpackId {
+        let id = UnpackId::new(self.unpack_flags.len());
+        self.unpack_flags.push(flags.into_boxed_slice());
         id
     }
 
@@ -397,6 +425,7 @@ impl CodeBuilder {
                 name: self.name(name),
                 bind_root,
             },
+            Operation::ImportFrom(name) => Opcode::ImportFrom(self.name(name)),
             Operation::LoadAttribute(name) => Opcode::LoadAttribute(self.name(name)),
             Operation::LoadSubscript => Opcode::LoadSubscript,
             Operation::BuildSlice {
@@ -410,12 +439,12 @@ impl CodeBuilder {
             },
             Operation::BuildList(count) => Opcode::BuildList(count),
             Operation::BuildTuple(count) => Opcode::BuildTuple(count),
-            Operation::BuildDict(entries) => {
-                let id = DictId::new(self.dicts.len());
-                self.dicts.push(entries.into_boxed_slice());
-                Opcode::BuildDict(id)
-            }
+            Operation::BuildDict(entries) => Opcode::BuildDict(self.unpack_flags(entries)),
             Operation::BuildSet(count) => Opcode::BuildSet(count),
+            Operation::BuildUnpacked { kind, starred } => Opcode::BuildUnpacked {
+                kind,
+                starred: self.unpack_flags(starred),
+            },
             Operation::UnpackSequence { count, star_index } => {
                 Opcode::UnpackSequence { count, star_index }
             }
@@ -559,7 +588,7 @@ impl CodeBuilder {
             functions: self.functions.into_boxed_slice(),
             classes: self.classes.into_boxed_slice(),
             formats: self.formats.into_boxed_slice(),
-            dicts: self.dicts.into_boxed_slice(),
+            unpack_flags: self.unpack_flags.into_boxed_slice(),
             errors: self.errors.into_boxed_slice(),
         })
     }
