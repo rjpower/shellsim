@@ -5,7 +5,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::System;
 
 use super::compare::{self, Format, Options, RightSide};
 use super::diff;
@@ -61,11 +62,13 @@ fn parse_pretty(value: &str, terminated: bool) -> Option<Pretty> {
 }
 
 /// Names of the references that point directly at a commit, for `%d` and `--decorate`.
-fn decorations(ctx: &CommandContext<'_>, root: &str, id: &str) -> String {
+fn decorations(system: &mut dyn System, root: &str, id: &str) -> String {
     let mut names = Vec::new();
-    let head_branch = repo::current_branch(ctx, root);
-    for branch in repo::branch_names(ctx, root) {
-        if repo::read_reference(ctx, root, &format!("refs/heads/{branch}")).as_deref() != Some(id) {
+    let head_branch = repo::current_branch(system, root);
+    for branch in repo::branch_names(system, root) {
+        if repo::read_reference(system, root, &format!("refs/heads/{branch}")).as_deref()
+            != Some(id)
+        {
             continue;
         }
         if head_branch.as_deref() == Some(branch.as_str()) {
@@ -74,12 +77,12 @@ fn decorations(ctx: &CommandContext<'_>, root: &str, id: &str) -> String {
             names.push(branch);
         }
     }
-    for tag in repo::reference_names(ctx, root, "tags") {
-        if repo::read_reference(ctx, root, &format!("refs/tags/{tag}")).as_deref() == Some(id) {
+    for tag in repo::reference_names(system, root, "tags") {
+        if repo::read_reference(system, root, &format!("refs/tags/{tag}")).as_deref() == Some(id) {
             names.push(format!("tag: {tag}"));
         }
     }
-    if head_branch.is_none() && repo::head_commit(ctx, root).as_deref() == Some(id) {
+    if head_branch.is_none() && repo::head_commit(system, root).as_deref() == Some(id) {
         names.insert(0, "HEAD".to_string());
     }
     if names.is_empty() {
@@ -304,32 +307,32 @@ struct Selection {
 }
 
 /// Resolve one revision argument, which may be a plain revision or an `a..b` range.
-fn select_revision(ctx: &mut CommandContext<'_>, root: &str, revision: &str) -> Option<Selection> {
+fn select_revision(system: &mut dyn System, root: &str, revision: &str) -> Option<Selection> {
     // `^rev` excludes everything reachable from `rev` and includes nothing.
     if let Some(excluded) = revision.strip_prefix('^') {
-        let commit = repo::resolve_revision(ctx, root, excluded)?;
+        let commit = repo::resolve_revision(system, root, excluded)?;
         return Some(Selection {
             included: Vec::new(),
-            excluded: repo::ancestors(ctx, root, &commit),
+            excluded: repo::ancestors(system, root, &commit),
         });
     }
     let Some((left, right, merge_base)) = split_range(revision) else {
         return Some(Selection {
-            included: vec![repo::resolve_revision(ctx, root, revision)?],
+            included: vec![repo::resolve_revision(system, root, revision)?],
             excluded: BTreeSet::new(),
         });
     };
     let right = if right.is_empty() { "HEAD" } else { right };
     let left = if left.is_empty() { "HEAD" } else { left };
     let (left_commit, right_commit) = (
-        repo::resolve_revision(ctx, root, left)?,
-        repo::resolve_revision(ctx, root, right)?,
+        repo::resolve_revision(system, root, left)?,
+        repo::resolve_revision(system, root, right)?,
     );
     let excluded = if merge_base {
-        let base = repo::merge_base(ctx, root, &left_commit, &right_commit)?;
-        repo::ancestors(ctx, root, &base)
+        let base = repo::merge_base(system, root, &left_commit, &right_commit)?;
+        repo::ancestors(system, root, &base)
     } else {
-        repo::ancestors(ctx, root, &left_commit)
+        repo::ancestors(system, root, &left_commit)
     };
     Some(Selection {
         included: vec![right_commit],
@@ -339,7 +342,7 @@ fn select_revision(ctx: &mut CommandContext<'_>, root: &str, revision: &str) -> 
 
 /// The commits listed by a set of revision arguments, newest first.
 pub(crate) fn history_for(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     revisions: &[String],
     first_parent: bool,
@@ -347,17 +350,17 @@ pub(crate) fn history_for(
     let mut included = Vec::new();
     let mut excluded = BTreeSet::new();
     for revision in revisions {
-        let selection = select_revision(ctx, root, revision)?;
+        let selection = select_revision(system, root, revision)?;
         included.extend(selection.included);
         excluded.extend(selection.excluded);
     }
     let listed = if first_parent {
         included
             .first()
-            .map(|start| repo::first_parent_history(ctx, root, start, 10_000))
+            .map(|start| repo::first_parent_history(system, root, start, 10_000))
             .unwrap_or_default()
     } else {
-        repo::reachable_history(ctx, root, &included, 10_000)
+        repo::reachable_history(system, root, &included, 10_000)
     };
     Some(
         listed
@@ -368,14 +371,15 @@ pub(crate) fn history_for(
 }
 
 /// Every branch and tag tip, for `--all`.
-pub(crate) fn all_reference_tips(ctx: &CommandContext<'_>, root: &str) -> Vec<String> {
+pub(crate) fn all_reference_tips(system: &mut dyn System, root: &str) -> Vec<String> {
     let mut tips = Vec::new();
     for (kind, names) in [
-        ("heads", repo::branch_names(ctx, root)),
-        ("tags", repo::reference_names(ctx, root, "tags")),
+        ("heads", repo::branch_names(system, root)),
+        ("tags", repo::reference_names(system, root, "tags")),
     ] {
         for name in names {
-            if let Some(commit) = repo::read_reference(ctx, root, &format!("refs/{kind}/{name}")) {
+            if let Some(commit) = repo::read_reference(system, root, &format!("refs/{kind}/{name}"))
+            {
                 tips.push(commit);
             }
         }
@@ -383,8 +387,8 @@ pub(crate) fn all_reference_tips(ctx: &CommandContext<'_>, root: &str) -> Vec<St
     tips
 }
 
-pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_log(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut pretty = Pretty::Medium;
@@ -410,7 +414,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     let mut stat = None;
     let mut graph: Option<Rail> = None;
     let mut paths: Vec<String> = Vec::new();
-    let cwd = ctx.cwd.clone();
+    let cwd = system.cwd().to_string();
     let mut flags = Flags::new(args).valued("nSG");
     while let Some(argument) = flags.next() {
         let (name, attached) = match argument {
@@ -419,11 +423,11 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
                 continue;
             }
             Arg::Operand(value) => {
-                if select_revision(ctx, &root, &value).is_some() {
+                if select_revision(system, &root, &value).is_some() {
                     revisions.push(value);
                     continue;
                 }
-                if !super::names_a_path(ctx, &root, &value) {
+                if !super::names_a_path(system, &root, &value) {
                     return super::ambiguous_argument(io, &value);
                 }
                 paths.push(super::pathspec(&cwd, &root, &value));
@@ -459,7 +463,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
                 let Some(value) = flags.value(attached) else {
                     return usage(io, &format!("{name} requires a date"));
                 };
-                let Some(seconds) = parse_date(&value, repo::now_seconds(ctx)) else {
+                let Some(seconds) = parse_date(&value, repo::now_seconds(system)) else {
                     return usage(io, &format!("unsupported date: {value}"));
                 };
                 if matches!(name.as_str(), "--since" | "--after") {
@@ -516,14 +520,14 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         }
     }
     if all_references {
-        revisions.extend(all_reference_tips(ctx, &root));
+        revisions.extend(all_reference_tips(system, &root));
     }
     if revisions.is_empty() {
         revisions.push("HEAD".to_string());
     }
-    let Some(mut history) = history_for(ctx, &root, &revisions, first_parent) else {
-        if repo::head_commit(ctx, &root).is_none() {
-            let branch = repo::current_branch(ctx, &root).unwrap_or_else(|| "HEAD".to_string());
+    let Some(mut history) = history_for(system, &root, &revisions, first_parent) else {
+        if repo::head_commit(system, &root).is_none() {
+            let branch = repo::current_branch(system, &root).unwrap_or_else(|| "HEAD".to_string());
             io.print_err(&format!(
                 "fatal: your current branch '{branch}' does not have any commits yet\n"
             ));
@@ -561,7 +565,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         history.retain(|(_, commit)| commit.timestamp <= seconds);
     }
     if let Some(needle) = &pickaxe {
-        history.retain(|(id, commit)| changes_occurrence_count(ctx, &root, id, commit, needle));
+        history.retain(|(id, commit)| changes_occurrence_count(system, &root, id, commit, needle));
     }
     if let Some(pattern) = &changed_lines {
         let Ok(regex) = regex::RegexBuilder::new(pattern)
@@ -571,10 +575,10 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             io.print_err(&format!("fatal: invalid pattern: {pattern}\n"));
             return 128;
         };
-        history.retain(|(id, commit)| matches_changed_lines(ctx, &root, id, commit, &regex));
+        history.retain(|(id, commit)| matches_changed_lines(system, &root, id, commit, &regex));
     }
     if !paths.is_empty() {
-        history.retain(|(id, commit)| commit_touches(ctx, &root, id, commit, &paths));
+        history.retain(|(id, commit)| commit_touches(system, &root, id, commit, &paths));
     }
     if skip < history.len() {
         history.drain(..skip);
@@ -585,7 +589,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     if reverse {
         history.reverse();
     }
-    let now = repo::now_seconds(ctx);
+    let now = repo::now_seconds(system);
     let outer = io;
     // Multi-line formats are separated by a blank line; one-line formats are not.
     let separated = matches!(
@@ -612,7 +616,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         }
         // `%d` and `%D` always expand, so decorations are computed whenever a format may use them.
         let decoration = if decorate || matches!(pretty, Pretty::Custom { .. }) {
-            decorations(ctx, &root, id)
+            decorations(system, &root, id)
         } else {
             String::new()
         };
@@ -641,7 +645,7 @@ pub(crate) fn git_log(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
             if diff_needs_spacing(&pretty) {
                 io.out.push(b'\n');
             }
-            emit_commit_diff(ctx, &root, id, commit, format, &paths, io);
+            emit_commit_diff(system, &root, id, commit, format, &paths, io);
         }
         match graph.as_mut() {
             Some(rail) => {
@@ -748,17 +752,17 @@ fn draw_on_rail(block: &[u8], rung: &Rung, head: usize, io: &mut Io) {
 }
 
 fn commit_touches(
-    ctx: &CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     id: &str,
     commit: &Commit,
     paths: &[String],
 ) -> bool {
-    let tree = repo::commit_tree(ctx, root, id).unwrap_or_default();
+    let tree = repo::commit_tree(system, root, id).unwrap_or_default();
     let parent = commit
         .parents
         .first()
-        .and_then(|parent| repo::commit_tree(ctx, root, parent))
+        .and_then(|parent| repo::commit_tree(system, root, parent))
         .unwrap_or_default();
     let mut names: BTreeSet<String> = tree.keys().cloned().collect();
     names.extend(parent.keys().cloned());
@@ -768,10 +772,12 @@ fn commit_touches(
 }
 
 /// The author date for a new commit, which `GIT_AUTHOR_DATE` may set as it does in Git.
-pub(crate) fn author_date(ctx: &mut CommandContext<'_>) -> i64 {
-    let now = repo::now_seconds(ctx);
-    ctx.get_var("GIT_AUTHOR_DATE")
-        .and_then(|value| parse_date(&value, now))
+pub(crate) fn author_date(system: &mut dyn System) -> i64 {
+    let now = repo::now_seconds(system);
+    system
+        .environment()
+        .get("GIT_AUTHOR_DATE")
+        .and_then(|value| parse_date(value, now))
         .unwrap_or(now)
 }
 
@@ -842,16 +848,16 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 /// The blob pair a commit changed for each path, against its first parent.
 fn changed_blobs(
-    ctx: &CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     id: &str,
     commit: &Commit,
 ) -> Vec<(Option<String>, Option<String>)> {
-    let tree = repo::commit_tree(ctx, root, id).unwrap_or_default();
+    let tree = repo::commit_tree(system, root, id).unwrap_or_default();
     let parent = commit
         .parents
         .first()
-        .and_then(|parent| repo::commit_tree(ctx, root, parent))
+        .and_then(|parent| repo::commit_tree(system, root, parent))
         .unwrap_or_default();
     let mut names: BTreeSet<String> = tree.keys().cloned().collect();
     names.extend(parent.keys().cloned());
@@ -867,52 +873,60 @@ fn changed_blobs(
 
 /// Whether a commit changed how many times `needle` appears, which is what `git log -S` selects.
 fn changes_occurrence_count(
-    ctx: &CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     id: &str,
     commit: &Commit,
     needle: &str,
 ) -> bool {
-    let occurrences = |hash: Option<String>| -> usize {
-        let Some(data) = hash.and_then(|hash| repo::read_blob(ctx, root, &hash)) else {
-            return 0;
-        };
-        if needle.is_empty() {
-            return 0;
-        }
-        String::from_utf8_lossy(&data).matches(needle).count()
+    if needle.is_empty() {
+        return false;
+    }
+    let blobs = changed_blobs(system, root, id, commit);
+    blobs.into_iter().any(|(before, after)| {
+        occurrence_count(system, root, before, needle)
+            != occurrence_count(system, root, after, needle)
+    })
+}
+
+fn occurrence_count(
+    system: &mut dyn System,
+    root: &str,
+    hash: Option<String>,
+    needle: &str,
+) -> usize {
+    let Some(data) = hash.and_then(|hash| repo::read_blob(system, root, &hash)) else {
+        return 0;
     };
-    changed_blobs(ctx, root, id, commit)
-        .into_iter()
-        .any(|(before, after)| occurrences(before) != occurrences(after))
+    String::from_utf8_lossy(&data).matches(needle).count()
 }
 
 /// Whether any line a commit added or removed matches `regex`, which is what `git log -G` selects.
 fn matches_changed_lines(
-    ctx: &CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     id: &str,
     commit: &Commit,
     regex: &regex::Regex,
 ) -> bool {
-    changed_blobs(ctx, root, id, commit)
-        .into_iter()
-        .any(|(before, after)| {
-            let read = |hash: Option<String>| {
-                hash.and_then(|hash| repo::read_blob(ctx, root, &hash))
-                    .unwrap_or_default()
-            };
-            let before = read(before);
-            let after = read(after);
-            diff::edit_script(&diff::split_lines(&before), &diff::split_lines(&after))
-                .iter()
-                .any(|edit| !matches!(edit.op, diff::Op::Keep) && regex.is_match(edit.text))
-        })
+    let blobs = changed_blobs(system, root, id, commit);
+    blobs.into_iter().any(|(before, after)| {
+        let before = read_blob_or_default(system, root, before);
+        let after = read_blob_or_default(system, root, after);
+        diff::edit_script(&diff::split_lines(&before), &diff::split_lines(&after))
+            .iter()
+            .any(|edit| !matches!(edit.op, diff::Op::Keep) && regex.is_match(edit.text))
+    })
+}
+
+fn read_blob_or_default(system: &mut dyn System, root: &str, hash: Option<String>) -> Vec<u8> {
+    hash.and_then(|hash| repo::read_blob(system, root, &hash))
+        .unwrap_or_default()
 }
 
 /// Render one commit's difference against its first parent.
 fn emit_commit_diff(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     id: &str,
     commit: &Commit,
@@ -920,11 +934,11 @@ fn emit_commit_diff(
     paths: &[String],
     io: &mut Io,
 ) {
-    let tree = repo::commit_tree(ctx, root, id).unwrap_or_default();
+    let tree = repo::commit_tree(system, root, id).unwrap_or_default();
     let parent = commit
         .parents
         .first()
-        .and_then(|parent| repo::commit_tree(ctx, root, parent))
+        .and_then(|parent| repo::commit_tree(system, root, parent))
         .unwrap_or_default();
     let options = Options {
         format,
@@ -932,11 +946,11 @@ fn emit_commit_diff(
         paths: paths.to_vec(),
         ..Options::default()
     };
-    compare::emit(ctx, root, &parent, &tree, &options, io);
+    compare::emit(system, root, &parent, &tree, &options, io);
 }
 
-pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_show(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut format = Some(Format::Patch);
@@ -980,12 +994,12 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
         // `REVISION:PATH` prints one file's contents at that revision.
         if revision.contains(':') {
             let prefix = revision.split(':').next().unwrap_or_default().to_string();
-            let Some((tree, path)) = repo::tree_and_path(ctx, &root, revision) else {
+            let Some((tree, path)) = repo::tree_and_path(system, &root, revision) else {
                 return super::ambiguous_argument(io, revision);
             };
             let Some(data) = tree
                 .get(&path)
-                .and_then(|entry| repo::read_blob(ctx, &root, &entry.hash))
+                .and_then(|entry| repo::read_blob(system, &root, &entry.hash))
             else {
                 io.print_err(&format!(
                     "fatal: path '{path}' does not exist in '{prefix}'\n"
@@ -995,13 +1009,13 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             io.out.extend_from_slice(&data);
             continue;
         }
-        let Some(id) = repo::resolve_revision(ctx, &root, revision) else {
+        let Some(id) = repo::resolve_revision(system, &root, revision) else {
             return super::ambiguous_argument(io, revision);
         };
-        let Some(commit) = repo::load_commit(ctx, &root, &id) else {
+        let Some(commit) = repo::load_commit(system, &root, &id) else {
             return super::ambiguous_argument(io, revision);
         };
-        if let Some(annotation) = read_annotation(ctx, &root, revision) {
+        if let Some(annotation) = read_annotation(system, &root, revision) {
             io.print(&format!(
                 "tag {revision}\nTagger: {} <{}>\nDate:   {}\n\n{}\n\n",
                 annotation.author_name,
@@ -1011,11 +1025,11 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             ));
         }
         let decoration = if matches!(pretty, Pretty::Custom { .. }) {
-            decorations(ctx, &root, &id)
+            decorations(system, &root, &id)
         } else {
             String::new()
         };
-        let now = repo::now_seconds(ctx);
+        let now = repo::now_seconds(system);
         io.print(&render_commit_header(
             &id,
             &commit,
@@ -1036,7 +1050,7 @@ pub(crate) fn git_show(ctx: &mut CommandContext<'_>, args: &[String], io: &mut I
             if diff_needs_spacing(&pretty) {
                 io.out.push(b'\n');
             }
-            emit_commit_diff(ctx, &root, &id, &commit, format, &[], io);
+            emit_commit_diff(system, &root, &id, &commit, format, &[], io);
         }
     }
     0
@@ -1050,6 +1064,6 @@ fn diff_needs_spacing(pretty: &Pretty) -> bool {
 }
 
 /// Read an annotated tag's message record, if `name` names one.
-fn read_annotation(ctx: &CommandContext<'_>, root: &str, name: &str) -> Option<Commit> {
-    repo::read_annotation(ctx, root, name)
+fn read_annotation(system: &mut dyn System, root: &str, name: &str) -> Option<Commit> {
+    repo::read_annotation(system, root, name)
 }

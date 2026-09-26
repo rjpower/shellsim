@@ -7,7 +7,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::{FileChange, FileKind, System};
 use crate::vfs::resolve_against;
 
 use super::compare;
@@ -164,7 +165,7 @@ fn collapsed_form(index: &Tree, path: &str) -> String {
     path.to_string()
 }
 
-pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+pub(crate) fn git_status(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
     let mut short = false;
     let mut version_two = false;
     let mut branch_header = false;
@@ -210,22 +211,22 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
             _ => return usage(io, &format!("unsupported status option: {name}")),
         }
     }
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
-    let cwd = ctx.cwd.clone();
+    let cwd = system.cwd().to_string();
     let paths: Vec<String> = paths
         .iter()
         .map(|value| super::pathspec(&cwd, &root, value))
         .collect();
     let super::switch::Snapshot { head, index, work } =
-        match super::switch::snapshot(ctx, &root, io) {
+        match super::switch::snapshot(system, &root, io) {
             Ok(snapshot) => snapshot,
             Err(status) => return status,
         };
-    let rules = ignore::load(ctx, &root);
+    let rules = ignore::load(system, &root);
     // A path with recorded conflict stages is unmerged and is reported on its own.
-    let unmerged = conflict::load_stages(ctx, &root);
+    let unmerged = conflict::load_stages(system, &root);
     let entries: Vec<Entry> = classify(&head, &index, &work)
         .into_iter()
         .filter(|entry| !unmerged.contains_key(&entry.path))
@@ -282,8 +283,8 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         .map(|(path, entry)| (displayed_path(&prefix, &path), entry))
         .collect();
     let report = Report {
-        branch: repo::current_branch(ctx, &root),
-        head: repo::head_commit(ctx, &root),
+        branch: repo::current_branch(system, &root),
+        head: repo::head_commit(system, &root),
         entries,
         tracked,
         untracked: untracked_paths,
@@ -304,7 +305,7 @@ pub(crate) fn git_status(ctx: &mut CommandContext<'_>, args: &[String], io: &mut
         emit_short_status(&report, io);
         return 0;
     }
-    let pending = unfinished_operation(ctx, &root, !report.unmerged.is_empty());
+    let pending = unfinished_operation(system, &root, !report.unmerged.is_empty());
     emit_long_status(&report, pending.as_deref(), io);
     0
 }
@@ -337,11 +338,7 @@ struct Report {
 ///
 /// Naming the operation matters more than the wording: an agent that reads "you have unmerged
 /// paths" mid-cherry-pick reaches for `git commit`, which refuses.
-fn unfinished_operation(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    conflicted: bool,
-) -> Option<String> {
+fn unfinished_operation(system: &mut dyn System, root: &str, conflicted: bool) -> Option<String> {
     let next = |command: &str| {
         if conflicted {
             format!("  (fix conflicts and run \"git {command} --continue\")\n")
@@ -349,7 +346,7 @@ fn unfinished_operation(
             format!("  (all conflicts fixed: run \"git {command} --continue\")\n")
         }
     };
-    if let Some((branch, onto)) = super::rebase::replaying(ctx, root) {
+    if let Some((branch, onto)) = super::rebase::replaying(system, root) {
         return Some(format!(
             "You are currently rebasing branch '{branch}' on '{}'.\n{}  (use \"git rebase --skip\" to skip this patch)\n  (use \"git rebase --abort\" to check out the original branch)\n\n",
             repo::short(&onto),
@@ -368,7 +365,7 @@ fn unfinished_operation(
             "to cancel the revert operation",
         ),
     ] {
-        if let Some(commit) = conflict::in_progress(ctx, root, kind) {
+        if let Some(commit) = conflict::in_progress(system, root, kind) {
             let doing = if command == "revert" {
                 "reverting"
             } else {
@@ -665,7 +662,7 @@ fn selected_paths(
     Ok(selected)
 }
 
-pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+pub(crate) fn git_add(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
     let mut all = false;
     let mut update_only = false;
     let mut dry_run = false;
@@ -699,18 +696,18 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     if operands.len() > 256 {
         return fatal(io, "too many pathspecs");
     }
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
-    let mut index = match require_index(ctx, &root, io) {
+    let mut index = match require_index(system, &root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
-    let work = match repo::collect_working_tree(ctx, &root) {
+    let work = match repo::collect_working_tree(system, &root) {
         Ok(work) => work,
         Err(status) => return status,
     };
-    let cwd = ctx.cwd.clone();
+    let cwd = system.cwd().to_string();
     let mut selected = if operands.is_empty() {
         let mut everything: BTreeSet<String> = index.keys().cloned().collect();
         everything.extend(work.keys().cloned());
@@ -718,8 +715,8 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
     } else {
         let units = (operands.len() as u64)
             .saturating_mul((index.len() as u64).saturating_add(work.len() as u64));
-        if !ctx.charge_cpu(units) {
-            return repo::resource_error(ctx);
+        if !system.charge_cpu(units) {
+            return repo::resource_error(system);
         }
         match selected_paths(&cwd, &root, &operands, &index, &work) {
             Ok(paths) => paths,
@@ -733,7 +730,7 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         selected.retain(|path| index.contains_key(path));
     }
     if !force {
-        let rules = ignore::load(ctx, &root);
+        let rules = ignore::load(system, &root);
         // Naming an ignored file outright is an error; sweeping one up by directory or glob is not.
         let named: Vec<String> = operands
             .iter()
@@ -754,22 +751,22 @@ pub(crate) fn git_add(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io
         selected.retain(|path| index.contains_key(path) || !rules.is_ignored(path));
     }
     if selected.len() > 100_000 {
-        return repo::resource_error(ctx);
+        return repo::resource_error(system);
     }
     let reserved = selected.len() as u64 * 64;
-    if !ctx.reserve_memory(reserved) {
-        return repo::resource_error(ctx);
+    if !system.reserve_memory(reserved) {
+        return repo::resource_error(system);
     }
     let staging = match (dry_run, verbose) {
         (true, _) => Staging::DryRun,
         (false, true) => Staging::Verbose,
         (false, false) => Staging::Silent,
     };
-    let status = stage_paths(ctx, &root, &mut index, &work, &selected, staging, io);
-    ctx.resources.release_memory(reserved);
+    let status = stage_paths(system, &root, &mut index, &work, &selected, staging, io);
+    system.release_memory(reserved);
     // Staging a conflicted path is how the user says the conflict is settled.
     if status == 0 && !dry_run {
-        conflict::resolve(ctx, &root, &selected);
+        conflict::resolve(system, &root, &selected);
     }
     status
 }
@@ -786,7 +783,7 @@ enum Staging {
 }
 
 fn stage_paths(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     index: &mut Tree,
     work: &Tree,
@@ -808,7 +805,7 @@ fn stage_paths(
             continue;
         }
         if let Some(recorded) = work.get(path) {
-            let Some(data) = repo::read_work_file(ctx, root, path) else {
+            let Some(data) = repo::read_work_file(system, root, path) else {
                 io.print_err(&format!("git add: unable to read '{path}'\n"));
                 return 1;
             };
@@ -818,7 +815,7 @@ fn stage_paths(
                 ));
                 return 1;
             }
-            if let Err(error) = repo::write_blob(ctx, root, &data) {
+            if let Err(error) = repo::write_blob(system, root, &data) {
                 io.print_err(&format!("git add: {error}\n"));
                 return 1;
             }
@@ -830,7 +827,7 @@ fn stage_paths(
     if dry_run {
         return 0;
     }
-    if let Err(error) = repo::store_index(ctx, root, index) {
+    if let Err(error) = repo::store_index(system, root, index) {
         io.print_err(&format!("git add: {error}\n"));
         return 1;
     }
@@ -848,7 +845,7 @@ fn repo_operand(cwd: &str, root: &str, operand: &str) -> Result<(String, String)
     Ok((absolute, relative))
 }
 
-pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+pub(crate) fn git_rm(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
     let mut cached = false;
     let mut force = false;
     let mut recursive = false;
@@ -875,19 +872,19 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     if operands.is_empty() || operands.len() > 256 {
         return usage(io, "git rm requires between 1 and 256 file paths");
     }
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
-    let mut index = match require_index(ctx, &root, io) {
+    let mut index = match require_index(system, &root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
-    let head = repo::head_tree(ctx, &root);
+    let head = repo::head_tree(system, &root);
     // Removing an unmerged path is how a modify/delete conflict is settled, so it needs no force.
-    let unmerged = conflict::load_stages(ctx, &root);
+    let unmerged = conflict::load_stages(system, &root);
     let mut selected: Vec<(String, String)> = Vec::new();
     for operand in operands {
-        let (absolute, relative) = match repo_operand(&ctx.cwd, &root, &operand) {
+        let (absolute, relative) = match repo_operand(system.cwd(), &root, &operand) {
             Ok(paths) => paths,
             Err(message) => return fatal(io, &message),
         };
@@ -913,7 +910,7 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
                 ));
                 return 128;
             }
-        } else if !cached && !ctx.vfs.is_file("/", &absolute) {
+        } else if !cached && !repo::is_file(system, "/", &absolute) {
             io.print_err(&format!("fatal: pathspec '{operand}' is missing\n"));
             return 128;
         }
@@ -924,7 +921,7 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
                     .get(&path)
                     .map(|entry| entry.hash.clone())
                     .unwrap_or_default();
-                let work_hash = match repo::metered_file_hash(ctx, &absolute) {
+                let work_hash = match repo::metered_file_hash(system, &absolute) {
                     Ok(hash) => hash,
                     Err(status) => return status,
                 };
@@ -947,30 +944,33 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
             selected.push((absolute, path));
         }
     }
-    let reserved = ctx.vfs.disk_used().saturating_add(4 * 1024);
-    if !ctx.reserve_memory(reserved) {
-        return repo::resource_error(ctx);
+    let reserved = system.disk_used().saturating_add(4 * 1024);
+    if !system.reserve_memory(reserved) {
+        return repo::resource_error(system);
     }
-    let before = ctx.vfs.clone();
-    let result = (|| -> Result<(), String> {
-        for (absolute, relative) in &selected {
-            if !cached && ctx.vfs.is_file("/", absolute) {
-                ctx.vfs
-                    .remove_file("/", absolute)
-                    .map_err(|error| error.to_string())?;
-                repo::prune_empty_parents(ctx, &root, absolute);
-            }
-            index.remove(relative);
+    // Every removal and the new index are computed first, then committed together in one
+    // transaction: a failing unlink or a full disk leaves both the working tree and the index
+    // exactly as they were.
+    let mut changes = Vec::new();
+    for (absolute, relative) in &selected {
+        if !cached && repo::is_file(system, "/", absolute) {
+            changes.push(FileChange::RemoveFile(absolute.clone()));
         }
-        repo::store_index(ctx, &root, &index).map_err(|error| error.to_string())
-    })();
-    ctx.resources.release_memory(reserved);
+        index.remove(relative);
+    }
+    changes.push(repo::store_index_change(&root, &index));
+    let result = system.apply_file_batch("/", changes);
+    system.release_memory(reserved);
     if let Err(error) = result {
-        ctx.vfs = before;
         io.print_err(&format!("git rm: {error}\n"));
         return 1;
     }
-    conflict::resolve(ctx, &root, selected.iter().map(|(_, path)| path));
+    for (absolute, _) in &selected {
+        if !cached {
+            repo::prune_empty_parents(system, &root, absolute);
+        }
+    }
+    conflict::resolve(system, &root, selected.iter().map(|(_, path)| path));
     if !quiet {
         for (_, relative) in &selected {
             io.print(&format!("rm '{relative}'\n"));
@@ -979,7 +979,7 @@ pub(crate) fn git_rm(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     0
 }
 
-pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+pub(crate) fn git_mv(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
     let mut operands = Vec::new();
     let mut force = false;
     for argument in Flags::new(args).clustered("fkv") {
@@ -1002,32 +1002,32 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
     if sources.is_empty() {
         return usage(io, "usage: git mv SOURCE... DESTINATION");
     }
-    let Some(root) = repo::find_repo_root(ctx) else {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
-    let (destination_absolute, _) = match repo_operand(&ctx.cwd, &root, destination) {
+    let (destination_absolute, _) = match repo_operand(system.cwd(), &root, destination) {
         Ok(paths) => paths,
         Err(message) => return fatal(io, &message),
     };
-    let into_directory = ctx.vfs.is_dir("/", &destination_absolute);
+    let into_directory = repo::is_dir(system, "/", &destination_absolute);
     if sources.len() > 1 && !into_directory {
         return usage(
             io,
             "destination must be a directory when moving several sources",
         );
     }
-    let mut index = match require_index(ctx, &root, io) {
+    let mut index = match require_index(system, &root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
     let mut moves: Vec<(String, String, String, String)> = Vec::new();
     for source in sources {
-        let (source_absolute, source_relative) = match repo_operand(&ctx.cwd, &root, source) {
+        let (source_absolute, source_relative) = match repo_operand(system.cwd(), &root, source) {
             Ok(paths) => paths,
             Err(message) => return fatal(io, &message),
         };
         // A directory source moves every tracked file below it.
-        let tracked: Vec<String> = if ctx.vfs.is_dir("/", &source_absolute) {
+        let tracked: Vec<String> = if repo::is_dir(system, "/", &source_absolute) {
             let prefix = format!("{source_relative}/");
             index
                 .keys()
@@ -1064,7 +1064,8 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
                 return fatal(io, "destination is outside the working tree");
             };
             if !force
-                && (ctx.vfs.exists("/", &target_absolute) || index.contains_key(&target_relative))
+                && (repo::exists(system, "/", &target_absolute)
+                    || index.contains_key(&target_relative))
             {
                 io.print_err(&format!(
                     "fatal: destination exists, source={source}, destination={target_relative}\n"
@@ -1079,54 +1080,71 @@ pub(crate) fn git_mv(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io)
             ));
         }
     }
-    let reserved = ctx.vfs.disk_used().saturating_add(4 * 1024);
-    if !ctx.reserve_memory(reserved) {
-        return repo::resource_error(ctx);
+    let reserved = system.disk_used().saturating_add(4 * 1024);
+    if !system.reserve_memory(reserved) {
+        return repo::resource_error(system);
     }
-    let before = ctx.vfs.clone();
-    let result = (|| -> Result<(), String> {
+    // Every move's blob, its new index entry, and the resulting index are computed first, then
+    // committed together in one transaction: a failing read or a full disk leaves both the
+    // working tree and the index exactly as they were.
+    let mut changes = Vec::new();
+    let build = (|| -> Result<(), String> {
         for (source_absolute, source_relative, target_absolute, target_relative) in &moves {
+            let info = system
+                .metadata("/", source_absolute, false)
+                .map_err(|error| error.to_string())?;
             // Read the link itself rather than what it points at, so moving a symbolic link
             // stages its target text and not the contents of the file at the end of it.
-            let data = repo::read_work_file(ctx, &root, source_relative)
+            let data = repo::read_work_file(system, &root, source_relative)
                 .ok_or_else(|| format!("cannot read '{source_relative}'"))?;
-            if !ctx.charge_cpu(data.len() as u64) {
+            if !system.charge_cpu(data.len() as u64) {
                 return Err("cpu limit exceeded".to_string());
             }
-            let hash = repo::write_blob(ctx, &root, &data).map_err(|error| error.to_string())?;
             // A move keeps the file's mode along with its content.
             let recorded = index.get(source_relative).cloned().unwrap_or_default();
+            let (hash, blob) = repo::blob_change(&root, data.clone());
+            changes.push(blob);
             index.remove(source_relative);
             index.insert(target_relative.clone(), repo::Entry { hash, ..recorded });
-            if ctx.vfs.exists("/", target_absolute) {
-                ctx.vfs
-                    .remove_file("/", target_absolute)
-                    .map_err(|error| error.to_string())?;
-            }
+            changes.push(FileChange::RemoveFile(source_absolute.clone()));
             if let Some(parent) = crate::vfs::parent_of(target_absolute) {
-                ctx.vfs
-                    .mkdir_all("/", &parent)
-                    .map_err(|error| error.to_string())?;
+                changes.push(FileChange::MkdirAll(parent));
             }
-            ctx.sync_vfs_time();
-            ctx.vfs
-                .rename("/", source_absolute, target_absolute)
-                .map_err(|error| error.to_string())?;
-            repo::prune_empty_parents(ctx, &root, source_absolute);
+            if info.kind == FileKind::Symlink {
+                changes.push(FileChange::PutSymlink {
+                    link: target_absolute.clone(),
+                    target: info.link_target.clone().unwrap_or_default(),
+                });
+            } else {
+                changes.push(FileChange::PutFile {
+                    path: target_absolute.clone(),
+                    bytes: data,
+                    mode: info.mode,
+                });
+            }
         }
-        repo::store_index(ctx, &root, &index).map_err(|error| error.to_string())
+        Ok(())
     })();
-    ctx.resources.release_memory(reserved);
-    if let Err(error) = result {
-        ctx.vfs = before;
+    if let Err(error) = build {
+        system.release_memory(reserved);
         io.print_err(&format!("git mv: {error}\n"));
         return 1;
+    }
+    changes.push(repo::store_index_change(&root, &index));
+    let result = system.apply_file_batch("/", changes);
+    system.release_memory(reserved);
+    if let Err(error) = result {
+        io.print_err(&format!("git mv: {error}\n"));
+        return 1;
+    }
+    for (source_absolute, _, _, _) in &moves {
+        repo::prune_empty_parents(system, &root, source_absolute);
     }
     0
 }
 
-pub(crate) fn git_restore(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_restore(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut staged = false;
@@ -1159,7 +1177,7 @@ pub(crate) fn git_restore(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
         }
     }
     if let Some(theirs) = side {
-        return super::switch::restore_side(ctx, theirs, &paths, io);
+        return super::switch::restore_side(system, theirs, &paths, io);
     }
     if paths.is_empty() {
         io.print_err("fatal: you must specify path(s) to restore\n");
@@ -1168,11 +1186,19 @@ pub(crate) fn git_restore(ctx: &mut CommandContext<'_>, args: &[String], io: &mu
     if !staged {
         worktree = true;
     }
-    restore_paths(ctx, &root, source.as_deref(), &paths, staged, worktree, io)
+    restore_paths(
+        system,
+        &root,
+        source.as_deref(),
+        &paths,
+        staged,
+        worktree,
+        io,
+    )
 }
 
 fn restore_paths(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     source: Option<&str>,
     paths: &[String],
@@ -1180,25 +1206,25 @@ fn restore_paths(
     worktree: bool,
     io: &mut Io,
 ) -> i32 {
-    let mut index_tree = match require_index(ctx, root, io) {
+    let mut index_tree = match require_index(system, root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
     let source_tree = match source {
         Some(revision) => {
-            let Some(commit) = repo::resolve_revision(ctx, root, revision) else {
+            let Some(commit) = repo::resolve_revision(system, root, revision) else {
                 return fatal(io, "unknown restore source");
             };
-            match super::require_tree(ctx, root, &commit, io) {
+            match super::require_tree(system, root, &commit, io) {
                 Ok(tree) => tree,
                 Err(status) => return status,
             }
         }
-        None if staged => repo::head_tree(ctx, root),
+        None if staged => repo::head_tree(system, root),
         None => index_tree.clone(),
     };
     if staged {
-        let cwd = ctx.cwd.clone();
+        let cwd = system.cwd().to_string();
         let selected = match selected_paths(&cwd, root, paths, &index_tree, &source_tree) {
             Ok(selected) => selected,
             Err(message) => return fatal(io, &message),
@@ -1213,20 +1239,20 @@ fn restore_paths(
                 }
             }
         }
-        if let Err(error) = repo::store_index(ctx, root, &index_tree) {
+        if let Err(error) = repo::store_index(system, root, &index_tree) {
             return cannot_write(io, "the index", &error);
         }
         // Putting a path back the way HEAD has it settles it: there is one side left, not three.
-        conflict::resolve(ctx, root, &selected);
+        conflict::resolve(system, root, &selected);
         if !worktree {
             return 0;
         }
     }
-    let work = match repo::collect_working_tree(ctx, root) {
+    let work = match repo::collect_working_tree(system, root) {
         Ok(work) => work,
         Err(status) => return status,
     };
-    let cwd = ctx.cwd.clone();
+    let cwd = system.cwd().to_string();
     // When restoring the working tree after `--staged`, the index is the source of truth again.
     let source_tree = if staged { index_tree } else { source_tree };
     let selected = match selected_paths(&cwd, root, paths, &source_tree, &work) {
@@ -1241,7 +1267,7 @@ fn restore_paths(
         .into_iter()
         .filter(|(path, _)| selected.contains(path))
         .collect();
-    repo::replace_work_tree(ctx, root, &old, &new).map_or_else(
+    repo::replace_work_tree(system, root, &old, &new).map_or_else(
         |error| {
             io.print_err(&format!("git restore: {error}\n"));
             1
@@ -1250,8 +1276,8 @@ fn restore_paths(
     )
 }
 
-pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_reset(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut mode = "--mixed".to_string();
@@ -1265,12 +1291,12 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
                 // has to be a path, or Git calls the argument ambiguous.
                 if revision.is_none()
                     && !flags.separated()
-                    && repo::resolve_revision(ctx, &root, &value).is_some()
+                    && repo::resolve_revision(system, &root, &value).is_some()
                 {
                     revision = Some(value);
                     continue;
                 }
-                if !super::names_a_path(ctx, &root, &value) {
+                if !super::names_a_path(system, &root, &value) {
                     return super::ambiguous_argument(io, &value);
                 }
                 paths.push(value);
@@ -1285,15 +1311,15 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         }
     }
     let revision = revision.unwrap_or_else(|| "HEAD".to_string());
-    let commit = match repo::resolve_revision(ctx, &root, &revision) {
+    let commit = match repo::resolve_revision(system, &root, &revision) {
         Some(commit) => commit,
         // A repository with no commits has an empty HEAD tree; resetting to it is a no-op.
         None if revision == "HEAD" => {
-            return i32::from(repo::store_index(ctx, &root, &Tree::new()).is_err())
+            return i32::from(repo::store_index(system, &root, &Tree::new()).is_err())
         }
         None => return super::ambiguous_argument(io, &revision),
     };
-    let tree = match super::require_tree(ctx, &root, &commit, io) {
+    let tree = match super::require_tree(system, &root, &commit, io) {
         Ok(tree) => tree,
         Err(status) => return status,
     };
@@ -1302,40 +1328,40 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
             return usage(io, "a pathspec cannot be combined with --soft or --hard");
         }
         // `git reset REVISION -- PATH` rewrites only those index entries.
-        return restore_paths(ctx, &root, Some(&revision), &paths, true, false, io);
+        return restore_paths(system, &root, Some(&revision), &paths, true, false, io);
     }
-    repo::record_orig_head(ctx, &root);
+    repo::record_orig_head(system, &root);
     // A whole-tree reset is how a merge, cherry-pick or revert is walked away from, so it drops
     // the recorded conflict sides along with the operation itself. Git clears them here too.
-    conflict::clear(ctx, &root);
+    conflict::clear(system, &root);
     if mode == "--hard" {
         // A hard reset removes paths known by either HEAD or the index while preserving untracked
         // files, matching the boundary agents rely on when discarding staged additions.
-        let mut old = repo::head_tree(ctx, &root);
-        match require_index(ctx, &root, io) {
+        let mut old = repo::head_tree(system, &root);
+        match require_index(system, &root, io) {
             Ok(index) => old.extend(index),
             Err(status) => return status,
         }
-        if let Err(error) = repo::replace_work_tree(ctx, &root, &old, &tree) {
+        if let Err(error) = repo::replace_work_tree(system, &root, &old, &tree) {
             io.print_err(&format!("git reset: {error}\n"));
             return 1;
         }
     }
     if mode != "--soft" {
-        if let Err(error) = repo::store_index(ctx, &root, &tree) {
+        if let Err(error) = repo::store_index(system, &root, &tree) {
             return cannot_write(io, "the index", &error);
         }
     }
     let target = revision.clone();
     let action = format!("reset: moving to {target}");
-    if let Err(error) = repo::update_head(ctx, &root, &commit, &action) {
+    if let Err(error) = repo::update_head(system, &root, &commit, &action) {
         return cannot_write(io, "HEAD", &error);
     }
     if mode == "--mixed" {
-        emit_unstaged_after_reset(ctx, &root, &tree, io);
+        emit_unstaged_after_reset(system, &root, &tree, io);
     }
     if mode == "--hard" {
-        let subject = repo::load_commit(ctx, &root, &commit)
+        let subject = repo::load_commit(system, &root, &commit)
             .map(|commit| commit.subject().to_string())
             .unwrap_or_default();
         io.print(&format!(
@@ -1347,8 +1373,8 @@ pub(crate) fn git_reset(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
 }
 
 /// List the paths that differ from the new index after a mixed reset, as Git does.
-fn emit_unstaged_after_reset(ctx: &mut CommandContext<'_>, root: &str, tree: &Tree, io: &mut Io) {
-    let Ok(work) = repo::collect_working_tree(ctx, root) else {
+fn emit_unstaged_after_reset(system: &mut dyn System, root: &str, tree: &Tree, io: &mut Io) {
+    let Ok(work) = repo::collect_working_tree(system, root) else {
         return;
     };
     let changed: Vec<&String> = tree
@@ -1364,8 +1390,8 @@ fn emit_unstaged_after_reset(ctx: &mut CommandContext<'_>, root: &str, tree: &Tr
     }
 }
 
-pub(crate) fn git_clean(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_clean(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut force = false;
@@ -1394,15 +1420,15 @@ pub(crate) fn git_clean(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         io.print_err("fatal: clean.requireForce is true and -f not given: refusing to clean\n");
         return 128;
     }
-    let index = match require_index(ctx, &root, io) {
+    let index = match require_index(system, &root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
-    let work = match repo::collect_working_tree(ctx, &root) {
+    let work = match repo::collect_working_tree(system, &root) {
         Ok(work) => work,
         Err(status) => return status,
     };
-    let rules = ignore::load(ctx, &root);
+    let rules = ignore::load(system, &root);
     let untracked: Vec<String> = work
         .keys()
         .filter(|path| !index.contains_key(*path))
@@ -1427,9 +1453,9 @@ pub(crate) fn git_clean(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
         }
         let absolute = repo::path_join(&root, entry.trim_end_matches('/'));
         let removed = if entry.ends_with('/') {
-            ctx.vfs.remove_all("/", &absolute).is_ok()
+            repo::remove_tree(system, "/", &absolute)
         } else {
-            ctx.vfs.remove_file("/", &absolute).is_ok()
+            system.unlink("/", &absolute).is_ok()
         };
         if !removed {
             io.print_err(&format!("warning: failed to remove {entry}\n"));
@@ -1440,8 +1466,8 @@ pub(crate) fn git_clean(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     0
 }
 
-pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_ls_files(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut nul = false;
@@ -1478,7 +1504,7 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     }
     if unmerged {
         // The three sides of each conflicted path, in the stage order Git prints.
-        for (path, entry) in conflict::load_stages(ctx, &root) {
+        for (path, entry) in conflict::load_stages(system, &root) {
             if !paths.is_empty()
                 && !paths
                     .iter()
@@ -1498,10 +1524,10 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
     if !cached && !modified && !deleted && !others {
         cached = true;
     }
-    let index = repo::load_index(ctx, &root).unwrap_or_default();
+    let index = repo::load_index(system, &root).unwrap_or_default();
     let needs_work = modified || deleted || others;
     let work = if needs_work {
-        match repo::collect_working_tree(ctx, &root) {
+        match repo::collect_working_tree(system, &root) {
             Ok(work) => work,
             Err(status) => return status,
         }
@@ -1509,7 +1535,7 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
         Tree::new()
     };
     let rules = if others && exclude_standard {
-        ignore::load(ctx, &root)
+        ignore::load(system, &root)
     } else {
         ignore::IgnoreRules::default()
     };
@@ -1541,7 +1567,7 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
                 .cloned(),
         );
     }
-    let cwd_prefix = repo::relative_path(&root, &ctx.cwd).unwrap_or_default();
+    let cwd_prefix = repo::relative_path(&root, system.cwd()).unwrap_or_default();
     let cwd_prefix = (!cwd_prefix.is_empty()).then(|| format!("{cwd_prefix}/"));
     let mut matched = false;
     for path in listed {
@@ -1576,14 +1602,22 @@ pub(crate) fn git_ls_files(ctx: &mut CommandContext<'_>, args: &[String], io: &m
 
 /// Stage every tracked path that differs in the working tree, as `git commit -a` does.
 pub(crate) fn stage_tracked_changes(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     io: &mut Io,
 ) -> Result<(), i32> {
-    let mut index = require_index(ctx, root, io)?;
-    let work = repo::collect_working_tree(ctx, root)?;
+    let mut index = require_index(system, root, io)?;
+    let work = repo::collect_working_tree(system, root)?;
     let selected: BTreeSet<String> = index.keys().cloned().collect();
-    let status = stage_paths(ctx, root, &mut index, &work, &selected, Staging::Silent, io);
+    let status = stage_paths(
+        system,
+        root,
+        &mut index,
+        &work,
+        &selected,
+        Staging::Silent,
+        io,
+    );
     if status == 0 {
         Ok(())
     } else {

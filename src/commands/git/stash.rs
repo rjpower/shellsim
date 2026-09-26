@@ -5,7 +5,8 @@
 //! `.git/stash-list`. Reapplying an entry is a three-way merge against the commit it was built
 //! on, so work committed in the meantime survives; a conflict leaves markers and keeps the entry.
 
-use crate::commands::{CommandContext, Io};
+use crate::commands::Io;
+use crate::syscalls::System;
 
 use super::conflict;
 use super::repo::{self, Tree};
@@ -27,8 +28,8 @@ fn tree_path(root: &str, id: u64, kind: &str) -> String {
     repo::git_path(root, &format!("stash/{id}.{kind}"))
 }
 
-fn load_entries(ctx: &CommandContext<'_>, root: &str) -> Vec<Entry> {
-    let Ok(bytes) = ctx.vfs.read("/", &list_path(root)) else {
+fn load_entries(system: &mut dyn System, root: &str) -> Vec<Entry> {
+    let Some(bytes) = repo::read_all(system, &list_path(root)) else {
         return Vec::new();
     };
     String::from_utf8_lossy(&bytes)
@@ -45,7 +46,7 @@ fn load_entries(ctx: &CommandContext<'_>, root: &str) -> Vec<Entry> {
         .collect()
 }
 
-fn store_entries(ctx: &mut CommandContext<'_>, root: &str, entries: &[Entry]) -> bool {
+fn store_entries(system: &mut dyn System, root: &str, entries: &[Entry]) -> bool {
     let text: String = entries
         .iter()
         .map(|entry| {
@@ -55,7 +56,7 @@ fn store_entries(ctx: &mut CommandContext<'_>, root: &str, entries: &[Entry]) ->
             )
         })
         .collect();
-    repo::write_vfs(ctx, &list_path(root), text.as_bytes()).is_ok()
+    repo::write_vfs(system, &list_path(root), text.as_bytes()).is_ok()
 }
 
 /// Parse a `stash@{N}` selector, defaulting to the newest entry.
@@ -71,8 +72,8 @@ fn selector(operand: Option<&String>) -> Option<usize> {
         .ok()
 }
 
-pub(crate) fn git_stash(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let Some(root) = repo::find_repo_root(ctx) else {
+pub(crate) fn git_stash(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
+    let Some(root) = repo::find_repo_root(system) else {
         return repo_error(io);
     };
     let mut include_untracked = false;
@@ -107,30 +108,30 @@ pub(crate) fn git_stash(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
     // `-q` only silences the progress report; diagnostics still reach standard error.
     let before = io.out.len();
     let status = match command {
-        "push" | "save" => push(ctx, &root, message, include_untracked, io),
-        "list" => list(ctx, &root, io),
+        "push" | "save" => push(system, &root, message, include_untracked, io),
+        "list" => list(system, &root, io),
         "show" => {
             let Some(position) = selector(operands.get(1).filter(|value| !value.starts_with('-')))
             else {
                 return usage(io, "usage: git stash show [-p] [stash@{N}]");
             };
-            show(ctx, &root, position, patch, io)
+            show(system, &root, position, patch, io)
         }
         "pop" | "apply" => {
             let Some(position) = selector(operands.get(1)) else {
                 return usage(io, "usage: git stash pop [stash@{N}]");
             };
-            apply(ctx, &root, position, command == "pop", io)
+            apply(system, &root, position, command == "pop", io)
         }
         "drop" => {
             let Some(position) = selector(operands.get(1)) else {
                 return usage(io, "usage: git stash drop [stash@{N}]");
             };
-            drop_entry(ctx, &root, position, io)
+            drop_entry(system, &root, position, io)
         }
         "clear" => {
             let entries: Vec<Entry> = Vec::new();
-            i32::from(!store_entries(ctx, &root, &entries))
+            i32::from(!store_entries(system, &root, &entries))
         }
         other => usage(io, &format!("unsupported stash command: {other}")),
     };
@@ -141,19 +142,19 @@ pub(crate) fn git_stash(ctx: &mut CommandContext<'_>, args: &[String], io: &mut 
 }
 
 fn push(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     message: Option<String>,
     include_untracked: bool,
     io: &mut Io,
 ) -> i32 {
-    let Some(base) = repo::head_commit(ctx, root) else {
+    let Some(base) = repo::head_commit(system, root) else {
         io.print_err("fatal: You do not have the initial commit yet\n");
         return 128;
     };
     // An unresolved conflict has three sides, and a stash entry records only one tree, so the
     // merge result would be silently thrown away. Git refuses for the same reason.
-    let unmerged = conflict::load_stages(ctx, root);
+    let unmerged = conflict::load_stages(system, root);
     if !unmerged.is_empty() {
         for path in unmerged.keys() {
             io.print_err(&format!("{path}: needs merge\n"));
@@ -161,12 +162,12 @@ fn push(
         io.print_err("error: could not write index\n");
         return 1;
     }
-    let index_tree = match require_index(ctx, root, io) {
+    let index_tree = match require_index(system, root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
-    let head_tree = repo::head_tree(ctx, root);
-    let mut work = match repo::collect_working_tree(ctx, root) {
+    let head_tree = repo::head_tree(system, root);
+    let mut work = match repo::collect_working_tree(system, root) {
         Ok(work) => work,
         Err(status) => return status,
     };
@@ -179,18 +180,18 @@ fn push(
     }
     // Blobs the stash refers to must outlive the reset, so store them now.
     for path in work.keys() {
-        let Some(data) = repo::read_work_file(ctx, root, path) else {
+        let Some(data) = repo::read_work_file(system, root, path) else {
             continue;
         };
-        if let Err(error) = repo::write_blob(ctx, root, &data) {
+        if let Err(error) = repo::write_blob(system, root, &data) {
             return cannot_write(io, "the object", &error);
         }
     }
-    let branch = repo::current_branch(ctx, root).unwrap_or_else(|| "HEAD".to_string());
-    let subject = repo::load_commit(ctx, root, &base)
+    let branch = repo::current_branch(system, root).unwrap_or_else(|| "HEAD".to_string());
+    let subject = repo::load_commit(system, root, &base)
         .map(|commit| commit.subject().to_string())
         .unwrap_or_default();
-    let mut entries = load_entries(ctx, root);
+    let mut entries = load_entries(system, root);
     let id = entries.iter().map(|entry| entry.id).max().unwrap_or(0) + 1;
     // Git labels an explicit message `On <branch>:` and a default one `WIP on <branch>:`.
     let message = message.map_or_else(
@@ -198,9 +199,11 @@ fn push(
         |text| format!("On {branch}: {text}"),
     );
     for (kind, tree) in [("work", &work), ("index", &index_tree)] {
-        if let Err(error) =
-            repo::write_vfs(ctx, &tree_path(root, id, kind), &repo::serialize_tree(tree))
-        {
+        if let Err(error) = repo::write_vfs(
+            system,
+            &tree_path(root, id, kind),
+            &repo::serialize_tree(tree),
+        ) {
             return cannot_write(io, "the stash entry", &error);
         }
     }
@@ -213,18 +216,18 @@ fn push(
             message: message.clone(),
         },
     );
-    if !store_entries(ctx, root, &entries) {
+    if !store_entries(system, root, &entries) {
         return 1;
     }
     // Restore the working tree and index to HEAD, discarding what was just saved.
     let mut previous = head_tree.clone();
     previous.extend(index_tree);
     previous.extend(work);
-    if let Err(error) = repo::replace_work_tree(ctx, root, &previous, &head_tree) {
+    if let Err(error) = repo::replace_work_tree(system, root, &previous, &head_tree) {
         io.print_err(&format!("git stash: {error}\n"));
         return 1;
     }
-    if let Err(error) = repo::store_index(ctx, root, &head_tree) {
+    if let Err(error) = repo::store_index(system, root, &head_tree) {
         return cannot_write(io, "the index", &error);
     }
     io.print(&format!(
@@ -233,33 +236,27 @@ fn push(
     0
 }
 
-fn list(ctx: &mut CommandContext<'_>, root: &str, io: &mut Io) -> i32 {
-    for (position, entry) in load_entries(ctx, root).iter().enumerate() {
+fn list(system: &mut dyn System, root: &str, io: &mut Io) -> i32 {
+    for (position, entry) in load_entries(system, root).iter().enumerate() {
         io.print(&format!("stash@{{{position}}}: {}\n", entry.message));
     }
     0
 }
 
 /// Report what an entry would reapply, as `git stash show` does.
-fn show(
-    ctx: &mut CommandContext<'_>,
-    root: &str,
-    position: usize,
-    patch: bool,
-    io: &mut Io,
-) -> i32 {
-    let entries = load_entries(ctx, root);
+fn show(system: &mut dyn System, root: &str, position: usize, patch: bool, io: &mut Io) -> i32 {
+    let entries = load_entries(system, root);
     let Some(entry) = entries.get(position) else {
         io.print_err(&format!(
             "fatal: stash@{{{position}}} is not a valid reference\n"
         ));
         return 128;
     };
-    let Some(work) = read_tree(ctx, &tree_path(root, entry.id, "work")) else {
+    let Some(work) = read_tree(system, &tree_path(root, entry.id, "work")) else {
         io.print_err("fatal: the stash entry is unreadable\n");
         return 128;
     };
-    let base = repo::commit_tree(ctx, root, &entry.base).unwrap_or_default();
+    let base = repo::commit_tree(system, root, &entry.base).unwrap_or_default();
     let options = super::compare::Options {
         format: if patch {
             super::compare::Format::Patch
@@ -268,22 +265,22 @@ fn show(
         },
         ..Default::default()
     };
-    super::compare::emit(ctx, root, &base, &work, &options, io);
+    super::compare::emit(system, root, &base, &work, &options, io);
     0
 }
 
-fn read_tree(ctx: &CommandContext<'_>, path: &str) -> Option<Tree> {
-    repo::parse_tree(&ctx.vfs.read("/", path).ok()?)
+fn read_tree(system: &mut dyn System, path: &str) -> Option<Tree> {
+    repo::parse_tree(&repo::read_all(system, path)?)
 }
 
 fn apply(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     position: usize,
     drop_after: bool,
     io: &mut Io,
 ) -> i32 {
-    let entries = load_entries(ctx, root);
+    let entries = load_entries(system, root);
     let Some(entry) = entries.get(position) else {
         io.print_err(&format!(
             "fatal: stash@{{{position}}} is not a valid reference\n"
@@ -291,19 +288,19 @@ fn apply(
         return 128;
     };
     let (Some(work), Some(index_tree)) = (
-        read_tree(ctx, &tree_path(root, entry.id, "work")),
-        read_tree(ctx, &tree_path(root, entry.id, "index")),
+        read_tree(system, &tree_path(root, entry.id, "work")),
+        read_tree(system, &tree_path(root, entry.id, "index")),
     ) else {
         io.print_err("fatal: the stash entry is unreadable\n");
         return 128;
     };
     // The entry is merged back in against the commit it was taken from, so anything committed or
     // edited since is kept rather than overwritten.
-    let base = match super::require_tree(ctx, root, &entry.base, io) {
+    let base = match super::require_tree(system, root, &entry.base, io) {
         Ok(tree) => tree,
         Err(status) => return status,
     };
-    let mine = match repo::collect_working_tree(ctx, root) {
+    let mine = match repo::collect_working_tree(system, root) {
         Ok(work) => work,
         Err(status) => return status,
     };
@@ -313,17 +310,17 @@ fn apply(
         if base.get(path) == Some(recorded) || work.get(path) == Some(recorded) {
             continue;
         }
-        let Some(data) = repo::read_work_file(ctx, root, path) else {
+        let Some(data) = repo::read_work_file(system, root, path) else {
             continue;
         };
-        if repo::write_blob(ctx, root, &data).is_err() {
+        if repo::write_blob(system, root, &data).is_err() {
             io.print_err(&format!("git stash: cannot record '{path}'\n"));
             return 1;
         }
     }
     // A file the entry would change that the working tree has already moved away from has two
     // unrecorded versions and room for one. Git refuses rather than choose, and so does this.
-    let index = match require_index(ctx, root, io) {
+    let index = match require_index(system, root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
@@ -349,7 +346,7 @@ fn apply(
         return 1;
     }
     let combined = conflict::combine(
-        ctx,
+        system,
         root,
         &base,
         &mine,
@@ -361,7 +358,7 @@ fn apply(
         Ok(combined) => combined,
         Err(failed) => return cannot_write(io, &failed.path, &failed.error),
     };
-    if let Err(error) = repo::update_work_tree(ctx, root, &mine, &combined.tree) {
+    if let Err(error) = repo::update_work_tree(system, root, &mine, &combined.tree) {
         io.print_err(&format!("git stash: {error}\n"));
         return 1;
     }
@@ -370,7 +367,7 @@ fn apply(
     // A file the entry brings back that nothing tracks yet cannot be left "unstaged", so Git
     // records it as a new file. Paths already tracked keep whatever the index says, and a file
     // that was untracked when the entry was pushed stays untracked.
-    let mut index = match require_index(ctx, root, io) {
+    let mut index = match require_index(system, root, io) {
         Ok(index) => index,
         Err(status) => return status,
     };
@@ -382,7 +379,7 @@ fn apply(
         .collect();
     if !restored.is_empty() {
         index.extend(restored);
-        if let Err(error) = repo::store_index(ctx, root, &index) {
+        if let Err(error) = repo::store_index(system, root, &index) {
             return cannot_write(io, "the index", &error);
         }
     }
@@ -390,7 +387,7 @@ fn apply(
         for path in combined.stages.keys() {
             io.print_err(&format!("CONFLICT (content): Merge conflict in {path}\n"));
         }
-        if !conflict::store_stages(ctx, root, &combined.stages) {
+        if !conflict::store_stages(system, root, &combined.stages) {
             io.print_err("fatal: unable to record the conflicted state\n");
             return 128;
         }
@@ -398,15 +395,15 @@ fn apply(
         io.print_err("The stash entry is kept in case you need it again.\n");
         return 1;
     }
-    super::worktree::git_status(ctx, &[], io);
+    super::worktree::git_status(system, &[], io);
     if drop_after {
-        return drop_entry(ctx, root, position, io);
+        return drop_entry(system, root, position, io);
     }
     0
 }
 
-fn drop_entry(ctx: &mut CommandContext<'_>, root: &str, position: usize, io: &mut Io) -> i32 {
-    let mut entries = load_entries(ctx, root);
+fn drop_entry(system: &mut dyn System, root: &str, position: usize, io: &mut Io) -> i32 {
+    let mut entries = load_entries(system, root);
     if position >= entries.len() {
         io.print_err(&format!(
             "fatal: stash@{{{position}}} is not a valid reference\n"
@@ -420,18 +417,18 @@ fn drop_entry(ctx: &mut CommandContext<'_>, root: &str, position: usize, io: &mu
         format!(
             "stash {} {} {}",
             entry.base,
-            read_tree(ctx, &tree_path(root, entry.id, "work"))
+            read_tree(system, &tree_path(root, entry.id, "work"))
                 .as_ref()
                 .map(repo::tree_hash)
                 .unwrap_or_default(),
-            read_tree(ctx, &tree_path(root, entry.id, "index"))
+            read_tree(system, &tree_path(root, entry.id, "index"))
                 .as_ref()
                 .map(repo::tree_hash)
                 .unwrap_or_default(),
         )
         .as_bytes(),
     );
-    if !store_entries(ctx, root, &entries) {
+    if !store_entries(system, root, &entries) {
         return 1;
     }
     io.print(&format!(

@@ -370,6 +370,9 @@ impl System for ActiveSystem<'_> {
                 FileChange::PutFile { path, bytes, .. } => {
                     (path.len() as u64).saturating_add(bytes.len() as u64)
                 }
+                FileChange::PutSymlink { link, target } => {
+                    (link.len() as u64).saturating_add(target.len() as u64)
+                }
             })
         });
         let snapshot = self.interp.vfs.disk_used().saturating_mul(2);
@@ -392,6 +395,16 @@ impl System for ActiveSystem<'_> {
             FileChange::PutFile { path, bytes, mode } => {
                 let absolute = resolve_against(base, &path);
                 staged.put_file(&absolute, bytes, mode)
+            }
+            FileChange::PutSymlink { link, target } => {
+                let absolute = resolve_against(base, &link);
+                if let Some(parent) = crate::vfs::parent_of(&absolute) {
+                    staged.mkdir_all(base, &parent)?;
+                }
+                // A symlink cannot be created on top of an existing node, so clear it first;
+                // a missing node is not an error here.
+                let _ = staged.remove_file(base, &absolute);
+                staged.symlink(base, &target, &absolute)
             }
         });
         if result.is_ok() {
@@ -815,6 +828,11 @@ pub(crate) enum FileChange {
         path: String,
         bytes: Vec<u8>,
         mode: u32,
+    },
+    /// Replace whatever is at `link` (if anything) with a symlink to `target`.
+    PutSymlink {
+        link: String,
+        target: String,
     },
 }
 

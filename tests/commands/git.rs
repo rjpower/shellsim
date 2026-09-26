@@ -1363,6 +1363,50 @@ fn configuration_keeps_every_value_and_expands_aliases() {
 }
 
 #[test]
+fn commit_identity_from_the_environment_needs_an_exported_variable() {
+    // `git` now runs as a genuine child process, so it sees exported variables only, the same
+    // as any other external command. A shell variable that was never exported does not reach it;
+    // an inline prefix assignment or an explicit `export` does, because both put the variable in
+    // the command's environment.
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs
+        .put_file("/one.txt", b"one\n".to_vec(), 0o644)
+        .unwrap();
+
+    assert_eq!(
+        run(
+            &mut env,
+            "GIT_AUTHOR_NAME=Nobody; git add -A; git commit -m unexported"
+        )
+        .0,
+        0
+    );
+    let unexported = run(&mut env, "git cat-file -p HEAD").1;
+    assert!(
+        unexported.contains("\nauthor shellsim <shellsim@localhost>"),
+        "{unexported}"
+    );
+
+    env.vfs
+        .put_file("/two.txt", b"two\n".to_vec(), 0o644)
+        .unwrap();
+    assert_eq!(
+        run(
+            &mut env,
+            "git add -A; GIT_AUTHOR_NAME=Ada GIT_AUTHOR_EMAIL=ada@example.com git commit -m prefixed"
+        )
+        .0,
+        0
+    );
+    let prefixed = run(&mut env, "git cat-file -p HEAD").1;
+    assert!(
+        prefixed.contains("\nauthor Ada <ada@example.com>"),
+        "{prefixed}"
+    );
+}
+
+#[test]
 fn apply_can_record_a_patch_in_the_index() {
     let mut env = Environment::new();
     assert_eq!(run(&mut env, "git init -q").0, 0);
@@ -1399,6 +1443,63 @@ fn apply_can_record_a_patch_in_the_index() {
     let refused = run(&mut env, "git apply /p.diff");
     assert_eq!(refused.0, 1);
     assert!(refused.2.contains("patch does not apply"), "{}", refused.2);
+}
+
+#[test]
+fn a_failed_cached_apply_leaves_the_index_and_worktree_unchanged() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/f1.txt", b"a\n".to_vec(), 0o644).unwrap();
+    env.vfs.put_file("/f2.txt", b"x\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    let index_before = env.vfs.read("/", "/.git/index").unwrap();
+
+    // The whole patch is computed and checked before anything commits: the first file's hunk
+    // matches, but the second's context does not, so applying it must change neither.
+    let script = r#"cat > /p.diff <<'PATCH'
+--- a/f1.txt
++++ b/f1.txt
+@@ -1 +1 @@
+-a
++A
+--- a/f2.txt
++++ b/f2.txt
+@@ -1 +1 @@
+-y
++Y
+PATCH
+git apply --cached /p.diff"#;
+    let failed = run(&mut env, script);
+    assert_ne!(failed.0, 0);
+    assert!(failed.2.contains("does not apply"), "{}", failed.2);
+
+    assert_eq!(env.vfs.read("/", "/f1.txt").unwrap(), b"a\n");
+    assert_eq!(env.vfs.read("/", "/f2.txt").unwrap(), b"x\n");
+    assert_eq!(env.vfs.read("/", "/.git/index").unwrap(), index_before);
+    assert_eq!(run(&mut env, "git status --short").1, "?? p.diff\n");
+}
+
+#[test]
+fn a_failed_git_rm_leaves_the_worktree_and_index_unchanged() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q").0, 0);
+    env.vfs.put_file("/a.txt", b"a\n".to_vec(), 0o644).unwrap();
+    env.vfs.put_file("/b.txt", b"b\n".to_vec(), 0o644).unwrap();
+    assert_eq!(run(&mut env, "git add -A; git commit -qm base").0, 0);
+    let index_before = env.vfs.read("/", "/.git/index").unwrap();
+
+    // Starve the command so its one commit transaction cannot complete; nothing it would have
+    // removed, and no index it would have written, may take effect.
+    env.resources = shellsim::resources::Resources::new(shellsim::Limits {
+        cpu: 20,
+        ..shellsim::Limits::unlimited()
+    });
+    let failed = run(&mut env, "git rm a.txt b.txt");
+    assert_ne!(failed.0, 0);
+
+    assert!(env.vfs.exists("/", "/a.txt"));
+    assert!(env.vfs.exists("/", "/b.txt"));
+    assert_eq!(env.vfs.read("/", "/.git/index").unwrap(), index_before);
 }
 
 #[test]

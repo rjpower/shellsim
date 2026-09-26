@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 
+use crate::syscalls::ActiveSystem;
 use crate::Environment;
 
 use super::repo::{self, Commit, Entry, Tree};
@@ -117,8 +118,13 @@ pub(crate) fn import_head_history(
             timestamp: source.timestamp,
             message: source.message,
         };
-        let imported_id = repo::store_commit(environment, destination_root, &commit, &tree)
-            .map_err(|error| format!("cannot store imported commit {source_id}: {error}"))?;
+        let imported_id = repo::store_commit(
+            &mut ActiveSystem::new(environment),
+            destination_root,
+            &commit,
+            &tree,
+        )
+        .map_err(|error| format!("cannot store imported commit {source_id}: {error}"))?;
         if source_id == &source_head {
             head_tree = Some(tree);
         }
@@ -130,21 +136,30 @@ pub(crate) fn import_head_history(
         .cloned()
         .ok_or_else(|| "HEAD was not imported".to_string())?;
     let head_tree = head_tree.ok_or_else(|| "HEAD tree was not imported".to_string())?;
-    repo::store_index(environment, destination_root, &head_tree)
-        .map_err(|error| format!("cannot store imported index: {error}"))?;
+    repo::store_index(
+        &mut ActiveSystem::new(environment),
+        destination_root,
+        &head_tree,
+    )
+    .map_err(|error| format!("cannot store imported index: {error}"))?;
     match head_reference {
         Some(reference) => {
-            repo::write_reference(environment, destination_root, &reference, &imported_head)
-                .map_err(|error| format!("cannot store imported branch: {error}"))?;
+            repo::write_reference(
+                &mut ActiveSystem::new(environment),
+                destination_root,
+                &reference,
+                &imported_head,
+            )
+            .map_err(|error| format!("cannot store imported branch: {error}"))?;
             repo::write_vfs(
-                environment,
+                &mut ActiveSystem::new(environment),
                 &repo::git_path(destination_root, repo::HEAD),
                 format!("ref: {reference}\n").as_bytes(),
             )
             .map_err(|error| format!("cannot store imported HEAD: {error}"))?;
         }
         None => repo::write_vfs(
-            environment,
+            &mut ActiveSystem::new(environment),
             &repo::git_path(destination_root, repo::HEAD),
             format!("{imported_head}\n").as_bytes(),
         )
@@ -315,10 +330,14 @@ fn import_tree(
                 "100644" | "100755" | "120000" => {
                     if state.blobs.insert(entry.id.clone()) {
                         let blob = objects.read_object(&entry.id, "blob")?;
-                        let imported_hash = repo::write_blob(environment, destination_root, &blob)
-                            .map_err(|error| {
-                                format!("cannot store imported blob {}: {error}", entry.id)
-                            })?;
+                        let imported_hash = repo::write_blob(
+                            &mut ActiveSystem::new(environment),
+                            destination_root,
+                            &blob,
+                        )
+                        .map_err(|error| {
+                            format!("cannot store imported blob {}: {error}", entry.id)
+                        })?;
                         if imported_hash != entry.id {
                             return Err(format!(
                                 "blob {} did not retain its SHA-1 during import",
@@ -408,7 +427,7 @@ fn initialize_private_repository(
         .map(|(key, value)| ((*key).to_string(), vec![(*value).to_string()]))
         .collect();
     repo::write_vfs(
-        environment,
+        &mut ActiveSystem::new(environment),
         &repo::git_path(destination_root, repo::CONFIG),
         &repo::serialize_config(&config),
     )

@@ -34,7 +34,9 @@ mod worktree;
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::commands::{reg_costed, CommandContext, CommandSpec, Io, Trust};
+use crate::commands::{CommandBody, CommandSpec, Io, Trust};
+use crate::program::ProcessContext;
+use crate::syscalls::System;
 use crate::vfs::{resolve_against, VfsError};
 
 /// Version string reported by `git --version`. The suffix keeps the simulation identifiable
@@ -139,7 +141,29 @@ pub(crate) fn reads_standard_input(args: &[String]) -> bool {
 }
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    reg_costed(m, &["git"], Trust::Partial, 150, 16 * 1024, cmd_git);
+    super::reg_system_input(
+        m,
+        "/usr/bin/git",
+        Trust::Partial,
+        150,
+        16 * 1024,
+        CommandBody::SystemPoll(cmd_git_entry),
+    );
+}
+
+/// Adapt the process-scoped entry point `System` expects to the module's own
+/// `(system, args, io)` signature, which every subcommand shares.
+///
+/// Only a few subcommands read standard input (`commit -F -`, `hash-object --stdin`, and an
+/// operandless `apply`); [`reads_standard_input`] decides which, matching how the shell decides
+/// whether to buffer input for this invocation at all.
+fn cmd_git_entry(context: &mut ProcessContext<'_>, io: &mut Io) -> crate::exec::ShellPoll {
+    if reads_standard_input(context.args) {
+        if let Err(poll) = context.read_standard_input(io) {
+            return poll;
+        }
+    }
+    crate::exec::ShellPoll::Ready(cmd_git(context.system, context.args, io))
 }
 
 /// An argument Git cannot make sense of: an option it does not have, or one used the wrong way.
@@ -177,13 +201,13 @@ pub(crate) fn cannot_write(io: &mut Io, what: &str, error: &VfsError) -> i32 {
 /// A root commit has no parent, and its change is measured against nothing. That is not the same
 /// as a parent whose tree is missing, which must not be read as "every file was added".
 pub(crate) fn parent_tree(
-    ctx: &CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     parent: Option<&String>,
     io: &mut Io,
 ) -> Result<repo::Tree, i32> {
     match parent {
-        Some(parent) => require_tree(ctx, root, parent, io),
+        Some(parent) => require_tree(system, root, parent, io),
         None => Ok(repo::Tree::new()),
     }
 }
@@ -194,11 +218,11 @@ pub(crate) fn parent_tree(
 /// has. What it cannot read is a *corrupt* one, and to a command that writes the index or the
 /// working tree "nothing is staged" reads as "delete everything", so those ask for it this way.
 pub(crate) fn require_index(
-    ctx: &CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     io: &mut Io,
 ) -> Result<repo::Tree, i32> {
-    repo::load_index(ctx, root).ok_or_else(|| fatal(io, "index file corrupt"))
+    repo::load_index(system, root).ok_or_else(|| fatal(io, "index file corrupt"))
 }
 
 /// One argument, as the command that asked for it sees it.
@@ -411,27 +435,27 @@ pub(crate) fn pathspec(cwd: &str, root: &str, value: &str) -> String {
 /// A missing tree reads as the empty tree, and to a command that writes the working tree an empty
 /// tree means "delete every file", so the commands that write ask for a tree this way.
 pub(crate) fn require_tree(
-    ctx: &CommandContext<'_>,
+    system: &mut dyn System,
     root: &str,
     commit: &str,
     io: &mut Io,
 ) -> Result<repo::Tree, i32> {
-    repo::commit_tree(ctx, root, commit).ok_or_else(|| {
+    repo::commit_tree(system, root, commit).ok_or_else(|| {
         io.print_err(&format!("fatal: unable to read tree of commit {commit}\n"));
         128
     })
 }
 
-pub(crate) fn names_a_path(ctx: &CommandContext<'_>, root: &str, value: &str) -> bool {
-    let absolute = resolve_against(&ctx.cwd, value);
-    if ctx.vfs.exists("/", &absolute) {
+pub(crate) fn names_a_path(system: &mut dyn System, root: &str, value: &str) -> bool {
+    let absolute = resolve_against(system.cwd(), value);
+    if repo::exists(system, "/", &absolute) {
         return true;
     }
     let Some(relative) = repo::relative_path(root, &absolute) else {
         return true;
     };
     let prefix = format!("{relative}/");
-    repo::load_index(ctx, root).is_some_and(|index| {
+    repo::load_index(system, root).is_some_and(|index| {
         index
             .keys()
             .any(|path| *path == relative || path.starts_with(&prefix))
@@ -454,7 +478,7 @@ pub(crate) fn repo_error(io: &mut Io) -> i32 {
     128
 }
 
-fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn cmd_git(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
     let mut globals = Globals::default();
     let mut directory: Option<String> = None;
     // The global options run out at the subcommand name, which is the first operand.
@@ -475,8 +499,10 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                     return usage(io, "-C requires a directory");
                 };
                 // Repeated -C options compose, as they do in Git.
-                let base = directory.as_deref().unwrap_or(&ctx.cwd);
-                directory = Some(resolve_against(base, &value));
+                let base = directory
+                    .clone()
+                    .unwrap_or_else(|| system.cwd().to_string());
+                directory = Some(resolve_against(&base, &value));
             }
             "-c" => {
                 let Some((key, value)) = flags
@@ -526,14 +552,13 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     };
     let restore_cwd = match directory {
         Some(target) => {
-            if !ctx.vfs.is_dir("/", &target) {
+            let previous = system.cwd().to_string();
+            if system.chdir(&target).is_err() {
                 io.print_err(&format!(
                     "fatal: cannot change to '{target}': No such file or directory\n"
                 ));
                 return 128;
             }
-            let previous = ctx.cwd.clone();
-            ctx.cwd = target;
             Some(previous)
         }
         None => None,
@@ -545,7 +570,7 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
             .take_while(|argument| *argument != "--")
             .any(|argument| argument == "--quiet" || is_short_quiet(argument));
     let before = (io.out.len(), io.err.len());
-    let status = dispatch(ctx, &globals, subcommand, &args[1..], io);
+    let status = dispatch(system, &globals, subcommand, &args[1..], io);
     if silence {
         io.out.truncate(before.0);
         // Progress notes such as `Switched to branch` go to standard error, as they do in Git;
@@ -555,80 +580,80 @@ fn cmd_git(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         }
     }
     if let Some(previous) = restore_cwd {
-        ctx.cwd = previous;
+        let _ = system.chdir(&previous);
     }
     status
 }
 
 fn dispatch(
-    ctx: &mut CommandContext<'_>,
+    system: &mut dyn System,
     globals: &Globals,
     subcommand: &str,
     args: &[String],
     io: &mut Io,
 ) -> i32 {
     match subcommand {
-        "init" => git_init(ctx, args, io),
-        "status" => worktree::git_status(ctx, args, io),
-        "add" => worktree::git_add(ctx, args, io),
-        "rm" => worktree::git_rm(ctx, args, io),
-        "mv" => worktree::git_mv(ctx, args, io),
-        "restore" => worktree::git_restore(ctx, args, io),
-        "reset" => worktree::git_reset(ctx, args, io),
-        "clean" => worktree::git_clean(ctx, args, io),
-        "ls-files" => worktree::git_ls_files(ctx, args, io),
-        "diff" => compare::git_diff(ctx, args, io),
-        "commit" => commit::git_commit(ctx, globals, args, io),
-        "log" => log::git_log(ctx, args, io),
-        "show" => log::git_show(ctx, args, io),
-        "rev-parse" => refs::git_rev_parse(ctx, args, io),
-        "rev-list" => refs::git_rev_list(ctx, args, io),
-        "branch" => refs::git_branch(ctx, args, io),
-        "tag" => refs::git_tag(ctx, globals, args, io),
-        "switch" => switch::git_switch(ctx, args, io),
-        "checkout" => switch::git_checkout(ctx, args, io),
-        "blame" => plumbing::git_blame(ctx, args, io),
-        "reflog" => plumbing::git_reflog(ctx, args, io),
-        "rebase" => rebase::git_rebase(ctx, globals, args, io),
-        "merge" => merge::git_merge(ctx, globals, args, io),
-        "cherry-pick" => merge::git_replay(ctx, globals, false, args, io),
-        "revert" => merge::git_replay(ctx, globals, true, args, io),
-        "config" => config::git_config(ctx, globals, args, io),
-        "remote" => config::git_remote(ctx, globals, args, io),
-        "stash" => stash::git_stash(ctx, args, io),
-        "apply" => apply::git_apply(ctx, args, io),
-        "grep" => plumbing::git_grep(ctx, args, io),
-        "cat-file" => plumbing::git_cat_file(ctx, args, io),
-        "hash-object" => plumbing::git_hash_object(ctx, args, io),
-        "ls-tree" => plumbing::git_ls_tree(ctx, args, io),
-        "check-ignore" => plumbing::git_check_ignore(ctx, args, io),
-        "merge-base" => plumbing::git_merge_base(ctx, args, io),
-        "describe" => plumbing::git_describe(ctx, args, io),
-        "shortlog" => plumbing::git_shortlog(ctx, args, io),
-        "show-ref" => plumbing::git_show_ref(ctx, args, io),
-        "symbolic-ref" => plumbing::git_symbolic_ref(ctx, args, io),
-        "for-each-ref" => plumbing::git_for_each_ref(ctx, args, io),
+        "init" => git_init(system, args, io),
+        "status" => worktree::git_status(system, args, io),
+        "add" => worktree::git_add(system, args, io),
+        "rm" => worktree::git_rm(system, args, io),
+        "mv" => worktree::git_mv(system, args, io),
+        "restore" => worktree::git_restore(system, args, io),
+        "reset" => worktree::git_reset(system, args, io),
+        "clean" => worktree::git_clean(system, args, io),
+        "ls-files" => worktree::git_ls_files(system, args, io),
+        "diff" => compare::git_diff(system, args, io),
+        "commit" => commit::git_commit(system, globals, args, io),
+        "log" => log::git_log(system, args, io),
+        "show" => log::git_show(system, args, io),
+        "rev-parse" => refs::git_rev_parse(system, args, io),
+        "rev-list" => refs::git_rev_list(system, args, io),
+        "branch" => refs::git_branch(system, args, io),
+        "tag" => refs::git_tag(system, globals, args, io),
+        "switch" => switch::git_switch(system, args, io),
+        "checkout" => switch::git_checkout(system, args, io),
+        "blame" => plumbing::git_blame(system, args, io),
+        "reflog" => plumbing::git_reflog(system, args, io),
+        "rebase" => rebase::git_rebase(system, globals, args, io),
+        "merge" => merge::git_merge(system, globals, args, io),
+        "cherry-pick" => merge::git_replay(system, globals, false, args, io),
+        "revert" => merge::git_replay(system, globals, true, args, io),
+        "config" => config::git_config(system, globals, args, io),
+        "remote" => config::git_remote(system, globals, args, io),
+        "stash" => stash::git_stash(system, args, io),
+        "apply" => apply::git_apply(system, args, io),
+        "grep" => plumbing::git_grep(system, args, io),
+        "cat-file" => plumbing::git_cat_file(system, args, io),
+        "hash-object" => plumbing::git_hash_object(system, args, io),
+        "ls-tree" => plumbing::git_ls_tree(system, args, io),
+        "check-ignore" => plumbing::git_check_ignore(system, args, io),
+        "merge-base" => plumbing::git_merge_base(system, args, io),
+        "describe" => plumbing::git_describe(system, args, io),
+        "shortlog" => plumbing::git_shortlog(system, args, io),
+        "show-ref" => plumbing::git_show_ref(system, args, io),
+        "symbolic-ref" => plumbing::git_symbolic_ref(system, args, io),
+        "for-each-ref" => plumbing::git_for_each_ref(system, args, io),
         other if NETWORK_COMMANDS.contains(&other) => {
-            ctx.note_unsupported(&format!("git:{other}"));
+            system.note_unsupported(&format!("git:{other}"));
             io.print_err(&format!(
                 "fatal: git {other} needs network access, which the simulation does not provide\n"
             ));
             128
         }
         other if UNSUPPORTED_COMMANDS.contains(&other) => {
-            ctx.note_unsupported(&format!("git:{other}"));
+            system.note_unsupported(&format!("git:{other}"));
             usage(io, &format!("unsupported subcommand: {other}"))
         }
         other => {
             // An alias expands to another subcommand; one that names itself is not followed.
-            if let Some(mut expansion) = config::alias(ctx, globals, other) {
+            if let Some(mut expansion) = config::alias(system, globals, other) {
                 let name = expansion.remove(0);
                 if name != other {
                     expansion.extend_from_slice(args);
-                    return dispatch(ctx, globals, &name, &expansion, io);
+                    return dispatch(system, globals, &name, &expansion, io);
                 }
             }
-            ctx.note_unsupported(&format!("git:{other}"));
+            system.note_unsupported(&format!("git:{other}"));
             io.print_err(&format!(
                 "git: '{other}' is not a git command. See 'git --help'.\n"
             ));
@@ -637,7 +662,7 @@ fn dispatch(
     }
 }
 
-fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+fn git_init(system: &mut dyn System, args: &[String], io: &mut Io) -> i32 {
     let mut branch = repo::DEFAULT_BRANCH.to_string();
     let mut quiet = false;
     let mut target = None;
@@ -664,16 +689,16 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         }
     }
     let target = target
-        .map(|path| resolve_against(&ctx.cwd, &path))
-        .unwrap_or_else(|| ctx.cwd.clone());
-    if !ctx.vfs.is_dir("/", &target) {
-        if let Err(error) = ctx.vfs.mkdir_all("/", &target) {
+        .map(|path| resolve_against(system.cwd(), &path))
+        .unwrap_or_else(|| system.cwd().to_string());
+    if !repo::is_dir(system, "/", &target) {
+        if let Err(error) = system.mkdir_all("/", &target) {
             io.print_err(&format!("git init: {error}\n"));
             return 1;
         }
     }
     let git = repo::path_join(&target, repo::GIT_DIR);
-    let reinitialized = ctx.vfs.is_dir("/", &git);
+    let reinitialized = repo::is_dir(system, "/", &git);
     for directory in [
         git.clone(),
         repo::path_join(&git, "refs/heads"),
@@ -681,7 +706,7 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
         repo::path_join(&git, "commits"),
         repo::path_join(&git, "objects"),
     ] {
-        if let Err(error) = ctx.vfs.mkdir_all("/", &directory) {
+        if let Err(error) = system.mkdir_all("/", &directory) {
             io.print_err(&format!("git init: {error}\n"));
             return 1;
         }
@@ -703,7 +728,7 @@ fn git_init(ctx: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
                 ),
             ),
         ] {
-            if let Err(error) = repo::write_vfs(ctx, &path, &contents) {
+            if let Err(error) = repo::write_vfs(system, &path, &contents) {
                 io.print_err(&format!("git init: {error}\n"));
                 return 1;
             }
