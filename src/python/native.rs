@@ -500,6 +500,9 @@ pub(super) trait PyRuntime {
     fn set_is_frozen(&self, set: PySet) -> PyResult<bool>;
     fn set_insert(&mut self, set: PySet, value: PyValue) -> PyResult<bool>;
     fn set_remove(&mut self, set: PySet, value: &PyValue) -> PyResult<bool>;
+    /// Replace a mutable set's members with already-deduplicated `items`, metering the change
+    /// in retained size. Frozen sets are rejected.
+    fn replace_set_items(&mut self, set: PySet, items: Vec<PyValue>) -> PyResult<()>;
     fn replace_list_items(&mut self, list: PyList, items: Vec<PyValue>) -> PyResult<()>;
     fn call_value(&mut self, callable: PyValue, args: CallArgs) -> PyResult<PyValue>;
     fn is_callable(&self, value: &PyValue) -> PyResult<bool>;
