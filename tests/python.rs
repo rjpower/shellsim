@@ -9,6 +9,8 @@ mod asyncio;
 mod bytes;
 #[path = "python/cli.rs"]
 mod cli;
+#[path = "python/exceptions.rs"]
+mod exceptions;
 #[path = "python/execution.rs"]
 mod execution;
 #[path = "python/execution_representation.rs"]
