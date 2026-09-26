@@ -2176,6 +2176,20 @@ impl PyRuntime for Vm<'_> {
         self
     }
 
+    fn caller_location(&self, depth: usize) -> Option<(String, u32)> {
+        let index = self
+            .bytecode_frames
+            .len()
+            .checked_sub(depth.checked_add(1)?)?;
+        let frame = &self.bytecode_frames[index];
+        // Call sites record the instruction pointer past the executing call.
+        let span = frame
+            .code
+            .spans
+            .get(frame.instruction_pointer.checked_sub(1)?)?;
+        Some((self.traceback_filename(), u32::try_from(span.line).ok()?))
+    }
+
     fn current_pid(&self) -> u32 {
         self.interp.process.pid
     }

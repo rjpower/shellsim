@@ -624,6 +624,9 @@ pub(super) trait PyRuntime {
     fn filesystem(&mut self) -> &mut dyn PyFilesystem;
     fn http(&mut self) -> &mut dyn PyHttpClient;
     fn processes(&mut self) -> &mut dyn PyProcessRunner;
+    /// The script path and source line executing `depth` Python frames below the innermost one,
+    /// or `None` when the stack is shallower. Depth 0 is the innermost frame.
+    fn caller_location(&self, depth: usize) -> Option<(String, u32)>;
     /// PID of the logical process running this Python interpreter.
     fn current_pid(&self) -> u32;
     /// PID of the logical parent of the process running this Python interpreter.

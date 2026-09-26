@@ -45,10 +45,15 @@ The core collection surface includes mutable sets and immutable `frozenset` valu
 comparison and set algebra. VFS-backed text and binary files support read, write, append, and
 their `+` update variants with a shared seekable cursor.
 
-Function calls support positional, variadic, keyword-only, and keyword-variadic parameters,
-including bounded `*iterable` and `**mapping` expansion. Duplicate keywords, non-string mapping
-keys, and non-mapping `**` operands are rejected explicitly. List, tuple, and set displays expand
-`*iterable` items in place.
+Function calls support positional-only (`/`), positional, variadic, keyword-only, and
+keyword-variadic parameters, including bounded `*iterable` and `**mapping` expansion. Duplicate
+keywords, non-string mapping keys, and non-mapping `**` operands are rejected explicitly. List,
+tuple, and set displays expand `*iterable` items in place.
+
+Augmented assignment updates mutable operands in place, as in CPython: `list +=` extends with any
+iterable, `set |=` and its siblings mutate the set, `dict |=` updates the mapping, and user classes
+may define `__iadd__` and the other in-place methods. Other operands fall back to the binary
+operator.
 
 Text formatting uses one protocol for f-strings and `str.format`, including conversions,
 alignment, width and precision, and decimal, binary, octal, and hexadecimal integer formats.
@@ -58,7 +63,13 @@ grouping. The `__import__` builtin uses the simulated loader for absolute import
 builtin accepts one source string and executes it in the simulated namespace. Code objects and
 explicit globals or locals mappings are not supported.
 The frozen `functools` module provides `reduce` and positional and keyword argument binding with
-`partial`.
+`partial`. The frozen `operator` module provides CPython's operator functions, `itemgetter`,
+`attrgetter`, and `methodcaller`.
+
+The frozen `warnings` module implements `warn`, `warn_explicit`, `filterwarnings`, `simplefilter`,
+`resetwarnings`, `catch_warnings` with `record=True`, and CPython's `default`, `once`, `module`,
+`always`, `ignore`, and `error` actions. A warning names the line executing `stacklevel` frames up.
+Every frame reports the script path, as tracebacks do, and `module=` filters match `__main__`.
 
 User-defined exception subclasses preserve inherited constructor arguments, including compatible
 `args`, `str`, and `repr` behavior.

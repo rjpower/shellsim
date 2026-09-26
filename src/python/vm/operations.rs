@@ -362,6 +362,122 @@ impl Vm<'_> {
         self.binary_protocol(operator, left, right)
     }
 
+    /// Augmented assignment. Numbers take the binary fast path. Builtin mutable containers
+    /// update the left operand in place, as `list.__iadd__` and `set.__ior__` do, and other
+    /// operands use their in-place method, such as `__iadd__`, when they define one. Everything
+    /// else falls back to the binary operator.
+    pub(super) fn inplace_binary(&mut self, operator: BinaryOperator) -> Result<(), String> {
+        let right = self.pop()?;
+        let left = self.pop()?;
+        if let Some(value) = number::exact_binary(self, operator, left, right)
+            .map_err(|error| self.record_native_error(error))?
+        {
+            self.stack.push(value);
+            return Ok(());
+        }
+        let value = match self.builtin_inplace(operator, left, right)? {
+            Some(value) => value,
+            None => match self.inplace_method(operator, left, right)? {
+                Some(value) => value,
+                None => self.binary_protocol_for(operator, left, right, true)?,
+            },
+        };
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn builtin_inplace(
+        &mut self,
+        operator: BinaryOperator,
+        left: Value,
+        right: Value,
+    ) -> Result<Option<Value>, String> {
+        let Some(id) = left.object_id() else {
+            return Ok(None);
+        };
+        let replacement = match (self.state.heap.get(id)?, operator) {
+            // `list += iterable` extends with any iterable, unlike `list + list`.
+            (Object::List(items), BinaryOperator::Add) => {
+                let mut items = items.clone();
+                for value in self.iterable_values(&right)? {
+                    self.push_materialized(&mut items, value)?;
+                }
+                Object::List(items)
+            }
+            // `dict |= other` is `dict.update(other)`.
+            (Object::Dict(_) | Object::DefaultDict { .. }, BinaryOperator::BitwiseOr) => {
+                let update = self
+                    .resolve_attribute(left, "update")?
+                    .ok_or("dict.update is not available")?;
+                self.invoke_value(update, vec![right])?;
+                return Ok(Some(left));
+            }
+            (Object::List(_), BinaryOperator::Multiply)
+            | (
+                Object::Set(_),
+                BinaryOperator::BitwiseOr
+                | BinaryOperator::BitwiseAnd
+                | BinaryOperator::BitwiseXor
+                | BinaryOperator::Subtract,
+            )
+            | (Object::ByteArray(_), BinaryOperator::Add | BinaryOperator::Multiply) => {
+                let result = self.binary_protocol_for(operator, left, right, true)?;
+                let result = result
+                    .object_id()
+                    .ok_or("in-place container operation produced a non-object")?;
+                self.state.heap.get(result)?.clone()
+            }
+            _ => return Ok(None),
+        };
+        self.state
+            .heap
+            .replace_payload(id, replacement, &mut self.interp.resources)?;
+        Ok(Some(left))
+    }
+
+    /// Call the left operand's in-place method, looked up on its type as CPython does.
+    fn inplace_method(
+        &mut self,
+        operator: BinaryOperator,
+        left: Value,
+        right: Value,
+    ) -> Result<Option<Value>, String> {
+        let name = match operator {
+            BinaryOperator::Add => "__iadd__",
+            BinaryOperator::Subtract => "__isub__",
+            BinaryOperator::Multiply => "__imul__",
+            BinaryOperator::MatrixMultiply => "__imatmul__",
+            BinaryOperator::Power => "__ipow__",
+            BinaryOperator::Divide => "__itruediv__",
+            BinaryOperator::FloorDivide => "__ifloordiv__",
+            BinaryOperator::Remainder => "__imod__",
+            BinaryOperator::LeftShift => "__ilshift__",
+            BinaryOperator::RightShift => "__irshift__",
+            BinaryOperator::BitwiseAnd => "__iand__",
+            BinaryOperator::BitwiseXor => "__ixor__",
+            BinaryOperator::BitwiseOr => "__ior__",
+        };
+        if let Some(id) = left.object_id() {
+            if let Object::Instance { class, .. } = self.state.heap.get(id)? {
+                let class = *class;
+                let Some((defining_class, descriptor)) = self.class_attribute_entry(class, name)?
+                else {
+                    return Ok(None);
+                };
+                let method = self.bind_descriptor(descriptor, Some(left), class, defining_class)?;
+                return self.invoke_value(method, vec![right]).map(Some);
+            }
+        }
+        let type_id = self.type_id(&left)?;
+        if self.state.types.attribute(type_id, name)?.is_none() {
+            return Ok(None);
+        }
+        let Some(method) = self.resolve_attribute(left, name)? else {
+            return Ok(None);
+        };
+        self.invoke_value(method, vec![right]).map(Some)
+    }
+
     #[cold]
     #[inline(never)]
     fn binary_protocol(
@@ -369,6 +485,17 @@ impl Vm<'_> {
         operator: BinaryOperator,
         left: Value,
         right: Value,
+    ) -> Result<Value, String> {
+        self.binary_protocol_for(operator, left, right, false)
+    }
+
+    /// The binary operator protocol. `inplace` only changes the operator an error names.
+    fn binary_protocol_for(
+        &mut self,
+        operator: BinaryOperator,
+        left: Value,
+        right: Value,
+        inplace: bool,
     ) -> Result<Value, String> {
         let (slot, name, reflected_slot, reflected_name) = match operator {
             BinaryOperator::Add => (Slot::Add, "__add__", Slot::ReflectedAdd, "__radd__"),
@@ -446,9 +573,13 @@ impl Vm<'_> {
         if let Some(value) = self.invoke_slot(&right, reflected_slot, reflected_name, vec![left])? {
             return Ok(value);
         }
+        let symbol = match (operator, inplace) {
+            (BinaryOperator::Power, true) => "**=".to_string(),
+            (operator, true) => format!("{}=", binary_operator_symbol(operator)),
+            (operator, false) => binary_operator_symbol(operator).to_string(),
+        };
         let message = format!(
-            "unsupported operand type(s) for {}: '{}' and '{}'",
-            binary_operator_symbol(operator),
+            "unsupported operand type(s) for {symbol}: '{}' and '{}'",
             self.type_name_of(&left)?,
             self.type_name_of(&right)?
         );
