@@ -446,6 +446,19 @@ fn logical_process_ids_back_jobs_wait_and_ps() {
 }
 
 #[test]
+fn shells_started_from_pipelines_and_subshells_report_their_own_pid() {
+    // A pipeline member or subshell forks from the outer shell and then execs bash, so `$$`
+    // must name the new shell rather than the one it was forked from.
+    let (status, output, error) = run(
+        "outer=$$; echo 'test $$ = $BASHPID && test $PPID != $$ && echo ok' | bash; \
+         (exec bash -c 'test $$ = $BASHPID && echo ok'); \
+         printf 'test $$ != %s && echo ok\n' \"$outer\" > /own.sh; bash /own.sh | cat",
+    );
+    assert_eq!(status, 0, "{error}");
+    assert_eq!(output, "ok\nok\nok\n");
+}
+
+#[test]
 fn nested_shells_remain_under_outer_timeout() {
     assert_eq!(
         run("timeout 1 sh -c 'sleep 2'; echo $?"),

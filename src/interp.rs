@@ -162,7 +162,7 @@ pub struct ProcessState {
     pub session_id: ProcessId,
     /// Process group inherited across ordinary forks or established by a group leader.
     pub process_group: ProcessId,
-    /// PID expanded by `$$`; preserved across Bash subshells.
+    /// PID expanded by `$$`; preserved across Bash subshells and reset when a shell image loads.
     pub shell_pid: ProcessId,
     /// shell + environment variables (we don't distinguish exported vs not for simplicity,
     /// except that `env`/child python only sees exported ones, tracked in `exported`)
@@ -1102,6 +1102,17 @@ impl Environment {
         state.command_hash.clear();
         state.directory_stack.clear();
         state.local_scopes.clear();
+        // The new image is a fresh shell: `$$` names it, and loop, job, and getopts state from
+        // the forked parent shell do not carry over.
+        state.shell_pid = pid;
+        state.jobs.clear();
+        state.next_job_id = 1;
+        state.loop_depth = 0;
+        state.cond_depth = 0;
+        state.getopts = GetoptsState {
+            optind: 1,
+            offset: 1,
+        };
         state.arg0 = image.arg0;
         state.positional = image.positional;
         state.opt_errexit = image.errexit;
