@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use num_bigint::BigInt;
 use num_traits::{Signed, Zero};
 
-use crate::commands::util::{ewln, wln};
+use crate::commands::util::{ewln, w, wln};
 use crate::commands::{CommandSpec, Io, Trust};
 use crate::exec::ShellPoll;
 use crate::program::ProcessContext;
@@ -40,8 +40,11 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
 const MAX_DIGITS: usize = 100_000;
 /// Cap on the `scale` builtin/variable and on any single operation's target scale.
 const MAX_SCALE: usize = 20_000;
-/// GNU `bc` wraps printed numbers before column 70; we match that width.
-const LINE_WIDTH: usize = 69;
+/// GNU `bc`'s default `BC_LINE_LENGTH` is 70, and that count *includes* the trailing backslash
+/// and newline of a continuation line (`man bc`: "This includes the backslash and newline
+/// characters for long numbers"). So each continuation line carries 70 - 1 (`\`) - 1 (`\n`) = 68
+/// digits; verified against GNU bc 1.07.1's actual output for `2^1000`.
+const LINE_WIDTH: usize = 68;
 
 fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     if let Err(poll) = context.read_standard_input(io) {
@@ -201,7 +204,7 @@ impl BigDec {
     /// `a / b`, truncated to exactly `target_scale` fractional digits.
     fn div(a: &BigDec, b: &BigDec, target_scale: usize) -> Result<BigDec, String> {
         if b.is_zero_value() {
-            return Err("divide by zero".to_string());
+            return Err("Divide by zero".to_string());
         }
         let num_exp = b.scale + target_scale;
         let den_exp = a.scale;
@@ -223,16 +226,15 @@ impl BigDec {
         Ok(result.rescale_to(target_scale))
     }
 
+    /// `a ^ exponent`, exponent must be an integer (POSIX allows a negative one: `a^-n` is
+    /// `1 / a^n` computed at `current_scale`, matching GNU `bc`).
     fn pow(a: &BigDec, exponent: &BigDec, current_scale: usize) -> Result<BigDec, String> {
         if exponent.scale != 0 {
             return Err("non-integer exponent".to_string());
         }
-        if exponent.value.is_negative() {
-            return Err("negative exponents are not supported".to_string());
-        }
-        let e: u32 = exponent
-            .value
-            .clone()
+        let negative_exponent = exponent.value.is_negative();
+        let magnitude = exponent.value.magnitude().clone();
+        let e: u32 = magnitude
             .try_into()
             .map_err(|_| "exponent too large".to_string())?;
         let raw_scale = a
@@ -248,11 +250,18 @@ impl BigDec {
         }
         let value = a.value.pow(e);
         let target_scale = raw_scale.min(a.scale.max(current_scale));
-        Ok(BigDec {
+        let result = BigDec {
             value,
             scale: raw_scale,
         }
-        .rescale_to(target_scale))
+        .rescale_to(target_scale);
+        if !negative_exponent {
+            return Ok(result);
+        }
+        if result.is_zero_value() {
+            return Err("Divide by zero".to_string());
+        }
+        BigDec::div(&BigDec::from_i64(1), &result, current_scale)
     }
 
     fn sqrt(a: &BigDec, target_scale: usize) -> Result<BigDec, String> {
@@ -1215,7 +1224,9 @@ fn exec_stmt(ctx: &mut Ctx, stmt: &Stmt, io: &mut Io) -> Result<Flow, Abort> {
             Ok(Flow::Normal)
         }
         Stmt::PrintString(s) => {
-            wln(io.out, s);
+            // A `bc` string literal statement prints its raw bytes (no escape processing, no
+            // automatic trailing newline); only expression statements print a trailing `\n`.
+            w(io.out, s);
             Ok(Flow::Normal)
         }
         Stmt::Block(list) => exec_list(ctx, list, io),
@@ -1285,7 +1296,9 @@ fn run_program(ctx: &mut Ctx, program: &[Stmt], io: &mut Io) -> i32 {
             Ok(Flow::Quit) => return 0,
             Ok(_) => {}
             Err(Abort::Runtime(message)) => {
-                ewln(io.err, &format!("Runtime error: {message}"));
+                // GNU bc's format is "Runtime error (func=(main), adr=N): <message>"; `adr` is
+                // an internal bytecode address with no equivalent here, so it is omitted.
+                ewln(io.err, &format!("Runtime error (func=(main)): {message}"));
             }
             Err(Abort::Resource) => return ctx.system.stop_status(),
         }
@@ -1321,7 +1334,7 @@ mod tests {
     fn division_by_zero_is_reported_not_panicked() {
         let a = dec("1");
         let b = dec("0");
-        assert_eq!(BigDec::div(&a, &b, 2).unwrap_err(), "divide by zero");
+        assert_eq!(BigDec::div(&a, &b, 2).unwrap_err(), "Divide by zero");
     }
 
     #[test]
@@ -1346,6 +1359,28 @@ mod tests {
     }
 
     #[test]
+    fn negative_exponent_is_a_reciprocal_at_the_current_scale() {
+        let two = dec("2");
+        let neg_one = dec("-1");
+        assert_eq!(format_bigdec(&BigDec::pow(&two, &neg_one, 0).unwrap()), "0");
+        let neg_two = dec("-2");
+        assert_eq!(
+            format_bigdec(&BigDec::pow(&two, &neg_two, 3).unwrap()),
+            ".250"
+        );
+    }
+
+    #[test]
+    fn zero_to_a_negative_power_is_divide_by_zero() {
+        let zero = dec("0");
+        let neg_one = dec("-1");
+        assert_eq!(
+            BigDec::pow(&zero, &neg_one, 0).unwrap_err(),
+            "Divide by zero"
+        );
+    }
+
+    #[test]
     fn number_formatting_drops_leading_zero() {
         assert_eq!(format_bigdec(&dec(".5")), ".5");
         assert_eq!(format_bigdec(&dec("0.001")), ".001");
@@ -1353,11 +1388,15 @@ mod tests {
     }
 
     #[test]
-    fn long_numbers_wrap_at_69_columns() {
+    fn long_numbers_wrap_at_68_digits_per_line() {
+        // GNU bc's default BC_LINE_LENGTH (70) counts the trailing `\` and `\n` themselves, so
+        // 68 digits + `\` + `\n` = 70 columns; verified against GNU bc 1.07.1's real output for
+        // `2^1000` (68 digits on each continuation line).
         let digits = "1".repeat(140);
         let wrapped = wrap_number(&digits);
         assert!(wrapped.contains("\\\n"));
-        assert_eq!(wrapped.split("\\\n").next().unwrap().len(), LINE_WIDTH);
+        assert_eq!(wrapped.split("\\\n").next().unwrap().len(), 68);
+        assert_eq!(LINE_WIDTH, 68);
     }
 
     #[test]

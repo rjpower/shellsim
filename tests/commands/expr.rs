@@ -92,9 +92,30 @@ fn non_integer_operands_reject_arithmetic() {
 }
 
 #[test]
-fn integer_overflow_is_reported_not_wrapped() {
-    let (status, _, stderr) = run("expr 9223372036854775807 + 1");
-    assert_eq!(status, 2);
+fn arithmetic_is_arbitrary_precision_like_gnu_expr() {
+    // GNU expr has no fixed-width integer limit: `expr 9223372036854775807 + 1` prints
+    // 9223372036854775808, one past i64::MAX, rather than reporting overflow.
+    assert_eq!(
+        run("expr 9223372036854775807 + 1"),
+        (0, "9223372036854775808\n".into(), String::new())
+    );
+}
+
+#[test]
+fn oversize_result_hits_the_documented_digit_cap() {
+    // Each operand is under the 100,000-digit cap on its own, but their product isn't: this
+    // exercises the post-multiplication cap check rather than the per-literal one. The CPU
+    // limit is raised because the point of this test is the digit cap, not the (much lower)
+    // default CPU budget that a multiplication this large would also legitimately hit.
+    let mut environment = Environment::with_limits(Limits {
+        cpu: u64::MAX,
+        ..Limits::unlimited()
+    });
+    let digits = "9".repeat(60_000);
+    let (outcome, _, stderr) =
+        environment.run_script_capture(&format!("expr {digits} '*' {digits}"));
+    assert_eq!(outcome.exit_status, 2);
+    let stderr = String::from_utf8_lossy(&stderr);
     assert!(stderr.contains("too large"), "{stderr}");
 }
 
@@ -103,6 +124,33 @@ fn unbalanced_parentheses_are_a_syntax_error() {
     let (status, _, stderr) = run("expr '(' 1 + 1");
     assert_eq!(status, 2);
     assert!(stderr.contains("syntax error"), "{stderr}");
+}
+
+#[test]
+fn leading_double_dash_is_an_end_of_options_marker() {
+    assert_eq!(run("expr -- -5 + 2"), (0, "-3\n".into(), String::new()));
+}
+
+#[test]
+fn or_of_two_falsy_operands_prints_zero() {
+    assert_eq!(run("expr 0 '|' ''"), (1, "0\n".into(), String::new()));
+}
+
+#[test]
+fn missing_operand_diagnostic_matches_gnu_expr() {
+    let (status, _, stderr) = run("expr");
+    assert_eq!(status, 2);
+    assert_eq!(
+        stderr,
+        "expr: missing operand\nTry 'expr --help' for more information.\n"
+    );
+}
+
+#[test]
+fn missing_argument_after_operator_matches_gnu_expr() {
+    let (status, _, stderr) = run("expr 1 +");
+    assert_eq!(status, 2);
+    assert_eq!(stderr, "expr: syntax error: missing argument after '+'\n");
 }
 
 #[test]
