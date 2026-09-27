@@ -334,25 +334,12 @@ impl Vm<'_> {
                     }
                     let payload = match layout {
                         ClassLayout::Object => InstancePayload::Object,
-                        ClassLayout::Int => {
-                            if !keyword_arguments.is_empty() {
-                                return Err(format!("{name}() does not accept keyword arguments"));
-                            }
-                            let value = arguments
-                                .first()
-                                .map(|value| {
-                                    protocol::int_value(&self.state.heap, value)
-                                        .or_else(|| value.as_int())
-                                        .ok_or_else(|| {
-                                            format!("{name}() argument is not supported")
-                                        })
-                                })
-                                .transpose()?
-                                .unwrap_or(0);
-                            if arguments.len() > 1 {
-                                return Err(format!("{name}() expects at most one value"));
-                            }
-                            InstancePayload::Int(value)
+                        ClassLayout::Builtin(builtin) => {
+                            InstancePayload::Builtin(self.builtin_value(
+                                builtin,
+                                arguments.clone(),
+                                keyword_arguments.clone(),
+                            )?)
                         }
                         ClassLayout::Type => {
                             let created = if let Some((owner, constructor)) =
@@ -947,59 +934,59 @@ impl Vm<'_> {
                     }
                     return Ok(CallResult::Value(Value::Int(length)));
                 }
-                let length = if let Some(length) =
-                    protocol::string_length(&self.state.heap, &arguments[0])?
-                {
-                    Some(length)
-                } else if let Some(id) = arguments[0].object_id() {
-                    match self.state.heap.get(id)? {
-                        Object::Bare => None,
-                        Object::List(values)
-                        | Object::Tuple(values)
-                        | Object::Set(values)
-                        | Object::FrozenSet(values) => Some(values.len()),
-                        Object::Range { start, stop, step } => {
-                            Some(range_length(*start, *stop, *step)?)
+                let subject = self.builtin_view(arguments[0])?;
+                let length =
+                    if let Some(length) = protocol::string_length(&self.state.heap, &subject)? {
+                        Some(length)
+                    } else if let Some(id) = subject.object_id() {
+                        match self.state.heap.get(id)? {
+                            Object::Bare => None,
+                            Object::List(values)
+                            | Object::Tuple(values)
+                            | Object::Set(values)
+                            | Object::FrozenSet(values) => Some(values.len()),
+                            Object::Range { start, stop, step } => {
+                                Some(range_length(*start, *stop, *step)?)
+                            }
+                            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
+                                Some(entries.len())
+                            }
+                            Object::BigInt(_)
+                            | Object::Complex { .. }
+                            | Object::String(_)
+                            | Object::Bytes(_)
+                            | Object::ByteArray(_)
+                            | Object::Slice { .. }
+                            | Object::Exception { .. }
+                            | Object::Function { .. }
+                            | Object::Class { .. }
+                            | Object::Instance { .. }
+                            | Object::DescriptorBoundMethod { .. }
+                            | Object::Iterator { .. }
+                            | Object::SequenceIterator { .. }
+                            | Object::RangeIterator { .. }
+                            | Object::CountIterator { .. }
+                            | Object::StreamIterator { .. }
+                            | Object::CallableIterator { .. }
+                            | Object::Generator { .. }
+                            | Object::Module { .. }
+                            | Object::ArrayStorage(_)
+                            | Object::Array { .. }
+                            | Object::WideValue { .. }
+                            | Object::Regex { .. }
+                            | Object::Match { .. }
+                            | Object::ArgumentParser { .. }
+                            | Object::Namespace { .. }
+                            | Object::EnumMember { .. }
+                            | Object::RaisesContext { .. }
+                            | Object::Property { .. }
+                            | Object::StaticMethod { .. }
+                            | Object::ClassMethod { .. }
+                            | Object::Super { .. } => None,
                         }
-                        Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                            Some(entries.len())
-                        }
-                        Object::BigInt(_)
-                        | Object::Complex { .. }
-                        | Object::String(_)
-                        | Object::Bytes(_)
-                        | Object::ByteArray(_)
-                        | Object::Slice { .. }
-                        | Object::Exception { .. }
-                        | Object::Function { .. }
-                        | Object::Class { .. }
-                        | Object::Instance { .. }
-                        | Object::DescriptorBoundMethod { .. }
-                        | Object::Iterator { .. }
-                        | Object::SequenceIterator { .. }
-                        | Object::RangeIterator { .. }
-                        | Object::CountIterator { .. }
-                        | Object::StreamIterator { .. }
-                        | Object::CallableIterator { .. }
-                        | Object::Generator { .. }
-                        | Object::Module { .. }
-                        | Object::ArrayStorage(_)
-                        | Object::Array { .. }
-                        | Object::WideValue { .. }
-                        | Object::Regex { .. }
-                        | Object::Match { .. }
-                        | Object::ArgumentParser { .. }
-                        | Object::Namespace { .. }
-                        | Object::EnumMember { .. }
-                        | Object::RaisesContext { .. }
-                        | Object::Property { .. }
-                        | Object::StaticMethod { .. }
-                        | Object::ClassMethod { .. }
-                        | Object::Super { .. } => None,
-                    }
-                } else {
-                    None
-                };
+                    } else {
+                        None
+                    };
                 let Some(length) = length else {
                     let message = format!(
                         "object of type '{}' has no len()",
@@ -1693,6 +1680,90 @@ impl Vm<'_> {
                 unreachable!("immediate call cannot suspend")
             }
         }
+    }
+
+    /// The value `builtin(*arguments, **keyword_arguments)` constructs, such as the tuple that
+    /// `tuple(iterable)` builds.
+    fn builtin_value(
+        &mut self,
+        builtin: BuiltinType,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<Value, String> {
+        match self.call_builtin_type(builtin, arguments, keyword_arguments)? {
+            CallResult::Value(value) => Ok(value),
+            _ => Err(format!("{}() did not produce a value", builtin.name())),
+        }
+    }
+
+    /// `builtin.__new__(class, ...)` for a builtin type that user classes may derive from, such
+    /// as `tuple.__new__(cls, iterable)`: the builtin value itself when `class` is `builtin`, and
+    /// otherwise an instance of the subclass `class` that holds the value.
+    pub(super) fn new_builtin_instance(
+        &mut self,
+        builtin: BuiltinType,
+        class: Value,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<Value, String> {
+        let name = builtin.name();
+        let subclass = match class.native_value() {
+            Some(NativeValue::BuiltinType(class_type)) if class_type == builtin => None,
+            Some(
+                native @ (NativeValue::BuiltinType(_)
+                | NativeValue::ExceptionType(_)
+                | NativeValue::ValueKind(_)),
+            ) => {
+                let class_name = match native {
+                    NativeValue::BuiltinType(class_type) => class_type.name(),
+                    NativeValue::ExceptionType(ExceptionType(class_name)) => class_name,
+                    NativeValue::ValueKind(kind) => kind
+                        .name
+                        .rsplit_once('.')
+                        .map_or(kind.name, |(_, class_name)| class_name),
+                    _ => unreachable!("matched above"),
+                };
+                let message = format!(
+                    "{name}.__new__({class_name}): {class_name} is not a subtype of {name}"
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
+            _ => match class.object_id().map(|id| (id, self.state.heap.get(id))) {
+                Some((
+                    id,
+                    Ok(Object::Class {
+                        layout: ClassLayout::Builtin(layout),
+                        ..
+                    }),
+                )) if *layout == builtin => Some(id),
+                Some((
+                    _,
+                    Ok(Object::Class {
+                        name: class_name, ..
+                    }),
+                )) => {
+                    let message = format!(
+                        "{name}.__new__({class_name}): {class_name} is not a subtype of {name}"
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                _ => {
+                    let type_name = self.type_name_of(&class)?;
+                    let message =
+                        format!("{name}.__new__(X): X is not a type object ({type_name})");
+                    return Err(self.raise_exception("TypeError", message));
+                }
+            },
+        };
+        let value = self.builtin_value(builtin, arguments, keyword_arguments)?;
+        let Some(class) = subclass else {
+            return Ok(value);
+        };
+        self.allocate_object(Object::Instance {
+            class,
+            payload: InstancePayload::Builtin(value),
+            attributes: InstanceAttributes::default(),
+        })
     }
 
     /// `object.__new__(class)`: a new instance of `class` with no attributes set.

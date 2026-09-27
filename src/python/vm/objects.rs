@@ -44,6 +44,12 @@ impl ContainerItems {
     }
 }
 
+/// Whether user classes may derive from `builtin`, holding its values as
+/// [`InstancePayload::Builtin`](super::super::heap::InstancePayload::Builtin).
+pub(super) fn is_subclassable_builtin(builtin: BuiltinType) -> bool {
+    matches!(builtin, BuiltinType::Int | BuiltinType::Tuple)
+}
+
 impl Vm<'_> {
     pub(super) fn load_attribute(&mut self, name: &str) -> Result<(), String> {
         let owner = self.pop()?;
@@ -844,6 +850,12 @@ impl Vm<'_> {
         self.raise_exception("AttributeError", message)
     }
 
+    /// `value`, or the builtin value it holds when it is an instance of a builtin subclass such
+    /// as a `tuple` subclass. Builtin operations that the class does not override act on it.
+    pub(super) fn builtin_view(&self, value: Value) -> Result<Value, String> {
+        Ok(protocol::builtin_payload(&self.state.heap, &value)?.unwrap_or(value))
+    }
+
     pub(super) fn load_subscript(&mut self) -> Result<(), String> {
         let index = self.pop()?;
         let owner = self.pop()?;
@@ -851,6 +863,7 @@ impl Vm<'_> {
             self.stack.push(value);
             return Ok(());
         }
+        let owner = self.builtin_view(owner)?;
         if let Some((start, stop, step)) = self.slice_parts(&index) {
             let value = self.load_builtin_slice(owner, start, stop, step)?;
             self.stack.push(value);
@@ -1405,12 +1418,6 @@ impl Vm<'_> {
             bases.len() == 1 && matches!(bases[0].native_value(), Some(NativeValue::EnumBase));
         let is_unittest =
             bases.len() == 1 && matches!(bases[0].native_value(), Some(NativeValue::UnitTestBase));
-        let has_int_base = bases.iter().any(|base| {
-            matches!(
-                base.native_value(),
-                Some(NativeValue::BuiltinType(BuiltinType::Int))
-            )
-        });
         let has_object_base = bases.iter().any(|base| {
             matches!(
                 base.native_value(),
@@ -1442,19 +1449,52 @@ impl Vm<'_> {
                         } else {
                             Some(Err("class bases must be classes".to_string()))
                         }
-                    } else if matches!(
-                        base.native_value(),
-                        Some(NativeValue::BuiltinType(
-                            BuiltinType::Int | BuiltinType::Object | BuiltinType::Type
-                        )) | Some(NativeValue::ExceptionType(_))
-                    ) {
-                        None
                     } else {
-                        Some(Err("class bases must be classes".to_string()))
+                        match base.native_value() {
+                            Some(NativeValue::BuiltinType(
+                                BuiltinType::Object | BuiltinType::Type,
+                            ))
+                            | Some(NativeValue::ExceptionType(_)) => None,
+                            Some(NativeValue::BuiltinType(builtin))
+                                if is_subclassable_builtin(builtin) =>
+                            {
+                                None
+                            }
+                            Some(NativeValue::BuiltinType(builtin)) => Some(Err(format!(
+                                "subclassing the builtin type '{}' is not supported",
+                                builtin.name()
+                            ))),
+                            _ => Some(Err("class bases must be classes".to_string())),
+                        }
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
+        // Direct builtin bases such as `tuple` and those inherited through user classes must agree
+        // on one instance layout, as in CPython.
+        let mut builtin_layouts = bases
+            .iter()
+            .filter_map(|base| match base.native_value() {
+                Some(NativeValue::BuiltinType(builtin)) if is_subclassable_builtin(builtin) => {
+                    Some(builtin)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for base in &user_bases {
+            if let Object::Class {
+                layout: ClassLayout::Builtin(builtin),
+                ..
+            } = self.state.heap.get(*base)?
+            {
+                builtin_layouts.push(*builtin);
+            }
+        }
+        builtin_layouts.dedup();
+        if builtin_layouts.len() > 1 {
+            return Err("multiple bases have instance lay-out conflict".into());
+        }
+        let builtin_layout = builtin_layouts.first().copied();
         let inherited_exception_bases = user_bases
             .iter()
             .filter_map(|base| match self.state.heap.get(*base) {
@@ -1470,28 +1510,16 @@ impl Vm<'_> {
         if direct_exception_bases.len() + inherited_exception_bases.len() > 1 {
             return Err("multiple exception bases are unsupported".into());
         }
-        if exception_base.is_some() && (has_int_base || has_type_base || is_enum || is_unittest) {
+        if exception_base.is_some()
+            && (builtin_layout.is_some() || has_type_base || is_enum || is_unittest)
+        {
             return Err("exception classes cannot use another instance layout".into());
-        }
-        if has_int_base && (bases.len() != 1 || is_enum || is_unittest) {
-            return Err("int inheritance with another direct base is unsupported".into());
         }
         if has_object_base && bases.len() != 1 {
             return Err("object cannot be combined with another direct base in this slice".into());
         }
         if has_type_base && bases.len() != 1 {
             return Err("type cannot be combined with another direct base in this slice".into());
-        }
-        let inherited_int_layouts = user_bases
-            .iter()
-            .filter_map(|base| match self.state.heap.get(*base) {
-                Ok(Object::Class { layout, .. }) => Some(*layout == ClassLayout::Int),
-                _ => None,
-            })
-            .filter(|is_int| *is_int)
-            .count();
-        if inherited_int_layouts > 1 {
-            return Err("multiple bases have incompatible int instance layouts".into());
         }
         let inherited_type_layouts = user_bases
             .iter()
@@ -1501,14 +1529,15 @@ impl Vm<'_> {
             })
             .filter(|is_type| *is_type)
             .count();
-        if inherited_type_layouts > 1 || (inherited_type_layouts == 1 && inherited_int_layouts == 1)
+        if inherited_type_layouts > 1
+            || ((has_type_base || inherited_type_layouts == 1) && builtin_layout.is_some())
         {
             return Err("multiple bases have incompatible instance layouts".into());
         }
         let layout = if has_type_base || inherited_type_layouts == 1 {
             ClassLayout::Type
-        } else if has_int_base || inherited_int_layouts == 1 {
-            ClassLayout::Int
+        } else if let Some(builtin) = builtin_layout {
+            ClassLayout::Builtin(builtin)
         } else {
             ClassLayout::Object
         };
@@ -1980,7 +2009,7 @@ impl Vm<'_> {
         }
         let builtin_ancestor = match layout {
             ClassLayout::Object => None,
-            ClassLayout::Int => Some(BuiltinType::Int.id()),
+            ClassLayout::Builtin(builtin) => Some(builtin.id()),
             ClassLayout::Type => Some(BuiltinType::Type.id()),
         };
         if let Some(ancestor) = builtin_ancestor {
@@ -2400,6 +2429,8 @@ impl Vm<'_> {
         let Some(slot_value) = self.state.types.slot(type_id, slot)? else {
             return Ok(None);
         };
+        // A native slot implements a builtin type's behavior, which an instance of a builtin
+        // subclass, as receiver or operand, takes part in through the value it holds.
         let slot_descriptor = match slot_value {
             SlotValue::NativeBinary(call) => {
                 let [argument] = arguments.as_slice() else {
@@ -2407,7 +2438,9 @@ impl Vm<'_> {
                         "binary protocol slot received the wrong number of arguments".into(),
                     );
                 };
-                return call(self, *receiver, *argument)
+                let (receiver, argument) =
+                    (self.builtin_view(*receiver)?, self.builtin_view(*argument)?);
+                return call(self, receiver, argument)
                     .map_err(|error| self.record_native_error(error));
             }
             SlotValue::NativeTernary(call) => {
@@ -2416,14 +2449,17 @@ impl Vm<'_> {
                         "ternary protocol slot received the wrong number of arguments".into(),
                     );
                 };
-                return call(self, *receiver, *first, *second)
+                let receiver = self.builtin_view(*receiver)?;
+                let (first, second) = (self.builtin_view(*first)?, self.builtin_view(*second)?);
+                return call(self, receiver, first, second)
                     .map_err(|error| self.record_native_error(error));
             }
             SlotValue::NativeUnary(call) => {
                 if !arguments.is_empty() {
                     return Err("unary protocol slot received arguments".into());
                 }
-                return call(self, *receiver).map_err(|error| self.record_native_error(error));
+                let receiver = self.builtin_view(*receiver)?;
+                return call(self, receiver).map_err(|error| self.record_native_error(error));
             }
             SlotValue::Descriptor(descriptor) => descriptor,
         };
@@ -2619,6 +2655,10 @@ impl Vm<'_> {
             if self.truth_value(&less)? {
                 return Ok(protocol::Comparison::Ordered(Ordering::Greater));
             }
+        }
+        let (builtin_left, builtin_right) = (self.builtin_view(*left)?, self.builtin_view(*right)?);
+        if builtin_left != *left || builtin_right != *right {
+            return self.compare_values(&builtin_left, &builtin_right);
         }
         protocol::compare(&self.state.heap, left, right)
     }

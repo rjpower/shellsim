@@ -29,7 +29,9 @@ const SYMBOL_NAME_BYTES: u64 = 24;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassLayout {
     Object,
-    Int,
+    /// A subclass of a builtin value type such as `int` or `tuple`, whose instances carry a
+    /// value of that type in [`InstancePayload::Builtin`].
+    Builtin(BuiltinType),
     Type,
 }
 
@@ -37,7 +39,10 @@ pub enum ClassLayout {
 #[derive(Clone, Debug)]
 pub enum InstancePayload {
     Object,
-    Int(i64),
+    /// The builtin value an instance of a builtin subclass stands for, such as the `int` of
+    /// `class Flag(int)` or the `tuple` of a named tuple. Builtin operations that the class does
+    /// not override act on this value.
+    Builtin(Value),
 }
 
 /// Runtime-local identity for an interned Python identifier.
@@ -1491,9 +1496,14 @@ fn trace_object(
             trace_values(enum_members.iter().copied(), object_work);
         }
         Object::Instance {
-            class, attributes, ..
+            class,
+            payload,
+            attributes,
         } => {
             object_work.push(*class);
+            if let InstancePayload::Builtin(value) = payload {
+                trace_value(*value, object_work);
+            }
             match attributes {
                 InstanceAttributes::Shaped { values, .. } => {
                     trace_values(values.iter().copied(), object_work);

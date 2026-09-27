@@ -84,6 +84,9 @@ impl Vm<'_> {
         if let Some(iterator) = self.class_iterator(&iterable)? {
             return Ok(iterator);
         }
+        if let Some(value) = protocol::builtin_payload(&self.state.heap, &iterable)? {
+            return self.make_iterator(value);
+        }
         let values = self.iterable_values(&iterable)?;
         let iterator = self.state.heap.allocate(
             Object::Iterator {

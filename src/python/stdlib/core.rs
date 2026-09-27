@@ -16,6 +16,7 @@ use super::super::native::{
     PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast,
 };
 use super::super::number::{index_argument, PyNumber};
+use super::super::object_model::BuiltinType;
 use super::super::protocol;
 use super::super::slice::SlicePlan;
 use super::super::unicode;
@@ -175,6 +176,17 @@ pub(crate) static LIST_TYPE: NativeTypeDef = NativeTypeDef {
         method("list", "index", list_index),
         method("list", "sort", list_sort),
         method("list", "copy", list_copy),
+    ],
+    getters: &[],
+};
+
+pub(crate) static TUPLE_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "tuple",
+    methods: &[
+        method("tuple", "__new__", tuple_new),
+        method("tuple", "__repr__", tuple_repr),
+        method("tuple", "count", tuple_count),
+        method("tuple", "index", tuple_index),
     ],
     getters: &[],
 };
@@ -2620,24 +2632,73 @@ fn list_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
     args.expect_positional("list.count", 1, 1)?;
     args.reject_keywords("list.count")?;
     let values = receiver.cast::<PyList>(runtime)?.items(runtime)?;
-    let mut count = 0i64;
-    for value in values {
-        runtime.charge_cpu(1)?;
-        if runtime.equals(&value, &args.positional()[0])? {
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| PyError::overflow_error("list is too large"))?;
-        }
-    }
-    Ok(Value::Int(count))
+    count_equal(runtime, &values, &args.positional()[0], "list")
 }
 
 fn list_index(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("list.index", 1, 3)?;
     args.reject_keywords("list.index")?;
     let values = receiver.cast::<PyList>(runtime)?.items(runtime)?;
-    let length =
-        i64::try_from(values.len()).map_err(|_| PyError::overflow_error("list too large"))?;
+    index_of(runtime, &values, args.positional(), "list")
+}
+
+/// `tuple.__new__(cls, iterable=())`, which receives the class explicitly.
+fn tuple_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    runtime.new_builtin_instance(BuiltinType::Tuple, receiver, args)
+}
+
+/// `tuple.__repr__(self)`, which a subclass's own `__repr__` may call.
+fn tuple_repr(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("tuple.__repr__", 0, 0)?;
+    args.reject_keywords("tuple.__repr__")?;
+    let tuple = receiver.cast::<PyTuple>(runtime)?;
+    let text = runtime.repr(&Value::Object(tuple.object_id()))?;
+    runtime.new_string(text)
+}
+
+fn tuple_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("tuple.count", 1, 1)?;
+    args.reject_keywords("tuple.count")?;
+    let values = receiver.cast::<PyTuple>(runtime)?.items(runtime)?;
+    count_equal(runtime, &values, &args.positional()[0], "tuple")
+}
+
+fn tuple_index(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("tuple.index", 1, 3)?;
+    args.reject_keywords("tuple.index")?;
+    let values = receiver.cast::<PyTuple>(runtime)?.items(runtime)?;
+    index_of(runtime, &values, args.positional(), "tuple")
+}
+
+/// `sequence.count(value)` for a list or tuple of `values`.
+fn count_equal(
+    runtime: &mut dyn PyRuntime,
+    values: &[PyValue],
+    value: &PyValue,
+    kind: &str,
+) -> PyResult {
+    let mut count = 0i64;
+    for item in values {
+        runtime.charge_cpu(1)?;
+        if runtime.equals(item, value)? {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| PyError::overflow_error(format!("{kind} is too large")))?;
+        }
+    }
+    Ok(Value::Int(count))
+}
+
+/// `sequence.index(value, start=0, stop=len)` for a list or tuple of `values`; `arguments` are
+/// the method's positional arguments.
+fn index_of(
+    runtime: &mut dyn PyRuntime,
+    values: &[PyValue],
+    arguments: &[PyValue],
+    kind: &str,
+) -> PyResult {
+    let length = i64::try_from(values.len())
+        .map_err(|_| PyError::overflow_error(format!("{kind} too large")))?;
     let endpoint = |value: Option<&PyValue>, default: i64| -> PyResult<i64> {
         value.map_or(Ok(default), |value| {
             runtime
@@ -2652,15 +2713,17 @@ fn list_index(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
             value.min(length)
         }
     };
-    let start = normalize(endpoint(args.positional().get(1), 0)?);
-    let stop = normalize(endpoint(args.positional().get(2), length)?);
+    let start = normalize(endpoint(arguments.get(1), 0)?);
+    let stop = normalize(endpoint(arguments.get(2), length)?);
     for index in start..stop {
         runtime.charge_cpu(1)?;
-        if runtime.equals(&values[index as usize], &args.positional()[0])? {
+        if runtime.equals(&values[index as usize], &arguments[0])? {
             return Ok(Value::Int(index));
         }
     }
-    Err(PyError::value_error("list.index(x): x not in list"))
+    Err(PyError::value_error(format!(
+        "{kind}.index(x): x not in {kind}"
+    )))
 }
 
 fn list_sort(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

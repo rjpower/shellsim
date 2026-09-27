@@ -171,6 +171,21 @@ fn exception_message(heap: &Heap, kind: &str, args: &[Value]) -> Result<String, 
     }
 }
 
+/// The builtin value behind an instance of a subclass of a builtin type such as `int` or
+/// `tuple`, which builtin operations the class does not override act on.
+pub fn builtin_payload(heap: &Heap, value: &Value) -> Result<Option<Value>, String> {
+    let Some(id) = value.object_id() else {
+        return Ok(None);
+    };
+    Ok(match heap.get(id)? {
+        Object::Instance {
+            payload: InstancePayload::Builtin(value),
+            ..
+        } => Some(*value),
+        _ => None,
+    })
+}
+
 /// The closest builtin exception ancestor and the `args` of an instance of a user exception
 /// class.
 pub fn user_exception_args(
@@ -350,7 +365,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 None => format!("<class '{name}'>"),
             },
             Object::Instance { class, payload, .. } => match payload {
-                InstancePayload::Int(value) => value.to_string(),
+                InstancePayload::Builtin(value) => render(heap, value, active)?,
                 InstancePayload::Object => match heap.get(*class)? {
                     Object::Class {
                         name,
@@ -463,9 +478,9 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
             (*step > 0 && *start < *stop) || (*step < 0 && *start > *stop)
         }
         Object::Instance {
-            payload: InstancePayload::Int(value),
+            payload: InstancePayload::Builtin(value),
             ..
-        } => *value != 0,
+        } => truth(heap, value)?,
         Object::Function { .. }
         | Object::Class { .. }
         | Object::Instance {

@@ -1088,6 +1088,9 @@ impl<'a> Vm<'a> {
             }
             return Ok(result);
         }
+        if let Some(value) = protocol::builtin_payload(&self.state.heap, value)? {
+            return self.iterable_values(&value);
+        }
         let mut result = Vec::new();
         if let Some(value) = protocol::string_value(&self.state.heap, value)? {
             for character in value.chars() {

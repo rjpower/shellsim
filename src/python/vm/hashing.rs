@@ -7,7 +7,7 @@
 
 use super::super::hash;
 use super::super::number::{self, NumberRef};
-use super::{Object, Slot, Value, ValueTag, Vm};
+use super::{protocol, Object, Slot, Value, ValueTag, Vm};
 
 /// Combines the hashes of a container's items into the container's hash.
 type Combine = fn(&[i64]) -> i64;
@@ -135,8 +135,9 @@ impl Vm<'_> {
         if is_dataclass {
             return Err(self.unhashable(value));
         }
-        if let Some(number) = number::view(&self.state.heap, value) {
-            return Ok(number_hash(number));
+        // An `int` or `tuple` subclass hashes as the value it holds.
+        if let Some(payload) = protocol::builtin_payload(&self.state.heap, value)? {
+            return self.hash_value(&payload);
         }
         let id = value.object_id().expect("instances are arena objects");
         Ok(hash::identity(id.as_raw() as u64))

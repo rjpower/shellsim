@@ -77,8 +77,15 @@ obj.attr` and `delattr` delete through the descriptor protocol: a class's `__del
 descriptor's `__delete__`, then the instance's own attribute. Classes and functions have no
 `__qualname__` or `__doc__`, so a nested class's `repr` omits its enclosing scope. Builtin
 functions, native methods and bound methods report `__name__`, and bound methods expose
-`__self__` and `__func__`. A subclass of `int` inherits the native `int` methods such as
-`bit_length` and `to_bytes`, and `from_bytes` called on the subclass returns an instance of it.
+`__self__` and `__func__`.
+
+A class may subclass `int` or `tuple`. Its instances carry the builtin value, so arithmetic,
+comparison, hashing, indexing, iteration, `len`, `repr` and `json.dumps` act on that value unless
+the class overrides them. The subclass inherits the native methods such as `bit_length`,
+`to_bytes`, `count` and `index`, and `from_bytes` called on the subclass returns an instance of
+it. `int.__new__(cls, ...)` and `tuple.__new__(cls, ...)` build a subclass instance from a user
+`__new__`. Subclassing any other builtin type, such as `list`, `dict` or `str`, fails with exit
+status 2 rather than producing an instance that lacks the builtin behavior.
 
 Calling a class whose MRO defines `__new__` calls it with the class and the arguments, then
 calls `__init__` only if the result is an instance of the class. `object.__new__` creates a plain

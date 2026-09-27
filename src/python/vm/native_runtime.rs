@@ -1153,6 +1153,21 @@ impl PyRuntime for Vm<'_> {
             .map_err(PyError::resource_error)
     }
 
+    fn builtin_payload(&self, value: &Value) -> PyResult<Option<Value>> {
+        protocol::builtin_payload(&self.state.heap, value).map_err(PyError::runtime_error)
+    }
+
+    fn new_builtin_instance(
+        &mut self,
+        builtin: BuiltinType,
+        class: Value,
+        args: CallArgs,
+    ) -> PyResult<Value> {
+        let (arguments, keyword_arguments) = args.into_parts();
+        Vm::new_builtin_instance(self, builtin, class, arguments, keyword_arguments)
+            .map_err(|error| self.raised_or_runtime_error(error))
+    }
+
     fn new_instance(&mut self, class: Value, has_arguments: bool) -> PyResult<Value> {
         Vm::new_instance(self, class, has_arguments)
             .map_err(|error| self.raised_or_runtime_error(error))
@@ -1225,10 +1240,11 @@ impl PyRuntime for Vm<'_> {
             } else {
                 match base.native_value() {
                     Some(NativeValue::BuiltinType(BuiltinType::Object)) => {}
-                    Some(NativeValue::BuiltinType(BuiltinType::Int))
-                        if layout == ClassLayout::Object =>
+                    Some(NativeValue::BuiltinType(builtin))
+                        if super::objects::is_subclassable_builtin(builtin)
+                            && layout == ClassLayout::Object =>
                     {
-                        layout = ClassLayout::Int;
+                        layout = ClassLayout::Builtin(builtin);
                     }
                     Some(NativeValue::BuiltinType(BuiltinType::Type))
                         if layout == ClassLayout::Object =>

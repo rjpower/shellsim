@@ -235,6 +235,10 @@ impl Vm<'_> {
             }
             return Ok(());
         }
+        // Instances of builtin subclasses compare as the values they hold; errors still name the
+        // subclasses.
+        let (subject_left, subject_right) = (left, right);
+        let (left, right) = (self.builtin_view(left)?, self.builtin_view(right)?);
         let result = match operator {
             ComparisonOperator::Equal => self.builtin_equality(&left, &right)?,
             ComparisonOperator::NotEqual => !self.builtin_equality(&left, &right)?,
@@ -252,7 +256,7 @@ impl Vm<'_> {
                     protocol::Comparison::Ordered(ordering) => accepted.contains(&ordering),
                     protocol::Comparison::Unordered => false,
                     protocol::Comparison::Unsupported => {
-                        return Err(self.raise_unorderable(symbol, &left, &right))
+                        return Err(self.raise_unorderable(symbol, &subject_left, &subject_right))
                     }
                 }
             }

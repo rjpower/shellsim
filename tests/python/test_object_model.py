@@ -652,3 +652,54 @@ def test_builtin_exception_methods_are_reachable_from_classes():
     assert LegacyError.__init__ is not Exception.__init__
     assert Finished(5).value == 5
     assert not hasattr(ValueError(), "value")
+
+
+class Pair(tuple):
+    def __new__(cls, first, second):
+        return super().__new__(cls, (first, second))
+
+    @property
+    def first(self):
+        return self[0]
+
+
+class LabeledTuple(tuple):
+    def __repr__(self):
+        return "Labeled" + tuple.__repr__(self)
+
+
+class Doubled(int):
+    def __new__(cls, value):
+        return super().__new__(cls, value * 2)
+
+
+def test_tuple_subclasses_behave_as_tuples():
+    import json
+
+    pair = Pair(1, 2)
+    assert (pair.first, len(pair), pair[-1], pair[:1], repr(pair)) == (1, 2, 2, (1,), "(1, 2)")
+    assert isinstance(pair, tuple) and type(pair) is Pair
+    assert pair == (1, 2) and (1, 2) == pair and hash(pair) == hash((1, 2))
+    assert pair < (1, 3) and sorted([Pair(2, 1), Pair(1, 2)]) == [(1, 2), (2, 1)]
+    first, second = pair
+    assert (first, second, list(pair), 2 in pair) == (1, 2, [1, 2], True)
+    assert (pair + (3,), (0,) + pair, pair * 2) == ((1, 2, 3), (0, 1, 2), (1, 2, 1, 2))
+    assert type(pair + (3,)) is tuple and type(tuple(pair)) is tuple
+    assert (pair.count(1), pair.index(2), {pair: "v"}[(1, 2)]) == (1, 1, "v")
+    assert ("%s-%s" % pair, "{}-{}".format(*pair), json.dumps(pair)) == ("1-2", "1-2", "[1, 2]")
+    pair.extra = 5
+    assert pair.extra == 5
+    assert repr(LabeledTuple([1])) == "Labeled(1,)"
+    assert tuple.__new__(LabeledTuple, [4]) == (4,) and type(tuple.__new__(LabeledTuple)) is LabeledTuple
+    assert Pair.__mro__ == (Pair, tuple, object)
+
+
+def test_builtin_new_constructs_subclass_instances():
+    assert (Doubled(3), type(Doubled(3)), Doubled(3) + 1) == (6, Doubled, 7)
+    try:
+        tuple.__new__(int, [4])
+    except TypeError as error:
+        assert str(error) == "tuple.__new__(int): int is not a subtype of tuple"
+    else:
+        raise AssertionError("tuple.__new__ accepted a class that is not a tuple subclass")
+    assert ((1, 2, 1).count(1), (1, 2).index(2)) == (2, 1)

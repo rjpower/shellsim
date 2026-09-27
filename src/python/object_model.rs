@@ -656,6 +656,10 @@ impl Default for TypeRegistry {
             &super::stdlib::core::SLICE_TYPE,
         );
         install_native_attributes(
+            &mut types[BuiltinType::Tuple as usize],
+            &super::stdlib::core::TUPLE_TYPE,
+        );
+        install_native_attributes(
             &mut types[BuiltinType::Dict as usize],
             &super::stdlib::core::DICT_TYPE,
         );
@@ -1091,6 +1095,10 @@ fn install_number_attributes(types: &mut [PyType]) {
     install_native_attributes(
         &mut types[BuiltinType::Int as usize],
         &super::number::INT_TYPE,
+    );
+    install_native_attributes(
+        &mut types[BuiltinType::Int as usize],
+        &super::number::INT_CONSTRUCTOR,
     );
     install_native_class_methods(
         &mut types[BuiltinType::Bool as usize],

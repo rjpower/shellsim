@@ -799,6 +799,16 @@ pub(super) trait PyRuntime {
     fn new_bytearray(&mut self, value: Vec<u8>) -> PyResult<PyValue>;
     fn property_getter(&self, property: PyProperty) -> PyResult<PyValue>;
     fn new_property(&mut self, getter: PyValue, setter: Option<PyValue>) -> PyResult<PyValue>;
+    /// The builtin value an instance of a subclass of a builtin type such as `tuple` holds.
+    fn builtin_payload(&self, value: &PyValue) -> PyResult<Option<PyValue>>;
+    /// `builtin.__new__(class, ...)`, such as `tuple.__new__(cls, iterable)`: the builtin value,
+    /// held by a new instance of `class` when it is a subclass of `builtin`.
+    fn new_builtin_instance(
+        &mut self,
+        builtin: super::object_model::BuiltinType,
+        class: PyValue,
+        args: CallArgs,
+    ) -> PyResult<PyValue>;
     /// `object.__new__(class, ...)`: a new, attribute-free instance of `class`. `has_arguments`
     /// says whether the call passed anything beyond the class.
     fn new_instance(&mut self, class: PyValue, has_arguments: bool) -> PyResult<PyValue>;
@@ -1204,16 +1214,15 @@ impl PyList {
 pub(super) struct PyTuple(ObjectId);
 
 impl FromPyValue for PyTuple {
+    /// Accepts a tuple, or an instance of a `tuple` subclass through the tuple it holds.
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
-            let actual = runtime.type_name(&value)?;
-            return Err(PyError::type_error(format!("expected tuple, got {actual}")));
-        };
-        if runtime.kind(&Value::Object(id))? == PyKind::Tuple {
-            Ok(Self(id))
-        } else {
-            let actual = runtime.type_name(&Value::Object(id))?;
-            Err(PyError::type_error(format!("expected tuple, got {actual}")))
+        let tuple = runtime.builtin_payload(&value)?.unwrap_or(value);
+        match tuple.object_id() {
+            Some(id) if runtime.kind(&tuple)? == PyKind::Tuple => Ok(Self(id)),
+            _ => {
+                let actual = runtime.type_name(&value)?;
+                Err(PyError::type_error(format!("expected tuple, got {actual}")))
+            }
         }
     }
 }

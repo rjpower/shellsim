@@ -106,9 +106,9 @@ pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>>
         Object::BigInt(value) => Some(NumberRef::BigInt(value)),
         Object::Complex { real, imag } => Some(NumberRef::Complex(*real, *imag)),
         Object::Instance {
-            payload: InstancePayload::Int(value),
+            payload: InstancePayload::Builtin(value),
             ..
-        } => Some(NumberRef::Int(*value)),
+        } => view(heap, value),
         _ => None,
     }
 }
@@ -203,6 +203,21 @@ macro_rules! real_number_type {
 
 pub(super) static BOOL_TYPE: NativeTypeDef = real_number_type!("bool", rational);
 pub(super) static INT_TYPE: NativeTypeDef = real_number_type!("int", rational);
+
+/// `int.__new__(cls, value=0)`, installed on `int` alone since `bool` cannot be subclassed.
+pub(super) static INT_CONSTRUCTOR: NativeTypeDef = NativeTypeDef {
+    name: "int",
+    methods: &[MethodDef {
+        type_name: "int",
+        name: "__new__",
+        call: int_new,
+    }],
+    getters: &[],
+};
+
+fn int_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    runtime.new_builtin_instance(super::object_model::BuiltinType::Int, receiver, args)
+}
 
 /// `int.from_bytes`, which receives the class so that `bool.from_bytes` returns a `bool`.
 pub(super) static INT_CLASS_METHODS: &[MethodDef] = &[MethodDef {
