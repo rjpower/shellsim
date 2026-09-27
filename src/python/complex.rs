@@ -73,9 +73,23 @@ impl Operand {
 
 /// Read one builtin number as a complex operand, or `None` for a non-numeric value.
 fn operand(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
+    Ok(match super::number::complex_operand(runtime, value) {
+        Some(NumberRef::Int(value)) => Some(Operand::Real(value as f64)),
+        Some(NumberRef::BigInt(value)) => Some(Operand::Real(bigint_to_f64(value)?)),
+        Some(NumberRef::UInt(value)) => Some(Operand::Real(value as f64)),
+        Some(NumberRef::Float(value)) => Some(Operand::Real(value)),
+        Some(NumberRef::Complex(real, imag)) => Some(Operand::Complex(Complex::new(real, imag))),
+        None => None,
+    })
+}
+
+/// Read any number as a `complex()` argument, including registered numbers such as NumPy
+/// scalars, which CPython reads through `__complex__`, `__float__` and `__index__`.
+fn constructor_operand(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
     Ok(match runtime.number(value) {
         Some(NumberRef::Int(value)) => Some(Operand::Real(value as f64)),
         Some(NumberRef::BigInt(value)) => Some(Operand::Real(bigint_to_f64(value)?)),
+        Some(NumberRef::UInt(value)) => Some(Operand::Real(value as f64)),
         Some(NumberRef::Float(value)) => Some(Operand::Real(value)),
         Some(NumberRef::Complex(real, imag)) => Some(Operand::Complex(Complex::new(real, imag))),
         None => None,
@@ -84,7 +98,7 @@ fn operand(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>
 
 /// A `complex()` argument: a number, or an object with a conversion method.
 fn number_or_method(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
-    match operand(runtime, value)? {
+    match constructor_operand(runtime, value)? {
         Some(operand) => Ok(Some(operand)),
         None if runtime.string_value(value)?.is_some() => Ok(None),
         None => operand_by_method(runtime, value),
@@ -116,7 +130,7 @@ fn operand_by_method(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<O
             };
             return Err(PyError::type_error(message));
         }
-        return operand(runtime, &result);
+        return constructor_operand(runtime, &result);
     }
     Ok(None)
 }

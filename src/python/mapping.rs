@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::ops::Deref;
 
+use super::native::KindNumber;
 use super::{Value, ValueTag};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -24,11 +25,7 @@ impl IndexedKey {
             return Some(Self::Integer(value));
         }
         if let Some(value) = value.float_value() {
-            let integer = value as i64;
-            if value.is_finite() && value.fract() == 0.0 && integer as f64 == value {
-                return Some(Self::Integer(integer));
-            }
-            return Some(Self::Float(value.to_bits()));
+            return Some(Self::float(value));
         }
         if value.inline_string_len().is_some() {
             return Some(Self::InlineString(*value));
@@ -36,7 +33,7 @@ impl IndexedKey {
         match value.tag() {
             ValueTag::None => Some(Self::None),
             ValueTag::Native => Some(Self::Native(*value)),
-            ValueTag::Registered => Some(Self::Registered(*value)),
+            ValueTag::Registered => Self::registered(*value),
             ValueTag::Object
             | ValueTag::Int
             | ValueTag::Float
@@ -57,6 +54,35 @@ impl IndexedKey {
             | ValueTag::SmallString13
             | ValueTag::SmallString14
             | ValueTag::SmallString15 => None,
+        }
+    }
+
+    /// Integral floats share the bucket of the equal integer, as `hash(2.0) == hash(2)`.
+    fn float(value: f64) -> Self {
+        let integer = value as i64;
+        if value.is_finite() && value.fract() == 0.0 && integer as f64 == value {
+            return Self::Integer(integer);
+        }
+        Self::Float(value.to_bits())
+    }
+
+    /// A registered number, such as a NumPy scalar, shares the bucket of the Python number it
+    /// equals. Complex numbers with an imaginary part and integers beyond `i64` stay unindexed,
+    /// like their builtin counterparts.
+    fn registered(value: Value) -> Option<Self> {
+        let (index, payload) = value.registered_parts()?;
+        let Some(kind) = super::stdlib::value_kind(index) else {
+            return Some(Self::Registered(value));
+        };
+        let Some(number) = kind.numeric.and_then(|numeric| numeric(kind, [payload, 0])) else {
+            return Some(Self::Registered(value));
+        };
+        match number {
+            KindNumber::Bool(value) => Some(Self::Integer(i64::from(value))),
+            KindNumber::Int(value) => Some(Self::Integer(value)),
+            KindNumber::UInt(value) => i64::try_from(value).ok().map(Self::Integer),
+            KindNumber::Float(value) => Some(Self::float(value)),
+            KindNumber::Complex(real, imag) => (imag == 0.0).then(|| Self::float(real)),
         }
     }
 }

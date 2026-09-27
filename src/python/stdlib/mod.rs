@@ -17,6 +17,7 @@ mod hashlib;
 pub mod heapq;
 mod http;
 mod importlib;
+mod introspect;
 pub mod itertools;
 pub mod json;
 pub mod math;
@@ -25,6 +26,7 @@ mod operator;
 pub mod os;
 pub mod pytest;
 pub mod re;
+mod scipy;
 pub mod string;
 mod r#struct;
 pub mod subprocess;
@@ -41,6 +43,17 @@ use super::native::{ModuleDef, ValueKindDef};
 /// Collect inline value registrations without teaching the VM about module-owned types.
 pub(super) fn value_kinds() -> impl Iterator<Item = &'static ValueKindDef> {
     numpy::value_kinds()
+}
+
+/// The registered kind at `index` in [`value_kinds`] order, which is also the order every
+/// type registry assigns kind indexes in. Pure protocols such as numeric views use it where
+/// no runtime is at hand.
+pub(super) fn value_kind(index: u8) -> Option<&'static ValueKindDef> {
+    static KINDS: std::sync::OnceLock<Vec<&'static ValueKindDef>> = std::sync::OnceLock::new();
+    KINDS
+        .get_or_init(|| value_kinds().collect())
+        .get(usize::from(index))
+        .copied()
 }
 
 /// Resolve a capability-free stdlib module implemented in ordinary Python source.
@@ -71,12 +84,12 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "_hashlib" => Some(&hashlib::MODULE),
         "_shellsim_http" => Some(&http::MODULE),
         "_importlib" => Some(&importlib::MODULE),
+        "_shellsim_introspect" => Some(&introspect::MODULE),
         "_shellsim_vfs" => Some(&vfs::MODULE),
         "_zlib" => Some(&zlib::MODULE),
         "_functools" => Some(&functools::MODULE),
         "itertools" => Some(&itertools::MODULE),
         "math" => Some(&math::MODULE),
-        "numpy" => Some(&numpy::MODULE),
         "_operator" => Some(&operator::MODULE),
         "_os" => Some(&os::MODULE),
         "_pytest" => Some(&pytest::MODULE),
@@ -89,6 +102,8 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "typing" => Some(&typing::MODULE),
         "unittest" => Some(&unittest::MODULE),
         "_shellsim_warnings" => Some(&warnings::MODULE),
+        _ if name.starts_with("_numpy") => numpy::native_module(name),
+        _ if name.starts_with("_scipy") => scipy::native_module(name),
         _ => None,
     }
 }

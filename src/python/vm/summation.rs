@@ -156,10 +156,15 @@ impl Vm<'_> {
         Err(self.raise_exception("TypeError", format!("sum() can't sum {kind}")))
     }
 
-    /// Classify `value` for the fast paths.
+    /// Classify `value` for the fast paths. Registered numbers such as NumPy scalars are not
+    /// Python `int`, `float`, or `complex` objects, so they take the generic path.
     fn sum_item(&self, value: &Value) -> Result<Item, String> {
+        if number::registered_number(&self.state.heap, value).is_some() {
+            return Ok(Item::Other);
+        }
         Ok(match number::view(&self.state.heap, value) {
             Some(NumberRef::Int(value)) => Item::Word(value),
+            Some(NumberRef::UInt(value)) => Item::Integer(Some(value as f64)),
             Some(NumberRef::BigInt(value)) => {
                 Item::Integer(value.to_f64().filter(|value| value.is_finite()))
             }

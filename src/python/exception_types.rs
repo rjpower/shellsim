@@ -109,6 +109,13 @@ pub(super) const EXCEPTION_TYPES: &[ExceptionTypeDef] = &[
     native("SubprocessError", "Exception"),
     native("CalledProcessError", "SubprocessError"),
     native("TimeoutExpired", "SubprocessError"),
+    // NumPy's AxisError also derives from IndexError; one parent is modeled, and ValueError is
+    // the one NumPy's own documentation leads with.
+    native("AxisError", "ValueError"),
+    native("LinAlgError", "ValueError"),
+    native("UFuncTypeError", "TypeError"),
+    native("DTypePromotionError", "TypeError"),
+    native("ComplexWarning", "RuntimeWarning"),
 ];
 
 /// Look up a modeled exception class by name.

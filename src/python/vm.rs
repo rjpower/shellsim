@@ -25,12 +25,13 @@ use super::heap::{
 };
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
-    PyArray, PyArrayDtype, PyArrayLayout, PyBinaryOp, PyByteArray, PyCallable, PyClass, PyClock,
-    PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity,
-    PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
-    PyProcessHandle, PyProcessOutput, PyProcessPoll, PyProcessRunner, PyProcessStartRequest,
-    PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyStreamRead,
-    PySubcommandSpec, PySubparsersSpec, PyTuple, PyValueCast,
+    PyArray, PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef,
+    PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError,
+    PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker,
+    PyMatch, PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessHandle, PyProcessOutput,
+    PyProcessPoll, PyProcessRunner, PyProcessStartRequest, PyProperty, PyRaisesContext, PyRegex,
+    PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple,
+    PyTypeObject, PyValueCast,
 };
 use super::number;
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};

@@ -109,8 +109,10 @@ print(sorted({1, 2, 3} - {2, 4}))"#;
 #[test]
 fn min_max_and_sorting_use_rich_comparisons_with_reflection() {
     // `min`, `max`, `sorted`, `list.sort` and `bisect` ask `<` (or `>` for `max`) as CPython
-    // does, so a class defining only the reflected operator orders.
+    // does, so a class defining only the reflected operator orders, and so do NumPy scalars
+    // compared against Python numbers.
     let source = r#"import bisect
+import numpy as np
 nan = float("nan")
 class OnlyGt:
     def __init__(self, v):
@@ -125,7 +127,8 @@ items.sort(reverse=True)
 print(items)
 print(min([nan, 1]), min([1, nan]), max([nan, 1]), max([1, nan]))
 print(sorted([(1, "a"), (0, "b"), (1, "c")], key=lambda t: t[0], reverse=True))
-print(bisect.bisect_left([OnlyGt(1), OnlyGt(3)], OnlyGt(2)))
+print(min(32, np.float64(np.inf)), max(np.array(3.0), 1), sorted([np.float64(3.0), 1, np.int64(2)]))
+print(bisect.bisect_left([1, np.float64(2.5), 4], 3))
 for call in (lambda: min(1, "a"), lambda: max(1, "a"), lambda: sorted([1, "a"])):
     try:
         call()
@@ -135,7 +138,7 @@ for call in (lambda: min(1, "a"), lambda: max(1, "a"), lambda: sorted([1, "a"]))
         run_shell(&format!("python3.14 <<'PY'\n{source}\nPY")),
         (
             0,
-            b"[G1, G2, G3] G1 G3\n[G3, G2, G1]\nnan 1 nan 1\n[(1, 'a'), (1, 'c'), (0, 'b')]\n1\n'<' not supported between instances of 'str' and 'int'\n'>' not supported between instances of 'str' and 'int'\n'<' not supported between instances of 'str' and 'int'\n".to_vec(),
+            b"[G1, G2, G3] G1 G3\n[G3, G2, G1]\nnan 1 nan 1\n[(1, 'a'), (1, 'c'), (0, 'b')]\n32 3.0 [1, np.int64(2), np.float64(3.0)]\n2\n'<' not supported between instances of 'str' and 'int'\n'>' not supported between instances of 'str' and 'int'\n'<' not supported between instances of 'str' and 'int'\n".to_vec(),
             Vec::new(),
         )
     );
@@ -215,7 +218,7 @@ fn venv_exposes_offline_python_and_pip_entrypoints() {
         run_shell(
             "printf 'numpy==2.1.3\\n' > /work/requirements.txt; python -m venv /tmp/example; /tmp/example/bin/pip install --no-cache-dir -r /work/requirements.txt; /tmp/example/bin/python -c 'import numpy; print(numpy.__version__)'"
         ),
-        (0, b"2.0.0-shellsim\n".to_vec(), Vec::new())
+        (0, b"2.5.3\n".to_vec(), Vec::new())
     );
 }
 

@@ -740,6 +740,7 @@ impl Vm<'_> {
                 | Object::Module { .. }
                 | Object::ArrayStorage(_)
                 | Object::Array { .. }
+                | Object::WideValue { .. }
                 | Object::Regex { .. }
                 | Object::Match { .. }
                 | Object::ArgumentParser { .. }
@@ -923,9 +924,10 @@ impl Vm<'_> {
     /// NumPy scalars and arrays, and instances of classes. `None` means the value is a builtin
     /// number, string, or bytes, or its type does not define `method`.
     fn conversion_method(&mut self, value: &Value, method: &str) -> Result<Option<Value>, String> {
-        let builtin = super::number::view(&self.state.heap, value).is_some()
-            || protocol::string_value(&self.state.heap, value)?.is_some()
-            || protocol::bytes_value(&self.state.heap, value)?.is_some();
+        let builtin = self.registered_kind(value).is_none()
+            && (super::number::view(&self.state.heap, value).is_some()
+                || protocol::string_value(&self.state.heap, value)?.is_some()
+                || protocol::bytes_value(&self.state.heap, value)?.is_some());
         if builtin {
             return Ok(None);
         }
@@ -992,7 +994,7 @@ impl Vm<'_> {
         let number = super::number::view(&self.state.heap, value);
         let float = match number {
             Some(NumberRef::Float(float)) => float,
-            Some(number @ (NumberRef::Int(_) | NumberRef::BigInt(_))) => {
+            Some(number @ (NumberRef::Int(_) | NumberRef::BigInt(_) | NumberRef::UInt(_))) => {
                 let text = number.to_bigint().expect("integer view").to_string();
                 return self
                     .new_integer(&text)

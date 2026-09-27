@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::bytecode::CodeRef;
 use super::mapping::OrderedMap;
-use super::native::{PyArgumentSpec, PyArrayDtype, PyArrayLayout};
+use super::native::{PyArgumentSpec, PyArrayBuffer, PyArrayView};
 use super::object_model::{BuiltinType, TypeId};
 use super::string::PyString;
 use super::Value;
@@ -235,13 +235,21 @@ pub enum Object {
         name: String,
         scope: ScopeId,
     },
-    /// Flat type-erased storage shared by one or more array views.
-    ArrayStorage(Vec<Value>),
-    /// An ndarray view. Indices are mapped into `ArrayStorage` by the layout.
+    /// Flat element storage shared by one or more array views: packed bytes, or traced Python
+    /// references for object arrays.
+    ArrayStorage(PyArrayBuffer),
+    /// An ndarray view. Byte strides and offset map indices into `ArrayStorage`.
     Array {
         storage: ObjectId,
-        layout: PyArrayLayout,
-        dtype: PyArrayDtype,
+        view: PyArrayView,
+        /// The array that owns the storage, for `ndarray.base`; `None` for owners.
+        base: Option<ObjectId>,
+    },
+    /// A registered value kind whose payload does not fit inline, such as a complex128 scalar.
+    WideValue {
+        type_id: TypeId,
+        kind: u8,
+        payload: [u64; 2],
     },
     /// A compiled regular expression.  The pattern is compiled at the operation boundary so
     /// regex execution never gets a host capability; keeping the source and flags here also
@@ -1158,6 +1166,7 @@ impl Heap {
             Object::Module { .. } => BuiltinType::Module.id(),
             Object::ArrayStorage(_) => BuiltinType::Native.id(),
             Object::Array { .. } => BuiltinType::Array.id(),
+            Object::WideValue { type_id, .. } => *type_id,
             Object::Regex { .. } => BuiltinType::Regex.id(),
             Object::Match { .. } => BuiltinType::Match.id(),
             Object::ArgumentParser { .. } => BuiltinType::ArgumentParser.id(),
@@ -1381,7 +1390,9 @@ fn trace_object(
         | Object::Tuple(items)
         | Object::Set(items)
         | Object::FrozenSet(items)
-        | Object::ArrayStorage(items) => trace_values(items.iter().copied(), object_work),
+        | Object::ArrayStorage(PyArrayBuffer::Values(items)) => {
+            trace_values(items.iter().copied(), object_work)
+        }
         Object::Dict(entries) => {
             for (key, value) in entries {
                 trace_values([*key, *value], object_work);
@@ -1467,7 +1478,10 @@ fn trace_object(
             trace_value(*return_value, object_work);
         }
         Object::Module { scope, .. } => scope_work.push(*scope),
-        Object::Array { storage, .. } => object_work.push(*storage),
+        Object::Array { storage, base, .. } => {
+            object_work.push(*storage);
+            object_work.extend(*base);
+        }
         Object::ArgumentParser {
             arguments,
             subparsers,
@@ -1507,6 +1521,8 @@ fn trace_object(
         | Object::String(_)
         | Object::Bytes(_)
         | Object::ByteArray(_)
+        | Object::ArrayStorage(PyArrayBuffer::Bytes(_))
+        | Object::WideValue { .. }
         | Object::Exception { .. }
         | Object::Slice { .. }
         | Object::BigInt(_)
@@ -1524,7 +1540,8 @@ fn trace_object(
 fn modeled_size(object: &Object) -> Result<u64, String> {
     const HEADER: u64 = 32;
     const VALUE: u64 = 24;
-    // Text and bytes are charged at their byte length rather than per value slot.
+    // Text, bytes, and packed array elements are charged at their byte length rather than per
+    // value slot.
     let packed = |length: usize| {
         u64::try_from(length)
             .ok()
@@ -1547,7 +1564,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::BigInt(value) => usize::try_from(value.bits().saturating_add(7) / 8)
             .map_err(|_| "modeled big integer size overflow")?,
         // Sixteen bytes of payload rounded up to one modeled value slot.
-        Object::Complex { .. } => 1,
+        Object::Complex { .. } | Object::WideValue { .. } => 1,
         Object::Range { .. } => 3,
         Object::Dict(entries) => entries
             .len()
@@ -1618,11 +1635,12 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .and_then(|size| size.checked_add(stack.len()))
             .ok_or("modeled object size overflow")?,
         Object::Module { name, .. } => name.len(),
-        Object::ArrayStorage(values) => values.len(),
-        Object::Array { layout, .. } => layout
+        Object::ArrayStorage(PyArrayBuffer::Bytes(bytes)) => return packed(bytes.len()),
+        Object::ArrayStorage(PyArrayBuffer::Values(values)) => values.len(),
+        Object::Array { view, .. } => view
             .shape
             .len()
-            .checked_add(layout.strides.len())
+            .checked_add(view.strides.len())
             .and_then(|size| size.checked_add(3))
             .ok_or("modeled object size overflow")?,
         Object::Regex { pattern, .. } => pattern.len(),

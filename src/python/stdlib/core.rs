@@ -3431,9 +3431,11 @@ fn builtin_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         Some(_) | None => None,
     };
     let value = args.positional()[0];
-    if matches!(runtime.kind(&value)?, PyKind::Instance | PyKind::Complex) {
-        // Like CPython, defer to the type's `__round__`, so a user class such as `Fraction`
-        // rounds itself.
+    if runtime.value_kind_of(&value).is_some()
+        || matches!(runtime.kind(&value)?, PyKind::Instance | PyKind::Complex)
+    {
+        // Like CPython, defer to the type's `__round__`, so a NumPy scalar keeps its dtype and
+        // a user class such as `Fraction` rounds itself.
         let Some(method) = runtime.get_attribute(value, "__round__")? else {
             return Err(PyError::type_error(format!(
                 "type {} doesn't define __round__ method",

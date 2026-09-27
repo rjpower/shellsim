@@ -1,0 +1,652 @@
+# Portable NumPy semantics. Expectations checked against NumPy 2.5.3 on CPython 3.14.4.
+# Scope: array construction, dtype inference, copy semantics, constructors and basic attributes.
+
+import numpy as np
+import pytest
+from numpy.testing import assert_allclose
+
+
+@pytest.mark.parametrize(
+    "values, dtype_name",
+    [
+        ([True, False], "bool"),
+        ([1, 2, 3], "int64"),
+        ([0.5, 2.5], "float64"),
+        ([1, 2.5], "float64"),
+        ([True, 1], "int64"),
+        ([True, 2.5], "float64"),
+        ([1, 1j], "complex128"),
+        ([1.5, 2j], "complex128"),
+        (["a", "bc"], "<U2"),
+        ([[1], [2.5]], "float64"),
+    ],
+)
+def test_array_infers_dtype_from_python_values(values, dtype_name):
+    assert np.array(values).dtype == np.dtype(dtype_name)
+
+
+def test_array_from_nested_lists_has_shape_and_values():
+    a = np.array([[1, 2, 3], [4, 5, 6]])
+    assert a.shape == (2, 3)
+    assert a.tolist() == [[1, 2, 3], [4, 5, 6]]
+
+
+def test_array_accepts_tuples_and_mixed_sequence_types():
+    assert np.array((1, 2, 3)).tolist() == [1, 2, 3]
+    assert np.array(((1, 2), (3, 4))).shape == (2, 2)
+    assert np.array([(1, 2), [3, 4]]).tolist() == [[1, 2], [3, 4]]
+    assert np.asarray((1.5, 2)).dtype == np.dtype("float64")
+
+
+def test_array_of_numpy_scalars_keeps_their_dtype():
+    assert np.array([np.int8(1), np.int8(2)]).dtype == np.dtype("int8")
+    assert np.array([np.float32(1), np.float64(2)]).dtype == np.dtype("float64")
+
+
+def test_array_from_list_of_arrays_stacks_them():
+    a = np.array([np.array([1, 2]), np.array([3, 4])])
+    assert a.shape == (2, 2)
+    assert a.tolist() == [[1, 2], [3, 4]]
+
+
+def test_mixed_python_objects_need_dtype_object():
+    a = np.array([1, "a", None], dtype=object)
+    assert a.dtype == np.dtype("object")
+    assert a.tolist() == [1, "a", None]
+
+
+@pytest.mark.parametrize(
+    "values, dtype_name, expected",
+    [
+        ([1, 2], "float64", [1.0, 2.0]),
+        ([1.7, 2.9], "int64", [1, 2]),
+        ([0, 1, 2], "bool", [False, True, True]),
+        ([1, 2], "uint8", [1, 2]),
+        ([1, 2], "float32", [1.0, 2.0]),
+    ],
+)
+def test_array_with_explicit_dtype_converts_values(values, dtype_name, expected):
+    a = np.array(values, dtype=np.dtype(dtype_name))
+    assert a.dtype == np.dtype(dtype_name)
+    assert a.tolist() == expected
+
+
+def test_array_with_complex64_dtype_holds_complex_values():
+    a = np.array([1, 2], dtype=np.complex64)
+    assert a.dtype == np.dtype("complex64")
+    assert a.tolist() == [complex(1, 0), complex(2, 0)]
+    assert type(a.tolist()[0]) is complex
+
+
+def test_explicit_dtype_rejects_out_of_range_python_int():
+    with pytest.raises(OverflowError) as info:
+        np.array([300], dtype=np.int8)
+    assert str(info.value) == "Python integer 300 out of bounds for int8"
+
+
+def test_explicit_float_dtype_rejects_non_numeric_string():
+    with pytest.raises(ValueError) as info:
+        np.array([1.5, "a"], dtype=float)
+    assert str(info.value) == "could not convert string to float: 'a'"
+
+
+def test_array_copies_existing_array():
+    a = np.array([1, 2, 3])
+    c = np.array(a)
+    assert c is not a
+    c[0] = 99
+    assert a.tolist() == [1, 2, 3]
+
+
+def test_asarray_returns_same_array_when_dtype_matches():
+    a = np.array([1, 2, 3])
+    b = np.asarray(a)
+    assert b is a
+    assert np.asarray(a, dtype=np.int64) is a
+    b[1] = 42
+    assert a.tolist() == [1, 42, 3]
+
+
+def test_asarray_converts_when_dtype_differs():
+    a = np.array([1, 2, 3])
+    b = np.asarray(a, dtype=np.float64)
+    assert b is not a
+    assert b.dtype == np.dtype("float64")
+
+
+def test_asarray_of_list_does_not_alias_list():
+    values = [1, 2]
+    a = np.asarray(values)
+    a[0] = 5
+    assert values == [1, 2]
+
+
+def test_array_copy_false_refuses_to_copy():
+    a = np.array([1, 2, 3])
+    assert np.array(a, copy=False) is a
+    with pytest.raises(ValueError):
+        np.array(a, dtype=float, copy=False)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [[1, 2], [3]],
+        [[1, 2], 3],
+        [[[1], [2]], [[3]]],
+    ],
+)
+def test_ragged_input_raises_value_error(rows):
+    with pytest.raises(ValueError) as info:
+        np.array(rows)
+    assert "inhomogeneous shape" in str(info.value)
+
+
+def test_array_rejects_nesting_deeper_than_64_levels():
+    value = 1
+    for _ in range(64):
+        value = [value]
+    assert np.array(value).ndim == 64
+    with pytest.raises(ValueError) as info:
+        np.array([value])
+    assert str(info.value) == (
+        "setting an array element with a sequence. The requested array would exceed the maximum "
+        "number of dimension of 64."
+    )
+
+
+def test_numeric_dtypes_convert_none_and_objects_as_numpy_does():
+    class Opaque:
+        pass
+
+    assert np.isnan(np.array([1, None, 2.5], dtype=float)).tolist() == [False, True, False]
+    assert np.isnan(np.array([None], dtype=complex)[0].imag)
+    assert np.array([None, Opaque(), 0, "x"], dtype=bool).tolist() == [False, True, False, True]
+    with pytest.raises(TypeError) as info:
+        np.array([None], dtype=np.int32)
+    assert str(info.value) == "int() argument must be a string, a bytes-like object or a real number, not 'NoneType'"
+    with pytest.raises(TypeError) as info:
+        np.array([Opaque()], dtype=float)
+    assert str(info.value) == "float() argument must be a string or a real number, not 'Opaque'"
+    with pytest.raises(TypeError) as info:
+        np.array([1j], dtype=np.uint8)
+    assert str(info.value) == "int() argument must be a string, a bytes-like object or a real number, not 'complex'"
+
+
+def test_zeros_and_ones_default_to_float64():
+    z = np.zeros((2, 3))
+    assert z.dtype == np.dtype("float64")
+    assert z.tolist() == [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    assert np.ones(3).tolist() == [1.0, 1.0, 1.0]
+
+
+def test_zeros_and_ones_accept_dtype():
+    assert np.zeros(3, dtype=bool).tolist() == [False, False, False]
+    o = np.ones((2,), dtype=int)
+    assert o.dtype == np.dtype("int64")
+    assert o.tolist() == [1, 1]
+
+
+def test_empty_has_requested_shape_and_dtype():
+    e = np.empty((2, 3), dtype=np.int32)
+    assert e.shape == (2, 3)
+    assert e.dtype == np.dtype("int32")
+
+
+def test_negative_dimension_raises_value_error():
+    with pytest.raises(ValueError) as info:
+        np.zeros(-1)
+    assert str(info.value) == "negative dimensions are not allowed"
+
+
+@pytest.mark.parametrize(
+    "fill, dtype_name",
+    [
+        (7, "int64"),
+        (7.5, "float64"),
+        (True, "bool"),
+        (1j, "complex128"),
+    ],
+)
+def test_full_infers_dtype_from_fill_value(fill, dtype_name):
+    f = np.full((2, 2), fill)
+    assert f.dtype == np.dtype(dtype_name)
+    assert f.tolist() == [[fill, fill], [fill, fill]]
+
+
+def test_full_with_dtype_converts_fill_value():
+    f = np.full(2, 7, dtype=np.int8)
+    assert f.dtype == np.dtype("int8")
+    assert f.tolist() == [7, 7]
+
+
+def test_like_constructors_preserve_dtype_and_shape():
+    src = np.array([[1, 2, 3]], dtype=np.int16)
+    for made in (np.zeros_like(src), np.ones_like(src), np.empty_like(src), np.full_like(src, 5)):
+        assert made.dtype == np.dtype("int16")
+        assert made.shape == (1, 3)
+    assert np.zeros_like(src).tolist() == [[0, 0, 0]]
+    assert np.ones_like(src).tolist() == [[1, 1, 1]]
+    assert np.full_like(src, 5).tolist() == [[5, 5, 5]]
+
+
+def test_like_constructors_accept_dtype_and_shape_overrides():
+    src = np.array([1, 2, 3])
+    assert np.full_like(src, 2.7).tolist() == [2, 2, 2]
+    f = np.full_like(src, 2.7, dtype=float)
+    assert f.dtype == np.dtype("float64")
+    assert f.tolist() == [2.7, 2.7, 2.7]
+    z = np.zeros_like(src, shape=(2, 2))
+    assert z.shape == (2, 2)
+    assert z.dtype == np.dtype("int64")
+
+
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        ((5,), [0, 1, 2, 3, 4]),
+        ((2, 6), [2, 3, 4, 5]),
+        ((1, 10, 3), [1, 4, 7]),
+        ((0,), []),
+        ((5, 1), []),
+    ],
+)
+def test_arange_integer_steps(args, expected):
+    a = np.arange(*args)
+    assert a.dtype == np.dtype("int64")
+    assert a.tolist() == expected
+
+
+def test_arange_negative_bounds_and_steps():
+    assert np.arange(-3, 3).tolist() == [-3, -2, -1, 0, 1, 2]
+    assert np.arange(5, 0, -2).tolist() == [5, 3, 1]
+    assert np.arange(10, 0, -3).tolist() == [10, 7, 4, 1]
+
+
+def test_arange_float_steps():
+    a = np.arange(1, 2, 0.25)
+    assert a.dtype == np.dtype("float64")
+    assert a.tolist() == [1.0, 1.25, 1.5, 1.75]
+    assert np.arange(0.5, 3).tolist() == [0.5, 1.5, 2.5]
+    assert np.arange(3.0).dtype == np.dtype("float64")
+    inexact = np.arange(0.0, 1.0, 0.3)
+    assert inexact.shape == (4,)
+    assert_allclose(inexact, [0.0, 0.3, 0.6, 0.9])
+
+
+def test_arange_accepts_dtype():
+    assert np.arange(3, dtype=np.int8).dtype == np.dtype("int8")
+    a = np.arange(1, 3, dtype=float)
+    assert a.dtype == np.dtype("float64")
+    assert a.tolist() == [1.0, 2.0]
+
+
+def test_arange_accepts_zero_d_array_bounds():
+    floats = np.arange(np.array(2.0), np.array(5))
+    assert floats.dtype == np.dtype("float64")
+    assert floats.tolist() == [2.0, 3.0, 4.0]
+    assert np.arange(np.array(3)).tolist() == [0, 1, 2]
+    assert np.arange(0, 1.5, np.array(0.5)).tolist() == [0.0, 0.5, 1.0]
+    with pytest.raises(TypeError, match="only 0-dimensional arrays"):
+        np.arange(np.array([3]))
+    with pytest.raises(ValueError, match="more than one element is ambiguous"):
+        np.arange(np.array([3, 4]))
+
+
+class _Pair:
+    """A user sequence. NumPy reads objects with `__len__` and `__getitem__` as sequences."""
+
+    def __init__(self, *items):
+        self.items = items
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+
+class _IterOnly:
+    def __iter__(self):
+        return iter([1, 2])
+
+
+def test_asarray_reads_user_sequences():
+    assert np.asarray(_Pair(1.5, 2)).tolist() == [1.5, 2.0]
+    nested = np.asarray([_Pair(1, 2), (3, 4)])
+    assert nested.dtype == np.dtype("int64")
+    assert nested.tolist() == [[1, 2], [3, 4]]
+    assert np.add(_Pair(1, 2), 1).tolist() == [2, 3]
+    np.testing.assert_allclose(_Pair(1.0, 2.0), (1.0, 2.0))
+    # An iterable without `__getitem__` is not a sequence, so it becomes an object scalar.
+    iter_only = np.asarray(_IterOnly())
+    assert iter_only.dtype == np.dtype(object)
+    assert iter_only.shape == ()
+    with pytest.raises(ValueError, match="inhomogeneous"):
+        np.asarray(_Pair(_Pair(1, 2), _Pair(3)))
+
+
+def test_arange_zero_step_raises():
+    with pytest.raises(ZeroDivisionError):
+        np.arange(0, 5, 0)
+
+
+def test_linspace_includes_endpoint_by_default():
+    a = np.linspace(0, 1, 5)
+    assert a.dtype == np.dtype("float64")
+    assert a.tolist() == [0.0, 0.25, 0.5, 0.75, 1.0]
+    assert np.linspace(5, 1, 3).tolist() == [5.0, 3.0, 1.0]
+
+
+def test_linspace_without_endpoint():
+    assert np.linspace(0, 1, 4, endpoint=False).tolist() == [0.0, 0.25, 0.5, 0.75]
+
+
+def test_linspace_small_counts():
+    assert np.linspace(1, 1, 1).tolist() == [1.0]
+    assert np.linspace(0, 1, 1).tolist() == [0.0]
+    assert np.linspace(0, 1, 0).shape == (0,)
+
+
+def test_linspace_retstep_returns_step():
+    values, step = np.linspace(0, 10, 5, retstep=True)
+    assert values.tolist() == [0.0, 2.5, 5.0, 7.5, 10.0]
+    assert step == 2.5
+    assert type(step) is np.float64
+
+
+def test_linspace_interpolates_complex_bounds_by_part():
+    values = np.linspace(1 + 1j, 2, 4, endpoint=False)
+    assert values.dtype == np.dtype("complex128")
+    assert values.tolist() == [1 + 1j, 1.25 + 0.75j, 1.5 + 0.5j, 1.75 + 0.25j]
+    values, step = np.linspace(0, 1j, 3, retstep=True)
+    assert values.tolist() == [0j, 0.5j, 1j]
+    assert step == 0.5j
+    assert np.linspace(0, 2j, 3, dtype=np.complex64).dtype == np.dtype("complex64")
+
+
+def test_linspace_with_dtype():
+    assert np.linspace(0, 10, 5, dtype=int).tolist() == [0, 2, 5, 7, 10]
+    assert np.linspace(2, 3, 5, dtype=np.float32).dtype == np.dtype("float32")
+
+
+def test_logspace_powers_of_base():
+    assert np.logspace(0, 3, 4).tolist() == [1.0, 10.0, 100.0, 1000.0]
+    assert np.logspace(0, 3, 4, base=2).tolist() == [1.0, 2.0, 4.0, 8.0]
+    assert_allclose(np.logspace(0, 2, 3, endpoint=False), [1.0, 4.641588833612778, 21.544346900318832])
+
+
+def test_eye_and_identity():
+    assert np.eye(2, 3).tolist() == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    assert np.identity(2).tolist() == [[1.0, 0.0], [0.0, 1.0]]
+    assert np.identity(2).dtype == np.dtype("float64")
+    assert np.identity(3, dtype=int).tolist() == [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+    assert np.eye(2, dtype=bool).tolist() == [[True, False], [False, True]]
+
+
+@pytest.mark.parametrize(
+    "k, expected",
+    [
+        (1, [[0, 1, 0], [0, 0, 1], [0, 0, 0]]),
+        (2, [[0, 0, 1], [0, 0, 0], [0, 0, 0]]),
+        (3, [[0, 0, 0], [0, 0, 0], [0, 0, 0]]),
+    ],
+)
+def test_eye_diagonal_offset(k, expected):
+    assert np.eye(3, k=k).tolist() == expected
+
+
+def test_eye_negative_diagonal_offset():
+    assert np.eye(3, k=-1).tolist() == [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+
+
+def test_diag_builds_matrix_from_vector():
+    assert np.diag([1, 2, 3]).tolist() == [[1, 0, 0], [0, 2, 0], [0, 0, 3]]
+    assert np.diag([1, 2], k=1).tolist() == [[0, 1, 0], [0, 0, 2], [0, 0, 0]]
+    assert np.diag([1.5, 2]).dtype == np.dtype("float64")
+
+
+@pytest.mark.parametrize(
+    "k, expected",
+    [
+        (0, [0, 4, 8]),
+        (1, [1, 5]),
+        (2, [2]),
+        (5, []),
+    ],
+)
+def test_diag_extracts_diagonal_from_matrix(k, expected):
+    m = np.arange(9).reshape(3, 3)
+    assert np.diag(m, k=k).tolist() == expected
+
+
+def test_diag_extracts_below_main_diagonal():
+    assert np.diag(np.arange(9).reshape(3, 3), k=-1).tolist() == [3, 7]
+
+
+def test_diag_extracts_from_non_square_matrix():
+    assert np.diag(np.array([[1, 2], [3, 4], [5, 6]])).tolist() == [1, 4]
+
+
+def test_meshgrid_xy_indexing():
+    x, y = np.meshgrid([1, 2, 3], [4, 5])
+    assert x.shape == (2, 3)
+    assert x.tolist() == [[1, 2, 3], [1, 2, 3]]
+    assert y.tolist() == [[4, 4, 4], [5, 5, 5]]
+
+
+def test_meshgrid_ij_indexing():
+    x, y = np.meshgrid([1, 2, 3], [4, 5], indexing="ij")
+    assert x.shape == (3, 2)
+    assert x.tolist() == [[1, 1], [2, 2], [3, 3]]
+    assert y.tolist() == [[4, 5], [4, 5], [4, 5]]
+
+
+def test_meshgrid_three_inputs_and_dtypes():
+    grids = np.meshgrid([1, 2], [3, 4, 5], [6.5])
+    assert len(grids) == 3
+    assert grids[0].shape == (3, 2, 1)
+    assert grids[0].dtype == np.dtype("int64")
+    assert grids[2].dtype == np.dtype("float64")
+
+
+def test_fromiter_consumes_iterable():
+    a = np.fromiter((x * x for x in range(4)), dtype=float)
+    assert a.dtype == np.dtype("float64")
+    assert a.tolist() == [0.0, 1.0, 4.0, 9.0]
+    assert np.fromiter([], dtype=float).shape == (0,)
+
+
+def test_iterable_reports_whether_iter_succeeds():
+    assert np.iterable([1, 2]) and np.iterable("ab") and np.iterable(np.arange(2))
+    assert not np.iterable(3) and not np.iterable(np.float64(1.5))
+    assert not np.iterable(np.array(5))
+
+
+def test_fromiter_count_limits_items():
+    a = np.fromiter(range(10), dtype=np.int8, count=3)
+    assert a.dtype == np.dtype("int8")
+    assert a.tolist() == [0, 1, 2]
+
+
+def test_fromiter_short_iterator_raises():
+    with pytest.raises(ValueError) as info:
+        np.fromiter(range(2), dtype=int, count=5)
+    assert str(info.value) == "iterator too short: Expected 5 but iterator had only 2 items."
+
+
+@pytest.mark.parametrize(
+    "dtype_name, itemsize",
+    [
+        ("bool", 1),
+        ("int8", 1),
+        ("int16", 2),
+        ("float16", 2),
+        ("int32", 4),
+        ("float32", 4),
+        ("int64", 8),
+        ("float64", 8),
+        ("complex64", 8),
+        ("complex128", 16),
+        ("object", 8),
+    ],
+)
+def test_size_attributes(dtype_name, itemsize):
+    a = np.zeros((2, 3), dtype=np.dtype(dtype_name))
+    assert a.ndim == 2
+    assert a.shape == (2, 3)
+    assert a.size == 6
+    assert a.itemsize == itemsize
+    assert a.nbytes == 6 * itemsize
+
+
+def test_zero_dimensional_arrays():
+    for a in (np.array(5), np.zeros(())):
+        assert a.shape == ()
+        assert a.ndim == 0
+        assert a.size == 1
+
+
+def test_empty_dimension_arrays():
+    a = np.zeros((0, 3))
+    assert a.shape == (0, 3)
+    assert a.size == 0
+    assert a.nbytes == 0
+    assert len(a) == 0
+    assert a.tolist() == []
+    assert np.zeros((3, 0)).tolist() == [[], [], []]
+
+
+def test_empty_list_gives_float64():
+    a = np.array([])
+    assert a.dtype == np.dtype("float64")
+    assert a.shape == (0,)
+    assert np.array([[]]).shape == (1, 0)
+
+
+def layout(a):
+    return a.strides, a.flags.c_contiguous, a.flags.f_contiguous, a.flags.owndata
+
+
+@pytest.mark.parametrize("name", ["zeros", "ones", "empty"])
+def test_shape_constructors_lay_out_fortran_order(name):
+    a = getattr(np, name)((2, 3, 4), dtype=np.int16, order="F")
+    assert layout(a) == ((2, 4, 12), False, True, True)
+    assert getattr(np, name)((2, 3), order="f").strides == (8, 16)
+    assert np.full((2, 3), 7, order="F").tolist() == [[7, 7, 7], [7, 7, 7]]
+    assert np.full((2, 3), 7, order="F").strides == (8, 16)
+    assert np.eye(2, 3, k=1, order="F").strides == (8, 16)
+    assert np.eye(2, 3, k=1, order="F").tolist() == [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+
+def test_constructor_order_argument_errors():
+    with pytest.raises(ValueError, match="only 'C' or 'F' order is permitted"):
+        np.zeros(3, order="K")
+    with pytest.raises(ValueError, match="only 'C' or 'F' order is permitted"):
+        np.full(3, 1, order="A")
+    with pytest.raises(ValueError) as info:
+        np.array([1], order="Q")
+    assert str(info.value) == "order must be one of 'C', 'F', 'A', or 'K' (got 'Q')"
+    with pytest.raises(TypeError, match="order must be str, not int"):
+        np.ones(3, order=1)
+
+
+def test_new_empty_arrays_have_zero_strides():
+    assert np.zeros((0, 3)).strides == (0, 0)
+    assert np.zeros((2, 0, 3), order="F").strides == (0, 0, 0)
+
+
+def test_array_copies_in_the_requested_order():
+    m = np.arange(6).reshape(2, 3)
+    f = np.array(m, order="F")
+    assert layout(f) == ((8, 16), False, True, True)
+    assert f.tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert np.array([[1, 2], [3, 4]], order="F").strides == (8, 16)
+    # The default order 'K' keeps the source's memory order, even for transposes and permutes.
+    assert np.array(f).strides == (8, 16)
+    assert np.array(m.T).strides == (8, 24)
+    assert np.array(m[::-1].T).strides == (8, 24)
+    assert np.array(m[:, ::-1]).strides == (24, 8)
+    permuted = np.arange(24).reshape(2, 3, 4).transpose(1, 2, 0)
+    assert layout(np.array(permuted)) == ((32, 8, 96), False, False, True)
+    assert np.array(f, order="C").strides == (24, 8)
+    assert np.array(f, order="A").strides == (8, 16)
+    assert np.array(f, dtype=np.float32).strides == (4, 8)
+
+
+def test_asarray_copies_only_for_a_different_layout():
+    m = np.arange(6).reshape(2, 3)
+    f = np.asfortranarray(m)
+    assert layout(f) == ((8, 16), False, True, True)
+    assert np.asfortranarray(f) is f
+    assert np.asarray(f) is f
+    assert np.asarray(f, order="A") is f
+    assert np.asarray(f, order="F") is f
+    assert np.asarray(f, order="C") is not f
+    assert np.ascontiguousarray(f).strides == (24, 8)
+    assert np.asarray([[1, 2], [3, 4]], order="F").strides == (8, 16)
+    scalar = np.asfortranarray(5)
+    assert (scalar.shape, scalar.flags.owndata) == ((1,), False)
+    with pytest.raises(ValueError, match="Unable to avoid copy"):
+        np.asarray(f, order="C", copy=False)
+
+
+def test_ndmin_prepends_axes_with_numpy_strides():
+    assert np.array([1, 2], ndmin=2).strides == (16, 8)
+    assert np.array([[1, 2]], ndmin=3).strides == (16, 16, 8)
+    assert np.array(5, ndmin=2).strides == (8, 8)
+    assert np.array([1, 2], ndmin=2, order="F").strides == (8, 8)
+
+
+def test_copies_and_casts_follow_their_default_orders():
+    m = np.arange(6).reshape(2, 3)
+    f = np.asfortranarray(m)
+    assert f.copy().strides == (24, 8)
+    assert f.copy(order="K").strides == (8, 16)
+    assert f.copy(order="A").strides == (8, 16)
+    assert m.copy(order="F").strides == (8, 16)
+    assert np.copy(f).strides == (8, 16)
+    assert np.copy(f, order="C").strides == (24, 8)
+    assert f.astype(np.float32).strides == (4, 8)
+    assert f.astype(np.float32, order="C").strides == (12, 4)
+    assert f.astype(f.dtype, copy=False) is f
+    assert f.astype(f.dtype, copy=False, order="C") is not f
+    for copied in [f.copy(order="F"), f.astype(np.float32, order="F")]:
+        assert copied.tolist() == [[0, 1, 2], [3, 4, 5]]
+
+
+def test_like_constructors_keep_the_prototype_order():
+    f = np.asfortranarray(np.arange(6).reshape(2, 3))
+    assert np.zeros_like(f).strides == (8, 16)
+    assert np.zeros_like(f, order="C").strides == (24, 8)
+    assert np.zeros_like(f, order="A").strides == (8, 16)
+    assert np.full_like(f, 3).strides == (8, 16)
+    assert np.empty_like(np.arange(6).reshape(2, 3).T).strides == (8, 24)
+    permuted = np.arange(24).reshape(2, 3, 4).transpose(1, 2, 0)
+    assert np.ones_like(permuted).strides == (32, 8, 96)
+    # A new shape of the same rank keeps the order; a different rank falls back to C order.
+    assert np.zeros_like(f, shape=(3, 2)).strides == (8, 24)
+    assert np.zeros_like(f, shape=(2, 2, 2)).strides == (32, 16, 8)
+    with pytest.raises(ValueError, match="order must be one of"):
+        np.zeros_like(f, order="X")
+
+
+def test_asarray_chkfinite_rejects_nan_and_inf():
+    assert np.asarray_chkfinite([1, 2], dtype=np.float32).dtype == np.float32
+    for bad in ([1.0, np.nan], [np.inf]):
+        with pytest.raises(ValueError, match="array must not contain infs or NaNs"):
+            np.asarray_chkfinite(bad)
+
+
+def test_isfortran_requires_fortran_but_not_c_order():
+    a = np.ones((2, 3))
+    assert not np.isfortran(a)
+    assert np.isfortran(a.T)
+    assert not np.isfortran(np.ones(3))
+
+
+def test_common_type_is_the_common_inexact_scalar_type():
+    assert np.common_type(np.ones(2, np.float32)) is np.float32
+    assert np.common_type(np.ones(2, np.float32), np.arange(2)) is np.float64
+    assert np.common_type(np.ones(2, np.float16)) is np.float16
+    assert np.common_type(np.ones(2), np.ones(2, np.complex64)) is np.complex128

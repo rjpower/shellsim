@@ -39,7 +39,13 @@ pub(super) type UnarySlotFn = fn(&mut dyn PyRuntime, PyValue) -> PyResult<Option
 #[derive(Clone, Copy, Default)]
 pub(super) struct ValueKindSlots {
     pub repr: Option<UnarySlotFn>,
+    pub str_: Option<UnarySlotFn>,
     pub bool_: Option<UnarySlotFn>,
+    pub get_item: Option<BinarySlotFn>,
+    pub positive: Option<UnarySlotFn>,
+    pub negative: Option<UnarySlotFn>,
+    pub invert: Option<UnarySlotFn>,
+    pub absolute: Option<UnarySlotFn>,
     pub add: Option<BinarySlotFn>,
     pub reflected_add: Option<BinarySlotFn>,
     pub subtract: Option<BinarySlotFn>,
@@ -48,6 +54,24 @@ pub(super) struct ValueKindSlots {
     pub reflected_multiply: Option<BinarySlotFn>,
     pub divide: Option<BinarySlotFn>,
     pub reflected_divide: Option<BinarySlotFn>,
+    pub floor_divide: Option<BinarySlotFn>,
+    pub reflected_floor_divide: Option<BinarySlotFn>,
+    pub remainder: Option<BinarySlotFn>,
+    pub reflected_remainder: Option<BinarySlotFn>,
+    pub divmod: Option<BinarySlotFn>,
+    pub reflected_divmod: Option<BinarySlotFn>,
+    pub power: Option<BinarySlotFn>,
+    pub reflected_power: Option<BinarySlotFn>,
+    pub left_shift: Option<BinarySlotFn>,
+    pub reflected_left_shift: Option<BinarySlotFn>,
+    pub right_shift: Option<BinarySlotFn>,
+    pub reflected_right_shift: Option<BinarySlotFn>,
+    pub bitwise_and: Option<BinarySlotFn>,
+    pub reflected_bitwise_and: Option<BinarySlotFn>,
+    pub bitwise_xor: Option<BinarySlotFn>,
+    pub reflected_bitwise_xor: Option<BinarySlotFn>,
+    pub bitwise_or: Option<BinarySlotFn>,
+    pub reflected_bitwise_or: Option<BinarySlotFn>,
     pub equal: Option<BinarySlotFn>,
     pub not_equal: Option<BinarySlotFn>,
     pub less_than: Option<BinarySlotFn>,
@@ -56,16 +80,76 @@ pub(super) struct ValueKindSlots {
     pub greater_equal: Option<BinarySlotFn>,
 }
 
-/// Static registration for a type-erased, inline Python value.
+/// Static registration for a type-erased Python value with a module-owned payload.
 ///
+/// Instances carry either an inline `u64` payload ([`PyRuntime::new_value_kind`]) or a 16-byte
+/// heap payload ([`PyRuntime::new_wide_value_kind`]); one kind uses one width consistently.
 /// `methods` and `getters` are installed on the registered Python type exactly like the tables of
 /// a [`NativeTypeDef`]; the payload stays opaque to the runtime.
+///
+/// Kinds are registered in iteration order, so every kind named in `bases` must be registered
+/// before the kinds that derive from it. The runtime linearizes `bases` with C3 like a class
+/// statement would.
 pub(super) struct ValueKindDef {
     pub name: &'static str,
     pub construct: NativeFn,
     pub slots: ValueKindSlots,
     pub methods: &'static [MethodDef],
     pub getters: &'static [GetterDef],
+    /// Direct Python bases, most specific first. An empty list means `object`.
+    pub bases: &'static [KindBase],
+    /// Calls an instance, e.g. a NumPy ufunc, with the instance as receiver.
+    pub call: Option<NativeMethodFn>,
+    /// The Python number an instance stands for, such as the value of a NumPy scalar. It backs
+    /// `int()`, `float()`, `complex()`, `__index__` (integers only), formatting, and equality
+    /// with builtin numbers, including inside containers where no runtime is at hand.
+    pub numeric: Option<KindNumericFn>,
+}
+
+/// Pure numeric view of one registered instance, given its kind and payload. Inline kinds pass
+/// `[payload, 0]`; wide kinds pass both words.
+pub(super) type KindNumericFn = fn(&'static ValueKindDef, [u64; 2]) -> Option<KindNumber>;
+
+impl ValueKindDef {
+    /// Whether instances are builtin `float`s too, directly or through a registered base, as
+    /// NumPy's `float64` is.
+    pub(super) fn is_float_subclass(&self) -> bool {
+        self.bases.iter().any(|base| match base {
+            KindBase::Float => true,
+            KindBase::Kind(kind) => kind.is_float_subclass(),
+            KindBase::Complex => false,
+        })
+    }
+
+    /// Whether instances are builtin `complex`es too, as NumPy's `complex128` is.
+    pub(super) fn is_complex_subclass(&self) -> bool {
+        self.bases.iter().any(|base| match base {
+            KindBase::Complex => true,
+            KindBase::Kind(kind) => kind.is_complex_subclass(),
+            KindBase::Float => false,
+        })
+    }
+}
+
+/// One direct base of a registered value kind.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum KindBase {
+    Kind(&'static ValueKindDef),
+    Float,
+    Complex,
+}
+
+/// The builtin Python number a registered value stands for.
+///
+/// `UInt` keeps unsigned 64-bit values above `i64::MAX` exact. Only `Int` and `UInt` support
+/// `__index__`; like NumPy's `bool`, a `Bool` converts with `int()` but is not an index.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum KindNumber {
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    Complex(f64, f64),
 }
 
 impl PartialEq for ValueKindDef {
@@ -205,38 +289,132 @@ pub(super) enum PyNativeKind {
     Array,
 }
 
-/// Opaque module-owned scalar identity carried by a type-erased array.
+/// Module-owned element type of an array, opaque to the runtime except for its storage needs.
+///
+/// The runtime uses `itemsize` to bounds-check views and `values` to decide whether elements are
+/// packed bytes or traced Python references. `tag` belongs to the module that created the array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PyArrayDtype {
-    id: u8,
-    name: &'static str,
+    tag: u32,
+    itemsize: u32,
+    values: bool,
 }
 
 impl PyArrayDtype {
-    pub const fn new(id: u8, name: &'static str) -> Self {
-        Self { id, name }
+    /// Size in bytes of one element stored as a Python reference.
+    pub const VALUE_ITEMSIZE: usize = 8;
+
+    /// A dtype whose elements are `itemsize` packed little-endian bytes.
+    pub const fn bytes(tag: u32, itemsize: u32) -> Self {
+        Self {
+            tag,
+            itemsize,
+            values: false,
+        }
     }
 
-    pub const fn name(self) -> &'static str {
-        self.name
+    /// A dtype whose elements are Python references (NumPy's `object`).
+    pub const fn values(tag: u32) -> Self {
+        Self {
+            tag,
+            itemsize: Self::VALUE_ITEMSIZE as u32,
+            values: true,
+        }
+    }
+
+    pub const fn tag(self) -> u32 {
+        self.tag
+    }
+
+    pub const fn itemsize(self) -> usize {
+        self.itemsize as usize
+    }
+
+    pub const fn is_values(self) -> bool {
+        self.values
     }
 }
 
-/// Shape and storage mapping for an opaque array view.
+/// Owned element storage for a new array.
+///
+/// `Values` element `i` is addressed at byte offset `i * PyArrayDtype::VALUE_ITEMSIZE`, so views
+/// use byte strides and offsets for both kinds of storage.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum PyArrayBuffer {
+    Bytes(Vec<u8>),
+    Values(Vec<PyValue>),
+}
+
+impl PyArrayBuffer {
+    /// Length of the addressable storage in bytes.
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Values(values) => values.len().saturating_mul(PyArrayDtype::VALUE_ITEMSIZE),
+        }
+    }
+}
+
+/// Shape, byte strides, and element type of one array view over shared storage.
+///
+/// Strides and `offset` are always in bytes. A zero stride repeats an element, which is how
+/// broadcast views are expressed; such views are created read-only.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct PyArrayLayout {
+pub(super) struct PyArrayView {
+    pub dtype: PyArrayDtype,
     pub shape: Vec<usize>,
     pub strides: Vec<isize>,
-    pub offset: isize,
+    pub offset: usize,
+    pub writeable: bool,
 }
 
-/// Scalar operation used by generic array kernels.
+/// Borrowed storage of one array. Kernels read elements at `view` byte offsets.
+pub(super) enum PyArrayData<'a> {
+    Bytes(&'a [u8]),
+    Values(&'a [PyValue]),
+}
+
+/// Mutably borrowed storage of one writeable array.
+pub(super) enum PyArrayDataMut<'a> {
+    Bytes(&'a mut [u8]),
+    Values(&'a mut [PyValue]),
+}
+
+/// One array lent to a read callback.
+pub(super) struct PyArrayRef<'a> {
+    pub view: &'a PyArrayView,
+    pub data: PyArrayData<'a>,
+}
+
+/// One writeable array's storage lent to a write callback.
+pub(super) struct PyArrayMut<'a> {
+    pub data: PyArrayDataMut<'a>,
+}
+
+/// A builtin or registered type object, as passed to `np.dtype(float)` or `np.dtype(np.int8)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PyBinaryOp {
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
+pub(super) enum PyTypeObject {
+    /// A builtin type, by its Python name, e.g. `int` or `str`.
+    Builtin(&'static str),
+    Kind(&'static ValueKindDef),
+}
+
+/// One parameter of a Python function, in declaration order, with its default when it has one.
+#[derive(Clone, Debug)]
+pub(super) struct PyParameter {
+    pub name: String,
+    pub kind: super::bytecode::ParameterKind,
+    pub default: Option<PyValue>,
+}
+
+/// A Python operator applied through the VM's full protocol, including user dunder methods.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PyOperator {
+    Unary(super::ast::UnaryOperator),
+    Binary(super::ast::BinaryOperator),
+    Compare(super::ast::ComparisonOperator),
+    /// The builtin `abs()`.
+    Absolute,
 }
 
 /// Interpreter-owned marker values exported by compatibility modules.
@@ -252,8 +430,6 @@ pub(super) enum PyMarker {
     Stdout,
     Stderr,
     ArrayType,
-    /// The builtin `complex` type, re-exported as `numpy.complex128`.
-    ComplexType,
 }
 
 /// Explicit access to shellsim's virtual clock and CPU-time counters.
@@ -449,6 +625,11 @@ pub(super) trait PyRuntime {
     fn replace_bytearray_items(&mut self, value: PyByteArray, items: Vec<u8>) -> PyResult<()>;
     fn is_integer_type(&self, value: &PyValue) -> bool;
     fn is_string_type(&self, value: &PyValue) -> bool;
+    /// Return whether `value` is the `Ellipsis` singleton that the `...` literal evaluates to.
+    ///
+    /// Native subscript handlers need this because `array[..., 0]` reaches `__getitem__` as the
+    /// tuple `(Ellipsis, 0)`, and the singleton has no other checked view.
+    fn is_ellipsis(&self, value: &PyValue) -> bool;
     /// The `NotImplemented` singleton, which a comparison or arithmetic method returns to let
     /// the other operand answer.
     fn not_implemented(&self) -> PyValue;
@@ -541,23 +722,59 @@ pub(super) trait PyRuntime {
     fn new_frozen_set(&mut self, items: Vec<PyValue>) -> PyResult<PyValue>;
     fn new_value_kind(&self, kind: &'static ValueKindDef, payload: u64) -> PyResult<PyValue>;
     fn value_kind_payload(&self, value: &PyValue, kind: &'static ValueKindDef) -> Option<u64>;
+    /// Allocate a value of `kind` whose payload needs 16 bytes, such as a complex128 scalar.
+    fn new_wide_value_kind(
+        &mut self,
+        kind: &'static ValueKindDef,
+        payload: [u64; 2],
+    ) -> PyResult<PyValue>;
+    fn wide_value_kind_payload(
+        &self,
+        value: &PyValue,
+        kind: &'static ValueKindDef,
+    ) -> Option<[u64; 2]>;
+    /// The registered kind of `value`, for inline and wide values alike.
+    fn value_kind_of(&self, value: &PyValue) -> Option<&'static ValueKindDef>;
+    /// `value` itself as a builtin or registered type object, if it is one.
+    fn type_object(&self, value: &PyValue) -> Option<PyTypeObject>;
+    /// The builtin type object with this Python name, such as `str` or `float`.
+    fn builtin_type(&self, name: &str) -> Option<PyValue>;
     fn value_kind_type(&self, kind: &'static ValueKindDef) -> PyResult<PyValue>;
+    /// Allocate an array that owns `buffer`, with its elements at `strides`. The buffer length
+    /// must equal the element count times the dtype's item size, object dtypes need `Values`
+    /// storage, and every addressed element must lie inside the buffer.
     fn new_array(
         &mut self,
-        items: Vec<PyValue>,
-        shape: Vec<usize>,
+        buffer: PyArrayBuffer,
         dtype: PyArrayDtype,
+        shape: Vec<usize>,
+        strides: Vec<isize>,
     ) -> PyResult<PyValue>;
-    fn new_array_view(&mut self, array: PyArray, layout: PyArrayLayout) -> PyResult<PyValue>;
-    fn array_layout(&self, array: PyArray) -> PyResult<(PyArrayLayout, PyArrayDtype)>;
-    fn array_get(&mut self, array: PyArray, index: &[usize]) -> PyResult<PyValue>;
-    fn array_set(&mut self, array: PyArray, index: &[usize], value: PyValue) -> PyResult<()>;
-    fn binary_op(
+    /// Allocate another view of `base`'s storage after checking that it stays inside the
+    /// storage and matches its element kind. A view of a read-only array stays read-only.
+    fn new_array_view(&mut self, base: PyArray, view: PyArrayView) -> PyResult<PyValue>;
+    fn array_view(&self, array: PyArray) -> PyResult<PyArrayView>;
+    /// Identity of the storage behind `array`; views of one buffer share it.
+    fn array_storage(&self, array: PyArray) -> PyResult<PyIdentity>;
+    /// The array that owns `array`'s storage, or `None` when `array` owns it.
+    fn array_base(&self, array: PyArray) -> PyResult<Option<PyValue>>;
+    fn set_array_writeable(&mut self, array: PyArray, writeable: bool) -> PyResult<()>;
+    /// Lend the storage of `arrays` to `read`. The callback cannot reach the runtime, so it
+    /// cannot run Python code while the storage is borrowed.
+    fn read_arrays(
+        &self,
+        arrays: &[PyArray],
+        read: &mut dyn FnMut(&[PyArrayRef<'_>]) -> PyResult<()>,
+    ) -> PyResult<()>;
+    /// Lend the storage of one writeable array to `write`. Read-only arrays raise NumPy's
+    /// `ValueError: assignment destination is read-only`.
+    fn write_array(
         &mut self,
-        operation: PyBinaryOp,
-        left: PyValue,
-        right: PyValue,
-    ) -> PyResult<PyValue>;
+        array: PyArray,
+        write: &mut dyn FnMut(PyArrayMut<'_>) -> PyResult<()>,
+    ) -> PyResult<()>;
+    /// Apply a Python operator with the VM's complete protocol, including user dunders.
+    fn apply_operator(&mut self, operator: PyOperator, operands: &[PyValue]) -> PyResult<PyValue>;
     fn new_string(&mut self, value: String) -> PyResult<PyValue>;
     fn new_bytes(&mut self, value: Vec<u8>) -> PyResult<PyValue>;
     fn new_bytearray(&mut self, value: Vec<u8>) -> PyResult<PyValue>;
@@ -643,6 +860,9 @@ pub(super) trait PyRuntime {
     /// The script path and source line executing `depth` Python frames below the innermost one,
     /// or `None` when the stack is shallower. Depth 0 is the innermost frame.
     fn caller_location(&self, depth: usize) -> Option<(String, u32)>;
+    /// The parameters of a Python function, or of the function a bound method wraps without its
+    /// bound first parameter. `None` for any other callable.
+    fn function_parameters(&self, value: &PyValue) -> PyResult<Option<Vec<PyParameter>>>;
     /// PID of the logical process running this Python interpreter.
     fn current_pid(&self) -> u32;
     /// PID of the logical parent of the process running this Python interpreter.
@@ -1364,12 +1584,20 @@ pub(super) enum ValueDef {
         name: &'static str,
         get: fn(&mut dyn PyRuntime) -> PyResult,
     },
+    /// An inline registered value, such as a NumPy ufunc or `np.True_`.
+    Registered {
+        name: &'static str,
+        kind: &'static ValueKindDef,
+        payload: u64,
+    },
 }
 
 impl ValueDef {
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Constant { name, .. } | Self::Factory { name, .. } => name,
+            Self::Constant { name, .. }
+            | Self::Factory { name, .. }
+            | Self::Registered { name, .. } => name,
         }
     }
 
@@ -1381,6 +1609,7 @@ impl ValueDef {
                 PyConstant::String(value) => return runtime.new_string((*value).to_string()),
             }),
             Self::Factory { get, .. } => get(runtime),
+            Self::Registered { kind, payload, .. } => runtime.new_value_kind(kind, *payload),
         }
     }
 }

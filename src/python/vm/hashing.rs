@@ -1,9 +1,9 @@
 //! The `hash()` builtin: dispatch from runtime values to CPython's hash algorithms.
 //!
-//! Builtin values hash by value with the algorithms in `python::hash`, and user instances follow
-//! CPython's rules: an explicit `__hash__` wins, `__hash__ = None` or an inherited `__eq__`
-//! without `__hash__` makes the class unhashable, and everything else, including registered
-//! native values, hashes by identity.
+//! Builtin values hash by value with the algorithms in `python::hash`, registered numbers such
+//! as NumPy scalars hash as the Python number they equal, and user instances follow CPython's
+//! rules: an explicit `__hash__` wins, `__hash__ = None` or an inherited `__eq__` without
+//! `__hash__` makes the class unhashable, and everything else hashes by identity.
 
 use super::super::hash;
 use super::super::number::{self, NumberRef};
@@ -71,6 +71,9 @@ impl Vm<'_> {
                 return Ok(hash::tuple(&parts));
             }
             Object::EnumMember { name, .. } => return Ok(hash::string(name)),
+            Object::WideValue { payload, .. } => {
+                return Ok(hash::identity(payload[0] ^ payload[1].rotate_left(32)))
+            }
             Object::List(_)
             | Object::Dict(_)
             | Object::DefaultDict { .. }
@@ -145,7 +148,7 @@ impl Vm<'_> {
         match number::index(&self.state.heap, result) {
             Some(NumberRef::Int(-1)) => Ok(-2),
             Some(NumberRef::Int(value)) => Ok(value),
-            Some(number @ NumberRef::BigInt(_)) => Ok(hash::big_integer(
+            Some(number @ (NumberRef::BigInt(_) | NumberRef::UInt(_))) => Ok(hash::big_integer(
                 &number.to_bigint().expect("integer view"),
             )),
             _ => Err(self.raise_exception("TypeError", "__hash__ method should return an integer")),
@@ -165,6 +168,7 @@ impl Vm<'_> {
 fn number_hash(number: NumberRef<'_>) -> i64 {
     match number {
         NumberRef::Int(value) => hash::integer(value),
+        NumberRef::UInt(value) => hash::big_integer(&value.into()),
         NumberRef::BigInt(value) => hash::big_integer(value),
         NumberRef::Float(value) => hash::float(value),
         NumberRef::Complex(real, imag) => hash::complex(real, imag),

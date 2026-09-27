@@ -41,6 +41,10 @@ mod pytest;
 mod resource_hardening;
 #[path = "python/runtime.rs"]
 mod runtime;
+#[path = "python/scientific_suites.rs"]
+mod scientific_suites;
+#[path = "python/scipy.rs"]
+mod scipy;
 #[path = "python/source_suites.rs"]
 mod source_suites;
 #[path = "python/stdin_streaming.rs"]

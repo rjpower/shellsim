@@ -1,5 +1,6 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
+use super::super::native::KindNumber;
 use super::format::{format_complex, format_float, format_integer, format_text, FormatError};
 use super::{
     number, protocol, BigInt, BinaryOperator, BuiltinType, ComparisonOperator, DisplayKind,
@@ -778,8 +779,9 @@ impl Vm<'_> {
     }
 
     /// `format(value, spec)`, which CPython defines as `type(value).__format__(value, spec)`.
-    /// A user class's `__format__` runs as written. Other values accept only the empty spec,
-    /// which gives `str(value)`.
+    /// A user class's `__format__` runs as written. Registered numbers such as NumPy scalars
+    /// format as the Python number they stand for, as NumPy's `__format__` does. Other values
+    /// accept only the empty spec, which gives `str(value)`.
     pub(super) fn format_object(
         &mut self,
         value: &Value,
@@ -795,6 +797,20 @@ impl Vm<'_> {
                     });
                 }
             }
+        }
+        if let Some((_, number)) = super::number::registered_number(&self.state.heap, value) {
+            let number = match number {
+                KindNumber::Bool(value) => Value::Bool(value),
+                KindNumber::Int(value) => Value::Int(value),
+                KindNumber::UInt(value) => {
+                    self.allocate_object(Object::BigInt(BigInt::from(value)))?
+                }
+                KindNumber::Float(value) => Value::Float(value),
+                KindNumber::Complex(real, imag) => {
+                    self.allocate_object(Object::Complex { real, imag })?
+                }
+            };
+            return self.format_object(&number, format_spec);
         }
         if format_spec.is_empty() {
             return self.display_value(value);

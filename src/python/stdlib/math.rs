@@ -10,9 +10,10 @@ use std::fmt;
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 
+use super::super::ast::BinaryOperator;
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyBinaryOp, PyConstant, PyError, PyKind, PyResult, PyRuntime,
+    CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyKind, PyOperator, PyResult, PyRuntime,
     PyValueCast, ValueDef,
 };
 use super::super::number::PyNumber;
@@ -588,9 +589,10 @@ fn native_prod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         None => Value::Int(1),
     };
     let iterator = runtime.iterator(args.positional()[0])?;
+    let multiply = PyOperator::Binary(BinaryOperator::Multiply);
     while let Some(item) = runtime.iterator_next(iterator)? {
         runtime.charge_cpu(1)?;
-        product = runtime.binary_op(PyBinaryOp::Multiply, product, item)?;
+        product = runtime.apply_operator(multiply, &[product, item])?;
     }
     Ok(product)
 }

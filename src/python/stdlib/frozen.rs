@@ -27,7 +27,92 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "io" => Some(include_str!("source/io.py")),
         "json" => Some(include_str!("source/json.py")),
         "logging" => Some(include_str!("source/logging.py")),
-        "numpy.random" => Some(include_str!("source/numpy_random.py")),
+        "numpy" => Some(include_str!("source/numpy/__init__.py")),
+        "numpy._arraypad" => Some(include_str!("source/numpy/_arraypad.py")),
+        "numpy._arraysetops" => Some(include_str!("source/numpy/_arraysetops.py")),
+        "numpy._arrayprint" => Some(include_str!("source/numpy/_arrayprint.py")),
+        "numpy._errstate" => Some(include_str!("source/numpy/_errstate.py")),
+        "numpy._function_base" => Some(include_str!("source/numpy/_function_base.py")),
+        "numpy._getlimits" => Some(include_str!("source/numpy/_getlimits.py")),
+        "numpy._histograms" => Some(include_str!("source/numpy/_histograms.py")),
+        "numpy._index_tricks" => Some(include_str!("source/numpy/_index_tricks.py")),
+        "numpy._methods" => Some(include_str!("source/numpy/_methods.py")),
+        "numpy._nanfunctions" => Some(include_str!("source/numpy/_nanfunctions.py")),
+        "numpy._numeric" => Some(include_str!("source/numpy/_numeric.py")),
+        "numpy._shape_base" => Some(include_str!("source/numpy/_shape_base.py")),
+        "numpy._statistics" => Some(include_str!("source/numpy/_statistics.py")),
+        "numpy._vectorize" => Some(include_str!("source/numpy/_vectorize.py")),
+        "numpy.exceptions" => Some(include_str!("source/numpy/exceptions.py")),
+        "numpy.fft" => Some(include_str!("source/numpy/fft.py")),
+        "numpy.lib" => Some(include_str!("source/numpy/lib/__init__.py")),
+        "numpy.lib._objectpickle" => Some(include_str!("source/numpy/lib/_objectpickle.py")),
+        "numpy.lib.format" => Some(include_str!("source/numpy/lib/format.py")),
+        "numpy.lib.npyio" => Some(include_str!("source/numpy/lib/npyio.py")),
+        "numpy.linalg" => Some(include_str!("source/numpy/linalg.py")),
+        "numpy.random" => Some(include_str!("source/numpy/random.py")),
+        "numpy.strings" => Some(include_str!("source/numpy/strings.py")),
+        "numpy.testing" => Some(include_str!("source/numpy/testing.py")),
+        "scipy" => Some(include_str!("source/scipy/__init__.py")),
+        "scipy._lib" => Some(include_str!("source/scipy/_lib/__init__.py")),
+        "scipy._lib._bunch" => Some(include_str!("source/scipy/_lib/_bunch.py")),
+        "scipy._lib._util" => Some(include_str!("source/scipy/_lib/_util.py")),
+        "scipy.linalg" => Some(include_str!("source/scipy/linalg/__init__.py")),
+        "scipy.linalg._basic" => Some(include_str!("source/scipy/linalg/_basic.py")),
+        "scipy.linalg._decomp" => Some(include_str!("source/scipy/linalg/_decomp.py")),
+        "scipy.linalg._decomp_cholesky" => {
+            Some(include_str!("source/scipy/linalg/_decomp_cholesky.py"))
+        }
+        "scipy.linalg._decomp_lu" => Some(include_str!("source/scipy/linalg/_decomp_lu.py")),
+        "scipy.linalg._decomp_polar" => Some(include_str!("source/scipy/linalg/_decomp_polar.py")),
+        "scipy.linalg._decomp_qr" => Some(include_str!("source/scipy/linalg/_decomp_qr.py")),
+        "scipy.linalg._decomp_svd" => Some(include_str!("source/scipy/linalg/_decomp_svd.py")),
+        "scipy.linalg._matfuncs" => Some(include_str!("source/scipy/linalg/_matfuncs.py")),
+        "scipy.linalg._misc" => Some(include_str!("source/scipy/linalg/_misc.py")),
+        "scipy.linalg._procrustes" => Some(include_str!("source/scipy/linalg/_procrustes.py")),
+        "scipy.linalg._special_matrices" => {
+            Some(include_str!("source/scipy/linalg/_special_matrices.py"))
+        }
+        "scipy.linalg.blas" => Some(include_str!("source/scipy/linalg/blas.py")),
+        "scipy.linalg.lapack" => Some(include_str!("source/scipy/linalg/lapack.py")),
+        "scipy.special" => Some(include_str!("source/scipy/special/__init__.py")),
+        "scipy.special._ufuncs" => Some(include_str!("source/scipy/special/_ufuncs.py")),
+        "scipy.stats" => Some(include_str!("source/scipy/stats/__init__.py")),
+        "scipy.stats._axis_nan_policy" => {
+            Some(include_str!("source/scipy/stats/_axis_nan_policy.py"))
+        }
+        "scipy.stats._continuous_distns" => {
+            Some(include_str!("source/scipy/stats/_continuous_distns.py"))
+        }
+        "scipy.stats._discrete_distns" => {
+            Some(include_str!("source/scipy/stats/_discrete_distns.py"))
+        }
+        "scipy.stats._distn_infrastructure" => {
+            Some(include_str!("source/scipy/stats/_distn_infrastructure.py"))
+        }
+        "scipy.stats._entropy" => Some(include_str!("source/scipy/stats/_entropy.py")),
+        "scipy.stats._finite_differences" => {
+            Some(include_str!("source/scipy/stats/_finite_differences.py"))
+        }
+        "scipy.stats._stats_py" => Some(include_str!("source/scipy/stats/_stats_py.py")),
+        "scipy.stats._warnings_errors" => {
+            Some(include_str!("source/scipy/stats/_warnings_errors.py"))
+        }
+        "scipy.stats.contingency" => Some(include_str!("source/scipy/stats/contingency.py")),
+        "scipy.cluster"
+        | "scipy.constants"
+        | "scipy.datasets"
+        | "scipy.differentiate"
+        | "scipy.fft"
+        | "scipy.fftpack"
+        | "scipy.integrate"
+        | "scipy.interpolate"
+        | "scipy.io"
+        | "scipy.ndimage"
+        | "scipy.odr"
+        | "scipy.optimize"
+        | "scipy.signal"
+        | "scipy.sparse"
+        | "scipy.spatial" => Some(include_str!("source/scipy/_unsupported.py")),
         "operator" => Some(include_str!("source/operator.py")),
         "os" => Some(include_str!("source/os.py")),
         "pathlib" => Some(include_str!("source/pathlib.py")),

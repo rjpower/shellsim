@@ -39,8 +39,7 @@ cleanup code.
 follow CPython 3.14, including the mixed-mode rules for real operands. Ordering, floor division,
 modulo, `int()`, `float()`, `round()`, and `math` functions reject complex values with
 `TypeError`. Complex format specifications follow CPython: the width applies to the whole
-number, and zero padding, `=` alignment and `%` are rejected. NumPy `complex128` arrays store
-these values directly, and `numpy.complex128` is the builtin `complex` type.
+number, and zero padding, `=` alignment and `%` are rejected.
 
 The core collection surface includes mutable sets and immutable `frozenset` values with mixed
 comparison and set algebra. VFS-backed text and binary files support read, write, append, and
@@ -181,4 +180,5 @@ Do not add an importable placeholder for a module whose central contract is abse
 an empty `sqlite3` namespace is less useful than a clear import failure because callers otherwise
 cannot tell which database semantics are real.
 
-The minimal NumPy design follows these rules in [numpy.md](numpy.md).
+The NumPy and SciPy implementations follow these rules; see [numpy.md](numpy.md) and
+[scipy.md](scipy.md).

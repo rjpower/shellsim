@@ -1,8 +1,8 @@
-//! Shortest round-trip decimal text for floats, as CPython's `repr` prints it.
+//! Shortest round-trip decimal text for floats, as CPython's `repr` and NumPy's Dragon4 print it.
 //!
 //! Rust's `{:e}` finds the fewest digits that round-trip, but when the value lies exactly halfway
-//! between two such digit strings it rounds up. CPython's `_Py_dg_dtoa` rounds half to even,
-//! so `repr(16.5042266845703125)` is `16.504226684570312`, not `...313`.
+//! between two such digit strings it rounds up. CPython's `_Py_dg_dtoa` and NumPy's Dragon4
+//! round half to even, so `repr(16.5042266845703125)` is `16.504226684570312`, not `...313`.
 
 use std::fmt::LowerExp;
 use std::str::FromStr;
@@ -16,6 +16,11 @@ pub(crate) struct Decimal {
 
 /// Shortest round-trip digits of a finite nonzero `f64`'s magnitude.
 pub(crate) fn shortest(value: f64) -> Decimal {
+    shortest_of(value.abs())
+}
+
+/// Shortest digits that round-trip through `f32`, for NumPy's single-precision scalars.
+pub(crate) fn shortest_f32(value: f32) -> Decimal {
     shortest_of(value.abs())
 }
 
@@ -134,5 +139,6 @@ mod tests {
     #[test]
     fn ties_round_to_even() {
         assert_eq!(shortest(16.504_226_684_570_312).digits, "16504226684570312");
+        assert_eq!(shortest_f32(0.1).digits, "1");
     }
 }
