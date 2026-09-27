@@ -1434,7 +1434,18 @@ impl Vm<'_> {
                     extra_keywords.push((key, value));
                     continue;
                 }
-                let message = format!("{name}() got an unexpected keyword argument '{keyword}'");
+                let positional_only = code.parameters.iter().any(|parameter| {
+                    parameter.name == keyword
+                        && parameter.kind == super::super::bytecode::ParameterKind::PositionalOnly
+                });
+                let message = if positional_only {
+                    format!(
+                        "{name}() got some positional-only arguments passed as keyword \
+                         arguments: '{keyword}'"
+                    )
+                } else {
+                    format!("{name}() got an unexpected keyword argument '{keyword}'")
+                };
                 return Err(self.raise_exception("TypeError", message));
             };
             if locals[slot].replace(value).is_some() {
@@ -1453,27 +1464,24 @@ impl Vm<'_> {
                 locals[slot] = Some(*default);
             }
         }
-        let missing = |kind: super::super::bytecode::ParameterKind| {
+        let missing = |keyword_only: bool| {
             code.parameters
                 .iter()
                 .enumerate()
                 .filter(|(slot, parameter)| {
-                    locals[*slot].is_none() && !parameter.has_default && parameter.kind == kind
+                    let kind_matches = match parameter.kind {
+                        super::super::bytecode::ParameterKind::PositionalOnly
+                        | super::super::bytecode::ParameterKind::Positional => !keyword_only,
+                        super::super::bytecode::ParameterKind::KeywordOnly => keyword_only,
+                        _ => false,
+                    };
+                    kind_matches && locals[*slot].is_none() && !parameter.has_default
                 })
                 .map(|(_, parameter)| format!("'{}'", parameter.name))
                 .collect::<Vec<_>>()
         };
-        for (kind, description) in [
-            (
-                super::super::bytecode::ParameterKind::Positional,
-                "positional",
-            ),
-            (
-                super::super::bytecode::ParameterKind::KeywordOnly,
-                "keyword-only",
-            ),
-        ] {
-            let names = missing(kind);
+        for (keyword_only, description) in [(false, "positional"), (true, "keyword-only")] {
+            let names = missing(keyword_only);
             if names.is_empty() {
                 continue;
             }

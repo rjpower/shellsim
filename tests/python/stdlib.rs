@@ -498,3 +498,26 @@ print(re.search(r"(a)\1", "aa"))
         );
     }
 }
+
+#[test]
+fn uncaught_warnings_print_the_caller_line_and_continue() {
+    let mut environment = Environment::new();
+    let script = "import warnings\n\ndef helper():\n    warnings.warn('deep', RuntimeWarning, stacklevel=2)\n\nwarnings.warn('plain')\nwarnings.warn('plain')\nhelper()\nprint('done')\n";
+    environment
+        .vfs
+        .put_file("/tool.py", script.as_bytes().to_vec(), 0o644)
+        .expect("install script");
+    let (outcome, stdout, stderr) = environment.run_script_capture("python3.14 /tool.py");
+
+    assert_eq!(outcome.exit_status, 0);
+    assert_eq!(stdout, b"done\n");
+    // The default filter shows each location once, so the second 'plain' is a new line.
+    assert_eq!(
+        String::from_utf8_lossy(&stderr),
+        concat!(
+            "/tool.py:6: UserWarning: plain\n  warnings.warn('plain')\n",
+            "/tool.py:7: UserWarning: plain\n  warnings.warn('plain')\n",
+            "/tool.py:8: RuntimeWarning: deep\n  helper()\n",
+        )
+    );
+}

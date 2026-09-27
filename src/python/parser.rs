@@ -219,6 +219,14 @@ impl Parser {
             let mut keyword_only = false;
             if !self.at(|kind| matches!(kind, TokenKind::RightParen)) {
                 loop {
+                    if self.take_positional_only_marker(&mut parameters, keyword_only)? {
+                        if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none()
+                            || self.at(|kind| matches!(kind, TokenKind::RightParen))
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     let keyword_variadic = self
                         .take(|kind| matches!(kind, TokenKind::DoubleStar))
                         .is_some();
@@ -822,6 +830,33 @@ impl Parser {
         Ok(ExpressionKind::FString(parts))
     }
 
+    /// Consume a `/` parameter marker, making every parameter before it positional-only.
+    fn take_positional_only_marker(
+        &mut self,
+        parameters: &mut [Parameter],
+        after_star: bool,
+    ) -> Result<bool, ParseError> {
+        if self.take(|kind| matches!(kind, TokenKind::Slash)).is_none() {
+            return Ok(false);
+        }
+        if after_star {
+            return Err(self.error("/ must be ahead of *"));
+        }
+        if parameters.is_empty() {
+            return Err(self.error("at least one argument must precede /"));
+        }
+        if parameters
+            .iter()
+            .any(|parameter| parameter.kind == ParameterKind::PositionalOnly)
+        {
+            return Err(self.error("/ may appear only once"));
+        }
+        for parameter in parameters {
+            parameter.kind = ParameterKind::PositionalOnly;
+        }
+        Ok(true)
+    }
+
     fn lambda_expression(&mut self) -> Result<Expression, ParseError> {
         let start = self.previous().span;
         let mut parameters = Vec::new();
@@ -830,6 +865,14 @@ impl Parser {
         let mut keyword_only = false;
         if !self.at(|kind| matches!(kind, TokenKind::Colon)) {
             loop {
+                if self.take_positional_only_marker(&mut parameters, keyword_only)? {
+                    if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none()
+                        || self.at(|kind| matches!(kind, TokenKind::Colon))
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 let keyword_variadic = self
                     .take(|kind| matches!(kind, TokenKind::DoubleStar))
                     .is_some();
@@ -1314,6 +1357,7 @@ impl Parser {
             TokenKind::AmpersandEqual => BinaryOperator::BitwiseAnd,
             TokenKind::CaretEqual => BinaryOperator::BitwiseXor,
             TokenKind::PipeEqual => BinaryOperator::BitwiseOr,
+            TokenKind::AtEqual => BinaryOperator::MatrixMultiply,
             _ => return None,
         };
         self.advance();
@@ -2139,6 +2183,20 @@ mod tests {
         parse(lex("values = {*left, 1, *right}").unwrap()).unwrap();
         for source in ["{*left: 1}", "{*left for left in right}"] {
             parse(lex(source).unwrap()).expect_err("a starred item cannot begin a key");
+        }
+    }
+
+    #[test]
+    fn positional_only_markers_follow_python_placement_rules() {
+        parse(lex("def f(a, b=1, /, c=2, *, d): pass\nvalue = lambda a, /: a\nx @= y").unwrap())
+            .unwrap();
+        for (source, message) in [
+            ("def f(/): pass", "at least one argument must precede /"),
+            ("def f(a, /, b, /): pass", "/ may appear only once"),
+            ("def f(*, a, /): pass", "/ must be ahead of *"),
+        ] {
+            let error = parse(lex(source).unwrap()).expect_err(source);
+            assert_eq!(error.message, message);
         }
     }
 

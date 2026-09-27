@@ -171,7 +171,7 @@ impl<'a> Lexer<'a> {
                     self.number(start, true)?
                 }
                 '.' => self.single(TokenKind::Dot),
-                '@' => self.single(TokenKind::At),
+                '@' => self.either('=', TokenKind::AtEqual, TokenKind::At),
                 ',' => self.single(TokenKind::Comma),
                 ':' => {
                     self.bump();

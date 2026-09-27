@@ -32,6 +32,7 @@ pub mod time;
 pub mod typing;
 pub mod unittest;
 mod vfs;
+mod warnings;
 mod zlib;
 
 use super::native::{ModuleDef, ValueKindDef};
@@ -85,6 +86,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "time" => Some(&time::MODULE),
         "typing" => Some(&typing::MODULE),
         "unittest" => Some(&unittest::MODULE),
+        "_shellsim_warnings" => Some(&warnings::MODULE),
         _ => None,
     }
 }

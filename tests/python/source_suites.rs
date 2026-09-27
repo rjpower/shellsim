@@ -14,6 +14,8 @@ const ASYNCIO: &[u8] = include_bytes!("test_asyncio.py");
 const LANGUAGE: &[u8] = include_bytes!("test_language.py");
 const EXCEPTIONS: &[u8] = include_bytes!("test_exceptions.py");
 const OBJECT_MODEL: &[u8] = include_bytes!("test_object_model.py");
+const OPERATOR: &[u8] = include_bytes!("test_operator.py");
+const WARNINGS: &[u8] = include_bytes!("test_warnings.py");
 const COUNT_10_MILLION: &[u8] = include_bytes!("performance/test_count_10_million.py");
 
 fn assert_source_suite(name: &str, source: &[u8]) {
@@ -80,6 +82,16 @@ fn exceptions() {
 #[test]
 fn object_model() {
     assert_source_suite("test_object_model.py", OBJECT_MODEL);
+}
+
+#[test]
+fn operator() {
+    assert_source_suite("test_operator.py", OPERATOR);
+}
+
+#[test]
+fn warnings() {
+    assert_source_suite("test_warnings.py", WARNINGS);
 }
 
 #[test]
