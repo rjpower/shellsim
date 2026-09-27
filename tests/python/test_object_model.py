@@ -284,3 +284,113 @@ def test_builtin_functions_and_bound_methods_have_names():
     method = receiver.describe
     assert method.__name__ == "describe" and method.__func__ is Base.describe
     assert method.__self__ is receiver
+
+
+def test_getattr_runs_only_for_attributes_ordinary_lookup_misses():
+    class Dynamic:
+        real = "class attribute"
+
+        def __init__(self):
+            self.stored = "instance attribute"
+
+        @property
+        def computed(self):
+            return "property"
+
+        def __getattr__(self, name):
+            if name.startswith("dyn_"):
+                return name[4:]
+            raise AttributeError(f"no {name} here")
+
+    class Child(Dynamic):
+        pass
+
+    value = Dynamic()
+    assert (value.real, value.stored, value.computed) == ("class attribute", "instance attribute", "property")
+    assert value.dyn_x == "x" and value.dyn_y == "y" and Child().dyn_z == "z"
+    assert hasattr(value, "dyn_w") and not hasattr(value, "other")
+    assert getattr(value, "other", "default") == "default"
+    try:
+        missing = value.other
+    except AttributeError as error:
+        assert str(error) == "no other here"
+    else:
+        raise AssertionError(f"__getattr__'s AttributeError did not propagate: {missing!r}")
+
+    class Broken:
+        def __getattr__(self, name):
+            raise KeyError(name)
+
+    for probe in (lambda: Broken().x, lambda: hasattr(Broken(), "x")):
+        try:
+            probe()
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("a non-AttributeError from __getattr__ must propagate")
+
+
+def test_setattr_receives_every_assignment_and_object_setattr_stores():
+    class Doubler:
+        def __setattr__(self, name, value):
+            object.__setattr__(self, name, value * 2)
+
+    class Inherits(Doubler):
+        pass
+
+    doubled = Doubler()
+    doubled.x = 2
+    doubled.y = 5
+    inherited = Inherits()
+    inherited.z = 21
+    assert (doubled.x, doubled.y, inherited.z) == (4, 10, 42)
+
+    class Validated:
+        def __init__(self):
+            self.count = 0
+
+        def __setattr__(self, name, value):
+            if value < 0:
+                raise ValueError("negative")
+            super().__setattr__(name, value)
+
+    validated = Validated()
+    validated.count = 3
+    try:
+        validated.count = -1
+    except ValueError:
+        pass
+    assert validated.count == 3
+
+    class Frozen:
+        def __init__(self, value):
+            object.__setattr__(self, "value", value)
+
+        def __setattr__(self, name, value):
+            raise AttributeError(f"cannot assign to field '{name}'")
+
+    frozen = Frozen(1)
+    try:
+        frozen.value = 2
+    except AttributeError as error:
+        assert str(error) == "cannot assign to field 'value'"
+    assert frozen.value == 1
+
+    class WithProperty:
+        def __init__(self):
+            self._x = 0
+
+        @property
+        def x(self):
+            return self._x
+
+        @x.setter
+        def x(self, value):
+            self._x = value + 100
+
+        def __setattr__(self, name, value):
+            object.__setattr__(self, name, value)
+
+    with_property = WithProperty()
+    with_property.x = 1
+    assert with_property.x == 101

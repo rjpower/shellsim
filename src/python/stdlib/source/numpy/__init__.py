@@ -74,12 +74,8 @@ typecodes = {
 
 class _flagsobj:
     """``ndarray.flags``: contiguity and mutability, by key (``flags["C_CONTIGUOUS"]``, and
-    NumPy's short and alias forms) or by lowercase attribute (``flags.c_contiguous``).
-
-    shellsim's interpreter does not call a custom ``__getattr__`` for instance attribute lookup
-    (only a module-level ``__getattr__``, for lazy submodules, gets that PEP 562 treatment - see
-    ``src/python/vm/objects.rs``'s ``Object::Instance`` case), so every named flag below is a
-    real ``@property`` instead of a dynamic fallback.
+    NumPy's short and alias forms) or by lowercase attribute (``flags.c_contiguous``). Each named
+    flag is a property.
     """
 
     _KEYS = ("C_CONTIGUOUS", "F_CONTIGUOUS", "OWNDATA", "WRITEABLE", "ALIGNED", "WRITEBACKIFCOPY")
@@ -193,11 +189,7 @@ def _is_f_contiguous(array):
 
 class _scalar_flags:
     """``generic.flags``: a NumPy scalar is always contiguous, owns its one element, and is
-    read-only.
-
-    Like `_flagsobj`, every named flag is a real ``@property``: shellsim's interpreter has no
-    instance-level ``__getattr__`` fallback to dispatch to.
-    """
+    read-only."""
 
     def __init__(self, value):
         self._value = value

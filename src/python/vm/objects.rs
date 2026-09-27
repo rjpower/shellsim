@@ -423,7 +423,12 @@ impl Vm<'_> {
                         return Ok(Some(value));
                     }
                     let Some((defining_class, descriptor)) = class_entry else {
-                        return self.builtin_base_attribute(class, Some(owner), name);
+                        if let Some(value) =
+                            self.builtin_base_attribute(class, Some(owner), name)?
+                        {
+                            return Ok(Some(value));
+                        }
+                        return self.call_getattr_hook(owner, class, name);
                     };
                     let value =
                         self.bind_descriptor(descriptor, Some(owner), class, defining_class)?;
@@ -514,7 +519,36 @@ impl Vm<'_> {
         Ok(value)
     }
 
+    /// Assign `owner.name = value`. A class that defines `__setattr__` receives the assignment;
+    /// otherwise [`Vm::store_attribute_default`] performs it.
     pub(super) fn store_attribute_by_symbol(
+        &mut self,
+        owner: Value,
+        symbol: SymbolId,
+        name: &str,
+        value: Value,
+    ) -> Result<(), String> {
+        if let Some(Object::Instance { class, .. }) = owner
+            .object_id()
+            .map(|id| self.state.heap.get(id))
+            .transpose()?
+        {
+            let class = *class;
+            if let Some((defining_class, hook)) =
+                self.class_attribute_entry(class, "__setattr__")?
+            {
+                let hook = self.bind_descriptor(hook, Some(owner), class, defining_class)?;
+                let name = self.allocate_string(name.to_string())?;
+                self.invoke_value(hook, vec![name, value])?;
+                return Ok(());
+            }
+        }
+        self.store_attribute_default(owner, symbol, name, value)
+    }
+
+    /// The assignment `object.__setattr__` performs: a data descriptor's setter, or else the
+    /// instance's own attribute storage.
+    pub(super) fn store_attribute_default(
         &mut self,
         owner: Value,
         symbol: SymbolId,
@@ -1740,6 +1774,23 @@ impl Vm<'_> {
             }
             _ => Ok(Some(value)),
         }
+    }
+
+    /// Call the class's `__getattr__` for an attribute that ordinary lookup did not find, as
+    /// Python does. An `AttributeError` it raises propagates with its own message; `getattr` with
+    /// a default and `hasattr` treat it as a missing attribute.
+    fn call_getattr_hook(
+        &mut self,
+        owner: Value,
+        class: ObjectId,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let Some((defining_class, hook)) = self.class_attribute_entry(class, "__getattr__")? else {
+            return Ok(None);
+        };
+        let hook = self.bind_descriptor(hook, Some(owner), class, defining_class)?;
+        let name = self.allocate_string(name.to_string())?;
+        self.invoke_value(hook, vec![name]).map(Some)
     }
 
     fn call_native_getter(

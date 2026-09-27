@@ -668,6 +668,9 @@ pub(super) trait PyRuntime {
     fn get_attribute(&mut self, value: PyValue, name: &str) -> PyResult<Option<PyValue>>;
     /// Assign an attribute through the runtime's descriptor protocol, as `setattr` does.
     fn set_attribute(&mut self, value: PyValue, name: &str, item: PyValue) -> PyResult<()>;
+    /// Assign an attribute without consulting a class's `__setattr__`, as `object.__setattr__`
+    /// does: data descriptors still apply, and other names go to the instance.
+    fn set_attribute_default(&mut self, value: PyValue, name: &str, item: PyValue) -> PyResult<()>;
     fn list_len(&self, list: PyList) -> PyResult<usize>;
     fn list_items(&mut self, list: PyList) -> PyResult<Vec<PyValue>>;
     fn list_append(&mut self, list: PyList, value: PyValue) -> PyResult<()>;

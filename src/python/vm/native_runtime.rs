@@ -643,13 +643,17 @@ impl PyRuntime for Vm<'_> {
             .intern_symbol(name, &mut self.interp.resources)
             .map_err(PyError::runtime_error)?;
         self.store_attribute_by_symbol(value, symbol, name, item)
-            .map_err(|message| {
-                if self.pending_exception.is_some() {
-                    PyError::new(PyErrorKind::Raised, message)
-                } else {
-                    PyError::runtime_error(message)
-                }
-            })
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
+    fn set_attribute_default(&mut self, value: Value, name: &str, item: Value) -> PyResult<()> {
+        let symbol = self
+            .state
+            .heap
+            .intern_symbol(name, &mut self.interp.resources)
+            .map_err(PyError::runtime_error)?;
+        self.store_attribute_default(value, symbol, name, item)
+            .map_err(|message| self.raised_or_runtime_error(message))
     }
 
     fn list_len(&self, list: PyList) -> PyResult<usize> {

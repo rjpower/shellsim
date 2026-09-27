@@ -259,6 +259,7 @@ pub(crate) static OBJECT_TYPE: NativeTypeDef = NativeTypeDef {
         method("object", "__hash__", object_hash),
         method("object", "__eq__", object_eq),
         method("object", "__ne__", object_ne),
+        method("object", "__setattr__", object_setattr),
     ],
     getters: &[],
 };
@@ -3604,6 +3605,26 @@ fn object_hash(_runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
         None => immediate_identity(&receiver),
     };
     Ok(Value::Int(super::super::hash::identity(identity)))
+}
+
+/// `object.__setattr__(name, value)`: the default assignment, which a class's own
+/// `__setattr__` calls to store a value after checking or transforming it.
+fn object_setattr(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("object.__setattr__")?;
+    let [name, value] = args.positional() else {
+        return Err(PyError::type_error(format!(
+            "expected 2 arguments, got {}",
+            args.positional().len()
+        )));
+    };
+    let Some(name) = runtime.string_value(name)? else {
+        return Err(PyError::type_error(format!(
+            "attribute name must be string, not '{}'",
+            runtime.type_name(name)?
+        )));
+    };
+    runtime.set_attribute_default(receiver, &name, *value)?;
+    Ok(Value::None)
 }
 
 /// `iterator.__iter__`: a builtin iterator is its own iterator.

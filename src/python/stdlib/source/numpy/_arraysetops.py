@@ -25,16 +25,10 @@ __all__ = [
 class _Result:
     """A tuple-like object with named fields, used for NumPy's small structured return values.
 
-    shellsim's interpreter does not support subclassing the builtin ``tuple`` (only ``object``,
-    ``int``, registered exception types, and other user classes), so this reimplements the
-    sequence protocol - iteration, indexing, length, unpacking - over a plain tuple held
-    internally. Subclasses set a class-level ``_fields`` tuple naming each position; instances
-    are built positionally, like ``collections.namedtuple``, but this lighter version is all
-    shellsim's frozen modules need.
-
-    Named-field access (``result.values``) is set as a real instance attribute in ``__init__``
-    rather than served through ``__getattr__``: shellsim's interpreter only calls a custom
-    ``__getattr__`` for modules (PEP 562), not for ordinary instances.
+    Subclasses set a class-level ``_fields`` tuple naming each position, and instances are built
+    positionally, like ``collections.namedtuple``. NumPy's results are ``tuple`` subclasses;
+    shellsim cannot subclass ``tuple`` yet (Loom #776), so this keeps the values in a tuple and
+    provides iteration, indexing, length, unpacking, and equality over it.
     """
 
     _fields = ()
