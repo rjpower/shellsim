@@ -16,6 +16,20 @@ from _numpy_io import *
 from _numpy_print import *
 from numpy._errstate import errstate, geterr, seterr
 from numpy._numeric import allclose, array_equal, array_equiv, isclose
+from numpy._methods import average, count_nonzero, mean, ptp, std, var
+from numpy._nanfunctions import (
+    nanargmax,
+    nanargmin,
+    nancumprod,
+    nancumsum,
+    nanmax,
+    nanmean,
+    nanmin,
+    nanprod,
+    nanstd,
+    nansum,
+    nanvar,
+)
 
 __version__ = "2.5.3"
 

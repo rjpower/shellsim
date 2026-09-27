@@ -64,7 +64,8 @@ pub(in crate::python) trait Numeric: Element {
         self != Self::zero()
     }
 
-    /// `np.maximum`: propagates NaN.
+    /// `np.maximum`: propagates NaN. Equal operands give the second one, so
+    /// `maximum(-0.0, 0.0)` is `0.0` and `maximum(0.0, -0.0)` is `-0.0`, as in NumPy.
     fn maximum(self, other: Self) -> Self {
         if self.is_nan() {
             return self;
@@ -72,14 +73,14 @@ pub(in crate::python) trait Numeric: Element {
         if other.is_nan() {
             return other;
         }
-        if self.compare(other) == Some(Ordering::Less) {
-            other
-        } else {
+        if self.compare(other) == Some(Ordering::Greater) {
             self
+        } else {
+            other
         }
     }
 
-    /// `np.minimum`: propagates NaN.
+    /// `np.minimum`: propagates NaN. Equal operands give the second one.
     fn minimum(self, other: Self) -> Self {
         if self.is_nan() {
             return self;
@@ -87,11 +88,18 @@ pub(in crate::python) trait Numeric: Element {
         if other.is_nan() {
             return other;
         }
-        if self.compare(other) == Some(Ordering::Greater) {
-            other
-        } else {
+        if self.compare(other) == Some(Ordering::Less) {
             self
+        } else {
+            other
         }
+    }
+
+    /// `self + sum(lane)`, as NumPy's `add` reduction combines a running total with one run of
+    /// elements. Floating types sum the run pairwise ([`pairwise_sum`]); others add in order.
+    fn add_lane(self, lane: &[Self], flags: &mut FpFlags) -> Self {
+        lane.iter()
+            .fold(self, |total, value| total.add(*value, flags))
     }
 
     /// `np.fmax`: ignores NaN when the other operand is a number.
@@ -146,6 +154,83 @@ pub(in crate::python) trait Real: Numeric {
     /// Apply a function at this type's working precision.
     fn map(self, double: fn(f64) -> f64, single: fn(f32) -> f32) -> Self;
     fn zip(self, other: Self, double: fn(f64, f64) -> f64, single: fn(f32, f32) -> f32) -> Self;
+}
+
+/// NumPy's pairwise summation (`pairwise_sum` in `loops_utils.h.src`). Runs shorter than 8
+/// add in order from `-0.0`; runs up to 128 use eight interleaved accumulators; longer runs split
+/// in half at a multiple of 8. Rounding error grows with `log n` instead of `n`, and matching the
+/// blocking exactly makes sums agree with NumPy bit for bit.
+pub(in crate::python) fn pairwise_sum<F>(values: &[F]) -> F
+where
+    F: Copy + std::ops::Add<Output = F> + From<f32>,
+{
+    let n = values.len();
+    if n < 8 {
+        return values.iter().fold(F::from(-0.0), |sum, value| sum + *value);
+    }
+    if n <= PAIRWISE_BLOCK {
+        let mut partial: [F; 8] = values[..8].try_into().expect("eight values");
+        let whole = n - n % 8;
+        for block in values[8..whole].chunks_exact(8) {
+            for (sum, value) in partial.iter_mut().zip(block) {
+                *sum = *sum + *value;
+            }
+        }
+        let [a, b, c, d, e, f, g, h] = partial;
+        let sum = ((a + b) + (c + d)) + ((e + f) + (g + h));
+        return values[whole..].iter().fold(sum, |sum, value| sum + *value);
+    }
+    let half = n / 2 - (n / 2) % 8;
+    pairwise_sum(&values[..half]) + pairwise_sum(&values[half..])
+}
+
+/// [`pairwise_sum`] for complex values. NumPy sums the interleaved real and imaginary parts as
+/// one run of scalars, so its blocks hold four complex values and it splits at a multiple of
+/// four.
+pub(in crate::python) fn pairwise_complex_sum<F>(values: &[Complex<F>]) -> (F, F)
+where
+    F: Copy + std::ops::Add<Output = F> + From<f32>,
+{
+    let n = values.len();
+    let zero = F::from(-0.0);
+    if n < 4 {
+        return values.iter().fold((zero, zero), |(re, im), value| {
+            (re + value.re, im + value.im)
+        });
+    }
+    if n <= PAIRWISE_BLOCK / 2 {
+        let mut partial = [values[0], values[1], values[2], values[3]];
+        let whole = n - n % 4;
+        for block in values[4..whole].chunks_exact(4) {
+            for (sum, value) in partial.iter_mut().zip(block) {
+                sum.re = sum.re + value.re;
+                sum.im = sum.im + value.im;
+            }
+        }
+        let [a, b, c, d] = partial;
+        let sum = ((a.re + b.re) + (c.re + d.re), (a.im + b.im) + (c.im + d.im));
+        return values[whole..]
+            .iter()
+            .fold(sum, |(re, im), value| (re + value.re, im + value.im));
+    }
+    let half = (n - n % 8) / 2;
+    let (left, right) = (
+        pairwise_complex_sum(&values[..half]),
+        pairwise_complex_sum(&values[half..]),
+    );
+    (left.0 + right.0, left.1 + right.1)
+}
+
+/// Longest run [`pairwise_sum`] adds without splitting (`PW_BLOCKSIZE`).
+const PAIRWISE_BLOCK: usize = 128;
+
+/// [`float_flags`] for a result computed from many inputs.
+fn lane_flags(result: f64, inputs: impl Iterator<Item = f64> + Clone, flags: &mut FpFlags) {
+    if result.is_nan() && !inputs.clone().any(f64::is_nan) {
+        flags.invalid = true;
+    } else if result.is_infinite() && inputs.clone().all(f64::is_finite) {
+        flags.overflow = true;
+    }
 }
 
 fn float_flags(result: f64, inputs: &[f64], flags: &mut FpFlags) {
@@ -614,6 +699,17 @@ macro_rules! real {
             fn is_true(self) -> bool {
                 self.to_f64() != 0.0
             }
+            fn add_lane(self, lane: &[Self], flags: &mut FpFlags) -> Self {
+                let values = lane.iter().map(|value| $to(*value)).collect::<Vec<$wide>>();
+                let total: $wide = $to(self) + pairwise_sum(&values);
+                let result = $from(total);
+                lane_flags(
+                    result.to_f64(),
+                    std::iter::once(self.to_f64()).chain(lane.iter().map(|value| value.to_f64())),
+                    flags,
+                );
+                result
+            }
         }
 
         impl RealBinary for $type {
@@ -781,6 +877,23 @@ macro_rules! complex {
     ($type:ty) => {
         impl Numeric for $type {
             const IS_COMPLEX: bool = true;
+
+            fn add_lane(self, lane: &[Self], flags: &mut FpFlags) -> Self {
+                let (re, im) = pairwise_complex_sum(lane);
+                let result = Complex {
+                    re: self.re + re,
+                    im: self.im + im,
+                };
+                let parts = |value: &Self| {
+                    let (re, im) = value.parts();
+                    [re, im]
+                };
+                let inputs = std::iter::once(&self).chain(lane).flat_map(parts);
+                let (re, im) = result.parts();
+                lane_flags(re, inputs.clone(), flags);
+                lane_flags(im, inputs, flags);
+                result
+            }
 
             fn add(self, other: Self, flags: &mut FpFlags) -> Self {
                 self.combine(other, flags, |a, b| (a.0 + b.0, a.1 + b.1))

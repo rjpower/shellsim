@@ -500,7 +500,7 @@ pub(in crate::python) fn find(name: &str) -> Option<usize> {
     UFUNCS.iter().position(|ufunc| ufunc.name == name)
 }
 
-fn named(name: &str) -> usize {
+pub(in crate::python) fn named(name: &str) -> usize {
     find(name).unwrap_or_else(|| panic!("ufunc {name} is registered"))
 }
 
@@ -635,9 +635,9 @@ fn method_outer(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: Call
     let index = receiver(runtime, &receiver_value);
     let name = UFUNCS[index].name;
     if UFUNCS[index].nin() != 2 {
-        return Err(PyError::value_error(format!(
-            "outer product only supported for binary functions"
-        )))
+        return Err(PyError::value_error(
+            "outer product only supported for binary functions",
+        ))
         .map_err(|error: PyError| PyError::value_error(format!("{name}: {}", error.message)));
     }
     args.expect_positional("outer", 2, 2)?;
@@ -759,7 +759,7 @@ fn out_array(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Op
 use super::super::super::native::PyValueCast;
 
 /// One prepared ufunc operand.
-enum Operand {
+pub(in crate::python) enum Operand {
     Array(Array),
     Weak {
         value: PyValue,
@@ -769,14 +769,14 @@ enum Operand {
 }
 
 impl Operand {
-    fn dtype(&self) -> Option<DType> {
+    pub(in crate::python) fn dtype(&self) -> Option<DType> {
         match self {
             Self::Array(array) => Some(array.dtype),
             Self::Weak { .. } => None,
         }
     }
 
-    fn shape(&self) -> &[usize] {
+    pub(in crate::python) fn shape(&self) -> &[usize] {
         match self {
             Self::Array(array) => array.shape(),
             Self::Weak { .. } => &[],
@@ -785,7 +785,10 @@ impl Operand {
 }
 
 /// Prepare one input, reporting whether it is a scalar (a Python number or a NumPy scalar).
-fn operand(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<(Operand, bool)> {
+pub(in crate::python) fn operand(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<(Operand, bool)> {
     if let Some((weak, leaf)) = convert::weak_scalar(runtime, &value)? {
         return Ok((Operand::Weak { value, leaf, weak }, true));
     }
@@ -795,7 +798,7 @@ fn operand(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<(Operand, bo
 }
 
 /// The dtype operands promote to under NEP 50.
-fn common_dtype(operands: &[Operand]) -> PyResult<DType> {
+pub(in crate::python) fn common_dtype(operands: &[Operand]) -> PyResult<DType> {
     let strong = operands
         .iter()
         .filter_map(Operand::dtype)
@@ -853,13 +856,13 @@ fn not_supported(name: &str) -> PyError {
 }
 
 /// Loop and output dtypes chosen for one call.
-struct Resolved {
-    /// Dtype every input is cast to; `None` means each input keeps its own dtype.
-    input: DType,
-    output: DType,
+pub(in crate::python) struct Resolved {
+    /// Dtype every input is cast to.
+    pub input: DType,
+    pub output: DType,
 }
 
-fn resolve(
+pub(in crate::python) fn resolve(
     ufunc: &UfuncDef,
     common: DType,
     inputs: &[DType],
@@ -1154,7 +1157,11 @@ fn reject_negative_exponent(runtime: &mut dyn PyRuntime, exponent: &Operand) -> 
     Ok(())
 }
 
-fn prepare(runtime: &mut dyn PyRuntime, operand: &Operand, dtype: DType) -> PyResult<Array> {
+pub(in crate::python) fn prepare(
+    runtime: &mut dyn PyRuntime,
+    operand: &Operand,
+    dtype: DType,
+) -> PyResult<Array> {
     match operand {
         Operand::Array(array) if dtype.kind() == Kind::Str && array.dtype.kind() == Kind::Str => {
             Ok(array.clone())
@@ -1402,7 +1409,7 @@ pub(in crate::python) fn arith_fn<T: Numeric>(op: ArithOp) -> fn(T, T, &mut FpFl
     }
 }
 
-fn compare_fn(op: CompareOp) -> fn(Option<Ordering>) -> bool {
+pub(in crate::python) fn compare_fn(op: CompareOp) -> fn(Option<Ordering>) -> bool {
     match op {
         CompareOp::Equal => |ordering| ordering == Some(Ordering::Equal),
         CompareOp::NotEqual => |ordering| ordering != Some(Ordering::Equal),
@@ -1533,7 +1540,7 @@ fn float_unary_flags(input: f64, result: f64, pole: Pole, flags: &mut FpFlags) {
     }
 }
 
-fn float_flags_binary(a: f64, b: f64, result: f64, flags: &mut FpFlags) {
+pub(in crate::python) fn float_flags_binary(a: f64, b: f64, result: f64, flags: &mut FpFlags) {
     if result.is_nan() && !a.is_nan() && !b.is_nan() {
         flags.invalid = true;
     } else if result.is_infinite() && a.is_finite() && b.is_finite() {
@@ -1541,9 +1548,9 @@ fn float_flags_binary(a: f64, b: f64, result: f64, flags: &mut FpFlags) {
     }
 }
 
-type Float2Pair = (fn(f64, f64) -> f64, fn(f32, f32) -> f32);
+pub(in crate::python) type Float2Pair = (fn(f64, f64) -> f64, fn(f32, f32) -> f32);
 
-fn float2_fn(op: Float2Op) -> Float2Pair {
+pub(in crate::python) fn float2_fn(op: Float2Op) -> Float2Pair {
     match op {
         Float2Op::Arctan2 => (f64::atan2, f32::atan2),
         Float2Op::Hypot => (f64::hypot, f32::hypot),
@@ -1710,7 +1717,11 @@ fn object_loop(
     ))
 }
 
-fn object_element(runtime: &mut dyn PyRuntime, ufunc: &UfuncDef, operands: &[PyValue]) -> PyResult {
+pub(in crate::python) fn object_element(
+    runtime: &mut dyn PyRuntime,
+    ufunc: &UfuncDef,
+    operands: &[PyValue],
+) -> PyResult {
     match ufunc.family {
         Family::Logical(op) => {
             let (a, b) = (runtime.truth(&operands[0])?, runtime.truth(&operands[1])?);

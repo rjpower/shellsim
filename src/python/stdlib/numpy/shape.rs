@@ -90,7 +90,7 @@ pub(in crate::python) fn resolve_shape(requested: &[i64], size: usize) -> PyResu
     let shape = requested
         .iter()
         .map(|dimension| match *dimension {
-            -1 if known == 0 || size % known != 0 => Err(mismatch()),
+            -1 if known == 0 || !size.is_multiple_of(known) => Err(mismatch()),
             -1 => Ok(size / known),
             dimension => Ok(dimension as usize),
         })

@@ -28,6 +28,8 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "logging" => Some(include_str!("source/logging.py")),
         "numpy" => Some(include_str!("source/numpy/__init__.py")),
         "numpy._errstate" => Some(include_str!("source/numpy/_errstate.py")),
+        "numpy._methods" => Some(include_str!("source/numpy/_methods.py")),
+        "numpy._nanfunctions" => Some(include_str!("source/numpy/_nanfunctions.py")),
         "numpy._numeric" => Some(include_str!("source/numpy/_numeric.py")),
         "numpy.exceptions" => Some(include_str!("source/numpy/exceptions.py")),
         "numpy.fft" => Some(include_str!("source/numpy/fft.py")),

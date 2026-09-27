@@ -404,6 +404,24 @@ def test_corrcoef_of_small_exact_data():
     assert_allclose(np.corrcoef(np.array([[1, 2, 3], [1, 3, 2]])), [[1.0, 0.5], [0.5, 1.0]])
 
 
+def test_float_sums_follow_numpy_iteration_order():
+    # The inputs are correctly rounded, so these bits are platform independent. NumPy sums each
+    # inner-loop run pairwise, walks reversed views backwards, copies strided blocks through its
+    # 8192-element buffer, and adds along an outer axis one element at a time.
+    x = np.arange(3000) * 0.1 + 1 / 3
+    m = x.reshape(30, 100)
+    assert x.sum() == 450850.00000000006
+    assert x[::-1].sum() == 450850.0
+    assert x[::-3].sum() == 150383.33333333334
+    assert m[::-1].sum() == 450850.0
+    assert m[:, :50].sum() == 221675.00000000003
+    assert m.T.sum() == x.sum()
+    assert m.sum(axis=1)[:2].tolist() == [528.3333333333334, 1528.3333333333335]
+    assert m.sum(axis=0)[:2].tolist() == [4360.000000000001, 4363.000000000001]
+    w = (np.arange(20000) * 0.001).astype(np.float32)
+    assert w.sum(dtype=np.float64) == 199990.00000001641
+
+
 def test_float_summation_is_accurate_within_tolerance():
     assert_allclose(np.full(1000, 0.1).sum(), 100.0, rtol=1e-13)
     assert_allclose(np.full(1000, 0.1).mean(), 0.1, rtol=1e-13)

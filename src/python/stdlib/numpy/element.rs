@@ -163,7 +163,7 @@ impl Number {
 }
 
 fn float_to_i64(value: f64) -> i64 {
-    if value.is_nan() || value >= 9.223_372_036_854_776e18 || value < -9.223_372_036_854_776e18 {
+    if value.is_nan() || !(-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&value) {
         i64::MIN
     } else {
         value as i64

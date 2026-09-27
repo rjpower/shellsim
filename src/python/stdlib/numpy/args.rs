@@ -46,6 +46,11 @@ impl Signature {
         self
     }
 
+    /// Whether the function takes a parameter called `name`.
+    pub(in crate::python) fn has(&self, name: &str) -> bool {
+        self.parameters.contains(&name) || self.keyword_only.contains(&name)
+    }
+
     pub(in crate::python) fn bind(&'static self, args: &CallArgs) -> PyResult<Bound> {
         let positional = args.positional();
         let function = self.function;
