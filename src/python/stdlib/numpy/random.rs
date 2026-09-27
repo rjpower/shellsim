@@ -427,26 +427,40 @@ fn uniform01_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     result_and_state(runtime, out, bitgen, gauss)
 }
 
-/// `_bounded_int_fill(state, low, count, legacy)`: `low` and `count` are already broadcast to
-/// the output shape by the Python caller (`count[i] = high_incl[i] - low[i] + 1`, computed as a
-/// Python `float`, which is exact for every range this module supports).
+/// `_bounded_int_fill(state, low, count, legacy, dtype_name)`: `low` and `count` are already
+/// broadcast to the output shape by the Python caller (`count[i] = high_incl[i] - low[i] + 1`,
+/// computed as a Python `float`, which is exact for every range this module supports).
+/// `dtype_name` selects the output dtype's own raw-word buffering (see
+/// `integers::NarrowBuffer`'s doc) for dtypes narrower than 32 bits; other dtypes draw a full raw
+/// word per element, unbuffered, as before.
 fn bounded_int_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("_bounded_int_fill", 4, 4)?;
+    args.expect_positional("_bounded_int_fill", 5, 5)?;
     let positional = args.positional().to_vec();
     let items = state_items(runtime, positional[0])?;
     let (mut bitgen, gauss) = bitgen_from_items(runtime, &items)?;
     let (low, shape) = i64_params(runtime, positional[1])?;
     let (count, _) = f64_params(runtime, positional[2])?;
     let legacy = runtime.truth(&positional[3])?;
+    let dtype_name = runtime.string_value(&positional[4])?.unwrap_or_default();
     reserve_and_charge(runtime, DType::INT64, low.len(), 2)?;
     let mut values = Vec::with_capacity(low.len());
-    for (lo, count) in low.iter().zip(count.iter()) {
-        values.push(integers::draw_bounded(
-            &mut bitgen,
-            *lo,
-            *count as u128,
-            legacy,
-        ));
+    if let Some(chunk_bits) = integers::narrow_chunk_bits(&dtype_name) {
+        let mut buffer = integers::NarrowBuffer::new();
+        for (lo, count) in low.iter().zip(count.iter()) {
+            let range_incl = (*count as u128 - 1) as u32;
+            let offset =
+                integers::draw_bounded_buffered(&mut bitgen, &mut buffer, range_incl, legacy, chunk_bits);
+            values.push(lo.wrapping_add(i64::from(offset)));
+        }
+    } else {
+        for (lo, count) in low.iter().zip(count.iter()) {
+            values.push(integers::draw_bounded(
+                &mut bitgen,
+                *lo,
+                *count as u128,
+                legacy,
+            ));
+        }
     }
     let out = wrap_i64(runtime, shape, &values)?;
     result_and_state(runtime, out, bitgen, gauss)

@@ -439,7 +439,7 @@ def _choice_indices(raw_state, store_state, pop_size, shape, replace, p, legacy)
         if p_arr is None:
             low_b = _np.zeros(n_samples, dtype=_np.int64)
             count_b = _np.full(n_samples, float(pop_size), dtype=_np.float64)
-            idx, new_state = _nr._bounded_int_fill(raw_state(), low_b, count_b, legacy)
+            idx, new_state = _nr._bounded_int_fill(raw_state(), low_b, count_b, legacy, "int64")
             store_state(new_state)
         else:
             idx = _weighted_choice_with_replacement(raw_state, store_state, p_arr, n_samples)
@@ -543,7 +543,9 @@ class Generator:
         elif _np.any(low_b >= high_b):
             raise ValueError("low >= high")
         count = high_incl.astype(_np.float64) - low_b.astype(_np.float64) + 1.0
-        values, new_state = _nr._bounded_int_fill(self._raw_state(), low_b, count, False)
+        values, new_state = _nr._bounded_int_fill(
+            self._raw_state(), low_b, count, False, dtype_name
+        )
         self._store_state(new_state)
         result = values if dtype_name == "int64" else values.astype(dtype_name)
         return _scalar(result) if target == () else result
@@ -824,7 +826,9 @@ class RandomState:
         if _np.any(low_b >= high_b):
             raise ValueError("low >= high")
         count = high_b.astype(_np.float64) - low_b.astype(_np.float64)
-        values, new_state = _nr._bounded_int_fill(self._raw_state(), low_b, count, True)
+        values, new_state = _nr._bounded_int_fill(
+            self._raw_state(), low_b, count, True, dtype_name
+        )
         self._store_state(new_state)
         result = values if dtype_name == "int64" else values.astype(dtype_name)
         return int(_scalar(result)) if target == () else result
