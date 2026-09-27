@@ -15,7 +15,7 @@ use super::super::native::{
     PyCallable, PyDict, PyError, PyIterator, PyKind, PyList, PyProperty, PyResult, PyRuntime,
     PySequence, PySet, PyTuple, PyValue, PyValueCast,
 };
-use super::super::number::PyNumber;
+use super::super::number::{index_argument, PyNumber};
 use super::super::protocol;
 use super::super::slice::SlicePlan;
 use super::super::unicode;
@@ -852,7 +852,7 @@ fn bytes_center(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
         .ok_or_else(|| PyError::resource_error("centered bytes are too large"))?;
     runtime.reserve_memory(capacity)?;
     runtime.charge_cpu(u64::try_from(capacity).unwrap_or(u64::MAX))?;
-    let left = padding / 2;
+    let left = center_left_padding(padding, width);
     let mut result = Vec::with_capacity(capacity);
     result.extend(std::iter::repeat_n(fill, left));
     result.extend(value);
@@ -1928,6 +1928,13 @@ fn string_rjust(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     string_justify(runtime, receiver, args, true)
 }
 
+/// The left share of `padding` for `str.center` and `bytes.center`: half, plus the odd unit when
+/// both the padding and the requested width are odd, as CPython does. So `'ab'.center(5)` is
+/// `'  ab '` but `'a'.center(4)` is `' a  '`.
+fn center_left_padding(padding: usize, width: i64) -> usize {
+    padding / 2 + (padding & usize::try_from(width).unwrap_or_default() & 1)
+}
+
 fn string_center(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.center", 1, 2)?;
     args.reject_keywords("str.center")?;
@@ -1950,7 +1957,7 @@ fn string_center(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
         .ok()
         .unwrap_or_default()
         .saturating_sub(value.chars().count());
-    let left = padding / 2;
+    let left = center_left_padding(padding, width);
     let right = padding - left;
     let fill_bytes = fill
         .len()
@@ -2492,22 +2499,6 @@ fn pop_index(raw: i64, length: usize) -> PyResult<usize> {
         .ok()
         .filter(|index| *index < length)
         .ok_or_else(|| PyError::exception("IndexError", "pop index out of range"))
-}
-
-/// Convert an index argument as CPython's `__index__` protocol does for builtin methods.
-fn index_argument(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<i64> {
-    if let Some(index) = runtime.int_value(value) {
-        return Ok(index);
-    }
-    if runtime.kind(value)? == PyKind::Int {
-        return Err(PyError::overflow_error(
-            "Python int too large to convert to C ssize_t",
-        ));
-    }
-    let actual = runtime.type_name(value)?;
-    Err(PyError::type_error(format!(
-        "'{actual}' object cannot be interpreted as an integer"
-    )))
 }
 
 fn list_remove(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

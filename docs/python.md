@@ -59,7 +59,9 @@ elements, find keys, and answer `in` with `x is y or x == y`, so a class's `__eq
 containers and an equal key of another type, such as `0.5` for `Fraction(1, 2)`, finds a dict entry.
 `object` provides `__hash__`, `__eq__`, and `__ne__`, so a class that defines `__eq__` can keep
 identity hashing with `__hash__ = object.__hash__`. Builtin functions, native methods and bound
-methods report `__name__`, and bound methods expose `__self__` and `__func__`.
+methods report `__name__`, and bound methods expose `__self__` and `__func__`. A subclass of `int`
+inherits the native `int` methods such as `bit_length` and `to_bytes`, and `from_bytes` called on
+the subclass returns an instance of it.
 
 Augmented assignment updates mutable operands in place, as in CPython: `list +=` extends with any
 iterable, `set |=` and its siblings mutate the set, `dict |=` updates the mapping, and user classes

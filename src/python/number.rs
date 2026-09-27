@@ -9,8 +9,8 @@ use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 use super::ast::{BinaryOperator, ComparisonOperator};
 use super::heap::{Heap, InstancePayload, Object};
 use super::native::{
-    CallArgs, FromPyValue, GetterDef, KindNumber, MethodDef, NativeTypeDef, PyError, PyResult,
-    PyRuntime, PyValue, ValueKindDef,
+    CallArgs, FromPyValue, GetterDef, KindNumber, MethodDef, NativeTypeDef, PyError, PyKind,
+    PyResult, PyRuntime, PyValue, ValueKindDef,
 };
 use super::ValueTag;
 
@@ -121,11 +121,38 @@ macro_rules! real_number_type {
     ($name:literal, rational) => {
         NativeTypeDef {
             name: $name,
-            methods: &[MethodDef {
-                type_name: $name,
-                name: "conjugate",
-                call: real_conjugate,
-            }],
+            methods: &[
+                MethodDef {
+                    type_name: $name,
+                    name: "conjugate",
+                    call: real_conjugate,
+                },
+                MethodDef {
+                    type_name: $name,
+                    name: "bit_length",
+                    call: int_bit_length,
+                },
+                MethodDef {
+                    type_name: $name,
+                    name: "bit_count",
+                    call: int_bit_count,
+                },
+                MethodDef {
+                    type_name: $name,
+                    name: "as_integer_ratio",
+                    call: int_as_integer_ratio,
+                },
+                MethodDef {
+                    type_name: $name,
+                    name: "is_integer",
+                    call: int_is_integer,
+                },
+                MethodDef {
+                    type_name: $name,
+                    name: "to_bytes",
+                    call: int_to_bytes,
+                },
+            ],
             getters: &[
                 GetterDef {
                     owner: $name,
@@ -176,6 +203,18 @@ macro_rules! real_number_type {
 
 pub(super) static BOOL_TYPE: NativeTypeDef = real_number_type!("bool", rational);
 pub(super) static INT_TYPE: NativeTypeDef = real_number_type!("int", rational);
+
+/// `int.from_bytes`, which receives the class so that `bool.from_bytes` returns a `bool`.
+pub(super) static INT_CLASS_METHODS: &[MethodDef] = &[MethodDef {
+    type_name: "int",
+    name: "from_bytes",
+    call: int_from_bytes,
+}];
+pub(super) static BOOL_CLASS_METHODS: &[MethodDef] = &[MethodDef {
+    type_name: "bool",
+    name: "from_bytes",
+    call: int_from_bytes,
+}];
 pub(super) static FLOAT_TYPE: NativeTypeDef = NativeTypeDef {
     methods: &[
         MethodDef {
@@ -305,11 +344,11 @@ fn float_is_integer(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs)
     Ok(PyValue::Bool(value.is_finite() && value.fract() == 0.0))
 }
 
-/// Return a real number as itself, normalizing `bool` to the equal `int`.
-fn real_part(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
-    Ok(match value.bool_value() {
-        Some(value) => PyValue::Int(i64::from(value)),
-        None => value,
+/// Return a real number as itself, normalizing `bool` and `int` subclasses to the equal `int`.
+fn real_part(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+    Ok(match runtime.number(&value) {
+        Some(NumberRef::Int(value)) => PyValue::Int(value),
+        _ => value,
     })
 }
 
@@ -330,6 +369,243 @@ fn real_conjugate(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -
     args.expect_positional("conjugate", 0, 0)?;
     args.reject_keywords("conjugate")?;
     real_part(runtime, value)
+}
+
+/// The receiver of an `int` method as an exact integer; `bool` receivers are 0 or 1.
+fn integer_receiver(runtime: &dyn PyRuntime, value: &PyValue, method: &str) -> PyResult<BigInt> {
+    runtime
+        .number(value)
+        .and_then(NumberRef::to_bigint)
+        .ok_or_else(|| {
+            PyError::type_error(format!("descriptor '{method}' requires a 'int' object"))
+        })
+}
+
+fn expect_no_arguments(method: &str, args: &CallArgs) -> PyResult<()> {
+    if !args.keywords().is_empty() {
+        return Err(PyError::type_error(format!(
+            "{method}() takes no keyword arguments"
+        )));
+    }
+    match args.positional().len() {
+        0 => Ok(()),
+        given => Err(PyError::type_error(format!(
+            "{method}() takes no arguments ({given} given)"
+        ))),
+    }
+}
+
+/// `int.bit_length()`: the number of bits in the absolute value, so `(-255).bit_length() == 8`.
+fn int_bit_length(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    expect_no_arguments("int.bit_length", &args)?;
+    let value = integer_receiver(runtime, &value, "bit_length")?;
+    let bits = i64::try_from(value.bits())
+        .map_err(|_| PyError::overflow_error("int too large to count bits"))?;
+    Ok(PyValue::Int(bits))
+}
+
+/// `int.bit_count()`: the number of one bits in the absolute value.
+fn int_bit_count(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    expect_no_arguments("int.bit_count", &args)?;
+    let value = integer_receiver(runtime, &value, "bit_count")?;
+    let ones = i64::try_from(value.magnitude().count_ones())
+        .map_err(|_| PyError::overflow_error("int too large to count bits"))?;
+    Ok(PyValue::Int(ones))
+}
+
+/// `int.as_integer_ratio()`: the pair `(int(self), 1)`.
+fn int_as_integer_ratio(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    expect_no_arguments("int.as_integer_ratio", &args)?;
+    integer_receiver(runtime, &value, "as_integer_ratio")?;
+    let numerator = real_part(runtime, value)?;
+    runtime.new_tuple(vec![numerator, PyValue::Int(1)])
+}
+
+/// `int.is_integer()`: always true, for duck-typing compatibility with `float.is_integer`.
+fn int_is_integer(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    expect_no_arguments("int.is_integer", &args)?;
+    integer_receiver(runtime, &value, "is_integer")?;
+    Ok(PyValue::Bool(true))
+}
+
+/// Bind the `(first, byteorder='big', *, signed=False)` parameters shared by `int.to_bytes` and
+/// `int.from_bytes`, positionally or by name. The result holds the value bound to each of the
+/// three parameters, in order.
+fn bind_byte_conversion(
+    function: &str,
+    first: &str,
+    args: &CallArgs,
+) -> PyResult<[Option<PyValue>; 3]> {
+    let positional = args.positional();
+    let given = positional.len().saturating_add(args.keywords().len());
+    if given > 3 {
+        return Err(PyError::type_error(format!(
+            "{function}() takes at most 3 arguments ({given} given)"
+        )));
+    }
+    if positional.len() > 2 {
+        return Err(PyError::type_error(format!(
+            "{function}() takes at most 2 positional arguments ({} given)",
+            positional.len()
+        )));
+    }
+    let mut bound = [
+        positional.first().copied(),
+        positional.get(1).copied(),
+        None,
+    ];
+    for (name, value) in args.keywords() {
+        let slot = match name.as_str() {
+            "byteorder" => 1,
+            "signed" => 2,
+            name if name == first => 0,
+            _ => {
+                return Err(PyError::type_error(format!(
+                    "{function}() got an unexpected keyword argument '{name}'"
+                )))
+            }
+        };
+        if bound[slot].is_some() {
+            return Err(PyError::type_error(format!(
+                "argument for {function}() given by name ('{name}') and position ({})",
+                slot + 1
+            )));
+        }
+        bound[slot] = Some(*value);
+    }
+    Ok(bound)
+}
+
+/// Whether a `byteorder` argument selects little-endian order; the default is `'big'`.
+fn little_endian(
+    runtime: &dyn PyRuntime,
+    function: &str,
+    byteorder: Option<PyValue>,
+) -> PyResult<bool> {
+    let Some(byteorder) = byteorder else {
+        return Ok(false);
+    };
+    match runtime.string_value(&byteorder)?.as_deref() {
+        Some("little") => Ok(true),
+        Some("big") => Ok(false),
+        Some(_) => Err(PyError::value_error(
+            "byteorder must be either 'little' or 'big'",
+        )),
+        None => Err(PyError::type_error(format!(
+            "{function}() argument 'byteorder' must be str, not {}",
+            runtime.type_name(&byteorder)?
+        ))),
+    }
+}
+
+/// `int.to_bytes(length=1, byteorder='big', *, signed=False)`: the integer in exactly `length`
+/// bytes, as two's complement when `signed` is true.
+///
+/// ```text
+/// (1024).to_bytes(2) == b'\x04\x00'
+/// (-1).to_bytes(2, 'little', signed=True) == b'\xff\xff'
+/// (256).to_bytes(1) -> OverflowError: int too big to convert
+/// ```
+fn int_to_bytes(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    let [length, byteorder, signed] = bind_byte_conversion("to_bytes", "length", &args)?;
+    let length = length.map_or(Ok(1), |length| index_argument(runtime, &length))?;
+    let little = little_endian(runtime, "to_bytes", byteorder)?;
+    let signed = signed.map_or(Ok(false), |signed| runtime.truth(&signed))?;
+    let length = usize::try_from(length)
+        .map_err(|_| PyError::value_error("length argument must be non-negative"))?;
+    let value = integer_receiver(runtime, &value, "to_bytes")?;
+    if value.is_negative() && !signed {
+        return Err(PyError::overflow_error(
+            "can't convert negative int to unsigned",
+        ));
+    }
+    // The shortest little-endian encoding; zero needs no bytes at all.
+    let mut bytes = if value.is_zero() {
+        Vec::new()
+    } else if signed {
+        value.to_signed_bytes_le()
+    } else {
+        value.magnitude().to_bytes_le()
+    };
+    if bytes.len() > length {
+        return Err(PyError::overflow_error("int too big to convert"));
+    }
+    runtime.reserve_memory(length)?;
+    runtime.charge_cpu(u64::try_from(length).unwrap_or(u64::MAX))?;
+    bytes.resize(length, if value.is_negative() { 0xff } else { 0 });
+    if !little {
+        bytes.reverse();
+    }
+    runtime.new_bytes(bytes)
+}
+
+/// `int.from_bytes(bytes, byteorder='big', *, signed=False)`: the integer encoded by a bytes-like
+/// object or an iterable of byte values.
+///
+/// The receiver is the class. As in CPython, a subclass such as `bool` converts the integer by
+/// calling the class, so `bool.from_bytes(b'\x01')` is `True`.
+fn int_from_bytes(runtime: &mut dyn PyRuntime, class: PyValue, args: CallArgs) -> PyResult {
+    let [data, byteorder, signed] = bind_byte_conversion("from_bytes", "bytes", &args)?;
+    let Some(data) = data else {
+        return Err(PyError::type_error(
+            "from_bytes() missing required argument 'bytes' (pos 1)",
+        ));
+    };
+    let little = little_endian(runtime, "from_bytes", byteorder)?;
+    let signed = signed.map_or(Ok(false), |signed| runtime.truth(&signed))?;
+    let mut bytes = byte_values(runtime, data)?;
+    runtime.charge_cpu(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
+    if !little {
+        bytes.reverse();
+    }
+    let value = if signed {
+        BigInt::from_signed_bytes_le(&bytes)
+    } else {
+        BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes)
+    };
+    let value = runtime.new_integer(&value.to_string())?;
+    runtime.call_value(class, CallArgs::new(vec![value], Vec::new()))
+}
+
+/// The bytes `int.from_bytes` decodes: a `bytes` or `bytearray` as is, or any other iterable of
+/// byte values converted as `bytes(value)` does. Integers and strings, which `bytes()` would
+/// treat as a length or text, are rejected as in CPython.
+fn byte_values(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<u8>> {
+    if let Some(bytes) = runtime.bytes_value(&value)? {
+        return Ok(bytes);
+    }
+    if matches!(
+        runtime.kind(&value)?,
+        PyKind::Bool | PyKind::Int | PyKind::Float | PyKind::String | PyKind::Complex
+    ) {
+        return Err(PyError::type_error(format!(
+            "cannot convert '{}' object to bytes",
+            runtime.type_name(&value)?
+        )));
+    }
+    let bytes_type = runtime
+        .builtin_type("bytes")
+        .expect("bytes is a builtin type");
+    let converted = runtime.call_value(bytes_type, CallArgs::new(vec![value], Vec::new()))?;
+    Ok(runtime
+        .bytes_value(&converted)?
+        .expect("bytes() returns bytes"))
+}
+
+/// Convert an index argument as CPython's `__index__` protocol does for builtin methods.
+pub(super) fn index_argument(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<i64> {
+    if let Some(index) = runtime.int_value(value) {
+        return Ok(index);
+    }
+    if runtime.kind(value)? == PyKind::Int {
+        return Err(PyError::overflow_error(
+            "Python int too large to convert to C ssize_t",
+        ));
+    }
+    let actual = runtime.type_name(value)?;
+    Err(PyError::type_error(format!(
+        "'{actual}' object cannot be interpreted as an integer"
+    )))
 }
 
 /// Return the exact index value accepted by sequence protocols. A registered boolean, like

@@ -1030,7 +1030,8 @@ fn install_native_class_methods(ty: &mut PyType, methods: &'static [super::nativ
 }
 
 /// Install the numeric-tower accessors (`real`, `imag`, `conjugate`, and the rational
-/// accessors on integers) on the builtin number types, including `complex`.
+/// accessors on integers), the integer methods such as `to_bytes` and `from_bytes`, and the
+/// float methods on the builtin number types, including `complex`.
 ///
 /// Attribute lookup on builtin types does not walk the MRO, so `bool` receives its own table
 /// rather than inheriting the one installed on `int`.
@@ -1042,6 +1043,14 @@ fn install_number_attributes(types: &mut [PyType]) {
     install_native_attributes(
         &mut types[BuiltinType::Int as usize],
         &super::number::INT_TYPE,
+    );
+    install_native_class_methods(
+        &mut types[BuiltinType::Bool as usize],
+        super::number::BOOL_CLASS_METHODS,
+    );
+    install_native_class_methods(
+        &mut types[BuiltinType::Int as usize],
+        super::number::INT_CLASS_METHODS,
     );
     install_native_attributes(
         &mut types[BuiltinType::Float as usize],

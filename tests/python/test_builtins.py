@@ -925,3 +925,85 @@ def test_bytes_affixes_membership_find_and_join():
     _assert_raises(lambda: b"a".endswith(("a",)), TypeError, "a bytes-like object is required, not 'str'")
     _assert_raises(lambda: "a" in b"a", TypeError, "a bytes-like object is required, not 'str'")
     _assert_raises(lambda: 256 in bytearray(b"a"), ValueError, "byte must be in range(0, 256)")
+
+
+def test_int_to_bytes_and_from_bytes_match_cpython():
+    assert (1024).to_bytes(2) == b"\x04\x00"
+    assert (1024).to_bytes(2, byteorder="little") == b"\x00\x04"
+    assert (-1).to_bytes(2, "big", signed=True) == b"\xff\xff"
+    assert (0).to_bytes(0) == b"" and (5).to_bytes() == b"\x05" and True.to_bytes() == b"\x01"
+    assert (2**70).to_bytes(10, "little") == b"\x00" * 8 + b"@\x00"
+    assert int.from_bytes(b"\x00\x10") == 16
+    assert int.from_bytes(b"\x00\x10", byteorder="little") == 4096
+    assert int.from_bytes(b"\xff\xff", "big", signed=True) == -1
+    assert int.from_bytes([1, 2]) == 258 and int.from_bytes(bytearray(b"\x01")) == 1
+    assert int.from_bytes(b"") == 0 and int.from_bytes(b"", signed=True) == 0
+    assert bool.from_bytes(b"\x01") is True and bool.from_bytes(b"\x00") is False
+    for value in [0, 1, 127, -128, 255, -(2**63), 2**64 + 3]:
+        encoded = value.to_bytes(9, "little", signed=True)
+        assert int.from_bytes(encoded, "little", signed=True) == value
+
+
+def test_int_byte_conversions_raise_cpython_errors():
+    too_big = (OverflowError, "int too big to convert")
+    assert raised(lambda: (-129).to_bytes(1, "big", signed=True)) == too_big
+    assert raised(lambda: (128).to_bytes(1, "big", signed=True)) == too_big
+    assert raised(lambda: (256).to_bytes(1)) == too_big
+    assert raised(lambda: (-1).to_bytes(2)) == (OverflowError, "can't convert negative int to unsigned")
+    assert raised(lambda: (1).to_bytes(-1)) == (ValueError, "length argument must be non-negative")
+    order = (ValueError, "byteorder must be either 'little' or 'big'")
+    assert raised(lambda: (1).to_bytes(1, "middle")) == order
+    assert raised(lambda: int.from_bytes(b"\x01", "middle")) == order
+    assert raised(lambda: (1).to_bytes(1, 5)) == (TypeError, "to_bytes() argument 'byteorder' must be str, not int")
+    assert raised(lambda: (1).to_bytes(1.5)) == (TypeError, "'float' object cannot be interpreted as an integer")
+    assert raised(lambda: (1).to_bytes(1, "big", True)) == (
+        TypeError,
+        "to_bytes() takes at most 2 positional arguments (3 given)",
+    )
+    assert raised(lambda: int.from_bytes()) == (TypeError, "from_bytes() missing required argument 'bytes' (pos 1)")
+    assert raised(lambda: int.from_bytes(5)) == (TypeError, "cannot convert 'int' object to bytes")
+    assert raised(lambda: int.from_bytes("ab")) == (TypeError, "cannot convert 'str' object to bytes")
+    assert raised(lambda: int.from_bytes([256])) == (ValueError, "bytes must be in range(0, 256)")
+
+
+def test_int_bit_and_ratio_methods():
+    assert (0).bit_length() == 0 and (-255).bit_length() == 8 and (2**100).bit_length() == 101
+    assert True.bit_length() == 1
+    assert (-255).bit_count() == 8 and (2**100 - 1).bit_count() == 100
+    assert (7).as_integer_ratio() == (7, 1) and True.as_integer_ratio() == (1, 1)
+    assert (2**80).as_integer_ratio() == (2**80, 1)
+    assert (7).is_integer() is True
+    assert raised(lambda: (7).bit_length(1)) == (TypeError, "int.bit_length() takes no arguments (1 given)")
+
+
+def test_int_subclasses_inherit_native_int_methods():
+    class Small(int):
+        pass
+
+    class Custom(int):
+        def bit_length(self):
+            return "custom"
+
+    assert Small(5).bit_length() == 3 and Small(12).to_bytes(2, "little") == b"\x0c\x00"
+    assert type(Small(3).conjugate()) is int and type(Small(3).real) is int
+    assert Small.bit_length(Small(5)) == 3
+    restored = Small.from_bytes(b"\x03")
+    assert type(restored) is Small and restored == 3
+    assert Custom(3).bit_length() == "custom"
+    assert not hasattr(Small(1), "missing")
+
+
+def test_bytes_constructor_rejects_bad_items():
+    assert raised(lambda: bytes([1, "a"])) == (TypeError, "'str' object cannot be interpreted as an integer")
+    assert raised(lambda: bytes([256])) == (ValueError, "bytes must be in range(0, 256)")
+    assert raised(lambda: bytes([2**70])) == (ValueError, "bytes must be in range(0, 256)")
+    assert raised(lambda: bytes(-1)) == (ValueError, "negative count")
+
+
+def test_center_puts_the_odd_padding_unit_where_cpython_does():
+    assert "ab".center(5, "*") == "**ab*"
+    assert "a".center(4, "*") == "*a**"
+    assert "abc".center(6, "*") == "*abc**"
+    assert "".center(3, "*") == "***"
+    assert b"ab".center(5, b"*") == b"**ab*"
+    assert bytearray(b"a").center(4, b"*") == bytearray(b"*a**")

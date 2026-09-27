@@ -341,16 +341,7 @@ impl Vm<'_> {
             // Native getters are data descriptors. Builtin receivers have no instance
             // dictionary, so reaching the type table first already gives CPython precedence.
             Some(NativeValue::NativeGetter(getter)) => {
-                return match (getter.get)(self, owner) {
-                    Ok(value) => Ok(Some(value)),
-                    // As in CPython, a getter's AttributeError means the attribute is absent for
-                    // this receiver, which `getattr` defaults and `hasattr` observe.
-                    Err(PyError {
-                        kind: PyErrorKind::Exception("AttributeError"),
-                        ..
-                    }) => Ok(None),
-                    Err(error) => Err(self.record_native_error(error)),
-                };
+                return self.call_native_getter(getter, owner);
             }
             _ => {}
         }
@@ -395,7 +386,7 @@ impl Vm<'_> {
                         }
                     }
                     let Some((defining_class, descriptor)) = entry else {
-                        return Ok(None);
+                        return self.builtin_base_attribute(id, None, name);
                     };
                     let value = self.bind_descriptor(descriptor, None, id, defining_class)?;
                     return Ok(Some(value));
@@ -432,7 +423,7 @@ impl Vm<'_> {
                         return Ok(Some(value));
                     }
                     let Some((defining_class, descriptor)) = class_entry else {
-                        return Ok(None);
+                        return self.builtin_base_attribute(class, Some(owner), name);
                     };
                     let value =
                         self.bind_descriptor(descriptor, Some(owner), class, defining_class)?;
@@ -1710,6 +1701,64 @@ impl Vm<'_> {
         Ok(None)
     }
 
+    /// Look up `name` among the native attributes of a user class's builtin base, such as
+    /// `int.bit_length` for `class Flag(int)`.
+    ///
+    /// The MRO stored on a class lists only user-defined ancestors, so this runs after it finds
+    /// nothing. `receiver` is the instance for instance lookup and `None` for lookup through the
+    /// class, which returns unbound methods and getters as the builtin type itself does.
+    fn builtin_base_attribute(
+        &mut self,
+        class: ObjectId,
+        receiver: Option<Value>,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let Object::Class { layout, .. } = self.state.heap.get(class)? else {
+            return Err("instance has an invalid class".into());
+        };
+        let base = match layout {
+            ClassLayout::Object => return Ok(None),
+            ClassLayout::Int => BuiltinType::Int,
+            ClassLayout::Type => BuiltinType::Type,
+        };
+        let Some(value) = self.state.types.attribute(base.id(), name)? else {
+            return Ok(None);
+        };
+        match (value.native_value(), receiver) {
+            (Some(NativeValue::NativeClassMethod(method)), _) => self
+                .bind_native_class_method(Value::Object(class), method)
+                .map(Some),
+            (Some(NativeValue::NativeMethod(_)), Some(receiver)) => self
+                .allocate_object(Object::DescriptorBoundMethod {
+                    receiver,
+                    descriptor: value,
+                    owner: None,
+                })
+                .map(Some),
+            (Some(NativeValue::NativeGetter(getter)), Some(receiver)) => {
+                self.call_native_getter(getter, receiver)
+            }
+            _ => Ok(Some(value)),
+        }
+    }
+
+    fn call_native_getter(
+        &mut self,
+        getter: &'static super::super::native::GetterDef,
+        receiver: Value,
+    ) -> Result<Option<Value>, String> {
+        match (getter.get)(self, receiver) {
+            Ok(value) => Ok(Some(value)),
+            // As in CPython, a getter's AttributeError means the attribute is absent for this
+            // receiver, which `getattr` defaults and `hasattr` observe.
+            Err(PyError {
+                kind: PyErrorKind::Exception("AttributeError"),
+                ..
+            }) => Ok(None),
+            Err(error) => Err(self.record_native_error(error)),
+        }
+    }
+
     fn is_data_descriptor(&mut self, value: &Value) -> Result<bool, String> {
         let Some(id) = value.object_id() else {
             return Ok(false);
@@ -2533,10 +2582,11 @@ impl Vm<'_> {
                         protocol::bytes_value(&self.state.heap, value)?.expect("guarded")
                     }
                     [value] if protocol::int_value(&self.state.heap, value).is_some() => {
-                        let length = usize::try_from(
+                        let Ok(length) = usize::try_from(
                             protocol::int_value(&self.state.heap, value).expect("guarded"),
-                        )
-                        .map_err(|_| "negative count")?;
+                        ) else {
+                            return Err(self.raise_exception("ValueError", "negative count"));
+                        };
                         self.reserve_result(length)?;
                         vec![0; length]
                     }
@@ -2544,9 +2594,24 @@ impl Vm<'_> {
                         let items = self.iterable_values(value)?;
                         let mut bytes = Vec::with_capacity(items.len());
                         for item in items {
-                            let byte = protocol::int_value(&self.state.heap, &item)
-                                .and_then(|value| u8::try_from(value).ok())
-                                .ok_or("bytes must be in range(0, 256)")?;
+                            let byte = match super::number::index(&self.state.heap, &item) {
+                                Some(super::number::NumberRef::Int(value)) => {
+                                    u8::try_from(value).ok()
+                                }
+                                Some(_) => None,
+                                None => {
+                                    return Err(self.raise_object_type_error(
+                                        &item,
+                                        "cannot be interpreted as an integer",
+                                    ))
+                                }
+                            };
+                            let Some(byte) = byte else {
+                                return Err(self.raise_exception(
+                                    "ValueError",
+                                    "bytes must be in range(0, 256)",
+                                ));
+                            };
                             bytes.push(byte);
                         }
                         bytes
