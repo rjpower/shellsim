@@ -133,7 +133,11 @@ fn searchsorted(
     let v_cast = convert::cast_array(runtime, &v, common, false)?;
     let n = a_cast.size();
     let count = v_cast.size();
-    runtime.charge_cpu((count as u64).saturating_mul(cost_log_n(n)) + 1)?;
+    runtime.charge_cpu(
+        (count as u64)
+            .saturating_mul(cost_log_n(n))
+            .saturating_add(1),
+    )?;
     array::reserve_elements(runtime, DType::INT64, count)?;
 
     let positions = match common.kind() {

@@ -358,7 +358,11 @@ fn lane_orders(
     let n = array.shape()[axis];
     let offsets = lane_offsets(array.shape(), array.strides(), axis);
     let lanes = offsets.len().checked_div(n).unwrap_or(0);
-    runtime.charge_cpu(cost_n_log_n(n).saturating_mul(lanes as u64) + 1)?;
+    runtime.charge_cpu(
+        cost_n_log_n(n)
+            .saturating_mul(lanes as u64)
+            .saturating_add(1),
+    )?;
     runtime.reserve_memory(offsets.len().saturating_mul(std::mem::size_of::<usize>()))?;
     if array.dtype.kind() == Kind::Object {
         return object_lane_orders(runtime, array, &offsets, n, descending);
