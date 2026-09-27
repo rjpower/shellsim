@@ -99,8 +99,8 @@ differences, the unsupported frontier, and resource limits.
   `result_type`, `can_cast`, `issubdtype`, `isdtype` and `mintypecode`.
 - **Indexing.** Basic indexing returns views. Integer-array and boolean-mask indexing follow
   NumPy's placement rules for combined advanced indices. Assignment works through every index
-  form, broadcasting the value as NumPy does. `select`, `extract` and `place` choose and fill
-  elements by condition.
+  form, broadcasting the value as NumPy does. `select`, `extract`, `place` and `putmask` choose
+  and fill elements by condition.
 - **Ufuncs.** The arithmetic, comparison, logical, bitwise, rounding, exponential,
   trigonometric and hyperbolic ufuncs, with `out=`, `where=`, `dtype=`, `casting=`, `order=`,
   and `reduce`/`accumulate`. Operators share the ufunc table. `np.errstate` and `np.seterr`

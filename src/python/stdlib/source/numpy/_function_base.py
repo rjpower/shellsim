@@ -578,14 +578,12 @@ def extract(condition, arr):
     return take(ravel(arr), nonzero(ravel(condition))[0])
 
 
-def place(arr, mask, vals):
-    if not isinstance(arr, ndarray):
-        raise TypeError(f"place() argument 1 must be numpy.ndarray, not {type(arr).__name__}")
-    mask = asarray(mask).astype(bool_)
-    if mask.size != arr.size:
-        raise ValueError("place: mask and data must be the same size")
-    # Arrays and NumPy scalars cast safely, as ``PyArray_FromAny`` requires; Python sequences
-    # and scalars convert straight to the array's dtype.
+def _fill_values(arr, vals):
+    """Convert the values ``place`` and ``putmask`` write into ``arr`` to its dtype.
+
+    Arrays and NumPy scalars cast safely, as ``PyArray_FromAny`` requires; Python sequences and
+    scalars convert straight to the array's dtype.
+    """
     if isinstance(vals, (ndarray, generic)):
         vals = asarray(vals)
         if not can_cast(vals.dtype, arr.dtype, casting="safe"):
@@ -593,9 +591,17 @@ def place(arr, mask, vals):
                 f"Cannot cast array data from {vals.dtype!r} to {arr.dtype!r} according to "
                 "the rule 'safe'"
             )
-        vals = vals.astype(arr.dtype)
-    else:
-        vals = array(vals, dtype=arr.dtype)
+        return vals.astype(arr.dtype)
+    return array(vals, dtype=arr.dtype)
+
+
+def place(arr, mask, vals):
+    if not isinstance(arr, ndarray):
+        raise TypeError(f"place() argument 1 must be numpy.ndarray, not {type(arr).__name__}")
+    mask = asarray(mask).astype(bool_)
+    if mask.size != arr.size:
+        raise ValueError("place: mask and data must be the same size")
+    vals = _fill_values(arr, vals)
     if not arr.flags.writeable:
         raise ValueError("WRITEBACKIFCOPY base is read-only")
     count = int(mask.sum())
@@ -608,6 +614,23 @@ def place(arr, mask, vals):
     # The first ``count`` values, repeated as needed, fill the masked positions in C order.
     vals = ravel(vals)
     arr[mask.reshape(arr.shape)] = vals[arange(count) % vals.size]
+
+
+def putmask(a, mask, values):
+    if not isinstance(a, ndarray):
+        raise TypeError("putmask: first argument must be an array")
+    if not a.flags.writeable:
+        raise ValueError("putmask: output array is read-only")
+    mask = asarray(mask).astype(bool_)
+    if mask.size != a.size:
+        raise ValueError("putmask: mask and data must be the same size")
+    values = _fill_values(a, values)
+    if values.size == 0:
+        return
+    # Unlike ``place``, the masked element at flat position ``i`` gets ``values[i % size]``.
+    mask = ravel(mask)
+    positions = arange(a.size)[mask]
+    a[mask.reshape(a.shape)] = ravel(values)[positions % values.size]
 
 
 _typecodes_by_elsize = "GDFgdfQqLlIiHhBb?"

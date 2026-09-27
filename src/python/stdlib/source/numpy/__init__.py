@@ -85,6 +85,7 @@ from numpy._function_base import (
     nan_to_num,
     place,
     polyfit,
+    putmask,
     polyval,
     real,
     real_if_close,

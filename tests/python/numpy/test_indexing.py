@@ -643,6 +643,36 @@ def test_place_rejects_mismatched_masks_and_empty_values(mask, vals, message):
         np.place(np.zeros(2), mask, vals)
 
 
+def test_putmask_takes_values_by_flat_position_not_by_count():
+    a = np.arange(6)
+    np.putmask(a, a > 2, [10, 20])
+    assert a.tolist() == [0, 1, 2, 20, 10, 20]
+    b = np.arange(6).reshape(2, 3)
+    np.putmask(b, b % 2 == 0, np.array([7]))
+    assert b.tolist() == [[7, 1, 7], [3, 7, 5]]
+
+
+def test_putmask_casts_python_values_and_ignores_empty_values():
+    a = np.arange(3)
+    assert np.putmask(a, [True, False, True], 2.5) is None
+    assert a.tolist() == [2, 1, 2]
+    np.putmask(a, [True, True, True], [])
+    assert a.tolist() == [2, 1, 2]
+    with pytest.raises(TypeError, match="according to the rule 'safe'"):
+        np.putmask(a, [True, False, True], np.array([1.5]))
+
+
+def test_putmask_rejects_non_arrays_mismatched_masks_and_read_only_arrays():
+    with pytest.raises(TypeError, match="putmask: first argument must be an array"):
+        np.putmask([1, 2], [True, False], [5])
+    with pytest.raises(ValueError, match="putmask: mask and data must be the same size"):
+        np.putmask(np.arange(3), [True, False], [5])
+    frozen = np.arange(3)
+    frozen.flags.writeable = False
+    with pytest.raises(ValueError, match="putmask: output array is read-only"):
+        np.putmask(frozen, [True, False, True], 1)
+
+
 def test_extract_takes_elements_where_the_raveled_condition_is_nonzero():
     a = np.arange(4).reshape(2, 2)
     assert np.extract(np.array([[1, 0], [0, 2]]), a).tolist() == [0, 3]
