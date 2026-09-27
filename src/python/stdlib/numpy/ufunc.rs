@@ -27,13 +27,14 @@ use super::super::super::native::{
 };
 use super::super::super::Value;
 use super::array::{
-    broadcast_shapes, broadcast_strides, element_count, new_array, reserve_elements, Array, Offsets,
+    broadcast_shapes, broadcast_strides, element_count, reserve_elements, Array, Offsets,
 };
 use super::convert::{self, Leaf};
 use super::dtype::{self, Casting, Category, DType, Kind, Weak};
 use super::element::{
     dispatch_complex, dispatch_integer, dispatch_numeric, dispatch_real, Element,
 };
+use super::layout::{self, Order};
 use super::ops::{ComplexParts, FpFlags, Integer, Numeric, Real};
 use super::scalar::NO_SLOTS;
 
@@ -813,6 +814,8 @@ pub(in crate::python) struct Options {
     pub keep_array: bool,
     /// `where=`, unless it is the literal `True`.
     pub mask: Option<PyValue>,
+    /// `order=` for an allocated output; `None` is NumPy's default, `K`.
+    pub order: Option<Order>,
 }
 
 impl Options {
@@ -879,7 +882,8 @@ fn keyword_options(
             }
             "where" if value.bool_value() == Some(true) => {}
             "where" => options.mask = Some(*value),
-            "subok" | "order" => {}
+            "order" => options.order = Some(Order::parse(runtime, Some(*value), Order::K)?),
+            "subok" => {}
             _ => {
                 return Err(PyError::type_error(format!(
                     "{name}() got an unexpected keyword argument '{keyword}'"
@@ -1370,7 +1374,17 @@ pub(in crate::python) fn evaluate(
         .iter()
         .map(|operand| prepare(runtime, operand, resolved.input))
         .collect::<PyResult<Vec<_>>>()?;
-    let (buffer, output_dtype, mut flags) = run(runtime, ufunc, &resolved, &prepared, &shape)?;
+    // The loop fills the output in its memory order: C order over the permuted axes.
+    let axes = match options.out {
+        Some(_) => (0..shape.len()).collect(),
+        None => output_axes(&operands, &shape, options.order.unwrap_or(Order::K))?,
+    };
+    let loop_shape = axes.iter().map(|axis| shape[*axis]).collect::<Vec<_>>();
+    let prepared = prepared
+        .iter()
+        .map(|input| layout::broadcast_reading_order(input, &shape, &axes))
+        .collect::<PyResult<Vec<_>>>()?;
+    let (buffer, output_dtype, mut flags) = run(runtime, ufunc, &resolved, &prepared, &loop_shape)?;
     let scalar_math = options.operator && all_scalars;
     let division = matches!(
         ufunc.family,
@@ -1384,7 +1398,7 @@ pub(in crate::python) fn evaluate(
         // overflow is `MIN // -1`, report it.
         flags.overflow = false;
     }
-    let result = new_array(runtime, buffer, output_dtype, shape)?;
+    let result = layout::new_array(runtime, buffer, output_dtype, shape, &axes)?;
     let value = if let Some(out) = &options.out {
         super::array::assign(runtime, out, &result)?;
         out.value()
@@ -1398,6 +1412,28 @@ pub(in crate::python) fn evaluate(
         flags,
         scalar_math,
     })
+}
+
+/// The memory order of an allocated output of `shape`, as NumPy's iterator applies `order`:
+/// `A` means Fortran order when every array operand is Fortran-contiguous, and `K` follows
+/// the operands' strides.
+fn output_axes(operands: &[Operand], shape: &[usize], order: Order) -> PyResult<Vec<usize>> {
+    let arrays = operands.iter().filter_map(|operand| match operand {
+        Operand::Array(array) => Some(array),
+        Operand::Weak { .. } => None,
+    });
+    let order = match order {
+        Order::A if shape.len() > 1 && arrays.clone().all(layout::is_f_contiguous) => Order::F,
+        Order::A => Order::C,
+        order => order,
+    };
+    if order != Order::K {
+        return Ok(layout::axes(order, shape.len()));
+    }
+    let strides = arrays
+        .map(|array| broadcast_strides(&array.view, shape))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(layout::iteration_axes(&strides, shape))
 }
 
 /// Check that a loop's `output` dtype casts to `out=` under `casting`.

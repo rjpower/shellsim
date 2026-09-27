@@ -13,20 +13,6 @@ use super::{
     MODELED_VALUE_BYTES,
 };
 
-/// C-order byte strides for `shape`.
-fn contiguous_strides(shape: &[usize], itemsize: usize) -> PyResult<Vec<isize>> {
-    let mut strides = vec![0isize; shape.len()];
-    let mut stride = itemsize;
-    for (axis, dimension) in shape.iter().enumerate().rev() {
-        strides[axis] =
-            isize::try_from(stride).map_err(|_| PyError::value_error("array is too big."))?;
-        stride = stride
-            .checked_mul((*dimension).max(1))
-            .ok_or_else(|| PyError::value_error("array is too big."))?;
-    }
-    Ok(strides)
-}
-
 /// Check that every element `view` addresses lies inside `buffer` and suits its element kind.
 fn validate_array_view(view: &PyArrayView, buffer: &PyArrayBuffer) -> PyResult<()> {
     let invalid = |message: &str| Err(PyError::runtime_error(message.to_string()));
@@ -1624,6 +1610,7 @@ impl PyRuntime for Vm<'_> {
         buffer: PyArrayBuffer,
         dtype: PyArrayDtype,
         shape: Vec<usize>,
+        strides: Vec<isize>,
     ) -> PyResult<Value> {
         let count = shape
             .iter()
@@ -1638,12 +1625,13 @@ impl PyRuntime for Vm<'_> {
             ));
         }
         let view = PyArrayView {
-            strides: contiguous_strides(&shape, dtype.itemsize())?,
+            strides,
             dtype,
             shape,
             offset: 0,
             writeable: true,
         };
+        validate_array_view(&view, &buffer)?;
         let storage = Vm::allocate_object(self, Object::ArrayStorage(buffer))
             .map_err(PyError::resource_error)?
             .object_id()

@@ -296,15 +296,28 @@ pub(in crate::python) fn zeroed_buffer(
     })
 }
 
-/// Wrap owned storage in a new C-contiguous array.
+/// Wrap owned storage, which holds the elements in C order, in a new C-contiguous array.
 pub(in crate::python) fn new_array(
     runtime: &mut dyn PyRuntime,
     buffer: PyArrayBuffer,
     dtype: DType,
     shape: Vec<usize>,
 ) -> PyResult<Array> {
+    let axes = (0..shape.len()).collect::<Vec<_>>();
+    super::layout::new_array(runtime, buffer, dtype, shape, &axes)
+}
+
+/// Wrap owned storage in a new array whose elements sit at `strides`; see
+/// [`super::layout`] for building strides from a memory order.
+pub(in crate::python) fn new_array_with_strides(
+    runtime: &mut dyn PyRuntime,
+    buffer: PyArrayBuffer,
+    dtype: DType,
+    shape: Vec<usize>,
+    strides: Vec<isize>,
+) -> PyResult<Array> {
     element_count(&shape)?;
-    let value = runtime.new_array(buffer, dtype.storage(), shape)?;
+    let value = runtime.new_array(buffer, dtype.storage(), shape, strides)?;
     Array::from_value(runtime, value)
 }
 

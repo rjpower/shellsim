@@ -19,6 +19,7 @@ use super::array::{self, Array};
 use super::convert;
 use super::dtype::{Category, DType, Kind};
 use super::index;
+use super::layout::{self, Order};
 use super::ufunc;
 
 pub(in crate::python) static ARRAY_TYPE: NativeTypeDef = NativeTypeDef {
@@ -409,11 +410,14 @@ pub(in crate::python) fn flat_offset(array: &Array, position: i64) -> PyResult<u
     Ok(array.offset_of(&index))
 }
 
+/// `a.copy(order='C')`.
 fn method_copy(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("copy", &["order"], 0);
-    SIGNATURE.bind(&args)?;
+    let bound = SIGNATURE.bind(&args)?;
     let array = receiver(runtime, receiver_value)?;
-    Ok(array::copy_array(runtime, &array)?.value())
+    let order = Order::parse(runtime, bound.value("order"), Order::C)?;
+    let axes = layout::axes_like(&array, order, array.ndim());
+    Ok(layout::copy(runtime, &array, &axes)?.value())
 }
 
 /// `copy.deepcopy(a)`: object elements are deep-copied through the `copy` module.
@@ -468,8 +472,19 @@ fn method_astype(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: Cal
             )));
         }
     }
+    let order = Order::parse(runtime, bound.value("order"), Order::K)?;
     let copy = args::flag(runtime, bound.get("copy"), true)?;
-    Ok(convert::cast_array(runtime, &array, target, copy)?.value())
+    let target = convert::cast_target(runtime, &array, target)?;
+    // As in NumPy, `A` keeps any contiguous array rather than only a Fortran one.
+    let layout_kept = match order {
+        Order::A => array.is_c_contiguous() || layout::is_f_contiguous(&array),
+        order => layout::satisfies(&array, order),
+    };
+    if !copy && target == array.dtype && layout_kept {
+        return Ok(receiver_value);
+    }
+    let axes = layout::axes_like(&array, order, array.ndim());
+    Ok(convert::cast_array_in(runtime, &array, target, &axes)?.value())
 }
 
 /// `a.fill(value)`.

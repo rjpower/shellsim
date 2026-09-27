@@ -27,6 +27,7 @@ use super::super::super::Value;
 use super::args::{self, Signature};
 use super::array::{self, Array};
 use super::convert;
+use super::layout::{self, Order};
 
 pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
     name: "_numpy_shape",
@@ -214,49 +215,10 @@ fn module_normalize_axis_index(runtime: &mut dyn PyRuntime, args: CallArgs) -> P
     Ok(Value::Int(axis_index(axis, ndim, prefix.as_deref())? as i64))
 }
 
-/// Memory order for `reshape`, `ravel`, and `flatten`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Order {
-    C,
-    F,
-    A,
-    K,
-}
-
-fn order_arg(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Order> {
-    let Some(value) = value.filter(|value| !value.is_none()) else {
-        return Ok(Order::C);
-    };
-    let Some(text) = runtime.string_value(&value)? else {
-        return Err(PyError::type_error(format!(
-            "order must be str, not {}",
-            runtime.type_name(&value)?
-        )));
-    };
-    Ok(match text.as_str() {
-        "C" | "c" => Order::C,
-        "F" | "f" => Order::F,
-        "A" | "a" => Order::A,
-        "K" | "k" => Order::K,
-        _ => {
-            return Err(PyError::value_error(format!(
-                "order must be one of 'C', 'F', 'A', or 'K' (got '{text}')"
-            )))
-        }
-    })
-}
-
-/// Whether the array is Fortran-contiguous, which is C-contiguity of its transpose.
-fn is_f_contiguous(array: &Array) -> bool {
-    let shape = array.shape().iter().rev().copied().collect::<Vec<_>>();
-    let strides = array.strides().iter().rev().copied().collect::<Vec<_>>();
-    array::is_c_contiguous(&shape, &strides, array.itemsize())
-}
-
 /// `A` order means Fortran order for arrays that are only Fortran-contiguous.
 fn resolve_any_order(array: &Array, order: Order) -> Order {
     match order {
-        Order::A if is_f_contiguous(array) && !array.is_c_contiguous() => Order::F,
+        Order::A if layout::is_fortran(array) => Order::F,
         Order::A => Order::C,
         order => order,
     }
@@ -480,7 +442,11 @@ fn method_reshape(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
         ));
     }
     let requested = requested_shape(runtime, &positional)?;
-    let order = order_arg(runtime, args.keyword("reshape", "order")?.copied())?;
+    let order = Order::parse(
+        runtime,
+        args.keyword("reshape", "order")?.copied(),
+        Order::C,
+    )?;
     let copy = copy_arg(runtime, args.keyword("reshape", "copy")?.copied())?;
     Ok(reshape_with(runtime, &array, &requested, order, copy)?.value())
 }
@@ -497,7 +463,7 @@ fn module_reshape(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
             PyError::type_error("reshape() missing required argument 'shape' (pos 2)")
         })?;
     let requested = requested_shape(runtime, &[shape])?;
-    let order = order_arg(runtime, bound.value("order"))?;
+    let order = Order::parse(runtime, bound.value("order"), Order::C)?;
     let copy = copy_arg(runtime, bound.get("copy"))?;
     Ok(reshape_with(runtime, &array, &requested, order, copy)?.value())
 }
@@ -512,8 +478,7 @@ fn ravel_order(runtime: &mut dyn PyRuntime, array: &Array, order: Order) -> PyRe
             array::ravel(runtime, &reversed)
         }
         Order::K => {
-            let mut axes = (0..array.ndim()).collect::<Vec<_>>();
-            axes.sort_by_key(|axis| std::cmp::Reverse(array.strides()[*axis].unsigned_abs()));
+            let axes = layout::axes_like(array, Order::K, array.ndim());
             let permuted = permute(runtime, array, &axes)?;
             array::ravel(runtime, &permuted)
         }
@@ -524,7 +489,7 @@ fn method_ravel(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     static SIGNATURE: Signature = Signature::new("ravel", &["order"], 0);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, receiver)?;
-    let order = order_arg(runtime, bound.value("order"))?;
+    let order = Order::parse(runtime, bound.value("order"), Order::C)?;
     Ok(ravel_order(runtime, &array, order)?.value())
 }
 
@@ -532,7 +497,7 @@ fn module_ravel(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("ravel", &["a", "order"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("a"))?;
-    let order = order_arg(runtime, bound.value("order"))?;
+    let order = Order::parse(runtime, bound.value("order"), Order::C)?;
     Ok(ravel_order(runtime, &array, order)?.value())
 }
 
@@ -541,7 +506,7 @@ fn method_flatten(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
     static SIGNATURE: Signature = Signature::new("flatten", &["order"], 0);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, receiver)?;
-    let order = order_arg(runtime, bound.value("order"))?;
+    let order = Order::parse(runtime, bound.value("order"), Order::C)?;
     let flat = ravel_order(runtime, &array, order)?;
     Ok(array::copy_array(runtime, &flat)?.value())
 }

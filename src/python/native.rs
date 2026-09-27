@@ -723,13 +723,15 @@ pub(super) trait PyRuntime {
     /// The builtin type object with this Python name, such as `str` or `float`.
     fn builtin_type(&self, name: &str) -> Option<PyValue>;
     fn value_kind_type(&self, kind: &'static ValueKindDef) -> PyResult<PyValue>;
-    /// Allocate a C-contiguous array that owns `buffer`. The buffer length must equal the
-    /// element count times the dtype's item size, and object dtypes need `Values` storage.
+    /// Allocate an array that owns `buffer`, with its elements at `strides`. The buffer length
+    /// must equal the element count times the dtype's item size, object dtypes need `Values`
+    /// storage, and every addressed element must lie inside the buffer.
     fn new_array(
         &mut self,
         buffer: PyArrayBuffer,
         dtype: PyArrayDtype,
         shape: Vec<usize>,
+        strides: Vec<isize>,
     ) -> PyResult<PyValue>;
     /// Allocate another view of `base`'s storage after checking that it stays inside the
     /// storage and matches its element kind. A view of a read-only array stays read-only.

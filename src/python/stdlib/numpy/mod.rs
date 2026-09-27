@@ -28,6 +28,7 @@ mod fft;
 mod format;
 mod index;
 mod io;
+mod layout;
 mod linalg;
 mod math;
 mod ndarray;
@@ -122,6 +123,7 @@ static MODULE: ModuleDef = ModuleDef {
         function("asarray", construct::asarray),
         function("asanyarray", construct::asarray),
         function("ascontiguousarray", construct::ascontiguousarray),
+        function("asfortranarray", construct::asfortranarray),
         function("copy", construct::copy),
         function("zeros", construct::zeros),
         function("ones", construct::ones),

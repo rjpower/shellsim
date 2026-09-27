@@ -430,3 +430,110 @@ def test_empty_list_gives_float64():
     assert a.dtype == np.dtype("float64")
     assert a.shape == (0,)
     assert np.array([[]]).shape == (1, 0)
+
+
+def layout(a):
+    return a.strides, a.flags.c_contiguous, a.flags.f_contiguous, a.flags.owndata
+
+
+@pytest.mark.parametrize("name", ["zeros", "ones", "empty"])
+def test_shape_constructors_lay_out_fortran_order(name):
+    a = getattr(np, name)((2, 3, 4), dtype=np.int16, order="F")
+    assert layout(a) == ((2, 4, 12), False, True, True)
+    assert getattr(np, name)((2, 3), order="f").strides == (8, 16)
+    assert np.full((2, 3), 7, order="F").tolist() == [[7, 7, 7], [7, 7, 7]]
+    assert np.full((2, 3), 7, order="F").strides == (8, 16)
+    assert np.eye(2, 3, k=1, order="F").strides == (8, 16)
+    assert np.eye(2, 3, k=1, order="F").tolist() == [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+
+def test_constructor_order_argument_errors():
+    with pytest.raises(ValueError, match="only 'C' or 'F' order is permitted"):
+        np.zeros(3, order="K")
+    with pytest.raises(ValueError, match="only 'C' or 'F' order is permitted"):
+        np.full(3, 1, order="A")
+    with pytest.raises(ValueError) as info:
+        np.array([1], order="Q")
+    assert str(info.value) == "order must be one of 'C', 'F', 'A', or 'K' (got 'Q')"
+    with pytest.raises(TypeError, match="order must be str, not int"):
+        np.ones(3, order=1)
+
+
+def test_new_empty_arrays_have_zero_strides():
+    assert np.zeros((0, 3)).strides == (0, 0)
+    assert np.zeros((2, 0, 3), order="F").strides == (0, 0, 0)
+
+
+def test_array_copies_in_the_requested_order():
+    m = np.arange(6).reshape(2, 3)
+    f = np.array(m, order="F")
+    assert layout(f) == ((8, 16), False, True, True)
+    assert f.tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert np.array([[1, 2], [3, 4]], order="F").strides == (8, 16)
+    # The default order 'K' keeps the source's memory order, even for transposes and permutes.
+    assert np.array(f).strides == (8, 16)
+    assert np.array(m.T).strides == (8, 24)
+    assert np.array(m[::-1].T).strides == (8, 24)
+    assert np.array(m[:, ::-1]).strides == (24, 8)
+    permuted = np.arange(24).reshape(2, 3, 4).transpose(1, 2, 0)
+    assert layout(np.array(permuted)) == ((32, 8, 96), False, False, True)
+    assert np.array(f, order="C").strides == (24, 8)
+    assert np.array(f, order="A").strides == (8, 16)
+    assert np.array(f, dtype=np.float32).strides == (4, 8)
+
+
+def test_asarray_copies_only_for_a_different_layout():
+    m = np.arange(6).reshape(2, 3)
+    f = np.asfortranarray(m)
+    assert layout(f) == ((8, 16), False, True, True)
+    assert np.asfortranarray(f) is f
+    assert np.asarray(f) is f
+    assert np.asarray(f, order="A") is f
+    assert np.asarray(f, order="F") is f
+    assert np.asarray(f, order="C") is not f
+    assert np.ascontiguousarray(f).strides == (24, 8)
+    assert np.asarray([[1, 2], [3, 4]], order="F").strides == (8, 16)
+    scalar = np.asfortranarray(5)
+    assert (scalar.shape, scalar.flags.owndata) == ((1,), False)
+    with pytest.raises(ValueError, match="Unable to avoid copy"):
+        np.asarray(f, order="C", copy=False)
+
+
+def test_ndmin_prepends_axes_with_numpy_strides():
+    assert np.array([1, 2], ndmin=2).strides == (16, 8)
+    assert np.array([[1, 2]], ndmin=3).strides == (16, 16, 8)
+    assert np.array(5, ndmin=2).strides == (8, 8)
+    assert np.array([1, 2], ndmin=2, order="F").strides == (8, 8)
+
+
+def test_copies_and_casts_follow_their_default_orders():
+    m = np.arange(6).reshape(2, 3)
+    f = np.asfortranarray(m)
+    assert f.copy().strides == (24, 8)
+    assert f.copy(order="K").strides == (8, 16)
+    assert f.copy(order="A").strides == (8, 16)
+    assert m.copy(order="F").strides == (8, 16)
+    assert np.copy(f).strides == (8, 16)
+    assert np.copy(f, order="C").strides == (24, 8)
+    assert f.astype(np.float32).strides == (4, 8)
+    assert f.astype(np.float32, order="C").strides == (12, 4)
+    assert f.astype(f.dtype, copy=False) is f
+    assert f.astype(f.dtype, copy=False, order="C") is not f
+    for copied in [f.copy(order="F"), f.astype(np.float32, order="F")]:
+        assert copied.tolist() == [[0, 1, 2], [3, 4, 5]]
+
+
+def test_like_constructors_keep_the_prototype_order():
+    f = np.asfortranarray(np.arange(6).reshape(2, 3))
+    assert np.zeros_like(f).strides == (8, 16)
+    assert np.zeros_like(f, order="C").strides == (24, 8)
+    assert np.zeros_like(f, order="A").strides == (8, 16)
+    assert np.full_like(f, 3).strides == (8, 16)
+    assert np.empty_like(np.arange(6).reshape(2, 3).T).strides == (8, 24)
+    permuted = np.arange(24).reshape(2, 3, 4).transpose(1, 2, 0)
+    assert np.ones_like(permuted).strides == (32, 8, 96)
+    # A new shape of the same rank keeps the order; a different rank falls back to C order.
+    assert np.zeros_like(f, shape=(3, 2)).strides == (8, 24)
+    assert np.zeros_like(f, shape=(2, 2, 2)).strides == (32, 16, 8)
+    with pytest.raises(ValueError, match="order must be one of"):
+        np.zeros_like(f, order="X")

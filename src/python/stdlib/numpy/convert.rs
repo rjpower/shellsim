@@ -18,6 +18,7 @@ use super::array::{
 };
 use super::dtype::{self, Category, DType, Kind};
 use super::element::{self, Number};
+use super::layout;
 use super::scalar;
 
 /// Python ints are exact up to this width; wider values only fit `object` arrays.
@@ -598,24 +599,46 @@ pub(in crate::python) fn cast_array(
     target: DType,
     copy: bool,
 ) -> PyResult<Array> {
-    let target = if target.kind() == Kind::Str && target.chars() == 0 {
-        match array.dtype.kind() {
-            Kind::Str => array.dtype,
-            Kind::Object => DType::str(object_str_width(runtime, array)?.max(1))?,
-            _ => DType::str(dtype::str_width_for(array.dtype).max(1))?,
-        }
-    } else {
-        target
-    };
-    if target == array.dtype {
-        return if copy {
-            super::array::copy_array(runtime, array)
-        } else {
-            Ok(array.clone())
-        };
+    let target = cast_target(runtime, array, target)?;
+    if target == array.dtype && !copy {
+        return Ok(array.clone());
     }
-    let buffer = cast_buffer(runtime, array, target)?;
-    new_array(runtime, buffer, target, array.shape().to_vec())
+    let axes = (0..array.ndim()).collect::<Vec<_>>();
+    cast_array_in(runtime, array, target, &axes)
+}
+
+/// `array` converted to `target` in new storage laid out in `axes` order (see
+/// [`super::layout`]). `target` must already be resolved by [`cast_target`].
+pub(in crate::python) fn cast_array_in(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+    target: DType,
+    axes: &[usize],
+) -> PyResult<Array> {
+    let source = layout::reading_order(array, axes);
+    let buffer = if target == array.dtype {
+        contiguous_buffer(runtime, &source)?
+    } else {
+        cast_buffer(runtime, &source, target)?
+    };
+    layout::new_array(runtime, buffer, target, array.shape().to_vec(), axes)
+}
+
+/// The dtype an `astype(target)` produces: an unsized `str` target is as wide as the widest
+/// element's text.
+pub(in crate::python) fn cast_target(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+    target: DType,
+) -> PyResult<DType> {
+    if target.kind() != Kind::Str || target.chars() != 0 {
+        return Ok(target);
+    }
+    Ok(match array.dtype.kind() {
+        Kind::Str => array.dtype,
+        Kind::Object => DType::str(object_str_width(runtime, array)?.max(1))?,
+        _ => DType::str(dtype::str_width_for(array.dtype).max(1))?,
+    })
 }
 
 /// The longest `str()` of an `object` array's elements, which sizes an unsized `str` cast as

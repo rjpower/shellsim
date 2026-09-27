@@ -15,6 +15,7 @@ use super::array::{self, Array};
 use super::convert::{self, Leaf};
 use super::dtype::{self, Casting, DType, Kind, Weak};
 use super::element::{self, Number};
+use super::layout::{self, Order};
 
 /// `np.array(object, dtype=None, *, copy=True, order='K', subok=False, ndmin=0, like=None)`.
 pub(in crate::python) fn array(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -22,46 +23,106 @@ pub(in crate::python) fn array(runtime: &mut dyn PyRuntime, args: CallArgs) -> P
         .keyword_only(&["copy", "order", "subok", "ndmin", "like"]);
     let bound = SIGNATURE.bind(&args)?;
     let dtype = args::optional_dtype(runtime, bound.value("dtype"))?;
-    let object = bound.required("object");
-    // copy=True always copies; copy=None copies only when needed; copy=False never copies.
     let copy = match bound.get("copy") {
-        None => Some(true),
-        Some(value) if value.is_none() => None,
-        Some(value) => Some(runtime.truth(&value)?),
+        None => Copy::Always,
+        Some(value) => copy_mode(runtime, value)?,
     };
+    let order = Order::parse(runtime, bound.value("order"), Order::K)?;
     let ndmin = args::optional_int(runtime, bound.value("ndmin"))?.unwrap_or(0);
-    let result = if runtime.native_kind(&object)? == Some(PyNativeKind::Array) {
-        let source = Array::from_value(runtime, object)?;
-        let target = dtype.unwrap_or(source.dtype);
-        let converted = convert::cast_array(runtime, &source, target, copy == Some(true))?;
-        if copy == Some(false) && converted.handle != source.handle {
-            return Err(PyError::value_error(
-                "Unable to avoid copy while creating an array as requested.",
-            ));
-        }
-        converted
-    } else {
-        if copy == Some(false) {
-            return Err(PyError::value_error(
-                "Unable to avoid copy while creating an array as requested.",
-            ));
-        }
-        convert::array_from_python(runtime, object, dtype, false)?
-    };
-    Ok(with_ndmin(runtime, result, ndmin)?.value())
+    let ndmin = usize::try_from(ndmin).unwrap_or(0);
+    Ok(from_object(runtime, bound.required("object"), dtype, copy, order, ndmin)?.value())
 }
 
-/// Prepend length-one axes until the array has `ndmin` dimensions.
-fn with_ndmin(runtime: &mut dyn PyRuntime, array: Array, ndmin: i64) -> PyResult<Array> {
-    let missing = usize::try_from(ndmin)
-        .unwrap_or(0)
-        .saturating_sub(array.ndim());
+/// NumPy's `copy` argument to array constructors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Copy {
+    /// `True`: always copy.
+    Always,
+    /// `None`: copy only when the dtype or layout requires it.
+    IfNeeded,
+    /// `False`: raise instead of copying.
+    Never,
+}
+
+fn copy_mode(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Copy> {
+    Ok(if value.is_none() {
+        Copy::IfNeeded
+    } else if runtime.truth(&value)? {
+        Copy::Always
+    } else {
+        Copy::Never
+    })
+}
+
+/// NumPy's `_array_fromobject_generic`: the array behind `np.array`, `np.asarray`, and their
+/// contiguous variants. An existing array is returned unchanged when neither its dtype nor its
+/// layout needs to change and `copy` allows it; otherwise it is copied in `order`, resolved
+/// against the source. Nested sequences are built in C order, or Fortran order when asked.
+fn from_object(
+    runtime: &mut dyn PyRuntime,
+    object: PyValue,
+    dtype: Option<DType>,
+    copy: Copy,
+    order: Order,
+    ndmin: usize,
+) -> PyResult<Array> {
+    let no_copy =
+        || PyError::value_error("Unable to avoid copy while creating an array as requested.");
+    let result = if runtime.native_kind(&object)? == Some(PyNativeKind::Array) {
+        let source = Array::from_value(runtime, object)?;
+        let target = match dtype {
+            Some(dtype) => convert::cast_target(runtime, &source, dtype)?,
+            None => source.dtype,
+        };
+        if target == source.dtype && copy != Copy::Always && layout::satisfies(&source, order) {
+            source
+        } else if copy == Copy::Never {
+            return Err(no_copy());
+        } else {
+            // A converting copy keeps a Fortran source's order unless C order is requested,
+            // and otherwise follows the source's strides even for `A`.
+            let order = match order {
+                Order::A if target != source.dtype => Order::K,
+                order => order,
+            };
+            let axes = layout::axes_like(&source, order, source.ndim());
+            convert::cast_array_in(runtime, &source, target, &axes)?
+        }
+    } else {
+        if copy == Copy::Never {
+            return Err(no_copy());
+        }
+        let array = convert::array_from_python(runtime, object, dtype, false)?;
+        if order == Order::F && !layout::is_f_contiguous(&array) {
+            layout::copy(runtime, &array, &layout::axes(Order::F, array.ndim()))?
+        } else {
+            array
+        }
+    };
+    with_ndmin(runtime, result, ndmin, order)
+}
+
+/// Prepend length-one axes until the array has `ndmin` dimensions, as NumPy's `_prepend_ones`
+/// does: the new axes take the item size as their stride for Fortran order, and the extent of
+/// the outermost axis otherwise.
+fn with_ndmin(
+    runtime: &mut dyn PyRuntime,
+    array: Array,
+    ndmin: usize,
+    order: Order,
+) -> PyResult<Array> {
+    let missing = ndmin.saturating_sub(array.ndim());
     if missing == 0 {
         return Ok(array);
     }
+    let stride = if order == Order::F || layout::is_fortran(&array) || array.ndim() == 0 {
+        array.itemsize() as isize
+    } else {
+        array.strides()[0].saturating_mul(array.shape()[0] as isize)
+    };
     let mut shape = vec![1; missing];
     shape.extend_from_slice(array.shape());
-    let mut strides = vec![0; missing];
+    let mut strides = vec![stride; missing];
     strides.extend_from_slice(array.strides());
     array::new_view(
         runtime,
@@ -73,39 +134,57 @@ fn with_ndmin(runtime: &mut dyn PyRuntime, array: Array, ndmin: i64) -> PyResult
     )
 }
 
-/// `np.asarray(a, dtype=None, order=None, *, copy=None)`.
+/// `np.asarray(a, dtype=None, order=None, *, copy=None)`, which `np.asanyarray` shares.
 pub(in crate::python) fn asarray(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("asarray", &["a", "dtype", "order"], 1)
         .keyword_only(&["copy", "like", "device"]);
     let bound = SIGNATURE.bind(&args)?;
     let dtype = args::optional_dtype(runtime, bound.value("dtype"))?;
-    let copy = args::flag(runtime, bound.value("copy"), false)?;
-    Ok(convert::array_from_python(runtime, bound.required("a"), dtype, copy)?.value())
+    let order = Order::parse(runtime, bound.value("order"), Order::K)?;
+    let copy = match bound.value("copy") {
+        None => Copy::IfNeeded,
+        Some(value) => copy_mode(runtime, value)?,
+    };
+    Ok(from_object(runtime, bound.required("a"), dtype, copy, order, 0)?.value())
 }
 
-/// `np.ascontiguousarray(a, dtype=None)`: a C-contiguous array, copying only when needed.
+/// `np.ascontiguousarray(a, dtype=None)`: a C-contiguous array of at least one dimension,
+/// copying only when needed.
 pub(in crate::python) fn ascontiguousarray(
     runtime: &mut dyn PyRuntime,
     args: CallArgs,
 ) -> PyResult {
-    static SIGNATURE: Signature =
-        Signature::new("ascontiguousarray", &["a", "dtype"], 1).keyword_only(&["like"]);
-    let bound = SIGNATURE.bind(&args)?;
-    let dtype = args::optional_dtype(runtime, bound.value("dtype"))?;
-    let array = convert::array_from_python(runtime, bound.required("a"), dtype, false)?;
-    let array = if array.is_c_contiguous() {
-        array
-    } else {
-        array::copy_array(runtime, &array)?
-    };
-    Ok(with_ndmin(runtime, array, 1)?.value())
+    contiguous(runtime, &args, "ascontiguousarray", Order::C)
 }
 
-/// `np.copy(a)`.
+/// `np.asfortranarray(a, dtype=None)`: a Fortran-contiguous array of at least one dimension,
+/// copying only when needed.
+pub(in crate::python) fn asfortranarray(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    contiguous(runtime, &args, "asfortranarray", Order::F)
+}
+
+fn contiguous(
+    runtime: &mut dyn PyRuntime,
+    args: &CallArgs,
+    name: &'static str,
+    order: Order,
+) -> PyResult {
+    static C: Signature =
+        Signature::new("ascontiguousarray", &["a", "dtype"], 1).keyword_only(&["like"]);
+    static F: Signature =
+        Signature::new("asfortranarray", &["a", "dtype"], 1).keyword_only(&["like"]);
+    let bound = if name == "asfortranarray" { &F } else { &C }.bind(args)?;
+    let dtype = args::optional_dtype(runtime, bound.value("dtype"))?;
+    let object = bound.required("a");
+    Ok(from_object(runtime, object, dtype, Copy::IfNeeded, order, 1)?.value())
+}
+
+/// `np.copy(a, order='K', subok=False)`.
 pub(in crate::python) fn copy(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("copy", &["a", "order", "subok"], 1);
     let bound = SIGNATURE.bind(&args)?;
-    Ok(convert::array_from_python(runtime, bound.required("a"), None, true)?.value())
+    let order = Order::parse(runtime, bound.value("order"), Order::K)?;
+    Ok(from_object(runtime, bound.required("a"), None, Copy::Always, order, 0)?.value())
 }
 
 /// What a new array's elements start as.
@@ -118,10 +197,12 @@ enum Fill {
     Value(PyValue),
 }
 
-/// An array of `shape` whose every element is `fill`, already converted to `dtype` storage.
+/// An array of `shape`, laid out in `axes` order, whose every element is `fill`, already
+/// converted to `dtype` storage.
 fn filled(
     runtime: &mut dyn PyRuntime,
     shape: Vec<usize>,
+    axes: &[usize],
     dtype: DType,
     fill: Fill,
 ) -> PyResult<Array> {
@@ -130,7 +211,7 @@ fn filled(
         Fill::Zero if dtype.kind() == Kind::Object => Value::Int(0),
         Fill::Empty | Fill::Zero => {
             let buffer = array::zeroed_buffer(runtime, dtype, count)?;
-            return array::new_array(runtime, buffer, dtype, shape);
+            return layout::new_array(runtime, buffer, dtype, shape, axes);
         }
         Fill::Value(fill) => fill,
     };
@@ -141,8 +222,9 @@ fn filled(
         let source = convert::array_from_python(runtime, fill, None, false)?;
         convert::cast_array(runtime, &source, dtype, false)?
     };
+    // Every element is the same, so the buffer is already in any memory order.
     let buffer = array::broadcast_buffer(runtime, &element, dtype, &shape)?;
-    array::new_array(runtime, buffer, dtype, shape)
+    layout::new_array(runtime, buffer, dtype, shape, axes)
 }
 
 /// `np.zeros`, `np.ones`, and `np.empty` share one signature; `empty` is zero-filled.
@@ -166,7 +248,11 @@ fn shaped(
     let bound = signature.bind(args)?;
     let shape = args::shape(runtime, bound.required("shape"))?;
     let dtype = args::optional_dtype(runtime, bound.value("dtype"))?.unwrap_or(DType::FLOAT64);
-    Ok(filled(runtime, shape, dtype, fill)?.value())
+    let axes = layout::axes(
+        Order::parse_new(runtime, bound.value("order"))?,
+        shape.len(),
+    );
+    Ok(filled(runtime, shape, &axes, dtype, fill)?.value())
 }
 
 pub(in crate::python) fn zeros(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -181,7 +267,7 @@ pub(in crate::python) fn ones(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
     shaped(runtime, &args, "ones", Fill::Value(Value::Int(1)))
 }
 
-/// `np.full(shape, fill_value, dtype=None)`: the dtype defaults to the fill value's.
+/// `np.full(shape, fill_value, dtype=None, order='C')`: the dtype defaults to the fill value's.
 pub(in crate::python) fn full(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature =
         Signature::new("full", &["shape", "fill_value", "dtype", "order"], 2)
@@ -193,18 +279,25 @@ pub(in crate::python) fn full(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
         Some(dtype) => dtype,
         None => convert::array_from_python(runtime, fill, None, false)?.dtype,
     };
-    Ok(filled(runtime, shape, dtype, Fill::Value(fill))?.value())
+    let axes = layout::axes(
+        Order::parse_new(runtime, bound.value("order"))?,
+        shape.len(),
+    );
+    Ok(filled(runtime, shape, &axes, dtype, Fill::Value(fill))?.value())
 }
 
-/// The `*_like` constructors: dtype and shape come from the prototype unless overridden.
-fn like(runtime: &mut dyn PyRuntime, bound: &args::Bound, fill: Fill) -> PyResult {
-    let prototype = convert::as_array(runtime, bound.required("a"))?;
+/// The `*_like` constructors: dtype, shape, and memory order (`order='K'`) come from the
+/// prototype unless overridden.
+fn like(runtime: &mut dyn PyRuntime, bound: &args::Bound, prototype: &str, fill: Fill) -> PyResult {
+    let prototype = convert::as_array(runtime, bound.required(prototype))?;
     let dtype = args::optional_dtype(runtime, bound.value("dtype"))?.unwrap_or(prototype.dtype);
     let shape = match bound.value("shape") {
         Some(shape) => args::shape(runtime, shape)?,
         None => prototype.shape().to_vec(),
     };
-    Ok(filled(runtime, shape, dtype, fill)?.value())
+    let order = Order::parse(runtime, bound.value("order"), Order::K)?;
+    let axes = layout::axes_like(&prototype, order, shape.len());
+    Ok(filled(runtime, shape, &axes, dtype, fill)?.value())
 }
 
 pub(in crate::python) fn zeros_like(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -212,7 +305,7 @@ pub(in crate::python) fn zeros_like(runtime: &mut dyn PyRuntime, args: CallArgs)
         Signature::new("zeros_like", &["a", "dtype", "order", "subok", "shape"], 1)
             .keyword_only(&["device"]);
     let bound = SIGNATURE.bind(&args)?;
-    like(runtime, &bound, Fill::Zero)
+    like(runtime, &bound, "a", Fill::Zero)
 }
 
 pub(in crate::python) fn empty_like(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -223,13 +316,7 @@ pub(in crate::python) fn empty_like(runtime: &mut dyn PyRuntime, args: CallArgs)
     )
     .keyword_only(&["device"]);
     let bound = SIGNATURE.bind(&args)?;
-    let prototype = convert::as_array(runtime, bound.required("prototype"))?;
-    let dtype = args::optional_dtype(runtime, bound.value("dtype"))?.unwrap_or(prototype.dtype);
-    let shape = match bound.value("shape") {
-        Some(shape) => args::shape(runtime, shape)?,
-        None => prototype.shape().to_vec(),
-    };
-    Ok(filled(runtime, shape, dtype, Fill::Empty)?.value())
+    like(runtime, &bound, "prototype", Fill::Empty)
 }
 
 pub(in crate::python) fn ones_like(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -237,7 +324,7 @@ pub(in crate::python) fn ones_like(runtime: &mut dyn PyRuntime, args: CallArgs) 
         Signature::new("ones_like", &["a", "dtype", "order", "subok", "shape"], 1)
             .keyword_only(&["device"]);
     let bound = SIGNATURE.bind(&args)?;
-    like(runtime, &bound, Fill::Value(Value::Int(1)))
+    like(runtime, &bound, "a", Fill::Value(Value::Int(1)))
 }
 
 pub(in crate::python) fn full_like(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -249,7 +336,7 @@ pub(in crate::python) fn full_like(runtime: &mut dyn PyRuntime, args: CallArgs) 
     .keyword_only(&["device"]);
     let bound = SIGNATURE.bind(&args)?;
     let fill = bound.required("fill_value");
-    like(runtime, &bound, Fill::Value(fill))
+    like(runtime, &bound, "a", Fill::Value(fill))
 }
 
 /// A float or int argument of a range constructor.
@@ -516,7 +603,7 @@ fn dimension(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<usize> {
     usize::try_from(value).map_err(|_| PyError::value_error("negative dimensions are not allowed"))
 }
 
-/// `np.eye(N, M=None, k=0, dtype=float)`.
+/// `np.eye(N, M=None, k=0, dtype=float, order='C')`.
 pub(in crate::python) fn eye(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("eye", &["N", "M", "k", "dtype", "order"], 1)
         .keyword_only(&["like", "device"]);
@@ -528,7 +615,12 @@ pub(in crate::python) fn eye(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyR
     };
     let k = args::optional_int(runtime, bound.value("k"))?.unwrap_or(0);
     let dtype = args::optional_dtype(runtime, bound.value("dtype"))?.unwrap_or(DType::FLOAT64);
-    Ok(eye_array(runtime, rows, columns, k, dtype)?.value())
+    let order = Order::parse_new(runtime, bound.value("order"))?;
+    let eye = eye_array(runtime, rows, columns, k, dtype)?;
+    if order == Order::F {
+        return Ok(layout::copy(runtime, &eye, &layout::axes(Order::F, 2))?.value());
+    }
+    Ok(eye.value())
 }
 
 fn eye_array(
@@ -571,7 +663,7 @@ pub(in crate::python) fn diag(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
             let size = length
                 .checked_add(k.unsigned_abs() as usize)
                 .ok_or_else(|| PyError::value_error("diagonal offset is too large"))?;
-            let result = filled(runtime, vec![size, size], source.dtype, Fill::Zero)?;
+            let result = filled(runtime, vec![size, size], &[0, 1], source.dtype, Fill::Zero)?;
             let (row, column) = if k >= 0 {
                 (0, k as usize)
             } else {

@@ -590,3 +590,30 @@ def test_zero_dimensional_results_are_numpy_scalars():
     assert type(np.int8(1) + 1) is np.int8
     assert type(np.maximum(np.float32(1), 2.0)) is np.float32
     assert type(np.less(np.int64(1), 2)) is np.bool_
+
+
+def test_ufunc_output_follows_the_operands_memory_order():
+    m = np.arange(6).reshape(2, 3)
+    f = np.asfortranarray(m)
+    for result in [f + 1, f + f, np.sin(f), -f, f + np.ones(3, dtype=int), f + np.ones((2, 1), dtype=int)]:
+        assert result.flags.f_contiguous and not result.flags.c_contiguous
+    assert (f > 0).strides == (1, 2)
+    assert (f + 1).tolist() == [[1, 2, 3], [4, 5, 6]]
+    # Operands that disagree keep C order.
+    assert (f + m).strides == (24, 8)
+    assert (f + np.ones((2, 3))).strides == (24, 8)
+    assert (m[:, ::-1] + 1).strides == (24, 8)
+    permuted = np.arange(24).reshape(2, 3, 4).transpose(1, 2, 0)
+    assert (permuted * 2.5).strides == (32, 8, 96)
+    assert (permuted * 2.5)[1, 2].tolist() == [15.0, 45.0]
+
+
+def test_ufunc_order_keyword_sets_the_output_layout():
+    m = np.arange(6).reshape(2, 3)
+    f = np.asfortranarray(m)
+    assert np.add(f, 1, order="C").strides == (24, 8)
+    assert np.add(m, 1, order="F").strides == (8, 16)
+    assert np.add(f, 1, order="A").strides == (8, 16)
+    assert np.add(m, 1, order="A").strides == (24, 8)
+    with pytest.raises(ValueError, match="order must be one of"):
+        np.add(m, 1, order="X")
