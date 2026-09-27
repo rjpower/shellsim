@@ -22,9 +22,9 @@ The package has two layers.
 Larger submodules (`fft`, `random`, `testing`, `lib` and the file I/O functions) load on first
 access through a module-level `__getattr__`, as in NumPy.
 
-Much of this code is ported from NumPy, pocketfft, Dragon4, and NumPy's random generators.
-`NOTICE.md` lists the ported components and reproduces their licenses; source and binary
-distributions ship it alongside `LICENSE`.
+Much of this code is ported from NumPy, pocketfft, and Dragon4; `numpy.random` is a clean-room
+reimplementation from published papers, not a port. `NOTICE.md` lists the ported components and
+reproduces their licenses; source and binary distributions ship it alongside `LICENSE`.
 
 ### Storage
 
@@ -123,9 +123,15 @@ differences, the unsupported frontier, and resource limits.
 - **FFT.** `numpy.fft` on a port of pocketfft, with NumPy's single- and double-precision
   dispatch.
 - **Random.** `numpy.random` implements `SeedSequence`, `MT19937`, `PCG64`, `Generator`, and the
-  legacy `RandomState`. Both draw uniforms, integers, normals, exponentials, and gamma,
-  chi-square, F, Student's t, binomial and Poisson variates, and choose, shuffle and permute.
-  Seeded streams match NumPy 2.5.3 bit for bit.
+  legacy `RandomState` from their published algorithms (Matsumoto and Nishimura's Mersenne
+  Twister, O'Neill's PCG, and the papers behind each distribution). Both draw uniforms, integers,
+  normals, exponentials, and gamma, chi-square, F, Student's t, binomial and Poisson variates, and
+  choose, shuffle and permute. Seeded streams match NumPy 2.5.3 bit for bit for `SeedSequence`,
+  raw and uniform draws (both bit generators, `float32` and `float64`), bounded integers at the
+  default dtype, legacy (`RandomState`) shuffling and permutation, and every distribution derived
+  only from uniforms and the polar-method Gaussian that `RandomState` uses internally: `binomial`,
+  `poisson`, `standard_gamma` on its common branch, and the `chisquare`/`f`/`standard_t` built on
+  it. See "Deliberate differences" for what does not match bit for bit.
 - **Text.** `str` arrays, `numpy.strings`, and object arrays with Python-level element operations.
 - **Printing.** Array `repr` and `str` use a port of NumPy's `arrayprint` and its Dragon4
   formatter, so output, print options, and line wrapping match NumPy.
@@ -157,6 +163,30 @@ never imports a module or calls arbitrary code.
   files load to equal arrays.
 - **Unseeded random streams.** Simulated programs have no host entropy, so an unseeded
   `SeedSequence` uses fixed entropy and produces the same stream on every run.
+- **Non-exact random streams.** A few areas of `numpy.random` could not be pinned down to NumPy's
+  bit-for-bit stream by black-box comparison, since NumPy does not document the exact algorithm
+  and shellsim's clean-room policy forbids reading NumPy's source to find it. These still draw
+  values with the right distribution, type, and shape:
+  - `Generator`'s ziggurat-based draws (`standard_normal`, `normal`, and `standard_exponential`
+    and `exponential` with the default `method="zig"`) use Marsaglia and Tsang's 2000 ziggurat
+    algorithm, but not NumPy's exact table packing or layer indexing. `standard_exponential`'s
+    `method="inv"` is exact instead (plain inversion, no rejection loop). Every distribution built
+    from a ziggurat-based normal inherits this: `Generator.standard_gamma` and `.gamma` for
+    `shape >= 1`, and `.chisquare`, `.f`, and `.standard_t`, which use it internally. Once a
+    `Generator` has drawn from any of these, its subsequent draws diverge from NumPy's stream even
+    for otherwise-exact operations, because the streams have desynchronized.
+  - `standard_gamma`'s `shape < 1` branch (Ahrens and Dieter's 1974 algorithm GS) matches bit for
+    bit on legacy `RandomState` only in its common case (roughly `e / (e + shape)` of draws); its
+    rarer case does not match on any bit generator, and neither case reliably matches on
+    `Generator`, which appears to draw its rejection-test uniform through the same undocumented
+    mechanism as the ziggurat.
+  - `Generator.shuffle`, `.permutation`, and `.choice` with `replace=False` draw a valid
+    permutation or subset, but not in NumPy's exact order; legacy `RandomState`'s Fisher-Yates
+    shuffle and permutation do match bit for bit.
+  - Bounded integer draws narrower than the platform word (`int8`, `uint8`, `uint16`, and `bool`)
+    draw a value in range but not NumPy's exact sequence, on both `Generator` and `RandomState`;
+    NumPy appears to buffer several narrow draws from each raw word in a way this module could not
+    reverse-engineer. The default (word-width or wider) integer dtypes match bit for bit.
 - **`str` and `object` elements** box to plain Python `str` values and the stored objects, not to
   `np.str_` or `np.object_` instances.
 - **Byte order.** Views between byte orders, big-endian `str` dtypes, and `tobytes` of object
