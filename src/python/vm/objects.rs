@@ -465,8 +465,11 @@ impl Vm<'_> {
         }
         let native_name = match owner.native_value() {
             Some(NativeValue::UnitTestBase) if name == "__name__" => Some("TestCase"),
-            Some(NativeValue::BuiltinType(builtin)) if name == "__name__" => Some(builtin.name()),
-            // Native value kinds record their qualified name, as `repr` shows it.
+            // Builtin types and native value kinds record their qualified names, as `repr` shows
+            // them; `__name__` is the last component.
+            Some(NativeValue::BuiltinType(builtin)) if name == "__name__" => {
+                builtin.name().rsplit('.').next()
+            }
             Some(NativeValue::ValueKind(kind)) if name == "__name__" => {
                 kind.name.rsplit('.').next()
             }
