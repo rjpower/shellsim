@@ -685,29 +685,26 @@ fn shuffle_indices_fn(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let positional = args.positional().to_vec();
     let items = state_items(runtime, positional[0])?;
     let (mut bitgen, gauss) = bitgen_from_items(runtime, &items)?;
-    let legacy = is_legacy_gauss(&gauss);
     let n = super::args::index_int(runtime, &positional[1])? as usize;
     reserve_and_charge(runtime, DType::INT64, n, 2)?;
     let mut values: Vec<i64> = (0..n as i64).collect();
-    sequence::shuffle_indices(&mut bitgen, &mut values, legacy);
+    sequence::shuffle_indices(&mut bitgen, &mut values);
     let out = wrap_i64(runtime, vec![n], &values)?;
     result_and_state(runtime, out, bitgen, gauss)
 }
 
-/// `_sample_without_replacement(state, n, size, legacy)`: draws `size` distinct indices from
-/// `[0, n)`. The underlying algorithm (a partial Fisher-Yates shuffle) builds an `n`-length
-/// working array regardless of `size`, so memory is reserved for `n`, not just the `size`-length
-/// result.
+/// `_sample_without_replacement(state, n, size)`: draws `size` distinct indices from `[0, n)`.
+/// The underlying algorithm (a partial Fisher-Yates shuffle) builds an `n`-length working array
+/// regardless of `size`, so memory is reserved for `n`, not just the `size`-length result.
 fn sample_without_replacement_fn(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_sample_without_replacement", 3, 3)?;
     let positional = args.positional().to_vec();
     let items = state_items(runtime, positional[0])?;
     let (mut bitgen, gauss) = bitgen_from_items(runtime, &items)?;
-    let legacy = is_legacy_gauss(&gauss);
     let n = super::args::index_int(runtime, &positional[1])? as usize;
     let size = super::args::index_int(runtime, &positional[2])? as usize;
     reserve_and_charge(runtime, DType::INT64, n, 2)?;
-    let values = sequence::sample_without_replacement(&mut bitgen, n, size, legacy);
+    let values = sequence::sample_without_replacement(&mut bitgen, n, size);
     let out = wrap_i64(runtime, vec![size], &values)?;
     result_and_state(runtime, out, bitgen, gauss)
 }

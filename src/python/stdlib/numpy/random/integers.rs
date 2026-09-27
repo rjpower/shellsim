@@ -56,6 +56,21 @@ pub(in crate::python) fn masked_u64(bitgen: &mut BitGen, range_incl: u64) -> u64
     }
 }
 
+/// Masked rejection in `[0, range_incl]`, picking the 32- or 64-bit primitive from the range.
+/// Fisher-Yates's own index draws (`shuffle`, `permutation`, and sampling without replacement)
+/// use this on *both* `Generator` and legacy `RandomState`, unlike `integers()`/`randint()`
+/// (which use Lemire for `Generator`): black-box comparison showed replaying
+/// `Generator(5).permutation(10)`'s raw words through Lemire (matching `.integers()`'s own
+/// algorithm) did not reproduce NumPy's permutation, but masked rejection did, exactly, matching
+/// on all nine index draws.
+pub(in crate::python) fn masked_bounded(bitgen: &mut BitGen, range_incl: u128) -> i64 {
+    if range_incl <= u128::from(u32::MAX) {
+        masked_u32(bitgen, range_incl as u32) as i64
+    } else {
+        masked_u64(bitgen, range_incl as u64) as i64
+    }
+}
+
 /// Lemire's method in `[0, range_excl)` using 32-bit words. `range_excl` may be `2**32`
 /// (the full word range), which needs no rejection at all.
 pub(in crate::python) fn lemire_u32(bitgen: &mut BitGen, range_excl: u64) -> u32 {
