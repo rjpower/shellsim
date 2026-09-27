@@ -18,8 +18,8 @@ pub(in crate::python) enum Precision {
 
 /// Shortest round-trip decimal digits and decimal exponent of a finite, nonzero value:
 /// `value == 0.{digits} × 10^(exponent + 1)`, i.e. `digits[0]` is the units digit at
-/// `10^exponent`.
-fn shortest_digits(value: f64, precision: Precision) -> (String, i32) {
+/// `10^exponent`. Shared with [`super::dragon4`], which extends this to fixed digit counts.
+pub(super) fn shortest_digits(value: f64, precision: Precision) -> (String, i32) {
     let decimal = match precision {
         Precision::Double => float_text::shortest(value),
         Precision::Single => float_text::shortest_f32(value as f32),

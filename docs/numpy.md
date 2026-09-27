@@ -22,9 +22,9 @@ The package has two layers.
 Larger submodules (`fft`, `random`, `testing`, `lib` and the file I/O functions) load on first
 access through a module-level `__getattr__`, as in NumPy.
 
-Much of this code is ported from NumPy, Dragon4, and NumPy's random generators.
-`NOTICE.md` lists the ported components and reproduces their licenses; source and binary
-distributions ship it alongside `LICENSE`.
+Much of this code is ported from NumPy and NumPy's random generators. `NOTICE.md` lists the
+ported components and reproduces their licenses; source and binary distributions ship it alongside
+`LICENSE`.
 
 ### Storage
 
@@ -131,8 +131,11 @@ differences, the unsupported frontier, and resource limits.
   chi-square, F, Student's t, binomial and Poisson variates, and choose, shuffle and permute.
   Seeded streams match NumPy 2.5.3 bit for bit.
 - **Text.** `str` arrays, `numpy.strings`, and object arrays with Python-level element operations.
-- **Printing.** Array `repr` and `str` use a port of NumPy's `arrayprint` and its Dragon4
-  formatter, so output, print options, and line wrapping match NumPy.
+- **Printing.** Scalar and array `repr`/`str`, `array2string`, `array_repr`, `array_str`,
+  `format_float_positional`/`_scientific`, and `set_printoptions`/`get_printoptions`/
+  `printoptions` reproduce NumPy's output byte for byte: shortest round-trip digits (via Rust's
+  correctly-rounded float formatting), the positional/scientific notation switch, summarization,
+  line wrapping, and dtype/shape suffixes.
 - **File I/O.** `save`, `load`, `savez`, `savez_compressed`, `savetxt`, `loadtxt`, and
   `genfromtxt` through the simulated `open` and the virtual filesystem. `.npy` and `.npz` files
   follow NumPy's formats byte for byte, so each implementation reads the other's files.

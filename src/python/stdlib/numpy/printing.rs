@@ -168,7 +168,7 @@ fn dragon4_scientific(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         ..common_options(runtime, &bound)?
     };
     let mut work = 0;
-    let text = dragon4::scientific(value, precision, &options, &mut work);
+    let text = dragon4::scientific(value, precision, &options, &mut work)?;
     runtime.charge_cpu(work)?;
     runtime.new_string(text)
 }
