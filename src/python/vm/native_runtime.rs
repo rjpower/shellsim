@@ -1344,22 +1344,22 @@ impl PyRuntime for Vm<'_> {
         )
     }
 
+    fn is_iterator(&self, value: &Value) -> PyResult<bool> {
+        Vm::is_iterator(self, value).map_err(PyError::runtime_error)
+    }
+
     fn iterator(&mut self, value: Value) -> PyResult<PyIterator> {
-        if let Some(id) = value.object_id() {
-            if matches!(
-                self.state.heap.get(id).map_err(PyError::runtime_error)?,
-                Object::Iterator { .. }
-                    | Object::SequenceIterator { .. }
-                    | Object::RangeIterator { .. }
-                    | Object::CountIterator { .. }
-                    | Object::CallableIterator { .. }
-                    | Object::Generator { .. }
-            ) {
-                return Value::Object(id).cast(self);
-            }
+        if Vm::is_iterator(self, &value).map_err(PyError::runtime_error)? {
+            return value.cast(self);
         }
         self.make_iterator(value)
-            .map_err(PyError::type_error)?
+            .map_err(|error| {
+                if self.pending_exception.is_some() {
+                    PyError::new(PyErrorKind::Raised, error)
+                } else {
+                    PyError::type_error(error)
+                }
+            })?
             .cast(self)
     }
 
@@ -1387,9 +1387,11 @@ impl PyRuntime for Vm<'_> {
                 }
                 Ok(value)
             }
-            Object::SequenceIterator { .. } | Object::RangeIterator { .. } => self
+            Object::SequenceIterator { .. }
+            | Object::RangeIterator { .. }
+            | Object::StreamIterator { .. } => self
                 .next_stored_iterator(id)
-                .map_err(PyError::runtime_error),
+                .map_err(|error| self.raised_or_runtime_error(error)),
             Object::CountIterator { current, step } => {
                 let value = current;
                 let next = super::super::stdlib::itertools::count_next(current, step)
@@ -1434,7 +1436,9 @@ impl PyRuntime for Vm<'_> {
                 }
             }
             Object::Generator { .. } => self.resume_generator(id).map_err(PyError::runtime_error),
-            _ => Err(PyError::type_error("expected an iterator")),
+            _ => self
+                .next_until_stop(&Value::Object(id))
+                .map_err(|error| self.raised_or_runtime_error(error)),
         }
     }
 
@@ -1497,13 +1501,8 @@ impl PyRuntime for Vm<'_> {
         ) {
             return Err(PyError::type_error("expected a generator"));
         }
-        self.close_generator(id).map_err(|error| {
-            if self.pending_exception.is_some() {
-                PyError::new(PyErrorKind::Raised, error)
-            } else {
-                PyError::runtime_error(error)
-            }
-        })
+        self.close_generator(id)
+            .map_err(|error| self.raised_or_runtime_error(error))
     }
 
     /// `generator.throw(exception)`: raise `exception`, an instance or an exception class, at the

@@ -1676,7 +1676,8 @@ impl Vm<'_> {
             Object::Generator { .. } => self.resume_generator(id)?,
             Object::Iterator { .. }
             | Object::SequenceIterator { .. }
-            | Object::RangeIterator { .. } => self.next_stored_iterator(id)?,
+            | Object::RangeIterator { .. }
+            | Object::StreamIterator { .. } => self.next_stored_iterator(id)?,
             _ => match self.invoke_slot(iterator, Slot::Next, "__next__", Vec::new())? {
                 Some(value) => Some(value),
                 None => return Err(self.raise_object_type_error(iterator, "is not an iterator")),

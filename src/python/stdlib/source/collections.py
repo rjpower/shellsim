@@ -22,7 +22,7 @@ class Counter:
         return key in self._counts
 
     def __iter__(self):
-        return self._counts.keys()
+        return iter(self._counts.keys())
 
     def __len__(self):
         return len(self._counts)
@@ -112,7 +112,7 @@ class deque:
         return len(self._items)
 
     def __iter__(self):
-        return self._items
+        return iter(self._items)
 
     def __getitem__(self, index):
         return self._items[index]

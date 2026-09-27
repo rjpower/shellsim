@@ -713,7 +713,12 @@ pub(super) trait PyRuntime {
     fn replace_list_items(&mut self, list: PyList, items: Vec<PyValue>) -> PyResult<()>;
     fn call_value(&mut self, callable: PyValue, args: CallArgs) -> PyResult<PyValue>;
     fn is_callable(&self, value: &PyValue) -> PyResult<bool>;
+    /// Whether `value` is an iterator: a builtin iterator or generator, or an object whose class
+    /// defines `__next__`.
+    fn is_iterator(&self, value: &PyValue) -> PyResult<bool>;
+    /// `iter(value)`: an iterator is returned as is; any other iterable produces one.
     fn iterator(&mut self, value: PyValue) -> PyResult<PyIterator>;
+    /// The next item of `iterator`, or `None` once it is exhausted.
     fn iterator_next(&mut self, iterator: PyIterator) -> PyResult<Option<PyValue>>;
     fn generator_send(
         &mut self,
@@ -1302,16 +1307,9 @@ impl PyCallable {
 
 impl FromPyValue for PyIterator {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
-            return Err(PyError::type_error("expected an iterator"));
-        };
-        if matches!(
-            runtime.kind(&Value::Object(id))?,
-            PyKind::Iterator | PyKind::Generator
-        ) {
-            Ok(Self(id))
-        } else {
-            Err(PyError::type_error("expected an iterator"))
+        match value.object_id() {
+            Some(id) if runtime.is_iterator(&value)? => Ok(Self(id)),
+            _ => Err(PyError::type_error("expected an iterator")),
         }
     }
 }

@@ -1,8 +1,8 @@
 //! Iteration, generator suspension, and sequence unpacking.
 
 use super::{
-    CallArgs, Execution, ForIterOutcome, IteratorAdvance, NativeValue, Object, Opcode, PyError,
-    PyErrorKind, PyRuntime, PyStreamRead, Stream, Value, Vm,
+    protocol, CallArgs, Execution, ForIterOutcome, IteratorAdvance, NativeValue, Object, Opcode,
+    PyError, PyErrorKind, PyRuntime, PyStreamRead, Slot, SlotValue, Stream, Value, Vm,
 };
 
 /// How a suspended generator resumes: with the value of its `yield` expression, or with an
@@ -81,6 +81,9 @@ impl Vm<'_> {
                 _ => {}
             }
         }
+        if let Some(iterator) = self.class_iterator(&iterable)? {
+            return Ok(iterator);
+        }
         let values = self.iterable_values(&iterable)?;
         let iterator = self.state.heap.allocate(
             Object::Iterator {
@@ -90,6 +93,69 @@ impl Vm<'_> {
             &mut self.interp.resources,
         )?;
         Ok(iterator)
+    }
+
+    /// Whether `value` is an iterator: one of the runtime's lazy iterator objects, or an object
+    /// whose class defines `__next__`.
+    pub(super) fn is_iterator(&self, value: &Value) -> Result<bool, String> {
+        if let Some(id) = value.object_id() {
+            if matches!(
+                self.state.heap.get(id)?,
+                Object::Iterator { .. }
+                    | Object::SequenceIterator { .. }
+                    | Object::RangeIterator { .. }
+                    | Object::CountIterator { .. }
+                    | Object::StreamIterator { .. }
+                    | Object::CallableIterator { .. }
+                    | Object::Generator { .. }
+            ) {
+                return Ok(true);
+            }
+        }
+        Ok(matches!(
+            self.state.types.slot(self.type_id(value)?, Slot::Next)?,
+            Some(slot) if !matches!(slot, SlotValue::Descriptor(Value::None))
+        ))
+    }
+
+    /// The iterator that the `__iter__` of `iterable`'s class returns, or `None` when the class
+    /// defines no `__iter__`. The iterator is returned unadvanced, so a loop over it calls
+    /// `__next__` once per item, as CPython does.
+    ///
+    /// A class that sets `__iter__ = None` declares its instances not iterable, even when it
+    /// defines `__getitem__`, and an `__iter__` that returns something other than an iterator
+    /// raises `TypeError`.
+    pub(super) fn class_iterator(&mut self, iterable: &Value) -> Result<Option<Value>, String> {
+        match self.state.types.slot(self.type_id(iterable)?, Slot::Iter)? {
+            None => return Ok(None),
+            Some(SlotValue::Descriptor(Value::None)) => {
+                return Err(self.raise_object_type_error(iterable, "is not iterable"));
+            }
+            Some(_) => {}
+        }
+        let Some(iterator) = self.invoke_slot(iterable, Slot::Iter, "__iter__", Vec::new())? else {
+            return Ok(None);
+        };
+        if !self.is_iterator(&iterator)? {
+            let type_name = self.type_name_of(&iterator)?;
+            return Err(self.raise_exception(
+                "TypeError",
+                format!("iter() returned non-iterator of type '{type_name}'"),
+            ));
+        }
+        Ok(Some(iterator))
+    }
+
+    /// The next item of `iterator`, or `None` once it is exhausted. A `StopIteration` raised by
+    /// a class's `__next__` ends the iteration rather than propagating.
+    pub(super) fn next_until_stop(&mut self, iterator: &Value) -> Result<Option<Value>, String> {
+        match self.iterator_next(iterator) {
+            Err(_) if self.pending_stop_iteration() => {
+                self.pending_exception = None;
+                Ok(None)
+            }
+            result => result,
+        }
     }
 
     /// Classify and, where possible, advance one iterator with a single arena lookup.
@@ -153,7 +219,7 @@ impl Vm<'_> {
             }
             Object::Generator { .. } => return Ok(IteratorAdvance::Generator),
             Object::StreamIterator { binary } => SlowPathAdvance::Stream(*binary),
-            _ => return Ok(IteratorAdvance::Invalid),
+            _ => return Ok(IteratorAdvance::Protocol),
         };
         match sequence {
             SlowPathAdvance::Sequence(owner, position) => {
@@ -211,7 +277,7 @@ impl Vm<'_> {
             IteratorAdvance::Exhausted => Ok(None),
             IteratorAdvance::Callable { .. }
             | IteratorAdvance::Generator
-            | IteratorAdvance::Invalid => Err("object is not a stored iterator".into()),
+            | IteratorAdvance::Protocol => Err("object is not a stored iterator".into()),
             // `next(sys.stdin)` and unpacking outside a `for` loop cannot suspend the way the
             // `ForIterator` opcode can; this is a narrower surface than CPython's `next()`.
             IteratorAdvance::Blocked(_) => {
@@ -346,7 +412,16 @@ impl Vm<'_> {
                     Ok(ForIterOutcome::Exhausted)
                 }
             },
-            IteratorAdvance::Invalid => Err("for-loop stack does not contain an iterator".into()),
+            IteratorAdvance::Protocol => match self.next_until_stop(&Value::Object(id))? {
+                Some(value) => {
+                    self.stack.push(value);
+                    Ok(ForIterOutcome::Yielded)
+                }
+                None => {
+                    self.stack.pop();
+                    Ok(ForIterOutcome::Exhausted)
+                }
+            },
             IteratorAdvance::Blocked(reason) => Ok(ForIterOutcome::Blocked(reason)),
         }
     }
@@ -354,11 +429,12 @@ impl Vm<'_> {
     /// One step of `yield from`, with the subiterator and the sent value on top of the stack.
     ///
     /// A generator subiterator receives the value through `send`. Any other iterator advances as
-    /// `next` would and, like CPython's builtin iterators, has no `send` for a value other than
-    /// `None`. [`ForIterOutcome::Yielded`] leaves the subiterator and its value on the stack;
-    /// [`ForIterOutcome::Exhausted`] replaces the subiterator with its return value, which is
-    /// `None` unless a generator returned one; [`ForIterOutcome::Blocked`] restores the stack for
-    /// a retry.
+    /// `next` would when the value is `None`, and otherwise receives it through its own `send`
+    /// method; CPython's builtin iterators have none, so sending them a value raises
+    /// `AttributeError`. [`ForIterOutcome::Yielded`] leaves the subiterator and its value on the
+    /// stack; [`ForIterOutcome::Exhausted`] replaces the subiterator with its return value, which
+    /// is `None` unless a generator returned one or a `send` method raised `StopIteration` with
+    /// one; [`ForIterOutcome::Blocked`] restores the stack for a retry.
     pub(super) fn yield_from_send(&mut self) -> Result<ForIterOutcome, String> {
         let sent = self.pop()?;
         let subiterator = *self.stack.last().ok_or("invalid bytecode stack effect")?;
@@ -378,11 +454,29 @@ impl Vm<'_> {
             return Ok(outcome);
         }
         if !sent.is_none() {
-            let type_name = self.type_name_of(&subiterator)?;
-            return Err(self.raise_exception(
-                "AttributeError",
-                format!("'{type_name}' object has no attribute 'send'"),
-            ));
+            let Some(send) = self.resolve_attribute(subiterator, "send")? else {
+                let type_name = self.type_name_of(&subiterator)?;
+                return Err(self.raise_exception(
+                    "AttributeError",
+                    format!("'{type_name}' object has no attribute 'send'"),
+                ));
+            };
+            return Ok(match self.call_subiterator_method(send, sent)? {
+                ForwardedThrow::Yielded(value) => {
+                    self.stack.push(value);
+                    ForIterOutcome::Yielded
+                }
+                ForwardedThrow::Returned(value) => {
+                    self.stack.pop();
+                    self.stack.push(value);
+                    ForIterOutcome::Exhausted
+                }
+                ForwardedThrow::Raise(exception) => {
+                    let message = format!("{} raised by send()", exception.kind);
+                    self.pending_exception = Some(exception);
+                    return Err(message);
+                }
+            });
         }
         let outcome = self.for_iterator()?;
         match outcome {
@@ -447,20 +541,32 @@ impl Vm<'_> {
 
     /// Pass an exception thrown into a generator suspended in `yield from` to its subiterator.
     ///
-    /// `GeneratorExit` closes a generator subiterator and is then raised in the delegating
-    /// generator. Any other exception is thrown into a generator subiterator; the result says
-    /// whether it yielded, returned, or raised. A subiterator that is not a generator has no
-    /// `throw` or `close`, so the exception is raised in the delegating generator.
+    /// `GeneratorExit` closes the subiterator, through `close` for a subiterator that is not a
+    /// generator, and is then raised in the delegating generator. Any other exception goes to
+    /// the subiterator's `throw`; the result says whether it yielded, returned, or raised. A
+    /// subiterator without `close` or `throw`, such as a builtin iterator, is skipped, so the
+    /// exception is raised in the delegating generator.
     fn forward_throw(
         &mut self,
         subiterator: &Value,
         exception: super::RaisedException,
     ) -> Result<ForwardedThrow, String> {
-        let Some(id) = self.suspendable_generator(subiterator)? else {
-            return Ok(ForwardedThrow::Raise(exception));
-        };
+        let generator = self.suspendable_generator(subiterator)?;
         if exception.kind == "GeneratorExit" {
-            return match self.close_generator(id) {
+            let closed = match generator {
+                Some(id) => self.close_generator(id),
+                None => match self.resolve_attribute(*subiterator, "close")? {
+                    Some(close) => <Self as PyRuntime>::call_value(
+                        self,
+                        close,
+                        CallArgs::new(Vec::new(), Vec::new()),
+                    )
+                    .map(|_| ())
+                    .map_err(|error| self.record_native_error(error)),
+                    None => Ok(()),
+                },
+            };
+            return match closed {
                 Ok(()) => Ok(ForwardedThrow::Raise(exception)),
                 Err(error) => self
                     .pending_exception
@@ -469,15 +575,50 @@ impl Vm<'_> {
                     .ok_or(error),
             };
         }
-        match self.throw_into_generator(id, exception) {
-            Ok(Some(value)) => Ok(ForwardedThrow::Yielded(value)),
-            Ok(None) => Ok(ForwardedThrow::Returned(self.take_return_value(id)?)),
-            Err(error) => self
-                .pending_exception
-                .take()
-                .map(ForwardedThrow::Raise)
-                .ok_or(error),
+        if let Some(id) = generator {
+            return match self.throw_into_generator(id, exception) {
+                Ok(Some(value)) => Ok(ForwardedThrow::Yielded(value)),
+                Ok(None) => Ok(ForwardedThrow::Returned(self.take_return_value(id)?)),
+                Err(error) => self
+                    .pending_exception
+                    .take()
+                    .map(ForwardedThrow::Raise)
+                    .ok_or(error),
+            };
         }
+        match self.resolve_attribute(*subiterator, "throw")? {
+            Some(throw) => self.call_subiterator_method(throw, exception.value),
+            None => Ok(ForwardedThrow::Raise(exception)),
+        }
+    }
+
+    /// Call a subiterator's `send` or `throw` method for `yield from`. Its result is the next
+    /// value to yield, and a `StopIteration` it raises ends the delegation with the exception's
+    /// value.
+    fn call_subiterator_method(
+        &mut self,
+        method: Value,
+        argument: Value,
+    ) -> Result<ForwardedThrow, String> {
+        let result = <Self as PyRuntime>::call_value(
+            self,
+            method,
+            CallArgs::new(vec![argument], Vec::new()),
+        );
+        let error = match result {
+            Ok(value) => return Ok(ForwardedThrow::Yielded(value)),
+            Err(error) => self.record_native_error(error),
+        };
+        let Some(exception) = self.pending_exception.take() else {
+            return Err(error);
+        };
+        if exception.kind != "StopIteration" {
+            return Ok(ForwardedThrow::Raise(exception));
+        }
+        let value = protocol::exception_args(&self.state.heap, &exception.value)?
+            .and_then(|(_, args)| args.first().copied())
+            .unwrap_or(Value::None);
+        Ok(ForwardedThrow::Returned(value))
     }
 
     /// Resume one generator frame until its next yield or terminal return. A generator's operand

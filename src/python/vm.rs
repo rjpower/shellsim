@@ -645,7 +645,8 @@ enum IteratorAdvance {
         sentinel: Value,
     },
     Generator,
-    Invalid,
+    /// An object of a class that defines `__next__`, advanced by calling it.
+    Protocol,
     /// Advancing a `StreamIterator` would block on fd 0; suspend the enclosing `for` loop.
     Blocked(crate::scheduler::WaitReason),
 }
@@ -1080,36 +1081,12 @@ impl<'a> Vm<'a> {
     }
 
     fn iterable_values(&mut self, value: &Value) -> Result<Vec<Value>, String> {
-        // A class that sets `__iter__ = None` declares its instances not iterable, even when it
-        // defines `__getitem__`.
-        if matches!(
-            self.state.types.slot(self.type_id(value)?, Slot::Iter)?,
-            Some(SlotValue::Descriptor(Value::None))
-        ) {
-            return Err(self.raise_object_type_error(value, "is not iterable"));
-        }
-        if let Some(iterable) = self.invoke_slot(value, Slot::Iter, "__iter__", Vec::new())? {
-            if protocol::identical(value, &iterable) {
-                let mut result = Vec::new();
-                loop {
-                    match self.invoke_slot(&iterable, Slot::Next, "__next__", Vec::new()) {
-                        Ok(Some(item)) => self.push_materialized(&mut result, item)?,
-                        Ok(None) => return Err("iterator does not define __next__".into()),
-                        Err(_error)
-                            if self
-                                .pending_exception
-                                .as_ref()
-                                .is_some_and(|exception| exception.kind == "StopIteration") =>
-                        {
-                            self.pending_exception = None;
-                            break;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                return Ok(result);
+        if let Some(iterator) = self.class_iterator(value)? {
+            let mut result = Vec::new();
+            while let Some(item) = self.next_until_stop(&iterator)? {
+                self.push_materialized(&mut result, item)?;
             }
-            return self.iterable_values(&iterable);
+            return Ok(result);
         }
         let mut result = Vec::new();
         if let Some(value) = protocol::string_value(&self.state.heap, value)? {

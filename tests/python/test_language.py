@@ -541,6 +541,134 @@ def test_yield_from_a_plain_iterable_evaluates_to_none():
     assert list(reuse()) == [None]
 
 
+class Counter:
+    """An infinite iterator that records each `__next__` call."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.calls += 1
+        return self.calls
+
+
+class Countdown:
+    def __init__(self, start):
+        self.remaining = start
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.remaining == 0:
+            raise StopIteration
+        self.remaining -= 1
+        return self.remaining
+
+
+class Naturals:
+    def __iter__(self):
+        number = 0
+        while True:
+            number += 1
+            yield number
+
+
+def test_class_iterators_advance_one_item_at_a_time():
+    counter = Counter()
+    for value in counter:
+        if value == 3:
+            break
+    assert counter.calls == 3
+    assert iter(counter) is counter
+    assert next(counter) == 4
+
+    for value in Naturals():
+        if value == 3:
+            break
+    assert value == 3
+    naturals = iter(Naturals())
+    assert [next(naturals), next(naturals)] == [1, 2]
+
+    import itertools
+
+    assert list(itertools.islice(Naturals(), 3)) == [1, 2, 3]
+
+    def delegate():
+        yield from Counter()
+
+    generator = delegate()
+    assert [next(generator), next(generator)] == [1, 2]
+
+    assert list(Countdown(3)) == [2, 1, 0]
+    assert sorted(Countdown(3)) == [0, 1, 2]
+    assert sum(Countdown(4)) == 6
+    assert [value * 2 for value in Countdown(2)] == [2, 0]
+    first, second = Countdown(2)
+    assert (first, second) == (1, 0)
+
+
+def test_iter_rejects_classes_without_a_proper_iterator():
+    class ReturnsList:
+        def __iter__(self):
+            return [1, 2]
+
+    class NotIterable:
+        __iter__ = None
+
+    for operation, message in [
+        (lambda: iter(ReturnsList()), "iter() returned non-iterator of type 'list'"),
+        (lambda: list(ReturnsList()), "iter() returned non-iterator of type 'list'"),
+        (lambda: iter(NotIterable()), "'NotIterable' object is not iterable"),
+    ]:
+        try:
+            operation()
+        except TypeError as error:
+            assert str(error) == message
+        else:
+            raise AssertionError(f"no TypeError: {message}")
+
+
+def test_yield_from_a_class_iterator_uses_its_send_throw_and_close():
+    events = []
+
+    class Echo:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return "next"
+
+        def send(self, value):
+            if value == "stop":
+                raise StopIteration("echo done")
+            return ("echo", value)
+
+        def throw(self, error):
+            return ("threw", type(error).__name__)
+
+        def close(self):
+            events.append("closed")
+
+    def delegate():
+        result = yield from Echo()
+        yield ("result", result)
+
+    generator = delegate()
+    assert next(generator) == "next"
+    assert generator.send(1) == ("echo", 1)
+    assert generator.throw(ValueError("x")) == ("threw", "ValueError")
+    assert generator.send("stop") == ("result", "echo done")
+
+    generator = delegate()
+    next(generator)
+    generator.close()
+    assert events == ["closed"]
+
+
 def test_numeric_literals_and_arithmetic_match_python():
     values = [1.2, 0.5, 1.0, 1_000.50_0, 1_2e-1, 1_2e1]
     assert values == [1.2, 0.5, 1.0, 1000.5, 1.2, 120.0]
