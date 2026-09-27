@@ -3,23 +3,49 @@
 import _shellsim_vfs
 
 
+def _parse_mode(mode):
+    """Validate an `open()` mode as CPython does and return `(operation, binary, plus)`."""
+    if not isinstance(mode, str):
+        raise TypeError("open() argument 'mode' must be str, not " + type(mode).__name__)
+    seen = ""
+    for char in mode:
+        if char not in "rwxabt+" or char in seen:
+            raise ValueError("invalid mode: " + repr(mode))
+        seen += char
+    if "t" in seen and "b" in seen:
+        raise ValueError("can't have text and binary mode at once")
+    operations = [char for char in seen if char in "rwxa"]
+    if len(operations) > 1:
+        raise ValueError("must have exactly one of create/read/write/append mode")
+    if not operations:
+        raise ValueError(
+            "Must have exactly one of create/read/write/append mode and at most one plus"
+        )
+    return operations[0], "b" in seen, "+" in seen
+
+
+def _binary_mode(operation, plus):
+    """The mode CPython's FileIO reports, which spells `w+` as `rb+`."""
+    if plus and operation == "w":
+        operation = "r"
+    return operation + "b" + ("+" if plus else "")
+
+
 class _File:
     def __init__(self, path, mode="r"):
-        if mode not in [
-            "r", "w", "a", "r+", "w+", "a+",
-            "rb", "wb", "ab", "rb+", "wb+", "ab+", "r+b", "w+b", "a+b",
-        ]:
-            raise ValueError("invalid file mode: " + mode)
+        operation, binary, plus = _parse_mode(mode)
         self.name = path
-        self.mode = mode
+        self.mode = _binary_mode(operation, plus) if binary else mode
         self.closed = False
         self._position = 0
-        self._binary = "b" in mode
-        self._operation = mode[0]
-        self._readable = self._operation == "r" or "+" in mode
-        self._writable = self._operation != "r" or "+" in mode
+        self._binary = binary
+        self._operation = operation
+        self._readable = operation == "r" or plus
+        self._writable = operation != "r" or plus
         self._empty = b"" if self._binary else ""
-        if self._operation == "r":
+        if operation == "x" and _shellsim_vfs.exists(path):
+            raise FileExistsError("[Errno 17] File exists: " + repr(path))
+        if operation == "r":
             self._data = self._read_file()
         elif self._operation == "a" and _shellsim_vfs.exists(path):
             self._data = self._read_file()
@@ -59,12 +85,9 @@ class _File:
             raise ValueError("file is not open for reading")
         if self._position >= len(self._data):
             return self._empty
-        end = self._position
-        newline = 10 if self._binary else "\n"
-        while end < len(self._data) and self._data[end] != newline:
-            end += 1
-        if end < len(self._data):
-            end += 1
+        newline = b"\n" if self._binary else "\n"
+        end = self._data.find(newline, self._position)
+        end = len(self._data) if end < 0 else end + 1
         value = self._data[self._position:end]
         self._position = end
         return value
@@ -157,6 +180,10 @@ class BufferedWriter(_File):
     pass
 
 
+class BufferedRandom(_File):
+    pass
+
+
 class _MemoryIO:
     def __init__(self, initial_value):
         self._data = initial_value
@@ -175,6 +202,39 @@ class _MemoryIO:
         else:
             value = self._data[self._position:self._position + size]
             self._position += len(value)
+        return value
+
+    def readline(self, size=-1):
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        newline = b"\n" if isinstance(self._data, bytes) else "\n"
+        end = self._data.find(newline, self._position)
+        end = len(self._data) if end < 0 else end + 1
+        if size is not None and size >= 0:
+            end = min(end, self._position + size)
+        value = self._data[self._position:end]
+        self._position = max(self._position, end)
+        return value
+
+    def readlines(self, hint=-1):
+        values = []
+        total = 0
+        line = self.readline()
+        while line:
+            values.append(line)
+            total += len(line)
+            if hint is not None and 0 < hint < total:
+                break
+            line = self.readline()
+        return values
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        value = self.readline()
+        if not value:
+            raise StopIteration
         return value
 
     def write(self, value):
@@ -225,6 +285,15 @@ class BytesIO(_MemoryIO):
 
 
 def open(path, mode="r", encoding=None, newline=None):
-    if "b" in mode:
+    operation, binary, plus = _parse_mode(mode)
+    if not binary:
+        return TextIOWrapper(str(path), mode)
+    if encoding is not None:
+        raise ValueError("binary mode doesn't take an encoding argument")
+    if newline is not None:
+        raise ValueError("binary mode doesn't take a newline argument")
+    if plus:
+        return BufferedRandom(str(path), mode)
+    if operation == "r":
         return BufferedReader(str(path), mode)
-    return TextIOWrapper(str(path), mode)
+    return BufferedWriter(str(path), mode)
