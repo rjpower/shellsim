@@ -168,8 +168,6 @@ never imports a module or calls arbitrary code.
 - **Product summation.** Products sum each dot product in index order. NumPy passes
   floating-point products to BLAS, whose blocked kernels add in a different order that depends
   on the CPU, so their last bits can differ.
-- **`fftfreq`/`rfftfreq` with `n=0`.** NumPy raises `ZeroDivisionError` building these; shellsim
-  returns the empty frequency array instead.
 
 ## Unsupported frontier
 

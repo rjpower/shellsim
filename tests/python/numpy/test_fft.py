@@ -192,6 +192,13 @@ def test_fftfreq_locates_cosine_peak():
     assert freqs[peak] == 4.0
 
 
+def test_fftfreq_and_rfftfreq_reject_zero_length():
+    with pytest.raises(ZeroDivisionError, match="division by zero"):
+        np.fft.fftfreq(0)
+    with pytest.raises(ZeroDivisionError, match="division by zero"):
+        np.fft.rfftfreq(0)
+
+
 # 13 and 17 use pocketfft's generic prime pass; 101 and 202 use Bluestein's algorithm.
 @pytest.mark.parametrize("n", [13, 17, 101, 202])
 def test_generic_radix_and_bluestein_lengths_match_direct_dft(n):

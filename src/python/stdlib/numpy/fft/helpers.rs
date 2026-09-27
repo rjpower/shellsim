@@ -58,9 +58,10 @@ fn build_freq(
 
 /// `n` must be an integer type (NumPy's own message, distinct from the usual
 /// "cannot be interpreted as an integer" `TypeError` other `n=`/`axis=` arguments raise).
-/// Negative `n` reuses the message array construction gives a negative size; shellsim treats
-/// `n=0` as the empty frequency array rather than reproducing NumPy's internal
-/// `ZeroDivisionError` for that case, since nothing in the supported surface depends on it.
+/// Negative `n` reuses the message array construction gives a negative size. `n=0` reproduces
+/// NumPy's own `ZeroDivisionError`: it computes the `1/(n*d)` scale before knowing there are no
+/// elements to apply it to, so the division fails even though the result would otherwise be the
+/// empty array.
 fn resolve_freq_n(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<usize> {
     let n = if let Some(n) = runtime.int_value(&value) {
         n
@@ -75,6 +76,9 @@ fn resolve_freq_n(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<usize
     };
     if n < 0 {
         return Err(PyError::value_error("negative dimensions are not allowed"));
+    }
+    if n == 0 {
+        return Err(PyError::zero_division_error("division by zero"));
     }
     Ok(n as usize)
 }
