@@ -139,6 +139,17 @@ def test_moveaxis_moves_single_and_multiple_axes():
     m = np.moveaxis(a, 2, 0)
     assert m.shape == (4, 2, 3)
     assert m[3, 1, 2] == a[1, 2, 3]
+    with pytest.raises(np.exceptions.AxisError, match="^source: axis 3 is out of bounds for array of dimension 3$"):
+        np.moveaxis(a, 3, 0)
+
+
+def test_axis_error_formats_its_axis_and_dimension():
+    error = np.exceptions.AxisError(2, 1)
+    assert (str(error), error.args) == ("axis 2 is out of bounds for array of dimension 1", (2, 1))
+    prefixed = np.exceptions.AxisError(-3, 2, "destination")
+    assert str(prefixed) == "destination: axis -3 is out of bounds for array of dimension 2"
+    assert str(np.exceptions.AxisError("custom")) == "custom"
+    assert isinstance(error, ValueError)
 
 
 def test_squeeze_removes_all_length_one_axes():

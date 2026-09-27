@@ -367,6 +367,12 @@ def test_information_theory_functions():
         [0.34657359027997264, 0.0, np.inf, np.inf],
     )
     close(special.kl_div([0.5, 0.0, 1.0], [0.25, 0.3, 0.0]), [0.09657359027997264, 0.3, np.inf])
+    # Negative arguments are outside the domain except at x == 0, y >= 0.
+    assert_array_equal(special.rel_entr([-1.0, 0.0, -1.0, 0.0], [1.0, -1.0, -1.0, 0.0]), [np.inf] * 3 + [0.0])
+    assert_array_equal(special.kl_div([-1.0, 0.0, 0.0], [1.0, -1.0, 2.0]), [np.inf, np.inf, 2.0])
+    # Near x == y, rel_entr keeps the precision that x * log(x / y) loses (...789 there).
+    assert special.rel_entr(2 / 3, 13 / 21) == 0.04940531476914786
+    assert special.kl_div(2 / 3, 13 / 21) == 0.001786267150100329
 
 
 def test_binom_and_poch():

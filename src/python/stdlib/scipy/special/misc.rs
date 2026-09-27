@@ -89,26 +89,41 @@ pub(in crate::python) fn entr(x: f64) -> f64 {
 }
 
 /// `rel_entr(x, y) = x ln(x / y)` for `x, y > 0`, continued to `rel_entr(0, y) = 0` for `y >= 0`
-/// and `rel_entr(x, y) = inf` for `x > 0`, `y <= 0`.
+/// and `inf` everywhere else. When `x / y` lies in `(1/2, 2)` the logarithm is taken as
+/// `ln_1p((x - y) / y)`, which keeps full precision near `x == y` and rounds as SciPy does.
 pub(in crate::python) fn rel_entr(x: f64, y: f64) -> f64 {
     if x.is_nan() || y.is_nan() {
         return f64::NAN;
     }
-    if x == 0.0 {
-        return 0.0;
+    if x > 0.0 && y > 0.0 {
+        let ratio = x / y;
+        if 0.5 < ratio && ratio < 2.0 {
+            return x * ((x - y) / y).ln_1p();
+        }
+        return x * ratio.ln();
     }
-    if y <= 0.0 {
-        return if x > 0.0 { f64::INFINITY } else { f64::NAN };
+    if x == 0.0 && y >= 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
     }
-    x * (x / y).ln()
 }
 
-/// `kl_div(x, y) = rel_entr(x, y) - x + y`.
+/// `kl_div(x, y) = x ln(x / y) - x + y` for `x, y > 0`, continued to `y` for `x == 0, y >= 0`
+/// and `inf` everywhere else. Unlike [`rel_entr`], SciPy takes the plain logarithm of the ratio
+/// here at every ratio.
 pub(in crate::python) fn kl_div(x: f64, y: f64) -> f64 {
     if x.is_nan() || y.is_nan() {
         return f64::NAN;
     }
-    rel_entr(x, y) - x + y
+    if x > 0.0 && y > 0.0 {
+        return x * (x / y).ln() - x + y;
+    }
+    if x == 0.0 && y >= 0.0 {
+        y
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// `boxcox(x, lmbda) = (x^lmbda - 1) / lmbda`, continued to `ln(x)` at `lmbda == 0`.
