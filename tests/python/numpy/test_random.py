@@ -397,3 +397,152 @@ def test_size_argument_sets_shape(size, shape):
     assert rng.integers(0, 5, size=size).shape == shape
     assert rng.uniform(size=size).shape == shape
     assert rng.normal(size=size).shape == shape
+
+
+def test_seed_sequence_generates_numpy_words():
+    seq = np.random.SeedSequence(12345)
+    assert seq.generate_state(3).tolist() == [2688385916, 3048105090, 4196366895]
+    assert seq.generate_state(2, np.uint64).tolist() == [13091511679009522556, 13538552136045918767]
+    child = seq.spawn(2)[1]
+    assert child.spawn_key == (1,)
+    assert child.generate_state(2).tolist() == [1457248422, 358904087]
+    with pytest.raises(ValueError, match="only support uint32 or uint64"):
+        seq.generate_state(2, np.int32)
+    with pytest.raises(TypeError, match="SeedSequence expects int or sequence of ints"):
+        np.random.SeedSequence(1.5)
+
+
+def test_pcg64_state_advance_and_jumped():
+    bit_generator = np.random.PCG64(7)
+    assert bit_generator.state == {
+        "bit_generator": "PCG64",
+        "state": {
+            "state": 208745520555909116978795849195383758904,
+            "inc": 261136684632268670825940853076396136793,
+        },
+        "has_uint32": 0,
+        "uinteger": 0,
+    }
+    assert np.random.PCG64(1).advance(12345).random_raw(2).tolist() == [
+        6725986476597619031,
+        15801925886187179136,
+    ]
+    assert np.random.PCG64(1).jumped(3).random_raw(2).tolist() == [
+        5863065313089933784,
+        11785604140192313526,
+    ]
+
+
+def test_generator_state_round_trip_includes_buffered_half():
+    rng = np.random.default_rng(7)
+    rng.integers(0, 10, dtype=np.int32)
+    state = rng.bit_generator.state
+    assert state["has_uint32"] == 1
+    first = rng.random(3).tolist()
+    rng.bit_generator.state = state
+    assert rng.random(3).tolist() == first
+
+
+def test_mt19937_seeded_from_seed_sequence():
+    assert np.random.MT19937(42).random_raw(3).tolist() == [2327846034, 3904886566, 2661450408]
+    assert np.random.MT19937(42).state["state"]["pos"] == 623
+    rng = np.random.Generator(np.random.MT19937(42))
+    assert rng.random(2).tolist() == [0.5419938930062744, 0.6196672126927824]
+
+
+def test_generator_single_precision_streams():
+    values = np.random.default_rng(2024).random(3, dtype=np.float32)
+    assert values.dtype == np.float32
+    assert values.tolist() == [0.24152815341949463, 0.6758313179016113, 0.09234333038330078]
+    normals = np.random.default_rng(2024).standard_normal(4, dtype=np.float32)
+    assert normals.tolist() == [
+        0.6110844016075134,
+        0.846587061882019,
+        0.21217942237854004,
+        0.38399016857147217,
+    ]
+
+
+def test_generator_normal_matches_numpy_ziggurat():
+    assert np.random.default_rng(2024).standard_normal(4).tolist() == [
+        1.0288568739519013,
+        1.6419200406711503,
+        1.1467195295966137,
+        -0.9731795154745656,
+    ]
+    # Enough draws to reach the ziggurat's base-layer tail and wedge rejections.
+    draws = np.random.default_rng(5).standard_normal(200000)
+    assert [float(draws.min()), float(draws.max())] == [-4.820175842608121, 4.371795668265591]
+    assert np.random.default_rng(1).normal([0, 10, 100], 2).tolist() == [
+        0.691168384129572,
+        11.643236287002317,
+        100.66087415236677,
+    ]
+
+
+@pytest.mark.parametrize(
+    "legacy, seed, low, high, dtype, expected",
+    [
+        (False, 3, -100, 100, "int8", [93, 51, 48, 61, 14, -80]),
+        (False, 9, 0, 100, "uint16", [52, 42, 65, 87, 1, 96]),
+        (False, 9, 0, 2, "bool", [True, False, False, False, False, True]),
+        (True, 9, 0, 100, "uint8", [97, 39, 2, 92, 81, 77]),
+    ],
+)
+def test_integer_dtypes_use_numpy_buffered_draws(legacy, seed, low, high, dtype, expected):
+    if legacy:
+        values = np.random.RandomState(seed).randint(low, high, size=6, dtype=dtype)
+    else:
+        values = np.random.default_rng(seed).integers(low, high, size=6, dtype=dtype)
+    assert values.dtype == np.dtype(dtype)
+    assert values.tolist() == expected
+
+
+def test_integer_bounds_broadcast():
+    assert np.random.default_rng(3).integers([0, 10, 100], [5, 20, 1000]).tolist() == [4, 10, 261]
+
+
+def test_integer_bounds_errors():
+    rng = np.random.default_rng(3)
+    with pytest.raises(ValueError, match="low is out of bounds for uint8"):
+        rng.integers(-1, 5, dtype=np.uint8)
+    with pytest.raises(ValueError, match="high is out of bounds for uint8"):
+        rng.integers(0, 257, dtype=np.uint8)
+    with pytest.raises(ValueError, match="high <= 0"):
+        rng.integers(0)
+    with pytest.raises(ValueError, match="low > high"):
+        rng.integers(5, 4, endpoint=True)
+    with pytest.raises(TypeError, match="Unsupported dtype"):
+        rng.integers(5, dtype=np.float64)
+
+
+def test_generator_choice_without_replacement_uses_floyd_and_tail_shuffle():
+    assert np.random.default_rng(11).choice(1000, 5, replace=False).tolist() == [128, 590, 133, 795, 498]
+    assert np.random.default_rng(11).choice(20000, 1000, replace=False)[:4].tolist() == [15148, 11237, 12942, 13198]
+
+
+def test_legacy_array_seed_and_gauss_state():
+    rs = np.random.RandomState([1, 2, 3])
+    assert rs.random_sample(2).tolist() == [0.6098612722867289, 0.8866970434146851]
+    rs.randn()
+    state = rs.get_state()
+    assert state[3] == 1
+    first = rs.randn(3).tolist()
+    rs.set_state(state)
+    assert rs.randn(3).tolist() == first
+    with pytest.raises(ValueError, match="Seed must be between 0 and 2\\*\\*32 - 1"):
+        np.random.RandomState(2**32)
+
+
+def test_distribution_parameter_errors():
+    rng = np.random.default_rng(1)
+    with pytest.raises(ValueError, match="scale < 0"):
+        rng.normal(0, -1)
+    with pytest.raises(ValueError, match="high - low < 0"):
+        rng.uniform(2, 1)
+    with pytest.raises(OverflowError):
+        rng.uniform(0, np.inf)
+    with pytest.raises(ValueError, match="array is read-only"):
+        values = np.arange(3)
+        values.setflags(write=False)
+        rng.shuffle(values)

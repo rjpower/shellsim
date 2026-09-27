@@ -509,3 +509,43 @@ fn numpy_fft_charges_transform_work_before_running() {
     assert_eq!(stdout, b"built\n");
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn numpy_random_reserves_and_charges_before_drawing() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        memory: 16 * 1024 * 1024,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "import numpy as np\nprint(np.random.default_rng(1).random(1000).shape)",
+        limits,
+    );
+    assert_eq!(
+        (status, stdout),
+        (0, b"(1000,)\n".to_vec()),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // Ten million doubles need 80 MB, which the fill reserves before drawing.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\nrng = np.random.default_rng(1)\nprint('seeded')\nrng.random(10_000_000)",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 16 * 1024 * 1024);
+    assert_eq!(stdout, b"seeded\n");
+    assert!(stderr.is_empty());
+    // One million draws fit in memory but prepay a million CPU units at once.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\nrng = np.random.default_rng(1)\nprint('seeded')\nrng.random(1_000_000)",
+        Limits {
+            cpu: 800_000,
+            ..limits
+        },
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 800_000);
+    assert_eq!(stdout, b"seeded\n");
+    assert!(stderr.is_empty());
+}
