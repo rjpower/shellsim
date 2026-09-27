@@ -103,6 +103,14 @@ fn unsupported_scipy_features_fail_explicitly() {
             "NotImplementedError: scipy.spatial.distance.dice is not supported by shellsim's SciPy",
         ),
         (
+            "from scipy.interpolate import BSpline",
+            "NotImplementedError: scipy.interpolate.BSpline is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy.interpolate import CubicSpline\nCubicSpline([0, 1, 2], [1, -1, 1]).roots()",
+            "NotImplementedError: PPoly.roots is not supported by shellsim's SciPy",
+        ),
+        (
             "from scipy.spatial import distance\ndistance.pdist([[1.0], [2.0]], 'yule')",
             "NotImplementedError: the 'yule' distance metric is not supported by shellsim's SciPy",
         ),

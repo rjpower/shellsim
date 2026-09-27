@@ -4,8 +4,8 @@ Real SciPy loads each subpackage lazily on first attribute access instead of imp
 them up front. shellsim reproduces that with a module ``__getattr__`` (PEP 562): touching
 ``scipy.stats`` imports the ``scipy.stats`` submodule the first time and caches it as a module
 attribute afterwards, exactly as ``import scipy.stats`` would. Only ``special``, ``stats``,
-``linalg`` and ``spatial`` do anything; the rest resolve to ``scipy._unsupported``, whose import
-always raises ``NotImplementedError``.
+``linalg``, ``spatial`` and ``interpolate`` do anything; the rest resolve to
+``scipy._unsupported``, whose import always raises ``NotImplementedError``.
 """
 
 import importlib

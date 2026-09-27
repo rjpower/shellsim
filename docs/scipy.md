@@ -1,7 +1,7 @@
 # SciPy in shellsim
 
-shellsim ships `scipy.special`, `scipy.stats`, `scipy.linalg` and `scipy.spatial` for simulated
-Python programs.
+shellsim ships `scipy.special`, `scipy.stats`, `scipy.linalg`, `scipy.spatial` and
+`scipy.interpolate` for simulated Python programs.
 It targets the observable behavior of SciPy 1.18.1 with NumPy 2.5.3: values, result dtypes,
 error types and messages, and warnings. It never runs host SciPy. The other SciPy subpackages
 raise `NotImplementedError` when imported.
@@ -51,6 +51,15 @@ raise `NotImplementedError` when imported.
   `pdist` sum each pair left to right, as SciPy's compiled loops do, so their `euclidean`,
   `sqeuclidean`, `cityblock`, `minkowski`, `chebyshev`, `braycurtis`, `canberra`, `hamming`
   and `jaccard` results match SciPy bit for bit.
+- **`scipy.interpolate`** is frozen Python over NumPy. `PPoly` stores each piece in the local
+  power basis and evaluates it summing from the constant term up; `CubicHermiteSpline`,
+  `CubicSpline` and `PchipInterpolator` compute knot slopes and hand `PPoly` the Hermite
+  coefficients. `CubicSpline` solves its slope system with the tridiagonal `solve_banded`
+  (periodic splines fold the wrap-around into a Sherman-Morrison update), and `interp1d`'s
+  spline kinds solve a banded B-spline collocation system and evaluate by the Cox-de Boor
+  recurrence, so building and evaluating stay linear in the number of points. `interp1d`'s
+  linear kind, the step kinds, `PPoly` evaluation, derivatives, antiderivatives and integrals,
+  and non-periodic `CubicSpline` coefficients match SciPy bit for bit on the suite's data.
 
 ### Rounding in `scipy.linalg`
 
@@ -142,6 +151,13 @@ them. Domain errors return NaN and poles return infinities.
   them; `cdist` and `pdist` with those metrics, their aliases, callable metrics and `out=`;
   `squareform`, `is_valid_dm`, `is_valid_y`, `num_obs_dm` and `num_obs_y`; and the deprecated
   `scipy.spatial.distance_matrix`, `minkowski_distance` and `minkowski_distance_p`.
+- **Interpolation (`scipy.interpolate`).** `interp1d` with every kind (`linear`, `nearest`,
+  `nearest-up`, `previous`, `next`, and spline orders by name or integer), fill values,
+  extrapolation, sorting and any interpolation axis; `PPoly` with evaluation, derivatives,
+  `derivative`, `antiderivative`, `integrate`, periodic extrapolation, descending breakpoints
+  and `construct_fast`; `CubicHermiteSpline`; `CubicSpline` with not-a-knot, natural, clamped,
+  periodic and explicit first- or second-derivative end conditions, including per-column
+  values and complex data; and `PchipInterpolator` (also `pchip`) and `pchip_interpolate`.
 - **LAPACK and BLAS wrappers.** The `s` and `d` forms of `getrf`, `getrs`, `gecon`, `getri`,
   `trtrs`, `trtri`, `potrf`, `potrs`, `potri`, `gtsv`, `gbsv`, `lange` and `nrm2`, with f2py's
   arguments, argument checks, `_flapack.error` exception and Fortran-ordered outputs, and `get_lapack_funcs`,
@@ -227,6 +243,13 @@ expectations were measured on the reference machine described above; see "Roundi
   does not match the data, raise `ValueError`; SciPy's compiled loops compute a meaningless
   result. `cdist` and `pdist` accept `base=` for `jensenshannon`, which SciPy's reject, and
   report an unexpected keyword with Python's usual `TypeError` message.
+- **Rounding in `scipy.interpolate`.** Periodic `CubicSpline` coefficients can differ from
+  SciPy's in the last bit, since the cyclic slope system is eliminated differently. A
+  three-point not-a-knot spline is the exact parabola through the points; SciPy's solve leaves
+  rounding noise of about `1e-17` in its cubic coefficient.
+- **`interp1d` without points** raises "x and y arrays must have at least 1 entry"; SciPy fails
+  with an internal reshape error. SciPy's `interp1d` also emits `RuntimeWarning`s for some
+  repeated abscissae that shellsim's does not.
 - **`scipy.spatial` deprecation warnings.** `distance_matrix` warns once; SciPy's also emits
   the warnings of the deprecated helpers it calls.
 - **Output layout of batched results.** The f2py wrappers, and the functions that return their
@@ -261,8 +284,12 @@ These fail explicitly with shellsim's unsupported-operation error or `NotImpleme
   (as functions and as `cdist`/`pdist` metrics), `directed_hausdorff`, and `scipy.spatial`'s
   data structures and computational geometry, such as `KDTree`, `ConvexHull`, `Delaunay` and
   `Voronoi`;
-- importing any subpackage other than `scipy.special`, `scipy.stats`, `scipy.linalg` and
-  `scipy.spatial`.
+- `PPoly.roots`, `solve`, `extend`, `from_spline` and `from_bernstein_basis`, and the other
+  names in SciPy's `scipy.interpolate`, such as `BSpline`, `make_interp_spline`,
+  `Akima1DInterpolator`, `UnivariateSpline`, `RegularGridInterpolator`, `griddata` and the
+  FITPACK functions (`splrep`, `splev`, ...);
+- importing any subpackage other than `scipy.special`, `scipy.stats`, `scipy.linalg`,
+  `scipy.spatial` and `scipy.interpolate`.
 
 Other `scipy.special` functions and `scipy.stats` names are absent, so accessing them raises
 `AttributeError`.
