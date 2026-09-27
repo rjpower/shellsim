@@ -8,7 +8,7 @@ use super::{
     InstancePayload, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime,
     PyStreamRead, RaisedException, ScopeId, Slot, Stream, Value, Vm,
 };
-use num_traits::{Signed, Zero};
+use num_traits::{One, Signed, Zero};
 
 impl Vm<'_> {
     /// The builtin `abs(value)`, through the `__abs__` slot.
@@ -1248,11 +1248,20 @@ impl Vm<'_> {
                         let error = PyError::zero_division_error("pow() 3rd argument cannot be 0");
                         return Err(self.record_native_error(error));
                     }
-                    if exponent.is_negative() {
-                        let error =
-                            PyError::value_error("negative exponent with modulus is not supported");
-                        return Err(self.record_native_error(error));
-                    }
+                    let positive_modulus = modulus.abs();
+                    // As in CPython, `pow(b, -e, m)` is `pow(inverse(b), e, m)`, and every
+                    // value is its own inverse modulo one.
+                    let (base, exponent) = if !exponent.is_negative() {
+                        (base, exponent)
+                    } else if positive_modulus.is_one() {
+                        (BigInt::zero(), -exponent)
+                    } else {
+                        let Some(inverse) = base.modinv(&positive_modulus) else {
+                            let message = "base is not invertible for the given modulus";
+                            return Err(self.record_native_error(PyError::value_error(message)));
+                        };
+                        (inverse, -exponent)
+                    };
                     let work = base_len
                         .saturating_add(modulus_len)
                         .saturating_mul(exponent_len.saturating_mul(4).max(1));
@@ -1260,7 +1269,6 @@ impl Vm<'_> {
                         .map_err(|error| error.to_string())?;
                     <Self as PyRuntime>::reserve_memory(self, modulus_len.saturating_mul(4).max(1))
                         .map_err(|error| error.to_string())?;
-                    let positive_modulus = modulus.abs();
                     let mut result = base.modpow(&exponent, &positive_modulus);
                     if modulus.is_negative() && !result.is_zero() {
                         result += modulus;

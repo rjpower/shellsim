@@ -812,6 +812,18 @@ def test_float_power_follows_ieee_special_values():
     _assert_raises(lambda: 10.0**400.0, OverflowError, "(34, 'Numerical result out of range')")
 
 
+
+def test_modular_pow_with_negative_exponent_inverts_the_base():
+    assert pow(3, -1, 7) == 5
+    assert pow(3, -2, 7) == 4
+    assert pow(3, -1, -7) == -2
+    assert pow(-3, -1, 7) == 2
+    assert pow(2, -1, 1) == 0
+    assert pow(10**30 + 1, -1, 10**20 + 7) == 18895348837412790699
+    message = "base is not invertible for the given modulus"
+    _assert_raises(lambda: pow(2, -1, 4), ValueError, message)
+    _assert_raises(lambda: pow(0, -1, 5), ValueError, message)
+
 class DeclinesOrdering:
     def __lt__(self, other):
         return NotImplemented
