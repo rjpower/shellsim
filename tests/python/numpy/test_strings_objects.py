@@ -110,6 +110,117 @@ def test_string_repeat_with_strings_multiply():
     assert repeated.tolist() == ["abab", "cc"]
 
 
+def test_strings_case_functions():
+    a = np.array(["Hello World", "foo BAR"])
+    assert np.strings.capitalize(a).tolist() == ["Hello world", "Foo bar"]
+    assert np.strings.lower(a).tolist() == ["hello world", "foo bar"]
+    assert np.strings.upper(a).tolist() == ["HELLO WORLD", "FOO BAR"]
+    assert np.strings.swapcase(a).tolist() == ["hELLO wORLD", "FOO bar"]
+    assert np.strings.title(a).tolist() == ["Hello World", "Foo Bar"]
+
+
+def test_strings_padding_functions():
+    a = np.array(["ab", "c"])
+    # `center`'s two elements are chosen with even total padding on both sides, since CPython's
+    # tie-break for an odd amount of padding is not itself under test here.
+    assert np.strings.center(np.array(["ab", "cd"]), 6, "*").tolist() == ["**ab**", "**cd**"]
+    assert np.strings.ljust(a, 4, "-").tolist() == ["ab--", "c---"]
+    assert np.strings.rjust(a, 4, "-").tolist() == ["--ab", "---c"]
+    assert np.strings.zfill(np.array(["7", "-3", "42"]), 4).tolist() == ["0007", "-003", "0042"]
+
+
+def test_strings_trimming_functions():
+    a = np.array(["  hi  ", "yo   "])
+    assert np.strings.strip(a).tolist() == ["hi", "yo"]
+    assert np.strings.lstrip(a).tolist() == ["hi  ", "yo   "]
+    assert np.strings.rstrip(a).tolist() == ["  hi", "yo"]
+    assert np.strings.strip(np.array(["xxhixx"]), "x").tolist() == ["hi"]
+
+
+def test_strings_search_and_replace_functions():
+    a = np.array(["Hello World", "foo bar"])
+    assert np.strings.count(a, "o").tolist() == [2, 2]
+    assert np.strings.find(a, "o").tolist() == [4, 1]
+    assert np.strings.rfind(a, "o").tolist() == [7, 2]
+    assert np.strings.index(a, "o").tolist() == [4, 1]
+    assert np.strings.rindex(a, "o").tolist() == [7, 2]
+    assert np.strings.find(a, "z").tolist() == [-1, -1]
+    with pytest.raises(ValueError):
+        np.strings.index(a, "z")
+    assert np.strings.replace(a, "o", "0").tolist() == ["Hell0 W0rld", "f00 bar"]
+    assert np.strings.replace(np.array(["aaaa"]), "a", "bb").tolist() == ["bbbbbbbb"]
+
+
+def test_strings_partition_and_rpartition_return_three_arrays():
+    a = np.array(["Hello World", "foobar"])
+    before, sep, after = np.strings.partition(a, " ")
+    assert (before.tolist(), sep.tolist(), after.tolist()) == (
+        ["Hello", "foobar"],
+        [" ", ""],
+        ["World", ""],
+    )
+    before, sep, after = np.strings.rpartition(a, " ")
+    assert (before.tolist(), sep.tolist(), after.tolist()) == (
+        ["Hello", ""],
+        [" ", ""],
+        ["World", "foobar"],
+    )
+
+
+def test_strings_slice_matches_python_slice_semantics():
+    a = np.array(["Hello World", "foo bar"])
+    # A single positional argument is `stop`, as with the builtin `slice(stop)`.
+    assert np.strings.slice(a, 5).tolist() == ["Hello", "foo b"]
+    assert np.strings.slice(a, 1, 5).tolist() == ["ello", "oo b"]
+    assert np.strings.slice(a, None, None, 2).tolist() == ["HloWrd", "fobr"]
+
+
+def test_strings_translate_maps_characters_elementwise():
+    table = {ord("a"): "A", ord("b"): "B"}
+    assert np.strings.translate(np.array(["abc", "cab"]), table).tolist() == ["ABc", "cAB"]
+
+
+def test_strings_mod_applies_values_to_every_element():
+    # shellsim applies `values` uniformly to every element rather than broadcasting one
+    # substitution per row (see the module docstring in `numpy/strings.py`); NumPy instead
+    # zips `values` against `a`, so this exercises shellsim's documented simplification.
+    result = np.strings.mod(np.array(["n=%d", "m=%d"]), (7,))
+    assert result.tolist() == ["n=7", "m=7"]
+
+
+def test_strings_predicate_functions():
+    assert np.strings.str_len(np.array(["ab", "c"])).tolist() == [2, 1]
+    assert np.strings.isalpha(np.array(["abc", "ab1"])).tolist() == [True, False]
+    assert np.strings.isdigit(np.array(["123", "12a"])).tolist() == [True, False]
+    assert np.strings.isdecimal(np.array(["123", "½"])).tolist() == [True, False]
+    assert np.strings.isnumeric(np.array(["123", "½"])).tolist() == [True, True]
+    assert np.strings.isalnum(np.array(["abc123", "ab 1"])).tolist() == [True, False]
+    assert np.strings.isspace(np.array(["   ", "a"])).tolist() == [True, False]
+    assert np.strings.islower(np.array(["abc", "Abc"])).tolist() == [True, False]
+    assert np.strings.isupper(np.array(["ABC", "Abc"])).tolist() == [True, False]
+    assert np.strings.istitle(np.array(["Hello World", "hello world"])).tolist() == [True, False]
+    assert np.strings.startswith(np.array(["Hello", "foo"]), "He").tolist() == [True, False]
+    assert np.strings.endswith(np.array(["Hello", "foo"]), "lo").tolist() == [True, False]
+
+
+def test_strings_comparison_functions():
+    a = np.array(["b", "a"])
+    b = np.array(["a", "a"])
+    assert np.strings.equal(a, b).tolist() == [False, True]
+    assert np.strings.not_equal(a, b).tolist() == [True, False]
+    assert np.strings.greater(a, b).tolist() == [True, False]
+    assert np.strings.greater_equal(a, b).tolist() == [True, True]
+    assert np.strings.less(a, b).tolist() == [False, False]
+    assert np.strings.less_equal(a, b).tolist() == [False, True]
+
+
+def test_strings_split_family_is_absent():
+    # `numpy.strings` has no `split`/`rsplit`/`splitlines`/`join`: ragged, per-element results
+    # do not fit a rectangular array, and NumPy 2.5.3 does not define them either.
+    for name in ("split", "rsplit", "splitlines", "join"):
+        assert not hasattr(np.strings, name)
+
+
 def test_string_arithmetic_without_a_loop_raises_type_error():
     a = np.array(["a", "b"])
     with pytest.raises(TypeError) as info:

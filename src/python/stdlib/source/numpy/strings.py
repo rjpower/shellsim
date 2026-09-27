@@ -8,12 +8,23 @@ result array gets the width of its longest element, a comparison gets `bool`, an
 index gets `int64`, exactly as constructing an array from those Python values normally would.
 
 Functions that take a per-element parameter other than the input arrays (`width`, `fillchar`,
-`start`, `end`, separators, ...) apply that parameter uniformly to every element rather than
-broadcasting it too; NumPy allows array-valued parameters there, which shellsim does not
-reproduce.
+`start`, `end`, separators, `mod`'s `values`, ...) apply that parameter uniformly to every
+element rather than broadcasting it too; NumPy allows array-valued parameters there, which
+shellsim does not reproduce.
+
+NumPy sizes a result array's dtype from an internal worst-case buffer estimate for the
+operation (e.g. `strip` keeps its input's width even when every stripped string is shorter);
+shellsim instead sizes it from the actual output text, as plain `np.array(...)` construction
+would. Values always match; the reported `.dtype.itemsize` can be narrower.
+
+`decode` and `encode` are absent because they convert to and from the `bytes_` (`S`) dtype,
+which shellsim's NumPy does not implement (see the "Unsupported frontier" section of
+docs/numpy.md).
 """
 
 import numpy as np
+
+_SLICE_UNSET = object()
 
 
 def _as_element_array(value):
@@ -47,6 +58,8 @@ def multiply(a, i):
 
 
 def mod(a, values):
+    # NumPy broadcasts `values` against `a` (one substitution per element); shellsim applies
+    # it uniformly instead, per the module-level note above.
     return _map1(lambda s: s % values, a)
 
 
@@ -138,28 +151,38 @@ def replace(a, old, new, count=-1):
     return _map1(lambda s: s.replace(old, new, count), a)
 
 
+def _partition3(a, method):
+    # `partition`/`rpartition` return three same-shaped arrays (before, separator, after),
+    # not one array of 3-tuples: matches `numpy.strings`, which reports each part separately.
+    array = _as_element_array(a)
+    flat = [method(value) for value in array.reshape(-1).tolist()]
+    columns = zip(*flat) if flat else ((), (), ())
+    return tuple(np.array(column).reshape(array.shape) for column in columns)
+
+
 def partition(a, sep):
-    return _map1(lambda s: s.partition(sep), a)
+    return _partition3(a, lambda s: s.partition(sep))
 
 
 def rpartition(a, sep):
-    return _map1(lambda s: s.rpartition(sep), a)
+    return _partition3(a, lambda s: s.rpartition(sep))
 
 
-def join(sep, seq):
-    return _map2(lambda s, parts: s.join(parts), sep, seq)
+def slice(a, start=None, stop=_SLICE_UNSET, step=None):
+    """Slice every element with `s[start:stop:step]`.
+
+    Matches the real `numpy.strings.slice`'s single-argument shorthand: a lone positional
+    argument is `stop` (as in the builtin `slice(stop)`), not `start`.
+    """
+    if stop is _SLICE_UNSET:
+        start, stop = None, start
+    return _map1(lambda s: s[start:stop:step], a)
 
 
-def split(a, sep=None, maxsplit=-1):
-    return _map1(lambda s: s.split(sep, maxsplit), a)
-
-
-def rsplit(a, sep=None, maxsplit=-1):
-    return _map1(lambda s: s.rsplit(sep, maxsplit), a)
-
-
-def splitlines(a, keepends=False):
-    return _map1(lambda s: s.splitlines(keepends), a)
+def translate(a, table, deletechars=None):
+    # NumPy's own `str`-dtype `translate` leaves `deletechars` without effect (confirmed
+    # against NumPy 2.5.3), so shellsim reproduces exactly `str.translate(table)`.
+    return _map1(lambda s: s.translate(table), a)
 
 
 def startswith(a, prefix, start=0, end=None):

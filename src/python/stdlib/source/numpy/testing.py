@@ -7,9 +7,19 @@ checks this text exactly. `assert_equal` recurses through lists, tuples, and dic
 nested structure still reports the exact path to it, matching NumPy's own behavior.
 """
 
-import cmath
+import math
 
 import numpy as np
+
+
+def _isnan(value):
+    value = complex(value)
+    return math.isnan(value.real) or math.isnan(value.imag)
+
+
+def _isinf(value):
+    value = complex(value)
+    return math.isinf(value.real) or math.isinf(value.imag)
 
 
 def _build_err_msg(actual, desired, err_msg, header="Items are not equal:"):
@@ -24,15 +34,19 @@ def _build_err_msg(actual, desired, err_msg, header="Items are not equal:"):
     return "\n".join(lines)
 
 
+def _is_negative(value):
+    # `math.copysign` does not exist in shellsim; `repr` already tracks the sign bit
+    # (`-0.0` prints with its minus sign), so it doubles as a sign test.
+    return repr(float(value)).startswith("-")
+
+
 def _float_equal(a, b):
     if a != a and b != b:
         return True
     if a != b:
         return False
     if a == 0 and b == 0:
-        import math
-
-        return math.copysign(1.0, a) == math.copysign(1.0, b)
+        return _is_negative(a) == _is_negative(b)
     return True
 
 
@@ -91,8 +105,8 @@ def _broadcast_or_fail(actual, desired, err_msg, header):
 
 def _array_values_equal(a, d):
     ca, cd = complex(a), complex(d)
-    if cmath.isnan(ca) or cmath.isnan(cd):
-        return cmath.isnan(ca) and cmath.isnan(cd)
+    if _isnan(ca) or _isnan(cd):
+        return _isnan(ca) and _isnan(cd)
     return ca == cd
 
 
@@ -122,9 +136,9 @@ def assert_array_less(actual, desired, err_msg="", verbose=True):
 
 def _isclose(a, d, rtol, atol, equal_nan):
     ca, cd = complex(a), complex(d)
-    if cmath.isnan(ca) or cmath.isnan(cd):
-        return equal_nan and cmath.isnan(ca) and cmath.isnan(cd)
-    if cmath.isinf(ca) or cmath.isinf(cd):
+    if _isnan(ca) or _isnan(cd):
+        return equal_nan and _isnan(ca) and _isnan(cd)
+    if _isinf(ca) or _isinf(cd):
         return ca == cd
     return abs(ca - cd) <= atol + rtol * abs(cd)
 
@@ -146,11 +160,11 @@ def _almost_equal(actual, desired, decimal, err_msg, header):
     d_flat = d_b.reshape(-1).tolist()
     for a, d in zip(a_flat, d_flat):
         ca, cd = complex(a), complex(d)
-        if cmath.isnan(ca) or cmath.isnan(cd):
-            if cmath.isnan(ca) and cmath.isnan(cd):
+        if _isnan(ca) or _isnan(cd):
+            if _isnan(ca) and _isnan(cd):
                 continue
             raise AssertionError(_build_err_msg(actual, desired, err_msg, header=header))
-        if cmath.isinf(ca) or cmath.isinf(cd):
+        if _isinf(ca) or _isinf(cd):
             if ca == cd:
                 continue
             raise AssertionError(_build_err_msg(actual, desired, err_msg, header=header))

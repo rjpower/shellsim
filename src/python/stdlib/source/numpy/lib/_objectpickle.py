@@ -23,11 +23,21 @@ The unpickler resolves only the small set of globals the pickler itself can prod
 so a crafted file cannot import a module or invoke arbitrary code.
 """
 
+import struct
+
 import numpy as np
 
 _FRAME_SIZE_TARGET = 64 * 1024
 _FRAME_SIZE_MIN = 4
 _BATCH_SIZE = 1000
+
+# `_reconstruct`'s third argument is always this exact one-byte object: NumPy passes the same
+# shared `b"b"` constant for every array in a pickle (it lives in `ndarray.__reduce__`'s
+# compiled code, reused on every call), so bytes memoization-by-identity picks it up as a
+# repeat after the first array. A literal written fresh at each `_save_ndarray` call would be a
+# distinct object every time and never get memoized, so it is hoisted to a single shared
+# instance here.
+_RECONSTRUCT_MODE = b"b"
 
 
 class UnpicklingError(Exception):
@@ -44,37 +54,60 @@ def loads(data):
     return _Unpickler(data).load()
 
 
+def _pack_be_double(value):
+    # BINFLOAT is the one big-endian field in an otherwise little-endian protocol.
+    return struct.pack(">d", value)
+
+
+def _unpack_be_double(data):
+    return struct.unpack(">d", bytes(data))[0]
+
+
+def _pack_uint_le(value, length):
+    """`int.to_bytes(length, 'little')`, built from shifts: shellsim's `int` has no
+    `to_bytes`/`from_bytes`, but its bitwise operators work on arbitrary-precision ints."""
+    return bytes((value >> (8 * index)) & 0xFF for index in range(length))
+
+
+def _unpack_uint_le(data):
+    value = 0
+    for index, byte in enumerate(data):
+        value |= byte << (8 * index)
+    return value
+
+
+def _pack_int_le(value, length):
+    if value < 0:
+        value += 1 << (8 * length)
+    return _pack_uint_le(value, length)
+
+
+def _unpack_int_le(data):
+    value = _unpack_uint_le(data)
+    bits = 8 * len(data)
+    if value >= 1 << (bits - 1):
+        value -= 1 << bits
+    return value
+
+
+def _bit_length(value):
+    if value < 0:
+        value = ~value
+    return 0 if value == 0 else len(bin(value)) - 2
+
+
 def _long_to_bytes(value):
     """Minimal little-endian two's-complement bytes for an arbitrary-precision int."""
     if value == 0:
         return b""
-    bit_length = value.bit_length() if value >= 0 else (~value).bit_length()
-    length = bit_length // 8 + 1
-    return value.to_bytes(length, "little", signed=True)
+    length = _bit_length(value) // 8 + 1
+    return _pack_int_le(value, length)
 
 
 def _long_from_bytes(data):
     if not data:
         return 0
-    return int.from_bytes(data, "little", signed=True)
-
-
-def _pack_be_double(value):
-    # BINFLOAT is the one big-endian field in an otherwise little-endian protocol.
-    bits = _float_to_bits(value)
-    return bits.to_bytes(8, "big")
-
-
-def _float_to_bits(value):
-    import struct
-
-    return int.from_bytes(struct.pack(">d", value), "big")
-
-
-def _unpack_be_double(data):
-    import struct
-
-    return struct.unpack(">d", data)[0]
+    return _unpack_int_le(data)
 
 
 class _Pickler:
@@ -102,7 +135,7 @@ class _Pickler:
         if not force and len(self._frame) < _FRAME_SIZE_TARGET:
             return
         if len(self._frame) >= _FRAME_SIZE_MIN:
-            self._out += b"\x95" + len(self._frame).to_bytes(8, "little")
+            self._out += b"\x95" + _pack_uint_le(len(self._frame), 8)
         self._out += self._frame
         self._frame = bytearray()
 
@@ -123,7 +156,7 @@ class _Pickler:
         if index < 256:
             self._emit(b"h" + bytes([index]))
         else:
-            self._emit(b"j" + index.to_bytes(4, "little"))
+            self._emit(b"j" + _pack_uint_le(index, 4))
 
     # -- dispatch ---------------------------------------------------------
 
@@ -135,6 +168,17 @@ class _Pickler:
             self._emit(b"\x88")
         elif value is False:
             self._emit(b"\x89")
+        elif value is np.ndarray:
+            self._save_global("numpy", "ndarray")
+        elif isinstance(value, np.dtype):
+            self._save_dtype(value)
+        elif isinstance(value, np.ndarray):
+            self._save_ndarray(value)
+        elif isinstance(value, np.generic):
+            # NumPy scalars always pickle through `numpy._core.multiarray.scalar`, even the
+            # ones (`float64`/`complex128`/`str_`/`bytes_`) that also subclass a builtin type
+            # `isinstance` would otherwise match below, so this check must come first.
+            self._save_scalar(value)
         elif isinstance(value, int):
             self._save_int(value)
         elif isinstance(value, float):
@@ -151,14 +195,6 @@ class _Pickler:
             self._save_list(value)
         elif isinstance(value, dict):
             self._save_dict(value)
-        elif value is np.ndarray:
-            self._save_global("numpy", "ndarray")
-        elif isinstance(value, np.dtype):
-            self._save_dtype(value)
-        elif isinstance(value, np.ndarray):
-            self._save_ndarray(value)
-        elif isinstance(value, np.generic):
-            self._save_scalar(value)
         else:
             raise NotImplementedError(
                 f"np.save cannot pickle {type(value).__name__!r} array elements in shellsim"
@@ -168,15 +204,15 @@ class _Pickler:
         if 0 <= value <= 0xFF:
             self._emit(b"K" + bytes([value]))
         elif 0x100 <= value <= 0xFFFF:
-            self._emit(b"M" + value.to_bytes(2, "little"))
+            self._emit(b"M" + _pack_uint_le(value, 2))
         elif -(2**31) <= value <= 2**31 - 1:
-            self._emit(b"J" + value.to_bytes(4, "little", signed=True))
+            self._emit(b"J" + _pack_int_le(value, 4))
         else:
             body = _long_to_bytes(value)
             if len(body) < 256:
                 self._emit(b"\x8a" + bytes([len(body)]) + body)
             else:
-                self._emit(b"\x8b" + len(body).to_bytes(4, "little") + body)
+                self._emit(b"\x8b" + _pack_uint_le(len(body), 4) + body)
 
     def _save_complex(self, value):
         cached = self._id_memo.get(id(value))
@@ -236,16 +272,20 @@ class _Pickler:
             return
         self._emit(b"]")
         self._id_memo[id(value)] = self._memoize()
+        # A single-element list uses the plain APPEND opcode; every other size, including a
+        # trailing remainder chunk of exactly 1 item after a full batch, still uses the
+        # MARK-delimited APPENDS form (confirmed against the reference for sizes 1, 2, 999-1002,
+        # 2000-2001).
+        if len(value) == 1:
+            self._save(value[0])
+            self._emit(b"a")
+            return
         for start in range(0, len(value), _BATCH_SIZE):
             chunk = value[start : start + _BATCH_SIZE]
-            if len(chunk) == 1:
-                self._save(chunk[0])
-                self._emit(b"a")
-            else:
-                self._emit(b"(")
-                for item in chunk:
-                    self._save(item)
-                self._emit(b"e")
+            self._emit(b"(")
+            for item in chunk:
+                self._save(item)
+            self._emit(b"e")
 
     def _save_dict(self, value):
         cached = self._id_memo.get(id(value))
@@ -255,19 +295,20 @@ class _Pickler:
         self._emit(b"}")
         self._id_memo[id(value)] = self._memoize()
         items = list(value.items())
+        # Same rule as `_save_list`: only a single-pair dict gets the plain SETITEM opcode.
+        if len(items) == 1:
+            key, val = items[0]
+            self._save(key)
+            self._save(val)
+            self._emit(b"s")
+            return
         for start in range(0, len(items), _BATCH_SIZE):
             chunk = items[start : start + _BATCH_SIZE]
-            if len(chunk) == 1:
-                key, val = chunk[0]
+            self._emit(b"(")
+            for key, val in chunk:
                 self._save(key)
                 self._save(val)
-                self._emit(b"s")
-            else:
-                self._emit(b"(")
-                for key, val in chunk:
-                    self._save(key)
-                    self._save(val)
-                self._emit(b"u")
+            self._emit(b"u")
 
     def _save_global(self, module, name):
         key = (module, name)
@@ -312,7 +353,7 @@ class _Pickler:
             self._emit_get(cached)
             return
         self._save_global("numpy._core.multiarray", "_reconstruct")
-        self._save_tuple((np.ndarray, (0,), b"b"))
+        self._save_tuple((np.ndarray, (0,), _RECONSTRUCT_MODE))
         self._emit(b"R")
         self._id_memo[id(array)] = self._memoize()
         fortran_order = bool(array.flags.f_contiguous) and not bool(array.flags.c_contiguous)
@@ -330,8 +371,8 @@ def _text_length_opcode(short_op, medium_op, long_op, payload):
     if length < 256:
         return short_op + bytes([length]) + payload
     if length < 2**32:
-        return medium_op + length.to_bytes(4, "little") + payload
-    return long_op + length.to_bytes(8, "little") + payload
+        return medium_op + _pack_uint_le(length, 4) + payload
+    return long_op + _pack_uint_le(length, 8) + payload
 
 
 def _dtype_pickle_fields(dtype):
@@ -439,14 +480,14 @@ class _Unpickler:
         elif op == b"K":
             stack.append(reader.read(1)[0])
         elif op == b"M":
-            stack.append(int.from_bytes(reader.read(2), "little"))
+            stack.append(_unpack_uint_le(reader.read(2)))
         elif op == b"J":
-            stack.append(int.from_bytes(reader.read(4), "little", signed=True))
+            stack.append(_unpack_int_le(reader.read(4)))
         elif op == b"\x8a":
             length = reader.read(1)[0]
             stack.append(_long_from_bytes(reader.read(length)))
         elif op == b"\x8b":
-            length = int.from_bytes(reader.read(4), "little")
+            length = _unpack_uint_le(reader.read(4))
             stack.append(_long_from_bytes(reader.read(length)))
         elif op == b"G":
             stack.append(_unpack_be_double(reader.read(8)))
@@ -454,19 +495,19 @@ class _Unpickler:
             length = reader.read(1)[0]
             stack.append(reader.read(length).decode("utf-8"))
         elif op == b"X":
-            length = int.from_bytes(reader.read(4), "little")
+            length = _unpack_uint_le(reader.read(4))
             stack.append(reader.read(length).decode("utf-8"))
         elif op == b"\x8d":
-            length = int.from_bytes(reader.read(8), "little")
+            length = _unpack_uint_le(reader.read(8))
             stack.append(reader.read(length).decode("utf-8"))
         elif op == b"C":
             length = reader.read(1)[0]
             stack.append(bytes(reader.read(length)))
         elif op == b"B":
-            length = int.from_bytes(reader.read(4), "little")
+            length = _unpack_uint_le(reader.read(4))
             stack.append(bytes(reader.read(length)))
         elif op == b"\x8e":
-            length = int.from_bytes(reader.read(8), "little")
+            length = _unpack_uint_le(reader.read(8))
             stack.append(bytes(reader.read(length)))
         elif op == b")":
             stack.append(())
@@ -513,7 +554,7 @@ class _Unpickler:
         elif op == b"h":
             self._push_memo(reader.read(1)[0])
         elif op == b"j":
-            self._push_memo(int.from_bytes(reader.read(4), "little"))
+            self._push_memo(_unpack_uint_le(reader.read(4)))
         elif op == b"c":
             module = reader.read_line().decode("utf-8")
             name = reader.read_line().decode("utf-8")
@@ -578,7 +619,12 @@ def _reconstruct_array(state):
     _version, shape, dtype, fortran_order, data = state
     order = "F" if fortran_order else "C"
     if dtype == np.dtype(object):
-        array = np.array(data, dtype=object)
+        # `np.array(data, dtype=object)` would try to nest same-length elements (a tuple
+        # and a list of matching length look like two rows of a 2-d array to it); filling
+        # a pre-shaped empty array element by element keeps `data` a flat list of objects.
+        array = np.empty(len(data), dtype=object)
+        for index, value in enumerate(data):
+            array[index] = value
     else:
         count = 1
         for dim in shape:

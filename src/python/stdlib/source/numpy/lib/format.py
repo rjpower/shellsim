@@ -11,6 +11,7 @@ a header whose `descr` is a list is rejected explicitly rather than partially su
 import numpy as np
 
 from numpy.lib import _objectpickle
+from numpy.lib._objectpickle import _pack_uint_le, _unpack_uint_le
 
 MAGIC_PREFIX = b"\x93NUMPY"
 ARRAY_ALIGN = 64
@@ -71,7 +72,7 @@ def _write_array_header(fp, d, version):
         _write_array_header(fp, d, (2, 0))
         return
     fp.write(magic(major, minor))
-    fp.write(len(body).to_bytes(length_field, "little"))
+    fp.write(_pack_uint_le(len(body), length_field))
     fp.write(body)
 
 
@@ -171,7 +172,7 @@ def _read_array_header(fp, version, max_header_size=10000):
     raw_length = fp.read(length_field)
     if len(raw_length) != length_field:
         raise ValueError("EOF reading the .npy header length")
-    length = int.from_bytes(raw_length, "little")
+    length = _unpack_uint_le(raw_length)
     if length > max_header_size:
         raise ValueError("array header is too large")
     header = fp.read(length)
