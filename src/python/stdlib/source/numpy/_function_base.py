@@ -1,5 +1,5 @@
 """Whole-array helpers that do not reduce to a single statistic: ``gradient``, ``diff``,
-``angle``, linear ``interp``/``correlate``/``convolve`` (thin wrappers over the native
+``trapezoid``, ``angle``, linear ``interp``/``correlate``/``convolve`` (thin wrappers over the native
 ``_numpy_math`` kernels), and the condition-driven selectors ``select``, ``extract``, ``place``
 and ``putmask``.
 """
@@ -21,6 +21,7 @@ __all__ = [
     "polyval",
     "putmask",
     "select",
+    "trapezoid",
     "vecdot",
 ]
 
@@ -63,6 +64,33 @@ def diff(a, n=1, axis=-1, prepend=None, append=None):
         upper_part, lower_part = a[tuple(upper)], a[tuple(lower)]
         a = (upper_part != lower_part) if a.dtype == np.bool_ else (upper_part - lower_part)
     return a
+
+
+def trapezoid(y, x=None, dx=1.0, axis=-1):
+    """The integral of `y` along `axis` by the trapezoidal rule, over sample points `x` or a
+    uniform spacing `dx`.
+
+    Interval ``i`` contributes ``d[i] * (y[i + 1] + y[i]) / 2.0`` and the contributions are
+    summed along `axis`. A 1-D `x` spaces that axis; an `x` of more dimensions is differenced
+    along `axis` and broadcasts against `y`, as `dx` does.
+    """
+    y = np.asanyarray(y)
+    if x is None:
+        d = dx
+    else:
+        x = np.asanyarray(x)
+        if x.ndim == 1:
+            d = np.diff(x)
+            shape = [1] * y.ndim
+            shape[axis] = d.shape[0]
+            d = d.reshape(shape)
+        else:
+            d = np.diff(x, axis=axis)
+    upper = [slice(None)] * y.ndim
+    lower = [slice(None)] * y.ndim
+    upper[axis] = slice(1, None)
+    lower[axis] = slice(None, -1)
+    return (d * (y[tuple(upper)] + y[tuple(lower)]) / 2.0).sum(axis)
 
 
 def gradient(f, *varargs, axis=None, edge_order=1):

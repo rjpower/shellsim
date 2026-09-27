@@ -453,3 +453,35 @@ def test_cumulative_sum_and_prod_can_include_the_identity():
 def test_cumulative_sum_requires_an_axis_for_multidimensional_input():
     with pytest.raises(ValueError, match="``axis`` argument is required"):
         np.cumulative_sum(np.ones((2, 2)))
+
+
+def test_trapezoid_integrates_with_uniform_and_sampled_spacing():
+    assert np.trapezoid([1, 2, 3]) == 4.0
+    assert np.trapezoid([1, 2, 3], dx=0.5) == 2.0
+    assert np.trapezoid([1, 2, 3], x=[0, 1, 3]) == 6.5
+    assert type(np.trapezoid([1, 2, 3])) is np.float64
+    assert np.trapezoid([]) == 0.0
+    assert np.trapezoid([5]) == 0.0
+
+
+def test_trapezoid_along_axes_with_one_and_two_dimensional_samples():
+    y = np.array([[1, 2, 3], [4, 5, 6]])
+    assert np.trapezoid(y).tolist() == [4.0, 10.0]
+    assert np.trapezoid(y, axis=0).tolist() == [2.5, 3.5, 4.5]
+    assert np.trapezoid(y, x=[0, 1, 4]).tolist() == [9.0, 21.0]
+    assert np.trapezoid(y, x=[[0, 1, 4], [0, 2, 3]]).tolist() == [9.0, 14.5]
+    assert np.trapezoid(y, x=[0, 2], axis=0).tolist() == [5.0, 7.0, 9.0]
+    assert np.trapezoid(np.ones((2, 3, 4)), axis=1).shape == (2, 4)
+
+
+def test_trapezoid_keeps_float32_and_complex_results():
+    single = np.trapezoid(np.array([1, 2, 3], dtype=np.float32))
+    assert single.dtype == np.float32 and single == 4.0
+    assert np.trapezoid([1 + 1j, 2, 3j]) == 2.5 + 2j
+
+
+def test_trapezoid_rejects_mismatched_samples():
+    with pytest.raises(ValueError, match="could not be broadcast"):
+        np.trapezoid([1, 2, 3], x=[1, 2, 3, 4])
+    with pytest.raises(IndexError):
+        np.trapezoid(3)

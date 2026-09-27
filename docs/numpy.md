@@ -130,9 +130,9 @@ differences, the unsupported frontier, and resource limits.
   and `@`, `tensordot`, and `numpy.linalg` for real arrays: `inv`, `solve`, `det`, `slogdet`,
   `eigh`, `eigvalsh`, `svd`, `qr`, `cholesky`, `lstsq`, `pinv`, `matrix_rank`, `matrix_power` and
   `norm`.
-- **Whole-array helpers.** `diff`, `gradient`, `interp`, `convolve`, `correlate`, `angle`,
-  `polyfit` and `polyval` (least-squares fit and Horner evaluation, not the `numpy.polynomial`
-  package, which is absent).
+- **Whole-array helpers.** `diff`, `gradient`, `interp`, `trapezoid`, `convolve`, `correlate`,
+  `angle`, `polyfit` and `polyval` (least-squares fit and Horner evaluation, not the
+  `numpy.polynomial` package, which is absent).
 - **FFT.** `numpy.fft`: `fft`, `ifft`, `rfft`, `irfft`, `hfft`, `ihfft`, their two- and
   n-dimensional forms (`fft2`, `fftn`, `rfft2`, `rfftn`, ...), `fftfreq`, `rfftfreq`,
   `fftshift`, and `ifftshift`, with `n`/`s`, `axis`/`axes`, `norm`, and `out`. Every transform
