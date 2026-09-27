@@ -117,4 +117,5 @@ suites!(numpy, "numpy", {
 
 suites!(scipy, "scipy", {
     special => "test_special.py";
+    stats => "test_stats.py";
 });

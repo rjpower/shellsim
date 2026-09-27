@@ -41,6 +41,31 @@ fn unsupported_scipy_features_fail_explicitly() {
             "import scipy.sparse",
             "NotImplementedError: scipy.sparse is not supported by shellsim's SciPy",
         ),
+        // Generic fitting and moments need scipy.optimize and scipy.integrate.
+        (
+            "from scipy import stats\nstats.t.fit([1.0, 2.0])",
+            "NotImplementedError: scipy.optimize is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy import stats\nstats.t.moment(5, 7)",
+            "NotImplementedError: scipy.integrate is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy import stats\nstats.rv_discrete(values=([1, 2], [0.5, 0.5]))",
+            "rv_discrete(values=...) is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy import stats\nstats.gamma",
+            "NotImplementedError: scipy.stats.gamma is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy import stats\nstats.describe([1, np.nan], nan_policy='omit')",
+            "describe(..., nan_policy='omit') with NaN input is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy import stats\nstats.chi2_contingency([[1, 2], [3, 4]], method=1)",
+            "chi2_contingency(..., method=...) is not supported by shellsim's SciPy",
+        ),
     ] {
         let (status, stderr) = run(Limits::default().cpu, source);
         assert_ne!(status, 0, "{source} unexpectedly succeeded");

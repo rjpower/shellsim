@@ -1,7 +1,8 @@
 """shellsim's SciPy.
 
-Submodules load on first access, as in SciPy. ``scipy.special`` is implemented; the other
-SciPy submodules raise ``NotImplementedError`` on import. The behavior targets SciPy 1.18.
+Submodules load on first access, as in SciPy. ``scipy.special`` and ``scipy.stats`` are
+implemented; the other SciPy submodules raise ``NotImplementedError`` on import. The behavior
+targets SciPy 1.18.
 """
 
 __version__ = "1.18.1"

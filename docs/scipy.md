@@ -1,8 +1,9 @@
 # SciPy in shellsim
 
-shellsim ships `scipy.special` for simulated Python programs. It targets the observable behavior
-of SciPy 1.18.1 with NumPy 2.5.3: values, result dtypes, error types and messages, and warnings.
-It never runs host SciPy. The other SciPy subpackages raise `NotImplementedError` when imported.
+shellsim ships `scipy.special` and `scipy.stats` for simulated Python programs. It targets the
+observable behavior of SciPy 1.18.1 with NumPy 2.5.3: values, result dtypes, error types and
+messages, and warnings. It never runs host SciPy. The other SciPy subpackages raise
+`NotImplementedError` when imported.
 
 ## Architecture
 
@@ -21,6 +22,14 @@ It never runs host SciPy. The other SciPy subpackages raise `NotImplementedError
   holds every ufunc, including the private `_binom_pmf`, `_binom_cdf`, `_binom_sf`, `_binom_ppf`
   and `_binom_isf` that `scipy.stats` calls. The `scipy` package loads subpackages on first
   access, as SciPy does.
+- **`scipy.stats`** is frozen Python ported from SciPy's own modules: the `rv_continuous` and
+  `rv_discrete` framework, `_axis_nan_policy`, `_stats_py`, `_entropy` and `contingency`,
+  computing with NumPy and `scipy.special`. SciPy writes the statistics against the array API;
+  the port keeps their NumPy branch. SciPy uses `inspect` to find a distribution's shape
+  parameters from the signatures of `_pdf` and `_cdf`, and to add `axis`, `nan_policy` and
+  `keepdims` to its statistics. shellsim has no `inspect`, so the port reads parameters through
+  a private module, `_shellsim_introspect`, and each statistic declares SciPy's full signature
+  itself.
 
 ### Loop selection
 
@@ -52,6 +61,21 @@ them. Domain errors return NaN and poles return infinities.
   `entr`, `rel_entr`, `kl_div`.
 - **Other.** `expm1`, `log1p`, `boxcox`, `inv_boxcox`, `comb`, `perm`, `factorial`,
   `factorial2`, `factorialk`, `logsumexp`, `softmax`, `log_softmax`.
+- **Distributions (`scipy.stats`).** `norm`, `t`, `chi2`, `f`, `uniform`, `expon`, `binom` and
+  `poisson`, and user subclasses of `rv_continuous` and `rv_discrete`. They provide densities or
+  mass functions, distribution and survival functions, their inverses and logarithms, `stats`,
+  `moment`, `entropy`, `median`, `mean`, `var`, `std`, `interval`, `support`, `nnlf`, `rvs`
+  from NumPy's seeded streams, and frozen distributions. `norm`, `uniform` and `expon` fit by
+  their closed-form estimates, and discrete `expect` sums its series as SciPy's does.
+- **Statistics (`scipy.stats`).** `describe`, `moment`, `skew`, `kurtosis`, `mode`, `sem`,
+  `zscore`, `zmap`, `trim_mean`, `rankdata` and `entropy`, with `axis`, `nan_policy` and
+  `keepdims` where SciPy accepts them.
+- **Correlation and tests (`scipy.stats`).** `pearsonr`, `spearmanr`, `linregress`,
+  `ttest_1samp`, `ttest_ind`, `ttest_ind_from_stats`, `ttest_rel`, `chisquare`,
+  `power_divergence`, and `chi2_contingency` with the rest of `scipy.stats.contingency`
+  (`margins`, `expected_freq` and `association`). Results carry SciPy's attributes, the
+  `pearsonr` and t-test results provide `confidence_interval`, and warnings use SciPy's
+  categories and messages.
 
 ## Compatibility contract
 
@@ -88,7 +112,14 @@ their Boost-based results can differ from shellsim's and from each other in the 
 - **`betaincc` in extended precision.** SciPy calls Boost's `ibetac` with Boost's default
   policy, which on x86-64 computes in 80-bit `long double`. shellsim computes Boost's algorithm
   in double precision, so most results differ in the last place, and results below about
-  `1e-280` lose up to half their digits or underflow to zero where SciPy's do not.
+  `1e-280` lose up to half their digits or underflow to zero where SciPy's do not. The
+  `pearsonr` p-value goes through `betaincc`, so it can differ from SciPy's in the last place.
+- **`scipy.stats` result objects** unpack, index and compare like SciPy's named tuples, but
+  they are not `tuple` instances, because shellsim cannot subclass `tuple`.
+- **`scipy.stats` warning locations.** Each statistic calls its axis and NaN handling from a
+  thin wrapper instead of a decorator, so a warning whose `stacklevel` SciPy chose for its
+  decorated call, such as the precision-loss `RuntimeWarning` from `skew`, is attributed one
+  frame deeper than in SciPy.
 
 ## Unsupported frontier
 
@@ -100,9 +131,19 @@ These fail explicitly with shellsim's unsupported-operation error or `NotImpleme
 - `reduce` and `accumulate` of `scipy.special` ufuncs;
 - complex `n` in `factorial`, `factorial2` and `factorialk` with `extend="complex"`, which
   reaches the unsupported complex `gamma`;
-- importing any subpackage other than `scipy.special`.
+- `nan_policy='omit'` with NaN input in `describe` and `spearmanr`, which SciPy computes with
+  masked arrays;
+- the resampling `method` objects (`PermutationMethod`, `MonteCarloMethod` and
+  `BootstrapMethod`) and `chi2_contingency(..., method=...)`;
+- `rv_discrete(values=...)`, which needs `__new__` to return a different class;
+- distribution methods that SciPy computes by numerical integration or root finding, such as
+  the generic `fit`, continuous `expect`, and `moment` orders beyond those `stats` provides.
+  They import `scipy.integrate` or `scipy.optimize` when called and fail there;
+- the other names in SciPy's `scipy.stats.__all__`, such as `gamma` or `mannwhitneyu`;
+- importing any subpackage other than `scipy.special` and `scipy.stats`.
 
-Other `scipy.special` functions are absent, so accessing them raises `AttributeError`.
+Other `scipy.special` functions and `scipy.stats` names are absent, so accessing them raises
+`AttributeError`.
 
 ## Safety and accounting
 
@@ -116,3 +157,6 @@ the work done and evaluates the element again with twice the allowance. Work per
 therefore bounded by the CPU limit rather than by a fixed cap. Kernels are pure functions, so a
 repeated evaluation gives the same result, and the repeated work is at most the work of the
 final evaluation.
+
+`scipy.stats` is Python code over NumPy and `scipy.special`, so the interpreter and those
+kernels meter its work.
