@@ -1,227 +1,148 @@
-//! Native kernels behind NumPy's Python-level math helpers: `interp` (NumPy's
-//! `compiled_interp`), `correlate` and `convolve` (`correlate2` and `correlate`), and
-//! `divmod`. The Python wrappers live in `numpy/_function_base.py`, as in NumPy.
+//! Native kernels for `numpy._function_base` and a few standalone math functions: piecewise
+//! linear interpolation (`_compiled_interp`/`_compiled_interp_complex`, backing `numpy.interp`),
+//! cross-correlation (`_correlate`, backing `numpy.correlate`/`numpy.convolve`), `divmod`,
+//! `round`/`around`, and `clip`.
 //!
-//! Functions are exported through the native module `_numpy_math`, which the frozen `numpy`
-//! package re-exports.
+//! Interpolation and correlation compute in a fixed working precision (`float64`, or
+//! `complex128` when the samples are complex) regardless of the input dtype, then the result is
+//! cast back: interpolation always produces `float64`/`complex128` (matching NumPy), while
+//! correlation and convolution cast back to the NEP 50 promotion of the two operand dtypes
+//! (matching NumPy's own dtype-preserving behavior). The `float64` working precision means
+//! integer correlation/convolution of values outside the 53-bit exactly-representable range may
+//! round differently than NumPy's native-width accumulation; this module does not special-case
+//! that.
+//!
+//! `round` and `clip` operate through existing machinery instead of a bespoke loop: `round`
+//! reads and writes one generic [`element::Number`] per element (so it preserves any numeric
+//! dtype without per-dtype dispatch), and `clip(a, lo, hi)` is exactly `minimum(maximum(a, lo),
+//! hi)` through the `maximum`/`minimum` ufuncs, which already implement NumPy's broadcasting,
+//! promotion, and `NaN` propagation.
 
 use super::super::super::native::{
-    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeFn, NativeTypeDef, PyArrayBuffer, PyError,
-    PyResult, PyRuntime, PyValue,
+    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyArrayBuffer, PyArrayData,
+    PyError, PyNativeKind, PyResult, PyRuntime, PyValue,
 };
+use super::super::super::number::NumberRef;
 use super::args::{self, Signature};
 use super::array::{self, Array};
 use super::convert;
-use super::dtype::{self, Category, DType, Kind};
-use super::element::{self, Complex, Element, Number, F16};
-use super::ops::{FpFlags, Numeric};
+use super::dtype::{self, Category, DType};
+use super::element::{self, Number, C128};
+use super::ops;
+use super::ufunc;
 
-pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
-    name: "_numpy_math",
-    functions: FUNCTIONS,
-    values: &[],
-};
+// ---------------------------------------------------------------------------------------------
+// interp
+// ---------------------------------------------------------------------------------------------
 
-static FUNCTIONS: &[FunctionDef] = &[
-    function("divmod", divmod),
-    function("_compiled_interp", compiled_interp),
-    function("_compiled_interp_complex", compiled_interp_complex),
-    function("_correlate", correlate),
-];
-
-const fn function(name: &'static str, call: NativeFn) -> FunctionDef {
-    FunctionDef {
-        module: "numpy",
-        name,
-        call,
-    }
+/// Where `x` falls among sorted sample points `xp`, found by bisection (`O(log xp.len())`, the
+/// per-point cost [`charge_interp`] charges for).
+enum Position {
+    /// `x` is `NaN`; the result is `NaN` regardless of the samples.
+    Nan,
+    /// `x < xp[0]`.
+    Below,
+    /// `x > xp[last]`.
+    Above,
+    /// `x == xp[index]`, and `index` is the last sample point (so there is no `index + 1` to
+    /// interpolate toward).
+    Exact(usize),
+    /// `x` is strictly between `xp[index]` and `xp[index + 1]`, `fraction` of the way across
+    /// (`0` at `xp[index]`); this also covers an exact match at any `index` other than the
+    /// last, since `fraction` is then exactly `0`.
+    Interval(usize, f64),
 }
 
-fn divmod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    super::ufunc::call_divmod(runtime, args)
-}
-
-/// Index `j` with `xp[j] <= key < xp[j + 1]`, or `-1` below the range and `len` above it,
-/// using NumPy's `binary_search_with_guess`. The guess, the previous result, makes sorted
-/// queries cheap; for unsorted `xp` the path it takes decides the answer, so it is ported
-/// exactly.
-fn search_with_guess(key: f64, xp: &[f64], guess: isize) -> isize {
-    const LIKELY_IN_CACHE_SIZE: isize = 8;
-    let len = xp.len() as isize;
-    let at = |index: isize| xp[index as usize];
-    if key > at(len - 1) {
-        return len;
+/// Locate `x` among sorted `xp`. On a tie, [`Position::Interval`]'s `index` is the *last*
+/// matching sample: `xp.partition_point` counts every `xp[i] <= x` from the left, so subtracting
+/// one lands on the rightmost equal element. This matches NumPy's own tie-break, confirmed
+/// black-box: `np.interp(2.0, [1, 2, 2, 3], [3, 2, 5, 0])` is `5.0`, `fp` at the second `2`, not
+/// the first.
+fn locate(xp: &[f64], x: f64) -> Position {
+    if x.is_nan() {
+        return Position::Nan;
     }
-    if key < at(0) {
-        return -1;
+    let last = xp.len() - 1;
+    if x < xp[0] {
+        return Position::Below;
     }
-    if len <= 4 {
-        let mut index = 1;
-        while index < len && key >= at(index) {
-            index += 1;
-        }
-        return index - 1;
+    if x > xp[last] {
+        return Position::Above;
     }
-    let guess = guess.min(len - 3).max(1);
-    let (mut low, mut high) = (0, len);
-    if key < at(guess) {
-        if key < at(guess - 1) {
-            high = guess - 1;
-            if guess > LIKELY_IN_CACHE_SIZE && key >= at(guess - LIKELY_IN_CACHE_SIZE) {
-                low = guess - LIKELY_IN_CACHE_SIZE;
-            }
-        } else {
-            return guess - 1;
-        }
-    } else if key < at(guess + 1) {
-        return guess;
-    } else if key < at(guess + 2) {
-        return guess + 1;
+    let index = xp.partition_point(|&sample| sample <= x) - 1;
+    if index == last {
+        Position::Exact(index)
     } else {
-        low = guess + 2;
-        if guess < len - LIKELY_IN_CACHE_SIZE - 1 && key < at(guess + LIKELY_IN_CACHE_SIZE) {
-            high = guess + LIKELY_IN_CACHE_SIZE;
-        }
+        let fraction = (x - xp[index]) / (xp[index + 1] - xp[index]);
+        Position::Interval(index, fraction)
     }
-    while low < high {
-        let middle = low + ((high - low) >> 1);
-        if key >= at(middle) {
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-    low - 1
 }
 
-/// The values one interpolation reads: `x` as float64 in C order with its shape, and `xp` as a
-/// contiguous float64 vector. `fp` is converted by the caller.
-struct Samples {
-    x: Vec<f64>,
-    shape: Vec<usize>,
-    xp: Vec<f64>,
+/// Charge CPU for one `interp` call in proportion to `x.len() * log2(xp.len())`, before the
+/// bisection loop runs.
+fn charge_interp(runtime: &mut dyn PyRuntime, x_len: usize, xp_len: usize) -> PyResult<()> {
+    let log_xp = xp_len.max(2).ilog2() as u64 + 1;
+    runtime.charge_cpu((x_len as u64).saturating_mul(log_xp) + 1)
 }
 
-/// Convert `x` and `xp` as `PyArray_ContiguousFromAny(..., NPY_DOUBLE)` does, checking that
-/// `xp` and `fp` are 1-d and of equal length.
-fn samples(runtime: &mut dyn PyRuntime, bound: &args::Bound, fp: &Array) -> PyResult<Samples> {
-    let xp = one_dimensional(runtime, bound.required("xp"), DType::FLOAT64)?;
-    let x = convert::array_from_python(runtime, bound.required("x"), Some(DType::FLOAT64), false)?;
-    let shape = x.shape().to_vec();
-    let x = array::read_elements::<f64>(runtime, &x)?;
-    let xp = array::read_elements::<f64>(runtime, &xp)?;
-    if xp.is_empty() && !x.is_empty() {
-        return Err(PyError::value_error("array of sample points is empty"));
-    }
-    if fp.size() != xp.len() {
-        return Err(PyError::value_error(
-            "fp and xp are not of the same length.",
-        ));
-    }
-    Ok(Samples { x, shape, xp })
-}
-
-/// A value converted to a 1-d array of `dtype`, with NumPy's depth errors.
+/// `xp`/`fp` as one-dimensional, equal-length, nonempty arrays, with NumPy's error text for
+/// each way they can fail (confirmed black-box against the reference interpreter).
+/// A one-dimensional array converted to `dtype`, with NumPy's "expected 1-D" error text: the
+/// short "object of too small depth for desired array" for a 0-d value, and — for a value of
+/// rank two or more — either "object too deep for desired array" when the value was already an
+/// ndarray, or the longer "setting an array element with a sequence..." message when it was not
+/// (a list of lists, for example). Both phrasings were confirmed black-box against the
+/// reference interpreter. `sort::bincount`'s `weights=` needs exactly this validation, so it is
+/// exposed from here rather than duplicated.
 pub(in crate::python) fn one_dimensional(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
     dtype: DType,
 ) -> PyResult<Array> {
-    let array = convert::array_from_python(runtime, value, Some(dtype), false)?;
+    let is_array = runtime.native_kind(&value)? == Some(PyNativeKind::Array);
+    let array = convert::as_array(runtime, value)?;
     match array.ndim() {
-        0 => Err(PyError::value_error(
-            "object of too small depth for desired array",
-        )),
-        1 => Ok(array),
-        _ => Err(PyError::value_error("object too deep for desired array")),
+        0 => {
+            return Err(PyError::value_error(
+                "object of too small depth for desired array",
+            ))
+        }
+        1 => {}
+        _ if is_array => return Err(PyError::value_error("object too deep for desired array")),
+        _ => {
+            return Err(PyError::value_error(
+                "setting an array element with a sequence. The requested array would exceed \
+                 the maximum number of dimension of 1.",
+            ))
+        }
     }
+    convert::cast_array(runtime, &array, dtype, false)
 }
 
-static INTERP: Signature = Signature::new("interp", &["x", "xp", "fp", "left", "right"], 3);
-
-/// A float64 result with `x`'s shape; a 0-d result is a scalar, as `PyArray_Return` gives.
-fn interp_result<T: Element>(
+/// `xp`/`fp` as one-dimensional, equal-length, nonempty arrays. `xp` is cast to `float64`;
+/// `fp`'s dtype is left to the caller, which knows whether it wants a real or complex working
+/// precision.
+fn validate_samples(
     runtime: &mut dyn PyRuntime,
-    dtype: DType,
-    shape: Vec<usize>,
-    values: &[T],
-) -> PyResult {
-    let result = array::array_from_elements(runtime, dtype, shape, values)?;
-    if result.ndim() == 0 {
-        return convert::element_to_scalar(runtime, &result, result.view.offset);
+    xp_value: PyValue,
+    fp_value: PyValue,
+) -> PyResult<(Array, Array)> {
+    let fp = convert::as_array(runtime, fp_value)?;
+    let xp = one_dimensional(runtime, xp_value, DType::FLOAT64)?;
+    if xp.size() == 0 {
+        return Err(PyError::value_error("array of sample points is empty"));
     }
-    Ok(result.value())
+    if xp.size() != fp.size() {
+        return Err(PyError::value_error(
+            "fp and xp are not of the same length.",
+        ));
+    }
+    Ok((xp, fp))
 }
 
-/// `numpy._core.multiarray.interp(x, xp, fp, left=None, right=None)`: NumPy's `arr_interp`.
-fn compiled_interp(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let bound = INTERP.bind(&args)?;
-    let fp = one_dimensional(runtime, bound.required("fp"), DType::FLOAT64)?;
-    let Samples { x, shape, xp } = samples(runtime, &bound, &fp)?;
-    let fp = array::read_elements::<f64>(runtime, &fp)?;
-    if x.is_empty() {
-        return interp_result::<f64>(runtime, DType::FLOAT64, shape, &[]);
-    }
-    let fill = |runtime: &mut dyn PyRuntime, name: &str, default: f64| match bound.value(name) {
-        Some(value) => args::float_arg(runtime, &value),
-        None => Ok(default),
-    };
-    let left = fill(runtime, "left", fp[0])?;
-    let right = fill(runtime, "right", fp[fp.len() - 1])?;
-    runtime.charge_cpu((x.len() as u64).saturating_mul(4) + xp.len() as u64)?;
-    runtime.reserve_memory(x.len().saturating_mul(8))?;
-    let result = if xp.len() == 1 {
-        x.iter()
-            .map(|&value| {
-                if value < xp[0] {
-                    left
-                } else if value > xp[0] {
-                    right
-                } else {
-                    fp[0]
-                }
-            })
-            .collect::<Vec<_>>()
-    } else {
-        let slope = |j: usize| (fp[j + 1] - fp[j]) / (xp[j + 1] - xp[j]);
-        let mut guess = 0isize;
-        x.iter()
-            .map(|&value| {
-                if value.is_nan() {
-                    return value;
-                }
-                guess = search_with_guess(value, &xp, guess);
-                let last = xp.len() as isize - 1;
-                if guess == -1 {
-                    return left;
-                }
-                if guess > last {
-                    return right;
-                }
-                let j = guess as usize;
-                if guess == last || xp[j] == value {
-                    return fp[j];
-                }
-                let slope = slope(j);
-                // If one direction gives NaN, NumPy tries the other.
-                let mut result = slope * (value - xp[j]) + fp[j];
-                if result.is_nan() {
-                    result = slope * (value - xp[j + 1]) + fp[j + 1];
-                    if result.is_nan() && fp[j] == fp[j + 1] {
-                        result = fp[j];
-                    }
-                }
-                result
-            })
-            .collect()
-    };
-    interp_result(runtime, DType::FLOAT64, shape, &result)
-}
-
-/// A `left=` or `right=` fill for complex interpolation, as `PyComplex_RealAsDouble` and
-/// `PyComplex_ImagAsDouble` read it.
+/// A real or complex scalar argument (`left`/`right`), accepting a bare Python number or a
+/// NumPy scalar of either kind.
 fn complex_arg(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<(f64, f64)> {
-    use super::super::super::number::NumberRef;
     if let Some((_, number)) = super::scalar::unbox_number(runtime, value) {
         return Ok(number.as_complex());
     }
@@ -231,325 +152,502 @@ fn complex_arg(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<(f64, f
     Ok((args::float_arg(runtime, value)?, 0.0))
 }
 
-/// `numpy._core.multiarray.interp_complex`: `arr_interp_complex`, which scales by the inverse
-/// of each interval rather than dividing.
-fn compiled_interp_complex(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let bound = INTERP.bind(&args)?;
-    let fp = one_dimensional(runtime, bound.required("fp"), DType::COMPLEX128)?;
-    let Samples { x, shape, xp } = samples(runtime, &bound, &fp)?;
-    let fp = array::read_elements::<element::C128>(runtime, &fp)?;
-    if x.is_empty() {
-        return interp_result::<element::C128>(runtime, DType::COMPLEX128, shape, &[]);
-    }
-    let (left, right) = (bound.value("left"), bound.value("right"));
-    let left = match left {
-        Some(value) => complex_arg(runtime, &value)?,
-        None => (fp[0].re, fp[0].im),
-    };
-    let right = match right {
-        Some(value) => complex_arg(runtime, &value)?,
-        None => (fp[fp.len() - 1].re, fp[fp.len() - 1].im),
-    };
-    let (left, right) = (
-        Complex {
-            re: left.0,
-            im: left.1,
-        },
-        Complex {
-            re: right.0,
-            im: right.1,
-        },
-    );
-    runtime.charge_cpu((x.len() as u64).saturating_mul(8) + xp.len() as u64)?;
-    runtime.reserve_memory(x.len().saturating_mul(16))?;
-    // One part of the interpolated value, retried from the right end when it is NaN.
-    let part = |slope: f64, value: f64, j: usize, low: f64, high: f64| {
-        let mut result = slope * (value - xp[j]) + low;
-        if result.is_nan() {
-            result = slope * (value - xp[j + 1]) + high;
-            if result.is_nan() && low == high {
-                result = low;
-            }
-        }
-        result
-    };
-    let result = if xp.len() == 1 {
-        x.iter()
-            .map(|&value| {
-                if value < xp[0] {
-                    left
-                } else if value > xp[0] {
-                    right
-                } else {
-                    fp[0]
-                }
-            })
-            .collect::<Vec<_>>()
+/// The scalar or array `result` boxed the way NumPy returns it: a NumPy scalar for a 0-d
+/// result, the array itself otherwise.
+fn finish_array(runtime: &mut dyn PyRuntime, result: Array) -> PyResult {
+    if result.ndim() == 0 {
+        convert::element_to_scalar(runtime, &result, result.view.offset)
     } else {
-        let mut guess = 0isize;
-        x.iter()
-            .map(|&value| {
-                if value.is_nan() {
-                    return Complex { re: value, im: 0.0 };
-                }
-                guess = search_with_guess(value, &xp, guess);
-                let last = xp.len() as isize - 1;
-                if guess == -1 {
-                    return left;
-                }
-                if guess > last {
-                    return right;
-                }
-                let j = guess as usize;
-                if guess == last || xp[j] == value {
-                    return fp[j];
-                }
-                let inverse = 1.0 / (xp[j + 1] - xp[j]);
-                let slope_re = (fp[j + 1].re - fp[j].re) * inverse;
-                let slope_im = (fp[j + 1].im - fp[j].im) * inverse;
-                Complex {
-                    re: part(slope_re, value, j, fp[j].re, fp[j + 1].re),
-                    im: part(slope_im, value, j, fp[j].im, fp[j + 1].im),
-                }
-            })
-            .collect()
-    };
-    interp_result(runtime, DType::COMPLEX128, shape, &result)
+        Ok(result.value())
+    }
 }
 
-/// A correlation mode, as `PyArray_CorrelatemodeConverter` parses it.
-#[derive(Clone, Copy)]
-enum Mode {
-    Valid,
-    Same,
-    Full,
-}
+/// `_compiled_interp(x, xp, fp, left, right)`: `numpy.interp` for real `fp`. Always computes
+/// and returns `float64`, matching NumPy (confirmed black-box: a `float32` `x` or an integer
+/// `fp` still interpolates to `float64`).
+fn interp_real(
+    runtime: &mut dyn PyRuntime,
+    x_value: PyValue,
+    xp_value: PyValue,
+    fp_value: PyValue,
+    left: Option<PyValue>,
+    right: Option<PyValue>,
+) -> PyResult {
+    let (xp, fp) = validate_samples(runtime, xp_value, fp_value)?;
+    let fp64 = convert::cast_array(runtime, &fp, DType::FLOAT64, false)?;
+    let xp_values = array::read_elements::<f64>(runtime, &xp)?;
+    let fp_values = array::read_elements::<f64>(runtime, &fp64)?;
+    let left = left
+        .map(|value| args::float_arg(runtime, &value))
+        .transpose()?;
+    let right = right
+        .map(|value| args::float_arg(runtime, &value))
+        .transpose()?;
 
-fn correlate_mode(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Mode> {
-    if let Some(text) = runtime.string_value(value)? {
-        let mode = match text.chars().next() {
-            Some('v' | 'V') => (Mode::Valid, "valid"),
-            Some('s' | 'S') => (Mode::Same, "same"),
-            Some('f' | 'F') => (Mode::Full, "full"),
-            _ => {
-                return Err(PyError::value_error(format!(
-                    "mode must be one of 'valid', 'same', or 'full' (got {})",
-                    runtime.repr(value)?
-                )))
+    let x = convert::as_array(runtime, x_value)?;
+    let x64 = convert::cast_array(runtime, &x, DType::FLOAT64, false)?;
+    let x_values = array::read_elements::<f64>(runtime, &x64)?;
+
+    charge_interp(runtime, x_values.len(), xp_values.len())?;
+    array::reserve_elements(runtime, DType::FLOAT64, x_values.len())?;
+
+    let last = xp_values.len() - 1;
+    let output = x_values
+        .iter()
+        .map(|&value| match locate(&xp_values, value) {
+            Position::Nan => f64::NAN,
+            Position::Below => left.unwrap_or(fp_values[0]),
+            Position::Above => right.unwrap_or(fp_values[last]),
+            Position::Exact(index) => fp_values[index],
+            Position::Interval(index, fraction) => {
+                fp_values[index] + fraction * (fp_values[index + 1] - fp_values[index])
             }
-        };
-        if text != mode.1 {
-            return Err(PyError::value_error(
-                "Use one of 'valid', 'same', or 'full' for convolve/correlate mode",
-            ));
-        }
-        return Ok(mode.0);
-    }
-    let number = runtime
-        .int_value(value)
-        .ok_or_else(|| PyError::type_error("convolve/correlate mode not understood"))?;
-    match number {
-        0 => Ok(Mode::Valid),
-        1 => Ok(Mode::Same),
-        2 => Ok(Mode::Full),
-        _ => Err(PyError::value_error(
-            "integer convolve/correlate mode must be 0, 1, or 2",
-        )),
-    }
+        })
+        .collect::<Vec<_>>();
+
+    let result =
+        array::array_from_elements(runtime, DType::FLOAT64, x64.shape().to_vec(), &output)?;
+    finish_array(runtime, result)
 }
 
-/// NumPy's `@name@_dot` loops: a sequential sum of products from zero, in the dtype's own
-/// arithmetic. NumPy hands long float dot products to BLAS, whose summation order depends on
-/// the host CPU, so results over many float terms can differ from NumPy in the last bits.
-fn dot<T: Numeric>(a: &[T], b: &[T]) -> T {
-    let mut flags = FpFlags::default();
-    a.iter().zip(b).fold(T::zero(), |sum, (x, y)| {
-        sum.add(x.multiply(*y, &mut flags), &mut flags)
-    })
+/// `_compiled_interp_complex(x, xp, fp, left, right)`: `numpy.interp` for complex `fp`. The
+/// real and imaginary parts interpolate independently at the same `x` position; always computes
+/// and returns `complex128`.
+fn interp_complex(
+    runtime: &mut dyn PyRuntime,
+    x_value: PyValue,
+    xp_value: PyValue,
+    fp_value: PyValue,
+    left: Option<PyValue>,
+    right: Option<PyValue>,
+) -> PyResult {
+    let (xp, fp) = validate_samples(runtime, xp_value, fp_value)?;
+    let fp128 = convert::cast_array(runtime, &fp, DType::COMPLEX128, false)?;
+    let xp_values = array::read_elements::<f64>(runtime, &xp)?;
+    let fp_values = array::read_elements::<C128>(runtime, &fp128)?
+        .into_iter()
+        .map(|value| (value.re, value.im))
+        .collect::<Vec<_>>();
+    let left = left.map(|value| complex_arg(runtime, &value)).transpose()?;
+    let right = right
+        .map(|value| complex_arg(runtime, &value))
+        .transpose()?;
+
+    let x = convert::as_array(runtime, x_value)?;
+    let x64 = convert::cast_array(runtime, &x, DType::FLOAT64, false)?;
+    let x_values = array::read_elements::<f64>(runtime, &x64)?;
+
+    charge_interp(runtime, x_values.len(), xp_values.len())?;
+    array::reserve_elements(runtime, DType::COMPLEX128, x_values.len())?;
+
+    let last = xp_values.len() - 1;
+    let output = x_values
+        .iter()
+        .map(|&value| {
+            let (re, im) = match locate(&xp_values, value) {
+                Position::Nan => (f64::NAN, f64::NAN),
+                Position::Below => left.unwrap_or(fp_values[0]),
+                Position::Above => right.unwrap_or(fp_values[last]),
+                Position::Exact(index) => fp_values[index],
+                Position::Interval(index, fraction) => (
+                    fp_values[index].0 + fraction * (fp_values[index + 1].0 - fp_values[index].0),
+                    fp_values[index].1 + fraction * (fp_values[index + 1].1 - fp_values[index].1),
+                ),
+            };
+            C128 { re, im }
+        })
+        .collect::<Vec<_>>();
+
+    let result =
+        array::array_from_elements(runtime, DType::COMPLEX128, x64.shape().to_vec(), &output)?;
+    finish_array(runtime, result)
 }
 
-/// `HALF_dot` accumulates in single precision and rounds once at the end.
-fn half_dot(a: &[F16], b: &[F16]) -> F16 {
-    F16::from_f32(
-        a.iter()
-            .zip(b)
-            .fold(0f32, |sum, (x, y)| sum + x.to_f32() * y.to_f32()),
+fn module_compiled_interp(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature =
+        Signature::new("_compiled_interp", &["x", "xp", "fp", "left", "right"], 5);
+    let bound = SIGNATURE.bind(&args)?;
+    interp_real(
+        runtime,
+        bound.required("x"),
+        bound.required("xp"),
+        bound.required("fp"),
+        bound.value("left"),
+        bound.value("right"),
     )
 }
 
-/// NumPy's `_pyarray_correlate` over typed values: `a` is at least as long as `v`, and both
-/// are non-empty. Edge outputs use partial overlaps; the middle uses the whole of `v`.
-fn correlate_values<T: Copy>(
-    a: &[T],
-    v: &[T],
-    mode: Mode,
-    dot: impl Fn(&[T], &[T]) -> T,
-) -> Vec<T> {
-    let (n1, n) = (a.len(), v.len());
-    let (n_left, n_right) = match mode {
-        Mode::Valid => (0, 0),
-        Mode::Same => (n / 2, n - n / 2 - 1),
-        Mode::Full => (n - 1, n - 1),
-    };
-    let mut output = Vec::with_capacity(n1 - n + 1 + n_left + n_right);
-    for step in 0..n_left {
-        let start = n_left - step;
-        let count = n - start;
-        output.push(dot(&a[..count], &v[start..start + count]));
-    }
-    for start in 0..=n1 - n {
-        output.push(dot(&a[start..start + n], v));
-    }
-    for step in 0..n_right {
-        let start = n1 - n + 1 + step;
-        let count = n - 1 - step;
-        output.push(dot(&a[start..start + count], &v[..count]));
-    }
-    output
+fn module_compiled_interp_complex(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new(
+        "_compiled_interp_complex",
+        &["x", "xp", "fp", "left", "right"],
+        5,
+    );
+    let bound = SIGNATURE.bind(&args)?;
+    interp_complex(
+        runtime,
+        bound.required("x"),
+        bound.required("xp"),
+        bound.required("fp"),
+        bound.value("left"),
+        bound.value("right"),
+    )
 }
 
-/// `_correlate(a, v, mode, conjugate)`: `conjugate=True` is NumPy's `correlate2`, behind
-/// `np.correlate`, which conjugates complex `v` and reverses the result when the inputs were
-/// swapped; `conjugate=False` is the older `correlate` behind `np.convolve`.
-fn correlate(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("correlate", &["a", "v", "mode", "conjugate"], 4);
-    let bound = SIGNATURE.bind(&args)?;
-    let mode = correlate_mode(runtime, &bound.required("mode"))?;
-    let conjugate = runtime.truth(&bound.required("conjugate"))?;
-    let first = convert::as_array(runtime, bound.required("a"))?;
-    let second = convert::as_array(runtime, bound.required("v"))?;
-    let dtype = dtype::promote(first.dtype, second.dtype)?;
-    if !dtype.is_numeric() {
-        return Err(PyError::unsupported(format!(
-            "correlate and convolve support numeric arrays, not {}",
-            dtype.repr()
-        )));
-    }
-    let first = one_dimensional(runtime, first.value(), dtype)?;
-    let second = one_dimensional(runtime, second.value(), dtype)?;
-    if first.size() == 0 {
+// ---------------------------------------------------------------------------------------------
+// correlate / convolve
+// ---------------------------------------------------------------------------------------------
+
+/// `_correlate(a, v, mode, conjugate)`, backing both `numpy.correlate` (`conjugate=True`) and
+/// `numpy.convolve` (which reverses `v` in Python first and calls this with `conjugate=False`).
+///
+/// `full[i] = sum_k a[k] * op(v[k - i + len(v) - 1])` over `k` where both indices are in range,
+/// `op` the identity or conjugation; this is the standard sliding-window cross-correlation,
+/// verified element-by-element against the reference interpreter's `np.correlate`. `'same'` and
+/// `'valid'` are prefixes of that `'full'` result: `'same'` keeps `max(len(a), len(v))` elements
+/// starting at `(len(v) - 1) / 2`, and `'valid'` keeps `|len(a) - len(v)| + 1` starting at
+/// `min(len(a), len(v)) - 1` — both offsets confirmed black-box, including the asymmetric
+/// `'same'` case where `v` is longer than `a`.
+fn correlate_kernel(
+    runtime: &mut dyn PyRuntime,
+    a: &Array,
+    v: &Array,
+    mode: &str,
+    conjugate: bool,
+) -> PyResult<Array> {
+    let (m, n) = (a.size(), v.size());
+    if m == 0 {
         return Err(PyError::value_error("first array argument cannot be empty"));
     }
-    if second.size() == 0 {
+    if n == 0 {
         return Err(PyError::value_error(
             "second array argument cannot be empty",
         ));
     }
-    let inverted = first.size() < second.size();
-    let (long, short) = if inverted {
-        (second, first)
-    } else {
-        (first, second)
-    };
-    let work = (long.size() as u64).saturating_mul(short.size() as u64);
-    runtime.charge_cpu(work.saturating_add(1))?;
-    let length = match mode {
-        Mode::Valid => long.size() - short.size() + 1,
-        Mode::Same => long.size(),
-        Mode::Full => long.size() + short.size() - 1,
-    };
-    array::reserve_elements(runtime, dtype, length)?;
-    // `correlate2` conjugates its second argument before any swap.
-    let conjugate_short = conjugate && dtype.category() == Category::Complex && !inverted;
-    let conjugate_long = conjugate && dtype.category() == Category::Complex && inverted;
-    let result = if dtype.kind() == Kind::Float16 {
-        let long = array::read_elements::<F16>(runtime, &long)?;
-        let short = array::read_elements::<F16>(runtime, &short)?;
-        let mut values = correlate_values(&long, &short, mode, half_dot);
-        if inverted && conjugate {
-            values.reverse();
+    let full_len = m + n - 1;
+    let (start, length) = match mode {
+        "full" => (0usize, full_len),
+        "same" => ((n - 1) / 2, m.max(n)),
+        "valid" => (m.min(n) - 1, m.max(n) - m.min(n) + 1),
+        other => {
+            return Err(PyError::value_error(format!(
+                "mode must be one of 'valid', 'same', or 'full' (got '{other}')"
+            )))
         }
-        array::pack_elements(&values)
-    } else {
-        element::dispatch_numeric!(dtype.kind(), T => {
-            let mut long = array::read_elements::<T>(runtime, &long)?;
-            let mut short = array::read_elements::<T>(runtime, &short)?;
-            for values in [(&mut long, conjugate_long), (&mut short, conjugate_short)]
-                .into_iter()
-                .filter(|(_, conjugate)| *conjugate)
-                .map(|(values, _)| values)
-            {
-                for value in values.iter_mut() {
-                    if let Number::Complex(real, imag) = value.to_number() {
-                        *value = T::from_number(Number::Complex(real, -imag));
-                    }
-                }
-            }
-            let mut values = correlate_values(&long, &short, mode, dot::<T>);
-            if inverted && conjugate {
-                values.reverse();
-            }
-            array::pack_elements(&values)
-        }, _ => unreachable!("correlate checked for a numeric dtype"))
     };
-    let result = array::new_array(runtime, PyArrayBuffer::Bytes(result), dtype, vec![length])?;
-    Ok(result.value())
+    // Every output element sums at most `n` products, so the total work is bounded by `m * n`
+    // regardless of mode; charge that before running the loops below.
+    runtime.charge_cpu((m as u64).saturating_mul(n as u64) + 1)?;
+
+    let dtype = dtype::promote(a.dtype, v.dtype)?;
+    let result = if dtype.category() == Category::Complex {
+        let a128 = convert::cast_array(runtime, a, DType::COMPLEX128, false)?;
+        let v128 = convert::cast_array(runtime, v, DType::COMPLEX128, false)?;
+        let a_values = array::read_elements::<C128>(runtime, &a128)?;
+        let v_values = array::read_elements::<C128>(runtime, &v128)?;
+        array::reserve_elements(runtime, DType::COMPLEX128, length)?;
+        let mut output = Vec::with_capacity(length);
+        for i in start..start + length {
+            let lag = i as isize - (n as isize - 1);
+            let mut sum = (0.0, 0.0);
+            for (k, &v_val) in v_values.iter().enumerate().take(n) {
+                let source = lag + k as isize;
+                if source < 0 || source as usize >= m {
+                    continue;
+                }
+                let a_val = a_values[source as usize];
+                let v_val = if conjugate {
+                    (v_val.re, -v_val.im)
+                } else {
+                    (v_val.re, v_val.im)
+                };
+                let product = ops::complex_multiply((a_val.re, a_val.im), v_val);
+                sum.0 += product.0;
+                sum.1 += product.1;
+            }
+            output.push(C128 {
+                re: sum.0,
+                im: sum.1,
+            });
+        }
+        array::array_from_elements(runtime, DType::COMPLEX128, vec![length], &output)?
+    } else {
+        let a64 = convert::cast_array(runtime, a, DType::FLOAT64, false)?;
+        let v64 = convert::cast_array(runtime, v, DType::FLOAT64, false)?;
+        let a_values = array::read_elements::<f64>(runtime, &a64)?;
+        let v_values = array::read_elements::<f64>(runtime, &v64)?;
+        array::reserve_elements(runtime, DType::FLOAT64, length)?;
+        let mut output = Vec::with_capacity(length);
+        for i in start..start + length {
+            let lag = i as isize - (n as isize - 1);
+            let mut sum = 0.0;
+            for (k, &v_val) in v_values.iter().enumerate().take(n) {
+                let source = lag + k as isize;
+                if source < 0 || source as usize >= m {
+                    continue;
+                }
+                sum += a_values[source as usize] * v_val;
+            }
+            output.push(sum);
+        }
+        array::array_from_elements(runtime, DType::FLOAT64, vec![length], &output)?
+    };
+    convert::cast_array(runtime, &result, dtype, false)
 }
 
-/// Methods this area installs on `numpy.ndarray`. They run NumPy's Python implementations in
-/// `numpy._methods`.
-pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
-    name: "numpy.ndarray",
-    methods: &[
-        MethodDef {
-            type_name: "numpy.ndarray",
-            name: "round",
-            call: method_round,
-        },
-        MethodDef {
-            type_name: "numpy.ndarray",
-            name: "clip",
-            call: method_clip,
-        },
-    ],
-    getters: &[],
-};
+fn module_correlate(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new("_correlate", &["a", "v", "mode", "conjugate"], 4);
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let v = convert::as_array(runtime, bound.required("v"))?;
+    let mode = runtime
+        .string_value(&bound.required("mode"))?
+        .unwrap_or_default();
+    let conjugate = runtime.truth(&bound.required("conjugate"))?;
+    Ok(correlate_kernel(runtime, &a, &v, &mode, conjugate)?.value())
+}
+
+// ---------------------------------------------------------------------------------------------
+// round / around
+// ---------------------------------------------------------------------------------------------
+
+/// `10 ** decimals`, the factor [`round_scaled`] scales by before rounding and divides by
+/// after.
+fn decimal_scale(decimals: i64) -> f64 {
+    10f64.powi(decimals.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+}
+
+/// Round-half-to-even at `10 ** -decimals` resolution's inverse (`scale = 10 ** decimals`).
+fn round_half_even(value: f64, scale: f64) -> f64 {
+    (value * scale).round_ties_even() / scale
+}
+
+/// [`round_half_even`] lifted to a dtype-independent [`Number`]: both parts of a complex value
+/// round independently, everything else rounds as a real number (through `as_f64`, which is
+/// exact for every supported integer width and for `f32`/`f16`).
+fn round_scaled(value: Number, scale: f64) -> Number {
+    match value {
+        Number::Complex(real, imag) => {
+            Number::Complex(round_half_even(real, scale), round_half_even(imag, scale))
+        }
+        other => Number::Float(round_half_even(other.as_f64(), scale)),
+    }
+}
+
+/// `round(scalar, decimals)`: NumPy scalars' `__round__` (via `scalar::method_round`), rounding
+/// half-to-even at `decimals` places in the same [`Number`] representation callers already
+/// hold. `dtype` is not needed for the arithmetic — `number`'s `f64` already holds the
+/// receiver's exact value, widening a float16/32 losslessly — but is accepted because the call
+/// site has already used it to reject a complex receiver (`__round__` is undefined there)
+/// before reaching this function.
+pub(in crate::python) fn round_number(dtype: DType, number: Number, decimals: i64) -> Number {
+    let _ = dtype;
+    round_scaled(number, decimal_scale(decimals))
+}
+
+/// `np.round`/`np.around`(a, decimals=0) and `a.round(decimals=0)`: round to `decimals` places
+/// with round-half-to-even, preserving `a`'s dtype. Reads and writes one generic [`Number`] per
+/// element (via [`element::read_number`]/[`element::write_number`]) rather than dispatching on
+/// dtype, since rounding needs no dtype-specific arithmetic — every numeric kind's `Number` cast
+/// back through `write_number` the same "unsafe" cast `astype` uses.
+fn round_array(runtime: &mut dyn PyRuntime, array: &Array, decimals: i64) -> PyResult<Array> {
+    let scale = decimal_scale(decimals);
+    let count = array.size();
+    array::reserve_elements(runtime, array.dtype, count)?;
+    runtime.charge_cpu(count as u64 + 1)?;
+    let kind = array.dtype.kind();
+    let itemsize = array.itemsize();
+    let mut buffer = array::buffer_with_capacity(array.dtype, count);
+    runtime.read_arrays(&[array.handle], &mut |arrays| {
+        let PyArrayData::Bytes(bytes) = arrays[0].data else {
+            return Err(PyError::unsupported(
+                "round on object arrays is not supported",
+            ));
+        };
+        let PyArrayBuffer::Bytes(output) = &mut buffer else {
+            unreachable!("numeric dtype has byte storage")
+        };
+        let mut slot = [0u8; 16];
+        for offset in array.offsets() {
+            let value = element::read_number(kind, &bytes[offset..offset + itemsize]);
+            let rounded = round_scaled(value, scale);
+            element::write_number(kind, rounded, &mut slot[..itemsize]);
+            output.extend_from_slice(&slot[..itemsize]);
+        }
+        Ok(())
+    })?;
+    array::new_array(runtime, buffer, array.dtype, array.shape().to_vec())
+}
+
+/// Store `result` into `out=` if given, otherwise box it the way NumPy returns a result.
+fn finish_with_out(runtime: &mut dyn PyRuntime, result: Array, out: Option<PyValue>) -> PyResult {
+    match out {
+        Some(out) => {
+            let out = Array::from_value(runtime, out)?;
+            array::assign(runtime, &out, &result)?;
+            Ok(out.value())
+        }
+        None => finish_array(runtime, result),
+    }
+}
+
+fn module_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new("round", &["a", "decimals", "out"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    let decimals = args::optional_int(runtime, bound.get("decimals"))?.unwrap_or(0);
+    let result = round_array(runtime, &array, decimals)?;
+    finish_with_out(runtime, result, bound.value("out"))
+}
 
 fn method_round(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    super::reduce::python_method(runtime, "_round", receiver, args)
+    static SIGNATURE: Signature = Signature::new("round", &["decimals", "out"], 0);
+    let bound = SIGNATURE.bind(&args)?;
+    let array = Array::from_value(runtime, receiver)?;
+    let decimals = args::optional_int(runtime, bound.get("decimals"))?.unwrap_or(0);
+    let result = round_array(runtime, &array, decimals)?;
+    finish_with_out(runtime, result, bound.value("out"))
+}
+
+// ---------------------------------------------------------------------------------------------
+// clip
+// ---------------------------------------------------------------------------------------------
+
+/// `np.clip(a, a_min, a_max)` and `a.clip(min, max)`: `minimum(maximum(a, a_min), a_max)`,
+/// skipping either ufunc call when its bound is `None`. Reusing `maximum`/`minimum` (rather
+/// than a bespoke comparison loop) gets their broadcasting, NEP 50 promotion, and `NaN`
+/// propagation for free, and matches NumPy's own definition of `clip`.
+///
+/// The array method's parameters are named `min`/`max` (not `a_min`/`a_max`), matching real
+/// NumPy's `ndarray.clip` signature: the frozen `numpy._numeric.clip` wrapper resolves the
+/// module function's legacy `a_min`/`a_max` positionals and its newer keyword-only `min=`/`max=`
+/// aliases, then always calls `a.clip(min=..., max=...)` on the array.
+fn clip_array(
+    runtime: &mut dyn PyRuntime,
+    a: PyValue,
+    a_min: Option<PyValue>,
+    a_max: Option<PyValue>,
+    out: Option<Array>,
+) -> PyResult {
+    match (a_min, a_max) {
+        (None, None) => {
+            let array = convert::as_array(runtime, a)?;
+            let copy = array::copy_array(runtime, &array)?;
+            finish_with_out(runtime, copy, out.map(|out| out.value()))
+        }
+        (Some(min), None) => ufunc::apply(
+            runtime,
+            ufunc::named("maximum"),
+            &[a, min],
+            &ufunc::Options {
+                out,
+                ..ufunc::Options::default()
+            },
+        ),
+        (None, Some(max)) => ufunc::apply(
+            runtime,
+            ufunc::named("minimum"),
+            &[a, max],
+            &ufunc::Options {
+                out,
+                ..ufunc::Options::default()
+            },
+        ),
+        (Some(min), Some(max)) => {
+            let lower = ufunc::apply(
+                runtime,
+                ufunc::named("maximum"),
+                &[a, min],
+                &ufunc::Options::default(),
+            )?;
+            ufunc::apply(
+                runtime,
+                ufunc::named("minimum"),
+                &[lower, max],
+                &ufunc::Options {
+                    out,
+                    ..ufunc::Options::default()
+                },
+            )
+        }
+    }
+}
+
+fn out_argument(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Option<Array>> {
+    value
+        .map(|value| Array::from_value(runtime, value))
+        .transpose()
+}
+
+fn module_clip(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new("clip", &["a", "a_min", "a_max", "out"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let out = out_argument(runtime, bound.value("out"))?;
+    clip_array(
+        runtime,
+        bound.required("a"),
+        bound.value("a_min"),
+        bound.value("a_max"),
+        out,
+    )
 }
 
 fn method_clip(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    super::reduce::python_method(runtime, "_clip", receiver, args)
+    static SIGNATURE: Signature = Signature::new("clip", &["min", "max", "out"], 0);
+    let bound = SIGNATURE.bind(&args)?;
+    let out = out_argument(runtime, bound.value("out"))?;
+    clip_array(
+        runtime,
+        receiver,
+        bound.value("min"),
+        bound.value("max"),
+        out,
+    )
 }
 
-/// Round `value` of `dtype` to `decimals` places the way NumPy's `round` does:
-/// `rint(x * 10**decimals) / 10**decimals`, ties to even, computed at the dtype's float precision.
-/// Integers are unchanged for `decimals >= 0`; otherwise they round through float64 and wrap on
-/// the cast back, so `round(np.uint8(255), -1)` is `4` as in NumPy.
-pub(in crate::python) fn round_number(dtype: DType, value: Number, decimals: i64) -> Number {
-    let factor = 10f64.powi(i32::try_from(decimals.unsigned_abs()).unwrap_or(i32::MAX));
-    let scale = |value: f64| {
-        if decimals >= 0 {
-            (value * factor).round_ties_even() / factor
-        } else {
-            (value / factor).round_ties_even() * factor
-        }
-    };
-    let scale_single = |value: f64| {
-        let factor = factor as f32;
-        let value = value as f32;
-        f64::from(if decimals >= 0 {
-            (value * factor).round_ties_even() / factor
-        } else {
-            (value / factor).round_ties_even() * factor
-        })
-    };
-    let single =
-        dtype.itemsize() <= 4 || dtype.category() == Category::Complex && dtype.itemsize() == 8;
-    let round = |value: f64| {
-        if single {
-            scale_single(value)
-        } else {
-            scale(value)
-        }
-    };
-    match value {
-        Number::Bool(_) => value,
-        Number::Int(_) | Number::UInt(_) if decimals >= 0 => value,
-        Number::Int(integer) => Number::Int(scale(integer as f64) as i64),
-        Number::UInt(integer) => Number::Int(scale(integer as f64) as i64),
-        Number::Float(float) => Number::Float(round(float)),
-        Number::Complex(real, imag) => Number::Complex(round(real), round(imag)),
+// ---------------------------------------------------------------------------------------------
+// module registration
+// ---------------------------------------------------------------------------------------------
+
+const fn function(
+    name: &'static str,
+    call: fn(&mut dyn PyRuntime, CallArgs) -> PyResult,
+) -> FunctionDef {
+    FunctionDef {
+        module: "numpy",
+        name,
+        call,
     }
 }
+
+pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
+    name: "_numpy_math",
+    functions: &[
+        function("_compiled_interp", module_compiled_interp),
+        function("_compiled_interp_complex", module_compiled_interp_complex),
+        function("_correlate", module_correlate),
+        function("divmod", ufunc::call_divmod),
+        function("round", module_round),
+        function("around", module_round),
+        function("clip", module_clip),
+    ],
+    values: &[],
+};
+
+const fn method(
+    name: &'static str,
+    call: fn(&mut dyn PyRuntime, PyValue, CallArgs) -> PyResult,
+) -> MethodDef {
+    MethodDef {
+        type_name: "numpy.ndarray",
+        name,
+        call,
+    }
+}
+
+/// Methods this module installs on `numpy.ndarray`.
+pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
+    name: "numpy.ndarray",
+    methods: &[method("round", method_round), method("clip", method_clip)],
+    getters: &[],
+};

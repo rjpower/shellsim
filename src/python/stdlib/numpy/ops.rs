@@ -809,19 +809,168 @@ impl ComplexParts for C128 {
 }
 
 /// `a / b` for complex values, as `np.divide` gives it for `complex128`.
+///
+/// Smith's algorithm (1962): scale by the ratio of the divisor's smaller component to its
+/// larger one, so every division stays within a factor of the divisor's own magnitude instead
+/// of squaring both components the way the textbook `(ac+bd)/(c²+d²)` formula does, which
+/// overflows for a divisor whose `|c|` or `|d|` is past roughly 1e154 even when the true
+/// quotient is representable. A zero divisor (either sign of either zero) divides by a literal
+/// `+0.0` rather than by `b` itself: black-box testing against the reference interpreter showed
+/// all four sign combinations of a `0.0 + 0.0i` divisor give an identical result, matching `a /
+/// +0.0` component-wise. [`Numeric::divide`] raises the floating-point flags for that zero-
+/// divisor case (component-wise: `NaN / 0` raises none, a finite nonzero numerator component
+/// raises `divide`, and `0 / 0` raises `invalid`); flags for every other divisor are inferred
+/// generically by comparing this function's result against its operands.
+///
+/// This does not special-case divisors whose magnitude is within about 1e8 of `f64::MAX`: an
+/// intermediate `c + d*r` can overflow to infinity there even though the quotient is finite, a
+/// limitation confirmed to match NumPy's own `complex128` division bit-for-bit on such inputs
+/// (for example `(1.7e308+1.7e308i) / (1.7e308+1.7e308i)` gives `NaN+0i` in both), though NumPy
+/// additionally raises an `overflow` flag there that this module's generic flag inference cannot
+/// see, since the final result is finite.
+///
+/// Scales by `1.0 / denom` once and multiplies both components, rather than dividing each
+/// component by `denom` separately: the two roundings are not equivalent (a division and a
+/// reciprocal-then-multiply can differ in their last bit), and matching NumPy's own last bit
+/// requires the multiply form — confirmed black-box, bit-for-bit against `hex()`, on
+/// `(-1 - 1.2246467991473532e-16j) / sqrt(2)`, where dividing each component by `denom` directly
+/// gives an imaginary part one ULP away from NumPy's.
 pub(in crate::python) fn complex_divide(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
-    todo!("clean-room rewrite: {a:?} / {b:?}")
+    let (a_re, a_im) = a;
+    let (b_re, b_im) = b;
+    if b_re == 0.0 && b_im == 0.0 {
+        return (a_re / 0.0, a_im / 0.0);
+    }
+    if b_re.abs() >= b_im.abs() {
+        let r = b_im / b_re;
+        let scl = 1.0 / (b_re + b_im * r);
+        ((a_re + a_im * r) * scl, (a_im - a_re * r) * scl)
+    } else {
+        let r = b_re / b_im;
+        let scl = 1.0 / (b_im + b_re * r);
+        ((a_re * r + a_im) * scl, (a_im * r - a_re) * scl)
+    }
+}
+
+/// `1 / (x, y)` by Smith's algorithm specialized for a numerator of exactly `1 + 0i`.
+///
+/// This is not simply [`complex_divide`] called with `a = (1.0, 0.0)`: NumPy's `reciprocal` and
+/// its ordinary division disagree on the sign of a resulting zero at the same inputs (black-box
+/// testing found `np.reciprocal(inf+0j)` is `0-0i` but `1/(inf+0j)` computed through division is
+/// `0+0i`). The difference traces to which IEEE 754 operation produces the imaginary part: this
+/// function negates `r` directly, where general division subtracts it from `a_im = 0.0`, and
+/// `-(+0.0) == -0.0` while `0.0 - (+0.0) == +0.0`. Like [`complex_divide`], it scales by `1.0 /
+/// denom` once and multiplies rather than dividing each component by `denom` separately, to
+/// match NumPy's last bit.
+fn smith_reciprocal(x: f64, y: f64) -> (f64, f64, f64) {
+    if x.abs() >= y.abs() {
+        let r = y / x;
+        let denom = x + y * r;
+        let scl = 1.0 / denom;
+        (scl, -r * scl, denom)
+    } else {
+        let r = x / y;
+        let denom = y + x * r;
+        let scl = 1.0 / denom;
+        (r * scl, -scl, denom)
+    }
 }
 
 /// `np.reciprocal` of a complex value, raising the floating-point flags NumPy reports for it.
+///
+/// Unlike [`complex_divide`] and [`complex_power`], whose callers infer flags by comparing the
+/// returned value against the original operands, `complex_reciprocal` sets its own: `invalid`
+/// when either result component is `NaN`, and `overflow` when [`smith_reciprocal`]'s scaled
+/// denominator overflows to infinity even though `x` and `y` were both finite, since that
+/// intermediate overflow does not show up in the final result (which rounds to a finite `±0`).
 pub(in crate::python) fn complex_reciprocal(a: (f64, f64), flags: &mut FpFlags) -> (f64, f64) {
-    let _ = flags;
-    todo!("clean-room rewrite: 1 / {a:?}")
+    let (x, y) = a;
+    let (real, imag, denom) = smith_reciprocal(x, y);
+    if denom.is_infinite() && x.is_finite() && y.is_finite() {
+        flags.overflow = true;
+    }
+    if real.is_nan() || imag.is_nan() {
+        flags.invalid = true;
+    }
+    (real, imag)
+}
+
+/// `exp(re + im*i)`, exact on the real axis (`im == 0` or `-0`) the way `exp(x) * (cos(0),
+/// sin(0))` is not, since `cos` and `sin` of exactly `0.0` still round to `1.0` and a
+/// sign-losing `0.0` rather than preserving `im`'s own sign.
+fn complex_exp((re, im): (f64, f64)) -> (f64, f64) {
+    let scale = re.exp();
+    if im == 0.0 {
+        return (scale, im);
+    }
+    (scale * im.cos(), scale * im.sin())
+}
+
+/// `base ** n` for a nonzero complex `base` and non-negative integer `n`, by exponentiation by
+/// squaring.
+///
+/// Seeds the accumulator with `base` itself at `n`'s lowest set bit instead of starting from the
+/// multiplicative identity `1 + 0i`: identity-seeded squaring computes one extra `(1+0i) *
+/// base`, which is enough to flip a resulting zero's sign. NumPy's own complex integer power
+/// does not make that extra multiplication either — confirmed against `(1 - 0i) ** 2` and `(1 -
+/// 0i) ** 3`, both of which keep the negative sign on their zero imaginary part.
+fn integer_power(base: (f64, f64), n: u64) -> (f64, f64) {
+    let mut result = None;
+    let mut square = base;
+    let mut bit = n;
+    while bit > 0 {
+        if bit & 1 == 1 {
+            result = Some(match result {
+                None => square,
+                Some(accumulated) => complex_multiply(accumulated, square),
+            });
+        }
+        bit >>= 1;
+        if bit > 0 {
+            square = complex_multiply(square, square);
+        }
+    }
+    result.unwrap_or((1.0, 0.0))
 }
 
 /// `a ** b` for complex values, as `np.power` gives it for `complex128`.
+///
+/// `0 ** b` is a pole or a removable singularity depending on `b`'s real part, confirmed
+/// black-box against the reference interpreter across `b in {0, positive, negative,
+/// positive-real complex, zero-real complex}`: `0 ** 0` is `1`, `0 ** b` is `0` when `b`'s real
+/// part is positive, and `0 ** b` is `NaN + NaNi` (with the generic flag inference below raising
+/// `invalid`) otherwise, which includes a purely imaginary `b`.
+///
+/// A `b` with an exactly integer value and zero imaginary part uses [`integer_power`] (inverted
+/// through [`smith_reciprocal`] for negative `b`), which is exact where the general formula
+/// below is not: squaring `1e150 + 1e150i` cancels its real part to exactly `0` because both
+/// terms of `x² - y²` round to the identical value before the subtraction, while `exp(b *
+/// log(a))` accumulates rounding error in the angle long before the final `cos`/`sin`. Every
+/// other exponent uses the principal branch, `exp(b * log(a))`, log's own principal branch cut
+/// along the negative real axis.
 pub(in crate::python) fn complex_power(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
-    todo!("clean-room rewrite: {a:?} ** {b:?}")
+    if a == (0.0, 0.0) {
+        if b == (0.0, 0.0) {
+            return (1.0, 0.0);
+        }
+        return if b.0 > 0.0 {
+            (0.0, 0.0)
+        } else {
+            (f64::NAN, f64::NAN)
+        };
+    }
+    if b.1 == 0.0 && b.0.fract() == 0.0 && b.0.abs() < 9.2e18 {
+        let n = b.0 as i64;
+        let magnitude = integer_power(a, n.unsigned_abs());
+        return if n >= 0 {
+            magnitude
+        } else {
+            let (real, imag, _denom) = smith_reciprocal(magnitude.0, magnitude.1);
+            (real, imag)
+        };
+    }
+    let log_a = (a.0.hypot(a.1).ln(), a.1.atan2(a.0));
+    complex_exp(complex_multiply(b, log_a))
 }
 
 pub(in crate::python) fn complex_multiply(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
@@ -862,13 +1011,25 @@ macro_rules! complex {
             fn divide(self, other: Self, flags: &mut FpFlags) -> Self {
                 let (b_real, b_imag) = other.parts();
                 if b_real == 0.0 && b_imag == 0.0 {
+                    // NumPy sets a zero-divisor's flags per component, independent of the
+                    // other component's NaN-ness: confirmed black-box, `(nan+1j) / (0+0j)`
+                    // still warns "divide by zero" from its finite `1j` alone, and `(inf+0j) /
+                    // (0+0j)` warns only "invalid" (an already-infinite component dividing by
+                    // zero raises neither flag; only a finite-nonzero component raises
+                    // `divide`, and an exact `0` raises `invalid`).
                     let (a_real, a_imag) = self.parts();
-                    if a_real.is_nan() || a_imag.is_nan() {
-                    } else if a_real != 0.0 || a_imag != 0.0 {
-                        flags.divide = true;
-                    } else {
-                        flags.invalid = true;
-                    }
+                    let mut classify = |component: f64| {
+                        if component.is_nan() || component.is_infinite() {
+                            // No flag: `nan / 0` is silent, and an already-infinite component
+                            // dividing by zero does not newly overflow or invalidate.
+                        } else if component == 0.0 {
+                            flags.invalid = true;
+                        } else {
+                            flags.divide = true;
+                        }
+                    };
+                    classify(a_real);
+                    classify(a_imag);
                     let (real, imag) = complex_divide(self.parts(), other.parts());
                     return Self::from_parts(real, imag);
                 }

@@ -1,84 +1,83 @@
-//! `diagonal` and `trace`, following NumPy's `PyArray_Diagonal` and `PyArray_Trace`.
+//! `np.diagonal` and `np.trace`: read-only diagonal views and their sum.
 //!
-//! A diagonal is a read-only view: the two chosen axes are removed and one axis stepping by
-//! the sum of their strides is appended. `trace` sums that view over its last axis through
-//! `ndarray.sum`, so its dtype rules and `out=` handling are the reduction's.
+//! A diagonal is a view, never a copy: stepping `offset` elements into the plane of `axis1` and
+//! `axis2` and then walking both axes together (stride `strides[axis1] + strides[axis2]`) reads
+//! every diagonal element without moving any storage. NumPy makes the view read-only because a
+//! write through it would touch two logical axes from one store; this module marks it read-only
+//! for the same reason. `trace` reuses the view: it is exactly [`super::super::reduce::reduce`]
+//! ("add") of the diagonal's last axis, which is where the view puts it.
 
 use super::super::super::super::native::{CallArgs, PyError, PyResult, PyRuntime, PyValue};
-use super::super::super::super::Value;
-use super::super::args::{self, Signature};
+use super::super::args::{self, Axes, Signature};
 use super::super::array::{self, Array};
 use super::super::convert;
-use super::axis_index;
+use super::super::reduce::{self, ReduceOptions};
+use super::super::ufunc;
 
-/// The diagonal view of `array` between `axis1` and `axis2`, `offset` above the main diagonal.
-fn diagonal(
+/// A read-only view of the `axis1`/`axis2` diagonal of `array` at `offset`, with `axis1` and
+/// `axis2` removed and the diagonal appended as the last axis — NumPy's own placement,
+/// confirmed black-box: `np.diagonal(np.arange(24).reshape(2,3,4))` (the default `axis1=0,
+/// axis2=1`) has shape `(4, 2)`, the untouched axis first and the length-`min(2,3)` diagonal
+/// last.
+///
+/// The diagonal's length follows NumPy's clamp, letting `offset` run past either axis down to
+/// an empty (not an error) result: `min(d1, d2 - offset)` for `offset >= 0`, or `min(d1 +
+/// offset, d2)` for `offset < 0`, floored at `0`.
+fn diagonal_view(
     runtime: &mut dyn PyRuntime,
     array: &Array,
     offset: i64,
     axis1: i64,
     axis2: i64,
 ) -> PyResult<Array> {
-    let ndim = array.ndim();
-    if ndim < 2 {
+    if array.ndim() < 2 {
         return Err(PyError::value_error(
             "diag requires an array of at least two dimensions",
         ));
     }
-    let first = axis_index(axis1, ndim, Some("axis1"))?;
-    let second = axis_index(axis2, ndim, Some("axis2"))?;
-    if first == second {
+    let axis1 = super::axis_index(axis1, array.ndim(), Some("axis1"))?;
+    let axis2 = super::axis_index(axis2, array.ndim(), Some("axis2"))?;
+    if axis1 == axis2 {
         return Err(PyError::value_error("axis1 and axis2 cannot be the same"));
     }
-    let (rows, columns) = (array.shape()[first], array.shape()[second]);
-    let (row_stride, column_stride) = (array.strides()[first], array.strides()[second]);
-    let (skip_rows, skip_columns) = if offset >= 0 {
-        (0, offset.unsigned_abs())
+    let (d1, d2) = (array.shape()[axis1], array.shape()[axis2]);
+    let (row_start, col_start, length) = if offset >= 0 {
+        let offset = offset as usize;
+        (0usize, offset, d1.min(d2.saturating_sub(offset)))
     } else {
-        (offset.unsigned_abs(), 0)
+        let offset = offset.unsigned_abs() as usize;
+        (offset, 0usize, d1.saturating_sub(offset).min(d2))
     };
-    let length = (rows as u64)
-        .saturating_sub(skip_rows)
-        .min((columns as u64).saturating_sub(skip_columns)) as usize;
-    let mut start = array.view.offset as isize;
-    if length > 0 {
-        start += skip_rows as isize * row_stride + skip_columns as isize * column_stride;
-    }
-    let mut shape = Vec::with_capacity(ndim - 1);
-    let mut strides = Vec::with_capacity(ndim - 1);
-    for axis in (0..ndim).filter(|axis| *axis != first && *axis != second) {
-        shape.push(array.shape()[axis]);
-        strides.push(array.strides()[axis]);
+
+    let mut shape = Vec::with_capacity(array.ndim() - 1);
+    let mut strides = Vec::with_capacity(array.ndim() - 1);
+    for axis in 0..array.ndim() {
+        if axis != axis1 && axis != axis2 {
+            shape.push(array.shape()[axis]);
+            strides.push(array.strides()[axis]);
+        }
     }
     shape.push(length);
-    strides.push(row_stride + column_stride);
-    let view = array::new_view(runtime, array, array.dtype, shape, strides, start as usize)?;
+    strides.push(array.strides()[axis1] + array.strides()[axis2]);
+
+    let base_offset = (array.view.offset as isize
+        + row_start as isize * array.strides()[axis1]
+        + col_start as isize * array.strides()[axis2]) as usize;
+    let view = array::new_view(runtime, array, array.dtype, shape, strides, base_offset)?;
     runtime.set_array_writeable(view.handle, false)?;
     Ok(view)
 }
 
-/// The `offset`, `axis1`, and `axis2` arguments, defaulting to `0, 0, 1`.
-fn diagonal_arguments(
-    runtime: &mut dyn PyRuntime,
-    bound: &args::Bound,
-) -> PyResult<(i64, i64, i64)> {
-    Ok((
-        args::optional_int(runtime, bound.value("offset"))?.unwrap_or(0),
-        args::optional_int(runtime, bound.value("axis1"))?.unwrap_or(0),
-        args::optional_int(runtime, bound.value("axis2"))?.unwrap_or(1),
-    ))
-}
-
-/// `np.diagonal(a, offset=0, axis1=0, axis2=1)`.
 pub(super) fn module_diagonal(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("diagonal", &["a", "offset", "axis1", "axis2"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("a"))?;
-    let (offset, axis1, axis2) = diagonal_arguments(runtime, &bound)?;
-    Ok(diagonal(runtime, &array, offset, axis1, axis2)?.value())
+    let offset = args::optional_int(runtime, bound.get("offset"))?.unwrap_or(0);
+    let axis1 = args::optional_int(runtime, bound.get("axis1"))?.unwrap_or(0);
+    let axis2 = args::optional_int(runtime, bound.get("axis2"))?.unwrap_or(1);
+    Ok(diagonal_view(runtime, &array, offset, axis1, axis2)?.value())
 }
 
-/// `ndarray.diagonal(offset=0, axis1=0, axis2=1)`.
 pub(super) fn method_diagonal(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
@@ -87,27 +86,51 @@ pub(super) fn method_diagonal(
     static SIGNATURE: Signature = Signature::new("diagonal", &["offset", "axis1", "axis2"], 0);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, receiver)?;
-    let (offset, axis1, axis2) = diagonal_arguments(runtime, &bound)?;
-    Ok(diagonal(runtime, &array, offset, axis1, axis2)?.value())
+    let offset = args::optional_int(runtime, bound.get("offset"))?.unwrap_or(0);
+    let axis1 = args::optional_int(runtime, bound.get("axis1"))?.unwrap_or(0);
+    let axis2 = args::optional_int(runtime, bound.get("axis2"))?.unwrap_or(1);
+    Ok(diagonal_view(runtime, &array, offset, axis1, axis2)?.value())
 }
 
-/// Sum the diagonal over its last axis with `dtype` and `out`.
-fn trace(runtime: &mut dyn PyRuntime, array: &Array, bound: &args::Bound) -> PyResult {
-    let (offset, axis1, axis2) = diagonal_arguments(runtime, bound)?;
-    let view = diagonal(runtime, array, offset, axis1, axis2)?;
-    let sum = runtime
-        .get_attribute(view.value(), "sum")?
-        .ok_or_else(|| PyError::runtime_error("ndarray.sum is missing"))?;
-    let mut keywords = vec![("axis".to_string(), Value::Int(-1))];
-    for name in ["dtype", "out"] {
-        if let Some(value) = bound.value(name) {
-            keywords.push((name.to_string(), value));
-        }
-    }
-    runtime.call_value(sum, CallArgs::new(Vec::new(), keywords))
+/// `np.trace`: the sum of one diagonal. Since [`diagonal_view`] always appends the diagonal as
+/// the last axis, this is [`reduce::reduce`] of that one axis with the `add` ufunc — the same
+/// engine `np.sum` uses, so `dtype=`/`out=` and the empty-diagonal-sums-to-zero identity behave
+/// exactly as they do for `sum`.
+fn trace_array(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+    offset: i64,
+    axis1: i64,
+    axis2: i64,
+    dtype: Option<super::super::dtype::DType>,
+    out: Option<Array>,
+) -> PyResult {
+    let diagonal = diagonal_view(runtime, array, offset, axis1, axis2)?;
+    let axis = diagonal.ndim() - 1;
+    reduce::reduce(
+        runtime,
+        ufunc::named("add"),
+        &diagonal,
+        &ReduceOptions {
+            axes: Axes::Some(vec![axis]),
+            dtype,
+            out,
+            keepdims: false,
+            initial: None,
+        },
+    )
 }
 
-/// `np.trace(a, offset=0, axis1=0, axis2=1, dtype=None, out=None)`.
+/// Accept `out=array` or an omitted/`None` `out=`.
+fn out_argument(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Option<Array>> {
+    value
+        .map(|value| {
+            Array::from_value(runtime, value)
+                .map_err(|_| PyError::type_error("output must be an array"))
+        })
+        .transpose()
+}
+
 pub(super) fn module_trace(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new(
         "trace",
@@ -116,10 +139,14 @@ pub(super) fn module_trace(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyRes
     );
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("a"))?;
-    trace(runtime, &array, &bound)
+    let offset = args::optional_int(runtime, bound.get("offset"))?.unwrap_or(0);
+    let axis1 = args::optional_int(runtime, bound.get("axis1"))?.unwrap_or(0);
+    let axis2 = args::optional_int(runtime, bound.get("axis2"))?.unwrap_or(1);
+    let dtype = args::optional_dtype(runtime, bound.value("dtype"))?;
+    let out = out_argument(runtime, bound.value("out"))?;
+    trace_array(runtime, &array, offset, axis1, axis2, dtype, out)
 }
 
-/// `ndarray.trace(offset=0, axis1=0, axis2=1, dtype=None, out=None)`.
 pub(super) fn method_trace(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
@@ -129,5 +156,35 @@ pub(super) fn method_trace(
         Signature::new("trace", &["offset", "axis1", "axis2", "dtype", "out"], 0);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, receiver)?;
-    trace(runtime, &array, &bound)
+    let offset = args::optional_int(runtime, bound.get("offset"))?.unwrap_or(0);
+    let axis1 = args::optional_int(runtime, bound.get("axis1"))?.unwrap_or(0);
+    let axis2 = args::optional_int(runtime, bound.get("axis2"))?.unwrap_or(1);
+    let dtype = args::optional_dtype(runtime, bound.value("dtype"))?;
+    let out = out_argument(runtime, bound.value("out"))?;
+    trace_array(runtime, &array, offset, axis1, axis2, dtype, out)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn diagonal_length_clamps_to_zero_past_either_axis() {
+        // offset >= 0: min(d1, d2 - offset), floored at 0.
+        assert_eq!(clamp_length(2, 3, 0), 2);
+        assert_eq!(clamp_length(2, 3, 1), 2);
+        assert_eq!(clamp_length(2, 3, 10), 0);
+        // offset < 0: min(d1 + offset, d2), floored at 0.
+        assert_eq!(clamp_length(2, 3, -1), 1);
+        assert_eq!(clamp_length(2, 3, -10), 0);
+    }
+
+    /// Test-only mirror of [`diagonal_view`]'s length clamp, isolated from array plumbing.
+    fn clamp_length(d1: usize, d2: usize, offset: i64) -> usize {
+        if offset >= 0 {
+            let offset = offset as usize;
+            d1.min(d2.saturating_sub(offset))
+        } else {
+            let offset = offset.unsigned_abs() as usize;
+            d1.saturating_sub(offset).min(d2)
+        }
+    }
 }

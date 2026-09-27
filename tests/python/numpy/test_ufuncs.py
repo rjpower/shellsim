@@ -626,6 +626,31 @@ def test_complex_division_multiplies_by_the_reciprocal_denominator():
     )
 
 
+def test_complex_division_by_zero_sets_flags_per_component():
+    """A zero divisor's `divide`/`invalid` flags follow each numerator component on its own,
+    not the pair together: a `NaN` component contributes neither flag, an exact `0` component
+    contributes `invalid`, and any other (finite nonzero, or already-infinite) component
+    contributes `divide` only when finite nonzero.
+    """
+    zero = complex(0.0, 0.0)
+
+    def warned(numerator):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            np.array([numerator]) / np.array([zero])
+        return sorted(str(w.message).split(" ")[0] for w in caught)
+
+    assert warned(complex(np.nan, 1.0)) == ["divide"]
+    assert warned(complex(1.0, np.nan)) == ["divide"]
+    assert warned(complex(np.nan, 0.0)) == ["invalid"]
+    assert warned(complex(np.nan, np.nan)) == []
+    assert warned(zero) == ["invalid"]
+    assert warned(complex(1.0, 1.0)) == ["divide"]
+    assert warned(complex(0.0, 1.0)) == ["divide", "invalid"]
+    assert warned(complex(np.inf, 0.0)) == ["invalid"]
+    assert warned(complex(np.inf, 1.0)) == ["divide"]
+
+
 def test_power_of_one_half_takes_the_square_root_for_a_constant_exponent():
     x = np.array([-0.0, -np.inf, 4.0])
     with warnings.catch_warnings(record=True) as caught:

@@ -116,9 +116,28 @@ def gradient(f, *varargs, axis=None, edge_order=1):
 
 
 def interp(x, xp, fp, left=None, right=None, period=None):
-    """Piecewise-linear interpolation of `x` against the samples (`xp`, `fp`)."""
+    """Piecewise-linear interpolation of `x` against the samples (`xp`, `fp`).
+
+    With `period`, `x` is interpreted modulo `period` before interpolating, `xp` is taken to
+    hold one period's worth of increasing sample points, and `left`/`right` are ignored (the
+    wrapped `x` always falls within the extended, periodic `xp`). This wraps `x` into
+    `[xp[0], xp[0] + period)` and interpolates it against `xp` extended by one point on each
+    side (`xp[-1] - period` before, `xp[0] + period` after, with `fp`'s matching end values), so
+    a wrapped `x` next to either edge of the period still interpolates against its true neighbor
+    across the wrap.
+    """
     if period is not None:
-        raise NotImplementedError("np.interp(period=...) is not supported")
+        period = abs(period)
+        if period == 0:
+            raise ValueError("period must be a non-zero value")
+        xp = np.asarray(xp)
+        fp = np.asanyarray(fp)
+        origin = xp[0]
+        x = origin + np.mod(x - origin, period)
+        xp = np.concatenate(([xp[-1] - period], xp, [xp[0] + period]))
+        fp = np.concatenate(([fp[-1]], fp, [fp[0]]))
+        left = None
+        right = None
     if np.asanyarray(fp).dtype.kind == "c":
         return _compiled_interp_complex(x, xp, fp, left, right)
     return _compiled_interp(x, xp, fp, left, right)

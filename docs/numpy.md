@@ -183,6 +183,9 @@ never imports a module or calls arbitrary code.
 - **Product summation.** Products sum each dot product in index order. NumPy passes
   floating-point products to BLAS, whose blocked kernels add in a different order that depends
   on the CPU, so their last bits can differ.
+- **`correlate`/`convolve`.** Both compute in `float64` (or `complex128`) regardless of the
+  input dtype, then cast the result back. Integer inputs whose products fall outside the 53-bit
+  exactly representable range may round differently than NumPy's native-width accumulation.
 
 ## Unsupported frontier
 
