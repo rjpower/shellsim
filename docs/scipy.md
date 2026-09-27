@@ -181,9 +181,11 @@ their Boost-based results can differ from shellsim's and from each other in the 
 - **`lstsq.default_lapack_driver`** does not exist, because shellsim's functions cannot hold
   attributes. The default driver is still `gelsd`.
 - **`gecon`'s reciprocal condition number**, and the `LinAlgWarning` that `solve` raises for an
-  ill-conditioned matrix, come from the explicit inverse (which the same factorization already
-  gives cheaply) rather than LAPACK's Hager-style iterative estimator. Both report a very small
-  number for the same ill-conditioned matrix, but not LAPACK's number.
+  ill-conditioned matrix (`assume_a="pos"` composes the same computation from `potri`, since
+  shellsim has no `pocon`), come from the explicit inverse rather than LAPACK's Hager-style
+  iterative estimator: `rcond = 1 / (norm_1(a) * norm_1(inv(a)))` exactly, at roughly twice the
+  cubic cost of the factorization alone. LAPACK's estimator is usually accurate enough to agree,
+  but is not guaranteed to match for every input.
 - **f2py wrapper exceptions.** Real SciPy's `scipy.linalg.lapack` and `scipy.linalg.blas`
   wrappers raise a generated, per-module exception (for example
   `scipy.linalg.lapack._flapack.error`) on a bad argument. shellsim raises a plain `ValueError`
@@ -247,4 +249,6 @@ kernels meter its work.
 before running it: cubic in the matrix order, times the number of stacked matrices, plus the
 right-hand sides of a solve. `expm` adds one matrix product per squaring. Working copies are
 reserved against the memory limit first. The Jacobi methods behind `svd` and `eigh` are charged
-per sweep by `numpy.linalg`.
+per sweep by `numpy.linalg`. `solve`'s exact reciprocal-condition-number check (see "Deliberate
+differences") is one more cubic factorization, charged the same way, so each `solve` call costs
+about twice a bare factorization's work.

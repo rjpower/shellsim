@@ -138,27 +138,32 @@ def _symmetrize(a, lower):
     return trusted + np.swapaxes(trusted, -1, -2) - diagonal[..., None] * identity
 
 
-def _warn_if_ill_conditioned(pivots, n, slice_index=0):
-    """Warn as SciPy's `solve` does for a near-singular matrix, from a factorization's diagonal.
+def _lange(norm_kind, a):
+    prefix = _prefix(a.dtype)
+    return getattr(_scipy_linalg, f"{prefix}lange")(norm_kind.encode(), a)
 
-    SciPy estimates the reciprocal condition number with LAPACK's `gecon` (Hager's iterative
-    estimator) and warns when it is smaller than machine epsilon; computing that estimate
-    (or, as `docs/scipy.md` explains, shellsim's cheap substitute for it, an explicit inverse)
-    for every `solve` call would double each call's cubic cost. Instead this uses the ratio of
-    the smallest to largest diagonal magnitude of the (already-computed) triangular factor,
-    scaled by `n`: a cheap proxy for the same near-singularity that costs no extra
-    factorization, though its reported number is not LAPACK's `rcond` and does not match
-    SciPy's last bits.
+
+def _rcond_1norm(a, inv_a):
+    """The exact 1-norm reciprocal condition number `1 / (norm_1(a) * norm_1(inv_a))`.
+
+    LAPACK's `gecon` estimates this iteratively (Hager's method) without forming the inverse.
+    `inv_a` is the explicit inverse the caller already has from the same factorization (via
+    `getri` or `potri`), which gives the exact value at the same cubic cost `gecon` itself
+    charges internally, so this composes it directly instead of estimating it.
     """
-    magnitudes = np.abs(pivots)
-    largest = magnitudes.max()
-    if largest == 0.0:
-        return
-    ratio = magnitudes.min() / largest
-    threshold = n * np.finfo(pivots.dtype).eps
-    if ratio < threshold:
+    anorm = _lange("1", a)
+    norm_inverse = _lange("1", inv_a)
+    if anorm <= 0.0 or norm_inverse == 0.0 or not math.isfinite(norm_inverse):
+        return 0.0
+    return 1.0 / (anorm * norm_inverse)
+
+
+def _warn_if_ill_conditioned(rcond, dtype, slice_index=0):
+    """Warn as SciPy's `solve` does when the reciprocal condition number `rcond` (from `gecon`
+    or `_rcond_1norm`) is below the dtype's machine epsilon, SciPy's own threshold."""
+    if rcond < np.finfo(dtype).eps:
         warnings.warn(
-            f"An ill-conditioned matrix detected: slice {slice_index} has rcond = {ratio}.",
+            f"An ill-conditioned matrix detected: slice {slice_index} has rcond = {rcond}.",
             LinAlgWarning,
             stacklevel=4,
         )
@@ -230,8 +235,10 @@ def solve(a, b, lower=False, overwrite_a=False, overwrite_b=False, check_finite=
     prefix = _prefix(dtype)
     getrf = getattr(_scipy_linalg, f"{prefix}getrf")
     getrs = getattr(_scipy_linalg, f"{prefix}getrs")
+    gecon = getattr(_scipy_linalg, f"{prefix}gecon")
     potrf = getattr(_scipy_linalg, f"{prefix}potrf")
     potrs = getattr(_scipy_linalg, f"{prefix}potrs")
+    potri = getattr(_scipy_linalg, f"{prefix}potri")
 
     def one(A, B):
         vector = B.ndim == 1
@@ -240,7 +247,10 @@ def solve(a, b, lower=False, overwrite_a=False, overwrite_b=False, check_finite=
             c, info = potrf(A, lower=lower)
             if info != 0:
                 raise LinAlgError("A singular matrix detected: slice(s) [0] are singular.")
-            _warn_if_ill_conditioned(np.diagonal(c) ** 2, A.shape[-1])
+            # No native `pocon`: compose the same exact-inverse technique `gecon` uses natively,
+            # from `potri`'s explicit inverse of the Cholesky factor already computed above.
+            inv_a, _ = potri(c, lower=lower)
+            _warn_if_ill_conditioned(_rcond_1norm(_symmetrize(A, lower), inv_a), dtype)
             x, _ = potrs(c, rhs, lower=lower)
         else:
             if assume_a in _SYMMETRIC_STRUCTURES:
@@ -248,18 +258,14 @@ def solve(a, b, lower=False, overwrite_a=False, overwrite_b=False, check_finite=
             lu, piv, info = getrf(A)
             if info != 0:
                 raise LinAlgError("A singular matrix detected: slice(s) [0] are singular.")
-            _warn_if_ill_conditioned(np.diagonal(lu), A.shape[-1])
+            rcond, _ = gecon(lu, _lange("1", A))
+            _warn_if_ill_conditioned(rcond, dtype)
             x, _ = getrs(lu, piv, rhs, trans=1 if transposed else 0)
         return x[:, 0] if vector else x
 
     # `getrs`/`potrs` return a Fortran-ordered array (matching LAPACK), but `scipy.linalg.solve`
     # itself returns a C-ordered one.
     return np.ascontiguousarray(_map_batch(one, [a, b], [2, b.ndim if b.ndim < a.ndim else 2]))
-
-
-def _lange(norm_kind, a):
-    prefix = _prefix(a.dtype)
-    return getattr(_scipy_linalg, f"{prefix}lange")(norm_kind.encode(), a)
 
 
 def solve_triangular(a, b, trans=0, lower=False, unit_diagonal=False, overwrite_b=False,

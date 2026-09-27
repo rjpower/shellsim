@@ -11,7 +11,6 @@
 # bits. Eigenvalue, singular value and least-squares results come from different algorithms in
 # shellsim and are compared to 1e-13 relative, with eigenvectors up to sign.
 
-import re
 import warnings
 
 import numpy as np
@@ -53,7 +52,7 @@ def order_70_lower_triangle():
     return np.tril(((np.arange(k * k).reshape(k, k) * 13) % 17 - 8) / 5.0) + 3 * np.eye(k)
 
 
-def test_solve_rounds_as_scipy_does():
+def test_solve_matches_scipy():
     close(sl.solve(G, b), [-0.3333333333333333, 0.6666666666666666, -0.0])
     close(
         sl.solve(G, np.array([[1.0, 0.0], [2.0, 1.0], [3.0, 0.0]])),
@@ -106,7 +105,7 @@ def test_solve_batches_over_leading_dimensions():
     )
 
 
-def test_order_12_solves_round_as_scipy_does():
+def test_order_12_solves_match_scipy():
     a, rhs = order_12()
     close(
         sl.solve(a, rhs),
@@ -165,7 +164,7 @@ def test_order_12_solves_round_as_scipy_does():
     )
 
 
-def test_order_70_triangular_solves_round_as_scipy_does():
+def test_order_70_triangular_solves_match_scipy():
     t = order_70_lower_triangle()
     ones = np.ones(70)
     close(
@@ -185,7 +184,7 @@ def test_order_70_triangular_solves_round_as_scipy_does():
     )
 
 
-def test_inv_and_det_round_as_scipy_does():
+def test_inv_and_det_match_scipy():
     close(
         sl.inv(G),
         [
@@ -256,7 +255,7 @@ def test_float16_and_bool_input_is_deprecated():
     assert caught[0][0] == "DeprecationWarning" and "dtype=bool (a.dtype.char = '?')" in caught[0][1]
 
 
-def test_lu_decompositions_round_as_scipy_does():
+def test_lu_decompositions_match_scipy():
     p, l, u = sl.lu(G)
     assert_array_equal(p, [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
     assert_array_equal(l, [[1.0, 0.0, 0.0], [0.14285714285714285, 1.0, 0.0], [0.5714285714285714, 0.5000000000000002, 1.0]])
@@ -300,7 +299,7 @@ def test_lu_decompositions_round_as_scipy_does():
     )
 
 
-def test_cholesky_decompositions_round_as_scipy_does():
+def test_cholesky_decompositions_match_scipy():
     upper = [[2.0, 0.5, 1.0], [0.0, 2.179449471770337, 1.1470786693528088], [0.0, 0.0, 1.9194297398747862]]
     assert_array_equal(sl.cholesky(S), upper)
     assert_array_equal(sl.cholesky(S, lower=True), np.array(upper).T)
@@ -340,7 +339,7 @@ def test_triangular_banded_and_circulant_solves():
     )
 
 
-def test_qr_rounds_as_scipy_does():
+def test_qr_matches_scipy():
     q, r = sl.qr(G)
     close(
         r,
@@ -473,7 +472,7 @@ def test_subspaces_polar_and_procrustes_agree_with_scipy():
     close(sl.orthogonal_procrustes(R, R[:, ::-1])[1], 91.0)
 
 
-def test_matrix_functions_round_as_scipy_does():
+def test_matrix_functions_match_scipy():
     close(
         sl.expm(np.array([[0.1, 0.2], [0.3, 1.9]])),
         [[1.1720433769251966, 0.6259875479854236], [0.9389813219781356, 6.805931308794008]],
@@ -595,7 +594,7 @@ def test_special_matrices():
     assert sl.khatri_rao(np.ones((2, 3)), np.ones((4, 3))).shape == (8, 3)
 
 
-def test_dft_matrix_keeps_signed_zeros():
+def test_dft_matrix_matches_scipy():
     # SciPy's own `dft` matrix (whose "1" entries carry a specific +0j/-0j pattern from its
     # internal FFT-based construction) is not reproduced bit-for-bit by shellsim's direct
     # `exp(-2j*pi*outer(k,k)/n)` formula: the two evaluate the same mathematical entries in a
@@ -666,13 +665,11 @@ def test_lapack_outputs_keep_fortran_order():
 
 
 def test_singular_and_ill_conditioned_input():
-    # shellsim estimates rcond from a cheap O(n) diagonal-ratio proxy rather than LAPACK's
-    # Hager-estimator `gecon` (see docs/scipy.md), so the reported number differs from SciPy's;
-    # both report the same ill-conditioned matrix with a very small rcond.
+    # shellsim computes rcond exactly from the explicit inverse (`gecon`, or `potri` composed
+    # the same way for the Cholesky path) rather than LAPACK's Hager estimator, but both are the
+    # same 1-norm reciprocal condition number, so this matches SciPy's literal value.
     _, caught = recorded(sl.solve, np.array([[1.0, 1.0], [1.0, 1.0 + 2.0**-52]]), np.array([1.0, 2.0]))
-    assert len(caught) == 1 and caught[0][0] == "LinAlgWarning"
-    match = re.fullmatch(r"An ill-conditioned matrix detected: slice 0 has rcond = (.+)\.", caught[0][1])
-    assert match and float(match.group(1)) < 1e-10
+    assert caught == [("LinAlgWarning", "An ill-conditioned matrix detected: slice 0 has rcond = 5.551115123125783e-17.")]
     _, caught = recorded(sl.lu_factor, np.array([[1.0, 2.0], [2.0, 4.0]]))
     assert caught == [("LinAlgWarning", "Diagonal number 2 is exactly zero. Singular matrix.")]
     singular = "A singular matrix detected: slice\\(s\\) \\[0\\] are singular."

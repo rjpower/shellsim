@@ -117,12 +117,13 @@ fn iterative_kernels_are_charged_for_the_iterations_they_run() {
 
 #[test]
 fn linear_solves_are_charged_for_their_cubic_work() {
-    let cpu = 20_000_000;
-    // Order 200 takes about 2.7 million multiply-adds to factor.
+    let cpu = 35_000_000;
+    // Order 200 factors twice (`getrf`, then `gecon` for the ill-conditioning check `solve`
+    // always runs), each about 16 million multiply-adds, plus a cheap `getrs`: about 32 million.
     let small =
         "import scipy.linalg as sl\nassert sl.solve(np.eye(200) * 2.0, np.ones(200))[0] == 0.5";
     assert_eq!(run(cpu, small), (0, String::new()));
-    // Order 400 takes about 21 million, which the same budget cannot cover.
+    // Order 400 takes about 256 million the same way, which the same budget cannot cover.
     let large = "import scipy.linalg as sl\nsl.solve(np.eye(400) * 2.0, np.ones(400))";
     assert_eq!(run(cpu, large), (137, String::new()));
 }
