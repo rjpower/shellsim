@@ -8,8 +8,8 @@
 //! that do not fit an integer dtype raise NumPy's `OverflowError`.
 
 use super::super::super::native::{
-    PyArrayBuffer, PyArrayData, PyArrayDtype, PyError, PyKind, PyNativeKind, PyResult, PyRuntime,
-    PyValue, PyValueCast,
+    CallArgs, PyArrayBuffer, PyArrayData, PyArrayDtype, PyError, PyKind, PyNativeKind, PyResult,
+    PyRuntime, PyValue, PyValueCast,
 };
 use super::super::super::protocol::quote_string;
 use super::array::{
@@ -384,14 +384,42 @@ fn not_a_number(target: DType, type_name: &str) -> PyError {
 }
 
 /// The number NumPy stores for an object that is not a number: its truth value in a bool dtype,
-/// NaN for `None` in an inexact dtype, and otherwise the error `int()` or `float()` raises.
+/// NaN for `None` in an inexact dtype, and otherwise the result of `int()`, `float()` or
+/// `complex()`, so `__float__`, `__index__` and 0-d arrays convert. Lists, tuples and arrays
+/// with dimensions are rejected first, as NumPy's element setters do.
 fn object_number(runtime: &mut dyn PyRuntime, value: &PyValue, target: DType) -> PyResult<Number> {
     match target.category() {
-        Category::Bool => Ok(Number::Bool(runtime.truth(value)?)),
-        Category::Float if value.is_none() => Ok(Number::Float(f64::NAN)),
-        Category::Complex if value.is_none() => Ok(Number::Complex(f64::NAN, f64::NAN)),
-        _ => Err(not_a_number(target, &runtime.type_name(value)?)),
+        Category::Bool => return Ok(Number::Bool(runtime.truth(value)?)),
+        Category::Float if value.is_none() => return Ok(Number::Float(f64::NAN)),
+        Category::Complex if value.is_none() => return Ok(Number::Complex(f64::NAN, f64::NAN)),
+        _ => {}
     }
+    let sequence = match runtime.kind(value)? {
+        PyKind::List | PyKind::Tuple => true,
+        _ if runtime.native_kind(value)? == Some(PyNativeKind::Array) => {
+            !Array::from_value(runtime, *value)?.view.shape.is_empty()
+        }
+        _ => false,
+    };
+    if sequence {
+        return Err(PyError::value_error(
+            "setting an array element with a sequence.",
+        ));
+    }
+    let constructor = match target.category() {
+        Category::Signed | Category::Unsigned => "int",
+        Category::Complex => "complex",
+        _ => "float",
+    };
+    let constructor = runtime
+        .builtin_type(constructor)
+        .ok_or_else(|| PyError::runtime_error(format!("builtin {constructor} is missing")))?;
+    let number = runtime.call_value(constructor, CallArgs::new(vec![*value], Vec::new()))?;
+    let leaf = leaf(runtime, &number)?;
+    if matches!(leaf, Leaf::Object) {
+        return Err(not_a_number(target, &runtime.type_name(value)?));
+    }
+    leaf_number(&leaf, target)
 }
 
 /// The number a leaf stands for when stored into a numeric dtype.

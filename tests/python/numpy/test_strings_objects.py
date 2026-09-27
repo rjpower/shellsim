@@ -362,6 +362,35 @@ def test_object_astype_numeric_and_str():
     assert text.tolist() == ["1", "ab"]
 
 
+class _FloatOnly:
+    def __float__(self):
+        return 2.5
+
+
+def test_object_astype_numeric_uses_number_protocols():
+    zero_d = np.empty(2, dtype=object)
+    zero_d[0] = np.array(10.0)
+    zero_d[1] = np.array(3)
+    assert type(zero_d[0]) is np.ndarray
+    assert zero_d.astype(float).tolist() == [10.0, 3.0]
+    assert zero_d.astype(np.int64).tolist() == [10, 3]
+    assert zero_d.astype(complex).tolist() == [10 + 0j, 3 + 0j]
+    assert np.array([_FloatOnly()], dtype=object).astype(float).tolist() == [2.5]
+    with pytest.raises(TypeError, match="not '_FloatOnly'"):
+        np.array([_FloatOnly()], dtype=object).astype(np.int64)
+    nested = np.empty(1, dtype=object)
+    nested[0] = np.array([1.0, 2.0])
+    with pytest.raises(ValueError, match="setting an array element with a sequence"):
+        nested.astype(float)
+
+
+def test_vectorize_converts_zero_d_results_to_otypes():
+    doubled = np.vectorize(lambda x: np.where(x < 3, x, 2 * x), otypes="d")
+    result = doubled([1.0, 5.0])
+    assert result.dtype == np.dtype("float64")
+    assert result.tolist() == [1.0, 10.0]
+
+
 def test_numeric_astype_object_boxes_python_numbers():
     ints = np.array([1, 2]).astype(object)
     assert ints.tolist() == [1, 2]
