@@ -595,7 +595,13 @@ impl PyRuntime for Vm<'_> {
         specification: &str,
     ) -> PyResult<String> {
         self.render_formatted_value(value, conversion, specification)
-            .map_err(PyError::value_error)
+            .map_err(|message| {
+                if self.pending_exception.is_some() {
+                    PyError::new(PyErrorKind::Raised, message)
+                } else {
+                    PyError::unsupported(message)
+                }
+            })
     }
 
     fn equals(&mut self, left: &Value, right: &Value) -> PyResult<bool> {

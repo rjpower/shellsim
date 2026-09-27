@@ -46,7 +46,12 @@ pub fn display(heap: &Heap, value: &Value) -> Result<String, String> {
 /// `<object object at 0x7f0000000010>`: derived from the arena slot, so it is stable across runs
 /// and distinct for live objects.
 pub fn address(id: super::heap::ObjectId) -> String {
-    format!("0x{:x}", 0x7f00_0000_0000_u64 + (id.as_raw() as u64) * 16)
+    format!("0x{:x}", address_value(id))
+}
+
+/// The numeric stand-in address of a heap object; see [`address`].
+pub fn address_value(id: super::heap::ObjectId) -> u64 {
+    0x7f00_0000_0000_u64 + (id.as_raw() as u64) * 16
 }
 
 pub fn repr(heap: &Heap, value: &Value) -> Result<String, String> {

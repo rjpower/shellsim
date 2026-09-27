@@ -83,6 +83,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             name: "prefix",
             value: PyConstant::String("/usr"),
         },
+        // The modeled interpreter is a 64-bit build.
+        ValueDef::Constant {
+            name: "maxsize",
+            value: PyConstant::Int(i64::MAX),
+        },
         ValueDef::Factory {
             name: "argv",
             get: argv,

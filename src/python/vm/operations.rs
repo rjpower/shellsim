@@ -1,7 +1,7 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
 use super::super::native::KindNumber;
-use super::format::{format_float, format_integer, format_text, FormatSpec};
+use super::format::{format_float, format_integer, format_text, FormatError};
 use super::{
     number, protocol, BigInt, BinaryOperator, BuiltinType, ComparisonOperator, DisplayKind,
     NativeValue, Object, Ordering, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
@@ -740,8 +740,12 @@ impl Vm<'_> {
         if format_spec.is_empty() {
             Ok(converted)
         } else {
-            format_text(&converted, &FormatSpec::parse(format_spec)?)
+            format_text(&converted, format_spec).map_err(|error| self.raise_format_error(error))
         }
+    }
+
+    fn raise_format_error(&mut self, error: FormatError) -> String {
+        self.raise_exception(error.kind, error.message)
     }
 
     /// `format(value, spec)`, which CPython defines as `type(value).__format__(value, spec)`.
@@ -804,35 +808,37 @@ impl Vm<'_> {
         self.reserve_result(largest.saturating_add(spec.len()).saturating_mul(2))
     }
 
-    fn format_unconverted_value(&self, value: &Value, text: &str) -> Result<String, String> {
+    /// `format(value, text)` for a builtin value with a non-empty specification: ints, bools
+    /// and floats through the numeric mini-language, strings through the string one, and
+    /// anything else with the `TypeError` of `object.__format__`.
+    fn format_unconverted_value(&mut self, value: &Value, text: &str) -> Result<String, String> {
         if super::number::is_complex(&self.state.heap, value) {
             return Err("format specifications for complex numbers are not implemented".into());
         }
-        let spec = FormatSpec::parse(text)?;
-        let number = super::number::view(&self.state.heap, value);
-        match (spec.presentation, number) {
-            (Some('f' | 'e' | 'E' | 'g' | 'G' | '%'), Some(_))
-            | (None, Some(number::NumberRef::Float(_))) => {
-                let float = super::number::as_f64(&self.state.heap, value)
-                    .ok_or("floating-point format requires a number")?;
-                format_float(
-                    float,
-                    &protocol::repr(&self.state.heap, &Value::Float(float))?,
-                    &spec,
-                )
+        let result = match super::number::view(&self.state.heap, value) {
+            Some(number::NumberRef::Float(float)) => {
+                let repr = protocol::repr(&self.state.heap, &Value::Float(float))?;
+                format_float(float, &repr, text)
             }
-            (Some('d' | 'b' | 'o' | 'x' | 'X') | None, Some(_)) => {
+            Some(_) => {
                 let integer = self
                     .bigint_operand(value)
                     .map_err(|_| "integer format requires an integer")?;
-                format_integer(integer, &spec)
+                let type_name = self.type_name_of(value)?;
+                format_integer(integer, text, &type_name)
             }
-            (_, Some(_)) => Err(format!("unsupported numeric format {text:?}")),
-            (_, None) => match protocol::string_value(&self.state.heap, value)? {
-                Some(text) => format_text(&text, &spec),
-                None => Err(format!("unsupported format specification {text:?}")),
+            None => match protocol::string_value(&self.state.heap, value)? {
+                Some(string) => format_text(&string, text),
+                None => {
+                    let type_name = self.type_name_of(value)?;
+                    return Err(self.raise_exception(
+                        "TypeError",
+                        format!("unsupported format string passed to {type_name}.__format__"),
+                    ));
+                }
             },
-        }
+        };
+        result.map_err(|error| self.raise_format_error(error))
     }
 
     pub(super) fn is_bigint(&self, value: &Value) -> Result<bool, String> {

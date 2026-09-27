@@ -16,12 +16,14 @@ use super::super::native::{
     PySequence, PySet, PyTuple, PyValue, PyValueCast,
 };
 use super::super::number::PyNumber;
+use super::super::protocol;
 use super::super::slice::SlicePlan;
 use super::super::unicode;
 
 static BUILTINS: &[FunctionDef] = &[
     builtin("__import__", builtin_import),
     builtin("ascii", builtin_ascii),
+    builtin("id", builtin_id),
     builtin("map", builtin_map),
     builtin("filter", builtin_filter),
     builtin("reversed", builtin_reversed),
@@ -1650,10 +1652,17 @@ pub(crate) fn slot_string_remainder(
         let requested = width.unwrap_or_default().max(precision.unwrap_or_default());
         runtime.reserve_memory(requested)?;
         runtime.charge_cpu(u64::try_from(requested).unwrap_or(u64::MAX))?;
+        let conversion_index = index;
         let conversion = *characters
             .get(index)
             .ok_or_else(|| PyError::value_error("incomplete format"))?;
         index += 1;
+        if !"sradiuxXofFeEgGc".contains(conversion) {
+            return Err(PyError::value_error(format!(
+                "unsupported format character '{conversion}' ({:#x}) at index {conversion_index}",
+                u32::from(conversion)
+            )));
+        }
         let value = if let Some(key) = mapping_key {
             used_mapping = true;
             let mapping = right.cast::<PyDict>(runtime)?;
@@ -1669,106 +1678,96 @@ pub(crate) fn slot_string_remainder(
             argument += 1;
             value
         };
-        let mut rendered = match conversion {
-            's' => runtime.display(&value)?,
-            'r' | 'a' => runtime.repr(&value)?,
-            'd' | 'i' | 'u' => runtime
-                .integer_text(&value)?
-                .ok_or_else(|| PyError::type_error("%d format: a real number is required"))?,
-            'x' | 'X' | 'o' => {
-                let decimal = runtime
-                    .integer_text(&value)?
-                    .ok_or_else(|| PyError::type_error("integer format requires an integer"))?;
-                let integer = decimal
-                    .parse::<BigInt>()
-                    .map_err(|_| PyError::runtime_error("invalid internal integer"))?;
-                let digits = match conversion {
-                    'x' => format!("{integer:x}"),
-                    'X' => format!("{integer:X}"),
-                    'o' => format!("{integer:o}"),
-                    _ => unreachable!(),
-                };
-                if alternate && integer != BigInt::zero() {
-                    match conversion {
-                        'x' => format!("0x{digits}"),
-                        'X' => format!("0X{digits}"),
-                        'o' => format!("0o{digits}"),
-                        _ => unreachable!(),
-                    }
-                } else {
-                    digits
-                }
-            }
+        let rendered = match conversion {
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
-                let number = value.cast::<PyNumber>(runtime)?.into_f64()?;
-                let precision = precision.unwrap_or(6);
-                match conversion {
-                    'f' | 'F' => format!("{number:.precision$}"),
-                    'e' => format!("{number:.precision$e}"),
-                    'E' => format!("{number:.precision$E}"),
-                    'g' | 'G' => {
-                        let mut text = format!("{number:.precision$}");
-                        if conversion == 'G' {
-                            text.make_ascii_uppercase();
-                        }
-                        text
+                // The format-spec mini-language renders floats the same way, including zero
+                // padding of nan and inf.
+                let number = match value.cast::<PyNumber>(runtime) {
+                    Ok(number) => number.into_f64()?,
+                    Err(_) => {
+                        let actual = runtime.type_name(&value)?;
+                        return Err(PyError::type_error(format!(
+                            "must be real number, not {actual}"
+                        )));
                     }
-                    _ => unreachable!(),
+                };
+                let mut spec = String::new();
+                if left_align {
+                    spec.push('<');
                 }
+                if plus {
+                    spec.push('+');
+                } else if space {
+                    spec.push(' ');
+                }
+                if alternate {
+                    spec.push('#');
+                }
+                if zero && !left_align {
+                    spec.push('0');
+                }
+                if let Some(width) = width {
+                    spec.push_str(&width.to_string());
+                }
+                spec.push_str(&format!(".{}{conversion}", precision.unwrap_or(6)));
+                runtime.format_value(&Value::Float(number), None, &spec)?
             }
-            'c' => {
-                if let Some(integer) = runtime.int_value(&value) {
-                    u32::try_from(integer)
-                        .ok()
-                        .and_then(char::from_u32)
-                        .ok_or_else(|| PyError::overflow_error("%c arg not in range"))?
-                        .to_string()
+            'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
+                let integer = percent_integer(runtime, &value, conversion)?;
+                let negative = integer.sign() == Sign::Minus;
+                let magnitude = integer.magnitude();
+                let digits = match conversion {
+                    'x' => magnitude.to_str_radix(16),
+                    'X' => magnitude.to_str_radix(16).to_ascii_uppercase(),
+                    'o' => magnitude.to_str_radix(8),
+                    _ => magnitude.to_string(),
+                };
+                let digits = pad_integer_precision(digits, precision);
+                let prefix = match (alternate, conversion) {
+                    (true, 'x') => "0x",
+                    (true, 'X') => "0X",
+                    (true, 'o') => "0o",
+                    _ => "",
+                };
+                let sign = if negative {
+                    "-"
+                } else if plus {
+                    "+"
+                } else if space {
+                    " "
                 } else {
-                    let OwnedPyString(text) = value.cast(runtime)?;
-                    if text.chars().count() != 1 {
-                        return Err(PyError::type_error("%c requires int or char"));
-                    }
-                    text
+                    ""
+                };
+                let length = sign.len() + prefix.len() + digits.len();
+                let padding = width.unwrap_or(0).saturating_sub(length);
+                if left_align {
+                    format!("{sign}{prefix}{digits}{}", " ".repeat(padding))
+                } else if zero {
+                    format!("{sign}{prefix}{}{digits}", "0".repeat(padding))
+                } else {
+                    format!("{}{sign}{prefix}{digits}", " ".repeat(padding))
                 }
             }
-            other => {
-                return Err(PyError::value_error(format!(
-                    "unsupported format character {other:?}"
-                )))
+            _ => {
+                let mut text = match conversion {
+                    's' => runtime.display(&value)?,
+                    'r' | 'a' => runtime.repr(&value)?,
+                    _ => percent_character(runtime, &value)?,
+                };
+                if conversion != 'c' {
+                    if let Some(precision) = precision {
+                        text = text.chars().take(precision).collect();
+                    }
+                }
+                let padding = width.unwrap_or(0).saturating_sub(text.chars().count());
+                if left_align {
+                    text.extend(std::iter::repeat_n(' ', padding));
+                    text
+                } else {
+                    format!("{}{text}", " ".repeat(padding))
+                }
             }
         };
-        if matches!(conversion, 's' | 'r' | 'a') {
-            if let Some(precision) = precision {
-                rendered = rendered.chars().take(precision).collect();
-            }
-        } else if matches!(conversion, 'd' | 'i' | 'u') {
-            rendered = pad_integer_precision(rendered, precision);
-        }
-        if matches!(
-            conversion,
-            'd' | 'i' | 'u' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G'
-        ) && !rendered.starts_with('-')
-        {
-            if plus {
-                rendered.insert(0, '+');
-            } else if space {
-                rendered.insert(0, ' ');
-            }
-        }
-        if let Some(width) = width {
-            let padding = width.saturating_sub(rendered.chars().count());
-            if padding > 0 {
-                let fill = if zero && !left_align { '0' } else { ' ' };
-                if left_align {
-                    rendered.extend(std::iter::repeat_n(fill, padding));
-                } else if fill == '0' && matches!(rendered.chars().next(), Some('+' | '-' | ' ')) {
-                    let sign = rendered.remove(0);
-                    rendered = format!("{sign}{}{rendered}", "0".repeat(padding));
-                } else {
-                    rendered = format!("{}{rendered}", fill.to_string().repeat(padding));
-                }
-            }
-        }
         runtime.reserve_memory(rendered.len())?;
         output.push_str(&rendered);
     }
@@ -1794,18 +1793,72 @@ fn parse_format_digits(characters: &[char], index: &mut usize) -> PyResult<Optio
     Ok((*index != start).then_some(value))
 }
 
-fn pad_integer_precision(mut value: String, precision: Option<usize>) -> String {
-    let Some(precision) = precision else {
-        return value;
-    };
-    let sign = value.starts_with('-').then(|| value.remove(0));
-    if value.len() < precision {
-        value = format!("{}{value}", "0".repeat(precision - value.len()));
+/// Zero-extend unsigned `digits` to `precision` digits, which `%`-formatting treats as a
+/// minimum digit count for integers.
+fn pad_integer_precision(digits: String, precision: Option<usize>) -> String {
+    match precision {
+        Some(precision) if digits.len() < precision => {
+            format!("{}{digits}", "0".repeat(precision - digits.len()))
+        }
+        _ => digits,
     }
-    if let Some(sign) = sign {
-        value.insert(0, sign);
+}
+
+/// The integer a `%d`-style conversion formats. `%d`, `%i` and `%u` truncate a float as
+/// `int()` does; `%x`, `%X` and `%o` require an integer.
+fn percent_integer(
+    runtime: &mut dyn PyRuntime,
+    value: &PyValue,
+    conversion: char,
+) -> PyResult<BigInt> {
+    if let Some(text) = runtime.integer_text(value)? {
+        return text
+            .parse::<BigInt>()
+            .map_err(|_| PyError::runtime_error("invalid internal integer"));
     }
-    value
+    let actual = runtime.type_name(value)?;
+    if !matches!(conversion, 'd' | 'i' | 'u') {
+        return Err(PyError::type_error(format!(
+            "%{conversion} format: an integer is required, not {actual}"
+        )));
+    }
+    let number = value
+        .cast::<PyNumber>(runtime)
+        .and_then(PyNumber::into_f64)
+        .map_err(|_| {
+            PyError::type_error(format!(
+                "%{conversion} format: a real number is required, not {actual}"
+            ))
+        })?;
+    if number.is_nan() {
+        return Err(PyError::value_error("cannot convert float NaN to integer"));
+    }
+    num_traits::FromPrimitive::from_f64(number.trunc())
+        .ok_or_else(|| PyError::overflow_error("cannot convert float infinity to integer"))
+}
+
+/// The character `%c` formats: an int code point or a one-character string.
+fn percent_character(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<String> {
+    if let Some(text) = runtime.integer_text(value)? {
+        return text
+            .parse::<u32>()
+            .ok()
+            .and_then(char::from_u32)
+            .map(String::from)
+            .ok_or_else(|| PyError::overflow_error("%c arg not in range(0x110000)"));
+    }
+    let requirement = "%c requires an int or a unicode character";
+    if runtime.kind(value)? != PyKind::String {
+        let actual = runtime.type_name(value)?;
+        return Err(PyError::type_error(format!("{requirement}, not {actual}")));
+    }
+    let OwnedPyString(text) = value.cast(runtime)?;
+    match text.chars().count() {
+        1 => Ok(text),
+        length => Err(PyError::type_error(format!(
+            "{requirement}, not a string of length {length}"
+        ))),
+    }
 }
 
 fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -2584,6 +2637,29 @@ fn builtin_getattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
             PyError::exception("AttributeError", format!("attribute {name:?} not found"))
         }),
     }
+}
+
+/// `id()`: an integer that two values share exactly when `is` holds between them.
+///
+/// A heap object's id is the stand-in address its default repr shows, so `hex(id(x))` matches
+/// `<object object at 0x...>`. Immediate values such as small ints, floats and short strings
+/// are identical when their contents are, so their id is a deterministic hash of the value,
+/// placed below the heap addresses.
+fn builtin_id(_runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    use std::hash::{Hash, Hasher};
+    const IMMEDIATE_BASE: u64 = 0x5000_0000_0000;
+    args.expect_positional("id", 1, 1)?;
+    args.reject_keywords("id")?;
+    let value = args.positional()[0];
+    let id = match value.object_id() {
+        Some(object) => protocol::address_value(object),
+        None => {
+            let mut hasher = std::hash::DefaultHasher::new();
+            value.hash(&mut hasher);
+            IMMEDIATE_BASE + (hasher.finish() % (1 << 40)) * 16
+        }
+    };
+    Ok(Value::Int(i64::try_from(id).expect("ids are below 2**47")))
 }
 
 /// `ascii()`: `repr()` with non-ASCII characters escaped as `\\x`, `\\u` or `\\U`.

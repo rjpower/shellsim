@@ -1,254 +1,516 @@
 //! Python's format-specification mini-language for f-strings, `format`, and `str.format`.
 //!
-//! A specification is parsed once into [`FormatSpec`], then rendered for an integer, float, or
-//! string. The supported grammar is `[align][sign][#][0][width][,][.precision][type]` with the
-//! default space fill. Custom fill characters, `=` alignment, the space sign, `_` grouping, and
-//! the `n`/`c` presentations are rejected explicitly rather than approximated.
+//! A specification is parsed into [`FormatSpec`], then rendered for an integer, float, or
+//! string. The grammar is CPython 3.14's:
+//!
+//! ```text
+//! [[fill]align][sign]["z"]["#"]["0"][width][grouping]["." precision [grouping]][type]
+//! ```
+//!
+//! Numbers render as a sign, a prefix such as `0x`, integer digits, and a remainder holding the
+//! fraction, exponent and `%`. Grouping separators go into the integer digits; with `0` fill
+//! and `=` alignment the padding becomes leading zero digits, so separators appear inside it
+//! (`format(1234, "012,")` is `0,000,001,234`). Checks run in CPython's order, and each failure
+//! carries CPython's exception type and message. The `n` presentation uses the C locale, as
+//! CPython does before a program calls `setlocale`, so it never groups.
 
 use super::BigInt;
-use num_bigint::Sign;
+use num_bigint::Sign as BigSign;
+use num_traits::ToPrimitive;
+
+/// A formatting failure: the exception CPython raises and its message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FormatError {
+    pub(super) kind: &'static str,
+    pub(super) message: String,
+}
+
+fn value_error(message: impl Into<String>) -> FormatError {
+    FormatError {
+        kind: "ValueError",
+        message: message.into(),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Align {
     Left,
     Right,
     Center,
+    /// `=`: padding goes between the sign (and prefix) and the digits.
+    Numeric,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Sign {
+    Plus,
+    Minus,
+    Space,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Grouping {
+    Comma,
+    Underscore,
+}
+
+impl Grouping {
+    fn separator(self) -> char {
+        match self {
+            Self::Comma => ',',
+            Self::Underscore => '_',
+        }
+    }
 }
 
 /// A parsed format specification. Widths and precisions are bounded by the caller's resource
 /// reservation before rendering allocates padding.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct FormatSpec {
+    pub(super) fill: Option<char>,
     pub(super) align: Option<Align>,
-    pub(super) plus: bool,
+    pub(super) sign: Option<Sign>,
+    /// `z`: show a value that rounds to negative zero without its sign.
+    pub(super) no_negative_zero: bool,
     pub(super) alternate: bool,
+    /// The `0` flag: zero fill unless a fill character is given, and `=` alignment for numbers
+    /// unless an alignment is given.
     pub(super) zero: bool,
     pub(super) width: usize,
-    pub(super) grouping: bool,
+    pub(super) grouping: Option<Grouping>,
     pub(super) precision: Option<usize>,
+    /// Separators between groups of three fraction digits (new in Python 3.14).
+    pub(super) fraction_grouping: Option<Grouping>,
     pub(super) presentation: Option<char>,
 }
 
+fn align_of(character: char) -> Option<Align> {
+    Some(match character {
+        '<' => Align::Left,
+        '>' => Align::Right,
+        '^' => Align::Center,
+        '=' => Align::Numeric,
+        _ => return None,
+    })
+}
+
+/// A decimal number at the front of `characters`, or `None` when it starts with no digit.
+fn leading_number(characters: &[char], position: &mut usize) -> Result<Option<usize>, FormatError> {
+    let start = *position;
+    let mut number = 0usize;
+    while let Some(digit) = characters.get(*position).and_then(|c| c.to_digit(10)) {
+        number = number
+            .checked_mul(10)
+            .and_then(|number| number.checked_add(digit as usize))
+            .ok_or_else(|| value_error("Too many decimal digits in format string"))?;
+        *position += 1;
+    }
+    Ok((*position > start).then_some(number))
+}
+
+fn grouping_type_error(grouping: Grouping, presentation: char) -> FormatError {
+    value_error(format!(
+        "Cannot specify '{}' with '{presentation}'.",
+        grouping.separator()
+    ))
+}
+
+fn unknown_code(presentation: char, type_name: &str) -> FormatError {
+    value_error(format!(
+        "Unknown format code '{presentation}' for object of type '{type_name}'"
+    ))
+}
+
 impl FormatSpec {
-    /// Parse `spec`, for example `">+12,.2f"` or `"#010x"`.
-    pub(super) fn parse(spec: &str) -> Result<Self, String> {
-        let unsupported = || format!("unsupported format specification {spec:?}");
+    /// Parse `spec` for a value of `type_name` whose presentation defaults to
+    /// `default_presentation` (`d` for ints, `s` for strings, none for floats), which decides
+    /// whether a grouping separator is allowed. For example `"*>+12,.2f"` or `"#010_x"`.
+    pub(super) fn parse(
+        spec: &str,
+        type_name: &str,
+        default_presentation: Option<char>,
+    ) -> Result<Self, FormatError> {
+        let characters = spec.chars().collect::<Vec<_>>();
         let mut parsed = Self::default();
-        let mut rest = spec;
-        if let Some(align) = rest.chars().next().and_then(|first| match first {
-            '<' => Some(Align::Left),
-            '>' => Some(Align::Right),
-            '^' => Some(Align::Center),
-            _ => None,
-        }) {
+        let mut position = 0;
+        if let Some(align) = characters.get(1).copied().and_then(align_of) {
+            parsed.fill = Some(characters[0]);
             parsed.align = Some(align);
-            rest = &rest[1..];
+            position = 2;
+        } else if let Some(align) = characters.first().copied().and_then(align_of) {
+            parsed.align = Some(align);
+            position = 1;
         }
-        if let Some(stripped) = rest.strip_prefix('+') {
-            parsed.plus = true;
-            rest = stripped;
-        } else if let Some(stripped) = rest.strip_prefix('-') {
-            rest = stripped;
+        parsed.sign = match characters.get(position) {
+            Some('+') => Some(Sign::Plus),
+            Some('-') => Some(Sign::Minus),
+            Some(' ') => Some(Sign::Space),
+            _ => None,
+        };
+        position += usize::from(parsed.sign.is_some());
+        if characters.get(position) == Some(&'z') {
+            parsed.no_negative_zero = true;
+            position += 1;
         }
-        if let Some(stripped) = rest.strip_prefix('#') {
+        if characters.get(position) == Some(&'#') {
             parsed.alternate = true;
-            rest = stripped;
+            position += 1;
         }
-        if let Some(stripped) = rest.strip_prefix('0') {
+        if parsed.fill.is_none() && characters.get(position) == Some(&'0') {
             parsed.zero = true;
-            rest = stripped;
+            position += 1;
         }
-        let (width, stripped) = leading_number(rest).map_err(|_| unsupported())?;
-        parsed.width = width.unwrap_or(0);
-        rest = stripped;
-        if let Some(stripped) = rest.strip_prefix(',') {
-            parsed.grouping = true;
-            rest = stripped;
+        parsed.width = leading_number(&characters, &mut position)?.unwrap_or(0);
+        parsed.grouping = parse_grouping(&characters, &mut position)?;
+        if characters.get(position) == Some(&'.') {
+            position += 1;
+            parsed.precision = Some(
+                leading_number(&characters, &mut position)?
+                    .ok_or_else(|| value_error("Format specifier missing precision"))?,
+            );
+            parsed.fraction_grouping = parse_grouping(&characters, &mut position)?;
         }
-        if let Some(stripped) = rest.strip_prefix('.') {
-            let (precision, stripped) = leading_number(stripped).map_err(|_| unsupported())?;
-            parsed.precision = Some(precision.ok_or_else(unsupported)?);
-            rest = stripped;
+        match &characters[position..] {
+            [] => parsed.presentation = default_presentation,
+            [presentation] => parsed.presentation = Some(*presentation),
+            _ => {
+                return Err(value_error(format!(
+                    "Invalid format specifier '{spec}' for object of type '{type_name}'"
+                )))
+            }
         }
-        let mut chars = rest.chars();
-        parsed.presentation = chars.next();
-        if chars.next().is_some() {
-            return Err(unsupported());
+        if let Some(grouping) = parsed.grouping {
+            match (parsed.presentation, grouping) {
+                (None | Some('d' | 'e' | 'f' | 'g' | 'E' | 'G' | '%' | 'F'), _) => {}
+                (Some('b' | 'o' | 'x' | 'X'), Grouping::Underscore) => {}
+                (Some(presentation), _) => return Err(grouping_type_error(grouping, presentation)),
+            }
         }
         Ok(parsed)
     }
 
-    fn sign(&self, negative: bool) -> &'static str {
-        if negative {
-            "-"
-        } else if self.plus {
-            "+"
-        } else {
-            ""
+    fn sign_text(&self, negative: bool) -> &'static str {
+        match (negative, self.sign) {
+            (true, _) => "-",
+            (false, Some(Sign::Plus)) => "+",
+            (false, Some(Sign::Space)) => " ",
+            (false, _) => "",
         }
     }
 
-    /// Pad a rendered number. Zero padding goes between the sign and the digits, and explicit
-    /// alignment takes precedence over it, as in CPython.
-    fn pad_number(&self, sign: &str, body: String) -> String {
-        let body = if self.grouping {
-            group_decimal(&body, self.zero_width(sign.len()))
-        } else {
-            body
-        };
-        let rendered = format!("{sign}{body}");
-        if self.align.is_none() && self.zero {
-            let padding = self.width.saturating_sub(rendered.len());
-            return format!("{sign}{}{body}", "0".repeat(padding));
-        }
-        align(&rendered, self.width, self.align.unwrap_or(Align::Right))
+    fn fill_char(&self) -> char {
+        self.fill.unwrap_or(if self.zero { '0' } else { ' ' })
     }
 
-    /// The minimum grouped digit-field width when zero padding applies.
-    fn zero_width(&self, sign: usize) -> usize {
-        if self.zero && self.align.is_none() {
-            self.width.saturating_sub(sign)
+    /// Lay out a number from its sign, prefix, integer digits and remainder.
+    fn render_number(
+        &self,
+        negative: bool,
+        prefix: &str,
+        digits: &str,
+        remainder: &str,
+        group_size: usize,
+    ) -> String {
+        let sign = self.sign_text(negative);
+        let fill = self.fill_char();
+        let align = self.align.unwrap_or(if self.zero {
+            Align::Numeric
+        } else {
+            Align::Right
+        });
+        let fixed = sign.len() + prefix.len() + remainder.chars().count();
+        // Zero fill with `=` alignment extends the digits themselves, so grouping covers it.
+        let minimum = if fill == '0' && align == Align::Numeric {
+            self.width.saturating_sub(fixed)
         } else {
             0
+        };
+        let digits = match self.grouping {
+            Some(grouping) if !digits.is_empty() => {
+                group_digits(digits, group_size, grouping.separator(), minimum)
+            }
+            _ => format!(
+                "{}{digits}",
+                "0".repeat(minimum.saturating_sub(digits.len()))
+            ),
+        };
+        let length = fixed + digits.chars().count();
+        let padding = self.width.saturating_sub(length);
+        let fill_text = |count: usize| fill.to_string().repeat(count);
+        match align {
+            Align::Numeric => format!("{sign}{prefix}{}{digits}{remainder}", fill_text(padding)),
+            Align::Left => format!("{sign}{prefix}{digits}{remainder}{}", fill_text(padding)),
+            Align::Right => format!("{}{sign}{prefix}{digits}{remainder}", fill_text(padding)),
+            Align::Center => format!(
+                "{}{sign}{prefix}{digits}{remainder}{}",
+                fill_text(padding / 2),
+                fill_text(padding - padding / 2)
+            ),
         }
     }
 }
 
-fn leading_number(text: &str) -> Result<(Option<usize>, &str), std::num::ParseIntError> {
-    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 {
-        return Ok((None, text));
+fn parse_grouping(
+    characters: &[char],
+    position: &mut usize,
+) -> Result<Option<Grouping>, FormatError> {
+    let both = || value_error("Cannot specify both ',' and '_'.");
+    let mut grouping = None;
+    if characters.get(*position) == Some(&',') {
+        grouping = Some(Grouping::Comma);
+        *position += 1;
     }
-    Ok((Some(text[..digits].parse()?), &text[digits..]))
+    if characters.get(*position) == Some(&'_') {
+        if grouping.is_some() {
+            return Err(both());
+        }
+        grouping = Some(Grouping::Underscore);
+        *position += 1;
+    }
+    if characters.get(*position) == Some(&',') && grouping == Some(Grouping::Underscore) {
+        return Err(both());
+    }
+    Ok(grouping)
 }
 
-/// Format an integer with the `d`, `b`, `o`, `x`, `X`, or default presentation.
-pub(super) fn format_integer(value: BigInt, spec: &FormatSpec) -> Result<String, String> {
-    if spec.precision.is_some() {
-        return Err("precision is not allowed in integer format".into());
-    }
-    let (radix, prefix, uppercase) = match spec.presentation {
-        None | Some('d') => (10, "", false),
-        Some('b') => (2, "0b", false),
-        Some('o') => (8, "0o", false),
-        Some('x') => (16, "0x", false),
-        Some('X') => (16, "0X", true),
-        Some(other) => return Err(format!("unsupported integer format type {other:?}")),
+/// Format an integer. `type_name` is `int` or `bool`, for error messages. Float presentations
+/// convert the value to a float first, as `int.__format__` does.
+pub(super) fn format_integer(
+    value: BigInt,
+    spec: &str,
+    type_name: &str,
+) -> Result<String, FormatError> {
+    let spec = FormatSpec::parse(spec, type_name, Some('d'))?;
+    let presentation = spec.presentation.unwrap_or('d');
+    let (radix, prefix, uppercase) = match presentation {
+        'd' | 'n' | 'c' => (10, "", false),
+        'b' => (2, "0b", false),
+        'o' => (8, "0o", false),
+        'x' => (16, "0x", false),
+        'X' => (16, "0X", true),
+        'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%' => {
+            let float = value
+                .to_f64()
+                .filter(|float| float.is_finite())
+                .ok_or(FormatError {
+                    kind: "OverflowError",
+                    message: "int too large to convert to float".into(),
+                })?;
+            return render_float(float, "", &spec, type_name);
+        }
+        other => return Err(unknown_code(other, type_name)),
     };
-    if spec.alternate && radix == 10 {
-        return Err("alternate form is not allowed for decimal integers".into());
+    if spec.precision.is_some() {
+        return Err(value_error(
+            "Precision not allowed in integer format specifier",
+        ));
     }
-    if spec.grouping && radix != 10 {
-        return Err("comma grouping requires decimal presentation".into());
+    if spec.no_negative_zero {
+        return Err(value_error(
+            "Negative zero coercion (z) not allowed in integer format specifier",
+        ));
     }
-    let negative = value.sign() == Sign::Minus;
+    if presentation == 'c' {
+        if spec.sign.is_some() {
+            return Err(value_error(
+                "Sign not allowed with integer format specifier 'c'",
+            ));
+        }
+        if spec.alternate {
+            return Err(value_error(
+                "Alternate form (#) not allowed with integer format specifier 'c'",
+            ));
+        }
+        let character = value.to_u32().and_then(char::from_u32).ok_or(FormatError {
+            kind: "OverflowError",
+            message: "%c arg not in range(0x110000)".into(),
+        })?;
+        return Ok(spec.render_number(false, "", "", &character.to_string(), 3));
+    }
+    let negative = value.sign() == BigSign::Minus;
     let magnitude = if negative { -value } else { value };
     let mut digits = magnitude.to_str_radix(radix);
     if uppercase {
         digits.make_ascii_uppercase();
     }
     let prefix = if spec.alternate { prefix } else { "" };
-    if !prefix.is_empty() && spec.zero && spec.align.is_none() {
-        let content = spec.sign(negative).len() + prefix.len() + digits.len();
-        let padding = spec.width.saturating_sub(content);
-        return Ok(format!(
-            "{}{prefix}{}{digits}",
-            spec.sign(negative),
-            "0".repeat(padding)
-        ));
-    }
-    Ok(spec.pad_number(spec.sign(negative), format!("{prefix}{digits}")))
+    let group_size = if radix == 10 { 3 } else { 4 };
+    Ok(spec.render_number(negative, prefix, &digits, "", group_size))
 }
 
-/// Format a float with the `f`, `e`, `E`, `g`, `G`, `%`, or default presentation. `repr` is
-/// Python's shortest round-trip text, used when neither a presentation nor a precision is given.
-pub(super) fn format_float(value: f64, repr: &str, spec: &FormatSpec) -> Result<String, String> {
-    if spec.alternate {
-        return Err("alternate form is not supported for floats".into());
+/// Format a float. `repr` is Python's shortest round-trip text for the value, used when neither
+/// a presentation nor a precision is given.
+pub(super) fn format_float(value: f64, repr: &str, spec: &str) -> Result<String, FormatError> {
+    let spec = FormatSpec::parse(spec, "float", None)?;
+    render_float(value, repr, &spec, "float")
+}
+
+fn render_float(
+    value: f64,
+    repr: &str,
+    spec: &FormatSpec,
+    type_name: &str,
+) -> Result<String, FormatError> {
+    let presentation = spec.presentation;
+    if let Some(other) = presentation.filter(|p| !"eEfFgGn%".contains(*p)) {
+        return Err(unknown_code(other, type_name));
     }
-    let precision = spec.precision.unwrap_or(6);
+    if let (Some('n'), Some(grouping)) = (presentation, spec.fraction_grouping) {
+        return Err(grouping_type_error(grouping, 'n'));
+    }
+    let alternate = spec.alternate;
     let magnitude = value.abs();
-    let body = match spec.presentation {
-        _ if !value.is_finite() => non_finite(value, spec.presentation),
-        Some('f') => format!("{magnitude:.precision$}"),
-        Some('e') => scientific(magnitude, precision, 'e'),
-        Some('E') => scientific(magnitude, precision, 'E'),
-        Some('g') => format_general(magnitude, precision, false, false),
-        Some('G') => format_general(magnitude, precision, false, true),
-        Some('%') => format!("{:.precision$}%", magnitude * 100.0),
-        None => match spec.precision {
-            Some(precision) => format_general(magnitude, precision, true, false),
-            None => repr.trim_start_matches('-').to_string(),
-        },
-        Some(other) => return Err(format!("unsupported floating-point format type {other:?}")),
+    let uppercase = matches!(presentation, Some('E' | 'F' | 'G'));
+    let text = if value.is_finite() {
+        let precision = spec.precision.unwrap_or(6);
+        match presentation {
+            Some('f' | 'F') => fixed(magnitude, precision, alternate),
+            Some('%') => format!("{}%", fixed(magnitude * 100.0, precision, alternate)),
+            Some('e' | 'E') => scientific(magnitude, precision, alternate, uppercase),
+            Some('g' | 'G' | 'n') => general(magnitude, precision, false, uppercase, alternate),
+            _ => match spec.precision {
+                Some(precision) => general(magnitude, precision, true, false, alternate),
+                None if alternate => with_point(repr.trim_start_matches('-')),
+                None => repr.trim_start_matches('-').to_string(),
+            },
+        }
+    } else {
+        let label = if value.is_nan() { "nan" } else { "inf" };
+        let label = if uppercase {
+            label.to_uppercase()
+        } else {
+            label.to_string()
+        };
+        if presentation == Some('%') {
+            format!("{label}%")
+        } else {
+            label
+        }
     };
-    let body = match spec.presentation {
-        Some('%') if !value.is_finite() => format!("{body}%"),
-        _ => body,
+    let mantissa_end = text.find(['e', 'E', '%']).unwrap_or(text.len());
+    let rounds_to_zero = text[..mantissa_end].bytes().all(|b| b == b'0' || b == b'.');
+    let negative =
+        value.is_sign_negative() && !(spec.no_negative_zero && value.is_finite() && rounds_to_zero);
+    let split = text.bytes().take_while(u8::is_ascii_digit).count();
+    let (digits, remainder) = text.split_at(split);
+    let remainder = match spec.fraction_grouping {
+        Some(grouping) => group_fraction(remainder, grouping.separator()),
+        None => remainder.to_string(),
     };
-    Ok(spec.pad_number(spec.sign(value.is_sign_negative()), body))
+    Ok(spec.render_number(negative, "", digits, &remainder, 3))
 }
 
-/// Format a string with the `s` or default presentation.
-pub(super) fn format_text(value: &str, spec: &FormatSpec) -> Result<String, String> {
-    if spec.plus || spec.alternate || spec.zero || spec.grouping || spec.precision.is_some() {
-        return Err("numeric format options are not allowed for strings".into());
+/// Format a string with the `s` or default presentation. `type_name` is `str` unless the text
+/// came from a `!r`/`!s` conversion of another type.
+pub(super) fn format_text(value: &str, spec: &str) -> Result<String, FormatError> {
+    let spec = FormatSpec::parse(spec, "str", Some('s'))?;
+    if let Some(other) = spec.presentation.filter(|p| *p != 's') {
+        return Err(unknown_code(other, "str"));
     }
-    if !matches!(spec.presentation, None | Some('s')) {
-        return Err(format!(
-            "unsupported string format type {:?}",
-            spec.presentation.unwrap_or_default()
+    if spec.sign.is_some() {
+        return Err(value_error("Sign not allowed in string format specifier"));
+    }
+    if spec.no_negative_zero {
+        return Err(value_error(
+            "Negative zero coercion (z) not allowed in string format specifier",
         ));
     }
-    Ok(align(value, spec.width, spec.align.unwrap_or(Align::Left)))
+    if spec.alternate {
+        return Err(value_error(
+            "Alternate form (#) not allowed in string format specifier",
+        ));
+    }
+    if spec.align == Some(Align::Numeric) {
+        return Err(value_error(
+            "'=' alignment not allowed in string format specifier",
+        ));
+    }
+    let text = match spec.precision {
+        Some(precision) => value.chars().take(precision).collect::<String>(),
+        None => value.to_string(),
+    };
+    let padding = spec.width.saturating_sub(text.chars().count());
+    let fill = spec.fill_char().to_string();
+    let (left, right) = match spec.align.unwrap_or(Align::Left) {
+        Align::Left | Align::Numeric => (0, padding),
+        Align::Right => (padding, 0),
+        Align::Center => (padding / 2, padding - padding / 2),
+    };
+    Ok(format!("{}{text}{}", fill.repeat(left), fill.repeat(right)))
 }
 
-fn non_finite(value: f64, presentation: Option<char>) -> String {
-    let label = if value.is_nan() { "nan" } else { "inf" };
-    if matches!(presentation, Some('E' | 'G')) {
-        label.to_uppercase()
-    } else {
-        label.into()
+/// `text` with a decimal point before its exponent if it has none, for the `#` form.
+fn with_point(text: &str) -> String {
+    if text.contains('.') {
+        return text.to_string();
+    }
+    match text.find(['e', 'E']) {
+        Some(exponent) => format!("{}.{}", &text[..exponent], &text[exponent..]),
+        None => format!("{text}."),
     }
 }
 
-fn scientific(value: f64, precision: usize, marker: char) -> String {
+fn fixed(value: f64, precision: usize, alternate: bool) -> String {
+    let text = format!("{value:.precision$}");
+    if alternate && precision == 0 {
+        format!("{text}.")
+    } else {
+        text
+    }
+}
+
+fn scientific(value: f64, precision: usize, alternate: bool, uppercase: bool) -> String {
     let rendered = format!("{value:.precision$e}");
     let (mantissa, exponent) = rendered.split_once('e').expect("Rust scientific format");
     let exponent = exponent.parse::<i32>().expect("Rust scientific exponent");
-    format!("{mantissa}{marker}{exponent:+03}")
+    let point = if alternate && precision == 0 { "." } else { "" };
+    let marker = if uppercase { 'E' } else { 'e' };
+    format!("{mantissa}{point}{marker}{exponent:+03}")
 }
 
 /// Format significant digits of a nonnegative finite value using Python's fixed/scientific
-/// thresholds. The default presentation keeps a trailing `.0` and switches to scientific one
-/// digit earlier than `g`.
-fn format_general(value: f64, precision: usize, default_type: bool, uppercase: bool) -> String {
+/// thresholds. The default presentation (`add_dot_0`) keeps a trailing `.0` and switches to
+/// scientific one digit earlier than `g`; the `#` form keeps trailing zeros and the point.
+fn general(
+    value: f64,
+    precision: usize,
+    add_dot_0: bool,
+    uppercase: bool,
+    alternate: bool,
+) -> String {
     let precision = precision.max(1);
-    let decimals = precision.saturating_sub(1);
+    let decimals = precision - 1;
     let scientific = format!("{value:.decimals$e}");
     let (mantissa, exponent) = scientific.split_once('e').expect("Rust scientific format");
     let exponent = exponent.parse::<i32>().expect("Rust scientific exponent");
-    let threshold = if default_type {
-        precision.saturating_sub(1)
-    } else {
-        precision
-    };
+    let threshold = if add_dot_0 { precision - 1 } else { precision };
     let use_scientific = exponent < -4 || usize::try_from(exponent).is_ok_and(|e| e >= threshold);
+    let marker = if uppercase { 'E' } else { 'e' };
     if use_scientific {
-        let mantissa = trim_fraction(mantissa, false);
-        return format!(
-            "{mantissa}{}{exponent:+03}",
-            if uppercase { 'E' } else { 'e' }
-        );
+        let mantissa = if alternate {
+            with_point(mantissa)
+        } else {
+            trim_fraction(mantissa, false)
+        };
+        return format!("{mantissa}{marker}{exponent:+03}");
     }
     let decimals = usize::try_from(precision as i128 - i128::from(exponent) - 1)
         .expect("fixed precision is nonnegative");
-    trim_fraction(&format!("{value:.decimals$}"), default_type)
+    let text = format!("{value:.decimals$}");
+    if alternate {
+        with_point(&text)
+    } else {
+        trim_fraction(&text, add_dot_0)
+    }
 }
 
 fn trim_fraction(value: &str, preserve_decimal: bool) -> String {
     let Some((integer, fraction)) = value.split_once('.') else {
-        return value.to_string();
+        return if preserve_decimal {
+            format!("{value}.0")
+        } else {
+            value.to_string()
+        };
     };
     let fraction = fraction.trim_end_matches('0');
     if fraction.is_empty() {
@@ -262,40 +524,41 @@ fn trim_fraction(value: &str, preserve_decimal: bool) -> String {
     }
 }
 
-/// Insert thousands separators in the leading digits of an unsigned `body`, first zero-filling
-/// those digits until the grouped field reaches `minimum` characters. As in CPython, a separator
-/// can make the result one character wider than `minimum`.
-fn group_decimal(body: &str, minimum: usize) -> String {
-    let digits = body.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 {
-        return body.into();
-    }
-    let rest = &body[digits..];
-    let mut filled = digits;
-    while filled + (filled - 1) / 3 + rest.len() < minimum {
+/// Insert `separator` between groups of `size` digits, counting from the right, after
+/// zero-filling the digits until the grouped text reaches `minimum` characters. As in CPython,
+/// a separator can make the result one character wider than `minimum`.
+fn group_digits(digits: &str, size: usize, separator: char, minimum: usize) -> String {
+    let mut filled = digits.len();
+    while filled + (filled - 1) / size < minimum {
         filled += 1;
     }
-    let padded = format!("{}{}", "0".repeat(filled - digits), &body[..digits]);
-    let mut result = String::with_capacity(filled + filled / 3 + rest.len());
+    let padded = format!("{}{digits}", "0".repeat(filled - digits.len()));
+    let mut result = String::with_capacity(filled + filled / size);
     for (index, digit) in padded.chars().enumerate() {
-        if index > 0 && (filled - index).is_multiple_of(3) {
-            result.push(',');
+        if index > 0 && (filled - index).is_multiple_of(size) {
+            result.push(separator);
         }
         result.push(digit);
     }
-    result.push_str(rest);
     result
 }
 
-fn align(value: &str, width: usize, alignment: Align) -> String {
-    let padding = width.saturating_sub(value.chars().count());
-    let left = match alignment {
-        Align::Right => padding,
-        Align::Center => padding / 2,
-        Align::Left => 0,
+/// Group the fraction digits that follow the decimal point in `remainder` in threes from the
+/// left, leaving any exponent or `%` untouched.
+fn group_fraction(remainder: &str, separator: char) -> String {
+    let Some(fraction) = remainder.strip_prefix('.') else {
+        return remainder.to_string();
     };
-    let right = padding - left;
-    format!("{}{}{}", " ".repeat(left), value, " ".repeat(right))
+    let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+    let mut result = String::from(".");
+    for (index, digit) in fraction[..digits].chars().enumerate() {
+        if index > 0 && index.is_multiple_of(3) {
+            result.push(separator);
+        }
+        result.push(digit);
+    }
+    result.push_str(&fraction[digits..]);
+    result
 }
 
 #[cfg(test)]
@@ -303,50 +566,116 @@ mod tests {
     use super::*;
 
     fn float(value: f64, spec: &str) -> String {
-        format_float(value, &value.to_string(), &FormatSpec::parse(spec).unwrap()).unwrap()
+        format_float(value, &value.to_string(), spec).unwrap()
     }
 
-    fn integer(value: i64, spec: &str) -> Result<String, String> {
-        format_integer(value.into(), &FormatSpec::parse(spec)?)
+    fn integer(value: i64, spec: &str) -> Result<String, FormatError> {
+        format_integer(value.into(), spec, "int")
     }
 
     #[test]
-    fn parses_every_supported_field() {
+    fn parses_every_field() {
         assert_eq!(
-            FormatSpec::parse(">+#012,.3f").unwrap(),
+            FormatSpec::parse("*>+z#012,.3_f", "float", None).unwrap(),
             FormatSpec {
+                fill: Some('*'),
                 align: Some(Align::Right),
-                plus: true,
+                sign: Some(Sign::Plus),
+                no_negative_zero: true,
                 alternate: true,
-                zero: true,
+                zero: false,
                 width: 12,
-                grouping: true,
+                grouping: Some(Grouping::Comma),
                 precision: Some(3),
+                fraction_grouping: Some(Grouping::Underscore),
                 presentation: Some('f'),
             }
         );
-        for invalid in ["*<5", "1,,.2", "5.2ff", ".f", " d"] {
-            assert!(FormatSpec::parse(invalid).is_err(), "{invalid}");
-        }
+        let invalid = FormatSpec::parse("5.2ff", "int", Some('d')).unwrap_err();
+        assert_eq!(
+            invalid.message,
+            "Invalid format specifier '5.2ff' for object of type 'int'"
+        );
+        let both = FormatSpec::parse(",_", "int", Some('d')).unwrap_err();
+        assert_eq!(both.message, "Cannot specify both ',' and '_'.");
+        let missing = FormatSpec::parse(".", "int", Some('d')).unwrap_err();
+        assert_eq!(missing.message, "Format specifier missing precision");
+    }
+
+    #[test]
+    fn fill_alignment_and_zero_flag_match_python() {
+        assert_eq!(integer(5, "*^9").unwrap(), "****5****");
+        assert_eq!(integer(5, "=+6").unwrap(), "+    5");
+        assert_eq!(integer(5, "<05").unwrap(), "50000");
+        assert_eq!(integer(-5, "0^8").unwrap(), "000-5000");
+        assert_eq!(integer(5, " 3d").unwrap(), "  5");
+        assert_eq!(integer(5, "x<+#8x").unwrap(), "+0x5xxxx");
+        assert_eq!(format_text("ab", "05").unwrap(), "ab000");
+        assert_eq!(
+            format_text("abc", "\u{e9}^7.2").unwrap(),
+            "\u{e9}\u{e9}ab\u{e9}\u{e9}\u{e9}"
+        );
     }
 
     #[test]
     fn grouping_zero_fills_before_inserting_separators() {
         assert_eq!(float(-1234.5, "+12,.2f"), "   -1,234.50");
         assert_eq!(float(1234.0, "012,.0f"), "0,000,001,234");
+        assert_eq!(float(1234.5, "*=12,.1f"), "*****1,234.5");
         assert_eq!(float(12345.0, ",.0"), "1e+04");
-        assert_eq!(integer(1234, "+012,d").unwrap(), "+000,001,234");
-        assert_eq!(integer(-1234567, ",").unwrap(), "-1,234,567");
-        assert!(integer(42, ",x").is_err());
+        assert_eq!(float(1234.56789, ",.5_f"), "1,234.567_89");
+        assert_eq!(integer(255, "#010_b").unwrap(), "0b1111_1111");
+        assert_eq!(integer(-1_234_567, ",").unwrap(), "-1,234,567");
+        assert_eq!(
+            integer(42, ",x").unwrap_err().message,
+            "Cannot specify ',' with 'x'."
+        );
     }
 
     #[test]
-    fn percent_and_signs_match_python() {
+    fn float_forms_match_python() {
         assert_eq!(float(0.125, ".1%"), "12.5%");
         assert_eq!(float(-0.5, "+08.1%"), "-0050.0%");
         assert_eq!(float(f64::INFINITY, "+%"), "+inf%");
-        assert_eq!(float(f64::NAN, "E"), "NAN");
-        assert_eq!(integer(255, "#06x").unwrap(), "0x00ff");
-        assert_eq!(integer(5, "^+5").unwrap(), " +5  ");
+        assert_eq!(float(f64::NAN, "F"), "NAN");
+        assert_eq!(float(f64::NAN, "+010.2f"), "+000000nan");
+        assert_eq!(float(-0.001, "z.1f"), "0.0");
+        assert_eq!(float(-0.06, "z.1f"), "-0.1");
+        assert_eq!(float(1.0, "#.0f"), "1.");
+        assert_eq!(float(1e20, "#.3g"), "1.00e+20");
+        assert_eq!(float(1.0, "#g"), "1.00000");
+        assert_eq!(format_float(1e16, "1e+16", "#").unwrap(), "1.e+16");
+    }
+
+    #[test]
+    fn errors_match_python() {
+        assert_eq!(
+            integer(5, ".2").unwrap_err().message,
+            "Precision not allowed in integer format specifier"
+        );
+        assert_eq!(
+            integer(65, "+c").unwrap_err().message,
+            "Sign not allowed with integer format specifier 'c'"
+        );
+        assert_eq!(integer(-1, "c").unwrap_err().kind, "OverflowError");
+        assert_eq!(integer(65, "5c").unwrap(), "    A");
+        assert_eq!(
+            format_float(1.5, "1.5", "d").unwrap_err().message,
+            "Unknown format code 'd' for object of type 'float'"
+        );
+        assert_eq!(
+            format_text("a", "=5").unwrap_err().message,
+            "'=' alignment not allowed in string format specifier"
+        );
+        assert_eq!(
+            format_text("a", ",").unwrap_err().message,
+            "Cannot specify ',' with 's'."
+        );
+        assert_eq!(
+            format_integer(BigInt::from(1), "s", "bool")
+                .unwrap_err()
+                .message,
+            "Unknown format code 's' for object of type 'bool'"
+        );
     }
 }

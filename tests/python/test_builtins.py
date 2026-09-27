@@ -244,3 +244,83 @@ def test_string_expandtabs_and_translate():
 
 def test_ascii_escapes_non_ascii_characters():
     assert ascii("caf\u00e9 \u4e00 \U0001f600") == "'caf\\xe9 \\u4e00 \\U0001f600'"
+
+
+def test_id_matches_identity():
+    first = []
+    second = []
+    assert id(first) == id(first) and id(first) != id(second)
+    assert id(5) == id(5) and id(5) != id(6)
+    assert f"{id(object()):#x}".startswith("0x")
+
+
+def test_sys_maxsize_is_64_bit():
+    import sys
+
+    assert sys.maxsize == 2**63 - 1
+
+
+FORMAT_CASES = [
+    (5, " 3d", "  5"),
+    (5, "*^9", "****5****"),
+    (5, "=+6", "+    5"),
+    (5, "<05", "50000"),
+    (-5, "0^8", "000-5000"),
+    ("ab", "05", "ab000"),
+    ("abc", "\u00e9^7.2", "\u00e9\u00e9ab\u00e9\u00e9\u00e9"),
+    (1234567, "_", "1_234_567"),
+    (255, "#_b", "0b1111_1111"),
+    (1234.5, "012,.1f", "00,001,234.5"),
+    (1234.5, "*=12,.1f", "*****1,234.5"),
+    (1234.56789, ",.5_f", "1,234.567_89"),
+    (-0.001, "z.1f", "0.0"),
+    (float("nan"), "F", "NAN"),
+    (float("nan"), "+010.2f", "+000000nan"),
+    (65, "5c", "    A"),
+    (1.0, "#.0f", "1."),
+    (1e20, "#.3g", "1.00e+20"),
+    (1e16, "#", "1.e+16"),
+    (True, "5", "    1"),
+    (123456789, "e", "1.234568e+08"),
+]
+
+FORMAT_ERRORS = [
+    (5, ".2", ValueError, "Precision not allowed in integer format specifier"),
+    (5, ",x", ValueError, "Cannot specify ',' with 'x'."),
+    (5, ",_", ValueError, "Cannot specify both ',' and '_'."),
+    (5, "5.2ff", ValueError, "Invalid format specifier '5.2ff' for object of type 'int'"),
+    (65, "+c", ValueError, "Sign not allowed with integer format specifier 'c'"),
+    (-1, "c", OverflowError, "%c arg not in range(0x110000)"),
+    (1.5, "d", ValueError, "Unknown format code 'd' for object of type 'float'"),
+    ("a", "=5", ValueError, "'=' alignment not allowed in string format specifier"),
+    ("a", "+", ValueError, "Sign not allowed in string format specifier"),
+    (True, "s", ValueError, "Unknown format code 's' for object of type 'bool'"),
+    (None, "5", TypeError, "unsupported format string passed to NoneType.__format__"),
+]
+
+
+def test_format_specifications_match_cpython():
+    for value, spec, expected in FORMAT_CASES:
+        assert (value, spec, format(value, spec)) == (value, spec, expected)
+    for value, spec, kind, message in FORMAT_ERRORS:
+        try:
+            format(value, spec)
+        except Exception as error:
+            assert (spec, type(error), str(error)) == (spec, kind, message)
+        else:
+            raise AssertionError(f"format({value!r}, {spec!r}) did not raise")
+
+
+def test_percent_formatting_matches_cpython():
+    nan = float("nan")
+    assert "%.2f|%5.1f|%E|%g|%#g" % (nan, -float("inf"), nan, 1e-5, 1.0) == ("nan| -inf|NAN|1e-05|1.00000")
+    assert "%e|%.0e|%#.0f" % (1e10, 12345.0, 1.0) == "1.000000e+10|1e+04|1."
+    assert "%#x|%#08X|%.4x|%#.4o|%x" % (0, -255, 255, 8, -255) == "0x0|-0X000FF|00ff|0o0010|-ff"
+    assert "%d|%+.3d|% 05d|%-6d|" % (3.7, 5, 5, 3) == "3|+005| 0005|3     |"
+    assert "%010f|%-6c|%10.3s" % (nan, 65, "abcdef") == "0000000nan|A     |       abc"
+    try:
+        _ = "%x" % 3.0
+    except TypeError as error:
+        assert str(error) == "%x format: an integer is required, not float"
+    else:
+        raise AssertionError("%x accepted a float")
