@@ -169,10 +169,7 @@ def column_stack(tup):
 
 
 def array_split(ary, indices_or_sections, axis=0):
-    try:
-        Ntotal = ary.shape[axis]
-    except AttributeError:
-        Ntotal = len(ary)
+    Ntotal = ary.shape[axis] if isinstance(ary, ndarray) else len(ary)
     try:
         Nsections = len(indices_or_sections) + 1
         div_points = [0] + list(indices_or_sections) + [Ntotal]

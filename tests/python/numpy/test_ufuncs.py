@@ -617,3 +617,15 @@ def test_ufunc_order_keyword_sets_the_output_layout():
     assert np.add(m, 1, order="A").strides == (24, 8)
     with pytest.raises(ValueError, match="order must be one of"):
         np.add(m, 1, order="X")
+
+
+def test_real_imag_and_iscomplexobj_accept_python_values():
+    assert np.real([1 + 2j, 3]).tolist() == [1.0, 3.0]
+    assert np.imag([1, 2]).tolist() == [0, 0]
+    assert np.real(2 - 5j) == 2.0
+    assert np.imag(2 - 5j) == -5.0
+    assert type(np.real(np.float32(2))) is np.float32
+    assert np.iscomplexobj([1, 1j])
+    assert np.iscomplexobj(np.complex64(0))
+    assert not np.iscomplexobj(1)
+    assert not np.iscomplexobj([1.5])

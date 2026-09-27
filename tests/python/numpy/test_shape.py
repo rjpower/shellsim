@@ -281,6 +281,10 @@ def test_array_split_puts_extra_elements_first():
     assert [p.tolist() for p in parts] == [[0], [1], []]
 
 
+def test_array_split_accepts_a_list():
+    assert [p.tolist() for p in np.array_split([1, 2, 3], 2)] == [[1, 2], [3]]
+
+
 def test_tile_repeats_whole_array():
     a = np.array([1, 2])
     assert np.tile(a, 3).tolist() == [1, 2, 1, 2, 1, 2]

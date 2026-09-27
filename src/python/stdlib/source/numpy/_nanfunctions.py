@@ -20,6 +20,7 @@ from _numpy import (
     full,
     fmax,
     fmin,
+    generic,
     inexact,
     intp,
     isnan,
@@ -83,10 +84,9 @@ def _divide_by_count(a, b, out=None):
             return divide(a, b, out=a if out is None else out, casting="unsafe")
         if out is not None:
             return divide(a, b, out=out, casting="unsafe")
-        try:
+        if isinstance(a, generic):
             return a.dtype.type(a / b)
-        except AttributeError:
-            return a / b
+        return a / b
 
 
 def _require_inexact(dtype, out):

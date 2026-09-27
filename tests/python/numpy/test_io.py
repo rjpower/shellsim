@@ -417,6 +417,12 @@ def test_genfromtxt_skips_comments():
     assert loaded.tolist() == [[1.0, 2.0], [3.0, 4.0]]
 
 
+def test_genfromtxt_usecols():
+    text = "1 2 3\n4 5 6\n"
+    assert np.genfromtxt(io.StringIO(text), usecols=(0, -1)).tolist() == [[1.0, 3.0], [4.0, 6.0]]
+    assert np.genfromtxt(io.StringIO(text), usecols=1).tolist() == [2.0, 5.0]
+
+
 def test_tobytes_uses_the_dtype_byte_order():
     values = np.arange(3, dtype=np.int32)
     assert values.tobytes() == b"\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00"

@@ -22,6 +22,7 @@ from _numpy import (
     empty,
     empty_like,
     float64,
+    generic,
     inexact,
     integer,
     isinf,
@@ -29,6 +30,7 @@ from _numpy import (
     issubdtype,
     logical_and,
     multiply,
+    ndarray,
     nonzero,
     ones,
     pi,
@@ -166,18 +168,22 @@ def cross(a, b, axisa=-1, axisb=-1, axisc=-1, axis=None):
     return moveaxis(cp, -1, axisc)
 
 
+# NumPy reads `.real`, `.imag` and `.dtype` and converts on AttributeError. shellsim rejects an
+# attribute a builtin does not model instead of raising AttributeError, so these functions test
+# the type first.
+_HAS_REAL_AND_IMAG = (ndarray, generic, int, float, complex)
+
+
 def real(val):
-    try:
+    if isinstance(val, _HAS_REAL_AND_IMAG):
         return val.real
-    except AttributeError:
-        return asanyarray(val).real
+    return asanyarray(val).real
 
 
 def imag(val):
-    try:
+    if isinstance(val, _HAS_REAL_AND_IMAG):
         return val.imag
-    except AttributeError:
-        return asanyarray(val).imag
+    return asanyarray(val).imag
 
 
 def iscomplex(x):
@@ -193,10 +199,7 @@ def isreal(x):
 
 
 def iscomplexobj(x):
-    try:
-        type_ = x.dtype.type
-    except AttributeError:
-        type_ = asarray(x).dtype.type
+    type_ = x.dtype.type if isinstance(x, (ndarray, generic)) else asarray(x).dtype.type
     return issubclass(type_, complexfloating)
 
 

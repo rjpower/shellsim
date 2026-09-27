@@ -755,9 +755,9 @@ def genfromtxt(fname, dtype=float, comments="#", delimiter=None, skip_header=0, 
     body = [first_line] + lines[position:] if first_values else []
 
     if usecols is not None:
-        try:
+        if isinstance(usecols, str):
             usecols = [part.strip() for part in usecols.split(",")]
-        except AttributeError:
+        else:
             try:
                 usecols = list(usecols)
             except TypeError:
