@@ -1,738 +1,267 @@
-"""Elementwise and signal helpers that NumPy writes in Python on top of ufuncs.
-
-``round``, ``around``, ``clip`` and ``cumulative_sum``/``cumulative_prod`` follow
-``numpy/_core/fromnumeric.py``; ``convolve``, ``correlate``, ``cross``, ``argwhere`` and
-``flatnonzero`` and ``isfortran`` follow ``numpy/_core/numeric.py``; ``nan_to_num``,
-``mintypecode``, ``common_type`` and the complex-type predicates follow
-``numpy/lib/_type_check_impl.py``; ``angle``, ``gradient``, ``interp``, ``select``, ``extract``,
-``place`` and ``asarray_chkfinite`` follow ``numpy/lib/_function_base_impl.py``
-(``place`` ports the C ``arr_place``); ``isposinf``, ``isneginf`` and ``fix`` follow
-``numpy/lib/_ufunclike_impl.py``; and ``polyval`` and ``polyfit`` follow
-``numpy/lib/_polynomial_impl.py``. ``vecdot`` is NumPy's gufunc written as a batched ``matmul``,
-so it sums each vector in index order like shellsim's other products. The native kernels behind
-``interp`` and ``correlate`` live in ``_numpy_math``.
+"""Whole-array helpers that do not reduce to a single statistic: ``gradient``, ``diff``,
+``angle``, linear ``interp``/``correlate``/``convolve`` (thin wrappers over the native
+``_numpy_math`` kernels), and the condition-driven selectors ``select``, ``extract``, ``place``
+and ``putmask``.
 """
 
-import warnings
-
-from _numpy import (
-    absolute,
-    add,
-    arange,
-    arctan2,
-    array,
-    asanyarray,
-    asarray,
-    bool_,
-    can_cast,
-    complexfloating,
-    conjugate,
-    copyto,
-    empty,
-    empty_like,
-    float64,
-    full,
-    full_like,
-    generic,
-    inexact,
-    integer,
-    isfinite,
-    isinf,
-    isnan,
-    issubdtype,
-    logical_and,
-    multiply,
-    ndarray,
-    nonzero,
-    ones,
-    pi,
-    promote_types,
-    result_type,
-    signbit,
-    sqrt,
-    take,
-    trunc,
-    zeros,
-    zeros_like,
-)
-from _numpy import complex64 as _complex64
-from _numpy import complex128 as _complex128
-from _numpy import float16 as _float16
-from _numpy import float32 as _float32
-from _numpy import ndim as _ndim
+import numpy as np
 from _numpy_math import _compiled_interp, _compiled_interp_complex, _correlate
-from _numpy_products import dot, matmul, outer
-from _numpy_shape import (
-    _normalize_axis_index,
-    broadcast_arrays,
-    broadcast_shapes,
-    concatenate,
-    moveaxis,
-    ravel,
-    transpose,
-)
-from numpy._getlimits import finfo
-from numpy._shape_base import atleast_1d, diff, normalize_axis_tuple, vander
 
-_NoValue = object()
-
-
-def _wrapit(obj, method, *args, **kwds):
-    arr = asarray(obj)
-    return getattr(arr, method)(*args, **kwds)
+__all__ = [
+    "angle",
+    "convolve",
+    "correlate",
+    "cross",
+    "diff",
+    "extract",
+    "gradient",
+    "interp",
+    "place",
+    "polyfit",
+    "polyval",
+    "putmask",
+    "select",
+    "vecdot",
+]
 
 
-def _wrapfunc(obj, method, *args, **kwds):
-    bound = getattr(obj, method, None)
-    if bound is None:
-        return _wrapit(obj, method, *args, **kwds)
-    try:
-        return bound(*args, **kwds)
-    except TypeError:
-        # An object with a differently shaped method of this name goes through an array.
-        return _wrapit(obj, method, *args, **kwds)
+def angle(z, deg=False):
+    """The phase of `z` (real input is treated as having a zero imaginary part)."""
+    z = np.asanyarray(z)
+    if z.dtype.kind == "c":
+        result = np.arctan2(z.imag, z.real)
+    else:
+        result = np.arctan2(np.zeros(z.shape, dtype=np.float64), z.astype(np.float64))
+    return result * (180.0 / np.pi) if deg else result
 
 
-def round(a, decimals=0, out=None):
-    return _wrapfunc(a, "round", decimals=decimals, out=out)
+def _diff_edge(a, axis, value):
+    """`value` broadcast to a length-1 slab of `a` along `axis`, for `diff`'s prepend/append."""
+    value = np.asanyarray(value)
+    if value.ndim != 0:
+        return value
+    shape = list(a.shape)
+    shape[axis] = 1
+    return np.broadcast_to(value, shape)
 
 
-def around(a, decimals=0, out=None):
-    return _wrapfunc(a, "round", decimals=decimals, out=out)
+def diff(a, n=1, axis=-1, prepend=None, append=None):
+    """The `n`-th discrete difference of `a` along `axis` (a boolean array uses ``!=``)."""
+    a = np.asanyarray(a)
+    if n < 0:
+        raise ValueError(f"order must be non-negative but got {n}")
+    axis = axis % a.ndim if a.ndim else axis
+    if prepend is not None:
+        a = np.concatenate([_diff_edge(a, axis, prepend), a], axis=axis)
+    if append is not None:
+        a = np.concatenate([a, _diff_edge(a, axis, append)], axis=axis)
+    for _ in range(n):
+        upper = [slice(None)] * a.ndim
+        lower = [slice(None)] * a.ndim
+        upper[axis] = slice(1, None)
+        lower[axis] = slice(None, -1)
+        upper_part, lower_part = a[tuple(upper)], a[tuple(lower)]
+        a = (upper_part != lower_part) if a.dtype == np.bool_ else (upper_part - lower_part)
+    return a
 
 
-def clip(a, a_min=_NoValue, a_max=_NoValue, out=None, *, min=_NoValue, max=_NoValue, **kwargs):
-    if a_min is _NoValue and a_max is _NoValue:
-        a_min = None if min is _NoValue else min
-        a_max = None if max is _NoValue else max
-    elif a_min is _NoValue:
-        raise TypeError("clip() missing 1 required positional argument: 'a_min'")
-    elif a_max is _NoValue:
-        raise TypeError("clip() missing 1 required positional argument: 'a_max'")
-    elif min is not _NoValue or max is not _NoValue:
-        raise ValueError(
-            "Passing `min` or `max` keyword argument when `a_min` and `a_max` are provided is "
-            "forbidden."
-        )
-    return _wrapfunc(a, "clip", a_min, a_max, out=out, **kwargs)
+def gradient(f, *varargs, axis=None, edge_order=1):
+    """The central-difference gradient of `f` along `axis` (every axis, by default).
+
+    One array per axis, or a single array when only one axis is differentiated. `varargs` gives
+    a uniform spacing per differentiated axis (one value, or one per axis); non-uniform
+    coordinate arrays are not supported.
+    """
+    if edge_order != 1:
+        raise NotImplementedError("np.gradient only supports edge_order=1")
+    f = np.asanyarray(f)
+    if axis is None:
+        axes = tuple(range(f.ndim))
+    elif isinstance(axis, (int, np.integer)):
+        axes = (int(axis) % f.ndim,)
+    else:
+        axes = tuple(int(ax) % f.ndim for ax in axis)
+
+    if len(varargs) == 0:
+        spacings = [1.0] * len(axes)
+    elif len(varargs) == 1:
+        spacings = [varargs[0]] * len(axes)
+    elif len(varargs) == len(axes):
+        spacings = list(varargs)
+    else:
+        raise TypeError("invalid number of arguments")
+
+    dtype = f.dtype if f.dtype.kind in "fc" else np.float64
+    results = []
+    for ax, spacing in zip(axes, spacings):
+        if not isinstance(spacing, (int, float, np.number)):
+            raise NotImplementedError("np.gradient only supports scalar, uniform spacing")
+        n = f.shape[ax]
+        result = np.empty(f.shape, dtype=dtype)
+        if n == 1:
+            result[...] = 0.0
+            results.append(result)
+            continue
+        center, lower, upper = [slice(None)] * f.ndim, [slice(None)] * f.ndim, [slice(None)] * f.ndim
+        center[ax], lower[ax], upper[ax] = slice(1, -1), slice(0, -2), slice(2, None)
+        result[tuple(center)] = (f[tuple(upper)].astype(dtype) - f[tuple(lower)].astype(dtype)) / 2.0
+        first, second = [slice(None)] * f.ndim, [slice(None)] * f.ndim
+        first[ax], second[ax] = 0, 1
+        result[tuple(first)] = f[tuple(second)].astype(dtype) - f[tuple(first)].astype(dtype)
+        last, before_last = [slice(None)] * f.ndim, [slice(None)] * f.ndim
+        last[ax], before_last[ax] = -1, -2
+        result[tuple(last)] = f[tuple(last)].astype(dtype) - f[tuple(before_last)].astype(dtype)
+        results.append(result / spacing)
+    return results[0] if len(results) == 1 else results
 
 
-def argwhere(a):
-    if _ndim(a) == 0:
-        a = atleast_1d(a)
-        return argwhere(a)[:, :0]
-    return transpose(nonzero(a))
-
-
-def flatnonzero(a):
-    return nonzero(ravel(a))[0]
+def interp(x, xp, fp, left=None, right=None, period=None):
+    """Piecewise-linear interpolation of `x` against the samples (`xp`, `fp`)."""
+    if period is not None:
+        raise NotImplementedError("np.interp(period=...) is not supported")
+    if np.asanyarray(fp).dtype.kind == "c":
+        return _compiled_interp_complex(x, xp, fp, left, right)
+    return _compiled_interp(x, xp, fp, left, right)
 
 
 def correlate(a, v, mode="valid"):
+    """The cross-correlation of `a` and `v`; complex `v` is conjugated."""
     return _correlate(a, v, mode, True)
 
 
 def convolve(a, v, mode="full"):
-    a, v = array(a, copy=None, ndmin=1), array(v, copy=None, ndmin=1)
-    if len(a) == 0:
-        raise ValueError("a cannot be empty")
-    if len(v) == 0:
-        raise ValueError("v cannot be empty")
-    if len(v) > len(a):
-        a, v = v, a
+    """The discrete convolution of `a` and `v`: correlation of `a` with `v` reversed."""
+    v = np.asanyarray(v)
     return _correlate(a, v[::-1], mode, False)
 
 
-def cross(a, b, axisa=-1, axisb=-1, axisc=-1, axis=None):
-    if axis is not None:
-        axisa, axisb, axisc = (axis,) * 3
-    a = asarray(a)
-    b = asarray(b)
-    if a.ndim < 1 or b.ndim < 1:
-        raise ValueError("At least one array has zero dimension")
-    axisa = _normalize_axis_index(axisa, a.ndim, msg_prefix="axisa")
-    axisb = _normalize_axis_index(axisb, b.ndim, msg_prefix="axisb")
-    a = moveaxis(a, axisa, -1)
-    b = moveaxis(b, axisb, -1)
-    if a.shape[-1] != 3 or b.shape[-1] != 3:
-        raise ValueError(
-            "Both input arrays must be (arrays of) 3-dimensional vectors, but they are "
-            f"{a.shape[-1]} and {b.shape[-1]} dimensional instead."
-        )
-    shape = (*broadcast_shapes(a.shape[:-1], b.shape[:-1]), 3)
-    axisc = _normalize_axis_index(axisc, len(shape), msg_prefix="axisc")
-    dtype = promote_types(a.dtype, b.dtype)
-    cp = empty(shape, dtype)
-    a = a.astype(dtype)
-    b = b.astype(dtype)
-    a0 = a[..., 0]
-    a1 = a[..., 1]
-    a2 = a[..., 2]
-    b0 = b[..., 0]
-    b1 = b[..., 1]
-    b2 = b[..., 2]
-    cp0 = cp[..., 0]
-    cp1 = cp[..., 1]
-    cp2 = cp[..., 2]
-    multiply(a1, b2, out=cp0)
-    tmp = multiply(a2, b1, out=...)
-    cp0 -= tmp
-    multiply(a2, b0, out=cp1)
-    multiply(a0, b2, out=tmp)
-    cp1 -= tmp
-    multiply(a0, b1, out=cp2)
-    multiply(a1, b0, out=tmp)
-    cp2 -= tmp
-    return moveaxis(cp, -1, axisc)
-
-
-# NumPy reads `.real`, `.imag` and `.dtype` and converts on AttributeError. shellsim rejects an
-# attribute a builtin does not model instead of raising AttributeError, so these functions test
-# the type first.
-_HAS_REAL_AND_IMAG = (ndarray, generic, int, float, complex)
-
-
-def iterable(y):
-    """Whether ``iter(y)`` succeeds."""
-    try:
-        iter(y)
-    except TypeError:
-        return False
-    return True
-
-
-def real(val):
-    if isinstance(val, _HAS_REAL_AND_IMAG):
-        return val.real
-    return asanyarray(val).real
-
-
-def imag(val):
-    if isinstance(val, _HAS_REAL_AND_IMAG):
-        return val.imag
-    return asanyarray(val).imag
-
-
-def iscomplex(x):
-    ax = asanyarray(x)
-    if issubclass(ax.dtype.type, complexfloating):
-        return ax.imag != 0
-    res = zeros(ax.shape, bool)
-    return res[()]
-
-
-def isreal(x):
-    return imag(x) == 0
-
-
-def iscomplexobj(x):
-    type_ = x.dtype.type if isinstance(x, (ndarray, generic)) else asarray(x).dtype.type
-    return issubclass(type_, complexfloating)
-
-
-def isrealobj(x):
-    return not iscomplexobj(x)
-
-
-def asarray_chkfinite(a, dtype=None, order=None):
-    a = asarray(a, dtype=dtype, order=order)
-    if a.dtype.char in "efdgFDG" and not isfinite(a).all():
-        raise ValueError("array must not contain infs or NaNs")
-    return a
-
-
-def isfortran(a):
-    return a.flags["F_CONTIGUOUS"] and not a.flags["C_CONTIGUOUS"]
-
-
-# ``common_type``'s precision ranks and result types, indexed by rank; there is no complex half.
-_float_precision = {"e": 0, "f": 1, "d": 2, "F": 1, "D": 2}
-_common_types = ((_float16, _float32, float64), (None, _complex64, _complex128))
-
-
-def common_type(*arrays):
-    is_complex = False
-    precision = 0
-    for a in arrays:
-        char = a.dtype.char
-        if char in "FD":
-            is_complex = True
-        if issubdtype(a.dtype, integer):
-            rank = 2
-        else:
-            rank = _float_precision.get(char)
-            if rank is None:
-                raise TypeError("can't get common type for non-numeric array")
-        precision = max(precision, rank)
-    return _common_types[is_complex][precision]
-
-
-def real_if_close(a, tol=100):
-    a = asanyarray(a)
-    type_ = a.dtype.type
-    if not issubclass(type_, complexfloating):
-        return a
-    if tol > 1:
-        tol = finfo(type_).eps * tol
-    if (absolute(a.imag) < tol).all():
-        a = a.real
-    return a
-
-
-def nan_to_num(x, copy=True, nan=0.0, posinf=None, neginf=None):
-    x = array(x, subok=True, copy=copy)
-    xtype = x.dtype.type
-    isscalar = x.ndim == 0
-    if not issubclass(xtype, inexact):
-        return x[()] if isscalar else x
-    iscomplex = issubclass(xtype, complexfloating)
-    dest = (x.real, x.imag) if iscomplex else (x,)
-    limits = finfo(x.real.dtype)
-    maxf, minf = limits.max, limits.min
-    if posinf is not None:
-        maxf = posinf
-    if neginf is not None:
-        minf = neginf
-    for d in dest:
-        idx_nan = isnan(d)
-        idx_posinf = isposinf(d)
-        idx_neginf = isneginf(d)
-        copyto(d, nan, where=idx_nan)
-        copyto(d, maxf, where=idx_posinf)
-        copyto(d, minf, where=idx_neginf)
-    return x[()] if isscalar else x
-
-
-def isposinf(x, out=None):
-    is_inf = isinf(x)
-    try:
-        positive = ~signbit(x)
-    except TypeError as e:
-        dtype = asanyarray(x).dtype
-        raise TypeError(
-            f"This operation is not supported for {dtype} values because it would be ambiguous."
-        ) from e
-    return logical_and(is_inf, positive, out)
-
-
-def isneginf(x, out=None):
-    is_inf = isinf(x)
-    try:
-        negative = signbit(x)
-    except TypeError as e:
-        dtype = asanyarray(x).dtype
-        raise TypeError(
-            f"This operation is not supported for {dtype} values because it would be ambiguous."
-        ) from e
-    return logical_and(is_inf, negative, out)
-
-
-def fix(x, out=None):
-    warnings.warn(
-        "numpy.fix is deprecated. Use numpy.trunc instead, which is faster and follows the "
-        "Array API standard.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return trunc(x, out=out)
-
-
-def angle(z, deg=False):
-    z = asanyarray(z)
-    if issubclass(z.dtype.type, complexfloating):
-        zimag = z.imag
-        zreal = z.real
-    else:
-        zimag = 0
-        zreal = z
-    a = arctan2(zimag, zreal)
-    if deg:
-        a *= 180 / pi
-    return a
-
-
-def interp(x, xp, fp, left=None, right=None, period=None):
-    fp = asarray(fp)
-    if iscomplexobj(fp):
-        interp_func = _compiled_interp_complex
-        input_dtype = _complex128
-    else:
-        interp_func = _compiled_interp
-        input_dtype = float64
-    if period is not None:
-        if period == 0:
-            raise ValueError("period must be a non-zero value")
-        period = abs(period)
-        left = None
-        right = None
-        x = asarray(x, dtype=float64)
-        xp = asarray(xp, dtype=float64)
-        fp = asarray(fp, dtype=input_dtype)
-        if xp.ndim != 1 or fp.ndim != 1:
-            raise ValueError("Data points must be 1-D sequences")
-        if xp.shape[0] != fp.shape[0]:
-            raise ValueError("fp and xp are not of the same length")
-        # Normalize both coordinates to one period and extend the samples by one period on
-        # each side, so points near the wrap-around interpolate across it.
-        x = x % period
-        xp = xp % period
-        asort_xp = xp.argsort()
-        xp = xp[asort_xp]
-        fp = fp[asort_xp]
-        xp = concatenate((xp[-1:] - period, xp, xp[0:1] + period))
-        fp = concatenate((fp[-1:], fp, fp[0:1]))
-    return interp_func(x, xp, fp, left, right)
-
-
-def gradient(f, *varargs, axis=None, edge_order=1):
-    f = asanyarray(f)
-    N = f.ndim
-    if axis is None:
-        axes = tuple(range(N))
-    else:
-        axes = normalize_axis_tuple(axis, N)
-    len_axes = len(axes)
-    n = len(varargs)
-    if n == 0:
-        dx = [1.0] * len_axes
-    elif n == 1 and _ndim(varargs[0]) == 0:
-        dx = varargs * len_axes
-    elif n == len_axes:
-        dx = list(varargs)
-        for i, distances in enumerate(dx):
-            distances = asanyarray(distances)
-            if distances.ndim == 0:
-                continue
-            elif distances.ndim != 1:
-                raise ValueError("distances must be either scalars or 1d")
-            if len(distances) != f.shape[axes[i]]:
-                raise ValueError(
-                    "when 1d, distances must match the length of the corresponding dimension"
-                )
-            if issubdtype(distances.dtype, integer):
-                distances = distances.astype(float64)
-            diffx = diff(distances)
-            if (diffx == diffx[0]).all():
-                diffx = diffx[0]
-            dx[i] = diffx
-    else:
-        raise TypeError("invalid number of arguments")
-    if edge_order > 2:
-        raise ValueError("'edge_order' greater than 2 not supported")
-    outvals = []
-    slice1 = [slice(None)] * N
-    slice2 = [slice(None)] * N
-    slice3 = [slice(None)] * N
-    slice4 = [slice(None)] * N
-    otype = f.dtype
-    if not issubdtype(otype, inexact):
-        # Integer data differentiates in float64.
-        if issubdtype(otype, integer):
-            f = f.astype(float64)
-        otype = float64
-    for axis, ax_dx in zip(axes, dx):
-        if f.shape[axis] < edge_order + 1:
-            raise ValueError(
-                "Shape of array too small to calculate a numerical gradient, at least "
-                "(edge_order + 1) elements are required."
-            )
-        out = empty_like(f, dtype=otype)
-        uniform_spacing = _ndim(ax_dx) == 0
-        slice1[axis] = slice(1, -1)
-        slice2[axis] = slice(None, -2)
-        slice3[axis] = slice(1, -1)
-        slice4[axis] = slice(2, None)
-        if uniform_spacing:
-            out[tuple(slice1)] = (f[tuple(slice4)] - f[tuple(slice2)]) / (2.0 * ax_dx)
-        else:
-            dx1 = ax_dx[0:-1]
-            dx2 = ax_dx[1:]
-            a = -dx2 / (dx1 * (dx1 + dx2))
-            b = (dx2 - dx1) / (dx1 * dx2)
-            c = dx1 / (dx2 * (dx1 + dx2))
-            shape = ones(N, dtype=int)
-            shape[axis] = -1
-            a = a.reshape(shape)
-            b = b.reshape(shape)
-            c = c.reshape(shape)
-            out[tuple(slice1)] = a * f[tuple(slice2)] + b * f[tuple(slice3)] + c * f[tuple(slice4)]
-        if edge_order == 1:
-            slice1[axis] = 0
-            slice2[axis] = 1
-            slice3[axis] = 0
-            dx_0 = ax_dx if uniform_spacing else ax_dx[0]
-            out[tuple(slice1)] = (f[tuple(slice2)] - f[tuple(slice3)]) / dx_0
-            slice1[axis] = -1
-            slice2[axis] = -1
-            slice3[axis] = -2
-            dx_n = ax_dx if uniform_spacing else ax_dx[-1]
-            out[tuple(slice1)] = (f[tuple(slice2)] - f[tuple(slice3)]) / dx_n
-        else:
-            slice1[axis] = 0
-            slice2[axis] = 0
-            slice3[axis] = 1
-            slice4[axis] = 2
-            if uniform_spacing:
-                a = -1.5 / ax_dx
-                b = 2.0 / ax_dx
-                c = -0.5 / ax_dx
-            else:
-                dx1 = ax_dx[0]
-                dx2 = ax_dx[1]
-                a = -(2.0 * dx1 + dx2) / (dx1 * (dx1 + dx2))
-                b = (dx1 + dx2) / (dx1 * dx2)
-                c = -dx1 / (dx2 * (dx1 + dx2))
-            out[tuple(slice1)] = a * f[tuple(slice2)] + b * f[tuple(slice3)] + c * f[tuple(slice4)]
-            slice1[axis] = -1
-            slice2[axis] = -3
-            slice3[axis] = -2
-            slice4[axis] = -1
-            if uniform_spacing:
-                a = 0.5 / ax_dx
-                b = -2.0 / ax_dx
-                c = 1.5 / ax_dx
-            else:
-                dx1 = ax_dx[-2]
-                dx2 = ax_dx[-1]
-                a = dx2 / (dx1 * (dx1 + dx2))
-                b = -(dx2 + dx1) / (dx1 * dx2)
-                c = (2.0 * dx2 + dx1) / (dx2 * (dx1 + dx2))
-            out[tuple(slice1)] = a * f[tuple(slice2)] + b * f[tuple(slice3)] + c * f[tuple(slice4)]
-        outvals.append(out)
-        slice1[axis] = slice(None)
-        slice2[axis] = slice(None)
-        slice3[axis] = slice(None)
-        slice4[axis] = slice(None)
-    if len_axes == 1:
-        return outvals[0]
-    return tuple(outvals)
+def polyfit(x, y, deg):
+    """The degree-`deg` polynomial's coefficients (highest power first) that least-squares fit
+    the points (`x`, `y`), via :func:`numpy.linalg.lstsq` on the Vandermonde matrix of `x`.
+    """
+    x = np.asanyarray(x, dtype=np.float64)
+    y = np.asanyarray(y, dtype=np.float64)
+    vander = np.stack([x**power for power in range(deg, -1, -1)], axis=-1)
+    coefficients, _, _, _ = np.linalg.lstsq(vander, y, rcond=None)
+    return coefficients
 
 
 def polyval(p, x):
-    p = asarray(p)
-    x = asanyarray(x)
-    y = zeros_like(x)
-    for pv in p:
-        y = y * x + pv
-    return y
+    """The polynomial with coefficients `p` (highest power first) evaluated at `x`."""
+    p = np.asanyarray(p)
+    result = 0
+    for coefficient in p:
+        result = result * x + coefficient
+    return result
 
 
-def polyfit(x, y, deg, rcond=None, full=False, w=None, cov=False):
-    # Imported here because `numpy.linalg` imports the `numpy` package this module helps build.
-    from numpy.exceptions import RankWarning
-    from numpy.linalg import inv, lstsq
+def cross(a, b, axisa=-1, axisb=-1, axisc=-1, axis=None):
+    """The 3-vector cross product of `a` and `b` along their last axis (or `axis`)."""
+    if axis is not None:
+        axisa = axisb = axisc = axis
+    a = np.moveaxis(np.asanyarray(a), axisa, -1)
+    b = np.moveaxis(np.asanyarray(b), axisb, -1)
+    if a.shape[-1] != 3 or b.shape[-1] != 3:
+        raise ValueError("incompatible dimensions for cross product (dimension must be 3)")
+    ax, ay, az = a[..., 0], a[..., 1], a[..., 2]
+    bx, by, bz = b[..., 0], b[..., 1], b[..., 2]
+    result = np.stack([ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx], axis=-1)
+    return np.moveaxis(result, -1, axisc)
 
-    order = int(deg) + 1
-    x = asarray(x) + 0.0
-    y = asarray(y) + 0.0
-    if deg < 0:
-        raise ValueError("expected deg >= 0")
-    if x.ndim != 1:
-        raise TypeError("expected 1D vector for x")
-    if x.size == 0:
-        raise TypeError("expected non-empty vector for x")
-    if y.ndim < 1 or y.ndim > 2:
-        raise TypeError("expected 1D or 2D array for y")
-    if x.shape[0] != y.shape[0]:
-        raise TypeError("expected x and y to have same length")
-    if rcond is None:
-        rcond = len(x) * finfo(x.dtype).eps
-    lhs = vander(x, order)
-    rhs = y
-    if w is not None:
-        w = asarray(w) + 0.0
-        if w.ndim != 1:
-            raise TypeError("expected a 1-d array for weights")
-        if w.shape[0] != y.shape[0]:
-            raise TypeError("expected w and y to have the same length")
-        lhs *= w[:, None]
-        if rhs.ndim == 2:
-            rhs *= w[:, None]
-        else:
-            rhs *= w
-    scale = sqrt((lhs * lhs).sum(axis=0))
-    lhs /= scale
-    c, resids, rank, s = lstsq(lhs, rhs, rcond)
-    c = (c.T / scale).T
-    if rank != order and not full:
-        msg = "Polyfit may be poorly conditioned"
-        warnings.warn(msg, RankWarning, stacklevel=2)
-    if full:
-        return (c, resids, rank, s, rcond)
-    elif cov:
-        Vbase = inv(dot(lhs.T, lhs))
-        Vbase /= outer(scale, scale)
-        if cov == "unscaled":
-            fac = 1
-        else:
-            if len(x) <= order:
-                raise ValueError(
-                    "the number of data points must exceed order to scale the covariance matrix"
-                )
-            fac = resids / (len(x) - order)
-        if y.ndim == 1:
-            return (c, Vbase * fac)
-        else:
-            return (c, Vbase[:, :, None] * fac)
-    else:
-        return c
+
+def vecdot(a, b, axis=-1):
+    """The dot product of `a` and `b` along `axis`, conjugating `a` (as for a complex inner product)."""
+    a = np.asanyarray(a)
+    b = np.asanyarray(b)
+    if a.shape[axis] != b.shape[axis]:
+        raise ValueError(
+            "vecdot: core dimension mismatch, with gufunc signature (n),(n)->() "
+            f"(size {b.shape[axis]} is different from {a.shape[axis]})"
+        )
+    left = np.conjugate(a) if a.dtype.kind == "c" else a
+    return np.sum(left * b, axis=axis)
 
 
 def select(condlist, choicelist, default=0):
+    """`choicelist[i]` at positions where `condlist[i]` is the first true condition, else `default`."""
     if len(condlist) != len(choicelist):
         raise ValueError("list of cases must be same length as list of conditions")
     if len(condlist) == 0:
         raise ValueError("select with an empty condition list is not possible")
-    # Python scalars stay weakly typed for promotion.
-    choicelist = [
-        choice if type(choice) in (int, float, complex) else asarray(choice)
-        for choice in choicelist
-    ]
-    choicelist.append(default if type(default) in (int, float, complex) else asarray(default))
-    try:
-        dtype = result_type(*choicelist)
-    except TypeError as e:
-        msg = f"Choicelist and default value do not have a common dtype: {e}"
-        raise TypeError(msg) from None
-    condlist = broadcast_arrays(*condlist)
-    choicelist = broadcast_arrays(*choicelist)
-    for i, cond in enumerate(condlist):
-        if cond.dtype.type is not bool_:
-            raise TypeError(f"invalid entry {i} in condlist: should be boolean ndarray")
-    if choicelist[0].ndim == 0:
-        result_shape = condlist[0].shape
-    else:
-        result_shape = broadcast_arrays(condlist[0], choicelist[0])[0].shape
-    result = full(result_shape, choicelist[-1], dtype)
-    # The first matching condition wins, so fill in reverse order.
-    choicelist = choicelist[-2::-1]
-    condlist = condlist[::-1]
-    for choice, cond in zip(choicelist, condlist):
-        copyto(result, choice, where=cond)
+    for index, cond in enumerate(condlist):
+        if np.asanyarray(cond).dtype != np.bool_:
+            raise TypeError(f"invalid entry {index} in condlist: should be boolean ndarray")
+    result = np.asanyarray(default)
+    for cond, choice in zip(reversed(condlist), reversed(choicelist)):
+        result = np.where(np.asanyarray(cond), choice, result)
     return result
 
 
 def extract(condition, arr):
-    return take(ravel(arr), nonzero(ravel(condition))[0])
+    """The elements of (raveled) `arr` at the positions where (raveled) `condition` is nonzero."""
+    condition = np.asanyarray(condition)
+    arr = np.asanyarray(arr)
+    return arr.reshape(-1)[np.flatnonzero(condition.reshape(-1))]
 
 
-def _fill_values(arr, vals):
-    """Convert the values ``place`` and ``putmask`` write into ``arr`` to its dtype.
-
-    Arrays and NumPy scalars cast safely, as ``PyArray_FromAny`` requires; Python sequences and
-    scalars convert straight to the array's dtype.
+def _require_safe_cast(source_dtype, dest_dtype):
+    """Raise as NumPy does when `place`/`putmask` are given a real array of values: unlike a
+    plain boolean-mask assignment (which casts permissively), both functions insist the value
+    array's dtype cast to the destination's dtype under the 'safe' rule.
     """
-    if isinstance(vals, (ndarray, generic)):
-        vals = asarray(vals)
-        if not can_cast(vals.dtype, arr.dtype, casting="safe"):
-            raise TypeError(
-                f"Cannot cast array data from {vals.dtype!r} to {arr.dtype!r} according to "
-                "the rule 'safe'"
-            )
-        return vals.astype(arr.dtype)
-    return array(vals, dtype=arr.dtype)
+    if not np.can_cast(source_dtype, dest_dtype, casting="safe"):
+        raise TypeError(
+            f"Cannot cast array data from {source_dtype!r} to {dest_dtype!r} according to the rule 'safe'"
+        )
 
 
 def place(arr, mask, vals):
-    if not isinstance(arr, ndarray):
-        raise TypeError(f"place() argument 1 must be numpy.ndarray, not {type(arr).__name__}")
-    mask = asarray(mask).astype(bool_)
+    """Write `vals`, cycled, into `arr` at the positions where `mask` is true, in C order."""
+    if not isinstance(arr, np.ndarray):
+        raise TypeError(f"argument 1 must be numpy.ndarray, not {type(arr).__name__}")
+    mask = np.asanyarray(mask, dtype=np.bool_)
     if mask.size != arr.size:
-        raise ValueError("place: mask and data must be the same size")
-    vals = _fill_values(arr, vals)
-    if not arr.flags.writeable:
-        raise ValueError("WRITEBACKIFCOPY base is read-only")
-    count = int(mask.sum())
-    if vals.size == 0:
-        if count:
-            raise ValueError("Cannot insert from an empty array!")
-        return
+        raise ValueError("mask and data must be the same size")
+    mask = mask.reshape(arr.shape)
+    count = int(np.count_nonzero(mask))
     if count == 0:
-        return
-    # The first ``count`` values, repeated as needed, fill the masked positions in C order.
-    vals = ravel(vals)
-    arr[mask.reshape(arr.shape)] = vals[arange(count) % vals.size]
+        return None
+    if isinstance(vals, np.ndarray):
+        pool = vals.reshape(-1)
+        if pool.size == 0:
+            raise ValueError("Cannot insert from an empty array!")
+        _require_safe_cast(pool.dtype, arr.dtype)
+        cycled = np.take(pool, np.arange(count) % pool.size)
+    else:
+        pool = list(vals)
+        if len(pool) == 0:
+            raise ValueError("Cannot insert from an empty array!")
+        cycled = [pool[i % len(pool)] for i in range(count)]
+    arr[mask] = cycled
+    return None
 
 
 def putmask(a, mask, values):
-    if not isinstance(a, ndarray):
+    """Write `values`, cycled by flat position (not by the count of true positions), where `mask` is true."""
+    if not isinstance(a, np.ndarray):
         raise TypeError("putmask: first argument must be an array")
-    if not a.flags.writeable:
-        raise ValueError("putmask: output array is read-only")
-    mask = asarray(mask).astype(bool_)
+    mask = np.asanyarray(mask, dtype=np.bool_)
     if mask.size != a.size:
         raise ValueError("putmask: mask and data must be the same size")
-    values = _fill_values(a, values)
-    if values.size == 0:
-        return
-    # Unlike ``place``, the masked element at flat position ``i`` gets ``values[i % size]``.
-    mask = ravel(mask)
-    positions = arange(a.size)[mask]
-    a[mask.reshape(a.shape)] = ravel(values)[positions % values.size]
-
-
-_typecodes_by_elsize = "GDFgdfQqLlIiHhBb?"
-
-
-def mintypecode(typechars, typeset="GDFgdf", default="d"):
-    typecodes = ((isinstance(t, str) and t) or asarray(t).dtype.char for t in typechars)
-    intersection = {t for t in typecodes if t in typeset}
-    if not intersection:
-        return default
-    if "F" in intersection and "d" in intersection:
-        return "D"
-    return min(intersection, key=_typecodes_by_elsize.index)
-
-
-def _cumulative_func(x, func, axis, dtype, out, include_initial):
-    x = atleast_1d(x)
-    x_ndim = x.ndim
-    if axis is None:
-        if x_ndim >= 2:
-            raise ValueError(
-                "For arrays which have more than one dimension ``axis`` argument is required."
-            )
-        axis = 0
-    if out is not None and include_initial:
-        item = [slice(None)] * x_ndim
-        item[axis] = slice(1, None)
-        func.accumulate(x, axis=axis, dtype=dtype, out=out[tuple(item)])
-        item[axis] = 0
-        out[tuple(item)] = func.identity
-        return out
-    res = func.accumulate(x, axis=axis, dtype=dtype, out=out)
-    if include_initial:
-        initial_shape = list(res.shape)
-        initial_shape[axis] = 1
-        res = concatenate([full_like(res, func.identity, shape=initial_shape), res], axis=axis)
-    return res
-
-
-def cumulative_sum(x, /, *, axis=None, dtype=None, out=None, include_initial=False):
-    return _cumulative_func(x, add, axis, dtype, out, include_initial)
-
-
-def cumulative_prod(x, /, *, axis=None, dtype=None, out=None, include_initial=False):
-    return _cumulative_func(x, multiply, axis, dtype, out, include_initial)
-
-
-def vecdot(x1, x2, /, *, axis=-1):
-    x1 = asanyarray(x1)
-    x2 = asanyarray(x2)
-    for operand, x in enumerate((x1, x2)):
-        if x.ndim < 1:
-            raise ValueError(
-                f"vecdot: Input operand {operand} does not have enough dimensions (has 0, "
-                "gufunc core with signature (n),(n)->() requires 1)"
-            )
-    x1 = moveaxis(x1, _normalize_axis_index(axis, x1.ndim), -1)
-    x2 = moveaxis(x2, _normalize_axis_index(axis, x2.ndim), -1)
-    if x1.shape[-1] != x2.shape[-1]:
-        raise ValueError(
-            "vecdot: Input operand 1 has a mismatch in its core dimension 0, with gufunc "
-            f"signature (n),(n)->() (size {x2.shape[-1]} is different from {x1.shape[-1]})"
-        )
-    if issubdtype(x1.dtype, complexfloating):
-        x1 = conjugate(x1)
-    result = matmul(x1[..., None, :], x2[..., :, None])[..., 0, 0]
-    return result[()] if isinstance(result, ndarray) and result.ndim == 0 else result
+    if not a.flags.writeable:
+        raise ValueError("putmask: output array is read-only")
+    mask = mask.reshape(a.shape)
+    positions = np.flatnonzero(mask.reshape(-1))
+    if isinstance(values, np.ndarray):
+        pool = values.reshape(-1)
+        if pool.size == 0:
+            return None
+        _require_safe_cast(pool.dtype, a.dtype)
+        selected = np.take(pool, positions % pool.size)
+    else:
+        pool = values if isinstance(values, (list, tuple)) else [values]
+        if len(pool) == 0:
+            return None
+        selected = [pool[int(index) % len(pool)] for index in positions]
+    a[mask] = selected
+    return None

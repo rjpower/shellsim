@@ -112,14 +112,17 @@ differences, the unsupported frontier, and resource limits.
   iterator does, including pairwise summation, so floating-point results match NumPy bit for bit
   in the common cases.
 - **Shape.** Reshaping, transposition and axis moves, joining and splitting (including `block`),
-  repetition, flips, rolls, `pad`, triangles and diagonals, `kron`, and broadcasting helpers, with
-  NumPy's view-or-copy semantics.
+  repetition, flips (`flip`, `fliplr`, `flipud`), rolls, `pad`, triangles and diagonals, `kron`,
+  and broadcasting helpers, with NumPy's view-or-copy semantics.
 - **Sorting and sets.** `sort`, `argsort`, `lexsort`, `partition`, `searchsorted`, `unique` and
   its variants, set operations, `histogram` and `digitize`.
-- **Products and linear algebra.** `dot`, `vdot`, `vecdot`, `inner`, `outer`, `matmul` and
-  `@`, `tensordot`, and `numpy.linalg` for real arrays: `inv`, `solve`, `det`, `slogdet`, `eigh`,
-  `eigvalsh`, `svd`, `qr`, `cholesky`, `lstsq`, `pinv`, `matrix_rank`, `matrix_power` and
+- **Products and linear algebra.** `dot`, `vdot`, `vecdot`, `cross`, `inner`, `outer`, `matmul`
+  and `@`, `tensordot`, and `numpy.linalg` for real arrays: `inv`, `solve`, `det`, `slogdet`,
+  `eigh`, `eigvalsh`, `svd`, `qr`, `cholesky`, `lstsq`, `pinv`, `matrix_rank`, `matrix_power` and
   `norm`.
+- **Whole-array helpers.** `diff`, `gradient`, `interp`, `convolve`, `correlate`, `angle`,
+  `polyfit` and `polyval` (least-squares fit and Horner evaluation, not the `numpy.polynomial`
+  package, which is absent).
 - **FFT.** `numpy.fft`: `fft`, `ifft`, `rfft`, `irfft`, `hfft`, `ihfft`, their two- and
   n-dimensional forms (`fft2`, `fftn`, `rfft2`, `rfftn`, ...), `fftfreq`, `rfftfreq`,
   `fftshift`, and `ifftshift`, with `n`/`s`, `axis`/`axes`, `norm`, and `out`. Every transform

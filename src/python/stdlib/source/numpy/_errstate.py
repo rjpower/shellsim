@@ -1,166 +1,161 @@
-"""Floating-point error handling for shellsim's NumPy: ``errstate``, ``seterr``, ``geterr``,
-``seterrcall`` and ``geterrcall``.
+"""Floating-point error reporting: ``errstate``, ``seterr``/``geterr``, and their call site.
 
-Ufunc loops record divide-by-zero, overflow, underflow and invalid-operation flags natively and
-call ``_report`` after the loop when any flag is set. The modes kept here decide whether each
-flag is ignored, warned about, raised, printed, passed to a callback, or written to a log
-object, following ``numpy/_core/src/umath/extobj.c``.
+Ufunc loops record raised IEEE-style flags natively (see ``numpy/ops.rs``) without touching
+Python. Once a loop finishes, the interpreter calls ``_report`` with the flags it saw; this module
+holds the mode table those flags are checked against, so ``errstate`` nests and restores like any
+context manager and native code pays nothing when no flag is raised.
 """
 
-import os
 import warnings
 
-from _numpy import _ComplexWarning as ComplexWarning
+from numpy.exceptions import ComplexWarning
 
-_MODES = ("ignore", "warn", "raise", "call", "print", "log")
+__all__ = ["errstate", "seterr", "geterr", "seterrcall", "geterrcall"]
+
 _CATEGORIES = ("divide", "over", "under", "invalid")
+_MODES = frozenset({"ignore", "warn", "raise", "call", "print", "log"})
 _MESSAGES = {
     "divide": "divide by zero",
     "over": "overflow",
     "under": "underflow",
     "invalid": "invalid value",
 }
-# The status bits NumPy passes to a 'call' handler.
-_BITS = {"divide": 1, "over": 2, "under": 4, "invalid": 8}
 
+# The default state a fresh interpreter starts with: NumPy warns on everything but underflow,
+# which is common and rarely actionable.
 _state = {"divide": "warn", "over": "warn", "under": "ignore", "invalid": "warn"}
-_handler = None
-_Unspecified = object()
+_callback = None
 
 
-def geterr():
-    """Return the current mode for each floating-point error category."""
-    return dict(_state)
-
-
-def geterrcall():
-    """Return the callback or log object used by the 'call' and 'log' modes."""
-    return _handler
-
-
-def _configuration(call, all, divide, over, under, invalid):
-    """Validate a change and return the modes and handler it produces, as ``_make_extobj``."""
-    modes = dict(_state)
-    for category, mode in (("all", all), ("divide", divide), ("over", over), ("under", under),
-                           ("invalid", invalid)):
-        if mode is None:
-            continue
-        if mode not in _MODES:
-            raise ValueError(f"invalid error mode {mode!r}")
-        if category == "all":
-            for name in _CATEGORIES:
-                modes[name] = mode
-        else:
-            modes[category] = mode
-    handler = _handler
-    if call is not _Unspecified:
-        if call is not None and not callable(call):
-            write = getattr(call, "write", None)
-            if write is None or not callable(write):
-                raise TypeError("python object must be callable or have a callable write method")
-        handler = call
-    return modes, handler
-
-
-def _install(modes, handler):
-    global _handler
-    _state.clear()
-    _state.update(modes)
-    _handler = handler
+def _validate(mode):
+    if mode not in _MODES:
+        raise ValueError(f"invalid error mode {mode!r}")
 
 
 def seterr(all=None, divide=None, over=None, under=None, invalid=None):
-    """Set the error modes and return the previous ones."""
-    previous = geterr()
-    _install(*_configuration(_Unspecified, all, divide, over, under, invalid))
+    """Set how floating-point errors are handled; return the previous settings."""
+    previous = dict(_state)
+    requested = {"divide": divide, "over": over, "under": under, "invalid": invalid}
+    for category, mode in requested.items():
+        chosen = all if mode is None else mode
+        if chosen is not None:
+            _validate(chosen)
+    for category, mode in requested.items():
+        chosen = all if mode is None else mode
+        if chosen is not None:
+            _state[category] = chosen
     return previous
+
+
+def geterr():
+    """The current floating-point error mode for each category."""
+    return dict(_state)
 
 
 def seterrcall(func):
-    """Set the 'call' mode callback or 'log' mode object and return the previous one."""
-    previous = geterrcall()
-    _install(*_configuration(func, None, None, None, None, None))
+    """Install the callable used by ``call`` mode; return the previous one."""
+    global _callback
+    if func is not None and not callable(func) and not hasattr(func, "write"):
+        raise ValueError("Only callable can be used as callback")
+    previous = _callback
+    _callback = func
     return previous
 
 
-class errstate:
-    """Context manager and decorator that sets error modes for a block and restores them."""
+def geterrcall():
+    """The callable installed by ``seterrcall``, or ``None``."""
+    return _callback
 
-    def __init__(self, *, call=_Unspecified, all=None, divide=None, over=None, under=None,
-                 invalid=None):
-        self._token = None
-        self._call = call
-        self._settings = (all, divide, over, under, invalid)
+
+class errstate:
+    """Context manager (and decorator) that overrides floating-point error modes.
+
+    ``np.errstate(divide="raise")`` raises inside the block; other categories keep their current
+    mode unless ``all=`` or their own keyword is also given. Settings restore on exit even when
+    the block raises.
+    """
+
+    def __init__(self, *, all=None, divide=None, over=None, under=None, invalid=None):
+        self._all = all
+        self._requested = {"divide": divide, "over": over, "under": under, "invalid": invalid}
+        for mode in self._requested.values():
+            if mode is not None:
+                _validate(mode)
+        if all is not None:
+            _validate(all)
+        self._previous = None
 
     def __enter__(self):
-        if self._token is not None:
-            raise TypeError("Cannot enter `np.errstate` twice.")
-        configuration = _configuration(self._call, *self._settings)
-        self._token = (geterr(), _handler)
-        _install(*configuration)
+        self._previous = dict(_state)
+        for category, mode in self._requested.items():
+            chosen = self._all if mode is None else mode
+            if chosen is not None:
+                _state[category] = chosen
+        return self
 
     def __exit__(self, *exc_info):
-        _install(*self._token)
-        self._token = None
+        _state.update(self._previous)
+        return False
 
-    def __call__(self, func):
-        def inner(*args, **kwargs):
-            configuration = _configuration(self._call, *self._settings)
-            saved = (geterr(), _handler)
-            _install(*configuration)
-            try:
-                return func(*args, **kwargs)
-            finally:
-                _install(*saved)
+    def __call__(self, function):
+        def wrapped(*args, **kwargs):
+            with errstate(
+                all=self._all,
+                divide=self._requested["divide"],
+                over=self._requested["over"],
+                under=self._requested["under"],
+                invalid=self._requested["invalid"],
+            ):
+                return function(*args, **kwargs)
 
-        inner.__name__ = getattr(func, "__name__", "inner")
-        inner.__doc__ = getattr(func, "__doc__", None)
-        return inner
+        return wrapped
 
 
-def _report(name, divide, over, under, invalid):
-    """Apply the error modes to the flags one ufunc call raised, in NumPy's order."""
-    raised = {"divide": divide, "over": over, "under": under, "invalid": invalid}
-    status = sum(_BITS[category] for category in _CATEGORIES if raised[category])
-    for category in _CATEGORIES:
-        if not raised[category]:
-            continue
-        mode = _state[category]
-        errtype = _MESSAGES[category]
-        if mode == "ignore":
-            continue
-        if mode == "warn":
-            warnings.warn(f"{errtype} encountered in {name}", RuntimeWarning, stacklevel=2)
-        elif mode == "raise":
-            raise FloatingPointError(f"{errtype} encountered in {name}")
-        elif mode == "print":
-            os.write(2, f"Warning: {errtype} encountered in {name}\n".encode())
-        elif mode == "call":
-            if _handler is None:
-                raise NameError(
-                    f"python callback specified for {errtype} (in  {name}) but no function found."
-                )
-            _handler(errtype, status)
-        elif _handler is None:
-            raise NameError(
-                f"log specified for {errtype} (in {name}) but no object with write method found."
-            )
-        else:
-            _handler.write(f"Warning: {errtype} encountered in {name}\n")
+def _act(category, name):
+    """Apply the current mode for `category` to a flag raised by ufunc `name`."""
+    mode = _state[category]
+    if mode == "ignore":
+        return
+    message = f"{_MESSAGES[category]} encountered in {name}"
+    if mode == "warn":
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+    elif mode == "raise":
+        raise FloatingPointError(message)
+    elif mode == "call":
+        if _callback is not None:
+            flag = 1 << _CATEGORIES.index(category)
+            _callback(_MESSAGES[category], flag)
+    elif mode in ("print", "log"):
+        print(f"Warning: {message}")
+
+
+def _report(name, divide, overflow, underflow, invalid):
+    """Apply the current error modes to the flags raised by one ufunc call.
+
+    Categories are checked in a fixed order (divide, overflow, underflow, invalid) so that a
+    ``raise`` mode reports the first flag in that order and a ``warn`` mode for an earlier
+    category is not skipped by a later ``raise``.
+    """
+    if divide:
+        _act("divide", name)
+    if overflow:
+        _act("over", name)
+    if underflow:
+        _act("under", name)
+    if invalid:
+        _act("invalid", name)
 
 
 def _warn_complex_discard():
-    """Warn that a conversion to a real type dropped an imaginary part."""
     warnings.warn(
         "Casting complex values to real discards the imaginary part", ComplexWarning, stacklevel=2
     )
 
 
 def _warn_where_without_out():
-    """Warn that a ufunc's ``where=`` mask without ``out=`` leaves elements uninitialized."""
     warnings.warn(
-        "'where' used without 'out', expect uninitialized memory in output. If this is "
-        "intentional, use out=None.",
+        "'where' used without 'out', expect uninitialized memory in output. "
+        "If this is intentional, use out=None.",
         UserWarning,
         stacklevel=2,
     )
