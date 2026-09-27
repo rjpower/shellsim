@@ -146,9 +146,10 @@ def test_strings_upper_truncates_when_case_folding_grows_past_the_input_width():
 
 def test_strings_padding_functions():
     a = np.array(["ab", "c"])
-    # `center`'s two elements are chosen with even total padding on both sides, since CPython's
-    # tie-break for an odd amount of padding is not itself under test here.
     assert np.strings.center(np.array(["ab", "cd"]), 6, "*").tolist() == ["**ab**", "**cd**"]
+    # An odd padding unit goes on the left only when the requested width is odd.
+    assert np.strings.center(np.array(["ab", "a", "abc"]), 5, "*").tolist() == ["**ab*", "**a**", "*abc*"]
+    assert np.strings.center(np.array(["a", "ab"]), 4, "*").tolist() == ["*a**", "*ab*"]
     assert np.strings.ljust(a, 4, "-").tolist() == ["ab--", "c---"]
     assert np.strings.rjust(a, 4, "-").tolist() == ["--ab", "---c"]
     assert np.strings.zfill(np.array(["7", "-3", "42"]), 4).tolist() == ["0007", "-003", "0042"]

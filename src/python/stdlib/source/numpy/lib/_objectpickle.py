@@ -63,51 +63,16 @@ def _unpack_be_double(data):
     return struct.unpack(">d", bytes(data))[0]
 
 
-def _pack_uint_le(value, length):
-    """`int.to_bytes(length, 'little')`, built from shifts: shellsim's `int` has no
-    `to_bytes`/`from_bytes`, but its bitwise operators work on arbitrary-precision ints."""
-    return bytes((value >> (8 * index)) & 0xFF for index in range(length))
-
-
-def _unpack_uint_le(data):
-    value = 0
-    for index, byte in enumerate(data):
-        value |= byte << (8 * index)
-    return value
-
-
-def _pack_int_le(value, length):
-    if value < 0:
-        value += 1 << (8 * length)
-    return _pack_uint_le(value, length)
-
-
-def _unpack_int_le(data):
-    value = _unpack_uint_le(data)
-    bits = 8 * len(data)
-    if value >= 1 << (bits - 1):
-        value -= 1 << bits
-    return value
-
-
-def _bit_length(value):
-    if value < 0:
-        value = ~value
-    return 0 if value == 0 else len(bin(value)) - 2
-
-
 def _long_to_bytes(value):
     """Minimal little-endian two's-complement bytes for an arbitrary-precision int."""
     if value == 0:
         return b""
-    length = _bit_length(value) // 8 + 1
-    return _pack_int_le(value, length)
+    magnitude = ~value if value < 0 else value
+    return value.to_bytes(magnitude.bit_length() // 8 + 1, "little", signed=True)
 
 
 def _long_from_bytes(data):
-    if not data:
-        return 0
-    return _unpack_int_le(data)
+    return int.from_bytes(data, "little", signed=True)
 
 
 class _Pickler:
@@ -135,7 +100,7 @@ class _Pickler:
         if not force and len(self._frame) < _FRAME_SIZE_TARGET:
             return
         if len(self._frame) >= _FRAME_SIZE_MIN:
-            self._out += b"\x95" + _pack_uint_le(len(self._frame), 8)
+            self._out += b"\x95" + len(self._frame).to_bytes(8, "little")
         self._out += self._frame
         self._frame = bytearray()
 
@@ -156,7 +121,7 @@ class _Pickler:
         if index < 256:
             self._emit(b"h" + bytes([index]))
         else:
-            self._emit(b"j" + _pack_uint_le(index, 4))
+            self._emit(b"j" + index.to_bytes(4, "little"))
 
     # -- dispatch ---------------------------------------------------------
 
@@ -204,15 +169,15 @@ class _Pickler:
         if 0 <= value <= 0xFF:
             self._emit(b"K" + bytes([value]))
         elif 0x100 <= value <= 0xFFFF:
-            self._emit(b"M" + _pack_uint_le(value, 2))
+            self._emit(b"M" + value.to_bytes(2, "little"))
         elif -(2**31) <= value <= 2**31 - 1:
-            self._emit(b"J" + _pack_int_le(value, 4))
+            self._emit(b"J" + value.to_bytes(4, "little", signed=True))
         else:
             body = _long_to_bytes(value)
             if len(body) < 256:
                 self._emit(b"\x8a" + bytes([len(body)]) + body)
             else:
-                self._emit(b"\x8b" + _pack_uint_le(len(body), 4) + body)
+                self._emit(b"\x8b" + len(body).to_bytes(4, "little") + body)
 
     def _save_complex(self, value):
         cached = self._id_memo.get(id(value))
@@ -371,8 +336,8 @@ def _text_length_opcode(short_op, medium_op, long_op, payload):
     if length < 256:
         return short_op + bytes([length]) + payload
     if length < 2**32:
-        return medium_op + _pack_uint_le(length, 4) + payload
-    return long_op + _pack_uint_le(length, 8) + payload
+        return medium_op + length.to_bytes(4, "little") + payload
+    return long_op + length.to_bytes(8, "little") + payload
 
 
 def _dtype_pickle_fields(dtype):
@@ -480,14 +445,14 @@ class _Unpickler:
         elif op == b"K":
             stack.append(reader.read(1)[0])
         elif op == b"M":
-            stack.append(_unpack_uint_le(reader.read(2)))
+            stack.append(int.from_bytes(reader.read(2), "little"))
         elif op == b"J":
-            stack.append(_unpack_int_le(reader.read(4)))
+            stack.append(int.from_bytes(reader.read(4), "little", signed=True))
         elif op == b"\x8a":
             length = reader.read(1)[0]
             stack.append(_long_from_bytes(reader.read(length)))
         elif op == b"\x8b":
-            length = _unpack_uint_le(reader.read(4))
+            length = int.from_bytes(reader.read(4), "little")
             stack.append(_long_from_bytes(reader.read(length)))
         elif op == b"G":
             stack.append(_unpack_be_double(reader.read(8)))
@@ -495,19 +460,19 @@ class _Unpickler:
             length = reader.read(1)[0]
             stack.append(reader.read(length).decode("utf-8"))
         elif op == b"X":
-            length = _unpack_uint_le(reader.read(4))
+            length = int.from_bytes(reader.read(4), "little")
             stack.append(reader.read(length).decode("utf-8"))
         elif op == b"\x8d":
-            length = _unpack_uint_le(reader.read(8))
+            length = int.from_bytes(reader.read(8), "little")
             stack.append(reader.read(length).decode("utf-8"))
         elif op == b"C":
             length = reader.read(1)[0]
             stack.append(bytes(reader.read(length)))
         elif op == b"B":
-            length = _unpack_uint_le(reader.read(4))
+            length = int.from_bytes(reader.read(4), "little")
             stack.append(bytes(reader.read(length)))
         elif op == b"\x8e":
-            length = _unpack_uint_le(reader.read(8))
+            length = int.from_bytes(reader.read(8), "little")
             stack.append(bytes(reader.read(length)))
         elif op == b")":
             stack.append(())
@@ -554,7 +519,7 @@ class _Unpickler:
         elif op == b"h":
             self._push_memo(reader.read(1)[0])
         elif op == b"j":
-            self._push_memo(_unpack_uint_le(reader.read(4)))
+            self._push_memo(int.from_bytes(reader.read(4), "little"))
         elif op == b"c":
             module = reader.read_line().decode("utf-8")
             name = reader.read_line().decode("utf-8")
