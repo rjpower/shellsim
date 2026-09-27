@@ -110,13 +110,38 @@ def test_string_repeat_with_strings_multiply():
     assert repeated.tolist() == ["abab", "cc"]
 
 
-def test_strings_case_functions():
+def test_strings_multiply_broadcasts_an_array_of_repeat_counts():
+    repeated = np.strings.multiply(np.array(["ab", "cd", "ef"]), np.array([2, 0, 3]))
+    # NumPy sizes this from the actual longest result, the same as constructing an array from
+    # the computed text; an all-empty result still floors at width 1.
+    assert repeated.dtype == np.dtype("<U6")
+    assert repeated.tolist() == ["abab", "", "efefef"]
+
+
+def test_strings_case_functions_keep_the_input_width():
     a = np.array(["Hello World", "foo BAR"])
-    assert np.strings.capitalize(a).tolist() == ["Hello world", "Foo bar"]
-    assert np.strings.lower(a).tolist() == ["hello world", "foo bar"]
-    assert np.strings.upper(a).tolist() == ["HELLO WORLD", "FOO BAR"]
-    assert np.strings.swapcase(a).tolist() == ["hELLO wORLD", "FOO bar"]
-    assert np.strings.title(a).tolist() == ["Hello World", "Foo Bar"]
+    assert a.dtype == np.dtype("<U11")
+    for result, expected in (
+        (np.strings.capitalize(a), ["Hello world", "Foo bar"]),
+        (np.strings.lower(a), ["hello world", "foo bar"]),
+        (np.strings.upper(a), ["HELLO WORLD", "FOO BAR"]),
+        (np.strings.swapcase(a), ["hELLO wORLD", "FOO bar"]),
+        (np.strings.title(a), ["Hello World", "Foo Bar"]),
+    ):
+        # NumPy's fixed-width buffer keeps exactly the input's width for every case function,
+        # even though none of these particular results is as long as "Hello World".
+        assert result.dtype == np.dtype("<U11")
+        assert result.tolist() == expected
+
+
+def test_strings_upper_truncates_when_case_folding_grows_past_the_input_width():
+    # German sharp s upper-cases to "SS", which is one character longer than "straße"; NumPy's
+    # `upper` does not grow the array to fit, it truncates to the original width instead.
+    a = np.array(["straße"])
+    assert a.dtype == np.dtype("<U6")
+    result = np.strings.upper(a)
+    assert result.dtype == np.dtype("<U6")
+    assert result.tolist() == ["STRASS"]
 
 
 def test_strings_padding_functions():
@@ -129,12 +154,44 @@ def test_strings_padding_functions():
     assert np.strings.zfill(np.array(["7", "-3", "42"]), 4).tolist() == ["0007", "-003", "0042"]
 
 
-def test_strings_trimming_functions():
+def test_strings_padding_functions_grow_to_the_wider_of_input_and_requested_width():
+    a = np.array(["Hello World"])  # <U11
+    # A requested width narrower than the input leaves the array's width unchanged.
+    small = np.strings.ljust(a, 3)
+    assert small.dtype == np.dtype("<U11")
+    assert small.tolist() == ["Hello World"]
+    big = np.strings.rjust(a, 15, "-")
+    assert big.dtype == np.dtype("<U15")
+    assert big.tolist() == ["----Hello World"]
+    narrow = np.strings.zfill(np.array(["7", "-3", "42"]), 1)
+    assert narrow.dtype == np.dtype("<U2")
+    assert narrow.tolist() == ["7", "-3", "42"]
+
+
+def test_strings_padding_functions_broadcast_an_array_of_widths():
+    result = np.strings.center(np.array(["ab", "cd"]), np.array([2, 8]), "*")
+    # The dtype fits the largest requested width even though only one row needs it.
+    assert result.dtype == np.dtype("<U8")
+    assert result.tolist() == ["ab", "***cd***"]
+
+
+def test_strings_trimming_functions_keep_the_input_width():
     a = np.array(["  hi  ", "yo   "])
-    assert np.strings.strip(a).tolist() == ["hi", "yo"]
-    assert np.strings.lstrip(a).tolist() == ["hi  ", "yo   "]
-    assert np.strings.rstrip(a).tolist() == ["  hi", "yo"]
+    assert a.dtype == np.dtype("<U6")
+    for result, expected in (
+        (np.strings.strip(a), ["hi", "yo"]),
+        (np.strings.lstrip(a), ["hi  ", "yo   "]),
+        (np.strings.rstrip(a), ["  hi", "yo"]),
+    ):
+        assert result.dtype == np.dtype("<U6")
+        assert result.tolist() == expected
     assert np.strings.strip(np.array(["xxhixx"]), "x").tolist() == ["hi"]
+
+
+def test_strings_strip_broadcasts_an_array_of_character_sets():
+    result = np.strings.strip(np.array(["xxhixx", "yyhoyy"]), np.array(["x", "y"]))
+    assert result.dtype == np.dtype("<U6")
+    assert result.tolist() == ["hi", "ho"]
 
 
 def test_strings_search_and_replace_functions():
@@ -149,6 +206,19 @@ def test_strings_search_and_replace_functions():
         np.strings.index(a, "z")
     assert np.strings.replace(a, "o", "0").tolist() == ["Hell0 W0rld", "f00 bar"]
     assert np.strings.replace(np.array(["aaaa"]), "a", "bb").tolist() == ["bbbbbbbb"]
+    # Content-based, not preserved: replacing a two-character run with one character shrinks
+    # below the input's own <U4 width.
+    shrunk = np.strings.replace(np.array(["aaaa"]), "aa", "b")
+    assert shrunk.dtype == np.dtype("<U2")
+    assert shrunk.tolist() == ["bb"]
+
+
+def test_strings_count_and_replace_broadcast_their_array_arguments():
+    a = np.array(["Hello World", "foo bar"])
+    assert np.strings.count(a, "o", np.array([0, 2])).tolist() == [2, 1]
+    replaced = np.strings.replace(np.array(["aaa", "bbb"]), np.array(["a", "b"]), "Z")
+    assert replaced.dtype == np.dtype("<U3")
+    assert replaced.tolist() == ["ZZZ", "ZZZ"]
 
 
 def test_strings_partition_and_rpartition_return_three_arrays():
@@ -167,25 +237,43 @@ def test_strings_partition_and_rpartition_return_three_arrays():
     )
 
 
+def test_strings_partition_broadcasts_an_array_of_separators():
+    before, sep, after = np.strings.partition(np.array(["a-b", "c:d"]), np.array(["-", ":"]))
+    assert before.tolist() == ["a", "c"]
+    assert sep.tolist() == ["-", ":"]
+    assert after.tolist() == ["b", "d"]
+
+
 def test_strings_slice_matches_python_slice_semantics():
     a = np.array(["Hello World", "foo bar"])
     # A single positional argument is `stop`, as with the builtin `slice(stop)`.
     assert np.strings.slice(a, 5).tolist() == ["Hello", "foo b"]
     assert np.strings.slice(a, 1, 5).tolist() == ["ello", "oo b"]
     assert np.strings.slice(a, None, None, 2).tolist() == ["HloWrd", "fobr"]
+    # `slice` keeps the input's width, like `strip` and the case functions.
+    small = np.strings.slice(a, 3)
+    assert small.dtype == np.dtype("<U11")
+    assert small.tolist() == ["Hel", "foo"]
+
+
+def test_strings_slice_broadcasts_arrays_of_start_and_stop():
+    result = np.strings.slice(np.array(["Hello World", "foo bar"]), np.array([1, 0]), np.array([5, 3]))
+    assert result.tolist() == ["ello", "foo"]
 
 
 def test_strings_translate_maps_characters_elementwise():
     table = {ord("a"): "A", ord("b"): "B"}
-    assert np.strings.translate(np.array(["abc", "cab"]), table).tolist() == ["ABc", "cAB"]
+    result = np.strings.translate(np.array(["abc", "cab"]), table)
+    assert result.dtype == np.dtype("<U3")
+    assert result.tolist() == ["ABc", "cAB"]
 
 
-def test_strings_mod_applies_values_to_every_element():
-    # shellsim applies `values` uniformly to every element rather than broadcasting one
-    # substitution per row (see the module docstring in `numpy/strings.py`); NumPy instead
-    # zips `values` against `a`, so this exercises shellsim's documented simplification.
-    result = np.strings.mod(np.array(["n=%d", "m=%d"]), (7,))
-    assert result.tolist() == ["n=7", "m=7"]
+def test_strings_mod_broadcasts_values_per_element():
+    result = np.strings.mod(np.array(["n=%d", "m=%d"]), np.array([7, 9]))
+    assert result.dtype == np.dtype("<U3")
+    assert result.tolist() == ["n=7", "m=9"]
+    # A one-element `values` broadcasts against every row, like any other array argument.
+    assert np.strings.mod(np.array(["n=%d", "m=%d"]), (7,)).tolist() == ["n=7", "m=7"]
 
 
 def test_strings_predicate_functions():
@@ -201,6 +289,20 @@ def test_strings_predicate_functions():
     assert np.strings.istitle(np.array(["Hello World", "hello world"])).tolist() == [True, False]
     assert np.strings.startswith(np.array(["Hello", "foo"]), "He").tolist() == [True, False]
     assert np.strings.endswith(np.array(["Hello", "foo"]), "lo").tolist() == [True, False]
+
+
+def test_strings_startswith_and_endswith_broadcast_an_array_of_patterns():
+    a = np.array(["Hello", "foo", "bar"])
+    assert np.strings.startswith(a, np.array(["He", "fo", "z"])).tolist() == [True, True, False]
+    assert np.strings.endswith(a, np.array(["lo", "o", "r"])).tolist() == [True, True, True]
+
+
+def test_strings_expandtabs_broadcasts_tabsize_but_keeps_content_based_width():
+    # `expandtabs` broadcasts `tabsize` like every other parameter; its result dtype is the one
+    # documented exception that does not match NumPy's own (unpinnable) width exactly -- values
+    # still match NumPy exactly, only `.dtype.itemsize` can differ.
+    result = np.strings.expandtabs(np.array(["a\tb", "cd"]), np.array([2, 4]))
+    assert result.tolist() == ["a b", "cd"]
 
 
 def test_strings_comparison_functions():

@@ -2,20 +2,34 @@
 
 The native `_numpy_strings` module (see `src/python/stdlib/numpy/strings.rs`) exports no
 functions of its own; everything here is built from ordinary `str` methods applied
-element-by-element, broadcasting extra array arguments the way a ufunc would. Packing the
-Python results back through `np.array(...)` gives the result its dtype for free: a `str`
-result array gets the width of its longest element, a comparison gets `bool`, and a count or
-index gets `int64`, exactly as constructing an array from those Python values normally would.
+element-by-element. Every argument -- the input array and any per-element parameter such as
+`width`, `fillchar`, `start`, `end`, `chars`, a separator, `old`/`new`/`count`, `tabsize`, or
+`mod`'s `values` -- is broadcast together first, the way a ufunc broadcasts its operands, so an
+array-valued parameter supplies one value per element exactly as NumPy's own `numpy.strings`
+does. `translate`'s `table` is the one exception: NumPy documents it as a single shared
+translation table for the whole call, not an array_like parameter, so shellsim does not
+broadcast it either.
 
-Functions that take a per-element parameter other than the input arrays (`width`, `fillchar`,
-`start`, `end`, separators, `mod`'s `values`, ...) apply that parameter uniformly to every
-element rather than broadcasting it too; NumPy allows array-valued parameters there, which
-shellsim does not reproduce.
+A `str`-dtype result's width is chosen to match NumPy's own rule wherever black-box probing
+against NumPy 2.5.3 pinned one down:
 
-NumPy sizes a result array's dtype from an internal worst-case buffer estimate for the
-operation (e.g. `strip` keeps its input's width even when every stripped string is shorter);
-shellsim instead sizes it from the actual output text, as plain `np.array(...)` construction
-would. Values always match; the reported `.dtype.itemsize` can be narrower.
+- `capitalize`, `lower`, `upper`, `swapcase`, `title`, `strip`, `lstrip`, `rstrip`, `slice`, and
+  `translate` keep the input's width exactly, even when every result is shorter -- and, matching
+  NumPy's own fixed-width buffers, a result that comes out *longer* than the input (case folding
+  can grow a string, e.g. `"straße".upper()`) is truncated to fit rather than widening the
+  array.
+- `center`, `ljust`, `rjust`, and `zfill` grow to `max(input width, requested width)`.
+- `add`, `multiply`, `replace`, `mod`, and `partition`/`rpartition` size the result from the
+  actual computed text (like plain `np.array(...)` construction), which is what NumPy itself
+  does for these too, except in one corner case: an all-empty `partition`/`rpartition` column
+  across the *whole* array reports `itemsize` 0 in NumPy but 1 in shellsim (`np.array`'s own
+  floor for an all-empty string array), since NumPy allocates that column from a rule internal
+  to its C implementation rather than from the text it wrote.
+- `expandtabs` could not be pinned down: probing it against varying tab sizes and input text
+  shows NumPy allocating more than the expanded text needs, by an amount that is not a simple
+  function of the input width, the tab size, or the number of tab characters present. shellsim
+  sizes its result from the actual expanded text instead. Values always match; only
+  `expandtabs`'s reported `.dtype.itemsize` can differ from NumPy's.
 
 `decode` and `encode` are absent because they convert to and from the `bytes_` (`S`) dtype,
 which shellsim's NumPy does not implement (see the "Unsupported frontier" section of
@@ -31,141 +45,185 @@ def _as_element_array(value):
     return value if isinstance(value, np.ndarray) else np.array(value)
 
 
-def _map1(func, a):
+def _broadcast(*args):
+    return np.broadcast_arrays(*(_as_element_array(value) for value in args))
+
+
+def _map(func, *args):
+    """Broadcast every argument together and apply `func` elementwise, like a ufunc.
+
+    The result's dtype is inferred from the returned Python values, exactly as `np.array(...)`
+    would: right for `bool`/`int` results (comparisons, `count`, `find`, the `isX` predicates),
+    and for the handful of `str` results (`add`, `multiply`, `replace`, `mod`, `expandtabs`)
+    whose width NumPy itself computes from the actual output text.
+    """
+    arrays = _broadcast(*args)
+    shape = arrays[0].shape
+    flats = [array.reshape(-1).tolist() for array in arrays]
+    results = [func(*values) for values in zip(*flats)]
+    return np.array(results).reshape(shape)
+
+
+def _char_width(dtype):
+    # shellsim's `<U>` dtypes report `itemsize` in bytes, 4 per character (see
+    # `numpy/lib/format.py`'s `_dtype_pickle_fields`, which relies on the same convention).
+    return max(dtype.itemsize // 4, 1)
+
+
+def _fixed_width_map(func, args, width):
+    arrays = _broadcast(*args)
+    shape = arrays[0].shape
+    flats = [array.reshape(-1).tolist() for array in arrays]
+    results = [func(*values) for values in zip(*flats)]
+    return np.array(results, dtype=f"<U{width}").reshape(shape)
+
+
+def _preserve(func, a, *rest):
+    """Elementwise map whose `str`-dtype result keeps `a`'s width exactly (NumPy's rule for
+    case folding, stripping, slicing, and translation). Object arrays have no fixed width to
+    preserve -- NumPy's own `numpy.strings` does not accept them either -- so they fall back to
+    `_map`'s content-based sizing, which is what this module already did for them before
+    `str`-dtype width fidelity was added."""
     array = _as_element_array(a)
-    flat = [func(value) for value in array.reshape(-1).tolist()]
-    return np.array(flat).reshape(array.shape)
+    if array.dtype.kind != "U":
+        return _map(func, array, *rest)
+    return _fixed_width_map(func, (array, *rest), _char_width(array.dtype))
 
 
-def _map2(func, a, b):
-    a = _as_element_array(a)
-    b = _as_element_array(b)
-    a, b = np.broadcast_arrays(a, b)
-    flat_a = a.reshape(-1).tolist()
-    flat_b = b.reshape(-1).tolist()
-    return np.array([func(x, y) for x, y in zip(flat_a, flat_b)]).reshape(a.shape)
+def _grow(func, a, width_param, *rest):
+    """Elementwise map whose `str`-dtype result grows to `max(a`'s width, `width_param`'s
+    largest requested value)`, NumPy's rule for `center`/`ljust`/`rjust`/`zfill`."""
+    array = _as_element_array(a)
+    width_array = _as_element_array(width_param)
+    if array.dtype.kind != "U":
+        return _map(func, array, width_array, *rest)
+    requested = int(width_array.max()) if width_array.size else 0
+    width = max(_char_width(array.dtype), requested, 1)
+    return _fixed_width_map(func, (array, width_array, *rest), width)
 
 
 # -- concatenation and repetition -------------------------------------------
 
 
 def add(x1, x2):
-    return _map2(lambda a, b: a + b, x1, x2)
+    return _map(lambda a, b: a + b, x1, x2)
 
 
 def multiply(a, i):
-    return _map2(lambda s, n: s * n, a, i)
+    return _map(lambda s, n: s * n, a, i)
 
 
 def mod(a, values):
-    # NumPy broadcasts `values` against `a` (one substitution per element); shellsim applies
-    # it uniformly instead, per the module-level note above.
-    return _map1(lambda s: s % values, a)
+    return _map(lambda s, v: s % v, a, values)
 
 
 # -- case ---------------------------------------------------------------
 
 
 def capitalize(a):
-    return _map1(str.capitalize, a)
+    return _preserve(str.capitalize, a)
 
 
 def lower(a):
-    return _map1(str.lower, a)
+    return _preserve(str.lower, a)
 
 
 def upper(a):
-    return _map1(str.upper, a)
+    return _preserve(str.upper, a)
 
 
 def swapcase(a):
-    return _map1(str.swapcase, a)
+    return _preserve(str.swapcase, a)
 
 
 def title(a):
-    return _map1(str.title, a)
+    return _preserve(str.title, a)
 
 
 # -- padding --------------------------------------------------------------
 
 
 def center(a, width, fillchar=" "):
-    return _map1(lambda s: s.center(width, fillchar), a)
+    return _grow(lambda s, w, f: s.center(w, f), a, width, fillchar)
 
 
 def ljust(a, width, fillchar=" "):
-    return _map1(lambda s: s.ljust(width, fillchar), a)
+    return _grow(lambda s, w, f: s.ljust(w, f), a, width, fillchar)
 
 
 def rjust(a, width, fillchar=" "):
-    return _map1(lambda s: s.rjust(width, fillchar), a)
+    return _grow(lambda s, w, f: s.rjust(w, f), a, width, fillchar)
 
 
 def zfill(a, width):
-    return _map1(lambda s: s.zfill(width), a)
+    return _grow(lambda s, w: s.zfill(w), a, width)
 
 
 def expandtabs(a, tabsize=8):
-    return _map1(lambda s: s.expandtabs(tabsize), a)
+    # See the module docstring: NumPy's own width here is not a pinnable function of the
+    # input width, tabsize, or tab count, so this keeps `_map`'s content-based sizing.
+    return _map(lambda s, t: s.expandtabs(t), a, tabsize)
 
 
 # -- trimming ---------------------------------------------------------------
 
 
 def strip(a, chars=None):
-    return _map1(lambda s: s.strip(chars), a)
+    return _preserve(lambda s, c: s.strip(c), a, chars)
 
 
 def lstrip(a, chars=None):
-    return _map1(lambda s: s.lstrip(chars), a)
+    return _preserve(lambda s, c: s.lstrip(c), a, chars)
 
 
 def rstrip(a, chars=None):
-    return _map1(lambda s: s.rstrip(chars), a)
+    return _preserve(lambda s, c: s.rstrip(c), a, chars)
 
 
 # -- search and replace ----------------------------------------------------
 
 
 def count(a, sub, start=0, end=None):
-    return _map1(lambda s: s.count(sub, start, end), a)
+    return _map(lambda s, u, i, j: s.count(u, i, j), a, sub, start, end)
 
 
 def find(a, sub, start=0, end=None):
-    return _map1(lambda s: s.find(sub, start, end), a)
+    return _map(lambda s, u, i, j: s.find(u, i, j), a, sub, start, end)
 
 
 def rfind(a, sub, start=0, end=None):
-    return _map1(lambda s: s.rfind(sub, start, end), a)
+    return _map(lambda s, u, i, j: s.rfind(u, i, j), a, sub, start, end)
 
 
 def index(a, sub, start=0, end=None):
-    return _map1(lambda s: s.index(sub, start, end), a)
+    return _map(lambda s, u, i, j: s.index(u, i, j), a, sub, start, end)
 
 
 def rindex(a, sub, start=0, end=None):
-    return _map1(lambda s: s.rindex(sub, start, end), a)
+    return _map(lambda s, u, i, j: s.rindex(u, i, j), a, sub, start, end)
 
 
 def replace(a, old, new, count=-1):
-    return _map1(lambda s: s.replace(old, new, count), a)
+    return _map(lambda s, o, n, c: s.replace(o, n, c), a, old, new, count)
 
 
-def _partition3(a, method):
+def _partition3(a, sep, method_name):
     # `partition`/`rpartition` return three same-shaped arrays (before, separator, after),
     # not one array of 3-tuples: matches `numpy.strings`, which reports each part separately.
-    array = _as_element_array(a)
-    flat = [method(value) for value in array.reshape(-1).tolist()]
-    columns = zip(*flat) if flat else ((), (), ())
-    return tuple(np.array(column).reshape(array.shape) for column in columns)
+    arrays = _broadcast(a, sep)
+    shape = arrays[0].shape
+    flats = [array.reshape(-1).tolist() for array in arrays]
+    results = [getattr(s, method_name)(part) for s, part in zip(*flats)]
+    columns = zip(*results) if results else ((), (), ())
+    return tuple(np.array(column).reshape(shape) for column in columns)
 
 
 def partition(a, sep):
-    return _partition3(a, lambda s: s.partition(sep))
+    return _partition3(a, sep, "partition")
 
 
 def rpartition(a, sep):
-    return _partition3(a, lambda s: s.rpartition(sep))
+    return _partition3(a, sep, "rpartition")
 
 
 def slice(a, start=None, stop=_SLICE_UNSET, step=None):
@@ -176,88 +234,89 @@ def slice(a, start=None, stop=_SLICE_UNSET, step=None):
     """
     if stop is _SLICE_UNSET:
         start, stop = None, start
-    return _map1(lambda s: s[start:stop:step], a)
+    return _preserve(lambda s, st, sp, sk: s[st:sp:sk], a, start, stop, step)
 
 
 def translate(a, table, deletechars=None):
     # NumPy's own `str`-dtype `translate` leaves `deletechars` without effect (confirmed
-    # against NumPy 2.5.3), so shellsim reproduces exactly `str.translate(table)`.
-    return _map1(lambda s: s.translate(table), a)
+    # against NumPy 2.5.3), so shellsim reproduces exactly `str.translate(table)`. `table`
+    # itself is not broadcast; see the module docstring.
+    return _preserve(lambda s: s.translate(table), a)
 
 
 def startswith(a, prefix, start=0, end=None):
-    return _map1(lambda s: s.startswith(prefix, start, end), a)
+    return _map(lambda s, p, i, j: s.startswith(p, i, j), a, prefix, start, end)
 
 
 def endswith(a, suffix, start=0, end=None):
-    return _map1(lambda s: s.endswith(suffix, start, end), a)
+    return _map(lambda s, x, i, j: s.endswith(x, i, j), a, suffix, start, end)
 
 
 # -- predicates -------------------------------------------------------------
 
 
 def str_len(a):
-    return _map1(len, a)
+    return _map(len, a)
 
 
 def isalpha(a):
-    return _map1(str.isalpha, a)
+    return _map(str.isalpha, a)
 
 
 def isdigit(a):
-    return _map1(str.isdigit, a)
+    return _map(str.isdigit, a)
 
 
 def isdecimal(a):
-    return _map1(str.isdecimal, a)
+    return _map(str.isdecimal, a)
 
 
 def isnumeric(a):
-    return _map1(str.isnumeric, a)
+    return _map(str.isnumeric, a)
 
 
 def isalnum(a):
-    return _map1(str.isalnum, a)
+    return _map(str.isalnum, a)
 
 
 def isspace(a):
-    return _map1(str.isspace, a)
+    return _map(str.isspace, a)
 
 
 def islower(a):
-    return _map1(str.islower, a)
+    return _map(str.islower, a)
 
 
 def isupper(a):
-    return _map1(str.isupper, a)
+    return _map(str.isupper, a)
 
 
 def istitle(a):
-    return _map1(str.istitle, a)
+    return _map(str.istitle, a)
 
 
 # -- comparisons (mirrors of the operators, for parity with numpy.strings) --
 
 
 def equal(x1, x2):
-    return _map2(lambda a, b: a == b, x1, x2)
+    return _map(lambda a, b: a == b, x1, x2)
 
 
 def not_equal(x1, x2):
-    return _map2(lambda a, b: a != b, x1, x2)
+    return _map(lambda a, b: a != b, x1, x2)
 
 
 def greater(x1, x2):
-    return _map2(lambda a, b: a > b, x1, x2)
+    return _map(lambda a, b: a > b, x1, x2)
 
 
 def greater_equal(x1, x2):
-    return _map2(lambda a, b: a >= b, x1, x2)
+    return _map(lambda a, b: a >= b, x1, x2)
 
 
 def less(x1, x2):
-    return _map2(lambda a, b: a < b, x1, x2)
+    return _map(lambda a, b: a < b, x1, x2)
 
 
 def less_equal(x1, x2):
-    return _map2(lambda a, b: a <= b, x1, x2)
+    return _map(lambda a, b: a <= b, x1, x2)
