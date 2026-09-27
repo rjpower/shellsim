@@ -27,7 +27,8 @@ inputs therefore compute in single precision. Wider integers and `float64` compu
 precision. `logit` registers its `float64` loop first, so only `float32` input selects single
 precision. `expit`, `logit`, `log_expit`, `xlogy` and `xlog1py` round every step to single
 precision, as xsf's templates do. The other single-precision loops compute in `f64` and round
-the result, as SciPy's do.
+the result, as SciPy's Cephes-based loops do; see the deliberate differences for the Boost-based
+ones.
 
 `bdtr` and `bdtrc` also have a loop that takes the trial count `n` as an integer. When a call
 selects a loop with a floating-point `n`, it issues SciPy's `DeprecationWarning`.
@@ -65,6 +66,11 @@ limits.
 - **`bdtr` and `bdtrc` precision.** shellsim evaluates both through Boost's incomplete beta
   function, where SciPy uses Cephes' `incbet`. The results agree less closely as `n` grows; at
   `n = 1000` their relative difference reaches about `7e-13`.
+- **Single precision in the Boost-based functions.** For `float32` input, SciPy runs Boost's
+  `betainc`, `betaincc`, `betaincinv`, `stdtr`, `stdtrit`, `fdtr`, `fdtrc` and `fdtri` in single
+  precision. shellsim computes them in double precision and rounds the result, which is at least
+  as accurate but differs from SciPy's `float32` result in the last place for about half of all
+  arguments.
 
 ## Unsupported frontier
 
