@@ -321,9 +321,13 @@ def test_triangular_banded_and_circulant_solves():
     wide = np.array([[0.0, 0.0, 1.0], [0.0, 1.0, 2.0], [4.0, 5.0, 6.0], [7.0, 8.0, 0.0]])
     assert_array_equal(sl.solve_banded((1, 2), wide, b), [0.12857142857142861, 0.042857142857142816, 0.4428571428571429])
     assert_array_equal(sl.solve_banded((0, 1), np.array([[0.0, 1.0, 2.0], [4.0, 5.0, 6.0]]), b), [0.2, 0.2, 0.5])
-    assert_array_equal(sl.solve_circulant(np.array([2.0, 1.0, 0.0]), b), [0.0, 1.0, 1.0])
-    assert_array_equal(
-        sl.solve_circulant(np.array([2.0, 1.0, 0.0]), np.stack([b, b], axis=1)), [[0.0, 0.0], [1.0, 1.0], [1.0, 1.0]]
+    # solve_circulant goes through an FFT/IFFT round trip, so its near-zero entries land at
+    # FFT-implementation-dependent rounding noise (order 1e-16) rather than an exact zero.
+    assert_allclose(sl.solve_circulant(np.array([2.0, 1.0, 0.0]), b), [0.0, 1.0, 1.0], atol=1e-12)
+    assert_allclose(
+        sl.solve_circulant(np.array([2.0, 1.0, 0.0]), np.stack([b, b], axis=1)),
+        [[0.0, 0.0], [1.0, 1.0], [1.0, 1.0]],
+        atol=1e-12,
     )
 
 

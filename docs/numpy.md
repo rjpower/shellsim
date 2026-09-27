@@ -22,7 +22,7 @@ The package has two layers.
 Larger submodules (`fft`, `random`, `testing`, `lib` and the file I/O functions) load on first
 access through a module-level `__getattr__`, as in NumPy.
 
-Much of this code is ported from NumPy, pocketfft, Dragon4, and NumPy's random generators.
+Much of this code is ported from NumPy, Dragon4, and NumPy's random generators.
 `NOTICE.md` lists the ported components and reproduces their licenses; source and binary
 distributions ship it alongside `LICENSE`.
 
@@ -120,8 +120,12 @@ differences, the unsupported frontier, and resource limits.
   `@`, `tensordot`, and `numpy.linalg` for real arrays: `inv`, `solve`, `det`, `slogdet`, `eigh`,
   `eigvalsh`, `svd`, `qr`, `cholesky`, `lstsq`, `pinv`, `matrix_rank`, `matrix_power` and
   `norm`.
-- **FFT.** `numpy.fft` on a port of pocketfft, with NumPy's single- and double-precision
-  dispatch.
+- **FFT.** `numpy.fft`: `fft`, `ifft`, `rfft`, `irfft`, `hfft`, `ihfft`, their two- and
+  n-dimensional forms (`fft2`, `fftn`, `rfft2`, `rfftn`, ...), `fftfreq`, `rfftfreq`,
+  `fftshift`, and `ifftshift`, with `n`/`s`, `axis`/`axes`, `norm`, and `out`. Every transform
+  length runs in O(n log n) (a radix-2 transform for powers of two, Bluestein's algorithm on
+  top of it otherwise); results agree with NumPy to about `1e-15 * log2(n)` relative to the
+  largest output magnitude, tighter than NumPy's own single-precision loops.
 - **Random.** `numpy.random` implements `SeedSequence`, `MT19937`, `PCG64`, `Generator`, and the
   legacy `RandomState`. Both draw uniforms, integers, normals, exponentials, and gamma,
   chi-square, F, Student's t, binomial and Poisson variates, and choose, shuffle and permute.
@@ -164,6 +168,8 @@ never imports a module or calls arbitrary code.
 - **Product summation.** Products sum each dot product in index order. NumPy passes
   floating-point products to BLAS, whose blocked kernels add in a different order that depends
   on the CPU, so their last bits can differ.
+- **`fftfreq`/`rfftfreq` with `n=0`.** NumPy raises `ZeroDivisionError` building these; shellsim
+  returns the empty frequency array instead.
 
 ## Unsupported frontier
 
