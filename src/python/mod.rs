@@ -828,7 +828,7 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
         return 2;
     }
 
-    let mut total = 0usize;
+    let mut collected = 0usize;
     let mut source_bytes = 0usize;
     let mut sources = Vec::new();
     for path in paths {
@@ -856,14 +856,10 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
                 return 2;
             }
         };
-        total += collection
-            .tests
-            .iter()
-            .map(|test| test.cases.len())
-            .sum::<usize>();
+        collected += collection.tests.len();
         sources.push((path, source, collection));
     }
-    if total == 0 {
+    if collected == 0 {
         err.extend_from_slice(b"pytest: no tests collected\n");
         return 5;
     }
@@ -871,17 +867,13 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
     // The wrapper is compiled by the same parser/compiler/VM as ordinary Python.  This keeps
     // collection source-driven while preserving VM exception handling for each test item.
     let mut wrapper = String::new();
-    if let Err(kind) = append_runner_piece(interp, &mut wrapper, "__shellsim_pytest_failed = 0\n") {
-        return append_failure(interp, err, "pytest", kind);
-    }
     if let Err(kind) = append_runner_piece(
         interp,
         &mut wrapper,
-        "from pathlib import Path as __ShellsimPath\n",
+        "__shellsim_pytest_failed = 0\n__shellsim_pytest_total = 0\nfrom pathlib import Path as __ShellsimPath\nfrom pytest import _parametrized_cases as __shellsim_pytest_cases\n",
     ) {
         return append_failure(interp, err, "pytest", kind);
     }
-    let mut item_index = 0usize;
     for (path, source, collection) in sources {
         if let Err(kind) = append_runner_piece(interp, &mut wrapper, &source) {
             return append_failure(interp, err, "pytest", kind);
@@ -892,31 +884,21 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
             }
         }
         for test in &collection.tests {
-            for (case_index, case) in test.cases.iter().enumerate() {
-                let item = match build_pytest_item(
-                    &path,
-                    test,
-                    case,
-                    case_index,
-                    item_index,
-                    &collection.fixtures,
-                ) {
-                    Ok(item) => item,
-                    Err(error) => {
-                        err.extend_from_slice(format!("pytest: {path}: {error}\n").as_bytes());
-                        return 2;
-                    }
-                };
-                item_index += 1;
-                if let Err(kind) = append_runner_piece(interp, &mut wrapper, &item) {
-                    return append_failure(interp, err, "pytest", kind);
+            let item = match build_pytest_item(&path, test, &collection.fixtures) {
+                Ok(item) => item,
+                Err(error) => {
+                    err.extend_from_slice(format!("pytest: {path}: {error}\n").as_bytes());
+                    return 2;
                 }
+            };
+            if let Err(kind) = append_runner_piece(interp, &mut wrapper, &item) {
+                return append_failure(interp, err, "pytest", kind);
             }
         }
     }
     let summary =
-        format!("print('__SHELLSIM_PYTEST_SUMMARY__', __shellsim_pytest_failed, {total})\n");
-    if let Err(kind) = append_runner_piece(interp, &mut wrapper, &summary) {
+        "print('__SHELLSIM_PYTEST_SUMMARY__', __shellsim_pytest_failed, __shellsim_pytest_total)\n";
+    if let Err(kind) = append_runner_piece(interp, &mut wrapper, summary) {
         return append_failure(interp, err, "pytest", kind);
     }
 
@@ -949,8 +931,9 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
     let mut fields = summary.split_whitespace();
     let _marker = fields.next();
     let failed = fields.next().and_then(|value| value.parse::<usize>().ok());
+    let total = fields.next().and_then(|value| value.parse::<usize>().ok());
     out.extend_from_slice(&python_out[..marker_start]);
-    let Some(failed) = failed else {
+    let (Some(failed), Some(total)) = (failed, total) else {
         err.extend_from_slice(b"pytest: runner produced an invalid summary\n");
         return 2;
     };
@@ -1264,14 +1247,11 @@ struct PytestFixture {
     yields: bool,
 }
 
-struct PytestCase {
-    values: HashMap<String, String>,
-}
-
 struct PytestFunction {
     name: String,
     parameters: Vec<String>,
-    cases: Vec<PytestCase>,
+    /// Parameters `@pytest.mark.parametrize` supplies; the others name fixtures.
+    parametrized: Vec<String>,
     skip: bool,
 }
 
@@ -1333,29 +1313,16 @@ fn collect_pytest_functions(source: &str) -> Result<PytestCollection, String> {
         if !name.starts_with("test_") {
             continue;
         }
-        let mut cases = vec![PytestCase {
-            values: HashMap::new(),
-        }];
+        let mut parametrized = Vec::new();
         let mut skip = false;
         for decorator in &decorators {
             skip |= parse_skip_marker(decorator)?;
-            let Some(parameters) = parse_parametrize(decorator)? else {
-                continue;
-            };
-            let mut expanded = Vec::new();
-            for case in cases {
-                for values in &parameters {
-                    let mut combined = case.values.clone();
-                    combined.extend(values.clone());
-                    expanded.push(PytestCase { values: combined });
-                }
-            }
-            cases = expanded;
+            parametrized.extend(parametrize_names(decorator)?.into_iter().flatten());
         }
         tests.push(PytestFunction {
             name,
             parameters: parameter_names,
-            cases,
+            parametrized,
             skip,
         });
     }
@@ -1383,9 +1350,10 @@ fn is_fixture_decorator(expression: &ast::Expression) -> bool {
     )
 }
 
-fn parse_parametrize(
-    expression: &ast::Expression,
-) -> Result<Option<Vec<HashMap<String, String>>>, String> {
+/// The argument names of a `@pytest.mark.parametrize` decorator, or `None` for other
+/// decorators. Only the names are read from source: the facade in `pytest.py` records the
+/// evaluated rows on the test function when its module runs, as pytest does.
+fn parametrize_names(expression: &ast::Expression) -> Result<Option<Vec<String>>, String> {
     let ast::ExpressionKind::Call {
         function,
         arguments,
@@ -1399,14 +1367,13 @@ fn parse_parametrize(
     ) {
         return Ok(None);
     }
-    let positional = arguments
+    let Some(names) = arguments
         .iter()
-        .filter(|argument| matches!(argument.kind, ast::CallArgumentKind::Positional))
-        .collect::<Vec<_>>();
-    if positional.len() < 2 {
+        .find(|argument| matches!(argument.kind, ast::CallArgumentKind::Positional))
+    else {
         return Err("pytest.mark.parametrize requires names and values".into());
-    }
-    let names = match &positional[0].value.kind {
+    };
+    let names = match &names.value.kind {
         ast::ExpressionKind::Constant(ast::Constant::String(names)) => names
             .split(',')
             .map(str::trim)
@@ -1425,28 +1392,7 @@ fn parse_parametrize(
     if names.is_empty() {
         return Err("parametrize names cannot be empty".into());
     }
-    let values = literal_sequence(&positional[1].value)
-        .ok_or("parametrize values must be a literal list or tuple")?;
-    let mut cases = Vec::with_capacity(values.len());
-    for value in values {
-        let row = if names.len() == 1 {
-            vec![value]
-        } else {
-            literal_sequence(value)
-                .ok_or("parametrize rows must be literal lists or tuples")?
-                .iter()
-                .collect()
-        };
-        if row.len() != names.len() {
-            return Err("parametrize row length does not match its names".into());
-        }
-        let mut mapped = HashMap::new();
-        for (name, value) in names.iter().zip(row) {
-            mapped.insert(name.clone(), literal_source(value)?);
-        }
-        cases.push(mapped);
-    }
-    Ok(Some(cases))
+    Ok(Some(names))
 }
 
 fn parse_skip_marker(expression: &ast::Expression) -> Result<bool, String> {
@@ -1481,133 +1427,6 @@ fn parse_skip_marker(expression: &ast::Expression) -> Result<bool, String> {
             }
         }
         _ => Ok(false),
-    }
-}
-
-fn literal_sequence(expression: &ast::Expression) -> Option<&[ast::Expression]> {
-    match &expression.kind {
-        ast::ExpressionKind::List(values) | ast::ExpressionKind::Tuple(values) => Some(values),
-        _ => None,
-    }
-}
-
-fn literal_source(expression: &ast::Expression) -> Result<String, String> {
-    match &expression.kind {
-        ast::ExpressionKind::Constant(ast::Constant::None) => Ok("None".into()),
-        ast::ExpressionKind::Constant(ast::Constant::Bool(value)) => Ok(if *value {
-            "True".into()
-        } else {
-            "False".into()
-        }),
-        ast::ExpressionKind::Constant(ast::Constant::Integer(value)) => Ok(value.to_string()),
-        ast::ExpressionKind::Constant(ast::Constant::BigInteger(value)) => Ok(value.clone()),
-        // Debug formatting keeps a float spelling (`3.0`, `1e-7`) that Python parses back to the
-        // same value; Display would turn `3.0` into the int `3`.
-        ast::ExpressionKind::Constant(ast::Constant::Float(value)) => Ok(format!("{value:?}")),
-        ast::ExpressionKind::Constant(ast::Constant::Imaginary(value)) => Ok(format!("{value:?}j")),
-        // Like `ast.literal_eval`, accept signed numbers and `real ± imaginary` complex literals.
-        ast::ExpressionKind::Unary {
-            operator: operator @ (ast::UnaryOperator::Positive | ast::UnaryOperator::Negative),
-            operand,
-        } if is_numeric_literal(operand) => {
-            let sign = if *operator == ast::UnaryOperator::Negative {
-                "-"
-            } else {
-                "+"
-            };
-            Ok(format!("({sign}{})", literal_source(operand)?))
-        }
-        ast::ExpressionKind::Binary {
-            left,
-            operator: operator @ (ast::BinaryOperator::Add | ast::BinaryOperator::Subtract),
-            right,
-        } if is_real_literal(left)
-            && matches!(
-                right.kind,
-                ast::ExpressionKind::Constant(ast::Constant::Imaginary(_))
-            ) =>
-        {
-            let sign = if *operator == ast::BinaryOperator::Subtract {
-                "-"
-            } else {
-                "+"
-            };
-            Ok(format!(
-                "({} {sign} {})",
-                literal_source(left)?,
-                literal_source(right)?
-            ))
-        }
-        ast::ExpressionKind::Constant(ast::Constant::String(value)) => Ok(format!("{value:?}")),
-        ast::ExpressionKind::Constant(ast::Constant::Bytes(value)) => Ok(format!(
-            "b\"{}\"",
-            value
-                .iter()
-                .map(|byte| format!("\\x{byte:02x}"))
-                .collect::<String>()
-        )),
-        ast::ExpressionKind::List(values) => Ok(format!(
-            "[{}]",
-            values
-                .iter()
-                .map(literal_source)
-                .collect::<Result<Vec<_>, _>>()?
-                .join(", ")
-        )),
-        ast::ExpressionKind::Tuple(values) => {
-            let values = values
-                .iter()
-                .map(literal_source)
-                .collect::<Result<Vec<_>, _>>()?;
-            let comma = if values.len() == 1 { "," } else { "" };
-            Ok(format!("({}{comma})", values.join(", ")))
-        }
-        ast::ExpressionKind::Dict(entries) => {
-            let mut rendered = Vec::new();
-            for entry in entries {
-                let ast::DictEntry::Pair(key, value) = entry else {
-                    return Err("parametrize literals cannot unpack mappings".into());
-                };
-                rendered.push(format!(
-                    "{}: {}",
-                    literal_source(key)?,
-                    literal_source(value)?
-                ));
-            }
-            Ok(format!("{{{}}}", rendered.join(", ")))
-        }
-        _ => Err("parametrize values must contain only literals".into()),
-    }
-}
-
-fn is_numeric_literal(expression: &ast::Expression) -> bool {
-    matches!(
-        expression.kind,
-        ast::ExpressionKind::Constant(
-            ast::Constant::Integer(_)
-                | ast::Constant::BigInteger(_)
-                | ast::Constant::Float(_)
-                | ast::Constant::Imaginary(_)
-        )
-    )
-}
-
-/// A real part of a complex literal: an int or float, optionally signed.
-fn is_real_literal(expression: &ast::Expression) -> bool {
-    match &expression.kind {
-        ast::ExpressionKind::Constant(
-            ast::Constant::Integer(_) | ast::Constant::BigInteger(_) | ast::Constant::Float(_),
-        ) => true,
-        ast::ExpressionKind::Unary {
-            operator: ast::UnaryOperator::Positive | ast::UnaryOperator::Negative,
-            operand,
-        } => matches!(
-            operand.kind,
-            ast::ExpressionKind::Constant(
-                ast::Constant::Integer(_) | ast::Constant::BigInteger(_) | ast::Constant::Float(_)
-            )
-        ),
-        _ => false,
     }
 }
 
@@ -1654,14 +1473,29 @@ fn expression_contains_yield(expression: &ast::Expression) -> bool {
     )
 }
 
+/// The wrapper code that runs every case of one test function. The cases come from
+/// `pytest._parametrized_cases` at run time, so parametrized values may be any expression.
 fn build_pytest_item(
     path: &str,
     test: &PytestFunction,
-    case: &PytestCase,
-    case_index: usize,
-    item_index: usize,
     fixtures: &HashMap<String, PytestFixture>,
 ) -> Result<String, String> {
+    let label = if test.parametrized.is_empty() {
+        format!("{:?}", format!("{path}::{}", test.name))
+    } else {
+        format!(
+            "{:?} + str(__shellsim_case_index) + \"]\"",
+            format!("{path}::{}[", test.name)
+        )
+    };
+    let mut item = format!(
+        "for __shellsim_case_index, __shellsim_case in enumerate(__shellsim_pytest_cases({})):\n    __shellsim_pytest_total += 1\n",
+        test.name
+    );
+    if test.skip {
+        item.push_str(&format!("    print({label}, 'SKIPPED')\n"));
+        return Ok(item);
+    }
     let mut setup = String::new();
     let mut teardown = Vec::new();
     let mut cache = HashMap::new();
@@ -1669,37 +1503,29 @@ fn build_pytest_item(
     let mut counter = 0usize;
     let mut arguments = Vec::new();
     for parameter in &test.parameters {
-        if let Some(value) = case.values.get(parameter) {
-            arguments.push(value.clone());
-        } else {
-            arguments.push(resolve_pytest_fixture(
-                parameter,
-                item_index,
-                fixtures,
-                &mut cache,
-                &mut active,
-                &mut counter,
-                &mut setup,
-                &mut teardown,
-            )?);
+        if test.parametrized.contains(parameter) {
+            continue;
         }
+        let value = resolve_pytest_fixture(
+            parameter,
+            fixtures,
+            &mut cache,
+            &mut active,
+            &mut counter,
+            &mut setup,
+            &mut teardown,
+        )?;
+        arguments.push(format!("{parameter}={value}"));
     }
-    let label = if test.cases.len() > 1 {
-        format!("{path}::{}[{case_index}]", test.name)
-    } else {
-        format!("{path}::{}", test.name)
-    };
-    if test.skip {
-        return Ok(format!("print({label:?}, 'SKIPPED')\n"));
-    }
-    let mut item = String::from("try:\n");
+    arguments.push("**__shellsim_case".into());
+    item.push_str("    try:\n");
     for line in setup.lines() {
-        item.push_str("    ");
+        item.push_str("        ");
         item.push_str(line);
         item.push('\n');
     }
     item.push_str(&format!(
-        "    {}({})\n    print({label:?}, 'PASSED')\nexcept Skipped:\n    print({label:?}, 'SKIPPED')\nexcept Exception as error:\n    print({label:?}, 'FAILED', error)\n    __shellsim_pytest_failed += 1\n",
+        "        {}({})\n        print({label}, 'PASSED')\n    except Skipped:\n        print({label}, 'SKIPPED')\n    except Exception as error:\n        print({label}, 'FAILED', error)\n        __shellsim_pytest_failed += 1\n",
         test.name,
         arguments.join(", ")
     ));
@@ -1707,7 +1533,7 @@ fn build_pytest_item(
     // error rather than a place to stop.
     for generator in teardown.into_iter().rev() {
         item.push_str(&format!(
-            "for _ in {generator}:\n    raise RuntimeError(\"fixture function has more than one 'yield'\")\n"
+            "    for _ in {generator}:\n        raise RuntimeError(\"fixture function has more than one 'yield'\")\n"
         ));
     }
     Ok(item)
@@ -1716,7 +1542,6 @@ fn build_pytest_item(
 #[allow(clippy::too_many_arguments)]
 fn resolve_pytest_fixture(
     name: &str,
-    item_index: usize,
     fixtures: &HashMap<String, PytestFixture>,
     cache: &mut HashMap<String, String>,
     active: &mut Vec<String>,
@@ -1731,8 +1556,7 @@ fn resolve_pytest_fixture(
         let variable = format!("__shellsim_fixture_{}", *counter);
         *counter += 1;
         setup.push_str(&format!(
-            "{variable} = __ShellsimPath({:?})\n{variable}.mkdir(parents=True, exist_ok=True)\n",
-            format!("/tmp/pytest-{item_index}")
+            "{variable} = __ShellsimPath(\"/tmp/pytest-\" + str(__shellsim_pytest_total))\n{variable}.mkdir(parents=True, exist_ok=True)\n"
         ));
         cache.insert(name.into(), variable.clone());
         return Ok(variable);
@@ -1747,7 +1571,7 @@ fn resolve_pytest_fixture(
     let mut arguments = Vec::new();
     for parameter in &fixture.parameters {
         arguments.push(resolve_pytest_fixture(
-            parameter, item_index, fixtures, cache, active, counter, setup, teardown,
+            parameter, fixtures, cache, active, counter, setup, teardown,
         )?);
     }
     active.pop();

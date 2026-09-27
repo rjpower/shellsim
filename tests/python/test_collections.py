@@ -77,7 +77,7 @@ def test_namedtuple_rejects_invalid_names_and_defaults():
         (("P", "x _y"), "Field names cannot start with an underscore: '_y'"),
         (("P", "x x"), "Encountered duplicate field name: 'x'"),
     ]:
-        assert error_of(lambda: namedtuple(*arguments)) == ("ValueError", message)
+        assert error_of(lambda arguments=arguments: namedtuple(*arguments)) == ("ValueError", message)
     too_many = error_of(lambda: namedtuple("P", "x", defaults=[1, 2]))
     assert too_many == ("TypeError", "Got more default values than field names")
 

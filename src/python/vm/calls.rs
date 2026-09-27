@@ -166,6 +166,7 @@ impl Vm<'_> {
                     closure,
                     defaults,
                     defining_class,
+                    ..
                 } => {
                     let method_frame = defining_class.zip(arguments.first().cloned());
                     if let Some((owner, receiver)) = method_frame {
@@ -492,6 +493,7 @@ impl Vm<'_> {
                             closure,
                             defaults,
                             defining_class,
+                            ..
                         } = self.state.heap.get(function)?.clone()
                         else {
                             return Err(format!("{name}.__init__ is not a function"));

@@ -77,7 +77,8 @@ obj.attr` and `delattr` delete through the descriptor protocol: a class's `__del
 descriptor's `__delete__`, then the instance's own attribute. Classes and functions have no
 `__qualname__` or `__doc__`, so a nested class's `repr` omits its enclosing scope. Builtin
 functions, native methods and bound methods report `__name__`, and bound methods expose
-`__self__` and `__func__`.
+`__self__` and `__func__`. A function holds its own attributes, as decorators expect: they may be
+assigned and deleted, and assigning `__name__` renames the function.
 
 A class may subclass `int` or `tuple`. Its instances carry the builtin value, so arithmetic,
 comparison, hashing, indexing, iteration, `len`, `repr` and `json.dumps` act on that value unless
@@ -190,9 +191,11 @@ inside the simulation when one becomes ready. Native async generators, async soc
 executors, host threads, text-mode subprocess streams, and custom event loops are not exposed;
 synchronous calls made inside a coroutine retain their usual blocking behavior.
 
-The bounded `pytest` runner supports ordinary and yield fixtures, fixture dependencies, literal
-`@pytest.mark.parametrize` cases, `tmp_path`/`tmpdir`, skip markers, `pytest.raises` with exception
-tuples and `match`, and explicit test files. Fixture scopes and dynamic parametrization remain outside this small runner. `unittest`
+The bounded `pytest` runner supports ordinary and yield fixtures, fixture dependencies,
+`@pytest.mark.parametrize`, `tmp_path`/`tmpdir`, skip markers, `pytest.raises` with exception
+tuples and `match`, and explicit test files. Parametrized values are evaluated when the test module
+runs, so they may be any expression, and stacked decorators vary the topmost fastest, as in
+pytest. Fixture scopes, `pytest.param` and custom `ids` remain outside this small runner. `unittest`
 supports straightforward test classes. Unsupported syntax and runner features produce an error
 rather than a false passing result.
 

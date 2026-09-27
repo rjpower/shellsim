@@ -375,10 +375,14 @@ impl Vm<'_> {
                 Object::Function {
                     name: function_name,
                     closure,
+                    attributes,
                     ..
                 } => {
                     if name == "__name__" {
                         return Ok(Some(self.allocate_string(function_name)?));
+                    }
+                    if let Some(value) = attributes.get(name) {
+                        return Ok(Some(*value));
                     }
                     if name == "__module__" {
                         return self.module_name_of(closure);
@@ -590,6 +594,9 @@ impl Vm<'_> {
             if let Some(id) = owner.object_id() {
                 match self.state.heap.get(id)? {
                     Object::Class { .. } => return self.set_class_attribute(id, name, Some(value)),
+                    Object::Function { .. } => {
+                        return self.set_function_attribute(id, name, Some(value))
+                    }
                     // `BaseException.args` is writable and stores any iterable as a tuple.
                     Object::Exception { args, .. } if name == "args" => {
                         let current = args.len();
@@ -701,6 +708,7 @@ impl Vm<'_> {
         let class = match self.state.heap.get(id)? {
             Object::Instance { class, .. } => *class,
             Object::Class { .. } => return self.set_class_attribute(id, name, None),
+            Object::Function { .. } => return self.set_function_attribute(id, name, None),
             Object::Module { scope, .. } => {
                 let scope = *scope;
                 if self.state.heap.scope_remove(scope, name)?.is_none() {
@@ -756,6 +764,66 @@ impl Vm<'_> {
     /// slots derived from dunder methods are recomputed for the class and its subclasses, and
     /// cached instance lookups are dropped, since a new data descriptor can shadow an instance
     /// attribute.
+    /// Assign (`Some`) or delete (`None`) an attribute of a function object. `__name__` renames
+    /// the function; every other name lives in the function's own `__dict__`.
+    fn set_function_attribute(
+        &mut self,
+        function: ObjectId,
+        name: &str,
+        value: Option<Value>,
+    ) -> Result<(), String> {
+        if name == "__name__" {
+            let Some(text) = value
+                .map(|value| protocol::string_ref(&self.state.heap, &value))
+                .transpose()?
+                .flatten()
+                .map(|text| text.as_str().to_string())
+            else {
+                return Err(
+                    self.raise_exception("TypeError", "__name__ must be set to a string object")
+                );
+            };
+            let Object::Function { name, .. } = self.state.heap.get_mut(function)? else {
+                unreachable!("checked by the caller")
+            };
+            *name = text;
+            return Ok(());
+        }
+        let Object::Function { attributes, .. } = self.state.heap.get(function)? else {
+            return Err("function attribute store on a non-function".into());
+        };
+        let exists = attributes.contains_key(name);
+        match value {
+            Some(value) => {
+                if !exists {
+                    let bytes = u64::try_from(name.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(MODELED_MAPPING_ENTRY_BYTES);
+                    self.state.heap.reserve_object_growth(
+                        function,
+                        bytes,
+                        &mut self.interp.resources,
+                    )?;
+                }
+                let Object::Function { attributes, .. } = self.state.heap.get_mut(function)? else {
+                    unreachable!("checked above")
+                };
+                attributes.insert(name.to_string(), value);
+            }
+            None if exists => {
+                let Object::Function { attributes, .. } = self.state.heap.get_mut(function)? else {
+                    unreachable!("checked above")
+                };
+                attributes.remove(name);
+            }
+            None => {
+                let message = format!("'function' object has no attribute '{name}'");
+                return Err(self.raise_exception("AttributeError", message));
+            }
+        }
+        Ok(())
+    }
+
     fn set_class_attribute(
         &mut self,
         class: ObjectId,
@@ -1390,6 +1458,7 @@ impl Vm<'_> {
                 closure,
                 defaults,
                 defining_class: None,
+                attributes: HashMap::new(),
             },
             &mut self.interp.resources,
         )?;

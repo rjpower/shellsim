@@ -703,3 +703,32 @@ def test_builtin_new_constructs_subclass_instances():
     else:
         raise AssertionError("tuple.__new__ accepted a class that is not a tuple subclass")
     assert ((1, 2, 1).count(1), (1, 2).index(2)) == (2, 1)
+
+
+def test_functions_hold_their_own_attributes():
+    def counted():
+        counted.calls += 1
+        return counted.calls
+
+    counted.calls = 0
+    counted.__module__ = "elsewhere"
+    assert (counted(), counted(), counted.__module__) == (1, 2, "elsewhere")
+    del counted.calls
+    assert not hasattr(counted, "calls")
+    try:
+        del counted.calls
+    except AttributeError as error:
+        assert str(error) == "'function' object has no attribute 'calls'"
+    else:
+        raise AssertionError("deleting a missing function attribute succeeded")
+    counted.__name__ = "renamed"
+    assert counted.__name__ == "renamed"
+    try:
+        counted.__name__ = 3
+    except TypeError as error:
+        assert str(error) == "__name__ must be set to a string object"
+    else:
+        raise AssertionError("a function accepted a non-string __name__")
+    square = lambda value: value * value  # noqa: E731
+    square.label = "square"
+    assert (square.label, square(3)) == ("square", 9)

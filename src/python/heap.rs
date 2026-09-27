@@ -155,6 +155,8 @@ pub enum Object {
         defaults: Vec<Value>,
         /// Class captured when this function is installed by a class body.
         defining_class: Option<ObjectId>,
+        /// Names assigned on the function object, its `__dict__`.
+        attributes: HashMap<String, Value>,
     },
     Class {
         /// Semantic type identity used by instances of this class.
@@ -1470,11 +1472,13 @@ fn trace_object(
             closure,
             defaults,
             defining_class,
+            attributes,
             ..
         } => {
             trace_values(defaults.iter().copied(), object_work);
             scope_work.extend(*closure);
             object_work.extend(*defining_class);
+            trace_values(attributes.values().copied(), object_work);
         }
         Object::Class {
             bases,
@@ -1646,11 +1650,13 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             name,
             code,
             defaults,
+            attributes,
             ..
         } => name
             .len()
             .checked_add(code.instructions.len())
             .and_then(|size| size.checked_add(defaults.len()))
+            .and_then(|size| size.checked_add(attributes.len()))
             .ok_or("modeled object size overflow")?,
         Object::Class {
             instance_type: _,

@@ -279,3 +279,85 @@ def test_bytes(value, length):
     let (status, stdout, stderr) = run_pytest(source, "python3.14 -m pytest /test_sample.py");
     assert_eq!(status, 0, "{stderr:?} {stdout:?}");
 }
+
+#[test]
+fn parametrize_evaluates_arbitrary_expressions_when_the_module_runs() {
+    let source = r#"import pytest
+CASES = [(1, 2), (3, 4)]
+seen = []
+
+@pytest.mark.parametrize("left, right", CASES)
+def test_named_cases(left, right):
+    assert right - left == 1
+
+@pytest.mark.parametrize("function, expected", [(lambda: 2 * 3, 6), (len, None)])
+def test_callables(function, expected):
+    assert expected is None or function() == expected
+
+@pytest.mark.parametrize("x", [0, 1])
+@pytest.mark.parametrize("y", [2, 3])
+def test_stacked(x, y, tmp_path):
+    assert tmp_path.exists()
+    seen.append((x, y))
+
+def test_stacked_order():
+    assert seen == [(0, 2), (1, 2), (0, 3), (1, 3)]
+
+@pytest.mark.parametrize("value", [])
+def test_empty(value):
+    assert False
+"#;
+    let (status, stdout, stderr) = run_pytest(source, "pytest /test_sample.py");
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "/test_sample.py::test_named_cases[0] PASSED\n/test_sample.py::test_named_cases[1] PASSED\n\
+         /test_sample.py::test_callables[0] PASSED\n/test_sample.py::test_callables[1] PASSED\n\
+         /test_sample.py::test_stacked[0] PASSED\n/test_sample.py::test_stacked[1] PASSED\n\
+         /test_sample.py::test_stacked[2] PASSED\n/test_sample.py::test_stacked[3] PASSED\n\
+         /test_sample.py::test_stacked_order PASSED\n"
+    );
+}
+
+#[test]
+fn parametrize_rows_must_match_their_names() {
+    let source = r#"import pytest
+
+@pytest.mark.parametrize("a, b", [(1, 2), (3,)])
+def test_pairs(a, b):
+    pass
+"#;
+    let (status, _stdout, stderr) = run_pytest(source, "pytest /test_sample.py");
+    assert_ne!(status, 0);
+    assert!(
+        String::from_utf8_lossy(&stderr).contains(
+            "in \"parametrize\" the number of names (2): ('a', 'b') must be equal to the number of values (1): (3,)"
+        ),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
+fn warns_checks_category_and_message() {
+    let source = r#"import warnings
+import pytest
+
+def test_matching_warning():
+    with pytest.warns(UserWarning, match="^care") as record:
+        warnings.warn("careful")
+    assert [str(warning.message) for warning in record.list] == ["careful"]
+
+def test_missing_warning():
+    with pytest.warns(DeprecationWarning):
+        warnings.warn("careful")
+"#;
+    let (status, stdout, stderr) = run_pytest(source, "pytest /test_sample.py");
+    assert_eq!(status, 1, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "/test_sample.py::test_matching_warning PASSED\n/test_sample.py::test_missing_warning FAILED \
+         DID NOT WARN. No warnings of type (<class 'DeprecationWarning'>,) were emitted.\n \
+         Emitted warnings: [UserWarning('careful')].\n"
+    );
+}
