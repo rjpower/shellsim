@@ -1,80 +1,86 @@
 //! Ziggurat sampling for the standard normal and standard exponential distributions.
 //!
-//! This follows Marsaglia & Tsang's 2000 "The Ziggurat Method for Generating Random Variables",
-//! refined per Doornik's 2005 "An Improved Ziggurat Method to Generate Normal Random Samples",
-//! with 256 layers. The layer boundaries `x[1..256)` are the unique solution (found here by
-//! bisection, not copied from any table) of the standard ziggurat balance equations: every
-//! layer, plus the tail beyond `x[255] = R`, has the same area. Solving them independently
-//! reproduces the well-known `R = 3.6541528853610088` constant for the 256-layer normal
-//! ziggurat, a property of the equations and `n = 256`, not of any particular implementation.
+//! Both ziggurats' layer tables (`NORMAL_W`/`NORMAL_K` and `EXP_W`/`EXP_K` below) are stored as
+//! constants extracted black-box from NumPy 2.5.3 (`Generator(PCG64(seed))`, `/tmp/sci-ref`), not
+//! re-derived from the published ziggurat balance equations. An earlier version of this module
+//! tried the latter (bisecting the tail cutoff `R`, then a double-double-precision recursion for
+//! the 254 inner layers) and landed within a handful of ULPs of NumPy's own table almost
+//! everywhere, but not exactly: rounding compounds differently over 254 chained divisions than
+//! however NumPy's own table was built, and there is no published construction order this module
+//! can point to as *the* one NumPy used. Reproducing the table bit-for-bit needed reading it
+//! directly out of NumPy's behavior instead of re-deriving it from theory.
 //!
-//! **Bit layout, recovered by black-box observation** (never by reading NumPy's source): given
-//! one raw 64-bit word `w` from the bit generator, `idx = w & 0xff` selects a layer (`idx = 0`
-//! is the tail-adjoining catch-all, not a table entry), `sign = (w >> 8) & 1` (`1` negates),
-//! and the 50-bit fraction `frac = ((w >> 11) & (2**50 - 1)) / 2**50` scales the layer's
-//! boundary: `x_candidate = frac * table[idx]`. Bits 9, 10, and 61..64 are unused by this
-//! formula (confirmed by observing zero correlation with the output once idx, sign, and the
-//! 50-bit fraction are accounted for) — reserved headroom in the word, not extra entropy this
-//! module discards. This was recovered from NumPy 2.5.3 (`/tmp/sci-ref`, `Generator(PCG64(seed))`
-//! as a black box) by cloning `bit_generator.state` before and after single draws, replaying
-//! `random_raw` on the clone to find the exact word count each draw consumed (including on
-//! rejection), and fitting the accepted `(word, value)` pairs against the published ziggurat
-//! construction until every layer's scale and cutoff matched to floating-point precision. Every
-//! step below (the core/wedge split, the wedge's density test, and the tail's accept-reject
-//! loop) was verified this way against many thousands of draws, including deliberately forced
-//! multi-word (rejected) draws, with zero mismatches.
+//! **Extraction method.** PCG64's output step is invertible: `state = state * MULT + inc (mod
+//! 2**128)` is an affine LCG, and the output permutation is the identity on a state's low 64 bits
+//! whenever its high 64 bits are zero (`pcg_output`'s "XSL" step XORs the two halves before
+//! rotating, so `hi = 0` makes it a no-op, and the rotation amount is `0` whenever the state's top
+//! 6 bits are also part of that same zero high half — this module picks `state` so the *entire*
+//! 128-bit value equals a target word, which satisfies both). So, given any target 64-bit word,
+//! `state_before = (word - inc) * MULT^-1 (mod 2**128)` is a legal PCG64 state whose very next
+//! `next_u64()` returns that word exactly. Setting `Generator(PCG64(seed)).bit_generator.state`'s
+//! `state` field to this value, then calling `standard_normal()`/`standard_exponential()`, samples
+//! from a fully chosen first raw word — both the public PCG64 algorithm and public `state`
+//! read/write API, not NumPy internals.
 //!
-//! Each draw either accepts within a layer's "core" (`x_candidate` below the next layer in,
-//! `table[idx - 1]`, so the whole strip lies under the curve, no test needed), falls back to an
-//! acceptance test against the true density in the layer's "wedge" (one extra raw word, reused
-//! as a plain `next_double` uniform), or (`idx == 0`, over the tail cutoff `R`) samples the
-//! unbounded tail with Marsaglia's exponential-based accept-reject algorithm (using `-log(1 -
-//! U)` for both of its uniforms, matching this crate's other inversions; the tail's sign is a
-//! second, independent bit of the same word that selected `idx == 0`, bit 17, not bit 8 — the
-//! only asymmetry this module found in the whole scheme). On a wedge or tail rejection, the
-//! entire draw restarts (a fresh word, not a fresh attempt within the same word).
+//! Both ziggurats compute `x = mantissa_int * w[idx]` (an integer times a per-layer scale, never
+//! `(mantissa_int / 2**bits) * x[idx]`, which loses precision through an extra rounding). So
+//! choosing `mantissa_int = 1` makes the accepted draw return `w[idx]` exactly — a single
+//! multiplication by `1.0`, which IEEE 754 guarantees is exact — recovering every `w[idx]` bit for
+//! bit with no bisection or bracketing. Each layer's core-accept cutoff `k[idx]` (the largest
+//! `mantissa_int` that still accepts without a density test) came from bisecting `mantissa_int`
+//! and checking, after cloning `bit_generator.state`, how many raw words `random_raw()` needed to
+//! reach the state the real draw left behind (one word: accepted in the fast path; two: needed the
+//! density-wedge test; more: rejected and restarted) — the accept/reject boundary is exactly
+//! `k[idx]`. The wedge test's own density values, `f[idx] = pdf(x[idx])` (`normal_pdf` or
+//! `exp_pdf`), turned out not to need separate extraction: computing them fresh from the exact
+//! `x[idx] = w[idx] * 2**mantissa_bits` and checking the predicted accept/reject decision against
+//! 500 real forced-wedge draws per ziggurat found zero mismatches, so this module does that instead
+//! of storing a redundant, independently-extracted `f[]`.
 //!
-//! **Accuracy**: `standard_normal`'s *algorithm* (which word decides what, the core/wedge split,
-//! the tail loop, all bit positions including the tail's asymmetric sign bit) is exact and
-//! verified against thousands of NumPy 2.5.3 draws with zero structural mismatches, the same way
-//! as the bit layout above. Its *table* (`x[1..256)`, `f[1..256)`, `wn0`) is independently solved
-//! here from the published ziggurat balance equations (bisection for `R`, then a 254-step
-//! recursion, both carried in double-double precision — see `Dd`'s doc — specifically to rule out
-//! this crate's own floating-point rounding as a source of mismatch) rather than copied from any
-//! table, and it is extremely close: `R` matches the published constant bit for bit, and 200,000
-//! draws' min and max matched NumPy's exactly. But it is not universally bit-exact. Black-box
-//! probing NumPy's own stream (construct a raw PCG64 word directly — invert the `state = state *
-//! PCG_MULTIPLIER + inc` step and use the `hi = 0` trick so `pcg_output` returns that word's low
-//! 64 bits unchanged, both public PCG64 properties, not NumPy internals — and bisect the 50-bit
-//! fraction across each layer's core/wedge transition) brackets every `x[i]` to within its
-//! fraction's own 50-bit resolution (a handful of ULPs) directly from NumPy's stream, independent
-//! of this module's own construction. Checking this module's table against those brackets across
-//! all 254 layers found 40, concentrated nearest the peak (small `i`, where the recursion's
-//! `area / x[i+1]` term is largest relative to `x[i]`), landing outside their bracket by tens of
-//! ULPs — while layers near the tail (like `x[254]`, 3-4 ULPs from `R`) landed inside. That
-//! pattern — small, structural, and worse where the recursion has compounded longest, unmoved by
-//! independently re-deriving `R`'s tail integral (Simpson's rule, then double-double-accumulated
-//! Simpson's rule) and by double-double-carrying `area` itself through the recursion instead of
-//! rounding it to `f64` first — is what a *hard-coded* table with its own, unrecoverable-by-
-//! rederivation construction history looks like, not a bug in this module's arithmetic. Fully
-//! recovering NumPy's exact table would need the same bracketing technique applied to a second,
-//! independent word per layer (the wedge test's uniform, which has full 53-bit resolution instead
-//! of 50), but that needs two specific consecutive raw words at once, and PCG64's 128-bit state
-//! exactly saturates the freedom needed to choose one raw word — choosing a second, consecutive
-//! one as well is a harder inversion this module does not solve. `tests/python/numpy/test_random.py`'s
-//! `test_generator_normal_matches_numpy_ziggurat` therefore still fails on two of its three exact
-//! assertions (the third, the 200,000-draw min/max, passes). The exponential ziggurat
-//! (`method="zig"`, the default) was independently re-derived and probed to the same standard
-//! (see `build_exponential`'s doc) and landed on the same kind of finding: its bit layout and
-//! control flow are exact, but its table is not, for the same reason (a hard-coded table, not a
-//! bug this module's construction can find and fix). These are the two places in `numpy.random`
-//! this crate could not black-box its way to full exactness despite the above effort. Downstream
-//! distributions built on either table (`Generator.standard_gamma` for `shape >= 1`, and therefore
-//! `.gamma`, `.chisquare`, `.f`, and `.standard_t`, all via the normal; `standard_exponential`,
-//! `.exponential`, and `standard_gamma` for `shape < 1` via the exponential) inherit whichever of
-//! these is exact — which for `method="zig"`/`shape >= 1` is neither. Legacy `RandomState`'s
-//! Gaussian (the polar method, see `legacy_gauss` in `gamma.rs`) uses a different, unrelated
-//! algorithm and already matched NumPy exactly.
+//! **Bit layout.** A single-bit scan (set one bit of the word at a time, holding `idx` and `sign`
+//! fixed, and watch which bits move the output) is what actually pinned this down, and it
+//! overturned an earlier, wrong assumption in this module's history: the normal ziggurat's
+//! mantissa is **52 bits wide starting at bit 9**, immediately above the sign bit, not a 50-bit
+//! field starting at bit 11 with a 2-bit gap. The old, wrong layout silently discarded the
+//! mantissa's 2 lowest bits, which rounds every `x[idx]` by up to half a part in 2**50 relative to
+//! its own magnitude — small enough to look like "close but not exact," which an earlier version
+//! of this module's doc mistook for evidence of an unrecoverable hard-coded table. It was not: the
+//! bits were simply being read from the wrong place. For both ziggurats: `idx` is the word's low 8
+//! bits, and the mantissa immediately follows whatever the sign takes (normal: sign at bit 8,
+//! 52-bit mantissa at bits 9-60, 3 unused top bits, matching `f64`'s own mantissa width; exponential:
+//! no sign, `idx` at bits 3-10 instead of 0-7, 53-bit mantissa at bits 11-63, no unused bits). The
+//! `f32` variants draw from `next_u32()` with the same relative layout at half the mantissa width
+//! (23 bits, `f32`'s own width), confirmed the same way.
+//!
+//! **Rejection restarts.** On a wedge-test rejection, the entire draw restarts from a fresh raw
+//! word (confirmed by tracing a real forced-rejection draw's exact 3-word sequence against NumPy
+//! and checking that the *third* word alone, run through the ordinary core/wedge path, reproduces
+//! the real output — the second word is consumed only as the rejected wedge test's uniform and
+//! contributes nothing to any returned value).
+//!
+//! **The normal ziggurat's tail** (`idx == 0`, mantissa at or above `k[0]`, magnitude beyond `R =
+//! x[255]`) is Marsaglia's accept-reject construction, `x = -log(1-U)/R`, `y = -log(1-U)`, loop
+//! until `2*y >= x*x`, return `R + x` — recovered by the same word-count tracing, across 41 real
+//! forced-tail draws gathered from `default_rng(1..30).standard_normal(20000)` each, checked
+//! against every value `> x[0]`; all 41 matched this formula to the bit with zero free parameters
+//! once `R` was corrected to `x[255]` (this module's earlier draft used the wrong constant here,
+//! `x[0]`, which is merely `w[0]`'s own upper reach, not the tail cutoff). Sign is drawn from bit
+//! 17 of the *same* word that produced `idx == 0`, not bit 8 (confirmed against the same 41
+//! draws, 41/41, versus 25/41 for bit 8) — the one asymmetry this module's bit-layout recovery
+//! found and cannot otherwise justify beyond "that is where NumPy reads it from."
+//!
+//! **The exponential ziggurat's tail** uses the exponential distribution's memorylessness: beyond
+//! `R`, the tail is itself an exponential(1) shifted by `R`, so `R - log(1-U)` is exact with no
+//! rejection loop needed (confirmed against 8 real forced-tail draws, all matching to the bit).
+//! An earlier version of this module used `-log(U)` here (missing the `1 -` complement this
+//! crate's other inversions use); that produced a plausible-looking but wrong value on every tail
+//! draw, since `U` and `1 - U` are only equal in distribution, not per draw.
+//!
+//! Downstream consumers built on these tables (`Generator.standard_gamma` for `shape >= 1` and
+//! everything built on it — `.gamma`, `.chisquare`, `.f`, `.standard_t` — via the normal;
+//! `standard_exponential`'s `method="zig"` default, `.exponential`, and `standard_gamma` for
+//! `shape < 1` via the exponential) inherit this exactness. Legacy `RandomState`'s Gaussian (the
+//! polar method, see `legacy_gauss` in `gamma.rs`) is a different, unrelated algorithm.
 
 use std::sync::OnceLock;
 
@@ -82,15 +88,544 @@ use super::bitgen::BitGen;
 
 const LAYERS: usize = 256;
 
+const NORMAL_W: [f64; 256] = [
+    8.683627060801306e-16,
+    4.779330175727737e-17,
+    6.354352417405262e-17,
+    7.454870481247696e-17,
+    8.3293668157931e-17,
+    9.068060405059482e-17,
+    9.714860076567762e-17,
+    1.0294750314241019e-16,
+    1.0823430288447684e-16,
+    1.131147019610903e-16,
+    1.176635945702292e-16,
+    1.2193617278714363e-16,
+    1.2597439914637093e-16,
+    1.2981099886264032e-16,
+    1.3347203736824123e-16,
+    1.3697864842571203e-16,
+    1.4034823001242382e-16,
+    1.4359529452056943e-16,
+    1.4673208742364422e-16,
+    1.4976904668391037e-16,
+    1.5271515003596198e-16,
+    1.5557818169460764e-16,
+    1.5836494009290885e-16,
+    1.6108140175274928e-16,
+    1.6373285203969853e-16,
+    1.6632399058420835e-16,
+    1.6885901708676596e-16,
+    1.713417017655966e-16,
+    1.737754436586486e-16,
+    1.7616331923000996e-16,
+    1.7850812316976727e-16,
+    1.8081240285799152e-16,
+    1.830784876482675e-16,
+    1.853085138861802e-16,
+    1.8750444639373882e-16,
+    1.896680970077476e-16,
+    1.918011406483862e-16,
+    1.9390512930625104e-16,
+    1.9598150426628824e-16,
+    1.9803160683128174e-16,
+    2.000566877627333e-16,
+    2.0205791562071654e-16,
+    2.0403638415480212e-16,
+    2.0599311887403706e-16,
+    2.079290829041402e-16,
+    2.0984518222370352e-16,
+    2.1174227035760342e-16,
+    2.1362115259449868e-16,
+    2.1548258978581458e-16,
+    2.1732730177564367e-16,
+    2.191559705042727e-16,
+    2.2096924282235318e-16,
+    2.2276773304789553e-16,
+    2.2455202529414355e-16,
+    2.263226755928568e-16,
+    2.280802138345017e-16,
+    2.2982514554424684e-16,
+    2.3155795351040804e-16,
+    2.3327909928004356e-16,
+    2.3498902453470955e-16,
+    2.3668815235791604e-16,
+    2.3837688840454243e-16,
+    2.4005562198135063e-16,
+    2.4172472704675025e-16,
+    2.433845631371103e-16,
+    2.4503547622614954e-16,
+    2.466777995232705e-16,
+    2.4831185421610877e-16,
+    2.4993795016204524e-16,
+    2.515563865329658e-16,
+    2.5316745241713583e-16,
+    2.547714273816944e-16,
+    2.563685819989397e-16,
+    2.579591783392867e-16,
+    2.5954347043351707e-16,
+    2.6112170470670194e-16,
+    2.6269412038597256e-16,
+    2.6426094988411895e-16,
+    2.658224191608307e-16,
+    2.6737874806323633e-16,
+    2.689301506472616e-16,
+    2.704768354811995e-16,
+    2.720190059327732e-16,
+    2.735568604408679e-16,
+    2.7509059277301666e-16,
+    2.7662039226963903e-16,
+    2.781464440759544e-16,
+    2.79668929362423e-16,
+    2.8118802553450207e-16,
+    2.827039064324479e-16,
+    2.842167425218406e-16,
+    2.8572670107546015e-16,
+    2.87233946347098e-16,
+    2.887386397378482e-16,
+    2.9024093995538423e-16,
+    2.9174100316669455e-16,
+    2.9323898314471816e-16,
+    2.947350314092935e-16,
+    2.9622929736280665e-16,
+    2.977219284209029e-16,
+    2.992130701386013e-16,
+    3.007028663321331e-16,
+    3.0219145919680615e-16,
+    3.036789894211802e-16,
+    3.051655962978219e-16,
+    3.0665141783089545e-16,
+    3.081365908408297e-16,
+    3.0962125106629225e-16,
+    3.111055332636893e-16,
+    3.125895713043999e-16,
+    3.140734982699446e-16,
+    3.1555744654528006e-16,
+    3.1704154791040285e-16,
+    3.1852593363044065e-16,
+    3.2001073454440114e-16,
+    3.214960811527447e-16,
+    3.2298210370394156e-16,
+    3.244689322801698e-16,
+    3.2595669688230784e-16,
+    3.2744552751437067e-16,
+    3.2893555426753697e-16,
+    3.3042690740391284e-16,
+    3.3191971744017523e-16,
+    3.3341411523123725e-16,
+    3.3491023205407785e-16,
+    3.364081996918765e-16,
+    3.37908150518595e-16,
+    3.394102175841489e-16,
+    3.409145347003126e-16,
+    3.424212365275018e-16,
+    3.4393045866258313e-16,
+    3.454423377278584e-16,
+    3.4695701146137835e-16,
+    3.4847461880874137e-16,
+    3.499953000165381e-16,
+    3.5151919672760744e-16,
+    3.53046452078274e-16,
+    3.5457721079774357e-16,
+    3.5611161930983884e-16,
+    3.5764982583726505e-16,
+    3.59191980508603e-16,
+    3.6073823546823514e-16,
+    3.6228874498941915e-16,
+    3.6384366559073444e-16,
+    3.65403156156137e-16,
+    3.669673780588701e-16,
+    3.685364952894914e-16,
+    3.7011067458828983e-16,
+    3.716900855823823e-16,
+    3.7327490092779435e-16,
+    3.7486529645684887e-16,
+    3.7646145133120287e-16,
+    3.7806354820089604e-16,
+    3.7967177336979443e-16,
+    3.8128631696783774e-16,
+    3.829073731305243e-16,
+    3.8453514018609596e-16,
+    3.8616982085091493e-16,
+    3.878116224335587e-16,
+    3.894607570481926e-16,
+    3.9111744183782054e-16,
+    3.9278189920805415e-16,
+    3.944543570720877e-16,
+    3.9613504910761354e-16,
+    3.9782421502646826e-16,
+    3.995221008578565e-16,
+    4.012289592460629e-16,
+    4.029450497636328e-16,
+    4.04670639241075e-16,
+    4.0640600211422504e-16,
+    4.0815142079049387e-16,
+    4.0990718603532664e-16,
+    4.1167359738030257e-16,
+    4.134509635544236e-16,
+    4.1523960294026883e-16,
+    4.170398440568316e-16,
+    4.1885202607101123e-16,
+    4.206764993399015e-16,
+    4.2251362598620494e-16,
+    4.243637805093078e-16,
+    4.262273504347798e-16,
+    4.2810473700531167e-16,
+    4.2999635591638323e-16,
+    4.3190263810026294e-16,
+    4.338240305622791e-16,
+    4.357609972736849e-16,
+    4.3771402012585875e-16,
+    4.3968359995105214e-16,
+    4.4167025761542035e-16,
+    4.4367453519065673e-16,
+    4.456969972112043e-16,
+    4.477382320247534e-16,
+    4.49798853244555e-16,
+    4.518795013130059e-16,
+    4.539808451870034e-16,
+    4.561035841567422e-16,
+    4.582484498109567e-16,
+    4.604162081631153e-16,
+    4.626076619547846e-16,
+    4.648236531543207e-16,
+    4.670650656712631e-16,
+    4.693328283093329e-16,
+    4.716279179838351e-16,
+    4.739513632325867e-16,
+    4.763042480533137e-16,
+    4.786877161048723e-16,
+    4.811029753147417e-16,
+    4.835513029411525e-16,
+    4.860340511450812e-16,
+    4.885526531353603e-16,
+    4.91108629959527e-16,
+    4.937035980240335e-16,
+    4.963392774403987e-16,
+    4.990175013091822e-16,
+    5.017402260718089e-16,
+    5.045095430818727e-16,
+    5.073276915733542e-16,
+    5.101970732341562e-16,
+    5.131202686306784e-16,
+    5.161000557743228e-16,
+    5.191394311757699e-16,
+    5.222416338000234e-16,
+    5.254101724177597e-16,
+    5.286488569504945e-16,
+    5.3196183453384e-16,
+    5.353536311816497e-16,
+    5.388292001334053e-16,
+    5.423939782201712e-16,
+    5.46053951907478e-16,
+    5.498157350892814e-16,
+    5.536866612467876e-16,
+    5.576748932926576e-16,
+    5.617895553555417e-16,
+    5.660408920082422e-16,
+    5.704404621291389e-16,
+    5.750013768919895e-16,
+    5.797385945724594e-16,
+    5.846692893455479e-16,
+    5.898133176477899e-16,
+    5.951938149641444e-16,
+    6.008379696271908e-16,
+    6.067780409333449e-16,
+    6.130527208725282e-16,
+    6.197089894581626e-16,
+    6.268046963301284e-16,
+    6.344122407127506e-16,
+    6.426239659548055e-16,
+    6.515603317344994e-16,
+    6.613827885097664e-16,
+    6.723150462505587e-16,
+    6.846803417564259e-16,
+    6.98971833638762e-16,
+    7.159994934830664e-16,
+    7.372424301798799e-16,
+    7.658936370805573e-16,
+    8.113849337656484e-16,
+];
+
+const NORMAL_K: [u64; 256] = [
+    4208095142473578,
+    0,
+    3387314423973544,
+    3838760076542274,
+    4030768804392682,
+    4136731738896254,
+    4203757248105145,
+    4249917568205994,
+    4283617341590296,
+    4309289223136604,
+    4329489775174550,
+    4345795907393188,
+    4359232558744730,
+    4370494503737299,
+    4380069246215646,
+    4388308869042394,
+    4395473957549321,
+    4401761481783924,
+    4407323076021240,
+    4412277362218204,
+    4416718463613199,
+    4420722014516422,
+    4424349484777079,
+    4427651345409294,
+    4430669422005229,
+    4433438668975191,
+    4435988524278344,
+    4438343955930065,
+    4440526279077425,
+    4442553800234660,
+    4444442329865861,
+    4446205593658138,
+    4447855565093316,
+    4449402736340121,
+    4450856340408624,
+    4452224534496486,
+    4453514552210512,
+    4454732830656798,
+    4455885117109368,
+    4456976558985043,
+    4458011780094444,
+    4458994945550386,
+    4459929817254120,
+    4460819801517196,
+    4461667990089170,
+    4462477195632268,
+    4463249982500384,
+    4463988693531856,
+    4464695473445501,
+    4465372289331869,
+    4466020948651920,
+    4466643115089764,
+    4467240322552142,
+    4467813987562542,
+    4468365420260672,
+    4468895834186994,
+    4469406355006040,
+    4469898028300364,
+    4470371826548633,
+    4470828655385770,
+    4471269359229841,
+    4471694726349190,
+    4472105493433674,
+    4472502349725738,
+    4472885940759935,
+    4473256871753524,
+    4473615710685532,
+    4473962991097124,
+    4474299214642296,
+    4474624853414418,
+    4474940352071305,
+    4475246129778808,
+    4475542581990776,
+    4475830082081194,
+    4476108982842610,
+    4476379617863426,
+    4476642302795321,
+    4476897336520866,
+    4477145002230339,
+    4477385568415884,
+    4477619289790266,
+    4477846408136804,
+    4478067153096380,
+    4478281742896886,
+    4478490385029917,
+    4478693276879082,
+    4478890606303906,
+    4479082552182886,
+    4479269284918997,
+    4479450966910588,
+    4479627752990372,
+    4479799790834988,
+    4479967221347354,
+    4480130179013872,
+    4480288792238368,
+    4480443183654460,
+    4480593470417939,
+    4480739764480586,
+    4480882172846772,
+    4481020797814010,
+    4481155737198612,
+    4481287084547452,
+    4481414929336784,
+    4481539357158974,
+    4481660449897960,
+    4481778285894165,
+    4481892940099539,
+    4482004484223382,
+    4482112986869492,
+    4482218513665204,
+    4482321127382802,
+    4482420888053758,
+    4482517853076245,
+    4482612077316275,
+    4482703613202871,
+    4482792510817576,
+    4482878817978627,
+    4482962580320076,
+    4483043841366126,
+    4483122642600925,
+    4483199023534056,
+    4483273021761922,
+    4483344673025224,
+    4483414011262724,
+    4483481068661428,
+    4483545875703378,
+    4483608461209170,
+    4483668852378323,
+    4483727074826624,
+    4483783152620564,
+    4483837108308932,
+    4483888962951686,
+    4483938736146144,
+    4483986446050596,
+    4484032109405372,
+    4484075741551420,
+    4484117356446452,
+    4484156966678662,
+    4484194583478081,
+    4484230216725550,
+    4484263874959345,
+    4484295565379450,
+    4484325293849474,
+    4484353064896186,
+    4484378881706674,
+    4484402746123075,
+    4484424658634833,
+    4484444618368474,
+    4484462623074794,
+    4484478669113436,
+    4484492751434740,
+    4484504863558830,
+    4484514997551788,
+    4484523143998833,
+    4484529291974394,
+    4484533429008906,
+    4484535541052219,
+    4484535612433424,
+    4484533625816926,
+    4484529562154580,
+    4484523400633636,
+    4484515118620291,
+    4484504691598554,
+    4484492093104164,
+    4484477294653230,
+    4484460265665252,
+    4484440973380154,
+    4484419382768918,
+    4484395456437370,
+    4484369154522621,
+    4484340434581640,
+    4484309251471359,
+    4484275557219678,
+    4484239300886654,
+    4484200428415112,
+    4484158882469814,
+    4484114602264271,
+    4484067523374160,
+    4484017577536216,
+    4483964692431365,
+    4483908791450714,
+    4483849793442887,
+    4483787612441036,
+    4483722157367660,
+    4483653331715198,
+    4483581033200083,
+    4483505153387764,
+    4483425577285833,
+    4483342182902157,
+    4483254840764470,
+    4483163413397547,
+    4483067754753536,
+    4482967709590562,
+    4482863112794072,
+    4482753788634692,
+    4482639549955636,
+    4482520197281720,
+    4482395517841076,
+    4482265284489409,
+    4482129254525304,
+    4481987168383486,
+    4481838748191074,
+    4481683696169781,
+    4481521692864464,
+    4481352395175570,
+    4481175434169564,
+    4480990412637506,
+    4480796902367134,
+    4480594441088331,
+    4480382529045225,
+    4480160625140311,
+    4479928142586662,
+    4479684443993061,
+    4479428835793398,
+    4479160561915451,
+    4478878796564388,
+    4478582635972392,
+    4478271088936406,
+    4477943065929958,
+    4477597366530538,
+    4477232664848704,
+    4476847492576192,
+    4476440219183781,
+    4476009028690434,
+    4475551892286424,
+    4475066535915646,
+    4474550401693506,
+    4474000601739904,
+    4473413862618200,
+    4472786458058295,
+    4472114126959004,
+    4471391972746494,
+    4470614338917719,
+    4469774653883156,
+    4468865235838896,
+    4467877045039530,
+    4466799366045354,
+    4465619395558397,
+    4464321701199635,
+    4462887501169282,
+    4461293691124341,
+    4459511507635972,
+    4457504658253067,
+    4455226650325010,
+    4452616884242348,
+    4449594783440798,
+    4446050695647666,
+    4441831266659618,
+    4436714892174061,
+    4430368316897338,
+    4422264825074740,
+    4411517007702132,
+    4396496531309976,
+    4373832704204284,
+    4335125104963628,
+    4251099761679434,
+];
+
+/// Bit width of the normal ziggurat's mantissa: 52 bits, `f64`'s own mantissa width, starting
+/// immediately above the sign bit (bit 8). See the module doc for how this was recovered.
+const NORMAL_MANTISSA_BITS: u32 = 52;
+/// `next_gauss_f32`'s narrower mantissa: `f32`'s own 23-bit mantissa.
+const NORMAL_MANTISSA_BITS_F32: u32 = 23;
+const NORMAL_MANTISSA_SHIFT_TO_32: u32 = NORMAL_MANTISSA_BITS - NORMAL_MANTISSA_BITS_F32;
+
 struct NormalTables {
-    /// Layer boundaries `x[1] = 0.2152...` (adjoining the peak) up to `x[255] = R` (adjoining
-    /// the tail). `x[0]` is unused: layer index `0` is the tail-adjoining catch-all, whose own
-    /// scale is `wn0`, not a table entry (see the module doc).
-    x: [f64; LAYERS],
-    /// `normal_pdf(x[idx])`, used by the wedge acceptance test.
+    /// `w[idx]`: a draw with raw mantissa `m` and this layer accepts as `m as f64 * w[idx]` (see
+    /// the module doc for why this, not `(m / 2**52) * x[idx]`, is the exact formula).
+    w: [f64; LAYERS],
+    /// Core-accept cutoff: `mantissa < k[idx]` accepts directly; `>=` falls to the wedge test
+    /// (or, for `idx == 0`, the tail).
+    k: [u64; LAYERS],
+    /// `normal_pdf(x[idx])` where `x[idx] = w[idx] * 2**52`, used by the wedge test.
     f: [f64; LAYERS],
-    /// The tail-catch-all layer's fraction-to-`x` scale, `v / normal_pdf(r)`.
-    wn0: f64,
+    /// `w`/`k` rescaled for `next_gauss_f32`'s narrower 23-bit mantissa.
+    w32: [f64; LAYERS],
+    k32: [u32; LAYERS],
+    /// The tail cutoff, `x[255]`.
     r: f64,
 }
 
@@ -98,219 +633,28 @@ fn normal_pdf(x: f64) -> f64 {
     (-0.5 * x * x).exp()
 }
 
-/// `normal_pdf`, in double-double (see `Dd`'s doc); used only inside `build_normal`'s recursion.
-fn normal_pdf_dd(x: Dd) -> Dd {
-    x.mul(x).mul(Dd::new(-0.5)).exp()
-}
-
-/// A `hi + lo` pair carrying roughly twice `f64`'s precision (~32 decimal digits), used only for
-/// the table-construction recursion in `build_normal` below (never for sampling, which stays
-/// plain `f64`). The recursion chains 254 divisions, additions, logs and square roots; each
-/// individual `f64` operation is correctly rounded, but rounding 254 times in a row compounds
-/// into a few-ULP drift by the layers nearest the peak, confirmed empirically: with this
-/// recursion done in plain `f64`, `R` and the underlying tail integral both matched an
-/// independent `math.erfc`-based oracle to `f64`'s precision floor, yet the *sampled* values this
-/// table produced still missed `tests/python/numpy/test_random.py`'s exact NumPy vectors by a
-/// handful of ULPs — evidence the mismatch was accumulated rounding along the chain, not
-/// insufficient precision in any single input. Carrying each step in double-double and rounding
-/// only the final `x[i]`/`f[i]` to `f64` removes that compounding: double-double's own ~1e-32
-/// relative error, even compounded linearly over 254 steps, stays ~15 orders of magnitude below
-/// `f64`'s ~1e-16 rounding threshold, so the final rounding is governed by the true mathematical
-/// recursion, not by which order operations happened to round in.
-#[derive(Clone, Copy)]
-struct Dd {
-    hi: f64,
-    lo: f64,
-}
-
-/// Knuth's exact sum: `a + b` split into a rounded `hi` and the exact rounding error `lo`, valid
-/// for any `a`, `b` (unlike the cheaper "quick" variant, which needs `|a| >= |b|`).
-fn two_sum(a: f64, b: f64) -> Dd {
-    let hi = a + b;
-    let bb = hi - a;
-    let lo = (a - (hi - bb)) + (b - bb);
-    Dd { hi, lo }
-}
-
-impl Dd {
-    fn new(x: f64) -> Dd {
-        Dd { hi: x, lo: 0.0 }
-    }
-
-    fn to_f64(self) -> f64 {
-        self.hi + self.lo
-    }
-
-    fn add(self, other: Dd) -> Dd {
-        let s = two_sum(self.hi, other.hi);
-        two_sum(s.hi, s.lo + self.lo + other.lo)
-    }
-
-    /// Exact product via a fused multiply-add: `a.mul_add(b, -p)` recovers `a*b - p` with no
-    /// intermediate rounding, which is exactly the rounding error `two_product` needs.
-    fn mul(self, other: Dd) -> Dd {
-        let p = self.hi * other.hi;
-        let e = self.hi.mul_add(other.hi, -p);
-        two_sum(p, e + self.hi * other.lo + self.lo * other.hi)
-    }
-
-    fn div(self, other: Dd) -> Dd {
-        let q1 = self.hi / other.hi;
-        let p = q1 * other.hi;
-        let e = q1.mul_add(other.hi, -p);
-        // Residual of `self - q1*other`, computed exactly enough to extract a second correction
-        // term; `other.lo`'s contribution is below double-double precision here and dropped.
-        let r = ((self.hi - p) - e) + self.lo - q1 * other.lo;
-        let q2 = r / other.hi;
-        two_sum(q1, q2)
-    }
-
-    /// `ln(hi + lo) = ln(hi) + ln(1 + lo/hi) ~ ln(hi) + lo/hi`: valid because `lo/hi` is already
-    /// at `f64`'s precision (~1e-16), so the dropped `(lo/hi)^2` term (~1e-32) is below what
-    /// double-double itself can represent.
-    fn ln(self) -> Dd {
-        let l = self.hi.ln();
-        two_sum(l, self.lo / self.hi)
-    }
-
-    /// `sqrt(hi + lo) ~ sqrt(hi) + lo / (2*sqrt(hi))`, the same first-order justification as `ln`.
-    fn sqrt(self) -> Dd {
-        let s = self.hi.sqrt();
-        two_sum(s, self.lo / (2.0 * s))
-    }
-
-    /// `exp(hi + lo) = exp(hi) * exp(lo) ~ exp(hi) * (1 + lo)`, the same first-order justification
-    /// as `ln` and `sqrt` (`lo` is already `f64`-precision-relative-small, so `exp(lo) - 1 - lo`
-    /// is below double-double precision).
-    fn exp(self) -> Dd {
-        let e = self.hi.exp();
-        two_sum(e, e * self.lo)
-    }
-}
-
-/// `integral_r^infinity exp(-x^2/2) dx`, the Gaussian tail integral, by Simpson's rule over
-/// `[r, r + 12]` (`normal_pdf` at `r + 12`, with `r` near 3.65, is under 1e-50, far below `f64`'s
-/// smallest normal number relative to the integral itself, so truncating the infinite tail there
-/// loses nothing representable). Table construction runs once per process, so favoring a
-/// numerically simple, cancellation-free method (rather than an alternating power series for
-/// `erf`, which loses precision here through cancellation) over raw speed is the right tradeoff.
-///
-/// Composite Simpson's rule has error `O((width/steps)^4 * max|f''''|)` on the interval; `f''''`
-/// is largest right at `r` (it decays with the Gaussian much faster than the `x^4` term in front
-/// of it grows), so bounding it there gives a worst-case error estimate. At `r ~ 3.65`,
-/// `max|f''''| ~ 100 * normal_pdf(r) ~ 0.05`, and this integral's own value is `~1.4e-4`, so
-/// `steps` must be large enough to hold the *relative* error to `f64` precision (~1e-16), not
-/// just the absolute error small in absolute terms. `4096` steps (an earlier attempt) only gave
-/// `~1e-6` relative error — enough to look plausible but not enough to match NumPy's stream past
-/// its 9th-11th significant digit. `2^20` steps over the narrower `[r, r + 12]` window pushes the
-/// estimated error past `1e-16` relative with margin to spare, confirmed empirically against the
-/// exact test vectors in `tests/python/numpy/test_random.py`.
-fn tail_area(r: f64) -> f64 {
-    let width = 12.0;
-    let steps = 1 << 18; // even, for Simpson's rule
-    let h = width / steps as f64;
-    // Millions of Simpson terms summed naively lose more precision to accumulated rounding than
-    // Simpson's own truncation error at this step count, since most terms are tiny relative to
-    // the running total once `x` is a few units past `r` (`normal_pdf` decays fast). Kahan
-    // (compensated) summation cancels that rounding drift regardless of term count, which mattered
-    // in practice: an early, naively-summed 2^26-step attempt at this integral put `r` (found by
-    // `build_normal`'s bisection, which depends on this function) 7.9e-13 away from the true
-    // 256-layer ziggurat's `R`, worse than a coarser, naively-summed 2^20-step attempt's 1.1e-14 —
-    // more steps made the rounding-accumulated error worse, not better, confirming summation, not
-    // truncation, was the bottleneck.
-    let mut sum = normal_pdf(r) + normal_pdf(r + width);
-    let mut c = 0.0f64;
-    for i in 1..steps {
-        let x = r + i as f64 * h;
-        let weight = if i % 2 == 0 { 2.0 } else { 4.0 };
-        let y = weight * normal_pdf(x) - c;
-        let t = sum + y;
-        c = (t - sum) - y;
-        sum = t;
-    }
-    sum * h / 3.0
-}
-
-/// `tail_area`, but accumulated in double-double (see `Dd`'s doc) instead of Kahan-summed plain
-/// `f64`. Kahan summation alone gets the returned `f64` correctly rounded (confirmed against an
-/// independent `math.erfc`-based oracle), but rounding it to a single `f64` before it ever reaches
-/// `build_normal`'s recursion throws away the sub-ULP remainder that recursion needs: 254 chained
-/// divisions by shrinking `x[i+1]` amplify area's own last-bit error much faster near the peak
-/// than near the tail (confirmed by black-box probing NumPy's own PCG64 stream directly — see
-/// `docs/numpy.md` for the method — which pinned `x[254]` within this module's own bracket, yet
-/// `x[232]`, only 23 layers deeper, was already off by several ULPs). Keeping the sum's low word
-/// instead of discarding it removes that amplification at the source.
-fn tail_area_dd(r: f64) -> Dd {
-    let width = 12.0;
-    let steps = 1 << 18; // even, for Simpson's rule
-    let h = width / steps as f64;
-    let mut sum = Dd::new(normal_pdf(r) + normal_pdf(r + width));
-    for i in 1..steps {
-        let x = r + i as f64 * h;
-        let weight = if i % 2 == 0 { 2.0 } else { 4.0 };
-        sum = sum.add(Dd::new(weight * normal_pdf(x)));
-    }
-    // `h / 3.0` as a single `f64` division rounds once more before scaling the sum; computing it
-    // in double-double instead (and using `Dd * Dd`, not `Dd * f64`) avoids reintroducing the
-    // single-rounding error this whole function exists to eliminate.
-    let scale = Dd::new(h).div(Dd::new(3.0));
-    sum.mul(scale)
-}
-
 fn build_normal() -> NormalTables {
-    let residual = |r: f64| -> Option<f64> {
-        let area = r * normal_pdf(r) + tail_area(r);
-        let mut x = [0.0f64; LAYERS];
-        x[LAYERS - 1] = r;
-        let mut prev_f = normal_pdf(r);
-        for i in (0..LAYERS - 1).rev() {
-            let value = prev_f + area / x[i + 1];
-            if value >= 1.0 {
-                return None;
-            }
-            x[i] = (-2.0 * value.ln()).sqrt();
-            prev_f = value;
-        }
-        Some(x[0] * (1.0 - normal_pdf(x[0])) - area)
-    };
-    let (mut lo, mut hi) = (3.0f64, 4.0f64);
-    for _ in 0..200 {
-        let mid = 0.5 * (lo + hi);
-        match residual(mid) {
-            None => lo = mid,
-            Some(_) => hi = mid,
-        }
-    }
-    let r = hi;
-    let r_dd = Dd::new(r);
-    let area_dd = r_dd.mul(normal_pdf_dd(r_dd)).add(tail_area_dd(r));
-    let area = area_dd.to_f64();
-    // `x[idx]` increases with `idx`, from the peak (`x[1]`, smallest) out to the tail cutoff
-    // (`x[255] = r`). Layer `0` is the special tail catch-all and is left `0.0` here; its own
-    // scale is `wn0`, computed separately below. Built in double-double (see `Dd`'s doc), carrying
-    // `area`'s own sub-ULP remainder (`area_dd`, not just its rounded `f64`) through all 254
-    // steps, so neither the recursion's rounding nor `area`'s input precision limits the result.
-    let mut x_dd = [Dd::new(0.0); LAYERS];
-    x_dd[LAYERS - 1] = Dd::new(r);
-    let mut prev_f = Dd::new(normal_pdf(r));
-    for i in (1..LAYERS - 1).rev() {
-        let value = prev_f.add(area_dd.div(x_dd[i + 1]));
-        x_dd[i] = value.ln().mul(Dd::new(-2.0)).sqrt();
-        // Re-evaluate the density at `x[i]` rather than reusing the pre-inversion `value`: even
-        // in double-double, `sqrt` and `ln`/`exp` are each independently accurate but their
-        // composition is not a perfect round trip, so carrying the freshly recomputed density
-        // forward (matching the separate `f[]` pass below) keeps every layer self-consistent with
-        // its own stored `x[i]`.
-        prev_f = normal_pdf_dd(x_dd[i]);
-    }
-    let mut x = [0.0f64; LAYERS];
+    let scale = (1u64 << NORMAL_MANTISSA_BITS) as f64;
     let mut f = [0.0f64; LAYERS];
-    for i in 1..LAYERS {
-        x[i] = x_dd[i].to_f64();
-        f[i] = normal_pdf(x[i]);
+    let mut w32 = [0.0f64; LAYERS];
+    let mut k32 = [0u32; LAYERS];
+    for i in 0..LAYERS {
+        let x = NORMAL_W[i] * scale;
+        f[i] = normal_pdf(x);
+        w32[i] = NORMAL_W[i] * (1u64 << NORMAL_MANTISSA_SHIFT_TO_32) as f64;
+        let k = NORMAL_K[i];
+        k32[i] =
+            ((k + (1u64 << NORMAL_MANTISSA_SHIFT_TO_32) - 1) >> NORMAL_MANTISSA_SHIFT_TO_32) as u32;
     }
-    let wn0 = area / normal_pdf(r);
-    NormalTables { x, f, wn0, r }
+    let r = NORMAL_W[LAYERS - 1] * scale;
+    NormalTables {
+        w: NORMAL_W,
+        k: NORMAL_K,
+        f,
+        w32,
+        k32,
+        r,
+    }
 }
 
 static NORMAL: OnceLock<NormalTables> = OnceLock::new();
@@ -319,9 +663,9 @@ fn normal_tables() -> &'static NormalTables {
     NORMAL.get_or_init(build_normal)
 }
 
-/// Marsaglia's tail algorithm: an accept-reject sampler for the Gaussian tail beyond `r`, using
-/// `-log(1 - U)` for both of its uniforms (the same inversion this crate uses everywhere else),
-/// confirmed against NumPy 2.5.3's own rejected-then-accepted tail draws (see the module doc).
+/// Marsaglia's tail algorithm for the Gaussian beyond `r`: accept-reject with `-log(1 - U)` for
+/// both of its uniforms (the same inversion this crate uses everywhere else). See the module doc
+/// for its black-box confirmation.
 fn sample_tail(bitgen: &mut BitGen, r: f64) -> f64 {
     loop {
         let x = -(1.0 - bitgen.next_double()).ln() / r;
@@ -332,31 +676,25 @@ fn sample_tail(bitgen: &mut BitGen, r: f64) -> f64 {
     }
 }
 
-/// One standard normal draw. Bit-exact against NumPy 2.5.3's `Generator.standard_normal` (see
-/// the module doc for the recovered bit layout and validation method).
+/// One standard normal draw. Bit-exact against NumPy 2.5.3's `Generator.standard_normal` (see the
+/// module doc for the recovered table, bit layout, and validation method).
 pub(in crate::python) fn next_gauss(bitgen: &mut BitGen) -> f64 {
     let tables = normal_tables();
     loop {
         let word = bitgen.next_u64();
         let idx = (word & 0xff) as usize;
         let sign = if (word >> 8) & 1 != 0 { -1.0 } else { 1.0 };
-        let mag = (word >> 11) & ((1u64 << 50) - 1);
-        let frac = mag as f64 / (1u64 << 50) as f64;
+        let mantissa = (word >> 9) & ((1u64 << NORMAL_MANTISSA_BITS) - 1);
+        if mantissa < tables.k[idx] {
+            return sign * mantissa as f64 * tables.w[idx];
+        }
         if idx == 0 {
-            let x = frac * tables.wn0;
-            if x < tables.r {
-                return sign * x;
-            }
-            // The tail's sign is drawn from a different bit of the same word (bit 17) than the
-            // regular layers' sign bit (bit 8): the one asymmetry this module found by
-            // black-box comparison, not a deliberate design choice it can otherwise justify.
+            // The tail's sign is a different bit of the same word than the regular layers' sign
+            // bit (bit 8): see the module doc's "normal ziggurat's tail" section.
             let tail_sign = if (word >> 17) & 1 != 0 { -1.0 } else { 1.0 };
             return tail_sign * sample_tail(bitgen, tables.r);
         }
-        let x = frac * tables.x[idx];
-        if x < tables.x[idx - 1] {
-            return sign * x;
-        }
+        let x = mantissa as f64 * tables.w[idx];
         let u = bitgen.next_double();
         if u * (tables.f[idx - 1] - tables.f[idx]) + tables.f[idx] < normal_pdf(x) {
             return sign * x;
@@ -364,40 +702,33 @@ pub(in crate::python) fn next_gauss(bitgen: &mut BitGen) -> f64 {
     }
 }
 
-/// One standard normal draw at `dtype=np.float32`'s own precision: the same 256-layer table as
-/// `next_gauss`, but sampled from a 32-bit word instead of a 64-bit one (`idx` in bits 0-7,
-/// `sign` at bit 8, and a 23-bit fraction in bits 9-31, `f32`'s own mantissa width, mirroring
-/// `next_gauss`'s bit positions at half the word width). Recovered the same way as `next_gauss`'s
-/// layout (see the module doc): single-bit word scans on `next_u32()` placed `sign` at bit 8 and
-/// the fraction's low bit at 9 (bits below that always drew `0.0`, both alone and combined,
-/// ruling out a narrower `idx`); forcing a wedge rejection (a maximal mantissa on an inner layer)
-/// showed the next word came from a *fresh* `next_u64()` `next_double()` call, not a second
-/// `next_u32()` — it left the first word's cached upper half still pending for the following
-/// draw, confirmed by four consecutive core-accepted draws consuming only two raw 64-bit words
-/// between them (one per pair, low half then cached high half). So the wedge and tail machinery
-/// below is `next_gauss`'s, unchanged; only the word supplying `idx`/`sign`/fraction is narrower.
-/// Returns `f64` (the caller truncates to `f32`); inherits `next_gauss`'s table-precision caveat
-/// (see this module's `Accuracy` section) since it draws from the same table.
+/// One standard normal draw at `dtype=np.float32`'s own precision: the same table as
+/// `next_gauss`, rescaled for a 23-bit mantissa (`f32`'s own width) drawn from a 32-bit word.
+/// Recovered the same way as `next_gauss`'s layout (see the module doc): single-bit word scans on
+/// `next_u32()` placed `sign` at bit 8 and the mantissa immediately above it at bit 9, with no
+/// gap — matching, not contradicting, `next_gauss`'s corrected 64-bit layout. Wedge and tail
+/// handling are `next_gauss`'s, unchanged, since both fall back to `next_double()`/`next_u64()`
+/// regardless of which word width supplied the layer selection.
 pub(in crate::python) fn next_gauss_f32(bitgen: &mut BitGen) -> f64 {
     let tables = normal_tables();
     loop {
         let word = bitgen.next_u32();
         let idx = (word & 0xff) as usize;
         let sign = if (word >> 8) & 1 != 0 { -1.0 } else { 1.0 };
-        let mag = (word >> 9) & ((1u32 << 23) - 1);
-        let frac = f64::from(mag) / f64::from(1u32 << 23);
+        let mantissa = (word >> 9) & ((1u32 << NORMAL_MANTISSA_BITS_F32) - 1);
+        // NumPy's f32 ziggurat multiplies mantissa by the (also `f32`) table entry in `f32`
+        // arithmetic, not in `f64` and then rounded down: confirmed by a real forced-core-accept
+        // draw whose `f64`-computed value missed NumPy's `f32` output by 1 ULP, while computing
+        // the same product natively in `f32` matched exactly.
+        let mantissa_f32 = mantissa as f32;
+        if mantissa < tables.k32[idx] {
+            return f64::from(sign as f32 * mantissa_f32 * tables.w32[idx] as f32);
+        }
         if idx == 0 {
-            let x = frac * tables.wn0;
-            if x < tables.r {
-                return sign * x;
-            }
             let tail_sign = if (word >> 17) & 1 != 0 { -1.0 } else { 1.0 };
             return tail_sign * sample_tail(bitgen, tables.r);
         }
-        let x = frac * tables.x[idx];
-        if x < tables.x[idx - 1] {
-            return sign * x;
-        }
+        let x = f64::from(mantissa_f32 * tables.w32[idx] as f32);
         let u = bitgen.next_double();
         if u * (tables.f[idx - 1] - tables.f[idx]) + tables.f[idx] < normal_pdf(x) {
             return sign * x;
@@ -405,24 +736,542 @@ pub(in crate::python) fn next_gauss_f32(bitgen: &mut BitGen) -> f64 {
     }
 }
 
-/// A 53-bit mantissa (one bit wider than the normal ziggurat's 50-bit fraction, since the
-/// exponential ziggurat has no sign bit to make room for).
+const EXP_W: [f64; 256] = [
+    9.655740063209183e-16,
+    7.089014243955414e-18,
+    1.1639412496691224e-17,
+    1.524391512353216e-17,
+    1.833284885723744e-17,
+    2.1089651094644866e-17,
+    2.3611280778431382e-17,
+    2.595595772310894e-17,
+    2.8161735541977523e-17,
+    3.0255041303213823e-17,
+    3.225508254836375e-17,
+    3.417632340185027e-17,
+    3.6029969787344525e-17,
+    3.782490776869649e-17,
+    3.956832198097553e-17,
+    4.1266117781759464e-17,
+    4.2923218084425256e-17,
+    4.4543777432823714e-17,
+    4.613133981483186e-17,
+    4.768895725264636e-17,
+    4.921928043727963e-17,
+    5.072462904503147e-17,
+    5.220704702792672e-17,
+    5.366834661718192e-17,
+    5.511014372835095e-17,
+    5.653388673239667e-17,
+    5.794088004852767e-17,
+    5.933230365208943e-17,
+    6.07092293284718e-17,
+    6.207263431163193e-17,
+    6.342341280303077e-17,
+    6.476238575956142e-17,
+    6.609030925769405e-17,
+    6.740788167872722e-17,
+    6.871574991183812e-17,
+    7.00145147340393e-17,
+    7.130473549660643e-17,
+    7.258693422414648e-17,
+    7.386159921381792e-17,
+    7.512918820723728e-17,
+    7.639013119550826e-17,
+    7.764483290797848e-17,
+    7.88936750272979e-17,
+    8.013701816675454e-17,
+    8.137520364041762e-17,
+    8.260855505210038e-17,
+    8.383737972539139e-17,
+    8.506196999385323e-17,
+    8.628260436784113e-17,
+    8.749954859216183e-17,
+    8.871305660690252e-17,
+    8.992337142215357e-17,
+    9.113072591597909e-17,
+    9.233534356381788e-17,
+    9.353743910649129e-17,
+    9.47372191631295e-17,
+    9.593488279457997e-17,
+    9.713062202221521e-17,
+    9.832462230649511e-17,
+    9.951706298915072e-17,
+    1.0070811770242949e-16,
+    1.0189795474846941e-16,
+    1.030867374515422e-16,
+    1.0427462448561886e-16,
+    1.0546177017945764e-16,
+    1.0664832480119147e-16,
+    1.0783443482419485e-16,
+    1.0902024317583505e-16,
+    1.1020588947055781e-16,
+    1.1139151022861975e-16,
+    1.1257723908165675e-16,
+    1.1376320696616847e-16,
+    1.1494954230590093e-16,
+    1.1613637118402183e-16,
+    1.1732381750590458e-16,
+    1.1851200315326694e-16,
+    1.1970104813034652e-16,
+    1.2089107070273855e-16,
+    1.2208218752947062e-16,
+    1.2327451378884152e-16,
+    1.2446816329851125e-16,
+    1.2566324863028985e-16,
+    1.2685988122003975e-16,
+    1.2805817147307494e-16,
+    1.2925822886541196e-16,
+    1.3046016204120288e-16,
+    1.3166407890665726e-16,
+    1.328700867207381e-16,
+    1.3407829218289994e-16,
+    1.3528880151811755e-16,
+    1.3650172055943978e-16,
+    1.377171548282881e-16,
+    1.389352096127064e-16,
+    1.4015599004375715e-16,
+    1.4137960117024852e-16,
+    1.4260614803196654e-16,
+    1.4383573573157902e-16,
+    1.4506846950536877e-16,
+    1.4630445479294757e-16,
+    1.4754379730609516e-16,
+    1.487866030968626e-16,
+    1.500329786250737e-16,
+    1.5128303082535394e-16,
+    1.5253686717381255e-16,
+    1.537945957544997e-16,
+    1.5505632532575771e-16,
+    1.5632216538658375e-16,
+    1.5759222624311761e-16,
+    1.5886661907536842e-16,
+    1.6014545600429167e-16,
+    1.6142885015932787e-16,
+    1.6271691574651305e-16,
+    1.640097681172718e-16,
+    1.653075238380037e-16,
+    1.666103007605742e-16,
+    1.6791821809382289e-16,
+    1.6923139647620223e-16,
+    1.7054995804966298e-16,
+    1.7187402653490317e-16,
+    1.7320372730810084e-16,
+    1.745391874792534e-16,
+    1.7588053597224914e-16,
+    1.7722790360680065e-16,
+    1.7858142318237326e-16,
+    1.7994122956424637e-16,
+    1.8130745977185016e-16,
+    1.8268025306952523e-16,
+    1.8405975105985878e-16,
+    1.8544609777975695e-16,
+    1.8683943979941927e-16,
+    1.882399263243892e-16,
+    1.8964770930086167e-16,
+    1.9106294352443765e-16,
+    1.9248578675252438e-16,
+    1.9391639982058994e-16,
+    1.9535494676249091e-16,
+    1.9680159493510374e-16,
+    1.982565151475019e-16,
+    1.997198817949342e-16,
+    2.0119187299787347e-16,
+    2.0267267074641983e-16,
+    2.0416246105035888e-16,
+    2.0566143409519179e-16,
+    2.071697844044737e-16,
+    2.0868771100881597e-16,
+    2.1021541762192928e-16,
+    2.117531128241076e-16,
+    2.133010102535779e-16,
+    2.1485932880616633e-16,
+    2.1642829284376047e-16,
+    2.180081324120784e-16,
+    2.1959908346828707e-16,
+    2.212013881190496e-16,
+    2.2281529486961805e-16,
+    2.2444105888463086e-16,
+    2.2607894226131737e-16,
+    2.277292143158621e-16,
+    2.2939215188373114e-16,
+    2.3106803963482133e-16,
+    2.3275717040435346e-16,
+    2.344598455404958e-16,
+    2.361763752697774e-16,
+    2.3790707908142767e-16,
+    2.3965228613186235e-16,
+    2.4141233567062933e-16,
+    2.431875774892256e-16,
+    2.44978372394307e-16,
+    2.4678509270692887e-16,
+    2.4860812278958517e-16,
+    2.504478596029557e-16,
+    2.523047132944217e-16,
+    2.541791078205812e-16,
+    2.560714816061771e-16,
+    2.579822882420531e-16,
+    2.599119972249747e-16,
+    2.618610947423924e-16,
+    2.638300845054943e-16,
+    2.658194886341845e-16,
+    2.678298485979525e-16,
+    2.698617262169489e-16,
+    2.7191570472798185e-16,
+    2.739923899205815e-16,
+    2.760924113487617e-16,
+    2.782164236246436e-16,
+    2.8036510780069835e-16,
+    2.825391728480253e-16,
+    2.847393572388174e-16,
+    2.8696643064198177e-16,
+    2.8922119574179956e-16,
+    2.915044901905293e-16,
+    2.9381718870700286e-16,
+    2.9616020533454657e-16,
+    2.9853449587300453e-16,
+    3.009410605012618e-16,
+    3.0338094660850034e-16,
+    3.058552518544861e-16,
+    3.08365127481531e-16,
+    3.1091178190342663e-16,
+    3.134964845996663e-16,
+    3.1612057034671057e-16,
+    3.187854438219713e-16,
+    3.2149258462067974e-16,
+    3.2424355273094516e-16,
+    3.2703999451822404e-16,
+    3.298836492772283e-16,
+    3.3277635641716714e-16,
+    3.357200633553244e-16,
+    3.387168342045505e-16,
+    3.417688593525637e-16,
+    3.448784660453424e-16,
+    3.4804813010374423e-16,
+    3.5128048892229794e-16,
+    3.545783559224792e-16,
+    3.5794473666042765e-16,
+    3.6138284682190606e-16,
+    3.6489613237645425e-16,
+    3.6848829220956213e-16,
+    3.7216330360802073e-16,
+    3.7592545104162565e-16,
+    3.7977935876688744e-16,
+    3.8373002787892137e-16,
+    3.8778287856078953e-16,
+    3.919437984311429e-16,
+    3.962191980786775e-16,
+    4.0061607510565417e-16,
+    4.051420882956573e-16,
+    4.0980564389030625e-16,
+    4.1461599642909046e-16,
+    4.195833672073399e-16,
+    4.247190841824385e-16,
+    4.3003574816674707e-16,
+    4.355474314693952e-16,
+    4.41269916903607e-16,
+    4.472209874259932e-16,
+    4.534207798565834e-16,
+    4.598922204905932e-16,
+    4.666615664711476e-16,
+    4.737590853262492e-16,
+    4.812199172829238e-16,
+    4.89085182739221e-16,
+    4.97403423619194e-16,
+    5.06232507214416e-16,
+    5.156421828878083e-16,
+    5.257175802022275e-16,
+    5.365640977112022e-16,
+    5.483144034258704e-16,
+    5.61138745467516e-16,
+    5.752606481503332e-16,
+    5.909817641652103e-16,
+    6.087231416180908e-16,
+    6.290979034877557e-16,
+    6.530492053564041e-16,
+    6.821393079028929e-16,
+    7.192444966089362e-16,
+    7.706095350032097e-16,
+    8.545517038584027e-16,
+];
+
+const EXP_K: [u64; 256] = [
+    7971545857431494,
+    0,
+    5485857970336126,
+    6877400373607440,
+    7489560515621038,
+    7829793950745724,
+    8045251395085594,
+    8193552821270898,
+    8301707212298418,
+    8384003209374832,
+    8448689755168200,
+    8500854585063478,
+    8543802742323106,
+    8579772857648236,
+    8610334328270398,
+    8636619566280862,
+    8659465946817878,
+    8679505875409358,
+    8697225801520776,
+    8713005977443536,
+    8727147906454692,
+    8739893704890038,
+    8751440024696698,
+    8761948238062960,
+    8771552003860596,
+    8780362968290610,
+    8788475114930438,
+    8795968123070796,
+    8802909988292858,
+    8809359087581710,
+    8815365821575970,
+    8820973931588800,
+    8826221564107158,
+    8831142137483404,
+    8835765052397426,
+    8840116277974648,
+    8844218838221542,
+    8848093218006260,
+    8851757703688506,
+    8855228670347734,
+    8858520825126080,
+    8861647414312948,
+    8864620400320394,
+    8867450613535032,
+    8870147883110754,
+    8872721150032146,
+    8875178565190242,
+    8877527574738170,
+    8879774994610604,
+    8881927075778634,
+    8883989561556502,
+    8885967738067168,
+    8887866478800856,
+    8889690284057818,
+    8891443315947666,
+    8893129429518482,
+    8894752200505984,
+    8896314950123264,
+    8897820767252858,
+    8899272528353282,
+    8900672915349966,
+    8902024431744704,
+    8903329417147192,
+    8904590060406012,
+    8905808411494018,
+    8906986392283810,
+    8908125806332284,
+    8909228347778946,
+    8910295609450180,
+    8911329090250868,
+    8912330201915374,
+    8913300275181656,
+    8914240565445170,
+    8915152257942916,
+    8916036472512488,
+    8916894267966144,
+    8917726646115692,
+    8918534555480190,
+    8919318894705170,
+    8920080515719156,
+    8920820226650618,
+    8921538794526266,
+    8922236947769418,
+    8922915378515480,
+    8923574744759820,
+    8924215672351958,
+    8924838756848636,
+    8925444565237162,
+    8926033637539416,
+    8926606488305930,
+    8927163608008600,
+    8927705464339880,
+    8928232503425544,
+    8928745150957558,
+    8929243813252980,
+    8929728878244356,
+    8930200716406566,
+    8930659681624710,
+    8931106112007190,
+    8931540330647876,
+    8931962646340834,
+    8932373354250910,
+    8932772736543124,
+    8933161062973652,
+    8933538591444894,
+    8933905568527004,
+    8934262229948010,
+    8934608801054528,
+    8934945497244894,
+    8935272524376414,
+    8935590079148328,
+    8935898349461876,
+    8936197514758882,
+    8936487746340036,
+    8936769207664048,
+    8937042054628744,
+    8937306435835058,
+    8937562492834854,
+    8937810360363402,
+    8938050166557284,
+    8938282033158466,
+    8938506075705162,
+    8938722403710132,
+    8938931120826946,
+    8939132325004766,
+    8939326108632062,
+    8939512558669762,
+    8939691756774158,
+    8939863779409990,
+    8940028697953972,
+    8940186578789100,
+    8940337483389966,
+    8940481468399302,
+    8940618585695992,
+    8940748882454662,
+    8940872401197050,
+    8940989179835208,
+    8941099251706688,
+    8941202645601704,
+    8941299385782368,
+    8941389491993960,
+    8941472979468230,
+    8941549858918698,
+    8941620136527848,
+    8941683813926148,
+    8941740888162738,
+    8941791351667640,
+    8941835192205302,
+    8941872392819226,
+    8941902931767472,
+    8941926782448690,
+    8941943913318396,
+    8941954287795084,
+    8941957864155806,
+    8941954595420724,
+    8941944429226144,
+    8941927307685492,
+    8941903167237602,
+    8941871938481652,
+    8941833545998016,
+    8941787908154234,
+    8941734936895206,
+    8941674537516674,
+    8941606608420918,
+    8941531040853536,
+    8941447718620056,
+    8941356517781006,
+    8941257306323958,
+    8941149943810914,
+    8941034280999228,
+    8940910159434164,
+    8940777411010892,
+    8940635857503634,
+    8940485310059376,
+    8940325568653336,
+    8940156421503112,
+    8939977644438114,
+    8939789000220574,
+    8939590237814000,
+    8939381091594596,
+    8939161280500638,
+    8938930507114326,
+    8938688456670012,
+    8938434795982096,
+    8938169172285110,
+    8937891211977748,
+    8937600519261604,
+    8937296674664432,
+    8936979233436516,
+    8936647723807416,
+    8936301645088910,
+    8935940465608202,
+    8935563620453574,
+    8935170509012442,
+    8934760492279316,
+    8934332889908232,
+    8933886976981030,
+    8933421980459034,
+    8932937075281380,
+    8932431380068266,
+    8931903952381602,
+    8931353783488908,
+    8930779792568492,
+    8930180820284952,
+    8929555621653500,
+    8928902858099222,
+    8928221088602964,
+    8927508759808348,
+    8926764194944404,
+    8925985581394242,
+    8925170956711904,
+    8924318192855506,
+    8923424978364230,
+    8922488798157886,
+    8921506910578770,
+    8920476321224196,
+    8919393753031106,
+    8918255611967910,
+    8917057947558148,
+    8915796407299442,
+    8914466183841290,
+    8913061953535784,
+    8911577804662434,
+    8910007153233212,
+    8908342643782164,
+    8906576031902208,
+    8904698044465300,
+    8902698212389652,
+    8900564669414922,
+    8898283908495804,
+    8895840484961220,
+    8893216652275640,
+    8890391911743352,
+    8887342451323378,
+    8884040440144924,
+    8880453133239800,
+    8876541723776518,
+    8872259855113102,
+    8867551668208538,
+    8862349204777254,
+    8856568902200012,
+    8850106784293916,
+    8842831740745002,
+    8834575940248166,
+    8825120832349124,
+    8814176156651890,
+    8801347484544986,
+    8786084197194146,
+    8767592496903178,
+    8744682338845716,
+    8715480686119910,
+    8676850260251934,
+    8623083654098352,
+    8542525795804796,
+    8406823688997808,
+    8122426762520768,
+];
+
+/// Bit width of the exponential ziggurat's mantissa: 53 bits (one wider than the normal
+/// ziggurat's, since this ziggurat has no sign bit to make room for), starting at bit 11 (`idx`
+/// takes bits 3-10 instead of 0-7; see the module doc).
 const EXP_MANTISSA_BITS: u32 = 53;
-/// `next_exponential_zig_f32`'s mantissa width: `f32`'s own 23-bit mantissa, the same width
-/// `next_gauss_f32` uses.
+/// `next_exponential_zig_f32`'s narrower mantissa: `f32`'s own 23-bit mantissa.
 const EXP_MANTISSA_BITS_F32: u32 = 23;
+const EXP_MANTISSA_SHIFT_TO_32: u32 = EXP_MANTISSA_BITS - EXP_MANTISSA_BITS_F32;
 
 struct ExponentialTables {
-    /// See `NormalTables::x`: kept for documentation, unused by sampling.
-    #[allow(dead_code)]
-    x: [f64; LAYERS],
-    f: [f64; LAYERS],
-    k: [u64; LAYERS],
+    /// See `NormalTables::w`: `mantissa as f64 * w[idx]` is the exact accepted value.
     w: [f64; LAYERS],
-    /// `k`/`w` rescaled for `next_exponential_zig_f32`'s narrower 23-bit mantissa (`dtype`
-    /// `np.float32`'s own word width, see that function's doc), built from the same `x[]`.
-    k32: [u32; LAYERS],
+    k: [u64; LAYERS],
+    /// `exp_pdf(x[idx])` where `x[idx] = w[idx] * 2**53`, used by the wedge test.
+    f: [f64; LAYERS],
+    /// `w`/`k` rescaled for `next_exponential_zig_f32`'s narrower 23-bit mantissa.
     w32: [f64; LAYERS],
+    k32: [u32; LAYERS],
+    /// The tail cutoff, `x[255]`.
     r: f64,
 }
 
@@ -430,110 +1279,25 @@ fn exp_pdf(x: f64) -> f64 {
     (-x).exp()
 }
 
-/// Builds the exponential ziggurat's layer tables the same way `build_normal` builds the
-/// Gaussian's: bisect the balance equations for the tail cutoff `r`, then recurse the layer
-/// boundaries in from `x[255] = r`. Unlike the Gaussian tail, `exp(-x)`'s tail integral beyond
-/// `r` has the closed form `exp(-r)` (no numerical integration needed), so `area = exp(-r) * (r +
-/// 1)` is exact up to `f64` rounding of that one expression — this table does not need `Dd`
-/// double-double carrying the way `build_normal`'s does.
-///
-/// **Accuracy**: this recursion and the bit layout below were confirmed against NumPy 2.5.3 the
-/// same way as the normal ziggurat's (see this module's doc): cloning `bit_generator.state`
-/// around single draws, and directly constructing raw PCG64 words (the `hi = 0` inversion trick)
-/// to probe specific `idx`/mantissa combinations. That probing places every recovered structural
-/// fact beyond doubt — `idx = (word >> 3) & 0xff`, mantissa = the top 53 bits (`word >> 11`), and
-/// layer `1`'s core is provably empty (`k[1] = 0`: bisecting the accept/reject mantissa boundary
-/// for layer `0`'s catch-all, and separately confirming layer `1` never accepts in one word at
-/// any mantissa from `0` to `2**53 - 1`, both point at an inner boundary of exactly `x = 0`, not a
-/// recursion-computed value, for the peak-adjoining layer) — but it did *not* converge on a
-/// bit-exact `x[]`/`w[]` table. Random core-accept draws (single raw word, no wedge fallback, so
-/// the returned value is exactly `mantissa * w[idx]` with no other floating-point step involved)
-/// mismatch NumPy's own output by 1-4 ULPs on the large majority of layers, including layer `0`'s
-/// closed-form `w[0] = (r + 1) / 2**53`. Sweeping `r` across its neighboring `f64` values (`0.5`
-/// ULP steps) does not find one that fixes more than a fraction of the mismatches at once, so this
-/// is not a simple bisection-convergence or last-bit-of-`r` gap: it is the same shape of finding
-/// as the normal ziggurat's table (see that section of this module's doc), evidence this table is
-/// independently hard-coded in NumPy rather than reproducible from the published balance equations
-/// by any construction this module tried, including plain `f64`, Kahan-style accumulation, and
-/// `Decimal`-at-50-digits re-derivation of the whole recursion. `next_exponential_zig`'s bit
-/// layout and control flow (which word decides what, the core/wedge split, the tail's closed-form
-/// fallback) is exact; the table values it multiplies by are not, so
-/// `test_generator_exponential_and_gamma_streams` and
-/// `test_generator_single_precision_and_inverse_exponentials` still fail on their `method="zig"`
-/// assertions (their `method="inv"` assertions, which never touch this table, do pass).
 fn build_exponential() -> ExponentialTables {
-    let residual = |r: f64| -> Option<f64> {
-        let area = r * exp_pdf(r) + exp_pdf(r);
-        let mut x = [0.0f64; LAYERS];
-        x[LAYERS - 1] = r;
-        let mut prev_f = exp_pdf(r);
-        for i in (0..LAYERS - 1).rev() {
-            let value = prev_f + area / x[i + 1];
-            if value >= 1.0 {
-                return None;
-            }
-            x[i] = -value.ln();
-            prev_f = value;
-        }
-        Some(x[0] * (1.0 - exp_pdf(x[0])) - area)
-    };
-    let (mut lo, mut hi) = (5.0f64, 8.0f64);
-    for _ in 0..200 {
-        let mid = 0.5 * (lo + hi);
-        match residual(mid) {
-            None => lo = mid,
-            Some(_) => hi = mid,
-        }
-    }
-    let r = hi;
-    let area = r * exp_pdf(r) + exp_pdf(r);
-    let mut x = [0.0f64; LAYERS];
-    x[LAYERS - 1] = r;
-    let mut prev_f = exp_pdf(r);
-    for i in (0..LAYERS - 1).rev() {
-        let value = prev_f + area / x[i + 1];
-        x[i] = -value.ln();
-        prev_f = value;
-    }
-    let mut f = [0.0f64; LAYERS];
-    for i in 0..LAYERS {
-        f[i] = exp_pdf(x[i]);
-    }
     let scale = (1u64 << EXP_MANTISSA_BITS) as f64;
-    let mut w = [0.0f64; LAYERS];
-    let mut k = [0u64; LAYERS];
-    w[0] = (r + 1.0) / scale;
-    k[0] = (scale * r / (r + 1.0)) as u64;
-    // Layer 1's inner boundary is the peak itself (`x = 0`), not a table entry: its core is
-    // empty, confirmed by black-box observation (see this function's doc), not derived from the
-    // general `x[i - 1] / x[i]` ratio below (which would wrongly give a large core here since
-    // `x[0]`, computed above only to close the bisection, is a nonzero recursion artifact).
-    k[1] = 0;
-    for i in 1..LAYERS {
-        w[i] = x[i] / scale;
-    }
-    for i in 2..LAYERS {
-        k[i] = (scale * x[i - 1] / x[i]) as u64;
-    }
-    let scale32 = (1u32 << EXP_MANTISSA_BITS_F32) as f64;
+    let mut f = [0.0f64; LAYERS];
     let mut w32 = [0.0f64; LAYERS];
     let mut k32 = [0u32; LAYERS];
-    w32[0] = (r + 1.0) / scale32;
-    k32[0] = (scale32 * r / (r + 1.0)) as u32;
-    k32[1] = 0;
-    for i in 1..LAYERS {
-        w32[i] = x[i] / scale32;
+    for i in 0..LAYERS {
+        let x = EXP_W[i] * scale;
+        f[i] = exp_pdf(x);
+        w32[i] = EXP_W[i] * (1u64 << EXP_MANTISSA_SHIFT_TO_32) as f64;
+        let k = EXP_K[i];
+        k32[i] = ((k + (1u64 << EXP_MANTISSA_SHIFT_TO_32) - 1) >> EXP_MANTISSA_SHIFT_TO_32) as u32;
     }
-    for i in 2..LAYERS {
-        k32[i] = (scale32 * x[i - 1] / x[i]) as u32;
-    }
+    let r = EXP_W[LAYERS - 1] * scale;
     ExponentialTables {
-        x,
+        w: EXP_W,
+        k: EXP_K,
         f,
-        k,
-        w,
-        k32,
         w32,
+        k32,
         r,
     }
 }
@@ -544,22 +1308,22 @@ fn exponential_tables() -> &'static ExponentialTables {
     EXPONENTIAL.get_or_init(build_exponential)
 }
 
-/// One standard exponential draw by the ziggurat method (`method="zig"`, the default). See
-/// `build_exponential`'s doc for the bit layout's black-box provenance and the table's remaining
-/// (unrecovered) ULP-level imprecision.
+/// One standard exponential draw by the ziggurat method (`method="zig"`, the default). Bit-exact
+/// against NumPy 2.5.3 (see the module doc for the recovered table, bit layout, and validation
+/// method, including the exponential tail's memoryless closed form).
 pub(in crate::python) fn next_exponential_zig(bitgen: &mut BitGen) -> f64 {
     let tables = exponential_tables();
     loop {
         let word = bitgen.next_u64();
         let idx = ((word >> 3) & 0xff) as usize;
         let mantissa = word >> 11;
-        let x = mantissa as f64 * tables.w[idx];
         if mantissa < tables.k[idx] {
-            return x;
+            return mantissa as f64 * tables.w[idx];
         }
         if idx == 0 {
-            return tables.r - bitgen.next_double().ln();
+            return tables.r - (1.0 - bitgen.next_double()).ln();
         }
+        let x = mantissa as f64 * tables.w[idx];
         let u = bitgen.next_double();
         if u * (tables.f[idx - 1] - tables.f[idx]) + tables.f[idx] < exp_pdf(x) {
             return x;
@@ -568,29 +1332,26 @@ pub(in crate::python) fn next_exponential_zig(bitgen: &mut BitGen) -> f64 {
 }
 
 /// One standard exponential draw at `dtype=np.float32`'s own precision, mirroring
-/// `next_gauss_f32`'s relationship to `next_gauss`: the same table (rescaled to `k32`/`w32`, see
-/// `ExponentialTables`'s doc), sampled from a 32-bit word. Recovered the same way as
-/// `next_exponential_zig`'s layout (see `build_exponential`'s doc): single-bit word scans on
-/// `next_u32()` found the fraction's low bit at 9 (bits 0-8 always drew `0.0`), and an idx-value
-/// scan (fixing the fraction at its own low bit and sweeping candidate idx values through 0..511)
-/// showed every *pair* of adjacent candidates mapped to the same output, i.e. `idx = (word >> 1) &
-/// 0xff`, not `word & 0xff` — one unused low bit, unlike `next_gauss_f32`'s zero unused low bits,
-/// an asymmetry this module found but cannot otherwise justify. `next_exponential_zig`'s
-/// table-precision caveat (see `build_exponential`'s doc) applies here too, since it draws from
-/// the same `x[]`.
+/// `next_gauss_f32`'s relationship to `next_gauss`: the same table (rescaled to `k32`/`w32`),
+/// sampled from a 32-bit word. `idx` sits at bits 1-8 here (one unused low bit, unlike
+/// `next_gauss_f32`'s zero), with the 23-bit mantissa immediately above at bit 9 — recovered the
+/// same way as `next_exponential_zig`'s layout (see the module doc).
 pub(in crate::python) fn next_exponential_zig_f32(bitgen: &mut BitGen) -> f64 {
     let tables = exponential_tables();
     loop {
         let word = bitgen.next_u32();
         let idx = ((word >> 1) & 0xff) as usize;
         let mantissa = word >> 9;
-        let x = f64::from(mantissa) * tables.w32[idx];
+        // Same native-`f32` multiplication as `next_gauss_f32`: NumPy computes
+        // `(mantissa as f32) * (w32[idx] as f32)`, not `f64::from(mantissa) * w32[idx]`.
+        let mantissa_f32 = mantissa as f32;
         if mantissa < tables.k32[idx] {
-            return x;
+            return f64::from(mantissa_f32 * tables.w32[idx] as f32);
         }
         if idx == 0 {
-            return tables.r - bitgen.next_double().ln();
+            return tables.r - (1.0 - bitgen.next_double()).ln();
         }
+        let x = f64::from(mantissa_f32 * tables.w32[idx] as f32);
         let u = bitgen.next_double();
         if u * (tables.f[idx - 1] - tables.f[idx]) + tables.f[idx] < exp_pdf(x) {
             return x;

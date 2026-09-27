@@ -501,6 +501,17 @@ fn normal_source_f32(gauss: &mut Option<(bool, f64)>) -> Box<dyn FnMut(&mut BitG
     }
 }
 
+/// `gamma::standard_gamma`'s exponential source for its `shape < 1` branch (see that module's
+/// doc): `Generator` draws it via the ziggurat, matching `standard_exponential`'s default method;
+/// legacy `RandomState` uses simple inversion, matching its own `standard_exponential`.
+fn exponential_source(gauss: &Option<(bool, f64)>) -> Box<dyn FnMut(&mut BitGen) -> f64> {
+    if is_legacy_gauss(gauss) {
+        Box::new(legacy::exponential)
+    } else {
+        Box::new(ziggurat::next_exponential_zig)
+    }
+}
+
 fn standard_normal_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_standard_normal_fill", 3, 3)?;
     let positional = args.positional().to_vec();
@@ -602,13 +613,19 @@ fn standard_gamma_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult 
         // `shape >= 1` draws normal deviates behind the scenes (Marsaglia-Tsang); matching
         // `standard_normal_fill`'s own dtype split keeps that source's word width consistent
         // with what a bare `standard_normal(dtype=...)` call would have consumed.
+        let mut exponential = exponential_source(&gauss);
         let mut source = if single {
             normal_source_f32(&mut gauss)
         } else {
             normal_source(&mut gauss)
         };
         for shape in &shapes {
-            values.push(gamma::standard_gamma(&mut bitgen, *shape, &mut *source));
+            values.push(gamma::standard_gamma(
+                &mut bitgen,
+                *shape,
+                &mut *source,
+                &mut *exponential,
+            ));
         }
     }
     let out = if single {
@@ -628,9 +645,10 @@ fn chisquare_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let (df, out_shape) = f64_params(runtime, positional[1])?;
     reserve_and_charge(runtime, DType::FLOAT64, df.len(), 8)?;
     let values: Vec<f64> = {
+        let mut exponential = exponential_source(&gauss);
         let mut source = normal_source(&mut gauss);
         df.iter()
-            .map(|df| gamma::chisquare(&mut bitgen, *df, &mut *source))
+            .map(|df| gamma::chisquare(&mut bitgen, *df, &mut *source, &mut *exponential))
             .collect()
     };
     let out = wrap_f64(runtime, out_shape, &values)?;
@@ -646,11 +664,14 @@ fn f_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let (dfden, _) = f64_params(runtime, positional[2])?;
     reserve_and_charge(runtime, DType::FLOAT64, dfnum.len(), 16)?;
     let values: Vec<f64> = {
+        let mut exponential = exponential_source(&gauss);
         let mut source = normal_source(&mut gauss);
         dfnum
             .iter()
             .zip(dfden.iter())
-            .map(|(num, den)| gamma::f_distribution(&mut bitgen, *num, *den, &mut *source))
+            .map(|(num, den)| {
+                gamma::f_distribution(&mut bitgen, *num, *den, &mut *source, &mut *exponential)
+            })
             .collect()
     };
     let out = wrap_f64(runtime, out_shape, &values)?;
@@ -665,9 +686,10 @@ fn standard_t_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let (df, out_shape) = f64_params(runtime, positional[1])?;
     reserve_and_charge(runtime, DType::FLOAT64, df.len(), 12)?;
     let values: Vec<f64> = {
+        let mut exponential = exponential_source(&gauss);
         let mut source = normal_source(&mut gauss);
         df.iter()
-            .map(|df| gamma::standard_t(&mut bitgen, *df, &mut *source))
+            .map(|df| gamma::standard_t(&mut bitgen, *df, &mut *source, &mut *exponential))
             .collect()
     };
     let out = wrap_f64(runtime, out_shape, &values)?;
