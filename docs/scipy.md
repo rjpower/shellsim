@@ -10,11 +10,16 @@ raise `NotImplementedError` when imported.
 - **Ufuncs.** Each `scipy.special` function is an entry in NumPy's ufunc table (see
   [numpy.md](numpy.md)), so broadcasting, `out=`, `where=`, `dtype=`, casting and scalar results
   behave as they do for NumPy's ufuncs. The native module `_scipy_special` exports them.
-- **Kernels** (`src/python/stdlib/scipy/special/`). The kernels are ports of the code SciPy 1.18
-  runs. Most functions come from Cephes, through SciPy's xsf library. `erfinv`, the incomplete
-  beta function and its inverse, the Student's t, F and binomial distributions, and `pdtrik`
-  come from Boost.Math, including its polynomial evaluation and root finders, so that results
-  round as SciPy's do. `NOTICE.md` lists the ported components and reproduces their licenses.
+- **Kernels** (`src/python/stdlib/scipy/special/`). The kernels are an independent
+  implementation of standard published algorithms, not a port of SciPy's Cephes- or
+  Boost.Math-derived code: the Lanczos approximation for `gamma`/`gammaln` (`gamma.rs`), a
+  series-plus-continued-fraction regularized incomplete gamma function (`igam.rs`) and a
+  continued-fraction regularized incomplete beta function (`ibeta.rs`) that every other
+  distribution function is built on, Peter Acklam's rational approximation refined by Halley's
+  method for `ndtri` (`erf.rs`), and Euler-Maclaurin summation for the Hurwitz and Riemann zeta
+  functions (`zeta.rs`). Matching SciPy's *values* (to about `1e-13` relative error) does not
+  require matching SciPy's *algorithms*, so results can differ from SciPy's by a few ULPs; see
+  "Deliberate differences" below for the specific, measured gaps.
 - **Frozen Python** (`src/python/stdlib/source/scipy/`). `scipy.special` star-imports the
   native module and adds the functions SciPy writes in Python: `zeta`, `comb`, `perm`,
   `factorial`, `factorial2`, `factorialk`, `logsumexp`, `softmax` and `log_softmax`. They
@@ -67,10 +72,10 @@ SciPy registers a `float32` loop and a `float64` loop for each function, and Num
 first loop that every input casts to safely. `float32`, `float16` and 8- and 16-bit integer
 inputs therefore compute in single precision. Wider integers and `float64` compute in double
 precision. `logit` registers its `float64` loop first, so only `float32` input selects single
-precision. `expit`, `logit`, `log_expit`, `xlogy` and `xlog1py` round every step to single
-precision, as xsf's templates do. The other single-precision loops compute in `f64` and round
-the result, as SciPy's Cephes-based loops do; see the deliberate differences for the Boost-based
-ones.
+precision. Every single-precision loop here computes in `f64` and rounds the final result, since
+a `float32` result correctly rounded from a `float64` computation meets this crate's accuracy
+target without a separate single-precision code path; see "Deliberate differences" for where
+this differs from SciPy's own `float32` loops in the last place.
 
 `bdtr` and `bdtrc` also have a loop that takes the trial count `n` as an integer. When a call
 selects a loop with a floating-point `n`, it issues SciPy's `DeprecationWarning`.
@@ -132,37 +137,36 @@ Cargo runs them under shellsim's pytest alongside the NumPy suites; see
 `tests/python/scipy.rs` holds shellsim-only checks for the unsupported frontier and resource
 limits.
 
-The reference is SciPy's x86-64 build. There Boost evaluates its Lanczos sums with SSE2
-instructions, which shellsim reproduces; SciPy's ARM builds round those sums differently, so
-their Boost-based results can differ from shellsim's and from each other in the last place.
 The exact `scipy.linalg` expectations were measured on the reference machine described above;
 on a CPU for which OpenBLAS selects other kernels, SciPy itself rounds the order-12 and
-order-70 cases differently.
+order-70 cases differently. `scipy.special`'s kernels are architecture-independent (plain `f64`
+arithmetic, no vendored SIMD sums), so its expectations do not depend on the reference machine.
 
 ## Deliberate differences
 
 - **`bdtr` and `bdtrc` warnings.** SciPy warns once for each element with a floating-point `n`;
   shellsim warns once per call. Under the default filters, both show a single warning.
-- **`bdtr` and `bdtrc` precision.** shellsim evaluates both through Boost's incomplete beta
-  function, where SciPy uses Cephes' `incbet`. The results agree less closely as `n` grows; at
-  `n = 1000` their relative difference reaches about `7e-13`.
-- **Single precision in the Boost-based functions.** For `float32` input, SciPy runs Boost's
-  `erfinv`, `betainc`, `betaincc`, `betaincinv`, `stdtr`, `stdtrit`, `fdtr`, `fdtrc`, `fdtri`,
-  `pdtrik` and binomial functions in single precision. shellsim computes them in double
-  precision and rounds the result, which is at least as accurate but differs from SciPy's
-  `float32` result in the last place for about half of all arguments.
-- **Gamma functions inside the Boost ports.** Where Boost's incomplete beta, t, F and Poisson
-  code calls Boost's own `tgamma`, `lgamma`, `erfc` and incomplete gamma functions, shellsim
-  calls their Cephes ports. `erfinv` and the binomial functions agree with SciPy exactly; for
-  `betainc`, `betaincinv`, `stdtr`, `stdtrit`, `fdtr` and `fdtri`, about 5% to 40% of
-  results differ in the last few places, by at most about `5e-14` relatively. `pdtrik` solves
-  for a root of a function that can be very flat, which magnifies the difference to about
-  `1e-11`.
-- **`betaincc` in extended precision.** SciPy calls Boost's `ibetac` with Boost's default
-  policy, which on x86-64 computes in 80-bit `long double`. shellsim computes Boost's algorithm
-  in double precision, so most results differ in the last place, and results below about
-  `1e-280` lose up to half their digits or underflow to zero where SciPy's do not. The
-  `pearsonr` p-value goes through `betaincc`, so it can differ from SciPy's in the last place.
+- **Precision of the iterative kernels.** shellsim's incomplete gamma, incomplete beta and
+  Hurwitz zeta functions (`igam.rs`, `ibeta.rs`, `zeta.rs`) are independent series and
+  continued-fraction implementations, not ports of SciPy's Cephes or Boost.Math code, so they do
+  not reproduce SciPy's rounding bit-for-bit. Every function everywhere in `scipy.special`
+  targets, and in spot checks over its domain meets, about `1e-13` relative error against SciPy
+  1.18.1; most arguments agree to within a few `f64` ULPs (for example `betainc(5, 200, 0.03)`
+  differs by about `3e-15` relatively, `stdtrit(7, 0.01)` by about `1e-16`). `gamma` and `binom`
+  on small integer arguments, and `poch` on integer `k`, use an exact product instead of the
+  general log-domain path and so agree with SciPy exactly. The `_binom_ppf` discrete search can
+  differ from SciPy's at the extreme tail (below about `1e-300`) where `cdf` underflows almost
+  to zero over several consecutive `k`; there is no simple rule for which `k` either
+  implementation's search lands on, so `tests/python/scipy/test_special.py` only pins the exact
+  value down to where both agree.
+- **Single-precision loops.** SciPy's `float32` loops for the Boost- and xsf-templated
+  functions (`erfinv`, `betainc`, `betaincc`, `betaincinv`, `stdtr`, `stdtrit`, `fdtr`, `fdtrc`,
+  `fdtri`, `pdtrik`, the binomial functions, `expit`, `logit`, `log_expit`, `xlogy` and
+  `xlog1py`) round every intermediate step to single precision; shellsim computes every function
+  in `f64` and rounds only the final result (see "Loop selection" above). Both are within
+  `float32` precision of the true value, but can differ from each other in the last one or two
+  bits, for example `expit` of a `float32` array disagreeing with SciPy in the last mantissa bit
+  at one of eight sample points checked during development.
 - **`scipy.stats` result objects** unpack, index and compare like SciPy's named tuples, but
   they are not `tuple` instances, because shellsim cannot subclass `tuple`.
 - **`scipy.stats` warning locations.** Each statistic calls its axis and NaN handling from a

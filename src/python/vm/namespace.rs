@@ -466,7 +466,10 @@ impl Vm<'_> {
             )
         })?;
         let code = super::super::compiler::compile(program);
-        let is_package = path.ends_with("/__init__.py");
+        // A frozen module's path is a synthetic `<frozen name>` marker, not a real file path, so
+        // package-ness for it comes from the frozen registry instead of a `/__init__.py` suffix.
+        let is_package =
+            path.ends_with("/__init__.py") || super::super::stdlib::frozen_module_is_package(&name);
         let package_name = if is_package {
             name.clone()
         } else {

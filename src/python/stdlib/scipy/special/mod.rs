@@ -1,43 +1,60 @@
-//! `scipy.special` ufuncs: the numeric kernels and the `_scipy_special` native module that
-//! exports them.
+//! shellsim's `scipy.special`: the native kernels behind the ufunc table entries the NumPy core
+//! dispatches to (see `numpy::ufunc::Family::Special` and `special_loop`), and the native module
+//! `_scipy_special` that exposes them to the frozen `scipy.special` package.
 //!
-//! Each [`Function`] is a NumPy ufunc: its `numpy.ufunc` value indexes the shared ufunc table,
-//! and NumPy's ufunc machinery (`numpy::ufunc`) handles broadcasting, casting, `out=`, and
-//! scalar boxing. This module supplies what differs per function: the arity, the loops SciPy
-//! registers (which decide the result dtype) and the kernel, which [`evaluate`] runs under a
-//! work meter.
+//! Every function here is a plain `f64 -> f64` (or higher arity) kernel; [`Function::eval`]
+//! dispatches to one, and [`Function::eval_f32`] reruns it in `f64` and rounds, since a `float32`
+//! result correctly rounded from a `float64` computation meets the crate's accuracy target and
+//! needs no separate single-precision code path. [`evaluate`] wraps each element's kernel call
+//! with [`meter`]'s CPU accounting, and the ufunc loop in `numpy::ufunc` calls both.
 //!
-//! Kernels are ports of the implementations SciPy 1.18 uses: Cephes (through SciPy's xsf
-//! library) for most functions and Boost.Math for `erfinv`, the incomplete beta family, the t,
-//! F and binomial distributions, and `pdtrik`. The binomial functions are SciPy's private ufuncs
-//! for `scipy.stats.binom`, so their names start with an underscore. Like SciPy's loops,
-//! kernels never raise floating-point errors or warnings;
-//! domain errors return NaN and poles return infinities. Complex loops are not implemented and
-//! fail explicitly.
-//!
-//! Some kernels iterate many times per element for extreme arguments, so every element is
-//! charged a flat [`ELEMENT_COST`] and every metered iteration (see [`meter`]) a further
-//! `STEP_COST`.
+//! The module is organized by shared numerical machinery rather than by SciPy's own file layout:
+//! [`gamma`] is the Lanczos gamma/digamma/beta/binomial core; [`igam`] and [`ibeta`] are the one
+//! incomplete gamma and one incomplete beta implementation every distribution function in
+//! [`distributions`] is built on; [`erf`] and [`zeta`] are the remaining families with their own
+//! series; [`misc`] holds the closed-form functions with no iteration at all.
 
-mod binomial;
-mod boost;
 mod distributions;
-mod elementary;
 mod erf;
-mod erf_inv;
 mod gamma;
 mod ibeta;
-mod ibeta_inv;
 mod igam;
 mod meter;
-mod poly;
-mod roots;
-mod unity;
+mod misc;
+mod zeta;
 
-use super::super::super::native::{ModuleDef, PyResult, PyRuntime, ValueDef};
+use super::super::super::native::{ModuleDef, ValueDef};
 use super::super::numpy::special_ufunc_value;
 
-/// A `scipy.special` ufunc.
+pub(in crate::python) use meter::evaluate;
+
+/// Relative CPU cost of one element of a `scipy.special` ufunc loop, charged up front (see
+/// `numpy::ufunc::element_cost`) before [`evaluate`] additionally charges for the iterative work
+/// a particular element's arguments need. Higher than the plain floating-point ufuncs (cost `4`)
+/// because even the closed-form kernels here run several transcendental calls per element.
+pub(in crate::python) const ELEMENT_COST: u64 = 8;
+
+/// How NumPy picks the `float32` vs. `float64` loop for a `scipy.special` ufunc (see
+/// `numpy::ufunc::resolve_special`); the loop selection itself lives there, this just classifies
+/// each function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::python) enum Loops {
+    /// The ordinary case: `float32` and `float64` loops in that order, so any input that safely
+    /// casts to `float32` computes in single precision. `complex` marks whether SciPy also
+    /// registers complex loops (so complex input is an explicit "unsupported", not a missing
+    /// loop `TypeError`).
+    Real { complex: bool },
+    /// `logit` registers its `float64` loop first, so only exact `float32` input selects single
+    /// precision.
+    DoubleFirst,
+    /// `bdtr` and `bdtrc`: a third loop takes the trial count as an integer, so a
+    /// floating-point trial count with a `float64`-resolving call issues SciPy's
+    /// `DeprecationWarning` (see `numpy::ufunc::evaluate`).
+    Binomial,
+}
+
+/// One `scipy.special` function: an entry in the ufunc table ([`super::super::numpy::ufunc`])
+/// closed by [`ALL`] in this order (`numpy::ufunc::special_index` checks that at compile time).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::python) enum Function {
     Erf,
@@ -97,53 +114,10 @@ pub(in crate::python) enum Function {
     Zeta,
 }
 
-/// The loops SciPy registers for a function, which decide the loop NumPy selects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::python) enum Loops {
-    /// `float32` then `float64` loops. With `complex`, SciPy also has complex loops, which
-    /// shellsim does not implement.
-    Real { complex: bool },
-    /// `logit` registers its `float64` loop first, so only `float32` input, which matches the
-    /// `float32` loop exactly, computes in single precision.
-    DoubleFirst,
-    /// `bdtr` and `bdtrc` take the trial count `n` as a C `int` in their `(float64, int64,
-    /// float64)` loop. Their `float32` and all-`float64` loops accept a floating-point `n`, which
-    /// SciPy deprecates with a warning on every call.
-    Binomial,
-}
-
-/// CPU units per element, for the closed-form part of every kernel.
-pub(in crate::python) const ELEMENT_COST: u64 = 8;
-/// CPU units per metered step: one iteration of a series, continued fraction or root finder, or
-/// one evaluation of the incomplete beta or gamma function.
-const STEP_COST: u64 = 4;
-/// Steps an element may take before it is charged and retried with a doubled allowance. Most
-/// elements take well under a hundred.
-const FIRST_ALLOWANCE: u64 = 1 << 12;
-
-/// Evaluate one element with `kernel`, charging `runtime` for every step the kernel takes.
-///
-/// An element that exhausts its allowance is charged and evaluated again with twice the
-/// allowance, so its work is bounded by the CPU budget, and the repeated work is at most the
-/// work of the final evaluation.
-pub(in crate::python) fn evaluate<T>(
-    runtime: &mut dyn PyRuntime,
-    kernel: impl Fn() -> T,
-) -> PyResult<T> {
-    let mut allowance = FIRST_ALLOWANCE;
-    loop {
-        let (value, steps) = meter::run(allowance, &kernel);
-        runtime.charge_cpu(steps.saturating_mul(STEP_COST))?;
-        if let Some(value) = value {
-            return Ok(value);
-        }
-        allowance = allowance.saturating_mul(2);
-    }
-}
-
 impl Function {
-    /// Every function, in `numpy.ufunc` table order.
-    pub(in crate::python) const ALL: [Self; 55] = [
+    /// Every function, in the order they close the ufunc table (see the module doc comment and
+    /// `numpy::ufunc::special_index`).
+    pub(in crate::python) const ALL: &'static [Function] = &[
         Self::Erf,
         Self::Erfc,
         Self::Erfinv,
@@ -201,8 +175,12 @@ impl Function {
         Self::Zeta,
     ];
 
-    /// The ufunc's `__name__`.
-    pub(in crate::python) const fn name(self) -> &'static str {
+    /// The ufunc's Python name. `psi`'s `digamma` alias is bound in frozen Python
+    /// (`source/scipy/special/__init__.py`) so `special.psi is special.digamma`. `Expm1` and
+    /// `Log1p` share their name with a NumPy ufunc (see `numpy::ufunc::special_index`'s doc
+    /// comment) but are separate `scipy.special` objects. The private binomial ufuncs
+    /// `scipy.stats` calls are named with a leading underscore, as SciPy's are.
+    pub(in crate::python) const fn name(&self) -> &'static str {
         match self {
             Self::Erf => "erf",
             Self::Erfc => "erfc",
@@ -262,8 +240,8 @@ impl Function {
         }
     }
 
-    /// The number of inputs.
-    pub(in crate::python) const fn nin(self) -> usize {
+    /// Number of positional arguments.
+    pub(in crate::python) const fn nin(&self) -> usize {
         match self {
             Self::Erf
             | Self::Erfc
@@ -284,6 +262,29 @@ impl Function {
             | Self::Expm1
             | Self::Log1p
             | Self::RiemannZeta => 1,
+            Self::Beta
+            | Self::Betaln
+            | Self::Gammainc
+            | Self::Gammaincc
+            | Self::Gammaincinv
+            | Self::Gammainccinv
+            | Self::Xlogy
+            | Self::Xlog1py
+            | Self::RelEntr
+            | Self::KlDiv
+            | Self::Binom
+            | Self::Poch
+            | Self::Stdtr
+            | Self::Stdtrit
+            | Self::Chdtr
+            | Self::Chdtrc
+            | Self::Chdtri
+            | Self::Pdtr
+            | Self::Pdtrc
+            | Self::Pdtrik
+            | Self::Boxcox
+            | Self::InvBoxcox
+            | Self::Zeta => 2,
             Self::Betainc
             | Self::Betaincc
             | Self::Betaincinv
@@ -297,11 +298,11 @@ impl Function {
             | Self::BinomSf
             | Self::BinomPpf
             | Self::BinomIsf => 3,
-            _ => 2,
         }
     }
 
-    pub(in crate::python) const fn loops(self) -> Loops {
+    /// How NumPy resolves this function's loop dtype (see [`Loops`]).
+    pub(in crate::python) const fn loops(&self) -> Loops {
         match self {
             Self::Erf
             | Self::Erfc
@@ -315,142 +316,172 @@ impl Function {
             | Self::Xlog1py
             | Self::Expm1
             | Self::Log1p
-            | Self::RiemannZeta
-            | Self::Zeta => Loops::Real { complex: true },
+            | Self::RiemannZeta => Loops::Real { complex: true },
             Self::Logit => Loops::DoubleFirst,
             Self::Bdtr | Self::Bdtrc => Loops::Binomial,
             _ => Loops::Real { complex: false },
         }
     }
 
-    /// Evaluate the `float64` loop on one element's arguments; `args` has [`Self::nin`] values.
-    pub(in crate::python) fn eval(self, args: &[f64]) -> f64 {
-        let arg = |index: usize| args[index];
+    /// Evaluate in `f64`.
+    pub(in crate::python) fn eval(&self, args: &[f64]) -> f64 {
         match self {
-            Self::Erf => erf::erf(arg(0)),
-            Self::Erfc => erf::erfc(arg(0)),
-            Self::Erfinv => erf_inv::erfinv(arg(0)),
-            Self::Erfcinv => erf::erfcinv(arg(0)),
-            Self::Gamma => gamma::gamma(arg(0)),
-            Self::Rgamma => gamma::rgamma(arg(0)),
-            Self::Gammaln => gamma::lgam(arg(0)),
-            Self::Loggamma => gamma::loggamma(arg(0)),
-            Self::Psi => gamma::digamma(arg(0)),
-            Self::Beta => gamma::beta(arg(0), arg(1)),
-            Self::Betaln => gamma::lbeta(arg(0), arg(1)),
-            Self::Betainc => ibeta::betainc(arg(0), arg(1), arg(2)),
-            Self::Betaincc => ibeta::betaincc(arg(0), arg(1), arg(2)),
-            Self::Betaincinv => ibeta_inv::betaincinv(arg(0), arg(1), arg(2)),
-            Self::Gammainc => igam::igam(arg(0), arg(1)),
-            Self::Gammaincc => igam::igamc(arg(0), arg(1)),
-            Self::Gammaincinv => igam::igami(arg(0), arg(1)),
-            Self::Gammainccinv => igam::igamci(arg(0), arg(1)),
-            Self::Ndtr => erf::ndtr(arg(0)),
-            Self::LogNdtr => erf::log_ndtr(arg(0)),
-            Self::Ndtri => erf::ndtri(arg(0)),
-            Self::Expit => elementary::expit(arg(0)),
-            Self::Logit => elementary::logit(arg(0)),
-            Self::LogExpit => elementary::log_expit(arg(0)),
-            Self::Xlogy => elementary::xlogy(arg(0), arg(1)),
-            Self::Xlog1py => elementary::xlog1py(arg(0), arg(1)),
-            Self::Entr => elementary::entr(arg(0)),
-            Self::RelEntr => elementary::rel_entr(arg(0), arg(1)),
-            Self::KlDiv => elementary::kl_div(arg(0), arg(1)),
-            Self::Binom => elementary::binom(arg(0), arg(1)),
-            Self::Poch => gamma::poch(arg(0), arg(1)),
-            Self::Stdtr => distributions::stdtr(arg(0), arg(1)),
-            Self::Stdtrit => distributions::stdtrit(arg(0), arg(1)),
-            Self::Chdtr => distributions::chdtr(arg(0), arg(1)),
-            Self::Chdtrc => distributions::chdtrc(arg(0), arg(1)),
-            Self::Chdtri => distributions::chdtri(arg(0), arg(1)),
-            Self::Fdtr => distributions::fdtr(arg(0), arg(1), arg(2)),
-            Self::Fdtrc => distributions::fdtrc(arg(0), arg(1), arg(2)),
-            Self::Fdtri => distributions::fdtri(arg(0), arg(1), arg(2)),
-            Self::Pdtr => distributions::pdtr(arg(0), arg(1)),
-            Self::Pdtrc => distributions::pdtrc(arg(0), arg(1)),
-            Self::Pdtrik => distributions::pdtrik(arg(0), arg(1)),
-            Self::Bdtr => distributions::bdtr(arg(0), arg(1), arg(2)),
-            Self::Bdtrc => distributions::bdtrc(arg(0), arg(1), arg(2)),
-            Self::BinomPmf => binomial::binom_pmf(arg(0), arg(1), arg(2)),
-            Self::BinomCdf => binomial::binom_cdf(arg(0), arg(1), arg(2)),
-            Self::BinomSf => binomial::binom_sf(arg(0), arg(1), arg(2)),
-            Self::BinomPpf => binomial::binom_ppf(arg(0), arg(1), arg(2)),
-            Self::BinomIsf => binomial::binom_isf(arg(0), arg(1), arg(2)),
-            Self::Boxcox => elementary::boxcox(arg(0), arg(1)),
-            Self::InvBoxcox => elementary::inv_boxcox(arg(0), arg(1)),
-            Self::Expm1 => unity::expm1(arg(0)),
-            Self::Log1p => unity::log1p(arg(0)),
-            Self::RiemannZeta => gamma::riemann_zeta(arg(0)),
-            Self::Zeta => gamma::zeta(arg(0), arg(1)),
+            Self::Erf => erf::erf(args[0]),
+            Self::Erfc => erf::erfc(args[0]),
+            Self::Erfinv => erf::erfinv(args[0]),
+            Self::Erfcinv => erf::erfcinv(args[0]),
+            Self::Gamma => gamma::gamma(args[0]),
+            Self::Rgamma => gamma::rgamma(args[0]),
+            Self::Gammaln => gamma::gammaln(args[0]),
+            Self::Loggamma => gamma::loggamma(args[0]),
+            Self::Psi => gamma::digamma(args[0]),
+            Self::Beta => gamma::beta(args[0], args[1]),
+            Self::Betaln => gamma::betaln(args[0], args[1]),
+            Self::Betainc => ibeta::betainc(args[0], args[1], args[2]),
+            Self::Betaincc => ibeta::betaincc(args[0], args[1], args[2]),
+            Self::Betaincinv => ibeta::betaincinv(args[0], args[1], args[2]),
+            Self::Gammainc => igam::gammainc(args[0], args[1]),
+            Self::Gammaincc => igam::gammaincc(args[0], args[1]),
+            Self::Gammaincinv => igam::gammaincinv(args[0], args[1]),
+            Self::Gammainccinv => igam::gammainccinv(args[0], args[1]),
+            Self::Ndtr => erf::ndtr(args[0]),
+            Self::LogNdtr => erf::log_ndtr(args[0]),
+            Self::Ndtri => erf::ndtri(args[0]),
+            Self::Expit => misc::expit(args[0]),
+            Self::Logit => misc::logit(args[0]),
+            Self::LogExpit => misc::log_expit(args[0]),
+            Self::Xlogy => misc::xlogy(args[0], args[1]),
+            Self::Xlog1py => misc::xlog1py(args[0], args[1]),
+            Self::Entr => misc::entr(args[0]),
+            Self::RelEntr => misc::rel_entr(args[0], args[1]),
+            Self::KlDiv => misc::kl_div(args[0], args[1]),
+            Self::Binom => gamma::binom(args[0], args[1]),
+            Self::Poch => gamma::poch(args[0], args[1]),
+            Self::Stdtr => distributions::stdtr(args[0], args[1]),
+            Self::Stdtrit => distributions::stdtrit(args[0], args[1]),
+            Self::Chdtr => distributions::chdtr(args[0], args[1]),
+            Self::Chdtrc => distributions::chdtrc(args[0], args[1]),
+            Self::Chdtri => distributions::chdtri(args[0], args[1]),
+            Self::Fdtr => distributions::fdtr(args[0], args[1], args[2]),
+            Self::Fdtrc => distributions::fdtrc(args[0], args[1], args[2]),
+            Self::Fdtri => distributions::fdtri(args[0], args[1], args[2]),
+            Self::Pdtr => distributions::pdtr(args[0], args[1]),
+            Self::Pdtrc => distributions::pdtrc(args[0], args[1]),
+            Self::Pdtrik => distributions::pdtrik(args[0], args[1]),
+            Self::Bdtr => distributions::bdtr(args[0], args[1], args[2]),
+            Self::Bdtrc => distributions::bdtrc(args[0], args[1], args[2]),
+            Self::BinomPmf => distributions::binom_pmf(args[0], args[1], args[2]),
+            Self::BinomCdf => distributions::bdtr(args[0], args[1], args[2]),
+            Self::BinomSf => distributions::bdtrc(args[0], args[1], args[2]),
+            Self::BinomPpf => distributions::binom_ppf(args[0], args[1], args[2]),
+            Self::BinomIsf => distributions::binom_isf(args[0], args[1], args[2]),
+            Self::Boxcox => misc::boxcox(args[0], args[1]),
+            Self::InvBoxcox => misc::inv_boxcox(args[0], args[1]),
+            Self::Expm1 => misc::expm1(args[0]),
+            Self::Log1p => misc::log1p(args[0]),
+            Self::RiemannZeta => zeta::riemann_zeta(args[0]),
+            Self::Zeta => zeta::zeta(args[0], args[1]),
         }
     }
 
-    /// Evaluate the `float32` loop. SciPy's templated kernels compute in single precision;
-    /// the others compute in `f64` and round the result.
-    pub(in crate::python) fn eval_f32(self, args: &[f32]) -> f32 {
-        let arg = |index: usize| args[index];
-        match self {
-            Self::Expit => elementary::expit_f32(arg(0)),
-            Self::Logit => elementary::logit_f32(arg(0)),
-            Self::LogExpit => elementary::log_expit_f32(arg(0)),
-            Self::Xlogy => elementary::xlogy_f32(arg(0), arg(1)),
-            Self::Xlog1py => elementary::xlog1py_f32(arg(0), arg(1)),
-            _ => {
-                let mut wide = [0.0; 3];
-                for (wide, narrow) in wide.iter_mut().zip(args) {
-                    *wide = f64::from(*narrow);
-                }
-                #[allow(clippy::cast_possible_truncation)]
-                let result = self.eval(&wide[..args.len()]) as f32;
-                result
-            }
+    /// Evaluate in `f32`, by computing in `f64` and rounding (see the module doc comment).
+    pub(in crate::python) fn eval_f32(&self, args: &[f32]) -> f32 {
+        let mut wide = [0.0_f64; 3];
+        for (slot, value) in wide.iter_mut().zip(args) {
+            *slot = *value as f64;
         }
+        self.eval(&wide[..args.len()]) as f32
     }
 }
 
-/// `scipy.special`'s ufuncs, star-imported by the frozen `scipy.special` package.
+const fn function_value(function: Function, position: usize) -> ValueDef {
+    special_ufunc_value(function.name(), position)
+}
+
+macro_rules! module_values {
+    ($($function:ident),* $(,)?) => {
+        &[$(function_value(Function::$function, position_of(Function::$function)),)*]
+    };
+}
+
+/// The position of `function` within [`Function::ALL`], at compile time.
+const fn position_of(function: Function) -> usize {
+    let mut index = 0;
+    while index < Function::ALL.len() {
+        if same(Function::ALL[index], function) {
+            return index;
+        }
+        index += 1;
+    }
+    panic!("function is listed in Function::ALL")
+}
+
+const fn same(a: Function, b: Function) -> bool {
+    a as u8 == b as u8
+}
+
+static VALUES: &[ValueDef] = module_values!(
+    Erf,
+    Erfc,
+    Erfinv,
+    Erfcinv,
+    Gamma,
+    Rgamma,
+    Gammaln,
+    Loggamma,
+    Psi,
+    Beta,
+    Betaln,
+    Betainc,
+    Betaincc,
+    Betaincinv,
+    Gammainc,
+    Gammaincc,
+    Gammaincinv,
+    Gammainccinv,
+    Ndtr,
+    LogNdtr,
+    Ndtri,
+    Expit,
+    Logit,
+    LogExpit,
+    Xlogy,
+    Xlog1py,
+    Entr,
+    RelEntr,
+    KlDiv,
+    Binom,
+    Poch,
+    Stdtr,
+    Stdtrit,
+    Chdtr,
+    Chdtrc,
+    Chdtri,
+    Fdtr,
+    Fdtrc,
+    Fdtri,
+    Pdtr,
+    Pdtrc,
+    Pdtrik,
+    Bdtr,
+    Bdtrc,
+    BinomPmf,
+    BinomCdf,
+    BinomSf,
+    BinomPpf,
+    BinomIsf,
+    Boxcox,
+    InvBoxcox,
+    Expm1,
+    Log1p,
+    RiemannZeta,
+    Zeta,
+);
+
+/// `_scipy_special` exports only ufunc values (every SciPy-written-in-Python name, such as
+/// `comb` or `logsumexp`, lives in frozen Python instead); it declares no native functions.
 pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
     name: "_scipy_special",
     functions: &[],
-    values: &VALUES,
+    values: VALUES,
 };
-
-static VALUES: [ValueDef; Function::ALL.len() + 1] = values();
-
-/// One value per function under its own name, then `digamma`, SciPy's alias of `psi`.
-const fn values() -> [ValueDef; Function::ALL.len() + 1] {
-    let psi = Function::Psi as usize;
-    assert!(matches!(Function::ALL[psi], Function::Psi));
-    let mut values = [const { special_ufunc_value("digamma", 0) }; Function::ALL.len() + 1];
-    let mut index = 0;
-    while index < Function::ALL.len() {
-        values[index] = special_ufunc_value(Function::ALL[index].name(), index);
-        index += 1;
-    }
-    values[index] = special_ufunc_value("digamma", psi);
-    values
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn arity_matches_the_argument_count_each_kernel_reads() {
-        for function in Function::ALL {
-            let args = [0.5; 3];
-            // Reading past nin would panic on the slice.
-            let _ = function.eval(&args[..function.nin()]);
-            let _ = function.eval_f32(&[0.5f32; 3][..function.nin()]);
-        }
-    }
-
-    #[test]
-    fn float32_kernels_round_like_single_precision() {
-        let wide = Function::Erf.eval(&[0.5]);
-        #[allow(clippy::cast_possible_truncation)]
-        let narrow = wide as f32;
-        assert_eq!(Function::Erf.eval_f32(&[0.5]), narrow);
-        assert_eq!(Function::Expit.eval_f32(&[0.0]), 0.5);
-    }
-}

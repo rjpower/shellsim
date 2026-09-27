@@ -12,10 +12,7 @@ below, which require these notices to accompany source and binary distributions.
 | Ziggurat | The ziggurat method derived from Julia, in NumPy's distributions | `src/python/stdlib/numpy/random/ziggurat.rs` | MIT |
 | MT19937 | Mersenne Twister by Makoto Matsumoto and Takuji Nishimura, with Jean-Sebastien Roy's randomkit | `src/python/stdlib/numpy/random/bitgen.rs` | BSD-3-Clause and MIT |
 | PCG64 | PCG by Melissa O'Neill | `src/python/stdlib/numpy/random/bitgen.rs` | MIT |
-| SciPy | SciPy 1.18 Python and Cython sources | `src/python/stdlib/scipy/`, `src/python/stdlib/source/scipy/` | BSD-3-Clause |
-| xsf | SciPy's special-function library | `src/python/stdlib/scipy/special/` | BSD-3-Clause |
-| Cephes | Stephen L. Moshier's Cephes Math Library, as distributed in xsf | `src/python/stdlib/scipy/special/` | BSD-3-Clause |
-| Boost.Math | The incomplete beta function and its inverse, the Student's t, F and binomial distributions, the inverse error function, the inverse incomplete gamma functions, the Lanczos approximation with its SSE2 evaluation, polynomial evaluation, and the TOMS 748 and discrete-quantile root finders, as used by SciPy and xsf | `src/python/stdlib/scipy/special/binomial.rs`, `boost.rs`, `distributions.rs`, `erf_inv.rs`, `gamma.rs`, `ibeta.rs`, `ibeta_inv.rs`, `igam.rs`, `roots.rs` | BSL-1.0 |
+| SciPy | SciPy 1.18 Python and Cython sources | `src/python/stdlib/scipy/`, `src/python/stdlib/source/scipy/` (excluding `scipy/special/`, an independent implementation; see `docs/scipy.md`) | BSD-3-Clause |
 | OpenBLAS | OpenBLAS 0.3 kernels (`ddot`, `daxpy`, `dgemv`) and its implementations of `getf2`, `potf2`, `lauu2`, `trti2`, `getrs` and `trtrs` | `src/python/stdlib/scipy/linalg/openblas.rs`, `src/python/stdlib/scipy/linalg/lapack.rs`, `src/python/stdlib/numpy/linalg/` | BSD-3-Clause |
 | GotoBLAS2 | The level-2 and level-3 drivers OpenBLAS inherits from GotoBLAS2 (`trsv`, `trmv`, `trsm` and their threading) | `src/python/stdlib/scipy/linalg/openblas.rs`, `src/python/stdlib/scipy/linalg/lapack.rs` | BSD-2-Clause |
 | LAPACK | Reference LAPACK 3.12 and the reference BLAS, as SciPy's OpenBLAS runs them | `src/python/stdlib/scipy/linalg/lapack.rs`, `src/python/stdlib/numpy/linalg/` | BSD-3-Clause |
@@ -353,111 +350,6 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
-
-## xsf
-
-```text
-BSD 3-Clause License
-
-Copyright (c) 2024, SciPy
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-1. Redistributions of source code must retain the above copyright notice, this
-   list of conditions and the following disclaimer.
-
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
-
-3. Neither the name of the copyright holder nor the names of its
-   contributors may be used to endorse or promote products derived from
-   this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
-
-## Cephes
-
-xsf distributes Cephes under the 3-clause BSD license with the author's permission; see
-https://lists.debian.org/debian-legal/2004/12/msg00295.html.
-
-```text
-Cephes Math Library Release 2.8:  June, 2000
-Copyright 1984, 1995, 2000 by Stephen L. Moshier
-
-This software is derived from the Cephes Math Library and is
-incorporated herein by permission of the author.
-
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-    * Redistributions of source code must retain the above copyright
-      notice, this list of conditions and the following disclaimer.
-    * Redistributions in binary form must reproduce the above copyright
-      notice, this list of conditions and the following disclaimer in the
-      documentation and/or other materials provided with the distribution.
-    * Neither the name of the <organization> nor the
-      names of its contributors may be used to endorse or promote products
-      derived from this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL <COPYRIGHT HOLDER> BE LIABLE FOR ANY
-DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
-
-## Boost.Math
-
-```text
-(C) Copyright John Maddock 2006-7, 2013-20.
-(C) Copyright Paul A. Bristow 2006-7, 2012-14, 2017.
-(C) Copyright Thomas Mang 2012.
-(C) Copyright Nikhar Agrawal 2013-14.
-(C) Copyright Christopher Kormanyos 2013-14, 2020, 2024.
-(C) Copyright Matt Borland 2024.
-
-Boost Software License - Version 1.0 - August 17th, 2003
-
-Permission is hereby granted, free of charge, to any person or organization
-obtaining a copy of the software and accompanying documentation covered by
-this license (the "Software") to use, reproduce, display, distribute,
-execute, and transmit the Software, and to prepare derivative works of the
-Software, and to permit third-parties to whom the Software is furnished to
-do so, all subject to the following:
-
-The copyright notices in the Software and this entire statement, including
-the above license grant, this restriction and the following disclaimer,
-must be included in all copies of the Software, in whole or in part, and
-all derivative works of the Software, unless such copies or derivative
-works are solely in the form of machine-executable object code generated by
-a source language processor.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
-SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
-FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
-ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
 ```
 
 ## OpenBLAS

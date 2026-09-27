@@ -1,91 +1,94 @@
-//! Work metering for the iterative kernels.
+//! CPU accounting for iterative `scipy.special` kernels.
 //!
-//! Series, continued fractions and root finders run from a handful to millions of iterations per
-//! element depending on the arguments. The Hurwitz zeta sum for a negative non-integer `q`, for
-//! example, runs about `|q|` terms, as SciPy's does. A flat per-element charge cannot bound that,
-//! and the kernels are pure functions with no runtime to charge.
+//! Series, continued fractions and root finders need an amount of work that depends on their
+//! arguments and can range from a handful of steps to millions (see `docs/scipy.md`, "Safety and
+//! accounting"). Charging a fixed cost per element would either overcharge the common case or
+//! let an adversarial input do unbounded work for a fixed price. Instead every iterative step
+//! calls [`tick`], and [`evaluate`] runs the kernel under a growing allowance, charging CPU for
+//! the steps actually taken:
 //!
-//! So each loop whose trip count depends on the arguments calls [`step`] once per iteration, and
-//! [`run`] evaluates a kernel under an allowance of steps. Once the allowance is spent, `step`
-//! returns `false`, every loop stops early, and `run` reports that the evaluation did not
-//! finish. The caller then charges the steps taken and retries with a larger allowance, so an
-//! element may do as much work as the CPU budget allows but never more than it has been charged
-//! for. Kernels are deterministic, so a retry computes what an unmetered evaluation would.
+//! 1. Run the kernel with a starting allowance.
+//! 2. If it never asked for a step beyond the allowance, charge for the steps it took and return
+//!    the result.
+//! 3. Otherwise charge for the steps it took, double the allowance, and run the kernel again from
+//!    scratch.
 //!
-//! The allowance is thread-local because it must reach loops deep inside kernels without
-//! changing their signatures. Evaluations never nest, and outside [`run`] the allowance is
-//! unlimited so unit tests can call kernels directly.
+//! Kernels are pure functions of their arguments, so rerunning with a larger allowance reproduces
+//! identical work up to the point where the previous run stopped, and the total work charged
+//! across every attempt is less than twice the cost of the final, successful attempt. A kernel
+//! that never converges still costs a bounded amount of CPU per doubling, so `runtime.charge_cpu`
+//! eventually reports resource exhaustion rather than looping forever.
+//!
+//! The allowance is carried in thread-local cells rather than threaded through every kernel
+//! call: kernels are plain `Fn(&[T]) -> T` closures shared with the ufunc loop (see
+//! `numpy::ufunc::special_loop`), which leaves no room for an extra accounting parameter. Each
+//! simulated Python process runs on one host thread, so the thread-local state never crosses
+//! between unrelated evaluations.
 
 use std::cell::Cell;
 
-#[derive(Clone, Copy)]
-struct Allowance {
-    remaining: u64,
-    exhausted: bool,
-}
-
-const UNLIMITED: Allowance = Allowance {
-    remaining: u64::MAX,
-    exhausted: false,
-};
+use super::super::super::super::native::{PyResult, PyRuntime};
 
 thread_local! {
-    static ALLOWANCE: Cell<Allowance> = const { Cell::new(UNLIMITED) };
+    static ALLOWANCE: Cell<u64> = const { Cell::new(0) };
+    static STEPS: Cell<u64> = const { Cell::new(0) };
+    static EXHAUSTED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Count one iteration. Returns `false` once the allowance is spent; the loop must then stop,
-/// and [`run`] discards the kernel's result.
-pub(super) fn step() -> bool {
-    ALLOWANCE.with(|cell| {
-        let mut allowance = cell.get();
-        if allowance.remaining == 0 {
-            allowance.exhausted = true;
-            cell.set(allowance);
+/// Starting number of iterations a kernel may run before [`evaluate`] doubles its allowance.
+const INITIAL_ALLOWANCE: u64 = 64;
+
+/// Record one unit of iterative work (one series term, continued-fraction step, or root-finder
+/// step). Returns `true` while the kernel stays under its current allowance and should keep
+/// going; a kernel that sees `false` must stop and return its best estimate so far.
+pub(in crate::python) fn tick() -> bool {
+    STEPS.with(|steps| {
+        let used = steps.get();
+        if used >= ALLOWANCE.with(Cell::get) {
+            EXHAUSTED.with(|exhausted| exhausted.set(true));
             return false;
         }
-        allowance.remaining -= 1;
-        cell.set(allowance);
+        steps.set(used + 1);
         true
     })
 }
 
-/// Evaluate `kernel` with at most `steps` iterations. Returns the result, or `None` if the
-/// kernel needed more steps, together with the steps taken.
-pub(super) fn run<T>(steps: u64, kernel: impl FnOnce() -> T) -> (Option<T>, u64) {
-    ALLOWANCE.with(|cell| {
-        cell.set(Allowance {
-            remaining: steps,
-            exhausted: false,
-        });
+/// Run `kernel` under a growing iteration allowance, charging CPU for the steps it actually
+/// took. `kernel` is called again, from scratch, each time it exhausts its allowance.
+pub(in crate::python) fn evaluate<T>(
+    runtime: &mut dyn PyRuntime,
+    kernel: impl Fn() -> T,
+) -> PyResult<T> {
+    let mut allowance = INITIAL_ALLOWANCE;
+    loop {
+        ALLOWANCE.with(|cell| cell.set(allowance));
+        STEPS.with(|cell| cell.set(0));
+        EXHAUSTED.with(|cell| cell.set(false));
         let value = kernel();
-        let allowance = cell.replace(UNLIMITED);
-        let taken = steps - allowance.remaining;
-        ((!allowance.exhausted).then_some(value), taken)
-    })
+        let steps = STEPS.with(Cell::get);
+        // Every evaluation, even a closed-form one that never calls `tick`, costs at least one
+        // unit so a tight loop of cheap calls still meters proportionally to element count.
+        runtime.charge_cpu(steps.max(1))?;
+        if !EXHAUSTED.with(Cell::get) {
+            return Ok(value);
+        }
+        allowance = allowance.saturating_mul(2);
+    }
 }
 
+/// Test-only escape hatch for calling a kernel directly, outside a `PyRuntime`: sets a generous
+/// fixed allowance so `tick()`-gated loops (series, continued fractions, root finders) run to
+/// their real convergence instead of the `0`-allowance default that applies when nothing has
+/// called [`evaluate`] yet. Lets unit tests exercise tricky kernel-internal logic (see
+/// `igam::tests`, `ibeta::tests`) without going through the ufunc dispatch and CPU-accounting
+/// machinery those tests are not about.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn count_to(n: u64) -> u64 {
-        let mut count = 0;
-        while count < n && step() {
-            count += 1;
-        }
-        count
-    }
-
-    #[test]
-    fn a_kernel_that_fits_its_allowance_finishes() {
-        assert_eq!(run(10, || count_to(10)), (Some(10), 10));
-        assert_eq!(run(10, || count_to(3)), (Some(3), 3));
-    }
-
-    #[test]
-    fn a_kernel_that_needs_more_steps_is_reported_unfinished() {
-        assert_eq!(run(10, || count_to(11)), (None, 10));
-        // The allowance is unlimited again afterwards.
-        assert_eq!(count_to(1000), 1000);
-    }
+pub(in crate::python) fn run_with_allowance_for_test<T>(
+    allowance: u64,
+    kernel: impl FnOnce() -> T,
+) -> T {
+    ALLOWANCE.with(|cell| cell.set(allowance));
+    STEPS.with(|cell| cell.set(0));
+    EXHAUSTED.with(|cell| cell.set(false));
+    kernel()
 }

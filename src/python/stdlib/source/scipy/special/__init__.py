@@ -1,457 +1,287 @@
-"""shellsim's ``scipy.special``.
+"""scipy.special: shellsim's special-function surface.
 
-The special functions are ``numpy.ufunc`` values from the native ``_scipy_special`` module.
-This module adds the functions SciPy writes in Python: ``comb``, ``perm``, ``factorial``,
-``factorial2``, ``factorialk``, ``zeta``, ``softmax``, ``log_softmax`` and ``logsumexp``,
-following SciPy 1.18's code for NumPy inputs.
+Star-imports the native ufuncs from `_ufuncs` (itself a star-import of the native module
+`_scipy_special`; see `src/python/stdlib/scipy/special/mod.rs`) and adds the handful of names
+SciPy itself defines in Python rather than as a ufunc: the `digamma` alias, the two-argument
+`zeta` dispatcher, and the counting/combinatorics and log-sum-exp family (`comb`, `perm`,
+`factorial`, `factorial2`, `factorialk`, `logsumexp`, `softmax`, `log_softmax`).
 """
 
-import math
 import warnings
 
 import numpy as np
-from _scipy_special import *
-from _scipy_special import _riemann_zeta, _zeta
 
+from . import _ufuncs
+from ._ufuncs import *  # noqa: F401,F403
 
-def _warn_non_integer_n():
-    """Warn as SciPy's legacy ``bdtr`` and ``bdtrc`` loops do for a floating-point ``n``."""
-    warnings.warn(
-        "non-integer arg n is deprecated, removed in SciPy 1.7.x", DeprecationWarning, stacklevel=2
-    )
+# `psi` and `digamma` are the same ufunc object under two names, so `special.psi is
+# special.digamma` holds.
+digamma = psi  # noqa: F821
 
 
 def zeta(x, q=None, out=None):
-    """The Riemann zeta function, or the Hurwitz zeta function when ``q`` is given."""
+    """Riemann zeta function (`q=None`) or Hurwitz zeta function (`q` given)."""
     if q is None:
-        return _riemann_zeta(x, out)
-    return _zeta(x, q, out)
+        return _ufuncs._riemann_zeta(x, out=out)
+    return _ufuncs._zeta(x, q, out=out)
 
 
-def _comb_int(N, k):
-    N = int(N)
-    k = int(k)
-    if k > N or N < 0 or k < 0:
+def _warn_non_integer_n():
+    """Issue the `DeprecationWarning` a non-integer `n` (trial count) triggers in `bdtr`/`bdtrc`.
+
+    Called from native code (`numpy::ufunc::evaluate`) via `errstate::call_warning`, mirroring
+    the warning SciPy's own binomial ufuncs raise for a non-integer or single-precision trial
+    count.
+    """
+    warnings.warn(
+        "non-integer arg n is deprecated, removed in SciPy 1.7.x",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+
+def _is_integer_dtype(value):
+    return np.issubdtype(np.asarray(value).dtype, np.integer)
+
+
+def _is_integer_valued(arr):
+    return bool(np.all(arr == np.floor(arr)) and np.all(np.isfinite(arr)))
+
+
+def _to_int_array(values, shape):
+    """Build the smallest of an `int64` or an object array of Python `int` that holds `values`."""
+    if all(-(2**63) <= value < 2**63 for value in values):
+        array = np.empty(len(values), dtype=np.int64)
+    else:
+        array = np.empty(len(values), dtype=object)
+    for index, value in enumerate(values):
+        array[index] = value
+    return array.reshape(shape)
+
+
+def _exact_map(arr, fn):
+    """Apply an exact (arbitrary-precision) integer `fn` elementwise, preserving scalar-ness."""
+    if arr.ndim == 0:
+        return fn(int(arr))
+    return _to_int_array([fn(int(value)) for value in arr.ravel()], arr.shape)
+
+
+def _float_map(arr, fn):
+    """Apply a `float` -> `float` `fn` elementwise, preserving scalar-ness as `np.float64`."""
+    if arr.ndim == 0:
+        return np.float64(fn(float(arr)))
+    values = [fn(float(value)) for value in arr.ravel()]
+    return np.array(values, dtype=np.float64).reshape(arr.shape)
+
+
+def _comb_int(n, k):
+    if k < 0 or n < 0 or k > n:
         return 0
-    M = N + 1
-    numerator = 1
-    denominator = 1
-    for j in range(1, min(k, N - k) + 1):
-        numerator *= M - j
-        denominator *= j
-    return numerator // denominator
+    k = min(k, n - k)
+    result = 1
+    for i in range(k):
+        result = result * (n - i) // (i + 1)
+    return result
 
 
-def comb(N, k, *, exact=False, repetition=False):
-    """The number of combinations of ``N`` things taken ``k`` at a time."""
+def comb(N, k, exact=False, repetition=False):
+    """Number of combinations of `N` things taken `k` at a time.
+
+    `exact=True` returns an arbitrary-precision Python `int` (or an object array of them);
+    otherwise this is `binom(N, k)`, restricted to `0` for negative `N` (unlike the fully
+    generalized `binom`, `comb` counts choices from an actual collection of `N` items).
+    """
     if repetition:
-        # C(n, 0) with repetition is 1 for n >= 0; comb(n - 1, 0) would give 0 for n = 0.
-        if exact:
-            if k == 0 and int(N) == N and N >= 0:
-                return 1
-        else:
-            k, N = np.asarray(k), np.asarray(N)
-            cond = (k == 0) & (N >= 0)
-            vals = binom(N + k - 1, k)
-            if isinstance(vals, np.ndarray):
-                vals[cond] = 1.0
-            elif cond:
-                vals = np.float64(1.0)
-            return vals
         return comb(N + k - 1, k, exact=exact)
     if exact:
-        if int(N) == N and int(k) == k:
-            return _comb_int(N, k)
-        raise ValueError("Non-integer `N` and `k` with `exact=True` is not supported.")
-    k, N = np.asarray(k), np.asarray(N)
-    cond = (k <= N) & (N >= 0) & (k >= 0)
-    vals = binom(N, k)
-    if isinstance(vals, np.ndarray):
-        vals[~cond] = 0
-    elif not cond:
-        vals = np.float64(0)
-    return vals
+        n_arr = np.asarray(N)
+        k_arr = np.asarray(k)
+        if not (_is_integer_valued(n_arr) and _is_integer_valued(k_arr)):
+            raise ValueError("Non-integer `N` and `k` with `exact=True` is not supported.")
+        n_b, k_b = np.broadcast_arrays(n_arr, k_arr)
+        if n_b.ndim == 0:
+            return _comb_int(int(n_b), int(k_b))
+        values = [_comb_int(int(n), int(k)) for n, k in zip(n_b.ravel(), k_b.ravel())]
+        return _to_int_array(values, n_b.shape)
+    result = binom(N, k)  # noqa: F821
+    if np.ndim(N) == 0:
+        return np.float64(0.0) if float(np.asarray(N)) < 0 else result
+    return np.where(np.asarray(N) < 0, 0.0, result)
+
+
+def _perm_int(n, k):
+    if k < 0 or n < 0 or k > n:
+        return 0
+    result = 1
+    for i in range(k):
+        result *= n - i
+    return result
 
 
 def perm(N, k, exact=False):
-    """The number of permutations of ``N`` things taken ``k`` at a time."""
+    """Number of permutations of `N` things taken `k` at a time."""
     if exact:
-        N = np.squeeze(N)[()]
-        k = np.squeeze(k)[()]
-        if not (np.isscalar(N) and np.isscalar(k)):
-            raise ValueError("`N` and `k` must be scalar integers with `exact=True`.")
-        floor_N, floor_k = int(N), int(k)
-        if not (floor_N == N and floor_k == k):
+        n_arr = np.asarray(N)
+        k_arr = np.asarray(k)
+        if not (_is_integer_valued(n_arr) and _is_integer_valued(k_arr)):
             raise ValueError("Non-integer `N` and `k` with `exact=True` is not supported.")
-        if (k > N) or (N < 0) or (k < 0):
-            return 0
-        val = 1
-        for i in range(floor_N - floor_k + 1, floor_N + 1):
-            val *= i
-        return val
-    k, N = np.asarray(k), np.asarray(N)
-    cond = (k <= N) & (N >= 0) & (k >= 0)
-    vals = poch(N - k + 1, k)
-    if isinstance(vals, np.ndarray):
-        vals[~cond] = 0
-    elif not cond:
-        vals = np.float64(0)
-    return vals
+        n_b, k_b = np.broadcast_arrays(n_arr, k_arr)
+        if n_b.ndim == 0:
+            return _perm_int(int(n_b), int(k_b))
+        values = [_perm_int(int(n), int(k)) for n, k in zip(n_b.ravel(), k_b.ravel())]
+        return _to_int_array(values, n_b.shape)
+    # poch(N - k + 1, k) = Gamma(N + 1) / Gamma(N - k + 1), the falling factorial.
+    return poch(np.asarray(N) - np.asarray(k) + 1.0, k)  # noqa: F821
 
 
-def _gamma1p(vals):
-    """``gamma(n + 1)``, with NaN rather than infinity at -1."""
-    res = gamma(vals + 1)
-    if isinstance(res, np.ndarray):
-        res[vals == -1] = np.nan
-    elif np.isinf(res) and vals == -1:
-        res = np.float64("nan")
-    return res
+_EXTEND_MESSAGE = "argument `extend` must be one of ('zero', 'complex')"
 
 
-# The largest n whose multifactorial with step k fits in int64 and in int32.
-_FACTORIALK_LIMITS_64BITS = {1: 20, 2: 33, 3: 44, 4: 54, 5: 65, 6: 74, 7: 84, 8: 93, 9: 101}
-_FACTORIALK_LIMITS_32BITS = {1: 12, 2: 19, 3: 25, 4: 31, 5: 37, 6: 43, 7: 47, 8: 51, 9: 56}
-
-
-def _range_prod(lo, hi, k=1):
-    """The product ``lo * (lo + k) * ... * hi``, split in halves to keep the operands balanced."""
-    if lo == 1 and k == 1:
-        return math.factorial(hi)
-    if lo + k < hi:
-        mid = (hi + lo) // 2
-        if k > 1:
-            # Keep mid in the same residue class modulo k as hi.
-            mid = mid - (mid - hi) % k
-        return _range_prod(lo, mid, k) * _range_prod(mid + k, hi, k)
-    elif lo + k == hi:
-        return lo * hi
-    else:
-        return hi
-
-
-def _factorialx_array_exact(n, k=1):
-    un = np.unique(n)
-    if k in _FACTORIALK_LIMITS_64BITS.keys():
-        if un[-1] > _FACTORIALK_LIMITS_64BITS[k]:
-            dt = object
-        else:
-            # SciPy picks int64 above the int32 limit and C long below it; both are int64 on
-            # the Linux systems shellsim simulates.
-            dt = np.int64
-    else:
-        dt = object
-    out = np.empty_like(n, dtype=dt)
-    un = un[un > 1]
-    out[n < 2] = 1
-    out[n < 0] = 0
-    # Each residue class modulo k is its own chain of products.
-    for lane in range(0, k):
-        ul = un[un % k == lane] if k > 1 else un
-        if ul.size:
-            val = _range_prod(1, int(ul[0]), k=k)
-            out[n == ul[0]] = val
-            for i in range(len(ul) - 1):
-                prev = ul[i]
-                current = ul[i + 1]
-                val *= _range_prod(int(prev + 1), int(current), k=k)
-                out[n == current] = val
-    return out
-
-
-def _factorialx_array_approx(n, k, extend):
-    if extend == "complex":
-        return _factorialx_approx_core(n, k=k, extend=extend)
-    result = np.zeros(n.shape)
-    np.place(result, np.isnan(n), np.nan)
-    cond = n >= 0
-    n_to_compute = np.extract(cond, n)
-    np.place(result, cond, _factorialx_approx_core(n_to_compute, k=k, extend=extend))
-    return result
-
-
-def _factorialx_approx_core(n, k, extend):
-    if k == 1:
-        result = _gamma1p(n)
-        if isinstance(n, np.ndarray):
-            result = np.array(result)
-        return result
-    if extend == "complex":
-        p_dtype = complex if (_is_subdtype(type(k), "c") or k < 0) else None
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            result = np.power(k, n / k, dtype=p_dtype) * _gamma1p(n / k)
-            result *= rgamma(1 / k + 1) / np.power(k, 1 / k, dtype=p_dtype)
-        if isinstance(n, np.ndarray):
-            result = np.array(result)
-        return result
-    # For extend="zero", n % k selects the correction to the gamma-based approximation.
-    n_mod_k = n % k
-    if not isinstance(n, np.ndarray):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            return (
-                np.power(k, (n - n_mod_k) / k)
-                * gamma(n / k + 1)
-                / gamma(n_mod_k / k + 1)
-                * max(n_mod_k, 1)
-            )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        result = np.power(k, n / k) * gamma(n / k + 1)
-
-    def corr(k, r):
-        return np.power(k, -r / k) / gamma(r / k + 1) * r
-
-    for r in np.unique(n_mod_k):
-        if r == 0:
-            continue
-        result[n_mod_k == r] *= corr(k, int(r))
-    return result
-
-
-_DTYPE_CLASSES = {"i": np.integer, "f": np.floating, "c": np.complexfloating, "n": np.number}
-
-
-def _is_subdtype(dtype, dtypes):
-    dtypes = dtypes if isinstance(dtypes, list) else [dtypes]
-    dtypes = [_DTYPE_CLASSES.get(x, x) for x in dtypes]
-    return any(np.issubdtype(dtype, dt) for dt in dtypes)
-
-
-def _factorialx_wrapper(fname, n, k, exact, extend):
-    """SciPy's shared implementation of ``factorial``, ``factorial2`` and ``factorialk``."""
+def _check_extend(extend):
     if extend not in ("zero", "complex"):
-        raise ValueError(
-            f"argument `extend` must be either 'zero' or 'complex', received: {extend}"
-        )
-    if exact and extend == "complex":
-        raise ValueError("Incompatible options: `exact=True` and `extend='complex'`")
+        raise ValueError(_EXTEND_MESSAGE)
 
-    msg_unsup = "Unsupported data type for {vname} in {fname}: {dtype}\n"
-    if fname == "factorial":
-        msg_unsup += (
-            "Permitted data types are integers and floating point numbers, "
-            "as well as complex numbers if `extend='complex' is passed."
-        )
-    else:
-        msg_unsup += (
-            "Permitted data types are integers, as well as floating point "
-            "numbers and complex numbers if `extend='complex' is passed."
-        )
-    msg_exact_not_possible = "`exact=True` only supports integers, cannot use data type {dtype}"
-    msg_needs_complex = (
-        "In order to use non-integer arguments, you must opt into this by passing "
-        "`extend='complex'`. Note that this changes the result for all negative "
-        "arguments (which by default return 0)."
-    )
 
-    if fname == "factorial2":
-        msg_needs_complex += (
-            " Additionally, it will rescale the values of the double factorial at even "
-            "integers by a factor of sqrt(2/pi)."
-        )
-    elif fname == "factorialk":
-        msg_needs_complex += (
-            " Additionally, it will perturb the values of the multifactorial at most "
-            "positive integers `n`."
-        )
-        if not _is_subdtype(type(k), ["i", "f", "c"]):
-            raise ValueError(msg_unsup.format(vname="`k`", fname=fname, dtype=type(k)))
-        elif _is_subdtype(type(k), ["f", "c"]) and extend != "complex":
-            raise ValueError(msg_needs_complex)
-        if extend == "zero" and k < 1:
-            msg = f"For `extend='zero'`, k must be a positive integer, received: {k}"
-            raise ValueError(msg)
-        elif k == 0:
-            raise ValueError("Parameter k cannot be zero!")
-
-    # factorial allows floats also for extend="zero".
-    types_requiring_complex = "c" if fname == "factorial" else ["f", "c"]
-
-    if np.ndim(n) == 0 and not isinstance(n, np.ndarray):
-        # Scalars.
-        if n is not None and not _is_subdtype(type(n), ["i", "f", "c"]):
-            raise ValueError(msg_unsup.format(vname="`n`", fname=fname, dtype=type(n)))
-        elif n is not None and _is_subdtype(type(n), types_requiring_complex) and (
-            extend != "complex"
-        ):
-            raise ValueError(msg_needs_complex)
-        elif n is None or np.isnan(n):
-            complexify = extend == "complex" and n is not None and _is_subdtype(type(n), "c")
-            return np.complex128("nan+nanj") if complexify else np.float64("nan")
-        elif extend == "zero" and n < 0:
-            return 0 if exact else np.float64(0)
-        elif n in {0, 1}:
-            return 1 if exact else np.float64(1)
-        elif exact and _is_subdtype(type(n), "i"):
-            return _range_prod(1, int(n), k=k)
-        elif exact:
-            raise ValueError(msg_exact_not_possible.format(dtype=type(n)))
-        return _factorialx_approx_core(n, k=k, extend=extend)
-
-    # Arrays.
-    n = np.asarray(n)
-    if not _is_subdtype(n.dtype, ["i", "f", "c"]):
-        raise ValueError(msg_unsup.format(vname="`n`", fname=fname, dtype=n.dtype))
-    elif _is_subdtype(n.dtype, types_requiring_complex) and extend != "complex":
-        raise ValueError(msg_needs_complex)
-    elif exact and _is_subdtype(n.dtype, ["f"]):
-        raise ValueError(msg_exact_not_possible.format(dtype=n.dtype))
-
-    if n.size == 0:
-        return n
-    elif exact:
-        return _factorialx_array_exact(n, k=k)
-    return _factorialx_array_approx(n, k=k, extend=extend)
+def _factorial_int(n):
+    if n < 0:
+        return 0
+    result = 1
+    for i in range(2, n + 1):
+        result *= i
+    return result
 
 
 def factorial(n, exact=False, extend="zero"):
-    """The factorial of ``n``, or ``gamma(n + 1)`` for non-integer ``n``."""
-    return _factorialx_wrapper("factorial", n, k=1, exact=exact, extend=extend)
+    """`n!`, continued to `factorial(x) = Gamma(x + 1)` for non-integer `x` (`extend='complex'`)
+    or to `0` for negative `x` (`extend='zero'`, the default)."""
+    _check_extend(extend)
+    if exact:
+        arr = np.asarray(n)
+        if not _is_integer_valued(arr):
+            raise ValueError("`exact=True` only supports integers")
+        return _exact_map(arr, _factorial_int)
+    if extend == "complex":
+        # No `dtype=` here: complex input must reach the `gamma` ufunc itself so it raises
+        # shellsim's own "complex input ... is not supported" error, rather than `np.asarray`
+        # rejecting it first with a generic `TypeError`.
+        return gamma(np.asarray(n) + 1.0)  # noqa: F821
+    arr = np.asarray(n)
+    return _float_map(arr, lambda x: 0.0 if x < 0.0 else gamma(x + 1.0))  # noqa: F821
+
+
+def _multifactorial_int(n, k):
+    if n < 0:
+        return 0
+    result = 1
+    while n > 0:
+        result *= n
+        n -= k
+    return result
+
+
+def _multifactorial_continuous_scalar(z, k):
+    """`z!^(k)` continued to real `z` via `k^((z-1)/k) Gamma(z/k + 1) / Gamma(1/k + 1)`, a
+    Gamma-function analytic continuation of the multifactorial recurrence `z!^(k) = z (z-k)!^(k)`.
+    `k < 0` needs a complex power of the (negative) base; `k > 0` stays real.
+    """
+    if z == 0.0:
+        return np.complex128(1.0) if k < 0 else np.float64(1.0)
+    exponent = (z - 1.0) / k
+    if k < 0:
+        magnitude = abs(k) ** exponent
+        angle = np.pi * exponent
+        power = np.complex128(complex(magnitude * np.cos(angle), magnitude * np.sin(angle)))
+    else:
+        power = k**exponent
+    return power * gamma(z / k + 1.0) / gamma(1.0 / k + 1.0)  # noqa: F821
+
+
+def _multifactorial_continuous(z, k):
+    arr = np.asarray(z, dtype=np.float64)
+    if arr.ndim == 0:
+        return _multifactorial_continuous_scalar(float(arr), k)
+    values = [_multifactorial_continuous_scalar(float(v), k) for v in arr.ravel()]
+    return np.array(values).reshape(arr.shape)
+
+
+_FACTORIAL2_MESSAGE = (
+    "In order to use non-integer arguments, you must opt into this by passing "
+    "`extend='complex'`. Note that this changes the result for all negative arguments "
+    "(which by default return 0). Additionally, it will rescale the values of the double "
+    "factorial at even integers by a factor of sqrt(2/pi)."
+)
 
 
 def factorial2(n, exact=False, extend="zero"):
-    """The double factorial ``n!! = n (n - 2) (n - 4) ...``."""
-    return _factorialx_wrapper("factorial2", n, k=2, exact=exact, extend=extend)
+    """Double factorial `n!! = n (n-2) (n-4) ... `."""
+    _check_extend(extend)
+    if extend == "complex":
+        return _multifactorial_continuous(n, 2.0)
+    if not _is_integer_dtype(n):
+        raise ValueError(_FACTORIAL2_MESSAGE)
+    arr = np.asarray(n)
+    if exact:
+        return _exact_map(arr, lambda v: _multifactorial_int(v, 2))
+    return _float_map(arr, lambda v: 0.0 if v < 0.0 else float(_multifactorial_int(int(v), 2)))
+
+
+_FACTORIALK_MESSAGE = (
+    "In order to use non-integer arguments, you must opt into this by passing "
+    "`extend='complex'`. Note that this changes the result for all negative arguments "
+    "(which by default return 0). Additionally, it will perturb the values of the "
+    "multifactorial at most positive integers `n`."
+)
 
 
 def factorialk(n, k, exact=False, extend="zero"):
-    """The multifactorial ``n (n - k) (n - 2k) ...``."""
-    return _factorialx_wrapper("factorialk", n, k=k, exact=exact, extend=extend)
-
-
-def _promote_floating(*args):
-    """SciPy's ``xp_promote(..., broadcast=True, force_floating=True)`` for NumPy arrays."""
-    args = [np.asarray(arg) if np.iterable(arg) else arg for arg in args]
-    present = [arg for arg in args if arg is not None]
-    try:
-        dtype = np.result_type(*present, 1.0)
-    except ValueError:
-        dtype = np.result_type(*present, np.asarray(1.0))
-    args = [None if arg is None else np.asarray(arg, dtype=dtype) for arg in args]
-    present = [arg for arg in args if arg is not None]
-    shapes = {arg.shape for arg in present}
-    try:
-        shape = np.broadcast_shapes(*shapes) if len(shapes) != 1 else present[0].shape
-    except ValueError as e:
-        raise ValueError("Array shapes are incompatible for broadcasting.") from e
-    return [
-        arg if arg is None or arg.shape == shape else np.broadcast_to(arg, shape)
-        for arg in args
-    ]
-
-
-def _wrap_radians(x):
-    # Wrap radians to (-pi, pi], preserving relative precision inside that interval.
-    wrapped = -((-x + np.pi) % (2 * np.pi) - np.pi)
-    return np.where(np.abs(x) < np.pi, x, wrapped)
-
-
-def _elements_and_indices_with_max_real(a, axis):
-    if np.iscomplexobj(a):
-        real_a = np.real(a)
-        max_ = np.max(real_a, axis=axis, keepdims=True)
-        mask = real_a == max_
-        # Of the elements with the largest real part, keep the last.
-        i = np.reshape(np.arange(a.size), a.shape)
-        i = np.where(mask, i, -1)
-        max_i = np.max(i, axis=axis, keepdims=True)
-        mask = i == max_i
-        a = np.where(mask, a, 0.0)
-        max_ = np.sum(a, axis=axis, dtype=a.dtype, keepdims=True)
-    else:
-        max_ = np.max(a, axis=axis, keepdims=True)
-        mask = a == max_
-    return max_, mask
-
-
-def _logsumexp(a, b, axis, return_sign):
-    # An element adds nothing to the sum when its weight is zero, even if it is infinite.
-    if b is not None:
-        a = np.where(b == 0, -np.inf, a)
-    a_max, i_max = _elements_and_indices_with_max_real(a, axis)
-    # The largest terms are summed separately, for precision.
-    a = np.where(i_max, -np.inf, a)
-    i_max_dt = i_max.astype(a.dtype)
-    b_i_max = i_max_dt if b is None else b * i_max_dt
-    m = np.sum(b_i_max, axis=axis, keepdims=True, dtype=a.dtype)
-    exp = b * np.exp(a - a_max) if b is not None else np.exp(a - a_max)
-    s = np.sum(exp, axis=axis, keepdims=True, dtype=exp.dtype)
-    s = np.where(s == 0, s, s / m)
-    sgn = np.sign(s + 1) * np.sign(m)
-    if np.iscomplexobj(s):
-        # a_max can carry a phase for complex input.
-        sgn = sgn * np.exp(np.imag(a_max) * 1.0j)
-    else:
-        s = np.where(s < -1, -s - 2, s)
-        m = np.abs(m)
-    out = np.log1p(s) + np.log(m) + a_max
-    if return_sign:
-        out = np.real(out)
-    elif not np.iscomplexobj(out):
-        out = np.where(sgn < 0, np.nan, out)
-    return out, sgn
+    """`k`-fold factorial `n(!^k) = n (n-k) (n-2k) ... `."""
+    _check_extend(extend)
+    if extend == "complex":
+        if k == 0:
+            raise ValueError("Parameter k cannot be zero!")
+        return _multifactorial_continuous(n, float(k))
+    if not (isinstance(k, (int, np.integer)) and not isinstance(k, bool)):
+        raise ValueError(_FACTORIALK_MESSAGE)
+    if k <= 0:
+        raise ValueError(f"For `extend='zero'`, k must be a positive integer, received: {k}")
+    if not _is_integer_dtype(n):
+        raise ValueError(_FACTORIALK_MESSAGE)
+    arr = np.asarray(n)
+    if exact:
+        return _exact_map(arr, lambda v: _multifactorial_int(v, k))
+    return _float_map(arr, lambda v: 0.0 if v < 0.0 else float(_multifactorial_int(int(v), k)))
 
 
 def logsumexp(a, axis=None, b=None, keepdims=False, return_sign=False):
-    """``log(sum(b * exp(a)))``, computed without overflow."""
-    a, b = _promote_floating(a, b)
-    a = np.atleast_1d(a)
-    b = np.atleast_1d(b) if b is not None else b
-    axis = tuple(range(a.ndim)) if axis is None else axis
-
-    if a.size != 0:
-        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-            # Where the result is infinite, the direct calculation handles the edge cases.
-            b_exp_a = np.exp(a) if b is None else b * np.exp(a)
-            sum_ = np.sum(b_exp_a, axis=axis, keepdims=True)
-            sgn_inf = np.sign(sum_) if return_sign else None
-            sum_ = np.abs(sum_) if return_sign else sum_
-            out_inf = np.log(sum_)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            out, sgn = _logsumexp(a, b, axis, return_sign)
-        out_finite = np.isfinite(out)
-        out = np.where(out_finite, out, out_inf)
-        sgn = np.where(out_finite, sgn, sgn_inf) if return_sign else sgn
+    """`log(sum(b * exp(a)))`, computed so a large `a` does not overflow `exp`."""
+    a = np.asarray(a, dtype=np.float64)
+    a_max = np.max(a, axis=axis, keepdims=True)
+    a_max_safe = np.where(np.isfinite(a_max), a_max, 0.0)
+    if b is not None:
+        terms = np.asarray(b, dtype=np.float64) * np.exp(a - a_max_safe)
     else:
-        shape = np.asarray(a.shape)
-        shape[axis] = 1
-        out = np.full(tuple(shape), -np.inf, dtype=a.dtype)
-        sgn = np.sign(out)
-
-    if np.iscomplexobj(out):
+        terms = np.exp(a - a_max_safe)
+    total = np.sum(terms, axis=axis, keepdims=keepdims)
+    reduced_max = a_max if keepdims else np.squeeze(a_max, axis=axis)
+    # `total` is legitimately `0.0` when every `a` is `-inf` (or, with `b`, by cancellation), and
+    # `log(0.0) = -inf` is exactly the wanted result there, not a domain error to warn about.
+    with np.errstate(divide="ignore"):
         if return_sign:
-            sgn = np.real(sgn) + _wrap_radians(np.imag(sgn)).astype(sgn.dtype) * 1j
-        else:
-            out = np.real(out) + _wrap_radians(np.imag(out)).astype(out.dtype) * 1j
-
-    out = np.squeeze(out, axis=axis) if not keepdims else out
-    sgn = np.squeeze(sgn, axis=axis) if (sgn is not None and not keepdims) else sgn
-    out = out[()] if out.ndim == 0 else out
-    sgn = sgn[()] if (sgn is not None and sgn.ndim == 0) else sgn
-    return (out, sgn) if return_sign else out
+            sign = np.sign(total)
+            result = np.log(np.abs(total)) + reduced_max
+            return result, sign
+        return np.log(total) + reduced_max
 
 
 def softmax(x, axis=None):
-    """``exp(x) / sum(exp(x))`` along ``axis``."""
-    x = np.asarray(x)
-    x_max = np.max(x, axis=axis, keepdims=True)
-    exp_x_shifted = np.exp(x - x_max)
-    return exp_x_shifted / np.sum(exp_x_shifted, axis=axis, keepdims=True)
+    """`exp(x) / sum(exp(x))`, computed so a large `x` does not overflow `exp`."""
+    x = np.asarray(x, dtype=np.float64)
+    shifted = np.exp(x - np.max(x, axis=axis, keepdims=True))
+    return shifted / np.sum(shifted, axis=axis, keepdims=True)
 
 
 def log_softmax(x, axis=None):
-    """``log(softmax(x))``, computed without overflow."""
-    x = np.asarray(x)
-    x_max = np.max(x, axis=axis, keepdims=True)
-    if x_max.ndim > 0:
-        x_max = np.where(np.isfinite(x_max), x_max, 0)
-    elif not np.isfinite(x_max):
-        x_max = 0
-    tmp = x - x_max
-    exp_tmp = np.exp(tmp)
-    with np.errstate(divide="ignore"):
-        s = np.sum(exp_tmp, axis=axis, keepdims=True)
-        out = np.log(s)
-    return tmp - out
+    """`log(softmax(x))`, computed directly so it stays accurate where `softmax` underflows."""
+    x = np.asarray(x, dtype=np.float64)
+    shifted = x - np.max(x, axis=axis, keepdims=True)
+    return shifted - np.log(np.sum(np.exp(shifted), axis=axis, keepdims=True))

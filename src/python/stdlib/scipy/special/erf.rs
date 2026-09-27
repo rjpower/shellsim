@@ -1,277 +1,259 @@
-//! The error function family and the standard normal distribution: `erf`, `erfc`, `erfcinv`,
-//! `ndtr`, `ndtri`, and `log_ndtr`.
+//! The error-function family (`erf`, `erfc`, `erfinv`, `erfcinv`) and the normal-distribution
+//! functions (`ndtr`, `log_ndtr`, `ndtri`) they share.
 //!
-//! `erf`, `erfc`, `ndtr`, `ndtri` and `erfcinv` are ports of Cephes
-//! (`xsf/cephes/{ndtr,ndtri,erfinv}.h`), as SciPy uses. SciPy computes `erfinv` with Boost, in
-//! `erf_inv.rs`, and `log_ndtr` with Faddeeva's `erfcx`; here `log_ndtr` uses the logarithm of
-//! `ndtr` with an asymptotic series in the far tail, which agrees with SciPy to within a few
-//! units in the last place.
-#![allow(clippy::excessive_precision, clippy::unreadable_literal)]
+//! `erf` and `erfc` reduce to the regularized incomplete gamma function at `a = 1/2`: the
+//! standard identity `erf(x) = P(1/2, x^2)` for `x >= 0` (substitute `u = t^2` in the defining
+//! integral of `erf`), reflected for negative `x`. This reuses [`super::igam`] instead of a
+//! separate rational approximation.
+//!
+//! `ndtri` (the standard normal quantile) is Peter Acklam's rational approximation ("An
+//! algorithm for computing the inverse normal cumulative distribution function", 2003, a widely
+//! reproduced public-domain algorithm accurate to about `1.15e-9` relative error), refined to
+//! full double precision by one step of Halley's rational method on `ndtr` (as Acklam's own
+//! writeup recommends). `erfcinv` is then just `ndtri` rescaled: `erfcinv(x) = -ndtri(x/2) /
+//! sqrt(2)`. `erfinv(x) = ndtri((x+1)/2) / sqrt(2)` the same way, plus one further Newton
+//! step directly against `erf`: `ndtri`'s Halley step loses precision for `erfinv` of a small
+//! `x`, where the probability it works in (`p = (x+1)/2`) sits next to `0.5` and so shares only
+//! half of a `float64`'s bits with the deviation being refined, while `erf(y) - x` itself stays
+//! full precision there.
 
-use std::f64::consts::{FRAC_1_SQRT_2, PI};
+use std::f64::consts::{PI, SQRT_2};
 
-use super::gamma::MAXLOG;
-use super::poly::{p1evl, polevl};
+use super::igam::{gammainc, gammaincc};
 
-const NDTR_P: [f64; 9] = [
-    2.46196981473530512524E-10,
-    5.64189564831068821977E-1,
-    7.46321056442269912687E0,
-    4.86371970985681366614E1,
-    1.96520832956077098242E2,
-    5.26445194995477358631E2,
-    9.34528527171957607540E2,
-    1.02755188689515710272E3,
-    5.57535335369399327526E2,
-];
-const NDTR_Q: [f64; 8] = [
-    1.32281951154744992508E1,
-    8.67072140885989742329E1,
-    3.54937778887819891062E2,
-    9.75708501743205489753E2,
-    1.82390916687909736289E3,
-    2.24633760818710981792E3,
-    1.65666309194161350182E3,
-    5.57535340817727675546E2,
-];
-const NDTR_R: [f64; 6] = [
-    5.64189583547755073984E-1,
-    1.27536670759978104416E0,
-    5.01905042251180477414E0,
-    6.16021097993053585195E0,
-    7.40974269950448939160E0,
-    2.97886665372100240670E0,
-];
-const NDTR_S: [f64; 6] = [
-    2.26052863220117276590E0,
-    9.39603524938001434673E0,
-    1.20489539808096656605E1,
-    1.70814450747565897222E1,
-    9.60896809063285878198E0,
-    3.36907645100081516050E0,
-];
-const NDTR_T: [f64; 5] = [
-    9.60497373987051638749E0,
-    9.00260197203842689217E1,
-    2.23200534594684319226E3,
-    7.00332514112805075473E3,
-    5.55923013010394962768E4,
-];
-const NDTR_U: [f64; 5] = [
-    3.35617141647503099647E1,
-    5.21357949780152679795E2,
-    4.59432382970980127987E3,
-    2.26290000613890934246E4,
-    4.92673942608635921086E4,
-];
-
-/// The complementary error function.
-pub(super) fn erfc(a: f64) -> f64 {
-    if a.is_nan() {
-        return f64::NAN;
-    }
-    let x = a.abs();
-    if x < 1.0 {
-        return 1.0 - erf(a);
-    }
-    let z = -a * a;
-    if z >= -MAXLOG {
-        let z = z.exp();
-        let (p, q) = if x < 8.0 {
-            (polevl(x, &NDTR_P), p1evl(x, &NDTR_Q))
-        } else {
-            (polevl(x, &NDTR_R), p1evl(x, &NDTR_S))
-        };
-        let mut y = (z * p) / q;
-        if a < 0.0 {
-            y = 2.0 - y;
-        }
-        if y != 0.0 {
-            return y;
-        }
-    }
-    // Underflow.
-    if a < 0.0 {
-        2.0
-    } else {
-        0.0
-    }
-}
-
-/// The error function.
-pub(super) fn erf(x: f64) -> f64 {
+/// `erf(x)`.
+pub(in crate::python) fn erf(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
     }
     if x < 0.0 {
-        return -erf(-x);
-    }
-    if x.abs() > 1.0 {
-        return 1.0 - erfc(x);
-    }
-    let z = x * x;
-    x * polevl(z, &NDTR_T) / p1evl(z, &NDTR_U)
-}
-
-/// The standard normal cumulative distribution function.
-pub(super) fn ndtr(a: f64) -> f64 {
-    if a.is_nan() {
-        return f64::NAN;
-    }
-    let x = a * FRAC_1_SQRT_2;
-    let z = x.abs();
-    if z < 1.0 {
-        return 0.5 + 0.5 * erf(x);
-    }
-    let y = 0.5 * erfc(z);
-    if x > 0.0 {
-        1.0 - y
+        -gammainc(0.5, x * x)
     } else {
-        y
+        gammainc(0.5, x * x)
     }
 }
 
-/// `log(ndtr(x))`, accurate in both tails.
-pub(super) fn log_ndtr(x: f64) -> f64 {
+/// `erfc(x) = 1 - erf(x)`, computed directly from the upper incomplete gamma function so it
+/// stays accurate for large `x`, where `1 - erf(x)` would lose precision by cancellation.
+pub(in crate::python) fn erfc(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
     }
-    let t = x * FRAC_1_SQRT_2;
-    if x >= -1.0 {
-        return (-erfc(t) / 2.0).ln_1p();
+    if x >= 0.0 {
+        gammaincc(0.5, x * x)
+    } else {
+        2.0 - gammaincc(0.5, x * x)
     }
-    if x > -20.0 {
-        return (0.5 * erfc(-t)).ln();
-    }
-    if x == f64::NEG_INFINITY {
-        return x;
-    }
-    // Mills' ratio: ndtr(x) = phi(x) / |x| * sum((-1)^k (2k - 1)!! / x^(2k)).
-    let inverse_square = 1.0 / (x * x);
-    let mut term = 1.0;
-    let mut sum = 1.0;
-    for k in 1..20 {
-        term *= -f64::from(2 * k - 1) * inverse_square;
-        sum += term;
-        if term.abs() < f64::EPSILON * sum.abs() {
-            break;
-        }
-    }
-    -0.5 * x * x - (-x).ln() - 0.5 * (2.0 * PI).ln() + sum.ln()
 }
 
-const NDTRI_P0: [f64; 5] = [
-    -5.99633501014107895267E1,
-    9.80010754185999661536E1,
-    -5.66762857469070293439E1,
-    1.39312609387279679503E1,
-    -1.23916583867381258016E0,
-];
-const NDTRI_Q0: [f64; 8] = [
-    1.95448858338141759834E0,
-    4.67627912898881538453E0,
-    8.63602421390890590575E1,
-    -2.25462687854119370527E2,
-    2.00260212380060660359E2,
-    -8.20372256168333339912E1,
-    1.59056225126211695515E1,
-    -1.18331621121330003142E0,
-];
-const NDTRI_P1: [f64; 9] = [
-    4.05544892305962419923E0,
-    3.15251094599893866154E1,
-    5.71628192246421288162E1,
-    4.40805073893200834700E1,
-    1.46849561928858024014E1,
-    2.18663306850790267539E0,
-    -1.40256079171354495875E-1,
-    -3.50424626827848203418E-2,
-    -8.57456785154685413611E-4,
-];
-const NDTRI_Q1: [f64; 8] = [
-    1.57799883256466749731E1,
-    4.53907635128879210584E1,
-    4.13172038254672030440E1,
-    1.50425385692907503408E1,
-    2.50464946208309415979E0,
-    -1.42182922854787788574E-1,
-    -3.80806407691578277194E-2,
-    -9.33259480895457427372E-4,
-];
-const NDTRI_P2: [f64; 9] = [
-    3.23774891776946035970E0,
-    6.91522889068984211695E0,
-    3.93881025292474443415E0,
-    1.33303460815807542389E0,
-    2.01485389549179081538E-1,
-    1.23716634817820021358E-2,
-    3.01581553508235416007E-4,
-    2.65806974686737550832E-6,
-    6.23974539184983293730E-9,
-];
-const NDTRI_Q2: [f64; 8] = [
-    6.02427039364742014255E0,
-    3.67983563856160859403E0,
-    1.37702099489081330271E0,
-    2.16236993594496635890E-1,
-    1.34204006088543189037E-2,
-    3.28014464682127739104E-4,
-    2.89247864745380683936E-6,
-    6.79019408009981274425E-9,
-];
-const SQRT2PI: f64 = 2.506628274631000502415765284811045253007;
-const EXP_MINUS_2: f64 = 0.13533528323661269189;
-
-/// The inverse of `ndtr`.
-pub(super) fn ndtri(y0: f64) -> f64 {
-    if y0 == 0.0 {
-        return f64::NEG_INFINITY;
-    }
-    if y0 == 1.0 {
-        return f64::INFINITY;
-    }
-    if !(0.0..=1.0).contains(&y0) {
+/// `ndtr(x) = 0.5 erfc(-x / sqrt(2))`, the standard normal CDF.
+pub(in crate::python) fn ndtr(x: f64) -> f64 {
+    if x.is_nan() {
         return f64::NAN;
     }
-    let mut negate = true;
-    let mut y = y0;
-    if y > 1.0 - EXP_MINUS_2 {
-        y = 1.0 - y;
-        negate = false;
+    0.5 * erfc(-x / SQRT_2)
+}
+
+/// `log(ndtr(x))`. Below `x = -20`, `ndtr(x)` itself can underflow to `0.0` (its true value is
+/// far smaller than the smallest positive `f64`), so this uses the standard asymptotic expansion
+/// of the normal tail (DLMF 7.17: `Q(x) ~ phi(x)/x * (1 - 1/x^2 + 3/x^4 - 15/x^6 + 105/x^8)` for
+/// the upper tail, mirrored here since `ndtr(x) = Q(-x)`) instead of `ndtr(x).ln()`.
+pub(in crate::python) fn log_ndtr(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
     }
-    if y > EXP_MINUS_2 {
-        let y = y - 0.5;
-        let y2 = y * y;
-        let x = y + y * (y2 * polevl(y2, &NDTRI_P0) / p1evl(y2, &NDTRI_Q0));
-        return x * SQRT2PI;
+    if x < -20.0 {
+        let inverse_square = 1.0 / (x * x);
+        let series = 1.0
+            + inverse_square
+                * (-1.0
+                    + inverse_square * (3.0 + inverse_square * (-15.0 + inverse_square * 105.0)));
+        return -0.5 * x * x - (-x).ln() - 0.5 * (2.0 * PI).ln() + series.ln();
     }
-    let x = (-2.0 * y.ln()).sqrt();
-    let x0 = x - x.ln() / x;
-    let z = 1.0 / x;
-    let x1 = if x < 8.0 {
-        z * polevl(z, &NDTRI_P1) / p1evl(z, &NDTRI_Q1)
+    // For `x > 0`, `ndtr(x)` is close to `1`, so `ln` of it directly loses precision the same way
+    // taking `ln` of `1 - epsilon` always does; `ndtr(-x)` is the same small complement, and
+    // `ln_1p` keeps full precision of `1 - small` instead of first rounding it to a `float64`
+    // near `1`.
+    let value = if x > 0.0 {
+        (-ndtr(-x)).ln_1p()
     } else {
-        z * polevl(z, &NDTRI_P2) / p1evl(z, &NDTRI_Q2)
+        ndtr(x).ln()
     };
-    let x = x0 - x1;
-    if negate {
-        -x
+    // `ndtr(x) < 1` strictly for finite `x`, so `log_ndtr(x)` is never truly `0.0`; a `0.0` here
+    // is `ndtr(-x)` having underflowed to exactly `0.0`, and the sign bit is the only trace left
+    // of which side of `1` the true value was on.
+    if value == 0.0 && x.is_finite() {
+        -0.0
     } else {
-        x
+        value
     }
 }
 
-/// The inverse complementary error function on `[0, 2]`, as SciPy's `erfcinv` computes it from
-/// Cephes' `ndtri` (`xsf/cephes/erfinv.h`).
-pub(super) fn erfcinv(y: f64) -> f64 {
-    if y > 0.0 && y < 2.0 {
-        return -ndtri(0.5 * y) * FRAC_1_SQRT_2;
+const ACKLAM_A: [f64; 6] = [
+    -3.969_683_028_665_376e1,
+    2.209_460_984_245_205e2,
+    -2.759_285_104_469_687e2,
+    1.383_577_518_672_69e2,
+    -3.066_479_806_614_716e1,
+    2.506_628_277_459_239,
+];
+const ACKLAM_B: [f64; 5] = [
+    -5.447_609_879_822_406e1,
+    1.615_858_368_580_409e2,
+    -1.556_989_798_598_866e2,
+    6.680_131_188_771_972e1,
+    -1.328_068_155_288_572e1,
+];
+const ACKLAM_C: [f64; 6] = [
+    -7.784_894_002_430_293e-3,
+    -3.223_964_580_411_365e-1,
+    -2.400_758_277_161_838,
+    -2.549_732_539_343_734,
+    4.374_664_141_464_968,
+    2.938_163_982_698_783,
+];
+const ACKLAM_D: [f64; 4] = [
+    7.784_695_709_041_462e-3,
+    3.224_671_290_700_398e-1,
+    2.445_134_137_142_996,
+    3.754_408_661_907_416,
+];
+
+/// `P_LOW` from Acklam's algorithm: below this (or above `1 - P_LOW`), `ndtri` uses the tail
+/// rational approximation instead of [`central_from_deviation`].
+const P_LOW: f64 = 0.024_25;
+
+/// The central branch of Acklam's rational approximation, taking `q = p - 0.5` directly rather
+/// than recovering it from `p`. [`erfinv`] already has `q` exactly (`x / 2`, no addition
+/// involved), and re-deriving it as `p - 0.5` after first rounding `p = (x + 1) / 2` for small
+/// `x` would cancel away most of `x`'s significant digits before this even runs.
+fn central_from_deviation(q: f64) -> f64 {
+    let r = q * q;
+    let num = ((((ACKLAM_A[0] * r + ACKLAM_A[1]) * r + ACKLAM_A[2]) * r + ACKLAM_A[3]) * r
+        + ACKLAM_A[4])
+        * r
+        + ACKLAM_A[5];
+    let den = ((((ACKLAM_B[0] * r + ACKLAM_B[1]) * r + ACKLAM_B[2]) * r + ACKLAM_B[3]) * r
+        + ACKLAM_B[4])
+        * r
+        + 1.0;
+    num * q / den
+}
+
+/// Acklam's rational approximation of `ndtri(p)`, before Halley refinement.
+fn ndtri_rational(p: f64) -> f64 {
+    if p < P_LOW {
+        let q = (-2.0 * p.ln()).sqrt();
+        let num = ((((ACKLAM_C[0] * q + ACKLAM_C[1]) * q + ACKLAM_C[2]) * q + ACKLAM_C[3]) * q
+            + ACKLAM_C[4])
+            * q
+            + ACKLAM_C[5];
+        let den = (((ACKLAM_D[0] * q + ACKLAM_D[1]) * q + ACKLAM_D[2]) * q + ACKLAM_D[3]) * q + 1.0;
+        return num / den;
     }
-    if y == 0.0 {
-        return f64::INFINITY;
+    if p <= 1.0 - P_LOW {
+        return central_from_deviation(p - 0.5);
     }
-    if y == 2.0 {
-        return f64::NEG_INFINITY;
+    -ndtri_rational(1.0 - p)
+}
+
+/// Halley's rational method on `ndtr(x) - p = 0`, as Acklam's writeup recommends, to bring the
+/// ~1e-9 rational starting point up to full double precision.
+fn halley_refine(mut x: f64, p: f64) -> f64 {
+    for _ in 0..2 {
+        // `ndtr(x) - p`, computed so it never rounds `ndtr(x)` to "close to `1`" first: for
+        // `x > 0`, `ndtr(x) = 1 - ndtr(-x)`, and `(1 - p) - ndtr(-x)` reaches the same value by
+        // way of two quantities that are each already close to `0` (`ndtr(-x)` directly, `1 - p`
+        // exactly by Sterbenz's lemma), rather than one close to `1` losing the low-order bits a
+        // tail probability like `1e-10` needs.
+        let error = if x <= 0.0 {
+            ndtr(x) - p
+        } else {
+            (1.0 - p) - ndtr(-x)
+        };
+        let density = (-0.5 * x * x).exp() / (2.0 * PI).sqrt();
+        if density == 0.0 {
+            break;
+        }
+        let u = error / density;
+        x -= u / (1.0 + x * u / 2.0);
     }
-    f64::NAN
+    x
+}
+
+/// `ndtri(p)`, the standard normal quantile function (inverse of [`ndtr`]).
+pub(in crate::python) fn ndtri(p: f64) -> f64 {
+    if p.is_nan() {
+        return f64::NAN;
+    }
+    if p <= 0.0 {
+        return if p == 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            f64::NAN
+        };
+    }
+    if p >= 1.0 {
+        return if p == 1.0 { f64::INFINITY } else { f64::NAN };
+    }
+    halley_refine(ndtri_rational(p), p)
+}
+
+/// `erfinv(x) = ndtri((x+1)/2) / sqrt(2)`, computed from `q = x / 2` (the deviation `p - 0.5`,
+/// exact) rather than recovering `p - 0.5` from a first-rounded `p = (x + 1) / 2` (see
+/// [`central_from_deviation`]).
+pub(in crate::python) fn erfinv(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x <= -1.0 {
+        return if x == -1.0 {
+            f64::NEG_INFINITY
+        } else {
+            f64::NAN
+        };
+    }
+    if x >= 1.0 {
+        return if x == 1.0 { f64::INFINITY } else { f64::NAN };
+    }
+    let q = 0.5 * x;
+    let p = 0.5 + q;
+    let start = if q.abs() <= 0.5 - P_LOW {
+        central_from_deviation(q)
+    } else {
+        ndtri_rational(p)
+    };
+    let y = halley_refine(start, p) / SQRT_2;
+    // One more Newton step, directly on `erf(y) - x = 0` rather than `ndtr` (which is [`halley_
+    // refine`]'s domain): for small `x`, `x` and `erf(y)` are both close to `0`, so their
+    // difference keeps full precision, where `ndtr(y sqrt(2)) - p` loses precision to `p`'s own
+    // proximity to `0.5` (see [`central_from_deviation`]'s doc comment for the same issue one
+    // level up).
+    let error = erf(y) - x;
+    let derivative = std::f64::consts::FRAC_2_SQRT_PI * (-y * y).exp();
+    if derivative == 0.0 {
+        y
+    } else {
+        y - error / derivative
+    }
+}
+
+/// `erfcinv(x) = -ndtri(x / 2) / sqrt(2)`: `erfc(y) = 2 ndtr(-y sqrt(2))` (from `erfc = 1 - erf`
+/// and the `ndtr`/`erf` identity), so `x = erfc(y)` gives `ndtr(-y sqrt(2)) = x / 2`, i.e.
+/// `-y sqrt(2) = ndtri(x / 2)`.
+pub(in crate::python) fn erfcinv(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        return if x == 0.0 { f64::INFINITY } else { f64::NAN };
+    }
+    if x >= 2.0 {
+        return if x == 2.0 {
+            f64::NEG_INFINITY
+        } else {
+            f64::NAN
+        };
+    }
+    -ndtri(0.5 * x) / SQRT_2
 }
