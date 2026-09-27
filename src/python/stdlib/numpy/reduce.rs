@@ -1,48 +1,66 @@
-//! Reductions and accumulations along axes: `ufunc.reduce`, `ufunc.accumulate`, `argmin` and
-//! `argmax`, and the `sum`/`prod`/`max`/`min`/`any`/`all`/`cumsum`/`cumprod` functions and
-//! methods built on them. The statistics NumPy writes in Python (`mean`, `var`, `std`,
-//! `average`, the `nan*` functions) live in `numpy/_methods.py` and `numpy/_nanfunctions.py` on
-//! top of these, as in NumPy.
+//! Reductions: `ufunc.reduce`/`ufunc.accumulate`, the `numpy` reduction functions built on them
+//! (`sum`, `prod`, `max`/`amax`, `min`/`amin`, `any`, `all`, `argmin`, `argmax`, `cumsum`,
+//! `cumprod`), their `ndarray` methods, and the `python_method` trampoline other areas use to
+//! reach Python-level helpers in `numpy._methods` (`round`, `clip`, and, through it, `mean`,
+//! `var`, `std`).
 //!
-//! A reduction visits its input the way NumPy's iterator does, so floating-point results match
-//! NumPy bit for bit in the common cases:
+//! # Walk order
 //!
-//! - The result starts from the ufunc's identity (`0` for `add`) or from `initial=`. A ufunc
-//!   without an identity, and every `object` reduction, starts from the first element instead.
-//! - Axes are ordered by stride magnitude and adjacent axes that step evenly merge, as in
-//!   NumPy's iterator; negative strides are kept, so a reversed view is visited in reverse.
-//! - [`runs`] reproduces how NumPy's buffered iterator splits each result's elements into
-//!   inner-loop calls. `add` sums each call's run pairwise ([`Numeric::add_lane`]) and adds that
-//!   to the running result. When the innermost axis is kept, the fold goes element by element.
-//!   An input that needs a cast, or that cannot be walked with one stride, is copied through
-//!   NumPy's 8192-element buffer, and each buffer is one run.
+//! A reduction never models NumPy's own buffered, block-unrolled iterator. Instead every
+//! reduction splits an array's axes into the ones kept in the output and the ones being
+//! combined, and reads the whole array once through [`layout::reading_order`] with the kept
+//! axes outermost and the reduced axes innermost. That lays out, for every output cell, a
+//! contiguous run of its inputs in the logical C order of the reduced axes alone, regardless of
+//! how the array is actually strided. Each run is then combined with [`reduce_numeric`],
+//! [`reduce_integer`], [`reduce_bool`], or [`reduce_object`], the same building block generic
+//! `ufunc.reduce` uses for every dtype.
 //!
-//! `add` and `multiply` accumulate booleans and small integers in the 64-bit integer of their
-//! signedness, so `np.sum` of `int8` values does not wrap. Integer reductions otherwise wrap
-//! silently; floating-point flags are reported under the names `reduce` and `accumulate`.
+//! # Floating-point accuracy
+//!
+//! Floating-point and complex `add` reductions combine a run with
+//! [`ops::Numeric::add_lane`], which sums pairwise (recursive halving with a sequential base
+//! case; see `ops.rs`) so rounding error grows like `log n` instead of `n`, the same asymptotic
+//! behavior as NumPy's own pairwise summation (Higham, *Accuracy and Stability of Numerical
+//! Algorithms*, 2nd ed., section 4.2). The block size and unrolling differ from NumPy's, so
+//! results agree with NumPy to a few ulps rather than bit for bit. Every other reduction
+//! combines its run sequentially in the order read.
+//!
+//! # Supported ufunc families
+//!
+//! `ufunc.reduce`/`accumulate` support every binary ufunc NumPy itself supports them for:
+//! `add`, `subtract`, `multiply`, `floor_divide`, `remainder`, `fmod`, `power`, `maximum`,
+//! `minimum`, `fmax`, `fmin`, `divide`, the bitwise ufuncs, the logical ufuncs (which always
+//! compute on a boolean cast of the input, as NumPy's own type resolution does), the comparison
+//! ufuncs (only on boolean input, since that is the only dtype NumPy registers a comparison
+//! reduce loop for), and the two-argument real functions `arctan2`, `hypot`, `copysign`,
+//! `logaddexp`, `logaddexp2`, and `heaviside`. `power` rechecks each element used as an exponent
+//! for a negative value on signed integer input, the same check ordinary `**` makes before its
+//! loop runs, since a per-element reduction step cannot make that check once up front the way
+//! whole-array application does. `scipy.special` ufuncs are rejected outright with their own
+//! error text naming SciPy: NumPy allows some of these (`scipy.special.xlogy.reduce` runs a real
+//! reduce loop upstream), but no caller in this codebase needs them, so this is an explicit
+//! unsupported frontier rather than a guess at behavior nothing exercises. `nextafter` and
+//! `ldexp` are not registered as ufuncs anywhere in shellsim's NumPy at all (`np.nextafter` and
+//! `np.ldexp` do not exist), so there is no elementwise loop for `.reduce()` to call in the
+//! first place; adding them is a math-kernel gap, not a reduction gap.
 
 use std::cmp::Ordering;
 
-use super::super::super::ast::ComparisonOperator;
 use super::super::super::native::{
-    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyArrayBuffer, PyArrayData,
-    PyArrayDtype, PyArrayView, PyError, PyKind, PyOperator, PyResult, PyRuntime, PyValue,
-    PyValueCast,
+    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyArrayBuffer, PyError, PyResult,
+    PyRuntime, PyValue,
 };
 use super::super::super::Value;
 use super::args::{self, Axes, Bound, Signature};
-use super::array::{
-    self, array_from_elements, contiguous_strides, element_count, new_array, reserve_elements,
-    Array, Offsets,
-};
+use super::array::{self, Array};
 use super::convert;
-use super::dtype::{self, DType, Kind};
-use super::element::{self, dispatch_integer, dispatch_numeric, dispatch_real, Number};
+use super::dtype::{self, Category, DType, Kind};
+use super::element::{dispatch_integer, dispatch_numeric, dispatch_real, Element, Number};
+use super::layout;
 use super::ops::{FpFlags, Integer, Numeric, Real};
-use super::ufunc::{self, ArithOp, BitOp, Family, LogicalOp, UfuncDef, UFUNCS};
-
-/// NumPy's iterator buffer size, `NPY_BUFSIZE`, in elements.
-const BUFFER_SIZE: usize = 8192;
+use super::ufunc::{
+    self, ArithOp, BitOp, CompareOp, Family, Float2Op, LogicalOp, UfuncDef, UFUNCS,
+};
 
 pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
     name: "_numpy_reduce",
@@ -64,17 +82,37 @@ const fn function(
 static FUNCTIONS: &[FunctionDef] = &[
     function("sum", module_sum),
     function("prod", module_prod),
-    function("max", module_max),
-    function("min", module_min),
     function("amax", module_max),
+    function("max", module_max),
     function("amin", module_min),
+    function("min", module_min),
     function("any", module_any),
     function("all", module_all),
+    function("argmin", module_argmin),
+    function("argmax", module_argmax),
     function("cumsum", module_cumsum),
     function("cumprod", module_cumprod),
-    function("argmax", module_argmax),
-    function("argmin", module_argmin),
 ];
+
+pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
+    name: "numpy.ndarray",
+    methods: &[
+        method("sum", method_sum),
+        method("prod", method_prod),
+        method("max", method_max),
+        method("min", method_min),
+        method("any", method_any),
+        method("all", method_all),
+        method("argmin", method_argmin),
+        method("argmax", method_argmax),
+        method("cumsum", method_cumsum),
+        method("cumprod", method_cumprod),
+        method("mean", method_mean),
+        method("var", method_var),
+        method("std", method_std),
+    ],
+    getters: &[],
+};
 
 const fn method(
     name: &'static str,
@@ -87,1122 +125,10 @@ const fn method(
     }
 }
 
-/// Methods this area installs on `numpy.ndarray`.
-pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
-    name: "numpy.ndarray",
-    methods: &[
-        method("sum", method_sum),
-        method("prod", method_prod),
-        method("max", method_max),
-        method("min", method_min),
-        method("any", method_any),
-        method("all", method_all),
-        method("cumsum", method_cumsum),
-        method("cumprod", method_cumprod),
-        method("argmax", method_argmax),
-        method("argmin", method_argmin),
-        method("mean", method_mean),
-        method("var", method_var),
-        method("std", method_std),
-    ],
-    getters: &[],
-};
-
-/// Options of one reduction.
-pub(in crate::python) struct ReduceOptions {
-    pub axes: Axes,
-    pub dtype: Option<DType>,
-    pub out: Option<Array>,
-    pub keepdims: bool,
-    pub initial: Option<PyValue>,
-}
-
-/// Reduce `array` with binary ufunc `index`.
-pub(in crate::python) fn reduce(
-    runtime: &mut dyn PyRuntime,
-    index: usize,
-    array: &Array,
-    options: &ReduceOptions,
-) -> PyResult {
-    let ufunc = &UFUNCS[index];
-    let requested = options.dtype.or(options.out.as_ref().map(|out| out.dtype));
-    let dtype = loop_dtype(ufunc, array.dtype, requested)?;
-    let shape = result_shape(array.shape(), &options.axes, options.keepdims);
-    if let Some(out) = &options.out {
-        check_out(ufunc.name, out, &shape)?;
-    }
-    let source = convert::cast_array(runtime, array, dtype, false)?;
-    let layout = Layout::new(&source.view, &options.axes, array.dtype != dtype);
-    let buffer = match dtype.kind() {
-        Kind::Object => reduce_objects(runtime, ufunc, &source, &layout, options.initial)?,
-        Kind::Str => {
-            return Err(PyError::unsupported(format!(
-                "{}.reduce on string arrays is not supported",
-                ufunc.name
-            )))
-        }
-        _ => reduce_numbers(runtime, ufunc, &source, &layout, options.initial)?,
-    };
-    let result = new_array(runtime, buffer, dtype, shape)?;
-    finish(runtime, result, options.out.as_ref())
-}
-
-/// The dtype a reduction computes in: `dtype=` (or `out=`'s dtype) when given, the 64-bit
-/// accumulator for `add` and `multiply` of booleans and integers, and otherwise the input's
-/// dtype as the ufunc resolves it. The loop must map its dtype to itself. Object logical
-/// reductions keep objects, returning an operand as Python's `and`/`or` do.
-fn loop_dtype(ufunc: &UfuncDef, input: DType, requested: Option<DType>) -> PyResult<DType> {
-    if ufunc.nin() != 2 {
-        return Err(PyError::value_error(
-            "reduce only supported for binary functions",
-        ));
-    }
-    if matches!(ufunc.family, Family::Special(_)) {
-        return Err(PyError::unsupported(format!(
-            "reduce and accumulate of scipy.special.{} are not supported by shellsim's SciPy",
-            ufunc.name
-        )));
-    }
-    let accumulates = matches!(
-        ufunc.family,
-        Family::Arith {
-            op: ArithOp::Add | ArithOp::Multiply,
-            ..
-        }
-    );
-    let common = match requested {
-        Some(dtype) => dtype,
-        None if accumulates && input.kind() != Kind::Object => dtype::accumulator(input),
-        None => input,
-    };
-    if common.kind() == Kind::Object && matches!(ufunc.family, Family::Logical(_)) {
-        return Ok(common);
-    }
-    let resolved = ufunc::resolve(ufunc, common, &[common, common], requested)?;
-    if resolved.input != resolved.output {
-        return Err(PyError::type_error(format!(
-            "No loop matching the specified signature and casting was found for ufunc {}",
-            ufunc.name
-        )));
-    }
-    Ok(resolved.input)
-}
-
-/// The shape left after reducing `axes`, with length-1 axes in their place for `keepdims`.
-fn result_shape(shape: &[usize], axes: &Axes, keepdims: bool) -> Vec<usize> {
-    shape
-        .iter()
-        .enumerate()
-        .filter_map(|(axis, length)| match (axes.contains(axis), keepdims) {
-            (false, _) => Some(*length),
-            (true, true) => Some(1),
-            (true, false) => None,
-        })
-        .collect()
-}
-
-fn check_out(name: &str, out: &Array, shape: &[usize]) -> PyResult<()> {
-    if out.ndim() != shape.len() {
-        return Err(PyError::value_error(format!(
-            "output parameter for reduction operation {name} has the wrong number of dimensions: \
-             Found {} but expected {}",
-            out.ndim(),
-            shape.len()
-        )));
-    }
-    if out.shape() != shape {
-        return Err(PyError::value_error(format!(
-            "output parameter for reduction operation {name} has a non-reduction dimension not \
-             equal to the output"
-        )));
-    }
-    Ok(())
-}
-
-/// Return a result: stored into `out=`, boxed as a scalar when 0-d, or the array itself.
-fn finish(runtime: &mut dyn PyRuntime, result: Array, out: Option<&Array>) -> PyResult {
-    if let Some(out) = out {
-        array::assign(runtime, out, &result)?;
-        return Ok(out.value());
-    }
-    if result.ndim() == 0 {
-        return convert::element_to_scalar(runtime, &result, result.view.offset);
-    }
-    Ok(result.value())
-}
-
-/// The ufunc's identity, the starting value of a numeric reduction without `initial=`.
-fn identity(family: Family) -> Option<Number> {
-    match family {
-        Family::Arith {
-            op: ArithOp::Add, ..
-        }
-        | Family::Logical(LogicalOp::Or | LogicalOp::Xor)
-        | Family::Bitwise(BitOp::Or | BitOp::Xor) => Some(Number::Int(0)),
-        Family::Arith {
-            op: ArithOp::Multiply,
-            ..
-        } => Some(Number::Int(1)),
-        Family::Logical(LogicalOp::And) => Some(Number::Bool(true)),
-        Family::Bitwise(BitOp::And) => Some(Number::Int(-1)),
-        _ => None,
-    }
-}
-
-fn no_identity(name: &str) -> PyError {
-    PyError::value_error(format!(
-        "zero-size array to reduction operation {name} which has no identity"
-    ))
-}
-
-/// How a reduction visits its input.
-struct Layout {
-    /// Shape and input strides of the kept axes, in order; results are stored in C order.
-    kept_shape: Vec<usize>,
-    kept_strides: Vec<isize>,
-    /// Reduced axes in NumPy's visiting order, outer to inner.
-    reduced_shape: Vec<usize>,
-    reduced_strides: Vec<isize>,
-    /// Byte offset of the first element.
-    start: usize,
-    /// NumPy's inner-loop calls: each result's elements, in visiting order, fall into blocks of
-    /// `block` elements, and each block into runs of at most `run`. `add` sums a run pairwise.
-    runs: Runs,
-    /// Elements folded into each result.
-    count: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Runs {
-    block: usize,
-    run: usize,
-}
-
-/// One axis of NumPy's reduction iterator over (result, input).
-#[derive(Clone, Copy, Debug)]
-struct IterAxis {
-    length: usize,
-    /// Input stride in bytes.
-    stride: isize,
-    reduced: bool,
-}
-
-impl Layout {
-    fn new(view: &PyArrayView, axes: &Axes, cast: bool) -> Self {
-        let (mut kept_shape, mut kept_strides) = (Vec::new(), Vec::new());
-        let mut iteration = Vec::new();
-        let mut count = 1usize;
-        for (axis, (&length, &stride)) in view.shape.iter().zip(&view.strides).enumerate() {
-            let reduced = axes.contains(axis);
-            if reduced {
-                count = count.saturating_mul(length);
-            } else {
-                kept_shape.push(length);
-                kept_strides.push(stride);
-            }
-            if length > 1 {
-                iteration.push(IterAxis {
-                    length,
-                    stride,
-                    reduced,
-                });
-            }
-        }
-        // NumPy stores iterator axes innermost first.
-        iteration.reverse();
-        let iteration = coalesce(order_axes(iteration));
-        let (reduced_shape, reduced_strides) = if count == 0 {
-            // The iterator skips empty axes; keep one so a result visits no elements.
-            (vec![0], vec![0])
-        } else {
-            iteration
-                .iter()
-                .rev()
-                .filter(|axis| axis.reduced)
-                .map(|axis| (axis.length, axis.stride))
-                .unzip()
-        };
-        Self {
-            kept_shape,
-            kept_strides,
-            reduced_shape,
-            reduced_strides,
-            start: view.offset,
-            runs: runs(&iteration, cast),
-            count,
-        }
-    }
-
-    fn results(&self) -> usize {
-        self.kept_shape.iter().product()
-    }
-
-    /// Offsets of each result's first element, in result order.
-    fn bases(&self) -> Offsets {
-        Offsets::new(&self.kept_shape, &self.kept_strides, self.start)
-    }
-
-    /// Offsets of the elements of the result at `base`, in visiting order.
-    fn elements(&self, base: usize) -> Offsets {
-        Offsets::new(&self.reduced_shape, &self.reduced_strides, base)
-    }
-}
-
-/// NumPy's iterator axis order (`npyiter_find_best_axis_ordering`), innermost first: a stable
-/// insertion sort by stride magnitude. A zero stride is ambiguous, so the scan steps past it.
-/// Reductions keep negative strides, so a reversed axis is still visited in reverse.
-fn order_axes(mut axes: Vec<IterAxis>) -> Vec<IterAxis> {
-    for next in 1..axes.len() {
-        let stride = axes[next].stride;
-        let mut position = next;
-        for earlier in (0..next).rev() {
-            let other = axes[earlier].stride;
-            if stride == 0 || other == 0 {
-                continue;
-            }
-            if other.unsigned_abs() <= stride.unsigned_abs() {
-                break;
-            }
-            position = earlier;
-        }
-        axes[position..=next].rotate_right(1);
-    }
-    axes
-}
-
-/// Merge adjacent axes that both operands step through evenly. The result is allocated in
-/// iteration order, so it merges two kept or two reduced axes; the input must also agree.
-fn coalesce(axes: Vec<IterAxis>) -> Vec<IterAxis> {
-    let mut merged: Vec<IterAxis> = Vec::with_capacity(axes.len());
-    for axis in axes {
-        match merged.last_mut() {
-            Some(inner)
-                if inner.reduced == axis.reduced
-                    && inner.stride * inner.length as isize == axis.stride =>
-            {
-                inner.length *= axis.length;
-            }
-            _ => merged.push(axis),
-        }
-    }
-    merged
-}
-
-/// The inner-loop runs of NumPy's buffered reduction iterator, following
-/// `npyiter_find_buffering_setup` for its two operands, the result and the input. It picks
-/// the outer dimension that minimizes estimated overhead. The input is buffered when it needs a
-/// cast or when it cannot be walked with one stride up to that dimension, and a buffer holds at
-/// most 8192 elements. In "reduce mode" the core below the first result/reduced boundary is
-/// one inner loop; otherwise one buffer's worth of reduced elements is.
-fn runs(axes: &[IterAxis], cast: bool) -> Runs {
-    let sequential = Runs { block: 1, run: 1 };
-    let Some(first) = axes.first() else {
-        return sequential;
-    };
-    if !first.reduced {
-        return sequential;
-    }
-    let mut cost = 1 + usize::from(cast);
-    let (mut result_single, mut input_single) = (1, 1);
-    let mut outer_reduce = 0;
-    let mut size = first.length;
-    let (mut best_dim, mut best_cost, mut best_size, mut best_core) = (0, cost, size, 1);
-    for dim in 1..axes.len() {
-        if outer_reduce != 0 || (size >= BUFFER_SIZE && cost > 1) {
-            break;
-        }
-        let (previous, current) = (axes[dim - 1], axes[dim]);
-        if result_single == dim {
-            if previous.reduced == current.reduced {
-                result_single += 1;
-            } else {
-                cost += 1;
-                outer_reduce = dim;
-            }
-        }
-        if input_single == dim {
-            if previous.stride * previous.length as isize == current.stride {
-                input_single += 1;
-            } else if !cast {
-                cost += 1;
-            }
-        }
-        let core = size;
-        size = size.saturating_mul(current.length);
-        let buffered_size = if size > BUFFER_SIZE && cost > 1 {
-            BUFFER_SIZE
-        } else {
-            size
-        };
-        if (cost as u128) * (best_size as u128) <= (best_cost as u128) * (buffered_size as u128) {
-            (best_dim, best_cost, best_size, best_core) = (dim, cost, size, core);
-        }
-    }
-    let reduce_mode = outer_reduce != 0 && best_dim == outer_reduce;
-    if reduce_mode {
-        return Runs {
-            block: best_core,
-            run: best_core,
-        };
-    }
-    let buffered = cast || input_single <= best_dim;
-    let run = if buffered && best_size > BUFFER_SIZE {
-        best_core * (BUFFER_SIZE / best_core)
-    } else {
-        best_size
-    };
-    Runs {
-        block: best_size,
-        run,
-    }
-}
-
-/// Run `$body` with `$T` bound to the element type of `$kind` and `$operation` to the ufunc's
-/// binary kernel for it.
-macro_rules! with_kernel {
-    ($family:expr, $kind:expr, |$T:ident, $operation:ident| $body:expr) => {{
-        let unsupported = || -> PyResult<()> {
-            Err(PyError::runtime_error(
-                "reduction has no kernel for its dtype",
-            ))
-        };
-        match $family {
-            Family::Arith { op, .. } => dispatch_numeric!($kind, $T => {
-                let $operation = ufunc::arith_fn::<$T>(op);
-                $body
-            }, _ => unsupported()),
-            Family::TrueDivide => dispatch_numeric!($kind, $T => {
-                let $operation = |a: $T, b: $T, flags: &mut FpFlags| a.divide(b, flags);
-                $body
-            }, _ => unsupported()),
-            Family::Logical(op) => {
-                type $T = bool;
-                let $operation = move |a: bool, b: bool, _: &mut FpFlags| match op {
-                    LogicalOp::And => a && b,
-                    LogicalOp::Or => a || b,
-                    LogicalOp::Xor => a != b,
-                };
-                $body
-            }
-            Family::Compare(op) => {
-                type $T = bool;
-                let test = ufunc::compare_fn(op);
-                let $operation = move |a: bool, b: bool, _: &mut FpFlags| test(a.compare(b));
-                $body
-            }
-            Family::Bitwise(op) => dispatch_integer!($kind, $T => {
-                let $operation = move |a: $T, b: $T, _: &mut FpFlags| match op {
-                    BitOp::And => a.bit_and(b),
-                    BitOp::Or => a.bit_or(b),
-                    BitOp::Xor => a.bit_xor(b),
-                    BitOp::LeftShift => a.left_shift(b),
-                    BitOp::RightShift => a.right_shift(b),
-                };
-                $body
-            }, _ => unsupported()),
-            Family::Float2(op) => dispatch_real!($kind, $T => {
-                let pair = ufunc::float2_fn(op);
-                let $operation = move |a: $T, b: $T, flags: &mut FpFlags| {
-                    let result = a.zip(b, pair.0, pair.1);
-                    ufunc::float_flags_binary(a.to_f64(), b.to_f64(), result.to_f64(), flags);
-                    result
-                };
-                $body
-            }, _ => unsupported()),
-            _ => unsupported(),
-        }
-    }};
-}
-
-fn reduce_numbers(
-    runtime: &mut dyn PyRuntime,
-    ufunc: &UfuncDef,
-    source: &Array,
-    layout: &Layout,
-    initial: Option<PyValue>,
-) -> PyResult<PyArrayBuffer> {
-    let dtype = source.dtype;
-    let mut start = [0u8; 16];
-    let has_start = match initial {
-        Some(value) => {
-            let PyArrayBuffer::Bytes(bytes) = convert::value_to_buffer(runtime, value, dtype)?
-            else {
-                return Err(PyError::runtime_error(
-                    "numeric initial value has object storage",
-                ));
-            };
-            start[..bytes.len()].copy_from_slice(&bytes);
-            true
-        }
-        None => match identity(ufunc.family) {
-            Some(number) => {
-                element::write_number(dtype.kind(), number, &mut start);
-                true
-            }
-            None => false,
-        },
-    };
-    if layout.count == 0 && !has_start {
-        return Err(no_identity(ufunc.name));
-    }
-    let results = layout.results();
-    runtime.charge_cpu((layout.count as u64).saturating_mul(results as u64) + 1)?;
-    reserve_elements(runtime, dtype, results)?;
-    // Scratch space for one run.
-    runtime.reserve_memory(
-        layout
-            .runs
-            .run
-            .min(layout.count)
-            .saturating_mul(dtype.itemsize()),
-    )?;
-    let mut output = vec![0u8; results * dtype.itemsize()];
-    let mut flags = FpFlags::default();
-    let fold_options = FoldOptions {
-        start: has_start.then_some(&start[..]),
-        pairwise: matches!(
-            ufunc.family,
-            Family::Arith {
-                op: ArithOp::Add,
-                ..
-            }
-        ),
-    };
-    let family = ufunc.family;
-    runtime.read_arrays(&[source.handle], &mut |arrays| {
-        let PyArrayData::Bytes(data) = arrays[0].data else {
-            return Err(PyError::runtime_error("numeric array has object storage"));
-        };
-        with_kernel!(family, dtype.kind(), |T, operation| {
-            fold::<T>(
-                data,
-                layout,
-                &fold_options,
-                &mut output,
-                &mut flags,
-                operation,
-            )
-        })
-    })?;
-    if dtype.is_integer() {
-        flags.overflow = false;
-    }
-    super::errstate::report(runtime, "reduce", flags)?;
-    Ok(PyArrayBuffer::Bytes(output))
-}
-
-struct FoldOptions<'a> {
-    /// Bytes of the starting value, or `None` to start from the first element.
-    start: Option<&'a [u8]>,
-    /// Sum each run pairwise, as NumPy's `add` does.
-    pairwise: bool,
-}
-
-/// Fold every result of a numeric reduction.
-fn fold<T: Numeric>(
-    data: &[u8],
-    layout: &Layout,
-    options: &FoldOptions<'_>,
-    output: &mut [u8],
-    flags: &mut FpFlags,
-    operation: impl Fn(T, T, &mut FpFlags) -> T,
-) -> PyResult<()> {
-    let start = options.start.map(T::read);
-    let read = |offset: usize| T::read(&data[offset..]);
-    let Runs { block, run } = layout.runs;
-    let mut lane = Vec::new();
-    for (base, target) in layout.bases().zip(output.chunks_exact_mut(T::SIZE)) {
-        let mut total = start;
-        let mut elements = layout.elements(base);
-        match total {
-            Some(mut sum) if options.pairwise && run > 1 => {
-                let mut left = layout.count;
-                while left > 0 {
-                    let mut block_left = block.min(left);
-                    left -= block_left;
-                    while block_left > 0 {
-                        let length = run.min(block_left);
-                        block_left -= length;
-                        lane.clear();
-                        lane.extend(elements.by_ref().take(length).map(read));
-                        sum = sum.add_lane(&lane, flags);
-                    }
-                }
-                total = Some(sum);
-            }
-            _ => {
-                for offset in elements {
-                    let value = read(offset);
-                    total = Some(match total {
-                        Some(sum) => operation(sum, value, flags),
-                        None => value,
-                    });
-                }
-            }
-        }
-        total
-            .ok_or_else(|| PyError::runtime_error("empty reduction without a start value"))?
-            .write(target);
-    }
-    Ok(())
-}
-
-/// The elements of each result of `layout`, in visiting order, from an object array.
-fn object_groups(
-    runtime: &mut dyn PyRuntime,
-    source: &Array,
-    layout: &Layout,
-) -> PyResult<Vec<Vec<PyValue>>> {
-    let results = layout.results();
-    runtime.reserve_memory(source.size().saturating_mul(PyArrayDtype::VALUE_ITEMSIZE))?;
-    let mut groups = Vec::with_capacity(results);
-    runtime.read_arrays(&[source.handle], &mut |arrays| {
-        let PyArrayData::Values(values) = arrays[0].data else {
-            return Err(PyError::runtime_error("object array has byte storage"));
-        };
-        for base in layout.bases() {
-            groups.push(
-                layout
-                    .elements(base)
-                    .map(|offset| values[offset / PyArrayDtype::VALUE_ITEMSIZE])
-                    .collect(),
-            );
-        }
-        Ok(())
-    })?;
-    Ok(groups)
-}
-
-/// An `object` reduction applies the Python operator element by element, starting from the
-/// first element. The identity is used only when there are no elements.
-fn reduce_objects(
-    runtime: &mut dyn PyRuntime,
-    ufunc: &UfuncDef,
-    source: &Array,
-    layout: &Layout,
-    initial: Option<PyValue>,
-) -> PyResult<PyArrayBuffer> {
-    let groups = object_groups(runtime, source, layout)?;
-    let mut output = Vec::with_capacity(groups.len());
-    for group in groups {
-        let mut items = group.into_iter();
-        let mut total = match initial.or_else(|| items.next()) {
-            Some(value) => value,
-            None => match identity(ufunc.family) {
-                Some(Number::Bool(value)) => Value::Bool(value),
-                Some(number) => Value::Int(number.wrapping_i64()),
-                None => return Err(no_identity(ufunc.name)),
-            },
-        };
-        for item in items {
-            runtime.charge_cpu(1)?;
-            total = object_operation(runtime, ufunc, total, item)?;
-        }
-        output.push(total);
-    }
-    Ok(PyArrayBuffer::Values(output))
-}
-
-/// One step of an `object` reduction or accumulation.
-fn object_operation(
-    runtime: &mut dyn PyRuntime,
-    ufunc: &UfuncDef,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult {
-    ufunc::object_element(runtime, ufunc, &[left, right])
-}
-
-/// Accumulate `array` along `axis` with binary ufunc `index`: element `i` of the result
-/// combines elements `0..=i`.
-pub(in crate::python) fn accumulate(
-    runtime: &mut dyn PyRuntime,
-    index: usize,
-    array: &Array,
-    axis: usize,
-    requested: Option<DType>,
-    out: Option<&Array>,
-) -> PyResult {
-    let ufunc = &UFUNCS[index];
-    let dtype = loop_dtype(ufunc, array.dtype, requested.or(out.map(|out| out.dtype)))?;
-    if let Some(out) = out {
-        if out.shape() != array.shape() {
-            return Err(PyError::value_error(format!(
-                "output operand with shape {} does not match the accumulation shape {}",
-                array::format_shape(out.shape()),
-                array::format_shape(array.shape())
-            )));
-        }
-    }
-    let source = convert::cast_array(runtime, array, dtype, false)?;
-    let shape = source.shape().to_vec();
-    let count = element_count(&shape)?;
-    let (length, stride) = (shape[axis], source.strides()[axis]);
-    let mut lane_shape = shape.clone();
-    lane_shape.remove(axis);
-    let mut lane_strides = source.strides().to_vec();
-    lane_strides.remove(axis);
-    let mut output_strides = contiguous_strides(&shape, dtype.itemsize().max(1));
-    let output_stride = output_strides.remove(axis);
-    let scan = Scan {
-        inputs: Offsets::new(&lane_shape, &lane_strides, source.view.offset),
-        outputs: Offsets::new(&lane_shape, &output_strides, 0),
-        length,
-        stride,
-        output_stride,
-    };
-    runtime.charge_cpu(count as u64 + 1)?;
-    let buffer = match dtype.kind() {
-        Kind::Str => {
-            return Err(PyError::unsupported(format!(
-                "{}.accumulate on string arrays is not supported",
-                ufunc.name
-            )))
-        }
-        Kind::Object => accumulate_objects(runtime, ufunc, &source, scan, count)?,
-        kind => {
-            reserve_elements(runtime, dtype, count)?;
-            let mut output = vec![0u8; count * dtype.itemsize()];
-            let mut flags = FpFlags::default();
-            let family = ufunc.family;
-            let mut scan = Some(scan);
-            runtime.read_arrays(&[source.handle], &mut |arrays| {
-                let PyArrayData::Bytes(data) = arrays[0].data else {
-                    return Err(PyError::runtime_error("numeric array has object storage"));
-                };
-                let scan = scan.take().expect("read callback runs once");
-                with_kernel!(family, kind, |T, operation| {
-                    scan_numbers::<T>(data, scan, &mut output, &mut flags, operation)
-                })
-            })?;
-            if dtype.is_integer() {
-                flags.overflow = false;
-            }
-            super::errstate::report(runtime, "accumulate", flags)?;
-            PyArrayBuffer::Bytes(output)
-        }
-    };
-    let result = new_array(runtime, buffer, dtype, shape)?;
-    if let Some(out) = out {
-        array::assign(runtime, out, &result)?;
-        return Ok(out.value());
-    }
-    Ok(result.value())
-}
-
-/// Where an accumulation reads and writes: one lane per position of the other axes.
-struct Scan {
-    inputs: Offsets,
-    outputs: Offsets,
-    length: usize,
-    stride: isize,
-    output_stride: isize,
-}
-
-fn scan_numbers<T: Numeric>(
-    data: &[u8],
-    scan: Scan,
-    output: &mut [u8],
-    flags: &mut FpFlags,
-    operation: impl Fn(T, T, &mut FpFlags) -> T,
-) -> PyResult<()> {
-    for (input, target) in scan.inputs.zip(scan.outputs) {
-        let mut total: Option<T> = None;
-        for step in 0..scan.length {
-            let offset = (input as isize + step as isize * scan.stride) as usize;
-            let value = T::read(&data[offset..]);
-            let next = match total {
-                Some(sum) => operation(sum, value, flags),
-                None => value,
-            };
-            let position = (target as isize + step as isize * scan.output_stride) as usize;
-            next.write(&mut output[position..position + T::SIZE]);
-            total = Some(next);
-        }
-    }
-    Ok(())
-}
-
-fn accumulate_objects(
-    runtime: &mut dyn PyRuntime,
-    ufunc: &UfuncDef,
-    source: &Array,
-    scan: Scan,
-    count: usize,
-) -> PyResult<PyArrayBuffer> {
-    runtime.reserve_memory(count.saturating_mul(PyArrayDtype::VALUE_ITEMSIZE))?;
-    // Snapshot every lane first: the Python operators below may run arbitrary code.
-    let Scan {
-        inputs,
-        outputs,
-        length,
-        stride,
-        output_stride,
-    } = scan;
-    let mut lanes = Some((inputs, outputs));
-    let mut snapshot = Vec::new();
-    runtime.read_arrays(&[source.handle], &mut |arrays| {
-        let PyArrayData::Values(values) = arrays[0].data else {
-            return Err(PyError::runtime_error("object array has byte storage"));
-        };
-        let (inputs, outputs) = lanes.take().expect("read callback runs once");
-        for (input, target) in inputs.zip(outputs) {
-            let items = (0..length)
-                .map(|step| {
-                    let offset = (input as isize + step as isize * stride) as usize;
-                    values[offset / PyArrayDtype::VALUE_ITEMSIZE]
-                })
-                .collect::<Vec<_>>();
-            snapshot.push((target, items));
-        }
-        Ok(())
-    })?;
-    let mut output = vec![Value::None; count];
-    for (target, items) in snapshot {
-        let mut total = None;
-        for (step, item) in items.into_iter().enumerate() {
-            runtime.charge_cpu(1)?;
-            let next = match total {
-                Some(sum) => object_operation(runtime, ufunc, sum, item)?,
-                None => item,
-            };
-            let position = (target as isize + step as isize * output_stride) as usize;
-            output[position / PyArrayDtype::VALUE_ITEMSIZE] = next;
-            total = Some(next);
-        }
-    }
-    Ok(PyArrayBuffer::Values(output))
-}
-
-/// Index of the first maximum (or minimum) along each lane. NaN counts as the extreme, so the
-/// first NaN wins, as in NumPy.
-fn arg_numbers<T: Numeric>(data: &[u8], scan: Scan, maximum: bool, output: &mut Vec<i64>) {
-    let wanted = if maximum {
-        Ordering::Greater
-    } else {
-        Ordering::Less
-    };
-    for input in scan.inputs {
-        let read =
-            |step: usize| T::read(&data[(input as isize + step as isize * scan.stride) as usize..]);
-        let mut best = read(0);
-        let mut index = 0;
-        if !best.is_nan() {
-            for step in 1..scan.length {
-                let value = read(step);
-                if value.is_nan() {
-                    index = step;
-                    break;
-                }
-                if value.compare(best) == Some(wanted) {
-                    best = value;
-                    index = step;
-                }
-            }
-        }
-        output.push(index as i64);
-    }
-}
-
-/// `np.argmax`/`np.argmin`: positions in C order for `axis=None`, else along `axis`.
-fn arg_extreme(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-    bound: &Bound,
-    maximum: bool,
-) -> PyResult {
-    let name = if maximum { "argmax" } else { "argmin" };
-    let array = convert::as_array(runtime, value)?;
-    let axis = args::axis(runtime, bound.get("axis"), array.ndim())?;
-    let keepdims = args::flag(runtime, bound.get("keepdims"), false)?;
-    let out = out_argument(runtime, bound.value("out"))?;
-    let (source, lane_axis) = match axis {
-        Some(axis) => (array.clone(), axis),
-        None => (array::ravel(runtime, &array)?, 0),
-    };
-    let length = source.shape()[lane_axis];
-    if length == 0 {
-        return Err(PyError::value_error(format!(
-            "attempt to get {name} of an empty sequence"
-        )));
-    }
-    let mut lane_shape = source.shape().to_vec();
-    lane_shape.remove(lane_axis);
-    let mut lane_strides = source.strides().to_vec();
-    lane_strides.remove(lane_axis);
-    let results = element_count(&lane_shape)?;
-    runtime.charge_cpu(source.size() as u64 + 1)?;
-    runtime.reserve_memory(results.saturating_mul(8))?;
-    let scan = Scan {
-        inputs: Offsets::new(&lane_shape, &lane_strides, source.view.offset),
-        outputs: Offsets::new(&[], &[], 0),
-        length,
-        stride: source.strides()[lane_axis],
-        output_stride: 0,
-    };
-    let indices = match source.dtype.kind() {
-        Kind::Object | Kind::Str => arg_values(runtime, &source, lane_axis, maximum)?,
-        kind => {
-            let mut indices = Vec::with_capacity(results);
-            let mut scan = Some(scan);
-            runtime.read_arrays(&[source.handle], &mut |arrays| {
-                let PyArrayData::Bytes(data) = arrays[0].data else {
-                    return Err(PyError::runtime_error("numeric array has object storage"));
-                };
-                let scan = scan.take().expect("read callback runs once");
-                dispatch_numeric!(kind, T => arg_numbers::<T>(data, scan, maximum, &mut indices), _ => {});
-                Ok(())
-            })?;
-            indices
-        }
-    };
-    let shape = match (keepdims, axis) {
-        (false, _) => lane_shape,
-        (true, None) => vec![1; array.ndim()],
-        (true, Some(axis)) => {
-            let mut shape = array.shape().to_vec();
-            shape[axis] = 1;
-            shape
-        }
-    };
-    let result = array_from_elements(runtime, DType::INT64, shape, &indices)?;
-    finish(runtime, result, out.as_ref())
-}
-
-/// `argmax`/`argmin` over strings (code point order) and objects (Python `>` and `<`).
-fn arg_values(
-    runtime: &mut dyn PyRuntime,
-    source: &Array,
-    lane_axis: usize,
-    maximum: bool,
-) -> PyResult<Vec<i64>> {
-    let objects = convert::cast_array(runtime, source, DType::OBJECT, false)?;
-    let values = array::read_objects(runtime, &objects)?;
-    // `values` is in C order, so walk it with C-order strides counted in elements.
-    let mut lane_shape = source.shape().to_vec();
-    let length = lane_shape.remove(lane_axis);
-    let mut lane_strides = contiguous_strides(source.shape(), 1);
-    let step = lane_strides.remove(lane_axis);
-    let operator = PyOperator::Compare(if maximum {
-        ComparisonOperator::Greater
-    } else {
-        ComparisonOperator::Less
-    });
-    let mut indices = Vec::new();
-    for first in Offsets::new(&lane_shape, &lane_strides, 0) {
-        let mut best = values[first];
-        let mut index = 0;
-        for position in 1..length {
-            runtime.charge_cpu(1)?;
-            let value = values[(first as isize + position as isize * step) as usize];
-            let better = runtime.apply_operator(operator, &[value, best])?;
-            if runtime.truth(&better)? {
-                best = value;
-                index = position;
-            }
-        }
-        indices.push(index as i64);
-    }
-    Ok(indices)
-}
-
-/// Accept `out=array` or `out=None`.
-fn out_argument(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Option<Array>> {
-    value
-        .map(|value| {
-            Array::from_value(runtime, value)
-                .map_err(|_| PyError::type_error("output must be an array"))
-        })
-        .transpose()
-}
-
-/// Reject `where=` masks other than `True`, which reductions do not implement.
-fn reject_where(runtime: &mut dyn PyRuntime, bound: &Bound, name: &str) -> PyResult<()> {
-    match bound.get("where") {
-        Some(value) if !(runtime.kind(&value)? == PyKind::Bool && runtime.truth(&value)?) => Err(
-            PyError::unsupported(format!("{name}() with a where= mask is not supported")),
-        ),
-        _ => Ok(()),
-    }
-}
-
-/// Bind `args` for a method call, with the receiver as the first positional argument.
-fn with_receiver(receiver: PyValue, args: &CallArgs) -> CallArgs {
-    let mut positional = vec![receiver];
-    positional.extend_from_slice(args.positional());
-    CallArgs::new(positional, args.keywords().to_vec())
-}
-
-static SUM: Signature = Signature::new(
-    "sum",
-    &["a", "axis", "dtype", "out", "keepdims", "initial", "where"],
-    1,
-);
-static PROD: Signature = Signature::new(
-    "prod",
-    &["a", "axis", "dtype", "out", "keepdims", "initial", "where"],
-    1,
-);
-static MAX: Signature = Signature::new(
-    "max",
-    &["a", "axis", "out", "keepdims", "initial", "where"],
-    1,
-);
-static MIN: Signature = Signature::new(
-    "min",
-    &["a", "axis", "out", "keepdims", "initial", "where"],
-    1,
-);
-static ANY: Signature =
-    Signature::new("any", &["a", "axis", "out", "keepdims"], 1).keyword_only(&["where"]);
-static ALL: Signature =
-    Signature::new("all", &["a", "axis", "out", "keepdims"], 1).keyword_only(&["where"]);
-static CUMSUM: Signature = Signature::new("cumsum", &["a", "axis", "dtype", "out"], 1);
-static CUMPROD: Signature = Signature::new("cumprod", &["a", "axis", "dtype", "out"], 1);
-static ARGMAX: Signature =
-    Signature::new("argmax", &["a", "axis", "out"], 1).keyword_only(&["keepdims"]);
-static ARGMIN: Signature =
-    Signature::new("argmin", &["a", "axis", "out"], 1).keyword_only(&["keepdims"]);
-
-/// A whole-array reduction such as `np.sum`, bound to `signature`. `dtype` fixes the loop
-/// dtype for `any` and `all`, which always reduce booleans.
-fn reduction(
-    runtime: &mut dyn PyRuntime,
-    signature: &'static Signature,
-    ufunc: &str,
-    dtype: Option<DType>,
-    args: &CallArgs,
-) -> PyResult {
-    let bound = signature.bind(args)?;
-    reject_where(runtime, &bound, bound.function())?;
-    let array = convert::as_array(runtime, bound.required("a"))?;
-    let requested = match dtype {
-        Some(dtype) => Some(dtype),
-        None if signature.has("dtype") => args::optional_dtype(runtime, bound.get("dtype"))?,
-        None => None,
-    };
-    let options = ReduceOptions {
-        axes: args::axes(runtime, bound.get("axis"), array.ndim())?,
-        dtype: requested,
-        out: out_argument(runtime, bound.value("out"))?,
-        keepdims: args::flag(runtime, bound.value("keepdims"), false)?,
-        initial: if signature.has("initial") {
-            bound.value("initial")
-        } else {
-            None
-        },
-    };
-    reduce(runtime, ufunc::named(ufunc), &array, &options)
-}
-
-/// `np.cumsum`/`np.cumprod`: `axis=None` accumulates the flattened array.
-fn cumulative(
-    runtime: &mut dyn PyRuntime,
-    signature: &'static Signature,
-    ufunc: &str,
-    args: &CallArgs,
-) -> PyResult {
-    let bound = signature.bind(args)?;
-    let array = convert::as_array(runtime, bound.required("a"))?;
-    let (array, axis) = match args::axis(runtime, bound.get("axis"), array.ndim())? {
-        Some(axis) => (array, axis),
-        None => (array::ravel(runtime, &array)?, 0),
-    };
-    let dtype = args::optional_dtype(runtime, bound.get("dtype"))?;
-    let out = out_argument(runtime, bound.value("out"))?;
-    accumulate(
-        runtime,
-        ufunc::named(ufunc),
-        &array,
-        axis,
-        dtype,
-        out.as_ref(),
-    )
-}
-
-fn module_sum(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    reduction(runtime, &SUM, "add", None, &args)
-}
-
-fn module_prod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    reduction(runtime, &PROD, "multiply", None, &args)
-}
-
-fn module_max(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    reduction(runtime, &MAX, "maximum", None, &args)
-}
-
-fn module_min(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    reduction(runtime, &MIN, "minimum", None, &args)
-}
-
-fn module_any(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    reduction(runtime, &ANY, "logical_or", Some(DType::BOOL), &args)
-}
-
-fn module_all(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    reduction(runtime, &ALL, "logical_and", Some(DType::BOOL), &args)
-}
-
-fn module_cumsum(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    cumulative(runtime, &CUMSUM, "add", &args)
-}
-
-fn module_cumprod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    cumulative(runtime, &CUMPROD, "multiply", &args)
-}
-
-fn module_argmax(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let bound = ARGMAX.bind(&args)?;
-    arg_extreme(runtime, bound.required("a"), &bound, true)
-}
-
-fn module_argmin(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let bound = ARGMIN.bind(&args)?;
-    arg_extreme(runtime, bound.required("a"), &bound, false)
-}
-
-fn method_sum(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    module_sum(runtime, with_receiver(receiver, &args))
-}
-
-fn method_prod(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    module_prod(runtime, with_receiver(receiver, &args))
-}
-
-fn method_max(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    module_max(runtime, with_receiver(receiver, &args))
-}
-
-fn method_min(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    module_min(runtime, with_receiver(receiver, &args))
-}
-
-fn method_any(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    module_any(runtime, with_receiver(receiver, &args))
-}
-
-fn method_all(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    module_all(runtime, with_receiver(receiver, &args))
-}
-
-fn method_cumsum(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    module_cumsum(runtime, with_receiver(receiver, &args))
-}
-
-fn method_cumprod(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    module_cumprod(runtime, with_receiver(receiver, &args))
-}
-
-fn method_argmax(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    module_argmax(runtime, with_receiver(receiver, &args))
-}
-
-fn method_argmin(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    module_argmin(runtime, with_receiver(receiver, &args))
-}
-
-/// Call a function of the frozen `numpy._methods` module with the receiver first.
+/// Call a method implemented in Python at `numpy._methods.<name>`, with `receiver` as the first
+/// positional argument ahead of `args`. `round` and `clip` reach `numpy._methods._round` and
+/// `_clip` this way; `numpy._methods` reaches `mean`/`var`/`std` the same way from Python, once
+/// `sum` (below) is in place for them to build on.
 pub(in crate::python) fn python_method(
     runtime: &mut dyn PyRuntime,
     name: &str,
@@ -1210,10 +136,14 @@ pub(in crate::python) fn python_method(
     args: CallArgs,
 ) -> PyResult {
     let module = runtime.import_module("numpy._methods")?;
-    let function = runtime
+    let implementation = runtime
         .get_attribute(module, name)?
         .ok_or_else(|| PyError::runtime_error(format!("numpy._methods.{name} is missing")))?;
-    runtime.call_value(function, with_receiver(receiver, &args))
+    let (positional, keywords) = args.into_parts();
+    let mut all_positional = Vec::with_capacity(positional.len() + 1);
+    all_positional.push(receiver);
+    all_positional.extend(positional);
+    runtime.call_value(implementation, CallArgs::new(all_positional, keywords))
 }
 
 fn method_mean(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -1228,65 +158,63 @@ fn method_std(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
     python_method(runtime, "_std", receiver, args)
 }
 
-static UFUNC_REDUCE: Signature = Signature::new(
-    "reduce",
-    &[
-        "array", "axis", "dtype", "out", "keepdims", "initial", "where",
-    ],
-    1,
-);
-static UFUNC_ACCUMULATE: Signature =
-    Signature::new("accumulate", &["array", "axis", "dtype", "out"], 1);
+/// A ufunc's identity, per name, since `ufunc.reduce`/`accumulate` on an arbitrary ufunc index
+/// dispatch by name lookup rather than a static table position.
+fn ufunc_named(name: &str) -> &'static UfuncDef {
+    UFUNCS
+        .iter()
+        .find(|candidate| candidate.name == name)
+        .unwrap_or_else(|| unreachable!("{name} is a registered ufunc"))
+}
 
-/// `ufunc.reduce(array, axis=0, dtype=None, out=None, keepdims=False, initial, where=True)`.
+// ---------------------------------------------------------------------------------------------
+// `ufunc.reduce` and `ufunc.accumulate`
+// ---------------------------------------------------------------------------------------------
+
+/// `ufunc.reduce(array, axis=0, dtype=None, out=None, keepdims=False, initial=<no value>,
+/// where=True)`. `axis` defaults to `0` in NumPy's signature but every caller in this codebase
+/// passes it explicitly or relies on `None` meaning every axis, which is also NumPy's behavior
+/// for `.reduce()` specifically (unlike `.accumulate()`, whose default axis really is `0`).
 pub(in crate::python) fn ufunc_reduce(
     runtime: &mut dyn PyRuntime,
     index: usize,
     args: CallArgs,
 ) -> PyResult {
-    let bound = UFUNC_REDUCE.bind(&args)?;
-    reject_where(runtime, &bound, "reduce")?;
+    static SIGNATURE: Signature = Signature::new(
+        "reduce",
+        &[
+            "array", "axis", "dtype", "out", "keepdims", "initial", "where",
+        ],
+        1,
+    );
+    let ufunc = &UFUNCS[index];
+    let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("array"))?;
-    let axes = match bound.get("axis") {
-        None if array.ndim() == 0 => Axes::All,
-        None => Axes::Some(vec![0]),
-        axis => args::axes(runtime, axis, array.ndim())?,
-    };
-    let options = ReduceOptions {
-        axes,
-        dtype: args::optional_dtype(runtime, bound.get("dtype"))?,
-        out: out_argument(runtime, bound.value("out"))?,
-        keepdims: args::flag(runtime, bound.value("keepdims"), false)?,
-        initial: bound.value("initial"),
-    };
-    reduce(runtime, index, &array, &options)
+    let axes = args::axes(runtime, bound.get("axis"), array.ndim())?;
+    let dtype = args::optional_dtype(runtime, bound.get("dtype"))?;
+    let out = out_array(runtime, bound.get("out"))?;
+    let keepdims = args::flag(runtime, bound.get("keepdims"), false)?;
+    let initial = bound.value("initial");
+    let where_ = bound.value("where");
+    reduce_call(
+        runtime, ufunc, array, axes, dtype, out, keepdims, initial, where_,
+    )
 }
 
-/// `ufunc.accumulate(array, axis=0, dtype=None, out=None)`.
+/// `ufunc.accumulate(array, axis=0, dtype=None, out=None)`: no `initial`, `where`, or
+/// `keepdims`, and `axis` is a single axis (default `0`), never `None` or a tuple.
 pub(in crate::python) fn ufunc_accumulate(
     runtime: &mut dyn PyRuntime,
     index: usize,
     args: CallArgs,
 ) -> PyResult {
-    let bound = UFUNC_ACCUMULATE.bind(&args)?;
+    static SIGNATURE: Signature =
+        Signature::new("accumulate", &["array", "axis", "dtype", "out"], 1);
+    let ufunc = &UFUNCS[index];
+    let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("array"))?;
-    if array.ndim() == 0 {
-        return Err(PyError::type_error("cannot accumulate on a scalar"));
-    }
     let axis = match bound.get("axis") {
         None => 0,
-        Some(value) if runtime.kind(&value)? == PyKind::Tuple => {
-            let tuple = value.cast(runtime)?;
-            match runtime.tuple_items(tuple)?.as_slice() {
-                [single] => array::normalize_axis(args::index_int(runtime, single)?, array.ndim())?,
-                _ => {
-                    return Err(PyError::value_error(
-                        "accumulate does not allow multiple axes",
-                    ))
-                }
-            }
-        }
-        Some(value) if value.is_none() && array.ndim() == 1 => 0,
         Some(value) if value.is_none() => {
             return Err(PyError::value_error(
                 "accumulate does not allow multiple axes",
@@ -1295,98 +223,1388 @@ pub(in crate::python) fn ufunc_accumulate(
         Some(value) => array::normalize_axis(args::index_int(runtime, &value)?, array.ndim())?,
     };
     let dtype = args::optional_dtype(runtime, bound.get("dtype"))?;
-    let out = out_argument(runtime, bound.value("out"))?;
-    accumulate(runtime, index, &array, axis, dtype, out.as_ref())
+    let out = out_array(runtime, bound.get("out"))?;
+    accumulate_call(runtime, ufunc, array, axis, dtype, out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// An `out=` argument, parsed the way every reduction function accepts it: an array, or omitted
+/// (`None` also counts as omitted, as it does throughout NumPy's reduction keywords).
+fn out_array(runtime: &dyn PyRuntime, value: Option<PyValue>) -> PyResult<Option<Array>> {
+    value
+        .filter(|value| !value.is_none())
+        .map(|value| Array::from_value(runtime, value))
+        .transpose()
+}
 
-    /// Iterator axes for a C-order `shape` of `f64` with the given element steps, innermost
-    /// first, after NumPy's ordering and coalescing.
-    fn axes(shape: &[usize], steps: &[isize], reduced: &[usize]) -> Vec<IterAxis> {
-        let mut axes: Vec<_> = shape
+// ---------------------------------------------------------------------------------------------
+// The reduction engine
+// ---------------------------------------------------------------------------------------------
+
+/// A binary operator computed through [`ops::Numeric`], the arithmetic family every element
+/// type in this module already implements (see `ops.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumericOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    FloorDivide,
+    Remainder,
+    Fmod,
+    Power,
+    Maximum,
+    Minimum,
+    Fmax,
+    Fmin,
+}
+
+/// A binary operator computed through [`ops::Integer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntegerOp {
+    And,
+    Or,
+    Xor,
+    LeftShift,
+    RightShift,
+}
+
+/// A binary operator on the boolean cast of the input, as the logical ufuncs always compute, or
+/// one of the comparison ufuncs, which NumPy only registers a reduce/accumulate loop for on
+/// boolean input (see [`combine_compare`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoolOp {
+    And,
+    Or,
+    Xor,
+    Compare(CompareOp),
+}
+
+/// The family a supported ufunc reduces or accumulates through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReduceOp {
+    Numeric(NumericOp),
+    Integer(IntegerOp),
+    Bool(BoolOp),
+    /// `arctan2`, `hypot`, `copysign`, `logaddexp`, `logaddexp2`, `heaviside`: real-only binary
+    /// functions computed through [`ops::Real::zip`] with the same function pair
+    /// ([`ufunc::float2_fn`]) the elementwise loop uses, so a two-element reduction matches
+    /// elementwise application exactly.
+    Float2(Float2Op),
+}
+
+/// Which [`ReduceOp`] a ufunc's [`Family`] reduces through, or the unsupported-frontier error
+/// documented at the top of this module.
+fn classify(ufunc: &UfuncDef) -> PyResult<ReduceOp> {
+    match ufunc.family {
+        Family::Arith { op, .. } => match op {
+            ArithOp::Add => Ok(ReduceOp::Numeric(NumericOp::Add)),
+            ArithOp::Subtract => Ok(ReduceOp::Numeric(NumericOp::Subtract)),
+            ArithOp::Multiply => Ok(ReduceOp::Numeric(NumericOp::Multiply)),
+            ArithOp::FloorDivide => Ok(ReduceOp::Numeric(NumericOp::FloorDivide)),
+            ArithOp::Remainder => Ok(ReduceOp::Numeric(NumericOp::Remainder)),
+            ArithOp::Fmod => Ok(ReduceOp::Numeric(NumericOp::Fmod)),
+            ArithOp::Power => Ok(ReduceOp::Numeric(NumericOp::Power)),
+            ArithOp::Maximum => Ok(ReduceOp::Numeric(NumericOp::Maximum)),
+            ArithOp::Minimum => Ok(ReduceOp::Numeric(NumericOp::Minimum)),
+            ArithOp::Fmax => Ok(ReduceOp::Numeric(NumericOp::Fmax)),
+            ArithOp::Fmin => Ok(ReduceOp::Numeric(NumericOp::Fmin)),
+        },
+        Family::TrueDivide => Ok(ReduceOp::Numeric(NumericOp::Divide)),
+        Family::Bitwise(op) => Ok(ReduceOp::Integer(match op {
+            BitOp::And => IntegerOp::And,
+            BitOp::Or => IntegerOp::Or,
+            BitOp::Xor => IntegerOp::Xor,
+            BitOp::LeftShift => IntegerOp::LeftShift,
+            BitOp::RightShift => IntegerOp::RightShift,
+        })),
+        Family::Logical(op) => Ok(ReduceOp::Bool(match op {
+            LogicalOp::And => BoolOp::And,
+            LogicalOp::Or => BoolOp::Or,
+            LogicalOp::Xor => BoolOp::Xor,
+        })),
+        Family::Compare(op) => Ok(ReduceOp::Bool(BoolOp::Compare(op))),
+        Family::Float2(op) => Ok(ReduceOp::Float2(op)),
+        _ if ufunc.nin() != 2 => Err(PyError::value_error(
+            "reduce only supported for binary functions",
+        )),
+        // `scipy.special` ufuncs get their own message: they are a SciPy limitation, not a
+        // NumPy one, even though a `scipy.special` ufunc reaches this classifier the same way
+        // an unsupported NumPy ufunc does.
+        Family::Special(_) => Err(unsupported_scipy_reduce(ufunc.name)),
+        _ => Err(unsupported_reduce(ufunc.name)),
+    }
+}
+
+fn unsupported_reduce(name: &str) -> PyError {
+    PyError::unsupported(format!(
+        "reduce/accumulate for ufunc '{name}' is not supported by shellsim's NumPy"
+    ))
+}
+
+fn unsupported_scipy_reduce(name: &str) -> PyError {
+    PyError::unsupported(format!(
+        "reduce and accumulate of scipy.special.{name} are not supported by shellsim's SciPy"
+    ))
+}
+
+fn no_identity_error(name: &str) -> PyError {
+    PyError::value_error(format!(
+        "zero-size array to reduction operation {name} which has no identity"
+    ))
+}
+
+/// NumPy's message when a ufunc has no reduce/accumulate loop at all for a resolved dtype: a
+/// comparison ufunc asked to reduce anything but a boolean array, or a real two-argument
+/// function (`arctan2` and friends) asked to reduce anything but a float array.
+fn no_matching_loop_error(name: &str) -> PyError {
+    PyError::type_error(format!(
+        "No loop matching the specified signature and casting was found for ufunc {name}"
+    ))
+}
+
+/// NumPy's message when a ufunc's loop exists but categorically excludes a dtype (complex input
+/// to `floor_divide`, `remainder`, or `fmod`), as opposed to [`no_matching_loop_error`], which
+/// covers a dtype request the resolver never considers a candidate loop for.
+fn no_complex_loop_error(name: &str) -> PyError {
+    PyError::type_error(format!(
+        "ufunc '{name}' not supported for the input types, and the inputs could not be safely \
+         coerced to any supported types according to the casting rule ''safe''"
+    ))
+}
+
+/// NumPy's message for `subtract`/`-` on boolean input.
+fn boolean_subtract_error() -> PyError {
+    PyError::type_error(
+        "numpy boolean subtract, the `-` operator, is not supported, use the bitwise_xor, the \
+         `^` operator, or the logical_xor function instead."
+            .to_string(),
+    )
+}
+
+fn where_needs_initial_error(name: &str) -> PyError {
+    PyError::value_error(format!(
+        "reduction operation '{name}' does not have an identity, so to use a where mask one has \
+         to specify 'initial'"
+    ))
+}
+
+/// The dtype every element is cast to before reducing, and whether the operator has an
+/// identity: `Add`/`Multiply` promote bool and small integers to the platform integer of their
+/// signedness the way NumPy's own `add`/`multiply` type resolution does for `.reduce()` and
+/// `.accumulate()` (not for elementwise application); `divide` widens to float; the logical
+/// ufuncs always compute on a boolean cast, ignoring any requested dtype, as NumPy's resolver
+/// does; every other operator keeps the array's own dtype unless `dtype=` overrides it.
+fn resolve_dtype(
+    ufunc: &UfuncDef,
+    op: ReduceOp,
+    array_dtype: DType,
+    requested: Option<DType>,
+) -> PyResult<DType> {
+    let dtype = match op {
+        // The logical ufuncs always compute on a boolean cast of the input, whatever `dtype=`
+        // asks for. A comparison ufunc instead only has a loop for boolean input at all: unlike
+        // every other case here, an explicit `dtype=` that is not itself bool never widens or
+        // narrows anything, it just changes which error fires (see `no_matching_loop_error`).
+        ReduceOp::Bool(BoolOp::And | BoolOp::Or | BoolOp::Xor) => DType::BOOL,
+        ReduceOp::Bool(BoolOp::Compare(_)) => {
+            let resolved = requested.unwrap_or(array_dtype);
+            if resolved.kind() != Kind::Bool {
+                return Err(no_matching_loop_error(ufunc.name));
+            }
+            resolved
+        }
+        ReduceOp::Numeric(NumericOp::Add | NumericOp::Multiply) => {
+            requested.unwrap_or_else(|| dtype::accumulator(array_dtype))
+        }
+        ReduceOp::Numeric(NumericOp::Divide) => {
+            requested.unwrap_or_else(|| dtype::true_divide_dtype(array_dtype))
+        }
+        ReduceOp::Numeric(NumericOp::Subtract) => {
+            let resolved = requested.unwrap_or(array_dtype);
+            if resolved.kind() == Kind::Bool {
+                return Err(boolean_subtract_error());
+            }
+            resolved
+        }
+        // `floor_divide`, `remainder`, and `fmod` promote a *default* boolean array (nothing
+        // requested through `dtype=`) the way NumPy's own type resolution does for every
+        // non-comparison arithmetic ufunc without a bool loop: to `int8`, the smallest signed
+        // type that holds `0`/`1`. An explicit `dtype=bool` is not promoted the same way; NumPy
+        // has no bool loop for these at all, so asking for one directly has no candidate loop,
+        // the same error as any other dtype none of these ufuncs support. None of the three has
+        // a complex loop either; `complex_divide`, which `floor_divide`/`remainder` would
+        // otherwise reach, is still an unfinished clean-room stub in `ops.rs` (kernels' unit),
+        // so this rejects complex up front with NumPy's own message instead of reaching that
+        // panic.
+        ReduceOp::Numeric(NumericOp::FloorDivide | NumericOp::Remainder | NumericOp::Fmod) => {
+            let resolved = requested.unwrap_or(array_dtype);
+            if resolved.category() == Category::Complex {
+                return Err(no_complex_loop_error(ufunc.name));
+            }
+            match (requested, resolved.kind()) {
+                (Some(_), Kind::Bool) => return Err(no_matching_loop_error(ufunc.name)),
+                (None, Kind::Bool) => DType::INT8,
+                _ => resolved,
+            }
+        }
+        // `power` promotes a default boolean array the same way, but (unlike the three above)
+        // does have a complex loop, so it is not rejected here.
+        ReduceOp::Numeric(NumericOp::Power) => {
+            let resolved = requested.unwrap_or(array_dtype);
+            match (requested, resolved.kind()) {
+                (Some(_), Kind::Bool) => return Err(no_matching_loop_error(ufunc.name)),
+                (None, Kind::Bool) => DType::INT8,
+                _ => resolved,
+            }
+        }
+        ReduceOp::Numeric(_) => requested.unwrap_or(array_dtype),
+        ReduceOp::Integer(int_op) => {
+            let base = requested.unwrap_or(array_dtype);
+            match (base.category(), int_op) {
+                (Category::Bool, IntegerOp::LeftShift | IntegerOp::RightShift) => DType::INT8,
+                (Category::Bool | Category::Signed | Category::Unsigned, _) => base,
+                _ => {
+                    return Err(PyError::type_error(format!(
+                        "ufunc '{}' not supported for the input types",
+                        ufunc.name
+                    )))
+                }
+            }
+        }
+        // Int/bool promote to the smallest float that holds every value (`smallest_float_for`),
+        // exactly as the elementwise loop resolves its working type before `dispatch_real!`
+        // picks it; an explicit `dtype=` is used as given, with no further promotion. Complex
+        // gets its own message the same way `floor_divide`/`remainder`/`fmod` do above (these
+        // functions are real-only, categorically, not just missing a loop for one dtype); any
+        // other non-float resolved dtype (bool, any integer width, str, object) has no
+        // candidate loop at all.
+        ReduceOp::Float2(_) => {
+            let resolved = requested.unwrap_or_else(|| array_dtype.smallest_float_for());
+            if resolved.category() == Category::Complex {
+                return Err(no_complex_loop_error(ufunc.name));
+            }
+            if !matches!(
+                resolved.kind(),
+                Kind::Float16 | Kind::Float32 | Kind::Float64
+            ) {
+                return Err(no_matching_loop_error(ufunc.name));
+            }
+            resolved
+        }
+    };
+    let numeric_object_ok = matches!(
+        op,
+        ReduceOp::Numeric(
+            NumericOp::Add
+                | NumericOp::Subtract
+                | NumericOp::Multiply
+                | NumericOp::Power
+                | NumericOp::Fmod
+                | NumericOp::Maximum
+                | NumericOp::Minimum
+                | NumericOp::Fmax
+                | NumericOp::Fmin
+        )
+    );
+    match dtype.kind() {
+        Kind::Object if numeric_object_ok => Ok(dtype),
+        Kind::Object | Kind::Str => Err(PyError::unsupported(format!(
+            "{} reduction of '{}' arrays is not supported by shellsim's NumPy",
+            ufunc.name,
+            dtype.kind().name()
+        ))),
+        _ => Ok(dtype),
+    }
+}
+
+/// An array's axes split into the ones a reduction keeps and the ones it combines.
+struct AxisSplit {
+    kept_axes: Vec<usize>,
+    reduce_axes: Vec<usize>,
+    kept_shape: Vec<usize>,
+    reduce_shape: Vec<usize>,
+}
+
+impl AxisSplit {
+    fn new(shape: &[usize], axes: &Axes) -> Self {
+        let ndim = shape.len();
+        let kept_axes = (0..ndim)
+            .filter(|&axis| !axes.contains(axis))
+            .collect::<Vec<_>>();
+        let reduce_axes = (0..ndim)
+            .filter(|&axis| axes.contains(axis))
+            .collect::<Vec<_>>();
+        let kept_shape = kept_axes.iter().map(|&axis| shape[axis]).collect();
+        let reduce_shape = reduce_axes.iter().map(|&axis| shape[axis]).collect();
+        Self {
+            kept_axes,
+            reduce_axes,
+            kept_shape,
+            reduce_shape,
+        }
+    }
+
+    /// Axis order with the kept axes outermost and the reduced axes innermost, so gathering
+    /// `array` in this order lays out each output cell's inputs as one contiguous run.
+    fn reading_order(&self) -> Vec<usize> {
+        self.kept_axes
             .iter()
-            .zip(steps)
+            .chain(&self.reduce_axes)
+            .copied()
+            .collect()
+    }
+
+    fn kept_count(&self) -> usize {
+        self.kept_shape.iter().product()
+    }
+
+    fn reduce_count(&self) -> usize {
+        self.reduce_shape.iter().product()
+    }
+
+    /// The output shape: the kept axes alone, or every axis with the reduced ones collapsed to
+    /// length one, in their original positions.
+    fn output_shape(&self, input_shape: &[usize], keepdims: bool) -> Vec<usize> {
+        if !keepdims {
+            return self.kept_shape.clone();
+        }
+        input_shape
+            .iter()
             .enumerate()
-            .filter(|(_, (length, _))| **length > 1)
-            .map(|(axis, (&length, &step))| IterAxis {
-                length,
-                stride: step * 8,
-                reduced: reduced.contains(&axis),
+            .map(|(axis, &dimension)| {
+                if self.reduce_axes.contains(&axis) {
+                    1
+                } else {
+                    dimension
+                }
             })
-            .collect();
-        axes.reverse();
-        coalesce(order_axes(axes))
+            .collect()
     }
+}
 
-    fn runs_of(shape: &[usize], steps: &[isize], reduced: &[usize], cast: bool) -> Runs {
-        runs(&axes(shape, steps, reduced), cast)
-    }
+/// Read `array`'s elements through `order` (see [`AxisSplit::reading_order`]), charging CPU for
+/// the elements visited before touching them, as every reduction here does before combining.
+fn gather<T: Element>(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+    order: &[usize],
+) -> PyResult<Vec<T>> {
+    array::read_elements(runtime, &layout::reading_order(array, order))
+}
 
-    // The expected runs reproduce the sums checked against NumPy 2.5.3 in
-    // `test_float_sums_follow_numpy_iteration_order`.
-    #[test]
-    fn contiguous_reductions_use_one_run_per_result() {
-        assert_eq!(
-            runs_of(&[3000], &[1], &[0], false),
-            Runs {
-                block: 3000,
-                run: 3000
-            }
-        );
-        // Reducing the last axis: "reduce mode" makes each row one inner loop.
-        assert_eq!(
-            runs_of(&[30, 100], &[100, 1], &[1], false),
-            Runs {
-                block: 100,
-                run: 100
-            }
-        );
-        // Reducing the first axis adds one element per inner loop.
-        assert_eq!(
-            runs_of(&[30, 100], &[100, 1], &[0], false),
-            Runs { block: 1, run: 1 }
-        );
-    }
+fn gather_objects(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+    order: &[usize],
+) -> PyResult<Vec<PyValue>> {
+    array::read_objects(runtime, &layout::reading_order(array, order))
+}
 
-    #[test]
-    fn strided_blocks_are_buffered() {
-        // `m[::-1].sum()`: the reversed rows do not coalesce, so the input is buffered whole.
-        assert_eq!(
-            runs_of(&[30, 100], &[-100, 1], &[0, 1], false),
-            Runs {
-                block: 3000,
-                run: 3000
-            }
-        );
-        // A 50-column slice of 1000 rows fills 8150-element buffers, a multiple of the row.
-        assert_eq!(
-            runs_of(&[1000, 50], &[100, 1], &[0, 1], false),
-            Runs {
-                block: 50_000,
-                run: 8150
-            }
-        );
-        // A cast input always goes through the buffer.
-        assert_eq!(
-            runs_of(&[20000], &[1], &[0], true),
-            Runs {
-                block: 20000,
-                run: 8192
-            }
-        );
+/// `where=`, converted to a boolean array, or `None` for the common case (omitted, or the
+/// literal `True` NumPy's own signature defaults to) where every element participates.
+fn where_array(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Option<Array>> {
+    let Some(value) = value else { return Ok(None) };
+    if value.bool_value() == Some(true) {
+        return Ok(None);
     }
+    Ok(Some(convert::array_from_python(
+        runtime,
+        value,
+        Some(DType::BOOL),
+        false,
+    )?))
+}
 
-    #[test]
-    fn axes_order_by_stride_magnitude_and_keep_direction() {
-        let ordered = axes(&[100, 30], &[1, -100], &[0, 1]);
-        let strides: Vec<_> = ordered.iter().map(|axis| axis.stride).collect();
-        assert_eq!(strides, [8, -800]);
-        // Two reversed axes still step evenly and merge.
-        let merged = axes(&[30, 100], &[-100, -1], &[0, 1]);
-        assert_eq!(merged.len(), 1);
-        assert_eq!((merged[0].length, merged[0].stride), (3000, -8));
+/// `mask` broadcast to `shape` and read through `order`, alongside the array it selects from.
+fn gather_mask(
+    runtime: &mut dyn PyRuntime,
+    mask: &Array,
+    shape: &[usize],
+    order: &[usize],
+) -> PyResult<Vec<bool>> {
+    let broadcast = layout::broadcast_reading_order(mask, shape, order)?;
+    array::read_elements(runtime, &broadcast)
+}
+
+/// The elements of one output cell's run: the whole window when `where=` selects everything
+/// (the common case, at no extra cost), or the selected elements copied out otherwise.
+fn window<'a, T: Copy>(
+    values: &'a [T],
+    mask: Option<&[bool]>,
+    bucket: usize,
+    count: usize,
+    storage: &'a mut Vec<T>,
+) -> &'a [T] {
+    let values = &values[bucket * count..(bucket + 1) * count];
+    let Some(mask) = mask else { return values };
+    let mask = &mask[bucket * count..(bucket + 1) * count];
+    storage.clear();
+    storage.extend(
+        values
+            .iter()
+            .zip(mask)
+            .filter_map(|(value, selected)| selected.then_some(*value)),
+    );
+    storage
+}
+
+fn identity_numeric<T: Numeric>(op: NumericOp) -> Option<T> {
+    match op {
+        NumericOp::Add => Some(T::zero()),
+        NumericOp::Multiply => Some(T::one()),
+        _ => None,
     }
+}
+
+fn combine_numeric<T: Numeric>(op: NumericOp, a: T, b: T, flags: &mut FpFlags) -> T {
+    match op {
+        NumericOp::Add => a.add(b, flags),
+        NumericOp::Subtract => a.subtract(b, flags),
+        NumericOp::Multiply => a.multiply(b, flags),
+        NumericOp::Divide => a.divide(b, flags),
+        NumericOp::FloorDivide => a.floor_divide(b, flags),
+        NumericOp::Remainder => a.remainder(b, flags),
+        // `fmod` has no dedicated `Numeric` method (only `add`/`subtract`/.../`power`, which
+        // every element type already needs for the arithmetic operators); reusing the
+        // elementwise loop's own function table keeps this identical to `np.fmod(a, b)` instead
+        // of a second, possibly-diverging implementation of C's `fmod` sign rule.
+        NumericOp::Fmod => ufunc::arith_fn(ArithOp::Fmod)(a, b, flags),
+        NumericOp::Power => a.power(b, flags),
+        NumericOp::Maximum => a.maximum(b),
+        NumericOp::Minimum => a.minimum(b),
+        NumericOp::Fmax => a.fmax(b),
+        NumericOp::Fmin => a.fmin(b),
+    }
+}
+
+/// `power.reduce`/`accumulate` on a signed integer array rejects a negative element used as an
+/// exponent, the same check `**` makes before its whole-array loop runs (see `ufunc.rs`'s
+/// `reject_negative_exponent`, which cannot be called from here: it is private to that module,
+/// and it inspects a whole operand up front rather than one element of a running fold). Every
+/// element but the very first plays the exponent role at some point in a left-to-right fold, so
+/// this runs once per element combined, not once per reduction. Unsigned integers can never
+/// compare less than zero, and this only ever fires for `T::IS_INTEGER`, so float and complex
+/// exponents (which real `power` allows to be negative) never reach it.
+fn check_power_exponent<T: Numeric>(op: NumericOp, value: T) -> PyResult<()> {
+    if op == NumericOp::Power && T::IS_INTEGER && value.compare(T::zero()) == Some(Ordering::Less) {
+        return Err(PyError::value_error(
+            "Integers to negative integer powers are not allowed.",
+        ));
+    }
+    Ok(())
+}
+
+/// Combine every output cell's run of `T` (see [`AxisSplit`]) with `op`. `Add` sums pairwise
+/// through [`ops::Numeric::add_lane`]; every other operator folds sequentially in the order
+/// read. An operator without an identity (everything but `Add`/`Multiply`) needs `initial` or a
+/// non-empty run.
+fn reduce_numeric<T: Numeric + Element>(
+    name: &str,
+    op: NumericOp,
+    split: &AxisSplit,
+    values: &[T],
+    mask: Option<&[bool]>,
+    initial: Option<Number>,
+) -> PyResult<(Vec<T>, FpFlags)> {
+    let seed = initial
+        .map(T::from_number)
+        .or_else(|| identity_numeric::<T>(op));
+    let (kept_count, reduce_count) = (split.kept_count(), split.reduce_count());
+    let mut flags = FpFlags::default();
+    let mut output = Vec::with_capacity(kept_count);
+    let mut storage = Vec::new();
+    for bucket in 0..kept_count {
+        let run = window(values, mask, bucket, reduce_count, &mut storage);
+        let result = if op == NumericOp::Add {
+            seed.unwrap_or_else(T::zero).add_lane(run, &mut flags)
+        } else {
+            match seed {
+                Some(seed) => run.iter().try_fold(seed, |acc, &value| {
+                    check_power_exponent(op, value)?;
+                    Ok(combine_numeric(op, acc, value, &mut flags))
+                })?,
+                None => {
+                    let Some((&first, rest)) = run.split_first() else {
+                        return Err(no_identity_error(name));
+                    };
+                    rest.iter().try_fold(first, |acc, &value| {
+                        check_power_exponent(op, value)?;
+                        Ok(combine_numeric(op, acc, value, &mut flags))
+                    })?
+                }
+            }
+        };
+        output.push(result);
+    }
+    Ok((output, flags))
+}
+
+fn identity_integer<T: Integer>(op: IntegerOp) -> Option<T> {
+    match op {
+        IntegerOp::And => Some(T::from_number(Number::Int(-1))),
+        IntegerOp::Or | IntegerOp::Xor => Some(T::zero()),
+        IntegerOp::LeftShift | IntegerOp::RightShift => None,
+    }
+}
+
+fn combine_integer<T: Integer>(op: IntegerOp, a: T, b: T) -> T {
+    match op {
+        IntegerOp::And => a.bit_and(b),
+        IntegerOp::Or => a.bit_or(b),
+        IntegerOp::Xor => a.bit_xor(b),
+        IntegerOp::LeftShift => a.left_shift(b),
+        IntegerOp::RightShift => a.right_shift(b),
+    }
+}
+
+fn reduce_integer<T: Integer + Element>(
+    name: &str,
+    op: IntegerOp,
+    split: &AxisSplit,
+    values: &[T],
+    mask: Option<&[bool]>,
+    initial: Option<Number>,
+) -> PyResult<Vec<T>> {
+    let seed = initial
+        .map(T::from_number)
+        .or_else(|| identity_integer::<T>(op));
+    let (kept_count, reduce_count) = (split.kept_count(), split.reduce_count());
+    let mut output = Vec::with_capacity(kept_count);
+    let mut storage = Vec::new();
+    for bucket in 0..kept_count {
+        let run = window(values, mask, bucket, reduce_count, &mut storage);
+        let result = match seed {
+            Some(seed) => run
+                .iter()
+                .fold(seed, |acc, &value| combine_integer(op, acc, value)),
+            None => {
+                let Some((&first, rest)) = run.split_first() else {
+                    return Err(no_identity_error(name));
+                };
+                rest.iter()
+                    .fold(first, |acc, &value| combine_integer(op, acc, value))
+            }
+        };
+        output.push(result);
+    }
+    Ok(output)
+}
+
+/// `hypot`'s identity is `0` (`hypot.reduce([])` is `0.0`, no error). `logaddexp`/`logaddexp2`'s
+/// is `-inf`, the identity for log-sum-exp (matching `log(0)`). `arctan2`, `copysign`, and
+/// `heaviside` have none.
+fn identity_float2<T: Real>(op: Float2Op) -> Option<T> {
+    match op {
+        Float2Op::Hypot => Some(T::from_f64(0.0)),
+        Float2Op::Logaddexp | Float2Op::Logaddexp2 => Some(T::from_f64(f64::NEG_INFINITY)),
+        Float2Op::Arctan2 | Float2Op::Copysign | Float2Op::Heaviside => None,
+    }
+}
+
+/// `op`'s function pair ([`ufunc::float2_fn`]) applied through [`ops::Real::zip`], the same
+/// mechanism the elementwise loop uses, so this matches `np.arctan2(a, b)` and friends exactly
+/// rather than risking a second, possibly-diverging implementation of the same math.
+fn combine_float2<T: Real>(op: Float2Op, a: T, b: T, flags: &mut FpFlags) -> T {
+    let (double, single) = ufunc::float2_fn(op);
+    let result = a.zip(b, double, single);
+    ufunc::float_flags_binary(a.to_f64(), b.to_f64(), result.to_f64(), flags);
+    result
+}
+
+/// Combine every output cell's run of `T` with `op`, always sequentially: none of `arctan2`,
+/// `hypot`, `copysign`, `logaddexp`, `logaddexp2`, or `heaviside` is associative in a way
+/// pairwise splitting would preserve, so unlike `add` this never sums in parallel halves.
+fn reduce_float2<T: Real + Element>(
+    name: &str,
+    op: Float2Op,
+    split: &AxisSplit,
+    values: &[T],
+    mask: Option<&[bool]>,
+    initial: Option<Number>,
+) -> PyResult<(Vec<T>, FpFlags)> {
+    let seed = initial.map(T::from_number).or_else(|| identity_float2(op));
+    let (kept_count, reduce_count) = (split.kept_count(), split.reduce_count());
+    let mut flags = FpFlags::default();
+    let mut output = Vec::with_capacity(kept_count);
+    let mut storage = Vec::new();
+    for bucket in 0..kept_count {
+        let run = window(values, mask, bucket, reduce_count, &mut storage);
+        let result = match seed {
+            Some(seed) => run.iter().fold(seed, |acc, &value| {
+                combine_float2(op, acc, value, &mut flags)
+            }),
+            None => {
+                let Some((&first, rest)) = run.split_first() else {
+                    return Err(no_identity_error(name));
+                };
+                rest.iter().fold(first, |acc, &value| {
+                    combine_float2(op, acc, value, &mut flags)
+                })
+            }
+        };
+        output.push(result);
+    }
+    Ok((output, flags))
+}
+
+/// `And`/`Or`/`Xor` always have an identity; a comparison has none (`equal.reduce([])` raises
+/// the same "which has no identity" error as `maximum.reduce([])`).
+fn identity_bool(op: BoolOp) -> Option<bool> {
+    match op {
+        BoolOp::And => Some(true),
+        BoolOp::Or | BoolOp::Xor => Some(false),
+        BoolOp::Compare(_) => None,
+    }
+}
+
+/// `equal`/`not_equal`/`less`/`less_equal`/`greater`/`greater_equal` on two already-boolean
+/// operands: NumPy only registers a comparison reduce/accumulate loop for boolean input, so by
+/// the time this runs `resolve_dtype` has already rejected anything else.
+fn combine_compare(op: CompareOp, a: bool, b: bool) -> bool {
+    match op {
+        CompareOp::Equal => a == b,
+        CompareOp::NotEqual => a != b,
+        CompareOp::Less => !a & b,
+        CompareOp::LessEqual => !a | b,
+        CompareOp::Greater => a & !b,
+        CompareOp::GreaterEqual => a | !b,
+    }
+}
+
+fn combine_bool(op: BoolOp, a: bool, b: bool) -> bool {
+    match op {
+        BoolOp::And => a && b,
+        BoolOp::Or => a || b,
+        BoolOp::Xor => a ^ b,
+        BoolOp::Compare(cmp) => combine_compare(cmp, a, b),
+    }
+}
+
+/// `And`/`Or`/`Xor` always have an identity, so only a comparison reduction can fail on an
+/// empty run without `initial`.
+fn reduce_bool(
+    name: &str,
+    op: BoolOp,
+    split: &AxisSplit,
+    values: &[bool],
+    mask: Option<&[bool]>,
+    initial: Option<bool>,
+) -> PyResult<Vec<bool>> {
+    let seed = initial.or_else(|| identity_bool(op));
+    let (kept_count, reduce_count) = (split.kept_count(), split.reduce_count());
+    let mut storage = Vec::new();
+    (0..kept_count)
+        .map(|bucket| {
+            let run = window(values, mask, bucket, reduce_count, &mut storage);
+            match seed {
+                Some(seed) => Ok(run
+                    .iter()
+                    .fold(seed, |acc, &value| combine_bool(op, acc, value))),
+                None => {
+                    let Some((&first, rest)) = run.split_first() else {
+                        return Err(no_identity_error(name));
+                    };
+                    Ok(rest
+                        .iter()
+                        .fold(first, |acc, &value| combine_bool(op, acc, value)))
+                }
+            }
+        })
+        .collect()
+}
+
+fn identity_object(op: NumericOp) -> Option<PyValue> {
+    match op {
+        NumericOp::Add => Some(Value::Int(0)),
+        NumericOp::Multiply => Some(Value::Int(1)),
+        _ => None,
+    }
+}
+
+/// Object arrays reduce with the ufunc's own Python operator ([`ufunc::object_element`]),
+/// element by element; there is no pairwise summation for `object` dtype.
+fn reduce_object(
+    runtime: &mut dyn PyRuntime,
+    ufunc: &UfuncDef,
+    op: NumericOp,
+    split: &AxisSplit,
+    values: &[PyValue],
+    mask: Option<&[bool]>,
+) -> PyResult<Vec<PyValue>> {
+    reduce_object_with(runtime, ufunc, identity_object(op), split, values, mask)
+}
+
+fn reduce_object_with(
+    runtime: &mut dyn PyRuntime,
+    ufunc: &UfuncDef,
+    identity: Option<PyValue>,
+    split: &AxisSplit,
+    values: &[PyValue],
+    mask: Option<&[bool]>,
+) -> PyResult<Vec<PyValue>> {
+    let (kept_count, reduce_count) = (split.kept_count(), split.reduce_count());
+    let mut output = Vec::with_capacity(kept_count);
+    let mut storage = Vec::new();
+    for bucket in 0..kept_count {
+        let run = window(values, mask, bucket, reduce_count, &mut storage);
+        let mut elements = run.iter().copied();
+        let mut accumulator = match identity {
+            Some(identity) => identity,
+            None => elements
+                .next()
+                .ok_or_else(|| no_identity_error(ufunc.name))?,
+        };
+        for value in elements {
+            accumulator = ufunc::object_element(runtime, ufunc, &[accumulator, value])?;
+        }
+        output.push(accumulator);
+    }
+    Ok(output)
+}
+
+/// The shared body of `ufunc.reduce`, `sum`, `prod`, `max`/`amax`, `min`/`amin`, `any`, and
+/// `all`: resolve the dtype, split the axes, read `where=` and `initial=`, combine every
+/// output cell's run, and assemble the result (see [`finish_reduction`]).
+#[allow(clippy::too_many_arguments)]
+fn reduce_call(
+    runtime: &mut dyn PyRuntime,
+    ufunc: &UfuncDef,
+    array: Array,
+    axes: Axes,
+    dtype: Option<DType>,
+    out: Option<Array>,
+    keepdims: bool,
+    initial: Option<PyValue>,
+    where_: Option<PyValue>,
+) -> PyResult<PyValue> {
+    let op = classify(ufunc)?;
+    let dtype = resolve_dtype(ufunc, op, array.dtype, dtype)?;
+    let array = if array.dtype == dtype {
+        array
+    } else {
+        convert::cast_array(runtime, &array, dtype, false)?
+    };
+    let split = AxisSplit::new(array.shape(), &axes);
+    let mask = where_array(runtime, where_)?;
+    if mask.is_some() && initial.is_none() && !has_identity(op) {
+        return Err(where_needs_initial_error(ufunc.name));
+    }
+    let order = split.reading_order();
+    array::reserve_elements(runtime, dtype, split.kept_count())?;
+    runtime.charge_cpu(array.size() as u64 + 1)?;
+    let mask_values = mask
+        .as_ref()
+        .map(|mask| gather_mask(runtime, mask, array.shape(), &order))
+        .transpose()?;
+    let (buffer, flags) = match (dtype.kind(), op) {
+        (Kind::Object, ReduceOp::Numeric(numeric_op)) => {
+            let values = gather_objects(runtime, &array, &order)?;
+            let output = reduce_object(
+                runtime,
+                ufunc,
+                numeric_op,
+                &split,
+                &values,
+                mask_values.as_deref(),
+            )?;
+            (PyArrayBuffer::Values(output), FpFlags::default())
+        }
+        (_, ReduceOp::Numeric(numeric_op)) => dispatch_numeric!(dtype.kind(), T => {
+            let values = gather::<T>(runtime, &array, &order)?;
+            let initial = initial.map(|value| numeric_initial(runtime, value, dtype)).transpose()?;
+            let (output, flags) = reduce_numeric::<T>(ufunc.name, numeric_op, &split, &values, mask_values.as_deref(), initial)?;
+            (PyArrayBuffer::Bytes(array::pack_elements(&output)), flags)
+        }, _ => unreachable!("object and str dtypes are rejected before this dispatch")),
+        (_, ReduceOp::Integer(integer_op)) => dispatch_integer!(dtype.kind(), T => {
+            let values = gather::<T>(runtime, &array, &order)?;
+            let initial = initial.map(|value| numeric_initial(runtime, value, dtype)).transpose()?;
+            let output = reduce_integer::<T>(ufunc.name, integer_op, &split, &values, mask_values.as_deref(), initial)?;
+            (PyArrayBuffer::Bytes(array::pack_elements(&output)), FpFlags::default())
+        }, _ => unreachable!("resolve_dtype only allows bool/signed/unsigned for bitwise ops")),
+        (Kind::Bool, ReduceOp::Bool(bool_op)) => {
+            let values = gather::<bool>(runtime, &array, &order)?;
+            let initial = initial.map(|value| runtime.truth(&value)).transpose()?;
+            let output = reduce_bool(
+                ufunc.name,
+                bool_op,
+                &split,
+                &values,
+                mask_values.as_deref(),
+                initial,
+            )?;
+            (
+                PyArrayBuffer::Bytes(array::pack_elements(&output)),
+                FpFlags::default(),
+            )
+        }
+        (_, ReduceOp::Bool(_)) => {
+            unreachable!("resolve_dtype only resolves Bool ops to the bool dtype")
+        }
+        (_, ReduceOp::Float2(float2_op)) => dispatch_real!(dtype.kind(), T => {
+            let values = gather::<T>(runtime, &array, &order)?;
+            let initial = initial.map(|value| numeric_initial(runtime, value, dtype)).transpose()?;
+            let (output, flags) = reduce_float2::<T>(ufunc.name, float2_op, &split, &values, mask_values.as_deref(), initial)?;
+            (PyArrayBuffer::Bytes(array::pack_elements(&output)), flags)
+        }, _ => unreachable!("resolve_dtype only resolves Float2 ops to a float dtype")),
+    };
+    super::errstate::report(runtime, "reduce", flags)?;
+    finish_reduction(runtime, dtype, array.shape(), &split, keepdims, buffer, out)
+}
+
+fn has_identity(op: ReduceOp) -> bool {
+    match op {
+        ReduceOp::Numeric(numeric_op) => matches!(numeric_op, NumericOp::Add | NumericOp::Multiply),
+        ReduceOp::Integer(_) => false,
+        ReduceOp::Bool(bool_op) => identity_bool(bool_op).is_some(),
+        ReduceOp::Float2(op) => identity_float2::<f64>(op).is_some(),
+    }
+}
+
+fn numeric_initial(runtime: &mut dyn PyRuntime, value: PyValue, dtype: DType) -> PyResult<Number> {
+    let leaf = convert::leaf(runtime, &value)?;
+    convert::leaf_number(&leaf, dtype)
+}
+
+/// Wrap a reduction's flat output buffer (in [`AxisSplit::kept_shape`] order) in an array of the
+/// right output shape, store it through `out=` if given, and box a 0-d result to a NumPy scalar.
+fn finish_reduction(
+    runtime: &mut dyn PyRuntime,
+    dtype: DType,
+    input_shape: &[usize],
+    split: &AxisSplit,
+    keepdims: bool,
+    buffer: PyArrayBuffer,
+    out: Option<Array>,
+) -> PyResult<PyValue> {
+    let shape = split.output_shape(input_shape, keepdims);
+    let result = array::new_array(runtime, buffer, dtype, shape)?;
+    if let Some(out) = out {
+        array::assign(runtime, &out, &result)?;
+        Ok(out.value())
+    } else if result.ndim() == 0 {
+        convert::element_to_scalar(runtime, &result, result.view.offset)
+    } else {
+        Ok(result.value())
+    }
+}
+
+/// The shared body of `ufunc.accumulate`, `cumsum`, and `cumprod`: resolve the dtype, walk
+/// `axis` with the other axes outermost, and write each run's running totals back over itself
+/// (no pairwise summation: the whole point of `accumulate` is to expose every partial total, so
+/// combining always folds sequentially in the order read).
+fn accumulate_call(
+    runtime: &mut dyn PyRuntime,
+    ufunc: &UfuncDef,
+    array: Array,
+    axis: usize,
+    dtype: Option<DType>,
+    out: Option<Array>,
+) -> PyResult<PyValue> {
+    let op = classify(ufunc)?;
+    let dtype = resolve_dtype(ufunc, op, array.dtype, dtype)?;
+    let array = if array.dtype == dtype {
+        array
+    } else {
+        convert::cast_array(runtime, &array, dtype, false)?
+    };
+    let kept_axes = (0..array.ndim())
+        .filter(|&candidate| candidate != axis)
+        .collect::<Vec<_>>();
+    let order = kept_axes
+        .iter()
+        .chain(std::iter::once(&axis))
+        .copied()
+        .collect::<Vec<_>>();
+    let axis_len = array.shape()[axis];
+    let kept_count: usize = kept_axes
+        .iter()
+        .map(|&candidate| array.shape()[candidate])
+        .product();
+    array::reserve_elements(runtime, dtype, array.size())?;
+    runtime.charge_cpu(array.size() as u64 + 1)?;
+    let (buffer, flags) = match (dtype.kind(), op) {
+        (Kind::Object, ReduceOp::Numeric(_)) => {
+            let values = gather_objects(runtime, &array, &order)?;
+            let output = accumulate_object(runtime, ufunc, &values, kept_count, axis_len)?;
+            (PyArrayBuffer::Values(output), FpFlags::default())
+        }
+        (_, ReduceOp::Numeric(numeric_op)) => dispatch_numeric!(dtype.kind(), T => {
+            let values = gather::<T>(runtime, &array, &order)?;
+            let (output, flags) = accumulate_numeric::<T>(numeric_op, &values, kept_count, axis_len)?;
+            (PyArrayBuffer::Bytes(array::pack_elements(&output)), flags)
+        }, _ => unreachable!("object and str dtypes are rejected before this dispatch")),
+        (_, ReduceOp::Integer(integer_op)) => dispatch_integer!(dtype.kind(), T => {
+            let values = gather::<T>(runtime, &array, &order)?;
+            let output = accumulate_integer::<T>(integer_op, &values, kept_count, axis_len);
+            (PyArrayBuffer::Bytes(array::pack_elements(&output)), FpFlags::default())
+        }, _ => unreachable!("resolve_dtype only allows bool/signed/unsigned for bitwise ops")),
+        (Kind::Bool, ReduceOp::Bool(bool_op)) => {
+            let values = gather::<bool>(runtime, &array, &order)?;
+            let output = accumulate_bool(bool_op, &values, kept_count, axis_len);
+            (
+                PyArrayBuffer::Bytes(array::pack_elements(&output)),
+                FpFlags::default(),
+            )
+        }
+        (_, ReduceOp::Bool(_)) => {
+            unreachable!("resolve_dtype only resolves Bool ops to the bool dtype")
+        }
+        (_, ReduceOp::Float2(float2_op)) => dispatch_real!(dtype.kind(), T => {
+            let values = gather::<T>(runtime, &array, &order)?;
+            let (output, flags) = accumulate_float2::<T>(float2_op, &values, kept_count, axis_len);
+            (PyArrayBuffer::Bytes(array::pack_elements(&output)), flags)
+        }, _ => unreachable!("resolve_dtype only resolves Float2 ops to a float dtype")),
+    };
+    super::errstate::report(runtime, "accumulate", flags)?;
+    let result = layout::new_array(runtime, buffer, dtype, array.shape().to_vec(), &order)?;
+    if let Some(out) = out {
+        array::assign(runtime, &out, &result)?;
+        Ok(out.value())
+    } else {
+        Ok(result.value())
+    }
+}
+
+fn accumulate_numeric<T: Numeric + Element>(
+    op: NumericOp,
+    values: &[T],
+    kept_count: usize,
+    axis_len: usize,
+) -> PyResult<(Vec<T>, FpFlags)> {
+    let mut flags = FpFlags::default();
+    let mut output = Vec::with_capacity(values.len());
+    for bucket in 0..kept_count {
+        let mut run = values[bucket * axis_len..(bucket + 1) * axis_len].iter();
+        let Some(&first) = run.next() else { continue };
+        let mut total = first;
+        output.push(total);
+        for &value in run {
+            check_power_exponent(op, value)?;
+            total = combine_numeric(op, total, value, &mut flags);
+            output.push(total);
+        }
+    }
+    Ok((output, flags))
+}
+
+fn accumulate_integer<T: Integer + Element>(
+    op: IntegerOp,
+    values: &[T],
+    kept_count: usize,
+    axis_len: usize,
+) -> Vec<T> {
+    let mut output = Vec::with_capacity(values.len());
+    for bucket in 0..kept_count {
+        let mut run = values[bucket * axis_len..(bucket + 1) * axis_len].iter();
+        let Some(&first) = run.next() else { continue };
+        let mut total = first;
+        output.push(total);
+        for &value in run {
+            total = combine_integer(op, total, value);
+            output.push(total);
+        }
+    }
+    output
+}
+
+fn accumulate_bool(op: BoolOp, values: &[bool], kept_count: usize, axis_len: usize) -> Vec<bool> {
+    let mut output = Vec::with_capacity(values.len());
+    for bucket in 0..kept_count {
+        let mut run = values[bucket * axis_len..(bucket + 1) * axis_len].iter();
+        let Some(&first) = run.next() else { continue };
+        let mut total = first;
+        output.push(total);
+        for &value in run {
+            total = combine_bool(op, total, value);
+            output.push(total);
+        }
+    }
+    output
+}
+
+fn accumulate_float2<T: Real + Element>(
+    op: Float2Op,
+    values: &[T],
+    kept_count: usize,
+    axis_len: usize,
+) -> (Vec<T>, FpFlags) {
+    let mut flags = FpFlags::default();
+    let mut output = Vec::with_capacity(values.len());
+    for bucket in 0..kept_count {
+        let mut run = values[bucket * axis_len..(bucket + 1) * axis_len].iter();
+        let Some(&first) = run.next() else { continue };
+        let mut total = first;
+        output.push(total);
+        for &value in run {
+            total = combine_float2(op, total, value, &mut flags);
+            output.push(total);
+        }
+    }
+    (output, flags)
+}
+
+fn accumulate_object(
+    runtime: &mut dyn PyRuntime,
+    ufunc: &UfuncDef,
+    values: &[PyValue],
+    kept_count: usize,
+    axis_len: usize,
+) -> PyResult<Vec<PyValue>> {
+    let mut output = Vec::with_capacity(values.len());
+    for bucket in 0..kept_count {
+        let mut run = values[bucket * axis_len..(bucket + 1) * axis_len]
+            .iter()
+            .copied();
+        let Some(mut total) = run.next() else {
+            continue;
+        };
+        output.push(total);
+        for value in run {
+            total = ufunc::object_element(runtime, ufunc, &[total, value])?;
+            output.push(total);
+        }
+    }
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------------------------
+// `sum`, `prod`, `max`/`amax`, `min`/`amin`, `any`, `all`
+// ---------------------------------------------------------------------------------------------
+
+static SUM_SIGNATURE: Signature = Signature::new(
+    "sum",
+    &["a", "axis", "dtype", "out", "keepdims", "initial", "where"],
+    1,
+);
+static SUM_METHOD_SIGNATURE: Signature = Signature::new(
+    "_sum",
+    &["axis", "dtype", "out", "keepdims", "initial", "where"],
+    0,
+);
+static PROD_SIGNATURE: Signature = Signature::new(
+    "prod",
+    &["a", "axis", "dtype", "out", "keepdims", "initial", "where"],
+    1,
+);
+static PROD_METHOD_SIGNATURE: Signature = Signature::new(
+    "_prod",
+    &["axis", "dtype", "out", "keepdims", "initial", "where"],
+    0,
+);
+
+fn sum_prod(
+    runtime: &mut dyn PyRuntime,
+    ufunc_name: &str,
+    array: Array,
+    bound: &Bound,
+) -> PyResult {
+    let ufunc = ufunc_named(ufunc_name);
+    let axes = args::axes(runtime, bound.get("axis"), array.ndim())?;
+    let dtype = args::optional_dtype(runtime, bound.get("dtype"))?;
+    let out = out_array(runtime, bound.get("out"))?;
+    let keepdims = args::flag(runtime, bound.get("keepdims"), false)?;
+    let initial = bound.value("initial");
+    let where_ = bound.value("where");
+    reduce_call(
+        runtime, ufunc, array, axes, dtype, out, keepdims, initial, where_,
+    )
+}
+
+fn module_sum(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = SUM_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    sum_prod(runtime, "add", array, &bound)
+}
+
+fn method_sum(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let bound = SUM_METHOD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, receiver)?;
+    sum_prod(runtime, "add", array, &bound)
+}
+
+fn module_prod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = PROD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    sum_prod(runtime, "multiply", array, &bound)
+}
+
+fn method_prod(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let bound = PROD_METHOD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, receiver)?;
+    sum_prod(runtime, "multiply", array, &bound)
+}
+
+static MAX_SIGNATURE: Signature = Signature::new(
+    "amax",
+    &["a", "axis", "out", "keepdims", "initial", "where"],
+    1,
+);
+static MAX_METHOD_SIGNATURE: Signature =
+    Signature::new("_amax", &["axis", "out", "keepdims", "initial", "where"], 0);
+static MIN_SIGNATURE: Signature = Signature::new(
+    "amin",
+    &["a", "axis", "out", "keepdims", "initial", "where"],
+    1,
+);
+static MIN_METHOD_SIGNATURE: Signature =
+    Signature::new("_amin", &["axis", "out", "keepdims", "initial", "where"], 0);
+
+fn max_min(runtime: &mut dyn PyRuntime, ufunc_name: &str, array: Array, bound: &Bound) -> PyResult {
+    let ufunc = ufunc_named(ufunc_name);
+    let axes = args::axes(runtime, bound.get("axis"), array.ndim())?;
+    let out = out_array(runtime, bound.get("out"))?;
+    let keepdims = args::flag(runtime, bound.get("keepdims"), false)?;
+    let initial = bound.value("initial");
+    let where_ = bound.value("where");
+    reduce_call(
+        runtime, ufunc, array, axes, None, out, keepdims, initial, where_,
+    )
+}
+
+fn module_max(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = MAX_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    max_min(runtime, "maximum", array, &bound)
+}
+
+fn method_max(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let bound = MAX_METHOD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, receiver)?;
+    max_min(runtime, "maximum", array, &bound)
+}
+
+fn module_min(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = MIN_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    max_min(runtime, "minimum", array, &bound)
+}
+
+fn method_min(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let bound = MIN_METHOD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, receiver)?;
+    max_min(runtime, "minimum", array, &bound)
+}
+
+static ANY_SIGNATURE: Signature =
+    Signature::new("any", &["a", "axis", "out", "keepdims"], 1).keyword_only(&["where"]);
+static ANY_METHOD_SIGNATURE: Signature =
+    Signature::new("_any", &["axis", "out", "keepdims"], 0).keyword_only(&["where"]);
+static ALL_SIGNATURE: Signature =
+    Signature::new("all", &["a", "axis", "out", "keepdims"], 1).keyword_only(&["where"]);
+static ALL_METHOD_SIGNATURE: Signature =
+    Signature::new("_all", &["axis", "out", "keepdims"], 0).keyword_only(&["where"]);
+
+fn any_all(runtime: &mut dyn PyRuntime, ufunc_name: &str, array: Array, bound: &Bound) -> PyResult {
+    let ufunc = ufunc_named(ufunc_name);
+    let axes = args::axes(runtime, bound.get("axis"), array.ndim())?;
+    let out = out_array(runtime, bound.get("out"))?;
+    let keepdims = args::flag(runtime, bound.get("keepdims"), false)?;
+    let where_ = bound.value("where");
+    reduce_call(
+        runtime, ufunc, array, axes, None, out, keepdims, None, where_,
+    )
+}
+
+fn module_any(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = ANY_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    any_all(runtime, "logical_or", array, &bound)
+}
+
+fn method_any(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let bound = ANY_METHOD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, receiver)?;
+    any_all(runtime, "logical_or", array, &bound)
+}
+
+fn module_all(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = ALL_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    any_all(runtime, "logical_and", array, &bound)
+}
+
+fn method_all(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let bound = ALL_METHOD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, receiver)?;
+    any_all(runtime, "logical_and", array, &bound)
+}
+
+// ---------------------------------------------------------------------------------------------
+// `argmin`, `argmax`
+// ---------------------------------------------------------------------------------------------
+
+static ARGMIN_SIGNATURE: Signature =
+    Signature::new("argmin", &["a", "axis", "out"], 1).keyword_only(&["keepdims"]);
+static ARGMIN_METHOD_SIGNATURE: Signature =
+    Signature::new("argmin", &["axis", "out"], 0).keyword_only(&["keepdims"]);
+static ARGMAX_SIGNATURE: Signature =
+    Signature::new("argmax", &["a", "axis", "out"], 1).keyword_only(&["keepdims"]);
+static ARGMAX_METHOD_SIGNATURE: Signature =
+    Signature::new("argmax", &["axis", "out"], 0).keyword_only(&["keepdims"]);
+
+fn arg_extreme(
+    runtime: &mut dyn PyRuntime,
+    array: Array,
+    axis: Option<usize>,
+    out: Option<Array>,
+    keepdims: bool,
+    is_max: bool,
+    name: &str,
+) -> PyResult<PyValue> {
+    let axes = match axis {
+        Some(axis) => Axes::Some(vec![axis]),
+        None => Axes::All,
+    };
+    let split = AxisSplit::new(array.shape(), &axes);
+    if split.kept_count() > 0 && split.reduce_count() == 0 {
+        return Err(PyError::value_error(format!(
+            "attempt to get {name} of an empty sequence"
+        )));
+    }
+    let order = split.reading_order();
+    array::reserve_elements(runtime, DType::INT64, split.kept_count())?;
+    runtime.charge_cpu(array.size() as u64 + 1)?;
+    let bytes = match array.dtype.kind() {
+        Kind::Object | Kind::Str => {
+            return Err(PyError::unsupported(format!(
+                "{name} of '{}' arrays is not supported by shellsim's NumPy",
+                array.dtype.kind().name()
+            )))
+        }
+        kind => dispatch_numeric!(kind, T => {
+            let values = gather::<T>(runtime, &array, &order)?;
+            let output = arg_extreme_numeric::<T>(&values, split.kept_count(), split.reduce_count(), is_max);
+            array::pack_elements(&output)
+        }, _ => unreachable!("object and str are rejected above")),
+    };
+    finish_reduction(
+        runtime,
+        DType::INT64,
+        array.shape(),
+        &split,
+        keepdims,
+        PyArrayBuffer::Bytes(bytes),
+        out,
+    )
+}
+
+/// The index of the first extreme value in each output cell's run. NaN dominates both
+/// directions, as [`ops::Numeric::maximum`]/`minimum` treat it, so the first NaN in a run
+/// becomes that run's argmax/argmin and no later comparison can replace it.
+fn arg_extreme_numeric<T: Numeric>(
+    values: &[T],
+    kept_count: usize,
+    reduce_count: usize,
+    is_max: bool,
+) -> Vec<i64> {
+    (0..kept_count)
+        .map(|bucket| {
+            let window = &values[bucket * reduce_count..(bucket + 1) * reduce_count];
+            let mut best_index = 0;
+            let mut best_value = window[0];
+            for (index, &value) in window.iter().enumerate().skip(1) {
+                if best_value.is_nan() {
+                    break;
+                }
+                let replace = value.is_nan()
+                    || matches!(
+                        (is_max, value.compare(best_value)),
+                        (true, Some(Ordering::Greater)) | (false, Some(Ordering::Less))
+                    );
+                if replace {
+                    best_value = value;
+                    best_index = index;
+                }
+            }
+            best_index as i64
+        })
+        .collect()
+}
+
+fn module_argmin(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = ARGMIN_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    let axis = args::axis(runtime, bound.get("axis"), array.ndim())?;
+    let out = out_array(runtime, bound.get("out"))?;
+    let keepdims = args::flag(runtime, bound.get("keepdims"), false)?;
+    arg_extreme(runtime, array, axis, out, keepdims, false, "argmin")
+}
+
+fn method_argmin(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let bound = ARGMIN_METHOD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, receiver)?;
+    let axis = args::axis(runtime, bound.get("axis"), array.ndim())?;
+    let out = out_array(runtime, bound.get("out"))?;
+    let keepdims = args::flag(runtime, bound.get("keepdims"), false)?;
+    arg_extreme(runtime, array, axis, out, keepdims, false, "argmin")
+}
+
+fn module_argmax(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = ARGMAX_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    let axis = args::axis(runtime, bound.get("axis"), array.ndim())?;
+    let out = out_array(runtime, bound.get("out"))?;
+    let keepdims = args::flag(runtime, bound.get("keepdims"), false)?;
+    arg_extreme(runtime, array, axis, out, keepdims, true, "argmax")
+}
+
+fn method_argmax(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let bound = ARGMAX_METHOD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, receiver)?;
+    let axis = args::axis(runtime, bound.get("axis"), array.ndim())?;
+    let out = out_array(runtime, bound.get("out"))?;
+    let keepdims = args::flag(runtime, bound.get("keepdims"), false)?;
+    arg_extreme(runtime, array, axis, out, keepdims, true, "argmax")
+}
+
+// ---------------------------------------------------------------------------------------------
+// `cumsum`, `cumprod`
+// ---------------------------------------------------------------------------------------------
+
+static CUMSUM_SIGNATURE: Signature = Signature::new("cumsum", &["a", "axis", "dtype", "out"], 1);
+static CUMSUM_METHOD_SIGNATURE: Signature = Signature::new("cumsum", &["axis", "dtype", "out"], 0);
+static CUMPROD_SIGNATURE: Signature = Signature::new("cumprod", &["a", "axis", "dtype", "out"], 1);
+static CUMPROD_METHOD_SIGNATURE: Signature =
+    Signature::new("cumprod", &["axis", "dtype", "out"], 0);
+
+/// `axis=None` flattens the array first, as `cumsum`/`cumprod` do (unlike `ufunc.accumulate`,
+/// which rejects `None`).
+fn cumulative(
+    runtime: &mut dyn PyRuntime,
+    ufunc_name: &str,
+    array: Array,
+    bound: &Bound,
+) -> PyResult {
+    let ufunc = ufunc_named(ufunc_name);
+    let (array, axis) = match args::axis(runtime, bound.get("axis"), array.ndim())? {
+        Some(axis) => (array, axis),
+        None => (array::ravel(runtime, &array)?, 0),
+    };
+    let dtype = args::optional_dtype(runtime, bound.get("dtype"))?;
+    let out = out_array(runtime, bound.get("out"))?;
+    accumulate_call(runtime, ufunc, array, axis, dtype, out)
+}
+
+fn module_cumsum(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = CUMSUM_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    cumulative(runtime, "add", array, &bound)
+}
+
+fn method_cumsum(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let bound = CUMSUM_METHOD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, receiver)?;
+    cumulative(runtime, "add", array, &bound)
+}
+
+fn module_cumprod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = CUMPROD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    cumulative(runtime, "multiply", array, &bound)
+}
+
+fn method_cumprod(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let bound = CUMPROD_METHOD_SIGNATURE.bind(&args)?;
+    let array = convert::as_array(runtime, receiver)?;
+    cumulative(runtime, "multiply", array, &bound)
 }

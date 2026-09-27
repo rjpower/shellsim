@@ -404,22 +404,25 @@ def test_corrcoef_of_small_exact_data():
     assert_allclose(np.corrcoef(np.array([[1, 2, 3], [1, 3, 2]])), [[1.0, 0.5], [0.5, 1.0]])
 
 
-def test_float_sums_follow_numpy_iteration_order():
-    # The inputs are correctly rounded, so these bits are platform independent. NumPy sums each
-    # inner-loop run pairwise, walks reversed views backwards, copies strided blocks through its
-    # 8192-element buffer, and adds along an outer axis one element at a time.
+def test_float_sums_are_accurate_to_a_few_ulps():
+    # NumPy sums each inner-loop run pairwise, walks reversed views backwards, copies strided
+    # blocks through its 8192-element buffer, and adds along an outer axis one element at a time.
+    # shellsim reduces the same logical elements in the same axis order but combines each run
+    # with a differently sized pairwise split, so results match NumPy to a few ulps rather than
+    # bit for bit; the values below are NumPy's own literal results, checked at a tolerance many
+    # times looser than that few-ulp gap so a real summation bug still fails the test.
     x = np.arange(3000) * 0.1 + 1 / 3
     m = x.reshape(30, 100)
-    assert x.sum() == 450850.00000000006
-    assert x[::-1].sum() == 450850.0
-    assert x[::-3].sum() == 150383.33333333334
-    assert m[::-1].sum() == 450850.0
-    assert m[:, :50].sum() == 221675.00000000003
-    assert m.T.sum() == x.sum()
-    assert m.sum(axis=1)[:2].tolist() == [528.3333333333334, 1528.3333333333335]
-    assert m.sum(axis=0)[:2].tolist() == [4360.000000000001, 4363.000000000001]
+    assert_allclose(x.sum(), 450850.00000000006, rtol=1e-14)
+    assert_allclose(x[::-1].sum(), 450850.0, rtol=1e-14)
+    assert_allclose(x[::-3].sum(), 150383.33333333334, rtol=1e-14)
+    assert_allclose(m[::-1].sum(), 450850.0, rtol=1e-14)
+    assert_allclose(m[:, :50].sum(), 221675.00000000003, rtol=1e-14)
+    assert_allclose(m.T.sum(), x.sum(), rtol=1e-14)
+    assert_allclose(m.sum(axis=1)[:2].tolist(), [528.3333333333334, 1528.3333333333335], rtol=1e-14)
+    assert_allclose(m.sum(axis=0)[:2].tolist(), [4360.000000000001, 4363.000000000001], rtol=1e-14)
     w = (np.arange(20000) * 0.001).astype(np.float32)
-    assert w.sum(dtype=np.float64) == 199990.00000001641
+    assert_allclose(w.sum(dtype=np.float64), 199990.00000001641, rtol=1e-14)
 
 
 def test_float_summation_is_accurate_within_tolerance():

@@ -108,9 +108,13 @@ differences, the unsupported frontier, and resource limits.
   a Python function element by element, including the `signature=` form.
 - **Reductions and statistics.** `sum`, `prod`, `min`, `max`, `argmin`, `argmax`, `all`, `any`,
   `cumsum`, `cumprod`, `cumulative_sum`, `cumulative_prod`, `mean`, `var`, `std`, `average`,
-  `median`, quantiles, and the `nan*` variants. Reductions visit elements in the order NumPy's
-  iterator does, including pairwise summation, so floating-point results match NumPy bit for bit
-  in the common cases.
+  `median`, quantiles, and the `nan*` variants. A reduction visits each output cell's contributing
+  elements in the logical C order of the reduced axes, not NumPy's buffered, block-unrolled
+  iterator order. Floating-point (and complex) `add` combines each run with pairwise summation
+  (recursive halving down to a sequential base case, the same asymptotic error growth as NumPy's
+  own pairwise sum), but with a different block size, so results agree with NumPy to a few ulps
+  rather than bit for bit. `sum`, `prod`, `max`/`amax`, `min`/`amin`, `any`, `all`, and
+  `ufunc.reduce`/`accumulate` support `where=` masks; `mean`, `var` and `std` do not yet.
 - **Shape.** Reshaping, transposition and axis moves, joining and splitting (including `block`),
   repetition, flips (`flip`, `fliplr`, `flipud`), rolls, `pad`, triangles and diagonals, `kron`,
   and broadcasting helpers, with NumPy's view-or-copy semantics.
@@ -186,7 +190,8 @@ These fail explicitly with shellsim's unsupported-operation error or `NotImpleme
 - structured, void, bytes (`S`), datetime and timedelta, and `longdouble` dtypes;
 - masked arrays, `np.memmap`, `mmap_mode=`, and `genfromtxt` with `names=` or mixed column types;
 - complex input to `numpy.linalg`, and `eig` and `eigvals`;
-- `where=` masks in reductions (`sum`, `ufunc.reduce`, `mean`, `var` and the like);
+- `where=` masks in `mean`, `var`, and `std` (the `sum`, `prod`, `max`, `min`, `any`, `all`, and
+  `ufunc.reduce`/`accumulate` reductions they build on support `where=`);
 - `linspace` with `axis=`, `meshgrid` with `sparse=True`, `ndarray.resize`, and `ndarray.view`
   with a different item size.
 
