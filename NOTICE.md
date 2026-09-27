@@ -7,7 +7,6 @@ below, which require these notices to accompany source and binary distributions.
 | Component | Upstream | shellsim files | License |
 | --- | --- | --- | --- |
 | NumPy | NumPy 2.5 Python and C sources | `src/python/stdlib/numpy/`, `src/python/stdlib/source/numpy/` | BSD-3-Clause |
-| Dragon4 | Ryan Juckett's Dragon4, as modified in NumPy's `dragon4.c` | `src/python/stdlib/numpy/dragon4.rs` | MIT |
 | pocketfft | `pocketfft_hdronly.h`, as vendored by NumPy | `src/python/stdlib/numpy/fft/pocketfft.rs` | BSD-3-Clause |
 | NumPy random | Kevin Sheppard's random module and distributions, in NumPy | `src/python/stdlib/numpy/random.rs`, `src/python/stdlib/numpy/random/`, `src/python/stdlib/source/numpy/random.py` | NCSA or BSD-3-Clause |
 | Ziggurat | The ziggurat method derived from Julia, in NumPy's distributions | `src/python/stdlib/numpy/random/ziggurat.rs` | MIT |
@@ -54,38 +53,6 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
-
-## Dragon4
-
-```text
-Copyright (c) 2014 Ryan Juckett
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to
-deal in the Software without restriction, including without limitation the
-rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
-sell copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
-
-dragon4.c|h h contains a modified version of Ryan Juckett's Dragon4
-implementation, obtained from https://www.ryanjuckett.com,
-which has been ported from C++ to C and which has
-modifications specific to printing floats in numpy.
-
-Ryan Juckett's original code was under the Zlib license; he gave numpy
-permission to include it under the MIT license instead.
 ```
 
 ## pocketfft

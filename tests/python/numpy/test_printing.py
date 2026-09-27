@@ -262,6 +262,14 @@ def test_bool_array_wraps():
     )
 
 
+def test_bool_column_pads_to_false_width_even_without_a_false():
+    # The bool column always reserves room for "False" (5 characters), even when every visible
+    # element is True; a 0-d array is the one exception, since it has no column to align.
+    assert np.array2string(np.array([True])) == "[ True]"
+    assert np.array2string(np.array([True, True, True])) == "[ True  True  True]"
+    assert np.array2string(np.array(True)) == "True"
+
+
 def test_zero_dimensional_arrays():
     assert str(np.array(5)) == "5"
     assert repr(np.array(5)) == "array(5)"
@@ -272,6 +280,27 @@ def test_zero_dimensional_arrays():
     assert repr(np.array(5, dtype=np.int8)) == "array(5, dtype=int8)"
     assert str(np.array("hi")) == "hi"
     assert repr(np.array("hi")) == "array('hi', dtype='<U2')"
+
+
+def test_zero_dimensional_str_ignores_printoptions_but_repr_does_not():
+    # A 0-d array has no siblings to align against, so `str()` shows the single value's own
+    # natural text (unaffected by `precision`), while `repr()` still goes through the same
+    # precision-aware formatter as any other array.
+    with np.printoptions(precision=3):
+        assert str(np.array(2.0 / 3)) == "0.6666666666666666"
+        assert repr(np.array(2.0 / 3)) == "array(0.667)"
+
+
+def test_scientific_notation_aligns_mantissa_digits_per_floatmode():
+    # Scientific notation has no space-padding mechanism for a mantissa's fraction digits, so
+    # every floatmode (including the "unique"/"maxprec" defaults) aligns a column by forcing
+    # real zero digits up to the widest natural mantissa; "fixed" additionally forces the
+    # requested precision.
+    values = np.array([1e-5, 1.0, 1.5e7])
+    assert np.array2string(values, floatmode="unique") == "[1.0e-05 1.0e+00 1.5e+07]"
+    assert np.array2string(values, floatmode="maxprec") == "[1.0e-05 1.0e+00 1.5e+07]"
+    assert np.array2string(values, floatmode="maxprec_equal") == "[1.0e-05 1.0e+00 1.5e+07]"
+    assert np.array2string(values, floatmode="fixed") == "[1.00000000e-05 1.00000000e+00 1.50000000e+07]"
 
 
 def test_float_scalar_repr_and_str():
