@@ -1,11 +1,14 @@
 """Elementwise and signal helpers that NumPy writes in Python on top of ufuncs.
 
-``round``, ``around`` and ``clip`` follow ``numpy/_core/fromnumeric.py``; ``convolve``,
-``correlate``, ``cross``, ``argwhere`` and ``flatnonzero`` follow ``numpy/_core/numeric.py``;
-``nan_to_num`` and the complex-type predicates follow ``numpy/lib/_type_check_impl.py``;
-``angle``, ``gradient`` and ``interp`` follow ``numpy/lib/_function_base_impl.py``; and
-``isposinf``, ``isneginf`` and ``fix`` follow ``numpy/lib/_ufunclike_impl.py``; and
-``polyval`` and ``polyfit`` follow ``numpy/lib/_polynomial_impl.py``. The native kernels behind
+``round``, ``around``, ``clip`` and ``cumulative_sum``/``cumulative_prod`` follow
+``numpy/_core/fromnumeric.py``; ``convolve``, ``correlate``, ``cross``, ``argwhere`` and
+``flatnonzero`` follow ``numpy/_core/numeric.py``; ``nan_to_num``, ``mintypecode`` and the
+complex-type predicates follow ``numpy/lib/_type_check_impl.py``; ``angle``, ``gradient``,
+``interp``, ``select``, ``extract`` and ``place`` follow ``numpy/lib/_function_base_impl.py``
+(``place`` ports the C ``arr_place``); ``isposinf``, ``isneginf`` and ``fix`` follow
+``numpy/lib/_ufunclike_impl.py``; and ``polyval`` and ``polyfit`` follow
+``numpy/lib/_polynomial_impl.py``. ``vecdot`` is NumPy's gufunc written as a batched ``matmul``,
+so it sums each vector in index order like shellsim's other products. The native kernels behind
 ``interp`` and ``correlate`` live in ``_numpy_math``.
 """
 
@@ -13,15 +16,22 @@ import warnings
 
 from _numpy import (
     absolute,
+    add,
+    arange,
     arctan2,
     array,
     asanyarray,
     asarray,
+    bool_,
+    can_cast,
     complexfloating,
+    conjugate,
     copyto,
     empty,
     empty_like,
     float64,
+    full,
+    full_like,
     generic,
     inexact,
     integer,
@@ -35,8 +45,10 @@ from _numpy import (
     ones,
     pi,
     promote_types,
+    result_type,
     signbit,
     sqrt,
+    take,
     trunc,
     zeros,
     zeros_like,
@@ -44,9 +56,10 @@ from _numpy import (
 from _numpy import complex128 as _complex128
 from _numpy import ndim as _ndim
 from _numpy_math import _compiled_interp, _compiled_interp_complex, _correlate
-from _numpy_products import dot, outer
+from _numpy_products import dot, matmul, outer
 from _numpy_shape import (
     _normalize_axis_index,
+    broadcast_arrays,
     broadcast_shapes,
     concatenate,
     moveaxis,
@@ -525,3 +538,140 @@ def polyfit(x, y, deg, rcond=None, full=False, w=None, cov=False):
             return (c, Vbase[:, :, None] * fac)
     else:
         return c
+
+
+def select(condlist, choicelist, default=0):
+    if len(condlist) != len(choicelist):
+        raise ValueError("list of cases must be same length as list of conditions")
+    if len(condlist) == 0:
+        raise ValueError("select with an empty condition list is not possible")
+    # Python scalars stay weakly typed for promotion.
+    choicelist = [
+        choice if type(choice) in (int, float, complex) else asarray(choice)
+        for choice in choicelist
+    ]
+    choicelist.append(default if type(default) in (int, float, complex) else asarray(default))
+    try:
+        dtype = result_type(*choicelist)
+    except TypeError as e:
+        msg = f"Choicelist and default value do not have a common dtype: {e}"
+        raise TypeError(msg) from None
+    condlist = broadcast_arrays(*condlist)
+    choicelist = broadcast_arrays(*choicelist)
+    for i, cond in enumerate(condlist):
+        if cond.dtype.type is not bool_:
+            raise TypeError(f"invalid entry {i} in condlist: should be boolean ndarray")
+    if choicelist[0].ndim == 0:
+        result_shape = condlist[0].shape
+    else:
+        result_shape = broadcast_arrays(condlist[0], choicelist[0])[0].shape
+    result = full(result_shape, choicelist[-1], dtype)
+    # The first matching condition wins, so fill in reverse order.
+    choicelist = choicelist[-2::-1]
+    condlist = condlist[::-1]
+    for choice, cond in zip(choicelist, condlist):
+        copyto(result, choice, where=cond)
+    return result
+
+
+def extract(condition, arr):
+    return take(ravel(arr), nonzero(ravel(condition))[0])
+
+
+def place(arr, mask, vals):
+    if not isinstance(arr, ndarray):
+        raise TypeError(f"place() argument 1 must be numpy.ndarray, not {type(arr).__name__}")
+    mask = asarray(mask).astype(bool_)
+    if mask.size != arr.size:
+        raise ValueError("place: mask and data must be the same size")
+    # Arrays and NumPy scalars cast safely, as ``PyArray_FromAny`` requires; Python sequences
+    # and scalars convert straight to the array's dtype.
+    if isinstance(vals, (ndarray, generic)):
+        vals = asarray(vals)
+        if not can_cast(vals.dtype, arr.dtype, casting="safe"):
+            raise TypeError(
+                f"Cannot cast array data from {vals.dtype!r} to {arr.dtype!r} according to "
+                "the rule 'safe'"
+            )
+        vals = vals.astype(arr.dtype)
+    else:
+        vals = array(vals, dtype=arr.dtype)
+    if not arr.flags.writeable:
+        raise ValueError("WRITEBACKIFCOPY base is read-only")
+    count = int(mask.sum())
+    if vals.size == 0:
+        if count:
+            raise ValueError("Cannot insert from an empty array!")
+        return
+    if count == 0:
+        return
+    # The first ``count`` values, repeated as needed, fill the masked positions in C order.
+    vals = ravel(vals)
+    arr[mask.reshape(arr.shape)] = vals[arange(count) % vals.size]
+
+
+_typecodes_by_elsize = "GDFgdfQqLlIiHhBb?"
+
+
+def mintypecode(typechars, typeset="GDFgdf", default="d"):
+    typecodes = ((isinstance(t, str) and t) or asarray(t).dtype.char for t in typechars)
+    intersection = {t for t in typecodes if t in typeset}
+    if not intersection:
+        return default
+    if "F" in intersection and "d" in intersection:
+        return "D"
+    return min(intersection, key=_typecodes_by_elsize.index)
+
+
+def _cumulative_func(x, func, axis, dtype, out, include_initial):
+    x = atleast_1d(x)
+    x_ndim = x.ndim
+    if axis is None:
+        if x_ndim >= 2:
+            raise ValueError(
+                "For arrays which have more than one dimension ``axis`` argument is required."
+            )
+        axis = 0
+    if out is not None and include_initial:
+        item = [slice(None)] * x_ndim
+        item[axis] = slice(1, None)
+        func.accumulate(x, axis=axis, dtype=dtype, out=out[tuple(item)])
+        item[axis] = 0
+        out[tuple(item)] = func.identity
+        return out
+    res = func.accumulate(x, axis=axis, dtype=dtype, out=out)
+    if include_initial:
+        initial_shape = list(res.shape)
+        initial_shape[axis] = 1
+        res = concatenate([full_like(res, func.identity, shape=initial_shape), res], axis=axis)
+    return res
+
+
+def cumulative_sum(x, /, *, axis=None, dtype=None, out=None, include_initial=False):
+    return _cumulative_func(x, add, axis, dtype, out, include_initial)
+
+
+def cumulative_prod(x, /, *, axis=None, dtype=None, out=None, include_initial=False):
+    return _cumulative_func(x, multiply, axis, dtype, out, include_initial)
+
+
+def vecdot(x1, x2, /, *, axis=-1):
+    x1 = asanyarray(x1)
+    x2 = asanyarray(x2)
+    for operand, x in enumerate((x1, x2)):
+        if x.ndim < 1:
+            raise ValueError(
+                f"vecdot: Input operand {operand} does not have enough dimensions (has 0, "
+                "gufunc core with signature (n),(n)->() requires 1)"
+            )
+    x1 = moveaxis(x1, _normalize_axis_index(axis, x1.ndim), -1)
+    x2 = moveaxis(x2, _normalize_axis_index(axis, x2.ndim), -1)
+    if x1.shape[-1] != x2.shape[-1]:
+        raise ValueError(
+            "vecdot: Input operand 1 has a mismatch in its core dimension 0, with gufunc "
+            f"signature (n),(n)->() (size {x2.shape[-1]} is different from {x1.shape[-1]})"
+        )
+    if issubdtype(x1.dtype, complexfloating):
+        x1 = conjugate(x1)
+    result = matmul(x1[..., None, :], x2[..., :, None])[..., 0, 0]
+    return result[()] if isinstance(result, ndarray) and result.ndim == 0 else result

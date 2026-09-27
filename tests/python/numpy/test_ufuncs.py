@@ -643,3 +643,83 @@ def test_complex_arrays_reject_real_only_operations():
     with pytest.raises(TypeError) as info:
         np.percentile(values, 50)
     assert str(info.value) == "a must be an array of real numbers"
+
+
+def test_vectorize_infers_output_type_from_a_first_call_on_numpy_scalars():
+    seen = []
+
+    def double(x):
+        seen.append(type(x).__name__)
+        return x * 2
+
+    result = np.vectorize(double)(np.array([1.0, 2.0]))
+    assert result.dtype == np.float64
+    assert result.tolist() == [2.0, 4.0]
+    # The inference call sees a NumPy scalar; the loop sees the objects of an object array.
+    assert seen == ["float64", "float", "float"]
+
+
+def test_vectorize_returns_zero_dimensional_arrays_for_scalars():
+    result = np.vectorize(lambda x: x + 1)(3.0)
+    assert isinstance(result, np.ndarray)
+    assert result.shape == ()
+    assert result == 4.0
+
+
+def test_vectorize_broadcasts_and_casts_to_otypes():
+    add = np.vectorize(lambda x, y: x + y)
+    result = add([1, 2], [[10], [20]])
+    assert result.dtype == np.int64
+    assert result.tolist() == [[11, 12], [21, 22]]
+    as_double = np.vectorize(lambda x, y: x + y, otypes="d")(np.array([1, 2]), 3)
+    assert as_double.dtype == np.float64
+    assert as_double.tolist() == [4.0, 5.0]
+    as_single = np.vectorize(lambda x: x + 1, otypes=[np.float32])([1, 2])
+    assert as_single.dtype == np.float32
+    assert as_single.tolist() == [2.0, 3.0]
+
+
+def test_vectorize_with_several_outputs_returns_a_tuple():
+    low, high = np.vectorize(lambda x: (x - 1, x + 1.5))([1, 2])
+    assert low.dtype == np.int64
+    assert high.dtype == np.float64
+    assert (low.tolist(), high.tolist()) == ([0, 1], [2.5, 3.5])
+
+
+def test_vectorize_passes_excluded_arguments_through():
+    add = np.vectorize(lambda x, offset=0: x + offset, excluded={"offset"})
+    assert add([1, 2], offset=5).tolist() == [6, 7]
+
+
+def test_vectorize_with_a_signature_loops_over_the_leading_dimensions():
+    total = np.vectorize(np.sum, signature="(n)->()")
+    assert total(np.arange(6).reshape(2, 3)).tolist() == [3, 12]
+
+
+def test_vectorize_as_a_decorator_takes_keyword_arguments():
+    @np.vectorize(otypes=[float])
+    def half(x):
+        return x / 2
+
+    assert half.__name__ == "half"
+    assert half([1, 3]).tolist() == [0.5, 1.5]
+
+
+def test_vectorize_needs_otypes_for_empty_input():
+    with pytest.raises(ValueError, match="cannot call `vectorize` on size 0 inputs"):
+        np.vectorize(lambda x: x)(np.array([]))
+
+
+def test_vectorize_rejects_invalid_otypes_and_signatures():
+    with pytest.raises(ValueError, match="Invalid otype specified: z"):
+        np.vectorize(lambda x: x, otypes="z")
+    with pytest.raises(ValueError, match="Invalid otype specification"):
+        np.vectorize(lambda x: x, otypes=5)
+    with pytest.raises(ValueError, match="not a valid gufunc signature"):
+        np.vectorize(lambda x: x, signature="(n)->()x")
+
+
+def test_vectorize_with_otypes_accepts_empty_input():
+    result = np.vectorize(lambda x: x, otypes="d")(np.array([]))
+    assert result.dtype == np.float64
+    assert result.shape == (0,)

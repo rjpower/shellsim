@@ -428,3 +428,16 @@ def test_float_summation_is_accurate_within_tolerance():
     assert np.arange(1, 10001, dtype=np.float64).sum() == 50005000.0
     # Sequential float32 accumulation drifts to about 999.90; pairwise summation stays near 1000.
     assert_allclose(np.full(10000, 0.1, np.float32).sum(), 1000.0, rtol=1e-5)
+
+
+def test_cumulative_sum_and_prod_can_include_the_identity():
+    assert np.cumulative_sum(np.array([1, 2, 3]), include_initial=True).tolist() == [0, 1, 3, 6]
+    assert np.cumulative_prod([1, 2, 3], include_initial=True).tolist() == [1, 1, 2, 6]
+    a = np.arange(6).reshape(2, 3)
+    result = np.cumulative_sum(a, axis=1, include_initial=True)
+    assert result.tolist() == [[0, 0, 1, 3], [0, 3, 7, 12]]
+
+
+def test_cumulative_sum_requires_an_axis_for_multidimensional_input():
+    with pytest.raises(ValueError, match="``axis`` argument is required"):
+        np.cumulative_sum(np.ones((2, 2)))

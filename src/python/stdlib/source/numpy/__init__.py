@@ -26,7 +26,7 @@ from numpy._arrayprint import (
 )
 from numpy._errstate import errstate, geterr, geterrcall, seterr, seterrcall
 from numpy._getlimits import finfo, iinfo
-from numpy._numeric import allclose, array_equal, array_equiv, isclose
+from numpy._numeric import allclose, array_equal, array_equiv, astype, isclose, isdtype
 from numpy._shape_base import (
     append,
     apply_along_axis,
@@ -66,6 +66,9 @@ from numpy._function_base import (
     convolve,
     correlate,
     cross,
+    cumulative_prod,
+    cumulative_sum,
+    extract,
     fix,
     flatnonzero,
     gradient,
@@ -78,13 +81,18 @@ from numpy._function_base import (
     isreal,
     isrealobj,
     iterable,
+    mintypecode,
     nan_to_num,
+    place,
     polyfit,
     polyval,
     real,
     real_if_close,
     round,
+    select,
+    vecdot,
 )
+from numpy._vectorize import typecodes, vectorize
 from numpy._methods import average, count_nonzero, mean, ptp, std, var
 from numpy._statistics import corrcoef, cov, median, percentile, quantile
 from numpy._histograms import digitize, histogram, histogram_bin_edges
@@ -124,6 +132,7 @@ __version__ = "2.5.3"
 newaxis = None
 amax = max
 amin = min
+concat = concatenate
 
 
 class flatiter:

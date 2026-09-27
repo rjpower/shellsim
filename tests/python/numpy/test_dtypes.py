@@ -587,3 +587,45 @@ def test_big_endian_arrays_keep_their_dtype_through_copies_and_indexing():
 )
 def test_can_cast_between_byte_orders(source, target, casting, expected):
     assert np.can_cast(source, target, casting=casting) is expected
+
+
+def test_isdtype_classifies_dtypes_by_kind():
+    assert np.isdtype(np.float32, ("real floating", "integral")) is True
+    assert np.isdtype(np.dtype("i8"), "numeric") is True
+    assert np.isdtype(np.bool_, "numeric") is False
+    assert np.isdtype(np.uint16, "signed integer") is False
+    assert np.isdtype(np.complex128, "complex floating") is True
+    assert np.isdtype(np.dtype("f8"), (np.float32, np.float64)) is True
+    # Abstract types are accepted but belong to no kind.
+    assert np.isdtype(np.floating, "real floating") is False
+
+
+def test_isdtype_rejects_non_dtypes():
+    with pytest.raises(TypeError, match="dtype argument must be a NumPy dtype"):
+        np.isdtype("f8", "real floating")
+    with pytest.raises(TypeError, match="dtype argument must be a NumPy dtype"):
+        np.isdtype(float, "real floating")
+    with pytest.raises(ValueError, match="'floating' is not a known kind name"):
+        np.isdtype(np.float64, "floating")
+    with pytest.raises(TypeError, match="kind argument must be comprised of NumPy dtypes"):
+        np.isdtype(np.float64, 3)
+
+
+def test_astype_function_accepts_arrays_and_scalars_only():
+    assert np.astype(np.ones(2), np.int32).dtype == np.int32
+    assert np.astype(np.float64(1.5), np.int64) == 1
+    with pytest.raises(TypeError, match="Input should be a NumPy array or scalar"):
+        np.astype([1, 2], np.int32)
+
+
+@pytest.mark.parametrize(
+    ("typechars", "expected"),
+    [("df", "d"), (["d", "l"], "d"), ("ll", "d"), ("Ff", "F"), ("Fd", "D"), ("fg", "g")],
+)
+def test_mintypecode_picks_the_smallest_safe_type(typechars, expected):
+    assert np.mintypecode(typechars) == expected
+
+
+def test_concat_is_concatenate():
+    assert np.concat is np.concatenate
+    assert np.concat(([1, 2], [3])).tolist() == [1, 2, 3]

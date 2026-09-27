@@ -603,3 +603,69 @@ def test_full_boolean_mask_assignment_takes_one_value_per_true_element():
     # A mask over the leading axis only selects rows, and the value broadcasts to them.
     a[np.array([True, False])] = np.full((1, 2), 4.0)
     assert a.tolist() == [[4.0, 4.0], [1.0, 1.0]]
+
+
+def test_place_repeats_values_over_masked_positions_in_c_order():
+    a = np.zeros(4)
+    np.place(a, [True, True, True, False], [7, 8])
+    assert a.tolist() == [7.0, 8.0, 7.0, 0.0]
+
+
+def test_place_writes_through_a_strided_view():
+    base = np.zeros((2, 3))
+    view = base[:, ::2]
+    np.place(view, np.array([[True, False], [False, True]]), [5, 6])
+    assert base.tolist() == [[5.0, 0.0, 0.0], [0.0, 0.0, 6.0]]
+
+
+def test_place_casts_python_values_but_requires_safe_array_casts():
+    a = np.zeros(3, dtype=np.int64)
+    np.place(a, [True, False, True], [1.5, 2.5])
+    assert a.tolist() == [1, 0, 2]
+    with pytest.raises(TypeError, match="according to the rule 'safe'"):
+        np.place(a, [True, False, True], np.array([1.5, 2.5]))
+
+
+def test_place_requires_an_ndarray():
+    with pytest.raises(TypeError, match="argument 1 must be numpy.ndarray, not list"):
+        np.place([1, 2], [True, False], [1])
+
+
+@pytest.mark.parametrize(
+    ("mask", "vals", "message"),
+    [
+        ([True], [1], "mask and data must be the same size"),
+        ([True, False], [], "Cannot insert from an empty array!"),
+    ],
+)
+def test_place_rejects_mismatched_masks_and_empty_values(mask, vals, message):
+    with pytest.raises(ValueError, match=message):
+        np.place(np.zeros(2), mask, vals)
+
+
+def test_extract_takes_elements_where_the_raveled_condition_is_nonzero():
+    a = np.arange(4).reshape(2, 2)
+    assert np.extract(np.array([[1, 0], [0, 2]]), a).tolist() == [0, 3]
+    assert np.extract([True, False, True], [[1, 2], [3, 4]]).tolist() == [1, 3]
+
+
+def test_select_takes_the_first_matching_choice_and_promotes():
+    result = np.select(
+        [np.array([True, False, False]), np.array([True, True, False])],
+        [np.array([1, 2, 3]), np.array([4.5, 5.5, 6.5])],
+        default=-1,
+    )
+    assert result.dtype == np.float64
+    assert result.tolist() == [1.0, 5.5, -1.0]
+
+
+def test_select_rejects_mismatched_lists():
+    with pytest.raises(ValueError, match="select with an empty condition list is not possible"):
+        np.select([], [])
+    with pytest.raises(ValueError, match="list of cases must be same length as list of conditions"):
+        np.select([np.array([True])], [1, 2])
+
+
+def test_select_requires_boolean_conditions():
+    with pytest.raises(TypeError, match="invalid entry 0 in condlist: should be boolean ndarray"):
+        np.select([np.array([1, 0])], [np.array([1, 2])])

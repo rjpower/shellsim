@@ -96,25 +96,28 @@ differences, the unsupported frontier, and resource limits.
 - **Construction and conversion.** `array` and the `as*array` family, the `*_like`
   constructors, `arange`, `linspace` (including complex bounds), `logspace`, `geomspace`, `eye`,
   `diag`, `meshgrid`, `fromiter`, `frombuffer`, `astype` with NumPy's casting rules, and
-  `result_type`, `can_cast` and `issubdtype`.
+  `result_type`, `can_cast`, `issubdtype`, `isdtype` and `mintypecode`.
 - **Indexing.** Basic indexing returns views. Integer-array and boolean-mask indexing follow
   NumPy's placement rules for combined advanced indices. Assignment works through every index
-  form, broadcasting the value as NumPy does.
+  form, broadcasting the value as NumPy does. `select`, `extract` and `place` choose and fill
+  elements by condition.
 - **Ufuncs.** The arithmetic, comparison, logical, bitwise, rounding, exponential,
   trigonometric and hyperbolic ufuncs, with `out=`, `where=`, `dtype=`, `casting=`, `order=`,
   and `reduce`/`accumulate`. Operators share the ufunc table. `np.errstate` and `np.seterr`
-  control whether floating-point errors are ignored, warned about, or raised.
+  control whether floating-point errors are ignored, warned about, or raised. `vectorize` applies
+  a Python function element by element, including the `signature=` form.
 - **Reductions and statistics.** `sum`, `prod`, `min`, `max`, `argmin`, `argmax`, `all`, `any`,
-  `cumsum`, `cumprod`, `mean`, `var`, `std`, `average`, `median`, quantiles, and the `nan*`
-  variants. Reductions visit elements in the order NumPy's iterator does, including pairwise
-  summation, so floating-point results match NumPy bit for bit in the common cases.
+  `cumsum`, `cumprod`, `cumulative_sum`, `cumulative_prod`, `mean`, `var`, `std`, `average`,
+  `median`, quantiles, and the `nan*` variants. Reductions visit elements in the order NumPy's
+  iterator does, including pairwise summation, so floating-point results match NumPy bit for bit
+  in the common cases.
 - **Shape.** Reshaping, transposition and axis moves, joining and splitting, repetition, flips,
   rolls, `pad`, triangles and diagonals, and broadcasting helpers, with NumPy's view-or-copy
   semantics.
 - **Sorting and sets.** `sort`, `argsort`, `lexsort`, `partition`, `searchsorted`, `unique` and
   its variants, set operations, `histogram` and `digitize`.
-- **Products and linear algebra.** `dot`, `vdot`, `inner`, `outer`, `matmul` and `@`,
-  `tensordot`, and `numpy.linalg` for real arrays: `inv`, `solve`, `det`, `slogdet`, `eigh`,
+- **Products and linear algebra.** `dot`, `vdot`, `vecdot`, `inner`, `outer`, `matmul` and
+  `@`, `tensordot`, and `numpy.linalg` for real arrays: `inv`, `solve`, `det`, `slogdet`, `eigh`,
   `eigvalsh`, `svd`, `qr`, `cholesky`, `lstsq`, `pinv`, `matrix_rank`, `matrix_power` and
   `norm`.
 - **FFT.** `numpy.fft` on a port of pocketfft, with NumPy's single- and double-precision
@@ -158,6 +161,9 @@ never imports a module or calls arbitrary code.
   `np.str_` or `np.object_` instances.
 - **Byte order.** Views between byte orders, big-endian `str` dtypes, and `tobytes` of object
   arrays are rejected.
+- **Product summation.** Products sum each dot product in index order. NumPy passes
+  floating-point products to BLAS, whose blocked kernels add in a different order that depends
+  on the CPU, so their last bits can differ.
 
 ## Unsupported frontier
 

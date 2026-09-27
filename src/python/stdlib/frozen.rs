@@ -40,6 +40,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "numpy._numeric" => Some(include_str!("source/numpy/_numeric.py")),
         "numpy._shape_base" => Some(include_str!("source/numpy/_shape_base.py")),
         "numpy._statistics" => Some(include_str!("source/numpy/_statistics.py")),
+        "numpy._vectorize" => Some(include_str!("source/numpy/_vectorize.py")),
         "numpy.exceptions" => Some(include_str!("source/numpy/exceptions.py")),
         "numpy.fft" => Some(include_str!("source/numpy/fft.py")),
         "numpy.lib" => Some(include_str!("source/numpy/lib/__init__.py")),

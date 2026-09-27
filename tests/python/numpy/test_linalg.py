@@ -357,3 +357,16 @@ def test_decompositions_return_float64_for_int_input():
     assert np.linalg.det(a).dtype == np.float64
     assert np.linalg.eigh(a)[0].dtype == np.float64
     assert np.linalg.svd(a)[1].dtype == np.float64
+
+
+def test_vecdot_sums_over_an_axis_and_conjugates_the_first_operand():
+    a = np.array([[1.0, 2.0], [3.0, 4.0]])
+    assert np.vecdot(a, np.array([1.0, 1.0])).tolist() == [3.0, 7.0]
+    assert np.vecdot(a, a, axis=0).tolist() == [10.0, 20.0]
+    assert np.vecdot(np.array([1 + 1j, 2]), np.array([1j, 1])) == 3 + 1j
+    assert np.vecdot([1, 2], [3, 4]) == 11
+
+
+def test_vecdot_rejects_mismatched_core_dimensions():
+    with pytest.raises(ValueError, match=r"size 3 is different from 2"):
+        np.vecdot(np.ones((2, 3)), np.ones(3), axis=0)

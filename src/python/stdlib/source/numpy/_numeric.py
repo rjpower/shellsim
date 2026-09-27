@@ -1,7 +1,8 @@
-"""Comparison helpers that NumPy itself writes in Python on top of ufuncs.
+"""Comparison and dtype helpers that NumPy itself writes in Python.
 
-``isclose``, ``allclose``, ``array_equal`` and ``array_equiv`` follow ``numpy/_core/numeric.py``
-so that promotion, broadcasting, NaN handling and 0-d results match NumPy exactly.
+``isclose``, ``allclose``, ``array_equal``, ``array_equiv`` and ``astype`` follow
+``numpy/_core/numeric.py`` so that promotion, broadcasting, NaN handling and 0-d results match
+NumPy exactly. ``isdtype`` follows ``numpy/_core/numerictypes.py``.
 """
 
 from _numpy import (
@@ -9,11 +10,37 @@ from _numpy import (
     asarray,
     bitwise_and,
     bitwise_or,
+    bool_,
+    complex64,
+    complex128,
+    complexfloating,
+    dtype,
+    float16,
+    float32,
+    float64,
+    floating,
+    generic,
+    inexact,
+    int8,
+    int16,
+    int32,
+    int64,
+    integer,
     isfinite,
     isnan,
+    isscalar,
     less_equal,
     ndarray,
+    number,
+    object_,
     result_type,
+    signedinteger,
+    str_,
+    uint8,
+    uint16,
+    uint32,
+    uint64,
+    unsignedinteger,
 )
 from _numpy_shape import ravel
 from numpy._errstate import errstate
@@ -71,3 +98,78 @@ def array_equiv(a1, a2):
         return _all_true(asanyarray(a1 == a2))
     except ValueError:
         return False
+
+
+def astype(x, dtype, /, *, copy=True, device=None):
+    if not (isinstance(x, ndarray) or isscalar(x)):
+        raise TypeError(f"Input should be a NumPy array or scalar. It is a {type(x)} instead.")
+    if device is not None and device != "cpu":
+        raise ValueError(f'Device not understood. Only "cpu" is allowed, but received: {device}')
+    return x.astype(dtype, copy=copy)
+
+
+_SIGNED = (int8, int16, int32, int64)
+_UNSIGNED = (uint8, uint16, uint32, uint64)
+_FLOATING = (float16, float32, float64)
+_COMPLEX = (complex64, complex128)
+# The scalar types shellsim implements. Abstract types such as ``np.floating`` are accepted, as
+# in NumPy, but belong to no kind.
+_SCALAR_TYPES = (
+    bool_,
+    *_SIGNED,
+    *_UNSIGNED,
+    *_FLOATING,
+    *_COMPLEX,
+    str_,
+    object_,
+    generic,
+    number,
+    integer,
+    signedinteger,
+    unsignedinteger,
+    inexact,
+    floating,
+    complexfloating,
+)
+_KINDS = {
+    "bool": (bool_,),
+    "signed integer": _SIGNED,
+    "unsigned integer": _UNSIGNED,
+    "integral": _SIGNED + _UNSIGNED,
+    "real floating": _FLOATING,
+    "complex floating": _COMPLEX,
+    "numeric": _SIGNED + _UNSIGNED + _FLOATING + _COMPLEX,
+}
+
+
+def _scalar_type(value):
+    if isinstance(value, dtype):
+        return value.type
+    for scalar_type in _SCALAR_TYPES:
+        if value is scalar_type:
+            return value
+    return None
+
+
+def isdtype(dtype, kind):
+    scalar_type = _scalar_type(dtype)
+    if scalar_type is None:
+        raise TypeError(f"dtype argument must be a NumPy dtype, but it is a {type(dtype)}.")
+    input_kinds = kind if isinstance(kind, tuple) else (kind,)
+    processed_kinds = []
+    for kind in input_kinds:
+        if isinstance(kind, str):
+            if kind not in _KINDS:
+                raise ValueError(
+                    f"kind argument is a string, but {kind!r} is not a known kind name."
+                )
+            processed_kinds.extend(_KINDS[kind])
+            continue
+        kind_type = _scalar_type(kind)
+        if kind_type is None:
+            raise TypeError(
+                "kind argument must be comprised of NumPy dtypes or strings only, but is a "
+                f"{type(kind)}."
+            )
+        processed_kinds.append(kind_type)
+    return any(scalar_type is kind for kind in processed_kinds)
