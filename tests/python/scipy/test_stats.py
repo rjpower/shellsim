@@ -77,6 +77,26 @@ CONTINUOUS = {
     ),
 }
 
+# logcdf(0.7) and logsf(0.7) for each distribution's CONTINUOUS shape arguments: shellsim
+# computes these as log(cdf(x)) and log(sf(x)) rather than SciPy's separate closed forms, so
+# this checks the values agree with SciPy's rather than only checking self-consistency.
+LOGCDF = {
+    "norm": -0.2770239422771313,
+    "t": -0.29783271523135313,
+    "chi2": -2.0651753815014904,
+    "f": -0.9571170060601609,
+    "uniform": -0.35667494393873245,
+    "expon": -0.6863410028083852,
+}
+LOGSF = {
+    "norm": -1.4189677615315315,
+    "t": -1.3564463806656266,
+    "chi2": -0.1355861317971587,
+    "f": -0.4845056476142998,
+    "uniform": -1.203972804325936,
+    "expon": -0.7,
+}
+
 
 @pytest.mark.parametrize("name", ["chi2", "expon", "f", "norm", "t", "uniform"])
 def test_continuous_distribution_values(name):
@@ -90,6 +110,8 @@ def test_continuous_distribution_values(name):
     close(dist.ppf(q, *args), ppf)
     close(dist.isf(1 - np.array(q), *args), ppf, rtol=1e-9)
     close(dist.logpdf(0.7, *args), np.log(dist.pdf(0.7, *args)))
+    close(dist.logcdf(0.7, *args), LOGCDF[name], rtol=1e-9)
+    close(dist.logsf(0.7, *args), LOGSF[name], rtol=1e-9)
     close(np.array(dist.stats(*args, moments="mvsk"), dtype=float), moments)
     close(dist.entropy(*args), entropy)
     close(dist.rvs(*args, size=3, random_state=1), rvs)
@@ -159,6 +181,13 @@ DISCRETE = {
     ),
 }
 
+# logpmf, logcdf and logsf at k=3 for each distribution's DISCRETE shape arguments, checked
+# against SciPy's literal values for the same reason as LOGCDF/LOGSF above.
+DISCRETE_LOGS = {
+    "binom": (-1.321151277766889, -0.4313819902707921, -1.0487105094288514),
+    "poisson": (-1.5428872736055896, -0.27763124086275504, -1.417067568961742),
+}
+
 
 @pytest.mark.parametrize("name", ["binom", "poisson"])
 def test_discrete_distribution_values(name):
@@ -167,6 +196,10 @@ def test_discrete_distribution_values(name):
     close(dist.pmf([0, 3, 7], *args), pmf)
     close(dist.cdf([0, 3, 7], *args), cdf)
     close(dist.sf([0, 3, 7], *args), 1 - np.array(cdf), rtol=1e-9)
+    logpmf, logcdf, logsf = DISCRETE_LOGS[name]
+    close(dist.logpmf(3, *args), logpmf, rtol=1e-9)
+    close(dist.logcdf(3, *args), logcdf, rtol=1e-9)
+    close(dist.logsf(3, *args), logsf, rtol=1e-9)
     assert dist.ppf([0.01, 0.5, 0.99], *args).tolist() == ppf
     close(np.array(dist.stats(*args, moments="mvsk"), dtype=float), moments)
     close(dist.entropy(*args), entropy)
