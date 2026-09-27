@@ -1101,15 +1101,12 @@ impl Compiler {
                         span,
                     );
                 } else {
+                    // The first step sends None, as `next` would.
                     self.expression(*value);
                     self.emit(Operation::GetIterator, span);
-                    let next = self.emit(Operation::ForIterator(usize::MAX), span);
-                    self.emit(Operation::Yield, span);
-                    self.emit(Operation::PopTop, span);
-                    self.emit(Operation::Jump(next), span);
-                    let exhausted = self.instructions.len();
-                    self.patch_jump(next, exhausted);
                     self.emit(Operation::LoadConstant(Constant::None), span);
+                    let finished = self.instructions.len() + 1;
+                    self.emit(Operation::YieldFromSend(finished), span);
                 }
             }
             ExpressionKind::Await(value) => {

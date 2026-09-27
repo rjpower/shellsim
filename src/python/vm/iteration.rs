@@ -1,7 +1,7 @@
 //! Iteration, generator suspension, and sequence unpacking.
 
 use super::{
-    CallArgs, Execution, ForIterOutcome, IteratorAdvance, NativeValue, Object, PyError,
+    CallArgs, Execution, ForIterOutcome, IteratorAdvance, NativeValue, Object, Opcode, PyError,
     PyErrorKind, PyRuntime, PyStreamRead, Stream, Value, Vm,
 };
 
@@ -10,6 +10,17 @@ use super::{
 enum GeneratorResume {
     Send(Value),
     Throw(super::RaisedException),
+}
+
+/// What became of an exception thrown into a generator suspended in `yield from`, after
+/// [`Vm::forward_throw`] passed it to the subiterator.
+enum ForwardedThrow {
+    /// The subiterator yielded this value; the delegating generator stays suspended.
+    Yielded(Value),
+    /// The subiterator returned this value, which becomes the value of `yield from`.
+    Returned(Value),
+    /// Raise this exception at the delegating generator's `yield from`.
+    Raise(super::RaisedException),
 }
 
 /// An iterator classified by [`Vm::advance_iterator`] whose advance needs a second, unborrowed
@@ -340,6 +351,135 @@ impl Vm<'_> {
         }
     }
 
+    /// One step of `yield from`, with the subiterator and the sent value on top of the stack.
+    ///
+    /// A generator subiterator receives the value through `send`. Any other iterator advances as
+    /// `next` would and, like CPython's builtin iterators, has no `send` for a value other than
+    /// `None`. [`ForIterOutcome::Yielded`] leaves the subiterator and its value on the stack;
+    /// [`ForIterOutcome::Exhausted`] replaces the subiterator with its return value, which is
+    /// `None` unless a generator returned one; [`ForIterOutcome::Blocked`] restores the stack for
+    /// a retry.
+    pub(super) fn yield_from_send(&mut self) -> Result<ForIterOutcome, String> {
+        let sent = self.pop()?;
+        let subiterator = *self.stack.last().ok_or("invalid bytecode stack effect")?;
+        if let Some(id) = self.suspendable_generator(&subiterator)? {
+            let outcome = match self.resume_generator_with(id, sent)? {
+                Some(value) => {
+                    self.stack.push(value);
+                    ForIterOutcome::Yielded
+                }
+                None => {
+                    self.stack.pop();
+                    let returned = self.take_return_value(id)?;
+                    self.stack.push(returned);
+                    ForIterOutcome::Exhausted
+                }
+            };
+            return Ok(outcome);
+        }
+        if !sent.is_none() {
+            let type_name = self.type_name_of(&subiterator)?;
+            return Err(self.raise_exception(
+                "AttributeError",
+                format!("'{type_name}' object has no attribute 'send'"),
+            ));
+        }
+        let outcome = self.for_iterator()?;
+        match outcome {
+            ForIterOutcome::Yielded => {}
+            ForIterOutcome::Exhausted => self.stack.push(Value::None),
+            ForIterOutcome::Blocked(_) => self.stack.push(sent),
+        }
+        Ok(outcome)
+    }
+
+    /// The generator `value` refers to, unless it is some other kind of iterator.
+    fn suspendable_generator(
+        &self,
+        value: &Value,
+    ) -> Result<Option<super::super::heap::ObjectId>, String> {
+        let Some(id) = value.object_id() else {
+            return Ok(None);
+        };
+        Ok(matches!(self.state.heap.get(id)?, Object::Generator { .. }).then_some(id))
+    }
+
+    /// Take the value a generator returned, leaving `None` behind so that it is reported once.
+    fn take_return_value(&mut self, id: super::super::heap::ObjectId) -> Result<Value, String> {
+        match self.state.heap.get_mut(id)? {
+            Object::Generator { return_value, .. } => {
+                Ok(std::mem::replace(return_value, Value::None))
+            }
+            _ => Err("object is not a generator".into()),
+        }
+    }
+
+    /// Close a generator as `generator.close()` does: raise `GeneratorExit` at its suspension
+    /// point and let it run its cleanup. A generator that yields again instead raises
+    /// `RuntimeError`; any other exception it raises stays pending.
+    pub(super) fn close_generator(
+        &mut self,
+        id: super::super::heap::ObjectId,
+    ) -> Result<(), String> {
+        let value = self.allocate_exception("GeneratorExit".into(), String::new())?;
+        let exit = super::RaisedException {
+            kind: "GeneratorExit".into(),
+            value,
+        };
+        match self.throw_into_generator(id, exit) {
+            Ok(Some(_)) => {
+                Err(self.raise_exception("RuntimeError", "generator ignored GeneratorExit"))
+            }
+            Ok(None) => Ok(()),
+            Err(error) => match self.pending_exception.take() {
+                Some(exception)
+                    if matches!(exception.kind.as_str(), "GeneratorExit" | "StopIteration") =>
+                {
+                    Ok(())
+                }
+                exception => {
+                    self.pending_exception = exception;
+                    Err(error)
+                }
+            },
+        }
+    }
+
+    /// Pass an exception thrown into a generator suspended in `yield from` to its subiterator.
+    ///
+    /// `GeneratorExit` closes a generator subiterator and is then raised in the delegating
+    /// generator. Any other exception is thrown into a generator subiterator; the result says
+    /// whether it yielded, returned, or raised. A subiterator that is not a generator has no
+    /// `throw` or `close`, so the exception is raised in the delegating generator.
+    fn forward_throw(
+        &mut self,
+        subiterator: &Value,
+        exception: super::RaisedException,
+    ) -> Result<ForwardedThrow, String> {
+        let Some(id) = self.suspendable_generator(subiterator)? else {
+            return Ok(ForwardedThrow::Raise(exception));
+        };
+        if exception.kind == "GeneratorExit" {
+            return match self.close_generator(id) {
+                Ok(()) => Ok(ForwardedThrow::Raise(exception)),
+                Err(error) => self
+                    .pending_exception
+                    .take()
+                    .map(ForwardedThrow::Raise)
+                    .ok_or(error),
+            };
+        }
+        match self.throw_into_generator(id, exception) {
+            Ok(Some(value)) => Ok(ForwardedThrow::Yielded(value)),
+            Ok(None) => Ok(ForwardedThrow::Returned(self.take_return_value(id)?)),
+            Err(error) => self
+                .pending_exception
+                .take()
+                .map(ForwardedThrow::Raise)
+                .ok_or(error),
+        }
+    }
+
     /// Resume one generator frame until its next yield or terminal return. A generator's operand
     /// stack is kept separate from its caller's stack, while its lexical scope remains in the
     /// shared heap so closures and mutations preserve normal Python aliasing.
@@ -382,6 +522,17 @@ impl Vm<'_> {
     /// blocks run as they would for an exception raised there. The result is the next yielded
     /// value, or `None` once the generator returns. An exception the generator does not handle,
     /// including one thrown before it starts or after it finishes, stays pending and closes it.
+    fn set_generator_running(
+        &mut self,
+        id: super::super::heap::ObjectId,
+        value: bool,
+    ) -> Result<(), String> {
+        if let Object::Generator { running, .. } = self.state.heap.get_mut(id)? {
+            *running = value;
+        }
+        Ok(())
+    }
+
     pub(super) fn throw_into_generator(
         &mut self,
         id: super::super::heap::ObjectId,
@@ -402,10 +553,10 @@ impl Vm<'_> {
         let (
             code,
             scope,
-            instruction_pointer,
+            mut instruction_pointer,
             mut handlers,
             exceptions,
-            frame_stack,
+            mut frame_stack,
             exhausted,
             running,
         ) = match self.state.heap.get(id)?.clone() {
@@ -434,9 +585,41 @@ impl Vm<'_> {
         if running {
             return Err("generator already executing".into());
         }
+        // A frame suspended in `yield from` sits at its `YieldFromSend`; a plain `yield` resumes
+        // after its `Yield`, which is never followed by a `YieldFromSend`.
+        let delegating = match code.instructions.get(instruction_pointer) {
+            Some(instruction) if !exhausted => match instruction.opcode {
+                Opcode::YieldFromSend(finished) => Some(finished),
+                _ => None,
+            },
+            _ => None,
+        };
+        let resume = match (resume, delegating) {
+            (GeneratorResume::Throw(exception), Some(finished)) => {
+                let subiterator = *frame_stack
+                    .last()
+                    .ok_or("yield from lost its subiterator")?;
+                self.set_generator_running(id, true)?;
+                let forwarded = self.forward_throw(&subiterator, exception);
+                self.set_generator_running(id, false)?;
+                match forwarded? {
+                    ForwardedThrow::Yielded(value) => return Ok(Some(value)),
+                    ForwardedThrow::Returned(value) => {
+                        frame_stack.pop();
+                        instruction_pointer = finished;
+                        GeneratorResume::Send(value)
+                    }
+                    ForwardedThrow::Raise(exception) => GeneratorResume::Throw(exception),
+                }
+            }
+            (resume, _) => resume,
+        };
         let handler = match &resume {
             GeneratorResume::Send(sent) => {
                 if exhausted {
+                    // A finished generator reports its return value only to the resume that
+                    // finished it.
+                    self.take_return_value(id)?;
                     return Ok(None);
                 }
                 if instruction_pointer == 0 && !sent.is_none() {
@@ -457,9 +640,7 @@ impl Vm<'_> {
                 return Err(format!("{} thrown into generator", exception.kind));
             }
         }
-        if let Object::Generator { running, .. } = self.state.heap.get_mut(id)? {
-            *running = true;
-        }
+        self.set_generator_running(id, true)?;
         let outer_stack = std::mem::take(&mut self.stack);
         self.stack = frame_stack;
         let generator_exceptions = exceptions

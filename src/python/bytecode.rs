@@ -247,6 +247,7 @@ pub enum Opcode {
     Raise(bool),
     RaiseFrom,
     Yield,
+    YieldFromSend(usize),
     AwaitResult,
     WithEnter,
     WithExit,
@@ -360,6 +361,11 @@ pub enum Operation {
     RaiseFrom,
     /// Suspend a generator frame and return the value on top of the stack.
     Yield,
+    /// One step of `yield from`: pop the value sent into the generator and pass it to the
+    /// subiterator below it. A yielded value suspends the frame at this same instruction, so the
+    /// next `send` repeats the step; when the subiterator finishes, it is replaced by its return
+    /// value and control jumps to the target.
+    YieldFromSend(usize),
     /// Unwrap the scheduler outcome sent into a suspended coroutine.
     AwaitResult,
     WithEnter,
@@ -551,6 +557,7 @@ impl CodeBuilder {
             Operation::Raise(cause) => Opcode::Raise(cause),
             Operation::RaiseFrom => Opcode::RaiseFrom,
             Operation::Yield => Opcode::Yield,
+            Operation::YieldFromSend(target) => Opcode::YieldFromSend(target),
             Operation::AwaitResult => Opcode::AwaitResult,
             Operation::WithEnter => Opcode::WithEnter,
             Operation::WithExit => Opcode::WithExit,
@@ -580,9 +587,9 @@ impl CodeBuilder {
             })
             .count();
         let call_signature = CallSignature {
-            is_generator: instructions
-                .iter()
-                .any(|instruction| matches!(instruction.opcode, Opcode::Yield)),
+            is_generator: instructions.iter().any(|instruction| {
+                matches!(instruction.opcode, Opcode::Yield | Opcode::YieldFromSend(_))
+            }),
             is_coroutine,
             positional_count,
             variadic_slot: parameters

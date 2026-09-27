@@ -1497,29 +1497,13 @@ impl PyRuntime for Vm<'_> {
         ) {
             return Err(PyError::type_error("expected a generator"));
         }
-        let value = self
-            .allocate_exception("GeneratorExit".into(), String::new())
-            .map_err(PyError::resource_error)?;
-        let exit = RaisedException {
-            kind: "GeneratorExit".into(),
-            value,
-        };
-        match self.throw_into_generator(id, exit) {
-            Ok(Some(_)) => Err(PyError::runtime_error("generator ignored GeneratorExit")),
-            Ok(None) => Ok(()),
-            Err(error) => match self.pending_exception.take() {
-                Some(exception)
-                    if matches!(exception.kind.as_str(), "GeneratorExit" | "StopIteration") =>
-                {
-                    Ok(())
-                }
-                Some(exception) => {
-                    self.pending_exception = Some(exception);
-                    Err(PyError::new(PyErrorKind::Raised, error))
-                }
-                None => Err(PyError::runtime_error(error)),
-            },
-        }
+        self.close_generator(id).map_err(|error| {
+            if self.pending_exception.is_some() {
+                PyError::new(PyErrorKind::Raised, error)
+            } else {
+                PyError::runtime_error(error)
+            }
+        })
     }
 
     /// `generator.throw(exception)`: raise `exception`, an instance or an exception class, at the

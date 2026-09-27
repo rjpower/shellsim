@@ -403,6 +403,144 @@ def test_generator_close_raises_generator_exit_without_resuming():
         raise AssertionError("close() must reject a generator that yields again")
 
 
+def test_yield_from_delegates_to_the_subgenerator():
+    events = []
+
+    def inner():
+        try:
+            received = yield 1
+            events.append(("inner received", received))
+            received = yield 2
+            events.append(("inner received", received))
+        except ValueError as error:
+            events.append(("inner caught", str(error)))
+            yield "recovered"
+        finally:
+            events.append("inner cleanup")
+        return "inner result"
+
+    def outer():
+        result = yield from inner()
+        events.append(("outer result", result))
+        yield "after"
+
+    generator = outer()
+    assert [next(generator), generator.send("a"), generator.send("b")] == [1, 2, "after"]
+    assert events == [
+        ("inner received", "a"),
+        ("inner received", "b"),
+        "inner cleanup",
+        ("outer result", "inner result"),
+    ]
+
+    events.clear()
+    generator = outer()
+    next(generator)
+    assert generator.throw(ValueError("boom")) == "recovered"
+    assert next(generator) == "after"
+    assert events == [("inner caught", "boom"), "inner cleanup", ("outer result", "inner result")]
+
+    events.clear()
+    generator = outer()
+    next(generator)
+    generator.close()
+    assert events == ["inner cleanup"]
+
+    def nested():
+        return (yield from outer())
+
+    generator = nested()
+    assert [next(generator), generator.send("x"), generator.send("y")] == [1, 2, "after"]
+
+    def returns_when_thrown():
+        try:
+            yield 1
+        except ValueError:
+            return "handled"
+
+    def delegator():
+        value = yield from returns_when_thrown()
+        yield value
+
+    generator = delegator()
+    next(generator)
+    assert generator.throw(ValueError) == "handled"
+
+
+def test_yield_from_raises_unhandled_exceptions_in_the_delegating_generator():
+    def inner():
+        yield 1
+
+    def delegator():
+        try:
+            yield from inner()
+        except KeyError as error:
+            yield ("caught", error.args)
+
+    generator = delegator()
+    next(generator)
+    assert generator.throw(KeyError("k")) == ("caught", ("k",))
+
+    def stubborn():
+        try:
+            yield 1
+        except GeneratorExit:
+            yield 2
+
+    def wraps_stubborn():
+        yield from stubborn()
+
+    generator = wraps_stubborn()
+    next(generator)
+    try:
+        generator.close()
+    except RuntimeError as error:
+        assert str(error) == "generator ignored GeneratorExit"
+    else:
+        raise AssertionError("close() must reject a subgenerator that yields again")
+
+
+def test_yield_from_a_plain_iterable_evaluates_to_none():
+    def plain():
+        value = yield from [1, 2, 3]
+        return value
+
+    assert list(plain()) == [1, 2, 3]
+    generator = plain()
+    next(generator)
+    try:
+        generator.send(5)
+    except AttributeError as error:
+        assert "object has no attribute 'send'" in str(error)
+    else:
+        raise AssertionError("a list iterator has no send()")
+
+    def empty():
+        yield from ()
+        return 3
+
+    try:
+        next(empty())
+    except StopIteration as stop:
+        assert stop.value == 3
+    else:
+        raise AssertionError("an empty delegation must finish the generator")
+
+    def finished():
+        yield 1
+        return 7
+
+    exhausted = finished()
+    assert list(exhausted) == [1]
+
+    def reuse():
+        value = yield from exhausted
+        yield value
+
+    # A finished generator delivers its return value only once, to whoever finished it.
+    assert list(reuse()) == [None]
+
+
 def test_numeric_literals_and_arithmetic_match_python():
     values = [1.2, 0.5, 1.0, 1_000.50_0, 1_2e-1, 1_2e1]
     assert values == [1.2, 0.5, 1.0, 1000.5, 1.2, 120.0]

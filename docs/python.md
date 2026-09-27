@@ -34,8 +34,10 @@ f-strings, VFS imports, and the common language protocols needed by real scripts
 support `yield`, `yield from`, `send`, `throw`, and `close`, including suspension in `try` and
 `with` regions. `throw` raises the exception at the suspended `yield`, so the generator's
 `except`, `finally`, and `with` blocks handle it, and `close` raises `GeneratorExit` there. `yield
-from` re-yields the items of its iterable; it does not forward `send`, `throw`, or `close` to a
-subgenerator, and it evaluates to `None`.
+from` passes `send`, `throw`, and `close` through to a subgenerator and evaluates to the value it
+returns. Any other iterable is advanced with `next`: sending it a value other than `None` raises
+`AttributeError`, an exception thrown at it is raised in the delegating generator, and the
+expression evaluates to `None`.
 
 `complex` is a native arena type. Its arithmetic, string parsing, `repr`, and error messages
 follow CPython 3.14, including the mixed-mode rules for real operands. Ordering, floor division,
