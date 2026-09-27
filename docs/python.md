@@ -159,4 +159,4 @@ Do not add an importable placeholder for a module whose central contract is abse
 an empty `sqlite3` namespace is less useful than a clear import failure because callers otherwise
 cannot tell which database semantics are real.
 
-The minimal NumPy design follows these rules in [numpy.md](numpy.md).
+The NumPy implementation follows these rules; see [numpy.md](numpy.md).
