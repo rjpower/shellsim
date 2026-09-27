@@ -249,6 +249,19 @@ def test_column_stack_turns_1d_inputs_into_columns():
     assert r.tolist() == [[1, 4], [2, 5], [3, 6]]
 
 
+def test_r_concatenates_along_the_first_axis():
+    assert repr(np.r_[0, 0, 1e-15]) == "array([0.e+00, 0.e+00, 1.e-15])"
+    assert np.r_[1:4, 7, [8, 9]].tolist() == [1, 2, 3, 7, 8, 9]
+    assert np.r_[np.array([1, 2]), 3.5].dtype == np.float64
+    assert np.r_[np.ones((1, 2)), np.zeros((2, 2))].shape == (3, 2)
+
+
+def test_c_stands_1d_items_as_columns():
+    assert np.c_[np.array([1, 2]), np.array([3, 4])].tolist() == [[1, 3], [2, 4]]
+    assert np.c_[np.ones((2, 2)), np.array([5, 6])].tolist() == [[1.0, 1.0, 5.0], [1.0, 1.0, 6.0]]
+    assert np.c_[np.array([[1, 2, 3]]), 0, 0, np.array([[4, 5, 6]])].tolist() == [[1, 2, 3, 0, 0, 4, 5, 6]]
+
+
 def test_dstack_joins_along_third_axis():
     r = np.dstack((np.array([1, 2]), np.array([3, 4])))
     assert r.shape == (1, 2, 2)

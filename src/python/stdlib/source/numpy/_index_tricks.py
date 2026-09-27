@@ -172,22 +172,25 @@ ogrid = _MeshGrid(sparse=True)
 
 def _stack_class(column):
     class _Stacker:
-        """``np.r_``/``np.c_``: concatenate slices, scalars and arrays along one axis."""
+        """``np.r_`` concatenates its items along the first axis, each made at least 1-D.
+        ``np.c_`` concatenates along the last axis, each made at least 2-D with a 1-D item
+        standing as a column. Slices expand to ranges, or to ``linspace`` counts when the step
+        is imaginary."""
 
         def __getitem__(self, key):
             parts = key if isinstance(key, tuple) else (key,)
             arrays = []
             for part in parts:
                 if isinstance(part, slice):
-                    arrays.append(_grid_axis(part, want_complex_as_count=True))
+                    item = _grid_axis(part, want_complex_as_count=True)
                 elif isinstance(part, str):
                     raise NotImplementedError("np.r_/np.c_ string directives are not supported")
                 else:
-                    arrays.append(np.atleast_1d(np.asanyarray(part)))
-            if column and all(a.ndim == 1 for a in arrays):
-                return np.column_stack(arrays)
-            promoted = [a if a.ndim > 1 else a.reshape((1,) + a.shape) for a in arrays]
-            return np.concatenate(promoted, axis=-1)
+                    item = np.atleast_1d(np.asanyarray(part))
+                if column and item.ndim == 1:
+                    item = item.reshape(-1, 1)
+                arrays.append(item)
+            return np.concatenate(arrays, axis=-1 if column else 0)
 
     return _Stacker()
 
