@@ -665,6 +665,16 @@ fn cast_buffer(
             values
         }
     };
+    if source.kind() == Kind::Object && target.kind() == Kind::Bool {
+        // NumPy's `BOOL_setitem` takes the truth of any object, so `None` and `[]` are False.
+        reserve_elements(runtime, target, count)?;
+        runtime.charge_cpu(count as u64 + 1)?;
+        let mut bytes = Vec::with_capacity(count);
+        for value in &values {
+            bytes.push(u8::from(runtime.truth(value)?));
+        }
+        return Ok(PyArrayBuffer::Bytes(bytes));
+    }
     let leaves = values
         .iter()
         .map(|value| leaf(runtime, value))

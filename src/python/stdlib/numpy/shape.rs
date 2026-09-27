@@ -107,7 +107,10 @@ pub(in crate::python) fn axis_index(
 }
 
 /// Items of a tuple or list, or `None` for any other value.
-fn sequence_items(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Option<Vec<PyValue>>> {
+pub(in crate::python) fn sequence_items(
+    runtime: &mut dyn PyRuntime,
+    value: &PyValue,
+) -> PyResult<Option<Vec<PyValue>>> {
     Ok(match runtime.kind(value)? {
         PyKind::Tuple => {
             let tuple = value.cast(runtime)?;
@@ -141,7 +144,6 @@ fn iterable_items(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Opti
             | PyKind::Int
             | PyKind::Float
             | PyKind::Complex
-            | PyKind::Native
             | PyKind::Function
             | PyKind::Class
             | PyKind::Module
@@ -443,10 +445,11 @@ fn reshape_with(
     array::new_array(runtime, buffer, array.dtype, shape)
 }
 
-/// Parse `reshape(2, 3)`, `reshape((2, 3))`, or `reshape([2, 3])`.
+/// Parse `reshape(2, 3)`, `reshape((2, 3))`, `reshape([2, 3])`, or an integer array, as
+/// `PyArray_IntpConverter` does.
 fn requested_shape(runtime: &mut dyn PyRuntime, values: &[PyValue]) -> PyResult<Vec<i64>> {
     let values = match values {
-        [single] => sequence_items(runtime, single)?.unwrap_or_else(|| vec![*single]),
+        [single] => iterable_items(runtime, single)?.unwrap_or_else(|| vec![*single]),
         values => values.to_vec(),
     };
     values

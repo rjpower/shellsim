@@ -294,6 +294,7 @@ pub(super) enum Builtin {
     StaticMethod,
     ClassMethod,
     Super,
+    SetAttribute,
 }
 
 pub(super) fn execute(

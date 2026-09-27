@@ -44,12 +44,22 @@ pub(in crate::python) fn report(
 /// Warn that a complex value lost its imaginary part in a conversion to a real type, as NumPy
 /// does with `ComplexWarning` for `float(np.complex128(1+2j))`.
 pub(in crate::python) fn warn_complex_discard(runtime: &mut dyn PyRuntime) -> PyResult<()> {
+    warn(runtime, "_warn_complex_discard")
+}
+
+/// Warn that a ufunc called with `where=` and no `out=` leaves unselected elements
+/// uninitialized, as NumPy 2 does with a `UserWarning`.
+pub(in crate::python) fn warn_where_without_out(runtime: &mut dyn PyRuntime) -> PyResult<()> {
+    warn(runtime, "_warn_where_without_out")
+}
+
+/// Call the warning function `name` of `numpy._errstate`, which issues the warning from
+/// Python so filters and `stacklevel` apply.
+fn warn(runtime: &mut dyn PyRuntime, name: &str) -> PyResult<()> {
     let module = runtime.import_module("numpy._errstate")?;
     let warn = runtime
-        .get_attribute(module, "_warn_complex_discard")?
-        .ok_or_else(|| {
-            PyError::runtime_error("numpy._errstate._warn_complex_discard is missing")
-        })?;
+        .get_attribute(module, name)?
+        .ok_or_else(|| PyError::runtime_error(format!("numpy._errstate.{name} is missing")))?;
     runtime.call_value(warn, CallArgs::new(Vec::new(), Vec::new()))?;
     Ok(())
 }

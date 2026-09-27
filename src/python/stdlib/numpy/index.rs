@@ -5,8 +5,10 @@
 //! 1. **Basic pass.** Integers, slices, `None`, and `...` only move the view: they change
 //!    shape, strides, and offset over the same storage, so the result is a view.
 //! 2. **Advanced pass.** Integer and boolean arrays select elements by position. Boolean masks
-//!    become one integer array per mask axis (their `nonzero`). When any array is present,
-//!    plain integers join them as 0-d arrays, as in NumPy. The index arrays broadcast to one
+//!    become one integer array per mask axis (their `nonzero`). A boolean scalar or 0-d mask
+//!    adds a new axis of length 1 and selects all of it (`True`) or none of it (`False`), as
+//!    NumPy's `HAS_0D_BOOL` does. When any array is present, plain integers join them as 0-d
+//!    arrays, as in NumPy. The index arrays broadcast to one
 //!    shape `B`, and the selected elements form a copy:
 //!    - when the advanced items are adjacent, `B` replaces them in place;
 //!    - otherwise `B` comes first, followed by the remaining axes.
@@ -38,6 +40,8 @@ enum Item {
     Array(Array),
     /// A boolean mask.
     Mask(Array),
+    /// A boolean scalar or 0-d mask.
+    Bool(bool),
 }
 
 impl Item {
@@ -46,7 +50,7 @@ impl Item {
         match self {
             Self::Int(_) | Self::Slice(..) | Self::Array(_) => 1,
             Self::Mask(mask) => mask.ndim(),
-            Self::NewAxis | Self::Ellipsis => 0,
+            Self::NewAxis | Self::Ellipsis | Self::Bool(_) => 0,
         }
     }
 }
@@ -82,11 +86,7 @@ fn parse_item(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Item> {
         return Ok(Item::Slice(start, stop, step));
     }
     match runtime.kind(&value)? {
-        PyKind::Bool => {
-            return Err(PyError::unsupported(
-                "boolean scalar indices are not supported",
-            ))
-        }
+        PyKind::Bool => return Ok(Item::Bool(runtime.truth(&value)?)),
         PyKind::Int => {
             return runtime
                 .int_value(&value)
@@ -98,9 +98,7 @@ fn parse_item(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Item> {
         _ => {
             if let Some((dtype, number)) = super::scalar::unbox_number(runtime, &value) {
                 if dtype.kind() == Kind::Bool {
-                    return Err(PyError::unsupported(
-                        "boolean scalar indices are not supported",
-                    ));
+                    return Ok(Item::Bool(number.wrapping_i64() != 0));
                 }
                 if super::scalar::is_index_dtype(dtype) {
                     return Ok(Item::Int(number.wrapping_i64()));
@@ -117,9 +115,7 @@ fn parse_item(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Item> {
         array
     };
     match array.dtype.category() {
-        Category::Bool if array.ndim() == 0 => Err(PyError::unsupported(
-            "0-d boolean array indices are not supported",
-        )),
+        Category::Bool if array.ndim() == 0 => Ok(Item::Bool(truth_values(runtime, &array)?[0])),
         Category::Bool => Ok(Item::Mask(array)),
         Category::Signed | Category::Unsigned => Ok(Item::Array(convert::cast_array(
             runtime,
@@ -196,7 +192,9 @@ pub(in crate::python) fn select(
         expanded.push(Item::Slice(None, None, None));
         axis += 1;
     }
-    let advanced = expanded.iter().any(|item| matches!(item, Item::Array(_)));
+    let advanced = expanded
+        .iter()
+        .any(|item| matches!(item, Item::Array(_) | Item::Bool(_)));
     if advanced {
         for item in &mut expanded {
             if let Item::Int(value) = item {
@@ -246,6 +244,19 @@ pub(in crate::python) fn select(
                 shape.push(array.shape()[source_axis]);
                 strides.push(array.strides()[source_axis]);
                 source_axis += 1;
+            }
+            Item::Bool(value) => {
+                // Index a new length-1 axis with `[0]` or `[]`.
+                let length = usize::from(value);
+                let indices = super::array::array_from_elements(
+                    runtime,
+                    DType::INT64,
+                    vec![length],
+                    &vec![0i64; length],
+                )?;
+                arrays.push((shape.len(), source_axis, indices));
+                shape.push(1);
+                strides.push(0);
             }
             Item::Mask(_) | Item::Ellipsis => unreachable!("expanded above"),
         }
@@ -531,28 +542,74 @@ fn assignment_source(runtime: &mut dyn PyRuntime, value: PyValue, dtype: DType) 
     convert::array_from_python(runtime, value, Some(dtype), false)
 }
 
-/// Normalize flat positions against `size` with NumPy's `take` error text.
+/// How `take` and `put` treat indices outside the axis, NumPy's `NPY_CLIPMODE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::python) enum ClipMode {
+    Raise,
+    Wrap,
+    Clip,
+}
+
+impl ClipMode {
+    /// Parse `mode=` as `PyArray_ClipmodeConverter` does; `None` means `raise`.
+    pub(in crate::python) fn parse(
+        runtime: &mut dyn PyRuntime,
+        value: Option<PyValue>,
+    ) -> PyResult<Self> {
+        let Some(value) = value.filter(|value| !value.is_none()) else {
+            return Ok(Self::Raise);
+        };
+        let Some(text) = runtime.string_value(&value)? else {
+            return Err(PyError::type_error("clipmode not understood"));
+        };
+        let (mode, exact) = match text.chars().next() {
+            Some('c' | 'C') => (Self::Clip, text == "clip"),
+            Some('w' | 'W') => (Self::Wrap, text == "wrap"),
+            Some('r' | 'R') => (Self::Raise, text == "raise"),
+            _ => {
+                let repr = runtime.repr(&value)?;
+                return Err(PyError::value_error(format!(
+                    "clipmode must be one of 'clip', 'raise', or 'wrap' (got {repr})"
+                )));
+            }
+        };
+        if !exact {
+            return Err(PyError::value_error(
+                "Use one of 'clip', 'raise', or 'wrap' for clip mode",
+            ));
+        }
+        Ok(mode)
+    }
+}
+
+/// Resolve positions against `size` under `mode`, with NumPy's `take` error text for
+/// `raise`. `wrap` reduces modulo `size`; `clip` clamps into `[0, size)`.
 pub(in crate::python) fn flat_positions(
     runtime: &mut dyn PyRuntime,
     indices: &Array,
     size: usize,
     axis: Option<usize>,
+    mode: ClipMode,
 ) -> PyResult<Vec<usize>> {
     let values = read_elements::<i64>(runtime, indices)?;
+    let signed = size as i64;
     values
         .into_iter()
-        .map(|value| {
-            let signed = size as i64;
-            let position = if value < 0 { value + signed } else { value };
-            if (0..signed).contains(&position) {
-                Ok(position as usize)
-            } else {
-                Err(index_error(match axis {
-                    Some(axis) => {
-                        format!("index {value} is out of bounds for axis {axis} with size {size}")
-                    }
-                    None => format!("index {value} is out of bounds for size {size}"),
-                }))
+        .map(|value| match mode {
+            ClipMode::Wrap => Ok(value.rem_euclid(signed.max(1)) as usize),
+            ClipMode::Clip => Ok(value.clamp(0, (signed - 1).max(0)) as usize),
+            ClipMode::Raise => {
+                let position = if value < 0 { value + signed } else { value };
+                if (0..signed).contains(&position) {
+                    Ok(position as usize)
+                } else {
+                    Err(index_error(match axis {
+                        Some(axis) => format!(
+                            "index {value} is out of bounds for axis {axis} with size {size}"
+                        ),
+                        None => format!("index {value} is out of bounds for size {size}"),
+                    }))
+                }
             }
         })
         .collect()

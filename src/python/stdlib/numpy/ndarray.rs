@@ -26,6 +26,10 @@ pub(in crate::python) static ARRAY_TYPE: NativeTypeDef = NativeTypeDef {
     methods: &[
         method("tolist", method_tolist),
         method("item", method_item),
+        method("__float__", method_float),
+        method("__int__", method_int),
+        method("__complex__", method_complex),
+        method("__index__", method_index),
         method("copy", method_copy),
         method("__copy__", method_copy),
         method("__deepcopy__", method_deepcopy),
@@ -274,6 +278,59 @@ fn method_tolist(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: Cal
     to_list(runtime, &array)
 }
 
+/// Convert the element of a 0-d array with the builtin `type_name`, as NumPy's
+/// `array_float`, `array_int`, and `array_complex` convert `a.item()`.
+fn convert_item(runtime: &mut dyn PyRuntime, receiver_value: PyValue, type_name: &str) -> PyResult {
+    let array = receiver(runtime, receiver_value)?;
+    if array.ndim() != 0 {
+        return Err(PyError::type_error(
+            "only 0-dimensional arrays can be converted to Python scalars",
+        ));
+    }
+    if type_name == "complex" && array.dtype.kind() == Kind::Str {
+        return Err(PyError::type_error(format!(
+            "Unable to convert {} to complex",
+            array.dtype.repr()
+        )));
+    }
+    let item = convert::element_to_python(runtime, &array, array.view.offset)?;
+    let class = runtime
+        .builtin_type(type_name)
+        .ok_or_else(|| PyError::runtime_error(format!("builtin {type_name} is missing")))?;
+    runtime.call_value(class, CallArgs::new(vec![item], Vec::new()))
+}
+
+fn method_float(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("__float__", 0, 0)?;
+    convert_item(runtime, receiver_value, "float")
+}
+
+fn method_int(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("__int__", 0, 0)?;
+    convert_item(runtime, receiver_value, "int")
+}
+
+fn method_complex(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    args.expect_positional("__complex__", 0, 0)?;
+    convert_item(runtime, receiver_value, "complex")
+}
+
+/// `operator.index(a)`: only 0-d integer arrays are indices.
+fn method_index(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("__index__", 0, 0)?;
+    let array = receiver(runtime, receiver_value)?;
+    if array.ndim() != 0 || !array.dtype.is_integer() {
+        return Err(PyError::type_error(
+            "only integer scalar arrays can be converted to a scalar index",
+        ));
+    }
+    convert::element_to_python(runtime, &array, array.view.offset)
+}
+
 /// `a.item(*index)`: one element as a Python scalar, by flat position or full index.
 fn method_item(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
     args.reject_keywords("item")?;
@@ -473,44 +530,101 @@ fn method_conjugate(
     )
 }
 
-/// `np.take(a, indices, axis=None)` and `a.take(indices, axis=None)`.
+/// `take`'s options: `out=` and `mode=`.
+pub(in crate::python) struct TakeOptions {
+    pub out: Option<Array>,
+    pub mode: index::ClipMode,
+}
+
+impl TakeOptions {
+    pub(in crate::python) fn parse(
+        runtime: &mut dyn PyRuntime,
+        bound: &args::Bound,
+    ) -> PyResult<Self> {
+        let out = bound
+            .value("out")
+            .map(|out| Array::from_value(runtime, out))
+            .transpose()?;
+        let mode = index::ClipMode::parse(runtime, bound.get("mode"))?;
+        Ok(Self { out, mode })
+    }
+}
+
+/// `np.take(a, indices, axis=None, out=None, mode='raise')` and `a.take(...)`, following
+/// `PyArray_TakeFrom`.
 pub(in crate::python) fn take(
     runtime: &mut dyn PyRuntime,
     array: &Array,
     indices: PyValue,
     axis: Option<PyValue>,
+    options: TakeOptions,
 ) -> PyResult {
-    let scalar_index =
-        runtime.int_value(&indices).is_some() || super::scalar::unbox(runtime, &indices).is_some();
     let positions = index::index_array(runtime, indices)?;
-    let Some(axis) = args::axis(runtime, axis, array.ndim())? else {
-        let flat = index::flat_positions(runtime, &positions, array.size(), None)?;
-        let all = array.offsets().collect::<Vec<_>>();
-        let offsets = flat
-            .iter()
-            .map(|position| all[*position])
-            .collect::<Vec<_>>();
-        let result = index::gather(runtime, array, &offsets, positions.shape().to_vec())?;
-        if scalar_index {
-            return convert::element_to_scalar(runtime, &result, result.view.offset);
-        }
-        return Ok(result.value());
+    let axis = args::axis(runtime, axis, array.ndim())?;
+    let length = match axis {
+        Some(axis) => array.shape()[axis],
+        None => array.size(),
     };
-    let length = array.shape()[axis];
-    let chosen = index::flat_positions(runtime, &positions, length, Some(axis))?;
+    if length == 0 && positions.size() != 0 {
+        return Err(PyError::exception(
+            "IndexError",
+            "cannot do a non-empty take from an empty axes.",
+        ));
+    }
+    let result = match axis {
+        None => {
+            let flat = index::flat_positions(runtime, &positions, length, None, options.mode)?;
+            let all = array.offsets().collect::<Vec<_>>();
+            let offsets = flat
+                .iter()
+                .map(|position| all[*position])
+                .collect::<Vec<_>>();
+            index::gather(runtime, array, &offsets, positions.shape().to_vec())?
+        }
+        Some(axis) => {
+            let chosen =
+                index::flat_positions(runtime, &positions, length, Some(axis), options.mode)?;
+            take_along(runtime, array, axis, &chosen, positions.shape())?
+        }
+    };
+    if let Some(out) = options.out {
+        if out.shape() != result.shape() {
+            return Err(PyError::value_error(
+                "output array does not match result of ndarray.take",
+            ));
+        }
+        array::assign(runtime, &out, &result)?;
+        return Ok(out.value());
+    }
+    // Like `PyArray_Return`, a 0-d result becomes a scalar.
+    if result.ndim() == 0 {
+        return convert::element_to_scalar(runtime, &result, result.view.offset);
+    }
+    Ok(result.value())
+}
+
+/// The elements at positions `chosen` along `axis`, which take the place of that axis with
+/// `index_shape`.
+fn take_along(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+    axis: usize,
+    chosen: &[usize],
+    index_shape: &[usize],
+) -> PyResult<Array> {
     let stride = array.strides()[axis];
     let before = &array.shape()[..axis];
     let after = &array.shape()[axis + 1..];
     let outer = index::relative_offsets(before, &array.strides()[..axis]);
     let inner = index::relative_offsets(after, &array.strides()[axis + 1..]);
     let mut shape = before.to_vec();
-    shape.extend_from_slice(positions.shape());
+    shape.extend_from_slice(index_shape);
     shape.extend_from_slice(after);
     let count = array::element_count(&shape)?;
     runtime.reserve_memory(count.saturating_mul(8))?;
     let mut offsets = Vec::with_capacity(count);
     for outer in &outer {
-        for position in &chosen {
+        for position in chosen {
             for inner in &inner {
                 offsets.push(
                     (array.view.offset as isize + outer + *position as isize * stride + inner)
@@ -519,36 +633,21 @@ pub(in crate::python) fn take(
             }
         }
     }
-    Ok(index::gather(runtime, array, &offsets, shape)?.value())
+    index::gather(runtime, array, &offsets, shape)
 }
 
 fn method_take(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("take", &["indices", "axis", "out", "mode"], 1);
     let bound = SIGNATURE.bind(&args)?;
-    reject_out_and_mode(&bound)?;
+    let options = TakeOptions::parse(runtime, &bound)?;
     let array = receiver(runtime, receiver_value)?;
     take(
         runtime,
         &array,
         bound.required("indices"),
         bound.value("axis"),
+        options,
     )
-}
-
-pub(in crate::python) fn reject_out_and_mode(bound: &args::Bound) -> PyResult<()> {
-    if bound.value("out").is_some() {
-        return Err(PyError::unsupported(format!(
-            "{}() with out= is not supported",
-            bound.function()
-        )));
-    }
-    if bound.value("mode").is_some() {
-        return Err(PyError::unsupported(format!(
-            "{}() with mode= is not supported",
-            bound.function()
-        )));
-    }
-    Ok(())
 }
 
 /// `np.put(a, indices, values)`: store `values`, cycled, at C-order flat positions.
@@ -557,9 +656,10 @@ pub(in crate::python) fn put(
     array: &Array,
     indices: PyValue,
     values: PyValue,
+    mode: index::ClipMode,
 ) -> PyResult {
     let positions = index::index_array(runtime, indices)?;
-    let flat = index::flat_positions(runtime, &positions, array.size(), None)?;
+    let flat = index::flat_positions(runtime, &positions, array.size(), None, mode)?;
     let source = if array.dtype.kind() == Kind::Object {
         convert::array_from_python(runtime, values, Some(DType::OBJECT), false)?
     } else {
@@ -610,15 +710,14 @@ fn cycle_buffer(
 fn method_put(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("put", &["indices", "values", "mode"], 2);
     let bound = SIGNATURE.bind(&args)?;
-    if bound.value("mode").is_some() {
-        return Err(PyError::unsupported("put() with mode= is not supported"));
-    }
+    let mode = index::ClipMode::parse(runtime, bound.get("mode"))?;
     let array = receiver(runtime, receiver_value)?;
     put(
         runtime,
         &array,
         bound.required("indices"),
         bound.required("values"),
+        mode,
     )
 }
 

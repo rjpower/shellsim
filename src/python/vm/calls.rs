@@ -610,7 +610,12 @@ impl Vm<'_> {
         let Some(NativeValue::Function(function)) = function.native_value() else {
             return Err(self.raise_object_type_error(&function, "is not callable"));
         };
-        if !keyword_arguments.is_empty() && !matches!(function, Builtin::Print | Builtin::Sorted) {
+        if !keyword_arguments.is_empty()
+            && !matches!(
+                function,
+                Builtin::Print | Builtin::Sorted | Builtin::Minimum | Builtin::Maximum
+            )
+        {
             return Err("this builtin does not accept keyword arguments".into());
         }
         match function {
@@ -1019,29 +1024,82 @@ impl Vm<'_> {
                 ))
             }
             Builtin::Minimum | Builtin::Maximum => {
-                if arguments.is_empty() {
-                    return Err("expected at least one argument".into());
-                }
-                let values = if arguments.len() == 1 {
-                    self.iterable_values(&arguments[0])?
-                } else {
-                    arguments
+                let (name, symbol, wanted) = match function {
+                    Builtin::Minimum => ("min", "<", Ordering::Less),
+                    _ => ("max", ">", Ordering::Greater),
                 };
-                let mut values = values.into_iter();
-                let mut selected = values.next().ok_or("argument is an empty sequence")?;
-                for value in values {
-                    self.charge_cpu(1)?;
-                    let ordering = self.sort_order(&value, &selected)?;
-                    let replace = match function {
-                        Builtin::Minimum => ordering == Ordering::Less,
-                        Builtin::Maximum => ordering == Ordering::Greater,
-                        _ => unreachable!(),
-                    };
-                    if replace {
-                        selected = value;
+                let mut key_function = None;
+                let mut default = None;
+                for (keyword, value) in keyword_arguments {
+                    match keyword.as_str() {
+                        "key" => key_function = Some(value).filter(|value| !value.is_none()),
+                        "default" => default = Some(value),
+                        _ => {
+                            let message =
+                                format!("{name}() got an unexpected keyword argument '{keyword}'");
+                            return Err(self.raise_exception("TypeError", message));
+                        }
                     }
                 }
-                Ok(CallResult::Value(selected))
+                let values = match arguments.len() {
+                    0 => {
+                        let message = format!("{name} expected at least 1 argument, got 0");
+                        return Err(self.raise_exception("TypeError", message));
+                    }
+                    1 => self.iterable_values(&arguments[0])?,
+                    _ if default.is_some() => {
+                        let message = format!(
+                            "Cannot specify a default for {name}() with multiple positional \
+                             arguments"
+                        );
+                        return Err(self.raise_exception("TypeError", message));
+                    }
+                    _ => arguments,
+                };
+                // CPython keeps the first of equal items: only a strictly smaller (for `min`) or
+                // larger (for `max`) key replaces the selection.
+                let mut selected: Option<(Value, Value)> = None;
+                for value in values {
+                    self.charge_cpu(1)?;
+                    let key = match key_function {
+                        Some(function) => {
+                            self.stack.push(function);
+                            self.stack.push(value);
+                            match self.call(1, &[], &[false], CallMode::Immediate)? {
+                                CallResult::Value(key) => key,
+                                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
+                                CallResult::EnteredFrame => {
+                                    unreachable!("immediate call entered a frame")
+                                }
+                                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                                    unreachable!("immediate call cannot suspend")
+                                }
+                            }
+                        }
+                        None => value,
+                    };
+                    let replace = match &selected {
+                        None => true,
+                        Some((selected_key, _)) => match self.compare_values(&key, selected_key)? {
+                            protocol::Comparison::Ordered(ordering) => ordering == wanted,
+                            protocol::Comparison::Unordered => false,
+                            protocol::Comparison::Unsupported => {
+                                return Err(self.raise_unorderable(symbol, &key, selected_key));
+                            }
+                        },
+                    };
+                    if replace {
+                        selected = Some((key, value));
+                    }
+                }
+                match (selected, default) {
+                    (Some((_, value)), _) => Ok(CallResult::Value(value)),
+                    (None, Some(default)) => Ok(CallResult::Value(default)),
+                    (None, None) => {
+                        let message = format!("{name}() iterable argument is empty");
+                        Err(self.raise_exception("ValueError", message))
+                    }
+                }
             }
             Builtin::Sum => {
                 expect_arity(&arguments, 1, 2)?;
@@ -1110,6 +1168,26 @@ impl Vm<'_> {
                 Ok(CallResult::Value(
                     self.divmod_value(arguments[0], arguments[1])?,
                 ))
+            }
+            Builtin::SetAttribute => {
+                if arguments.len() != 3 {
+                    let message = format!("setattr expected 3 arguments, got {}", arguments.len());
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                let Some(name) = protocol::string_value(&self.state.heap, &arguments[1])? else {
+                    let message = format!(
+                        "attribute name must be string, not '{}'",
+                        self.type_name_of(&arguments[1])?
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                };
+                // `setattr(owner, name, value)` is `owner.name = value` with a computed name.
+                let symbol = self
+                    .state
+                    .heap
+                    .intern_symbol(&name, &mut self.interp.resources)?;
+                self.store_attribute_by_symbol(arguments[0], symbol, &name, arguments[2])?;
+                Ok(CallResult::Value(Value::None))
             }
             Builtin::Callable => {
                 expect_arity(&arguments, 1, 1)?;

@@ -122,7 +122,11 @@ fn samples(runtime: &mut dyn PyRuntime, bound: &args::Bound, fp: &Array) -> PyRe
 }
 
 /// A value converted to a 1-d array of `dtype`, with NumPy's depth errors.
-fn one_dimensional(runtime: &mut dyn PyRuntime, value: PyValue, dtype: DType) -> PyResult<Array> {
+pub(in crate::python) fn one_dimensional(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+    dtype: DType,
+) -> PyResult<Array> {
     let array = convert::array_from_python(runtime, value, Some(dtype), false)?;
     match array.ndim() {
         0 => Err(PyError::value_error(

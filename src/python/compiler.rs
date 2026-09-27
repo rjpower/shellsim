@@ -12,6 +12,10 @@ use super::bytecode::{
 use super::source::Span;
 use std::collections::HashSet;
 
+/// The parameter holding a comprehension's outermost iterator. CPython names it `.0` too; the
+/// name cannot collide with an identifier.
+const COMPREHENSION_ITERATOR: &str = ".0";
+
 pub fn compile(program: Program) -> CodeRef {
     let mut compiler = Compiler {
         instructions: Vec::new(),
@@ -1390,22 +1394,54 @@ impl Compiler {
         nested.emit_comprehension_body(&clauses, 0, &element, kind, &result_name, span);
         nested.emit(Operation::LoadName(result_name), span);
         nested.emit(Operation::Return, span);
+        self.call_comprehension("<comprehension>", nested, &clauses[0].iterable, span);
+    }
+
+    /// Create a comprehension's function from `nested` and call it. As in CPython, the
+    /// outermost iterable is evaluated in the enclosing scope when the comprehension is
+    /// created, so `gen = (x for x in gen)` iterates the old `gen` and a class body's names are
+    /// visible to it. The function receives the iterator as its parameter `.0`.
+    fn call_comprehension(
+        &mut self,
+        name: &str,
+        nested: Compiler,
+        outermost: &Expression,
+        span: Span,
+    ) {
+        let parameter = Parameter {
+            name: COMPREHENSION_ITERATOR.into(),
+            has_default: false,
+            kind: BytecodeParameterKind::PositionalOnly,
+        };
         self.emit(
             Operation::MakeFunction {
-                name: "<comprehension>".into(),
-                code: nested.finish(Vec::new()),
+                name: name.into(),
+                code: nested.finish(vec![parameter]),
                 defaults: 0,
             },
             span,
         );
+        self.expression(outermost.clone());
+        self.emit(Operation::GetIterator, span);
         self.emit(
             Operation::Call {
-                positional: 0,
+                positional: 1,
                 keywords: Vec::new(),
-                starred: Vec::new(),
+                starred: vec![false],
             },
             span,
         );
+    }
+
+    /// Push the iterator for clause `index` of a comprehension: the `.0` parameter for the
+    /// outermost clause, and a new iterator over the clause's iterable otherwise.
+    fn comprehension_iterator(&mut self, clause: &ComprehensionClause, index: usize, span: Span) {
+        if index == 0 {
+            self.emit(Operation::LoadName(COMPREHENSION_ITERATOR.into()), span);
+            return;
+        }
+        self.expression(clause.iterable.clone());
+        self.emit(Operation::GetIterator, span);
     }
 
     fn emit_generator_expression(
@@ -1431,22 +1467,7 @@ impl Compiler {
         nested.emit_generator_comprehension_body(&clauses, 0, &element, span);
         nested.emit(Operation::LoadConstant(Constant::None), span);
         nested.emit(Operation::Return, span);
-        self.emit(
-            Operation::MakeFunction {
-                name: "<genexpr>".into(),
-                code: nested.finish(Vec::new()),
-                defaults: 0,
-            },
-            span,
-        );
-        self.emit(
-            Operation::Call {
-                positional: 0,
-                keywords: Vec::new(),
-                starred: Vec::new(),
-            },
-            span,
-        );
+        self.call_comprehension("<genexpr>", nested, &clauses[0].iterable, span);
     }
 
     fn emit_dict_comprehension(
@@ -1476,22 +1497,7 @@ impl Compiler {
         nested.emit_dict_comprehension_body(&clauses, 0, &key, &value, &result_name, span);
         nested.emit(Operation::LoadName(result_name), span);
         nested.emit(Operation::Return, span);
-        self.emit(
-            Operation::MakeFunction {
-                name: "<dictcomp>".into(),
-                code: nested.finish(Vec::new()),
-                defaults: 0,
-            },
-            span,
-        );
-        self.emit(
-            Operation::Call {
-                positional: 0,
-                keywords: Vec::new(),
-                starred: Vec::new(),
-            },
-            span,
-        );
+        self.call_comprehension("<dictcomp>", nested, &clauses[0].iterable, span);
     }
 
     fn emit_comprehension_body(
@@ -1504,8 +1510,7 @@ impl Compiler {
         span: Span,
     ) {
         let clause = &clauses[index];
-        self.expression(clause.iterable.clone());
-        self.emit(Operation::GetIterator, span);
+        self.comprehension_iterator(clause, index, span);
         let next = self.emit(Operation::ForIterator(usize::MAX), span);
         self.store_target(clause.target.clone(), span);
         for condition in &clause.conditions {
@@ -1549,8 +1554,7 @@ impl Compiler {
         span: Span,
     ) {
         let clause = &clauses[index];
-        self.expression(clause.iterable.clone());
-        self.emit(Operation::GetIterator, span);
+        self.comprehension_iterator(clause, index, span);
         let next = self.emit(Operation::ForIterator(usize::MAX), span);
         self.store_target(clause.target.clone(), span);
         for condition in &clause.conditions {
@@ -1580,8 +1584,7 @@ impl Compiler {
         span: Span,
     ) {
         let clause = &clauses[index];
-        self.expression(clause.iterable.clone());
-        self.emit(Operation::GetIterator, span);
+        self.comprehension_iterator(clause, index, span);
         let next = self.emit(Operation::ForIterator(usize::MAX), span);
         self.store_target(clause.target.clone(), span);
         for condition in &clause.conditions {

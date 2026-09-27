@@ -784,21 +784,48 @@ impl Vm<'_> {
         Err(self.raise_exception("TypeError", message))
     }
 
-    /// Convert a registered value, such as a NumPy scalar, with its type's conversion method
-    /// (`__int__` or `__float__`), as CPython's `int()` and `float()` do. `None` means the value
-    /// is not registered or its type has no such method.
-    fn registered_conversion(
-        &mut self,
-        value: &Value,
-        method: &str,
-    ) -> Result<Option<Value>, String> {
-        if self.registered_kind(value).is_none() {
+    /// Call `value`'s conversion method `method` (`__int__`, `__float__`, or `__index__`), as
+    /// CPython's `int()` and `float()` do for values that are not builtin numbers or strings:
+    /// NumPy scalars and arrays, and instances of classes. `None` means the value is a builtin
+    /// number, string, or bytes, or its type does not define `method`.
+    fn conversion_method(&mut self, value: &Value, method: &str) -> Result<Option<Value>, String> {
+        let builtin = self.registered_kind(value).is_none()
+            && (super::number::view(&self.state.heap, value).is_some()
+                || protocol::string_value(&self.state.heap, value)?.is_some()
+                || protocol::bytes_value(&self.state.heap, value)?.is_some());
+        if builtin {
             return Ok(None);
         }
         let Some(method) = self.resolve_attribute(*value, method)? else {
             return Ok(None);
         };
         self.invoke_value(method, Vec::new()).map(Some)
+    }
+
+    /// An int from the first of `methods` that `value` defines, checking that the method
+    /// returned an int as CPython does. `int()` tries `__int__` then `__index__`; `float()` falls
+    /// back to `__index__` only.
+    fn int_by_method(
+        &mut self,
+        value: &Value,
+        methods: &[&'static str],
+    ) -> Result<Option<Value>, String> {
+        for &method in methods {
+            let Some(result) = self.conversion_method(value, method)? else {
+                continue;
+            };
+            if protocol::int_value(&self.state.heap, &result).is_none()
+                && !self.is_bigint(&result)?
+            {
+                let message = format!(
+                    "{method} returned non-int (type {})",
+                    self.type_name_of(&result)?
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
+            return Ok(Some(result));
+        }
+        Ok(None)
     }
 
     /// `int(value)` for a number: integers stay exact and floats truncate toward zero, as
@@ -821,7 +848,14 @@ impl Vm<'_> {
                 );
                 return Err(self.raise_exception("TypeError", message));
             }
-            None => return Err("int() argument is not supported".into()),
+            None => {
+                let message = format!(
+                    "int() argument must be a string, a bytes-like object or a real number, not \
+                     '{}'",
+                    self.type_name_of(value)?
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
         };
         if float.is_nan() {
             return Err(self.raise_exception("ValueError", "cannot convert float NaN to integer"));
@@ -2116,21 +2150,36 @@ impl Vm<'_> {
                             self.new_integer(&decimal)
                                 .map_err(|error| self.record_native_error(error))?
                         }
-                        Some(value) => match self.registered_conversion(value, "__int__")? {
-                            Some(converted) => converted,
-                            None => self.truncate_to_int(value)?,
-                        },
+                        Some(value) => {
+                            match self.int_by_method(value, &["__int__", "__index__"])? {
+                                Some(converted) => converted,
+                                None => self.truncate_to_int(value)?,
+                            }
+                        }
                     }
                 }
             }
             BuiltinType::Float => {
                 expect_arity(&arguments, 0, 1)?;
-                if let Some(value) = arguments.first() {
-                    if let Some(converted) = self.registered_conversion(value, "__float__")? {
+                let mut argument = arguments.first().copied();
+                if let Some(value) = argument {
+                    if let Some(converted) = self.conversion_method(&value, "__float__")? {
+                        if converted.tag() != ValueTag::Float {
+                            let message = format!(
+                                "{}.__float__ returned non-float (type {})",
+                                self.type_name_of(&value)?,
+                                self.type_name_of(&converted)?
+                            );
+                            return Err(self.raise_exception("TypeError", message));
+                        }
                         return Ok(CallResult::Value(converted));
                     }
+                    // CPython falls back to `__index__` and converts the int it returns.
+                    if let Some(index) = self.int_by_method(&value, &["__index__"])? {
+                        argument = Some(index);
+                    }
                 }
-                let converted = match arguments.first() {
+                let converted = match argument.as_ref() {
                     None => 0.0,
                     Some(value)
                         if matches!(

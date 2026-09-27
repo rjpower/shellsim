@@ -386,9 +386,8 @@ pub(super) struct PyArrayRef<'a> {
     pub data: PyArrayData<'a>,
 }
 
-/// One writeable array lent to a write callback.
+/// One writeable array's storage lent to a write callback.
 pub(super) struct PyArrayMut<'a> {
-    pub view: &'a PyArrayView,
     pub data: PyArrayDataMut<'a>,
 }
 

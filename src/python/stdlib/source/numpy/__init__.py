@@ -2,8 +2,8 @@
 
 Arrays, dtypes, ufuncs and most functions are native and live in the ``_numpy*`` modules; this
 package re-exports them and adds the parts written in Python: floating-point error state,
-``flatiter``, ``ndarray.flags``, and the ``linalg``, ``fft``, ``random``, ``testing`` and
-``exceptions`` submodules. The behavior targets NumPy 2.5.
+``flatiter``, ``ndarray.flags``, order statistics, histograms, set operations, and the
+``linalg``, ``fft``, ``random``, ``testing`` and ``exceptions`` submodules. The behavior targets NumPy 2.5.
 """
 
 from _numpy import *
@@ -19,6 +19,8 @@ from numpy._getlimits import finfo, iinfo
 from numpy._numeric import allclose, array_equal, array_equiv, isclose
 from numpy._shape_base import (
     append,
+    apply_along_axis,
+    apply_over_axes,
     array_split,
     atleast_1d,
     atleast_2d,
@@ -31,11 +33,13 @@ from numpy._shape_base import (
     flipud,
     hsplit,
     hstack,
+    put_along_axis,
     resize,
     roll,
     rot90,
     split,
     stack,
+    take_along_axis,
     tile,
     tri,
     tril,
@@ -69,6 +73,22 @@ from numpy._function_base import (
     round,
 )
 from numpy._methods import average, count_nonzero, mean, ptp, std, var
+from numpy._statistics import median, percentile, quantile
+from numpy._histograms import digitize, histogram, histogram_bin_edges
+from numpy._index_tricks import index_exp, ix_, ndenumerate, ndindex, s_
+from numpy._arraysetops import (
+    ediff1d,
+    intersect1d,
+    isin,
+    setdiff1d,
+    setxor1d,
+    union1d,
+    unique,
+    unique_all,
+    unique_counts,
+    unique_inverse,
+    unique_values,
+)
 from numpy._nanfunctions import (
     nanargmax,
     nanargmin,
@@ -76,8 +96,11 @@ from numpy._nanfunctions import (
     nancumsum,
     nanmax,
     nanmean,
+    nanmedian,
     nanmin,
+    nanpercentile,
     nanprod,
+    nanquantile,
     nanstd,
     nansum,
     nanvar,

@@ -1,9 +1,10 @@
 """Shape functions that NumPy writes in Python on top of its C primitives.
 
-Stacking, splitting, ``tile``, ``roll``, the triangle helpers, ``diff``, ``rot90``, ``append``
-and ``resize`` follow ``numpy/_core/shape_base.py``, ``numpy/lib/_shape_base_impl.py``,
-``numpy/_core/numeric.py``, ``numpy/lib/_twodim_base_impl.py`` and
-``numpy/lib/_function_base_impl.py``, so views, copies and dtypes match NumPy.
+Stacking, splitting, ``tile``, ``roll``, the triangle helpers, ``diff``, ``rot90``, ``append``,
+``resize`` and the ``*_along_axis`` functions follow ``numpy/_core/shape_base.py``,
+``numpy/lib/_shape_base_impl.py``, ``numpy/_core/numeric.py``,
+``numpy/lib/_twodim_base_impl.py`` and ``numpy/lib/_function_base_impl.py``, so views, copies
+and dtypes match NumPy.
 """
 
 import itertools
@@ -13,6 +14,7 @@ from _numpy import (
     arange,
     array,
     asanyarray,
+    asarray,
     empty_like,
     greater_equal,
     int8,
@@ -21,6 +23,7 @@ from _numpy import (
     int64,
     integer,
     intp,
+    issubdtype,
     ndarray,
     not_equal,
     subtract,
@@ -34,6 +37,7 @@ from _numpy_shape import (
     broadcast_arrays,
     broadcast_to,
     concatenate,
+    expand_dims,
     flip,
     ravel,
     reshape,
@@ -401,3 +405,114 @@ def resize(a, new_shape):
     repeats = -(-new_size // a.size)
     a = concatenate((a,) * repeats)[:new_size]
     return reshape(a, new_shape)
+
+
+def _make_along_axis_idx(arr_shape, indices, axis):
+    # compute dimensions to iterate over
+    if not issubdtype(indices.dtype, integer):
+        raise IndexError("`indices` must be an integer array")
+    if len(arr_shape) != indices.ndim:
+        raise ValueError("`indices` and `arr` must have the same number of dimensions")
+    shape_ones = (1,) * indices.ndim
+    dest_dims = list(range(axis)) + [None] + list(range(axis + 1, indices.ndim))
+
+    # build a fancy index, consisting of orthogonal aranges, with the
+    # requested index inserted at the right location
+    fancy_index = []
+    for dim, n in zip(dest_dims, arr_shape):
+        if dim is None:
+            fancy_index.append(indices)
+        else:
+            ind_shape = shape_ones[:dim] + (-1,) + shape_ones[dim + 1 :]
+            fancy_index.append(arange(n).reshape(ind_shape))
+
+    return tuple(fancy_index)
+
+
+def take_along_axis(arr, indices, axis=-1):
+    if axis is None:
+        if indices.ndim != 1:
+            raise ValueError("when axis=None, `indices` must have a single dimension.")
+        arr = ravel(arr).copy()
+        axis = 0
+    else:
+        axis = _normalize_axis_index(axis, arr.ndim)
+    return arr[_make_along_axis_idx(arr.shape, indices, axis)]
+
+
+def put_along_axis(arr, indices, values, axis):
+    if axis is None:
+        if indices.ndim != 1:
+            raise ValueError("when axis=None, `indices` must have a single dimension.")
+        # NumPy assigns into a flattened copy here, so the input is left unchanged.
+        arr = ravel(arr).copy()
+        axis = 0
+    else:
+        axis = _normalize_axis_index(axis, arr.ndim)
+    arr[_make_along_axis_idx(arr.shape, indices, axis)] = values
+
+
+def apply_along_axis(func1d, axis, arr, *args, **kwargs):
+    from numpy._index_tricks import ndindex
+
+    arr = asanyarray(arr)
+    nd = arr.ndim
+    axis = _normalize_axis_index(axis, nd)
+
+    # arr, with the iteration axis at the end
+    in_dims = list(range(nd))
+    inarr_view = transpose(arr, in_dims[:axis] + in_dims[axis + 1 :] + [axis])
+
+    # compute indices for the iteration axes, and append a trailing ellipsis to
+    # prevent 0d arrays decaying to scalars, which fixes gh-8642
+    inds = ndindex(inarr_view.shape[:-1])
+    inds = (ind + (Ellipsis,) for ind in inds)
+
+    # invoke the function on the first item
+    try:
+        ind0 = next(inds)
+    except StopIteration:
+        raise ValueError("Cannot apply_along_axis when any iteration dimensions are 0") from None
+    res = asanyarray(func1d(inarr_view[ind0], *args, **kwargs))
+
+    # build a buffer for storing evaluations of func1d.
+    # remove the requested axis, and add the new ones on the end.
+    # laid out so that each write is contiguous.
+    # for a tuple index inds, buff[inds] = func1d(inarr_view[inds])
+    buff = zeros_like(res, shape=inarr_view.shape[:-1] + res.shape)
+
+    # permutation of axes such that out = buff.transpose(buff_permute)
+    buff_dims = list(range(buff.ndim))
+    buff_permute = (
+        buff_dims[0:axis]
+        + buff_dims[buff.ndim - res.ndim : buff.ndim]
+        + buff_dims[axis : buff.ndim - res.ndim]
+    )
+
+    # save the first result, then compute and save all remaining results
+    buff[ind0] = res
+    for ind in inds:
+        buff[ind] = asanyarray(func1d(inarr_view[ind], *args, **kwargs))
+
+    return transpose(buff, buff_permute)
+
+
+def apply_over_axes(func, a, axes):
+    val = asarray(a)
+    N = a.ndim
+    if array(axes).ndim == 0:
+        axes = (axes,)
+    for axis in axes:
+        if axis < 0:
+            axis = N + axis
+        args = (val, axis)
+        res = func(*args)
+        if res.ndim == val.ndim:
+            val = res
+        else:
+            res = expand_dims(res, axis)
+            if res.ndim == val.ndim:
+                val = res
+            else:
+                raise ValueError("function is not returning an array of the correct shape")
+    return val

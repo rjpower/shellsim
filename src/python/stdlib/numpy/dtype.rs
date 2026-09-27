@@ -387,14 +387,6 @@ fn signed_with_bits(bits: u32) -> DType {
     }
 }
 
-fn float_with_bits(bits: u32) -> DType {
-    match bits {
-        16 => DType::FLOAT16,
-        32 => DType::FLOAT32,
-        _ => DType::FLOAT64,
-    }
-}
-
 fn wider(left: DType, right: DType) -> DType {
     if left.itemsize() >= right.itemsize() {
         left
@@ -605,14 +597,6 @@ pub(in crate::python) fn accumulator(dtype: DType) -> DType {
     match dtype.category() {
         Category::Bool | Category::Signed => DType::INT64,
         Category::Unsigned => DType::UINT64,
-        _ => dtype,
-    }
-}
-
-/// Result dtype of `mean`, `var`, and `std` without an explicit `dtype`.
-pub(in crate::python) fn mean_dtype(dtype: DType) -> DType {
-    match dtype.category() {
-        Category::Bool | Category::Signed | Category::Unsigned => DType::FLOAT64,
         _ => dtype,
     }
 }

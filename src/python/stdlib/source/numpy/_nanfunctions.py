@@ -3,6 +3,11 @@
 Each function replaces NaN with a neutral value (``0`` for sums, ``1`` for products, ``±inf``
 for extrema) and reduces, then restores NaN and warns where a whole slice was NaN. Integer and
 boolean arrays cannot hold NaN and go straight to the ordinary reduction.
+
+``nanmedian``, ``nanpercentile`` and ``nanquantile`` instead move each slice's NaNs out of the
+way and take the ordinary order statistic of the rest. NumPy computes short ``nanmedian`` slices
+through masked arrays; here every slice takes the ``apply_along_axis`` path, which gives the same
+values.
 """
 
 import warnings
@@ -11,6 +16,8 @@ from _numpy import (
     array,
     asanyarray,
     divide,
+    empty_like,
+    full,
     fmax,
     fmin,
     inexact,
@@ -32,9 +39,18 @@ from _numpy_reduce import argmax, argmin, cumprod, cumsum, prod
 from _numpy_reduce import max as _amax
 from _numpy_reduce import min as _amin
 from _numpy_reduce import sum as _sum
+from _numpy_shape import moveaxis
 from numpy._errstate import errstate
 from numpy._methods import mean as _mean
+from numpy._index_tricks import ndindex
 from numpy._methods import var as _var
+from numpy._shape_base import apply_along_axis, normalize_axis_tuple
+from numpy._statistics import (
+    _quantile_is_valid,
+    _quantile_unchecked,
+    _ureduce,
+    _weights_are_valid,
+)
 
 _inf = float("inf")
 
@@ -193,3 +209,222 @@ def nanstd(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *, mean=N
     if hasattr(var, "dtype"):
         return var.dtype.type(sqrt(var))
     return sqrt(var)
+
+
+def _remove_nan_1d(arr1d, second_arr1d=None, overwrite_input=False):
+    """Move the NaNs of a 1-D array to the end and cut them off, doing the same to a second
+    array of the same length. Returns the two arrays and whether they may be overwritten."""
+    if arr1d.dtype == object_:
+        # object arrays do not support `isnan` (gh-9009), so make a guess
+        c = not_equal(arr1d, arr1d, dtype=bool)
+    else:
+        c = isnan(arr1d)
+    s = c.nonzero()[0]
+    if s.size == arr1d.size:
+        warnings.warn("All-NaN slice encountered", RuntimeWarning, stacklevel=6)
+        if second_arr1d is None:
+            return arr1d[:0], None, True
+        return arr1d[:0], second_arr1d[:0], True
+    if s.size == 0:
+        return arr1d, second_arr1d, overwrite_input
+    if not overwrite_input:
+        arr1d = arr1d.copy()
+    # select non-nans at end of array
+    enonan = arr1d[-s.size :][~c[-s.size :]]
+    # fill nans in beginning of array with non-nans of end
+    arr1d[s[: enonan.size]] = enonan
+    if second_arr1d is None:
+        return arr1d[: -s.size], None, True
+    if not overwrite_input:
+        second_arr1d = second_arr1d.copy()
+    enonan = second_arr1d[-s.size :][~c[-s.size :]]
+    second_arr1d[s[: enonan.size]] = enonan
+    return arr1d[: -s.size], second_arr1d[: -s.size], True
+
+
+def _nanmedian1d(arr1d, overwrite_input=False):
+    from numpy._statistics import median
+
+    arr1d_parsed, _, overwrite_input = _remove_nan_1d(arr1d, overwrite_input=overwrite_input)
+    if arr1d_parsed.size == 0:
+        # Ensure that a nan-esque scalar of the appropriate type (and unit)
+        # is returned for `timedelta64` and `complexfloating`
+        return arr1d[-1]
+    return median(arr1d_parsed, overwrite_input=overwrite_input)
+
+
+def _nanmedian(a, axis=None, out=None, overwrite_input=False):
+    if axis is None or a.ndim == 1:
+        part = a.ravel()
+        if out is None:
+            return _nanmedian1d(part, overwrite_input)
+        out[...] = _nanmedian1d(part, overwrite_input)
+        return out
+    result = apply_along_axis(_nanmedian1d, axis, a, overwrite_input)
+    if out is not None:
+        out[...] = result
+    return result
+
+
+def nanmedian(a, axis=None, out=None, overwrite_input=False, keepdims=False):
+    a = asanyarray(a)
+    # apply_along_axis in _nanmedian doesn't handle empty arrays well,
+    # so deal them upfront
+    if a.size == 0:
+        return nanmean(a, axis, out=out, keepdims=keepdims)
+    return _ureduce(
+        a, func=_nanmedian, keepdims=keepdims, axis=axis, out=out, overwrite_input=overwrite_input
+    )
+
+
+def _nan_check_weights(weights, a, axis, method):
+    if method != "inverted_cdf":
+        raise ValueError(f"Only method 'inverted_cdf' supports weights. Got: {method}.")
+    if axis is not None:
+        axis = normalize_axis_tuple(axis, a.ndim, argname="axis")
+    weights = _weights_are_valid(weights=weights, a=a, axis=axis)
+    if _any(weights < 0):
+        raise ValueError("Weights must be non-negative.")
+    return weights
+
+
+def nanpercentile(
+    a,
+    q,
+    axis=None,
+    out=None,
+    overwrite_input=False,
+    method="linear",
+    keepdims=False,
+    *,
+    weights=None,
+):
+    a = asanyarray(a)
+    if a.dtype.kind == "c":
+        raise TypeError("a must be an array of real numbers")
+    weak_q = type(q) in (int, float)
+    q = divide(q, 100, out=...)
+    if not _quantile_is_valid(q):
+        raise ValueError("Percentiles must be in the range [0, 100]")
+    if weights is not None:
+        weights = _nan_check_weights(weights, a, axis, method)
+    return _nanquantile_unchecked(
+        a, q, axis, out, overwrite_input, method, keepdims, weights, weak_q
+    )
+
+
+def nanquantile(
+    a,
+    q,
+    axis=None,
+    out=None,
+    overwrite_input=False,
+    method="linear",
+    keepdims=False,
+    *,
+    weights=None,
+):
+    a = asanyarray(a)
+    if a.dtype.kind == "c":
+        raise TypeError("a must be an array of real numbers")
+    weak_q = type(q) in (int, float)
+    q = asanyarray(q)
+    if not _quantile_is_valid(q):
+        raise ValueError("Quantiles must be in the range [0, 1]")
+    if weights is not None:
+        weights = _nan_check_weights(weights, a, axis, method)
+    return _nanquantile_unchecked(
+        a, q, axis, out, overwrite_input, method, keepdims, weights, weak_q
+    )
+
+
+def _nanquantile_unchecked(
+    a,
+    q,
+    axis=None,
+    out=None,
+    overwrite_input=False,
+    method="linear",
+    keepdims=False,
+    weights=None,
+    weak_q=False,
+):
+    # apply_along_axis in _nanpercentile doesn't handle empty arrays well,
+    # so deal them upfront
+    if a.size == 0:
+        return nanmean(a, axis, out=out, keepdims=keepdims)
+    return _ureduce(
+        a,
+        func=_nanquantile_ureduce_func,
+        q=q,
+        weights=weights,
+        keepdims=keepdims,
+        axis=axis,
+        out=out,
+        overwrite_input=overwrite_input,
+        method=method,
+        weak_q=weak_q,
+    )
+
+
+def _nanquantile_ureduce_func(
+    a, q, weights, axis=None, out=None, overwrite_input=False, method="linear", weak_q=False
+):
+    if axis is None or a.ndim == 1:
+        part = a.ravel()
+        wgt = None if weights is None else weights.ravel()
+        result = _nanquantile_1d(part, q, overwrite_input, method, weights=wgt, weak_q=weak_q)
+    # Note that this code could try to fill in `out` right away
+    elif weights is None:
+        result = apply_along_axis(
+            _nanquantile_1d, axis, a, q, overwrite_input, method, weights, weak_q
+        )
+        # apply_along_axis fills in collapsed axis with results.
+        # Move those axes to the beginning to match percentile's
+        # convention.
+        if q.ndim != 0:
+            from_ax = [axis + i for i in range(q.ndim)]
+            result = moveaxis(result, from_ax, list(range(q.ndim)))
+    else:
+        # We need to apply along axis over 2 arrays, a and weights.
+        # move operation axes to end for simplicity:
+        a = moveaxis(a, axis, -1)
+        if weights is not None:
+            weights = moveaxis(weights, axis, -1)
+        if out is not None:
+            result = out
+        else:
+            # weights are limited to `inverted_cdf` so the result dtype
+            # is known to be identical to that of `a` here:
+            result = empty_like(a, shape=q.shape + a.shape[:-1])
+        for ii in ndindex(a.shape[:-1]):
+            result[(...,) + ii] = _nanquantile_1d(
+                a[ii],
+                q,
+                weights=weights[ii],
+                overwrite_input=overwrite_input,
+                method=method,
+                weak_q=weak_q,
+            )
+        return result
+    if out is not None:
+        out[...] = result
+    return result
+
+
+def _nanquantile_1d(arr1d, q, overwrite_input=False, method="linear", weights=None, weak_q=False):
+    """The quantiles of the non-NaN elements of ``arr1d``, or NaN when there are none."""
+    arr1d, weights, overwrite_input = _remove_nan_1d(
+        arr1d, second_arr1d=weights, overwrite_input=overwrite_input
+    )
+    if arr1d.size == 0:
+        # convert to scalar
+        return full(q.shape, nan, dtype=arr1d.dtype)[()]
+    return _quantile_unchecked(
+        arr1d,
+        q,
+        overwrite_input=overwrite_input,
+        method=method,
+        weights=weights,
+        weak_q=weak_q,
+    )

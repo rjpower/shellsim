@@ -61,9 +61,6 @@ pub(in crate::python) trait Numeric: Element {
     fn is_nan(self) -> bool {
         false
     }
-    fn is_true(self) -> bool {
-        self != Self::zero()
-    }
 
     /// `np.maximum`: propagates NaN. Equal operands give the second one, so
     /// `maximum(-0.0, 0.0)` is `0.0` and `maximum(0.0, -0.0)` is `-0.0`, as in NumPy.
@@ -124,16 +121,6 @@ pub(in crate::python) trait Numeric: Element {
         }
         self.minimum(other)
     }
-
-    /// Sort order with NaN last, as `np.sort` uses.
-    fn sort_order(self, other: Self) -> Ordering {
-        match (self.is_nan(), other.is_nan()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            (false, false) => self.compare(other).unwrap_or(Ordering::Equal),
-        }
-    }
 }
 
 /// Bitwise operations on integers and bool.
@@ -144,8 +131,6 @@ pub(in crate::python) trait Integer: Numeric {
     fn invert(self) -> Self;
     fn left_shift(self, other: Self) -> Self;
     fn right_shift(self, other: Self) -> Self;
-    /// The value as `i128`, for exact comparisons across integer kinds and gcd/lcm.
-    fn wide(self) -> i128;
 }
 
 /// Real floating-point types, computed in `f64` or `f32` as their precision requires.
@@ -372,9 +357,6 @@ macro_rules! signed {
                     self >> other
                 }
             }
-            fn wide(self) -> i128 {
-                i128::from(self)
-            }
         }
     };
 }
@@ -484,9 +466,6 @@ macro_rules! unsigned {
                     self >> other
                 }
             }
-            fn wide(self) -> i128 {
-                i128::from(self)
-            }
         }
     };
 }
@@ -565,9 +544,6 @@ impl Integer for bool {
     }
     fn right_shift(self, other: Self) -> Self {
         self && !other
-    }
-    fn wide(self) -> i128 {
-        i128::from(self)
     }
 }
 
@@ -703,9 +679,6 @@ macro_rules! real {
             }
             fn is_nan(self) -> bool {
                 self.to_f64().is_nan()
-            }
-            fn is_true(self) -> bool {
-                self.to_f64() != 0.0
             }
             fn add_lane(self, lane: &[Self], flags: &mut FpFlags) -> Self {
                 let values = lane.iter().map(|value| $to(*value)).collect::<Vec<$wide>>();
@@ -981,10 +954,6 @@ macro_rules! complex {
             fn is_nan(self) -> bool {
                 let (real, imag) = self.parts();
                 real.is_nan() || imag.is_nan()
-            }
-            fn is_true(self) -> bool {
-                let (real, imag) = self.parts();
-                real != 0.0 || imag != 0.0
             }
         }
 

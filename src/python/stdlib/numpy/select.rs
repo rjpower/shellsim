@@ -125,7 +125,7 @@ pub(in crate::python) fn module_where(runtime: &mut dyn PyRuntime, args: CallArg
 }
 
 /// The truth of each element of `condition` broadcast to `shape`, in C order.
-fn broadcast_truth(
+pub(in crate::python) fn broadcast_truth(
     runtime: &mut dyn PyRuntime,
     condition: &Array,
     shape: &[usize],

@@ -12,7 +12,11 @@
 //! 4. **Result.** Results go to a fresh array, or are cast with `same_kind` into `out=`.
 //!    Results with shape `()` box to NumPy scalars unless `out=` was given.
 //!
+//! A `where=` mask computes only the selected elements; see [`masked`].
+//!
 //! Floating-point flags raised by a loop go to [`super::errstate::report`].
+
+mod masked;
 
 use std::cmp::Ordering;
 
@@ -668,6 +672,8 @@ pub(in crate::python) struct Options {
     pub operator: bool,
     /// `out=...`: return a 0-d result as an array rather than a scalar.
     pub keep_array: bool,
+    /// `where=`, unless it is the literal `True`.
+    pub mask: Option<PyValue>,
 }
 
 impl Options {
@@ -697,6 +703,9 @@ pub(in crate::python) fn call(
         )));
     }
     let (mut options, out) = keyword_options(runtime, ufunc.name, &args, positional.get(nin))?;
+    if options.mask.is_some() && out.is_none() {
+        super::errstate::warn_where_without_out(runtime)?;
+    }
     match out {
         Some(out) if runtime.is_ellipsis(&out) => options.keep_array = true,
         out => options.out = out_array(runtime, out)?,
@@ -730,11 +739,7 @@ fn keyword_options(
                 options.casting = Some(Casting::parse(&text)?);
             }
             "where" if value.bool_value() == Some(true) => {}
-            "where" => {
-                return Err(PyError::unsupported(format!(
-                    "{name}() with a where= mask is not supported"
-                )))
-            }
+            "where" => options.mask = Some(*value),
             "subok" | "order" => {}
             _ => {
                 return Err(PyError::type_error(format!(
@@ -1094,6 +1099,9 @@ pub(in crate::python) fn evaluate(
     inputs: &[PyValue],
     options: &Options,
 ) -> PyResult<Evaluated> {
+    if let Some(mask) = options.mask {
+        return masked::evaluate(runtime, index, inputs, options, mask);
+    }
     let ufunc = &UFUNCS[index];
     let mut operands = Vec::with_capacity(inputs.len());
     let mut all_scalars = true;
@@ -1139,18 +1147,7 @@ pub(in crate::python) fn evaluate(
                 )));
             }
         }
-        if !dtype::can_cast(resolved.output, out.dtype, casting) {
-            return Err(PyError::exception(
-                "UFuncTypeError",
-                format!(
-                    "Cannot cast ufunc '{}' output from {} to {} with casting rule '{}'",
-                    ufunc.name,
-                    resolved.output.repr(),
-                    out.dtype.repr(),
-                    casting.name()
-                ),
-            ));
-        }
+        check_output_cast(ufunc, resolved.output, out, casting)?;
     }
     let shape = match &options.out {
         Some(out) => out.shape().to_vec(),
@@ -1197,6 +1194,28 @@ pub(in crate::python) fn evaluate(
         flags,
         scalar_math,
     })
+}
+
+/// Check that a loop's `output` dtype casts to `out=` under `casting`.
+fn check_output_cast(
+    ufunc: &UfuncDef,
+    output: DType,
+    out: &Array,
+    casting: Casting,
+) -> PyResult<()> {
+    if dtype::can_cast(output, out.dtype, casting) {
+        return Ok(());
+    }
+    Err(PyError::exception(
+        "UFuncTypeError",
+        format!(
+            "Cannot cast ufunc '{}' output from {} to {} with casting rule '{}'",
+            ufunc.name,
+            output.repr(),
+            out.dtype.repr(),
+            casting.name()
+        ),
+    ))
 }
 
 /// `np.divmod(x1, x2)`: `(floor_divide(x1, x2), remainder(x1, x2))` from one pass of NumPy's

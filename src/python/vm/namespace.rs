@@ -150,6 +150,7 @@ impl Vm<'_> {
                 "staticmethod" => Builtin::StaticMethod,
                 "classmethod" => Builtin::ClassMethod,
                 "super" => Builtin::Super,
+                "setattr" => Builtin::SetAttribute,
                 _ => {
                     return exception_types::exception_type(name)
                         .filter(|definition| definition.builtin)

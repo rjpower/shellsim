@@ -101,9 +101,7 @@ numpy_suites! {
     errstate => "test_errstate.py";
     #[ignore = "pending: NumPy surface completion (phase 4)"]
     reductions => "test_reductions.py";
-    #[ignore = "pending: NumPy surface completion (phase 4)"]
     shape => "test_shape.py";
-    #[ignore = "pending: NumPy surface completion (phase 4)"]
     sorting => "test_sorting.py";
     #[ignore = "pending: NumPy surface completion (phase 4)"]
     strings_objects => "test_strings_objects.py";

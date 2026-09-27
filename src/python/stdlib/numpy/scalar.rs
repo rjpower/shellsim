@@ -10,12 +10,12 @@
 //! Python values rather than `np.str_` and `np.object_` instances.
 
 use super::super::super::native::{
-    CallArgs, GetterDef, KindBase, KindNumber, MethodDef, PyError, PyKind, PyResult, PyRuntime,
-    PyValue, PyValueCast, ValueKindDef, ValueKindSlots,
+    CallArgs, GetterDef, KindBase, KindNumber, MethodDef, PyError, PyErrorKind, PyKind, PyResult,
+    PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
 };
 use super::super::super::Value;
 use super::dtype::{Category, DType, Kind};
-use super::element::{Number, C128};
+use super::element::Number;
 use super::format::{complex_repr, float_repr, number_str, Precision};
 
 pub(in crate::python) const NO_SLOTS: ValueKindSlots = ValueKindSlots {
@@ -501,26 +501,26 @@ fn scalar_numeric(kind: &'static ValueKindDef, payload: [u64; 2]) -> Option<Kind
     })
 }
 
-/// `scalar[()]` is the scalar itself and `scalar[...]` a 0-d array holding it; NumPy rejects
-/// every other index.
+/// `scalar[index]`, which indexes the scalar as a 0-d array, as `gen_arrtype_subscript` does:
+/// `scalar[()]` is the scalar, `scalar[...]` a 0-d array, and `scalar[..., None]` a 1-d array.
+/// NumPy reports every failed index as the same IndexError.
 fn slot_get_item(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
     index: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    if runtime.is_ellipsis(&index) {
-        return super::convert::as_array(runtime, receiver).map(|array| Some(array.value()));
+    let array = super::convert::as_array(runtime, receiver)?;
+    match super::index::get_item(runtime, &array, index) {
+        Ok(value) => Ok(Some(value)),
+        Err(PyError {
+            kind: PyErrorKind::Type | PyErrorKind::Value | PyErrorKind::Exception(_),
+            ..
+        }) => Err(PyError::exception(
+            "IndexError",
+            "invalid index to scalar variable.",
+        )),
+        Err(error) => Err(error),
     }
-    if runtime.kind(&index)? == PyKind::Tuple {
-        let tuple = index.cast(runtime)?;
-        if runtime.tuple_items(tuple)?.is_empty() {
-            return Ok(Some(receiver));
-        }
-    }
-    Err(PyError::exception(
-        "IndexError",
-        "invalid index to scalar variable.",
-    ))
 }
 
 /// Printing precision of a float or complex dtype.
@@ -795,10 +795,4 @@ pub(in crate::python) fn is_index_dtype(dtype: DType) -> bool {
         dtype.category(),
         Category::Bool | Category::Signed | Category::Unsigned
     )
-}
-
-/// A complex128 value read from scalar bytes.
-pub(in crate::python) fn complex_value(bytes: &[u8; 16]) -> C128 {
-    use super::element::Element;
-    C128::read(bytes)
 }

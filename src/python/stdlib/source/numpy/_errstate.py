@@ -154,3 +154,13 @@ def _warn_complex_discard():
     warnings.warn(
         "Casting complex values to real discards the imaginary part", ComplexWarning, stacklevel=2
     )
+
+
+def _warn_where_without_out():
+    """Warn that a ufunc's ``where=`` mask without ``out=`` leaves elements uninitialized."""
+    warnings.warn(
+        "'where' used without 'out', expect uninitialized memory in output. If this is "
+        "intentional, use out=None.",
+        UserWarning,
+        stacklevel=2,
+    )

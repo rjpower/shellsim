@@ -45,6 +45,33 @@ def test_generator_expressions_are_lazy_scoped_iterables():
     assert item == 50
 
 
+def test_comprehensions_evaluate_the_outermost_iterable_on_creation():
+    values = iter([(0,), (1,)])
+    # The generator iterates the old binding, not itself.
+    values = (value + (None,) for value in values)
+    assert next(values) == (0, None)
+    numbers = [1, 2]
+    doubled = (number * 2 for number in numbers)
+    numbers = [5]
+    assert list(doubled) == [2, 4]
+    try:
+        (value for value in 5)
+    except TypeError as error:
+        assert str(error) == "'int' object is not iterable"
+    else:
+        raise AssertionError("a generator accepted a non-iterable")
+
+    class Table:
+        rows = [1, 2, 3]
+        doubled = [row * 2 for row in rows]
+        keyed = {row: row for row in rows}
+        listed = list(row for row in rows)  # noqa: C400
+
+    assert Table.doubled == [2, 4, 6]
+    assert Table.keyed == {1: 1, 2: 2, 3: 3}
+    assert Table.listed == [1, 2, 3]
+
+
 def test_dataclasses_and_enums_use_normal_runtime_values():
     import dataclasses
     import enum
@@ -698,9 +725,11 @@ def test_sum_compensates_float_and_complex_totals():
     assert sum([2**63 - 1, 1]) == 2**63
     assert sum([], True) is True
     assert sum([[1], [2]], []) == [1, 2]
-    for start, name in [("", "strings [use ''.join(seq) instead]"),
-                        (b"", "bytes [use b''.join(seq) instead]"),
-                        (bytearray(), "bytearray [use b''.join(seq) instead]")]:
+    for start, name in [
+        ("", "strings [use ''.join(seq) instead]"),
+        (b"", "bytes [use b''.join(seq) instead]"),
+        (bytearray(), "bytearray [use b''.join(seq) instead]"),
+    ]:
         try:
             sum([], start)
         except TypeError as error:
@@ -753,18 +782,14 @@ def test_with_enter_failure_reaches_the_enclosing_context_only():
             with context:
                 pass
         except TypeError as error:
-            assert str(error).endswith(
-                f"object does not support the context manager protocol (missed {method} method)"
-            )
+            assert str(error).endswith(f"object does not support the context manager protocol (missed {method} method)")
         else:
             raise AssertionError(f"{context!r} was accepted as a context manager")
     try:
         with 1:
             pass
     except TypeError as error:
-        assert str(error) == (
-            "'int' object does not support the context manager protocol (missed __exit__ method)"
-        )
+        assert str(error) == ("'int' object does not support the context manager protocol (missed __exit__ method)")
 
 
 def test_object_instances_are_identity_sentinels():
@@ -777,13 +802,11 @@ def test_object_instances_are_identity_sentinels():
     try:
         sentinel.name = 1
     except AttributeError as error:
-        assert str(error) == (
-            "'object' object has no attribute 'name' and no __dict__ for setting new attributes"
-        )
+        assert str(error) == ("'object' object has no attribute 'name' and no __dict__ for setting new attributes")
     else:
         raise AssertionError("object() accepted an attribute")
     try:
-        sentinel.name
+        _ = sentinel.name
     except AttributeError as error:
         assert str(error) == "'object' object has no attribute 'name'"
     else:
@@ -823,7 +846,7 @@ def test_divmod_uses_dunder_methods_and_cpython_messages():
         else:
             raise AssertionError("division by zero succeeded")
     try:
-        0.0 ** -1
+        0.0**-1
     except ZeroDivisionError as error:
         assert str(error) == "zero to a negative power"
     else:
@@ -849,9 +872,7 @@ def test_attribute_stores_on_builtin_values_raise_attribute_error():
     try:
         (1).name = 2
     except AttributeError as error:
-        assert str(error) == (
-            "'int' object has no attribute 'name' and no __dict__ for setting new attributes"
-        )
+        assert str(error) == ("'int' object has no attribute 'name' and no __dict__ for setting new attributes")
     else:
         raise AssertionError("int accepted an attribute")
 

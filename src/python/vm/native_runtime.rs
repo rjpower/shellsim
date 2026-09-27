@@ -1753,7 +1753,7 @@ impl PyRuntime for Vm<'_> {
         if !view.writeable {
             return Err(PyError::value_error("assignment destination is read-only"));
         }
-        let (storage, view) = (*storage, view.clone());
+        let storage = *storage;
         let data = match self
             .state
             .heap
@@ -1764,7 +1764,7 @@ impl PyRuntime for Vm<'_> {
             Object::ArrayStorage(PyArrayBuffer::Values(values)) => PyArrayDataMut::Values(values),
             _ => return Err(PyError::runtime_error("array storage changed object kind")),
         };
-        write(PyArrayMut { view: &view, data })
+        write(PyArrayMut { data })
     }
 
     fn apply_operator(&mut self, operator: PyOperator, operands: &[Value]) -> PyResult<Value> {

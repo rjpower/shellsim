@@ -813,31 +813,36 @@ pub(in crate::python) fn size(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
     ))
 }
 
-/// `np.take(a, indices, axis=None)`.
+/// `np.take(a, indices, axis=None, out=None, mode='raise')`.
 pub(in crate::python) fn take(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature =
         Signature::new("take", &["a", "indices", "axis", "out", "mode"], 2);
     let bound = SIGNATURE.bind(&args)?;
-    super::ndarray::reject_out_and_mode(&bound)?;
+    let options = super::ndarray::TakeOptions::parse(runtime, &bound)?;
     let array = convert::as_array(runtime, bound.required("a"))?;
     super::ndarray::take(
         runtime,
         &array,
         bound.required("indices"),
         bound.value("axis"),
+        options,
     )
 }
 
-/// `np.put(a, ind, v)`.
+/// `np.put(a, ind, v, mode='raise')`.
 pub(in crate::python) fn put(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("put", &["a", "ind", "v", "mode"], 3);
     let bound = SIGNATURE.bind(&args)?;
-    if bound.value("mode").is_some() {
-        return Err(PyError::unsupported("put() with mode= is not supported"));
-    }
     let array = Array::from_value(runtime, bound.required("a"))
         .map_err(|_| PyError::type_error("argument 1 must be numpy.ndarray"))?;
-    super::ndarray::put(runtime, &array, bound.required("ind"), bound.required("v"))
+    let mode = super::index::ClipMode::parse(runtime, bound.get("mode"))?;
+    super::ndarray::put(
+        runtime,
+        &array,
+        bound.required("ind"),
+        bound.required("v"),
+        mode,
+    )
 }
 
 /// One operand of `result_type`: a strong dtype, or a weak Python scalar.

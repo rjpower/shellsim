@@ -96,6 +96,45 @@ fn constructor_operand(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Opt
     })
 }
 
+/// A `complex()` argument: a number, or an object with a conversion method.
+fn number_or_method(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
+    match constructor_operand(runtime, value)? {
+        Some(operand) => Ok(Some(operand)),
+        None if runtime.string_value(value)?.is_some() => Ok(None),
+        None => operand_by_method(runtime, value),
+    }
+}
+
+/// Read an object that is not a number through `__complex__`, then `__float__`, then
+/// `__index__`, as CPython's `complex()` does, checking each method's result type.
+fn operand_by_method(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
+    for (method, expected) in [
+        ("__complex__", PyKind::Complex),
+        ("__float__", PyKind::Float),
+        ("__index__", PyKind::Int),
+    ] {
+        let Some(bound) = runtime.get_attribute(*value, method)? else {
+            continue;
+        };
+        let result = runtime.call_value(bound, CallArgs::new(Vec::new(), Vec::new()))?;
+        if runtime.kind(&result)? != expected {
+            let actual = runtime.type_name(&result)?;
+            // CPython names the owning type only for `__float__`.
+            let message = match expected {
+                PyKind::Complex => format!("__complex__ returned non-complex (type {actual})"),
+                PyKind::Float => format!(
+                    "{}.__float__ returned non-float (type {actual})",
+                    runtime.type_name(value)?
+                ),
+                _ => format!("__index__ returned non-int (type {actual})"),
+            };
+            return Err(PyError::type_error(message));
+        }
+        return constructor_operand(runtime, &result);
+    }
+    Ok(None)
+}
+
 fn bigint_to_f64(value: &num_bigint::BigInt) -> PyResult<f64> {
     value
         .to_f64()
@@ -163,7 +202,7 @@ pub(super) fn construct(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult
         return runtime.new_complex(value.real, value.imag);
     }
     let real = match real {
-        Some(value) => match constructor_operand(runtime, &value)? {
+        Some(value) => match number_or_method(runtime, &value)? {
             Some(Operand::Complex(_))
                 if imag.is_none() && runtime.kind(&value)? == PyKind::Complex =>
             {
@@ -180,7 +219,7 @@ pub(super) fn construct(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult
         None => Operand::Real(0.0),
     };
     let imag = match imag {
-        Some(value) => match constructor_operand(runtime, &value)? {
+        Some(value) => match number_or_method(runtime, &value)? {
             Some(operand) => Some(operand),
             None => {
                 let actual = runtime.type_name(&value)?;

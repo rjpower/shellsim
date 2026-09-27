@@ -27,11 +27,13 @@ def _as_dtype(value):
 
 
 class finfo:
-    """Machine limits for floating-point types."""
+    """Machine limits for floating-point types.
 
-    _finfo_cache = {}
+    NumPy caches one instance per type in ``__new__``; shellsim classes do not yet run a
+    user-defined ``__new__``, so each call builds a new, equal instance.
+    """
 
-    def __new__(cls, dtype):
+    def __init__(self, dtype):
         if dtype is None:
             raise TypeError("dtype must not be None")
         dtype = _as_dtype(dtype)
@@ -41,14 +43,7 @@ class finfo:
             real = dtype
         else:
             raise ValueError(f"data type {dtype!r} not compatible with finfo")
-        key = real.name
-        cached = cls._finfo_cache.get(key)
-        if cached is not None:
-            return cached
-        obj = object.__new__(cls)
-        obj._init(real)
-        cls._finfo_cache[key] = obj
-        return obj
+        self._init(real)
 
     def _init(self, dtype):
         eps, largest, normal, subnormal, precision, maxexp, minexp, nmant = _CONSTANTS[

@@ -89,3 +89,121 @@ def test_invalid_inputs_raise_python_exceptions():
         raise AssertionError("dict.pop() accepted a missing key")
     except KeyError:
         pass
+
+
+def _assert_raises(call, error, message):
+    try:
+        call()
+    except error as caught:
+        assert str(caught) == message, str(caught)
+    else:
+        raise AssertionError(f"{message!r} was not raised")
+
+
+def test_min_and_max_accept_key_and_default():
+    assert min([3, 1, 2], key=lambda value: -value) == 3
+    assert max(3, 1, 2, key=lambda value: -value) == 1
+    assert max([], default=5) == 5
+    assert min([], key=len, default="x") == "x"
+    assert min([2, 1], default=None) == 1
+    assert min(range(1, 5), key=None) == 1
+    # Of equal keys, both functions keep the first item.
+    pairs = [(1, "a"), (1, "b")]
+    assert min(pairs, key=lambda pair: pair[0]) == (1, "a")
+    assert max(pairs, key=lambda pair: pair[0]) == (1, "a")
+    _assert_raises(lambda: min([]), ValueError, "min() iterable argument is empty")
+    _assert_raises(lambda: max(), TypeError, "max expected at least 1 argument, got 0")
+    _assert_raises(
+        lambda: min(1, 2, default=0),
+        TypeError,
+        "Cannot specify a default for min() with multiple positional arguments",
+    )
+    _assert_raises(lambda: min([1], bogus=1), TypeError, "min() got an unexpected keyword argument 'bogus'")
+    _assert_raises(lambda: max([1, "a"]), TypeError, "'>' not supported between instances of 'str' and 'int'")
+
+
+def test_setattr_stores_through_descriptors():
+    class Box:
+        pass
+
+    class Doubler:
+        @property
+        def value(self):
+            return self._value
+
+        @value.setter
+        def value(self, value):
+            self._value = value * 2
+
+    box = Box()
+    box.size = 3
+    assert box.size == 3
+    doubler = Doubler()
+    doubler.value = 4
+    assert doubler.value == 8
+    _assert_raises(lambda: setattr(box, 1, 2), TypeError, "attribute name must be string, not 'int'")
+    _assert_raises(lambda: setattr(box, "size"), TypeError, "setattr expected 3 arguments, got 2")
+
+
+def test_numeric_conversions_use_dunder_methods_in_cpython_order():
+    class Indexable:
+        def __index__(self):
+            return 7
+
+    class Floaty:
+        def __float__(self):
+            return 2.5
+
+    class Complexish:
+        def __complex__(self):
+            return 1 + 2j
+
+    class Integral:
+        def __int__(self):
+            return 4
+
+        def __index__(self):
+            return 9
+
+    class OnlyInt:
+        def __int__(self):
+            return 3
+
+    class BadInt:
+        def __int__(self):
+            return 1.5
+
+    class BadFloat:
+        def __float__(self):
+            return 1
+
+    class BadComplex:
+        def __complex__(self):
+            return 1
+
+    # int() prefers __int__ to __index__; float() and complex() fall back to __index__.
+    assert int(Indexable()) == 7
+    assert int(Integral()) == 4
+    assert float(Indexable()) == 7.0
+    assert float(Floaty()) == 2.5
+    assert complex(Complexish()) == 1 + 2j
+    assert complex(Floaty()) == 2.5 + 0j
+    assert complex(Indexable(), Floaty()) == 7 + 2.5j
+    _assert_raises(lambda: int(BadInt()), TypeError, "__int__ returned non-int (type float)")
+    _assert_raises(lambda: float(BadFloat()), TypeError, "BadFloat.__float__ returned non-float (type int)")
+    _assert_raises(lambda: complex(BadComplex()), TypeError, "__complex__ returned non-complex (type int)")
+    _assert_raises(
+        lambda: int(None),
+        TypeError,
+        "int() argument must be a string, a bytes-like object or a real number, not 'NoneType'",
+    )
+    _assert_raises(
+        lambda: float(OnlyInt()),
+        TypeError,
+        "float() argument must be a string or a real number, not 'OnlyInt'",
+    )
+    _assert_raises(
+        lambda: float(object()),
+        TypeError,
+        "float() argument must be a string or a real number, not 'object'",
+    )
