@@ -409,6 +409,111 @@ def test_ufunc_reduce_accumulate_and_outer():
     assert_array_equal(np.multiply.outer([1, 2], [3, 4]), [[3, 4], [6, 8]])
 
 
+def test_ufunc_reduce_and_accumulate_error_cases():
+    with pytest.raises(ValueError, match="zero-size array to reduction operation maximum"):
+        np.maximum.reduce(np.array([], dtype=np.float64))
+    arr = np.array([1, 2, 3])
+    mask = np.array([True, False, True])
+    with pytest.raises(
+        ValueError,
+        match="reduction operation 'maximum' does not have an identity",
+    ):
+        np.maximum.reduce(arr, where=mask)
+    assert np.maximum.reduce(arr, where=mask, initial=-1) == 3
+    with pytest.raises(ValueError, match="reduce only supported for binary functions"):
+        np.sqrt.reduce(arr)
+    with pytest.raises(ValueError, match="accumulate does not allow multiple axes"):
+        np.add.accumulate(np.array([[1, 2], [3, 4]]), axis=None)
+
+
+def test_comparison_ufunc_reduce_and_accumulate_require_bool():
+    # NumPy only registers a comparison reduce/accumulate loop for boolean input: reducing folds
+    # left to right the same as any other binary ufunc without an identity (the first element
+    # seeds the fold), it just happens that every intermediate result stays boolean too.
+    mixed = np.array([True, False, True])
+    all_true = np.array([True, True, True])
+    assert np.equal.reduce(mixed) == False  # noqa: E712
+    assert np.not_equal.reduce(mixed) == False  # noqa: E712
+    assert np.less.reduce(mixed) == True  # noqa: E712
+    assert np.less_equal.reduce(mixed) == True  # noqa: E712
+    assert np.greater.reduce(mixed) == False  # noqa: E712
+    assert np.greater_equal.reduce(mixed) == True  # noqa: E712
+    assert np.equal.reduce(all_true) == True  # noqa: E712
+    assert np.greater.reduce(all_true) == False  # noqa: E712
+    assert_array_equal(np.equal.accumulate(mixed), [True, False, False])
+    assert_array_equal(np.not_equal.accumulate(mixed), [True, True, False])
+    assert_array_equal(np.less.accumulate(mixed), [True, False, True])
+    assert_array_equal(np.greater_equal.accumulate(mixed), [True, True, True])
+    with pytest.raises(
+        ValueError, match="zero-size array to reduction operation equal"
+    ):
+        np.equal.reduce(np.array([], dtype=bool))
+    # NumPy 2.5.3's exact wording for "no reduce loop for this dtype" is not stable across a
+    # test run: it depends on which internal resolver path a prior, unrelated call already
+    # warmed up for this same ufunc object, so this only pins the substrings both wordings
+    # share rather than either exact sentence.
+    with pytest.raises(TypeError, match="loop.*match"):
+        np.equal.reduce(np.array([1, 0, 1]))
+    with pytest.raises(TypeError, match="loop.*match"):
+        np.less.reduce(np.array([1.0, 2.0]))
+
+
+def test_power_and_fmod_reduce_and_accumulate():
+    assert np.power.reduce(np.array([2, 3, 2])) == 64
+    assert_array_equal(np.power.accumulate(np.array([2, 3, 2])), [2, 8, 64])
+    assert np.fmod.reduce(np.array([10, 3, 2])) == 1
+    assert_array_equal(np.fmod.accumulate(np.array([10, 3, 2])), [10, 1, 1])
+    assert_allclose(np.fmod.reduce(np.array([10.5, 3.0])), 1.5)
+    # A boolean array without a bool loop promotes to int8, the smallest type holding 0/1.
+    promoted = np.power.reduce(np.array([True, True, False]))
+    assert promoted == 1
+    assert promoted.dtype == np.int8
+    assert np.fmod.reduce(np.array([True, True])).dtype == np.int8
+    with pytest.raises(
+        ValueError, match="Integers to negative integer powers are not allowed"
+    ):
+        np.power.reduce(np.array([2, -1]))
+    with pytest.raises(
+        ValueError, match="Integers to negative integer powers are not allowed"
+    ):
+        np.power.accumulate(np.array([2, -1]))
+    # The first element only ever plays "base", never "exponent", so it may be negative.
+    assert np.power.reduce(np.array([-1, 2, 3])) == 1
+    with pytest.raises(ValueError, match="zero-size array to reduction operation power"):
+        np.power.reduce(np.array([], dtype=np.int64))
+    with pytest.raises(ValueError, match="zero-size array to reduction operation fmod"):
+        np.fmod.reduce(np.array([], dtype=np.int64))
+    with pytest.raises(TypeError, match="not supported for the input types"):
+        np.fmod.reduce(np.array([1 + 1j, 2 + 2j]))
+
+
+def test_float2_ufunc_reduce_and_accumulate():
+    a = np.array([1.0, 2.0, 3.0])
+    assert_allclose(np.arctan2.reduce(a), 0.15333604941031637)
+    assert_allclose(
+        np.arctan2.accumulate(a), [1.0, 0.4636476090008061, 0.15333604941031637]
+    )
+    assert_allclose(np.hypot.reduce(a), 3.7416573867739413)
+    assert np.hypot.reduce(np.array([], dtype=np.float64)) == 0.0
+    assert_allclose(np.logaddexp.reduce(a), 3.4076059644443806)
+    assert np.logaddexp.reduce(np.array([], dtype=np.float64)) == -np.inf
+    assert_allclose(np.logaddexp2.reduce(a), 3.807354922057604)
+    assert_allclose(np.copysign.reduce(a), 1.0)
+    assert_allclose(np.heaviside.reduce(a), 1.0)
+    # Int/bool promote to the smallest float that holds every value, as the elementwise loop
+    # already resolves before the ufunc runs.
+    assert np.arctan2.reduce(np.array([True, True, False])).dtype == np.float16
+    assert np.arctan2.reduce(np.array([1, 2, 3], dtype=np.int16)).dtype == np.float32
+    with pytest.raises(
+        ValueError, match="zero-size array to reduction operation arctan2"
+    ):
+        np.arctan2.reduce(np.array([], dtype=np.float64))
+    with pytest.raises(TypeError, match="No loop matching"):
+        np.arctan2.reduce(a, dtype=np.int64)
+    with pytest.raises(TypeError, match="not supported for the input types"):
+        np.arctan2.reduce(np.array([1 + 1j, 2 + 2j]))
+
+
 def test_out_argument_returns_and_fills_the_given_array():
     a = np.array([1, 2])
     target = np.zeros(2, np.int64)
