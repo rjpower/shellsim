@@ -505,6 +505,37 @@ with zipfile.ZipFile('/work/items.zip') as archive:
 }
 
 #[test]
+fn frozen_zipfile_writes_deflated_members_and_member_streams() {
+    let source = r#"import io
+import zipfile
+
+buffer = io.BytesIO()
+with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr('zeros.bin', bytes(5000))
+    archive.writestr('plain.txt', b'stored', compress_type=zipfile.ZIP_STORED)
+    with archive.open('member.txt', 'w') as member:
+        member.write(b'written through open')
+print(len(buffer.getvalue()) < 1000)
+with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as archive:
+    print(archive.namelist())
+    print(len(archive.read('zeros.bin')), archive.read('plain.txt'), archive.read('member.txt'))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            concat!(
+                "True\n",
+                "['zeros.bin', 'plain.txt', 'member.txt']\n",
+                "5000 b'stored' b'written through open'\n",
+            )
+            .into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
 fn frozen_statistics_path_parts_json_error_and_access_cover_common_calls() {
     let source = r#"import json
 import os
