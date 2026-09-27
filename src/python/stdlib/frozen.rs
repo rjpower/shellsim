@@ -17,6 +17,7 @@ pub(super) fn is_package(name: &str) -> bool {
             | "scipy"
             | "scipy._lib"
             | "scipy.linalg"
+            | "scipy.spatial"
             | "scipy.special"
             | "scipy.stats"
     )
@@ -80,6 +81,8 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "scipy.linalg" => Some(include_str!("source/scipy/linalg/__init__.py")),
         "scipy.linalg.blas" => Some(include_str!("source/scipy/linalg/blas.py")),
         "scipy.linalg.lapack" => Some(include_str!("source/scipy/linalg/lapack.py")),
+        "scipy.spatial" => Some(include_str!("source/scipy/spatial/__init__.py")),
+        "scipy.spatial.distance" => Some(include_str!("source/scipy/spatial/distance.py")),
         "scipy.special" => Some(include_str!("source/scipy/special/__init__.py")),
         "scipy.special._ufuncs" => Some(include_str!("source/scipy/special/_ufuncs.py")),
         "scipy.stats" => Some(include_str!("source/scipy/stats/__init__.py")),
@@ -100,8 +103,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         | "scipy.odr"
         | "scipy.optimize"
         | "scipy.signal"
-        | "scipy.sparse"
-        | "scipy.spatial" => Some(include_str!("source/scipy/_unsupported.py")),
+        | "scipy.sparse" => Some(include_str!("source/scipy/_unsupported.py")),
         "operator" => Some(include_str!("source/operator.py")),
         "os" => Some(include_str!("source/os.py")),
         "pathlib" => Some(include_str!("source/pathlib.py")),

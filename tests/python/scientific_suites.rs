@@ -128,4 +128,5 @@ suites!(scipy, "scipy", {
     special => "test_special.py";
     stats => "test_stats.py";
     linalg => "test_linalg.py";
+    spatial => "test_spatial.py";
 });

@@ -94,6 +94,18 @@ fn unsupported_scipy_features_fail_explicitly() {
             "from scipy.linalg import blas\nblas.ddot",
             "NotImplementedError: BLAS routine ddot is not supported by shellsim's SciPy",
         ),
+        (
+            "from scipy.spatial import KDTree",
+            "NotImplementedError: scipy.spatial.KDTree is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy.spatial import distance\ndistance.dice",
+            "NotImplementedError: scipy.spatial.distance.dice is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy.spatial import distance\ndistance.pdist([[1.0], [2.0]], 'yule')",
+            "NotImplementedError: the 'yule' distance metric is not supported by shellsim's SciPy",
+        ),
     ] {
         let (status, stderr) = run(Limits::default().cpu, source);
         assert_ne!(status, 0, "{source} unexpectedly succeeded");

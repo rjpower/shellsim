@@ -425,6 +425,7 @@ def test_svd_agrees_with_scipy():
 
 
 def test_least_squares_and_pseudo_inverses_agree_with_scipy():
+    assert sl.lstsq.default_lapack_driver == "gelsd"
     x, residues, rank, singular = sl.lstsq(np.array([[1.0, 1.0], [1.0, 2.0], [1.0, 3.0]]), np.array([1.0, 2.0, 2.0]))
     close(x, [0.6666666666666663, 0.5000000000000002])
     assert residues.shape == ()

@@ -1,6 +1,7 @@
 # SciPy in shellsim
 
-shellsim ships `scipy.special`, `scipy.stats` and `scipy.linalg` for simulated Python programs.
+shellsim ships `scipy.special`, `scipy.stats`, `scipy.linalg` and `scipy.spatial` for simulated
+Python programs.
 It targets the observable behavior of SciPy 1.18.1 with NumPy 2.5.3: values, result dtypes,
 error types and messages, and warnings. It never runs host SciPy. The other SciPy subpackages
 raise `NotImplementedError` when imported.
@@ -43,6 +44,13 @@ raise `NotImplementedError` when imported.
   shellsim's own dense kernels, not a port of OpenBLAS or reference LAPACK (see below). `svd`,
   `eigh` and the functions built on them (`lstsq`, `pinv`, `pinvh`, `polar`, `null_space`,
   `orth`, `subspace_angles` and `orthogonal_procrustes`) use shellsim's `numpy.linalg`.
+
+- **`scipy.spatial.distance`** is frozen Python. Each metric is one vectorized NumPy expression
+  over the last axis of two broadcast operands, shared by the vector functions, `cdist` and
+  `pdist`. The vector functions sum with NumPy's pairwise summation, as SciPy's do; `cdist` and
+  `pdist` sum each pair left to right, as SciPy's compiled loops do, so their `euclidean`,
+  `sqeuclidean`, `cityblock`, `minkowski`, `chebyshev`, `braycurtis`, `canberra`, `hamming`
+  and `jaccard` results match SciPy bit for bit.
 
 ### Rounding in `scipy.linalg`
 
@@ -128,6 +136,12 @@ them. Domain errors return NaN and poles return infinities.
   (`toeplitz`, `circulant`, `hankel`, `hadamard`, `leslie`, `block_diag`, `companion`,
   `helmert`, `hilbert`, `invhilbert`, `pascal`, `invpascal`, `fiedler`, `fiedler_companion`,
   `convolution_matrix` and `dft`), `LinAlgError` and `LinAlgWarning`.
+- **Distances (`scipy.spatial.distance`).** `braycurtis`, `canberra`, `chebyshev`,
+  `cityblock`, `correlation`, `cosine`, `euclidean`, `hamming`, `jaccard`, `jensenshannon`,
+  `mahalanobis`, `minkowski`, `seuclidean` and `sqeuclidean`, with weights where SciPy takes
+  them; `cdist` and `pdist` with those metrics, their aliases, callable metrics and `out=`;
+  `squareform`, `is_valid_dm`, `is_valid_y`, `num_obs_dm` and `num_obs_y`; and the deprecated
+  `scipy.spatial.distance_matrix`, `minkowski_distance` and `minkowski_distance_p`.
 - **LAPACK and BLAS wrappers.** The `s` and `d` forms of `getrf`, `getrs`, `gecon`, `getri`,
   `trtrs`, `trtri`, `potrf`, `potrs`, `potri`, `gtsv`, `gbsv`, `lange` and `nrm2`, with f2py's
   arguments, argument checks, `_flapack.error` exception and Fortran-ordered outputs, and `get_lapack_funcs`,
@@ -194,8 +208,6 @@ expectations were measured on the reference machine described above; see "Roundi
   `polar`, `null_space`, `orth`, `subspace_angles` and `orthogonal_procrustes` build on the SVD
   or `eigh`; a singular value or eigenvalue that is mathematically zero can come out exactly
   zero where SciPy's is near `1e-16`.
-- **`lstsq.default_lapack_driver`** does not exist, because shellsim's functions cannot hold
-  attributes. The default driver is still `gelsd`.
 - **`gecon`'s reciprocal condition number**, and the `LinAlgWarning` that `solve` raises for an
   ill-conditioned matrix (`assume_a="pos"` composes the same computation from `potri`, since
   shellsim has no `pocon`), come from the explicit inverse rather than LAPACK's Hager-style
@@ -208,6 +220,15 @@ expectations were measured on the reference machine described above; see "Roundi
 - **`dft`'s signed zeros.** SciPy builds `dft` from an internal FFT routine whose intermediate
   rounding leaves a machine-dependent pattern of signed zeros in the imaginary part. shellsim's
   closed-form construction gives the same values but not always the same zero sign.
+- **Rounding in `scipy.spatial.distance`.** `cdist` and `pdist` compute `cosine`,
+  `correlation`, `seuclidean` and `mahalanobis` in a different order from SciPy's compiled
+  loops and can differ in the last bit. The weighted vector functions can too.
+- **Validation in `cdist` and `pdist`.** A non-positive Minkowski `p`, and a `VI` whose size
+  does not match the data, raise `ValueError`; SciPy's compiled loops compute a meaningless
+  result. `cdist` and `pdist` accept `base=` for `jensenshannon`, which SciPy's reject, and
+  report an unexpected keyword with Python's usual `TypeError` message.
+- **`scipy.spatial` deprecation warnings.** `distance_matrix` warns once; SciPy's also emits
+  the warnings of the deprecated helpers it calls.
 - **Output layout of batched results.** The f2py wrappers, and the functions that return their
   results, return Fortran-ordered arrays as SciPy's do. For stacked input, `eigh` and
   `qr(mode="raw")` return C-ordered arrays where SciPy's are not contiguous.
@@ -236,7 +257,12 @@ These fail explicitly with shellsim's unsupported-operation error or `NotImpleme
 - the other names in SciPy's `scipy.linalg.__all__`, such as `eig`, `schur`, `logm`, `sqrtm` and
   `solveh_banded`, and the LAPACK and BLAS routines not listed above, such as `dgeev` or
   `ddot`;
-- importing any subpackage other than `scipy.special`, `scipy.stats` and `scipy.linalg`.
+- the boolean dissimilarities `dice`, `rogerstanimoto`, `russellrao`, `sokalsneath` and `yule`
+  (as functions and as `cdist`/`pdist` metrics), `directed_hausdorff`, and `scipy.spatial`'s
+  data structures and computational geometry, such as `KDTree`, `ConvexHull`, `Delaunay` and
+  `Voronoi`;
+- importing any subpackage other than `scipy.special`, `scipy.stats`, `scipy.linalg` and
+  `scipy.spatial`.
 
 Other `scipy.special` functions and `scipy.stats` names are absent, so accessing them raises
 `AttributeError`.

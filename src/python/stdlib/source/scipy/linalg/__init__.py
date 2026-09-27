@@ -703,7 +703,7 @@ def lstsq(a, b, cond=None, overwrite_a=False, overwrite_b=False, check_finite=Tr
     SciPy reports it); otherwise a shape-`(0,)` array. `singular_values` is `None` for the
     `"gelsy"` driver, which does not compute them (SciPy's does not either).
     """
-    driver = lapack_driver or "gelsd"
+    driver = lapack_driver or lstsq.default_lapack_driver
     if driver not in ("gelsd", "gelsy", "gelss"):
         raise ValueError(f'LAPACK driver "{driver}" is not found')
     a = np.asarray(a)
@@ -748,6 +748,9 @@ def lstsq(a, b, cond=None, overwrite_a=False, overwrite_b=False, check_finite=Tr
         x = x[:, 0]
     return x, residues, rank, singular_values
 
+
+
+lstsq.default_lapack_driver = "gelsd"
 
 def pinv(a, atol=None, rtol=None, return_rank=False, check_finite=True):
     """The Moore-Penrose pseudo-inverse of `a`, via its SVD."""
