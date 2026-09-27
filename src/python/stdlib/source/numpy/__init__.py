@@ -224,8 +224,25 @@ from _numpy import _c_contiguous, _writeable
 
 import numpy.exceptions as exceptions
 import numpy.linalg as linalg
-import numpy.fft as fft
 from numpy._arraypad import pad
-import numpy.random as random
-import numpy.strings as strings
-import numpy.testing as testing
+
+
+def __getattr__(attr):
+    # As in NumPy, the larger submodules load on first access rather than with the package.
+    if attr == "fft":
+        import numpy.fft as fft
+
+        return fft
+    elif attr == "random":
+        import numpy.random as random
+
+        return random
+    elif attr == "strings":
+        import numpy.strings as strings
+
+        return strings
+    elif attr == "testing":
+        import numpy.testing as testing
+
+        return testing
+    raise AttributeError(f"module {__name__!r} has no attribute {attr!r}")

@@ -415,8 +415,10 @@ fn complex_values_are_metered_heap_allocations() {
 
 #[test]
 fn complex_arrays_reserve_element_storage_before_allocation() {
+    // `import numpy` loads the Python half of the package, which needs about 2 MiB; the
+    // million-element array needs 16 MB.
     let limits = Limits {
-        memory: 64 * 1024,
+        memory: 4 * 1024 * 1024,
         ..Limits::unlimited()
     };
     let (status, stdout, _, _) = run_with_limits(
@@ -425,11 +427,11 @@ fn complex_arrays_reserve_element_storage_before_allocation() {
     );
     assert_eq!((status, stdout), (0, b"0j\n".to_vec()));
     let (status, stdout, stderr, usage) = run_with_limits(
-        "import numpy as np\nnp.zeros(100000, dtype=complex)",
+        "import numpy as np\nnp.zeros(1_000_000, dtype=complex)",
         limits,
     );
     assert_eq!(status, 137);
-    assert!(usage.memory_peak <= 64 * 1024);
+    assert!(usage.memory_peak <= 4 * 1024 * 1024);
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 }
@@ -472,6 +474,34 @@ fn numpy_jacobi_eigensolver_charges_each_sweep() {
     let (status, stdout, stderr, usage) = run_with_limits(
         "import numpy as np\na = np.arange(14400.0).reshape(120, 120) % 7\na = a + a.T\n\
          print('built')\nnp.linalg.eigvalsh(a)",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 5_000_000);
+    assert_eq!(stdout, b"built\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn numpy_fft_charges_transform_work_before_running() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "import numpy as np\nprint(np.fft.fft(np.ones(8)).real[0])",
+        limits,
+    );
+    assert_eq!(
+        (status, stdout),
+        (0, b"8.0\n".to_vec()),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // 64 transforms of 4096 points cost 64 * 24 * 4096 units in pocketfft's model, which the
+    // call charges before transforming anything.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\na = np.zeros((64, 4096))\nprint('built')\nnp.fft.fft(a)",
         limits,
     );
     assert_eq!(status, 137);

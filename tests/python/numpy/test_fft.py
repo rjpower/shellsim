@@ -190,3 +190,122 @@ def test_fftfreq_locates_cosine_peak():
     freqs = np.fft.rfftfreq(n, d=1.0 / rate)
     peak = np.argmax(np.abs(np.fft.rfft(signal)))
     assert freqs[peak] == 4.0
+
+
+# 13 and 17 use pocketfft's generic prime pass; 101 and 202 use Bluestein's algorithm.
+@pytest.mark.parametrize("n", [13, 17, 101, 202])
+def test_generic_radix_and_bluestein_lengths_match_direct_dft(n):
+    signal = np.cos(np.arange(n) * 0.37) + 1j * np.sin(np.arange(n) * 0.11)
+    k = np.arange(n)
+    kernel = np.exp(-2j * np.pi * np.outer(k, k) / n)
+    assert_allclose(np.fft.fft(signal), kernel @ signal, atol=1e-9)
+    assert_allclose(np.fft.irfft(np.fft.rfft(signal.real), n), signal.real, atol=1e-12)
+
+
+@pytest.mark.parametrize("norm", [None, "backward", "ortho", "forward"])
+def test_norm_modes_round_trip(norm):
+    signal = np.arange(6.0) - 1.5j
+    assert_allclose(np.fft.ifft(np.fft.fft(signal, norm=norm), norm=norm), signal, atol=1e-12)
+
+
+def test_norm_modes_scale_forward_and_inverse():
+    ones = np.ones(4)
+    assert_allclose(np.fft.fft(ones, norm="ortho"), [2, 0, 0, 0], atol=1e-12)
+    assert_allclose(np.fft.fft(ones, norm="forward"), [1, 0, 0, 0], atol=1e-12)
+    assert_allclose(np.fft.ifft(ones, norm="forward"), [4, 0, 0, 0], atol=1e-12)
+    assert_allclose(np.fft.rfft(ones, norm="ortho"), [2, 0, 0], atol=1e-12)
+
+
+def test_single_precision_input_gives_single_precision_output():
+    x32 = np.arange(5, dtype=np.float32)
+    assert np.fft.fft(x32).dtype == np.complex64
+    assert np.fft.rfft(x32).dtype == np.complex64
+    assert np.fft.irfft(np.fft.rfft(x32)).dtype == np.float32
+    assert np.fft.ifft(x32.astype(np.complex64)).dtype == np.complex64
+    assert np.fft.fft(np.arange(4, dtype=np.float16)).dtype == np.complex64
+
+
+def test_single_precision_loop_follows_numpy_dispatch():
+    # A normalized transform passes a float32 scale, which selects NumPy's float loop; the
+    # unnormalized forward transform runs in double precision and rounds the result.
+    x = (np.arange(7, dtype=np.float32) * 0.3) ** 2
+    assert np.fft.ifft(x).tolist() == [
+        (1.1700000762939453 + 0j),
+        (-0.07596264779567719 - 0.6541042923927307j),
+        (-0.24138164520263672 - 0.25120416283607483j),
+        (-0.26765576004981995 - 0.07189671695232391j),
+        (-0.26765576004981995 + 0.07189671695232391j),
+        (-0.24138164520263672 + 0.25120416283607483j),
+        (-0.07596264779567719 + 0.6541042923927307j),
+    ]
+    assert np.fft.fft(x).tolist() == [
+        (8.190000534057617 + 0j),
+        (-0.5317385196685791 + 4.578729629516602j),
+        (-1.6896713972091675 + 1.7584290504455566j),
+        (-1.873590350151062 + 0.5032769441604614j),
+        (-1.873590350151062 - 0.5032769441604614j),
+        (-1.6896713972091675 - 1.7584290504455566j),
+        (-0.5317385196685791 - 4.578729629516602j),
+    ]
+
+
+def test_hermitian_transforms_invert_each_other():
+    spectrum = np.array([4.0, 1 - 1j, 0.5j, 2.0])
+    signal = np.fft.hfft(spectrum)
+    assert signal.shape == (6,)
+    assert signal.dtype == np.float64
+    assert_allclose(signal, np.fft.irfft(np.conj(spectrum)) * 6, atol=1e-12)
+    assert_allclose(np.fft.ihfft(signal), spectrum, atol=1e-12)
+
+
+def test_multidimensional_transforms():
+    a = np.arange(24.0).reshape(2, 3, 4) ** 1.5
+    nested = np.fft.fft(np.fft.fft(np.fft.fft(a, axis=2), axis=1), axis=0)
+    assert_allclose(np.fft.fftn(a), nested, atol=1e-9)
+    assert_allclose(np.fft.ifftn(np.fft.fftn(a)), a, atol=1e-12)
+    assert_allclose(np.fft.ifft2(np.fft.fft2(a)), a, atol=1e-12)
+    assert np.fft.fft2(a, s=(5, 3)).shape == (2, 5, 3)
+    spectrum = np.fft.rfftn(a)
+    assert spectrum.shape == (2, 3, 3)
+    assert_allclose(spectrum, nested[..., :3], atol=1e-9)
+    assert_allclose(np.fft.irfftn(spectrum, a.shape, axes=(0, 1, 2)), a, atol=1e-12)
+    assert_allclose(np.fft.irfft2(np.fft.rfft2(a)), a, atol=1e-12)
+    with pytest.raises(ValueError, match="Shape and axes have different lengths."):
+        np.fft.fftn(a, s=(2, 2), axes=(0,))
+
+
+def test_fftshift_and_ifftshift():
+    assert np.fft.fftshift(np.arange(5)).tolist() == [3, 4, 0, 1, 2]
+    assert np.fft.ifftshift(np.fft.fftshift(np.arange(5))).tolist() == [0, 1, 2, 3, 4]
+    grid = np.arange(6).reshape(2, 3)
+    assert np.fft.fftshift(grid).tolist() == [[5, 3, 4], [2, 0, 1]]
+    assert np.fft.fftshift(grid, axes=1).tolist() == [[2, 0, 1], [5, 3, 4]]
+    assert np.fft.fftshift(np.fft.fftfreq(4)).tolist() == [-0.5, -0.25, 0.0, 0.25]
+
+
+def test_out_argument_receives_the_result():
+    out = np.zeros(4, dtype=np.complex64)
+    result = np.fft.fft(np.arange(4.0), out=out)
+    assert result is out
+    assert out.tolist() == [6 + 0j, -2 + 2j, -2 + 0j, -2 - 2j]
+    with pytest.raises(ValueError, match="output array has wrong shape."):
+        np.fft.fft(np.arange(4.0), out=np.zeros(3, dtype=complex))
+    with pytest.raises(TypeError, match=r"Cannot cast ufunc 'fft' output from dtype\('complex128'\)"):
+        np.fft.fft(np.arange(4.0), out=np.zeros(4))
+
+
+def test_invalid_arguments_raise_numpy_errors():
+    with pytest.raises(ValueError, match=r"Invalid number of FFT data points \(0\) specified."):
+        np.fft.fft([1.0, 2.0], n=0)
+    with pytest.raises(ValueError, match="Invalid norm value bad"):
+        np.fft.fft([1.0], norm="bad")
+    with pytest.raises(TypeError, match="ufunc 'rfft_n_even' not supported for the input types"):
+        np.fft.rfft([1j, 2.0])
+    with pytest.raises(ValueError, match="n should be an integer"):
+        np.fft.fftfreq(2.5)
+
+
+def test_non_finite_values_propagate():
+    result = np.fft.fft([np.nan, 1.0, 2.0])
+    assert np.isnan(result).all()
+    assert np.isinf(np.fft.fft([np.inf, 0.0])).real.all()
