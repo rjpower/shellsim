@@ -118,24 +118,21 @@ def gradient(f, *varargs, axis=None, edge_order=1):
 def interp(x, xp, fp, left=None, right=None, period=None):
     """Piecewise-linear interpolation of `x` against the samples (`xp`, `fp`).
 
-    With `period`, `x` is interpreted modulo `period` before interpolating, `xp` is taken to
-    hold one period's worth of increasing sample points, and `left`/`right` are ignored (the
-    wrapped `x` always falls within the extended, periodic `xp`). This wraps `x` into
-    `[xp[0], xp[0] + period)` and interpolates it against `xp` extended by one point on each
-    side (`xp[-1] - period` before, `xp[0] + period` after, with `fp`'s matching end values), so
-    a wrapped `x` next to either edge of the period still interpolates against its true neighbor
-    across the wrap.
+    With `period`, `x` and `xp` are reduced modulo the period, `xp` is sorted, and one sample
+    from each end is repeated one period away so points near the wrap interpolate across it.
+    `left` and `right` are ignored.
     """
     if period is not None:
-        period = abs(period)
         if period == 0:
             raise ValueError("period must be a non-zero value")
-        xp = np.asarray(xp)
-        fp = np.asanyarray(fp)
-        origin = xp[0]
-        x = origin + np.mod(x - origin, period)
-        xp = np.concatenate(([xp[-1] - period], xp, [xp[0] + period]))
-        fp = np.concatenate(([fp[-1]], fp, [fp[0]]))
+        period = abs(period)
+        x = np.mod(x, period)
+        xp = np.mod(xp, period)
+        order = np.argsort(xp)
+        xp = xp[order]
+        fp = np.asanyarray(fp)[order]
+        xp = np.concatenate((xp[-1:] - period, xp, xp[0:1] + period))
+        fp = np.concatenate((fp[-1:], fp, fp[0:1]))
         left = None
         right = None
     if np.asanyarray(fp).dtype.kind == "c":

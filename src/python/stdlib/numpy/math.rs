@@ -44,37 +44,47 @@ enum Position {
     Below,
     /// `x > xp[last]`.
     Above,
-    /// `x == xp[index]`, and `index` is the last sample point (so there is no `index + 1` to
-    /// interpolate toward).
+    /// `x == xp[index]`.
     Exact(usize),
-    /// `x` is strictly between `xp[index]` and `xp[index + 1]`, `fraction` of the way across
-    /// (`0` at `xp[index]`); this also covers an exact match at any `index` other than the
-    /// last, since `fraction` is then exactly `0`.
-    Interval(usize, f64),
+    /// `x` is strictly between `xp[index]` and `xp[index + 1]`.
+    Interval(usize),
 }
 
-/// Locate `x` among sorted `xp`. On a tie, [`Position::Interval`]'s `index` is the *last*
-/// matching sample: `xp.partition_point` counts every `xp[i] <= x` from the left, so subtracting
-/// one lands on the rightmost equal element. This matches NumPy's own tie-break, confirmed
-/// black-box: `np.interp(2.0, [1, 2, 2, 3], [3, 2, 5, 0])` is `5.0`, `fp` at the second `2`, not
-/// the first.
+/// Locate `x` among sorted `xp`. On a tie the index is the *last* matching sample, as in
+/// NumPy: `np.interp(2.0, [1, 2, 2, 3], [3, 2, 5, 0])` is `5.0`, `fp` at the second `2`.
 fn locate(xp: &[f64], x: f64) -> Position {
     if x.is_nan() {
         return Position::Nan;
     }
-    let last = xp.len() - 1;
     if x < xp[0] {
         return Position::Below;
     }
-    if x > xp[last] {
+    if x > xp[xp.len() - 1] {
         return Position::Above;
     }
     let index = xp.partition_point(|&sample| sample <= x) - 1;
-    if index == last {
+    if xp[index] == x {
         Position::Exact(index)
     } else {
-        let fraction = (x - xp[index]) / (xp[index + 1] - xp[index]);
-        Position::Interval(index, fraction)
+        Position::Interval(index)
+    }
+}
+
+/// The line with `slope` through `(x0, y0)` and `(x1, y1)` evaluated at `x`, computed as NumPy
+/// does: from the left end, then from the right end if that is `NaN` (an infinite slope or
+/// sample), and `y0` if both are `NaN` but the samples are equal, such as two equal infinities.
+/// NumPy divides by the interval width for a real slope but multiplies by its reciprocal for
+/// each part of a complex one, so the caller supplies the slope.
+fn interpolate(x: f64, x0: f64, x1: f64, y0: f64, y1: f64, slope: f64) -> f64 {
+    let value = slope * (x - x0) + y0;
+    if !value.is_nan() {
+        return value;
+    }
+    let value = slope * (x - x1) + y1;
+    if value.is_nan() && y0 == y1 {
+        y0
+    } else {
+        value
     }
 }
 
@@ -199,8 +209,10 @@ fn interp_real(
             Position::Below => left.unwrap_or(fp_values[0]),
             Position::Above => right.unwrap_or(fp_values[last]),
             Position::Exact(index) => fp_values[index],
-            Position::Interval(index, fraction) => {
-                fp_values[index] + fraction * (fp_values[index + 1] - fp_values[index])
+            Position::Interval(index) => {
+                let (x0, x1) = (xp_values[index], xp_values[index + 1]);
+                let (y0, y1) = (fp_values[index], fp_values[index + 1]);
+                interpolate(value, x0, x1, y0, y1, (y1 - y0) / (x1 - x0))
             }
         })
         .collect::<Vec<_>>();
@@ -249,10 +261,15 @@ fn interp_complex(
                 Position::Below => left.unwrap_or(fp_values[0]),
                 Position::Above => right.unwrap_or(fp_values[last]),
                 Position::Exact(index) => fp_values[index],
-                Position::Interval(index, fraction) => (
-                    fp_values[index].0 + fraction * (fp_values[index + 1].0 - fp_values[index].0),
-                    fp_values[index].1 + fraction * (fp_values[index + 1].1 - fp_values[index].1),
-                ),
+                Position::Interval(index) => {
+                    let (x0, x1) = (xp_values[index], xp_values[index + 1]);
+                    let ((re0, im0), (re1, im1)) = (fp_values[index], fp_values[index + 1]);
+                    let inverse = 1.0 / (x1 - x0);
+                    (
+                        interpolate(value, x0, x1, re0, re1, (re1 - re0) * inverse),
+                        interpolate(value, x0, x1, im0, im1, (im1 - im0) * inverse),
+                    )
+                }
             };
             C128 { re, im }
         })

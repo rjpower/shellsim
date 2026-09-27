@@ -544,6 +544,15 @@ def test_object_sum_folds_with_python_add():
     assert np.array(["a", "b", "c"], dtype=object).sum() == "abc"
 
 
+def test_object_reductions_start_from_initial_or_the_first_element():
+    assert np.array([1, 2], dtype=object).sum(initial=10) == 13
+    assert np.array(["a", "b"], dtype=object).sum(initial="x") == "xab"
+    assert np.add.reduce(np.array([], dtype=object)) == 0
+    assert np.multiply.reduce(np.array([], dtype=object)) == 1
+    with pytest.raises(ValueError, match="to use a where mask one has to specify 'initial'"):
+        np.array(["a"], dtype=object).sum(where=[False])
+
+
 def test_object_sum_of_mixed_types_raises():
     with pytest.raises(TypeError) as info:
         np.array([1, "a"], dtype=object).sum()

@@ -409,6 +409,14 @@ def test_ufunc_reduce_accumulate_and_outer():
     assert_array_equal(np.multiply.outer([1, 2], [3, 4]), [[3, 4], [6, 8]])
 
 
+def test_ufunc_reduce_defaults_to_the_first_axis():
+    assert np.add.reduce(np.ones((2, 3)), keepdims=True).shape == (1, 3)
+    assert_array_equal(np.add.reduce(np.ones((0, 3))), [0.0, 0.0, 0.0])
+    assert np.maximum.reduce(np.ones((2, 0))).shape == (0,)
+    assert np.add.reduce(np.array(5)) == 5
+    assert np.add.reduce(np.ones((2, 3)), axis=None) == 6.0
+
+
 def test_ufunc_reduce_and_accumulate_error_cases():
     with pytest.raises(ValueError, match="zero-size array to reduction operation maximum"):
         np.maximum.reduce(np.array([], dtype=np.float64))
@@ -719,6 +727,27 @@ def test_interp_linear_with_clamped_and_explicit_edges():
     assert type(np.interp(2.5, xp, fp)) is np.float64
     assert_array_equal(np.interp([0, 1.5, 5], xp, fp), [3.0, 2.5, 0.0])
     assert_array_equal(np.interp([0, 5], xp, fp, left=-1, right=99), [-1.0, 99.0])
+
+
+def test_interp_rounds_like_numpy_and_survives_infinite_samples():
+    # A real slope divides by the interval width; a complex one multiplies by its reciprocal.
+    assert np.interp(0.5, [-2, 1], [3, 1]) == 1.3333333333333335
+    complex_fp = [0.7 - 1.4j, -4.2 + 0.7j / 3]
+    assert np.interp(2.51, [2.5, 3.1], complex_fp) == 0.6183333333333351 - 1.3727777777777783j
+    inf = np.inf
+    assert np.interp([0, 1, 1.5], [0, 1, 2], [0, inf, 1]).tolist() == [0.0, inf, inf]
+    assert np.interp(0.5, [0, 1], [inf, inf]) == inf
+    assert np.isnan(np.interp(0.5, [0, 1], [inf, -inf]))
+    assert np.interp(1e308, [-1e308, 1.5e308], [0, 1]) == 1.0
+
+
+def test_interp_with_period_wraps_and_sorts_the_samples():
+    x = [-180, -170, -185, 185, -10, -5, 0, 365]
+    result = np.interp(x, [190, -190, 350, -350], [5, 10, 3, 4], period=360)
+    assert result.tolist() == [7.5, 5.0, 8.75, 6.25, 3.0, 3.25, 3.5, 3.75]
+    assert np.interp(7.5, [1, 2, 3], [1, 2, 3], period=-5) == 2.5
+    with pytest.raises(ValueError, match="period must be a non-zero value"):
+        np.interp(1, [1, 2], [1, 2], period=0)
 
 
 def test_polyfit_recovers_exact_polynomials_and_polyval_evaluates():

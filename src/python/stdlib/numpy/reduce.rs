@@ -157,13 +157,10 @@ fn method_std(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
     python_method(runtime, "_std", receiver, args)
 }
 
-/// A ufunc's identity, per name, since `ufunc.reduce`/`accumulate` on an arbitrary ufunc index
-/// dispatch by name lookup rather than a static table position.
-fn ufunc_named(name: &str) -> &'static UfuncDef {
-    UFUNCS
-        .iter()
-        .find(|candidate| candidate.name == name)
-        .unwrap_or_else(|| unreachable!("{name} is a registered ufunc"))
+/// The registered ufunc called `name`, for reductions that are fixed to one ufunc such as `sum`
+/// and `trace`.
+pub(in crate::python) fn ufunc_named(name: &str) -> &'static UfuncDef {
+    &UFUNCS[ufunc::named(name)]
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -189,7 +186,12 @@ pub(in crate::python) fn ufunc_reduce(
     let ufunc = &UFUNCS[index];
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("array"))?;
-    let axes = args::axes(runtime, bound.get("axis"), array.ndim())?;
+    // Unlike `np.sum`, `ufunc.reduce` reduces only the first axis unless told otherwise; an
+    // explicit `axis=None` reduces every axis.
+    let axes = match bound.get("axis") {
+        None if array.ndim() > 0 => Axes::Some(vec![0]),
+        axis => args::axes(runtime, axis, array.ndim())?,
+    };
     let dtype = args::optional_dtype(runtime, bound.get("dtype"))?;
     let out = out_array(runtime, bound.get("out"))?;
     let keepdims = args::flag(runtime, bound.get("keepdims"), false)?;
@@ -979,7 +981,9 @@ fn identity_object(op: NumericOp) -> Option<PyValue> {
 }
 
 /// Object arrays reduce with the ufunc's own Python operator ([`ufunc::object_element`]),
-/// element by element; there is no pairwise summation for `object` dtype.
+/// element by element, starting from `initial` or else the first element, so
+/// `np.array(["a", "b"], dtype=object).sum()` is `"ab"`. Only an empty run falls back to the
+/// ufunc's identity. There is no pairwise summation for `object` dtype.
 fn reduce_object(
     runtime: &mut dyn PyRuntime,
     ufunc: &UfuncDef,
@@ -987,17 +991,7 @@ fn reduce_object(
     split: &AxisSplit,
     values: &[PyValue],
     mask: Option<&[bool]>,
-) -> PyResult<Vec<PyValue>> {
-    reduce_object_with(runtime, ufunc, identity_object(op), split, values, mask)
-}
-
-fn reduce_object_with(
-    runtime: &mut dyn PyRuntime,
-    ufunc: &UfuncDef,
-    identity: Option<PyValue>,
-    split: &AxisSplit,
-    values: &[PyValue],
-    mask: Option<&[bool]>,
+    initial: Option<PyValue>,
 ) -> PyResult<Vec<PyValue>> {
     let (kept_count, reduce_count) = (split.kept_count(), split.reduce_count());
     let mut output = Vec::with_capacity(kept_count);
@@ -1005,11 +999,11 @@ fn reduce_object_with(
     for bucket in 0..kept_count {
         let run = window(values, mask, bucket, reduce_count, &mut storage);
         let mut elements = run.iter().copied();
-        let mut accumulator = match identity {
-            Some(identity) => identity,
-            None => elements
-                .next()
-                .ok_or_else(|| no_identity_error(ufunc.name))?,
+        let Some(mut accumulator) = initial
+            .or_else(|| elements.next())
+            .or_else(|| identity_object(op))
+        else {
+            return Err(no_identity_error(ufunc.name));
         };
         for value in elements {
             accumulator = ufunc::object_element(runtime, ufunc, &[accumulator, value])?;
@@ -1019,11 +1013,11 @@ fn reduce_object_with(
     Ok(output)
 }
 
-/// The shared body of `ufunc.reduce`, `sum`, `prod`, `max`/`amax`, `min`/`amin`, `any`, and
-/// `all`: resolve the dtype, split the axes, read `where=` and `initial=`, combine every
+/// The shared body of `ufunc.reduce`, `sum`, `prod`, `max`/`amax`, `min`/`amin`, `any`, `all`,
+/// and `trace`: resolve the dtype, split the axes, read `where=` and `initial=`, combine every
 /// output cell's run, and assemble the result (see [`finish_reduction`]).
 #[allow(clippy::too_many_arguments)]
-fn reduce_call(
+pub(in crate::python) fn reduce_call(
     runtime: &mut dyn PyRuntime,
     ufunc: &UfuncDef,
     array: Array,
@@ -1044,7 +1038,10 @@ fn reduce_call(
         convert::cast_array(runtime, &array, dtype, false)?
     };
     let mask = where_array(runtime, where_)?;
-    if mask.is_some() && initial.is_none() && !has_identity(op) {
+    // An object reduction starts from its first element, so NumPy treats it as having no
+    // identity for `where=`.
+    let has_identity = has_identity(op) && dtype.kind() != Kind::Object;
+    if mask.is_some() && initial.is_none() && !has_identity {
         return Err(where_needs_initial_error(ufunc.name));
     }
     let order = split.reading_order();
@@ -1064,6 +1061,7 @@ fn reduce_call(
                 &split,
                 &values,
                 mask_values.as_deref(),
+                initial,
             )?;
             (PyArrayBuffer::Values(output), FpFlags::default())
         }

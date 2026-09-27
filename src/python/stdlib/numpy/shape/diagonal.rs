@@ -11,8 +11,7 @@ use super::super::super::super::native::{CallArgs, PyError, PyResult, PyRuntime,
 use super::super::args::{self, Axes, Signature};
 use super::super::array::{self, Array};
 use super::super::convert;
-use super::super::reduce::{self, ReduceOptions};
-use super::super::ufunc;
+use super::super::reduce;
 
 /// A read-only view of the `axis1`/`axis2` diagonal of `array` at `offset`, with `axis1` and
 /// `axis2` removed and the diagonal appended as the last axis — NumPy's own placement,
@@ -93,9 +92,9 @@ pub(super) fn method_diagonal(
 }
 
 /// `np.trace`: the sum of one diagonal. Since [`diagonal_view`] always appends the diagonal as
-/// the last axis, this is [`reduce::reduce`] of that one axis with the `add` ufunc — the same
-/// engine `np.sum` uses, so `dtype=`/`out=` and the empty-diagonal-sums-to-zero identity behave
-/// exactly as they do for `sum`.
+/// the last axis, this is [`reduce::reduce_call`] of that one axis with the `add` ufunc, the
+/// same engine `np.sum` uses, so `dtype=`/`out=` and the empty-diagonal-sums-to-zero identity
+/// behave exactly as they do for `sum`.
 fn trace_array(
     runtime: &mut dyn PyRuntime,
     array: &Array,
@@ -107,17 +106,16 @@ fn trace_array(
 ) -> PyResult {
     let diagonal = diagonal_view(runtime, array, offset, axis1, axis2)?;
     let axis = diagonal.ndim() - 1;
-    reduce::reduce(
+    reduce::reduce_call(
         runtime,
-        ufunc::named("add"),
-        &diagonal,
-        &ReduceOptions {
-            axes: Axes::Some(vec![axis]),
-            dtype,
-            out,
-            keepdims: false,
-            initial: None,
-        },
+        reduce::ufunc_named("add"),
+        diagonal,
+        Axes::Some(vec![axis]),
+        dtype,
+        out,
+        false,
+        None,
+        None,
     )
 }
 
