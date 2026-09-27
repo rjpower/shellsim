@@ -2,10 +2,11 @@
 //!
 //! Lists, tuples, dicts and sets compare their elements, find keys and answer `in` with the
 //! rule `x is y or x == y`, where `==` is the full rich-comparison protocol. A user class's
-//! `__eq__` therefore holds inside containers: `[Fraction(1, 2)] == [0.5]`, and an equal key
-//! finds a dict entry. Builtin containers compare element by element through the same rule.
-//! Values that cannot run user code, such as numbers and strings, keep the structural fast path
-//! in `protocol::equals`.
+//! `__eq__`, or a native type's equality slot such as a NumPy dtype's, therefore holds inside
+//! containers: `[Fraction(1, 2)] == [0.5]`, `(np.dtype("f8"),) == (np.float64,)`, and an equal
+//! key finds a dict entry. Builtin containers compare element by element through the same rule.
+//! Values whose types define no equality slot, such as numbers and strings, keep the structural
+//! fast path in `protocol::equals`.
 //!
 //! Nesting is bounded, so comparing two distinct self-containing lists raises `RecursionError`
 //! as it does in CPython, instead of recursing without limit.
@@ -13,7 +14,7 @@
 use super::super::ast::ComparisonOperator;
 use super::super::heap::{Object, ObjectId};
 use super::super::protocol;
-use super::{Value, Vm};
+use super::{Slot, Value, Vm};
 
 /// Nesting bound for builtin container comparison, matching the hash nesting bound.
 const MAX_EQUALITY_DEPTH: usize = 256;
@@ -31,8 +32,9 @@ enum EqualityKind {
     Plain,
     /// A builtin list, tuple, dict or set, compared element by element.
     Container,
-    /// An instance of a user class, which may define `__eq__`.
-    Instance,
+    /// A user class instance, which may define `__eq__`, or a value whose native type has an
+    /// equality slot.
+    Rich,
 }
 
 impl Vm<'_> {
@@ -51,7 +53,7 @@ impl Vm<'_> {
             return Ok(true);
         }
         match (self.equality_kind(left)?, self.equality_kind(right)?) {
-            (EqualityKind::Instance, _) | (_, EqualityKind::Instance) => {
+            (EqualityKind::Rich, _) | (_, EqualityKind::Rich) => {
                 self.compare_truth(ComparisonOperator::Equal, left, right)
             }
             (EqualityKind::Plain, EqualityKind::Plain) => {
@@ -106,18 +108,23 @@ impl Vm<'_> {
     }
 
     fn equality_kind(&self, value: &Value) -> Result<EqualityKind, String> {
-        let Some(id) = value.object_id() else {
-            return Ok(EqualityKind::Plain);
-        };
-        Ok(match self.state.heap.get(id)? {
-            Object::Instance { .. } => EqualityKind::Instance,
-            Object::List(_)
-            | Object::Tuple(_)
-            | Object::Dict(_)
-            | Object::DefaultDict { .. }
-            | Object::Set(_)
-            | Object::FrozenSet(_) => EqualityKind::Container,
-            _ => EqualityKind::Plain,
+        if let Some(id) = value.object_id() {
+            match self.state.heap.get(id)? {
+                Object::Instance { .. } => return Ok(EqualityKind::Rich),
+                Object::List(_)
+                | Object::Tuple(_)
+                | Object::Dict(_)
+                | Object::DefaultDict { .. }
+                | Object::Set(_)
+                | Object::FrozenSet(_) => return Ok(EqualityKind::Container),
+                _ => {}
+            }
+        }
+        let type_id = self.type_id(value)?;
+        Ok(if self.state.types.slot(type_id, Slot::Equal)?.is_some() {
+            EqualityKind::Rich
+        } else {
+            EqualityKind::Plain
         })
     }
 

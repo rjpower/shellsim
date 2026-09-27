@@ -256,6 +256,25 @@ def test_r_concatenates_along_the_first_axis():
     assert np.r_[np.ones((1, 2)), np.zeros((2, 2))].shape == (3, 2)
 
 
+def test_mgrid_and_ogrid_expand_slices_to_coordinate_grids():
+    assert np.mgrid[0:1:5j].tolist() == [0.0, 0.25, 0.5, 0.75, 1.0]
+    assert np.mgrid[0:3].dtype == np.int64
+    assert np.mgrid[0:3,].shape == (1, 3)
+    grid = np.mgrid[0:3, 0:1:3j]
+    assert (grid.shape, grid.dtype) == ((2, 3, 3), np.float64)
+    assert grid[1, 0].tolist() == [0.0, 0.5, 1.0]
+    rows, cols = np.ogrid[0:3, 0:1:3j]
+    assert (rows.shape, cols.shape, rows.dtype) == ((3, 1), (1, 3), np.float64)
+    with pytest.raises(AttributeError):
+        np.mgrid[3]
+
+
+def test_grid_points_step_from_start_while_r_uses_linspace():
+    points = [0.001, 0.5508333333333333, 1.1006666666666665, 1.6504999999999996, 2.200333333333333, 2.7501666666666664]
+    assert np.mgrid[1e-3:3.3:7j].tolist() == points + [3.2999999999999994]
+    assert np.r_[1e-3:3.3:7j].tolist() == points + [3.3]
+
+
 def test_c_stands_1d_items_as_columns():
     assert np.c_[np.array([1, 2]), np.array([3, 4])].tolist() == [[1, 3], [2, 4]]
     assert np.c_[np.ones((2, 2)), np.array([5, 6])].tolist() == [[1.0, 1.0, 5.0], [1.0, 1.0, 6.0]]

@@ -417,11 +417,23 @@ pub(in crate::python) fn arange(runtime: &mut dyn PyRuntime, args: CallArgs) -> 
     array::reserve_elements(runtime, dtype, length)?;
     runtime.charge_cpu(length as u64 + 1)?;
     let integral = inferred == DType::INT64 && (dtype.is_integer() || dtype.kind() == Kind::Object);
+    // NumPy fills a float range from its first two stored elements, so element `i` is
+    // `start + i * ((start + step) - start)` in the result's precision, which can differ from
+    // `start + i * step` in the last bit.
+    let narrow = |value: f64| {
+        if dtype == DType::FLOAT32 {
+            f64::from(value as f32)
+        } else {
+            value
+        }
+    };
+    let first = narrow(start);
+    let delta = narrow(narrow(start + step) - first);
     let values = (0..length).map(|index| {
         if integral {
             Number::Int(start as i64 + index as i64 * step as i64)
         } else {
-            Number::Float(start + index as f64 * step)
+            Number::Float(first + index as f64 * delta)
         }
     });
     Ok(numbers_array(runtime, dtype, vec![length], values)?.value())

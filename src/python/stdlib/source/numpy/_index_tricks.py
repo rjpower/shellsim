@@ -133,16 +133,23 @@ s_ = _IndexExpression(wrap_single=False)
 index_exp = _IndexExpression(wrap_single=True)
 
 
-def _grid_axis(part, want_complex_as_count):
-    if isinstance(part, slice):
-        start = 0 if part.start is None else part.start
-        stop = part.stop
-        step = 1 if part.step is None else part.step
-        if want_complex_as_count and isinstance(step, complex):
-            count = int(abs(step))
-            return np.linspace(start, stop, count)
-        return np.arange(start, stop, step)
-    raise TypeError("mgrid/ogrid indices must be slices")
+def _slice_values(part, grid):
+    """The values `part` stands for in ``mgrid``/``ogrid``/``r_``: ``arange(start, stop, step)``,
+    or ``count`` evenly spaced points from start to stop inclusive when the step is imaginary
+    (``0:1:5j``). The grids space those points as ``start + i * delta`` while ``r_`` uses
+    ``linspace``, so the two can differ in the last bit, as they do in NumPy."""
+    if not isinstance(part, slice):
+        # NumPy reads the step of every grid key, so a non-slice fails on that attribute.
+        raise AttributeError(f"'{type(part).__name__}' object has no attribute 'step'")
+    start = 0 if part.start is None else part.start
+    step = 1 if part.step is None else part.step
+    if not isinstance(step, complex):
+        return np.arange(start, part.stop, step)
+    count = int(abs(step))
+    if not grid:
+        return np.linspace(start, part.stop, count)
+    delta = (part.stop - start) / (count - 1) if count > 1 else 0.0
+    return start + np.arange(count) * delta
 
 
 class _MeshGrid:
@@ -152,14 +159,16 @@ class _MeshGrid:
         self._sparse = sparse
 
     def __getitem__(self, key):
-        parts = key if isinstance(key, tuple) else (key,)
-        axes = [_grid_axis(part, want_complex_as_count=True) for part in parts]
+        if not isinstance(key, tuple):
+            return _slice_values(key, grid=True)
+        axes = [_slice_values(part, grid=True) for part in key]
+        dtype = np.result_type(*axes)
         ndim = len(axes)
         shaped = []
         for axis, values in enumerate(axes):
             shape = [1] * ndim
             shape[axis] = values.size
-            shaped.append(values.reshape(shape))
+            shaped.append(values.astype(dtype).reshape(shape))
         if self._sparse:
             return tuple(shaped)
         broadcast_shape = np.broadcast_shapes(*(a.shape for a in shaped))
@@ -182,7 +191,7 @@ def _stack_class(column):
             arrays = []
             for part in parts:
                 if isinstance(part, slice):
-                    item = _grid_axis(part, want_complex_as_count=True)
+                    item = _slice_values(part, grid=False)
                 elif isinstance(part, str):
                     raise NotImplementedError("np.r_/np.c_ string directives are not supported")
                 else:

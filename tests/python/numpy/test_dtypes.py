@@ -90,6 +90,14 @@ def test_dtype_equality_with_aliases_and_types():
     assert np.dtype("float32") != np.dtype("float64")
 
 
+def test_containers_compare_dtypes_and_arrays_through_their_equality():
+    assert (np.dtype("f8"), 1) == (np.float64, 1)
+    assert [np.float64] == [np.dtype("f8")]
+    assert {"x": np.dtype("i4")} == {"x": np.int32}
+    assert np.float64 in [np.dtype("f8")]
+    assert [np.array(1), np.float64(1.5)] == [1, 1.5]
+
+
 def test_dtype_str_and_repr():
     d = np.dtype("float32")
     assert str(d) == "float32"

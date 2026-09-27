@@ -276,6 +276,13 @@ def test_arange_float_steps():
     assert_allclose(inexact, [0.0, 0.3, 0.6, 0.9])
 
 
+def test_arange_steps_by_the_difference_of_its_first_two_elements():
+    assert np.arange(0.1, 1, 0.3).tolist() == [0.1, 0.4, 0.7000000000000001]
+    assert np.arange(1, 0, -0.1).tolist()[-3:] == [0.30000000000000016, 0.20000000000000018, 0.1000000000000002]
+    single = np.arange(0.5, 3.0, 0.7, dtype=np.float32).tolist()
+    assert single == [0.5, 1.2000000476837158, 1.9000000953674316, 2.6000001430511475]
+
+
 def test_arange_accepts_dtype():
     assert np.arange(3, dtype=np.int8).dtype == np.dtype("int8")
     a = np.arange(1, 3, dtype=float)
