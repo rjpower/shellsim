@@ -1,12 +1,15 @@
-"""Statistics NumPy writes in Python on top of ufunc reductions.
+"""Array methods and statistics NumPy writes on top of ufuncs.
 
-``mean``, ``var``, ``std`` and ``ptp`` follow ``numpy/_core/_methods.py``; ``average`` and
-``count_nonzero`` follow ``numpy/lib/_function_base_impl.py`` and ``numpy/_core/numeric.py``.
+``mean``, ``var``, ``std``, ``ptp`` and ``clip`` follow ``numpy/_core/_methods.py``; ``round``
+follows ``PyArray_Round`` in ``numpy/_core/src/multiarray/calculation.c``, which is itself a
+sequence of ufunc calls; ``average`` and ``count_nonzero`` follow
+``numpy/lib/_function_base_impl.py`` and ``numpy/_core/numeric.py``.
 Keeping NumPy's structure keeps its result dtypes, warnings, and float16 handling: integer and
 boolean inputs compute in ``float64``, ``float16`` accumulates in ``float32``, and an empty slice
 warns and gives NaN.
 """
 
+import operator
 import warnings
 
 from _numpy import (
@@ -15,7 +18,10 @@ from _numpy import (
     asanyarray,
     bool_,
     complexfloating,
+    copyto,
+    empty,
     float16,
+    float64,
     floating,
     integer,
     intp,
@@ -24,7 +30,9 @@ from _numpy import (
     minimum,
     multiply,
     ndarray,
+    positive,
     result_type,
+    rint,
     sqrt,
     subtract,
     true_divide,
@@ -218,3 +226,85 @@ def count_nonzero(a, axis=None, *, keepdims=False):
     if axis is None and not keepdims:
         return int(_sum(nonzero))
     return _sum(nonzero, axis=axis, dtype=intp, keepdims=keepdims)
+
+
+def _power_of_ten(n):
+    """``power_of_ten`` in ``calculation.c``: exact up to 1e8, then repeated scaling by ten."""
+    if n < 9:
+        return (1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8)[n]
+    ret = 1e9
+    while n > 9:
+        ret *= 10.0
+        n -= 1
+    return ret
+
+
+def _round_array(a, decimals, out):
+    """``PyArray_Round``: scale, round half to even with ``rint``, and scale back."""
+    if out is not None and out.size != a.size:
+        raise ValueError("invalid output shape")
+    if a.dtype.kind == "c":
+        arr = out if out is not None else a.copy()
+        arr.real[...] = _round_array(asanyarray(a.real), decimals, None)
+        arr.imag[...] = _round_array(asanyarray(a.imag), decimals, None)
+        return arr
+    is_integer = a.dtype.kind in "iu"
+    if decimals >= 0:
+        if is_integer:
+            if out is not None:
+                copyto(out, a)
+                return out
+            return a
+        if decimals == 0:
+            return rint(a) if out is None else rint(a, out)
+        op1, op2 = multiply, true_divide
+    else:
+        op1, op2 = true_divide, multiply
+        decimals = -decimals
+    ret_int = False
+    if out is None:
+        # Integers round through float64 and cast back.
+        ret_int = is_integer
+        out = empty(a.shape, float64 if is_integer else a.dtype)
+    f = _power_of_ten(decimals)
+    ret = op1(a, f, out)
+    rint(ret, ret)
+    op2(ret, f, ret)
+    if ret_int:
+        return ret.astype(a.dtype)
+    return ret
+
+
+def _round(a, decimals=0, out=None):
+    """``ndarray.round``: a 0-d result without ``out`` is returned as a scalar."""
+    result = _round_array(a, operator.index(decimals), out)
+    if out is None and isinstance(result, ndarray) and result.ndim == 0:
+        return result[()]
+    return result
+
+
+def _clip(a, min=None, max=None, out=None, **kwargs):
+    if a.dtype.kind in "iu":
+        # Python int bounds beyond the dtype's range are dropped rather than converted, as
+        # NEP 50 does no value-based promotion.
+        bits = a.dtype.itemsize * 8
+        low, high = (0, (1 << bits) - 1) if a.dtype.kind == "u" else (
+            -(1 << (bits - 1)),
+            (1 << (bits - 1)) - 1,
+        )
+        if type(min) is int and min <= low:
+            min = None
+        if type(max) is int and max >= high:
+            max = None
+    if min is None and max is None:
+        return positive(a, out=out, **kwargs)
+    if min is None:
+        return minimum(a, max, out=out, **kwargs)
+    if max is None:
+        return maximum(a, min, out=out, **kwargs)
+    # NumPy's `clip` ufunc resolves all three operands together; `minimum(maximum(...))`
+    # promotes the same way and propagates NaN from any operand as its loops do.
+    if out is None:
+        return minimum(maximum(a, min, **kwargs), max, **kwargs)
+    maximum(a, min, out=out, **kwargs)
+    return minimum(out, max, out=out, **kwargs)

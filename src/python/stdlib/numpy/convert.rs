@@ -97,7 +97,7 @@ impl Leaf {
 
 /// Combine two inferred dtypes the way array construction does: strings absorb numbers at
 /// their printed width instead of failing.
-fn infer_promote(left: DType, right: DType) -> PyResult<DType> {
+pub(in crate::python) fn infer_promote(left: DType, right: DType) -> PyResult<DType> {
     match (left.category(), right.category()) {
         (Category::Str, Category::Str) | (Category::Object, _) | (_, Category::Object) => {
             dtype::promote(left, right)

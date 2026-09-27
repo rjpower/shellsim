@@ -37,6 +37,7 @@ mod products;
 mod random;
 mod reduce;
 mod scalar;
+mod select;
 mod shape;
 mod sort;
 mod strings;
@@ -74,11 +75,12 @@ pub(in crate::python) fn value_kinds() -> impl Iterator<Item = &'static ValueKin
 }
 
 /// Attribute tables installed on `numpy.ndarray`, core first.
-pub(in crate::python) fn array_types() -> [&'static NativeTypeDef; 7] {
+pub(in crate::python) fn array_types() -> [&'static NativeTypeDef; 8] {
     [
         &ndarray::ARRAY_TYPE,
         &reduce::ARRAY_METHODS,
         &shape::ARRAY_METHODS,
+        &select::ARRAY_METHODS,
         &sort::ARRAY_METHODS,
         &products::ARRAY_METHODS,
         &math::ARRAY_METHODS,
@@ -145,6 +147,9 @@ static MODULE: ModuleDef = ModuleDef {
         function("size", construct::size),
         function("take", construct::take),
         function("put", construct::put),
+        function("nonzero", select::module_nonzero),
+        function("where", select::module_where),
+        function("copyto", select::module_copyto),
         function("result_type", construct::result_type),
         function("promote_types", construct::promote_types),
         function("can_cast", construct::can_cast),

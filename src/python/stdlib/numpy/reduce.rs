@@ -1202,7 +1202,7 @@ fn method_argmin(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
 }
 
 /// Call a function of the frozen `numpy._methods` module with the receiver first.
-fn python_method(
+pub(in crate::python) fn python_method(
     runtime: &mut dyn PyRuntime,
     name: &str,
     receiver: PyValue,

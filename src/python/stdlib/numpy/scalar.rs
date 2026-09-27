@@ -294,18 +294,96 @@ const SCALAR_SLOTS: ValueKindSlots = ValueKindSlots {
     greater_equal: Some(super::ufunc::slot_greater_equal),
 };
 
-static GENERIC_METHODS: &[MethodDef] = &[
-    method("item", method_item),
-    method("tolist", method_item),
-    method("conjugate", method_conjugate),
-    method("conj", method_conjugate),
-    method("__int__", method_int),
-    method("__float__", method_float),
-    method("__complex__", method_complex),
-    method("__round__", method_round),
-];
+/// The `numpy.generic` methods NumPy implements by converting the scalar to a 0-d array,
+/// calling the array method, and unwrapping a 0-d result (`gentype_generic_method`).
+macro_rules! generic_methods {
+    ([$($fixed:expr),* $(,)?], [$($function:ident => $name:literal),* $(,)?]) => {
+        $(
+            fn $function(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+                forward_to_array(runtime, receiver, $name, args)
+            }
+        )*
+        static GENERIC_METHODS: &[MethodDef] = &[$($fixed,)* $(method($name, $function),)*];
+    };
+}
+
+generic_methods!(
+    [
+        method("item", method_item),
+        method("tolist", method_item),
+        method("conjugate", method_conjugate),
+        method("conj", method_conjugate),
+        method("__int__", method_int),
+        method("__float__", method_float),
+        method("__complex__", method_complex),
+        method("__round__", method_round),
+    ],
+    [
+        forward_all => "all",
+        forward_any => "any",
+        forward_argmax => "argmax",
+        forward_argmin => "argmin",
+        forward_argsort => "argsort",
+        forward_astype => "astype",
+        forward_clip => "clip",
+        forward_copy => "copy",
+        forward_cumprod => "cumprod",
+        forward_cumsum => "cumsum",
+        forward_diagonal => "diagonal",
+        forward_fill => "fill",
+        forward_flatten => "flatten",
+        forward_max => "max",
+        forward_mean => "mean",
+        forward_min => "min",
+        forward_nonzero => "nonzero",
+        forward_prod => "prod",
+        forward_put => "put",
+        forward_ravel => "ravel",
+        forward_repeat => "repeat",
+        forward_reshape => "reshape",
+        forward_round => "round",
+        forward_searchsorted => "searchsorted",
+        forward_sort => "sort",
+        forward_squeeze => "squeeze",
+        forward_std => "std",
+        forward_sum => "sum",
+        forward_swapaxes => "swapaxes",
+        forward_take => "take",
+        forward_tobytes => "tobytes",
+        forward_trace => "trace",
+        forward_transpose => "transpose",
+        forward_var => "var",
+        forward_view => "view",
+    ]
+);
+
+/// Call the array method `name` on `receiver` as a 0-d array; a 0-d array result becomes a
+/// scalar again, as `PyArray_Return` does.
+fn forward_to_array(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    name: &str,
+    args: CallArgs,
+) -> PyResult {
+    let array = super::convert::as_array(runtime, receiver)?;
+    let method = runtime
+        .get_attribute(array.value(), name)?
+        .ok_or_else(|| PyError::runtime_error(format!("numpy.ndarray.{name} is missing")))?;
+    let result = runtime.call_value(method, args)?;
+    if runtime.native_kind(&result)? == Some(super::super::super::native::PyNativeKind::Array) {
+        let result = super::array::Array::from_value(runtime, result)?;
+        if result.ndim() == 0 {
+            return super::convert::element_to_scalar(runtime, &result, result.view.offset);
+        }
+        return Ok(result.value());
+    }
+    Ok(result)
+}
 
 static GENERIC_GETTERS: &[GetterDef] = &[
+    getter("T", get_self),
+    getter("base", get_base),
+    getter("strides", get_shape),
     getter("dtype", get_dtype),
     getter("real", get_real),
     getter("imag", get_imag),
@@ -670,6 +748,14 @@ fn get_imag(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
 fn get_itemsize(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     let (dtype, _) = receiver_number(runtime, &receiver)?;
     Ok(Value::Int(dtype.itemsize() as i64))
+}
+
+fn get_self(_runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    Ok(receiver)
+}
+
+fn get_base(_runtime: &mut dyn PyRuntime, _receiver: PyValue) -> PyResult {
+    Ok(Value::None)
 }
 
 fn get_ndim(_runtime: &mut dyn PyRuntime, _receiver: PyValue) -> PyResult {

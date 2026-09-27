@@ -515,6 +515,18 @@ fn equals_inner(
                     sequence_equal(heap, left, right, active)?
                 }
                 (
+                    Object::Slice {
+                        start: left_start,
+                        stop: left_stop,
+                        step: left_step,
+                    },
+                    Object::Slice {
+                        start: right_start,
+                        stop: right_stop,
+                        step: right_step,
+                    },
+                ) => (left_start, left_stop, left_step) == (right_start, right_stop, right_step),
+                (
                     Object::Range {
                         start: left_start,
                         stop: left_stop,

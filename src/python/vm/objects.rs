@@ -837,6 +837,19 @@ impl Vm<'_> {
     }
 
     /// Pop one slice bound. An explicit `None` bound is the same as an omitted one.
+    /// One `slice()` argument. Slices store machine-integer bounds, so other bound objects,
+    /// which CPython keeps as-is, are rejected explicitly.
+    fn slice_bound(&mut self, value: &Value) -> Result<Option<i64>, String> {
+        if value.is_none() {
+            return Ok(None);
+        }
+        protocol::int_value(&self.state.heap, value)
+            .map(Some)
+            .ok_or_else(|| {
+                "slice() bounds other than integers and None are not supported".to_string()
+            })
+    }
+
     fn pop_slice_bound(&mut self, present: bool, name: &str) -> Result<Option<i64>, String> {
         if !present {
             return Ok(None);
@@ -2026,6 +2039,30 @@ impl Vm<'_> {
                 expect_arity(&arguments, 0, 0)?;
                 self.allocate_object(Object::Bare)?
             }
+            BuiltinType::Slice => {
+                if arguments.is_empty() || arguments.len() > 3 {
+                    return Err(self.raise_exception(
+                        "TypeError",
+                        format!(
+                            "slice expected at least 1 argument, got {}",
+                            arguments.len()
+                        ),
+                    ));
+                }
+                let mut bounds = arguments
+                    .iter()
+                    .map(|value| self.slice_bound(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if bounds.len() == 1 {
+                    bounds.insert(0, None);
+                }
+                bounds.resize(3, None);
+                self.allocate_object(Object::Slice {
+                    start: bounds[0],
+                    stop: bounds[1],
+                    step: bounds[2],
+                })?
+            }
             BuiltinType::None => {
                 expect_arity(&arguments, 0, 0)?;
                 Value::None
@@ -2412,7 +2449,10 @@ impl Vm<'_> {
     /// The modeled exception class that `class` is or derives from: the class itself for a
     /// builtin exception type, the recorded exception base for a user exception class, and
     /// `None` for anything else.
-    fn exception_class_base(&self, class: &Value) -> Result<Option<&'static str>, String> {
+    pub(super) fn exception_class_base(
+        &self,
+        class: &Value,
+    ) -> Result<Option<&'static str>, String> {
         if let Some(NativeValue::ExceptionType(ExceptionType(name))) = class.native_value() {
             return Ok(Some(name));
         }

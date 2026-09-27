@@ -244,6 +244,7 @@ pub enum Opcode {
     ClearException,
     Reraise,
     Raise(bool),
+    RaiseFrom,
     Yield,
     AwaitResult,
     WithEnter,
@@ -353,6 +354,8 @@ pub enum Operation {
     ClearException,
     Reraise,
     Raise(bool),
+    /// `raise exception from cause`: pops the cause, then the exception.
+    RaiseFrom,
     /// Suspend a generator frame and return the value on top of the stack.
     Yield,
     /// Unwrap the scheduler outcome sent into a suspended coroutine.
@@ -543,6 +546,7 @@ impl CodeBuilder {
             Operation::ClearException => Opcode::ClearException,
             Operation::Reraise => Opcode::Reraise,
             Operation::Raise(cause) => Opcode::Raise(cause),
+            Operation::RaiseFrom => Opcode::RaiseFrom,
             Operation::Yield => Opcode::Yield,
             Operation::AwaitResult => Opcode::AwaitResult,
             Operation::WithEnter => Opcode::WithEnter,

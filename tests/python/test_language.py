@@ -854,3 +854,41 @@ def test_attribute_stores_on_builtin_values_raise_attribute_error():
         )
     else:
         raise AssertionError("int accepted an attribute")
+
+
+def test_raise_from_raises_the_new_exception_and_validates_the_cause():
+    try:
+        try:
+            int("x")
+        except ValueError as error:
+            raise RuntimeError("wrapped") from error
+    except RuntimeError as error:
+        assert str(error) == "wrapped"
+    else:
+        raise AssertionError("raise from did not raise")
+    try:
+        raise ValueError("plain") from None
+    except ValueError as error:
+        assert str(error) == "plain"
+    try:
+        raise ValueError("bad cause") from 1
+    except TypeError as error:
+        assert str(error) == "exception causes must derive from BaseException"
+    else:
+        raise AssertionError("a non-exception cause was accepted")
+
+
+def test_slice_builtin_builds_slices():
+    assert slice(3) == slice(None, 3, None)
+    part = slice(1, 5, 2)
+    assert (part.start, part.stop, part.step) == (1, 5, 2)
+    assert isinstance(part, slice) and type(part) is slice
+    assert repr(part) == "slice(1, 5, 2)"
+    assert [0, 1, 2, 3, 4, 5][part] == [1, 3]
+    assert "abcdef"[slice(None, None, -2)] == "fdb"
+    try:
+        slice()
+    except TypeError as error:
+        assert str(error) == "slice expected at least 1 argument, got 0"
+    else:
+        raise AssertionError("slice() accepted no arguments")

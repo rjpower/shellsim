@@ -15,7 +15,59 @@ from _numpy_math import *
 from _numpy_io import *
 from _numpy_print import *
 from numpy._errstate import errstate, geterr, geterrcall, seterr, seterrcall
+from numpy._getlimits import finfo, iinfo
 from numpy._numeric import allclose, array_equal, array_equiv, isclose
+from numpy._shape_base import (
+    append,
+    array_split,
+    atleast_1d,
+    atleast_2d,
+    atleast_3d,
+    column_stack,
+    diff,
+    dsplit,
+    dstack,
+    fliplr,
+    flipud,
+    hsplit,
+    hstack,
+    resize,
+    roll,
+    rot90,
+    split,
+    stack,
+    tile,
+    tri,
+    tril,
+    triu,
+    vsplit,
+    vstack,
+)
+from numpy._function_base import (
+    angle,
+    argwhere,
+    around,
+    clip,
+    convolve,
+    correlate,
+    cross,
+    fix,
+    flatnonzero,
+    gradient,
+    imag,
+    interp,
+    iscomplex,
+    iscomplexobj,
+    isneginf,
+    isposinf,
+    isreal,
+    isrealobj,
+    nan_to_num,
+    polyval,
+    real,
+    real_if_close,
+    round,
+)
 from numpy._methods import average, count_nonzero, mean, ptp, std, var
 from numpy._nanfunctions import (
     nanargmax,
@@ -34,6 +86,8 @@ from numpy._nanfunctions import (
 __version__ = "2.5.3"
 
 newaxis = None
+amax = max
+amin = min
 
 
 class flatiter:
@@ -66,7 +120,7 @@ class _flagsobj:
     """``ndarray.flags``: memory-layout flags. Setting ``writeable`` updates the array."""
 
     def __init__(self, array):
-        object.__setattr__(self, "_array", array)
+        self._array = array
 
     @property
     def writeable(self):
@@ -92,6 +146,14 @@ class _flagsobj:
     @property
     def aligned(self):
         return True
+
+    @property
+    def fnc(self):
+        return self.f_contiguous and not self.c_contiguous
+
+    @property
+    def forc(self):
+        return self.f_contiguous or self.c_contiguous
 
     def __getitem__(self, key):
         names = {
@@ -128,5 +190,6 @@ from _numpy import _c_contiguous, _writeable
 import numpy.exceptions as exceptions
 import numpy.linalg as linalg
 import numpy.fft as fft
+from numpy._arraypad import pad
 import numpy.random as random
 import numpy.testing as testing

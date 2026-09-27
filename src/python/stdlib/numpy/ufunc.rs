@@ -666,6 +666,8 @@ pub(in crate::python) struct Options {
     /// The call comes from a Python operator such as `a + b`. When every operand is a scalar,
     /// NumPy's scalar math also reports integer overflow and names the operation `scalar add`.
     pub operator: bool,
+    /// `out=...`: return a 0-d result as an array rather than a scalar.
+    pub keep_array: bool,
 }
 
 impl Options {
@@ -695,7 +697,10 @@ pub(in crate::python) fn call(
         )));
     }
     let (mut options, out) = keyword_options(runtime, ufunc.name, &args, positional.get(nin))?;
-    options.out = out_array(runtime, out)?;
+    match out {
+        Some(out) if runtime.is_ellipsis(&out) => options.keep_array = true,
+        out => options.out = out_array(runtime, out)?,
+    }
     apply(runtime, index, &positional[..nin], &options)
 }
 
@@ -1182,7 +1187,7 @@ pub(in crate::python) fn evaluate(
     let value = if let Some(out) = &options.out {
         super::array::assign(runtime, out, &result)?;
         out.value()
-    } else if result.ndim() == 0 {
+    } else if result.ndim() == 0 && !options.keep_array {
         convert::element_to_scalar(runtime, &result, result.view.offset)?
     } else {
         result.value()

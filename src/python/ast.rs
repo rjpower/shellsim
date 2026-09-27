@@ -96,7 +96,11 @@ pub enum StatementKind {
         otherwise: Vec<Statement>,
         finalbody: Vec<Statement>,
     },
-    Raise(Option<Expression>),
+    /// `raise [exception [from cause]]`.
+    Raise {
+        exception: Option<Expression>,
+        cause: Option<Expression>,
+    },
     With {
         context: Expression,
         target: Option<AssignmentTarget>,

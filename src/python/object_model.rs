@@ -61,10 +61,11 @@ pub(super) enum BuiltinType {
     Property,
     Array,
     Complex,
+    Slice,
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 32] = [
+    pub(super) const ALL: [Self; 33] = [
         Self::Object,
         Self::Type,
         Self::None,
@@ -97,6 +98,7 @@ impl BuiltinType {
         Self::Property,
         Self::Array,
         Self::Complex,
+        Self::Slice,
     ];
 
     pub(super) const fn id(self) -> TypeId {
@@ -137,6 +139,7 @@ impl BuiltinType {
             Self::Property => "property",
             Self::Array => "numpy.ndarray",
             Self::Complex => "complex",
+            Self::Slice => "slice",
         }
     }
 }

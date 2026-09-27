@@ -95,7 +95,6 @@ numpy_suites! {
     construction => "test_construction.py";
     dtypes => "test_dtypes.py";
     scalars => "test_scalars.py";
-    #[ignore = "pending: typed NumPy core (phase 2)"]
     indexing => "test_indexing.py";
     #[ignore = "pending: NumPy ufunc table (phase 3)"]
     ufuncs => "test_ufuncs.py";

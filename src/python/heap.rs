@@ -1132,7 +1132,7 @@ impl Heap {
             Object::Exception { .. } => BuiltinType::Exception.id(),
             Object::List(_) => BuiltinType::List.id(),
             Object::Tuple(_) => BuiltinType::Tuple.id(),
-            Object::Slice { .. } => BuiltinType::Native.id(),
+            Object::Slice { .. } => BuiltinType::Slice.id(),
             Object::Dict(_) | Object::DefaultDict { .. } => BuiltinType::Dict.id(),
             Object::Set(_) => BuiltinType::Set.id(),
             Object::FrozenSet(_) => BuiltinType::FrozenSet.id(),

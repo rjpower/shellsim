@@ -100,6 +100,7 @@ impl Vm<'_> {
                 "dict" => Some(BuiltinType::Dict),
                 "set" => Some(BuiltinType::Set),
                 "frozenset" => Some(BuiltinType::FrozenSet),
+                "slice" => Some(BuiltinType::Slice),
                 _ => None,
             };
             if let Some(builtin_type) = builtin_type {

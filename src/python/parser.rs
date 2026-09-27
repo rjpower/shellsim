@@ -508,7 +508,7 @@ impl Parser {
             };
             StatementKind::Assert { test, message }
         } else if self.take(|kind| matches!(kind, TokenKind::Raise)).is_some() {
-            let value = if self.at(|kind| {
+            let exception = if self.at(|kind| {
                 matches!(
                     kind,
                     TokenKind::Semicolon | TokenKind::Newline | TokenKind::Dedent
@@ -518,7 +518,14 @@ impl Parser {
             } else {
                 Some(self.tuple_expression()?)
             };
-            StatementKind::Raise(value)
+            let cause = if exception.is_some()
+                && self.take(|kind| matches!(kind, TokenKind::From)).is_some()
+            {
+                Some(self.expression()?)
+            } else {
+                None
+            };
+            StatementKind::Raise { exception, cause }
         } else {
             let expression = self.tuple_expression()?;
             if self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {

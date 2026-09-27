@@ -327,6 +327,7 @@ impl Vm<'_> {
                     Err("exception raised".into())
                 }
                 Opcode::Raise(has_value) => self.dispatch_raise(has_value),
+                Opcode::RaiseFrom => self.dispatch_raise_from(),
                 Opcode::WithEnter => self.dispatch_with_enter(),
                 Opcode::WithExit => self.dispatch_with_exit(),
                 Opcode::WithExitException => self.dispatch_with_exit_exception(),
@@ -484,6 +485,26 @@ impl Vm<'_> {
         };
         self.pending_exception = Some(exception);
         Err("exception raised".into())
+    }
+
+    /// `raise exception from cause`. The cause must be an exception, an exception class, or
+    /// `None`. Exceptions do not record `__cause__` yet, so a valid cause is checked and then
+    /// dropped; an uncaught chained exception prints without its cause.
+    #[cold]
+    #[inline(never)]
+    fn dispatch_raise_from(&mut self) -> Result<DispatchControl, String> {
+        let cause = self.pop()?;
+        let valid = cause == Value::None
+            || protocol::exception_parts(&self.state.heap, &cause)?.is_some()
+            || self.user_exception_kind(&cause)?.is_some()
+            || self.exception_class_base(&cause)?.is_some();
+        if !valid {
+            return Err(self.raise_exception(
+                "TypeError",
+                "exception causes must derive from BaseException",
+            ));
+        }
+        self.dispatch_raise(true)
     }
 
     #[inline(never)]

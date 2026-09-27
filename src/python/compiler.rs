@@ -626,14 +626,20 @@ impl Compiler {
                 let finished = self.emit(Operation::PopTop, span);
                 self.patch_jump(passed, finished);
             }
-            StatementKind::Raise(value) => {
-                if let Some(value) = value {
-                    self.expression(value);
+            StatementKind::Raise { exception, cause } => match (exception, cause) {
+                (Some(exception), Some(cause)) => {
+                    self.expression(exception);
+                    self.expression(cause);
+                    self.emit(Operation::RaiseFrom, span);
+                }
+                (Some(exception), None) => {
+                    self.expression(exception);
                     self.emit(Operation::Raise(true), span);
-                } else {
+                }
+                (None, _) => {
                     self.emit(Operation::Raise(false), span);
                 }
-            }
+            },
             StatementKind::Try {
                 body,
                 handlers,
