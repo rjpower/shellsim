@@ -73,3 +73,28 @@ def test_getters_and_method_callers():
     assert operator.attrgetter("values", "values")(Vector([1])) == ([1], [1])
     assert operator.methodcaller("replace", "a", "b")("aa") == "bb"
     assert repr(operator.itemgetter(1)) == "operator.itemgetter(1)"
+
+
+def test_index_uses_dunder_index_and_rejects_other_types():
+    class Index:
+        def __index__(self):
+            return 7
+
+    class NotInt:
+        def __index__(self):
+            return 1.5
+
+    assert operator.index(Index()) == 7
+    assert type(operator.index(True)) is int
+    assert operator.index(2**70) == 2**70
+    for value, message in [
+        (1.5, "'float' object cannot be interpreted as an integer"),
+        ("1", "'str' object cannot be interpreted as an integer"),
+        (NotInt(), "__index__ returned non-int (type float)"),
+    ]:
+        try:
+            operator.index(value)
+        except TypeError as error:
+            assert str(error) == message
+        else:
+            raise AssertionError(f"operator.index({value!r}) did not raise")

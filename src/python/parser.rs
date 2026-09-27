@@ -22,6 +22,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<Program, ParseError> {
         current: 0,
         expression_depth: 0,
         compound_depth: 0,
+        scope_depth: 0,
     }
     .program()
 }
@@ -31,6 +32,8 @@ struct Parser {
     current: usize,
     expression_depth: usize,
     compound_depth: usize,
+    /// Number of enclosing `def` and `class` bodies, which forbid `from module import *`.
+    scope_depth: usize,
 }
 
 enum ParsedSubscript {
@@ -304,10 +307,13 @@ impl Parser {
             if self.take(|kind| matches!(kind, TokenKind::Arrow)).is_some() {
                 self.skip_annotation(|kind| matches!(kind, TokenKind::Colon))?;
             }
+            self.scope_depth += 1;
+            let body = self.suite();
+            self.scope_depth -= 1;
             StatementKind::Function {
                 name,
                 parameters,
-                body: self.suite()?,
+                body: body?,
                 is_async,
             }
         } else if self.take(|kind| matches!(kind, TokenKind::Class)).is_some() {
@@ -358,16 +364,26 @@ impl Parser {
                     "expected ')' after class bases",
                 )?;
             }
+            self.scope_depth += 1;
+            let body = self.suite();
+            self.scope_depth -= 1;
             StatementKind::Class {
                 name,
                 bases,
                 metaclass,
-                body: self.suite()?,
+                body: body?,
             }
         } else if self.take(|kind| matches!(kind, TokenKind::From)).is_some() {
             let mut module = String::new();
-            while self.take(|kind| matches!(kind, TokenKind::Dot)).is_some() {
-                module.push('.');
+            // The lexer emits `...` as one token, so `from ....pkg` arrives as `...` then `.`.
+            while let Some(token) =
+                self.take(|kind| matches!(kind, TokenKind::Dot | TokenKind::Ellipsis))
+            {
+                module.push_str(if token.kind == TokenKind::Ellipsis {
+                    "..."
+                } else {
+                    "."
+                });
             }
             if !self.at(|kind| matches!(kind, TokenKind::Import)) {
                 module.push_str(&self.module_name("expected a module name after 'from'")?);
@@ -378,32 +394,39 @@ impl Parser {
                 |kind| matches!(kind, TokenKind::Import),
                 "expected 'import' after module name",
             )?;
-            let mut names = Vec::new();
-            let parenthesized = self
-                .take(|kind| matches!(kind, TokenKind::LeftParen))
-                .is_some();
-            loop {
-                let imported = self.name("expected a name to import")?;
-                let binding = if self.take(|kind| matches!(kind, TokenKind::As)).is_some() {
-                    self.name("expected a binding after 'as'")?
-                } else {
-                    imported.clone()
-                };
-                names.push((imported, binding));
-                if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
-                    break;
+            if self.take(|kind| matches!(kind, TokenKind::Star)).is_some() {
+                if self.scope_depth > 0 {
+                    return Err(self.error("import * only allowed at module level"));
                 }
-                if parenthesized && self.at(|kind| matches!(kind, TokenKind::RightParen)) {
-                    break;
+                StatementKind::ImportStar { module }
+            } else {
+                let mut names = Vec::new();
+                let parenthesized = self
+                    .take(|kind| matches!(kind, TokenKind::LeftParen))
+                    .is_some();
+                loop {
+                    let imported = self.name("expected a name to import")?;
+                    let binding = if self.take(|kind| matches!(kind, TokenKind::As)).is_some() {
+                        self.name("expected a binding after 'as'")?
+                    } else {
+                        imported.clone()
+                    };
+                    names.push((imported, binding));
+                    if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
+                        break;
+                    }
+                    if parenthesized && self.at(|kind| matches!(kind, TokenKind::RightParen)) {
+                        break;
+                    }
                 }
+                if parenthesized {
+                    self.expect(
+                        |kind| matches!(kind, TokenKind::RightParen),
+                        "expected ')' after imported names",
+                    )?;
+                }
+                StatementKind::ImportFrom { module, names }
             }
-            if parenthesized {
-                self.expect(
-                    |kind| matches!(kind, TokenKind::RightParen),
-                    "expected ')' after imported names",
-                )?;
-            }
-            StatementKind::ImportFrom { module, names }
         } else if self
             .take(|kind| matches!(kind, TokenKind::Import))
             .is_some()
@@ -427,7 +450,21 @@ impl Parser {
             }
             StatementKind::Import { modules }
         } else if self.take(|kind| matches!(kind, TokenKind::Del)).is_some() {
-            StatementKind::Delete(assignment_target(self.postfix()?)?)
+            // `del a, b` deletes each target in turn; a trailing comma is allowed.
+            let mut targets = vec![assignment_target(self.postfix()?)?];
+            let mut listed = false;
+            while self.take(|kind| matches!(kind, TokenKind::Comma)).is_some() {
+                listed = true;
+                if self.at(|kind| matches!(kind, TokenKind::Newline | TokenKind::Semicolon)) {
+                    break;
+                }
+                targets.push(assignment_target(self.postfix()?)?);
+            }
+            if listed {
+                StatementKind::Delete(AssignmentTarget::Sequence(targets))
+            } else {
+                StatementKind::Delete(targets.remove(0))
+            }
         } else if self
             .take(|kind| matches!(kind, TokenKind::Return))
             .is_some()
@@ -488,7 +525,7 @@ impl Parser {
             };
             StatementKind::Assert { test, message }
         } else if self.take(|kind| matches!(kind, TokenKind::Raise)).is_some() {
-            let value = if self.at(|kind| {
+            let exception = if self.at(|kind| {
                 matches!(
                     kind,
                     TokenKind::Semicolon | TokenKind::Newline | TokenKind::Dedent
@@ -498,7 +535,14 @@ impl Parser {
             } else {
                 Some(self.tuple_expression()?)
             };
-            StatementKind::Raise(value)
+            let cause = if exception.is_some()
+                && self.take(|kind| matches!(kind, TokenKind::From)).is_some()
+            {
+                Some(self.expression()?)
+            } else {
+                None
+            };
+            StatementKind::Raise { exception, cause }
         } else {
             let expression = self.tuple_expression()?;
             if self.take(|kind| matches!(kind, TokenKind::Colon)).is_some() {
@@ -765,9 +809,19 @@ impl Parser {
                         });
                     }
                     let field: String = chars[start..cursor].iter().collect();
-                    let (source, conversion, format_spec) = split_fstring_field(&field, span)?;
+                    let FStringField {
+                        expression: source,
+                        conversion,
+                        format_spec,
+                        debug_text,
+                    } = split_fstring_field(&field, span)?;
+                    if let Some(debug_text) = debug_text {
+                        parts.push(FStringPart::Text(debug_text));
+                    }
+                    // CPython parses a field as if it were parenthesized, which allows
+                    // surrounding whitespace and line breaks.
                     let embedded_tokens =
-                        super::lexer::lex(&source).map_err(|error| ParseError {
+                        super::lexer::lex(&format!("({source})")).map_err(|error| ParseError {
                             message: format!("invalid f-string expression: {}", error.message),
                             span,
                         })?;
@@ -1567,6 +1621,7 @@ impl Parser {
             TokenKind::Float(value) => ExpressionKind::Constant(Constant::Float(value)),
             TokenKind::Imaginary(value) => ExpressionKind::Constant(Constant::Imaginary(value)),
             TokenKind::None => ExpressionKind::Constant(Constant::None),
+            TokenKind::Ellipsis => ExpressionKind::Constant(Constant::Ellipsis),
             TokenKind::True => ExpressionKind::Constant(Constant::Bool(true)),
             TokenKind::False => ExpressionKind::Constant(Constant::Bool(false)),
             TokenKind::Name(name) => ExpressionKind::Name(name),
@@ -2027,10 +2082,24 @@ impl Parser {
     }
 }
 
-fn split_fstring_field(
-    source: &str,
-    span: Span,
-) -> Result<(String, Option<char>, String), ParseError> {
+/// One replacement field of an f-string, split at its conversion and format specification.
+struct FStringField {
+    /// The source of the field's expression.
+    expression: String,
+    conversion: Option<char>,
+    format_spec: String,
+    /// For a self-documenting field such as `{x = }`, the text printed before the value: the
+    /// expression's source through the `=` and any whitespace after it.
+    debug_text: Option<String>,
+}
+
+/// Split the text between an f-string field's braces into its expression, `!` conversion and
+/// `:` format specification.
+///
+/// A field whose expression ends in a lone `=` is self-documenting, as in CPython 3.8 and later:
+/// `f"{x = }"` prints `x = ` and then `repr(x)`, or `format(x, spec)` when a specification is
+/// given without a conversion.
+fn split_fstring_field(source: &str, span: Span) -> Result<FStringField, ParseError> {
     let mut nesting = 0usize;
     let mut quote = None;
     let mut escaped = false;
@@ -2057,23 +2126,40 @@ fn split_fstring_field(
             nesting += 1;
         } else if matches!(ch, ')' | ']' | '}') {
             nesting = nesting.saturating_sub(1);
+        } else if ch == '!' && characters.get(index + 1) == Some(&'=') {
+            // `!=` is an operator, not a conversion.
+            continue;
         } else if nesting == 0 && matches!(ch, '!' | ':') {
             marker = Some((index, ch));
             break;
         }
     }
-    let Some((index, marker)) = marker else {
-        return Ok((source.to_string(), None, String::new()));
-    };
-    let expression = characters[..index].iter().collect::<String>();
+    let end = marker.map_or(characters.len(), |(index, _)| index);
+    let mut expression = characters[..end].iter().collect::<String>();
+    let debug_text =
+        self_documenting(&expression).map(|source| std::mem::replace(&mut expression, source));
     if expression.trim().is_empty() {
         return Err(ParseError {
             message: "f-string field requires an expression".into(),
             span,
         });
     }
+    let Some((index, marker)) = marker else {
+        let conversion = debug_text.as_ref().map(|_| 'r');
+        return Ok(FStringField {
+            expression,
+            conversion,
+            format_spec: String::new(),
+            debug_text,
+        });
+    };
     if marker == ':' {
-        return Ok((expression, None, characters[index + 1..].iter().collect()));
+        return Ok(FStringField {
+            expression,
+            conversion: None,
+            format_spec: characters[index + 1..].iter().collect(),
+            debug_text,
+        });
     }
     let conversion = characters
         .get(index + 1)
@@ -2098,7 +2184,23 @@ fn split_fstring_field(
             })
         }
     };
-    Ok((expression, Some(conversion), format_spec))
+    Ok(FStringField {
+        expression,
+        conversion: Some(conversion),
+        format_spec,
+        debug_text,
+    })
+}
+
+/// The expression of a self-documenting f-string field, `source` without its final `=`, if
+/// `source` ends in an `=` that is not part of a comparison operator.
+fn self_documenting(source: &str) -> Option<String> {
+    let trimmed = source.trim_end();
+    let expression = trimmed.strip_suffix('=')?;
+    if expression.ends_with(['=', '!', '<', '>']) {
+        return None;
+    }
+    Some(expression.to_string())
 }
 
 fn assignment_target(expression: Expression) -> Result<AssignmentTarget, ParseError> {
@@ -2151,6 +2253,27 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_imports_are_module_level_statements() {
+        let program = parse(lex("from math import *").unwrap()).unwrap();
+        assert!(matches!(
+            &program.statements[0].kind,
+            StatementKind::ImportStar { module } if module == "math"
+        ));
+        for source in [
+            "def f():\n    from math import *",
+            "class C:\n    from math import *",
+        ] {
+            let error = parse(lex(source).unwrap()).expect_err(source);
+            assert!(error
+                .message
+                .contains("import * only allowed at module level"));
+        }
+        for source in ["from math import *, sin", "from math import (*)"] {
+            assert!(parse(lex(source).unwrap()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn parses_comma_separated_imports_and_rejects_a_missing_module() {
         let program = parse(lex("import math, urllib.error as errors, random").unwrap()).unwrap();
         let StatementKind::Import { modules } = &program.statements[0].kind else {
@@ -2176,6 +2299,44 @@ mod tests {
         let error = parse(lex("values[1,,2]").unwrap())
             .expect_err("a tuple subscript cannot contain an empty member");
         assert!(error.message.contains("expected an expression"));
+    }
+
+    #[test]
+    fn ellipsis_is_an_atom_and_three_relative_import_dots() {
+        for source in [
+            "x = ...",
+            "a[..., 0]",
+            "a[1, ...]",
+            "a[...]",
+            "def f(): ...",
+            "[..., 1]",
+            "f(...)",
+        ] {
+            parse(lex(source).unwrap()).expect(source);
+        }
+        let program = parse(lex("a[..., 0]").unwrap()).unwrap();
+        let StatementKind::Expression(Expression {
+            kind: ExpressionKind::Subscript { index, .. },
+            ..
+        }) = &program.statements[0].kind
+        else {
+            panic!("expected a subscript")
+        };
+        let ExpressionKind::Tuple(items) = &index.kind else {
+            panic!("expected a tuple index")
+        };
+        assert_eq!(items[0].kind, ExpressionKind::Constant(Constant::Ellipsis));
+
+        let program = parse(lex("from ... import a\nfrom ....pkg import b").unwrap()).unwrap();
+        let modules = program
+            .statements
+            .iter()
+            .map(|statement| match &statement.kind {
+                StatementKind::ImportFrom { module, .. } => module.as_str(),
+                _ => panic!("expected an import"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(modules, ["...", "....pkg"]);
     }
 
     #[test]

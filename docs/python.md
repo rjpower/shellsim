@@ -38,8 +38,9 @@ cleanup code.
 `complex` is a native arena type. Its arithmetic, string parsing, `repr`, and error messages
 follow CPython 3.14, including the mixed-mode rules for real operands. Ordering, floor division,
 modulo, `int()`, `float()`, `round()`, and `math` functions reject complex values with
-`TypeError`. Format specifications on complex values are not implemented. NumPy `complex128`
-arrays store these values directly, and `numpy.complex128` is the builtin `complex` type.
+`TypeError`. Complex format specifications follow CPython: the width applies to the whole
+number, and zero padding, `=` alignment and `%` are rejected. NumPy `complex128` arrays store
+these values directly, and `numpy.complex128` is the builtin `complex` type.
 
 The core collection surface includes mutable sets and immutable `frozenset` values with mixed
 comparison and set algebra. VFS-backed text and binary files support read, write, append, and
@@ -50,21 +51,48 @@ keyword-variadic parameters, including bounded `*iterable` and `**mapping` expan
 keywords, non-string mapping keys, and non-mapping `**` operands are rejected explicitly. List,
 tuple, and set displays expand `*iterable` items in place.
 
+The `...` literal evaluates to the `Ellipsis` singleton, so `obj[..., 0]` passes the tuple
+`(Ellipsis, 0)` to `__getitem__`. Binary-operator and rich-comparison methods may return
+`NotImplemented` to decline. The runtime then tries the reflected method and then the default:
+identity for `==` and `!=`, and `TypeError` for ordering and arithmetic. As in CPython 3.14,
+testing `NotImplemented` for truth raises `TypeError`. Lists, tuples, dictionaries, and sets compare
+elements, find keys, and answer `in` with `x is y or x == y`, so a class's `__eq__` holds inside
+containers and an equal key of another type, such as `0.5` for `Fraction(1, 2)`, finds a dict entry.
+`object` provides `__hash__`, `__eq__`, and `__ne__`, so a class that defines `__eq__` can keep
+identity hashing with `__hash__ = object.__hash__`. Builtin functions, native methods and bound
+methods report `__name__`, and bound methods expose `__self__` and `__func__`.
+
 Augmented assignment updates mutable operands in place, as in CPython: `list +=` extends with any
 iterable, `set |=` and its siblings mutate the set, `dict |=` updates the mapping, and user classes
 may define `__iadd__` and the other in-place methods. Other operands fall back to the binary
 operator.
 
-Text formatting uses one protocol for f-strings and `str.format`, including conversions,
+Text formatting uses one protocol for f-strings, `format()` and `str.format`, including conversions,
 alignment, width and precision, and decimal, binary, octal, and hexadecimal integer formats.
 It also handles signed fixed-point output, general floating-point precision, and decimal comma
-grouping. The `__import__` builtin uses the simulated loader for absolute imports; relative
+grouping. `from module import *` binds the names in a list or tuple `__all__`, or else the
+names without a leading underscore, and only at module level. The `__import__` builtin uses the
+simulated loader for absolute imports; relative
 `__import__` calls are explicitly unsupported. The `exec`
 builtin accepts one source string and executes it in the simulated namespace. Code objects and
 explicit globals or locals mappings are not supported.
 The frozen `functools` module provides `reduce` and positional and keyword argument binding with
 `partial`. The frozen `operator` module provides CPython's operator functions, `itemgetter`,
 `attrgetter`, and `methodcaller`.
+
+`math` includes `isclose`, the hyperbolic functions and their inverses, and `gamma` and
+`lgamma`. The hyperbolic functions use Rust's standard library and the gamma functions the `libm`
+crate, so their last bit can differ from CPython's. Poles and out-of-domain arguments raise
+`ValueError`, and finite arguments whose result overflows raise `OverflowError`. `round()` and
+`math.floor`, `ceil`, and `trunc` defer to a class's `__round__`, `__floor__`, `__ceil__`, and
+`__trunc__`, and other `math` functions convert instances through `__float__`.
+
+The frozen `fractions` module provides `Fraction`, built from integers, fractions, rational or
+decimal strings, and floats or other objects with `as_integer_ratio`. Arithmetic with integers and
+fractions is exact and metered like other integer work; mixing in a float or complex number gives a
+float or complex result. Fractions hash like equal integers and floats and support rounding,
+`limit_denominator`, and `from_float`. `Decimal` operands, the `numbers` ABCs, and format
+specifications are not supported.
 
 The frozen `warnings` module implements `warn`, `warn_explicit`, `filterwarnings`, `simplefilter`,
 `resetwarnings`, `catch_warnings` with `record=True`, and CPython's `default`, `once`, `module`,

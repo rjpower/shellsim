@@ -31,12 +31,14 @@ impl Vm<'_> {
             function_return: None,
             pending_native_call: None,
         });
+        self.synchronous_frames += 1;
         let result = loop {
             match self.execute_active_frame(VM_POLL_QUANTUM) {
                 Ok(Execution::Pending) => {}
                 result => break result,
             }
         };
+        self.synchronous_frames -= 1;
         let frame = self
             .bytecode_frames
             .pop()
@@ -161,6 +163,7 @@ impl Vm<'_> {
                     dispatch_next(self.import(code.name(name), bind_root))
                 }
                 Opcode::ImportFrom(name) => dispatch_next(self.import_from(code.name(name))),
+                Opcode::ImportStar => dispatch_next(self.import_star()),
                 Opcode::LoadAttribute(name) => {
                     let symbol = self
                         .symbol_for(code, code_cache, name)
@@ -326,6 +329,7 @@ impl Vm<'_> {
                     Err("exception raised".into())
                 }
                 Opcode::Raise(has_value) => self.dispatch_raise(has_value),
+                Opcode::RaiseFrom => self.dispatch_raise_from(),
                 Opcode::WithEnter => self.dispatch_with_enter(),
                 Opcode::WithExit => self.dispatch_with_exit(),
                 Opcode::WithExitException => self.dispatch_with_exit_exception(),
@@ -472,6 +476,26 @@ impl Vm<'_> {
                     kind: kind.to_string(),
                     value,
                 }
+            } else if self.exception_class_base(&value)?.is_some() {
+                // `raise Cls` raises `Cls()`, running any user `__init__`.
+                self.stack.push(value);
+                let instance = match self.call(0, &[], &[], CallMode::Immediate)? {
+                    CallResult::Value(instance) => instance,
+                    CallResult::Exit(status) => {
+                        return Ok(DispatchControl::Complete(Execution::Exit(status)))
+                    }
+                    CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
+                    CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                        unreachable!("immediate call cannot suspend")
+                    }
+                };
+                let kind = self
+                    .user_exception_kind(&instance)?
+                    .ok_or("exception class produced a non-exception instance")?;
+                RaisedException {
+                    kind,
+                    value: instance,
+                }
             } else {
                 return Err("exceptions must derive from BaseException".into());
             }
@@ -485,14 +509,49 @@ impl Vm<'_> {
         Err("exception raised".into())
     }
 
+    /// `raise exception from cause`. The cause must be an exception, an exception class, or
+    /// `None`. Exceptions do not record `__cause__` yet, so a valid cause is checked and then
+    /// dropped; an uncaught chained exception prints without its cause.
+    #[cold]
+    #[inline(never)]
+    fn dispatch_raise_from(&mut self) -> Result<DispatchControl, String> {
+        let cause = self.pop()?;
+        let valid = cause == Value::None
+            || protocol::exception_parts(&self.state.heap, &cause)?.is_some()
+            || self.user_exception_kind(&cause)?.is_some()
+            || self.exception_class_base(&cause)?.is_some();
+        if !valid {
+            return Err(self.raise_exception(
+                "TypeError",
+                "exception causes must derive from BaseException",
+            ));
+        }
+        self.dispatch_raise(true)
+    }
+
     #[inline(never)]
     fn dispatch_with_enter(&mut self) -> Result<DispatchControl, String> {
         let context = self.pop()?;
+        // CPython looks up `__exit__` first, then `__enter__`.
+        for method in ["__exit__", "__enter__"] {
+            if self.resolve_attribute(context, method)?.is_none() {
+                let message = format!(
+                    "'{}' object does not support the context manager protocol (missed {method} \
+                     method)",
+                    self.type_name_of(&context)?
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
+        }
         self.stack.push(context);
-        self.with_contexts.push(context);
         self.load_attribute("__enter__")?;
         match self.call(0, &[], &[], CallMode::Immediate)? {
-            CallResult::Value(value) => self.stack.push(value),
+            // The context joins the cleanup stack only once `__enter__` has succeeded, so an
+            // exception from `__enter__` reaches the enclosing handler, not this `__exit__`.
+            CallResult::Value(value) => {
+                self.with_contexts.push(context);
+                self.stack.push(value);
+            }
             CallResult::Exit(status) => {
                 return Ok(DispatchControl::Complete(Execution::Exit(status)))
             }
@@ -522,6 +581,8 @@ impl Vm<'_> {
 
     #[inline(never)]
     fn dispatch_with_exit_exception(&mut self) -> Result<DispatchControl, String> {
+        // The handler pushed the exception; `__exit__` receives it from the exception stack.
+        self.pop()?;
         let context = self.with_contexts.pop().ok_or("with stack underflow")?;
         let exception = self
             .exception_stack
@@ -677,10 +738,12 @@ impl Vm<'_> {
             if self.enter_exception_handler() {
                 return Ok(true);
             }
+            let file = self.imported_module_file();
             let Some(function_return) = self.unwind_deferred_frame() else {
                 frames.push(TracebackFrame {
                     name: "<module>".to_string(),
                     span,
+                    file,
                 });
                 frames.reverse();
                 self.traceback_frames = frames;
@@ -689,6 +752,7 @@ impl Vm<'_> {
             frames.push(TracebackFrame {
                 name: function_return.name.clone(),
                 span,
+                file,
             });
             error = format!(
                 "{error} in {} at line {}, column {}",
@@ -710,6 +774,16 @@ impl Vm<'_> {
             .expect("deferred function frame was checked above");
         self.stack.push(value);
         true
+    }
+
+    /// `__file__` of the module whose code the active frame runs, when that module was imported.
+    /// Imported code runs under the module's scope; the main program keeps its globals outside
+    /// the scope chain, so its frames find no `__file__` here.
+    fn imported_module_file(&self) -> Option<String> {
+        let heap = &self.state.heap;
+        let root = heap.scope_root(*self.local_scopes.last()?).ok()?;
+        let file = heap.scope_get(root, "__file__")?;
+        protocol::string_value(heap, file).ok().flatten()
     }
 
     fn unwind_deferred_frame(&mut self) -> Option<FunctionReturn> {

@@ -12,6 +12,10 @@ use super::bytecode::{
 use super::source::Span;
 use std::collections::HashSet;
 
+/// The parameter holding a comprehension's outermost iterator. CPython names it `.0` too; the
+/// name cannot collide with an identifier.
+const COMPREHENSION_ITERATOR: &str = ".0";
+
 pub fn compile(program: Program) -> CodeRef {
     let mut compiler = Compiler {
         instructions: Vec::new(),
@@ -225,6 +229,16 @@ impl Compiler {
                 }
                 self.emit(Operation::PopTop, span);
             }
+            StatementKind::ImportStar { module } => {
+                self.emit(
+                    Operation::Import {
+                        name: module,
+                        bind_root: false,
+                    },
+                    span,
+                );
+                self.emit(Operation::ImportStar, span);
+            }
             StatementKind::Assign { targets, value } => {
                 self.expression(value);
                 let last = targets.len().saturating_sub(1);
@@ -248,31 +262,7 @@ impl Compiler {
             } => {
                 self.augmented_assignment(target, operator, value, span);
             }
-            StatementKind::Delete(target) => match target {
-                AssignmentTarget::Name(name) => {
-                    if self.globals.contains(&name) {
-                        self.emit(Operation::DeleteGlobal(name), span);
-                    } else {
-                        self.emit(Operation::DeleteName(name), span);
-                    }
-                }
-                AssignmentTarget::Subscript { value, index } => {
-                    self.expression(value);
-                    self.expression(index);
-                    self.emit(Operation::DeleteSubscript, span);
-                }
-                AssignmentTarget::Attribute { .. }
-                | AssignmentTarget::Sequence(_)
-                | AssignmentTarget::Star(_) => {
-                    self.emit(
-                        Operation::RuntimeError(
-                            "this deletion target is not implemented; names and subscripts are supported"
-                                .into(),
-                        ),
-                        span,
-                    );
-                }
-            },
+            StatementKind::Delete(target) => self.delete(target, span),
             StatementKind::Expression(expression) => {
                 self.expression(expression);
                 self.emit(Operation::PopExpression, span);
@@ -616,14 +606,20 @@ impl Compiler {
                 let finished = self.emit(Operation::PopTop, span);
                 self.patch_jump(passed, finished);
             }
-            StatementKind::Raise(value) => {
-                if let Some(value) = value {
-                    self.expression(value);
+            StatementKind::Raise { exception, cause } => match (exception, cause) {
+                (Some(exception), Some(cause)) => {
+                    self.expression(exception);
+                    self.expression(cause);
+                    self.emit(Operation::RaiseFrom, span);
+                }
+                (Some(exception), None) => {
+                    self.expression(exception);
                     self.emit(Operation::Raise(true), span);
-                } else {
+                }
+                (None, _) => {
                     self.emit(Operation::Raise(false), span);
                 }
-            }
+            },
             StatementKind::Try {
                 body,
                 handlers,
@@ -869,6 +865,38 @@ impl Compiler {
         }
     }
 
+    /// Delete `target`; a sequence such as `del a, [b, c]` deletes its targets left to right.
+    fn delete(&mut self, target: AssignmentTarget, span: Span) {
+        match target {
+            AssignmentTarget::Name(name) => {
+                if self.globals.contains(&name) {
+                    self.emit(Operation::DeleteGlobal(name), span);
+                } else {
+                    self.emit(Operation::DeleteName(name), span);
+                }
+            }
+            AssignmentTarget::Subscript { value, index } => {
+                self.expression(value);
+                self.expression(index);
+                self.emit(Operation::DeleteSubscript, span);
+            }
+            AssignmentTarget::Sequence(targets) => {
+                for target in targets {
+                    self.delete(target, span);
+                }
+            }
+            AssignmentTarget::Attribute { .. } | AssignmentTarget::Star(_) => {
+                self.emit(
+                    Operation::RuntimeError(
+                        "this deletion target is not implemented; names and subscripts are supported"
+                            .into(),
+                    ),
+                    span,
+                );
+            }
+        }
+    }
+
     fn augmented_assignment(
         &mut self,
         target: AssignmentTarget,
@@ -949,13 +977,13 @@ impl Compiler {
                             self.emit(Operation::LoadConstant(Constant::String(text)), span);
                         }
                         FStringPart::Expression(expression) => {
-                            self.emit(Operation::LoadName("str".into()), span);
+                            // `f"{x}"` is `format(x, "")`, which honors `__format__` and does
+                            // not depend on the name `str`.
                             self.expression(expression);
                             self.emit(
-                                Operation::Call {
-                                    positional: 1,
-                                    keywords: Vec::new(),
-                                    starred: vec![false],
+                                Operation::FormatValue {
+                                    conversion: None,
+                                    format_spec: String::new(),
                                 },
                                 span,
                             );
@@ -1374,22 +1402,54 @@ impl Compiler {
         nested.emit_comprehension_body(&clauses, 0, &element, kind, &result_name, span);
         nested.emit(Operation::LoadName(result_name), span);
         nested.emit(Operation::Return, span);
+        self.call_comprehension("<comprehension>", nested, &clauses[0].iterable, span);
+    }
+
+    /// Create a comprehension's function from `nested` and call it. As in CPython, the
+    /// outermost iterable is evaluated in the enclosing scope when the comprehension is
+    /// created, so `gen = (x for x in gen)` iterates the old `gen` and a class body's names are
+    /// visible to it. The function receives the iterator as its parameter `.0`.
+    fn call_comprehension(
+        &mut self,
+        name: &str,
+        nested: Compiler,
+        outermost: &Expression,
+        span: Span,
+    ) {
+        let parameter = Parameter {
+            name: COMPREHENSION_ITERATOR.into(),
+            has_default: false,
+            kind: BytecodeParameterKind::PositionalOnly,
+        };
         self.emit(
             Operation::MakeFunction {
-                name: "<comprehension>".into(),
-                code: nested.finish(Vec::new()),
+                name: name.into(),
+                code: nested.finish(vec![parameter]),
                 defaults: 0,
             },
             span,
         );
+        self.expression(outermost.clone());
+        self.emit(Operation::GetIterator, span);
         self.emit(
             Operation::Call {
-                positional: 0,
+                positional: 1,
                 keywords: Vec::new(),
-                starred: Vec::new(),
+                starred: vec![false],
             },
             span,
         );
+    }
+
+    /// Push the iterator for clause `index` of a comprehension: the `.0` parameter for the
+    /// outermost clause, and a new iterator over the clause's iterable otherwise.
+    fn comprehension_iterator(&mut self, clause: &ComprehensionClause, index: usize, span: Span) {
+        if index == 0 {
+            self.emit(Operation::LoadName(COMPREHENSION_ITERATOR.into()), span);
+            return;
+        }
+        self.expression(clause.iterable.clone());
+        self.emit(Operation::GetIterator, span);
     }
 
     fn emit_generator_expression(
@@ -1415,22 +1475,7 @@ impl Compiler {
         nested.emit_generator_comprehension_body(&clauses, 0, &element, span);
         nested.emit(Operation::LoadConstant(Constant::None), span);
         nested.emit(Operation::Return, span);
-        self.emit(
-            Operation::MakeFunction {
-                name: "<genexpr>".into(),
-                code: nested.finish(Vec::new()),
-                defaults: 0,
-            },
-            span,
-        );
-        self.emit(
-            Operation::Call {
-                positional: 0,
-                keywords: Vec::new(),
-                starred: Vec::new(),
-            },
-            span,
-        );
+        self.call_comprehension("<genexpr>", nested, &clauses[0].iterable, span);
     }
 
     fn emit_dict_comprehension(
@@ -1460,22 +1505,7 @@ impl Compiler {
         nested.emit_dict_comprehension_body(&clauses, 0, &key, &value, &result_name, span);
         nested.emit(Operation::LoadName(result_name), span);
         nested.emit(Operation::Return, span);
-        self.emit(
-            Operation::MakeFunction {
-                name: "<dictcomp>".into(),
-                code: nested.finish(Vec::new()),
-                defaults: 0,
-            },
-            span,
-        );
-        self.emit(
-            Operation::Call {
-                positional: 0,
-                keywords: Vec::new(),
-                starred: Vec::new(),
-            },
-            span,
-        );
+        self.call_comprehension("<dictcomp>", nested, &clauses[0].iterable, span);
     }
 
     fn emit_comprehension_body(
@@ -1488,8 +1518,7 @@ impl Compiler {
         span: Span,
     ) {
         let clause = &clauses[index];
-        self.expression(clause.iterable.clone());
-        self.emit(Operation::GetIterator, span);
+        self.comprehension_iterator(clause, index, span);
         let next = self.emit(Operation::ForIterator(usize::MAX), span);
         self.store_target(clause.target.clone(), span);
         for condition in &clause.conditions {
@@ -1533,8 +1562,7 @@ impl Compiler {
         span: Span,
     ) {
         let clause = &clauses[index];
-        self.expression(clause.iterable.clone());
-        self.emit(Operation::GetIterator, span);
+        self.comprehension_iterator(clause, index, span);
         let next = self.emit(Operation::ForIterator(usize::MAX), span);
         self.store_target(clause.target.clone(), span);
         for condition in &clause.conditions {
@@ -1564,8 +1592,7 @@ impl Compiler {
         span: Span,
     ) {
         let clause = &clauses[index];
-        self.expression(clause.iterable.clone());
-        self.emit(Operation::GetIterator, span);
+        self.comprehension_iterator(clause, index, span);
         let next = self.emit(Operation::ForIterator(usize::MAX), span);
         self.store_target(clause.target.clone(), span);
         for condition in &clause.conditions {

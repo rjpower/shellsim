@@ -12,14 +12,59 @@ use num_traits::{Signed, ToPrimitive, Zero};
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyResult, PyRuntime, PyValueCast,
-    ValueDef,
+    CallArgs, FunctionDef, ModuleDef, PyBinaryOp, PyConstant, PyError, PyKind, PyResult, PyRuntime,
+    PyValueCast, ValueDef,
 };
 use super::super::number::PyNumber;
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "math",
     functions: &[
+        FunctionDef {
+            module: "math",
+            name: "acosh",
+            call: native_acosh,
+        },
+        FunctionDef {
+            module: "math",
+            name: "asinh",
+            call: native_asinh,
+        },
+        FunctionDef {
+            module: "math",
+            name: "atanh",
+            call: native_atanh,
+        },
+        FunctionDef {
+            module: "math",
+            name: "cosh",
+            call: native_cosh,
+        },
+        FunctionDef {
+            module: "math",
+            name: "gamma",
+            call: native_gamma,
+        },
+        FunctionDef {
+            module: "math",
+            name: "isclose",
+            call: native_isclose,
+        },
+        FunctionDef {
+            module: "math",
+            name: "lgamma",
+            call: native_lgamma,
+        },
+        FunctionDef {
+            module: "math",
+            name: "sinh",
+            call: native_sinh,
+        },
+        FunctionDef {
+            module: "math",
+            name: "tanh",
+            call: native_tanh,
+        },
         FunctionDef {
             module: "math",
             name: "acos",
@@ -132,6 +177,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
         FunctionDef {
             module: "math",
+            name: "prod",
+            call: native_prod,
+        },
+        FunctionDef {
+            module: "math",
             name: "radians",
             call: native_radians,
         },
@@ -180,6 +230,87 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     ],
 };
 
+fn native_acosh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "acosh")
+}
+
+fn native_asinh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "asinh")
+}
+
+fn native_atanh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "atanh")
+}
+
+fn native_cosh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "cosh")
+}
+
+fn native_gamma(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "gamma")
+}
+
+/// `math.isclose(a, b, *, rel_tol=1e-09, abs_tol=0.0)`, binding its four parameters as CPython
+/// does: `a` and `b` by position or name, and the tolerances by name only.
+fn native_isclose(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    const NAMES: [&str; 4] = ["a", "b", "rel_tol", "abs_tol"];
+    let positional = args.positional();
+    if positional.len() > 2 {
+        return Err(PyError::type_error(format!(
+            "isclose() takes exactly 2 positional arguments ({} given)",
+            positional.len()
+        )));
+    }
+    let mut bound: [Option<Value>; 4] = [None; 4];
+    for (slot, value) in bound.iter_mut().zip(positional) {
+        *slot = Some(*value);
+    }
+    for (name, value) in args.keywords() {
+        let Some(index) = NAMES.iter().position(|candidate| candidate == name) else {
+            return Err(PyError::type_error(format!(
+                "isclose() got an unexpected keyword argument '{name}'"
+            )));
+        };
+        if bound[index].replace(*value).is_some() {
+            return Err(PyError::type_error(format!(
+                "argument for isclose() given by name ('{name}') and position ({})",
+                index + 1
+            )));
+        }
+    }
+    let mut numbers = [0.0, 0.0, 1e-9, 0.0];
+    for (index, value) in bound.into_iter().enumerate() {
+        match value {
+            Some(value) => numbers[index] = real_argument(runtime, value)?,
+            None if index < 2 => {
+                return Err(PyError::type_error(format!(
+                    "isclose() missing required argument '{}' (pos {})",
+                    NAMES[index],
+                    index + 1
+                )))
+            }
+            None => {}
+        }
+    }
+    runtime.charge_cpu(1)?;
+    let [a, b, relative, absolute] = numbers;
+    isclose(a, b, relative, absolute)
+        .map(Value::Bool)
+        .map_err(math_error)
+}
+
+fn native_lgamma(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "lgamma")
+}
+
+fn native_sinh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "sinh")
+}
+
+fn native_tanh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "tanh")
+}
+
 fn native_acos(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "acos")
 }
@@ -197,7 +328,36 @@ fn native_atan2(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 }
 
 fn native_ceil(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    if let Some(result) = rounding_method(runtime, &args, "__ceil__")? {
+        return Ok(result);
+    }
     native_call(runtime, args, "ceil")
+}
+
+/// The result of an instance's `__floor__`, `__ceil__` or `__trunc__`, which `math.floor`,
+/// `math.ceil` and `math.trunc` call for values that are not builtin real numbers, as CPython
+/// does. `None` means the caller should convert the value to a float instead.
+fn rounding_method(
+    runtime: &mut dyn PyRuntime,
+    args: &CallArgs,
+    method: &str,
+) -> PyResult<Option<Value>> {
+    let [value] = args.positional() else {
+        return Ok(None);
+    };
+    if !matches!(runtime.kind(value)?, PyKind::Instance | PyKind::Complex) {
+        return Ok(None);
+    }
+    match runtime.get_attribute(*value, method)? {
+        Some(method) => runtime
+            .call_value(method, CallArgs::new(Vec::new(), Vec::new()))
+            .map(Some),
+        None if method == "__trunc__" => Err(PyError::type_error(format!(
+            "type {} doesn't define __trunc__ method",
+            runtime.type_name(value)?
+        ))),
+        None => Ok(None),
+    }
 }
 
 /// Compute exact combinations with work and result storage bounded before multiplication.
@@ -293,10 +453,14 @@ fn native_trunc(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 fn native_round_direction(runtime: &mut dyn PyRuntime, args: CallArgs, floor: bool) -> PyResult {
     args.expect_positional("math integer conversion", 1, 1)?;
     args.reject_keywords("math integer conversion")?;
+    let method = if floor { "__floor__" } else { "__trunc__" };
+    if let Some(result) = rounding_method(runtime, &args, method)? {
+        return Ok(result);
+    }
     if let Some(integer) = runtime.integer_text(&args.positional()[0])? {
         return runtime.new_integer(&integer);
     }
-    let value = args.positional()[0].cast::<PyNumber>(runtime)?.into_f64()?;
+    let value = real_argument(runtime, args.positional()[0])?;
     if value.is_nan() {
         return Err(PyError::value_error("cannot convert float NaN to integer"));
     }
@@ -405,6 +569,32 @@ fn native_pow(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "pow")
 }
 
+/// Multiply `start` (default 1) by each item of the iterable through the `*` protocol, so
+/// integers stay exact and NumPy scalars and other numeric types keep their own rules.
+fn native_prod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    if args.positional().len() != 1 {
+        return Err(PyError::type_error(format!(
+            "prod() takes exactly 1 positional argument ({} given)",
+            args.positional().len()
+        )));
+    }
+    if let Some((name, _)) = args.keywords().iter().find(|(name, _)| name != "start") {
+        return Err(PyError::type_error(format!(
+            "prod() got an unexpected keyword argument '{name}'"
+        )));
+    }
+    let mut product = match args.keyword("prod", "start")? {
+        Some(start) => *start,
+        None => Value::Int(1),
+    };
+    let iterator = runtime.iterator(args.positional()[0])?;
+    while let Some(item) = runtime.iterator_next(iterator)? {
+        runtime.charge_cpu(1)?;
+        product = runtime.binary_op(PyBinaryOp::Multiply, product, item)?;
+    }
+    Ok(product)
+}
+
 fn native_radians(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "radians")
 }
@@ -427,7 +617,7 @@ fn native_call(runtime: &mut dyn PyRuntime, args: CallArgs, name: &'static str) 
         .positional()
         .iter()
         .cloned()
-        .map(|value| value.cast::<PyNumber>(runtime).and_then(PyNumber::into_f64))
+        .map(|value| real_argument(runtime, value))
         .collect::<PyResult<Vec<_>>>()?;
     runtime.charge_cpu(u64::try_from(values.len()).unwrap_or(u64::MAX))?;
     let value = call(name, &values).map_err(math_error)?;
@@ -436,6 +626,20 @@ fn native_call(runtime: &mut dyn PyRuntime, args: CallArgs, name: &'static str) 
         MathValue::Int(value) => Value::Int(value),
         MathValue::Bool(value) => Value::Bool(value),
     })
+}
+
+/// A real argument as a float. Like CPython, an instance of a user class, such as a `Fraction`,
+/// converts through its `__float__`.
+fn real_argument(runtime: &mut dyn PyRuntime, value: Value) -> PyResult<f64> {
+    let method = match runtime.kind(&value)? {
+        PyKind::Instance => runtime.get_attribute(value, "__float__")?,
+        _ => None,
+    };
+    let value = match method {
+        Some(method) => runtime.call_value(method, CallArgs::new(Vec::new(), Vec::new()))?,
+        None => value,
+    };
+    value.cast::<PyNumber>(runtime)?.into_f64()
 }
 
 fn math_error(error: MathError) -> PyError {
@@ -518,6 +722,14 @@ pub fn constant(name: &str) -> Option<MathValue> {
 /// Dispatch one of the observed/reviewer-requested `math` functions.
 pub fn call(name: &str, args: &[f64]) -> MathResult {
     match name {
+        "acosh" => unary("acosh", args, acosh),
+        "asinh" => unary("asinh", args, asinh),
+        "atanh" => unary("atanh", args, atanh),
+        "cosh" => unary("cosh", args, cosh),
+        "gamma" => unary("gamma", args, gamma),
+        "lgamma" => unary("lgamma", args, lgamma),
+        "sinh" => unary("sinh", args, sinh),
+        "tanh" => unary("tanh", args, tanh),
         "acos" => unary("acos", args, acos),
         "asin" => unary("asin", args, asin),
         "atan" => unary("atan", args, |value| Ok(MathValue::Float(value.atan()))),
@@ -619,6 +831,87 @@ pub fn exp(value: f64) -> MathResult {
         return Err(MathError::OverflowError("math range error"));
     }
     Ok(MathValue::Float(result))
+}
+
+/// A finite argument whose result is infinite has overflowed, which Python reports as a range
+/// error. Infinite arguments may give infinite results.
+fn overflow_checked(value: f64, result: f64) -> MathResult {
+    if value.is_finite() && result.is_infinite() {
+        return Err(MathError::OverflowError("math range error"));
+    }
+    Ok(MathValue::Float(result))
+}
+
+/// Whether `a` and `b` differ by at most `relative` times the larger magnitude or by at most
+/// `absolute` (PEP 485). Equal values, including equal infinities, are close; an infinity is
+/// close only to itself, and NaN to nothing.
+pub fn isclose(a: f64, b: f64, relative: f64, absolute: f64) -> Result<bool, MathError> {
+    if relative < 0.0 || absolute < 0.0 {
+        return Err(MathError::ValueError("tolerances must be non-negative"));
+    }
+    if a == b {
+        return Ok(true);
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return Ok(false);
+    }
+    let difference = (b - a).abs();
+    Ok(difference <= (relative * b).abs()
+        || difference <= (relative * a).abs()
+        || difference <= absolute)
+}
+
+/// The poles of the gamma function: zero and the negative integers.
+fn is_gamma_pole(value: f64) -> bool {
+    value.is_finite() && value <= 0.0 && value == value.trunc()
+}
+
+/// Return the gamma function. Poles and negative infinity are domain errors.
+pub fn gamma(value: f64) -> MathResult {
+    if is_gamma_pole(value) || value == f64::NEG_INFINITY {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    overflow_checked(value, libm::tgamma(value))
+}
+
+/// Return the natural logarithm of the gamma function's absolute value.
+pub fn lgamma(value: f64) -> MathResult {
+    if is_gamma_pole(value) {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    overflow_checked(value, libm::lgamma(value))
+}
+
+pub fn sinh(value: f64) -> MathResult {
+    overflow_checked(value, value.sinh())
+}
+
+pub fn cosh(value: f64) -> MathResult {
+    overflow_checked(value, value.cosh())
+}
+
+pub fn tanh(value: f64) -> MathResult {
+    Ok(MathValue::Float(value.tanh()))
+}
+
+pub fn asinh(value: f64) -> MathResult {
+    Ok(MathValue::Float(value.asinh()))
+}
+
+/// Return the inverse hyperbolic cosine, defined from 1 upward.
+pub fn acosh(value: f64) -> MathResult {
+    if value < 1.0 {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    Ok(MathValue::Float(value.acosh()))
+}
+
+/// Return the inverse hyperbolic tangent, defined strictly between -1 and 1.
+pub fn atanh(value: f64) -> MathResult {
+    if value.abs() >= 1.0 {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    Ok(MathValue::Float(value.atanh()))
 }
 
 /// Return the inverse sine in radians.
@@ -731,13 +1024,76 @@ pub fn sqrt(value: f64) -> MathResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{call, ceil, constant, exp, isinf, isnan, log, sin, sqrt, MathError, MathValue};
+    use super::{
+        call, ceil, constant, exp, isclose, isinf, isnan, log, sin, sqrt, MathError, MathValue,
+    };
 
     fn float(result: MathValue) -> f64 {
         match result {
             MathValue::Float(value) => value,
             other => panic!("expected float, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn isclose_compares_relative_and_absolute_differences() {
+        assert_eq!(isclose(1.0, 1.0 + 1e-10, 1e-9, 0.0), Ok(true));
+        assert_eq!(isclose(0.0, 1e-10, 1e-9, 0.0), Ok(false));
+        assert_eq!(isclose(0.0, 1e-10, 1e-9, 1e-9), Ok(true));
+        assert_eq!(isclose(f64::INFINITY, f64::INFINITY, 1e-9, 0.0), Ok(true));
+        assert_eq!(isclose(f64::INFINITY, 1e308, 1.0, 0.0), Ok(false));
+        assert_eq!(isclose(f64::NAN, f64::NAN, 1e-9, 0.0), Ok(false));
+        assert_eq!(
+            isclose(1.0, 2.0, -1.0, 0.0),
+            Err(MathError::ValueError("tolerances must be non-negative"))
+        );
+    }
+
+    #[test]
+    fn gamma_reports_poles_and_overflow_as_python_does() {
+        for name in ["gamma", "lgamma"] {
+            for value in [0.0, -0.0, -3.0] {
+                assert_eq!(
+                    call(name, &[value]),
+                    Err(MathError::ValueError("math domain error"))
+                );
+            }
+            assert!(float(call(name, &[f64::NAN]).unwrap()).is_nan());
+        }
+        assert_eq!(call("gamma", &[5.0]), Ok(MathValue::Float(24.0)));
+        assert_eq!(
+            call("gamma", &[f64::NEG_INFINITY]),
+            Err(MathError::ValueError("math domain error"))
+        );
+        assert_eq!(
+            call("lgamma", &[f64::NEG_INFINITY]),
+            Ok(MathValue::Float(f64::INFINITY))
+        );
+        assert_eq!(
+            call("gamma", &[172.0]),
+            Err(MathError::OverflowError("math range error"))
+        );
+    }
+
+    #[test]
+    fn hyperbolic_functions_report_domain_and_range_errors() {
+        for name in ["sinh", "cosh", "tanh", "asinh", "acosh", "atanh"] {
+            assert!(float(call(name, &[f64::NAN]).unwrap()).is_nan());
+        }
+        for (name, value) in [("acosh", 0.0), ("atanh", 1.0), ("atanh", f64::INFINITY)] {
+            assert_eq!(
+                call(name, &[value]),
+                Err(MathError::ValueError("math domain error"))
+            );
+        }
+        assert_eq!(
+            call("sinh", &[1000.0]),
+            Err(MathError::OverflowError("math range error"))
+        );
+        assert_eq!(
+            float(call("sinh", &[f64::INFINITY]).unwrap()),
+            f64::INFINITY
+        );
     }
 
     #[test]

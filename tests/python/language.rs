@@ -370,3 +370,48 @@ print(counter(), counter())"#;
     assert_eq!(stdout, b"41 42\n");
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn wildcard_imports_bind_all_or_public_names() {
+    let mut environment = Environment::new();
+    for (path, source) in [
+        ("/public.py", "value = 7\n_private = 9\n"),
+        (
+            "/explicit.py",
+            "__all__ = ['_private']\n_private = 11\nother = 12\n",
+        ),
+        ("/bad.py", "__all__ = [7]\n"),
+        ("/missing.py", "__all__ = ['absent']\n"),
+        ("/unordered.py", "__all__ = {'value'}\nvalue = 1\n"),
+    ] {
+        environment
+            .vfs
+            .put_file(path, source.as_bytes().to_vec(), 0o644)
+            .unwrap();
+    }
+    // Expected output recorded from CPython 3.14 with the same modules.
+    let source = r#"from public import *
+assert value == 7 and "_private" not in dir()
+from explicit import *
+assert _private == 11 and "other" not in dir()
+for module in ["bad", "missing", "unordered"]:
+    try:
+        exec(f"from {module} import *")
+    except (TypeError, AttributeError) as error:
+        print(type(error).__name__, error)
+from math import *
+print(cos(0), floor(2.5))
+"#;
+    assert_eq!(
+        super::support::run_python_text_in(&mut environment, source),
+        (
+            0,
+            "TypeError Item in bad.__all__ must be str, not int\n\
+             AttributeError module 'missing' has no attribute 'absent'\n\
+             TypeError 'set' object does not support indexing\n\
+             1.0 2\n"
+                .into(),
+            String::new()
+        )
+    );
+}

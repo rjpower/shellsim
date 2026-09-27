@@ -13,6 +13,7 @@ const BUILTINS: &[u8] = include_bytes!("test_builtins.py");
 const ASYNCIO: &[u8] = include_bytes!("test_asyncio.py");
 const LANGUAGE: &[u8] = include_bytes!("test_language.py");
 const EXCEPTIONS: &[u8] = include_bytes!("test_exceptions.py");
+const FRACTIONS: &[u8] = include_bytes!("test_fractions.py");
 const OBJECT_MODEL: &[u8] = include_bytes!("test_object_model.py");
 const OPERATOR: &[u8] = include_bytes!("test_operator.py");
 const WARNINGS: &[u8] = include_bytes!("test_warnings.py");
@@ -77,6 +78,11 @@ fn language() {
 #[test]
 fn exceptions() {
     assert_source_suite("test_exceptions.py", EXCEPTIONS);
+}
+
+#[test]
+fn fractions() {
+    assert_source_suite("test_fractions.py", FRACTIONS);
 }
 
 #[test]

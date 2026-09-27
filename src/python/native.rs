@@ -94,6 +94,9 @@ pub(super) enum PyErrorKind {
     Overflow,
     Runtime,
     Resource,
+    /// A valid Python operation that shellsim does not model. It is not a Python exception:
+    /// the program stops with the minimal-shim diagnostic, as for an unmodeled builtin.
+    Unsupported,
     Exception(&'static str),
     /// A nested VM operation already stored the concrete Python exception.
     Raised,
@@ -140,6 +143,10 @@ impl PyError {
 
     pub fn resource_error(message: impl Into<String>) -> Self {
         Self::new(PyErrorKind::Resource, message)
+    }
+
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::new(PyErrorKind::Unsupported, message)
     }
 
     pub fn exception(kind: &'static str, message: impl Into<String>) -> Self {
@@ -442,6 +449,10 @@ pub(super) trait PyRuntime {
     fn replace_bytearray_items(&mut self, value: PyByteArray, items: Vec<u8>) -> PyResult<()>;
     fn is_integer_type(&self, value: &PyValue) -> bool;
     fn is_string_type(&self, value: &PyValue) -> bool;
+    /// The `NotImplemented` singleton, which a comparison or arithmetic method returns to let
+    /// the other operand answer.
+    fn not_implemented(&self) -> PyValue;
+    fn is_not_implemented(&self, value: &PyValue) -> bool;
     /// View a builtin `bool`, `int`, `float`, or `complex` without copying its storage.
     fn number(&self, value: &PyValue) -> Option<super::number::NumberRef<'_>>;
     /// Allocate a builtin `complex` in the metered object arena.
@@ -474,6 +485,8 @@ pub(super) trait PyRuntime {
     fn compare(&mut self, left: &PyValue, right: &PyValue) -> PyResult<Ordering>;
     /// Resolve an attribute through the runtime's descriptor and MRO protocol.
     fn get_attribute(&mut self, value: PyValue, name: &str) -> PyResult<Option<PyValue>>;
+    /// Assign an attribute through the runtime's descriptor protocol, as `setattr` does.
+    fn set_attribute(&mut self, value: PyValue, name: &str, item: PyValue) -> PyResult<()>;
     fn list_len(&self, list: PyList) -> PyResult<usize>;
     fn list_items(&mut self, list: PyList) -> PyResult<Vec<PyValue>>;
     fn list_append(&mut self, list: PyList, value: PyValue) -> PyResult<()>;
@@ -637,30 +650,9 @@ pub(super) trait PyRuntime {
     /// Deliver a signal to an arbitrary modeled process, not only an owned subprocess handle.
     fn send_os_signal(&mut self, pid: u32, signal: crate::process::Signal) -> PyResult<()>;
 
-    fn type_name(&self, value: &PyValue) -> PyResult<&'static str> {
-        Ok(match self.kind(value)? {
-            PyKind::None => "NoneType",
-            PyKind::Bool => "bool",
-            PyKind::Int => "int",
-            PyKind::Float => "float",
-            PyKind::String => "str",
-            PyKind::Bytes => "bytes",
-            PyKind::ByteArray => "bytearray",
-            PyKind::List => "list",
-            PyKind::Tuple => "tuple",
-            PyKind::Dict => "dict",
-            PyKind::Set => "set",
-            PyKind::Function => "function",
-            PyKind::Class => "type",
-            PyKind::Instance => "object",
-            PyKind::Iterator => "iterator",
-            PyKind::Generator => "generator",
-            PyKind::Module => "module",
-            PyKind::Array => "numpy.ndarray",
-            PyKind::Complex => "complex",
-            PyKind::Native => "object",
-        })
-    }
+    /// The name CPython prints for a value's type in error messages, such as `int`,
+    /// `float32` or a user class name.
+    fn type_name(&self, value: &PyValue) -> PyResult<String>;
 }
 
 /// Checked handle to an interpreter-owned array view.

@@ -1,9 +1,9 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
-use super::format::{format_float, format_integer, format_text, FormatSpec};
+use super::format::{format_complex, format_float, format_integer, format_text, FormatError};
 use super::{
-    number, protocol, BigInt, BinaryOperator, ComparisonOperator, DisplayKind, Object, Ordering,
-    SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
+    number, protocol, BigInt, BinaryOperator, BuiltinType, ComparisonOperator, DisplayKind,
+    NativeValue, Object, Ordering, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
 };
 
 impl Vm<'_> {
@@ -80,11 +80,9 @@ impl Vm<'_> {
             };
             for (key, value) in additions {
                 let mut replaced = false;
-                for (existing_key, existing_value) in &mut entries {
-                    if protocol::identical(existing_key, &key)
-                        || protocol::equals(&self.state.heap, existing_key, &key)?
-                    {
-                        *existing_value = value;
+                for entry in &mut entries {
+                    if self.values_equal(&entry.0, &key)? {
+                        entry.1 = value;
                         replaced = true;
                         break;
                     }
@@ -156,6 +154,22 @@ impl Vm<'_> {
         Ok(())
     }
 
+    /// The truth of `left <operator> right` under the full rich-comparison protocol, including
+    /// the reflected operand, as CPython's `PyObject_RichCompareBool` computes it for `min`,
+    /// `max` and sorting.
+    pub(super) fn compare_truth(
+        &mut self,
+        operator: ComparisonOperator,
+        left: &Value,
+        right: &Value,
+    ) -> Result<bool, String> {
+        self.stack.push(*left);
+        self.stack.push(*right);
+        self.compare(operator)?;
+        let result = self.pop()?;
+        self.truth_value(&result)
+    }
+
     pub(super) fn compare(&mut self, operator: ComparisonOperator) -> Result<(), String> {
         let right = self.pop()?;
         let left = self.pop()?;
@@ -165,22 +179,22 @@ impl Vm<'_> {
         }
         let mut slot_result = match operator {
             ComparisonOperator::Equal => {
-                self.invoke_slot(&left, Slot::Equal, "__eq__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::Equal, "__eq__", vec![right])?
             }
             ComparisonOperator::NotEqual => {
-                self.invoke_slot(&left, Slot::NotEqual, "__ne__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::NotEqual, "__ne__", vec![right])?
             }
             ComparisonOperator::Less => {
-                self.invoke_slot(&left, Slot::LessThan, "__lt__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::LessThan, "__lt__", vec![right])?
             }
             ComparisonOperator::LessEqual => {
-                self.invoke_slot(&left, Slot::LessEqual, "__le__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::LessEqual, "__le__", vec![right])?
             }
             ComparisonOperator::Greater => {
-                self.invoke_slot(&left, Slot::GreaterThan, "__gt__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::GreaterThan, "__gt__", vec![right])?
             }
             ComparisonOperator::GreaterEqual => {
-                self.invoke_slot(&left, Slot::GreaterEqual, "__ge__", vec![right])?
+                self.invoke_operator_slot(&left, Slot::GreaterEqual, "__ge__", vec![right])?
             }
             ComparisonOperator::In | ComparisonOperator::NotIn => {
                 self.invoke_slot(&right, Slot::Contains, "__contains__", vec![left])?
@@ -198,13 +212,14 @@ impl Vm<'_> {
                 _ => None,
             };
             if let Some((slot, name)) = reflected {
-                slot_result = self.invoke_slot(&right, slot, name, vec![left])?;
+                slot_result = self.invoke_operator_slot(&right, slot, name, vec![left])?;
             }
         }
         if slot_result.is_none() && matches!(operator, ComparisonOperator::NotEqual) {
-            let mut equality = self.invoke_slot(&left, Slot::Equal, "__eq__", vec![right])?;
+            let mut equality =
+                self.invoke_operator_slot(&left, Slot::Equal, "__eq__", vec![right])?;
             if equality.is_none() {
-                equality = self.invoke_slot(&right, Slot::Equal, "__eq__", vec![left])?;
+                equality = self.invoke_operator_slot(&right, Slot::Equal, "__eq__", vec![left])?;
             }
             if let Some(value) = equality {
                 slot_result = Some(Value::Bool(!self.truth_value(&value)?));
@@ -220,8 +235,8 @@ impl Vm<'_> {
             return Ok(());
         }
         let result = match operator {
-            ComparisonOperator::Equal => protocol::equals(&self.state.heap, &left, &right)?,
-            ComparisonOperator::NotEqual => !protocol::equals(&self.state.heap, &left, &right)?,
+            ComparisonOperator::Equal => self.builtin_equality(&left, &right)?,
+            ComparisonOperator::NotEqual => !self.builtin_equality(&left, &right)?,
             ComparisonOperator::Less
             | ComparisonOperator::LessEqual
             | ComparisonOperator::Greater
@@ -283,7 +298,41 @@ impl Vm<'_> {
             _ => false,
         };
         if direct {
-            return protocol::contains(&self.state.heap, container, needle);
+            if let Object::Bytes(value) | Object::ByteArray(value) = self.state.heap.get(id)? {
+                let length = value.len();
+                // A bytes needle is searched for in linear time; an int needle is one byte.
+                let needle_length = match protocol::bytes_ref(&self.state.heap, needle)? {
+                    Some(needle) => needle.len(),
+                    None => match protocol::int_value(&self.state.heap, needle) {
+                        Some(byte) if (0..256).contains(&byte) => 1,
+                        Some(_) => {
+                            return Err(
+                                self.raise_exception("ValueError", "byte must be in range(0, 256)")
+                            );
+                        }
+                        None => {
+                            let message = format!(
+                                "a bytes-like object is required, not '{}'",
+                                self.type_name_of(needle)?
+                            );
+                            return Err(self.raise_exception("TypeError", message));
+                        }
+                    },
+                };
+                self.charge_cpu(
+                    u64::try_from(length.saturating_add(needle_length)).unwrap_or(u64::MAX),
+                )?;
+            }
+            return match self.state.heap.get(id)? {
+                Object::List(_) | Object::Tuple(_) => self.sequence_contains(id, needle),
+                Object::Set(_) | Object::FrozenSet(_) => {
+                    Ok(self.find_set_entry(id, needle)?.is_some())
+                }
+                Object::Dict(_) | Object::DefaultDict { .. } => {
+                    Ok(self.find_mapping_entry(id, needle)?.is_some())
+                }
+                _ => protocol::contains(&self.state.heap, container, needle),
+            };
         }
         let iterator = self.make_iterator(*container)?;
         loop {
@@ -297,24 +346,10 @@ impl Vm<'_> {
                 }
                 Err(error) => return Err(error),
             };
-            if self.item_equals(&item, needle)? {
+            if self.values_equal(&item, needle)? {
                 return Ok(true);
             }
         }
-    }
-
-    /// `item == needle` with user `__eq__` on either side, as membership tests use it.
-    fn item_equals(&mut self, item: &Value, needle: &Value) -> Result<bool, String> {
-        if protocol::identical(item, needle) {
-            return Ok(true);
-        }
-        if let Some(result) = self.invoke_slot(item, Slot::Equal, "__eq__", vec![*needle])? {
-            return self.truth_value(&result);
-        }
-        if let Some(result) = self.invoke_slot(needle, Slot::Equal, "__eq__", vec![*item])? {
-            return self.truth_value(&result);
-        }
-        protocol::equals(&self.state.heap, item, needle)
     }
 
     pub(super) fn binary(&mut self, operator: BinaryOperator) -> Result<(), String> {
@@ -435,7 +470,8 @@ impl Vm<'_> {
         Ok(Some(left))
     }
 
-    /// Call the left operand's in-place method, looked up on its type as CPython does.
+    /// Call the left operand's in-place method, looked up on its type as CPython does. A method
+    /// that returns `NotImplemented` declines, and the caller falls back to the binary operator.
     fn inplace_method(
         &mut self,
         operator: BinaryOperator,
@@ -465,7 +501,10 @@ impl Vm<'_> {
                     return Ok(None);
                 };
                 let method = self.bind_descriptor(descriptor, Some(left), class, defining_class)?;
-                return self.invoke_value(method, vec![right]).map(Some);
+                let result = self.invoke_value(method, vec![right])?;
+                return Ok(
+                    (result.native_value() != Some(NativeValue::NotImplemented)).then_some(result)
+                );
             }
         }
         let type_id = self.type_id(&left)?;
@@ -567,23 +606,135 @@ impl Vm<'_> {
                 "__ror__",
             ),
         };
-        if let Some(value) = self.invoke_slot(&left, slot, name, vec![right])? {
-            return Ok(value);
-        }
-        if let Some(value) = self.invoke_slot(&right, reflected_slot, reflected_name, vec![left])? {
-            return Ok(value);
-        }
         let symbol = match (operator, inplace) {
             (BinaryOperator::Power, true) => "**=".to_string(),
             (operator, true) => format!("{}=", binary_operator_symbol(operator)),
             (operator, false) => binary_operator_symbol(operator).to_string(),
         };
-        let message = format!(
-            "unsupported operand type(s) for {symbol}: '{}' and '{}'",
-            self.type_name_of(&left)?,
-            self.type_name_of(&right)?
-        );
+        self.binary_slot_protocol(
+            left,
+            right,
+            (slot, name, reflected_slot, reflected_name),
+            &symbol,
+        )
+    }
+
+    /// `divmod(left, right)`: the binary protocol over `__divmod__` and `__rdivmod__`.
+    pub(super) fn divmod_value(&mut self, left: Value, right: Value) -> Result<Value, String> {
+        self.binary_slot_protocol(
+            left,
+            right,
+            (
+                Slot::DivMod,
+                "__divmod__",
+                Slot::ReflectedDivMod,
+                "__rdivmod__",
+            ),
+            "divmod()",
+        )
+    }
+
+    /// CPython's `binary_op1`: try the left operand's method, then the right operand's
+    /// reflected method, and raise `TypeError` naming `symbol` when both decline.
+    fn binary_slot_protocol(
+        &mut self,
+        left: Value,
+        right: Value,
+        (slot, name, reflected_slot, reflected_name): (Slot, &str, Slot, &str),
+        symbol: &str,
+    ) -> Result<Value, String> {
+        // As in CPython, a right operand whose type is a proper subclass of the left operand's
+        // type gets its reflected method first, so `1.0 + np.float64(2)` stays a NumPy scalar.
+        let left_type = self.type_id(&left)?;
+        let right_type = self.type_id(&right)?;
+        let right_first = left_type != right_type
+            && self.state.types.is_subclass(right_type, left_type)?
+            && self.state.types.slot(right_type, reflected_slot)?.is_some();
+        if right_first {
+            if let Some(value) =
+                self.invoke_operator_slot(&right, reflected_slot, reflected_name, vec![left])?
+            {
+                return Ok(value);
+            }
+        }
+        if let Some(value) = self.invoke_operator_slot(&left, slot, name, vec![right])? {
+            return Ok(value);
+        }
+        if !right_first {
+            if let Some(value) =
+                self.invoke_operator_slot(&right, reflected_slot, reflected_name, vec![left])?
+            {
+                return Ok(value);
+            }
+        }
+        let message = match self.sequence_operator_message(&left, &right, symbol)? {
+            Some(message) => message,
+            None => format!(
+                "unsupported operand type(s) for {symbol}: '{}' and '{}'",
+                self.type_name_of(&left)?,
+                self.type_name_of(&right)?
+            ),
+        };
         Err(self.raise_exception("TypeError", message))
+    }
+
+    /// CPython's message when `+` or `*` reaches a builtin sequence's concatenation or
+    /// repetition with an operand it cannot combine, such as `"a" + 1`.
+    fn sequence_operator_message(
+        &mut self,
+        left: &Value,
+        right: &Value,
+        symbol: &str,
+    ) -> Result<Option<String>, String> {
+        let left_sequence = self.builtin_sequence(left)?;
+        match symbol.trim_end_matches('=') {
+            "+" => {
+                let Some(sequence) = left_sequence else {
+                    return Ok(None);
+                };
+                let other = self.type_name_of(right)?;
+                Ok(Some(match sequence {
+                    BuiltinType::Bytes => format!("can't concat {other} to bytes"),
+                    BuiltinType::ByteArray => format!("can't concat {other} to bytearray"),
+                    _ => {
+                        let name = builtin_sequence_name(sequence);
+                        format!("can only concatenate {name} (not \"{other}\") to {name}")
+                    }
+                }))
+            }
+            "*" => {
+                let other = if left_sequence.is_some() {
+                    right
+                } else if self.builtin_sequence(right)?.is_some() {
+                    left
+                } else {
+                    return Ok(None);
+                };
+                let other = self.type_name_of(other)?;
+                Ok(Some(format!(
+                    "can't multiply sequence by non-int of type '{other}'"
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The builtin sequence type (`str`, `bytes`, `bytearray`, `list` or `tuple`) that
+    /// `value`'s type derives from, if any.
+    fn builtin_sequence(&self, value: &Value) -> Result<Option<BuiltinType>, String> {
+        let type_id = self.type_id(value)?;
+        for sequence in [
+            BuiltinType::String,
+            BuiltinType::Bytes,
+            BuiltinType::ByteArray,
+            BuiltinType::List,
+            BuiltinType::Tuple,
+        ] {
+            if self.state.types.is_subclass(type_id, sequence.id())? {
+                return Ok(Some(sequence));
+            }
+        }
+        Ok(None)
     }
 
     pub(super) fn format_value(
@@ -606,26 +757,53 @@ impl Vm<'_> {
         format_spec: &str,
     ) -> Result<String, String> {
         self.reserve_format_spec(format_spec)?;
-        let converted = match conversion {
-            Some('r' | 'a') => Some(protocol::repr(&self.state.heap, value)?),
-            Some('s') => Some(protocol::display(&self.state.heap, value)?),
-            Some(other) => return Err(format!("unsupported f-string conversion !{other}")),
-            None => None,
-        };
-        let rendered = if format_spec.is_empty() {
-            converted.unwrap_or(protocol::display(&self.state.heap, value)?)
-        } else if format_spec.contains(['{', '}']) {
+        if format_spec.contains(['{', '}']) {
             return Err("nested f-string format specifications are not implemented".into());
-        } else if let Some(converted) = converted {
-            format_text(&converted, &FormatSpec::parse(format_spec)?)?
-        } else {
-            self.format_unconverted_value(value, format_spec)?
+        }
+        let converted = match conversion {
+            Some('r' | 'a') => self.repr_value(value)?,
+            Some('s') => self.display_value(value)?,
+            Some(other) => return Err(format!("unsupported f-string conversion !{other}")),
+            None => return self.format_object(value, format_spec),
         };
-        Ok(rendered)
+        if format_spec.is_empty() {
+            Ok(converted)
+        } else {
+            format_text(&converted, format_spec).map_err(|error| self.raise_format_error(error))
+        }
+    }
+
+    fn raise_format_error(&mut self, error: FormatError) -> String {
+        self.raise_exception(error.kind, error.message)
+    }
+
+    /// `format(value, spec)`, which CPython defines as `type(value).__format__(value, spec)`.
+    /// A user class's `__format__` runs as written. Other values accept only the empty spec,
+    /// which gives `str(value)`.
+    pub(super) fn format_object(
+        &mut self,
+        value: &Value,
+        format_spec: &str,
+    ) -> Result<String, String> {
+        if let Some(id) = value.object_id() {
+            if matches!(self.state.heap.get(id)?, Object::Instance { .. }) {
+                if let Some(method) = self.special_method(value, "__format__")? {
+                    let spec = self.allocate_string(format_spec.to_string())?;
+                    let result = self.invoke_value(method, vec![spec])?;
+                    return protocol::string_value(&self.state.heap, &result)?.ok_or_else(|| {
+                        self.raise_exception("TypeError", "__format__ must return a str")
+                    });
+                }
+            }
+        }
+        if format_spec.is_empty() {
+            return self.display_value(value);
+        }
+        self.format_unconverted_value(value, format_spec)
     }
 
     /// Reserve the largest width or precision before formatting can allocate padding.
-    fn reserve_format_spec(&mut self, spec: &str) -> Result<(), String> {
+    pub(super) fn reserve_format_spec(&mut self, spec: &str) -> Result<(), String> {
         let mut largest = 0_usize;
         let mut digits = None::<usize>;
         for byte in spec.bytes() {
@@ -644,35 +822,35 @@ impl Vm<'_> {
         self.reserve_result(largest.saturating_add(spec.len()).saturating_mul(2))
     }
 
-    fn format_unconverted_value(&self, value: &Value, text: &str) -> Result<String, String> {
-        if super::number::is_complex(&self.state.heap, value) {
-            return Err("format specifications for complex numbers are not implemented".into());
-        }
-        let spec = FormatSpec::parse(text)?;
-        let number = super::number::view(&self.state.heap, value);
-        match (spec.presentation, number) {
-            (Some('f' | 'e' | 'E' | 'g' | 'G' | '%'), Some(_))
-            | (None, Some(number::NumberRef::Float(_))) => {
-                let float = super::number::as_f64(&self.state.heap, value)
-                    .ok_or("floating-point format requires a number")?;
-                format_float(
-                    float,
-                    &protocol::repr(&self.state.heap, &Value::Float(float))?,
-                    &spec,
-                )
+    /// `format(value, text)` for a builtin value with a non-empty specification: ints, bools
+    /// and floats through the numeric mini-language, strings through the string one, and
+    /// anything else with the `TypeError` of `object.__format__`.
+    fn format_unconverted_value(&mut self, value: &Value, text: &str) -> Result<String, String> {
+        let result = match super::number::view(&self.state.heap, value) {
+            Some(number::NumberRef::Complex(real, imag)) => format_complex(real, imag, text),
+            Some(number::NumberRef::Float(float)) => {
+                let repr = protocol::repr(&self.state.heap, &Value::Float(float))?;
+                format_float(float, &repr, text)
             }
-            (Some('d' | 'b' | 'o' | 'x' | 'X') | None, Some(_)) => {
+            Some(_) => {
                 let integer = self
                     .bigint_operand(value)
                     .map_err(|_| "integer format requires an integer")?;
-                format_integer(integer, &spec)
+                let type_name = self.type_name_of(value)?;
+                format_integer(integer, text, &type_name)
             }
-            (_, Some(_)) => Err(format!("unsupported numeric format {text:?}")),
-            (_, None) => match protocol::string_value(&self.state.heap, value)? {
-                Some(text) => format_text(&text, &spec),
-                None => Err(format!("unsupported format specification {text:?}")),
+            None => match protocol::string_value(&self.state.heap, value)? {
+                Some(string) => format_text(&string, text),
+                None => {
+                    let type_name = self.type_name_of(value)?;
+                    return Err(self.raise_exception(
+                        "TypeError",
+                        format!("unsupported format string passed to {type_name}.__format__"),
+                    ));
+                }
             },
-        }
+        };
+        result.map_err(|error| self.raise_format_error(error))
     }
 
     pub(super) fn is_bigint(&self, value: &Value) -> Result<bool, String> {
@@ -683,12 +861,9 @@ impl Vm<'_> {
     }
 
     fn bigint_operand(&self, value: &Value) -> Result<BigInt, String> {
-        match super::number::view(&self.state.heap, value) {
-            Some(super::number::NumberRef::Int(value)) => Ok(BigInt::from(value)),
-            Some(super::number::NumberRef::BigInt(value)) => Ok(value.clone()),
-            Some(super::number::NumberRef::Float(_) | super::number::NumberRef::Complex(..))
-            | None => Err("unsupported arithmetic operands".into()),
-        }
+        super::number::view(&self.state.heap, value)
+            .and_then(super::number::NumberRef::to_bigint)
+            .ok_or_else(|| "unsupported arithmetic operands".into())
     }
 
     pub(super) fn numeric_float(&self, value: &Value) -> Result<f64, String> {
@@ -710,6 +885,16 @@ impl Vm<'_> {
 }
 
 /// The source spelling of a binary operator, as CPython prints it in `TypeError` messages.
+fn builtin_sequence_name(sequence: BuiltinType) -> &'static str {
+    match sequence {
+        BuiltinType::String => "str",
+        BuiltinType::Bytes => "bytes",
+        BuiltinType::ByteArray => "bytearray",
+        BuiltinType::List => "list",
+        _ => "tuple",
+    }
+}
+
 fn binary_operator_symbol(operator: BinaryOperator) -> &'static str {
     match operator {
         BinaryOperator::Add => "+",

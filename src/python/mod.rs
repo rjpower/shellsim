@@ -11,6 +11,8 @@ mod complex;
 mod cpython_names;
 mod exception_types;
 mod filesystem;
+mod float_text;
+mod hash;
 mod heap;
 mod http;
 mod lexer;
@@ -26,6 +28,7 @@ mod source;
 mod stdlib;
 mod string;
 mod token;
+mod unicode;
 mod vm;
 
 use std::collections::HashMap;
@@ -1536,6 +1539,13 @@ fn literal_source(expression: &ast::Expression) -> Result<String, String> {
             ))
         }
         ast::ExpressionKind::Constant(ast::Constant::String(value)) => Ok(format!("{value:?}")),
+        ast::ExpressionKind::Constant(ast::Constant::Bytes(value)) => Ok(format!(
+            "b\"{}\"",
+            value
+                .iter()
+                .map(|byte| format!("\\x{byte:02x}"))
+                .collect::<String>()
+        )),
         ast::ExpressionKind::List(values) => Ok(format!(
             "[{}]",
             values

@@ -142,6 +142,86 @@ fn descriptors_and_zero_argument_super_share_method_binding() {
 }
 
 #[test]
+fn zero_argument_super_works_in_initializers_run_by_instantiation() {
+    // `Leaf()` runs the inherited `Middle.__init__`, whose `super()` must start after `Middle`.
+    // The failed `Broken()` must not leave its method frame behind for later calls.
+    assert_eq!(
+        run_shell(
+            "python3.14 -c 'class Root:\n    def __init__(self, seed=None):\n        self.seed = seed\nclass Middle(Root):\n    def __init__(self, name=None):\n        super().__init__(7)\n        self.name = name\n    def label(self):\n        return \"middle\"\nclass Leaf(Middle):\n    def label(self):\n        return super().label() + \"-leaf\"\nclass Broken(Root):\n    def __init__(self):\n        super().__init__(1)\n        raise ValueError(\"boom\")\nleaf = Leaf(name=\"x\")\ntry:\n    Broken()\nexcept ValueError as error:\n    print(error)\nprint(leaf.seed, leaf.name, leaf.label())'"
+        ),
+        (0, b"boom\n7 x middle-leaf\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn super_init_continues_into_object_and_base_exception() {
+    // After the last user class, `super().__init__` reaches `object.__init__`, which takes no
+    // arguments, or `BaseException.__init__`, which replaces `args`.
+    let source = r#"class Plain:
+    def __init__(self):
+        super().__init__()
+        self.ready = True
+class Extra:
+    def __init__(self, value):
+        super().__init__(value)
+class Tagged(ValueError):
+    def __init__(self, a, b):
+        super().__init__(a, b)
+        self.extra = 1
+class Keyword(Exception):
+    def __init__(self):
+        super().__init__(x=1)
+class Late(Exception):
+    def __init__(self, value):
+        super().__init__()
+        self.args = ("late", value)
+print(Plain().ready)
+error = Tagged(1, 2)
+print(error.args, str(error), repr(error), error.extra)
+print(str(Late(4)), Late(4).args)
+for build in (lambda: Extra(1), Keyword):
+    try:
+        build()
+    except TypeError as error:
+        print(error)"#;
+    assert_eq!(
+        run_python_text(source),
+        (
+            0,
+            "True\n(1, 2) (1, 2) Tagged(1, 2) 1\n('late', 4) ('late', 4)\nobject.__init__() takes exactly one argument (the instance to initialize)\nKeyword() takes no keyword arguments\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn raising_a_user_exception_class_raises_an_instance() {
+    let source = r#"class Tagged(LookupError):
+    def __init__(self):
+        super().__init__("tagged")
+        self.tag = 7
+class Done(IndexError):
+    pass
+for build in (lambda: Tagged, lambda: Done):
+    try:
+        raise build()
+    except LookupError as error:
+        print(type(error).__name__, error.args, getattr(error, "tag", None))
+try:
+    raise Tagged from None
+except Tagged as error:
+    print("from", error)"#;
+    assert_eq!(
+        run_python_text(source),
+        (
+            0,
+            "Tagged ('tagged',) 7\nDone () None\nfrom tagged\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
 fn user_descriptors_follow_precedence_and_receive_set_name() {
     assert_eq!(
         run_shell(
@@ -287,6 +367,30 @@ print(hasattr(sys.stdin, 'buffer'))
         (
             0,
             "1 0.0 0 0\n7 2.5 1 6 1\nTrue 0\n<attribute 'real' of 'int' objects> <attribute 'imag' of 'float' objects> True False\nTrue\nattribute 'real' of 'int' objects is not writable\nattribute 'real' of 'float' objects is not writable\nTrue\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn functions_report_their_names() {
+    let source = r#"def outer():
+    def inner():
+        pass
+    return inner
+
+class C:
+    def method(self):
+        pass
+
+print(outer.__name__, outer().__name__, (lambda: 0).__name__, C.method.__name__)
+print(getattr(outer, "__name__"), hasattr(outer, "__name__"))
+"#;
+    assert_eq!(
+        run_python_text(source),
+        (
+            0,
+            "outer inner <lambda> method\nouter True\n".into(),
             String::new()
         )
     );

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::native::{BinarySlotFn, TernarySlotFn, UnarySlotFn};
+use super::native::{BinarySlotFn, PyError, PyResult, PyRuntime, TernarySlotFn, UnarySlotFn};
 use super::Value;
 
 // Builtins and native value kinds are immutable process metadata. A fixed charge keeps their
@@ -30,6 +30,10 @@ pub(super) enum BuiltinType {
     Object,
     Type,
     None,
+    /// The type of the `Ellipsis` singleton, which CPython names `ellipsis`.
+    Ellipsis,
+    /// The type of the `NotImplemented` singleton.
+    NotImplemented,
     Bool,
     Int,
     Float,
@@ -57,13 +61,16 @@ pub(super) enum BuiltinType {
     Property,
     Array,
     Complex,
+    Slice,
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 30] = [
+    pub(super) const ALL: [Self; 33] = [
         Self::Object,
         Self::Type,
         Self::None,
+        Self::Ellipsis,
+        Self::NotImplemented,
         Self::Bool,
         Self::Int,
         Self::Float,
@@ -91,6 +98,7 @@ impl BuiltinType {
         Self::Property,
         Self::Array,
         Self::Complex,
+        Self::Slice,
     ];
 
     pub(super) const fn id(self) -> TypeId {
@@ -102,6 +110,8 @@ impl BuiltinType {
             Self::Object => "object",
             Self::Type => "type",
             Self::None => "NoneType",
+            Self::Ellipsis => "ellipsis",
+            Self::NotImplemented => "NotImplementedType",
             Self::Bool => "bool",
             Self::Int => "int",
             Self::Float => "float",
@@ -129,6 +139,7 @@ impl BuiltinType {
             Self::Property => "property",
             Self::Array => "numpy.ndarray",
             Self::Complex => "complex",
+            Self::Slice => "slice",
         }
     }
 }
@@ -174,6 +185,8 @@ pub struct TypeSlots {
     pub reflected_floor_divide: Option<SlotValue>,
     pub remainder: Option<SlotValue>,
     pub reflected_remainder: Option<SlotValue>,
+    pub divmod: Option<SlotValue>,
+    pub reflected_divmod: Option<SlotValue>,
     pub left_shift: Option<SlotValue>,
     pub reflected_left_shift: Option<SlotValue>,
     pub right_shift: Option<SlotValue>,
@@ -240,6 +253,8 @@ pub enum Slot {
     ReflectedFloorDivide,
     Remainder,
     ReflectedRemainder,
+    DivMod,
+    ReflectedDivMod,
     LeftShift,
     ReflectedLeftShift,
     RightShift,
@@ -261,7 +276,7 @@ pub enum Slot {
 }
 
 impl Slot {
-    const ALL: [Self; 52] = [
+    const ALL: [Self; 54] = [
         Self::Call,
         Self::New,
         Self::Init,
@@ -296,6 +311,8 @@ impl Slot {
         Self::ReflectedFloorDivide,
         Self::Remainder,
         Self::ReflectedRemainder,
+        Self::DivMod,
+        Self::ReflectedDivMod,
         Self::LeftShift,
         Self::ReflectedLeftShift,
         Self::RightShift,
@@ -355,6 +372,8 @@ impl TypeSlots {
             reflected_floor_divide: get("__rfloordiv__"),
             remainder: get("__mod__"),
             reflected_remainder: get("__rmod__"),
+            divmod: get("__divmod__"),
+            reflected_divmod: get("__rdivmod__"),
             left_shift: get("__lshift__"),
             reflected_left_shift: get("__rlshift__"),
             right_shift: get("__rshift__"),
@@ -412,6 +431,8 @@ impl TypeSlots {
             &self.reflected_floor_divide,
             &self.remainder,
             &self.reflected_remainder,
+            &self.divmod,
+            &self.reflected_divmod,
             &self.left_shift,
             &self.reflected_left_shift,
             &self.right_shift,
@@ -472,6 +493,8 @@ impl TypeSlots {
             Slot::ReflectedFloorDivide => self.reflected_floor_divide.as_ref(),
             Slot::Remainder => self.remainder.as_ref(),
             Slot::ReflectedRemainder => self.reflected_remainder.as_ref(),
+            Slot::DivMod => self.divmod.as_ref(),
+            Slot::ReflectedDivMod => self.reflected_divmod.as_ref(),
             Slot::LeftShift => self.left_shift.as_ref(),
             Slot::ReflectedLeftShift => self.reflected_left_shift.as_ref(),
             Slot::RightShift => self.right_shift.as_ref(),
@@ -529,6 +552,8 @@ impl TypeSlots {
             Slot::ReflectedFloorDivide => &mut self.reflected_floor_divide,
             Slot::Remainder => &mut self.remainder,
             Slot::ReflectedRemainder => &mut self.reflected_remainder,
+            Slot::DivMod => &mut self.divmod,
+            Slot::ReflectedDivMod => &mut self.reflected_divmod,
             Slot::LeftShift => &mut self.left_shift,
             Slot::ReflectedLeftShift => &mut self.reflected_left_shift,
             Slot::RightShift => &mut self.right_shift,
@@ -595,8 +620,20 @@ impl Default for TypeRegistry {
             });
         }
         install_native_attributes(
+            &mut types[BuiltinType::Object as usize],
+            &super::stdlib::core::OBJECT_TYPE,
+        );
+        install_native_attributes(
             &mut types[BuiltinType::Type as usize],
             &super::stdlib::core::TYPE_TYPE,
+        );
+        install_native_attributes(
+            &mut types[BuiltinType::Exception as usize],
+            &super::stdlib::core::EXCEPTION_TYPE,
+        );
+        install_native_attributes(
+            &mut types[BuiltinType::Iterator as usize],
+            &super::stdlib::core::ITERATOR_TYPE,
         );
         install_native_attributes(
             &mut types[BuiltinType::String as usize],
@@ -945,6 +982,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
         slots.reflected_floor_divide = Some(intrinsic(super::number::slot_reflected_floor_divide));
         slots.remainder = Some(intrinsic(super::number::slot_remainder));
         slots.reflected_remainder = Some(intrinsic(super::number::slot_reflected_remainder));
+        slots.divmod = Some(intrinsic(super::number::slot_divmod));
+        slots.reflected_divmod = Some(intrinsic(super::number::slot_reflected_divmod));
         slots.left_shift = Some(intrinsic(super::number::slot_left_shift));
         slots.reflected_left_shift = Some(intrinsic(super::number::slot_left_shift));
         slots.right_shift = Some(intrinsic(super::number::slot_right_shift));
@@ -1067,14 +1106,20 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.reflected_floor_divide = Some(intrinsic(super::complex::slot_reflected_floor_divide));
     slots.remainder = Some(intrinsic(super::complex::slot_remainder));
     slots.reflected_remainder = Some(intrinsic(super::complex::slot_reflected_remainder));
-    slots.less_than = Some(intrinsic(super::complex::slot_less_than));
-    slots.less_equal = Some(intrinsic(super::complex::slot_less_equal));
-    slots.greater_than = Some(intrinsic(super::complex::slot_greater_than));
-    slots.greater_equal = Some(intrinsic(super::complex::slot_greater_equal));
 
     let stream = &mut types[BuiltinType::Stream as usize].slots;
     stream.iter = Some(unary(super::stdlib::sys::slot_iter));
     stream.next = Some(unary(super::stdlib::sys::slot_next));
+
+    types[BuiltinType::NotImplemented as usize].slots.bool_ = Some(unary(not_implemented_bool));
+}
+
+/// CPython 3.14 rejects `NotImplemented` in a boolean context. Truth-testing it usually means an
+/// operator method's result was used without checking whether the method declined.
+fn not_implemented_bool(_: &mut dyn PyRuntime, _: Value) -> PyResult<Option<Value>> {
+    Err(PyError::type_error(
+        "NotImplemented should not be used in a boolean context",
+    ))
 }
 
 #[cfg(test)]

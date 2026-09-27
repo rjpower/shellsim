@@ -2,14 +2,26 @@
 
 use super::{
     expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BytecodeFrame, CallArgs,
-    CallMode, CallResult, ClassLayout, CodeRef, Execution, FunctionInvocation, FunctionReturn,
-    HashMap, InstanceAttributes, InstancePayload, NativeValue, Object, Ordering, PendingNativeCall,
-    PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, ScopeId, Slot, Stream, Value,
-    Vm,
+    CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator, Execution, FunctionInvocation,
+    FunctionReturn, HashMap, InstanceAttributes, InstancePayload, NativeValue, Object,
+    PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, ScopeId,
+    Slot, Stream, Value, Vm,
 };
 use num_traits::{Signed, Zero};
 
 impl Vm<'_> {
+    /// The builtin `abs(value)`, through the `__abs__` slot.
+    pub(super) fn absolute(&mut self, value: Value) -> Result<Value, String> {
+        if let Some(result) = self.invoke_slot(&value, Slot::Absolute, "__abs__", Vec::new())? {
+            return Ok(result);
+        }
+        let message = format!(
+            "bad operand type for abs(): '{}'",
+            self.type_name_of(&value)?
+        );
+        Err(self.raise_exception("TypeError", message))
+    }
+
     fn pow_integer_argument(&self, value: &Value) -> Result<(BigInt, usize), PyError> {
         let decimal = <Self as PyRuntime>::integer_text(self, value)?.ok_or_else(|| {
             PyError::type_error("pow() 3rd argument not allowed unless all arguments are integers")
@@ -221,7 +233,7 @@ impl Vm<'_> {
                             CallMode::Immediate => None,
                         };
                         let previous_suspend = self.native_suspend_allowed;
-                        self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+                        self.native_suspend_allowed = self.may_suspend(mode);
                         let result = (method.call)(self, receiver, call);
                         self.native_suspend_allowed = previous_suspend;
                         match result {
@@ -295,7 +307,8 @@ impl Vm<'_> {
                             else {
                                 return Err("invalid enum member".into());
                             };
-                            if protocol::equals(&self.state.heap, value, &arguments[0])? {
+                            let value = *value;
+                            if self.values_equal(&value, &arguments[0])? {
                                 return Ok(CallResult::Value(member));
                             }
                         }
@@ -473,13 +486,17 @@ impl Vm<'_> {
                             code,
                             closure,
                             defaults,
-                            ..
+                            defining_class,
                         } = self.state.heap.get(function)?.clone()
                         else {
                             return Err(format!("{name}.__init__ is not a function"));
                         };
                         arguments.insert(0, instance);
-                        match self.call_python_function(
+                        // Zero-argument `super()` in the initializer reads this frame.
+                        if let Some(owner) = defining_class {
+                            self.method_frames.push((owner, instance));
+                        }
+                        let result = self.call_python_function(
                             &function_name,
                             &code,
                             closure,
@@ -490,7 +507,11 @@ impl Vm<'_> {
                                 mode: CallMode::Immediate,
                                 pop_method_frame: false,
                             },
-                        )? {
+                        );
+                        if defining_class.is_some() {
+                            self.method_frames.pop();
+                        }
+                        match result? {
                             CallResult::Value(value) if value.is_none() => {}
                             CallResult::Value(_) => {
                                 return Err("__init__() should return None".into())
@@ -552,7 +573,7 @@ impl Vm<'_> {
                 CallMode::Immediate => None,
             };
             let previous_suspend = self.native_suspend_allowed;
-            self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+            self.native_suspend_allowed = self.may_suspend(mode);
             let result = (method.call)(self, receiver, call);
             self.native_suspend_allowed = previous_suspend;
             return match result {
@@ -581,7 +602,7 @@ impl Vm<'_> {
                 CallMode::Immediate => None,
             };
             let previous_suspend = self.native_suspend_allowed;
-            self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+            self.native_suspend_allowed = self.may_suspend(mode);
             let result = (function.call)(self, call);
             self.native_suspend_allowed = previous_suspend;
             return match result {
@@ -605,7 +626,16 @@ impl Vm<'_> {
         let Some(NativeValue::Function(function)) = function.native_value() else {
             return Err(self.raise_object_type_error(&function, "is not callable"));
         };
-        if !keyword_arguments.is_empty() && !matches!(function, Builtin::Print | Builtin::Sorted) {
+        if !keyword_arguments.is_empty()
+            && !matches!(
+                function,
+                Builtin::Print
+                    | Builtin::Sorted
+                    | Builtin::Minimum
+                    | Builtin::Maximum
+                    | Builtin::Format
+            )
+        {
             return Err("this builtin does not accept keyword arguments".into());
         }
         match function {
@@ -663,7 +693,7 @@ impl Vm<'_> {
                 };
                 let marker = Value::Native(NativeValue::Stream(Stream::Stdin));
                 let previous_suspend = self.native_suspend_allowed;
-                self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+                self.native_suspend_allowed = self.may_suspend(mode);
                 let result = self.read_stream(&marker, None, true);
                 self.native_suspend_allowed = previous_suspend;
                 match result {
@@ -804,6 +834,41 @@ impl Vm<'_> {
                 let value = self.repr_value(&arguments[0])?;
                 Ok(CallResult::Value(self.allocate_string(value)?))
             }
+            Builtin::Format => {
+                if !keyword_arguments.is_empty() {
+                    let message = "format() takes no keyword arguments".to_string();
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                if !(1..=2).contains(&arguments.len()) {
+                    let (bound, count) = if arguments.is_empty() {
+                        ("least 1 argument", 0)
+                    } else {
+                        ("most 2 arguments", arguments.len())
+                    };
+                    let message = format!("format expected at {bound}, got {count}");
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                let spec = match arguments.get(1) {
+                    Some(spec) => {
+                        protocol::string_value(&self.state.heap, spec)?.ok_or_else(|| {
+                            let message = format!(
+                                "format() argument 2 must be str, not {}",
+                                self.type_name_of(spec).unwrap_or_default()
+                            );
+                            self.raise_exception("TypeError", message)
+                        })?
+                    }
+                    None => String::new(),
+                };
+                self.reserve_format_spec(&spec)?;
+                let value = self.format_object(&arguments[0], &spec)?;
+                Ok(CallResult::Value(self.allocate_string(value)?))
+            }
+            Builtin::Hash => {
+                expect_arity(&arguments, 1, 1)?;
+                let hash = self.hash_value(&arguments[0])?;
+                Ok(CallResult::Value(Value::Int(hash)))
+            }
             Builtin::Dir => {
                 expect_arity(&arguments, 0, 1)?;
                 let mut names = if let Some(value) = arguments.first() {
@@ -856,7 +921,8 @@ impl Vm<'_> {
                 if let Some(value) =
                     self.invoke_slot(&arguments[0], Slot::Length, "__len__", Vec::new())?
                 {
-                    let length = value.as_int().ok_or("__len__() should return an integer")?;
+                    let length = protocol::int_value(&self.state.heap, &value)
+                        .ok_or("__len__() should return an integer")?;
                     if length < 0 {
                         return Err("__len__() should return >= 0".into());
                     }
@@ -868,6 +934,7 @@ impl Vm<'_> {
                     Some(length)
                 } else if let Some(id) = arguments[0].object_id() {
                     match self.state.heap.get(id)? {
+                        Object::Bare => None,
                         Object::List(values)
                         | Object::Tuple(values)
                         | Object::Set(values)
@@ -964,18 +1031,18 @@ impl Vm<'_> {
                     self.reserve_result(64)?;
                     keyed.push((key, value));
                 }
-                // Stable insertion sort keeps comparison dispatch and failure order obvious.
+                // Stable insertion sort keeps comparison dispatch and failure order obvious. Like
+                // CPython's sort it only asks `<`, and a reversed sort keeps equal items in order.
                 for index in 1..keyed.len() {
                     let mut current = index;
                     while current > 0 {
                         self.charge_cpu(1)?;
-                        if self.sort_order(&keyed[current].0, &keyed[current - 1].0)?
-                            != if reverse {
-                                Ordering::Greater
-                            } else {
-                                Ordering::Less
-                            }
-                        {
+                        let (left, right) = if reverse {
+                            (keyed[current - 1].0, keyed[current].0)
+                        } else {
+                            (keyed[current].0, keyed[current - 1].0)
+                        };
+                        if !self.compare_truth(ComparisonOperator::Less, &left, &right)? {
                             break;
                         }
                         keyed.swap(current, current - 1);
@@ -988,52 +1055,88 @@ impl Vm<'_> {
                 ))
             }
             Builtin::Minimum | Builtin::Maximum => {
-                if arguments.is_empty() {
-                    return Err("expected at least one argument".into());
-                }
-                let values = if arguments.len() == 1 {
-                    self.iterable_values(&arguments[0])?
-                } else {
-                    arguments
+                let (name, operator) = match function {
+                    Builtin::Minimum => ("min", ComparisonOperator::Less),
+                    _ => ("max", ComparisonOperator::Greater),
                 };
-                let mut values = values.into_iter();
-                let mut selected = values.next().ok_or("argument is an empty sequence")?;
-                for value in values {
-                    self.charge_cpu(1)?;
-                    let ordering = self.sort_order(&value, &selected)?;
-                    let replace = match function {
-                        Builtin::Minimum => ordering == Ordering::Less,
-                        Builtin::Maximum => ordering == Ordering::Greater,
-                        _ => unreachable!(),
-                    };
-                    if replace {
-                        selected = value;
+                let mut key_function = None;
+                let mut default = None;
+                for (keyword, value) in keyword_arguments {
+                    match keyword.as_str() {
+                        "key" => key_function = Some(value).filter(|value| !value.is_none()),
+                        "default" => default = Some(value),
+                        _ => {
+                            let message =
+                                format!("{name}() got an unexpected keyword argument '{keyword}'");
+                            return Err(self.raise_exception("TypeError", message));
+                        }
                     }
                 }
-                Ok(CallResult::Value(selected))
+                let values = match arguments.len() {
+                    0 => {
+                        let message = format!("{name} expected at least 1 argument, got 0");
+                        return Err(self.raise_exception("TypeError", message));
+                    }
+                    1 => self.iterable_values(&arguments[0])?,
+                    _ if default.is_some() => {
+                        let message = format!(
+                            "Cannot specify a default for {name}() with multiple positional \
+                             arguments"
+                        );
+                        return Err(self.raise_exception("TypeError", message));
+                    }
+                    _ => arguments,
+                };
+                // CPython keeps the first of equal items: only a strictly smaller (for `min`) or
+                // larger (for `max`) key replaces the selection.
+                let mut selected: Option<(Value, Value)> = None;
+                for value in values {
+                    self.charge_cpu(1)?;
+                    let key = match key_function {
+                        Some(function) => {
+                            self.stack.push(function);
+                            self.stack.push(value);
+                            match self.call(1, &[], &[false], CallMode::Immediate)? {
+                                CallResult::Value(key) => key,
+                                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
+                                CallResult::EnteredFrame => {
+                                    unreachable!("immediate call entered a frame")
+                                }
+                                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                                    unreachable!("immediate call cannot suspend")
+                                }
+                            }
+                        }
+                        None => value,
+                    };
+                    let replace = match &selected {
+                        None => true,
+                        Some((selected_key, _)) => {
+                            self.compare_truth(operator, &key, &selected_key.clone())?
+                        }
+                    };
+                    if replace {
+                        selected = Some((key, value));
+                    }
+                }
+                match (selected, default) {
+                    (Some((_, value)), _) => Ok(CallResult::Value(value)),
+                    (None, Some(default)) => Ok(CallResult::Value(default)),
+                    (None, None) => {
+                        let message = format!("{name}() iterable argument is empty");
+                        Err(self.raise_exception("ValueError", message))
+                    }
+                }
             }
             Builtin::Sum => {
                 expect_arity(&arguments, 1, 2)?;
                 let values = self.iterable_values(&arguments[0])?;
-                let mut total = arguments.get(1).cloned().unwrap_or(Value::Int(0));
-                for value in values {
-                    self.charge_cpu(1)?;
-                    total = self.add_numbers(total, value)?;
-                }
-                Ok(CallResult::Value(total))
+                let start = arguments.get(1).copied().unwrap_or(Value::Int(0));
+                Ok(CallResult::Value(self.builtin_sum(values, start)?))
             }
             Builtin::Absolute => {
                 expect_arity(&arguments, 1, 1)?;
-                let Some(value) =
-                    self.invoke_slot(&arguments[0], Slot::Absolute, "__abs__", Vec::new())?
-                else {
-                    let message = format!(
-                        "bad operand type for abs(): '{}'",
-                        self.type_name_of(&arguments[0])?
-                    );
-                    return Err(self.raise_exception("TypeError", message));
-                };
-                Ok(CallResult::Value(value))
+                Ok(CallResult::Value(self.absolute(arguments[0])?))
             }
             Builtin::Power => {
                 expect_arity(&arguments, 2, 3)?;
@@ -1080,13 +1183,29 @@ impl Vm<'_> {
             }
             Builtin::Divmod => {
                 expect_arity(&arguments, 2, 2)?;
-                let quotient =
-                    self.binary_value(BinaryOperator::FloorDivide, arguments[0], arguments[1])?;
-                let remainder =
-                    self.binary_value(BinaryOperator::Remainder, arguments[0], arguments[1])?;
-                Ok(CallResult::Value(self.allocate_object(Object::Tuple(
-                    vec![quotient, remainder],
-                ))?))
+                Ok(CallResult::Value(
+                    self.divmod_value(arguments[0], arguments[1])?,
+                ))
+            }
+            Builtin::SetAttribute => {
+                if arguments.len() != 3 {
+                    let message = format!("setattr expected 3 arguments, got {}", arguments.len());
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                let Some(name) = protocol::string_value(&self.state.heap, &arguments[1])? else {
+                    let message = format!(
+                        "attribute name must be string, not '{}'",
+                        self.type_name_of(&arguments[1])?
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                };
+                // `setattr(owner, name, value)` is `owner.name = value` with a computed name.
+                let symbol = self
+                    .state
+                    .heap
+                    .intern_symbol(&name, &mut self.interp.resources)?;
+                self.store_attribute_by_symbol(arguments[0], symbol, &name, arguments[2])?;
+                Ok(CallResult::Value(Value::None))
             }
             Builtin::Callable => {
                 expect_arity(&arguments, 1, 1)?;
@@ -1131,35 +1250,13 @@ impl Vm<'_> {
                 };
                 Ok(CallResult::Value(value))
             }
-            Builtin::Range => {
-                expect_arity(&arguments, 1, 3)?;
-                let integers = arguments
-                    .iter()
-                    .map(|value| value.as_int().ok_or("range arguments must be integers"))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let (start, stop, step) = match integers.as_slice() {
-                    [stop] => (0, *stop, 1),
-                    [start, stop] => (*start, *stop, 1),
-                    [start, stop, step] => (*start, *stop, *step),
-                    _ => unreachable!(),
-                };
-                if step == 0 {
-                    return Err(
-                        self.raise_exception("ValueError", "range() arg 3 must not be zero")
-                    );
-                }
-                Ok(CallResult::Value(self.allocate_object(Object::Range {
-                    start,
-                    stop,
-                    step,
-                })?))
-            }
             Builtin::Enumerate => {
                 expect_arity(&arguments, 1, 2)?;
                 let values = self.iterable_values(&arguments[0])?;
-                let start = arguments.get(1).map_or(Ok(0), |value| {
-                    value.as_int().ok_or("enumerate start must be an integer")
-                })?;
+                let start = match arguments.get(1) {
+                    Some(value) => self.index_argument(value)?,
+                    None => 0,
+                };
                 let mut result = Vec::new();
                 for (offset, value) in values.into_iter().enumerate() {
                     self.reserve_result(64)?;
@@ -1530,7 +1627,7 @@ impl Vm<'_> {
                         CallArgs::new(Vec::new(), Vec::new()),
                     )
                     .map_err(|error| error.to_string())?;
-                    if protocol::equals(&self.state.heap, &value, &sentinel)? {
+                    if self.values_equal(&value, &sentinel)? {
                         if let Object::CallableIterator { exhausted, .. } =
                             self.state.heap.get_mut(id)?
                         {
@@ -1583,6 +1680,7 @@ impl Vm<'_> {
             PyErrorKind::Runtime => Some("RuntimeError"),
             PyErrorKind::Exception(kind) => Some(kind),
             PyErrorKind::Resource
+            | PyErrorKind::Unsupported
             | PyErrorKind::Raised
             | PyErrorKind::Exit(_)
             | PyErrorKind::Suspend(_) => None,
@@ -1598,6 +1696,12 @@ impl Vm<'_> {
         error.message
     }
 
+    /// Whether a native called in `mode` may suspend its process: only a deferred call made
+    /// by scheduler-dispatched bytecode, outside any synchronous execution.
+    fn may_suspend(&self, mode: CallMode) -> bool {
+        matches!(mode, CallMode::Deferred(_)) && self.synchronous_frames == 0
+    }
+
     pub(super) fn resume_native_call(
         &mut self,
         pending: PendingNativeCall,
@@ -1607,7 +1711,7 @@ impl Vm<'_> {
         }
         let retry = pending.clone();
         let previous_suspend = self.native_suspend_allowed;
-        self.native_suspend_allowed = true;
+        self.native_suspend_allowed = self.synchronous_frames == 0;
         let result = match pending {
             PendingNativeCall::Function {
                 function,
@@ -1646,7 +1750,7 @@ impl Vm<'_> {
         };
         let marker = Value::Native(NativeValue::Stream(Stream::Stdin));
         let previous_suspend = self.native_suspend_allowed;
-        self.native_suspend_allowed = true;
+        self.native_suspend_allowed = self.synchronous_frames == 0;
         let result = self.read_stream(&marker, None, true);
         self.native_suspend_allowed = previous_suspend;
         match result {

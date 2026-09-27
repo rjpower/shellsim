@@ -16,10 +16,14 @@ use super::super::native::{
     PySequence, PySet, PyTuple, PyValue, PyValueCast,
 };
 use super::super::number::PyNumber;
+use super::super::protocol;
 use super::super::slice::SlicePlan;
+use super::super::unicode;
 
 static BUILTINS: &[FunctionDef] = &[
     builtin("__import__", builtin_import),
+    builtin("ascii", builtin_ascii),
+    builtin("id", builtin_id),
     builtin("map", builtin_map),
     builtin("filter", builtin_filter),
     builtin("reversed", builtin_reversed),
@@ -71,12 +75,24 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "encode", string_encode),
         method("str", "lower", string_lower),
         method("str", "upper", string_upper),
+        method("str", "title", string_title),
+        method("str", "capitalize", string_capitalize),
+        method("str", "swapcase", string_swapcase),
         method("str", "zfill", string_zfill),
+        method("str", "expandtabs", string_expandtabs),
+        method("str", "translate", string_translate),
+        method("str", "removeprefix", string_removeprefix),
+        method("str", "removesuffix", string_removesuffix),
         method("str", "isalnum", string_isalnum),
         method("str", "isalpha", string_isalpha),
         method("str", "isdigit", string_isdigit),
+        method("str", "isdecimal", string_isdecimal),
+        method("str", "isnumeric", string_isnumeric),
+        method("str", "isspace", string_isspace),
+        method("str", "isascii", string_isascii),
         method("str", "islower", string_islower),
         method("str", "isupper", string_isupper),
+        method("str", "istitle", string_istitle),
     ],
     getters: &[],
 };
@@ -89,6 +105,7 @@ pub(crate) static BYTES_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytes", "startswith", bytes_startswith),
         method("bytes", "endswith", bytes_endswith),
         method("bytes", "find", bytes_find),
+        method("bytes", "join", bytes_join),
         method("bytes", "index", bytes_index),
         method("bytes", "count", bytes_count),
         method("bytes", "partition", bytes_partition),
@@ -98,7 +115,6 @@ pub(crate) static BYTES_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytes", "lstrip", bytes_lstrip),
         method("bytes", "rstrip", bytes_rstrip),
         method("bytes", "split", bytes_split),
-        method("bytes", "join", bytes_join),
         method("bytes", "upper", bytes_upper),
         method("bytes", "lower", bytes_lower),
         method("bytes", "replace", bytes_replace),
@@ -121,6 +137,7 @@ pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytearray", "startswith", bytes_startswith),
         method("bytearray", "endswith", bytes_endswith),
         method("bytearray", "find", bytes_find),
+        method("bytearray", "join", bytes_join),
         method("bytearray", "index", bytes_index),
         method("bytearray", "count", bytes_count),
         method("bytearray", "partition", bytes_partition),
@@ -130,7 +147,6 @@ pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytearray", "lstrip", bytes_lstrip),
         method("bytearray", "rstrip", bytes_rstrip),
         method("bytearray", "split", bytes_split),
-        method("bytearray", "join", bytes_join),
         method("bytearray", "upper", bytes_upper),
         method("bytearray", "lower", bytes_lower),
         method("bytearray", "replace", bytes_replace),
@@ -227,6 +243,32 @@ pub(crate) static FROZENSET_TYPE: NativeTypeDef = NativeTypeDef {
 pub(crate) static PROPERTY_TYPE: NativeTypeDef = NativeTypeDef {
     name: "property",
     methods: &[method("property", "setter", property_setter)],
+    getters: &[],
+};
+
+pub(crate) static OBJECT_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "object",
+    methods: &[
+        method("object", "__init__", object_init),
+        method("object", "__hash__", object_hash),
+        method("object", "__eq__", object_eq),
+        method("object", "__ne__", object_ne),
+    ],
+    getters: &[],
+};
+
+pub(crate) static ITERATOR_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "iterator",
+    methods: &[
+        method("iterator", "__iter__", iterator_iter),
+        method("iterator", "__next__", iterator_next),
+    ],
+    getters: &[],
+};
+
+pub(crate) static EXCEPTION_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "BaseException",
+    methods: &[method("BaseException", "__init__", exception_init)],
     getters: &[],
 };
 
@@ -375,6 +417,24 @@ fn string_upper(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     )
 }
 
+fn string_title(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_transform(runtime, receiver, args, unicode::title, "str.title")
+}
+
+fn string_capitalize(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_transform(
+        runtime,
+        receiver,
+        args,
+        unicode::capitalize,
+        "str.capitalize",
+    )
+}
+
+fn string_swapcase(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_transform(runtime, receiver, args, unicode::swapcase, "str.swapcase")
+}
+
 fn string_transform(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
@@ -394,7 +454,7 @@ fn string_isalnum(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
         runtime,
         receiver,
         args,
-        char::is_alphanumeric,
+        unicode::is_alphanumeric,
         "str.isalnum",
     )
 }
@@ -404,7 +464,46 @@ fn string_isalpha(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
 }
 
 fn string_isdigit(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    string_predicate(runtime, receiver, args, char::is_numeric, "str.isdigit")
+    string_predicate(runtime, receiver, args, unicode::is_digit, "str.isdigit")
+}
+
+fn string_isdecimal(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_predicate(
+        runtime,
+        receiver,
+        args,
+        unicode::is_decimal,
+        "str.isdecimal",
+    )
+}
+
+fn string_isnumeric(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_predicate(
+        runtime,
+        receiver,
+        args,
+        unicode::is_numeric,
+        "str.isnumeric",
+    )
+}
+
+fn string_isspace(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_predicate(runtime, receiver, args, unicode::is_space, "str.isspace")
+}
+
+fn string_isascii(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.isascii", 0, 0)?;
+    args.reject_keywords("str.isascii")?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    Ok(PyValue::Bool(value.is_ascii()))
+}
+
+fn string_istitle(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.istitle", 0, 0)?;
+    args.reject_keywords("str.istitle")?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    Ok(PyValue::Bool(unicode::is_title(&value)))
 }
 
 fn string_islower(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -521,21 +620,93 @@ fn bytes_endswith(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
     bytes_affix(runtime, receiver, args, false)
 }
 
+/// `bytes.startswith` and `bytes.endswith`: test one affix or each affix of a tuple against
+/// the bytes in `[start, end)`, which follow slice clamping.
 fn bytes_affix(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
     args: CallArgs,
     prefix: bool,
 ) -> PyResult {
-    args.expect_positional("bytes affix test", 1, 1)?;
-    args.reject_keywords("bytes affix test")?;
+    let name = if prefix { "startswith" } else { "endswith" };
+    args.expect_positional(name, 1, 3)?;
+    args.reject_keywords(name)?;
     let PyBytes(value) = receiver.cast(runtime)?;
-    let PyBytes(needle) = args.positional()[0].cast(runtime)?;
-    Ok(PyValue::Bool(if prefix {
-        value.starts_with(&needle)
+    let affix = args.positional()[0];
+    let affixes = if runtime.kind(&affix)? == PyKind::Tuple {
+        affix.cast::<PyTuple>(runtime)?.items(runtime)?
+    } else if runtime.bytes_value(&affix)?.is_some() {
+        vec![affix]
     } else {
-        value.ends_with(&needle)
-    }))
+        let actual = runtime.type_name(&affix)?;
+        return Err(PyError::type_error(format!(
+            "{name} first arg must be bytes or a tuple of bytes, not {actual}"
+        )));
+    };
+    let (start, end) = string_bounds(runtime, args.positional(), value.len())?;
+    let window = value.get(start..end).unwrap_or_default();
+    for affix in affixes {
+        let Some(affix) = runtime.bytes_value(&affix)? else {
+            let actual = runtime.type_name(&affix)?;
+            return Err(PyError::type_error(format!(
+                "a bytes-like object is required, not '{actual}'"
+            )));
+        };
+        runtime.charge_cpu(u64::try_from(affix.len()).unwrap_or(u64::MAX))?;
+        let matched = start <= end
+            && if prefix {
+                window.starts_with(&affix)
+            } else {
+                window.ends_with(&affix)
+            };
+        if matched {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+/// `bytes.join(iterable)` and `bytearray.join`: the bytes-like items with the receiver between
+/// them, as an object of the receiver's type.
+fn bytes_join(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytes.join", 1, 1)?;
+    args.reject_keywords("bytes.join")?;
+    let PyBytes(separator) = receiver.cast(runtime)?;
+    let iterator = runtime.iterator(args.positional()[0])?;
+    let mut parts = Vec::new();
+    let mut length = 0usize;
+    while let Some(value) = runtime.iterator_next(iterator)? {
+        runtime.charge_cpu(1)?;
+        let Some(part) = runtime.bytes_value(&value)? else {
+            return Err(PyError::type_error(format!(
+                "sequence item {}: expected a bytes-like object, {} found",
+                parts.len(),
+                runtime.type_name(&value)?
+            )));
+        };
+        length = length
+            .checked_add(part.len())
+            .ok_or_else(|| PyError::resource_error("joined bytes are too large"))?;
+        // Each part is a host copy that lives until the join finishes, so repeating one large
+        // item must exhaust the budget as the copies accumulate.
+        runtime.reserve_memory(part.len())?;
+        parts.push(part);
+    }
+    length = length
+        .checked_add(
+            separator
+                .len()
+                .saturating_mul(parts.len().saturating_sub(1)),
+        )
+        .ok_or_else(|| PyError::resource_error("joined bytes are too large"))?;
+    runtime.reserve_memory(length)?;
+    runtime.charge_cpu(u64::try_from(length).unwrap_or(u64::MAX))?;
+    let joined = parts.join(separator.as_slice());
+    if runtime.kind(&receiver)? == PyKind::ByteArray {
+        runtime.new_bytearray(joined)
+    } else {
+        runtime.new_bytes(joined)
+    }
 }
 
 fn bytes_find(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -566,43 +737,12 @@ fn bytes_search(
     args.reject_keywords(name)?;
     let PyBytes(value) = receiver.cast(runtime)?;
     let PyBytes(needle) = args.positional()[0].cast(runtime)?;
-    let optional_index = |value: Option<&PyValue>, default| -> PyResult<i64> {
-        value
-            .map(|value| {
-                runtime
-                    .int_value(value)
-                    .ok_or_else(|| PyError::type_error("slice indices must be integers"))
-            })
-            .transpose()
-            .map(|value| value.unwrap_or(default))
-    };
-    let start = optional_index(args.positional().get(1), 0)?;
-    let end = optional_index(
-        args.positional().get(2),
-        i64::try_from(value.len()).unwrap_or(i64::MAX),
-    )?;
-    let length = i64::try_from(value.len()).unwrap_or(i64::MAX);
-    let normalize = |index: i64| {
-        usize::try_from(if index < 0 {
-            index.saturating_add(length).max(0)
-        } else {
-            index
-        })
-        .unwrap_or(value.len())
-        .min(value.len())
-    };
-    let start = normalize(start);
-    let end = normalize(end);
-    runtime.charge_cpu(u64::try_from(end.saturating_sub(start)).unwrap_or(u64::MAX))?;
+    let (start, end) = string_bounds(runtime, args.positional(), value.len())?;
+    // Two-way search is linear in both lengths.
+    let work = end.saturating_sub(start).saturating_add(needle.len());
+    runtime.charge_cpu(u64::try_from(work).unwrap_or(u64::MAX))?;
     Ok(if start <= end && needle.len() <= end - start {
-        if needle.is_empty() {
-            Some(start)
-        } else {
-            value[start..end]
-                .windows(needle.len())
-                .position(|window| window == needle)
-                .map(|position| start + position)
-        }
+        memchr::memmem::find(&value[start..end], &needle).map(|position| start + position)
     } else {
         None
     })
@@ -866,33 +1006,6 @@ fn split_bytes(
         splits += 1;
     }
     part(&value[start..])
-}
-
-fn bytes_join(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    args.expect_positional("bytes.join", 1, 1)?;
-    args.reject_keywords("bytes.join")?;
-    let kind = runtime.kind(&receiver)?;
-    let PyBytes(separator) = receiver.cast(runtime)?;
-    let items = collect_values(runtime, args.positional()[0])?;
-    let mut result = Vec::new();
-    for (index, item) in items.iter().enumerate() {
-        let Some(part) = runtime.bytes_value(item)? else {
-            let actual = runtime.type_name(item)?;
-            return Err(PyError::type_error(format!(
-                "sequence item {index}: expected a bytes-like object, {actual} found"
-            )));
-        };
-        let separator = if index == 0 { &[][..] } else { &separator[..] };
-        let growth = part
-            .len()
-            .checked_add(separator.len())
-            .ok_or_else(|| PyError::resource_error("joined bytes are too large"))?;
-        runtime.reserve_memory(growth)?;
-        runtime.charge_cpu(u64::try_from(growth).unwrap_or(u64::MAX))?;
-        result.extend_from_slice(separator);
-        result.extend(part);
-    }
-    new_bytes_like(runtime, kind, result)
 }
 
 fn bytes_upper(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -1197,21 +1310,232 @@ fn string_zfill(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     runtime.new_string(result)
 }
 
+/// `str.startswith` and `str.endswith`: test one affix or each affix of a tuple against the
+/// characters in `[start, end)`, which follow slice clamping.
 fn string_affix(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
     args: CallArgs,
     prefix: bool,
 ) -> PyResult {
-    args.expect_positional("str prefix test", 1, 1)?;
-    args.reject_keywords("str prefix test")?;
+    let name = if prefix { "startswith" } else { "endswith" };
+    args.expect_positional(name, 1, 3)?;
+    args.reject_keywords(name)?;
     let OwnedPyString(value) = receiver.cast(runtime)?;
-    let OwnedPyString(needle) = args.positional()[0].cast(runtime)?;
-    Ok(Value::Bool(if prefix {
-        value.starts_with(&needle)
+    let affix = args.positional()[0];
+    let affixes = match runtime.kind(&affix)? {
+        PyKind::String => vec![affix],
+        PyKind::Tuple => affix.cast::<PyTuple>(runtime)?.items(runtime)?,
+        _ => {
+            let actual = runtime.type_name(&affix)?;
+            return Err(PyError::type_error(format!(
+                "{name} first arg must be str or a tuple of str, not {actual}"
+            )));
+        }
+    };
+    let characters = value.chars().collect::<Vec<_>>();
+    let (start, end) = string_bounds(runtime, args.positional(), characters.len())?;
+    let window = characters.get(start..end).unwrap_or_default();
+    for affix in affixes {
+        if runtime.kind(&affix)? != PyKind::String {
+            let actual = runtime.type_name(&affix)?;
+            return Err(PyError::type_error(format!(
+                "tuple for {name} must only contain str, not {actual}"
+            )));
+        }
+        let OwnedPyString(affix) = affix.cast(runtime)?;
+        runtime.charge_cpu(u64::try_from(affix.len()).unwrap_or(u64::MAX))?;
+        let affix = affix.chars().collect::<Vec<_>>();
+        // CPython rejects an empty affix when `start` lies past the end of the string.
+        let matched = start <= end
+            && if prefix {
+                window.starts_with(&affix)
+            } else {
+                window.ends_with(&affix)
+            };
+        if matched {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn string_removeprefix(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_remove_affix(runtime, receiver, args, true)
+}
+
+fn string_removesuffix(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    string_remove_affix(runtime, receiver, args, false)
+}
+
+fn string_remove_affix(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    prefix: bool,
+) -> PyResult {
+    let name = if prefix {
+        "removeprefix"
     } else {
-        value.ends_with(&needle)
-    }))
+        "removesuffix"
+    };
+    args.expect_positional(name, 1, 1)?;
+    args.reject_keywords(name)?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    let affix = args.positional()[0];
+    if runtime.kind(&affix)? != PyKind::String {
+        let actual = runtime.type_name(&affix)?;
+        return Err(PyError::type_error(format!(
+            "{name}() argument must be str, not {actual}"
+        )));
+    }
+    let OwnedPyString(affix) = affix.cast(runtime)?;
+    let stripped = if prefix {
+        value.strip_prefix(affix.as_str())
+    } else {
+        value.strip_suffix(affix.as_str())
+    };
+    match stripped {
+        Some(stripped) => runtime.new_string(stripped.to_owned()),
+        None => Ok(receiver),
+    }
+}
+
+/// `str.expandtabs`: replace each tab with spaces up to the next multiple of `tabsize` columns.
+/// Newlines and carriage returns reset the column, and a non-positive `tabsize` deletes tabs.
+fn string_expandtabs(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("expandtabs", 0, 1)?;
+    args.reject_unknown_keywords("expandtabs", &["tabsize"])?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    let tabsize = match args.keyword("expandtabs", "tabsize")? {
+        Some(_) if !args.positional().is_empty() => {
+            return Err(PyError::type_error(
+                "expandtabs() got multiple values for argument 'tabsize'",
+            ));
+        }
+        Some(tabsize) => Some(*tabsize),
+        None => args.positional().first().copied(),
+    };
+    let tabsize = match tabsize {
+        Some(tabsize) => runtime.int_value(&tabsize).ok_or_else(|| {
+            let actual = runtime
+                .type_name(&tabsize)
+                .unwrap_or_else(|_| "object".into());
+            PyError::type_error(format!(
+                "'{actual}' object cannot be interpreted as an integer"
+            ))
+        })?,
+        None => 8,
+    };
+    let tabsize = usize::try_from(tabsize).unwrap_or(0);
+    let too_long = || PyError::overflow_error("new string is too long");
+    // Size the result before building it so a large `tabsize` is charged, not allocated.
+    let mut column = 0usize;
+    let mut length = 0usize;
+    for character in value.chars() {
+        let width = match character {
+            '\t' if tabsize > 0 => tabsize - column % tabsize,
+            '\t' => 0,
+            _ => 1,
+        };
+        column = match character {
+            '\n' | '\r' => 0,
+            _ => column.checked_add(width).ok_or_else(too_long)?,
+        };
+        length = length.checked_add(width).ok_or_else(too_long)?;
+    }
+    runtime.reserve_memory(length)?;
+    runtime.charge_cpu(u64::try_from(length).unwrap_or(u64::MAX))?;
+    let mut output = String::with_capacity(length);
+    column = 0;
+    for character in value.chars() {
+        match character {
+            '\t' if tabsize > 0 => {
+                let spaces = tabsize - column % tabsize;
+                output.extend(std::iter::repeat_n(' ', spaces));
+                column += spaces;
+            }
+            '\t' => {}
+            '\n' | '\r' => {
+                output.push(character);
+                column = 0;
+            }
+            _ => {
+                output.push(character);
+                column += 1;
+            }
+        }
+    }
+    runtime.new_string(output)
+}
+
+/// `str.translate` with a dict, list or tuple table indexed by code point. A missing key or
+/// out-of-range index keeps the character; `None` deletes it. Other mapping types would need
+/// a general subscript protocol here, so they are rejected as unsupported.
+fn string_translate(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("translate", 1, 1)?;
+    args.reject_keywords("translate")?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    let table = args.positional()[0];
+    let table_kind = runtime.kind(&table)?;
+    let items = match table_kind {
+        PyKind::Dict => None,
+        PyKind::List | PyKind::Tuple => Some(table.cast::<PySequence>(runtime)?.items(runtime)?),
+        PyKind::Instance | PyKind::Native => {
+            return Err(PyError::unsupported(
+                "str.translate() with a table that is not a dict, list or tuple",
+            ));
+        }
+        _ => {
+            let actual = runtime.type_name(&table)?;
+            return Err(PyError::type_error(format!(
+                "'{actual}' object is not subscriptable"
+            )));
+        }
+    };
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        let code = u32::from(character);
+        let mapped = match &items {
+            Some(items) => usize::try_from(code)
+                .ok()
+                .and_then(|index| items.get(index).copied()),
+            None => runtime.dict_get(table.cast::<PyDict>(runtime)?, &Value::Int(code.into()))?,
+        };
+        let Some(mapped) = mapped else {
+            output.push(character);
+            continue;
+        };
+        match runtime.kind(&mapped)? {
+            PyKind::None => {}
+            PyKind::String => {
+                let OwnedPyString(text) = mapped.cast(runtime)?;
+                runtime.reserve_memory(text.len())?;
+                output.push_str(&text);
+            }
+            _ => {
+                let replacement = runtime
+                    .int_value(&mapped)
+                    .and_then(|code| u32::try_from(code).ok())
+                    .and_then(char::from_u32);
+                match replacement {
+                    Some(replacement) => output.push(replacement),
+                    None if matches!(runtime.kind(&mapped)?, PyKind::Int | PyKind::Bool) => {
+                        return Err(PyError::value_error(
+                            "character mapping must be in range(0x110000)",
+                        ));
+                    }
+                    None => {
+                        return Err(PyError::type_error(
+                            "character mapping must return integer, None or str",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    runtime.new_string(output)
 }
 
 fn string_find(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -1321,26 +1645,24 @@ fn string_bounds(
             usize::try_from(value).unwrap_or(usize::MAX).min(length)
         }
     };
-    let start = arguments
-        .get(1)
-        .map(|value| {
-            runtime
-                .int_value(value)
-                .map(normalize_start)
-                .ok_or_else(|| PyError::type_error("slice indices must be integers"))
+    let index = |value: &PyValue| -> PyResult<Option<i64>> {
+        if matches!(value, &Value::None) {
+            return Ok(None);
+        }
+        runtime.int_value(value).map(Some).ok_or_else(|| {
+            PyError::type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            )
         })
-        .transpose()?
-        .unwrap_or(0);
-    let end = arguments
-        .get(2)
-        .map(|value| {
-            runtime
-                .int_value(value)
-                .map(normalize_end)
-                .ok_or_else(|| PyError::type_error("slice indices must be integers"))
-        })
-        .transpose()?
-        .unwrap_or(length);
+    };
+    let start = match arguments.get(1) {
+        Some(value) => index(value)?.map_or(0, normalize_start),
+        None => 0,
+    };
+    let end = match arguments.get(2) {
+        Some(value) => index(value)?.map_or(length, normalize_end),
+        None => length,
+    };
     Ok((start, end))
 }
 
@@ -1768,10 +2090,17 @@ pub(crate) fn slot_string_remainder(
         let requested = width.unwrap_or_default().max(precision.unwrap_or_default());
         runtime.reserve_memory(requested)?;
         runtime.charge_cpu(u64::try_from(requested).unwrap_or(u64::MAX))?;
+        let conversion_index = index;
         let conversion = *characters
             .get(index)
             .ok_or_else(|| PyError::value_error("incomplete format"))?;
         index += 1;
+        if !"sradiuxXofFeEgGc".contains(conversion) {
+            return Err(PyError::value_error(format!(
+                "unsupported format character '{conversion}' ({:#x}) at index {conversion_index}",
+                u32::from(conversion)
+            )));
+        }
         let value = if let Some(key) = mapping_key {
             used_mapping = true;
             let mapping = right.cast::<PyDict>(runtime)?;
@@ -1787,106 +2116,96 @@ pub(crate) fn slot_string_remainder(
             argument += 1;
             value
         };
-        let mut rendered = match conversion {
-            's' => runtime.display(&value)?,
-            'r' | 'a' => runtime.repr(&value)?,
-            'd' | 'i' | 'u' => runtime
-                .integer_text(&value)?
-                .ok_or_else(|| PyError::type_error("%d format: a real number is required"))?,
-            'x' | 'X' | 'o' => {
-                let decimal = runtime
-                    .integer_text(&value)?
-                    .ok_or_else(|| PyError::type_error("integer format requires an integer"))?;
-                let integer = decimal
-                    .parse::<BigInt>()
-                    .map_err(|_| PyError::runtime_error("invalid internal integer"))?;
-                let digits = match conversion {
-                    'x' => format!("{integer:x}"),
-                    'X' => format!("{integer:X}"),
-                    'o' => format!("{integer:o}"),
-                    _ => unreachable!(),
-                };
-                if alternate && integer != BigInt::zero() {
-                    match conversion {
-                        'x' => format!("0x{digits}"),
-                        'X' => format!("0X{digits}"),
-                        'o' => format!("0o{digits}"),
-                        _ => unreachable!(),
-                    }
-                } else {
-                    digits
-                }
-            }
+        let rendered = match conversion {
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
-                let number = value.cast::<PyNumber>(runtime)?.into_f64()?;
-                let precision = precision.unwrap_or(6);
-                match conversion {
-                    'f' | 'F' => format!("{number:.precision$}"),
-                    'e' => format!("{number:.precision$e}"),
-                    'E' => format!("{number:.precision$E}"),
-                    'g' | 'G' => {
-                        let mut text = format!("{number:.precision$}");
-                        if conversion == 'G' {
-                            text.make_ascii_uppercase();
-                        }
-                        text
+                // The format-spec mini-language renders floats the same way, including zero
+                // padding of nan and inf.
+                let number = match value.cast::<PyNumber>(runtime) {
+                    Ok(number) => number.into_f64()?,
+                    Err(_) => {
+                        let actual = runtime.type_name(&value)?;
+                        return Err(PyError::type_error(format!(
+                            "must be real number, not {actual}"
+                        )));
                     }
-                    _ => unreachable!(),
+                };
+                let mut spec = String::new();
+                if left_align {
+                    spec.push('<');
                 }
+                if plus {
+                    spec.push('+');
+                } else if space {
+                    spec.push(' ');
+                }
+                if alternate {
+                    spec.push('#');
+                }
+                if zero && !left_align {
+                    spec.push('0');
+                }
+                if let Some(width) = width {
+                    spec.push_str(&width.to_string());
+                }
+                spec.push_str(&format!(".{}{conversion}", precision.unwrap_or(6)));
+                runtime.format_value(&Value::Float(number), None, &spec)?
             }
-            'c' => {
-                if let Some(integer) = runtime.int_value(&value) {
-                    u32::try_from(integer)
-                        .ok()
-                        .and_then(char::from_u32)
-                        .ok_or_else(|| PyError::overflow_error("%c arg not in range"))?
-                        .to_string()
+            'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
+                let integer = percent_integer(runtime, &value, conversion)?;
+                let negative = integer.sign() == Sign::Minus;
+                let magnitude = integer.magnitude();
+                let digits = match conversion {
+                    'x' => magnitude.to_str_radix(16),
+                    'X' => magnitude.to_str_radix(16).to_ascii_uppercase(),
+                    'o' => magnitude.to_str_radix(8),
+                    _ => magnitude.to_string(),
+                };
+                let digits = pad_integer_precision(digits, precision);
+                let prefix = match (alternate, conversion) {
+                    (true, 'x') => "0x",
+                    (true, 'X') => "0X",
+                    (true, 'o') => "0o",
+                    _ => "",
+                };
+                let sign = if negative {
+                    "-"
+                } else if plus {
+                    "+"
+                } else if space {
+                    " "
                 } else {
-                    let OwnedPyString(text) = value.cast(runtime)?;
-                    if text.chars().count() != 1 {
-                        return Err(PyError::type_error("%c requires int or char"));
-                    }
-                    text
+                    ""
+                };
+                let length = sign.len() + prefix.len() + digits.len();
+                let padding = width.unwrap_or(0).saturating_sub(length);
+                if left_align {
+                    format!("{sign}{prefix}{digits}{}", " ".repeat(padding))
+                } else if zero {
+                    format!("{sign}{prefix}{}{digits}", "0".repeat(padding))
+                } else {
+                    format!("{}{sign}{prefix}{digits}", " ".repeat(padding))
                 }
             }
-            other => {
-                return Err(PyError::value_error(format!(
-                    "unsupported format character {other:?}"
-                )))
+            _ => {
+                let mut text = match conversion {
+                    's' => runtime.display(&value)?,
+                    'r' | 'a' => runtime.repr(&value)?,
+                    _ => percent_character(runtime, &value)?,
+                };
+                if conversion != 'c' {
+                    if let Some(precision) = precision {
+                        text = text.chars().take(precision).collect();
+                    }
+                }
+                let padding = width.unwrap_or(0).saturating_sub(text.chars().count());
+                if left_align {
+                    text.extend(std::iter::repeat_n(' ', padding));
+                    text
+                } else {
+                    format!("{}{text}", " ".repeat(padding))
+                }
             }
         };
-        if matches!(conversion, 's' | 'r' | 'a') {
-            if let Some(precision) = precision {
-                rendered = rendered.chars().take(precision).collect();
-            }
-        } else if matches!(conversion, 'd' | 'i' | 'u') {
-            rendered = pad_integer_precision(rendered, precision);
-        }
-        if matches!(
-            conversion,
-            'd' | 'i' | 'u' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G'
-        ) && !rendered.starts_with('-')
-        {
-            if plus {
-                rendered.insert(0, '+');
-            } else if space {
-                rendered.insert(0, ' ');
-            }
-        }
-        if let Some(width) = width {
-            let padding = width.saturating_sub(rendered.chars().count());
-            if padding > 0 {
-                let fill = if zero && !left_align { '0' } else { ' ' };
-                if left_align {
-                    rendered.extend(std::iter::repeat_n(fill, padding));
-                } else if fill == '0' && matches!(rendered.chars().next(), Some('+' | '-' | ' ')) {
-                    let sign = rendered.remove(0);
-                    rendered = format!("{sign}{}{rendered}", "0".repeat(padding));
-                } else {
-                    rendered = format!("{}{rendered}", fill.to_string().repeat(padding));
-                }
-            }
-        }
         runtime.reserve_memory(rendered.len())?;
         output.push_str(&rendered);
     }
@@ -1912,18 +2231,72 @@ fn parse_format_digits(characters: &[char], index: &mut usize) -> PyResult<Optio
     Ok((*index != start).then_some(value))
 }
 
-fn pad_integer_precision(mut value: String, precision: Option<usize>) -> String {
-    let Some(precision) = precision else {
-        return value;
-    };
-    let sign = value.starts_with('-').then(|| value.remove(0));
-    if value.len() < precision {
-        value = format!("{}{value}", "0".repeat(precision - value.len()));
+/// Zero-extend unsigned `digits` to `precision` digits, which `%`-formatting treats as a
+/// minimum digit count for integers.
+fn pad_integer_precision(digits: String, precision: Option<usize>) -> String {
+    match precision {
+        Some(precision) if digits.len() < precision => {
+            format!("{}{digits}", "0".repeat(precision - digits.len()))
+        }
+        _ => digits,
     }
-    if let Some(sign) = sign {
-        value.insert(0, sign);
+}
+
+/// The integer a `%d`-style conversion formats. `%d`, `%i` and `%u` truncate a float as
+/// `int()` does; `%x`, `%X` and `%o` require an integer.
+fn percent_integer(
+    runtime: &mut dyn PyRuntime,
+    value: &PyValue,
+    conversion: char,
+) -> PyResult<BigInt> {
+    if let Some(text) = runtime.integer_text(value)? {
+        return text
+            .parse::<BigInt>()
+            .map_err(|_| PyError::runtime_error("invalid internal integer"));
     }
-    value
+    let actual = runtime.type_name(value)?;
+    if !matches!(conversion, 'd' | 'i' | 'u') {
+        return Err(PyError::type_error(format!(
+            "%{conversion} format: an integer is required, not {actual}"
+        )));
+    }
+    let number = value
+        .cast::<PyNumber>(runtime)
+        .and_then(PyNumber::into_f64)
+        .map_err(|_| {
+            PyError::type_error(format!(
+                "%{conversion} format: a real number is required, not {actual}"
+            ))
+        })?;
+    if number.is_nan() {
+        return Err(PyError::value_error("cannot convert float NaN to integer"));
+    }
+    num_traits::FromPrimitive::from_f64(number.trunc())
+        .ok_or_else(|| PyError::overflow_error("cannot convert float infinity to integer"))
+}
+
+/// The character `%c` formats: an int code point or a one-character string.
+fn percent_character(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<String> {
+    if let Some(text) = runtime.integer_text(value)? {
+        return text
+            .parse::<u32>()
+            .ok()
+            .and_then(char::from_u32)
+            .map(String::from)
+            .ok_or_else(|| PyError::overflow_error("%c arg not in range(0x110000)"));
+    }
+    let requirement = "%c requires an int or a unicode character";
+    if runtime.kind(value)? != PyKind::String {
+        let actual = runtime.type_name(value)?;
+        return Err(PyError::type_error(format!("{requirement}, not {actual}")));
+    }
+    let OwnedPyString(text) = value.cast(runtime)?;
+    match text.chars().count() {
+        1 => Ok(text),
+        length => Err(PyError::type_error(format!(
+            "{requirement}, not a string of length {length}"
+        ))),
+    }
 }
 
 fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -2980,6 +3353,55 @@ fn builtin_getattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     }
 }
 
+/// `id()`: an integer that two values share exactly when `is` holds between them.
+///
+/// A heap object's id is the stand-in address its default repr shows, so `hex(id(x))` matches
+/// `<object object at 0x...>`. Immediate values such as small ints, floats and short strings
+/// are identical when their contents are, so their id is a deterministic hash of the value,
+/// placed below the heap addresses.
+fn builtin_id(_runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("id", 1, 1)?;
+    args.reject_keywords("id")?;
+    let value = args.positional()[0];
+    let id = match value.object_id() {
+        Some(object) => protocol::address_value(object),
+        None => immediate_identity(&value),
+    };
+    Ok(Value::Int(i64::try_from(id).expect("ids are below 2**47")))
+}
+
+/// The stand-in address of an immediate value, below the heap addresses. Equal immediates are
+/// the same object, so this is a deterministic hash of the value.
+fn immediate_identity(value: &PyValue) -> u64 {
+    use std::hash::{Hash, Hasher};
+    const IMMEDIATE_BASE: u64 = 0x5000_0000_0000;
+    let mut hasher = std::hash::DefaultHasher::new();
+    value.hash(&mut hasher);
+    IMMEDIATE_BASE + (hasher.finish() % (1 << 40)) * 16
+}
+
+/// `ascii()`: `repr()` with non-ASCII characters escaped as `\\x`, `\\u` or `\\U`.
+fn builtin_ascii(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("ascii", 1, 1)?;
+    args.reject_keywords("ascii")?;
+    let text = runtime.repr(&args.positional()[0])?;
+    runtime.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
+    let mut output = String::with_capacity(text.len());
+    for character in text.chars() {
+        let code = u32::from(character);
+        if character.is_ascii() {
+            output.push(character);
+        } else if code <= 0xff {
+            output.push_str(&format!("\\x{code:02x}"));
+        } else if code <= 0xffff {
+            output.push_str(&format!("\\u{code:04x}"));
+        } else {
+            output.push_str(&format!("\\U{code:08x}"));
+        }
+    }
+    runtime.new_string(output)
+}
+
 fn builtin_hasattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("hasattr", 2, 2)?;
     args.reject_keywords("hasattr")?;
@@ -3008,7 +3430,23 @@ fn builtin_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         )?),
         Some(_) | None => None,
     };
-    match args.positional()[0].cast::<PyNumber>(runtime)? {
+    let value = args.positional()[0];
+    if matches!(runtime.kind(&value)?, PyKind::Instance | PyKind::Complex) {
+        // Like CPython, defer to the type's `__round__`, so a user class such as `Fraction`
+        // rounds itself.
+        let Some(method) = runtime.get_attribute(value, "__round__")? else {
+            return Err(PyError::type_error(format!(
+                "type {} doesn't define __round__ method",
+                runtime.type_name(&value)?
+            )));
+        };
+        let arguments = args.positional().get(1).or(keyword_digits).copied();
+        return runtime.call_value(
+            method,
+            CallArgs::new(arguments.into_iter().collect(), Vec::new()),
+        );
+    }
+    match value.cast::<PyNumber>(runtime)? {
         PyNumber::Int(value) => round_integer(runtime, BigInt::from(value), digits),
         PyNumber::BigInt(value) => {
             let value = value
@@ -3119,6 +3557,88 @@ fn property_setter(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArg
     let property = receiver.cast::<PyProperty>(runtime)?;
     let getter = runtime.property_getter(property)?;
     runtime.new_property(getter, Some(args.positional()[0]))
+}
+
+/// `object.__init__`, which ends an initializer chain reached through `super().__init__()`.
+/// It accepts only the instance.
+fn object_init(_runtime: &mut dyn PyRuntime, _receiver: PyValue, args: CallArgs) -> PyResult {
+    if !args.positional().is_empty() || !args.keywords().is_empty() {
+        return Err(PyError::type_error(
+            "object.__init__() takes exactly one argument (the instance to initialize)",
+        ));
+    }
+    Ok(Value::None)
+}
+
+/// `object.__hash__`: the identity hash an instance has unless its class overrides it, so a
+/// class that defines `__eq__` can keep it with `__hash__ = object.__hash__`.
+fn object_hash(_runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("object.__hash__", 0, 0)?;
+    args.reject_keywords("object.__hash__")?;
+    let identity = match receiver.object_id() {
+        Some(object) => object.as_raw() as u64,
+        None => immediate_identity(&receiver),
+    };
+    Ok(Value::Int(super::super::hash::identity(identity)))
+}
+
+/// `iterator.__iter__`: a builtin iterator is its own iterator.
+fn iterator_iter(_runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("__iter__", 0, 0)?;
+    args.reject_keywords("__iter__")?;
+    Ok(receiver)
+}
+
+/// `iterator.__next__`: the next item of a builtin iterator, or `StopIteration` at the end, so
+/// `it.__next__` works wherever `next(it)` does.
+fn iterator_next(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("__next__", 0, 0)?;
+    args.reject_keywords("__next__")?;
+    let iterator = runtime.iterator(receiver)?;
+    runtime
+        .iterator_next(iterator)?
+        .ok_or_else(|| PyError::exception("StopIteration", ""))
+}
+
+/// `object.__eq__`: an object equals itself, and any other comparison is left to the other
+/// operand by returning `NotImplemented`.
+fn object_eq(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("object.__eq__", 1, 1)?;
+    args.reject_keywords("object.__eq__")?;
+    if protocol::identical(&receiver, &args.positional()[0]) {
+        return Ok(Value::Bool(true));
+    }
+    Ok(runtime.not_implemented())
+}
+
+/// `object.__ne__`: the inverse of the receiver's `__eq__`, or `NotImplemented` when that
+/// declines.
+fn object_ne(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("object.__ne__", 1, 1)?;
+    args.reject_keywords("object.__ne__")?;
+    let other = args.positional()[0];
+    let equal = match runtime.get_attribute(receiver, "__eq__")? {
+        Some(method) => runtime.call_value(method, CallArgs::new(vec![other], Vec::new()))?,
+        None => object_eq(runtime, receiver, CallArgs::new(vec![other], Vec::new()))?,
+    };
+    if runtime.is_not_implemented(&equal) {
+        return Ok(equal);
+    }
+    Ok(Value::Bool(!runtime.truth(&equal)?))
+}
+
+/// `BaseException.__init__`, which replaces the exception's `args` with its positional
+/// arguments.
+fn exception_init(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    if !args.keywords().is_empty() {
+        let type_name = runtime.type_name(&receiver)?;
+        return Err(PyError::type_error(format!(
+            "{type_name}() takes no keyword arguments"
+        )));
+    }
+    let items = runtime.new_tuple(args.positional().to_vec())?;
+    runtime.set_attribute(receiver, "args", items)?;
+    Ok(Value::None)
 }
 
 fn type_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

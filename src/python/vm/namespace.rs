@@ -1,9 +1,9 @@
 //! Name, scope, import, and per-code cache operations used by bytecode execution.
 
 use super::{
-    cpython_names, exception_types, protocol, Arc, Builtin, BuiltinType, CodeRef, ExceptionType,
-    Execution, HashMap, NameId, NativeValue, Object, PyModuleLoader, PyRuntime, RaisedException,
-    ScopeId, SymbolId, Value, Vm,
+    cpython_names, exception_types, protocol, Arc, BuiltinType, CodeRef, ExceptionType, Execution,
+    HashMap, NameId, NativeValue, Object, PyModuleLoader, PyRuntime, RaisedException, ScopeId,
+    SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
 };
 
 impl Vm<'_> {
@@ -100,57 +100,31 @@ impl Vm<'_> {
                 "dict" => Some(BuiltinType::Dict),
                 "set" => Some(BuiltinType::Set),
                 "frozenset" => Some(BuiltinType::FrozenSet),
+                "slice" => Some(BuiltinType::Slice),
+                "range" => Some(BuiltinType::Range),
                 _ => None,
             };
             if let Some(builtin_type) = builtin_type {
                 return Some(Value::Native(NativeValue::BuiltinType(builtin_type)));
             }
+            match name {
+                "Ellipsis" => return Some(Value::Native(NativeValue::Ellipsis)),
+                "NotImplemented" => return Some(Value::Native(NativeValue::NotImplemented)),
+                _ => {}
+            }
             if let Some(function) = super::super::stdlib::core::builtin_function(name) {
                 return Some(Value::Native(NativeValue::NativeFunction(function)));
             }
-            let builtin = match name {
-                "print" => Builtin::Print,
-                "input" => Builtin::Input,
-                "exec" => Builtin::Exec,
-                "exit" | "quit" => Builtin::Exit,
-                "chr" => Builtin::Character,
-                "ord" => Builtin::Ordinal,
-                "bin" => Builtin::Binary,
-                "oct" => Builtin::Octal,
-                "hex" => Builtin::Hexadecimal,
-                "repr" => Builtin::Repr,
-                "dir" => Builtin::Dir,
-                "isinstance" => Builtin::IsInstance,
-                "issubclass" => Builtin::IsSubclass,
-                "len" => Builtin::Length,
-                "sorted" => Builtin::Sorted,
-                "min" => Builtin::Minimum,
-                "max" => Builtin::Maximum,
-                "sum" => Builtin::Sum,
-                "abs" => Builtin::Absolute,
-                "pow" => Builtin::Power,
-                "divmod" => Builtin::Divmod,
-                "callable" => Builtin::Callable,
-                "range" => Builtin::Range,
-                "enumerate" => Builtin::Enumerate,
-                "zip" => Builtin::Zip,
-                "any" => Builtin::Any,
-                "all" => Builtin::All,
-                "iter" => Builtin::Iter,
-                "next" => Builtin::Next,
-                "property" => Builtin::Property,
-                "staticmethod" => Builtin::StaticMethod,
-                "classmethod" => Builtin::ClassMethod,
-                "super" => Builtin::Super,
-                _ => {
-                    return exception_types::exception_type(name)
-                        .filter(|definition| definition.builtin)
-                        .map(|definition| {
-                            Value::Native(NativeValue::ExceptionType(ExceptionType(
-                                definition.name,
-                            )))
-                        })
-                }
+            let Some(builtin) = BUILTIN_FUNCTIONS
+                .iter()
+                .find(|(builtin_name, _)| *builtin_name == name)
+                .map(|(_, builtin)| *builtin)
+            else {
+                return exception_types::exception_type(name)
+                    .filter(|definition| definition.builtin)
+                    .map(|definition| {
+                        Value::Native(NativeValue::ExceptionType(ExceptionType(definition.name)))
+                    });
             };
             Some(Value::Native(NativeValue::Function(builtin)))
         })();
@@ -620,7 +594,7 @@ impl Vm<'_> {
     /// else the submodule `module.name`, else raise CPython's `ImportError`.
     pub(super) fn import_from(&mut self, name: &str) -> Result<(), String> {
         let module = *self.stack.last().ok_or("import stack underflow")?;
-        if let Some(value) = self.resolve_attribute(module, name)? {
+        if let Some(value) = self.resolve_optional_attribute(module, name)? {
             self.stack.push(value);
             return Ok(());
         }
@@ -649,6 +623,96 @@ impl Vm<'_> {
             }
             result => result,
         }
+    }
+
+    /// `from module import *` with the module on top of the stack: bind every name in the
+    /// module's `__all__`, or else every name without a leading underscore, in the current scope.
+    pub(super) fn import_star(&mut self) -> Result<(), String> {
+        let module = self.pop()?;
+        let names = match module.native_value() {
+            Some(NativeValue::Module(definition)) => definition
+                .functions
+                .iter()
+                .map(|function| function.name)
+                .chain(definition.values.iter().map(|value| value.name()))
+                .filter(|name| !name.starts_with('_'))
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            _ => {
+                let Some(Object::Module { scope, name }) = module
+                    .object_id()
+                    .map(|id| self.state.heap.get(id))
+                    .transpose()?
+                else {
+                    return Err(self.missing_attribute(&module, "__all__"));
+                };
+                let (scope, module_name) = (*scope, name.clone());
+                match self.state.heap.scope_get(scope, "__all__").copied() {
+                    Some(all) => {
+                        let items = match all
+                            .object_id()
+                            .map(|id| self.state.heap.get(id))
+                            .transpose()?
+                        {
+                            Some(Object::List(items) | Object::Tuple(items)) => items.clone(),
+                            // CPython indexes `__all__`; lists and tuples are what modules use.
+                            _ => {
+                                let message = format!(
+                                    "'{}' object does not support indexing",
+                                    self.type_name_of(&all)?
+                                );
+                                return Err(self.raise_exception("TypeError", message));
+                            }
+                        };
+                        let mut names = Vec::with_capacity(items.len());
+                        for item in items {
+                            let Some(name) = protocol::string_value(&self.state.heap, &item)?
+                            else {
+                                let message = format!(
+                                    "Item in {module_name}.__all__ must be str, not {}",
+                                    self.type_name_of(&item)?
+                                );
+                                return Err(self.raise_exception("TypeError", message));
+                            };
+                            names.push(name);
+                        }
+                        names
+                    }
+                    None => {
+                        let mut names = self
+                            .state
+                            .heap
+                            .scope_values(scope)?
+                            .into_keys()
+                            .filter(|name| !name.starts_with('_'))
+                            .collect::<Vec<_>>();
+                        // Bind in a stable order so later metering and errors are deterministic.
+                        names.sort_unstable();
+                        names
+                    }
+                }
+            }
+        };
+        for name in names {
+            self.charge_cpu(1)?;
+            let Some(value) = self.resolve_attribute(module, &name)? else {
+                return Err(self.missing_attribute(&module, &name));
+            };
+            if let Some(scope) = self.local_scopes.last().copied() {
+                self.state
+                    .heap
+                    .scope_insert(scope, name, value, &mut self.interp.resources)?;
+            } else {
+                let symbol = self
+                    .state
+                    .heap
+                    .intern_symbol(&name, &mut self.interp.resources)?;
+                self.state
+                    .globals
+                    .insert(symbol, value, &mut self.interp.resources)?;
+            }
+        }
+        Ok(())
     }
 
     /// Install synthetic package parents for a dotted import and push the value selected by

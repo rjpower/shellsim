@@ -1,7 +1,7 @@
 //! Iteration, generator suspension, and sequence unpacking.
 
 use super::{
-    protocol, CallArgs, Execution, ForIterOutcome, IteratorAdvance, NativeValue, Object, PyError,
+    CallArgs, Execution, ForIterOutcome, IteratorAdvance, NativeValue, Object, PyError,
     PyErrorKind, PyRuntime, PyStreamRead, Stream, Value, Vm,
 };
 
@@ -310,7 +310,7 @@ impl Vm<'_> {
                     CallArgs::new(Vec::new(), Vec::new()),
                 )
                 .map_err(|error| error.to_string())?;
-                if protocol::equals(&self.state.heap, &value, &sentinel)? {
+                if self.values_equal(&value, &sentinel)? {
                     self.exhaust_callable_iterator(id)?;
                     self.stack.pop();
                     return Ok(ForIterOutcome::Exhausted);

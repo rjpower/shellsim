@@ -80,20 +80,16 @@ fn real_only_operations_reject_complex_explicitly() {
     for (source, expected) in [
         (
             "import math\nmath.sqrt(1j)",
-            "expected a real number, got complex",
+            "must be real number, not complex",
         ),
-        ("round(1j)", "expected a real number, got complex"),
-        (
-            "f'{1j:.2f}'",
-            "format specifications for complex numbers are not implemented",
-        ),
+        ("round(1j)", "type complex doesn't define __round__ method"),
         (
             "max(1j, 2j)",
             "not supported between instances of 'complex' and 'complex'",
         ),
         (
             "1 < 1j",
-            "not supported between instances of 'complex' and 'int'",
+            "'<' not supported between instances of 'int' and 'complex'",
         ),
     ] {
         let (status, _, stderr) = run(source);

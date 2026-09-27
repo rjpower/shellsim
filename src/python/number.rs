@@ -24,6 +24,17 @@ pub(super) enum NumberRef<'a> {
     Complex(f64, f64),
 }
 
+impl NumberRef<'_> {
+    /// The exact integer this number holds, if it is an integer.
+    pub(super) fn to_bigint(self) -> Option<BigInt> {
+        match self {
+            Self::Int(value) => Some(BigInt::from(value)),
+            Self::BigInt(value) => Some(value.clone()),
+            Self::Float(_) | Self::Complex(..) => None,
+        }
+    }
+}
+
 /// Resolve Python numeric storage into one semantic numeric view.
 pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>> {
     if let Some(value) = value.float_value() {
@@ -109,7 +120,134 @@ macro_rules! real_number_type {
 
 pub(super) static BOOL_TYPE: NativeTypeDef = real_number_type!("bool", rational);
 pub(super) static INT_TYPE: NativeTypeDef = real_number_type!("int", rational);
-pub(super) static FLOAT_TYPE: NativeTypeDef = real_number_type!("float");
+pub(super) static FLOAT_TYPE: NativeTypeDef = NativeTypeDef {
+    methods: &[
+        MethodDef {
+            type_name: "float",
+            name: "conjugate",
+            call: real_conjugate,
+        },
+        MethodDef {
+            type_name: "float",
+            name: "is_integer",
+            call: float_is_integer,
+        },
+        MethodDef {
+            type_name: "float",
+            name: "as_integer_ratio",
+            call: float_as_integer_ratio,
+        },
+        MethodDef {
+            type_name: "float",
+            name: "hex",
+            call: float_hex,
+        },
+    ],
+    ..real_number_type!("float")
+};
+
+/// `float.as_integer_ratio()`: the exact fraction in lowest terms with a positive denominator.
+fn float_as_integer_ratio(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("float.as_integer_ratio", 0, 0)?;
+    let Some(NumberRef::Float(value)) = runtime.number(&value) else {
+        return Err(PyError::type_error(
+            "descriptor 'as_integer_ratio' requires a 'float' object",
+        ));
+    };
+    if value.is_nan() {
+        return Err(PyError::value_error("cannot convert NaN to integer ratio"));
+    }
+    if value.is_infinite() {
+        return Err(PyError::overflow_error(
+            "cannot convert Infinity to integer ratio",
+        ));
+    }
+    // A finite double is `mantissa * 2**exponent` with an integer mantissa below 2**53.
+    let bits = value.to_bits();
+    let biased = i32::try_from((bits >> 52) & 0x7ff).expect("eleven-bit exponent");
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (mut mantissa, mut exponent) = if biased == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1u64 << 52), biased - 1075)
+    };
+    if mantissa == 0 {
+        exponent = 0;
+    }
+    while mantissa != 0 && mantissa % 2 == 0 && exponent < 0 {
+        mantissa /= 2;
+        exponent += 1;
+    }
+    let mut numerator = BigInt::from(mantissa);
+    let mut denominator = BigInt::from(1u8);
+    if exponent >= 0 {
+        numerator <<= usize::try_from(exponent).expect("non-negative exponent");
+    } else {
+        denominator <<= usize::try_from(-exponent).expect("positive exponent");
+    }
+    if value.is_sign_negative() {
+        numerator = -numerator;
+    }
+    let numerator = runtime.new_integer(&numerator.to_string())?;
+    let denominator = runtime.new_integer(&denominator.to_string())?;
+    runtime.new_tuple(vec![numerator, denominator])
+}
+
+/// `float.hex()`: the exact value in C99 hexadecimal notation, with all 13 fraction digits.
+///
+/// ```text
+/// (0.1).hex() == '0x1.999999999999ap-4'
+/// (5e-324).hex() == '0x0.0000000000001p-1022'
+/// ```
+fn float_hex(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("float.hex")?;
+    if !args.positional().is_empty() {
+        return Err(PyError::type_error(format!(
+            "float.hex() takes no arguments ({} given)",
+            args.positional().len()
+        )));
+    }
+    let Some(NumberRef::Float(value)) = runtime.number(&value) else {
+        return Err(PyError::type_error(
+            "descriptor 'hex' requires a 'float' object",
+        ));
+    };
+    runtime.new_string(float_hex_text(value))
+}
+
+fn float_hex_text(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    if value.is_infinite() {
+        return format!("{sign}inf");
+    }
+    if value == 0.0 {
+        return format!("{sign}0x0.0p+0");
+    }
+    let bits = value.to_bits();
+    let biased = (bits >> 52) & 0x7ff;
+    let fraction = bits & ((1u64 << 52) - 1);
+    // Subnormals keep the minimum exponent with a leading 0 digit.
+    let (leading, exponent) = if biased == 0 {
+        (0, -1022)
+    } else {
+        (1, biased as i64 - 1023)
+    };
+    format!("{sign}0x{leading}.{fraction:013x}p{exponent:+}")
+}
+
+/// `float.is_integer()`: whether a finite float has no fractional part.
+fn float_is_integer(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("float.is_integer", 0, 0)?;
+    let Some(NumberRef::Float(value)) = runtime.number(&value) else {
+        return Err(PyError::type_error(
+            "descriptor 'is_integer' requires a 'float' object",
+        ));
+    };
+    Ok(PyValue::Bool(value.is_finite() && value.fract() == 0.0))
+}
 
 /// Return a real number as itself, normalizing `bool` to the equal `int`.
 fn real_part(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
@@ -241,22 +379,16 @@ pub(super) enum PyNumber {
     Float(f64),
 }
 
+/// A builtin real number: a `bool`, `int` or `float`.
 impl FromPyValue for PyNumber {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        if let Some(value) = runtime.int_value(&value) {
-            return Ok(Self::Int(value));
+        if let Some(number) = runtime.number(&value).and_then(real_number) {
+            return Ok(number);
         }
-        if let Some(value) = runtime.integer_text(&value)? {
-            return Ok(Self::BigInt(value));
-        }
-        if let Some(value) = value.float_value() {
-            Ok(Self::Float(value))
-        } else {
-            let actual = runtime.type_name(&value)?;
-            Err(PyError::type_error(format!(
-                "expected a real number, got {actual}"
-            )))
-        }
+        let actual = runtime.type_name(&value)?;
+        Err(PyError::type_error(format!(
+            "must be real number, not {actual}"
+        )))
     }
 }
 
@@ -403,6 +535,47 @@ pub(super) fn slot_reflected_remainder(
     slot_binary(runtime, left, right, BinaryOperator::Remainder)
 }
 
+/// `int.__divmod__` and `float.__divmod__`: the pair `(left // right, left % right)`.
+pub(super) fn slot_divmod(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    divmod_numbers(runtime, left, right)
+}
+
+pub(super) fn slot_reflected_divmod(
+    runtime: &mut dyn PyRuntime,
+    right: PyValue,
+    left: PyValue,
+) -> PyResult<Option<PyValue>> {
+    divmod_numbers(runtime, left, right)
+}
+
+fn divmod_numbers(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (Some(left), Some(right)) = (try_number(runtime, left)?, try_number(runtime, right)?)
+    else {
+        return Ok(None);
+    };
+    let quotient = binary_numbers(
+        runtime,
+        left.clone(),
+        right.clone(),
+        BinaryOperator::FloorDivide,
+    )?;
+    let remainder = binary_numbers(runtime, left, right, BinaryOperator::Remainder)?;
+    match (quotient, remainder) {
+        (Some(quotient), Some(remainder)) => {
+            Ok(Some(runtime.new_tuple(vec![quotient, remainder])?))
+        }
+        _ => Ok(None),
+    }
+}
+
 pub(super) fn slot_bitwise_and(
     runtime: &mut dyn PyRuntime,
     left: PyValue,
@@ -513,6 +686,29 @@ fn slot_binary(
     binary_numbers(runtime, left, right, operation)
 }
 
+/// Python's float floor division and remainder for a nonzero divisor. The remainder takes the
+/// divisor's sign, including a signed zero, and `left == quotient * right + remainder` up to
+/// rounding. A finite dividend over an infinite divisor with the opposite sign has quotient
+/// `-1` and an infinite remainder; an infinite or NaN dividend gives NaN for both.
+fn float_divmod(left: f64, right: f64) -> (f64, f64) {
+    // Rust's `%` is C `fmod`: exact, with the dividend's sign.
+    let mut remainder = left % right;
+    let mut quotient = (left - remainder) / right;
+    if remainder != 0.0 && (remainder < 0.0) != (right < 0.0) {
+        remainder += right;
+        quotient -= 1.0;
+    }
+    if remainder == 0.0 {
+        remainder = 0.0_f64.copysign(right);
+    }
+    if quotient == 0.0 {
+        // Keep true division's sign, so `0.0 // -1.0` and `1.0 // -inf` are `-0.0`.
+        return (0.0_f64.copysign(left / right), remainder);
+    }
+    // `quotient` is integral in exact arithmetic; rounding removes division error.
+    (quotient.round(), remainder)
+}
+
 fn binary_numbers(
     runtime: &mut dyn PyRuntime,
     left: PyNumber,
@@ -538,25 +734,20 @@ fn binary_numbers(
             BinaryOperator::Divide | BinaryOperator::FloorDivide | BinaryOperator::Remainder
         ) && right == 0.0
         {
-            return Err(PyError::zero_division_error(
-                if matches!(operation, BinaryOperator::Divide) {
-                    "division by zero"
-                } else {
-                    "float division or modulo by zero"
-                },
-            ));
+            return Err(PyError::zero_division_error("division by zero"));
         }
         return Ok(Some(PyValue::Float(match operation {
             BinaryOperator::Add => left + right,
             BinaryOperator::Subtract => left - right,
             BinaryOperator::Multiply => left * right,
             BinaryOperator::Power => {
-                if left == 0.0 && right < 0.0 {
-                    return Err(PyError::zero_division_error(
-                        "0.0 cannot be raised to a negative power",
-                    ));
+                // Infinite and NaN operands follow IEEE 754 `pow`, as in CPython. Only finite
+                // operands raise, and a negative base with a fractional exponent gives the
+                // principal complex root.
+                if left == 0.0 && right < 0.0 && right.is_finite() {
+                    return Err(PyError::zero_division_error("zero to a negative power"));
                 }
-                if left < 0.0 && right.is_finite() && right.fract() != 0.0 {
+                if left < 0.0 && left.is_finite() && right.is_finite() && right.fract() != 0.0 {
                     let magnitude = (-left).powf(right);
                     let angle = std::f64::consts::PI * right;
                     return create_complex(
@@ -567,11 +758,6 @@ fn binary_numbers(
                     .map(Some);
                 }
                 let value = left.powf(right);
-                if value.is_nan() {
-                    return Err(PyError::value_error(
-                        "negative number cannot be raised to a fractional power",
-                    ));
-                }
                 if value.is_infinite() && left.is_finite() && right.is_finite() {
                     return Err(PyError::overflow_error(
                         "(34, 'Numerical result out of range')",
@@ -580,8 +766,8 @@ fn binary_numbers(
                 value
             }
             BinaryOperator::Divide => left / right,
-            BinaryOperator::FloorDivide => (left / right).floor(),
-            BinaryOperator::Remainder => left - (left / right).floor() * right,
+            BinaryOperator::FloorDivide => float_divmod(left, right).0,
+            BinaryOperator::Remainder => float_divmod(left, right).1,
             BinaryOperator::BitwiseAnd
             | BinaryOperator::BitwiseXor
             | BinaryOperator::BitwiseOr
@@ -611,9 +797,7 @@ fn binary_numbers(
                 .to_f64()
                 .ok_or_else(|| PyError::overflow_error("power exponent is too large"))?;
             if left == 0.0 {
-                return Err(PyError::zero_division_error(
-                    "0.0 cannot be raised to a negative power",
-                ));
+                return Err(PyError::zero_division_error("zero to a negative power"));
             }
             return Ok(Some(PyValue::Float(left.powf(right))));
         }
@@ -866,14 +1050,21 @@ fn bigint_floor_div(left: &BigInt, right: &BigInt) -> BigInt {
     quotient
 }
 
+/// The operand of a builtin `int` or `float` operator.
 fn try_number(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Option<PyNumber>> {
-    if let Some(value) = runtime.int_value(&value) {
-        return Ok(Some(PyNumber::Int(value)));
+    Ok(runtime.number(&value).and_then(real_number))
+}
+
+/// A real number as the owned [`PyNumber`] builtin arithmetic computes with.
+fn real_number(number: NumberRef<'_>) -> Option<PyNumber> {
+    match number {
+        NumberRef::Int(value) => Some(PyNumber::Int(value)),
+        NumberRef::Float(value) => Some(PyNumber::Float(value)),
+        NumberRef::BigInt(_) => number
+            .to_bigint()
+            .map(|value| PyNumber::BigInt(value.to_string())),
+        NumberRef::Complex(..) => None,
     }
-    if let Some(value) = runtime.integer_text(&value)? {
-        return Ok(Some(PyNumber::BigInt(value)));
-    }
-    Ok(value.float_value().map(PyNumber::Float))
 }
 
 fn integer_decimal(value: PyNumber) -> String {

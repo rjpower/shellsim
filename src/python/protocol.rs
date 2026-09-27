@@ -42,6 +42,18 @@ pub fn display(heap: &Heap, value: &Value) -> Result<String, String> {
     repr(heap, value)
 }
 
+/// The stand-in for a CPython object address in default reprs such as
+/// `<object object at 0x7f0000000010>`: derived from the arena slot, so it is stable across runs
+/// and distinct for live objects.
+pub fn address(id: super::heap::ObjectId) -> String {
+    format!("0x{:x}", address_value(id))
+}
+
+/// The numeric stand-in address of a heap object; see [`address`].
+pub fn address_value(id: super::heap::ObjectId) -> u64 {
+    0x7f00_0000_0000_u64 + (id.as_raw() as u64) * 16
+}
+
 pub fn repr(heap: &Heap, value: &Value) -> Result<String, String> {
     render(heap, value, &mut BTreeSet::new())
 }
@@ -75,7 +87,7 @@ pub fn string_index(heap: &Heap, owner: &Value, index: &Value) -> Result<StringI
     let Some(text) = string_ref(heap, owner)? else {
         return Ok(StringIndex::NotString);
     };
-    let Some(index) = index.as_int() else {
+    let Some(index) = int_value(heap, index) else {
         return Ok(StringIndex::NotInteger);
     };
     Ok(indexed_char(text.as_str(), index, text.is_ascii())
@@ -119,6 +131,17 @@ pub fn bytes_value(heap: &Heap, value: &Value) -> Result<Option<Vec<u8>>, String
     };
     Ok(match heap.get(id)? {
         Object::Bytes(value) | Object::ByteArray(value) => Some(value.clone()),
+        _ => None,
+    })
+}
+
+/// Borrow the contents of a `bytes` or `bytearray` without copying them.
+pub fn bytes_ref<'heap>(heap: &'heap Heap, value: &Value) -> Result<Option<&'heap [u8]>, String> {
+    let Some(id) = value.object_id() else {
+        return Ok(None);
+    };
+    Ok(match heap.get(id)? {
+        Object::Bytes(value) | Object::ByteArray(value) => Some(value),
         _ => None,
     })
 }
@@ -184,23 +207,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
         return Ok(value.immediate_int().expect("tag checked").to_string());
     }
     if let Some(value) = value.float_value() {
-        if value.is_nan() {
-            return Ok("nan".into());
-        }
-        if value.is_infinite() {
-            return Ok(if value.is_sign_negative() {
-                "-inf"
-            } else {
-                "inf"
-            }
-            .into());
-        }
-        let text = value.to_string();
-        return Ok(if text.contains(['.', 'e', 'E']) {
-            text
-        } else {
-            format!("{text}.0")
-        });
+        return Ok(super::float_text::repr(value));
     }
     if let Some(value) = value.bool_value() {
         return Ok(if value { "True" } else { "False" }.into());
@@ -221,6 +228,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
     if let Some(id) = value.object_id() {
         if !active.insert(id) {
             return Ok(match heap.get(id)? {
+                Object::Bare => "<object ...>",
                 Object::String(_) => "<str ...>",
                 Object::Bytes(_) => "<bytes ...>",
                 Object::ByteArray(_) => "<bytearray ...>",
@@ -261,6 +269,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             .into());
         }
         let rendered = match heap.get(id)? {
+            Object::Bare => format!("<object object at {}>", address(id)),
             Object::String(value) => quote_string(value),
             Object::Bytes(value) => quote_bytes(value),
             Object::ByteArray(value) => format!("bytearray({})", quote_bytes(value)),
@@ -283,7 +292,11 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 }
             }
             Object::Slice { start, stop, step } => {
-                format!("slice({start:?}, {stop:?}, {step:?})")
+                let bound = |bound: &Option<i64>| match bound {
+                    Some(value) => value.to_string(),
+                    None => "None".to_string(),
+                };
+                format!("slice({}, {}, {})", bound(start), bound(stop), bound(step))
             }
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 let mut rendered = Vec::with_capacity(entries.len());
@@ -414,6 +427,7 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         return Err("invalid Python value tag".into());
     };
     Ok(match heap.get(id)? {
+        Object::Bare => true,
         Object::String(value) => !value.is_empty(),
         Object::Bytes(value) => !value.is_empty(),
         Object::ByteArray(value) => !value.is_empty(),
@@ -514,6 +528,18 @@ fn equals_inner(
                 | (Object::Tuple(left), Object::Tuple(right)) => {
                     sequence_equal(heap, left, right, active)?
                 }
+                (
+                    Object::Slice {
+                        start: left_start,
+                        stop: left_stop,
+                        step: left_step,
+                    },
+                    Object::Slice {
+                        start: right_start,
+                        stop: right_stop,
+                        step: right_step,
+                    },
+                ) => (left_start, left_stop, left_step) == (right_start, right_stop, right_step),
                 (
                     Object::Range {
                         start: left_start,
@@ -850,10 +876,13 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
     }
     match container.object_id() {
         Some(id) => match heap.get(id)? {
-            Object::String(_) | Object::Exception { .. } | Object::Slice { .. } => {
+            Object::Bare | Object::String(_) | Object::Exception { .. } | Object::Slice { .. } => {
                 Err("object is not a container".into())
             }
             Object::Bytes(value) | Object::ByteArray(value) => {
+                if let Some(needle) = bytes_ref(heap, needle)? {
+                    return Ok(memchr::memmem::find(value, needle).is_some());
+                }
                 let needle = int_value(heap, needle)
                     .and_then(|value| u8::try_from(value).ok())
                     .ok_or("bytes containment requires an integer in range(0, 256)")?;
@@ -965,12 +994,23 @@ fn is_printable(character: char) -> bool {
         ))
 }
 
+/// CPython's bytes repr: single quotes unless the value contains `'` but no `"`, escaping only
+/// the chosen quote.
 fn quote_bytes(value: &[u8]) -> String {
-    let mut rendered = String::from("b'");
+    let quote = if value.contains(&b'\'') && !value.contains(&b'"') {
+        b'"'
+    } else {
+        b'\''
+    };
+    let mut rendered = String::from("b");
+    rendered.push(char::from(quote));
     for byte in value {
         match byte {
             b'\\' => rendered.push_str("\\\\"),
-            b'\'' => rendered.push_str("\\'"),
+            byte if *byte == quote => {
+                rendered.push('\\');
+                rendered.push(char::from(quote));
+            }
             b'\n' => rendered.push_str("\\n"),
             b'\r' => rendered.push_str("\\r"),
             b'\t' => rendered.push_str("\\t"),
@@ -978,7 +1018,7 @@ fn quote_bytes(value: &[u8]) -> String {
             _ => rendered.push_str(&format!("\\x{byte:02x}")),
         }
     }
-    rendered.push('\'');
+    rendered.push(char::from(quote));
     rendered
 }
 
@@ -986,6 +1026,13 @@ fn quote_bytes(value: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::resources::{Limits, Resources};
+
+    #[test]
+    fn bytes_repr_switches_quotes_like_cpython() {
+        assert_eq!(quote_bytes(b"it's"), r#"b"it's""#);
+        assert_eq!(quote_bytes(br#"it's "x""#), r#"b'it\'s "x"'"#);
+        assert_eq!(quote_bytes(b"\"\\\n\x00"), r#"b'"\\\n\x00'"#);
+    }
 
     #[test]
     fn dict_and_set_equality_are_order_independent() {

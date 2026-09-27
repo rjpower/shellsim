@@ -302,6 +302,73 @@ with open('/tmp/items.csv', 'r') as stream:
 }
 
 #[test]
+fn open_parses_modes_and_streams_read_lines_like_cpython() {
+    // Expected output was produced by CPython 3.14.4 running the same source.
+    let source = r#"
+import io
+
+path = "/tmp/modes.txt"
+with open(path, "wt") as stream:
+    print(stream.mode, type(stream).__name__, stream.write("one\ntwo\nthree"))
+with open(path, "bw+") as stream:
+    print(stream.mode, type(stream).__name__)
+    stream.write(b"alpha\nbeta\n")
+with open(path, "tr") as stream:
+    print(stream.readline(), end="")
+    print(stream.readlines())
+try:
+    open(path, "x")
+except FileExistsError as error:
+    print("exists", error)
+for mode in ["rw", "rtb", "", "rr", "rU"]:
+    try:
+        open(path, mode)
+    except ValueError as error:
+        print(repr(mode), error)
+try:
+    open(path, "rb", encoding="utf-8")
+except ValueError as error:
+    print(error)
+
+stream = io.StringIO("ab\ncd\n\nef")
+print(repr(stream.readline(1)), repr(stream.readline()), repr(stream.readline(-1)))
+print(stream.readlines(0))
+stream.seek(0)
+print(stream.readlines(3))
+stream.seek(0)
+print([line for line in stream])
+data = io.BytesIO(b"x\ny")
+print(next(data), data.readlines())
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            concat!(
+                "wt TextIOWrapper 13\n",
+                "rb+ BufferedRandom\n",
+                "alpha\n",
+                "['beta\\n']\n",
+                "exists [Errno 17] File exists: '/tmp/modes.txt'\n",
+                "'rw' must have exactly one of create/read/write/append mode\n",
+                "'rtb' can't have text and binary mode at once\n",
+                "'' Must have exactly one of create/read/write/append mode and at most one plus\n",
+                "'rr' invalid mode: 'rr'\n",
+                "'rU' invalid mode: 'rU'\n",
+                "binary mode doesn't take an encoding argument\n",
+                "'a' 'b\\n' 'cd\\n'\n",
+                "['\\n', 'ef']\n",
+                "['ab\\n', 'cd\\n']\n",
+                "['ab\\n', 'cd\\n', '\\n', 'ef']\n",
+                "b'x\\n' [b'y']\n",
+            )
+            .into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
 fn frozen_pathlib_uses_paths_without_host_filesystem_access() {
     let source = r#"
 from pathlib import Path
@@ -497,6 +564,37 @@ with zipfile.ZipFile('/work/items.zip') as archive:
                 "first b'\\x00\\x01\\xff'\n",
                 "True\n",
                 "b'first'\n",
+            )
+            .into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
+fn frozen_zipfile_writes_deflated_members_and_member_streams() {
+    let source = r#"import io
+import zipfile
+
+buffer = io.BytesIO()
+with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr('zeros.bin', bytes(5000))
+    archive.writestr('plain.txt', b'stored', compress_type=zipfile.ZIP_STORED)
+    with archive.open('member.txt', 'w') as member:
+        member.write(b'written through open')
+print(len(buffer.getvalue()) < 1000)
+with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as archive:
+    print(archive.namelist())
+    print(len(archive.read('zeros.bin')), archive.read('plain.txt'), archive.read('member.txt'))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            concat!(
+                "True\n",
+                "['zeros.bin', 'plain.txt', 'member.txt']\n",
+                "5000 b'stored' b'written through open'\n",
             )
             .into(),
             String::new(),

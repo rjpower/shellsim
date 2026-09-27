@@ -21,6 +21,7 @@ pub mod itertools;
 pub mod json;
 pub mod math;
 pub mod numpy;
+mod operator;
 pub mod os;
 pub mod pytest;
 pub mod re;
@@ -76,6 +77,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "itertools" => Some(&itertools::MODULE),
         "math" => Some(&math::MODULE),
         "numpy" => Some(&numpy::MODULE),
+        "_operator" => Some(&operator::MODULE),
         "_os" => Some(&os::MODULE),
         "_pytest" => Some(&pytest::MODULE),
         "re" => Some(&re::MODULE),

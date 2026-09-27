@@ -1,12 +1,46 @@
 //! Runtime object operations for attributes, subscription, descriptors, classes, and types.
 
+use std::collections::BTreeSet;
+
+use super::super::heap::ObjectId;
 use super::{
     exception_types, expect_arity, protocol, range_length, select_string_slice, Arc,
     BuiltinSubscript, BuiltinType, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout,
-    CodeCaches, CodeRef, ExceptionType, Execution, HashMap, LoadAttributeCache, NameId,
-    NativeValue, Object, Ordering, PyError, PyErrorKind, PyRuntime, SlicePlan, Slot, SlotValue,
-    SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution, HashMap, LoadAttributeCache,
+    NameId, NativeValue, Object, Ordering, PyError, PyErrorKind, PyRuntime, SlicePlan, Slot,
+    SlotValue, SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
+
+/// Items of a builtin container whose `repr` the VM renders item by item.
+enum ContainerItems {
+    List(Vec<Value>),
+    Tuple(Vec<Value>),
+    Set(Vec<Value>),
+    FrozenSet(Vec<Value>),
+    Dict(Vec<(Value, Value)>),
+}
+
+impl ContainerItems {
+    fn len(&self) -> usize {
+        match self {
+            Self::List(items) | Self::Tuple(items) | Self::Set(items) | Self::FrozenSet(items) => {
+                items.len()
+            }
+            Self::Dict(entries) => entries.len(),
+        }
+    }
+
+    /// CPython's text for a container met again while rendering itself.
+    fn placeholder(&self) -> &'static str {
+        match self {
+            Self::List(_) => "[...]",
+            Self::Tuple(_) => "(...)",
+            Self::Set(_) => "set(...)",
+            Self::FrozenSet(_) => "frozenset(...)",
+            Self::Dict(_) => "{...}",
+        }
+    }
+}
 
 impl Vm<'_> {
     pub(super) fn load_attribute(&mut self, name: &str) -> Result<(), String> {
@@ -35,7 +69,7 @@ impl Vm<'_> {
             Some(Ok(Object::Class {
                 name: class_name, ..
             })) => format!("type object '{class_name}' has no attribute '{name}'"),
-            Some(Ok(Object::Instance { .. })) => match self.type_name_of(owner) {
+            Some(Ok(Object::Instance { .. } | Object::Bare)) => match self.type_name_of(owner) {
                 Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
                 Err(error) => return error,
             },
@@ -203,6 +237,31 @@ impl Vm<'_> {
         self.resolve_attribute_inner(owner, symbol, name)
     }
 
+    /// Resolve an attribute where an `AttributeError` raised during the lookup means the
+    /// attribute is absent, as in CPython's `PyObject_GetOptionalAttr`. `getattr` defaults,
+    /// `hasattr` and `from module import name` use this, so a module `__getattr__` or property
+    /// that raises `AttributeError` reads as a missing name while other exceptions propagate.
+    pub(super) fn resolve_optional_attribute(
+        &mut self,
+        owner: Value,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let error = match self.resolve_attribute(owner, name) {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let Some(exception) = self.pending_exception.take() else {
+            return Err(error);
+        };
+        let attribute_error =
+            Value::Native(NativeValue::ExceptionType(ExceptionType("AttributeError")));
+        if self.exception_type_matches(attribute_error, &exception)? {
+            return Ok(None);
+        }
+        self.pending_exception = Some(exception);
+        Err(error)
+    }
+
     fn resolve_attribute_by_symbol(
         &mut self,
         owner: Value,
@@ -213,6 +272,21 @@ impl Vm<'_> {
     }
 
     fn resolve_attribute_inner(
+        &mut self,
+        owner: Value,
+        symbol: Option<SymbolId>,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let found = self.lookup_attribute(owner, symbol, name)?;
+        if found.is_none() && name == "__class__" {
+            // Every object inherits `object.__class__`, which reports its type unless the
+            // class defines its own `__class__`.
+            return self.type_of(&owner).map(Some);
+        }
+        Ok(found)
+    }
+
+    fn lookup_attribute(
         &mut self,
         owner: Value,
         symbol: Option<SymbolId>,
@@ -283,7 +357,26 @@ impl Vm<'_> {
         if let Some(id) = owner.object_id() {
             match self.state.heap.get(id)?.clone() {
                 Object::Module { scope, .. } => {
-                    return Ok(self.state.heap.scope_get(scope, name).copied());
+                    if let Some(value) = self.state.heap.scope_get(scope, name).copied() {
+                        return Ok(Some(value));
+                    }
+                    // PEP 562: a module-level `__getattr__` supplies names the module does not
+                    // define, which is how packages import submodules lazily. It runs after
+                    // the type's attributes, of which modules model only `__class__`.
+                    let hook = self.state.heap.scope_get(scope, "__getattr__").copied();
+                    let Some(hook) = hook.filter(|_| name != "__class__") else {
+                        return Ok(None);
+                    };
+                    let name = self.allocate_string(name.to_string())?;
+                    return self.invoke_value(hook, vec![name]).map(Some);
+                }
+                Object::Function {
+                    name: function_name,
+                    ..
+                } => {
+                    if name == "__name__" {
+                        return Ok(Some(self.allocate_string(function_name)?));
+                    }
                 }
                 Object::Class {
                     name: class_name, ..
@@ -359,6 +452,19 @@ impl Vm<'_> {
                     )?;
                     return Ok(Some(value));
                 }
+                // A bound method exposes its receiver and function and reads other attributes,
+                // such as `__name__`, from the function, as CPython's method objects do.
+                Object::DescriptorBoundMethod {
+                    receiver,
+                    descriptor,
+                    ..
+                } if name != "__class__" => {
+                    return match name {
+                        "__self__" => Ok(Some(receiver)),
+                        "__func__" => Ok(Some(descriptor)),
+                        _ => self.lookup_attribute(descriptor, None, name),
+                    };
+                }
                 Object::Match { .. } => {}
                 Object::ArgumentParser { prog, .. } => {
                     if name == "prog" {
@@ -385,20 +491,31 @@ impl Vm<'_> {
                 _ => {}
             }
         }
-        let native_name = match owner.native_value() {
-            Some(NativeValue::UnitTestBase) if name == "__name__" => Some("TestCase"),
-            Some(NativeValue::BuiltinType(builtin)) if name == "__name__" => Some(builtin.name()),
-            // Native value kinds record their qualified name, as `repr` shows it.
-            Some(NativeValue::ValueKind(kind)) if name == "__name__" => {
-                kind.name.rsplit('.').next()
-            }
-            Some(NativeValue::ExceptionType(ExceptionType(exception_name)))
-                if name == "__name__" =>
-            {
-                Some(exception_name)
-            }
-            _ => None,
-        };
+        let native_name =
+            match owner.native_value() {
+                Some(NativeValue::UnitTestBase) if name == "__name__" => Some("TestCase"),
+                // Builtin types and native value kinds record their qualified names, as `repr` shows
+                // them; `__name__` is the last component.
+                Some(NativeValue::BuiltinType(builtin)) if name == "__name__" => {
+                    builtin.name().rsplit('.').next()
+                }
+                Some(NativeValue::ValueKind(kind)) if name == "__name__" => {
+                    kind.name.rsplit('.').next()
+                }
+                Some(NativeValue::ExceptionType(ExceptionType(exception_name)))
+                    if name == "__name__" =>
+                {
+                    Some(exception_name)
+                }
+                Some(NativeValue::Function(builtin)) if name == "__name__" => Some(builtin.name()),
+                Some(NativeValue::NativeFunction(function)) if name == "__name__" => {
+                    Some(function.name)
+                }
+                Some(
+                    NativeValue::NativeMethod(method) | NativeValue::NativeClassMethod(method),
+                ) if name == "__name__" => Some(method.name),
+                _ => None,
+            };
         let value = native_name
             .map(str::to_string)
             .map(|name| self.allocate_string(name))
@@ -434,7 +551,11 @@ impl Vm<'_> {
                         return Ok(());
                     }
                     Object::Property { setter: None, .. } => {
-                        return Err(format!("property {name:?} has no setter"));
+                        let message = format!(
+                            "property '{name}' of '{}' object has no setter",
+                            self.type_name_of(&owner)?
+                        );
+                        return Err(self.raise_exception("AttributeError", message));
                     }
                     Object::Instance {
                         class: descriptor_class,
@@ -466,26 +587,35 @@ impl Vm<'_> {
         Ok(())
     }
 
-    /// Explain why a receiver without an instance dictionary rejects an attribute store.
+    /// Raise CPython's `AttributeError` for a store on a receiver without an instance
+    /// dictionary: data descriptors are not writable, other type attributes are read-only, and
+    /// new names have nowhere to go.
     fn reject_builtin_attribute_store(&mut self, owner: Value, name: &str) -> String {
-        let getter = self
+        let attribute = self
             .type_id(&owner)
             .and_then(|owner_type| self.state.types.attribute(owner_type, name))
             .ok()
-            .flatten()
-            .and_then(|value| value.native_value());
-        match getter {
-            Some(NativeValue::NativeGetter(getter)) => {
-                self.record_native_error(PyError::exception(
-                    "AttributeError",
-                    format!(
-                        "attribute '{}' of '{}' objects is not writable",
-                        getter.name, getter.owner
-                    ),
-                ))
+            .flatten();
+        let type_name = match self.type_name_of(&owner) {
+            Ok(type_name) => type_name,
+            Err(error) => return error,
+        };
+        let message = match attribute.and_then(|value| value.native_value()) {
+            Some(NativeValue::NativeGetter(getter)) => format!(
+                "attribute '{}' of '{}' objects is not writable",
+                getter.name, getter.owner
+            ),
+            _ if attribute.is_some()
+                || matches!(self.resolve_attribute(owner, name), Ok(Some(_))) =>
+            {
+                format!("'{type_name}' object attribute '{name}' is read-only")
             }
-            _ => "object does not support attribute assignment".into(),
-        }
+            _ => format!(
+                "'{type_name}' object has no attribute '{name}' and no __dict__ for setting new \
+                 attributes"
+            ),
+        };
+        self.raise_exception("AttributeError", message)
     }
 
     pub(super) fn load_subscript(&mut self) -> Result<(), String> {
@@ -500,6 +630,7 @@ impl Vm<'_> {
             self.stack.push(value);
             return Ok(());
         }
+        let index = self.sequence_index(&owner, index)?;
         let value = if matches!(owner.native_value(), Some(NativeValue::TypingList)) {
             let parameter = match index.native_value() {
                 Some(NativeValue::BuiltinType(BuiltinType::Int)) => "int".to_string(),
@@ -527,7 +658,7 @@ impl Vm<'_> {
                     } else {
                         "tuple"
                     };
-                    let Some(index) = index.as_int() else {
+                    let Some(index) = protocol::int_value(&self.state.heap, &index) else {
                         let message = format!(
                             "{sequence} indices must be integers or slices, not {}",
                             self.type_name_of(&index)?
@@ -551,7 +682,13 @@ impl Vm<'_> {
                 }
                 Object::Range { start, stop, step } => {
                     let length = range_length(*start, *stop, *step)?;
-                    let index = index.as_int().ok_or("range index must be an integer")?;
+                    let Some(index) = protocol::int_value(&self.state.heap, &index) else {
+                        let message = format!(
+                            "range indices must be integers or slices, not {}",
+                            self.type_name_of(&index)?
+                        );
+                        return Err(self.raise_exception("TypeError", message));
+                    };
                     let index = if index < 0 {
                         i128::try_from(length).map_err(|_| "range is too large")?
                             + i128::from(index)
@@ -580,7 +717,8 @@ impl Vm<'_> {
                     factory: Some(*factory),
                 },
                 Object::Set(_) => BuiltinSubscript::Set,
-                Object::String(_)
+                Object::Bare
+                | Object::String(_)
                 | Object::Bytes(_)
                 | Object::ByteArray(_)
                 | Object::Slice { .. }
@@ -727,39 +865,202 @@ impl Vm<'_> {
         Err("object is not sliceable".into())
     }
 
+    /// `value` as a machine integer, read through `__index__` as CPython's `PyNumber_Index` reads
+    /// sequence indices and slice bounds; NumPy integer scalars and 0-d integer arrays qualify.
+    /// `None` means `value` is not an integer and its type defines no `__index__`.
+    fn index_value(&mut self, value: &Value) -> Result<Option<i64>, String> {
+        if let Some(index) = protocol::int_value(&self.state.heap, value) {
+            return Ok(Some(index));
+        }
+        let Some(result) = self.int_by_method(value, &["__index__"])? else {
+            return Ok(None);
+        };
+        match protocol::int_value(&self.state.heap, &result) {
+            Some(index) => Ok(Some(index)),
+            None => {
+                Err(self
+                    .raise_exception("IndexError", "cannot fit 'int' into an index-sized integer"))
+            }
+        }
+    }
+
+    /// A builtin sequence's subscript with a non-int index, such as a NumPy integer, replaced by
+    /// the int its `__index__` returns. Other owners and indices are returned unchanged.
+    fn sequence_index(&mut self, owner: &Value, index: Value) -> Result<Value, String> {
+        let Some(id) = owner.object_id() else {
+            return Ok(index);
+        };
+        let sequence = matches!(
+            self.state.heap.get(id)?,
+            Object::List(_)
+                | Object::Tuple(_)
+                | Object::Range { .. }
+                | Object::String(_)
+                | Object::Bytes(_)
+                | Object::ByteArray(_)
+        );
+        if !sequence || protocol::int_value(&self.state.heap, &index).is_some() {
+            return Ok(index);
+        }
+        Ok(self.index_value(&index)?.map_or(index, Value::Int))
+    }
+
+    /// An integer argument read through `__index__`, such as a `range()` bound. Anything else
+    /// raises CPython's `TypeError`.
+    pub(super) fn index_argument(&mut self, value: &Value) -> Result<i64, String> {
+        if let Some(index) = self.index_value(value)? {
+            return Ok(index);
+        }
+        let message = format!(
+            "'{}' object cannot be interpreted as an integer",
+            self.type_name_of(value)?
+        );
+        Err(self.raise_exception("TypeError", message))
+    }
+
+    /// Call `value`'s conversion method `method` (`__int__`, `__float__`, or `__index__`), as
+    /// CPython's `int()` and `float()` do for values that are not builtin numbers or strings:
+    /// NumPy scalars and arrays, and instances of classes. `None` means the value is a builtin
+    /// number, string, or bytes, or its type does not define `method`.
+    fn conversion_method(&mut self, value: &Value, method: &str) -> Result<Option<Value>, String> {
+        let builtin = super::number::view(&self.state.heap, value).is_some()
+            || protocol::string_value(&self.state.heap, value)?.is_some()
+            || protocol::bytes_value(&self.state.heap, value)?.is_some();
+        if builtin {
+            return Ok(None);
+        }
+        let Some(method) = self.special_method(value, method)? else {
+            return Ok(None);
+        };
+        self.invoke_value(method, Vec::new()).map(Some)
+    }
+
+    /// `value`'s special method `name`, bound to `value`. CPython looks special methods up on
+    /// the type, so an instance attribute of the same name does not replace the class's method.
+    /// Native kinds have no instance dictionary, so ordinary attribute lookup finds the same
+    /// method for them.
+    pub(super) fn special_method(
+        &mut self,
+        value: &Value,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let class = match value
+            .object_id()
+            .map(|id| self.state.heap.get(id))
+            .transpose()?
+        {
+            Some(Object::Instance { class, .. }) => *class,
+            _ => return self.resolve_attribute(*value, name),
+        };
+        let Some((defining_class, descriptor)) = self.class_attribute_entry(class, name)? else {
+            return Ok(None);
+        };
+        self.bind_descriptor(descriptor, Some(*value), class, defining_class)
+            .map(Some)
+    }
+
+    /// An int from the first of `methods` that `value` defines, checking that the method
+    /// returned an int as CPython does. `int()` tries `__int__` then `__index__`; `float()` falls
+    /// back to `__index__` only.
+    fn int_by_method(
+        &mut self,
+        value: &Value,
+        methods: &[&'static str],
+    ) -> Result<Option<Value>, String> {
+        for &method in methods {
+            let Some(result) = self.conversion_method(value, method)? else {
+                continue;
+            };
+            if protocol::int_value(&self.state.heap, &result).is_none()
+                && !self.is_bigint(&result)?
+            {
+                let message = format!(
+                    "{method} returned non-int (type {})",
+                    self.type_name_of(&result)?
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
+            return Ok(Some(result));
+        }
+        Ok(None)
+    }
+
+    /// `int(value)` for a number: integers stay exact and floats truncate toward zero, as
+    /// `int.__new__` does through `__index__` and `__trunc__`.
+    fn truncate_to_int(&mut self, value: &Value) -> Result<Value, String> {
+        use super::number::NumberRef;
+        let number = super::number::view(&self.state.heap, value);
+        let float = match number {
+            Some(NumberRef::Float(float)) => float,
+            Some(number @ (NumberRef::Int(_) | NumberRef::BigInt(_))) => {
+                let text = number.to_bigint().expect("integer view").to_string();
+                return self
+                    .new_integer(&text)
+                    .map_err(|error| self.record_native_error(error));
+            }
+            Some(NumberRef::Complex(..)) => {
+                let message = format!(
+                    "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+                    self.type_name_of(value)?
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
+            None => {
+                let message = format!(
+                    "int() argument must be a string, a bytes-like object or a real number, not \
+                     '{}'",
+                    self.type_name_of(value)?
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
+        };
+        if float.is_nan() {
+            return Err(self.raise_exception("ValueError", "cannot convert float NaN to integer"));
+        }
+        if float.is_infinite() {
+            return Err(
+                self.raise_exception("OverflowError", "cannot convert float infinity to integer")
+            );
+        }
+        let text = format!("{:.0}", float.trunc());
+        self.new_integer(&text)
+            .map_err(|error| self.record_native_error(error))
+    }
+
+    /// One `slice()` argument. Slices store machine-integer bounds read through `__index__`, so
+    /// other bound objects, which CPython keeps as-is, are rejected explicitly.
+    fn slice_bound(&mut self, value: &Value) -> Result<Option<i64>, String> {
+        if value.is_none() {
+            return Ok(None);
+        }
+        self.index_value(value)?.map(Some).ok_or_else(|| {
+            "slice() bounds other than integers and None are not supported".to_string()
+        })
+    }
+
+    /// Pop one slice bound. An explicit `None` bound is the same as an omitted one.
+    fn pop_slice_bound(&mut self, present: bool, name: &str) -> Result<Option<i64>, String> {
+        if !present {
+            return Ok(None);
+        }
+        let value = self.pop()?;
+        if value.is_none() {
+            return Ok(None);
+        }
+        self.index_value(&value)?
+            .map(Some)
+            .ok_or_else(|| format!("slice {name} must be an integer"))
+    }
+
     pub(super) fn build_slice(
         &mut self,
         has_start: bool,
         has_stop: bool,
         has_step: bool,
     ) -> Result<(), String> {
-        let step = if has_step {
-            Some(
-                self.pop()?
-                    .as_int()
-                    .ok_or("slice step must be an integer")?,
-            )
-        } else {
-            None
-        };
-        let stop = if has_stop {
-            Some(
-                self.pop()?
-                    .as_int()
-                    .ok_or("slice stop must be an integer")?,
-            )
-        } else {
-            None
-        };
-        let start = if has_start {
-            Some(
-                self.pop()?
-                    .as_int()
-                    .ok_or("slice start must be an integer")?,
-            )
-        } else {
-            None
-        };
+        let step = self.pop_slice_bound(has_step, "step")?;
+        let stop = self.pop_slice_bound(has_stop, "stop")?;
+        let start = self.pop_slice_bound(has_start, "start")?;
         let value = self.allocate_object(Object::Slice { start, stop, step })?;
         self.stack.push(value);
         Ok(())
@@ -778,9 +1079,10 @@ impl Vm<'_> {
         let Some(id) = owner.object_id() else {
             return Err(self.raise_object_type_error(&owner, "does not support item assignment"));
         };
+        let index = self.sequence_index(&owner, index)?;
         match self.state.heap.get(id)? {
             Object::List(values) => {
-                let Some(index) = index.as_int() else {
+                let Some(index) = protocol::int_value(&self.state.heap, &index) else {
                     let message = format!(
                         "list indices must be integers or slices, not {}",
                         self.type_name_of(&index)?
@@ -803,24 +1105,7 @@ impl Vm<'_> {
                 values[index] = value;
             }
             Object::Dict(_) | Object::DefaultDict { .. } => {
-                if let Some(position) = self.find_mapping_entry(id, &index)? {
-                    let entries = match self.state.heap.get_mut(id)? {
-                        Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
-                        _ => unreachable!(),
-                    };
-                    entries.set_value(position, value);
-                } else {
-                    self.state.heap.reserve_object_growth(
-                        id,
-                        MODELED_MAPPING_ENTRY_BYTES,
-                        &mut self.interp.resources,
-                    )?;
-                    let entries = match self.state.heap.get_mut(id)? {
-                        Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
-                        _ => unreachable!(),
-                    };
-                    entries.push((index, value));
-                }
+                self.dict_set_entry(id, index, value)?
             }
             // Item assignment on these would be a shellsim gap, not a CPython TypeError.
             Object::ByteArray(_) | Object::ArrayStorage(_) | Object::Array { .. } => {
@@ -1617,6 +1902,21 @@ impl Vm<'_> {
         self.invoke_value(callable, arguments).map(Some)
     }
 
+    /// Invoke a binary-operator or rich-comparison slot. A method that returns `NotImplemented`
+    /// declines the operation, so the result is `None` exactly as if the slot were absent and the
+    /// caller goes on to the reflected method or the default behavior, as CPython does.
+    pub(super) fn invoke_operator_slot(
+        &mut self,
+        receiver: &Value,
+        slot: Slot,
+        method_name: &str,
+        arguments: Vec<Value>,
+    ) -> Result<Option<Value>, String> {
+        Ok(self
+            .invoke_slot(receiver, slot, method_name, arguments)?
+            .filter(|value| value.native_value() != Some(NativeValue::NotImplemented)))
+    }
+
     pub(super) fn truth_value(&mut self, value: &Value) -> Result<bool, String> {
         if let Some(result) = self.invoke_slot(value, Slot::Bool, "__bool__", Vec::new())? {
             return result
@@ -1635,11 +1935,82 @@ impl Vm<'_> {
     }
 
     pub(super) fn repr_value(&mut self, value: &Value) -> Result<String, String> {
+        self.repr_nested(value, &mut BTreeSet::new())
+    }
+
+    /// `repr()` that renders container items through their own `__repr__` and protocol slots,
+    /// as CPython does. `active` holds the containers being rendered, so a container that
+    /// contains itself prints as `[...]`.
+    fn repr_nested(
+        &mut self,
+        value: &Value,
+        active: &mut BTreeSet<ObjectId>,
+    ) -> Result<String, String> {
         if let Some(result) = self.invoke_slot(value, Slot::Repr, "__repr__", Vec::new())? {
             return protocol::string_value(&self.state.heap, &result)?
                 .ok_or_else(|| "__repr__ should return str".into());
         }
-        protocol::repr(&self.state.heap, value)
+        let Some((id, container)) = self.container_items(value)? else {
+            return protocol::repr(&self.state.heap, value);
+        };
+        if !active.insert(id) {
+            return Ok(container.placeholder().into());
+        }
+        self.charge_cpu(u64::try_from(container.len()).unwrap_or(u64::MAX))?;
+        let rendered = match container {
+            ContainerItems::List(items) => format!("[{}]", self.repr_items(&items, active)?),
+            ContainerItems::Tuple(items) => match items.as_slice() {
+                [only] => format!("({},)", self.repr_nested(only, active)?),
+                _ => format!("({})", self.repr_items(&items, active)?),
+            },
+            ContainerItems::Set(items) if items.is_empty() => "set()".into(),
+            ContainerItems::Set(items) => format!("{{{}}}", self.repr_items(&items, active)?),
+            ContainerItems::FrozenSet(items) if items.is_empty() => "frozenset()".into(),
+            ContainerItems::FrozenSet(items) => {
+                format!("frozenset({{{}}})", self.repr_items(&items, active)?)
+            }
+            ContainerItems::Dict(entries) => {
+                let mut parts = Vec::with_capacity(entries.len());
+                for (key, item) in &entries {
+                    let key = self.repr_nested(key, active)?;
+                    let item = self.repr_nested(item, active)?;
+                    parts.push(format!("{key}: {item}"));
+                }
+                format!("{{{}}}", parts.join(", "))
+            }
+        };
+        active.remove(&id);
+        Ok(rendered)
+    }
+
+    fn repr_items(
+        &mut self,
+        items: &[Value],
+        active: &mut BTreeSet<ObjectId>,
+    ) -> Result<String, String> {
+        let mut parts = Vec::with_capacity(items.len());
+        for item in items {
+            parts.push(self.repr_nested(item, active)?);
+        }
+        Ok(parts.join(", "))
+    }
+
+    /// A snapshot of a builtin container's items, for rendering them through the VM.
+    fn container_items(&self, value: &Value) -> Result<Option<(ObjectId, ContainerItems)>, String> {
+        let Some(id) = value.object_id() else {
+            return Ok(None);
+        };
+        let items = match self.state.heap.get(id)? {
+            Object::List(items) => ContainerItems::List(items.clone()),
+            Object::Tuple(items) => ContainerItems::Tuple(items.clone()),
+            Object::Set(items) => ContainerItems::Set(items.clone()),
+            Object::FrozenSet(items) => ContainerItems::FrozenSet(items.clone()),
+            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
+                ContainerItems::Dict(entries.iter().copied().collect())
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some((id, items)))
     }
 
     pub(super) fn display_value(&mut self, value: &Value) -> Result<String, String> {
@@ -1652,6 +2023,7 @@ impl Vm<'_> {
             .types
             .slot(self.type_id(value)?, Slot::Repr)?
             .is_some()
+            || self.container_items(value)?.is_some()
         {
             return self.repr_value(value);
         }
@@ -1689,17 +2061,21 @@ impl Vm<'_> {
                 return Ok(protocol::Comparison::Ordered(left.len().cmp(&right.len())));
             }
         }
-        if let Some(equal) = self.invoke_slot(left, Slot::Equal, "__eq__", vec![*right])? {
+        if let Some(equal) = self.invoke_operator_slot(left, Slot::Equal, "__eq__", vec![*right])? {
             if self.truth_value(&equal)? {
                 return Ok(protocol::Comparison::Ordered(Ordering::Equal));
             }
         }
-        if let Some(less) = self.invoke_slot(left, Slot::LessThan, "__lt__", vec![*right])? {
+        if let Some(less) =
+            self.invoke_operator_slot(left, Slot::LessThan, "__lt__", vec![*right])?
+        {
             if self.truth_value(&less)? {
                 return Ok(protocol::Comparison::Ordered(Ordering::Less));
             }
         }
-        if let Some(less) = self.invoke_slot(right, Slot::LessThan, "__lt__", vec![*left])? {
+        if let Some(less) =
+            self.invoke_operator_slot(right, Slot::LessThan, "__lt__", vec![*left])?
+        {
             if self.truth_value(&less)? {
                 return Ok(protocol::Comparison::Ordered(Ordering::Greater));
             }
@@ -1707,13 +2083,16 @@ impl Vm<'_> {
         protocol::compare(&self.state.heap, left, right)
     }
 
-    /// Order two values for `sorted`, `min` and `max`, which compare with `<` as CPython does.
-    /// A NaN orders as equal, so the earlier value stays in place.
+    /// Order two values for native sorting, heap and bisection helpers with the `<` operator
+    /// alone, as CPython's do: `left < right` is `Less`, `right < left` is `Greater`, and
+    /// anything else, such as a NaN, is `Equal`, so the earlier value stays in place.
     pub(super) fn sort_order(&mut self, left: &Value, right: &Value) -> Result<Ordering, String> {
-        match self.compare_values(left, right)? {
-            protocol::Comparison::Ordered(ordering) => Ok(ordering),
-            protocol::Comparison::Unordered => Ok(Ordering::Equal),
-            protocol::Comparison::Unsupported => Err(self.raise_unorderable("<", left, right)),
+        if self.compare_truth(ComparisonOperator::Less, left, right)? {
+            Ok(Ordering::Less)
+        } else if self.compare_truth(ComparisonOperator::Less, right, left)? {
+            Ok(Ordering::Greater)
+        } else {
+            Ok(Ordering::Equal)
         }
     }
 
@@ -1774,20 +2153,16 @@ impl Vm<'_> {
                 return Ok((class, *value, accessed_class));
             }
         }
-        if name == "__new__"
-            && matches!(
-                self.state.heap.get(start_class)?,
-                Object::Class {
-                    layout: ClassLayout::Type,
-                    ..
-                }
-            )
-        {
-            if let Some(descriptor) = self
-                .state
-                .types
-                .attribute(BuiltinType::Type.id(), "__new__")?
-            {
+        // Past the last user class, the MRO continues through builtin ancestors such as `type`,
+        // `BaseException` and `object`, whose methods live in the type registry. User types
+        // register no attributes there, so only builtin ancestors can match.
+        let Object::Class { instance_type, .. } = self.state.heap.get(accessed_class)? else {
+            return Err("super() receiver has an invalid class".into());
+        };
+        let ancestors = self.state.types.get(*instance_type)?.mro.clone();
+        for ancestor in ancestors {
+            self.charge_cpu(1)?;
+            if let Some(descriptor) = self.state.types.attribute(ancestor, name)? {
                 return Ok((start_class, descriptor, accessed_class));
             }
         }
@@ -1799,12 +2174,122 @@ impl Vm<'_> {
     /// Construction is centralized here so type identity, `type()`, and calling a type do not
     /// depend on the unrelated builtin-function dispatch table. Collection construction remains
     /// metered through the normal iterator and allocation paths.
+    /// `d[key] = value` for the dict `id`: replace the value of an equal key, or append the pair.
+    fn dict_set_entry(&mut self, id: ObjectId, key: Value, value: Value) -> Result<(), String> {
+        if let Some(position) = self.find_mapping_entry(id, &key)? {
+            let entries = match self.state.heap.get_mut(id)? {
+                Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
+                _ => unreachable!("dict kind was checked during lookup"),
+            };
+            entries.set_value(position, value);
+            return Ok(());
+        }
+        self.state.heap.reserve_object_growth(
+            id,
+            MODELED_MAPPING_ENTRY_BYTES,
+            &mut self.interp.resources,
+        )?;
+        let entries = match self.state.heap.get_mut(id)? {
+            Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
+            _ => unreachable!("dict kind was checked during lookup"),
+        };
+        entries.push((key, value));
+        Ok(())
+    }
+
+    /// `dict(source=(), /, **keywords)`: the entries of a mapping (a dict, or any object with
+    /// `keys()` and `__getitem__`) or the pairs of an iterable, followed by the keywords.
+    fn construct_dict(
+        &mut self,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<Value, String> {
+        if arguments.len() > 1 {
+            let message = format!("dict expected at most 1 argument, got {}", arguments.len());
+            return Err(self.raise_exception("TypeError", message));
+        }
+        let dict = self.allocate_object(Object::Dict(Vec::new().into()))?;
+        let id = dict.object_id().expect("dicts are arena objects");
+        if let Some(source) = arguments.first() {
+            for (key, value) in self.dict_source_entries(source)? {
+                self.charge_cpu(1)?;
+                self.dict_set_entry(id, key, value)?;
+            }
+        }
+        for (name, value) in keyword_arguments {
+            let key = self.allocate_string(name)?;
+            self.dict_set_entry(id, key, value)?;
+        }
+        Ok(dict)
+    }
+
+    fn dict_source_entries(&mut self, source: &Value) -> Result<Vec<(Value, Value)>, String> {
+        if let Some(id) = source.object_id() {
+            if let Object::Dict(entries) | Object::DefaultDict { entries, .. } =
+                self.state.heap.get(id)?
+            {
+                return Ok(entries.to_vec());
+            }
+        }
+        if let Some(keys) = self.resolve_optional_attribute(*source, "keys")? {
+            let keys = <Self as PyRuntime>::call_value(
+                self,
+                keys,
+                super::CallArgs::new(Vec::new(), Vec::new()),
+            )
+            .map_err(|error| self.record_native_error(error))?;
+            let mut entries = Vec::new();
+            for key in self.iterable_values(&keys)? {
+                let Some(value) =
+                    self.invoke_slot(source, Slot::GetItem, "__getitem__", vec![key])?
+                else {
+                    return Err(self.raise_object_type_error(source, "is not subscriptable"));
+                };
+                entries.push((key, value));
+            }
+            return Ok(entries);
+        }
+        let mut entries = Vec::new();
+        for (index, item) in self.iterable_values(source)?.into_iter().enumerate() {
+            let pair = match self.iterable_values(&item) {
+                Ok(pair) => pair,
+                // CPython 3.14 replaces the "'int' object is not iterable" of a non-iterable
+                // element with a message that omits the type name.
+                Err(message)
+                    if message.ends_with("object is not iterable")
+                        && self
+                            .pending_exception
+                            .as_ref()
+                            .is_some_and(|exception| exception.kind == "TypeError") =>
+                {
+                    self.pending_exception = None;
+                    return Err(self.raise_exception("TypeError", "object is not iterable"));
+                }
+                Err(error) => return Err(error),
+            };
+            let [key, value] = pair.as_slice() else {
+                let message = format!(
+                    "dictionary update sequence element #{index} has length {}; 2 is required",
+                    pair.len()
+                );
+                return Err(self.raise_exception("ValueError", message));
+            };
+            entries.push((*key, *value));
+        }
+        Ok(entries)
+    }
+
     pub(super) fn call_builtin_type(
         &mut self,
         builtin_type: BuiltinType,
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
     ) -> Result<CallResult, String> {
+        if builtin_type == BuiltinType::Dict {
+            return self
+                .construct_dict(arguments, keyword_arguments)
+                .map(CallResult::Value);
+        }
         if builtin_type == BuiltinType::Complex {
             let arguments = super::CallArgs::new(arguments, keyword_arguments);
             let value = super::super::complex::construct(self, arguments)
@@ -1847,11 +2332,70 @@ impl Vm<'_> {
             },
             BuiltinType::Object => {
                 expect_arity(&arguments, 0, 0)?;
-                return Err("direct object() instances are not implemented".into());
+                self.allocate_object(Object::Bare)?
+            }
+            BuiltinType::Slice => {
+                if arguments.is_empty() || arguments.len() > 3 {
+                    return Err(self.raise_exception(
+                        "TypeError",
+                        format!(
+                            "slice expected at least 1 argument, got {}",
+                            arguments.len()
+                        ),
+                    ));
+                }
+                let mut bounds = arguments
+                    .iter()
+                    .map(|value| self.slice_bound(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if bounds.len() == 1 {
+                    bounds.insert(0, None);
+                }
+                bounds.resize(3, None);
+                self.allocate_object(Object::Slice {
+                    start: bounds[0],
+                    stop: bounds[1],
+                    step: bounds[2],
+                })?
+            }
+            BuiltinType::Range => {
+                let bound = match arguments.len() {
+                    0 => Some("least 1 argument"),
+                    1..=3 => None,
+                    _ => Some("most 3 arguments"),
+                };
+                if let Some(bound) = bound {
+                    let message = format!("range expected at {bound}, got {}", arguments.len());
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                let mut integers = Vec::with_capacity(arguments.len());
+                for value in &arguments {
+                    integers.push(self.index_argument(value)?);
+                }
+                let (start, stop, step) = match integers.as_slice() {
+                    [stop] => (0, *stop, 1),
+                    [start, stop] => (*start, *stop, 1),
+                    [start, stop, step] => (*start, *stop, *step),
+                    _ => unreachable!(),
+                };
+                if step == 0 {
+                    return Err(
+                        self.raise_exception("ValueError", "range() arg 3 must not be zero")
+                    );
+                }
+                self.allocate_object(Object::Range { start, stop, step })?
             }
             BuiltinType::None => {
                 expect_arity(&arguments, 0, 0)?;
                 Value::None
+            }
+            BuiltinType::Ellipsis => {
+                expect_arity(&arguments, 0, 0)?;
+                Value::Native(NativeValue::Ellipsis)
+            }
+            BuiltinType::NotImplemented => {
+                expect_arity(&arguments, 0, 0)?;
+                Value::Native(NativeValue::NotImplemented)
             }
             BuiltinType::Bool => {
                 expect_arity(&arguments, 0, 1)?;
@@ -1894,17 +2438,36 @@ impl Vm<'_> {
                             self.new_integer(&decimal)
                                 .map_err(|error| self.record_native_error(error))?
                         }
-                        Some(value) => Value::Int(
-                            protocol::int_value(&self.state.heap, value)
-                                .or_else(|| value.as_int())
-                                .ok_or("int() argument is not supported")?,
-                        ),
+                        Some(value) => {
+                            match self.int_by_method(value, &["__int__", "__index__"])? {
+                                Some(converted) => converted,
+                                None => self.truncate_to_int(value)?,
+                            }
+                        }
                     }
                 }
             }
             BuiltinType::Float => {
                 expect_arity(&arguments, 0, 1)?;
-                let converted = match arguments.first() {
+                let mut argument = arguments.first().copied();
+                if let Some(value) = argument {
+                    if let Some(converted) = self.conversion_method(&value, "__float__")? {
+                        if converted.tag() != ValueTag::Float {
+                            let message = format!(
+                                "{}.__float__ returned non-float (type {})",
+                                self.type_name_of(&value)?,
+                                self.type_name_of(&converted)?
+                            );
+                            return Err(self.raise_exception("TypeError", message));
+                        }
+                        return Ok(CallResult::Value(converted));
+                    }
+                    // CPython falls back to `__index__` and converts the int it returns.
+                    if let Some(index) = self.int_by_method(&value, &["__index__"])? {
+                        argument = Some(index);
+                    }
+                }
+                let converted = match argument.as_ref() {
                     None => 0.0,
                     Some(value)
                         if matches!(
@@ -2033,26 +2596,8 @@ impl Vm<'_> {
                 };
                 self.allocate_object(object)?
             }
-            BuiltinType::Dict => {
-                expect_arity(&arguments, 0, 1)?;
-                let entries = match arguments.first() {
-                    None => Vec::new(),
-                    Some(value) if value.object_id().is_some() => {
-                        match self.state.heap.get(value.object_id().unwrap())? {
-                            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                                entries.to_vec()
-                            }
-                            _ => {
-                                return Err("dict() argument is not a mapping in this slice".into())
-                            }
-                        }
-                    }
-                    Some(_) => return Err("dict() argument is not a mapping in this slice".into()),
-                };
-                self.allocate_object(Object::Dict(entries.into()))?
-            }
+            BuiltinType::Dict => unreachable!("dict construction returned above"),
             BuiltinType::Function
-            | BuiltinType::Range
             | BuiltinType::Module
             | BuiltinType::Iterator
             | BuiltinType::Generator
@@ -2112,6 +2657,8 @@ impl Vm<'_> {
                 NativeValue::Module(_) => BuiltinType::Module.id(),
                 NativeValue::Stream(_) => BuiltinType::Stream.id(),
                 NativeValue::Environment => BuiltinType::Environment.id(),
+                NativeValue::Ellipsis => BuiltinType::Ellipsis.id(),
+                NativeValue::NotImplemented => BuiltinType::NotImplemented.id(),
                 _ => BuiltinType::Native.id(),
             },
             ValueTag::Object => self
@@ -2221,7 +2768,10 @@ impl Vm<'_> {
     /// The modeled exception class that `class` is or derives from: the class itself for a
     /// builtin exception type, the recorded exception base for a user exception class, and
     /// `None` for anything else.
-    fn exception_class_base(&self, class: &Value) -> Result<Option<&'static str>, String> {
+    pub(super) fn exception_class_base(
+        &self,
+        class: &Value,
+    ) -> Result<Option<&'static str>, String> {
         if let Some(NativeValue::ExceptionType(ExceptionType(name))) = class.native_value() {
             return Ok(Some(name));
         }

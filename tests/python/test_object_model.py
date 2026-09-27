@@ -133,3 +133,154 @@ def test_json_uses_ordinary_runtime_values():
     assert value["small"] + value["large"] == 9223372036854775809
     assert value["items"] == [1, 2]
     assert json.loads(json.dumps(value))["large"] == 9223372036854775808
+
+
+def test_class_attribute_falls_back_to_the_runtime_type():
+    value = Child(1)
+    assert value.__class__ is Child
+    assert value.__class__.__name__ == "Child"
+    assert (3).__class__ is int
+    assert "x".__class__ is str
+    assert json.__class__.__name__ == "module"
+
+
+def test_range_is_a_type():
+    values = range(1, 7, 2)
+    assert isinstance(values, range)
+    assert type(values) is range
+    assert not isinstance([1, 3, 5], range)
+    assert list(values) == [1, 3, 5]
+    for arguments, message in [
+        ((), "range expected at least 1 argument, got 0"),
+        ((1, 2, 3, 4), "range expected at most 3 arguments, got 4"),
+    ]:
+        try:
+            range(*arguments)
+        except TypeError as error:
+            assert str(error) == message
+        else:
+            raise AssertionError(arguments)
+
+
+class ReadOnlyPoint:
+    @property
+    def x(self):
+        return 1
+
+
+def test_assigning_a_read_only_property_raises_attribute_error():
+    # CPython names the class by its qualified name; a module-level class keeps them equal.
+    try:
+        ReadOnlyPoint().x = 2
+    except AttributeError as error:
+        assert str(error) == "property 'x' of 'ReadOnlyPoint' object has no setter"
+    else:
+        raise AssertionError("a property without a setter accepted a value")
+
+
+class Half:
+    """Equal to 0.5 and hashing like it, as a numeric type such as Fraction does."""
+
+    def __eq__(self, other):
+        return other == 0.5
+
+    def __hash__(self):
+        return hash(0.5)
+
+
+class Never:
+    def __eq__(self, other):
+        return False
+
+    __hash__ = object.__hash__
+
+
+class Recorded:
+    def __init__(self, value, log):
+        self.value = value
+        self.log = log
+
+    def __eq__(self, other):
+        self.log.append((self.value, other.value))
+        return self.value == other.value
+
+    __hash__ = None
+
+
+def test_containers_compare_elements_with_eq():
+    assert [Half()] == [0.5] and (0.5, Half()) == (Half(), 0.5)
+    assert [[Half()], {"k": (Half(),)}] == [[0.5], {"k": (0.5,)}]
+    assert [Half()] != [0.25] and not [Half()] == [0.5, 1]
+    assert Half() in [0.5] and 0.5 in (Half(),) and Half() in {0.5} and Half() in {0.5: 1}
+    assert {Half(): "a"}[0.5] == "a" and {0.5: "a"}.get(Half()) == "a"
+    assert len({0.5: 1, Half(): 2}) == 1 and len({Half(), 0.5}) == 1
+    assert {0.5: [Half()]} == {Half(): [0.5]} and {Half()} == {0.5}
+    values = [1, Half(), 0.5]
+    assert values.index(0.5) == 1 and values.count(0.5) == 2
+    values.remove(0.5)
+    assert len(values) == 2 and values[1] == 0.5
+
+
+def test_container_equality_checks_identity_first_and_stops_at_the_first_difference():
+    never = Never()
+    assert [never] == [never] and never in [never] and never != never
+    log = []
+    left = [Recorded(1, log), Recorded(2, log), Recorded(3, log)]
+    right = [Recorded(1, log), Recorded(5, log), Recorded(3, log)]
+    assert left != right and log == [(1, 1), (2, 5)]
+    first = [1]
+    first.append(first)
+    second = [1]
+    second.append(second)
+    assert first == first
+    try:
+        equal = first == second
+    except RecursionError:
+        pass
+    else:
+        raise AssertionError(f"comparing distinct self-containing lists returned {equal}")
+
+
+def test_object_provides_identity_hash_and_equality():
+    never = Never()
+    assert hash(never) == object.__hash__(never) and {never: 1}[never] == 1
+    assert object.__eq__(never, never) is True and object.__eq__(never, 1) is NotImplemented
+    assert object.__ne__(never, 1) is True and object.__ne__(Half(), 0.5) is False
+    assert object.__ne__(object(), 1) is NotImplemented
+
+
+def test_builtin_iterators_expose_next_and_iter():
+    iterator = iter([1, 2, 0.5, 4])
+    assert iterator.__iter__() is iterator and iterator.__next__() == 1
+    assert list(iter(iterator.__next__, Half())) == [2]
+    remaining = iter(range(1))
+    assert remaining.__next__() == 0
+    try:
+        remaining.__next__()
+    except StopIteration:
+        pass
+    else:
+        raise AssertionError("an exhausted iterator did not raise StopIteration")
+
+
+def test_builtin_functions_and_bound_methods_have_names():
+    import math
+
+    functions = [round, len, print, sorted, math.floor, [].append, "".join, dict.fromkeys, object.__hash__]
+    assert [function.__name__ for function in functions] == [
+        "round",
+        "len",
+        "print",
+        "sorted",
+        "floor",
+        "append",
+        "join",
+        "fromkeys",
+        "__hash__",
+    ]
+    assert (repr(len), repr(math.floor)) == ("<built-in function len>", "<built-in function floor>")
+    assert repr(list.append) == "<method 'append' of 'list' objects>"
+    receiver = Base(1)
+    method = receiver.describe
+    assert method.__name__ == "describe" and method.__func__ is Base.describe
+    assert method.__self__ is receiver

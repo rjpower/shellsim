@@ -106,6 +106,8 @@ pub struct ScopeId(usize);
 
 #[derive(Clone, Debug)]
 pub enum Object {
+    /// A direct `object()` instance: identity only, with no attributes.
+    Bare,
     String(PyString),
     Bytes(Vec<u8>),
     ByteArray(Vec<u8>),
@@ -1115,13 +1117,14 @@ impl Heap {
 
     fn infer_type_id(&self, object: &Object) -> Result<TypeId, String> {
         Ok(match object {
+            Object::Bare => BuiltinType::Object.id(),
             Object::String(_) => BuiltinType::String.id(),
             Object::Bytes(_) => BuiltinType::Bytes.id(),
             Object::ByteArray(_) => BuiltinType::ByteArray.id(),
             Object::Exception { .. } => BuiltinType::Exception.id(),
             Object::List(_) => BuiltinType::List.id(),
             Object::Tuple(_) => BuiltinType::Tuple.id(),
-            Object::Slice { .. } => BuiltinType::Native.id(),
+            Object::Slice { .. } => BuiltinType::Slice.id(),
             Object::Dict(_) | Object::DefaultDict { .. } => BuiltinType::Dict.id(),
             Object::Set(_) => BuiltinType::Set.id(),
             Object::FrozenSet(_) => BuiltinType::FrozenSet.id(),
@@ -1500,7 +1503,8 @@ fn trace_object(
             object_work.push(*start_class);
             trace_value(*receiver, object_work);
         }
-        Object::String(_)
+        Object::Bare
+        | Object::String(_)
         | Object::Bytes(_)
         | Object::ByteArray(_)
         | Object::Exception { .. }
@@ -1520,10 +1524,16 @@ fn trace_object(
 fn modeled_size(object: &Object) -> Result<u64, String> {
     const HEADER: u64 = 32;
     const VALUE: u64 = 24;
+    // Text and bytes are charged at their byte length rather than per value slot.
+    let packed = |length: usize| {
+        u64::try_from(length)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(HEADER))
+            .ok_or_else(|| String::from("modeled object size overflow"))
+    };
     let slots = match object {
-        Object::String(value) => value.len(),
-        Object::Bytes(value) => value.len(),
-        Object::ByteArray(value) => value.len(),
+        Object::String(value) => return packed(value.len()),
+        Object::Bytes(value) | Object::ByteArray(value) => return packed(value.len()),
         Object::Exception { kind, message } => kind
             .len()
             .checked_add(message.len())
@@ -1532,6 +1542,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         | Object::Tuple(values)
         | Object::Set(values)
         | Object::FrozenSet(values) => values.len(),
+        Object::Bare => 0,
         Object::Slice { .. } => 3,
         Object::BigInt(value) => usize::try_from(value.bits().saturating_add(7) / 8)
             .map_err(|_| "modeled big integer size overflow")?,
@@ -1717,6 +1728,14 @@ mod tests {
             } => *shape,
             _ => panic!("expected shaped instance"),
         }
+    }
+
+    #[test]
+    fn text_and_byte_payloads_are_charged_per_byte() {
+        assert_eq!(modeled_size(&Object::Bytes(vec![0; 1000])), Ok(1032));
+        assert_eq!(modeled_size(&Object::ByteArray(vec![0; 10])), Ok(42));
+        assert_eq!(modeled_size(&Object::String("é".repeat(5).into())), Ok(42));
+        assert_eq!(modeled_size(&Object::List(vec![Value::None; 10])), Ok(272));
     }
 
     #[test]

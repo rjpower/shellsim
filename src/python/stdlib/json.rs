@@ -220,6 +220,15 @@ fn encode_string(value: &str, ensure_ascii: bool) -> PyResult<String> {
     Ok(ascii)
 }
 
+/// CPython's error for a value `json` cannot encode, naming the type as `__name__` does.
+fn not_serializable(runtime: &dyn PyRuntime, value: &PyValue) -> PyError {
+    let name = runtime
+        .type_name(value)
+        .unwrap_or_else(|_| "object".to_string());
+    let short = name.rsplit('.').next().unwrap_or(&name);
+    PyError::type_error(format!("Object of type {short} is not JSON serializable"))
+}
+
 fn dump_value(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
@@ -343,10 +352,10 @@ fn dump_value(
                     depth,
                 ))
             }
-            _ => Err(PyError::type_error("object is not JSON serializable")),
+            _ => Err(not_serializable(runtime, &value)),
         };
     }
-    Err(PyError::type_error("object is not JSON serializable"))
+    Err(not_serializable(runtime, &value))
 }
 
 fn join_json_container(
@@ -479,11 +488,11 @@ fn size_bound(
                 }
                 Ok(size)
             }
-            _ => Err(PyError::type_error("object is not JSON serializable")),
+            _ => Err(not_serializable(runtime, &value)),
         };
         active.pop();
         result
     } else {
-        Err(PyError::type_error("object is not JSON serializable"))
+        Err(not_serializable(runtime, &value))
     }
 }

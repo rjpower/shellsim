@@ -40,13 +40,16 @@ use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
 
 mod calls;
 mod dispatch;
+mod equality;
 mod format;
+mod hashing;
 mod host;
 mod iteration;
 mod namespace;
 mod native_runtime;
 mod objects;
 mod operations;
+mod summation;
 const VM_POLL_QUANTUM: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +74,11 @@ pub(super) enum NativeValue {
     EnumBase,
     /// Marker used as the only supported base for the capability-free unittest slice.
     UnitTestBase,
+    /// The `Ellipsis` singleton written as `...`. An immediate marker keeps identity, equality,
+    /// and dictionary hashing canonical without allocating an arena object.
+    Ellipsis,
+    /// The `NotImplemented` singleton returned by binary and comparison methods that decline.
+    NotImplemented,
 }
 
 impl NativeValue {
@@ -87,7 +95,9 @@ impl NativeValue {
     const UNITTEST_BASE: u8 = 10;
     const VALUE_KIND: u8 = 11;
     const NATIVE_GETTER: u8 = 12;
-    const NATIVE_CLASS_METHOD: u8 = 13;
+    const ELLIPSIS: u8 = 13;
+    const NOT_IMPLEMENTED: u8 = 14;
+    const NATIVE_CLASS_METHOD: u8 = 15;
 
     pub(super) fn encode(self) -> (u64, u8) {
         match self {
@@ -120,6 +130,8 @@ impl NativeValue {
             Self::TypingList => (0, Self::TYPING_LIST),
             Self::EnumBase => (0, Self::ENUM_BASE),
             Self::UnitTestBase => (0, Self::UNITTEST_BASE),
+            Self::Ellipsis => (0, Self::ELLIPSIS),
+            Self::NotImplemented => (0, Self::NOT_IMPLEMENTED),
         }
     }
 
@@ -175,6 +187,8 @@ impl NativeValue {
             Self::TYPING_LIST => Self::TypingList,
             Self::ENUM_BASE => Self::EnumBase,
             Self::UNITTEST_BASE => Self::UnitTestBase,
+            Self::ELLIPSIS => Self::Ellipsis,
+            Self::NOT_IMPLEMENTED => Self::NotImplemented,
             Self::VALUE_KIND => {
                 // SAFETY: `encode` stores a non-null pointer to a static `ValueKindDef`.
                 Self::ValueKind(unsafe {
@@ -213,6 +227,16 @@ impl NativeValue {
             Self::ValueKind(kind) => format!("<class '{}'>", kind.name),
             Self::ExceptionType(ExceptionType(name)) => format!("<class '{name}'>"),
             Self::NativeGetter(getter) => format!("{getter:?}"),
+            Self::Ellipsis => "Ellipsis".into(),
+            Self::NotImplemented => "NotImplemented".into(),
+            Self::Function(builtin) => format!("<built-in function {}>", builtin.name()),
+            Self::NativeFunction(function) => format!("<built-in function {}>", function.name),
+            Self::NativeMethod(method) | Self::NativeClassMethod(method) => {
+                format!(
+                    "<method '{}' of '{}' objects>",
+                    method.name, method.type_name
+                )
+            }
             _ => "<native object>".into(),
         }
     }
@@ -239,6 +263,9 @@ struct TracebackFrame {
     name: String,
     /// Source location this frame was executing when the exception passed through it.
     span: Span,
+    /// `__file__` of the imported module that owns this frame's code, or `None` for the main
+    /// program, whose name depends on how it was started.
+    file: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,6 +291,8 @@ pub(super) enum Builtin {
     Octal,
     Hexadecimal,
     Repr,
+    Format,
+    Hash,
     Dir,
     IsInstance,
     IsSubclass,
@@ -276,7 +305,6 @@ pub(super) enum Builtin {
     Power,
     Divmod,
     Callable,
-    Range,
     Enumerate,
     Zip,
     Any,
@@ -287,6 +315,58 @@ pub(super) enum Builtin {
     StaticMethod,
     ClassMethod,
     Super,
+    SetAttribute,
+}
+
+/// The builtin functions the VM implements itself, by Python name. `exit` and `quit` share one.
+pub(super) const BUILTIN_FUNCTIONS: &[(&str, Builtin)] = &[
+    ("print", Builtin::Print),
+    ("input", Builtin::Input),
+    ("exec", Builtin::Exec),
+    ("exit", Builtin::Exit),
+    ("quit", Builtin::Exit),
+    ("chr", Builtin::Character),
+    ("ord", Builtin::Ordinal),
+    ("bin", Builtin::Binary),
+    ("oct", Builtin::Octal),
+    ("hex", Builtin::Hexadecimal),
+    ("repr", Builtin::Repr),
+    ("format", Builtin::Format),
+    ("hash", Builtin::Hash),
+    ("dir", Builtin::Dir),
+    ("isinstance", Builtin::IsInstance),
+    ("issubclass", Builtin::IsSubclass),
+    ("len", Builtin::Length),
+    ("sorted", Builtin::Sorted),
+    ("min", Builtin::Minimum),
+    ("max", Builtin::Maximum),
+    ("sum", Builtin::Sum),
+    ("abs", Builtin::Absolute),
+    ("pow", Builtin::Power),
+    ("divmod", Builtin::Divmod),
+    ("callable", Builtin::Callable),
+    ("enumerate", Builtin::Enumerate),
+    ("zip", Builtin::Zip),
+    ("any", Builtin::Any),
+    ("all", Builtin::All),
+    ("iter", Builtin::Iter),
+    ("next", Builtin::Next),
+    ("property", Builtin::Property),
+    ("staticmethod", Builtin::StaticMethod),
+    ("classmethod", Builtin::ClassMethod),
+    ("super", Builtin::Super),
+    ("setattr", Builtin::SetAttribute),
+];
+
+impl Builtin {
+    /// The builtin's Python name, as `__name__` and `repr` report it.
+    pub(super) fn name(self) -> &'static str {
+        BUILTIN_FUNCTIONS
+            .iter()
+            .find(|(_, builtin)| *builtin == self)
+            .map(|(name, _)| *name)
+            .expect("every builtin function has a name")
+    }
 }
 
 pub(super) fn execute(
@@ -481,6 +561,10 @@ struct VmState {
     pending_wait: Option<crate::scheduler::WaitReason>,
     async_timer_deadlines: BTreeSet<u64>,
     native_suspend_allowed: bool,
+    /// Synchronous executions (imports, class bodies, generators, `exec`, and Python calls made
+    /// from native code) now running. Their callers cannot resume a suspended frame, so while
+    /// any is active, natives finish blocking operations instead of suspending.
+    synchronous_frames: usize,
     exception_stack: Vec<RaisedException>,
     with_contexts: Vec<Value>,
     method_frames: Vec<(super::heap::ObjectId, Value)>,
@@ -837,8 +921,10 @@ impl<'a> Vm<'a> {
         for frame in &frames {
             self.err.extend_from_slice(
                 format!(
-                    "  File \"{filename}\", line {}, in {}\n",
-                    frame.span.line, frame.name
+                    "  File \"{}\", line {}, in {}\n",
+                    frame.file.as_deref().unwrap_or(&filename),
+                    frame.span.line,
+                    frame.name
                 )
                 .as_bytes(),
             );
@@ -913,6 +999,7 @@ impl<'a> Vm<'a> {
     fn value_from_constant(&mut self, value: &Constant) -> Result<Value, String> {
         Ok(match value {
             Constant::None => Value::None,
+            Constant::Ellipsis => Value::Native(NativeValue::Ellipsis),
             Constant::Bool(value) => Value::Bool(*value),
             Constant::Integer(value) => Value::Int(*value),
             Constant::BigInteger(value) => {
@@ -957,6 +1044,14 @@ impl<'a> Vm<'a> {
     }
 
     fn iterable_values(&mut self, value: &Value) -> Result<Vec<Value>, String> {
+        // A class that sets `__iter__ = None` declares its instances not iterable, even when it
+        // defines `__getitem__`.
+        if matches!(
+            self.state.types.slot(self.type_id(value)?, Slot::Iter)?,
+            Some(SlotValue::Descriptor(Value::None))
+        ) {
+            return Err(self.raise_object_type_error(value, "is not iterable"));
+        }
         if let Some(iterable) = self.invoke_slot(value, Slot::Iter, "__iter__", Vec::new())? {
             if protocol::identical(value, &iterable) {
                 let mut result = Vec::new();
@@ -1036,7 +1131,7 @@ impl<'a> Vm<'a> {
                                 CallArgs::new(Vec::new(), Vec::new()),
                             )
                             .map_err(|error| error.to_string())?;
-                            if protocol::equals(&self.state.heap, &item, &sentinel)? {
+                            if self.values_equal(&item, &sentinel)? {
                                 if let Object::CallableIterator { exhausted, .. } =
                                     self.state.heap.get_mut(id)?
                                 {
@@ -1058,12 +1153,58 @@ impl<'a> Vm<'a> {
                         self.push_materialized(&mut result, value)?;
                     }
                 }
+                Object::Instance { .. }
+                    if self
+                        .state
+                        .types
+                        .slot(self.type_id(value)?, Slot::GetItem)?
+                        .is_some() =>
+                {
+                    self.legacy_sequence_values(value, &mut result)?;
+                }
                 _ => return Err(self.raise_object_type_error(value, "is not iterable")),
             }
         } else {
             return Err(self.raise_object_type_error(value, "is not iterable"));
         }
         Ok(result)
+    }
+
+    /// Iterate an instance without `__iter__` through CPython's legacy sequence protocol:
+    /// call `__getitem__(0)`, `__getitem__(1)`, ... until it raises `IndexError` or
+    /// `StopIteration`. Any other exception propagates. Each item is metered, so a
+    /// `__getitem__` that never raises exhausts the CPU budget instead of looping forever.
+    fn legacy_sequence_values(
+        &mut self,
+        value: &Value,
+        result: &mut Vec<Value>,
+    ) -> Result<(), String> {
+        let mut index: i64 = 0;
+        loop {
+            match self.invoke_slot(value, Slot::GetItem, "__getitem__", vec![Value::Int(index)]) {
+                Ok(Some(item)) => self.push_materialized(result, item)?,
+                Ok(None) => return Err("__getitem__ slot disappeared during iteration".into()),
+                Err(error) => {
+                    let Some(exception) = self.pending_exception.as_ref() else {
+                        return Err(error);
+                    };
+                    let kind = match self.user_exception_base(&exception.value)? {
+                        Some(base) => base,
+                        None => exception.kind.as_str(),
+                    };
+                    if !exception_types::exception_is_subclass(kind, "IndexError")
+                        && !exception_types::exception_is_subclass(kind, "StopIteration")
+                    {
+                        return Err(error);
+                    }
+                    self.pending_exception = None;
+                    return Ok(());
+                }
+            }
+            index = index
+                .checked_add(1)
+                .ok_or("sequence index exceeds bounded integer range")?;
+        }
     }
 
     fn push_materialized(&mut self, values: &mut Vec<Value>, value: Value) -> Result<(), String> {
@@ -1081,33 +1222,38 @@ impl<'a> Vm<'a> {
     fn find_value(&mut self, values: &[Value], needle: &Value) -> Result<Option<usize>, String> {
         for (position, value) in values.iter().enumerate() {
             self.charge_cpu(1)?;
-            if protocol::identical(value, needle)
-                || protocol::equals(&self.state.heap, value, needle)?
-            {
+            if self.values_equal(value, needle)? {
                 return Ok(Some(position));
             }
         }
         Ok(None)
     }
 
+    /// The position of the entry whose key equals `needle`. A user `__eq__` may mutate the dict,
+    /// so each candidate key is read again before it is compared.
     fn find_mapping_entry(
         &mut self,
         id: ObjectId,
         needle: &Value,
     ) -> Result<Option<usize>, String> {
-        let heap = &self.state.heap;
-        let entries = match heap.get(id)? {
-            Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
+        let candidates = match self.state.heap.get(id)? {
+            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
+                entries.candidate_positions(needle).collect::<Vec<_>>()
+            }
             _ => return Err("dict handle changed object kind".into()),
         };
-        for position in entries.candidate_positions(needle) {
-            let candidate = entries[position].0;
-            if !self.interp.resources.charge_cpu(1) {
-                return Err("resource limit exceeded while executing Python".into());
-            }
-            if protocol::identical(&candidate, needle)
-                || protocol::equals(heap, &candidate, needle)?
-            {
+        for position in candidates {
+            self.charge_cpu(1)?;
+            let candidate = match self.state.heap.get(id)? {
+                Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
+                    entries.get(position).map(|entry| entry.0)
+                }
+                _ => return Err("dict handle changed object kind".into()),
+            };
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if self.values_equal(&candidate, needle)? {
                 return Ok(Some(position));
             }
         }
@@ -1125,9 +1271,7 @@ impl<'a> Vm<'a> {
                 _ => return Err("set handle changed object kind".into()),
             };
             self.charge_cpu(1)?;
-            if protocol::identical(&candidate, needle)
-                || protocol::equals(&self.state.heap, &candidate, needle)?
-            {
+            if self.values_equal(&candidate, needle)? {
                 return Ok(Some(position));
             }
         }

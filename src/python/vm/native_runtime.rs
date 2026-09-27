@@ -108,6 +108,16 @@ fn stdin_wait_reason(wait: crate::descriptors::IoWait) -> crate::scheduler::Wait
 }
 
 impl Vm<'_> {
+    /// A VM failure as a native error: the Python exception it raised, if any, or else an
+    /// internal runtime error.
+    fn raised_or_runtime_error(&self, message: String) -> PyError {
+        if self.pending_exception.is_some() {
+            PyError::new(PyErrorKind::Raised, message)
+        } else {
+            PyError::runtime_error(message)
+        }
+    }
+
     /// Read `sys.stdin`/`sys.stdin.buffer` from the fully-supplied `ProcessInput::stdin` slice.
     ///
     /// Used by synchronous execution: the interactive REPL, nested/legacy command dispatch (a
@@ -385,6 +395,7 @@ impl PyRuntime for Vm<'_> {
                 .get(value.object_id().expect("tag checked"))
                 .map_err(PyError::runtime_error)?
             {
+                Object::Bare => PyKind::Native,
                 Object::String(_) => PyKind::String,
                 Object::Bytes(_) => PyKind::Bytes,
                 Object::ByteArray(_) => PyKind::ByteArray,
@@ -484,6 +495,18 @@ impl PyRuntime for Vm<'_> {
         )
     }
 
+    fn type_name(&self, value: &Value) -> PyResult<String> {
+        self.type_name_of(value).map_err(PyError::runtime_error)
+    }
+
+    fn not_implemented(&self) -> Value {
+        Value::Native(NativeValue::NotImplemented)
+    }
+
+    fn is_not_implemented(&self, value: &Value) -> bool {
+        value.native_value() == Some(NativeValue::NotImplemented)
+    }
+
     fn number(&self, value: &Value) -> Option<super::number::NumberRef<'_>> {
         super::number::view(&self.state.heap, value)
     }
@@ -550,11 +573,18 @@ impl PyRuntime for Vm<'_> {
         specification: &str,
     ) -> PyResult<String> {
         self.render_formatted_value(value, conversion, specification)
-            .map_err(PyError::value_error)
+            .map_err(|message| {
+                if self.pending_exception.is_some() {
+                    PyError::new(PyErrorKind::Raised, message)
+                } else {
+                    PyError::unsupported(message)
+                }
+            })
     }
 
     fn equals(&mut self, left: &Value, right: &Value) -> PyResult<bool> {
-        protocol::equals(&self.state.heap, left, right).map_err(PyError::runtime_error)
+        self.values_equal(left, right)
+            .map_err(|message| self.raised_or_runtime_error(message))
     }
 
     fn compare(&mut self, left: &Value, right: &Value) -> PyResult<Ordering> {
@@ -568,8 +598,30 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn get_attribute(&mut self, value: Value, name: &str) -> PyResult<Option<Value>> {
-        self.resolve_attribute(value, name)
-            .map_err(PyError::runtime_error)
+        self.resolve_optional_attribute(value, name)
+            .map_err(|message| {
+                if self.pending_exception.is_some() {
+                    PyError::new(PyErrorKind::Raised, message)
+                } else {
+                    PyError::runtime_error(message)
+                }
+            })
+    }
+
+    fn set_attribute(&mut self, value: Value, name: &str, item: Value) -> PyResult<()> {
+        let symbol = self
+            .state
+            .heap
+            .intern_symbol(name, &mut self.interp.resources)
+            .map_err(PyError::runtime_error)?;
+        self.store_attribute_by_symbol(value, symbol, name, item)
+            .map_err(|message| {
+                if self.pending_exception.is_some() {
+                    PyError::new(PyErrorKind::Raised, message)
+                } else {
+                    PyError::runtime_error(message)
+                }
+            })
     }
 
     fn list_len(&self, list: PyList) -> PyResult<usize> {
@@ -701,9 +753,9 @@ impl PyRuntime for Vm<'_> {
                 _ => return Err(PyError::runtime_error("list handle changed object kind")),
             };
             self.charge_cpu(1).map_err(PyError::resource_error)?;
-            if protocol::identical(&candidate, needle)
-                || protocol::equals(&self.state.heap, &candidate, needle)
-                    .map_err(PyError::runtime_error)?
+            if self
+                .values_equal(&candidate, needle)
+                .map_err(|message| self.raised_or_runtime_error(message))?
             {
                 return Ok(Some(position));
             }
@@ -1287,8 +1339,9 @@ impl PyRuntime for Vm<'_> {
                 }
                 self.charge_cpu(1).map_err(PyError::resource_error)?;
                 let value = self.call_value(callable, CallArgs::new(Vec::new(), Vec::new()))?;
-                if protocol::equals(&self.state.heap, &value, &sentinel)
-                    .map_err(PyError::runtime_error)?
+                if self
+                    .values_equal(&value, &sentinel)
+                    .map_err(|message| self.raised_or_runtime_error(message))?
                 {
                     let Object::CallableIterator { exhausted, .. } = self
                         .state

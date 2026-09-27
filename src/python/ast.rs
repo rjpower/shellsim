@@ -23,6 +23,10 @@ pub enum StatementKind {
         module: String,
         names: Vec<(String, String)>,
     },
+    /// `from module import *` binds the module's public names; only valid at module level.
+    ImportStar {
+        module: String,
+    },
     Assign {
         targets: Vec<AssignmentTarget>,
         value: Expression,
@@ -92,7 +96,11 @@ pub enum StatementKind {
         otherwise: Vec<Statement>,
         finalbody: Vec<Statement>,
     },
-    Raise(Option<Expression>),
+    /// `raise [exception [from cause]]`.
+    Raise {
+        exception: Option<Expression>,
+        cause: Option<Expression>,
+    },
     With {
         context: Expression,
         target: Option<AssignmentTarget>,
@@ -297,6 +305,8 @@ pub enum ParameterKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Constant {
     None,
+    /// The `...` literal, which evaluates to the `Ellipsis` singleton.
+    Ellipsis,
     Bool(bool),
     Integer(i64),
     BigInteger(String),

@@ -170,6 +170,12 @@ impl<'a> Lexer<'a> {
                 '.' if matches!(self.source[self.offset..].chars().nth(1), Some('0'..='9')) => {
                     self.number(start, true)?
                 }
+                '.' if self.source[self.offset..].starts_with("...") => {
+                    self.bump();
+                    self.bump();
+                    self.bump();
+                    TokenKind::Ellipsis
+                }
                 '.' => self.single(TokenKind::Dot),
                 '@' => self.either('=', TokenKind::AtEqual, TokenKind::At),
                 ',' => self.single(TokenKind::Comma),
@@ -921,6 +927,29 @@ mod tests {
         ));
         assert!(lex("0x_ ").is_err());
         assert!(lex("0b2").is_err());
+    }
+
+    #[test]
+    fn three_dots_lex_as_one_ellipsis_token() {
+        let kinds = |source: &str| {
+            lex(source)
+                .unwrap()
+                .into_iter()
+                .map(|token| token.kind)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds("x[...]")[..4],
+            [
+                TokenKind::Name("x".into()),
+                TokenKind::LeftBracket,
+                TokenKind::Ellipsis,
+                TokenKind::RightBracket
+            ]
+        );
+        assert_eq!(kinds("....")[..2], [TokenKind::Ellipsis, TokenKind::Dot]);
+        assert_eq!(kinds("a.b")[1], TokenKind::Dot);
+        assert_eq!(kinds("..5")[..2], [TokenKind::Dot, TokenKind::Float(0.5)]);
     }
 
     #[test]

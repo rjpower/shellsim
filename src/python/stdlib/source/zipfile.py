@@ -1,4 +1,9 @@
-"""ZIP32 files over the modeled VFS and shellsim's bounded archive command."""
+"""ZIP32 files over the modeled VFS and shellsim's bounded archive command.
+
+Archives are read through the simulated ``unzip`` command. Writing supports stored and
+deflated members; deflated data is ``zlib.compress`` output without its two-byte header and
+four-byte checksum, which is the raw DEFLATE stream a ZIP member holds.
+"""
 
 import _shellsim_vfs
 import io
@@ -50,8 +55,8 @@ class ZipFile:
                  compresslevel=None, strict_timestamps=True, metadata_encoding=None):
         if mode not in ("r", "w", "x", "a"):
             raise ValueError("ZipFile mode must be 'r', 'w', 'x', or 'a'")
-        if mode != "r" and compression != ZIP_STORED:
-            raise ValueError("shellsim ZipFile writing supports ZIP_STORED only")
+        if mode != "r" and compression not in (ZIP_STORED, ZIP_DEFLATED):
+            raise ValueError("shellsim ZipFile writing supports ZIP_STORED and ZIP_DEFLATED only")
         self.mode = mode
         self.compression = compression
         self._closed = False
@@ -67,7 +72,7 @@ class ZipFile:
             self._names = self._list_names()
             if mode == "a":
                 for name in self._names:
-                    self._entries.append((name, self.read(name)))
+                    self._entries.append((name, self.read(name), self.compression))
         else:
             self._archive = None
             self._names = []
@@ -126,8 +131,11 @@ class ZipFile:
         return _shellsim_vfs.read_bytes(self._extracted + "/" + name)
 
     def open(self, name, mode="r", pwd=None, force_zip64=False):
+        if mode == "w":
+            self._check_writable(None)
+            return _MemberWriter(self, name)
         if mode != "r":
-            raise ValueError("ZipFile.open writing is not supported; use writestr")
+            raise ValueError('open() requires mode "r" or "w"')
         return io.BytesIO(self.read(name, pwd))
 
     def extract(self, member, path=None, pwd=None):
@@ -161,7 +169,8 @@ class ZipFile:
         if arcname is None:
             arcname = filename.rstrip("/").split("/")[-1]
         arcname = _safe_name(arcname)
-        self._entries.append((arcname, _shellsim_vfs.read_bytes(filename)))
+        data = _shellsim_vfs.read_bytes(filename)
+        self._entries.append((arcname, data, self._member_compression(compress_type)))
 
     def writestr(self, zinfo_or_arcname, data, compress_type=None, compresslevel=None):
         self._check_writable(compress_type)
@@ -170,19 +179,25 @@ class ZipFile:
         name = _safe_name(name.rstrip("/")) + ("/" if name.endswith("/") else "")
         if isinstance(data, str):
             data = data.encode("utf-8")
-        self._entries.append((name, data))
+        compression = self._member_compression(compress_type)
+        if name.endswith("/"):
+            compression = ZIP_STORED
+        self._entries.append((name, data, compression))
+
+    def _member_compression(self, compress_type):
+        return self.compression if compress_type is None else compress_type
 
     def _check_writable(self, compress_type):
         if self.mode == "r":
             raise ValueError("write() requires mode 'w', 'x', or 'a'")
-        if compress_type is not None and compress_type != ZIP_STORED:
-            raise ValueError("shellsim ZipFile writing supports ZIP_STORED only")
+        if compress_type is not None and compress_type not in (ZIP_STORED, ZIP_DEFLATED):
+            raise ValueError("shellsim ZipFile writing supports ZIP_STORED and ZIP_DEFLATED only")
 
     def close(self):
         if self._closed:
             return
         if self.mode != "r":
-            data = _encode_stored(self._entries)
+            data = _encode(self._entries)
             if self._sink is not None:
                 self._sink.seek(0)
                 self._sink.write(data)
@@ -203,20 +218,35 @@ class ZipFile:
         return False
 
 
-def _encode_stored(entries):
+class _MemberWriter(io.BytesIO):
+    """The file ``ZipFile.open(name, "w")`` returns: the member is added when it closes."""
+
+    def __init__(self, archive, name):
+        io.BytesIO.__init__(self)
+        self._archive = archive
+        self._name = name
+
+    def close(self):
+        if not self.closed:
+            self._archive.writestr(self._name, self.getvalue())
+        io.BytesIO.close(self)
+
+
+def _encode(entries):
     output = b""
     central = b""
-    for name, data in entries:
+    for name, data, compression in entries:
         encoded = name.encode("utf-8")
         crc = zlib.crc32(data)
+        stored = zlib.compress(data)[2:-4] if compression == ZIP_DEFLATED else data
         offset = len(output)
-        output += struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, ZIP_STORED,
-                              0, 0, crc, len(data), len(data), len(encoded), 0)
-        output += encoded + data
+        output += struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, compression,
+                              0, 0, crc, len(stored), len(data), len(encoded), 0)
+        output += encoded + stored
         directory = name.endswith("/")
         mode = (0o040755 if directory else 0o100644) << 16
         central += struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 0x031E, 20, 0,
-                               ZIP_STORED, 0, 0, crc, len(data), len(data), len(encoded),
+                               compression, 0, 0, crc, len(stored), len(data), len(encoded),
                                0, 0, 0, 0, mode, offset)
         central += encoded
     result = output + central

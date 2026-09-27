@@ -13,7 +13,7 @@
 use num_traits::ToPrimitive;
 
 use super::native::{
-    CallArgs, GetterDef, MethodDef, NativeTypeDef, PyError, PyResult, PyRuntime, PyValue,
+    CallArgs, GetterDef, MethodDef, NativeTypeDef, PyError, PyKind, PyResult, PyRuntime, PyValue,
 };
 use super::number::NumberRef;
 
@@ -80,6 +80,45 @@ fn operand(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>
         Some(NumberRef::Complex(real, imag)) => Some(Operand::Complex(Complex::new(real, imag))),
         None => None,
     })
+}
+
+/// A `complex()` argument: a number, or an object with a conversion method.
+fn number_or_method(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
+    match operand(runtime, value)? {
+        Some(operand) => Ok(Some(operand)),
+        None if runtime.string_value(value)?.is_some() => Ok(None),
+        None => operand_by_method(runtime, value),
+    }
+}
+
+/// Read an object that is not a number through `__complex__`, then `__float__`, then
+/// `__index__`, as CPython's `complex()` does, checking each method's result type.
+fn operand_by_method(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
+    for (method, expected) in [
+        ("__complex__", PyKind::Complex),
+        ("__float__", PyKind::Float),
+        ("__index__", PyKind::Int),
+    ] {
+        let Some(bound) = runtime.get_attribute(*value, method)? else {
+            continue;
+        };
+        let result = runtime.call_value(bound, CallArgs::new(Vec::new(), Vec::new()))?;
+        if runtime.kind(&result)? != expected {
+            let actual = runtime.type_name(&result)?;
+            // CPython names the owning type only for `__float__`.
+            let message = match expected {
+                PyKind::Complex => format!("__complex__ returned non-complex (type {actual})"),
+                PyKind::Float => format!(
+                    "{}.__float__ returned non-float (type {actual})",
+                    runtime.type_name(value)?
+                ),
+                _ => format!("__index__ returned non-int (type {actual})"),
+            };
+            return Err(PyError::type_error(message));
+        }
+        return operand(runtime, &result);
+    }
+    Ok(None)
 }
 
 fn bigint_to_f64(value: &num_bigint::BigInt) -> PyResult<f64> {
@@ -149,8 +188,12 @@ pub(super) fn construct(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult
         return runtime.new_complex(value.real, value.imag);
     }
     let real = match real {
-        Some(value) => match operand(runtime, &value)? {
-            Some(Operand::Complex(_)) if imag.is_none() => return Ok(value),
+        Some(value) => match number_or_method(runtime, &value)? {
+            Some(Operand::Complex(_))
+                if imag.is_none() && runtime.kind(&value)? == PyKind::Complex =>
+            {
+                return Ok(value)
+            }
             Some(operand) => operand,
             None => {
                 let actual = runtime.type_name(&value)?;
@@ -162,7 +205,7 @@ pub(super) fn construct(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult
         None => Operand::Real(0.0),
     };
     let imag = match imag {
-        Some(value) => match operand(runtime, &value)? {
+        Some(value) => match number_or_method(runtime, &value)? {
             Some(operand) => Some(operand),
             None => {
                 let actual = runtime.type_name(&value)?;
@@ -181,7 +224,9 @@ pub(super) fn construct(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult
             result.real -= imag.imag;
             result.imag = imag.real;
         }
-        None => {}
+        // A complex `real` argument that is not an exact `complex`, such as a NumPy complex
+        // scalar, keeps its imaginary part.
+        None => result.imag = real.widen().imag,
     }
     if let (Operand::Complex(real), Some(_)) = (real, imag) {
         result.imag += real.imag;
@@ -340,7 +385,7 @@ pub(super) fn repr(value: Complex) -> String {
 ///
 /// Unlike `float.__repr__`, integral components carry no `.0`. `signed` forces a leading `+`
 /// for non-negative values and NaN, matching `Py_DTSF_SIGN`.
-fn repr_component(value: f64, signed: bool) -> String {
+pub(super) fn repr_component(value: f64, signed: bool) -> String {
     let sign = if value.is_sign_negative() && !value.is_nan() {
         "-"
     } else if signed {
@@ -348,118 +393,12 @@ fn repr_component(value: f64, signed: bool) -> String {
     } else {
         ""
     };
-    if value.is_nan() {
-        return format!("{sign}nan");
-    }
-    if value.is_infinite() {
-        return format!("{sign}inf");
-    }
-    // `{:e}` yields the shortest round-trip digits as `d[.ddd]e<exponent>`.
-    let scientific = format!("{:e}", value.abs());
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("scientific formatting has an exponent");
-    let exponent: i32 = exponent.parse().expect("scientific exponent is an integer");
-    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-    let body = if !(-4..16).contains(&exponent) {
-        let (first, remainder) = digits.split_at(1);
-        let fraction = if remainder.is_empty() {
-            String::new()
-        } else {
-            format!(".{remainder}")
-        };
-        let exponent_sign = if exponent < 0 { '-' } else { '+' };
-        format!("{first}{fraction}e{exponent_sign}{:02}", exponent.abs())
-    } else if exponent < 0 {
-        let zeros = "0".repeat(usize::try_from(-exponent - 1).expect("negative exponent"));
-        format!("0.{zeros}{digits}")
-    } else {
-        let point = usize::try_from(exponent + 1).expect("non-negative exponent");
-        if digits.len() <= point {
-            format!("{digits}{}", "0".repeat(point - digits.len()))
-        } else {
-            format!("{}.{}", &digits[..point], &digits[point..])
-        }
-    };
-    format!("{sign}{body}")
+    format!("{sign}{}", super::float_text::magnitude_repr(value, false))
 }
-
-const HASH_BITS: u32 = 61;
-const HASH_MODULUS: u64 = (1 << HASH_BITS) - 1;
-const HASH_INF: i64 = 314_159;
-const HASH_IMAG: u64 = 1_000_003;
 
 /// CPython's `hash(complex)`: `hash(real) + 1000003 * hash(imag)` with wrapping arithmetic.
-///
-/// CPython hashes NaN by object identity; this runtime has no `hash()` builtin that could
-/// observe that, so NaN components hash as `0`, CPython's pre-3.10 behavior.
 pub(super) fn hash(value: Complex) -> i64 {
-    let real = hash_float(value.real) as u64;
-    let imag = hash_float(value.imag) as u64;
-    let combined = real.wrapping_add(HASH_IMAG.wrapping_mul(imag)) as i64;
-    if combined == -1 {
-        -2
-    } else {
-        combined
-    }
-}
-
-/// CPython's `_Py_HashDouble`: reduce a finite double modulo the Mersenne prime `2**61 - 1`.
-fn hash_float(value: f64) -> i64 {
-    if value.is_nan() {
-        return 0;
-    }
-    if value.is_infinite() {
-        return if value > 0.0 { HASH_INF } else { -HASH_INF };
-    }
-    let (mut mantissa, mut exponent) = frexp(value);
-    let negative = mantissa < 0.0;
-    mantissa = mantissa.abs();
-    let mut hashed = 0u64;
-    while mantissa != 0.0 {
-        hashed = ((hashed << 28) & HASH_MODULUS) | hashed >> (HASH_BITS - 28);
-        mantissa *= 268_435_456.0;
-        exponent -= 28;
-        let integer = mantissa as u64;
-        mantissa -= integer as f64;
-        hashed += integer;
-        if hashed >= HASH_MODULUS {
-            hashed -= HASH_MODULUS;
-        }
-    }
-    let bits = HASH_BITS as i32;
-    let exponent = if exponent >= 0 {
-        exponent % bits
-    } else {
-        bits - 1 - ((-1 - exponent) % bits)
-    } as u32;
-    hashed = ((hashed << exponent) & HASH_MODULUS) | hashed >> (HASH_BITS - exponent);
-    let hashed = if negative {
-        (hashed as i64).wrapping_neg()
-    } else {
-        hashed as i64
-    };
-    if hashed == -1 {
-        -2
-    } else {
-        hashed
-    }
-}
-
-/// Split a finite, nonzero-or-zero double into a mantissa in `[0.5, 1)` and a power of two.
-fn frexp(value: f64) -> (f64, i32) {
-    if value == 0.0 {
-        return (value, 0);
-    }
-    let bits = value.to_bits();
-    let biased = ((bits >> 52) & 0x7ff) as i32;
-    if biased == 0 {
-        // Subnormal: scale into the normal range first.
-        let (mantissa, exponent) = frexp(value * 2f64.powi(54));
-        return (mantissa, exponent - 54);
-    }
-    let mantissa = f64::from_bits((bits & !(0x7ff << 52)) | (1022 << 52));
-    (mantissa, biased - 1022)
+    super::hash::complex(value.real, value.imag)
 }
 
 /// CPython's `_Py_c_prod`, including C11 Annex G recovery of infinities.
@@ -788,52 +727,6 @@ pub(super) fn slot_reflected_remainder(
     unsupported(runtime, "%", left, right)
 }
 
-/// Raise CPython's `TypeError` for ordering involving a complex number.
-fn unordered(
-    runtime: &mut dyn PyRuntime,
-    symbol: &str,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
-    let left = runtime.type_name(&left)?;
-    let right = runtime.type_name(&right)?;
-    Err(PyError::type_error(format!(
-        "'{symbol}' not supported between instances of '{left}' and '{right}'"
-    )))
-}
-
-pub(super) fn slot_less_than(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
-    unordered(runtime, "<", left, right)
-}
-
-pub(super) fn slot_less_equal(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
-    unordered(runtime, "<=", left, right)
-}
-
-pub(super) fn slot_greater_than(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
-    unordered(runtime, ">", left, right)
-}
-
-pub(super) fn slot_greater_equal(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
-    unordered(runtime, ">=", left, right)
-}
-
 pub(super) fn slot_positive(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
@@ -898,9 +791,6 @@ mod tests {
         assert_eq!(hash(Complex::new(0.0, 2.0)), 2_000_006);
         assert_eq!(hash(Complex::new(0.0, 1.0)), 1_000_003);
         assert_eq!(hash(Complex::new(1.5, -2.25)), -576_460_752_305_423_493);
-        assert_eq!(hash_float(-1.0), -2);
-        assert_eq!(hash_float(f64::INFINITY), 314_159);
-        assert_eq!(hash_float(0.5), 1 << 60);
     }
 
     #[test]

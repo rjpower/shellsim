@@ -193,6 +193,8 @@ pub enum Opcode {
     },
     /// `from module import name`, with the module on top of the stack; it stays there.
     ImportFrom(NameId),
+    /// `from module import *`: pop the module and bind its public names in the current scope.
+    ImportStar,
     LoadAttribute(NameId),
     LoadSubscript,
     BuildSlice {
@@ -242,6 +244,7 @@ pub enum Opcode {
     ClearException,
     Reraise,
     Raise(bool),
+    RaiseFrom,
     Yield,
     AwaitResult,
     WithEnter,
@@ -280,6 +283,7 @@ pub enum Operation {
         bind_root: bool,
     },
     ImportFrom(String),
+    ImportStar,
     LoadAttribute(String),
     LoadSubscript,
     BuildSlice {
@@ -350,6 +354,8 @@ pub enum Operation {
     ClearException,
     Reraise,
     Raise(bool),
+    /// `raise exception from cause`: pops the cause, then the exception.
+    RaiseFrom,
     /// Suspend a generator frame and return the value on top of the stack.
     Yield,
     /// Unwrap the scheduler outcome sent into a suspended coroutine.
@@ -431,6 +437,7 @@ impl CodeBuilder {
                 bind_root,
             },
             Operation::ImportFrom(name) => Opcode::ImportFrom(self.name(name)),
+            Operation::ImportStar => Opcode::ImportStar,
             Operation::LoadAttribute(name) => Opcode::LoadAttribute(self.name(name)),
             Operation::LoadSubscript => Opcode::LoadSubscript,
             Operation::BuildSlice {
@@ -539,6 +546,7 @@ impl CodeBuilder {
             Operation::ClearException => Opcode::ClearException,
             Operation::Reraise => Opcode::Reraise,
             Operation::Raise(cause) => Opcode::Raise(cause),
+            Operation::RaiseFrom => Opcode::RaiseFrom,
             Operation::Yield => Opcode::Yield,
             Operation::AwaitResult => Opcode::AwaitResult,
             Operation::WithEnter => Opcode::WithEnter,

@@ -16,6 +16,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "datetime" => Some(include_str!("source/datetime.py")),
         "collections" => Some(include_str!("source/collections.py")),
         "copy" => Some(include_str!("source/copy.py")),
+        "fractions" => Some(include_str!("source/fractions.py")),
         "glob" => Some(include_str!("source/glob.py")),
         "functools" => Some(include_str!("source/functools.py")),
         "hashlib" => Some(include_str!("source/hashlib.py")),
