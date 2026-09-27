@@ -33,6 +33,11 @@ fn info_value(info: Option<usize>) -> Value {
     Value::Int(info.map(|value| value as i64).unwrap_or(0))
 }
 
+/// The `_flapack.error` f2py raises when an argument fails the wrapper's check.
+fn f2py_error(message: String) -> PyError {
+    PyError::exception("error", message)
+}
+
 /// Parse an f2py `trans` code (0 = no transpose, 1 or 2 = transpose; real routines treat a
 /// conjugate transpose the same as a plain transpose), with f2py's own argument-check message
 /// on an out-of-range value.
@@ -40,7 +45,7 @@ fn trans_arg(trans: i64, routine: &str, ordinal: &str) -> PyResult<Trans> {
     match trans {
         0 => Ok(Trans::No),
         1 | 2 => Ok(Trans::Transpose),
-        _ => Err(PyError::value_error(format!(
+        _ => Err(f2py_error(format!(
             "(trans>=0 && trans <=2) failed for {ordinal} keyword trans: {routine}:trans={trans}"
         ))),
     }
@@ -518,10 +523,15 @@ fn lange_impl(runtime: &mut dyn PyRuntime, args: CallArgs, precision: Precision)
     static SIGNATURE: Signature = Signature::new("lange", &["norm", "a"], 2);
     let bound = SIGNATURE.bind(&args)?;
     let norm_value = bound.required("norm");
-    let norm_byte = runtime
-        .bytes_value(&norm_value)?
-        .and_then(|bytes| bytes.first().copied())
-        .ok_or_else(|| PyError::type_error("lange() argument 'norm' must be bytes"))?;
+    // f2py accepts a one-character `str` or `bytes` and checks only its first character.
+    let norm_text = match runtime.string_value(&norm_value)? {
+        Some(text) => text,
+        None => runtime
+            .bytes_value(&norm_value)?
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .ok_or_else(|| PyError::type_error("lange() argument 'norm' must be str"))?,
+    };
+    let norm_byte = norm_text.bytes().next().unwrap_or(b' ');
     let a = as_array(runtime, bound.required("a"))?;
     runtime.charge_cpu(a.size() as u64 + 1)?;
     let mat = to_mat(runtime, &a)?;
@@ -534,9 +544,12 @@ fn lange_impl(runtime: &mut dyn PyRuntime, args: CallArgs, precision: Precision)
         b'I' => dense::inf_norm(&mat),
         b'F' | b'E' => dense::frobenius_norm(&mat),
         _ => {
-            return Err(PyError::value_error(
-                "norm must be one of 'M', '1', 'O', 'I', 'F', 'E'",
-            ))
+            return Err(f2py_error(format!(
+                "(norm=='M'||norm=='m'||norm=='1'||norm=='O'||norm=='o'||norm=='I'||norm=='i'||\
+                 norm=='F'||norm=='f'||norm=='E'||norm=='e') failed for 1st argument norm: \
+                 {}lange:norm='{norm_text}'",
+                precision_letter(precision)
+            )))
         }
     };
     let value = match precision {

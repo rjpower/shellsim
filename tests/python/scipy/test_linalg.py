@@ -637,12 +637,13 @@ def test_blas_and_lapack_wrappers():
     assert_array_equal(x, [-0.3333333333333333, 0.6666666666666666, -0.0])
     assert blas.find_best_blas_type((np.float32(1),)) == ("s", np.dtype("float32"), True)
     assert lapack.find_best_lapack_type((np.ones(2, dtype=np.float32), np.ones(2))) == ("d", np.dtype("float64"), True)
-    # Real SciPy raises f2py's own per-module `_flapack.error` here; shellsim's f2py-style
-    # wrappers raise a plain ValueError with the same f2py argument-check message instead of
-    # replicating f2py's generated per-module exception classes, so this only checks the common
-    # `Exception` base and the message, not the exact exception type.
-    with pytest.raises(Exception, match=r"\(trans>=0 && trans <=2\) failed for 1st keyword trans: dgetrs:trans=3"):
+    with pytest.raises(Exception, match=r"\(trans>=0 && trans <=2\) failed for 1st keyword trans: dgetrs:trans=3") as raised:
         sl.lu_solve(sl.lu_factor(np.eye(2)), np.ones(2), trans=3)
+    assert (type(raised.value).__module__, type(raised.value).__name__) == ("_flapack", "error")
+    assert type(raised.value).__mro__[1:] == (Exception, BaseException, object)
+    assert lapack.dlange("1", np.eye(2)) == 1.0
+    with pytest.raises(Exception, match=r"failed for 1st argument norm: dlange:norm='X'"):
+        lapack.dlange("X", np.eye(2))
     with pytest.raises(Exception, match="failed for 2nd keyword trans: dtrtrs:trans=-1"):
         lapack.dtrtrs(np.eye(2), np.ones(2), trans=-1)
 

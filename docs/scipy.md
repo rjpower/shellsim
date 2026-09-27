@@ -130,7 +130,7 @@ them. Domain errors return NaN and poles return infinities.
   `convolution_matrix` and `dft`), `LinAlgError` and `LinAlgWarning`.
 - **LAPACK and BLAS wrappers.** The `s` and `d` forms of `getrf`, `getrs`, `gecon`, `getri`,
   `trtrs`, `trtri`, `potrf`, `potrs`, `potri`, `gtsv`, `gbsv`, `lange` and `nrm2`, with f2py's
-  arguments, argument checks and Fortran-ordered outputs, and `get_lapack_funcs`,
+  arguments, argument checks, `_flapack.error` exception and Fortran-ordered outputs, and `get_lapack_funcs`,
   `get_blas_funcs`, `find_best_blas_type` and `find_best_lapack_type`.
 
 ## Compatibility contract
@@ -204,10 +204,6 @@ expectations were measured on the reference machine described above; see "Roundi
   iterative estimator: `rcond = 1 / (norm_1(a) * norm_1(inv(a)))` exactly, at roughly twice the
   cubic cost of the factorization alone. LAPACK's estimator is usually accurate enough to agree,
   but is not guaranteed to match for every input.
-- **f2py wrapper exceptions.** Real SciPy's `scipy.linalg.lapack` and `scipy.linalg.blas`
-  wrappers raise a generated, per-module exception (for example
-  `scipy.linalg.lapack._flapack.error`) on a bad argument. shellsim raises a plain `ValueError`
-  carrying the same f2py-generated message instead of replicating those generated classes.
 - **`fiedler_companion`** swaps the top-right and bottom sub-diagonal entries of `companion(a)`,
   which reproduces M. Fiedler's 2003 construction for a cubic polynomial but not his general
   interleaving construction for higher degree.
