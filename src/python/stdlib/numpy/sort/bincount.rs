@@ -1,100 +1,107 @@
-//! `np.bincount(x, /, weights=None, minlength=0)`, following `arr_bincount`.
+//! `numpy.bincount`: counts, or weighted sums, of small non-negative integers.
 //!
-//! Counts are `int64`; with `weights` they are `float64` sums added in input order. The
-//! result has one slot per value up to the largest, so its memory is reserved before
-//! counting.
+//! The output has one slot per integer from `0` to `max(x.max(), minlength - 1)`; slot `i`
+//! holds the count of `i` in `x` (or, with `weights`, the sum of the matching weights). Cost is
+//! charged once per input element before the accumulation loop runs, and the output length is
+//! reserved before it is allocated, so a single huge value in `x` cannot force an unbounded
+//! allocation for free.
 
-use super::super::super::super::native::{
-    CallArgs, PyError, PyNativeKind, PyResult, PyRuntime, PyValue,
-};
+use super::super::super::super::native::{CallArgs, PyError, PyResult, PyRuntime, PyValue};
 use super::super::args::{self, Signature};
-use super::super::array;
+use super::super::array::{self, Array};
 use super::super::convert;
-use super::super::dtype::{Category, DType};
-use super::super::math::one_dimensional;
+use super::super::dtype::{Casting, DType};
 
-/// The values to count, as `arr_bincount` converts them: integers cast to `int64`, anything
-/// else only when the cast is safe. An empty list is accepted whatever dtype it infers.
-fn counted_values(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<i64>> {
-    let is_array = runtime.native_kind(&value)? == Some(PyNativeKind::Array);
-    let array = convert::as_array(runtime, value)?;
-    match array.ndim() {
-        0 => {
-            return Err(PyError::value_error(
-                "object of too small depth for desired array",
-            ))
-        }
-        1 => {}
-        _ => return Err(super::too_deep(is_array)),
+static SIGNATURE: Signature =
+    Signature::new("bincount", &["x"], 1).keyword_only(&["weights", "minlength"]);
+
+pub(in crate::python) fn module_bincount(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = SIGNATURE.bind(&args)?;
+    bincount(
+        runtime,
+        bound.required("x"),
+        bound.value("weights"),
+        bound.value("minlength"),
+    )
+}
+
+fn depth_error(ndim: usize) -> PyError {
+    if ndim == 0 {
+        PyError::value_error("object of too small depth for desired array")
+    } else {
+        PyError::value_error("object too deep for desired array")
     }
-    if !is_array && array.size() == 0 {
-        return Ok(Vec::new());
+}
+
+fn bincount(
+    runtime: &mut dyn PyRuntime,
+    x: PyValue,
+    weights: Option<PyValue>,
+    minlength: Option<PyValue>,
+) -> PyResult {
+    let x = convert::as_array(runtime, x)?;
+    if x.ndim() != 1 {
+        return Err(depth_error(x.ndim()));
     }
-    if !matches!(
-        array.dtype.category(),
-        Category::Bool | Category::Signed | Category::Unsigned
-    ) {
+    if !super::super::dtype::can_cast(x.dtype, DType::INT64, Casting::Safe) {
         return Err(PyError::type_error(format!(
             "Cannot cast array data from {} to {} according to the rule 'safe'",
-            array.dtype.repr(),
+            x.dtype.repr(),
             DType::INT64.repr()
         )));
     }
-    let array = convert::cast_array(runtime, &array, DType::INT64, false)?;
-    array::read_elements::<i64>(runtime, &array)
-}
-
-pub(super) fn module_bincount(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("bincount", &["x", "weights", "minlength"], 1);
-    let bound = SIGNATURE.bind(&args)?;
-    let values = counted_values(runtime, bound.required("x"))?;
-    let minlength = match bound.get("minlength") {
-        Some(value) if value.is_none() => {
-            return Err(PyError::type_error("use 0 instead of None for minlength"))
+    let x64 = convert::cast_array(runtime, &x, DType::INT64, false)?;
+    let values = array::read_elements::<i64>(runtime, &x64)?;
+    let minlength = match minlength {
+        Some(value) => {
+            let requested = args::index_int(runtime, &value)?;
+            if requested < 0 {
+                return Err(PyError::value_error("'minlength' must not be negative"));
+            }
+            requested as usize
         }
-        Some(value) => args::index_int(runtime, &value)?,
         None => 0,
     };
-    let minlength = usize::try_from(minlength)
-        .map_err(|_| PyError::value_error("'minlength' must not be negative"))?;
-    if values.is_empty() {
-        runtime.reserve_memory(minlength.saturating_mul(8))?;
-        let counts = vec![0i64; minlength];
-        return Ok(
-            array::array_from_elements(runtime, DType::INT64, vec![minlength], &counts)?.value(),
-        );
-    }
-    let (smallest, largest) = values
-        .iter()
-        .fold((values[0], values[0]), |(low, high), value| {
-            (low.min(*value), high.max(*value))
-        });
-    if smallest < 0 {
-        return Err(PyError::value_error(
-            "'list' argument must have no negative elements",
-        ));
-    }
-    // `largest` is non-negative here, and reserving memory rejects an oversized result.
-    let size = (largest as usize).saturating_add(1).max(minlength);
-    runtime.reserve_memory(size.saturating_mul(8))?;
-    runtime.charge_cpu(values.len() as u64 + size as u64)?;
-    let Some(weights) = bound.value("weights") else {
-        let mut counts = vec![0i64; size];
-        for value in &values {
-            counts[*value as usize] += 1;
+    runtime.charge_cpu(values.len() as u64 + 1)?;
+    let mut highest = -1i64;
+    for &value in &values {
+        if value < 0 {
+            return Err(PyError::value_error(
+                "'list' argument must have no negative elements",
+            ));
         }
-        return Ok(array::array_from_elements(runtime, DType::INT64, vec![size], &counts)?.value());
-    };
-    let weights = one_dimensional(runtime, weights, DType::FLOAT64)?;
-    let weights = array::read_elements::<f64>(runtime, &weights)?;
-    if weights.len() != values.len() {
+        highest = highest.max(value);
+    }
+    let length = usize::try_from(highest + 1).unwrap_or(0).max(minlength);
+
+    match weights {
+        None => {
+            array::reserve_elements(runtime, DType::INT64, length)?;
+            let mut counts = vec![0i64; length];
+            for &value in &values {
+                counts[value as usize] += 1;
+            }
+            Ok(array::array_from_elements(runtime, DType::INT64, vec![length], &counts)?.value())
+        }
+        Some(weights) => {
+            let weights = weights_array(runtime, weights, values.len())?;
+            array::reserve_elements(runtime, DType::FLOAT64, length)?;
+            let mut sums = vec![0f64; length];
+            for (&value, &weight) in values.iter().zip(&weights) {
+                sums[value as usize] += weight;
+            }
+            Ok(array::array_from_elements(runtime, DType::FLOAT64, vec![length], &sums)?.value())
+        }
+    }
+}
+
+fn weights_array(runtime: &mut dyn PyRuntime, weights: PyValue, n: usize) -> PyResult<Vec<f64>> {
+    let weights = convert::as_array(runtime, weights)?;
+    if weights.size() != n {
         return Err(PyError::value_error(
             "The weights and list don't have the same length.",
         ));
     }
-    let mut sums = vec![0.0f64; size];
-    for (value, weight) in values.iter().zip(&weights) {
-        sums[*value as usize] += weight;
-    }
-    Ok(array::array_from_elements(runtime, DType::FLOAT64, vec![size], &sums)?.value())
+    let cast: Array = convert::cast_array(runtime, &weights, DType::FLOAT64, false)?;
+    array::read_elements::<f64>(runtime, &cast)
 }

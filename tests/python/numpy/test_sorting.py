@@ -62,6 +62,71 @@ def test_argsort_places_nan_last():
     assert np.argsort(np.array([3.0, np.nan, -1.0])).tolist() == [2, 0, 1]
 
 
+def test_sort_complex_orders_by_real_then_imaginary_with_nan_last():
+    # NaN in either component sorts after every NaN-free value; among NaN-containing values,
+    # NaN still orders by real part then imaginary part, with NaN standing in as "greatest".
+    values = [1 + 2j, complex(float("nan"), 1), 3 + 0j, 2 + 1j, complex(2, float("nan"))]
+    r = np.sort(np.array(values))
+    reals = [v.real for v in r]
+    imags = [v.imag for v in r]
+    assert reals[:3] == [1.0, 2.0, 3.0]
+    assert imags[:3] == [2.0, 1.0, 0.0]
+    assert reals[3] == 2.0 and np.isnan(imags[3])
+    assert np.isnan(reals[4]) and imags[4] == 1.0
+
+
+def test_sort_descending_reverses_non_nan_order():
+    assert np.sort(np.array([3, 1, 2]), descending=True).tolist() == [3, 2, 1]
+
+
+def test_argsort_descending_reverses_non_nan_order():
+    assert np.argsort(np.array([3, 1, 2]), descending=True).tolist() == [0, 2, 1]
+
+
+def test_sort_descending_keeps_nan_last():
+    r = np.sort(np.array([3.0, np.nan, 1.0]), descending=True)
+    assert r[:2].tolist() == [3.0, 1.0]
+    assert np.isnan(r[2])
+
+
+def test_sort_rejects_kind_with_stable_or_descending():
+    a = np.array([3, 1, 2])
+    with pytest.raises(ValueError):
+        np.sort(a, kind="quicksort", stable=True)
+    with pytest.raises(ValueError):
+        np.sort(a, kind="quicksort", descending=True)
+
+
+def test_sort_rejects_unknown_kind():
+    with pytest.raises(ValueError):
+        np.sort(np.array([1, 2, 3]), kind="bogus")
+
+
+def test_sort_rejects_order_keyword():
+    with pytest.raises(ValueError):
+        np.sort(np.array([1, 2, 3]), order="x")
+
+
+class _Rank:
+    """A minimal Python object with `__lt__`, standing in for a non-numeric dtype element."""
+
+    def __init__(self, n):
+        self.n = n
+
+    def __lt__(self, other):
+        return self.n < other.n
+
+
+def test_sort_object_dtype_uses_python_less_than():
+    arr = np.array([_Rank(3), _Rank(1), _Rank(2)], dtype=object)
+    assert [v.n for v in np.sort(arr)] == [1, 2, 3]
+
+
+def test_argsort_object_dtype_is_stable():
+    arr = np.array([_Rank(1), _Rank(3), _Rank(1)], dtype=object)
+    assert np.argsort(arr, kind="stable").tolist() == [0, 2, 1]
+
+
 def test_sort_bool():
     assert np.sort(np.array([True, False, True, False])).tolist() == [False, False, True, True]
 
@@ -107,6 +172,97 @@ def test_lexsort_is_stable_for_full_ties():
 def test_lexsort_accepts_2d_key_array():
     keys = np.array([[9, 8, 7, 6], [1, 1, 0, 0]])
     assert np.lexsort(keys).tolist() == [3, 2, 1, 0]
+
+
+def test_lexsort_rejects_empty_keys():
+    with pytest.raises(TypeError):
+        np.lexsort(())
+
+
+def test_lexsort_rejects_mismatched_shapes():
+    with pytest.raises(ValueError):
+        np.lexsort((np.array([1, 2]), np.array([1, 2, 3])))
+
+
+def test_partition_places_kth_element_at_its_sorted_position():
+    # NumPy's introselect only guarantees the kth position and the <=/>= split around it, not a
+    # full ordering, so this checks the documented contract rather than an exact array match.
+    a = np.array([3, 1, 4, 1, 5, 9, 2, 6])
+    p = np.partition(a, 3)
+    assert p[3] == np.sort(a)[3]
+    assert all(x <= p[3] for x in p[:3])
+    assert all(x >= p[3] for x in p[4:])
+
+
+def test_partition_satisfies_contract_for_multiple_kth_positions():
+    a = np.array([3, 1, 4, 1, 5, 9, 2, 6])
+    p = np.partition(a, [2, 5])
+    expected = np.sort(a)
+    assert p[2] == expected[2]
+    assert p[5] == expected[5]
+    assert all(x <= p[2] for x in p[:2])
+    assert all(x >= p[5] for x in p[6:])
+
+
+def test_argpartition_indices_reproduce_a_valid_partition():
+    a = np.array([3, 1, 4, 1, 5, 9, 2, 6])
+    idx = np.argpartition(a, 3)
+    assert a[idx][3] == np.sort(a)[3]
+
+
+def test_ndarray_partition_is_in_place_and_returns_none():
+    a = np.array([3, 1, 4, 1, 5])
+    expected_kth = np.sort(a)[2]
+    assert a.partition(2) is None
+    assert a[2] == expected_kth
+
+
+def test_partition_accepts_negative_kth():
+    a = np.array([3, 1, 4, 1, 5, 9, 2, 6])
+    assert np.partition(a, -1)[-1] == a.max()
+
+
+def test_partition_kth_out_of_bounds_raises():
+    with pytest.raises(ValueError):
+        np.partition(np.array([1, 2, 3]), 100)
+
+
+def test_partition_kth_must_be_integer():
+    with pytest.raises(TypeError):
+        np.partition(np.array([1, 2, 3]), 1.5)
+
+
+def test_partition_rejects_unknown_kind():
+    with pytest.raises(ValueError):
+        np.partition(np.array([1, 2, 3]), 1, kind="bogus")
+
+
+def test_partition_accepts_introselect_kind():
+    assert np.partition(np.array([3, 1, 2]), 1, kind="introselect").tolist() == [1, 2, 3]
+
+
+def test_copyto_full_assignment():
+    dst = np.array([1, 2, 3, 4])
+    np.copyto(dst, np.array([10, 20, 30, 40]))
+    assert dst.tolist() == [10, 20, 30, 40]
+
+
+def test_copyto_with_where_mask():
+    dst = np.array([1, 2, 3, 4])
+    np.copyto(dst, np.array([10, 20, 30, 40]), where=np.array([True, False, True, False]))
+    assert dst.tolist() == [10, 2, 30, 4]
+
+
+def test_copyto_rejects_unsafe_cast_by_default():
+    dst = np.array([1, 2, 3])
+    with pytest.raises(TypeError):
+        np.copyto(dst, np.array([1.5, 2.5, 3.5]))
+
+
+def test_copyto_unsafe_casting_override():
+    dst = np.array([1.0, 2.0, 3.0])
+    np.copyto(dst, np.array([1, 2, 3]), casting="unsafe")
+    assert dst.tolist() == [1.0, 2.0, 3.0]
 
 
 def test_unique_returns_sorted_values():
@@ -195,6 +351,37 @@ def test_searchsorted_keeps_value_shape():
     assert np.searchsorted(a, [[5, 25], [30, 35]]).tolist() == [[0, 2], [2, 3]]
 
 
+def test_searchsorted_rejects_unknown_side():
+    with pytest.raises(ValueError):
+        np.searchsorted(np.array([1, 2, 3]), 2, side="up")
+
+
+def test_searchsorted_sorter_must_contain_integers():
+    with pytest.raises(TypeError):
+        np.searchsorted(np.array([1, 2, 3]), 2, sorter=np.array([0.5, 1.5, 2.5]))
+
+
+def test_searchsorted_sorter_length_must_match():
+    with pytest.raises(ValueError):
+        np.searchsorted(np.array([1, 2, 3]), 2, sorter=np.array([0, 1]))
+
+
+def test_searchsorted_side_right_with_sorter_on_unsorted_array():
+    a = np.array([3, 1, 2])
+    sorter = np.argsort(a)
+    assert np.searchsorted(a, 2, side="right", sorter=sorter) == 2
+
+
+def test_searchsorted_rejects_2d_array():
+    with pytest.raises(ValueError):
+        np.searchsorted(np.array([[1, 2], [3, 4]]), 2)
+
+
+def test_searchsorted_rejects_0d_array():
+    with pytest.raises(ValueError):
+        np.searchsorted(np.array(5), 2)
+
+
 def test_where_selects_elementwise():
     r = np.where(np.array([True, False, True]), np.array([1, 2, 3]), np.array([10, 20, 30]))
     assert r.tolist() == [1, 20, 3]
@@ -216,6 +403,11 @@ def test_where_promotes_branch_dtypes():
 def test_where_requires_both_or_neither_branch():
     with pytest.raises(ValueError):
         np.where(np.array([True]), 1)
+
+
+def test_nonzero_rejects_0d_array():
+    with pytest.raises(ValueError):
+        np.nonzero(np.array(5))
 
 
 def test_nonzero_1d_returns_one_element_tuple():
@@ -318,6 +510,16 @@ def test_bincount_minlength_pads_output():
 def test_bincount_rejects_negative_values():
     with pytest.raises(ValueError):
         np.bincount(np.array([0, -1]))
+
+
+def test_bincount_rejects_2d_input():
+    with pytest.raises(ValueError):
+        np.bincount(np.array([[1, 2], [3, 4]]))
+
+
+def test_bincount_rejects_non_integer_dtype():
+    with pytest.raises(TypeError):
+        np.bincount(np.array([1.5, 2.5]))
 
 
 def test_histogram_with_bin_count_closes_last_bin():

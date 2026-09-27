@@ -527,6 +527,34 @@ fn numpy_fft_charges_transform_work_before_running() {
 }
 
 #[test]
+fn numpy_sort_charges_n_log_n_work_before_sorting() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "import numpy as np\nprint(np.sort(np.array([3, 1, 2])).tolist())",
+        limits,
+    );
+    assert_eq!(
+        (status, stdout),
+        (0, b"[1, 2, 3]\n".to_vec()),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // Sorting charges n * ceil(log2(n)) units per lane before any comparison runs, so two
+    // million elements exhausts the budget even though building the input is much cheaper.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\na = np.arange(2_000_000)\nprint('built')\nnp.sort(a)",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 5_000_000);
+    assert_eq!(stdout, b"built\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn numpy_random_reserves_and_charges_before_drawing() {
     let limits = Limits {
         cpu: 5_000_000,

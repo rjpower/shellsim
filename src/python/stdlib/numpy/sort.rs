@@ -1,20 +1,28 @@
-//! Sorting, searching, and counting: `sort`, `argsort`, `lexsort`, `partition`,
-//! `argpartition`, `searchsorted`, and `bincount`. Set operations, `histogram`, `digitize`,
-//! `median`, and the percentiles are Python on top of these, as in NumPy.
+//! Sorting, partial sorting, and lexicographic ordering: `sort`, `argsort`, `lexsort`,
+//! `partition`, `argpartition`, and the matching `numpy.ndarray` methods. `numpy.searchsorted`
+//! and `numpy.bincount` live in the [`search`] and [`bincount`] submodules.
 //!
-//! Functions are exported through the native module `_numpy_sort`, which the frozen `numpy`
-//! package re-exports.
+//! NumPy documents three sort algorithms (`quicksort`/`heapsort`/`stable`, aliased as
+//! `mergesort`) plus `introselect` for `partition`, and calls the first three "unstable": NumPy
+//! does not promise how they order equal elements. A stable sort is therefore a valid result
+//! for every `kind`, so every `kind` here runs the same algorithm — sort an index permutation
+//! with one comparator per dtype family, using [`slice::sort_by`] (a stable sort) for byte-backed
+//! dtypes and a hand-written stable merge sort ([`merge_sort_by`]) where the comparator must call
+//! back into Python (`object` elements). `partition`/`argpartition` fully sort each lane too,
+//! which satisfies their weaker contract (only position `kth` need be in its sorted place).
 //!
-//! Every sort here is a stable merge sort of a permutation, whatever `kind` requests. NumPy's
-//! `quicksort` and `heapsort` are not stable and its SIMD sorts depend on the CPU, so the order
-//! it gives equal elements is unspecified, and the stable order is one NumPy may produce.
-//! `partition` sorts each lane completely, which satisfies its contract: the kth element is in
-//! sorted position, with no larger element before it and no smaller one after.
+//! The sort order follows NumPy's documentation: NaN sorts after every non-NaN value of the
+//! same dtype; complex values compare by real part then imaginary part, and (derived from
+//! black-box probing of NumPy 2.5.3, since the docs only say "NaN-containing values sort last")
+//! any value with NaN in either part sorts after every NaN-free value, then among NaN-containing
+//! values again by real part then imaginary part with NaN standing in for "greater than any
+//! number" in that part; strings compare by code point; `object` elements compare with Python
+//! `<`. `descending=True` reverses the non-NaN run and leaves the NaN suffix (already in input
+//! order) in place, matching NumPy's observed output.
 //!
-//! The order is NumPy's `Tag::less`: NaN sorts after every number; complex values compare by
-//! real part, then imaginary part, with values that have NaN parts last; strings compare by
-//! code point; objects compare with Python `<`. `descending=True` reverses the order of the
-//! non-NaN values and keeps NaN last, as NumPy does.
+//! Every sort and partial sort charges CPU proportional to `n·log2(n)` per lane before running;
+//! `searchsorted` charges `m·log2(n)` for `m` binary searches against a lane of length `n`. See
+//! `sort/search.rs` and `sort/bincount.rs` for their own strategy notes.
 
 mod bincount;
 mod search;
@@ -24,14 +32,15 @@ use std::cmp::Ordering;
 use super::super::super::ast::ComparisonOperator;
 use super::super::super::native::{
     CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyArrayBuffer, PyArrayData,
-    PyError, PyKind, PyNativeKind, PyOperator, PyResult, PyRuntime, PyValue,
+    PyArrayDtype, PyError, PyKind, PyNativeKind, PyOperator, PyResult, PyRuntime, PyValue,
 };
-use super::super::super::Value;
-use super::args::{self, Bound, Signature};
-use super::array::{self, contiguous_strides, new_array, reserve_elements, Array, Offsets};
+use super::args::{self, Signature};
+use super::array::{self, Array};
 use super::convert;
-use super::dtype::{Category, DType, Kind};
-use super::element::{self, Number};
+use super::dtype::{DType, Kind};
+use super::element::{dispatch_numeric, Element, Number, C128, C64, F16};
+use super::index;
+use super::ops::{ComplexParts, Numeric};
 
 pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
     name: "_numpy_sort",
@@ -84,435 +93,475 @@ pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
-/// Elements read in C order into a form that carries NumPy's sort order.
-enum Keys {
-    /// Bool and integer kinds; `i128` holds every `int64` and `uint64` value.
-    Integers(Vec<i128>),
-    /// Real floats, widened exactly to `f64`.
-    Reals(Vec<f64>),
-    Complex(Vec<(f64, f64)>),
-    /// Fixed-width strings of `width` code points each, padded with NUL.
-    Strings {
-        chars: Vec<u32>,
-        width: usize,
-    },
-    Objects(Vec<PyValue>),
+fn receiver(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Array> {
+    Array::from_value(runtime, value)
 }
 
-impl Keys {
-    /// Read every element of `arrays`, which share one dtype, one array after another.
-    fn read(runtime: &mut dyn PyRuntime, arrays: &[&Array]) -> PyResult<Self> {
-        let dtype = arrays[0].dtype;
-        let count = arrays.iter().map(|array| array.size()).sum::<usize>();
-        runtime.charge_cpu(count as u64 + 1)?;
-        if dtype.kind() == Kind::Object {
-            let mut values = Vec::with_capacity(count);
-            for array in arrays {
-                values.extend(array::read_objects(runtime, array)?);
-            }
-            return Ok(Self::Objects(values));
-        }
-        runtime.reserve_memory(count.saturating_mul(dtype.itemsize().max(16)))?;
-        let kind = dtype.kind();
-        let width = dtype.chars();
-        let mut keys = match dtype.category() {
-            Category::Str => Self::Strings {
-                chars: Vec::with_capacity(count.saturating_mul(width)),
-                width,
-            },
-            Category::Float => Self::Reals(Vec::with_capacity(count)),
-            Category::Complex => Self::Complex(Vec::with_capacity(count)),
-            _ => Self::Integers(Vec::with_capacity(count)),
-        };
-        for array in arrays {
-            runtime.read_arrays(&[array.handle], &mut |views| {
-                let PyArrayData::Bytes(bytes) = views[0].data else {
-                    return Err(PyError::runtime_error("numeric array has object storage"));
-                };
-                for offset in array.offsets() {
-                    match &mut keys {
-                        Self::Strings { chars, width } => {
-                            let text = &bytes[offset..offset + *width * 4];
-                            chars.extend(text.chunks_exact(4).map(|unit| {
-                                u32::from_le_bytes(unit.try_into().expect("four bytes"))
-                            }));
-                        }
-                        Self::Reals(values) => {
-                            values.push(element::read_number(kind, &bytes[offset..]).as_f64());
-                        }
-                        Self::Complex(values) => {
-                            values.push(element::read_number(kind, &bytes[offset..]).as_complex());
-                        }
-                        Self::Integers(values) => {
-                            values.push(match element::read_number(kind, &bytes[offset..]) {
-                                Number::UInt(value) => i128::from(value),
-                                other => i128::from(other.wrapping_i64()),
-                            });
-                        }
-                        Self::Objects(_) => unreachable!("object arrays return early"),
-                    }
-                }
-                Ok(())
-            })?;
-        }
-        Ok(keys)
-    }
+/// One unit of work per comparison, `ceil(log2(n+1))` comparisons per element: a conservative
+/// bound on a stable `n log n` sort or merge sort of `n` items.
+fn cost_n_log_n(n: usize) -> u64 {
+    let depth = usize::BITS - n.leading_zeros();
+    (n as u64).saturating_mul(u64::from(depth) + 1)
+}
 
-    /// NumPy's order between elements `left` and `right`, for every kind but objects.
-    /// NaN-carrying values rank after all others, and `descending` reverses only the rest.
-    fn order(&self, left: usize, right: usize, descending: bool) -> Ordering {
-        let (rank, values) = match self {
-            Self::Integers(values) => (Ordering::Equal, values[left].cmp(&values[right])),
-            Self::Reals(values) => {
-                let (a, b) = (values[left], values[right]);
-                (
-                    a.is_nan().cmp(&b.is_nan()),
-                    a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-                )
-            }
-            Self::Complex(values) => {
-                let (a, b) = (values[left], values[right]);
-                let within = match complex_class(a) {
-                    0 => (a.0, a.1).partial_cmp(&(b.0, b.1)),
-                    1 => a.0.partial_cmp(&b.0),
-                    2 => a.1.partial_cmp(&b.1),
-                    _ => Some(Ordering::Equal),
-                };
-                (
-                    complex_class(a).cmp(&complex_class(b)),
-                    within.unwrap_or(Ordering::Equal),
-                )
-            }
-            Self::Strings { chars, width } => (
-                Ordering::Equal,
-                chars[left * width..(left + 1) * width]
-                    .cmp(&chars[right * width..(right + 1) * width]),
-            ),
-            Self::Objects(_) => unreachable!("objects compare through Python"),
-        };
-        rank.then(if descending { values.reverse() } else { values })
-    }
+/// `ceil(log2(n+1))`, the depth of a binary search over `n` items.
+pub(in crate::python) fn cost_log_n(n: usize) -> u64 {
+    u64::from(usize::BITS - n.leading_zeros()) + 1
+}
 
-    /// Whether element `left` sorts before element `right`.
-    fn less(
-        &self,
-        runtime: &mut dyn PyRuntime,
-        left: usize,
-        right: usize,
-        descending: bool,
-    ) -> PyResult<bool> {
-        match self {
-            Self::Objects(values) => {
-                let (a, b) = if descending {
-                    (values[right], values[left])
-                } else {
-                    (values[left], values[right])
-                };
-                python_less(runtime, a, b)
-            }
-            _ => Ok(self.order(left, right, descending) == Ordering::Less),
-        }
-    }
-
-    /// NumPy's three-way `compare` function, which binary search on strings and objects
-    /// uses: objects try `<`, then `>`.
-    fn compare(
-        &self,
-        runtime: &mut dyn PyRuntime,
-        left: usize,
-        right: usize,
-    ) -> PyResult<Ordering> {
-        let Self::Objects(values) = self else {
-            return Ok(self.order(left, right, false));
-        };
-        let (a, b) = (values[left], values[right]);
-        if python_less(runtime, a, b)? {
-            return Ok(Ordering::Less);
-        }
-        if python_less(runtime, b, a)? {
-            return Ok(Ordering::Greater);
-        }
-        Ok(Ordering::Equal)
-    }
-
-    /// Whether NumPy searches this kind with its generic `compare`-based binary search.
-    fn is_generic(&self) -> bool {
-        matches!(self, Self::Strings { .. } | Self::Objects(_))
+/// NumPy's sort order for one real (bool/integer/float) dtype: IEEE order among non-NaN values,
+/// NaN after every non-NaN value, NaN equal to NaN (so a stable sort keeps NaNs in input order).
+fn real_order<T: Numeric>(a: T, b: T) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (false, false) => a
+            .compare(b)
+            .expect("non-NaN values of one dtype always compare"),
+        (false, true) => Ordering::Less,
+        (true, false) => Ordering::Greater,
+        (true, true) => Ordering::Equal,
     }
 }
 
-/// The NaN class of a complex value in NumPy's order: `R + Rj`, `R + nanj`, `nan + Rj`,
-/// `nan + nanj`.
-fn complex_class((real, imag): (f64, f64)) -> u8 {
-    u8::from(real.is_nan()) * 2 + u8::from(imag.is_nan())
+/// NumPy's sort order for `complex`, derived by probing NumPy 2.5.3's `argsort`: NaN-free
+/// values order by real part then imaginary part; a value with NaN in either part sorts after
+/// every NaN-free value; among NaN-containing values, real part then imaginary part again,
+/// with NaN acting as "greater than any number" in that part.
+fn complex_order(a: (f64, f64), b: (f64, f64)) -> Ordering {
+    let has_nan = |v: (f64, f64)| v.0.is_nan() || v.1.is_nan();
+    match (has_nan(a), has_nan(b)) {
+        (false, true) => Ordering::Less,
+        (true, false) => Ordering::Greater,
+        _ => real_order(a.0, b.0).then_with(|| real_order(a.1, b.1)),
+    }
 }
 
-fn python_less(runtime: &mut dyn PyRuntime, left: PyValue, right: PyValue) -> PyResult<bool> {
-    let result = runtime.apply_operator(
-        PyOperator::Compare(ComparisonOperator::Less),
-        &[left, right],
-    )?;
+/// NumPy's sort order, one comparator per byte-backed element type so [`dispatch_numeric!`]
+/// picks it monomorphically. Bool/integer/float route to [`real_order`]; complex routes to
+/// [`complex_order`] through its real and imaginary parts.
+trait SortKey: Copy {
+    fn sort_cmp(self, other: Self) -> Ordering;
+    fn sort_is_nan(self) -> bool;
+}
+
+macro_rules! real_sort_key {
+    ($($t:ty),* $(,)?) => {
+        $(impl SortKey for $t {
+            fn sort_cmp(self, other: Self) -> Ordering {
+                real_order(self, other)
+            }
+            fn sort_is_nan(self) -> bool {
+                Numeric::is_nan(self)
+            }
+        })*
+    };
+}
+
+real_sort_key!(bool, i8, i16, i32, i64, u8, u16, u32, u64, F16, f32, f64);
+
+macro_rules! complex_sort_key {
+    ($($t:ty),* $(,)?) => {
+        $(impl SortKey for $t {
+            fn sort_cmp(self, other: Self) -> Ordering {
+                complex_order(self.parts(), other.parts())
+            }
+            fn sort_is_nan(self) -> bool {
+                Numeric::is_nan(self)
+            }
+        })*
+    };
+}
+
+complex_sort_key!(C64, C128);
+
+/// Reverse the non-NaN prefix of an ascending order, leaving the trailing `nan_suffix`
+/// positions (already in input order, since equal keys sort stably) in place — NumPy's
+/// `descending=True`, which keeps NaN last either way.
+fn apply_descending(mut order: Vec<usize>, nan_suffix: usize, descending: bool) -> Vec<usize> {
+    if descending {
+        let split = order.len() - nan_suffix;
+        order[..split].reverse();
+    }
+    order
+}
+
+/// Byte offsets, relative to an array's own `view.offset`, of every element of `shape` at
+/// `strides`, enumerated lane by lane: every axis but `axis`, in C order, outermost first, then
+/// `0..shape[axis]` along `axis`. [`lane_orders`] and every function that builds a same-shaped
+/// output from its result use this same enumeration, so their flat positions line up.
+fn lane_offsets(shape: &[usize], strides: &[isize], axis: usize) -> Vec<isize> {
+    let n = shape[axis];
+    let axis_stride = strides[axis];
+    let (outer_shape, outer_strides): (Vec<usize>, Vec<isize>) = shape
+        .iter()
+        .zip(strides)
+        .enumerate()
+        .filter(|(a, _)| *a != axis)
+        .map(|(_, (&d, &s))| (d, s))
+        .unzip();
+    let outer = index::relative_offsets(&outer_shape, &outer_strides);
+    let mut offsets = Vec::with_capacity(outer.len() * n);
+    for lane in outer {
+        for k in 0..n {
+            offsets.push(lane + k as isize * axis_stride);
+        }
+    }
+    offsets
+}
+
+/// [`lane_offsets`], as absolute byte offsets from `base`.
+fn absolute_lane_offsets(
+    shape: &[usize],
+    strides: &[isize],
+    axis: usize,
+    base: usize,
+) -> Vec<usize> {
+    lane_offsets(shape, strides, axis)
+        .into_iter()
+        .map(|relative| (base as isize + relative) as usize)
+        .collect()
+}
+
+/// A stable sort of `items` by a fallible `less` predicate, ties keeping their original
+/// relative order: a plain top-down merge sort, so a Python-level comparator (`object`
+/// elements) runs `O(n log n)` times, matching the CPU already charged for the lane.
+fn merge_sort_by<T: Copy>(
+    items: &mut [T],
+    less: &mut impl FnMut(&T, &T) -> PyResult<bool>,
+) -> PyResult<()> {
+    let n = items.len();
+    if n <= 1 {
+        return Ok(());
+    }
+    let mid = n / 2;
+    let mut left = items[..mid].to_vec();
+    let mut right = items[mid..].to_vec();
+    merge_sort_by(&mut left, less)?;
+    merge_sort_by(&mut right, less)?;
+    let (mut i, mut j, mut k) = (0, 0, 0);
+    while i < left.len() && j < right.len() {
+        if less(&right[j], &left[i])? {
+            items[k] = right[j];
+            j += 1;
+        } else {
+            items[k] = left[i];
+            i += 1;
+        }
+        k += 1;
+    }
+    items[k..k + (left.len() - i)].copy_from_slice(&left[i..]);
+    let k = k + (left.len() - i);
+    items[k..k + (right.len() - j)].copy_from_slice(&right[j..]);
+    Ok(())
+}
+
+/// `a < b` for `object` elements, NumPy's sort comparator for that dtype.
+fn less_than(runtime: &mut dyn PyRuntime, a: PyValue, b: PyValue) -> PyResult<bool> {
+    let result = runtime.apply_operator(PyOperator::Compare(ComparisonOperator::Less), &[a, b])?;
     runtime.truth(&result)
 }
 
-/// Stable merge sort of `items` by `less`, using `scratch` of the same length. Comparisons
-/// may fail, since object comparisons run Python code; the first failure ends the sort.
-fn merge_sort(
-    items: &mut [usize],
-    scratch: &mut [usize],
-    less: &mut dyn FnMut(usize, usize) -> PyResult<bool>,
-) -> PyResult<()> {
-    const RUN: usize = 16;
-    let count = items.len();
-    for start in (0..count).step_by(RUN) {
-        let end = (start + RUN).min(count);
-        for next in start + 1..end {
-            let mut position = next;
-            while position > start && less(items[position], items[position - 1])? {
-                items.swap(position, position - 1);
-                position -= 1;
-            }
-        }
-    }
-    let mut width = RUN;
-    while width < count {
-        for start in (0..count).step_by(2 * width) {
-            let middle = (start + width).min(count);
-            let end = (start + 2 * width).min(count);
-            let (mut left, mut right, mut output) = (start, middle, start);
-            while left < middle && right < end {
-                // Take from the right run only when strictly smaller, which keeps ties stable.
-                if less(items[right], items[left])? {
-                    scratch[output] = items[right];
-                    right += 1;
-                } else {
-                    scratch[output] = items[left];
-                    left += 1;
-                }
-                output += 1;
-            }
-            let rest = middle - left;
-            scratch[output..output + rest].copy_from_slice(&items[left..middle]);
-            scratch[output + rest..end].copy_from_slice(&items[right..end]);
-        }
-        items.copy_from_slice(scratch);
-        width *= 2;
-    }
-    Ok(())
-}
-
-/// The lanes of a C-contiguous shape along one axis, addressed in elements.
-struct Lanes {
-    /// First element of each lane, lanes in C order of the other axes.
-    bases: Vec<usize>,
-    length: usize,
-    step: usize,
-}
-
-impl Lanes {
-    fn new(runtime: &mut dyn PyRuntime, shape: &[usize], axis: usize) -> PyResult<Self> {
-        let mut strides = contiguous_strides(shape, 1);
-        let step = strides.remove(axis) as usize;
-        let mut lane_shape = shape.to_vec();
-        let length = lane_shape.remove(axis);
-        let lanes = array::element_count(&lane_shape)?;
-        runtime.reserve_memory(lanes.saturating_mul(8))?;
-        Ok(Self {
-            bases: Offsets::new(&lane_shape, &strides, 0).collect(),
-            length,
-            step,
-        })
-    }
-
-    /// C-order index of element `position` of lane `lane`.
-    fn index(&self, lane: usize, position: usize) -> usize {
-        self.bases[lane] + position * self.step
-    }
-
-    /// The identity permutation of every lane, lane after lane.
-    fn identity(&self, runtime: &mut dyn PyRuntime) -> PyResult<Vec<usize>> {
-        let count = self.bases.len().saturating_mul(self.length);
-        runtime.reserve_memory(count.saturating_mul(8))?;
-        Ok((0..self.bases.len()).flat_map(|_| 0..self.length).collect())
-    }
-}
-
-/// Stably reorder each lane's positions in `permutation` by `keys`.
-fn sort_lanes(
-    runtime: &mut dyn PyRuntime,
-    keys: &Keys,
-    lanes: &Lanes,
-    permutation: &mut [usize],
+/// Ascending-stable order of one numeric or `float16`/complex lane at relative offsets `lane`.
+fn numeric_lane_order<T: SortKey + Element>(
+    bytes: &[u8],
+    base: usize,
+    lane: &[isize],
     descending: bool,
-) -> PyResult<()> {
-    let length = lanes.length;
-    if length < 2 {
-        return Ok(());
-    }
-    runtime.reserve_memory(length.saturating_mul(8))?;
-    let mut scratch = vec![0; length];
-    let depth = u64::from(usize::BITS - length.leading_zeros());
-    let comparisons = (length as u64).saturating_mul(depth);
-    let step = lanes.step;
-    for (lane, base) in lanes.bases.iter().enumerate() {
-        runtime.charge_cpu(comparisons)?;
-        merge_sort(
-            &mut permutation[lane * length..(lane + 1) * length],
-            &mut scratch,
-            &mut |left, right| {
-                keys.less(runtime, base + left * step, base + right * step, descending)
-            },
-        )?;
-    }
-    Ok(())
+) -> Vec<usize> {
+    let mut keyed: Vec<(T, usize)> = lane
+        .iter()
+        .enumerate()
+        .map(|(k, &relative)| (T::read(&bytes[(base as isize + relative) as usize..]), k))
+        .collect();
+    keyed.sort_by(|a, b| a.0.sort_cmp(b.0));
+    let nan_suffix = keyed
+        .iter()
+        .rev()
+        .take_while(|(v, _)| v.sort_is_nan())
+        .count();
+    let order = keyed.into_iter().map(|(_, k)| k).collect();
+    apply_descending(order, nan_suffix, descending)
 }
 
-/// The stable sorting permutation of every lane of `array` along `axis`.
-fn argsort_lanes(
+/// Compare two elements' UCS-4 code points in order; equal-length runs since both come from one
+/// array's fixed-width `str` storage.
+fn compare_code_points(a: &[u8], b: &[u8]) -> Ordering {
+    a.chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four bytes")))
+        .cmp(
+            b.chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four bytes"))),
+        )
+}
+
+fn str_lane_order(
+    bytes: &[u8],
+    base: usize,
+    lane: &[isize],
+    width: usize,
+    descending: bool,
+) -> Vec<usize> {
+    let read = |relative: isize| {
+        let offset = (base as isize + relative) as usize;
+        &bytes[offset..offset + width]
+    };
+    let mut order: Vec<usize> = (0..lane.len()).collect();
+    order.sort_by(|&a, &b| compare_code_points(read(lane[a]), read(lane[b])));
+    apply_descending(order, 0, descending)
+}
+
+fn object_lane_orders(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+    offsets: &[isize],
+    n: usize,
+    descending: bool,
+) -> PyResult<Vec<usize>> {
+    let base = array.view.offset;
+    let mut snapshots: Vec<Vec<PyValue>> = Vec::new();
+    runtime.read_arrays(&[array.handle], &mut |arrays| {
+        let PyArrayData::Values(values) = arrays[0].data else {
+            return Err(PyError::runtime_error(
+                "sort saw byte storage for an object dtype",
+            ));
+        };
+        for lane in offsets.chunks(n.max(1)) {
+            snapshots.push(
+                lane.iter()
+                    .map(|&relative| {
+                        values[((base as isize + relative) as usize) / PyArrayDtype::VALUE_ITEMSIZE]
+                    })
+                    .collect(),
+            );
+        }
+        Ok(())
+    })?;
+    let mut result = Vec::with_capacity(offsets.len());
+    for lane in snapshots {
+        let mut order: Vec<usize> = (0..lane.len()).collect();
+        merge_sort_by(&mut order, &mut |&a, &b| {
+            less_than(runtime, lane[a], lane[b])
+        })?;
+        result.extend(apply_descending(order, 0, descending));
+    }
+    Ok(result)
+}
+
+/// The ascending- (or, if `descending`, mostly-descending-) stable permutation of every lane of
+/// `array` along `axis`: for each lane, the `n` local positions `0..n` in sorted order, lanes
+/// concatenated in the [`lane_offsets`] enumeration.
+fn lane_orders(
     runtime: &mut dyn PyRuntime,
     array: &Array,
     axis: usize,
     descending: bool,
-) -> PyResult<(Lanes, Vec<usize>)> {
-    if descending && array.dtype.kind() == Kind::Object {
-        return Err(PyError::type_error(
-            "no current sort function meets the requirements",
-        ));
+) -> PyResult<Vec<usize>> {
+    let n = array.shape()[axis];
+    let offsets = lane_offsets(array.shape(), array.strides(), axis);
+    let lanes = offsets.len().checked_div(n).unwrap_or(0);
+    runtime.charge_cpu(cost_n_log_n(n).saturating_mul(lanes as u64) + 1)?;
+    runtime.reserve_memory(offsets.len().saturating_mul(std::mem::size_of::<usize>()))?;
+    if array.dtype.kind() == Kind::Object {
+        return object_lane_orders(runtime, array, &offsets, n, descending);
     }
-    let keys = Keys::read(runtime, &[array])?;
-    let lanes = Lanes::new(runtime, array.shape(), axis)?;
-    let mut permutation = lanes.identity(runtime)?;
-    sort_lanes(runtime, &keys, &lanes, &mut permutation, descending)?;
-    Ok((lanes, permutation))
+    let base = array.view.offset;
+    let kind = array.dtype.kind();
+    let width = array.dtype.itemsize();
+    let mut result = Vec::with_capacity(offsets.len());
+    runtime.read_arrays(&[array.handle], &mut |arrays| {
+        let PyArrayData::Bytes(bytes) = arrays[0].data else {
+            return Err(PyError::runtime_error(
+                "sort saw object storage for a numeric dtype",
+            ));
+        };
+        if kind == Kind::Str {
+            for lane in offsets.chunks(n.max(1)) {
+                result.extend(str_lane_order(bytes, base, lane, width, descending));
+            }
+        } else {
+            dispatch_numeric!(kind, T => {
+                for lane in offsets.chunks(n.max(1)) {
+                    result.extend(numeric_lane_order::<T>(bytes, base, lane, descending));
+                }
+            }, _ => unreachable!("Str and Object are handled separately"));
+        }
+        Ok(())
+    })?;
+    Ok(result)
 }
 
-/// A sorted C-contiguous copy of `array`, each lane along `axis` in order.
+/// A buffer holding, for every output lane position (in the [`lane_offsets`] enumeration), the
+/// element `source` had at the `chosen` local position of that same lane.
+fn gather_chosen(
+    runtime: &mut dyn PyRuntime,
+    source: &Array,
+    source_offsets: &[isize],
+    n: usize,
+    chosen: &[usize],
+) -> PyResult<PyArrayBuffer> {
+    let count = chosen.len();
+    array::reserve_elements(runtime, source.dtype, count)?;
+    runtime.charge_cpu(count as u64 + 1)?;
+    let mut buffer = array::buffer_with_capacity(source.dtype, count);
+    let base = source.view.offset;
+    runtime.read_arrays(&[source.handle], &mut |arrays| {
+        match (&arrays[0].data, &mut buffer) {
+            (PyArrayData::Bytes(bytes), PyArrayBuffer::Bytes(out)) => {
+                let itemsize = source.itemsize();
+                for (i, &k) in chosen.iter().enumerate() {
+                    let lane = i / n.max(1);
+                    let relative = source_offsets[lane * n + k];
+                    let offset = (base as isize + relative) as usize;
+                    out.extend_from_slice(&bytes[offset..offset + itemsize]);
+                }
+            }
+            (PyArrayData::Values(values), PyArrayBuffer::Values(out)) => {
+                for (i, &k) in chosen.iter().enumerate() {
+                    let lane = i / n.max(1);
+                    let relative = source_offsets[lane * n + k];
+                    let offset = (base as isize + relative) as usize;
+                    out.push(values[offset / PyArrayDtype::VALUE_ITEMSIZE]);
+                }
+            }
+            _ => unreachable!("gather copies between storages of one element kind"),
+        }
+        Ok(())
+    })?;
+    Ok(buffer)
+}
+
+/// Write each of `source`'s lanes, permuted by `chosen`, into `target` (of the same shape and
+/// dtype — `source` itself for an in-place sort, or a fresh array for a copying one).
+fn write_sorted(
+    runtime: &mut dyn PyRuntime,
+    source: &Array,
+    target: &Array,
+    axis: usize,
+    chosen: &[usize],
+) -> PyResult<()> {
+    let n = source.shape()[axis];
+    let source_offsets = lane_offsets(source.shape(), source.strides(), axis);
+    let buffer = gather_chosen(runtime, source, &source_offsets, n, chosen)?;
+    let target_offsets =
+        absolute_lane_offsets(target.shape(), target.strides(), axis, target.view.offset);
+    array::scatter(runtime, target, &target_offsets, &buffer)
+}
+
+/// A fresh array of `source`'s shape and dtype holding its elements sorted along `axis` by
+/// `chosen`.
 fn sorted_copy(
     runtime: &mut dyn PyRuntime,
-    array: &Array,
+    source: &Array,
     axis: usize,
-    descending: bool,
+    chosen: &[usize],
 ) -> PyResult<Array> {
-    let (lanes, permutation) = argsort_lanes(runtime, array, axis, descending)?;
-    let source = array::contiguous_buffer(runtime, array)?;
-    reserve_elements(runtime, array.dtype, array.size())?;
-    let length = lanes.length;
-    let moves = (0..lanes.bases.len()).flat_map(|lane| {
-        let (lanes, permutation) = (&lanes, &permutation);
-        (0..length).map(move |position| {
-            (
-                lanes.index(lane, position),
-                lanes.index(lane, permutation[lane * length + position]),
-            )
-        })
-    });
-    let buffer = match &source {
-        PyArrayBuffer::Bytes(bytes) => {
-            let size = array.itemsize();
-            let mut output = vec![0u8; bytes.len()];
-            for (target, origin) in moves {
-                output[target * size..(target + 1) * size]
-                    .copy_from_slice(&bytes[origin * size..(origin + 1) * size]);
-            }
-            PyArrayBuffer::Bytes(output)
-        }
-        PyArrayBuffer::Values(values) => {
-            let mut output = vec![Value::None; values.len()];
-            for (target, origin) in moves {
-                output[target] = values[origin];
-            }
-            PyArrayBuffer::Values(output)
-        }
-    };
-    new_array(runtime, buffer, array.dtype, array.shape().to_vec())
+    let buffer = array::zeroed_buffer(runtime, source.dtype, source.size())?;
+    let target = array::new_array(runtime, buffer, source.dtype, source.shape().to_vec())?;
+    write_sorted(runtime, source, &target, axis, chosen)?;
+    Ok(target)
 }
 
-/// Sorting permutations as an `int64` array of `shape`.
-fn permutation_array(
+/// A fresh int64 array of `shape` holding `chosen` (local axis positions) placed along `axis`
+/// the same way [`sorted_copy`] places values — `argsort`'s and `lexsort`'s result.
+fn indices_array(
     runtime: &mut dyn PyRuntime,
     shape: Vec<usize>,
-    lanes: &Lanes,
-    permutation: &[usize],
+    axis: usize,
+    chosen: &[usize],
 ) -> PyResult<Array> {
-    let mut indices = vec![0i64; permutation.len()];
-    for lane in 0..lanes.bases.len() {
-        for position in 0..lanes.length {
-            indices[lanes.index(lane, position)] =
-                permutation[lane * lanes.length + position] as i64;
-        }
-    }
-    array::array_from_elements(runtime, DType::INT64, shape, &indices)
+    let count = chosen.len();
+    array::reserve_elements(runtime, DType::INT64, count)?;
+    runtime.charge_cpu(count as u64 + 1)?;
+    let indices: Vec<i64> = chosen.iter().map(|&k| k as i64).collect();
+    let buffer = array::zeroed_buffer(runtime, DType::INT64, count)?;
+    let target = array::new_array(runtime, buffer, DType::INT64, shape.clone())?;
+    let contiguous = array::contiguous_strides(&shape, DType::INT64.itemsize());
+    let offsets = absolute_lane_offsets(&shape, &contiguous, axis, 0);
+    array::scatter(
+        runtime,
+        &target,
+        &offsets,
+        &PyArrayBuffer::Bytes(array::pack_elements(&indices)),
+    )?;
+    Ok(target)
 }
 
-static SORT: Signature = Signature::new("sort", &["a", "axis", "kind", "order"], 1)
-    .keyword_only(&["stable", "descending"]);
-static ARGSORT: Signature = Signature::new("argsort", &["a", "axis", "kind", "order"], 1)
-    .keyword_only(&["stable", "descending"]);
-static SORT_METHOD: Signature =
-    Signature::new("sort", &["axis", "kind", "order"], 0).keyword_only(&["stable", "descending"]);
-static ARGSORT_METHOD: Signature = Signature::new("argsort", &["axis", "kind", "order"], 0)
-    .keyword_only(&["stable", "descending"]);
-
-/// Check `kind`, `order`, `stable`, and `descending` as `array_sort` does, returning whether
-/// to sort in descending order.
-fn sort_options(runtime: &mut dyn PyRuntime, bound: &Bound) -> PyResult<bool> {
-    let mut optional_flag = |name| -> PyResult<Option<bool>> {
-        bound
-            .value(name)
-            .map(|value| runtime.truth(&value))
-            .transpose()
-    };
-    let stable = optional_flag("stable")?;
-    let descending = optional_flag("descending")?;
-    if let Some(kind) = bound.value("kind") {
-        parse_option(
-            runtime,
-            &kind,
-            "sort kind",
-            "must be one of 'quick', 'heap', or 'stable'",
-            |text| {
-                matches!(
-                    text.chars().next(),
-                    Some('q' | 'Q' | 'h' | 'H' | 'm' | 'M' | 's' | 'S')
-                )
-            },
-        )?;
-        if stable.is_some() || descending.is_some() {
-            return Err(PyError::value_error(
-                "`kind` and keyword parameters can't be provided at the same time. Use only one \
-                 of them.",
-            ));
-        }
-    }
-    reject_order(bound)?;
-    Ok(descending.unwrap_or(false))
-}
-
-/// Check a string option as NumPy's `string_converter_helper` does.
-fn parse_option(
+/// `axis=None` flattens (`np.sort`/`np.argsort`/`np.partition`/`np.argpartition`, module and
+/// method forms except in-place `sort`/`partition`); an omitted axis defaults to -1; otherwise
+/// the axis is normalized.
+fn resolve_axis_flatten(
     runtime: &mut dyn PyRuntime,
-    value: &PyValue,
-    name: &str,
-    message: &str,
-    accept: impl Fn(&str) -> bool,
-) -> PyResult<()> {
-    let Some(text) = runtime.string_value(value)? else {
-        return Err(PyError::type_error(format!(
-            "{name} must be str, not {}",
-            runtime.type_name(value)?
-        )));
-    };
-    if accept(&text) {
-        return Ok(());
+    array: &Array,
+    axis: Option<PyValue>,
+) -> PyResult<(Array, usize)> {
+    match axis {
+        None => Ok((array.clone(), array::normalize_axis(-1, array.ndim())?)),
+        Some(value) if value.is_none() => {
+            let flat = array::ravel(runtime, array)?;
+            Ok((flat, 0))
+        }
+        Some(value) => {
+            let axis = array::normalize_axis(args::index_int(runtime, &value)?, array.ndim())?;
+            Ok((array.clone(), axis))
+        }
     }
-    let repr = runtime.repr(value)?;
-    Err(PyError::value_error(format!(
-        "{name} {message} (got {repr})"
-    )))
 }
 
-/// `order=` names structured fields, which shellsim's dtypes do not have.
-fn reject_order(bound: &Bound) -> PyResult<()> {
+/// The axis for in-place `ndarray.sort`/`ndarray.partition`, which (unlike every other form)
+/// does not accept `axis=None`: an omitted axis defaults to -1, and any explicit value —
+/// including `None` — goes through the ordinary integer conversion, so `None` raises NumPy's
+/// "cannot be interpreted as an integer" `TypeError` instead of flattening.
+fn resolve_axis_strict(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+    axis: Option<PyValue>,
+) -> PyResult<usize> {
+    let raw = match axis {
+        None => -1,
+        Some(value) => args::index_int(runtime, &value)?,
+    };
+    array::normalize_axis(raw, array.ndim())
+}
+
+fn kind_type_error(runtime: &dyn PyRuntime, value: &PyValue, noun: &str) -> PyError {
+    let type_name = runtime
+        .type_name(value)
+        .unwrap_or_else(|_| "object".to_string());
+    PyError::type_error(format!("{noun} kind must be str, not {type_name}"))
+}
+
+/// `kind=` for `sort`/`argsort`: NumPy's `PyArray_SortkindConverter` matches by lowercase first
+/// letter, so any spelling of `quicksort`, `heapsort`, `mergesort`, or `stable` (and anything
+/// else starting the same way) is accepted; shellsim always sorts stably, which is a valid
+/// result for every one of them.
+fn check_sort_kind(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<()> {
+    let text = runtime
+        .string_value(&value)?
+        .ok_or_else(|| kind_type_error(runtime, &value, "sort"))?;
+    match text.chars().next().map(|c| c.to_ascii_lowercase()) {
+        Some('q' | 'h' | 'm' | 's') => Ok(()),
+        _ => Err(PyError::value_error(format!(
+            "sort kind must be one of 'quick', 'heap', or 'stable' (got '{text}')"
+        ))),
+    }
+}
+
+/// `kind=` for `partition`/`argpartition`: NumPy accepts only the exact string `'introselect'`
+/// (its default), so an explicit `None` is a `TypeError` rather than "use the default".
+fn check_select_kind(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<()> {
+    let Some(value) = value else { return Ok(()) };
+    let text = runtime
+        .string_value(&value)?
+        .ok_or_else(|| kind_type_error(runtime, &value, "select"))?;
+    if text == "introselect" {
+        Ok(())
+    } else {
+        Err(PyError::value_error(format!(
+            "select kind must be 'introselect' (got '{text}')"
+        )))
+    }
+}
+
+fn reject_order(bound: &args::Bound) -> PyResult<()> {
     if bound.value("order").is_some() {
         return Err(PyError::value_error(
             "Cannot specify order when the array has no fields.",
@@ -521,312 +570,430 @@ fn reject_order(bound: &Bound) -> PyResult<()> {
     Ok(())
 }
 
-/// `array` and the axis to sort along: `axis=None` sorts the flattened array.
-fn sort_axis(
-    runtime: &mut dyn PyRuntime,
-    array: Array,
-    axis: Option<PyValue>,
-) -> PyResult<(Array, usize)> {
-    match axis {
-        Some(axis) if axis.is_none() => Ok((array::ravel(runtime, &array)?, 0)),
-        axis => {
-            let axis = axis.map_or(Ok(-1), |axis| args::index_int(runtime, &axis))?;
-            let axis = array::normalize_axis(axis, array.ndim())?;
-            Ok((array, axis))
-        }
-    }
-}
-
-/// `np.sort(a, axis=-1, kind=None, order=None, *, stable=None, descending=None)`.
-fn module_sort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let bound = SORT.bind(&args)?;
-    let array = convert::as_array(runtime, bound.required("a"))?;
-    let descending = sort_options(runtime, &bound)?;
-    let (array, axis) = sort_axis(runtime, array, bound.get("axis"))?;
-    Ok(sorted_copy(runtime, &array, axis, descending)?.value())
-}
-
-/// `ndarray.sort(axis=-1, kind=None, order=None, *, stable=None, descending=None)`: sort in
-/// place, writing through views.
-fn method_sort(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    let bound = SORT_METHOD.bind(&args)?;
-    let array = Array::from_value(runtime, receiver)?;
-    let descending = sort_options(runtime, &bound)?;
-    let axis = match bound.value("axis") {
-        Some(axis) => args::index_int(runtime, &axis)?,
-        None => -1,
-    };
-    let axis = array::normalize_axis(axis, array.ndim())?;
-    if !array.view.writeable {
-        return Err(PyError::value_error("sort array is read-only"));
-    }
-    let sorted = sorted_copy(runtime, &array, axis, descending)?;
-    array::assign(runtime, &array, &sorted)?;
-    Ok(Value::None)
-}
-
-/// Shared by `np.argsort` and `ndarray.argsort`. A 0-d array argsorts as one element, as
-/// `PyArray_CheckAxis` makes it.
-fn argsort(runtime: &mut dyn PyRuntime, array: Array, bound: &Bound) -> PyResult {
-    let descending = sort_options(runtime, bound)?;
-    let array = if array.ndim() == 0 {
-        array::ravel(runtime, &array)?
-    } else {
-        array
-    };
-    let (array, axis) = sort_axis(runtime, array, bound.get("axis"))?;
-    let (lanes, permutation) = argsort_lanes(runtime, &array, axis, descending)?;
-    Ok(permutation_array(runtime, array.shape().to_vec(), &lanes, &permutation)?.value())
-}
-
-/// `np.argsort(a, axis=-1, kind=None, order=None, *, stable=None, descending=None)`.
-fn module_argsort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let bound = ARGSORT.bind(&args)?;
-    let array = convert::as_array(runtime, bound.required("a"))?;
-    argsort(runtime, array, &bound)
-}
-
-fn method_argsort(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    let bound = ARGSORT_METHOD.bind(&args)?;
-    let array = Array::from_value(runtime, receiver)?;
-    argsort(runtime, array, &bound)
-}
-
-/// `np.lexsort(keys, axis=-1)`: the last key is the primary one. Following `PyArray_LexSort`,
-/// the permutation is sorted stably by each key in turn, from the first key to the last.
-fn module_lexsort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("lexsort", &["keys", "axis"], 1);
-    let bound = SIGNATURE.bind(&args)?;
-    let keys = lexsort_keys(runtime, bound.required("keys"))?;
-    let shape = keys[0].shape().to_vec();
-    if keys[1..].iter().any(|key| key.shape() != shape) {
-        return Err(PyError::value_error("all keys need to be the same shape"));
-    }
-    let axis = match bound.value("axis") {
-        Some(axis) => args::index_int(runtime, &axis)?,
-        None => -1,
-    };
-    // A 0-d key accepts axis 0 or -1 for backwards compatibility.
-    if shape.is_empty() && (axis == 0 || axis == -1) {
-        return Ok(array::array_from_elements(runtime, DType::INT64, shape, &[0i64])?.value());
-    }
-    let axis = array::normalize_axis(axis, shape.len())?;
-    let lanes = Lanes::new(runtime, &shape, axis)?;
-    let mut permutation = lanes.identity(runtime)?;
-    for key in &keys {
-        let key = Keys::read(runtime, &[key])?;
-        sort_lanes(runtime, &key, &lanes, &mut permutation, false)?;
-    }
-    Ok(permutation_array(runtime, shape, &lanes, &permutation)?.value())
-}
-
-/// The keys of `lexsort`: the items of a sequence, or the rows of an array.
-fn lexsort_keys(runtime: &mut dyn PyRuntime, keys: PyValue) -> PyResult<Vec<Array>> {
-    let items = match runtime.kind(&keys)? {
-        PyKind::Tuple | PyKind::List => {
-            super::shape::sequence_items(runtime, &keys)?.unwrap_or_default()
-        }
-        _ if runtime.native_kind(&keys)? == Some(PyNativeKind::Array) => {
-            let array = Array::from_value(runtime, keys)?;
-            let rows = array.shape().first().copied().unwrap_or(0);
-            (0..rows)
-                .map(|row| super::index::get_item(runtime, &array, Value::Int(row as i64)))
-                .collect::<PyResult<Vec<_>>>()?
-        }
-        _ => Vec::new(),
-    };
-    if items.is_empty() {
-        return Err(PyError::type_error(
-            "need sequence of keys with len > 0 in lexsort",
+/// `kind=`/`stable=`/`descending=` for `sort`/`argsort`: NumPy rejects `kind` together with
+/// either keyword parameter (whether that parameter is `True` or `False`; an explicit `None` on
+/// either side counts as "not given"), and otherwise applies whichever of `stable`/`descending`
+/// was given (both default to ascending, stably — this implementation's only mode).
+fn sort_direction(runtime: &mut dyn PyRuntime, bound: &args::Bound) -> PyResult<bool> {
+    let kind = bound.value("kind");
+    let stable = bound.value("stable");
+    let descending = bound.value("descending");
+    if kind.is_some() && (stable.is_some() || descending.is_some()) {
+        return Err(PyError::value_error(
+            "`kind` and keyword parameters can't be provided at the same time. Use only one of \
+             them.",
         ));
     }
-    items
-        .into_iter()
-        .map(|item| convert::as_array(runtime, item))
-        .collect()
+    if let Some(kind) = kind {
+        check_sort_kind(runtime, kind)?;
+    }
+    match descending {
+        Some(value) => runtime.truth(&value),
+        None => Ok(false),
+    }
 }
 
-static PARTITION: Signature =
+static SORT_SIGNATURE: Signature = Signature::new("sort", &["a", "axis", "kind", "order"], 1)
+    .keyword_only(&["stable", "descending"]);
+static SORT_METHOD_SIGNATURE: Signature =
+    Signature::new("sort", &["axis", "kind", "order"], 0).keyword_only(&["stable", "descending"]);
+static ARGSORT_SIGNATURE: Signature = Signature::new("argsort", &["a", "axis", "kind", "order"], 1)
+    .keyword_only(&["stable", "descending"]);
+static ARGSORT_METHOD_SIGNATURE: Signature =
+    Signature::new("argsort", &["axis", "kind", "order"], 0)
+        .keyword_only(&["stable", "descending"]);
+static PARTITION_SIGNATURE: Signature =
     Signature::new("partition", &["a", "kth", "axis", "kind", "order"], 2);
-static ARGPARTITION: Signature =
-    Signature::new("argpartition", &["a", "kth", "axis", "kind", "order"], 2);
-static PARTITION_METHOD: Signature =
+static PARTITION_METHOD_SIGNATURE: Signature =
     Signature::new("partition", &["kth", "axis", "kind", "order"], 1);
-static ARGPARTITION_METHOD: Signature =
+static ARGPARTITION_SIGNATURE: Signature =
+    Signature::new("argpartition", &["a", "kth", "axis", "kind", "order"], 2);
+static ARGPARTITION_METHOD_SIGNATURE: Signature =
     Signature::new("argpartition", &["kth", "axis", "kind", "order"], 1);
 
-/// Validate `kth`, `kind`, and `order` as `partition_prep_kth_array` and `array_partition`
-/// do. The positions are only checked, since the lanes are sorted completely.
-fn check_partition(
+fn module_sort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = SORT_SIGNATURE.bind(&args)?;
+    reject_order(&bound)?;
+    let descending = sort_direction(runtime, &bound)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    let (target, axis) = resolve_axis_flatten(runtime, &array, bound.get("axis"))?;
+    let order = lane_orders(runtime, &target, axis, descending)?;
+    Ok(sorted_copy(runtime, &target, axis, &order)?.value())
+}
+
+fn method_sort(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+    let bound = SORT_METHOD_SIGNATURE.bind(&args)?;
+    reject_order(&bound)?;
+    let descending = sort_direction(runtime, &bound)?;
+    let array = receiver(runtime, receiver_value)?;
+    let axis = resolve_axis_strict(runtime, &array, bound.get("axis"))?;
+    let order = lane_orders(runtime, &array, axis, descending)?;
+    write_sorted(runtime, &array, &array, axis, &order)?;
+    Ok(super::super::super::Value::None)
+}
+
+fn module_argsort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let bound = ARGSORT_SIGNATURE.bind(&args)?;
+    reject_order(&bound)?;
+    let descending = sort_direction(runtime, &bound)?;
+    let array = convert::as_array(runtime, bound.required("a"))?;
+    let (target, axis) = resolve_axis_flatten(runtime, &array, bound.get("axis"))?;
+    let order = lane_orders(runtime, &target, axis, descending)?;
+    Ok(indices_array(runtime, target.shape().to_vec(), axis, &order)?.value())
+}
+
+fn method_argsort(
     runtime: &mut dyn PyRuntime,
-    bound: &Bound,
-    array: &Array,
-    axis: usize,
-) -> PyResult<()> {
-    if let Some(kind) = bound.value("kind") {
-        parse_option(
-            runtime,
-            &kind,
-            "select kind",
-            "must be 'introselect'",
-            |text| text == "introselect",
-        )?;
-    }
-    reject_order(bound)?;
-    let kth = bound.required("kth");
-    let is_array = runtime.native_kind(&kth)? == Some(PyNativeKind::Array);
-    let kth = convert::as_array(runtime, kth)?;
-    if kth.ndim() > 1 {
-        return Err(too_deep(is_array));
-    }
-    match kth.dtype.category() {
-        Category::Bool => {
-            return Err(PyError::value_error(
-                "Booleans unacceptable as partition index",
-            ))
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    let bound = ARGSORT_METHOD_SIGNATURE.bind(&args)?;
+    reject_order(&bound)?;
+    let descending = sort_direction(runtime, &bound)?;
+    let array = receiver(runtime, receiver_value)?;
+    let (target, axis) = resolve_axis_flatten(runtime, &array, bound.get("axis"))?;
+    let order = lane_orders(runtime, &target, axis, descending)?;
+    Ok(indices_array(runtime, target.shape().to_vec(), axis, &order)?.value())
+}
+
+/// `kth=`: one `int`, or a sequence/array of them (each checked, since our full sort already
+/// puts every position in its final place regardless of which `kth` NumPy would have picked).
+fn kth_values(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<i64>> {
+    if runtime.native_kind(&value)? == Some(PyNativeKind::Array) {
+        let array = Array::from_value(runtime, value)?;
+        if array.ndim() == 0 {
+            return Ok(vec![kth_int(runtime, &value)?]);
         }
-        Category::Signed | Category::Unsigned => {}
-        _ => return Err(PyError::type_error("Partition index must be integer")),
+        let cast = convert::cast_array(runtime, &array, DType::INT64, false)?;
+        return array::read_elements::<i64>(runtime, &cast);
     }
-    let kth = convert::cast_array(runtime, &kth, DType::INT64, false)?;
-    let length = array.shape()[axis] as i64;
-    for position in array::read_elements::<i64>(runtime, &kth)? {
-        let position = if position < 0 {
-            position + length
-        } else {
-            position
-        };
-        if array.size() != 0 && !(0..length).contains(&position) {
+    match runtime.kind(&value)? {
+        PyKind::List => {
+            let list = super::super::super::native::PyValueCast::cast(value, runtime)?;
+            runtime
+                .list_items(list)?
+                .iter()
+                .map(|item| kth_int(runtime, item))
+                .collect()
+        }
+        PyKind::Tuple => {
+            let tuple = super::super::super::native::PyValueCast::cast(value, runtime)?;
+            runtime
+                .tuple_items(tuple)?
+                .iter()
+                .map(|item| kth_int(runtime, item))
+                .collect()
+        }
+        _ => Ok(vec![kth_int(runtime, &value)?]),
+    }
+}
+
+fn kth_int(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<i64> {
+    if let Some(value) = runtime.int_value(value) {
+        return Ok(value);
+    }
+    if let Some((dtype, number)) = super::scalar::unbox_number(runtime, value) {
+        if super::scalar::is_index_dtype(dtype) {
+            return Ok(number.wrapping_i64());
+        }
+    }
+    Err(PyError::type_error("Partition index must be integer"))
+}
+
+fn check_kth(kth: PyValue, runtime: &mut dyn PyRuntime, n: usize) -> PyResult<()> {
+    for k in kth_values(runtime, kth)? {
+        let normalized = if k < 0 { k + n as i64 } else { k };
+        if !(0..n as i64).contains(&normalized) {
             return Err(PyError::value_error(format!(
-                "kth(={position}) out of bounds ({length})"
+                "kth(={normalized}) out of bounds ({n})"
             )));
         }
     }
     Ok(())
 }
 
-/// The error `PyArray_FromAny` gives a value with more than one dimension when at most one is
-/// allowed: a nested sequence fails while its shape is discovered, an array afterwards.
-fn too_deep(is_array: bool) -> PyError {
-    PyError::value_error(if is_array {
-        "object too deep for desired array"
-    } else {
-        "setting an array element with a sequence. The requested array would exceed the \
-         maximum number of dimension of 1."
-    })
-}
-
-/// The array to partition and its axis, after validating the arguments.
-fn partition_input(
-    runtime: &mut dyn PyRuntime,
-    array: Array,
-    bound: &Bound,
-) -> PyResult<(Array, usize)> {
-    let (array, axis) = sort_axis(runtime, array, bound.get("axis"))?;
-    check_partition(runtime, bound, &array, axis)?;
-    Ok((array, axis))
-}
-
-/// `np.partition(a, kth, axis=-1, kind='introselect', order=None)`.
 fn module_partition(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let bound = PARTITION.bind(&args)?;
+    let bound = PARTITION_SIGNATURE.bind(&args)?;
+    reject_order(&bound)?;
+    check_select_kind(runtime, bound.get("kind"))?;
     let array = convert::as_array(runtime, bound.required("a"))?;
-    let (array, axis) = partition_input(runtime, array, &bound)?;
-    Ok(sorted_copy(runtime, &array, axis, false)?.value())
+    let (target, axis) = resolve_axis_flatten(runtime, &array, bound.get("axis"))?;
+    check_kth(bound.required("kth"), runtime, target.shape()[axis])?;
+    let order = lane_orders(runtime, &target, axis, false)?;
+    Ok(sorted_copy(runtime, &target, axis, &order)?.value())
 }
 
-/// `ndarray.partition(kth, axis=-1, kind='introselect', order=None)`, in place.
-fn method_partition(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    let bound = PARTITION_METHOD.bind(&args)?;
-    let array = Array::from_value(runtime, receiver)?;
-    if bound.get("axis").is_some_and(|axis| axis.is_none()) {
-        return Err(PyError::type_error(
-            "'NoneType' object cannot be interpreted as an integer",
-        ));
-    }
-    let (array, axis) = partition_input(runtime, array, &bound)?;
-    if !array.view.writeable {
-        return Err(PyError::value_error("partition array is read-only"));
-    }
-    let sorted = sorted_copy(runtime, &array, axis, false)?;
-    array::assign(runtime, &array, &sorted)?;
-    Ok(Value::None)
+fn method_partition(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    let bound = PARTITION_METHOD_SIGNATURE.bind(&args)?;
+    reject_order(&bound)?;
+    check_select_kind(runtime, bound.get("kind"))?;
+    let array = receiver(runtime, receiver_value)?;
+    let axis = resolve_axis_strict(runtime, &array, bound.get("axis"))?;
+    check_kth(bound.required("kth"), runtime, array.shape()[axis])?;
+    let order = lane_orders(runtime, &array, axis, false)?;
+    write_sorted(runtime, &array, &array, axis, &order)?;
+    Ok(super::super::super::Value::None)
 }
 
-fn argpartition(runtime: &mut dyn PyRuntime, array: Array, bound: &Bound) -> PyResult {
-    let array = if array.ndim() == 0 {
-        array::ravel(runtime, &array)?
-    } else {
-        array
-    };
-    let (array, axis) = partition_input(runtime, array, bound)?;
-    let (lanes, permutation) = argsort_lanes(runtime, &array, axis, false)?;
-    Ok(permutation_array(runtime, array.shape().to_vec(), &lanes, &permutation)?.value())
-}
-
-/// `np.argpartition(a, kth, axis=-1, kind='introselect', order=None)`.
 fn module_argpartition(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let bound = ARGPARTITION.bind(&args)?;
+    let bound = ARGPARTITION_SIGNATURE.bind(&args)?;
+    reject_order(&bound)?;
+    check_select_kind(runtime, bound.get("kind"))?;
     let array = convert::as_array(runtime, bound.required("a"))?;
-    argpartition(runtime, array, &bound)
+    let (target, axis) = resolve_axis_flatten(runtime, &array, bound.get("axis"))?;
+    check_kth(bound.required("kth"), runtime, target.shape()[axis])?;
+    let order = lane_orders(runtime, &target, axis, false)?;
+    Ok(indices_array(runtime, target.shape().to_vec(), axis, &order)?.value())
 }
 
-fn method_argpartition(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    let bound = ARGPARTITION_METHOD.bind(&args)?;
-    let array = Array::from_value(runtime, receiver)?;
-    argpartition(runtime, array, &bound)
+fn method_argpartition(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    let bound = ARGPARTITION_METHOD_SIGNATURE.bind(&args)?;
+    reject_order(&bound)?;
+    check_select_kind(runtime, bound.get("kind"))?;
+    let array = receiver(runtime, receiver_value)?;
+    let (target, axis) = resolve_axis_flatten(runtime, &array, bound.get("axis"))?;
+    check_kth(bound.required("kth"), runtime, target.shape()[axis])?;
+    let order = lane_orders(runtime, &target, axis, false)?;
+    Ok(indices_array(runtime, target.shape().to_vec(), axis, &order)?.value())
+}
+
+/// One `lexsort` key element, tagged with enough of its dtype family to compare correctly.
+/// Columns are homogeneous (each key array has one dtype), so mixing variants never compares.
+enum Key {
+    Number(Number),
+    Str(Vec<u32>),
+    Object(PyValue),
+}
+
+fn number_sort_cmp(a: Number, b: Number) -> Ordering {
+    match (a, b) {
+        (Number::Bool(a), Number::Bool(b)) => a.cmp(&b),
+        (Number::Int(a), Number::Int(b)) => a.cmp(&b),
+        (Number::UInt(a), Number::UInt(b)) => a.cmp(&b),
+        (Number::Float(a), Number::Float(b)) => real_order(a, b),
+        (Number::Complex(ar, ai), Number::Complex(br, bi)) => complex_order((ar, ai), (br, bi)),
+        _ => real_order(a.as_f64(), b.as_f64()),
+    }
+}
+
+fn key_ordering(runtime: &mut dyn PyRuntime, a: &Key, b: &Key) -> PyResult<Ordering> {
+    match (a, b) {
+        (Key::Number(a), Key::Number(b)) => Ok(number_sort_cmp(*a, *b)),
+        (Key::Str(a), Key::Str(b)) => Ok(a.cmp(b)),
+        (Key::Object(a), Key::Object(b)) => {
+            if less_than(runtime, *a, *b)? {
+                Ok(Ordering::Less)
+            } else if less_than(runtime, *b, *a)? {
+                Ok(Ordering::Greater)
+            } else {
+                Ok(Ordering::Equal)
+            }
+        }
+        _ => unreachable!("one dtype per key column"),
+    }
+}
+
+fn read_key_column(runtime: &mut dyn PyRuntime, key: &Array, axis: usize) -> PyResult<Vec<Key>> {
+    let offsets = lane_offsets(key.shape(), key.strides(), axis);
+    let base = key.view.offset;
+    let kind = key.dtype.kind();
+    let mut values = Vec::with_capacity(offsets.len());
+    if kind == Kind::Object {
+        runtime.read_arrays(&[key.handle], &mut |arrays| {
+            let PyArrayData::Values(data) = arrays[0].data else {
+                return Err(PyError::runtime_error(
+                    "lexsort saw byte storage for an object dtype",
+                ));
+            };
+            values.extend(offsets.iter().map(|&relative| {
+                Key::Object(
+                    data[((base as isize + relative) as usize) / PyArrayDtype::VALUE_ITEMSIZE],
+                )
+            }));
+            Ok(())
+        })?;
+        return Ok(values);
+    }
+    runtime.read_arrays(&[key.handle], &mut |arrays| {
+        let PyArrayData::Bytes(bytes) = arrays[0].data else {
+            return Err(PyError::runtime_error(
+                "lexsort saw object storage for a numeric dtype",
+            ));
+        };
+        if kind == Kind::Str {
+            let width = key.dtype.itemsize();
+            values.extend(offsets.iter().map(|&relative| {
+                let offset = (base as isize + relative) as usize;
+                Key::Str(
+                    bytes[offset..offset + width]
+                        .chunks_exact(4)
+                        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four bytes")))
+                        .collect(),
+                )
+            }));
+        } else {
+            dispatch_numeric!(kind, T => {
+                values.extend(offsets.iter().map(|&relative| {
+                    let offset = (base as isize + relative) as usize;
+                    Key::Number(T::read(&bytes[offset..]).to_number())
+                }));
+            }, _ => unreachable!("Str and Object are handled separately"));
+        }
+        Ok(())
+    })?;
+    Ok(values)
+}
+
+/// `np.lexsort(keys, axis=-1)`: an ascending-stable order along `axis`, comparing the last key
+/// first (most significant) down to the first (a final tie-break).
+fn lexicographic_lane_orders(
+    runtime: &mut dyn PyRuntime,
+    keys: &[Array],
+    axis: usize,
+) -> PyResult<Vec<usize>> {
+    let shape = keys[0].shape();
+    let n = shape[axis];
+    let lanes = array::element_count(shape)?.checked_div(n).unwrap_or(0);
+    runtime.charge_cpu(
+        cost_n_log_n(n)
+            .saturating_mul(lanes as u64)
+            .saturating_mul(keys.len() as u64)
+            + 1,
+    )?;
+    let columns = keys
+        .iter()
+        .map(|key| read_key_column(runtime, key, axis))
+        .collect::<PyResult<Vec<_>>>()?;
+    let mut result = Vec::with_capacity(lanes * n);
+    for lane in 0..lanes {
+        let base = lane * n;
+        let mut order: Vec<usize> = (0..n).collect();
+        merge_sort_by(&mut order, &mut |&a, &b| {
+            for column in columns.iter().rev() {
+                match key_ordering(runtime, &column[base + a], &column[base + b])? {
+                    Ordering::Less => return Ok(true),
+                    Ordering::Greater => return Ok(false),
+                    Ordering::Equal => {}
+                }
+            }
+            Ok(false)
+        })?;
+        result.extend(order);
+    }
+    Ok(result)
+}
+
+fn key_arrays(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<Array>> {
+    match runtime.kind(&value)? {
+        PyKind::List => {
+            let list = super::super::super::native::PyValueCast::cast(value, runtime)?;
+            runtime
+                .list_items(list)?
+                .into_iter()
+                .map(|item| convert::as_array(runtime, item))
+                .collect()
+        }
+        PyKind::Tuple => {
+            let tuple = super::super::super::native::PyValueCast::cast(value, runtime)?;
+            runtime
+                .tuple_items(tuple)?
+                .into_iter()
+                .map(|item| convert::as_array(runtime, item))
+                .collect()
+        }
+        _ => {
+            let array = convert::as_array(runtime, value)?;
+            if array.ndim() == 0 {
+                return Ok(vec![array]);
+            }
+            super::ndarray::rows(runtime, &array)?
+                .into_iter()
+                .map(|row| Array::from_value(runtime, row))
+                .collect()
+        }
+    }
+}
+
+fn module_lexsort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new("lexsort", &["keys", "axis"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let keys = key_arrays(runtime, bound.required("keys"))?;
+    let Some(first) = keys.first() else {
+        return Err(PyError::type_error(
+            "need sequence of keys with len > 0 in lexsort",
+        ));
+    };
+    for key in &keys[1..] {
+        if key.shape() != first.shape() {
+            return Err(PyError::value_error("all keys need to be the same shape"));
+        }
+    }
+    let axis = match bound.get("axis") {
+        None => array::normalize_axis(-1, first.ndim())?,
+        Some(value) => array::normalize_axis(args::index_int(runtime, &value)?, first.ndim())?,
+    };
+    let order = lexicographic_lane_orders(runtime, &keys, axis)?;
+    Ok(indices_array(runtime, first.shape().to_vec(), axis, &order)?.value())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sort_keys(keys: &Keys, count: usize, descending: bool) -> Vec<usize> {
-        let mut items = (0..count).collect::<Vec<_>>();
-        let mut scratch = vec![0; count];
-        merge_sort(&mut items, &mut scratch, &mut |left, right| {
-            Ok(keys.order(left, right, descending) == Ordering::Less)
-        })
-        .expect("numeric comparisons cannot fail");
-        items
+    #[test]
+    fn real_order_puts_nan_after_every_number_and_treats_nan_as_equal() {
+        assert_eq!(real_order(1.0f64, 2.0), Ordering::Less);
+        assert_eq!(real_order(f64::NAN, 1.0), Ordering::Greater);
+        assert_eq!(real_order(1.0, f64::NAN), Ordering::Less);
+        assert_eq!(real_order(f64::NAN, f64::NAN), Ordering::Equal);
+        assert_eq!(real_order(3i8, -1i8), Ordering::Greater);
     }
 
     #[test]
-    fn merge_sort_is_stable_across_runs() {
-        // 40 elements span three insertion-sorted runs and two merge passes.
-        let values = (0..40)
-            .map(|index| f64::from(index % 3))
-            .collect::<Vec<_>>();
-        let order = sort_keys(&Keys::Reals(values), 40, false);
-        let expected = (0..40)
-            .filter(|index| index % 3 == 0)
-            .chain((0..40).filter(|index| index % 3 == 1))
-            .chain((0..40).filter(|index| index % 3 == 2))
-            .collect::<Vec<_>>();
-        assert_eq!(order, expected);
-    }
-
-    #[test]
-    fn nan_sorts_last_in_both_directions() {
-        let keys = Keys::Reals(vec![1.0, f64::NAN, 3.0, 1.0, -0.0, 0.0]);
-        assert_eq!(sort_keys(&keys, 6, false), [4, 5, 0, 3, 2, 1]);
-        assert_eq!(sort_keys(&keys, 6, true), [2, 0, 3, 4, 5, 1]);
-    }
-
-    #[test]
-    fn complex_values_with_nan_parts_follow_numpy_classes() {
+    fn complex_order_groups_nan_containing_values_last_by_component() {
         let nan = f64::NAN;
-        let keys = Keys::Complex(vec![
-            (1.0, 1.0),
-            (nan, 0.0),
-            (1.0, nan),
-            (0.0, 0.0),
-            (nan, nan),
-            (1.0, -1.0),
-            (nan, -1.0),
-        ]);
-        // NumPy 2.5: np.argsort(c, stable=True) and np.argsort(c, descending=True, stable=True).
-        assert_eq!(sort_keys(&keys, 7, false), [3, 5, 0, 2, 6, 1, 4]);
-        assert_eq!(sort_keys(&keys, 7, true), [0, 5, 3, 2, 1, 6, 4]);
+        assert_eq!(complex_order((1.0, 2.0), (2.0, 1.0)), Ordering::Less);
+        // A NaN-free value always sorts before a NaN-containing one, even with a smaller real
+        // part on the NaN-containing side.
+        assert_eq!(complex_order((3.0, 0.0), (2.0, nan)), Ordering::Less);
+        assert_eq!(complex_order((2.0, nan), (nan, 0.0)), Ordering::Less);
+        assert_eq!(complex_order((nan, 0.0), (nan, 1.0)), Ordering::Less);
+        assert_eq!(complex_order((nan, 2.0), (nan, nan)), Ordering::Less);
+    }
+
+    #[test]
+    fn apply_descending_keeps_nan_suffix_in_place() {
+        let order = apply_descending(vec![2, 0, 1, 3, 4], 2, true);
+        assert_eq!(order, vec![1, 0, 2, 3, 4]);
+        let order = apply_descending(vec![2, 0, 1], 0, false);
+        assert_eq!(order, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn merge_sort_by_is_stable_and_supports_a_fallible_comparator() {
+        let mut items = vec![3usize, 1, 4, 1, 5, 9, 2, 6];
+        let source = items.clone();
+        merge_sort_by(&mut items, &mut |&a, &b| Ok(a < b)).unwrap();
+        let mut expected = source;
+        expected.sort();
+        assert_eq!(items, expected);
+    }
+
+    #[test]
+    fn lane_offsets_enumerate_lane_then_position() {
+        // shape (2,3), C strides, axis=0: two lanes (one per column) of 2 elements each.
+        let offsets = lane_offsets(&[2, 3], &[24, 8], 0);
+        assert_eq!(offsets, vec![0, 24, 8, 32, 16, 40]);
+        // axis=1: three lanes (one per row) of 3 elements each, in row order.
+        let offsets = lane_offsets(&[2, 3], &[24, 8], 1);
+        assert_eq!(offsets, vec![0, 8, 16, 24, 32, 40]);
     }
 }
