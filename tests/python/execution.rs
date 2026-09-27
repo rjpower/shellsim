@@ -145,6 +145,52 @@ for call in (lambda: min(1, "a"), lambda: max(1, "a"), lambda: sorted([1, "a"]))
 }
 
 #[test]
+fn instances_with_only_getitem_iterate_through_the_sequence_protocol() {
+    // CPython iterates `__getitem__(0)`, `__getitem__(1)`, ... until `IndexError` or
+    // `StopIteration`; other exceptions propagate, and `__iter__ = None` opts out.
+    let source = r#"class Seq:
+    def __init__(self, *items):
+        self.items = items
+    def __getitem__(self, index):
+        return self.items[index]
+class Done(IndexError):
+    pass
+class Stops:
+    def __getitem__(self, index):
+        if index == 2:
+            raise StopIteration
+        return index * 10
+class Custom:
+    def __getitem__(self, index):
+        if index == 3:
+            raise Done
+        return index
+class Missing:
+    def __getitem__(self, index):
+        raise KeyError(index)
+class Opted:
+    __iter__ = None
+    def __getitem__(self, index):
+        return index
+print([x for x in Seq(1, 2)], tuple(Seq("a")), 2 in Seq(1, 2), sum(Seq(1, 2)))
+first, second = Seq(4, 5)
+print(first, second, next(iter(Seq(6))), list(Stops()), list(Custom()))
+for call in (lambda: list(Missing()), lambda: iter(Opted()), lambda: iter(5)):
+    try:
+        call()
+    except (KeyError, TypeError) as error:
+        print(type(error).__name__, error)"#;
+    assert_eq!(
+        run_shell(&format!("python3.14 <<'PY'\n{source}\nPY")),
+        (
+            0,
+            b"[1, 2] ('a',) True 3\n4 5 6 [0, 10] [0, 1, 2]\nKeyError 0\nTypeError 'Opted' object is not iterable\nTypeError 'int' object is not iterable\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
 fn script_execution_defines_file_without_exposing_the_host() {
     assert_eq!(
         run_shell("printf 'print(__file__)\\n' > /work/program.py; python /work/program.py"),

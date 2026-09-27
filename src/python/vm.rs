@@ -971,6 +971,14 @@ impl<'a> Vm<'a> {
     }
 
     fn iterable_values(&mut self, value: &Value) -> Result<Vec<Value>, String> {
+        // A class that sets `__iter__ = None` declares its instances not iterable, even when it
+        // defines `__getitem__`.
+        if matches!(
+            self.state.types.slot(self.type_id(value)?, Slot::Iter)?,
+            Some(SlotValue::Descriptor(Value::None))
+        ) {
+            return Err(self.raise_object_type_error(value, "is not iterable"));
+        }
         if let Some(iterable) = self.invoke_slot(value, Slot::Iter, "__iter__", Vec::new())? {
             if protocol::identical(value, &iterable) {
                 let mut result = Vec::new();
@@ -1072,12 +1080,58 @@ impl<'a> Vm<'a> {
                         self.push_materialized(&mut result, value)?;
                     }
                 }
+                Object::Instance { .. }
+                    if self
+                        .state
+                        .types
+                        .slot(self.type_id(value)?, Slot::GetItem)?
+                        .is_some() =>
+                {
+                    self.legacy_sequence_values(value, &mut result)?;
+                }
                 _ => return Err(self.raise_object_type_error(value, "is not iterable")),
             }
         } else {
             return Err(self.raise_object_type_error(value, "is not iterable"));
         }
         Ok(result)
+    }
+
+    /// Iterate an instance without `__iter__` through CPython's legacy sequence protocol:
+    /// call `__getitem__(0)`, `__getitem__(1)`, ... until it raises `IndexError` or
+    /// `StopIteration`. Any other exception propagates. Each item is metered, so a
+    /// `__getitem__` that never raises exhausts the CPU budget instead of looping forever.
+    fn legacy_sequence_values(
+        &mut self,
+        value: &Value,
+        result: &mut Vec<Value>,
+    ) -> Result<(), String> {
+        let mut index: i64 = 0;
+        loop {
+            match self.invoke_slot(value, Slot::GetItem, "__getitem__", vec![Value::Int(index)]) {
+                Ok(Some(item)) => self.push_materialized(result, item)?,
+                Ok(None) => return Err("__getitem__ slot disappeared during iteration".into()),
+                Err(error) => {
+                    let Some(exception) = self.pending_exception.as_ref() else {
+                        return Err(error);
+                    };
+                    let kind = match self.user_exception_base(&exception.value)? {
+                        Some(base) => base,
+                        None => exception.kind.as_str(),
+                    };
+                    if !exception_types::exception_is_subclass(kind, "IndexError")
+                        && !exception_types::exception_is_subclass(kind, "StopIteration")
+                    {
+                        return Err(error);
+                    }
+                    self.pending_exception = None;
+                    return Ok(());
+                }
+            }
+            index = index
+                .checked_add(1)
+                .ok_or("sequence index exceeds bounded integer range")?;
+        }
     }
 
     fn push_materialized(&mut self, values: &mut Vec<Value>, value: Value) -> Result<(), String> {
