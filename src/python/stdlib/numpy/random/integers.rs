@@ -114,6 +114,24 @@ pub(in crate::python) fn lemire_u64(bitgen: &mut BitGen, range_excl: u128) -> u6
     }
 }
 
+/// Lemire's method in `[0, range_excl)`, picking the 32- or 64-bit primitive from the range and
+/// returning `0` without drawing anything when `range_excl <= 1` (only one value is possible),
+/// mirroring `draw_bounded`'s `count == 1` shortcut. `Generator.choice(..., replace=False)`'s own
+/// index draws use this — Floyd's algorithm for the selection step and its Fisher-Yates final
+/// shuffle both draw `[0, j]` via Lemire, unlike `shuffle`/`permutation`'s masked rejection (see
+/// `super::sequence`'s module doc for how that was recovered and confirmed by state replay, not
+/// just matching output values).
+pub(in crate::python) fn lemire_bounded(bitgen: &mut BitGen, range_excl: u128) -> u64 {
+    if range_excl <= 1 {
+        return 0;
+    }
+    if range_excl <= 1u128 << 32 {
+        u64::from(lemire_u32(bitgen, range_excl as u64))
+    } else {
+        lemire_u64(bitgen, range_excl)
+    }
+}
+
 /// A buffer of unused bits from a `next_u32()` word, shared across a whole array fill so a
 /// dtype narrower than 32 bits packs several draws into one raw word instead of spending a full
 /// word per element.

@@ -73,6 +73,7 @@ static FUNCTIONS: &[FunctionDef] = &[
     function("_poisson_fill", poisson_fill),
     function("_shuffle_indices", shuffle_indices_fn),
     function("_sample_without_replacement", sample_without_replacement_fn),
+    function("_choice_without_replacement", choice_without_replacement_fn),
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -512,6 +513,23 @@ fn exponential_source(gauss: &Option<(bool, f64)>) -> Box<dyn FnMut(&mut BitGen)
     }
 }
 
+/// `dtype=np.float32`'s own exponential source for `standard_gamma`'s `shape < 1` branch: see
+/// `ziggurat::next_exponential_zig_f32`'s doc for `Generator`'s narrower word; legacy
+/// `RandomState` has no narrower form, so it reuses `exponential_source`.
+fn exponential_source_f32(gauss: &Option<(bool, f64)>) -> Box<dyn FnMut(&mut BitGen) -> f64> {
+    if is_legacy_gauss(gauss) {
+        Box::new(legacy::exponential)
+    } else {
+        Box::new(ziggurat::next_exponential_zig_f32)
+    }
+}
+
+/// `dtype=np.float32`'s own uniform source for `standard_gamma` (see `gamma.rs`'s module doc): a
+/// single `next_u32()` word divided down, instead of the usual 53-bit `next_double()`.
+fn uniform_source_f32() -> Box<dyn FnMut(&mut BitGen) -> f64> {
+    Box::new(|bitgen: &mut BitGen| f64::from(bitgen.next_u32()) / 4_294_967_296.0)
+}
+
 fn standard_normal_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_standard_normal_fill", 3, 3)?;
     let positional = args.positional().to_vec();
@@ -612,12 +630,22 @@ fn standard_gamma_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult 
     {
         // `shape >= 1` draws normal deviates behind the scenes (Marsaglia-Tsang); matching
         // `standard_normal_fill`'s own dtype split keeps that source's word width consistent
-        // with what a bare `standard_normal(dtype=...)` call would have consumed.
-        let mut exponential = exponential_source(&gauss);
+        // with what a bare `standard_normal(dtype=...)` call would have consumed. `shape < 1`
+        // and the squeeze test both narrow their own uniform draws at `f32` too (see `gamma.rs`).
+        let mut exponential = if single {
+            exponential_source_f32(&gauss)
+        } else {
+            exponential_source(&gauss)
+        };
         let mut source = if single {
             normal_source_f32(&mut gauss)
         } else {
             normal_source(&mut gauss)
+        };
+        let mut uniform: Box<dyn FnMut(&mut BitGen) -> f64> = if single {
+            uniform_source_f32()
+        } else {
+            Box::new(BitGen::next_double)
         };
         for shape in &shapes {
             values.push(gamma::standard_gamma(
@@ -625,6 +653,7 @@ fn standard_gamma_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult 
                 *shape,
                 &mut *source,
                 &mut *exponential,
+                &mut *uniform,
             ));
         }
     }
@@ -762,6 +791,25 @@ fn sample_without_replacement_fn(runtime: &mut dyn PyRuntime, args: CallArgs) ->
     let size = super::args::index_int(runtime, &positional[2])? as usize;
     reserve_and_charge(runtime, DType::INT64, n, 2)?;
     let values = sequence::sample_without_replacement(&mut bitgen, n, size);
+    let out = wrap_i64(runtime, vec![size], &values)?;
+    result_and_state(runtime, out, bitgen, gauss)
+}
+
+/// `_choice_without_replacement(state, n, size, shuffle)`: `Generator.choice(..., replace=False,
+/// p=None)`'s own index draws (see `sequence::choice_without_replacement`'s doc for the two
+/// algorithms NumPy switches between). The large-population algorithm builds an `n`-length
+/// working array regardless of `size`, so memory is reserved for `n`, not just the
+/// `size`-length result, matching `sample_without_replacement_fn` above.
+fn choice_without_replacement_fn(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("_choice_without_replacement", 4, 4)?;
+    let positional = args.positional().to_vec();
+    let items = state_items(runtime, positional[0])?;
+    let (mut bitgen, gauss) = bitgen_from_items(runtime, &items)?;
+    let n = super::args::index_int(runtime, &positional[1])? as usize;
+    let size = super::args::index_int(runtime, &positional[2])? as usize;
+    let shuffle = runtime.truth(&positional[3])?;
+    reserve_and_charge(runtime, DType::INT64, n, 2)?;
+    let values = sequence::choice_without_replacement(&mut bitgen, n, size, shuffle);
     let out = wrap_i64(runtime, vec![size], &values)?;
     result_and_state(runtime, out, bitgen, gauss)
 }

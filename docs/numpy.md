@@ -130,10 +130,11 @@ differences, the unsupported frontier, and resource limits.
   raw and uniform draws (both bit generators, `float32` and `float64`), bounded integers at every
   dtype including the narrower, per-word-buffered ones (`int8`, `uint8`, `int16`, `uint16`, and
   `bool`), `Generator` and legacy `RandomState` shuffling, permutation, and sampling distinct
-  indices, and every distribution derived only from uniforms and the polar-method Gaussian that
-  `RandomState` uses internally: `binomial`, `poisson`, `standard_gamma` on its common branch, and
-  the `chisquare`/`f`/`standard_t` built on it. See "Deliberate differences" for what does not
-  match bit for bit.
+  indices (including `Generator.choice` with `replace=False`), and every distribution built from
+  uniforms, gamma, and either bit generator's own Gaussian: `binomial`, `poisson`,
+  `standard_gamma` (both its `shape >= 1` squeeze-and-reject branch and its `shape < 1`
+  Weibull-envelope rejection branch), and `chisquare`, `f`, and `standard_t` built on it. See
+  "Deliberate differences" for what does not match bit for bit.
 - **Text.** `str` arrays, `numpy.strings`, and object arrays with Python-level element operations.
 - **Printing.** Array `repr` and `str` use a port of NumPy's `arrayprint` and its Dragon4
   formatter, so output, print options, and line wrapping match NumPy.
@@ -183,18 +184,6 @@ never imports a module or calls arbitrary code.
     `standard_exponential`'s `method="inv"` is exact instead (plain inversion, no table). Every
     distribution built from a ziggurat-based normal inherits this: `Generator.standard_gamma` and
     `.gamma` for `shape >= 1`, and `.chisquare`, `.f`, and `.standard_t`, which use it internally.
-  - `standard_gamma`'s `shape < 1` branch (Ahrens and Dieter's 1974 algorithm GS) matches bit for
-    bit on legacy `RandomState` only in its common case (roughly `e / (e + shape)` of draws); its
-    rarer case does not match on any bit generator, and neither case reliably matches on
-    `Generator`, which appears to draw its rejection-test uniform through the same undocumented
-    mechanism as the ziggurat.
-  - `Generator.choice` with `replace=False` and no `p` draws a valid subset (and, when
-    `size == len(a)`, a valid permutation), but not in NumPy's exact order: it is not
-    `Generator.shuffle`/`.permutation` under the hood despite drawing 64-bit words the same shape
-    would suggest (see `sequence.rs`'s module doc for the black-box search this ruled out).
-    `Generator.shuffle`, `.permutation`, and sampling distinct indices with `p=None` otherwise
-    match NumPy's Fisher-Yates bit for bit, as does legacy `RandomState`'s `.choice`,
-    `.shuffle`, and `.permutation` in every case.
 - **`str` and `object` elements** box to plain Python `str` values and the stored objects, not to
   `np.str_` or `np.object_` instances.
 - **Byte order.** Views between byte orders, big-endian `str` dtypes, and `tobytes` of object

@@ -408,7 +408,7 @@ def _weighted_choice_without_replacement(raw_state, store_state, p_arr, n_sample
     return _np.array(result, dtype=_np.int64)
 
 
-def _choice_indices(raw_state, store_state, pop_size, shape, replace, p, legacy):
+def _choice_indices(raw_state, store_state, pop_size, shape, replace, p, legacy, shuffle=True):
     n_samples = _prod(shape) if shape else 1
     p_arr = None
     if p is not None:
@@ -427,12 +427,14 @@ def _choice_indices(raw_state, store_state, pop_size, shape, replace, p, legacy)
         if p_arr is None:
             if legacy:
                 full, new_state = _nr._shuffle_indices(raw_state(), pop_size)
+                store_state(new_state)
+                idx = _np.asarray(full, dtype=_np.int64)[:n_samples]
             else:
-                full, new_state = _nr._sample_without_replacement(
-                    raw_state(), pop_size, n_samples
+                idx, new_state = _nr._choice_without_replacement(
+                    raw_state(), pop_size, n_samples, shuffle
                 )
-            store_state(new_state)
-            idx = _np.asarray(full, dtype=_np.int64)[:n_samples]
+                store_state(new_state)
+                idx = _np.asarray(idx, dtype=_np.int64)
         else:
             idx = _weighted_choice_without_replacement(raw_state, store_state, p_arr, n_samples)
     else:
@@ -550,11 +552,11 @@ class Generator:
         result = values if dtype_name == "int64" else values.astype(dtype_name)
         return _scalar(result) if target == () else result
 
-    def choice(self, a, size=None, replace=True, p=None):
+    def choice(self, a, size=None, replace=True, p=None, shuffle=True):
         pop_size, values_source = _choice_population(a)
         shape = _shape_of(size)
         idx = _choice_indices(
-            self._raw_state, self._store_state, pop_size, shape, replace, p, False
+            self._raw_state, self._store_state, pop_size, shape, replace, p, False, shuffle
         )
         return _choice_result(idx, values_source, size, shape)
 
