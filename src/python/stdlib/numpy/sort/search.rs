@@ -13,13 +13,13 @@
 use std::cmp::Ordering;
 
 use super::super::super::super::native::{
-    CallArgs, PyArrayBuffer, PyArrayData, PyError, PyResult, PyRuntime, PyValue,
+    CallArgs, PyArrayBuffer, PyError, PyResult, PyRuntime, PyValue,
 };
 use super::super::args::Signature;
 use super::super::array::{self, Array};
 use super::super::convert;
 use super::super::dtype::{self, DType, Kind};
-use super::super::element::{dispatch_numeric, Element};
+use super::super::element::dispatch_numeric;
 use super::{cost_log_n, less_than, SortKey};
 
 static MODULE_SIGNATURE: Signature = Signature::new("searchsorted", &["a", "v", "side", "sorter"], 2);
@@ -169,23 +169,15 @@ fn searchsorted(
                 .collect()
         }
         kind => {
-            let mut positions = Vec::with_capacity(count);
-            runtime.read_arrays(&[a_cast.handle, v_cast.handle], &mut |arrays| {
-                let (PyArrayData::Bytes(a_bytes), PyArrayData::Bytes(v_bytes)) = (&arrays[0].data, &arrays[1].data)
-                else {
-                    return Err(PyError::runtime_error("searchsorted saw object storage for a numeric dtype"));
-                };
-                dispatch_numeric!(kind, T => {
-                    let index = |i: usize| logical.as_ref().map_or(i, |order| order[i] as usize);
-                    let read = |offset: usize| T::read(&a_bytes[offset * T::SIZE..]);
-                    for chunk in v_bytes.chunks_exact(T::SIZE) {
-                        let target = T::read(chunk);
-                        positions.push(binary_search(n, right, |mid| read(index(mid)).sort_cmp(target)) as i64);
-                    }
-                }, _ => unreachable!("Str and Object are handled separately"));
-                Ok(())
-            })?;
-            positions
+            let index = |i: usize| logical.as_ref().map_or(i, |order| order[i] as usize);
+            dispatch_numeric!(kind, T => {
+                let a_values = array::read_elements::<T>(runtime, &a_cast)?;
+                let v_values = array::read_elements::<T>(runtime, &v_cast)?;
+                v_values
+                    .iter()
+                    .map(|&target| binary_search(n, right, |mid| a_values[index(mid)].sort_cmp(target)) as i64)
+                    .collect()
+            }, _ => unreachable!("Str and Object are handled separately"))
         }
     };
 
