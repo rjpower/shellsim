@@ -53,7 +53,7 @@ print(a.astype(float).dtype, a.astype(float).tolist())
         run(source),
         (
             0,
-            b"(2, 3) 2 6 int64\narray([[1, 2, 3], [4, 5, 6]]) True True\n[[1, 2, 3], [4, 5, 6]] 6 [1, 2, 3]\n(3, 2) [[1, 4], [20, 5], [3, 6]] [[1, 20, 3], [4, 5, 6]]\n[[1, 20], [3, 4], [5, 60]] [[1, 20, 3], [4, 5, 60]]\n[1, 20, 3, 4, 5, 60] [1, 20, 3, 4, 5, 60]\n[1, 20, 3, 4, 5, 60] [[1, 20, 3], [4, 5, 60]]\nfloat64 [[1.0, 20.0, 3.0], [4.0, 5.0, 60.0]]\n".to_vec(),
+            b"(2, 3) 2 6 int64\n[[1 2 3]\n [4 5 6]] True True\n[[1, 2, 3], [4, 5, 6]] 6 [1, 2, 3]\n(3, 2) [[1, 4], [20, 5], [3, 6]] [[1, 20, 3], [4, 5, 6]]\n[[1, 20], [3, 4], [5, 60]] [[1, 20, 3], [4, 5, 60]]\n[1, 20, 3, 4, 5, 60] [1, 20, 3, 4, 5, 60]\n[1, 20, 3, 4, 5, 60] [[1, 20, 3], [4, 5, 60]]\nfloat64 [[1.0, 20.0, 3.0], [4.0, 5.0, 60.0]]\n".to_vec(),
             Vec::new(),
         )
     );
@@ -214,12 +214,13 @@ for value in (np.array([100], dtype=np.int8) * 2,
               np.array([1.5], dtype=np.float32) * 2.0):
     print(value.dtype, value.tolist())
 "#;
+    // NumPy warns about the two scalar overflows, as CPython's `-c` reports them.
     assert_eq!(
         run(source),
         (
             0,
-            b"-128 <class 'numpy.int16'>\n0 <class 'numpy.int32'>\n<class 'numpy.int64'> <class 'numpy.float64'>\n16777216.0\n<class 'numpy.float32'> <class 'numpy.float64'>\n<class 'numpy.float64'> <class 'numpy.float64'>\nfloat64 float64\n0.1\nint8 [-128, -127]\nuint8 [0] [255]\nint8 [-56]\nuint8 [2]\nuint64 [2]\nfloat32 [3.0]\n".to_vec(),
-            Vec::new(),
+            b"-128 <class 'numpy.int16'>\n0 <class 'numpy.int32'>\n<class 'numpy.int64'> <class 'numpy.float64'>\n1.6777216e+07\n<class 'numpy.float32'> <class 'numpy.float64'>\n<class 'numpy.float64'> <class 'numpy.float64'>\nfloat64 float64\n0.1\nint8 [-128, -127]\nuint8 [0] [255]\nint8 [-56]\nuint8 [2]\nuint64 [2]\nfloat32 [3.0]\n".to_vec(),
+            b"<string>:2: RuntimeWarning: overflow encountered in scalar add\n<string>:3: RuntimeWarning: overflow encountered in scalar add\n".to_vec(),
         )
     );
 }
@@ -462,7 +463,7 @@ print(np.percentile([0, 10, 20, 30], 25))
         run(source),
         (
             0,
-            b"True True 2.0.0-shellsim\n[0.0, 3.0] [2.0, 2.0, -2.0]\n[-1, 0, 1]\n[False, True] [True, False]\n[[1, 0, 0], [0, 2, 0], [0, 0, 3]]\n[[0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 3], [0, 0, 0, 0]]\n[2, 6]\n[1, 2, 0]\n[[1, 0], [1, 0]]\nFalse\n7.5\n".to_vec(),
+            b"True True 2.5.3\n[0.0, 3.0] [2.0, 2.0, -2.0]\n[-1, 0, 1]\n[False, True] [True, False]\n[[1, 0, 0], [0, 2, 0], [0, 0, 3]]\n[[0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 3], [0, 0, 0, 0]]\n[2, 6]\n[1, 2, 0]\n[[1, 0], [1, 0]]\nFalse\n7.5\n".to_vec(),
             Vec::new(),
         )
     );
@@ -473,47 +474,43 @@ fn unsupported_or_invalid_array_operations_fail_explicitly() {
     for (source, expected) in [
         (
             "import numpy as np\nnp.array([[1], [2, 3]])",
-            "setting an array element with a sequence",
+            "ValueError: setting an array element with a sequence. The requested array has an inhomogeneous shape",
         ),
         (
             "import numpy as np\nnp.array([1, 2]) + np.array([1, 2, 3])",
-            "operands could not be broadcast together",
-        ),
-        (
-            "import numpy as np\nnp.matmul(np.array([1, 2]), np.array([3, 4]))",
-            "matmul requires aligned two-dimensional arrays",
+            "ValueError: operands could not be broadcast together with shapes (2,) (3,)",
         ),
         (
             "import numpy as np\nnp.zeros((-1, 2))",
-            "negative dimensions are not allowed",
+            "ValueError: negative dimensions are not allowed",
         ),
         (
-            "import numpy as np\nnp.array([1], dtype='complex64')",
-            "unsupported numpy dtype",
+            "import numpy as np\nnp.array([1], dtype='S3')",
+            "NumPy dtype 'S3' is not supported",
         ),
         (
             "import numpy as np\nbool(np.array([1, 2]))",
-            "truth value of an array",
+            "ValueError: The truth value of an array with more than one element is ambiguous",
         ),
         (
             "import numpy as np\na = np.zeros((2, 2)); a[[0, 1]] = [1, 2, 3]",
-            "operands could not be broadcast together",
+            "ValueError: shape mismatch: value array of shape (3,) could not be broadcast to indexing result of shape (2,2)",
         ),
         (
-            "import numpy as np\na = np.zeros((2, 2)); a[[0, 1]] = [[[1, 2], [3, 4]]]",
-            "assignment value cannot be broadcast to the indexed shape",
+            "import numpy as np\na = np.zeros((2, 2)); a[...] = np.ones((2, 2, 2))",
+            "ValueError: could not broadcast input array from shape (2,2,2) into shape (2,2)",
         ),
         (
             "import numpy as np\nnp.zeros([1] * 65)",
-            "arrays support at most 64 dimensions",
+            "ValueError: maximum supported dimension for an ndarray is currently 64, found 65",
         ),
         (
             "import numpy as np\nvalue = 1\nfor _ in range(65):\n    value = [value]\nnp.array(value)",
-            "arrays support at most 64 dimensions",
+            "ValueError: setting an array element with a sequence. The requested array would exceed the maximum number of dimension of 64.",
         ),
         (
-            "import numpy as np\nnp.array([1.0]) / 0",
-            "ZeroDivisionError",
+            "import numpy as np\nnp.linspace(0, 1j, 3, dtype=float)",
+            "linspace() with complex bounds and a real dtype is not supported",
         ),
     ] {
         assert_fails_with(source, expected);
@@ -791,77 +788,19 @@ print('ok')
 #[test]
 fn complex_operations_without_a_real_value_domain_fail_explicitly() {
     let prelude = "import numpy as np\nx = np.array([1+2j, 3-4j])\n";
+    let no_loop = "not supported for the input types, and the inputs could not be safely coerced";
     for (operation, expected) in [
-        (
-            "x < x",
-            "ordering comparison is not supported for complex values",
-        ),
-        (
-            "x >= 1",
-            "ordering comparison is not supported for complex values",
-        ),
-        (
-            "np.float64(1) < 1j",
-            "ordering comparison is not supported for complex values",
-        ),
-        ("x.min()", "ndarray.min is not supported for complex values"),
-        ("np.max(x)", "numpy.max is not supported for complex values"),
-        (
-            "np.argmax(x)",
-            "numpy.argmax is not supported for complex values",
-        ),
-        (
-            "np.argsort(x)",
-            "numpy.argsort is not supported for complex values",
-        ),
-        (
-            "np.minimum(x, 1)",
-            "numpy.minimum is not supported for complex values",
-        ),
-        (
-            "np.sqrt(x)",
-            "numpy.sqrt is not supported for complex values",
-        ),
-        ("np.exp(x)", "numpy.exp is not supported for complex values"),
-        (
-            "np.floor(x)",
-            "numpy.floor is not supported for complex values",
-        ),
-        (
-            "np.isnan(x)",
-            "numpy.isnan is not supported for complex values",
-        ),
-        (
-            "np.isinf(x)",
-            "numpy.isinf is not supported for complex values",
-        ),
-        ("~x", "numpy.invert is not supported for complex values"),
+        ("np.floor(x)", format!("TypeError: ufunc 'floor' {no_loop}")),
+        ("~x", format!("TypeError: ufunc 'invert' {no_loop}")),
         (
             "np.percentile(x, 50)",
-            "numpy.percentile is not supported for complex values",
-        ),
-        (
-            "np.allclose(x, x)",
-            "numpy.allclose is not supported for complex values",
-        ),
-        (
-            "np.linspace(0, 1j, 3)",
-            "numpy.linspace is not supported for complex values",
-        ),
-        ("np.var(x)", "numpy.var is not supported for complex values"),
-        (
-            "np.median(x)",
-            "numpy.median is not supported for complex values",
-        ),
-        (
-            "x.astype(float)",
-            "cannot convert complex to numpy.float64 without discarding the imaginary part",
+            "TypeError: a must be an array of real numbers".into(),
         ),
         (
             "np.array([1j], dtype=np.int32)",
-            "cannot convert complex to numpy.int32 without discarding the imaginary part",
+            "TypeError: int() argument must be a string, a bytes-like object or a real number, not 'complex'".into(),
         ),
     ] {
-        assert_fails_with(&format!("{prelude}{operation}"), expected);
+        assert_fails_with(&format!("{prelude}{operation}"), &expected);
     }
 }

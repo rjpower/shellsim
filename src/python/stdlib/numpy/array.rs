@@ -223,10 +223,13 @@ pub(in crate::python) fn broadcast_strides(
     view: &PyArrayView,
     shape: &[usize],
 ) -> PyResult<Vec<isize>> {
-    let extra = shape
-        .len()
-        .checked_sub(view.shape.len())
-        .ok_or_else(|| PyError::value_error("cannot broadcast to a lower rank"))?;
+    let extra = shape.len().checked_sub(view.shape.len()).ok_or_else(|| {
+        PyError::value_error(format!(
+            "could not broadcast input array from shape {} into shape {}",
+            format_shape(&view.shape),
+            format_shape(shape)
+        ))
+    })?;
     let mut strides = vec![0isize; shape.len()];
     for (axis, (dimension, stride)) in view.shape.iter().zip(&view.strides).enumerate() {
         let target = shape[extra + axis];
@@ -455,18 +458,44 @@ pub(in crate::python) fn assign(
     scatter(runtime, destination, &offsets, &buffer)
 }
 
-/// `source` cast to `dtype` and broadcast to `shape`, as a C-order buffer.
+/// The number of leading length-1 axes of `source` beyond `ndim`. NumPy drops them when it
+/// assigns an array, so `a[...] = b[None]` stores `b`.
+fn surplus_unit_axes(source: &[usize], ndim: usize) -> usize {
+    source
+        .iter()
+        .take(source.len().saturating_sub(ndim))
+        .take_while(|dimension| **dimension == 1)
+        .count()
+}
+
+/// Whether assigning an array of shape `source` to `target` elements broadcasts, as NumPy's
+/// `PyArray_AssignArray` decides after dropping surplus leading length-1 axes.
+pub(in crate::python) fn assignable(source: &[usize], target: &[usize]) -> bool {
+    let source = &source[surplus_unit_axes(source, target.len())..];
+    source.len() <= target.len()
+        && source
+            .iter()
+            .rev()
+            .zip(target.iter().rev())
+            .all(|(dimension, target)| dimension == target || *dimension == 1)
+}
+
+/// `source` cast to `dtype` and broadcast to `shape`, as a C-order buffer. Leading length-1
+/// axes beyond `shape`'s rank are dropped first, as NumPy does when assigning.
 pub(in crate::python) fn broadcast_buffer(
     runtime: &mut dyn PyRuntime,
     source: &Array,
     dtype: DType,
     shape: &[usize],
 ) -> PyResult<PyArrayBuffer> {
-    let source = if source.dtype == dtype {
+    let mut source = if source.dtype == dtype {
         source.clone()
     } else {
         super::convert::cast_array(runtime, source, dtype, false)?
     };
+    let surplus = surplus_unit_axes(&source.view.shape, shape.len());
+    source.view.shape.drain(..surplus);
+    source.view.strides.drain(..surplus);
     let strides = broadcast_strides(&source.view, shape)?;
     let count = element_count(shape)?;
     reserve_elements(runtime, dtype, count)?;

@@ -517,20 +517,73 @@ pub(in crate::python) fn linspace(runtime: &mut dyn PyRuntime, args: CallArgs) -
             "linspace() with axis= is not supported",
         ));
     }
-    let start = args::float_arg(runtime, &bound.required("start"))?;
-    let stop = args::float_arg(runtime, &bound.required("stop"))?;
+    let start = limit_arg(runtime, &bound.required("start"))?;
+    let stop = limit_arg(runtime, &bound.required("stop"))?;
     let num = linspace_count(runtime, bound.value("num"))?;
     let endpoint = args::flag(runtime, bound.get("endpoint"), true)?;
     let retstep = args::flag(runtime, bound.get("retstep"), false)?;
-    let dtype = args::optional_dtype(runtime, bound.value("dtype"))?.unwrap_or(DType::FLOAT64);
+    let dtype = args::optional_dtype(runtime, bound.value("dtype"))?;
     runtime.charge_cpu(num as u64 + 1)?;
-    let (values, step) = linspace_values(start, stop, num, endpoint);
-    let result = float_array(runtime, dtype, &values)?.value();
+    let (values, step) = linspace_values(start.real, stop.real, num, endpoint);
+    let (result, step) = if start.complex || stop.complex {
+        // Complex bounds interpolate each part separately, as NumPy's complex arithmetic does.
+        let dtype = dtype.unwrap_or(DType::COMPLEX128);
+        if dtype.category() != dtype::Category::Complex {
+            return Err(PyError::unsupported(
+                "linspace() with complex bounds and a real dtype is not supported",
+            ));
+        }
+        let (imaginary, imaginary_step) = linspace_values(start.imag, stop.imag, num, endpoint);
+        let numbers = values
+            .iter()
+            .zip(&imaginary)
+            .map(|(real, imag)| Number::Complex(*real, *imag));
+        let result = numbers_array(runtime, dtype, vec![num], numbers)?;
+        (
+            result,
+            (DType::COMPLEX128, Number::Complex(step, imaginary_step)),
+        )
+    } else {
+        let dtype = dtype.unwrap_or(DType::FLOAT64);
+        let result = float_array(runtime, dtype, &values)?;
+        (result, (DType::FLOAT64, Number::Float(step)))
+    };
     if !retstep {
-        return Ok(result);
+        return Ok(result.value());
     }
-    let step = super::scalar::box_number(runtime, DType::FLOAT64, Number::Float(step))?;
-    runtime.new_tuple(vec![result, step])
+    let step = super::scalar::box_number(runtime, step.0, step.1)?;
+    runtime.new_tuple(vec![result.value(), step])
+}
+
+/// A real or complex `start` or `stop` of `linspace`.
+struct Limit {
+    real: f64,
+    imag: f64,
+    complex: bool,
+}
+
+fn limit_arg(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Limit> {
+    use super::super::super::number::NumberRef;
+    let parts = match super::scalar::unbox_number(runtime, value) {
+        Some((_, Number::Complex(real, imag))) => Some((real, imag)),
+        Some(_) => None,
+        None => match runtime.number(value) {
+            Some(NumberRef::Complex(real, imag)) => Some((real, imag)),
+            _ => None,
+        },
+    };
+    Ok(match parts {
+        Some((real, imag)) => Limit {
+            real,
+            imag,
+            complex: true,
+        },
+        None => Limit {
+            real: args::float_arg(runtime, value)?,
+            imag: 0.0,
+            complex: false,
+        },
+    })
 }
 
 /// `np.logspace(start, stop, num=50, endpoint=True, base=10.0, dtype=None)`.

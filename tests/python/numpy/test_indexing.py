@@ -551,3 +551,55 @@ def test_integer_index_assignment_accepts_zero_d_array():
     assert a.tolist() == [0.0, 2.5, 0.0]
     with pytest.raises(ValueError, match="setting an array element with a sequence."):
         a[0] = np.array([1.0, 2.0])
+
+
+def test_assignment_drops_leading_length_one_axes():
+    a = np.zeros((2, 2))
+    a[...] = np.arange(4.0).reshape(1, 1, 2, 2)
+    assert a.tolist() == [[0.0, 1.0], [2.0, 3.0]]
+    a[[0, 1]] = np.ones((1, 2, 2))
+    assert a.tolist() == [[1.0, 1.0], [1.0, 1.0]]
+    a[0] = np.full((1, 1, 2), 5.0)
+    assert a.tolist() == [[5.0, 5.0], [1.0, 1.0]]
+    target = np.zeros(3)
+    np.copyto(target, np.ones((1, 3)))
+    assert target.tolist() == [1.0, 1.0, 1.0]
+    assert np.full(2, [[4, 5]]).tolist() == [4, 5]
+
+
+def test_assignment_that_cannot_broadcast_names_both_shapes():
+    a = np.zeros((2, 2))
+    with pytest.raises(ValueError) as info:
+        a[...] = np.ones((2, 2, 2))
+    assert str(info.value) == "could not broadcast input array from shape (2,2,2) into shape (2,2)"
+    with pytest.raises(ValueError) as info:
+        a[0] = np.ones((2, 2))
+    assert str(info.value) == "could not broadcast input array from shape (2,2) into shape (2,)"
+    with pytest.raises(ValueError) as info:
+        a[[0, 1]] = [1, 2, 3]
+    assert str(info.value) == (
+        "shape mismatch: value array of shape (3,) could not be broadcast to indexing result of shape (2,2)"
+    )
+
+
+def test_full_boolean_mask_assignment_takes_one_value_per_true_element():
+    a = np.zeros((2, 2))
+    mask = np.array([[True, False], [True, True]])
+    a[mask] = [7, 8, 9]
+    assert a.tolist() == [[7.0, 0.0], [8.0, 9.0]]
+    a[mask] = [1]
+    assert a.tolist() == [[1.0, 0.0], [1.0, 1.0]]
+    with pytest.raises(ValueError) as info:
+        a[mask] = [1, 2]
+    assert str(info.value) == (
+        "NumPy boolean array indexing assignment cannot assign 2 input values to the 3 output values "
+        "where the mask is true"
+    )
+    with pytest.raises(TypeError) as info:
+        a[(mask,)] = np.ones((1, 3))
+    assert str(info.value) == (
+        "NumPy boolean array indexing assignment requires a 0 or 1-dimensional input, input has 2 dimensions"
+    )
+    # A mask over the leading axis only selects rows, and the value broadcasts to them.
+    a[np.array([True, False])] = np.full((1, 2), 4.0)
+    assert a.tolist() == [[4.0, 4.0], [1.0, 1.0]]

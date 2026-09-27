@@ -142,6 +142,37 @@ def test_ragged_input_raises_value_error(rows):
     assert "inhomogeneous shape" in str(info.value)
 
 
+def test_array_rejects_nesting_deeper_than_64_levels():
+    value = 1
+    for _ in range(64):
+        value = [value]
+    assert np.array(value).ndim == 64
+    with pytest.raises(ValueError) as info:
+        np.array([value])
+    assert str(info.value) == (
+        "setting an array element with a sequence. The requested array would exceed the maximum "
+        "number of dimension of 64."
+    )
+
+
+def test_numeric_dtypes_convert_none_and_objects_as_numpy_does():
+    class Opaque:
+        pass
+
+    assert np.isnan(np.array([1, None, 2.5], dtype=float)).tolist() == [False, True, False]
+    assert np.isnan(np.array([None], dtype=complex)[0].imag)
+    assert np.array([None, Opaque(), 0, "x"], dtype=bool).tolist() == [False, True, False, True]
+    with pytest.raises(TypeError) as info:
+        np.array([None], dtype=np.int32)
+    assert str(info.value) == "int() argument must be a string, a bytes-like object or a real number, not 'NoneType'"
+    with pytest.raises(TypeError) as info:
+        np.array([Opaque()], dtype=float)
+    assert str(info.value) == "float() argument must be a string or a real number, not 'Opaque'"
+    with pytest.raises(TypeError) as info:
+        np.array([1j], dtype=np.uint8)
+    assert str(info.value) == "int() argument must be a string, a bytes-like object or a real number, not 'complex'"
+
+
 def test_zeros_and_ones_default_to_float64():
     z = np.zeros((2, 3))
     assert z.dtype == np.dtype("float64")
@@ -277,6 +308,16 @@ def test_linspace_retstep_returns_step():
     assert values.tolist() == [0.0, 2.5, 5.0, 7.5, 10.0]
     assert step == 2.5
     assert type(step) is np.float64
+
+
+def test_linspace_interpolates_complex_bounds_by_part():
+    values = np.linspace(1 + 1j, 2, 4, endpoint=False)
+    assert values.dtype == np.dtype("complex128")
+    assert values.tolist() == [1 + 1j, 1.25 + 0.75j, 1.5 + 0.5j, 1.75 + 0.25j]
+    values, step = np.linspace(0, 1j, 3, retstep=True)
+    assert values.tolist() == [0j, 0.5j, 1j]
+    assert step == 0.5j
+    assert np.linspace(0, 2j, 3, dtype=np.complex64).dtype == np.dtype("complex64")
 
 
 def test_linspace_with_dtype():

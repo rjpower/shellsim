@@ -556,10 +556,61 @@ pub(in crate::python) fn set_item(
         }
         Selection::Gather { shape, offsets } => {
             let source = assignment_source(runtime, value, array.dtype)?;
+            if is_full_mask(runtime, array, index)? {
+                check_mask_assignment(&source, offsets.len())?;
+            } else if !super::array::assignable(source.shape(), &shape) {
+                return Err(PyError::value_error(format!(
+                    "shape mismatch: value array of shape {} could not be broadcast to indexing \
+                     result of shape {}",
+                    format_shape(source.shape()),
+                    format_shape(&shape)
+                )));
+            }
             let buffer = super::array::broadcast_buffer(runtime, &source, array.dtype, &shape)?;
             scatter(runtime, array, &offsets, &buffer)
         }
     }
+}
+
+/// Whether `index`, alone or as a 1-tuple, is one boolean array of `array`'s shape, which NumPy
+/// assigns through with its own rules (`array_assign_boolean_subscript`) rather than by
+/// broadcasting.
+fn is_full_mask(runtime: &mut dyn PyRuntime, array: &Array, index: PyValue) -> PyResult<bool> {
+    let index = if runtime.kind(&index)? == PyKind::Tuple {
+        let tuple = index.cast(runtime)?;
+        match runtime.tuple_items(tuple)?.as_slice() {
+            [item] => *item,
+            _ => return Ok(false),
+        }
+    } else {
+        index
+    };
+    if runtime.native_kind(&index)? != Some(PyNativeKind::Array) {
+        return Ok(false);
+    }
+    let mask = Array::from_value(runtime, index)?;
+    Ok(mask.dtype.kind() == Kind::Bool && mask.shape() == array.shape())
+}
+
+/// A value assigned through a full boolean mask is a scalar, one value, or one value for each
+/// `True` element.
+fn check_mask_assignment(source: &Array, selected: usize) -> PyResult<()> {
+    if source.ndim() > 1 {
+        return Err(PyError::type_error(format!(
+            "NumPy boolean array indexing assignment requires a 0 or 1-dimensional input, input \
+             has {} dimensions",
+            source.ndim()
+        )));
+    }
+    if source.size() != 1 && source.size() != selected {
+        return Err(PyError::value_error(format!(
+            "NumPy boolean array indexing assignment cannot assign {} input values to the {} \
+             output values where the mask is true",
+            source.size(),
+            selected
+        )));
+    }
+    Ok(())
 }
 
 /// The array an assigned value stands for, converted with the destination's rules.

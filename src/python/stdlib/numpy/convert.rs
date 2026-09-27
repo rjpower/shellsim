@@ -209,6 +209,13 @@ fn discover(
             }
             return Err(inhomogeneous(&shape, shape.len()));
         }
+        if shape.len() == super::array::MAX_DIMS {
+            return Err(PyError::value_error(format!(
+                "setting an array element with a sequence. The requested array would exceed \
+                 the maximum number of dimension of {}.",
+                super::array::MAX_DIMS
+            )));
+        }
         shape.push(length.unwrap_or(0));
         super::array::element_count(&shape)?;
         if children.is_empty() {
@@ -364,6 +371,29 @@ pub(in crate::python) fn checked_int(value: WideInt, dtype: DType) -> PyResult<N
     })
 }
 
+/// The TypeError of `int(value)` or `float(value)` for a value of type `type_name`, which NumPy
+/// raises when such a value is stored into an integer or inexact dtype.
+fn not_a_number(target: DType, type_name: &str) -> PyError {
+    PyError::type_error(if target.is_integer() {
+        format!(
+            "int() argument must be a string, a bytes-like object or a real number, not '{type_name}'"
+        )
+    } else {
+        format!("float() argument must be a string or a real number, not '{type_name}'")
+    })
+}
+
+/// The number NumPy stores for an object that is not a number: its truth value in a bool dtype,
+/// NaN for `None` in an inexact dtype, and otherwise the error `int()` or `float()` raises.
+fn object_number(runtime: &mut dyn PyRuntime, value: &PyValue, target: DType) -> PyResult<Number> {
+    match target.category() {
+        Category::Bool => Ok(Number::Bool(runtime.truth(value)?)),
+        Category::Float if value.is_none() => Ok(Number::Float(f64::NAN)),
+        Category::Complex if value.is_none() => Ok(Number::Complex(f64::NAN, f64::NAN)),
+        _ => Err(not_a_number(target, &runtime.type_name(value)?)),
+    }
+}
+
 /// The number a leaf stands for when stored into a numeric dtype.
 pub(in crate::python) fn leaf_number(leaf: &Leaf, target: DType) -> PyResult<Number> {
     let integer_target = target.is_integer();
@@ -390,10 +420,7 @@ pub(in crate::python) fn leaf_number(leaf: &Leaf, target: DType) -> PyResult<Num
         Leaf::Float(value) => Number::Float(*value),
         Leaf::Complex(real, imag) => {
             if !matches!(target.category(), Category::Complex | Category::Bool) {
-                return Err(PyError::type_error(format!(
-                    "{}() argument must be a string or a real number, not 'complex'",
-                    if integer_target { "int" } else { "float" }
-                )));
+                return Err(not_a_number(target, "complex"));
             }
             Number::Complex(*real, *imag)
         }
@@ -509,8 +536,16 @@ fn write_leaves(
         kind => {
             let itemsize = target.itemsize();
             let mut bytes = vec![0u8; leaves.len() * itemsize];
-            for (leaf, chunk) in leaves.iter().zip(bytes.chunks_exact_mut(itemsize)) {
-                element::write_number(kind, leaf_number(leaf, target)?, chunk);
+            for ((leaf, value), chunk) in leaves
+                .iter()
+                .zip(values)
+                .zip(bytes.chunks_exact_mut(itemsize))
+            {
+                let number = match leaf {
+                    Leaf::Object => object_number(runtime, value, target)?,
+                    leaf => leaf_number(leaf, target)?,
+                };
+                element::write_number(kind, number, chunk);
             }
             PyArrayBuffer::Bytes(bytes)
         }

@@ -629,3 +629,17 @@ def test_real_imag_and_iscomplexobj_accept_python_values():
     assert np.iscomplexobj(np.complex64(0))
     assert not np.iscomplexobj(1)
     assert not np.iscomplexobj([1.5])
+
+
+def test_complex_arrays_reject_real_only_operations():
+    values = np.array([1 + 2j, 3 - 4j])
+    for operation, name in [(np.floor, "floor"), (np.invert, "invert")]:
+        with pytest.raises(TypeError) as info:
+            operation(values)
+        assert str(info.value) == (
+            f"ufunc '{name}' not supported for the input types, and the inputs could not be safely "
+            "coerced to any supported types according to the casting rule ''safe''"
+        )
+    with pytest.raises(TypeError) as info:
+        np.percentile(values, 50)
+    assert str(info.value) == "a must be an array of real numbers"
