@@ -1,661 +1,635 @@
-"""NumPy array pickles without a general ``pickle`` module.
+"""A clean-room protocol-4 pickler and restricted unpickler for `numpy.save`/`numpy.load`.
 
-shellsim has no ``pickle``, but ``.npy`` files store object arrays as the protocol 4 pickle that
-NumPy writes with ``pickle.dump``. ``dump`` writes the same bytes as CPython's C pickler for
-arrays whose elements are None, bools, ints, floats, complex numbers, strings, bytes, NumPy
-scalars and arrays, and lists, tuples and dicts of these, including its memo and frame layout.
-Two strings or bytes objects that are equal share a memo entry, as interned literals do in
-CPython. Other element types raise ``NotImplementedError``.
+shellsim has no `pickle` module, so `np.save` needs its own encoder for `dtype=object`
+arrays, and `np.load(allow_pickle=True)` needs a decoder that never imports a module or
+calls arbitrary code. Both are built directly from the pickle protocol (PEP 3154) and the
+`pickletools` opcode descriptions, and their output was checked byte for byte against
+CPython 3.14's `pickle.dumps` and NumPy 2.5.3's `np.save` for the element types shellsim
+supports: `None`, `bool`, `int`, `float`, `complex`, `str`, `bytes`, `list`, `tuple`, `dict`,
+and NumPy scalars and arrays, nested to any depth.
 
-``load`` reads pickles of protocols 2 to 5, but resolves only the globals NumPy's array pickles
-use: its array and scalar reconstructors, ``ndarray``, ``dtype``, and a few builtins. Reading a
-file therefore never imports a module or calls arbitrary code; any other global raises
-``UnpicklingError``, as a restricted ``pickle.Unpickler`` would.
+Framing (protocol 4's `FRAME` opcode) is reproduced with CPython's own thresholds: pickled
+bytes are buffered and flushed as a frame once the buffer reaches 64 KiB, and a `str`/`bytes`
+payload at or above that size is written directly to the stream, forcing a flush of whatever
+was buffered first. Memoization matches CPython's `MEMOIZE` scheme (one shared, sequential
+index space) with one deliberate difference, noted in docs/numpy.md: shellsim strings have no
+identity, so they are memoized by value. Every other memoized type (bytes, tuples, lists,
+dicts, and the dtype/global objects built along the way) is memoized by object identity, as
+CPython does.
+
+The unpickler resolves only the small set of globals the pickler itself can produce
+(`numpy._core.multiarray._reconstruct` and `.scalar`, `numpy.ndarray`, `numpy.dtype`, and
+`builtins.complex`); anything else raises `UnpicklingError` before it is looked up or called,
+so a crafted file cannot import a module or invoke arbitrary code.
 """
 
 import struct
 
-import numpy
+import numpy as np
 
-_FRAME_SIZE_MIN = 4
 _FRAME_SIZE_TARGET = 64 * 1024
-_BATCHSIZE = 1000
-_MULTIARRAY = "numpy._core.multiarray"
+_FRAME_SIZE_MIN = 4
+_BATCH_SIZE = 1000
+
+# `_reconstruct`'s third argument is always this exact one-byte object: NumPy passes the same
+# shared `b"b"` constant for every array in a pickle (it lives in `ndarray.__reduce__`'s
+# compiled code, reused on every call), so bytes memoization-by-identity picks it up as a
+# repeat after the first array. A literal written fresh at each `_save_ndarray` call would be a
+# distinct object every time and never get memoized, so it is hoisted to a single shared
+# instance here.
+_RECONSTRUCT_MODE = b"b"
 
 
 class UnpicklingError(Exception):
-    pass
+    """A pickle stream named a disallowed global, was malformed, or ran out of bytes."""
 
 
-class _Global:
-    """A module attribute that pickles as a reference, such as ``numpy.ndarray``."""
-
-    def __init__(self, module, name):
-        self.module = module
-        self.name = name
+def dumps(array):
+    """The protocol-4 pickle bytes for a `numpy.ndarray`, matching CPython's `pickle.dumps`."""
+    return _Pickler().dumps(array)
 
 
-class _Reduce:
-    """An object that pickles as ``func(*args)``, then ``BUILD`` with ``state`` if given."""
-
-    def __init__(self, key, func, args, state=None):
-        self.key = key
-        self.func = func
-        self.args = args
-        self.state = state
+def loads(data):
+    """Reconstruct the value a restricted `dumps`-compatible pickle stream encodes."""
+    return _Unpickler(data).load()
 
 
-_RECONSTRUCT = _Global(_MULTIARRAY, "_reconstruct")
-_SCALAR = _Global(_MULTIARRAY, "scalar")
-_NDARRAY = _Global("numpy", "ndarray")
-_DTYPE = _Global("numpy", "dtype")
-_COMPLEX = _Global("builtins", "complex")
+def _pack_be_double(value):
+    # BINFLOAT is the one big-endian field in an otherwise little-endian protocol.
+    return struct.pack(">d", value)
 
 
-def _dtype_reduce(dtype):
-    """``dtype.__reduce__()``: NumPy keeps one instance of each native builtin dtype, so equal
-    native dtypes share a memo entry and other dtypes never do."""
-    if dtype.kind == "O":
-        descr, order, sizes, flags = "O8", "|", (-1, -1), 63
-    elif dtype.kind == "U":
-        descr, order, sizes, flags = f"U{dtype.itemsize // 4}", "<", (dtype.itemsize, 4), 8
-    else:
-        descr, sizes, flags = f"{dtype.kind}{dtype.itemsize}", (-1, -1), 0
-        order = "|" if dtype.itemsize == 1 else dtype.str[0]
-    key = ("dtype", dtype.str) if dtype.isnative else ("unique", object())
-    state = (3, order, None, None, None, sizes[0], sizes[1], flags)
-    return _Reduce(key, _DTYPE, (descr, False, True), state)
+def _unpack_be_double(data):
+    return struct.unpack(">d", bytes(data))[0]
 
 
-def _array_reduce(array):
-    """``ndarray.__reduce__()``: object elements travel as a C-order list, others as bytes in
-    the array's memory order."""
-    fortran = bool(array.flags.fnc)
-    if array.dtype.kind == "O":
-        raw = array.ravel().tolist()
-    else:
-        raw = array.tobytes(order="A")
-    state = (1, tuple(array.shape), _dtype_reduce(array.dtype), fortran, raw)
-    return _Reduce(("id", id(array)), _RECONSTRUCT, (_NDARRAY, (0,), b"b"), state)
+def _pack_uint_le(value, length):
+    """`int.to_bytes(length, 'little')`, built from shifts: shellsim's `int` has no
+    `to_bytes`/`from_bytes`, but its bitwise operators work on arbitrary-precision ints."""
+    return bytes((value >> (8 * index)) & 0xFF for index in range(length))
 
 
-def _encode_long(value):
-    """Two's-complement little-endian bytes of ``value``, as ``pickle.encode_long`` gives."""
-    magnitude = -value - 1 if value < 0 else value
-    bits = 0
-    while magnitude:
-        magnitude >>= 1
-        bits += 1
-    length = (bits >> 3) + 1
-    remaining = value % (1 << (8 * length))
-    data = bytearray()
-    for _ in range(length):
-        data.append(remaining & 0xFF)
-        remaining >>= 8
-    if value < 0 and length > 1 and data[-1] == 0xFF and data[-2] & 0x80:
-        del data[-1]
-    return bytes(data)
-
-
-def _decode_long(data):
+def _unpack_uint_le(data):
     value = 0
-    for byte in reversed(data):
-        value = (value << 8) | byte
-    if data and data[-1] & 0x80:
-        value -= 1 << (8 * len(data))
+    for index, byte in enumerate(data):
+        value |= byte << (8 * index)
     return value
+
+
+def _pack_int_le(value, length):
+    if value < 0:
+        value += 1 << (8 * length)
+    return _pack_uint_le(value, length)
+
+
+def _unpack_int_le(data):
+    value = _unpack_uint_le(data)
+    bits = 8 * len(data)
+    if value >= 1 << (bits - 1):
+        value -= 1 << bits
+    return value
+
+
+def _bit_length(value):
+    if value < 0:
+        value = ~value
+    return 0 if value == 0 else len(bin(value)) - 2
+
+
+def _long_to_bytes(value):
+    """Minimal little-endian two's-complement bytes for an arbitrary-precision int."""
+    if value == 0:
+        return b""
+    length = _bit_length(value) // 8 + 1
+    return _pack_int_le(value, length)
+
+
+def _long_from_bytes(data):
+    if not data:
+        return 0
+    return _unpack_int_le(data)
 
 
 class _Pickler:
     def __init__(self):
-        self.output = []
-        self.framing = False
-        self.frame = None
-        self.frame_size = 0
-        self.memo = {}
-        # Objects memoized by id stay referenced so that no other object can reuse their id.
-        self.alive = []
+        self._out = bytearray()
+        self._frame = bytearray()
+        self._next_memo = 0
+        self._id_memo = {}
+        self._str_memo = {}
+        self._global_memo = {}
+        self._dtype_memo = {}
 
-    def dump(self, obj):
-        self.output.append(b"\x80\x04")
-        self.framing = True
-        self.save(obj)
-        self.write(b".")
-        self.commit_frame()
+    def dumps(self, value):
+        self._out += b"\x80\x04"
+        self._save(value)
+        self._frame += b"."
+        self._commit(force=True)
+        return bytes(self._out)
 
-    def write(self, data):
-        if not self.framing:
-            self.output.append(data)
+    # -- framing --------------------------------------------------------
+
+    def _commit(self, force=False):
+        if not self._frame:
             return
-        if self.frame is None:
-            self.frame = []
-            self.frame_size = 0
-        self.frame.append(data)
-        self.frame_size += len(data)
-
-    def commit_frame(self):
-        if self.frame is None:
+        if not force and len(self._frame) < _FRAME_SIZE_TARGET:
             return
-        data = b"".join(self.frame)
-        if len(data) >= _FRAME_SIZE_MIN:
-            self.output.append(b"\x95" + struct.pack("<Q", len(data)))
-        self.output.append(data)
-        self.frame = None
+        if len(self._frame) >= _FRAME_SIZE_MIN:
+            self._out += b"\x95" + _pack_uint_le(len(self._frame), 8)
+        self._out += self._frame
+        self._frame = bytearray()
 
-    def write_payload(self, header, payload):
-        # Large payloads bypass framing so a reader can copy them without buffering.
-        if len(payload) < _FRAME_SIZE_TARGET:
-            self.write(header)
-            self.write(payload)
-            return
-        self.commit_frame()
-        self.output.append(header)
-        self.output.append(payload)
+    def _emit(self, data):
+        self._frame += data
 
-    def memoize(self, key):
-        self.memo[key] = len(self.memo)
-        self.write(b"\x94")
+    def _emit_large(self, data):
+        self._commit(force=True)
+        self._out += data
 
-    def memo_get(self, key):
-        index = self.memo[key]
+    def _memoize(self):
+        index = self._next_memo
+        self._next_memo += 1
+        self._emit(b"\x94")
+        return index
+
+    def _emit_get(self, index):
         if index < 256:
-            self.write(b"h" + bytes([index]))
+            self._emit(b"h" + bytes([index]))
         else:
-            self.write(b"j" + struct.pack("<I", index))
+            self._emit(b"j" + _pack_uint_le(index, 4))
 
-    def save(self, obj):
-        # CPython's C pickler ends a frame at the start of the save that finds it full.
-        if self.frame is not None and self.frame_size >= _FRAME_SIZE_TARGET:
-            self.commit_frame()
-        kind = type(obj)
-        if obj is None:
-            self.write(b"N")
-        elif kind is bool:
-            self.write(b"\x88" if obj else b"\x89")
-        elif kind is int:
-            self.save_int(obj)
-        elif kind is float:
-            self.write(b"G" + struct.pack(">d", obj))
-        elif kind is str:
-            self.save_memoized(("str", obj), self.save_str, obj)
-        elif kind is bytes:
-            self.save_memoized(("bytes", obj), self.save_bytes, obj)
-        elif kind is tuple:
-            self.save_memoized(("id", id(obj)), self.save_tuple, obj)
-        elif kind is list:
-            self.save_memoized(("id", id(obj)), self.save_list, obj)
-        elif kind is dict:
-            self.save_memoized(("id", id(obj)), self.save_dict, obj)
-        elif kind is complex:
-            reduced = _Reduce(("id", id(obj)), _COMPLEX, (obj.real, obj.imag))
-            self.save_memoized(reduced.key, self.save_reduce, reduced, obj)
-        elif kind is _Global:
-            self.save_memoized(("global", obj.module, obj.name), self.save_global, obj)
-        elif kind is _Reduce:
-            self.save_memoized(obj.key, self.save_reduce, obj)
-        elif isinstance(obj, numpy.ndarray):
-            reduced = _array_reduce(obj)
-            self.save_memoized(reduced.key, self.save_reduce, reduced, obj)
-        elif isinstance(obj, numpy.generic):
-            reduced = _Reduce(
-                ("unique", object()),
-                _SCALAR,
-                (_dtype_reduce(obj.dtype), numpy.array(obj).tobytes()),
-            )
-            self.save_reduce(reduced)
+    # -- dispatch ---------------------------------------------------------
+
+    def _save(self, value):
+        self._commit(force=False)
+        if value is None:
+            self._emit(b"N")
+        elif value is True:
+            self._emit(b"\x88")
+        elif value is False:
+            self._emit(b"\x89")
+        elif value is np.ndarray:
+            self._save_global("numpy", "ndarray")
+        elif isinstance(value, np.dtype):
+            self._save_dtype(value)
+        elif isinstance(value, np.ndarray):
+            self._save_ndarray(value)
+        elif isinstance(value, np.generic):
+            # NumPy scalars always pickle through `numpy._core.multiarray.scalar`, even the
+            # ones (`float64`/`complex128`/`str_`/`bytes_`) that also subclass a builtin type
+            # `isinstance` would otherwise match below, so this check must come first.
+            self._save_scalar(value)
+        elif isinstance(value, int):
+            self._save_int(value)
+        elif isinstance(value, float):
+            self._emit(b"G" + _pack_be_double(value))
+        elif isinstance(value, complex):
+            self._save_complex(value)
+        elif isinstance(value, str):
+            self._save_str(value)
+        elif isinstance(value, bytes):
+            self._save_bytes(value)
+        elif isinstance(value, tuple):
+            self._save_tuple(value)
+        elif isinstance(value, list):
+            self._save_list(value)
+        elif isinstance(value, dict):
+            self._save_dict(value)
         else:
             raise NotImplementedError(
-                f"np.save cannot pickle {kind.__name__!r} array elements in shellsim"
+                f"np.save cannot pickle {type(value).__name__!r} array elements in shellsim"
             )
 
-    def save_memoized(self, key, save, obj, keep=None):
-        if key in self.memo:
-            self.memo_get(key)
-            return
-        self.alive.append(obj if keep is None else keep)
-        save(obj)
-
-    def save_int(self, value):
-        if -0x80000000 <= value <= 0x7FFFFFFF:
-            if 0 <= value <= 0xFF:
-                self.write(b"K" + bytes([value]))
-            elif 0 <= value <= 0xFFFF:
-                self.write(b"M" + struct.pack("<H", value))
+    def _save_int(self, value):
+        if 0 <= value <= 0xFF:
+            self._emit(b"K" + bytes([value]))
+        elif 0x100 <= value <= 0xFFFF:
+            self._emit(b"M" + _pack_uint_le(value, 2))
+        elif -(2**31) <= value <= 2**31 - 1:
+            self._emit(b"J" + _pack_int_le(value, 4))
+        else:
+            body = _long_to_bytes(value)
+            if len(body) < 256:
+                self._emit(b"\x8a" + bytes([len(body)]) + body)
             else:
-                self.write(b"J" + struct.pack("<i", value))
+                self._emit(b"\x8b" + _pack_uint_le(len(body), 4) + body)
+
+    def _save_complex(self, value):
+        cached = self._id_memo.get(id(value))
+        if cached is not None:
+            self._emit_get(cached)
             return
-        data = _encode_long(value)
-        if len(data) < 256:
-            self.write(b"\x8a" + bytes([len(data)]) + data)
-        else:
-            self.write(b"\x8b" + struct.pack("<i", len(data)) + data)
+        self._save_global("builtins", "complex")
+        self._save_tuple((value.real, value.imag))
+        self._emit(b"R")
+        self._id_memo[id(value)] = self._memoize()
 
-    def save_str(self, value):
-        data = value.encode("utf-8")
-        if len(data) < 256:
-            header = b"\x8c" + bytes([len(data)])
-        elif len(data) <= 0xFFFFFFFF:
-            header = b"X" + struct.pack("<I", len(data))
+    def _save_str(self, value):
+        cached = self._str_memo.get(value)
+        if cached is not None:
+            self._emit_get(cached)
+            return
+        encoded = value.encode("utf-8")
+        opcode = _text_length_opcode(b"\x8c", b"X", b"\x8d", encoded)
+        if len(encoded) >= _FRAME_SIZE_TARGET:
+            self._emit_large(opcode)
         else:
-            header = b"\x8d" + struct.pack("<Q", len(data))
-        self.write_payload(header, data)
-        self.memoize(("str", value))
+            self._emit(opcode)
+        self._str_memo[value] = self._memoize()
 
-    def save_bytes(self, value):
-        if len(value) < 256:
-            header = b"C" + bytes([len(value)])
-        elif len(value) <= 0xFFFFFFFF:
-            header = b"B" + struct.pack("<I", len(value))
+    def _save_bytes(self, value):
+        cached = self._id_memo.get(id(value))
+        if cached is not None:
+            self._emit_get(cached)
+            return
+        opcode = _text_length_opcode(b"C", b"B", b"\x8e", value)
+        if len(value) >= _FRAME_SIZE_TARGET:
+            self._emit_large(opcode)
         else:
-            header = b"\x8e" + struct.pack("<Q", len(value))
-        self.write_payload(header, value)
-        self.memoize(("bytes", value))
+            self._emit(opcode)
+        self._id_memo[id(value)] = self._memoize()
 
-    def save_tuple(self, value):
-        key = ("id", id(value))
+    def _save_tuple(self, value):
         if not value:
-            self.write(b")")
+            self._emit(b")")
             return
-        if len(value) <= 3:
-            for item in value:
-                self.save(item)
-            if key in self.memo:
-                # The tuple contains itself through a mutable element.
-                self.write(b"0" * len(value))
-                self.memo_get(key)
-                return
-            self.write(bytes([0x84 + len(value)]))
-        else:
-            self.write(b"(")
-            for item in value:
-                self.save(item)
-            if key in self.memo:
-                self.write(b"1")
-                self.memo_get(key)
-                return
-            self.write(b"t")
-        self.memoize(key)
+        cached = self._id_memo.get(id(value))
+        if cached is not None:
+            self._emit_get(cached)
+            return
+        batched = len(value) > 3
+        if batched:
+            self._emit(b"(")
+        for item in value:
+            self._save(item)
+        self._emit({1: b"\x85", 2: b"\x86", 3: b"\x87"}.get(len(value), b"t"))
+        self._id_memo[id(value)] = self._memoize()
 
-    def save_list(self, value):
-        self.write(b"]")
-        self.memoize(("id", id(value)))
+    def _save_list(self, value):
+        cached = self._id_memo.get(id(value))
+        if cached is not None:
+            self._emit_get(cached)
+            return
+        self._emit(b"]")
+        self._id_memo[id(value)] = self._memoize()
+        # A single-element list uses the plain APPEND opcode; every other size, including a
+        # trailing remainder chunk of exactly 1 item after a full batch, still uses the
+        # MARK-delimited APPENDS form (confirmed against the reference for sizes 1, 2, 999-1002,
+        # 2000-2001).
         if len(value) == 1:
-            self.save(value[0])
-            self.write(b"a")
+            self._save(value[0])
+            self._emit(b"a")
             return
-        start = 0
-        while start < len(value):
-            self.write(b"(")
-            for item in value[start:start + _BATCHSIZE]:
-                self.save(item)
-            self.write(b"e")
-            start += _BATCHSIZE
+        for start in range(0, len(value), _BATCH_SIZE):
+            chunk = value[start : start + _BATCH_SIZE]
+            self._emit(b"(")
+            for item in chunk:
+                self._save(item)
+            self._emit(b"e")
 
-    def save_dict(self, value):
-        self.write(b"}")
-        self.memoize(("id", id(value)))
+    def _save_dict(self, value):
+        cached = self._id_memo.get(id(value))
+        if cached is not None:
+            self._emit_get(cached)
+            return
+        self._emit(b"}")
+        self._id_memo[id(value)] = self._memoize()
         items = list(value.items())
+        # Same rule as `_save_list`: only a single-pair dict gets the plain SETITEM opcode.
         if len(items) == 1:
-            self.save(items[0][0])
-            self.save(items[0][1])
-            self.write(b"s")
+            key, val = items[0]
+            self._save(key)
+            self._save(val)
+            self._emit(b"s")
             return
-        start = 0
-        while start < len(items):
-            self.write(b"(")
-            for key, item in items[start:start + _BATCHSIZE]:
-                self.save(key)
-                self.save(item)
-            self.write(b"u")
-            start += _BATCHSIZE
+        for start in range(0, len(items), _BATCH_SIZE):
+            chunk = items[start : start + _BATCH_SIZE]
+            self._emit(b"(")
+            for key, val in chunk:
+                self._save(key)
+                self._save(val)
+            self._emit(b"u")
 
-    def save_global(self, value):
-        self.save(value.module)
-        self.save(value.name)
-        self.write(b"\x93")
-        self.memoize(("global", value.module, value.name))
+    def _save_global(self, module, name):
+        key = (module, name)
+        cached = self._global_memo.get(key)
+        if cached is not None:
+            self._emit_get(cached)
+            return
+        self._save_str(module)
+        self._save_str(name)
+        self._emit(b"\x93")
+        self._global_memo[key] = self._memoize()
 
-    def save_reduce(self, value):
-        self.save(value.func)
-        self.save(value.args)
-        self.write(b"R")
-        if value.key in self.memo:
-            self.write(b"0")
-            self.memo_get(value.key)
+    def _save_dtype(self, dtype):
+        key = dtype.str
+        cached = self._dtype_memo.get(key)
+        if cached is not None:
+            self._emit_get(cached)
+            return
+        self._save_global("numpy", "dtype")
+        code, byteorder, itemsize, alignment, flags = _dtype_pickle_fields(dtype)
+        self._save_tuple((code, False, True))
+        self._emit(b"R")
+        self._dtype_memo[key] = self._memoize()
+        self._save_tuple((3, byteorder, None, None, None, itemsize, alignment, flags))
+        self._emit(b"b")
+
+    def _save_scalar(self, value):
+        cached = self._id_memo.get(id(value))
+        if cached is not None:
+            self._emit_get(cached)
+            return
+        self._save_global("numpy._core.multiarray", "scalar")
+        dtype = value.dtype
+        payload = np.array(value, dtype=dtype).tobytes()
+        self._save_tuple((dtype, payload))
+        self._emit(b"R")
+        self._id_memo[id(value)] = self._memoize()
+
+    def _save_ndarray(self, array):
+        cached = self._id_memo.get(id(array))
+        if cached is not None:
+            self._emit_get(cached)
+            return
+        self._save_global("numpy._core.multiarray", "_reconstruct")
+        self._save_tuple((np.ndarray, (0,), _RECONSTRUCT_MODE))
+        self._emit(b"R")
+        self._id_memo[id(array)] = self._memoize()
+        fortran_order = bool(array.flags.f_contiguous) and not bool(array.flags.c_contiguous)
+        order = "F" if fortran_order else "C"
+        if array.dtype == np.dtype(object):
+            data = array.reshape(-1, order=order).tolist()
         else:
-            self.memoize(value.key)
-        if value.state is not None:
-            self.save(value.state)
-            self.write(b"b")
+            data = array.tobytes(order=order)
+        self._save_tuple((1, array.shape, array.dtype, fortran_order, data))
+        self._emit(b"b")
 
 
-def dump(obj, file):
-    """Write ``obj`` to ``file`` as ``pickle.dump(obj, file, protocol=4)`` does."""
-    pickler = _Pickler()
-    pickler.dump(obj)
-    file.write(b"".join(pickler.output))
+def _text_length_opcode(short_op, medium_op, long_op, payload):
+    length = len(payload)
+    if length < 256:
+        return short_op + bytes([length]) + payload
+    if length < 2**32:
+        return medium_op + _pack_uint_le(length, 4) + payload
+    return long_op + _pack_uint_le(length, 8) + payload
+
+
+def _dtype_pickle_fields(dtype):
+    """(code, byteorder, itemsize, alignment, flags) for a dtype's pickled `__reduce__` state.
+
+    Matches NumPy's own encoding: the code is the dtype's `.str` without its byte-order
+    character, except for `object`, which NumPy pickles as the legacy code `'O8'`. Plain
+    numeric dtypes carry no real itemsize/alignment/flags in the state (`-1, -1, 0`); `str`
+    dtypes carry their true byte itemsize, a 4-byte alignment, and flag `8`; `object` carries
+    `-1, -1, 63`. These constants were read off `pickle.dumps(np.dtype(...))` for every dtype
+    shellsim supports.
+    """
+    if dtype.kind == "O":
+        return "O8", "|", -1, -1, 63
+    if dtype.kind == "U":
+        return f"U{dtype.itemsize // 4}", "<", dtype.itemsize, 4, 8
+    return dtype.str[1:], dtype.str[0], -1, -1, 0
+
+
+# -- restricted unpickling ------------------------------------------------
+
+_RECONSTRUCT = object()
+_NDARRAY_CLASS = object()
+_DTYPE_CTOR = object()
+_SCALAR_CTOR = object()
+
+_ALLOWED_GLOBALS = {
+    ("numpy._core.multiarray", "_reconstruct"): _RECONSTRUCT,
+    ("numpy", "ndarray"): _NDARRAY_CLASS,
+    ("numpy", "dtype"): _DTYPE_CTOR,
+    ("numpy._core.multiarray", "scalar"): _SCALAR_CTOR,
+    ("builtins", "complex"): complex,
+}
+
+
+def _resolve_global(module, name):
+    key = (module, name)
+    if key not in _ALLOWED_GLOBALS:
+        raise UnpicklingError(f"global '{module}.{name}' is forbidden")
+    return _ALLOWED_GLOBALS[key]
 
 
 class _Pending:
-    """An array or dtype under construction: the result of ``REDUCE``, completed by ``BUILD``.
+    """A reduced-but-not-yet-built object: the target of a later `BUILD` opcode."""
 
-    The memo slots that hold it are recorded so ``BUILD`` can replace them with the result.
-    """
+    __slots__ = ("kind", "payload", "memo_index")
 
-    def __init__(self, kind, args):
+    def __init__(self, kind, payload=None):
         self.kind = kind
-        self.args = args
-        self.slots = []
+        self.payload = payload
+        self.memo_index = None
 
 
-def _codecs_encode(text, encoding="utf-8"):
-    return text.encode(encoding)
+class _Reader:
+    def __init__(self, data):
+        self._data = data
+        self._pos = 0
 
+    def read(self, count):
+        end = self._pos + count
+        if end > len(self._data):
+            raise UnpicklingError("pickle data was truncated")
+        chunk = self._data[self._pos : end]
+        self._pos = end
+        return chunk
 
-def _scalar(dtype, data):
-    if dtype.kind == "O":
-        return data
-    return numpy.frombuffer(data, dtype=dtype)[0]
-
-
-def _reconstruct(cls, shape, typecode):
-    return _Pending("array", ())
-
-
-_ALLOWED_GLOBALS = {
-    (_MULTIARRAY, "_reconstruct"): _reconstruct,
-    ("numpy.core.multiarray", "_reconstruct"): _reconstruct,
-    (_MULTIARRAY, "scalar"): _scalar,
-    ("numpy.core.multiarray", "scalar"): _scalar,
-    ("numpy", "ndarray"): numpy.ndarray,
-    ("numpy", "dtype"): numpy.dtype,
-    ("builtins", "complex"): complex,
-    ("__builtin__", "complex"): complex,
-    ("builtins", "set"): set,
-    ("__builtin__", "set"): set,
-    ("builtins", "frozenset"): frozenset,
-    ("__builtin__", "frozenset"): frozenset,
-    ("builtins", "bytearray"): bytearray,
-    ("__builtin__", "bytearray"): bytearray,
-    ("_codecs", "encode"): _codecs_encode,
-}
-
-_CALLABLE = (_reconstruct, _scalar, complex, set, frozenset, bytearray, _codecs_encode)
-
-
-def _finish_dtype(pending, state):
-    descr = pending.args[0]
-    if not isinstance(descr, str):
-        raise UnpicklingError("invalid dtype descriptor in pickle")
-    if len(state) >= 5 and (state[3] is not None or state[4] is not None):
-        raise NotImplementedError("structured dtypes are not supported by shellsim's NumPy")
-    dtype = numpy.dtype(descr)
-    if len(state) >= 2 and state[1] == ">":
-        dtype = dtype.newbyteorder(">")
-    return dtype
-
-
-def _finish_array(state):
-    if len(state) == 5:
-        state = state[1:]
-    if len(state) != 4:
-        raise UnpicklingError("invalid ndarray state in pickle")
-    shape, dtype, fortran, raw = state
-    shape = tuple(shape)
-    count = 1
-    for length in shape:
-        count *= length
-    if dtype.kind == "O":
-        if not isinstance(raw, list) or len(raw) != count:
-            raise ValueError("object pickle not returning list")
-        array = numpy.empty(count, dtype=object)
-        for index, item in enumerate(raw):
-            array[index] = item
-        array = array.reshape(shape)
-        return numpy.asfortranarray(array) if fortran else array
-    if isinstance(raw, str):
-        raw = raw.encode("latin1")
-    if len(raw) != count * dtype.itemsize:
-        raise ValueError("buffer size does not match array size")
-    array = numpy.frombuffer(raw, dtype=dtype, count=count).copy()
-    if fortran:
-        return array.reshape(shape[::-1]).T
-    return array.reshape(shape)
+    def read_line(self):
+        newline = self._data.find(b"\n", self._pos)
+        if newline < 0:
+            raise UnpicklingError("pickle data was truncated")
+        line = self._data[self._pos : newline]
+        self._pos = newline + 1
+        return line
 
 
 class _Unpickler:
-    def __init__(self, data, encoding):
-        self.data = data
-        self.position = 0
-        self.encoding = encoding
-        self.stack = []
-        self.marks = []
-        self.memo = {}
-
-    def take(self, count):
-        end = self.position + count
-        if end > len(self.data):
-            raise UnpicklingError("pickle data was truncated")
-        value = self.data[self.position:end]
-        self.position = end
-        return value
-
-    def pop_mark(self):
-        if not self.marks:
-            raise UnpicklingError("could not find MARK")
-        items = self.stack
-        self.stack = self.marks.pop()
-        return items
-
-    def put(self, index):
-        value = self.stack[-1]
-        self.memo[index] = value
-        if isinstance(value, _Pending):
-            value.slots.append(index)
-
-    def get(self, index):
-        if index not in self.memo:
-            raise UnpicklingError(f"Memo value not found at index {index}")
-        self.stack.append(self.memo[index])
-
-    def text(self, data):
-        if self.encoding == "bytes":
-            return data
-        return data.decode(self.encoding)
-
-    def find_class(self, module, name):
-        value = _ALLOWED_GLOBALS.get((module, name))
-        if value is None:
-            raise UnpicklingError(f"global '{module}.{name}' is forbidden")
-        return value
-
-    def reduce(self, func, args):
-        if func is numpy.dtype:
-            return _Pending("dtype", args)
-        if not any(func is allowed for allowed in _CALLABLE):
-            raise UnpicklingError("only NumPy array and scalar reconstructors may be called")
-        return func(*args)
-
-    def build(self, state):
-        pending = self.stack[-1]
-        if not isinstance(pending, _Pending):
-            raise UnpicklingError("BUILD is only supported for NumPy arrays and dtypes")
-        if pending.kind == "dtype":
-            value = _finish_dtype(pending, state)
-        else:
-            value = _finish_array(state)
-        self.stack[-1] = value
-        for index in pending.slots:
-            self.memo[index] = value
+    def __init__(self, data):
+        self._reader = _Reader(bytes(data))
+        self._stack = []
+        self._marks = []
+        self._memo = []
 
     def load(self):
-        stack = self.stack
         while True:
-            opcode = self.take(1)[0]
-            if opcode == 0x80:
-                protocol = self.take(1)[0]
-                if protocol > 5:
-                    raise ValueError(f"unsupported pickle protocol: {protocol}")
-            elif opcode == 0x95:
-                self.take(8)
-            elif opcode == 0x2E:
-                if not stack:
-                    raise UnpicklingError("unpickling stack underflow")
-                value = stack.pop()
-                if isinstance(value, _Pending):
-                    raise UnpicklingError("pickle ends before its array is built")
-                return value
-            elif opcode == 0x28:
-                self.marks.append(stack)
-                self.stack = stack = []
-            elif opcode == 0x30:
-                if stack:
-                    stack.pop()
-                else:
-                    self.pop_mark()
-                    stack = self.stack
-            elif opcode == 0x31:
-                self.pop_mark()
-                stack = self.stack
-            elif opcode == 0x32:
-                stack.append(stack[-1])
-            elif opcode == 0x4E:
-                stack.append(None)
-            elif opcode == 0x88:
-                stack.append(True)
-            elif opcode == 0x89:
-                stack.append(False)
-            elif opcode == 0x4B:
-                stack.append(self.take(1)[0])
-            elif opcode == 0x4D:
-                stack.append(struct.unpack("<H", self.take(2))[0])
-            elif opcode == 0x4A:
-                stack.append(struct.unpack("<i", self.take(4))[0])
-            elif opcode == 0x8A:
-                stack.append(_decode_long(self.take(self.take(1)[0])))
-            elif opcode == 0x8B:
-                length = struct.unpack("<i", self.take(4))[0]
-                if length < 0:
-                    raise UnpicklingError("LONG pickle has negative byte count")
-                stack.append(_decode_long(self.take(length)))
-            elif opcode == 0x47:
-                stack.append(struct.unpack(">d", self.take(8))[0])
-            elif opcode == 0x8C:
-                stack.append(self.take(self.take(1)[0]).decode("utf-8"))
-            elif opcode == 0x58:
-                stack.append(self.take(struct.unpack("<I", self.take(4))[0]).decode("utf-8"))
-            elif opcode == 0x8D:
-                stack.append(self.take(struct.unpack("<Q", self.take(8))[0]).decode("utf-8"))
-            elif opcode == 0x43:
-                stack.append(self.take(self.take(1)[0]))
-            elif opcode == 0x42:
-                stack.append(self.take(struct.unpack("<I", self.take(4))[0]))
-            elif opcode == 0x8E:
-                stack.append(self.take(struct.unpack("<Q", self.take(8))[0]))
-            elif opcode == 0x96:
-                stack.append(bytearray(self.take(struct.unpack("<Q", self.take(8))[0])))
-            elif opcode == 0x55:
-                stack.append(self.text(self.take(self.take(1)[0])))
-            elif opcode == 0x54:
-                length = struct.unpack("<i", self.take(4))[0]
-                if length < 0:
-                    raise UnpicklingError("BINSTRING pickle has negative byte count")
-                stack.append(self.text(self.take(length)))
-            elif opcode == 0x29:
-                stack.append(())
-            elif opcode == 0x74:
-                items = self.pop_mark()
-                stack = self.stack
-                stack.append(tuple(items))
-            elif 0x85 <= opcode <= 0x87:
-                count = opcode - 0x84
-                if len(stack) < count:
-                    raise UnpicklingError("unpickling stack underflow")
-                items = tuple(stack[-count:])
-                del stack[-count:]
-                stack.append(items)
-            elif opcode == 0x5D:
-                stack.append([])
-            elif opcode == 0x6C:
-                items = self.pop_mark()
-                stack = self.stack
-                stack.append(list(items))
-            elif opcode == 0x61:
-                item = stack.pop()
-                stack[-1].append(item)
-            elif opcode == 0x65:
-                items = self.pop_mark()
-                stack = self.stack
-                stack[-1].extend(items)
-            elif opcode == 0x7D:
-                stack.append({})
-            elif opcode == 0x64:
-                items = self.pop_mark()
-                stack = self.stack
-                stack.append({items[i]: items[i + 1] for i in range(0, len(items), 2)})
-            elif opcode == 0x73:
-                item = stack.pop()
-                key = stack.pop()
-                stack[-1][key] = item
-            elif opcode == 0x75:
-                items = self.pop_mark()
-                stack = self.stack
-                target = stack[-1]
-                for i in range(0, len(items), 2):
-                    target[items[i]] = items[i + 1]
-            elif opcode == 0x8F:
-                stack.append(set())
-            elif opcode == 0x90:
-                items = self.pop_mark()
-                stack = self.stack
-                stack[-1].update(items)
-            elif opcode == 0x91:
-                items = self.pop_mark()
-                stack = self.stack
-                stack.append(frozenset(items))
-            elif opcode == 0x71:
-                self.put(self.take(1)[0])
-            elif opcode == 0x72:
-                self.put(struct.unpack("<I", self.take(4))[0])
-            elif opcode == 0x94:
-                self.put(len(self.memo))
-            elif opcode == 0x68:
-                self.get(self.take(1)[0])
-            elif opcode == 0x6A:
-                self.get(struct.unpack("<I", self.take(4))[0])
-            elif opcode == 0x63:
-                module = self.readline().decode("ascii")
-                name = self.readline().decode("ascii")
-                stack.append(self.find_class(module, name))
-            elif opcode == 0x93:
-                name = stack.pop()
-                module = stack.pop()
-                if type(name) is not str or type(module) is not str:
-                    raise UnpicklingError("STACK_GLOBAL requires str")
-                stack.append(self.find_class(module, name))
-            elif opcode == 0x52:
-                args = stack.pop()
-                func = stack.pop()
-                stack.append(self.reduce(func, args))
-            elif opcode == 0x62:
-                self.build(stack.pop())
-            else:
-                raise UnpicklingError(f"unsupported pickle opcode 0x{opcode:02x}")
+            op = self._reader.read(1)
+            if op == b".":
+                if not self._stack:
+                    raise UnpicklingError("pickle data was truncated")
+                return self._stack[-1]
+            self._dispatch(op)
 
-    def readline(self):
-        end = self.data.find(b"\n", self.position)
-        if end < 0:
+    def _dispatch(self, op):
+        reader = self._reader
+        stack = self._stack
+        if op == b"\x80":
+            reader.read(1)
+        elif op == b"\x95":
+            reader.read(8)
+        elif op == b"N":
+            stack.append(None)
+        elif op == b"\x88":
+            stack.append(True)
+        elif op == b"\x89":
+            stack.append(False)
+        elif op == b"K":
+            stack.append(reader.read(1)[0])
+        elif op == b"M":
+            stack.append(_unpack_uint_le(reader.read(2)))
+        elif op == b"J":
+            stack.append(_unpack_int_le(reader.read(4)))
+        elif op == b"\x8a":
+            length = reader.read(1)[0]
+            stack.append(_long_from_bytes(reader.read(length)))
+        elif op == b"\x8b":
+            length = _unpack_uint_le(reader.read(4))
+            stack.append(_long_from_bytes(reader.read(length)))
+        elif op == b"G":
+            stack.append(_unpack_be_double(reader.read(8)))
+        elif op == b"\x8c":
+            length = reader.read(1)[0]
+            stack.append(reader.read(length).decode("utf-8"))
+        elif op == b"X":
+            length = _unpack_uint_le(reader.read(4))
+            stack.append(reader.read(length).decode("utf-8"))
+        elif op == b"\x8d":
+            length = _unpack_uint_le(reader.read(8))
+            stack.append(reader.read(length).decode("utf-8"))
+        elif op == b"C":
+            length = reader.read(1)[0]
+            stack.append(bytes(reader.read(length)))
+        elif op == b"B":
+            length = _unpack_uint_le(reader.read(4))
+            stack.append(bytes(reader.read(length)))
+        elif op == b"\x8e":
+            length = _unpack_uint_le(reader.read(8))
+            stack.append(bytes(reader.read(length)))
+        elif op == b")":
+            stack.append(())
+        elif op == b"]":
+            stack.append([])
+        elif op == b"}":
+            stack.append({})
+        elif op == b"(":
+            self._marks.append(len(stack))
+        elif op in (b"\x85", b"\x86", b"\x87"):
+            count = {b"\x85": 1, b"\x86": 2, b"\x87": 3}[op]
+            items = tuple(stack[len(stack) - count :])
+            del stack[len(stack) - count :]
+            stack.append(items)
+        elif op == b"t":
+            mark = self._marks.pop()
+            items = tuple(stack[mark:])
+            del stack[mark:]
+            stack.append(items)
+        elif op == b"a":
+            value = stack.pop()
+            stack[-1].append(value)
+        elif op == b"e":
+            mark = self._marks.pop()
+            items = stack[mark:]
+            del stack[mark:]
+            stack[-1].extend(items)
+        elif op == b"s":
+            value = stack.pop()
+            key = stack.pop()
+            stack[-1][key] = value
+        elif op == b"u":
+            mark = self._marks.pop()
+            items = stack[mark:]
+            del stack[mark:]
+            target = stack[-1]
+            for index in range(0, len(items), 2):
+                target[items[index]] = items[index + 1]
+        elif op == b"\x94":
+            top = stack[-1]
+            if isinstance(top, _Pending):
+                top.memo_index = len(self._memo)
+            self._memo.append(top)
+        elif op == b"h":
+            self._push_memo(reader.read(1)[0])
+        elif op == b"j":
+            self._push_memo(_unpack_uint_le(reader.read(4)))
+        elif op == b"c":
+            module = reader.read_line().decode("utf-8")
+            name = reader.read_line().decode("utf-8")
+            stack.append(_resolve_global(module, name))
+        elif op == b"\x93":
+            name = stack.pop()
+            module = stack.pop()
+            stack.append(_resolve_global(module, name))
+        elif op == b"R":
+            self._op_reduce()
+        elif op == b"b":
+            self._op_build()
+        else:
+            raise UnpicklingError(f"unsupported pickle opcode {op!r}")
+
+    def _push_memo(self, index):
+        if index >= len(self._memo):
             raise UnpicklingError("pickle data was truncated")
-        value = self.data[self.position:end]
-        self.position = end + 1
-        return value
+        self._stack.append(self._memo[index])
+
+    def _op_reduce(self):
+        args = self._stack.pop()
+        target = self._stack.pop()
+        if target is _RECONSTRUCT:
+            result = _Pending("array")
+        elif target is _DTYPE_CTOR:
+            result = _Pending("dtype", args[0])
+        elif target is _SCALAR_CTOR:
+            dtype, payload = args
+            result = np.frombuffer(payload, dtype=dtype)[0]
+        elif target is complex:
+            result = complex(*args)
+        else:
+            raise UnpicklingError("only NumPy array and scalar reconstructors may be called")
+        self._stack.append(result)
+
+    def _op_build(self):
+        state = self._stack.pop()
+        obj = self._stack.pop()
+        if not isinstance(obj, _Pending):
+            raise UnpicklingError("only NumPy array and scalar reconstructors may be called")
+        if obj.kind == "dtype":
+            final = _reconstruct_dtype(obj.payload, state)
+        else:
+            final = _reconstruct_array(state)
+        if obj.memo_index is not None:
+            self._memo[obj.memo_index] = final
+        self._stack.append(final)
 
 
-def load(file, encoding="ASCII"):
-    """Read one pickle from ``file``, leaving it positioned after the pickle's ``STOP``."""
-    start = file.tell()
-    data = file.read()
-    unpickler = _Unpickler(data, encoding)
-    value = unpickler.load()
-    file.seek(start + unpickler.position)
-    return value
+def _reconstruct_dtype(code, state):
+    _version, byteorder, _subarray, _names, _fields, _itemsize, _alignment, _flags = state
+    if code.startswith("O"):
+        return np.dtype(object)
+    if code.startswith("U"):
+        return np.dtype("<U" + code[1:])
+    order = byteorder if byteorder in ("<", ">") else "<"
+    return np.dtype(order + code)
+
+
+def _reconstruct_array(state):
+    _version, shape, dtype, fortran_order, data = state
+    order = "F" if fortran_order else "C"
+    if dtype == np.dtype(object):
+        # `np.array(data, dtype=object)` would try to nest same-length elements (a tuple
+        # and a list of matching length look like two rows of a 2-d array to it); filling
+        # a pre-shaped empty array element by element keeps `data` a flat list of objects.
+        array = np.empty(len(data), dtype=object)
+        for index, value in enumerate(data):
+            array[index] = value
+    else:
+        count = 1
+        for dim in shape:
+            count *= dim
+        array = np.frombuffer(data, dtype=dtype, count=count).copy()
+    if shape:
+        return array.reshape(shape, order=order)
+    return array.reshape(())

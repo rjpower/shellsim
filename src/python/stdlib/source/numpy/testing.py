@@ -1,148 +1,238 @@
-"""``numpy.testing``: array assertions used by test suites."""
+"""`numpy.testing`: array-aware assertion helpers with NumPy's comparison rules and messages.
+
+Failure messages follow NumPy's `build_err_msg` layout (a header line, an optional inline or
+multi-line `err_msg`, then ` ACTUAL: ...` / ` DESIRED: ...` lines) since the portable suite
+checks this text exactly. `assert_equal` recurses through lists, tuples, and dicts, prepending
+`item=<index>` or `key=<repr>` context to `err_msg` as it goes, so a mismatch deep inside a
+nested structure still reports the exact path to it, matching NumPy's own behavior.
+"""
+
+import math
 
 import numpy as np
 
 
-def _message(header, detail, err_msg):
-    lines = [header]
-    if err_msg:
-        lines.append(err_msg)
-    lines.append(detail)
-    return "\n".join(lines)
+def _isnan(value):
+    value = complex(value)
+    return math.isnan(value.real) or math.isnan(value.imag)
 
 
-def assert_array_equal(actual, desired, err_msg="", verbose=True, *, strict=False):
-    """Raise ``AssertionError`` unless the arrays have one shape and equal elements (NaNs match)."""
-    actual = np.asarray(actual)
-    desired = np.asarray(desired)
-    if strict and (actual.shape != desired.shape or actual.dtype != desired.dtype):
-        raise AssertionError(_message("Arrays are not equal", f"(shapes {actual.shape}, {desired.shape} mismatch)", err_msg))
-    left = actual.tolist() if actual.ndim else [actual.item()]
-    right = desired.tolist() if desired.ndim else [desired.item()]
-    if actual.shape != desired.shape and actual.ndim and desired.ndim:
-        raise AssertionError(_message("Arrays are not equal", f"(shapes {actual.shape}, {desired.shape} mismatch)", err_msg))
-    if not _equal(left, right):
-        raise AssertionError(_message("Arrays are not equal", f" ACTUAL: {actual!r}\n DESIRED: {desired!r}", err_msg))
-
-
-def _flat(values):
-    if isinstance(values, list):
-        items = []
-        for value in values:
-            items.extend(_flat(value))
-        return items
-    return [values]
-
-
-def _equal(left, right):
-    left, right = _flat(left), _flat(right)
-    if len(left) != len(right):
-        if len(left) == 1:
-            left = left * len(right)
-        elif len(right) == 1:
-            right = right * len(left)
-        else:
-            return False
-    for a, b in zip(left, right):
-        if a != a and b != b:
-            continue
-        if a != b:
-            return False
-    return True
-
-
-def assert_allclose(actual, desired, rtol=1e-07, atol=0, equal_nan=True, err_msg="", verbose=True, *, strict=False):
-    """Raise ``AssertionError`` unless ``|actual - desired| <= atol + rtol * |desired|`` everywhere."""
-    actual_array = np.asarray(actual)
-    desired_array = np.asarray(desired)
-    left = _flat(actual_array.tolist())
-    right = _flat(desired_array.tolist())
-    if len(left) != len(right):
-        if len(right) == 1:
-            right = right * len(left)
-        elif len(left) == 1:
-            left = left * len(right)
-        else:
-            raise AssertionError(_message(f"Not equal to tolerance rtol={rtol:g}, atol={atol:g}", f"(shapes {actual_array.shape}, {desired_array.shape} mismatch)", err_msg))
-    for a, b in zip(left, right):
-        if a != a or b != b:
-            if equal_nan and a != a and b != b:
-                continue
-            raise AssertionError(_message(f"Not equal to tolerance rtol={rtol:g}, atol={atol:g}", f" ACTUAL: {actual_array!r}\n DESIRED: {desired_array!r}", err_msg))
-        if a == b:
-            continue
-        if abs(a - b) > atol + rtol * abs(b):
-            raise AssertionError(_message(f"Not equal to tolerance rtol={rtol:g}, atol={atol:g}", f" ACTUAL: {actual_array!r}\n DESIRED: {desired_array!r}", err_msg))
+def _isinf(value):
+    value = complex(value)
+    return math.isinf(value.real) or math.isinf(value.imag)
 
 
 def _build_err_msg(actual, desired, err_msg, header="Items are not equal:"):
-    """NumPy's ``build_err_msg`` for an actual and a desired value."""
     lines = ["\n" + header]
-    err_msg = str(err_msg)
     if err_msg:
         if "\n" not in err_msg and len(err_msg) < 79 - len(header):
             lines = [lines[0] + " " + err_msg]
         else:
             lines.append(err_msg)
-    for name, value in (("ACTUAL", actual), ("DESIRED", desired)):
-        text = repr(value)
-        if text.count("\n") > 3:
-            text = "\n".join(text.splitlines()[:3]) + "..."
-        lines.append(f" {name}: {text}")
+    lines.append(" ACTUAL: " + repr(actual))
+    lines.append(" DESIRED: " + repr(desired))
     return "\n".join(lines)
 
 
-def assert_equal(actual, desired, err_msg="", verbose=True, *, strict=False):
-    """Raise ``AssertionError`` unless the values are equal, as NumPy's ``assert_equal``.
+def _is_negative(value):
+    # `math.copysign` does not exist in shellsim; `repr` already tracks the sign bit
+    # (`-0.0` prints with its minus sign), so it doubles as a sign test.
+    return repr(float(value)).startswith("-")
 
-    Containers are compared item by item and arrays elementwise. For scalars, NaN equals NaN,
-    zeros of different signs differ, and complex numbers compare their parts separately.
-    """
-    if isinstance(desired, dict):
-        if not isinstance(actual, dict):
-            raise AssertionError(repr(type(actual)))
-        assert_equal(len(actual), len(desired), err_msg)
+
+def _float_equal(a, b):
+    if a != a and b != b:
+        return True
+    if a != b:
+        return False
+    if a == 0 and b == 0:
+        return _is_negative(a) == _is_negative(b)
+    return True
+
+
+def _scalars_equal(actual, desired):
+    if isinstance(actual, complex) or isinstance(desired, complex):
+        a, d = complex(actual), complex(desired)
+        return _float_equal(a.real, d.real) and _float_equal(a.imag, d.imag)
+    if isinstance(actual, (float, np.floating)) or isinstance(desired, (float, np.floating)):
+        return _float_equal(float(actual), float(desired))
+    return actual == desired
+
+
+def assert_(condition, msg=""):
+    if not condition:
+        raise AssertionError(msg)
+
+
+def assert_equal(actual, desired, err_msg="", verbose=True):
+    """Recursive equality: arrays compare like `assert_array_equal`, dicts/lists/tuples
+    recurse elementwise (reporting the path to a mismatch), and scalars distinguish `nan`
+    (treated equal) and signed zero (treated unequal), matching NumPy's `assert_equal`."""
+    if isinstance(desired, np.ndarray) or isinstance(actual, np.ndarray):
+        assert_array_equal(actual, desired, err_msg=err_msg, verbose=verbose)
+        return
+    if isinstance(desired, dict) or isinstance(actual, dict):
+        if not (isinstance(desired, dict) and isinstance(actual, dict)):
+            raise AssertionError(_build_err_msg(actual, desired, err_msg))
+        if sorted(actual.keys(), key=repr) != sorted(desired.keys(), key=repr):
+            raise AssertionError(_build_err_msg(actual, desired, err_msg))
         for key in desired:
-            if key not in actual:
-                raise AssertionError(repr(key))
-            assert_equal(actual[key], desired[key], f"key={key!r}\n{err_msg}")
+            assert_equal(actual[key], desired[key], err_msg=f"key={key!r}\n" + err_msg, verbose=verbose)
         return
-    if isinstance(desired, (list, tuple)) and isinstance(actual, (list, tuple)):
-        assert_equal(len(actual), len(desired), err_msg)
+    if isinstance(desired, (list, tuple)) or isinstance(actual, (list, tuple)):
+        if not (isinstance(desired, (list, tuple)) and isinstance(actual, (list, tuple))):
+            raise AssertionError(_build_err_msg(actual, desired, err_msg))
+        if len(actual) != len(desired):
+            raise AssertionError(_build_err_msg(actual, desired, err_msg))
         for index in range(len(desired)):
-            assert_equal(actual[index], desired[index], f"item={index!r}\n{err_msg}")
+            assert_equal(
+                actual[index], desired[index], err_msg=f"item={index}\n" + err_msg, verbose=verbose
+            )
         return
-    if isinstance(actual, np.ndarray) or isinstance(desired, np.ndarray):
-        assert_array_equal(actual, desired, err_msg, strict=strict)
+    if _scalars_equal(actual, desired):
         return
-    msg = _build_err_msg(actual, desired, err_msg)
-    if np.iscomplexobj(actual) or np.iscomplexobj(desired):
-        actual_parts = (np.real(actual), np.imag(actual)) if np.iscomplexobj(actual) else (actual, 0)
-        desired_parts = (np.real(desired), np.imag(desired)) if np.iscomplexobj(desired) else (desired, 0)
-        try:
-            assert_equal(actual_parts[0], desired_parts[0])
-            assert_equal(actual_parts[1], desired_parts[1])
-        except AssertionError:
-            raise AssertionError(msg) from None
-        return
-    if np.isscalar(desired) != np.isscalar(actual):
-        raise AssertionError(msg)
+    raise AssertionError(_build_err_msg(actual, desired, err_msg))
+
+
+def _broadcast_or_fail(actual, desired, err_msg, header):
+    a_arr = np.asarray(actual)
+    d_arr = np.asarray(desired)
     try:
-        if np.isnan(desired) and np.isnan(actual):
-            return
-        if desired == 0 and actual == 0 and np.signbit(desired) != np.signbit(actual):
-            raise AssertionError(msg)
-    except (TypeError, ValueError, NotImplementedError):
-        pass
-    if not (desired == actual):
-        raise AssertionError(msg)
+        return np.broadcast_arrays(a_arr, d_arr)
+    except Exception:
+        raise AssertionError(_build_err_msg(actual, desired, err_msg, header=header)) from None
 
 
-def assert_array_almost_equal(actual, desired, decimal=6, err_msg="", verbose=True):
-    """Raise ``AssertionError`` unless ``|actual - desired| < 1.5 * 10**-decimal`` everywhere."""
-    assert_allclose(actual, desired, rtol=0, atol=1.5 * 10.0 ** (-decimal), err_msg=err_msg)
+def _array_values_equal(a, d):
+    ca, cd = complex(a), complex(d)
+    if _isnan(ca) or _isnan(cd):
+        return _isnan(ca) and _isnan(cd)
+    return ca == cd
+
+
+def assert_array_equal(actual, desired, err_msg="", verbose=True, strict=False):
+    header = "Arrays are not equal"
+    a_b, d_b = _broadcast_or_fail(actual, desired, err_msg, header)
+    a_flat = a_b.reshape(-1).tolist()
+    d_flat = d_b.reshape(-1).tolist()
+    for a, d in zip(a_flat, d_flat):
+        if isinstance(a, str) or isinstance(d, str):
+            equal = a == d
+        else:
+            equal = _array_values_equal(a, d)
+        if not equal:
+            raise AssertionError(_build_err_msg(actual, desired, err_msg, header=header))
+
+
+def assert_array_less(actual, desired, err_msg="", verbose=True):
+    header = "Arrays are not less-ordered"
+    a_b, d_b = _broadcast_or_fail(actual, desired, err_msg, header)
+    a_flat = a_b.reshape(-1).tolist()
+    d_flat = d_b.reshape(-1).tolist()
+    for a, d in zip(a_flat, d_flat):
+        if not (a < d):
+            raise AssertionError(_build_err_msg(actual, desired, err_msg, header=header))
+
+
+def _isclose(a, d, rtol, atol, equal_nan):
+    ca, cd = complex(a), complex(d)
+    if _isnan(ca) or _isnan(cd):
+        return equal_nan and _isnan(ca) and _isnan(cd)
+    if _isinf(ca) or _isinf(cd):
+        return ca == cd
+    return abs(ca - cd) <= atol + rtol * abs(cd)
+
+
+def assert_allclose(actual, desired, rtol=1e-7, atol=0, equal_nan=True, err_msg="", verbose=True):
+    header = f"Not equal to tolerance rtol={rtol:g}, atol={atol:g}"
+    a_b, d_b = _broadcast_or_fail(actual, desired, err_msg, header)
+    a_flat = a_b.reshape(-1).tolist()
+    d_flat = d_b.reshape(-1).tolist()
+    for a, d in zip(a_flat, d_flat):
+        if not _isclose(a, d, rtol, atol, equal_nan):
+            raise AssertionError(_build_err_msg(actual, desired, err_msg, header=header))
+
+
+def _almost_equal(actual, desired, decimal, err_msg, header):
+    a_b, d_b = _broadcast_or_fail(actual, desired, err_msg, header)
+    threshold = 1.5 * 10.0 ** (-decimal)
+    a_flat = a_b.reshape(-1).tolist()
+    d_flat = d_b.reshape(-1).tolist()
+    for a, d in zip(a_flat, d_flat):
+        ca, cd = complex(a), complex(d)
+        if _isnan(ca) or _isnan(cd):
+            if _isnan(ca) and _isnan(cd):
+                continue
+            raise AssertionError(_build_err_msg(actual, desired, err_msg, header=header))
+        if _isinf(ca) or _isinf(cd):
+            if ca == cd:
+                continue
+            raise AssertionError(_build_err_msg(actual, desired, err_msg, header=header))
+        if abs(ca - cd) >= threshold:
+            raise AssertionError(_build_err_msg(actual, desired, err_msg, header=header))
 
 
 def assert_almost_equal(actual, desired, decimal=7, err_msg="", verbose=True):
-    """Raise ``AssertionError`` unless ``|actual - desired| < 1.5 * 10**-decimal``."""
-    assert_allclose(actual, desired, rtol=0, atol=1.5 * 10.0 ** (-decimal), err_msg=err_msg)
+    _almost_equal(actual, desired, decimal, err_msg, f"Arrays are not almost equal to {decimal} decimals")
+
+
+def assert_array_almost_equal(actual, desired, decimal=6, err_msg="", verbose=True):
+    _almost_equal(actual, desired, decimal, err_msg, f"Arrays are not almost equal to {decimal} decimals")
+
+
+class _AssertRaisesContext:
+    def __init__(self, expected):
+        self.expected = expected
+        self.exception = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            raise AssertionError(f"{self.expected.__name__} not raised")
+        if not issubclass(exc_type, self.expected):
+            return False
+        self.exception = exc_value
+        return True
+
+
+def assert_raises(exception_class, *args, **kwargs):
+    if not args:
+        return _AssertRaisesContext(exception_class)
+    func = args[0]
+    with _AssertRaisesContext(exception_class):
+        func(*args[1:], **kwargs)
+    return None
+
+
+class _AssertWarnsContext:
+    def __init__(self, expected):
+        self.expected = expected
+        self._catcher = None
+        self._records = None
+
+    def __enter__(self):
+        import warnings
+
+        self._catcher = warnings.catch_warnings(record=True)
+        self._records = self._catcher.__enter__()
+        warnings.simplefilter("always")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._catcher.__exit__(exc_type, exc_value, traceback)
+        if exc_type is not None:
+            return False
+        if not any(issubclass(record.category, self.expected) for record in self._records):
+            raise AssertionError(f"{self.expected.__name__} not triggered")
+        return False
+
+
+def assert_warns(warning_class, *args, **kwargs):
+    if not args:
+        return _AssertWarnsContext(warning_class)
+    func = args[0]
+    with _AssertWarnsContext(warning_class):
+        result = func(*args[1:], **kwargs)
+    return result

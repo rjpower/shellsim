@@ -110,6 +110,219 @@ def test_string_repeat_with_strings_multiply():
     assert repeated.tolist() == ["abab", "cc"]
 
 
+def test_strings_multiply_broadcasts_an_array_of_repeat_counts():
+    repeated = np.strings.multiply(np.array(["ab", "cd", "ef"]), np.array([2, 0, 3]))
+    # NumPy sizes this from the actual longest result, the same as constructing an array from
+    # the computed text; an all-empty result still floors at width 1.
+    assert repeated.dtype == np.dtype("<U6")
+    assert repeated.tolist() == ["abab", "", "efefef"]
+
+
+def test_strings_case_functions_keep_the_input_width():
+    a = np.array(["Hello World", "foo BAR"])
+    assert a.dtype == np.dtype("<U11")
+    for result, expected in (
+        (np.strings.capitalize(a), ["Hello world", "Foo bar"]),
+        (np.strings.lower(a), ["hello world", "foo bar"]),
+        (np.strings.upper(a), ["HELLO WORLD", "FOO BAR"]),
+        (np.strings.swapcase(a), ["hELLO wORLD", "FOO bar"]),
+        (np.strings.title(a), ["Hello World", "Foo Bar"]),
+    ):
+        # NumPy's fixed-width buffer keeps exactly the input's width for every case function,
+        # even though none of these particular results is as long as "Hello World".
+        assert result.dtype == np.dtype("<U11")
+        assert result.tolist() == expected
+
+
+def test_strings_upper_truncates_when_case_folding_grows_past_the_input_width():
+    # German sharp s upper-cases to "SS", which is one character longer than "straße"; NumPy's
+    # `upper` does not grow the array to fit, it truncates to the original width instead.
+    a = np.array(["straße"])
+    assert a.dtype == np.dtype("<U6")
+    result = np.strings.upper(a)
+    assert result.dtype == np.dtype("<U6")
+    assert result.tolist() == ["STRASS"]
+
+
+def test_strings_padding_functions():
+    a = np.array(["ab", "c"])
+    # `center`'s two elements are chosen with even total padding on both sides, since CPython's
+    # tie-break for an odd amount of padding is not itself under test here.
+    assert np.strings.center(np.array(["ab", "cd"]), 6, "*").tolist() == ["**ab**", "**cd**"]
+    assert np.strings.ljust(a, 4, "-").tolist() == ["ab--", "c---"]
+    assert np.strings.rjust(a, 4, "-").tolist() == ["--ab", "---c"]
+    assert np.strings.zfill(np.array(["7", "-3", "42"]), 4).tolist() == ["0007", "-003", "0042"]
+
+
+def test_strings_padding_functions_grow_to_the_wider_of_input_and_requested_width():
+    a = np.array(["Hello World"])  # <U11
+    # A requested width narrower than the input leaves the array's width unchanged.
+    small = np.strings.ljust(a, 3)
+    assert small.dtype == np.dtype("<U11")
+    assert small.tolist() == ["Hello World"]
+    big = np.strings.rjust(a, 15, "-")
+    assert big.dtype == np.dtype("<U15")
+    assert big.tolist() == ["----Hello World"]
+    narrow = np.strings.zfill(np.array(["7", "-3", "42"]), 1)
+    assert narrow.dtype == np.dtype("<U2")
+    assert narrow.tolist() == ["7", "-3", "42"]
+
+
+def test_strings_padding_functions_broadcast_an_array_of_widths():
+    result = np.strings.center(np.array(["ab", "cd"]), np.array([2, 8]), "*")
+    # The dtype fits the largest requested width even though only one row needs it.
+    assert result.dtype == np.dtype("<U8")
+    assert result.tolist() == ["ab", "***cd***"]
+
+
+def test_strings_trimming_functions_keep_the_input_width():
+    a = np.array(["  hi  ", "yo   "])
+    assert a.dtype == np.dtype("<U6")
+    for result, expected in (
+        (np.strings.strip(a), ["hi", "yo"]),
+        (np.strings.lstrip(a), ["hi  ", "yo   "]),
+        (np.strings.rstrip(a), ["  hi", "yo"]),
+    ):
+        assert result.dtype == np.dtype("<U6")
+        assert result.tolist() == expected
+    assert np.strings.strip(np.array(["xxhixx"]), "x").tolist() == ["hi"]
+
+
+def test_strings_strip_broadcasts_an_array_of_character_sets():
+    result = np.strings.strip(np.array(["xxhixx", "yyhoyy"]), np.array(["x", "y"]))
+    assert result.dtype == np.dtype("<U6")
+    assert result.tolist() == ["hi", "ho"]
+
+
+def test_strings_search_and_replace_functions():
+    a = np.array(["Hello World", "foo bar"])
+    assert np.strings.count(a, "o").tolist() == [2, 2]
+    assert np.strings.find(a, "o").tolist() == [4, 1]
+    assert np.strings.rfind(a, "o").tolist() == [7, 2]
+    assert np.strings.index(a, "o").tolist() == [4, 1]
+    assert np.strings.rindex(a, "o").tolist() == [7, 2]
+    assert np.strings.find(a, "z").tolist() == [-1, -1]
+    with pytest.raises(ValueError):
+        np.strings.index(a, "z")
+    assert np.strings.replace(a, "o", "0").tolist() == ["Hell0 W0rld", "f00 bar"]
+    assert np.strings.replace(np.array(["aaaa"]), "a", "bb").tolist() == ["bbbbbbbb"]
+    # Content-based, not preserved: replacing a two-character run with one character shrinks
+    # below the input's own <U4 width.
+    shrunk = np.strings.replace(np.array(["aaaa"]), "aa", "b")
+    assert shrunk.dtype == np.dtype("<U2")
+    assert shrunk.tolist() == ["bb"]
+
+
+def test_strings_count_and_replace_broadcast_their_array_arguments():
+    a = np.array(["Hello World", "foo bar"])
+    assert np.strings.count(a, "o", np.array([0, 2])).tolist() == [2, 1]
+    replaced = np.strings.replace(np.array(["aaa", "bbb"]), np.array(["a", "b"]), "Z")
+    assert replaced.dtype == np.dtype("<U3")
+    assert replaced.tolist() == ["ZZZ", "ZZZ"]
+
+
+def test_strings_partition_and_rpartition_return_three_arrays():
+    a = np.array(["Hello World", "foobar"])
+    before, sep, after = np.strings.partition(a, " ")
+    assert (before.tolist(), sep.tolist(), after.tolist()) == (
+        ["Hello", "foobar"],
+        [" ", ""],
+        ["World", ""],
+    )
+    before, sep, after = np.strings.rpartition(a, " ")
+    assert (before.tolist(), sep.tolist(), after.tolist()) == (
+        ["Hello", ""],
+        [" ", ""],
+        ["World", "foobar"],
+    )
+
+
+def test_strings_partition_broadcasts_an_array_of_separators():
+    before, sep, after = np.strings.partition(np.array(["a-b", "c:d"]), np.array(["-", ":"]))
+    assert before.tolist() == ["a", "c"]
+    assert sep.tolist() == ["-", ":"]
+    assert after.tolist() == ["b", "d"]
+
+
+def test_strings_slice_matches_python_slice_semantics():
+    a = np.array(["Hello World", "foo bar"])
+    # A single positional argument is `stop`, as with the builtin `slice(stop)`.
+    assert np.strings.slice(a, 5).tolist() == ["Hello", "foo b"]
+    assert np.strings.slice(a, 1, 5).tolist() == ["ello", "oo b"]
+    assert np.strings.slice(a, None, None, 2).tolist() == ["HloWrd", "fobr"]
+    # `slice` keeps the input's width, like `strip` and the case functions.
+    small = np.strings.slice(a, 3)
+    assert small.dtype == np.dtype("<U11")
+    assert small.tolist() == ["Hel", "foo"]
+
+
+def test_strings_slice_broadcasts_arrays_of_start_and_stop():
+    result = np.strings.slice(np.array(["Hello World", "foo bar"]), np.array([1, 0]), np.array([5, 3]))
+    assert result.tolist() == ["ello", "foo"]
+
+
+def test_strings_translate_maps_characters_elementwise():
+    table = {ord("a"): "A", ord("b"): "B"}
+    result = np.strings.translate(np.array(["abc", "cab"]), table)
+    assert result.dtype == np.dtype("<U3")
+    assert result.tolist() == ["ABc", "cAB"]
+
+
+def test_strings_mod_broadcasts_values_per_element():
+    result = np.strings.mod(np.array(["n=%d", "m=%d"]), np.array([7, 9]))
+    assert result.dtype == np.dtype("<U3")
+    assert result.tolist() == ["n=7", "m=9"]
+    # A one-element `values` broadcasts against every row, like any other array argument.
+    assert np.strings.mod(np.array(["n=%d", "m=%d"]), (7,)).tolist() == ["n=7", "m=7"]
+
+
+def test_strings_predicate_functions():
+    assert np.strings.str_len(np.array(["ab", "c"])).tolist() == [2, 1]
+    assert np.strings.isalpha(np.array(["abc", "ab1"])).tolist() == [True, False]
+    assert np.strings.isdigit(np.array(["123", "12a"])).tolist() == [True, False]
+    assert np.strings.isdecimal(np.array(["123", "½"])).tolist() == [True, False]
+    assert np.strings.isnumeric(np.array(["123", "½"])).tolist() == [True, True]
+    assert np.strings.isalnum(np.array(["abc123", "ab 1"])).tolist() == [True, False]
+    assert np.strings.isspace(np.array(["   ", "a"])).tolist() == [True, False]
+    assert np.strings.islower(np.array(["abc", "Abc"])).tolist() == [True, False]
+    assert np.strings.isupper(np.array(["ABC", "Abc"])).tolist() == [True, False]
+    assert np.strings.istitle(np.array(["Hello World", "hello world"])).tolist() == [True, False]
+    assert np.strings.startswith(np.array(["Hello", "foo"]), "He").tolist() == [True, False]
+    assert np.strings.endswith(np.array(["Hello", "foo"]), "lo").tolist() == [True, False]
+
+
+def test_strings_startswith_and_endswith_broadcast_an_array_of_patterns():
+    a = np.array(["Hello", "foo", "bar"])
+    assert np.strings.startswith(a, np.array(["He", "fo", "z"])).tolist() == [True, True, False]
+    assert np.strings.endswith(a, np.array(["lo", "o", "r"])).tolist() == [True, True, True]
+
+
+def test_strings_expandtabs_broadcasts_tabsize_but_keeps_content_based_width():
+    # `expandtabs` broadcasts `tabsize` like every other parameter; its result dtype is the one
+    # documented exception that does not match NumPy's own (unpinnable) width exactly -- values
+    # still match NumPy exactly, only `.dtype.itemsize` can differ.
+    result = np.strings.expandtabs(np.array(["a\tb", "cd"]), np.array([2, 4]))
+    assert result.tolist() == ["a b", "cd"]
+
+
+def test_strings_comparison_functions():
+    a = np.array(["b", "a"])
+    b = np.array(["a", "a"])
+    assert np.strings.equal(a, b).tolist() == [False, True]
+    assert np.strings.not_equal(a, b).tolist() == [True, False]
+    assert np.strings.greater(a, b).tolist() == [True, False]
+    assert np.strings.greater_equal(a, b).tolist() == [True, True]
+    assert np.strings.less(a, b).tolist() == [False, False]
+    assert np.strings.less_equal(a, b).tolist() == [False, True]
+
+
+def test_strings_split_family_is_absent():
+    # `numpy.strings` has no `split`/`rsplit`/`splitlines`/`join`: ragged, per-element results
+    # do not fit a rectangular array, and NumPy 2.5.3 does not define them either.
+    for name in ("split", "rsplit", "splitlines", "join"):
+        assert not hasattr(np.strings, name)
+
+
 def test_string_arithmetic_without_a_loop_raises_type_error():
     a = np.array(["a", "b"])
     with pytest.raises(TypeError) as info:
