@@ -4,11 +4,9 @@ Two generator families are implemented:
 
 - ``Generator`` (returned by ``default_rng``), backed by a bit generator
   (``PCG64`` by default, or ``MT19937``). Bounded integers use Lemire's
-  method; the normal/exponential ziggurat is this module's own clean-room
-  implementation of the published Marsaglia-Tsang algorithm and does not
-  reproduce NumPy's exact stream (see docs/numpy.md). ``standard_gamma`` and
-  the distributions built from it inherit that difference whenever they
-  draw a normal deviate.
+  method. The normal and exponential draws use Marsaglia and Tsang's
+  ziggurat with computed tables, which agree with NumPy's to about 1e-14
+  (see docs/numpy.md); the gamma family built on them inherits that.
 - ``RandomState`` (legacy), always backed by ``MT19937``, matching NumPy's
   original generator bit for bit: ``init_genrand``/``init_by_array``
   seeding, masked-rejection bounded integers, and the Marsaglia polar-method
@@ -32,10 +30,7 @@ import _numpy_random as _nr
 # This is Melissa O'Neill's public "seed_seq_fe" design
 # (https://www.pcg-random.org/posts/developing-a-seed_seq-alternative.html),
 # which NumPy documents using the same hashmix/mix building blocks and pool
-# size. The constants and control flow below were derived from that public
-# description and confirmed against NumPy 2.5.3's own generate_state/spawn
-# output treated strictly as a black box (matching scalar, multi-word, and
-# multi-level-spawn entropy, and the low-word-first uint64 packing).
+# size. Words are packed low word first into uint64 output, as in NumPy.
 # ---------------------------------------------------------------------------
 
 _MASK32 = 0xFFFFFFFF
@@ -231,18 +226,16 @@ def _pcg_state_from_seed_sequence(seed_sequence):
     return _nr._pcg_seed(words[0], words[1], words[2], words[3])
 
 
+_PCG64_JUMP = 0x9E3779B97F4A7C15F39CC0605CEDC835
+
+
 class PCG64:
     """PCG64 (O'Neill 2014), XSL-RR variant: the default `Generator` bit generator.
 
     128-bit LCG state advanced by PCG's published 128-bit multiplier,
     output through the xorshift-low/random-rotate (XSL RR) function that
-    folds state to 64 bits. `advance` and `jumped` are both the same
-    generic LCG jump-ahead by repeated doubling; `jumped`'s distance-per-
-    jump ordinarily comes from PCG's C++ template parameters, which NumPy
-    does not expose through Python, so its coefficients were recovered by
-    treating ``jumped`` as an unknown affine map over the 128-bit state and
-    solving for it from `PCG64(1).jumped(3)`'s published output (see
-    `random/bitgen.rs`).
+    folds state to 64 bits. `advance` and `jumped` use the LCG jump-ahead;
+    a jump is (phi - 1) * 2**128 steps, rounded up, as NumPy documents.
     """
 
     def __init__(self, seed=None):
@@ -269,12 +262,13 @@ class PCG64:
         ]
 
     def advance(self, delta):
-        self._state = _nr._pcg_advance(self._state, int(delta))
+        self._state = _nr._pcg_advance(self._state, int(delta) % (1 << 128))
         return self
 
-    def jumped(self, iterations=1):
-        self._state = _nr._pcg_jumped(self._state, int(iterations))
-        return self
+    def jumped(self, jumps=1):
+        bit_generator = PCG64()
+        bit_generator.state = self.state
+        return bit_generator.advance(_PCG64_JUMP * int(jumps))
 
     def random_raw(self, size=None):
         n = 1 if size is None else int(size)
@@ -486,12 +480,9 @@ class Generator:
 
     Uniform draws come straight from the bit generator's words (Lemire's
     method for bounded integers; the top 53 bits of a 64-bit draw, or two
-    tempered MT19937 words, for doubles in ``[0, 1)``); those match NumPy
-    2.5.3 bit for bit for both `PCG64` and `MT19937`. The normal and
-    exponential ziggurat is this module's own implementation and does not
-    reproduce NumPy's exact stream (see docs/numpy.md); `standard_gamma`
-    (and `gamma`, `chisquare`, `f`, `standard_t`, which are built on it)
-    inherit that difference whenever they consume a normal deviate.
+    tempered MT19937 words, for doubles in ``[0, 1)``) and match NumPy bit
+    for bit. Normal, exponential, and gamma-family draws match to about
+    1e-14 relative (see the ziggurat note in docs/numpy.md).
     """
 
     def __init__(self, bit_generator):

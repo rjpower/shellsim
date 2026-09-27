@@ -136,18 +136,10 @@ differences, the unsupported frontier, and resource limits.
   top of it otherwise); results agree with NumPy to about `1e-15 * log2(n)` relative to the
   largest output magnitude, tighter than NumPy's own single-precision loops.
 - **Random.** `numpy.random` implements `SeedSequence`, `MT19937`, `PCG64`, `Generator`, and the
-  legacy `RandomState` from their published algorithms (Matsumoto and Nishimura's Mersenne
-  Twister, O'Neill's PCG, and the papers behind each distribution). Both draw uniforms, integers,
-  normals, exponentials, and gamma, chi-square, F, Student's t, binomial and Poisson variates, and
-  choose, shuffle and permute. Seeded streams match NumPy 2.5.3 bit for bit for `SeedSequence`,
-  raw and uniform draws (both bit generators, `float32` and `float64`), bounded integers at every
-  dtype including the narrower, per-word-buffered ones (`int8`, `uint8`, `int16`, `uint16`, and
-  `bool`), `Generator` and legacy `RandomState` shuffling, permutation, and sampling distinct
-  indices (including `Generator.choice` with `replace=False`), and every distribution built from
-  uniforms, gamma, and either bit generator's own Gaussian: `binomial`, `poisson`,
-  `standard_gamma` (both its `shape >= 1` squeeze-and-reject branch and its `shape < 1`
-  Weibull-envelope rejection branch), and `chisquare`, `f`, and `standard_t` built on it. See
-  "Deliberate differences" for what does not match bit for bit.
+  legacy `RandomState` from published algorithms. Both draw uniforms, integers, normals,
+  exponentials, and gamma, chi-square, F, Student's t, binomial and Poisson variates, and choose,
+  shuffle and permute. Seeded streams match NumPy 2.5.3 bit for bit, except for the ziggurat
+  draws described under "Deliberate differences".
 - **Text.** `str` arrays, `numpy.strings`, and object arrays with Python-level element operations.
 - **Printing.** Scalar and array `repr`/`str`, `array2string`, `array_repr`, `array_str`,
   `format_float_positional`/`_scientific`, and `set_printoptions`/`get_printoptions`/
@@ -185,24 +177,11 @@ never imports a module or calls arbitrary code.
   files load to equal arrays.
 - **Unseeded random streams.** Simulated programs have no host entropy, so an unseeded
   `SeedSequence` uses fixed entropy and produces the same stream on every run.
-- **Non-exact random streams.** A few areas of `numpy.random` could not be pinned down to NumPy's
-  bit-for-bit stream by black-box comparison, since NumPy does not document the exact algorithm
-  and shellsim's clean-room policy forbids reading NumPy's source to find it. These still draw
-  values with the right distribution, type, and shape, and (except where noted) consume the same
-  number of raw words as NumPy, so later draws on the same generator stay synchronized:
-  - `Generator`'s ziggurat-based draws (`standard_normal`, `normal`, and `standard_exponential`
-    and `exponential` with the default `method="zig"`, at both `float64` and `float32`) reproduce
-    NumPy's exact bit layout, table packing, and layer indexing (recovered by constructing raw
-    PCG64 words directly and bisecting NumPy's own accept/reject boundaries), but not every table
-    entry's exact `f64` value: black-box bracketing places roughly a sixth of the normal
-    ziggurat's 254 layers, and most of the exponential ziggurat's, outside what this module's own
-    re-derivation of the published balance equations produces, concentrated nearest the peak where
-    a 254-step recursion compounds rounding the most — evidence of a hard-coded table, not a bug
-    in this module's arithmetic (see `ziggurat.rs`'s module doc for the full account). A draw that
-    happens to land in an exact layer is exact; one that does not is off by a handful of ULPs.
-    `standard_exponential`'s `method="inv"` is exact instead (plain inversion, no table). Every
-    distribution built from a ziggurat-based normal inherits this: `Generator.standard_gamma` and
-    `.gamma` for `shape >= 1`, and `.chisquare`, `.f`, and `.standard_t`, which use it internally.
+- **Ziggurat draws.** `Generator`'s normal and exponential draws (the latter with the default
+  `method="zig"`) compute their ziggurat tables from Marsaglia and Tsang's recursion. NumPy's
+  tables differ in the last few bits, so these draws, and the gamma, chi-square, F and Student's
+  t draws built on them, agree with NumPy to about `1e-14` relative. They consume the same raw
+  words, so later draws stay aligned.
 - **`str` and `object` elements** box to plain Python `str` values and the stored objects, not to
   `np.str_` or `np.object_` instances.
 - **Byte order.** Views between byte orders, big-endian `str` dtypes, and `tobytes` of object

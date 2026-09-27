@@ -1,8 +1,13 @@
 # Portable NumPy semantics. Expectations checked against NumPy 2.5.3 on CPython 3.14.4.
 # Scope: exact legacy MT19937 and default_rng PCG64 streams, result types, and seeding rules.
+# Generator's ziggurat tables are computed from Marsaglia and Tsang's recursion, so its normal
+# and exponential draws, and the gamma-family draws built on them, match NumPy to a tolerance.
 
 import numpy as np
 import pytest
+from numpy.testing import assert_allclose
+
+ZIGGURAT_RTOL = 1e-13
 
 
 def test_legacy_rand_stream():
@@ -433,6 +438,23 @@ def test_pcg64_state_advance_and_jumped():
     ]
 
 
+def test_pcg64_jumped_returns_a_new_generator_for_any_stream():
+    bit_generator = np.random.PCG64(2)
+    jumped = bit_generator.jumped()
+    assert jumped is not bit_generator and type(jumped) is np.random.PCG64
+    assert jumped.random_raw(2).tolist() == [17613949133350213019, 14352335435533080182]
+    assert bit_generator.state == np.random.PCG64(2).state
+    assert np.random.PCG64(1).advance(-1).advance(1).random_raw() == np.random.PCG64(1).random_raw()
+
+
+def test_pcg64_advance_and_jumped_discard_the_buffered_half_word():
+    bit_generator = np.random.PCG64(1)
+    np.random.Generator(bit_generator).integers(0, 10, dtype=np.int32)
+    assert bit_generator.state["has_uint32"] == 1
+    assert bit_generator.jumped().state["has_uint32"] == 0
+    assert bit_generator.advance(5).state["has_uint32"] == 0
+
+
 def test_generator_state_round_trip_includes_buffered_half():
     rng = np.random.default_rng(7)
     rng.integers(0, 10, dtype=np.int32)
@@ -463,22 +485,35 @@ def test_generator_single_precision_streams():
     ]
 
 
-def test_generator_normal_matches_numpy_ziggurat():
-    assert np.random.default_rng(2024).standard_normal(4).tolist() == [
-        1.0288568739519013,
-        1.6419200406711503,
-        1.1467195295966137,
-        -0.9731795154745656,
-    ]
+def test_generator_normal_follows_numpy_ziggurat():
+    expected = [1.0288568739519013, 1.6419200406711503, 1.1467195295966137, -0.9731795154745656]
+    assert_allclose(np.random.default_rng(2024).standard_normal(4), expected, rtol=ZIGGURAT_RTOL)
     # Enough draws to reach the ziggurat's base-layer tail and wedge rejections.
     draws = np.random.default_rng(5).standard_normal(200000)
-    assert [float(draws.min()), float(draws.max())] == [-4.820175842608121, 4.371795668265591]
-    assert np.random.default_rng(1).normal([0, 10, 100], 2).tolist() == [
-        0.691168384129572,
-        11.643236287002317,
-        100.66087415236677,
-    ]
+    assert_allclose([draws.min(), draws.max()], [-4.820175842608121, 4.371795668265591])
+    assert_allclose(draws.sum(), 365.95781498290273, rtol=1e-11)
+    expected = [0.691168384129572, 11.643236287002317, 100.66087415236677]
+    assert_allclose(np.random.default_rng(1).normal([0, 10, 100], 2), expected, rtol=ZIGGURAT_RTOL)
 
+
+
+def _force_next_word(rng, word):
+    # PCG64 advances its 128-bit LCG state and then outputs it; a state whose high half is zero
+    # outputs its low half unchanged, so stepping back from `word` makes it the next raw word.
+    multiplier = 0x2360ED051FC65DA44385DF649FCCF645
+    state = rng.bit_generator.state
+    increment = state["state"]["inc"]
+    state["state"]["state"] = (word - increment) * pow(multiplier, -1, 1 << 128) % (1 << 128)
+    rng.bit_generator.state = state
+
+
+def test_generator_normal_rejects_candidates_above_the_top_layer_density():
+    rng = np.random.default_rng(1)
+    _force_next_word(rng, 12345)
+    assert rng.bit_generator.random_raw() == 12345
+    # Layer 1 with the largest mantissa lies above the density, so the draw restarts.
+    _force_next_word(rng, 1 | ((1 << 52) - 1) << 9)
+    assert_allclose(rng.standard_normal(), 0.7171486007530798, rtol=ZIGGURAT_RTOL)
 
 @pytest.mark.parametrize(
     "legacy, seed, low, high, dtype, expected",
@@ -550,31 +585,27 @@ def test_distribution_parameter_errors():
 
 def test_generator_exponential_and_gamma_streams():
     rng = np.random.default_rng(12345)
-    assert rng.standard_exponential(4).tolist() == [
-        0.18413256735377503,
-        0.6450270693873458,
-        4.690218692461341,
-        0.4185586661538189,
-    ]
-    assert rng.exponential([0.5, 2.0], size=(2, 2)).tolist() == [
-        [0.25552372206434737, 2.645608513542529],
-        [0.7271540468558736, 0.39866300558055573],
-    ]
+    expected = [0.18413256735377503, 0.6450270693873458, 4.690218692461341, 0.4185586661538189]
+    assert_allclose(rng.standard_exponential(4), expected, rtol=ZIGGURAT_RTOL)
+    expected = [[0.25552372206434737, 2.645608513542529], [0.7271540468558736, 0.39866300558055573]]
+    assert_allclose(rng.exponential([0.5, 2.0], size=(2, 2)), expected, rtol=ZIGGURAT_RTOL)
     # Shapes below 1 use rejection from the exponential; above 1, Marsaglia and Tsang.
-    assert rng.standard_gamma(0.3, 3).tolist() == [
-        0.2668038100283782,
-        0.009614776660842888,
-        0.06569752471329031,
-    ]
-    assert rng.standard_gamma([2.5, 100.0]).tolist() == [3.5475905768350997, 105.5268819117015]
-    assert rng.gamma(3.0, 2.0, 2).tolist() == [10.922463334055482, 8.859155392065684]
+    expected = [0.2668038100283782, 0.009614776660842888, 0.06569752471329031]
+    assert_allclose(rng.standard_gamma(0.3, 3), expected, rtol=ZIGGURAT_RTOL)
+    expected = [3.5475905768350997, 105.5268819117015]
+    assert_allclose(rng.standard_gamma([2.5, 100.0]), expected, rtol=ZIGGURAT_RTOL)
+    expected = [10.922463334055482, 8.859155392065684]
+    assert_allclose(rng.gamma(3.0, 2.0, 2), expected, rtol=ZIGGURAT_RTOL)
 
 
 def test_generator_chisquare_f_and_t_streams():
     rng = np.random.default_rng(7)
-    assert rng.chisquare([1.0, 50.0]).tolist() == [0.8293904490318487, 46.66008573980642]
-    assert rng.f(3.0, [7.0, 20.0]).tolist() == [0.5281338185443447, 0.42095518115438546]
-    assert rng.standard_t([1.0, 30.0]).tolist() == [0.16747494601466173, 0.8474464134087695]
+    expected = [0.8293904490318487, 46.66008573980642]
+    assert_allclose(rng.chisquare([1.0, 50.0]), expected, rtol=ZIGGURAT_RTOL)
+    expected = [0.5281338185443447, 0.42095518115438546]
+    assert_allclose(rng.f(3.0, [7.0, 20.0]), expected, rtol=ZIGGURAT_RTOL)
+    expected = [0.16747494601466173, 0.8474464134087695]
+    assert_allclose(rng.standard_t([1.0, 30.0]), expected, rtol=ZIGGURAT_RTOL)
 
 
 def test_generator_binomial_and_poisson_streams():

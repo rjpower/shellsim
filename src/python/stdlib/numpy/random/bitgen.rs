@@ -7,12 +7,10 @@
 //! advanced by the 128-bit multiplier `0x2360ed051fc65da44385df649fccf645`, output through the
 //! "XSL RR" (xorshift-low, random-rotation) function that folds the state to 64 bits.
 //!
-//! Both generators reproduce NumPy 2.5.3's seeded streams bit for bit. The derivation involved
-//! no NumPy source: the constants above are the published PCG and Mersenne Twister constants,
-//! and the NumPy-specific choices (how `SeedSequence` output seeds each generator, the initial
-//! twister position, PCG64's word-combination order) were pinned down by comparing this
-//! generator's output against NumPy's own documented and black-box-observed outputs. See
-//! `docs/numpy.md` for which streams this matches exactly.
+//! Both generators reproduce NumPy's seeded streams bit for bit. The constants are the published
+//! PCG and Mersenne Twister ones; the NumPy-specific choices (how `SeedSequence` output seeds
+//! each generator, the initial twister position, PCG64's word order) match NumPy's observed
+//! output.
 //!
 //! [`BitGen`] is the common draw interface both generators implement: `next_u32`/`next_u64` are
 //! the "next word" primitives distributions are built on, `next_double` is each generator's own
@@ -99,14 +97,6 @@ fn mt_temper(y: u32) -> u32 {
 /// PCG64's 128-bit LCG multiplier (O'Neill 2014, the published `PCG_DEFAULT_MULTIPLIER_128`).
 pub(in crate::python) const PCG_MULTIPLIER: u128 = 0x2360_ed05_1fc6_5da4_4385_df64_9fcc_f645;
 
-/// Coefficients of PCG64's stream-jump step (`jumped`), applied through the same generic
-/// LCG-advance doubling as [`pcg_advance`]. NumPy does not document the jump distance; these
-/// were recovered by solving the affine relation `jumped(state) = a*state + b (mod 2**128)`
-/// from two observed states sharing one increment (see the module doc), then checked against
-/// `PCG64(1).jumped(3)`.
-const PCG_JUMP_MULTIPLIER: u128 = 0x6e73_ee76_9f54_f314_571d_82d3_d60e_5bb5;
-const PCG_JUMP_INCREMENT: u128 = 0xd28d_f2c2_8dd9_8991_69b2_e64f_d4bc_d96f;
-
 fn pcg_step(state: u128, inc: u128) -> u128 {
     state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(inc)
 }
@@ -119,7 +109,7 @@ fn pcg_output(state: u128) -> u64 {
     (hi ^ lo).rotate_right(rotation)
 }
 
-/// The generic LCG jump-ahead used by both `advance` and `jumped`: composing the step function
+/// The LCG jump-ahead behind `advance` and `jumped`: composing the step function
 /// `delta` times is itself affine, and repeated squaring computes its coefficients in
 /// `O(log2(delta))` steps (the standard PCG `pcg_advance_lcg_128` technique).
 fn lcg_advance(state: u128, mut delta: u128, mut cur_mult: u128, mut cur_plus: u128) -> u128 {
@@ -139,10 +129,6 @@ fn lcg_advance(state: u128, mut delta: u128, mut cur_mult: u128, mut cur_plus: u
 
 pub(in crate::python) fn pcg_advance(state: u128, inc: u128, delta: u128) -> u128 {
     lcg_advance(state, delta, PCG_MULTIPLIER, inc)
-}
-
-pub(in crate::python) fn pcg_jumped(state: u128, iterations: u128) -> u128 {
-    lcg_advance(state, iterations, PCG_JUMP_MULTIPLIER, PCG_JUMP_INCREMENT)
 }
 
 /// PCG64's `pcg_setseq_128_srandom_r`: derive `(state, inc)` from a 128-bit initial state and a

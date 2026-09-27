@@ -59,7 +59,6 @@ static FUNCTIONS: &[FunctionDef] = &[
     function("_mt_seed_array", mt_seed_array),
     function("_pcg_seed", pcg_seed),
     function("_pcg_advance", pcg_advance),
-    function("_pcg_jumped", pcg_jumped),
     function("_raw_fill", raw_fill),
     function("_uniform01_fill", uniform01_fill),
     function("_bounded_int_fill", bounded_int_fill),
@@ -332,55 +331,19 @@ fn pcg_advance(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let positional = args.positional().to_vec();
     let items = state_items(runtime, positional[0])?;
     let (bitgen, _) = bitgen_from_items(runtime, &items)?;
-    let BitGen::Pcg64 {
-        state,
-        inc,
-        has_uint32,
-        uinteger,
-    } = bitgen
-    else {
+    let BitGen::Pcg64 { state, inc, .. } = bitgen else {
         return Err(PyError::runtime_error("advance() needs a PCG64 state"));
     };
     let delta = parse_u128(runtime, &positional[1])?;
     let state = bitgen::pcg_advance(state, inc, delta);
-    bitgen_to_value(
-        runtime,
-        BitGen::Pcg64 {
-            state,
-            inc,
-            has_uint32,
-            uinteger,
-        },
-        None,
-    )
-}
-
-fn pcg_jumped(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("_pcg_jumped", 2, 2)?;
-    let positional = args.positional().to_vec();
-    let items = state_items(runtime, positional[0])?;
-    let (bitgen, _) = bitgen_from_items(runtime, &items)?;
-    let BitGen::Pcg64 {
+    // Advancing discards the buffered half of a 64-bit word, as NumPy does.
+    let bitgen = BitGen::Pcg64 {
         state,
         inc,
-        has_uint32,
-        uinteger,
-    } = bitgen
-    else {
-        return Err(PyError::runtime_error("jumped() needs a PCG64 state"));
+        has_uint32: false,
+        uinteger: 0,
     };
-    let iterations = parse_u128(runtime, &positional[1])?;
-    let state = bitgen::pcg_jumped(state, iterations);
-    bitgen_to_value(
-        runtime,
-        BitGen::Pcg64 {
-            state,
-            inc,
-            has_uint32,
-            uinteger,
-        },
-        None,
-    )
+    bitgen_to_value(runtime, bitgen, None)
 }
 
 // ---------------------------------------------------------------------------------------------

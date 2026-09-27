@@ -5,10 +5,9 @@
 //! low-order values that would bias the result. Legacy `RandomState.randint` uses the older
 //! masked-rejection method: mask the raw word down to the smallest `2**k - 1` covering the
 //! range and reject draws that fall outside it. Both pick the raw word width (32 or 64 bits)
-//! from the requested range, not the output dtype: a small range draws 32-bit words even when
-//! stored as `int64`, which is what lets a `float64`-sized `randint` call spend only as much
-//! entropy as the range needs. This matches NumPy's own per-width specialization, confirmed
-//! against its published output for narrow, wide, and dtype-buffered ranges.
+//! from the requested range, not the output dtype, so a small range draws 32-bit words even when
+//! stored as `int64`. Dtypes narrower than 32 bits pack several draws into each 32-bit word.
+//! The word widths and packing match NumPy's, so seeded draws agree exactly.
 
 use super::bitgen::BitGen;
 
@@ -57,12 +56,8 @@ pub(in crate::python) fn masked_u64(bitgen: &mut BitGen, range_incl: u64) -> u64
 }
 
 /// Masked rejection in `[0, range_incl]`, picking the 32- or 64-bit primitive from the range.
-/// Fisher-Yates's own index draws (`shuffle`, `permutation`, and sampling without replacement)
-/// use this on *both* `Generator` and legacy `RandomState`, unlike `integers()`/`randint()`
-/// (which use Lemire for `Generator`): black-box comparison showed replaying
-/// `Generator(5).permutation(10)`'s raw words through Lemire (matching `.integers()`'s own
-/// algorithm) did not reproduce NumPy's permutation, but masked rejection did, exactly, matching
-/// on all nine index draws.
+/// Shuffles and permutations use this on both `Generator` and legacy `RandomState`, although
+/// `Generator.integers` uses Lemire's method.
 pub(in crate::python) fn masked_bounded(bitgen: &mut BitGen, range_incl: u128) -> i64 {
     if range_incl <= u128::from(u32::MAX) {
         masked_u32(bitgen, range_incl as u32) as i64
@@ -114,13 +109,9 @@ pub(in crate::python) fn lemire_u64(bitgen: &mut BitGen, range_excl: u128) -> u6
     }
 }
 
-/// Lemire's method in `[0, range_excl)`, picking the 32- or 64-bit primitive from the range and
-/// returning `0` without drawing anything when `range_excl <= 1` (only one value is possible),
-/// mirroring `draw_bounded`'s `count == 1` shortcut. `Generator.choice(..., replace=False)`'s own
-/// index draws use this — Floyd's algorithm for the selection step and its Fisher-Yates final
-/// shuffle both draw `[0, j]` via Lemire, unlike `shuffle`/`permutation`'s masked rejection (see
-/// `super::sequence`'s module doc for how that was recovered and confirmed by state replay, not
-/// just matching output values).
+/// Lemire's method in `[0, range_excl)`, picking the 32- or 64-bit primitive from the range. A
+/// single possible value returns `0` without drawing, like `draw_bounded`'s `count == 1` case.
+/// `Generator.choice(..., replace=False)` draws its indices with this.
 pub(in crate::python) fn lemire_bounded(bitgen: &mut BitGen, range_excl: u128) -> u64 {
     if range_excl <= 1 {
         return 0;
@@ -132,23 +123,9 @@ pub(in crate::python) fn lemire_bounded(bitgen: &mut BitGen, range_excl: u128) -
     }
 }
 
-/// A buffer of unused bits from a `next_u32()` word, shared across a whole array fill so a
-/// dtype narrower than 32 bits packs several draws into one raw word instead of spending a full
-/// word per element.
-///
-/// Recovered by black-box comparison against NumPy 2.5.3 (never by reading its source): drawing
-/// six `uint16` values one call at a time consumed one raw 64-bit PCG64 word per call, but
-/// drawing the same six values in one `size=6` call consumed only two — cloning
-/// `bit_generator.state` around both forms and replaying `random_raw` on the clone (the same
-/// technique used throughout this crate) showed the batched call packs two 16-bit draws from
-/// each `next_u32()` word (low half first, then high half) before asking for a fresh one, and an
-/// `int8` batch packs four 8-bit draws the same way. A `bool` batch packs 32 single-bit draws
-/// per word (`chunk_bits = 1`, not `8`, even though `bool` is stored as one byte): fitting
-/// Lemire's method (below) with `range_excl = 2` to a `chunk_bits = 8` hypothesis did not match,
-/// while `chunk_bits = 1` matched every sample. The buffer itself does not persist across
-/// separate array-fill calls (a fresh `NarrowBuffer` starts empty each time), only the
-/// `next_u32()` word it draws from does (via the bit generator's own persistent `has_uint32`
-/// half-word cache, unrelated to this struct).
+/// Unused bits of a `next_u32()` word, shared across one array fill so that a dtype narrower
+/// than 32 bits takes several draws from each word, low bits first: two per word for 16-bit
+/// dtypes, four for 8-bit dtypes, and 32 for `bool`. Each fill starts with an empty buffer.
 pub(in crate::python) struct NarrowBuffer {
     word: u32,
     remaining: u32,
@@ -176,10 +153,9 @@ impl NarrowBuffer {
     }
 }
 
-/// One bounded draw in `[0, range_incl]`, using `chunk_bits`-wide pieces of `buffer` instead of a
-/// full raw word per draw (see `NarrowBuffer`'s doc). `chunk_bits` is always wide enough to hold
-/// `range_incl` (the caller picks it from the output dtype, which is always at least as wide as
-/// the requested range), so this is `masked_u32`/`lemire_u32` with the word source swapped out.
+/// One bounded draw in `[0, range_incl]` from `chunk_bits`-wide pieces of `buffer`: `masked_u32`
+/// or `lemire_u32` with a narrower word. The output dtype, and so `chunk_bits`, always covers
+/// `range_incl`.
 pub(in crate::python) fn draw_bounded_buffered(
     bitgen: &mut BitGen,
     buffer: &mut NarrowBuffer,
@@ -216,9 +192,8 @@ pub(in crate::python) fn draw_bounded_buffered(
     }
 }
 
-/// The `next_u32()`-chunk width NumPy packs draws at for each dtype narrower than 32 bits, or
-/// `None` for dtypes that already draw a full word (or more) per element and need no buffering
-/// (see `NarrowBuffer`'s doc for how this was recovered).
+/// The chunk width for each dtype narrower than 32 bits, or `None` for dtypes that draw whole
+/// words.
 pub(in crate::python) fn narrow_chunk_bits(dtype_name: &str) -> Option<u32> {
     match dtype_name {
         "bool" => Some(1),
