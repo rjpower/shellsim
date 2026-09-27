@@ -4,8 +4,9 @@
 ``correlate``, ``cross``, ``argwhere`` and ``flatnonzero`` follow ``numpy/_core/numeric.py``;
 ``nan_to_num`` and the complex-type predicates follow ``numpy/lib/_type_check_impl.py``;
 ``angle``, ``gradient`` and ``interp`` follow ``numpy/lib/_function_base_impl.py``; and
-``isposinf``, ``isneginf`` and ``fix`` follow ``numpy/lib/_ufunclike_impl.py``. The native
-kernels behind ``interp`` and ``correlate`` live in ``_numpy_math``.
+``isposinf``, ``isneginf`` and ``fix`` follow ``numpy/lib/_ufunclike_impl.py``; and
+``polyval`` and ``polyfit`` follow ``numpy/lib/_polynomial_impl.py``. The native kernels behind
+``interp`` and ``correlate`` live in ``_numpy_math``.
 """
 
 import warnings
@@ -33,6 +34,7 @@ from _numpy import (
     pi,
     promote_types,
     signbit,
+    sqrt,
     trunc,
     zeros,
     zeros_like,
@@ -40,6 +42,7 @@ from _numpy import (
 from _numpy import complex128 as _complex128
 from _numpy import ndim as _ndim
 from _numpy_math import _compiled_interp, _compiled_interp_complex, _correlate
+from _numpy_products import dot, outer
 from _numpy_shape import (
     _normalize_axis_index,
     broadcast_shapes,
@@ -49,7 +52,7 @@ from _numpy_shape import (
     transpose,
 )
 from numpy._getlimits import finfo
-from numpy._shape_base import atleast_1d, diff, normalize_axis_tuple
+from numpy._shape_base import atleast_1d, diff, normalize_axis_tuple, vander
 
 _NoValue = object()
 
@@ -450,3 +453,63 @@ def polyval(p, x):
         y = y * x + pv
     return y
 
+
+def polyfit(x, y, deg, rcond=None, full=False, w=None, cov=False):
+    # Imported here because `numpy.linalg` imports the `numpy` package this module helps build.
+    from numpy.exceptions import RankWarning
+    from numpy.linalg import inv, lstsq
+
+    order = int(deg) + 1
+    x = asarray(x) + 0.0
+    y = asarray(y) + 0.0
+    if deg < 0:
+        raise ValueError("expected deg >= 0")
+    if x.ndim != 1:
+        raise TypeError("expected 1D vector for x")
+    if x.size == 0:
+        raise TypeError("expected non-empty vector for x")
+    if y.ndim < 1 or y.ndim > 2:
+        raise TypeError("expected 1D or 2D array for y")
+    if x.shape[0] != y.shape[0]:
+        raise TypeError("expected x and y to have same length")
+    if rcond is None:
+        rcond = len(x) * finfo(x.dtype).eps
+    lhs = vander(x, order)
+    rhs = y
+    if w is not None:
+        w = asarray(w) + 0.0
+        if w.ndim != 1:
+            raise TypeError("expected a 1-d array for weights")
+        if w.shape[0] != y.shape[0]:
+            raise TypeError("expected w and y to have the same length")
+        lhs *= w[:, None]
+        if rhs.ndim == 2:
+            rhs *= w[:, None]
+        else:
+            rhs *= w
+    scale = sqrt((lhs * lhs).sum(axis=0))
+    lhs /= scale
+    c, resids, rank, s = lstsq(lhs, rhs, rcond)
+    c = (c.T / scale).T
+    if rank != order and not full:
+        msg = "Polyfit may be poorly conditioned"
+        warnings.warn(msg, RankWarning, stacklevel=2)
+    if full:
+        return (c, resids, rank, s, rcond)
+    elif cov:
+        Vbase = inv(dot(lhs.T, lhs))
+        Vbase /= outer(scale, scale)
+        if cov == "unscaled":
+            fac = 1
+        else:
+            if len(x) <= order:
+                raise ValueError(
+                    "the number of data points must exceed order to scale the covariance matrix"
+                )
+            fac = resids / (len(x) - order)
+        if y.ndim == 1:
+            return (c, Vbase * fac)
+        else:
+            return (c, Vbase[:, :, None] * fac)
+    else:
+        return c

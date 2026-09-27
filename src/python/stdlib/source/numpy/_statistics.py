@@ -1,10 +1,13 @@
-"""Order statistics: ``median``, ``percentile`` and ``quantile``.
+"""Statistics written in Python: ``median``, ``percentile``, ``quantile``, ``cov`` and
+``corrcoef``.
 
 The code follows ``numpy/lib/_function_base_impl.py`` step for step, including the thirteen
 quantile methods, the weighted ``inverted_cdf`` path, and the NaN propagation that reads the
 last element after a partition. ``partition`` here is a full stable sort, which selects the same
 order statistics as NumPy's introselect.
 """
+
+import warnings
 
 import numpy as np
 from numpy._shape_base import normalize_axis_tuple
@@ -573,3 +576,97 @@ def _quantile(arr, quantiles, axis=-1, method="linear", out=None, weights=None, 
         else:
             np.copyto(result, arr[-1, ...], where=slices_having_nans)
     return result
+
+
+def cov(
+    m, y=None, rowvar=True, bias=False, ddof=None, fweights=None, aweights=None, *, dtype=None
+):
+    if ddof is not None and ddof != int(ddof):
+        raise ValueError("ddof must be integer")
+    m = np.asarray(m)
+    if m.ndim > 2:
+        raise ValueError("m has more than 2 dimensions")
+    if y is not None:
+        y = np.asarray(y)
+        if y.ndim > 2:
+            raise ValueError("y has more than 2 dimensions")
+    if dtype is None:
+        if y is None:
+            dtype = np.result_type(m, np.float64)
+        else:
+            dtype = np.result_type(m, y, np.float64)
+    X = np.array(m, ndmin=2, dtype=dtype)
+    if not rowvar and m.ndim != 1:
+        X = X.T
+    if X.shape[0] == 0:
+        return np.array([]).reshape(0, 0)
+    if y is not None:
+        y = np.array(y, copy=None, ndmin=2, dtype=dtype)
+        if not rowvar and y.shape[0] != 1:
+            y = y.T
+        X = np.concatenate((X, y), axis=0)
+    if ddof is None:
+        if bias == 0:
+            ddof = 1
+        else:
+            ddof = 0
+    w = None
+    if fweights is not None:
+        fweights = np.asarray(fweights, dtype=float)
+        if not np.all(fweights == np.around(fweights)):
+            raise TypeError("fweights must be integer")
+        if fweights.ndim > 1:
+            raise RuntimeError("cannot handle multidimensional fweights")
+        if fweights.shape[0] != X.shape[1]:
+            raise RuntimeError("incompatible numbers of samples and fweights")
+        if any(fweights < 0):
+            raise ValueError("fweights cannot be negative")
+        w = fweights
+    if aweights is not None:
+        aweights = np.asarray(aweights, dtype=float)
+        if aweights.ndim > 1:
+            raise RuntimeError("cannot handle multidimensional aweights")
+        if aweights.shape[0] != X.shape[1]:
+            raise RuntimeError("incompatible numbers of samples and aweights")
+        if any(aweights < 0):
+            raise ValueError("aweights cannot be negative")
+        if w is None:
+            w = aweights
+        else:
+            w *= aweights
+    avg, w_sum = np.average(X, axis=1, weights=w, returned=True)
+    w_sum = w_sum[0]
+    if w is None:
+        fact = X.shape[1] - ddof
+    elif ddof == 0:
+        fact = w_sum
+    elif aweights is None:
+        fact = w_sum - ddof
+    else:
+        fact = w_sum - ddof * sum(w * aweights) / w_sum
+    if fact <= 0:
+        warnings.warn("Degrees of freedom <= 0 for slice", RuntimeWarning, stacklevel=2)
+        fact = 0.0
+    X -= avg[:, None]
+    if w is None:
+        X_T = X.T
+    else:
+        X_T = (X * w).T
+    c = np.dot(X, X_T.conj())
+    c *= np.true_divide(1, fact)
+    return c.squeeze()
+
+
+def corrcoef(x, y=None, rowvar=True, *, dtype=None):
+    c = cov(x, y, rowvar, dtype=dtype)
+    try:
+        d = np.diag(c)
+    except ValueError:
+        return c / c
+    stddev = np.sqrt(d.real)
+    c /= stddev[:, None]
+    c /= stddev[None, :]
+    np.clip(c.real, -1, 1, out=c.real)
+    if np.iscomplexobj(c):
+        np.clip(c.imag, -1, 1, out=c.imag)
+    return c

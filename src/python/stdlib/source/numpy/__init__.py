@@ -44,6 +44,7 @@ from numpy._shape_base import (
     tri,
     tril,
     triu,
+    vander,
     vsplit,
     vstack,
 )
@@ -67,13 +68,14 @@ from numpy._function_base import (
     isreal,
     isrealobj,
     nan_to_num,
+    polyfit,
     polyval,
     real,
     real_if_close,
     round,
 )
 from numpy._methods import average, count_nonzero, mean, ptp, std, var
-from numpy._statistics import median, percentile, quantile
+from numpy._statistics import corrcoef, cov, median, percentile, quantile
 from numpy._histograms import digitize, histogram, histogram_bin_edges
 from numpy._index_tricks import index_exp, ix_, ndenumerate, ndindex, s_
 from numpy._arraysetops import (

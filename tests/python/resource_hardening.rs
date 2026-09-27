@@ -433,3 +433,49 @@ fn complex_arrays_reserve_element_storage_before_allocation() {
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn numpy_linalg_charges_cubic_work_before_factoring() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "import numpy as np\nprint(np.linalg.inv(np.eye(20)).trace())",
+        limits,
+    );
+    assert_eq!(
+        (status, stdout),
+        (0, b"20.0\n".to_vec()),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // Inverting 300x300 costs 2 * 300^3 units, which the call charges before factoring.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\na = np.eye(300)\nprint('built')\nnp.linalg.inv(a)",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 5_000_000);
+    assert_eq!(stdout, b"built\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn numpy_jacobi_eigensolver_charges_each_sweep() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        ..Limits::unlimited()
+    };
+    // Each sweep over a 120x120 matrix costs 120^3 units, so a few sweeps exhaust the budget
+    // even though the call charges only quadratic setup work up front.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\na = np.arange(14400.0).reshape(120, 120) % 7\na = a + a.T\n\
+         print('built')\nnp.linalg.eigvalsh(a)",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 5_000_000);
+    assert_eq!(stdout, b"built\n");
+    assert!(stderr.is_empty());
+}

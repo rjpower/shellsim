@@ -1,7 +1,7 @@
 """Shape functions that NumPy writes in Python on top of its C primitives.
 
-Stacking, splitting, ``tile``, ``roll``, the triangle helpers, ``diff``, ``rot90``, ``append``,
-``resize`` and the ``*_along_axis`` functions follow ``numpy/_core/shape_base.py``,
+Stacking, splitting, ``tile``, ``roll``, the triangle helpers, ``vander``, ``diff``, ``rot90``,
+``append``, ``resize`` and the ``*_along_axis`` functions follow ``numpy/_core/shape_base.py``,
 ``numpy/lib/_shape_base_impl.py``, ``numpy/_core/numeric.py``,
 ``numpy/lib/_twodim_base_impl.py`` and ``numpy/lib/_function_base_impl.py``, so views, copies
 and dtypes match NumPy.
@@ -15,6 +15,7 @@ from _numpy import (
     array,
     asanyarray,
     asarray,
+    empty,
     empty_like,
     greater_equal,
     int8,
@@ -24,8 +25,10 @@ from _numpy import (
     integer,
     intp,
     issubdtype,
+    multiply,
     ndarray,
     not_equal,
+    promote_types,
     subtract,
     where,
     zeros,
@@ -300,6 +303,22 @@ def triu(m, k=0):
     m = asanyarray(m)
     mask = tri(*m.shape[-2:], k=k - 1, dtype=_bool)
     return where(mask, zeros(1, m.dtype), m)
+
+
+def vander(x, N=None, increasing=False):
+    x = asarray(x)
+    if x.ndim != 1:
+        raise ValueError("x must be a one-dimensional array or sequence.")
+    if N is None:
+        N = len(x)
+    v = empty((len(x), N), dtype=promote_types(x.dtype, int))
+    tmp = v[:, ::-1] if not increasing else v
+    if N > 0:
+        tmp[:, 0] = 1
+    if N > 1:
+        tmp[:, 1:] = x[:, None]
+        multiply.accumulate(tmp[:, 1:], out=tmp[:, 1:], axis=1)
+    return v
 
 
 _NoValue = object()
