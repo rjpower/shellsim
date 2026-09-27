@@ -792,6 +792,29 @@ def test_with_enter_failure_reaches_the_enclosing_context_only():
         assert str(error) == ("'int' object does not support the context manager protocol (missed __exit__ method)")
 
 
+def test_with_suppressing_an_exception_inside_loops_keeps_the_loop_running():
+    class Suppress:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, kind, value, traceback):
+            self.value = value
+            return True
+
+    def fail(value):
+        raise TypeError(value)
+
+    seen = []
+    for outer in [1, 2]:
+        for inner in [10, 20]:
+            with Suppress() as caught:
+                with Suppress():
+                    fail(inner)
+                fail(outer + inner)
+            seen.append(str(caught.value))
+    assert seen == ["11", "21", "12", "22"]
+
+
 def test_object_instances_are_identity_sentinels():
     sentinel = object()
     other = object()

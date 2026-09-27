@@ -561,6 +561,8 @@ impl Vm<'_> {
 
     #[inline(never)]
     fn dispatch_with_exit_exception(&mut self) -> Result<DispatchControl, String> {
+        // The handler pushed the exception; `__exit__` receives it from the exception stack.
+        self.pop()?;
         let context = self.with_contexts.pop().ok_or("with stack underflow")?;
         let exception = self
             .exception_stack
