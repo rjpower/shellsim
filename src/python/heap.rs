@@ -1540,10 +1540,17 @@ fn trace_object(
 fn modeled_size(object: &Object) -> Result<u64, String> {
     const HEADER: u64 = 32;
     const VALUE: u64 = 24;
+    // Text, bytes, and packed array elements are charged at their byte length rather than per
+    // value slot.
+    let packed = |length: usize| {
+        u64::try_from(length)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(HEADER))
+            .ok_or_else(|| String::from("modeled object size overflow"))
+    };
     let slots = match object {
-        Object::String(value) => value.len(),
-        Object::Bytes(value) => value.len(),
-        Object::ByteArray(value) => value.len(),
+        Object::String(value) => return packed(value.len()),
+        Object::Bytes(value) | Object::ByteArray(value) => return packed(value.len()),
         Object::Exception { kind, message } => kind
             .len()
             .checked_add(message.len())
@@ -1628,13 +1635,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .and_then(|size| size.checked_add(stack.len()))
             .ok_or("modeled object size overflow")?,
         Object::Module { name, .. } => name.len(),
-        // Packed elements are charged at their byte length rather than per value slot.
-        Object::ArrayStorage(PyArrayBuffer::Bytes(bytes)) => {
-            return u64::try_from(bytes.len())
-                .ok()
-                .and_then(|bytes| bytes.checked_add(HEADER))
-                .ok_or_else(|| "modeled object size overflow".into());
-        }
+        Object::ArrayStorage(PyArrayBuffer::Bytes(bytes)) => return packed(bytes.len()),
         Object::ArrayStorage(PyArrayBuffer::Values(values)) => values.len(),
         Object::Array { view, .. } => view
             .shape
@@ -1745,6 +1746,14 @@ mod tests {
             } => *shape,
             _ => panic!("expected shaped instance"),
         }
+    }
+
+    #[test]
+    fn text_and_byte_payloads_are_charged_per_byte() {
+        assert_eq!(modeled_size(&Object::Bytes(vec![0; 1000])), Ok(1032));
+        assert_eq!(modeled_size(&Object::ByteArray(vec![0; 10])), Ok(42));
+        assert_eq!(modeled_size(&Object::String("é".repeat(5).into())), Ok(42));
+        assert_eq!(modeled_size(&Object::List(vec![Value::None; 10])), Ok(272));
     }
 
     #[test]
