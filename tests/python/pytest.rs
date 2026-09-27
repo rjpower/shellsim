@@ -265,3 +265,17 @@ def test_round_trip(value):
     let (status, stdout, stderr) = run_pytest(source, "python3.14 -m pytest /test_sample.py");
     assert_eq!(status, 0, "{stderr:?} {stdout:?}");
 }
+
+#[test]
+fn parametrize_rows_keep_bytes_literals() {
+    let source = r#"import pytest
+
+@pytest.mark.parametrize("value, length", [(b"", 0), (b"a\x00\xff'\"", 5)])
+def test_bytes(value, length):
+    assert type(value) is bytes
+    assert len(value) == length
+    assert value in (b"", b"a\x00\xff'\"")
+"#;
+    let (status, stdout, stderr) = run_pytest(source, "python3.14 -m pytest /test_sample.py");
+    assert_eq!(status, 0, "{stderr:?} {stdout:?}");
+}
