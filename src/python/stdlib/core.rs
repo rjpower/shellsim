@@ -155,6 +155,12 @@ pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
+pub(crate) static SLICE_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "slice",
+    methods: &[method("slice", "indices", slice_indices)],
+    getters: &[],
+};
+
 pub(crate) static LIST_TYPE: NativeTypeDef = NativeTypeDef {
     name: "list",
     methods: &[
@@ -2499,6 +2505,31 @@ fn pop_index(raw: i64, length: usize) -> PyResult<usize> {
         .ok()
         .filter(|index| *index < length)
         .ok_or_else(|| PyError::exception("IndexError", "pop index out of range"))
+}
+
+/// `slice.indices(length)`: the normalized `(start, stop, step)` for a sequence of `length`.
+fn slice_indices(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("slice.indices")?;
+    let [length] = args.positional() else {
+        return Err(PyError::type_error(format!(
+            "slice.indices() takes exactly one argument ({} given)",
+            args.positional().len()
+        )));
+    };
+    let length = index_argument(runtime, length)?;
+    if length < 0 {
+        return Err(PyError::value_error("length should not be negative"));
+    }
+    let (start, stop, step) = runtime
+        .slice_parts(&receiver)
+        .ok_or_else(|| PyError::type_error("descriptor 'indices' requires a 'slice' object"))?;
+    let (start, stop, step) = super::super::slice::slice_indices(length, start, stop, step)
+        .map_err(PyError::value_error)?;
+    runtime.new_tuple(vec![
+        PyValue::Int(start),
+        PyValue::Int(stop),
+        PyValue::Int(step),
+    ])
 }
 
 fn list_remove(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

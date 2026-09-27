@@ -275,10 +275,7 @@ class flatiter:
     def _positions(self, key):
         size = self._array.size
         if isinstance(key, slice):
-            # `slice.indices()` is not implemented (see "Interpreter gaps" in the numpy-core-py
-            # handoff), so let a plain int64 arange do the start/stop/step/negative-index
-            # normalization instead of reimplementing it here.
-            return arange(size)[key].tolist()
+            return list(range(*key.indices(size)))
         if isinstance(key, (list, tuple, ndarray)):
             return [int(i) % size if int(i) < 0 else int(i) for i in asanyarray(key).reshape(-1).tolist()]
         index = int(key)

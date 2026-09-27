@@ -6,6 +6,45 @@
 
 use std::ops::Range;
 
+/// Python's `slice.indices(length)`: the start, stop, and step a slice selects in a sequence of
+/// `length` items. Omitted bounds take the step direction's defaults, negative bounds count from
+/// the end, and out-of-range bounds are clamped, so `slice(None, None, -1)` over 5 items gives
+/// `(4, -1, -1)`.
+pub(super) fn slice_indices(
+    length: i64,
+    start: Option<i64>,
+    stop: Option<i64>,
+    step: Option<i64>,
+) -> Result<(i64, i64, i64), String> {
+    let step = step.unwrap_or(1);
+    if step == 0 {
+        return Err("slice step cannot be zero".into());
+    }
+    let (lower, upper) = if step > 0 {
+        (0, length)
+    } else {
+        (-1, length.saturating_sub(1))
+    };
+    let clamp = |value: i64| {
+        let value = if value < 0 {
+            value.saturating_add(length)
+        } else {
+            value
+        };
+        value.clamp(lower, upper)
+    };
+    let (default_start, default_stop) = if step > 0 {
+        (lower, upper)
+    } else {
+        (upper, lower)
+    };
+    Ok((
+        start.map_or(default_start, clamp),
+        stop.map_or(default_stop, clamp),
+        step,
+    ))
+}
+
 /// A normalized slice over a sequence with a known length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SlicePlan {
@@ -24,29 +63,7 @@ impl SlicePlan {
     ) -> Result<Self, String> {
         isize::try_from(length).map_err(|_| "sequence is too large to slice")?;
         let length = i64::try_from(length).map_err(|_| "sequence is too large to slice")?;
-        let step = step.unwrap_or(1);
-        if step == 0 {
-            return Err("slice step cannot be zero".into());
-        }
-        let normalize = |value: i64, minimum: i64, maximum: i64| {
-            let value = if value < 0 {
-                value.saturating_add(length)
-            } else {
-                value
-            };
-            value.clamp(minimum, maximum)
-        };
-        let (first, stop) = if step > 0 {
-            (
-                start.map_or(0, |value| normalize(value, 0, length)),
-                stop.map_or(length, |value| normalize(value, 0, length)),
-            )
-        } else {
-            (
-                start.map_or(length - 1, |value| normalize(value, -1, length - 1)),
-                stop.map_or(-1, |value| normalize(value, -1, length - 1)),
-            )
-        };
+        let (first, stop, step) = slice_indices(length, start, stop, step)?;
         let selected = if (step > 0 && first < stop) || (step < 0 && first > stop) {
             usize::try_from((stop - first - step.signum()) / step + 1)
                 .map_err(|_| "slice length overflow")?

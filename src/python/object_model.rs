@@ -652,6 +652,10 @@ impl Default for TypeRegistry {
             &super::stdlib::core::LIST_TYPE,
         );
         install_native_attributes(
+            &mut types[BuiltinType::Slice as usize],
+            &super::stdlib::core::SLICE_TYPE,
+        );
+        install_native_attributes(
             &mut types[BuiltinType::Dict as usize],
             &super::stdlib::core::DICT_TYPE,
         );

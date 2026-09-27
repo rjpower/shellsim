@@ -1020,3 +1020,15 @@ def test_callable_recognizes_call_methods_and_native_methods():
     assert callable(Callable()) and callable(Inherits())
     assert not callable(object())
     assert callable(str.upper) and callable("a".upper) and callable(dict.fromkeys)
+
+
+def test_slice_indices_normalizes_bounds_for_a_length():
+    assert slice(None).indices(5) == (0, 5, 1)
+    assert slice(None, None, -1).indices(5) == (4, -1, -1)
+    assert slice(-3, -1).indices(5) == (2, 4, 1)
+    assert slice(-100, 100, 2).indices(5) == (0, 5, 2)
+    assert slice(2, -100, -1).indices(5) == (2, -1, -1)
+    assert slice(None, None, -1).indices(0) == (-1, -1, -1)
+    assert raised(lambda: slice(None, None, 0).indices(3)) == (ValueError, "slice step cannot be zero")
+    assert raised(lambda: slice(1).indices(-1)) == (ValueError, "length should not be negative")
+    assert raised(lambda: slice(1).indices(1.5)) == (TypeError, "'float' object cannot be interpreted as an integer")
