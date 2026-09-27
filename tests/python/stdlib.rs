@@ -242,6 +242,27 @@ except TypeError:
 }
 
 #[test]
+fn math_prod_multiplies_through_the_operator_protocol() {
+    let source = r#"import math
+print(math.prod([]), math.prod([2, 3], start=4), math.prod([1.5, 2]), math.prod(["a"], start=3))
+print(math.prod(range(1, 30)) == math.factorial(29))
+for args, kwargs in [((), {}), (([1], [2]), {}), (([1],), {"x": 1}), ((5,), {})]:
+    try:
+        math.prod(*args, **kwargs)
+    except TypeError as error:
+        print(error)
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"1 24 3.0 aaa\nTrue\nprod() takes exactly 1 positional argument (0 given)\nprod() takes exactly 1 positional argument (2 given)\nprod() got an unexpected keyword argument 'x'\n'int' object is not iterable\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
 fn expanded_math_and_complex_functions_cover_agent_numeric_checks() {
     let source = r#"import cmath
 import math

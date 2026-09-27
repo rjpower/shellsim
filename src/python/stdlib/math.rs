@@ -11,9 +11,10 @@ use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 
 use super::super::native::PyValue as Value;
+use super::super::ast::BinaryOperator;
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyResult, PyRuntime, PyValueCast,
-    ValueDef,
+    CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyOperator, PyResult, PyRuntime,
+    PyValueCast, ValueDef,
 };
 use super::super::number::PyNumber;
 
@@ -129,6 +130,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             module: "math",
             name: "pow",
             call: native_pow,
+        },
+        FunctionDef {
+            module: "math",
+            name: "prod",
+            call: native_prod,
         },
         FunctionDef {
             module: "math",
@@ -403,6 +409,33 @@ fn native_log2(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 
 fn native_pow(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "pow")
+}
+
+/// Multiply `start` (default 1) by each item of the iterable through the `*` protocol, so
+/// integers stay exact and NumPy scalars and other numeric types keep their own rules.
+fn native_prod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    if args.positional().len() != 1 {
+        return Err(PyError::type_error(format!(
+            "prod() takes exactly 1 positional argument ({} given)",
+            args.positional().len()
+        )));
+    }
+    if let Some((name, _)) = args.keywords().iter().find(|(name, _)| name != "start") {
+        return Err(PyError::type_error(format!(
+            "prod() got an unexpected keyword argument '{name}'"
+        )));
+    }
+    let mut product = match args.keyword("prod", "start")? {
+        Some(start) => *start,
+        None => Value::Int(1),
+    };
+    let iterator = runtime.iterator(args.positional()[0])?;
+    let multiply = PyOperator::Binary(BinaryOperator::Multiply);
+    while let Some(item) = runtime.iterator_next(iterator)? {
+        runtime.charge_cpu(1)?;
+        product = runtime.apply_operator(multiply, &[product, item])?;
+    }
+    Ok(product)
 }
 
 fn native_radians(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
