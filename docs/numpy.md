@@ -99,8 +99,8 @@ differences, the unsupported frontier, and resource limits.
   `result_type`, `can_cast`, `issubdtype`, `isdtype` and `mintypecode`.
 - **Indexing.** Basic indexing returns views. Integer-array and boolean-mask indexing follow
   NumPy's placement rules for combined advanced indices. Assignment works through every index
-  form, broadcasting the value as NumPy does. `select`, `extract`, `place` and `putmask` choose
-  and fill elements by condition.
+  form, broadcasting the value as NumPy does. `select`, `extract`, `place`, `putmask`, `nonzero`,
+  `where` and `copyto` choose and fill elements by condition.
 - **Ufuncs.** The arithmetic, comparison, logical, bitwise, rounding, exponential,
   trigonometric and hyperbolic ufuncs, with `out=`, `where=`, `dtype=`, `casting=`, `order=`,
   and `reduce`/`accumulate`. Operators share the ufunc table. `np.errstate` and `np.seterr`
@@ -114,8 +114,9 @@ differences, the unsupported frontier, and resource limits.
 - **Shape.** Reshaping, transposition and axis moves, joining and splitting (including `block`),
   repetition, flips (`flip`, `fliplr`, `flipud`), rolls, `pad`, triangles and diagonals, `kron`,
   and broadcasting helpers, with NumPy's view-or-copy semantics.
-- **Sorting and sets.** `sort`, `argsort`, `lexsort`, `partition`, `searchsorted`, `unique` and
-  its variants, set operations, `histogram` and `digitize`.
+- **Sorting and sets.** `sort`, `argsort`, `lexsort`, `partition`, `argpartition`,
+  `searchsorted`, `bincount`, `unique` and its variants, set operations, `histogram` and
+  `digitize`.
 - **Products and linear algebra.** `dot`, `vdot`, `vecdot`, `cross`, `inner`, `outer`, `matmul`
   and `@`, `tensordot`, and `numpy.linalg` for real arrays: `inv`, `solve`, `det`, `slogdet`,
   `eigh`, `eigvalsh`, `svd`, `qr`, `cholesky`, `lstsq`, `pinv`, `matrix_rank`, `matrix_power` and
@@ -158,7 +159,10 @@ never imports a module or calls arbitrary code.
 
 - **Sorting.** Every sort is a stable merge sort, whatever `kind` requests. NumPy's default
   sorts are not stable, so the order they give equal elements is unspecified; the stable order is
-  one NumPy may produce.
+  one NumPy may produce. `partition` and `argpartition` fully sort each lane rather than running
+  introselect, which still satisfies NumPy's documented contract (the `kth` element lands where a
+  full sort would put it, with smaller elements before it and larger ones after) but leaves the
+  unindexed elements in sorted, not arbitrary, order.
 - **`frombuffer`.** Arrays cannot share storage with a Python `bytes` or `bytearray`, so
   `frombuffer` copies. The copy is read-only, so a write that NumPy would pass through to a
   `bytearray` fails instead of silently diverging.

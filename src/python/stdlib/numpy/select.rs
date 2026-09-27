@@ -95,7 +95,11 @@ pub(in crate::python) fn module_nonzero(runtime: &mut dyn PyRuntime, args: CallA
     nonzero(runtime, &array)
 }
 
-fn method_nonzero(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+fn method_nonzero(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
     args.expect_positional("nonzero", 0, 0)?;
     args.reject_keywords("nonzero")?;
     let array = receiver(runtime, receiver_value)?;
@@ -110,12 +114,19 @@ fn operand_array(
 ) -> PyResult<Array> {
     match operand {
         ufunc::Operand::Array(array) => convert::cast_array(runtime, &array, dtype, false),
-        ufunc::Operand::Weak { value, leaf, .. } => convert::weak_array(runtime, value, &leaf, dtype),
+        ufunc::Operand::Weak { value, leaf, .. } => {
+            convert::weak_array(runtime, value, &leaf, dtype)
+        }
     }
 }
 
 /// Combine two same-dtype, same-shape broadcast buffers by `truth`, element by element.
-fn select_buffer(truth: &[bool], itemsize: usize, x: &PyArrayBuffer, y: &PyArrayBuffer) -> PyArrayBuffer {
+fn select_buffer(
+    truth: &[bool],
+    itemsize: usize,
+    x: &PyArrayBuffer,
+    y: &PyArrayBuffer,
+) -> PyArrayBuffer {
     match (x, y) {
         (PyArrayBuffer::Bytes(x), PyArrayBuffer::Bytes(y)) => {
             let mut out = vec![0u8; truth.len() * itemsize];
@@ -139,7 +150,12 @@ fn select_buffer(truth: &[bool], itemsize: usize, x: &PyArrayBuffer, y: &PyArray
 
 /// `np.where(condition, x, y)`: `x` where `condition` is true, `y` elsewhere, promoted and
 /// broadcast together like a binary ufunc.
-fn where_select(runtime: &mut dyn PyRuntime, condition: PyValue, x: PyValue, y: PyValue) -> PyResult {
+fn where_select(
+    runtime: &mut dyn PyRuntime,
+    condition: PyValue,
+    x: PyValue,
+    y: PyValue,
+) -> PyResult {
     let condition = convert::array_from_python(runtime, condition, Some(DType::BOOL), false)?;
     let operands = [ufunc::operand(runtime, x)?.0, ufunc::operand(runtime, y)?.0];
     let dtype = ufunc::common_dtype(&operands)?;

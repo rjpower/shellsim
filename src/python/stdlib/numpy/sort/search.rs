@@ -22,10 +22,14 @@ use super::super::dtype::{self, DType, Kind};
 use super::super::element::dispatch_numeric;
 use super::{cost_log_n, less_than, SortKey};
 
-static MODULE_SIGNATURE: Signature = Signature::new("searchsorted", &["a", "v", "side", "sorter"], 2);
+static MODULE_SIGNATURE: Signature =
+    Signature::new("searchsorted", &["a", "v", "side", "sorter"], 2);
 static METHOD_SIGNATURE: Signature = Signature::new("searchsorted", &["v", "side", "sorter"], 1);
 
-pub(in crate::python) fn module_searchsorted(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn module_searchsorted(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
+) -> PyResult {
     let bound = MODULE_SIGNATURE.bind(&args)?;
     searchsorted(
         runtime,
@@ -72,7 +76,11 @@ fn parse_side(runtime: &mut dyn PyRuntime, side: Option<PyValue>) -> PyResult<bo
 }
 
 /// `sorter`'s int64 values, checked for an integer dtype and matching length.
-fn parse_sorter(runtime: &mut dyn PyRuntime, sorter: Option<PyValue>, n: usize) -> PyResult<Option<Vec<i64>>> {
+fn parse_sorter(
+    runtime: &mut dyn PyRuntime,
+    sorter: Option<PyValue>,
+    n: usize,
+) -> PyResult<Option<Vec<i64>>> {
     let Some(value) = sorter else { return Ok(None) };
     let array = convert::as_array(runtime, value)?;
     if !array.dtype.is_integer() {
@@ -164,7 +172,9 @@ fn searchsorted(
             v_bytes
                 .chunks_exact(width)
                 .map(|value| {
-                    binary_search(n, right, |mid| super::compare_code_points(&read(&a_bytes, index(mid)), value)) as i64
+                    binary_search(n, right, |mid| {
+                        super::compare_code_points(&read(&a_bytes, index(mid)), value)
+                    }) as i64
                 })
                 .collect()
         }
@@ -182,7 +192,11 @@ fn searchsorted(
     };
 
     if v.ndim() == 0 {
-        return super::super::scalar::box_number(runtime, DType::INT64, super::super::element::Number::Int(positions[0]));
+        return super::super::scalar::box_number(
+            runtime,
+            DType::INT64,
+            super::super::element::Number::Int(positions[0]),
+        );
     }
     Ok(array::array_from_elements(runtime, DType::INT64, v.shape().to_vec(), &positions)?.value())
 }
