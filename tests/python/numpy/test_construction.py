@@ -293,6 +293,39 @@ def test_arange_accepts_zero_d_array_bounds():
         np.arange(np.array([3, 4]))
 
 
+class _Pair:
+    """A user sequence. NumPy reads objects with `__len__` and `__getitem__` as sequences."""
+
+    def __init__(self, *items):
+        self.items = items
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+
+class _IterOnly:
+    def __iter__(self):
+        return iter([1, 2])
+
+
+def test_asarray_reads_user_sequences():
+    assert np.asarray(_Pair(1.5, 2)).tolist() == [1.5, 2.0]
+    nested = np.asarray([_Pair(1, 2), (3, 4)])
+    assert nested.dtype == np.dtype("int64")
+    assert nested.tolist() == [[1, 2], [3, 4]]
+    assert np.add(_Pair(1, 2), 1).tolist() == [2, 3]
+    np.testing.assert_allclose(_Pair(1.0, 2.0), (1.0, 2.0))
+    # An iterable without `__getitem__` is not a sequence, so it becomes an object scalar.
+    iter_only = np.asarray(_IterOnly())
+    assert iter_only.dtype == np.dtype(object)
+    assert iter_only.shape == ()
+    with pytest.raises(ValueError, match="inhomogeneous"):
+        np.asarray(_Pair(_Pair(1, 2), _Pair(3)))
+
+
 def test_arange_zero_step_raises():
     with pytest.raises(ZeroDivisionError):
         np.arange(0, 5, 0)

@@ -126,17 +126,28 @@ fn sequence_items(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Opti
             let tuple = value.cast(runtime)?;
             runtime.tuple_items(tuple).map(Some)
         }
-        _ if runtime.type_name(value)? == "range" => {
-            let iterator = runtime.iterator(*value)?;
-            let mut items = Vec::new();
-            while let Some(item) = runtime.iterator_next(iterator)? {
-                runtime.charge_cpu(1)?;
-                items.push(item);
-            }
-            Ok(Some(items))
+        _ if runtime.type_name(value)? == "range" => iterated_items(runtime, value).map(Some),
+        // NumPy treats any object with `__getitem__` and `__len__` as a sequence and takes its
+        // items by iterating it.
+        PyKind::Instance
+            if runtime.get_attribute(*value, "__getitem__")?.is_some()
+                && runtime.get_attribute(*value, "__len__")?.is_some() =>
+        {
+            iterated_items(runtime, value).map(Some)
         }
         _ => Ok(None),
     }
+}
+
+fn iterated_items(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Vec<PyValue>> {
+    let iterator = runtime.iterator(*value)?;
+    let mut items = Vec::new();
+    while let Some(item) = runtime.iterator_next(iterator)? {
+        runtime.charge_cpu(1)?;
+        runtime.reserve_memory(16)?;
+        items.push(item);
+    }
+    Ok(items)
 }
 
 fn inhomogeneous(shape: &[usize], depth: usize) -> PyError {
