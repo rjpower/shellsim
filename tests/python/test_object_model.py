@@ -552,3 +552,103 @@ def test_del_and_delattr_remove_attributes_through_the_protocol():
             assert str(error) == message
         else:
             raise AssertionError(message)
+
+
+class Singleton:
+    instance = None
+
+    def __new__(cls):
+        if cls.instance is None:
+            cls.instance = super().__new__(cls)
+        return cls.instance
+
+
+class Tagged:
+    def __new__(cls, value):
+        instance = super().__new__(cls)
+        instance.tag = value * 2
+        return instance
+
+    def __init__(self, value):
+        self.value = value
+
+
+class TaggedChild(Tagged):
+    def __init__(self, value):
+        super().__init__(value)
+        self.child = True
+
+
+class StaticNew:
+    @staticmethod
+    def __new__(cls, *, name):
+        instance = object.__new__(cls)
+        instance.name = name
+        return instance
+
+
+class ReturnsOther:
+    initialized = []
+
+    def __new__(cls):
+        return 7
+
+    def __init__(self):
+        ReturnsOther.initialized.append(self)
+
+
+class ForwardsArguments:
+    def __new__(cls, *args):
+        return super().__new__(cls, *args)
+
+
+class NoInitializer:
+    pass
+
+
+def test_new_creates_the_instance_that_init_receives():
+    assert Singleton() is Singleton()
+    tagged = Tagged(3)
+    assert (tagged.tag, tagged.value) == (6, 3)
+    child = TaggedChild(4)
+    assert (child.tag, child.value, child.child, type(child)) == (8, 4, True, TaggedChild)
+    assert StaticNew(name="n").name == "n"
+    # `__init__` runs only when `__new__` returns an instance of the class.
+    assert ReturnsOther() == 7
+    assert ReturnsOther.initialized == []
+    assert type(object.__new__(Tagged)) is Tagged
+    assert NoInitializer.__new__ is object.__new__
+    assert NoInitializer.__init__ is object.__init__
+
+
+def test_object_new_rejects_arguments_nothing_accepts():
+    for operation, message in [
+        (lambda: ForwardsArguments(1), "object.__new__() takes exactly one argument (the type to instantiate)"),
+        (lambda: object.__new__(NoInitializer, 1), "NoInitializer() takes no arguments"),
+        (lambda: object.__new__(ValueError), "object.__new__(ValueError) is not safe, use ValueError.__new__()"),
+        (lambda: object.__new__(LegacyError), "object.__new__(LegacyError) is not safe, use LegacyError.__new__()"),
+    ]:
+        try:
+            operation()
+        except TypeError as error:
+            assert str(error) == message
+        else:
+            raise AssertionError(message)
+
+
+class LegacyError(Exception):
+    def __init__(self, message, code):
+        Exception.__init__(self, message)
+        self.code = code
+
+
+class Finished(StopIteration):
+    pass
+
+
+def test_builtin_exception_methods_are_reachable_from_classes():
+    error = LegacyError("failed", 3)
+    assert (error.args, str(error), error.code) == (("failed",), "failed", 3)
+    assert LegacyError.__init__ is not Exception.__init__
+    assert Finished(5).value == 5
+    assert not hasattr(ValueError(), "value")

@@ -1,11 +1,11 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
 use super::{
-    expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BytecodeFrame, CallArgs,
-    CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator, Execution, FunctionInvocation,
-    FunctionReturn, HashMap, InstanceAttributes, InstancePayload, NativeValue, Object,
-    PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, ScopeId,
-    Slot, Stream, Value, Vm,
+    expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BuiltinType,
+    BytecodeFrame, CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator,
+    ExceptionType, Execution, FunctionInvocation, FunctionReturn, HashMap, InstanceAttributes,
+    InstancePayload, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime,
+    PyStreamRead, RaisedException, ScopeId, Slot, Stream, Value, Vm,
 };
 use num_traits::{Signed, Zero};
 
@@ -318,6 +318,19 @@ impl Vm<'_> {
                             }
                         }
                         return Err(format!("value is not a valid {name}"));
+                    }
+                    if layout != ClassLayout::Type && exception_base.is_none() && !is_dataclass {
+                        if let Some((owner, constructor)) =
+                            self.class_attribute_entry(id, "__new__")?
+                        {
+                            return self.construct_with_new(
+                                id,
+                                owner,
+                                constructor,
+                                arguments,
+                                keyword_arguments,
+                            );
+                        }
                     }
                     let payload = match layout {
                         ClassLayout::Object => InstancePayload::Object,
@@ -1633,6 +1646,131 @@ impl Vm<'_> {
     /// Advance any Python iterator by one item; `Ok(None)` means a builtin iterator is exhausted.
     /// A user iterator's `StopIteration` stays pending as an error, so callers that treat it as
     /// exhaustion check [`Self::pending_stop_iteration`].
+    /// Instantiate a class whose MRO defines `__new__`, as `type.__call__` does: call `__new__`
+    /// with the class and the call's arguments, then run `__init__` with the same arguments
+    /// when the result is an instance of the class. Any other result is returned as is.
+    fn construct_with_new(
+        &mut self,
+        class: super::super::heap::ObjectId,
+        owner: super::super::heap::ObjectId,
+        constructor: Value,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<CallResult, String> {
+        // `__new__` is a static method that receives the class explicitly.
+        let constructor = self.bind_descriptor(constructor, None, class, owner)?;
+        let mut new_arguments = Vec::with_capacity(arguments.len().saturating_add(1));
+        new_arguments.push(Value::Object(class));
+        new_arguments.extend(arguments.iter().copied());
+        let created =
+            match self.invoke_call(constructor, new_arguments, keyword_arguments.clone())? {
+                CallResult::Value(value) => value,
+                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
+                CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
+                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                    unreachable!("immediate call cannot suspend")
+                }
+            };
+        if !self.is_instance(&created, &Value::Object(class))? {
+            return Ok(CallResult::Value(created));
+        }
+        let Some((owner, initializer)) = self.class_attribute_entry(class, "__init__")? else {
+            return Ok(CallResult::Value(created));
+        };
+        let initializer = self.bind_descriptor(initializer, Some(created), class, owner)?;
+        match self.invoke_call(initializer, arguments, keyword_arguments)? {
+            CallResult::Value(value) if value.is_none() => Ok(CallResult::Value(created)),
+            CallResult::Value(value) => {
+                let type_name = self.type_name_of(&value)?;
+                Err(self.raise_exception(
+                    "TypeError",
+                    format!("__init__() should return None, not '{type_name}'"),
+                ))
+            }
+            CallResult::Exit(status) => Ok(CallResult::Exit(status)),
+            CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
+            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                unreachable!("immediate call cannot suspend")
+            }
+        }
+    }
+
+    /// `object.__new__(class)`: a new instance of `class` with no attributes set.
+    ///
+    /// As in CPython, extra arguments are an error when the class overrides `__new__` (they were
+    /// meant for it) or when it keeps `object.__init__` (nothing would accept them). A class whose
+    /// instances have a builtin layout, such as an `int` or exception subclass, must be created
+    /// by that builtin's `__new__`.
+    pub(super) fn new_instance(
+        &mut self,
+        class: Value,
+        has_arguments: bool,
+    ) -> Result<Value, String> {
+        if matches!(
+            class.native_value(),
+            Some(NativeValue::BuiltinType(BuiltinType::Object))
+        ) {
+            if has_arguments {
+                return Err(self.raise_exception("TypeError", "object() takes no arguments"));
+            }
+            return self.allocate_object(Object::Bare);
+        }
+        let builtin = match class.native_value() {
+            Some(NativeValue::BuiltinType(builtin)) => Some(builtin.name()),
+            Some(NativeValue::ExceptionType(ExceptionType(name))) => Some(name),
+            _ => None,
+        };
+        if let Some(name) = builtin {
+            return Err(self.raise_exception(
+                "TypeError",
+                format!("object.__new__({name}) is not safe, use {name}.__new__()"),
+            ));
+        }
+        let Some((id, name, layout, exception_base)) =
+            class
+                .object_id()
+                .and_then(|id| match self.state.heap.get(id) {
+                    Ok(Object::Class {
+                        name,
+                        layout,
+                        exception_base,
+                        ..
+                    }) => Some((id, name.clone(), *layout, *exception_base)),
+                    _ => None,
+                })
+        else {
+            let type_name = self.type_name_of(&class)?;
+            return Err(self.raise_exception(
+                "TypeError",
+                format!("object.__new__(X): X is not a type object ({type_name})"),
+            ));
+        };
+        if layout != ClassLayout::Object || exception_base.is_some() {
+            return Err(self.raise_exception(
+                "TypeError",
+                format!("object.__new__({name}) is not safe, use {name}.__new__()"),
+            ));
+        }
+        if has_arguments {
+            if self.class_attribute_entry(id, "__new__")?.is_some() {
+                return Err(self.raise_exception(
+                    "TypeError",
+                    "object.__new__() takes exactly one argument (the type to instantiate)",
+                ));
+            }
+            if self.class_attribute_entry(id, "__init__")?.is_none() {
+                return Err(
+                    self.raise_exception("TypeError", format!("{name}() takes no arguments"))
+                );
+            }
+        }
+        self.allocate_object(Object::Instance {
+            class: id,
+            payload: InstancePayload::Object,
+            attributes: InstanceAttributes::default(),
+        })
+    }
+
     pub(super) fn iterator_next(&mut self, iterator: &Value) -> Result<Option<Value>, String> {
         let Some(id) = iterator.object_id() else {
             return Err(self.raise_object_type_error(iterator, "is not an iterator"));

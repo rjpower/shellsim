@@ -676,7 +676,8 @@ pub(super) trait PyRuntime {
     fn exception_with_args(&mut self, kind: &'static str, args: Vec<PyValue>) -> PyError;
     /// Raise the `StopIteration` that ends `generator`, carrying its return value.
     fn generator_stop(&mut self, generator: PyIterator) -> PyError;
-    /// The class name and constructor arguments of a builtin exception instance.
+    /// The builtin exception class and constructor arguments of an exception instance. For an
+    /// instance of a user exception class, the class is its closest builtin ancestor.
     fn exception_args(&mut self, value: &PyValue) -> PyResult<Option<(String, Vec<PyValue>)>>;
     /// Delete an attribute without consulting a class's `__delattr__`, as
     /// `object.__delattr__` does.
@@ -798,6 +799,9 @@ pub(super) trait PyRuntime {
     fn new_bytearray(&mut self, value: Vec<u8>) -> PyResult<PyValue>;
     fn property_getter(&self, property: PyProperty) -> PyResult<PyValue>;
     fn new_property(&mut self, getter: PyValue, setter: Option<PyValue>) -> PyResult<PyValue>;
+    /// `object.__new__(class, ...)`: a new, attribute-free instance of `class`. `has_arguments`
+    /// says whether the call passed anything beyond the class.
+    fn new_instance(&mut self, class: PyValue, has_arguments: bool) -> PyResult<PyValue>;
     /// Allocate a class through the runtime's single `type.__new__` implementation.
     fn new_type(
         &mut self,

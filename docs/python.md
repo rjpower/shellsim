@@ -75,10 +75,18 @@ class name with its module. Class attributes, special methods included, may be a
 after the class statement, and the change applies to existing instances and subclasses. `del
 obj.attr` and `delattr` delete through the descriptor protocol: a class's `__delattr__`, a
 descriptor's `__delete__`, then the instance's own attribute. Classes and functions have no
-`__qualname__` or `__doc__`, so a nested class's `repr` omits its enclosing scope. Builtin functions, native methods and bound
-methods report `__name__`, and bound methods expose `__self__` and `__func__`. A subclass of `int`
-inherits the native `int` methods such as `bit_length` and `to_bytes`, and `from_bytes` called on
-the subclass returns an instance of it.
+`__qualname__` or `__doc__`, so a nested class's `repr` omits its enclosing scope. Builtin
+functions, native methods and bound methods report `__name__`, and bound methods expose
+`__self__` and `__func__`. A subclass of `int` inherits the native `int` methods such as
+`bit_length` and `to_bytes`, and `from_bytes` called on the subclass returns an instance of it.
+
+Calling a class whose MRO defines `__new__` calls it with the class and the arguments, then
+calls `__init__` only if the result is an instance of the class. `object.__new__` creates a plain
+instance and, like CPython's, rejects arguments that neither an overriding `__new__` nor an
+`__init__` would accept. Attribute lookup on a class continues through its builtin ancestors, so
+`C.__init__ is object.__init__` for a class without its own, and `Exception.__init__(self, message)`
+initializes a user exception. User `__new__` methods of exception classes and dataclasses are not
+called yet.
 
 Augmented assignment updates mutable operands in place, as in CPython: `list +=` extends with any
 iterable, `set |=` and its siblings mutate the set, `dict |=` updates the mapping, and user classes

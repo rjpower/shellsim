@@ -255,6 +255,7 @@ pub(crate) static PROPERTY_TYPE: NativeTypeDef = NativeTypeDef {
 pub(crate) static OBJECT_TYPE: NativeTypeDef = NativeTypeDef {
     name: "object",
     methods: &[
+        method("object", "__new__", object_new),
         method("object", "__init__", object_init),
         method("object", "__hash__", object_hash),
         method("object", "__eq__", object_eq),
@@ -302,12 +303,17 @@ fn exception_args(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
 /// `StopIteration.value`: the first argument, which is a generator's return value, or `None`.
 fn stop_iteration_value(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     match runtime.exception_args(&receiver)? {
-        Some((kind, args)) if kind == "StopIteration" => {
+        Some((kind, args))
+            if super::super::exception_types::exception_is_subclass(&kind, "StopIteration") =>
+        {
             Ok(args.first().copied().unwrap_or(Value::None))
         }
-        Some((kind, _)) => Err(PyError::exception(
+        Some(_) => Err(PyError::exception(
             "AttributeError",
-            format!("'{kind}' object has no attribute 'value'"),
+            format!(
+                "'{}' object has no attribute 'value'",
+                runtime.type_name(&receiver)?
+            ),
         )),
         None => Err(PyError::type_error(
             "descriptor 'value' requires an exception",
@@ -3623,6 +3629,12 @@ fn property_setter(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArg
 
 /// `object.__init__`, which ends an initializer chain reached through `super().__init__()`.
 /// It accepts only the instance.
+/// `object.__new__(cls)`: the receiver is the class, since `__new__` is a static method.
+fn object_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let has_arguments = !args.positional().is_empty() || !args.keywords().is_empty();
+    runtime.new_instance(receiver, has_arguments)
+}
+
 fn object_init(_runtime: &mut dyn PyRuntime, _receiver: PyValue, args: CallArgs) -> PyResult {
     if !args.positional().is_empty() || !args.keywords().is_empty() {
         return Err(PyError::type_error(

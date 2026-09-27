@@ -171,6 +171,15 @@ fn exception_message(heap: &Heap, kind: &str, args: &[Value]) -> Result<String, 
     }
 }
 
+/// The closest builtin exception ancestor and the `args` of an instance of a user exception
+/// class.
+pub fn user_exception_args(
+    heap: &Heap,
+    value: &Value,
+) -> Result<Option<(&'static str, Vec<Value>)>, String> {
+    Ok(user_exception_parts(heap, value)?.map(|exception| (exception.base, exception.args)))
+}
+
 /// An instance of a user exception class: its closest builtin exception ancestor and `args`.
 struct UserException {
     base: &'static str,

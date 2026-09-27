@@ -311,6 +311,14 @@ impl Vm<'_> {
                 return Ok(Some(value));
             }
         }
+        if let Some(NativeValue::ExceptionType(_)) = owner.native_value() {
+            // Every builtin exception class shares the `BaseException` methods, then `object`'s.
+            for ancestor in [BuiltinType::Exception.id(), BuiltinType::Object.id()] {
+                if let Some(value) = self.state.types.attribute(ancestor, name)? {
+                    return Ok(Some(value));
+                }
+            }
+        }
         if let Some(NativeValue::ValueKind(kind)) = owner.native_value() {
             if let Some(type_id) = self.state.types.value_kind_type_id(kind) {
                 if let Some(value) = self.state.types.attribute(type_id, name)? {
@@ -319,26 +327,21 @@ impl Vm<'_> {
             }
         }
         let owner_type = self.type_id(&owner)?;
+        // A class's own MRO, builtin ancestors included, precedes the methods of its metaclass,
+        // so those wait until the `Object::Class` arm below has searched it.
+        let owner_is_class = owner
+            .object_id()
+            .is_some_and(|id| matches!(self.state.heap.get(id), Ok(Object::Class { .. })));
         match self
             .state
             .types
             .attribute(owner_type, name)?
             .and_then(|value| value.native_value())
         {
-            Some(NativeValue::NativeMethod(method)) => {
-                if method.name == "__new__" {
-                    return Ok(Some(Value::Native(NativeValue::NativeMethod(method))));
-                }
-                let bound = self.allocate_object(Object::DescriptorBoundMethod {
-                    receiver: owner,
-                    descriptor: Value::Native(NativeValue::NativeMethod(method)),
-                    owner: None,
-                })?;
-                return Ok(Some(bound));
-            }
-            Some(NativeValue::NativeClassMethod(method)) => {
-                let class = self.state.types.value(owner_type)?;
-                return self.bind_native_class_method(class, method).map(Some);
+            Some(NativeValue::NativeMethod(_) | NativeValue::NativeClassMethod(_))
+                if owner_is_class => {}
+            Some(NativeValue::NativeMethod(_) | NativeValue::NativeClassMethod(_)) => {
+                return self.type_method(owner, owner_type, name);
             }
             // Native getters are data descriptors. Builtin receivers have no instance
             // dictionary, so reaching the type table first already gives CPython precedence.
@@ -386,6 +389,9 @@ impl Vm<'_> {
                     }
                     let mut entry = self.class_attribute_entry(id, name)?;
                     if entry.is_none() {
+                        if let Some(value) = self.builtin_base_attribute(id, None, name)? {
+                            return Ok(Some(value));
+                        }
                         let Object::Class { metaclass, .. } = self.state.heap.get(id)? else {
                             unreachable!()
                         };
@@ -395,7 +401,7 @@ impl Vm<'_> {
                         }
                     }
                     let Some((defining_class, descriptor)) = entry else {
-                        return self.builtin_base_attribute(id, None, name);
+                        return self.type_method(owner, owner_type, name);
                     };
                     let value = self.bind_descriptor(descriptor, None, id, defining_class)?;
                     return Ok(Some(value));
@@ -2126,30 +2132,71 @@ impl Vm<'_> {
         Ok(None)
     }
 
-    /// Look up `name` among the native attributes of a user class's builtin base, such as
-    /// `int.bit_length` for `class Flag(int)`.
+    /// The native method `name` of the builtin type `owner_type`, bound to `owner`, or `None`.
+    /// `__new__` stays unbound, and a class method binds to the type.
+    fn type_method(
+        &mut self,
+        owner: Value,
+        owner_type: TypeId,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        match self
+            .state
+            .types
+            .attribute(owner_type, name)?
+            .and_then(|value| value.native_value())
+        {
+            Some(NativeValue::NativeMethod(method)) if method.name == "__new__" => {
+                Ok(Some(Value::Native(NativeValue::NativeMethod(method))))
+            }
+            Some(NativeValue::NativeMethod(method)) => self
+                .allocate_object(Object::DescriptorBoundMethod {
+                    receiver: owner,
+                    descriptor: Value::Native(NativeValue::NativeMethod(method)),
+                    owner: None,
+                })
+                .map(Some),
+            Some(NativeValue::NativeClassMethod(method)) => {
+                let class = self.state.types.value(owner_type)?;
+                self.bind_native_class_method(class, method).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Look up `name` among the native attributes of a user class's builtin ancestors, such as
+    /// `int.bit_length` for `class Flag(int)` or `object.__init__` for any class.
     ///
     /// The MRO stored on a class lists only user-defined ancestors, so this runs after it finds
-    /// nothing. `receiver` is the instance for instance lookup and `None` for lookup through the
-    /// class, which returns unbound methods and getters as the builtin type itself does.
+    /// nothing and continues through the builtin types that end the class's full MRO. User types
+    /// register no attributes in the type registry, so only builtin ancestors can match.
+    /// `receiver` is the instance for instance lookup and `None` for lookup through the class,
+    /// which returns unbound methods and getters as the builtin type itself does.
     fn builtin_base_attribute(
         &mut self,
         class: ObjectId,
         receiver: Option<Value>,
         name: &str,
     ) -> Result<Option<Value>, String> {
-        let Object::Class { layout, .. } = self.state.heap.get(class)? else {
+        let Object::Class { instance_type, .. } = self.state.heap.get(class)? else {
             return Err("instance has an invalid class".into());
         };
-        let base = match layout {
-            ClassLayout::Object => return Ok(None),
-            ClassLayout::Int => BuiltinType::Int,
-            ClassLayout::Type => BuiltinType::Type,
-        };
-        let Some(value) = self.state.types.attribute(base.id(), name)? else {
+        let mut found = None;
+        for ancestor in self.state.types.get(*instance_type)?.mro.clone() {
+            self.charge_cpu(1)?;
+            found = self.state.types.attribute(ancestor, name)?;
+            if found.is_some() {
+                break;
+            }
+        }
+        let Some(value) = found else {
             return Ok(None);
         };
         match (value.native_value(), receiver) {
+            // `__new__` is a static method: it stays unbound and takes the class explicitly.
+            (Some(NativeValue::NativeMethod(method)), _) if method.name == "__new__" => {
+                Ok(Some(value))
+            }
             (Some(NativeValue::NativeClassMethod(method)), _) => self
                 .bind_native_class_method(Value::Object(class), method)
                 .map(Some),

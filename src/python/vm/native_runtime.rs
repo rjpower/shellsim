@@ -666,7 +666,14 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn exception_args(&mut self, value: &Value) -> PyResult<Option<(String, Vec<Value>)>> {
-        protocol::exception_args(&self.state.heap, value).map_err(PyError::runtime_error)
+        if let Some(exception) =
+            protocol::exception_args(&self.state.heap, value).map_err(PyError::runtime_error)?
+        {
+            return Ok(Some(exception));
+        }
+        Ok(protocol::user_exception_args(&self.state.heap, value)
+            .map_err(PyError::runtime_error)?
+            .map(|(base, args)| (base.to_string(), args)))
     }
 
     fn delete_attribute_default(&mut self, value: Value, name: &str) -> PyResult<()> {
@@ -1144,6 +1151,11 @@ impl PyRuntime for Vm<'_> {
     fn new_property(&mut self, getter: Value, setter: Option<Value>) -> PyResult<Value> {
         self.allocate_object(Object::Property { getter, setter })
             .map_err(PyError::resource_error)
+    }
+
+    fn new_instance(&mut self, class: Value, has_arguments: bool) -> PyResult<Value> {
+        Vm::new_instance(self, class, has_arguments)
+            .map_err(|error| self.raised_or_runtime_error(error))
     }
 
     fn new_type(
