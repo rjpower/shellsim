@@ -281,6 +281,18 @@ def test_arange_accepts_dtype():
     assert a.tolist() == [1.0, 2.0]
 
 
+def test_arange_accepts_zero_d_array_bounds():
+    floats = np.arange(np.array(2.0), np.array(5))
+    assert floats.dtype == np.dtype("float64")
+    assert floats.tolist() == [2.0, 3.0, 4.0]
+    assert np.arange(np.array(3)).tolist() == [0, 1, 2]
+    assert np.arange(0, 1.5, np.array(0.5)).tolist() == [0.0, 0.5, 1.0]
+    with pytest.raises(TypeError, match="only 0-dimensional arrays"):
+        np.arange(np.array([3]))
+    with pytest.raises(ValueError, match="more than one element is ambiguous"):
+        np.arange(np.array([3, 4]))
+
+
 def test_arange_zero_step_raises():
     with pytest.raises(ZeroDivisionError):
         np.arange(0, 5, 0)

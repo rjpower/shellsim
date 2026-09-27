@@ -339,8 +339,23 @@ pub(in crate::python) fn full_like(runtime: &mut dyn PyRuntime, args: CallArgs) 
     like(runtime, &bound, "a", Fill::Value(fill))
 }
 
-/// A float or int argument of a range constructor.
+/// A float or int argument of a range constructor. A 0-d array stands for its element.
 fn range_number(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<(Number, bool)> {
+    if runtime.native_kind(value)? == Some(PyNativeKind::Array) {
+        let array = Array::from_value(runtime, *value)?;
+        if array.view.shape.is_empty() {
+            let element = convert::element_to_scalar(runtime, &array, array.view.offset)?;
+            return range_number(runtime, &element);
+        }
+        // NumPy compares the bounds before converting them, so an array with no or several
+        // elements fails on its truth value, and a one-element array on the conversion.
+        if array.view.shape.iter().product::<usize>() != 1 {
+            runtime.truth(value)?;
+        }
+        return Err(PyError::type_error(
+            "only 0-dimensional arrays can be converted to Python scalars",
+        ));
+    }
     match convert::leaf(runtime, value)? {
         Leaf::Bool(value) => Ok((Number::Int(i64::from(value)), false)),
         Leaf::Int(value) => i64::try_from(value)
