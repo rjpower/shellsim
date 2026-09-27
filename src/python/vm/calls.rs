@@ -238,7 +238,7 @@ impl Vm<'_> {
                             CallMode::Immediate => None,
                         };
                         let previous_suspend = self.native_suspend_allowed;
-                        self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+                        self.native_suspend_allowed = self.may_suspend(mode);
                         let result = (method.call)(self, receiver, call);
                         self.native_suspend_allowed = previous_suspend;
                         match result {
@@ -569,7 +569,7 @@ impl Vm<'_> {
                 CallMode::Immediate => None,
             };
             let previous_suspend = self.native_suspend_allowed;
-            self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+            self.native_suspend_allowed = self.may_suspend(mode);
             let result = (method.call)(self, receiver, call);
             self.native_suspend_allowed = previous_suspend;
             return match result {
@@ -598,7 +598,7 @@ impl Vm<'_> {
                 CallMode::Immediate => None,
             };
             let previous_suspend = self.native_suspend_allowed;
-            self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+            self.native_suspend_allowed = self.may_suspend(mode);
             let result = (function.call)(self, call);
             self.native_suspend_allowed = previous_suspend;
             return match result {
@@ -685,7 +685,7 @@ impl Vm<'_> {
                 };
                 let marker = Value::Native(NativeValue::Stream(Stream::Stdin));
                 let previous_suspend = self.native_suspend_allowed;
-                self.native_suspend_allowed = matches!(mode, CallMode::Deferred(_));
+                self.native_suspend_allowed = self.may_suspend(mode);
                 let result = self.read_stream(&marker, None, true);
                 self.native_suspend_allowed = previous_suspend;
                 match result {
@@ -1681,6 +1681,12 @@ impl Vm<'_> {
         error.message
     }
 
+    /// Whether a native called in `mode` may suspend its process: only a deferred call made
+    /// by scheduler-dispatched bytecode, outside any synchronous execution.
+    fn may_suspend(&self, mode: CallMode) -> bool {
+        matches!(mode, CallMode::Deferred(_)) && self.synchronous_frames == 0
+    }
+
     pub(super) fn resume_native_call(
         &mut self,
         pending: PendingNativeCall,
@@ -1690,7 +1696,7 @@ impl Vm<'_> {
         }
         let retry = pending.clone();
         let previous_suspend = self.native_suspend_allowed;
-        self.native_suspend_allowed = true;
+        self.native_suspend_allowed = self.synchronous_frames == 0;
         let result = match pending {
             PendingNativeCall::Function {
                 function,
@@ -1729,7 +1735,7 @@ impl Vm<'_> {
         };
         let marker = Value::Native(NativeValue::Stream(Stream::Stdin));
         let previous_suspend = self.native_suspend_allowed;
-        self.native_suspend_allowed = true;
+        self.native_suspend_allowed = self.synchronous_frames == 0;
         let result = self.read_stream(&marker, None, true);
         self.native_suspend_allowed = previous_suspend;
         match result {

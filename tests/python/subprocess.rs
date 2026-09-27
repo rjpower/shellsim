@@ -27,6 +27,37 @@ subprocess.run(["printf", "inherited"])
     );
 }
 
+/// Constructors, generators, and imports run their bytecode synchronously, so a child process
+/// started there must finish without suspending the Python process.
+#[test]
+fn subprocesses_complete_inside_synchronously_executed_code() {
+    let mut environment = Environment::new();
+    let result = run(
+        &mut environment,
+        r#"
+import subprocess
+
+class Probe:
+    def __init__(self):
+        self.output = subprocess.check_output(["echo", "from init"])
+
+def generate():
+    yield subprocess.run(["echo", "from generator"], capture_output=True).stdout
+
+print(Probe().output, next(generate()))
+"#,
+    );
+    // Recorded from CPython 3.14 with the host's `echo`.
+    assert_eq!(
+        result,
+        (
+            0,
+            "b'from init\\n' b'from generator\\n'\n".into(),
+            String::new()
+        )
+    );
+}
+
 #[test]
 fn input_wrappers_and_failure_status_match_the_synchronous_api() {
     let mut environment = Environment::new();

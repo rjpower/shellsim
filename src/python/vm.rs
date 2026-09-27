@@ -488,6 +488,10 @@ struct VmState {
     pending_wait: Option<crate::scheduler::WaitReason>,
     async_timer_deadlines: BTreeSet<u64>,
     native_suspend_allowed: bool,
+    /// Synchronous executions (imports, class bodies, generators, `exec`, and Python calls made
+    /// from native code) now running. Their callers cannot resume a suspended frame, so while
+    /// any is active, natives finish blocking operations instead of suspending.
+    synchronous_frames: usize,
     exception_stack: Vec<RaisedException>,
     with_contexts: Vec<Value>,
     method_frames: Vec<(super::heap::ObjectId, Value)>,

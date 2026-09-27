@@ -31,12 +31,14 @@ impl Vm<'_> {
             function_return: None,
             pending_native_call: None,
         });
+        self.synchronous_frames += 1;
         let result = loop {
             match self.execute_active_frame(VM_POLL_QUANTUM) {
                 Ok(Execution::Pending) => {}
                 result => break result,
             }
         };
+        self.synchronous_frames -= 1;
         let frame = self
             .bytecode_frames
             .pop()
