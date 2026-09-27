@@ -146,55 +146,70 @@ pub(in crate::python) trait Real: Numeric {
     fn zip(self, other: Self, double: fn(f64, f64) -> f64, single: fn(f32, f32) -> f32) -> Self;
 }
 
-/// Elements above this length split in half recursively; at or below it they sum in a plain
-/// left-to-right loop. NumPy's own base case is larger and unrolled by 8; the choice here only
-/// has to keep the recursion tree shallow (`O(log n)` deep) and does not try to match NumPy's
-/// block size, so the two sums agree to a few ulps rather than bit for bit.
-const PAIRWISE_BASE_CASE: usize = 8;
-
-/// The sum of `values` with rounding error that grows like `log n` rather than `n`, by recursive
-/// halving with a sequential base case (Higham, *Accuracy and Stability of Numerical
-/// Algorithms*, 2nd ed., section 4.2). An empty slice sums to `-0.0`, the base case's starting
-/// value: `-0.0` is the exact identity for float addition (`x + -0.0 == x` for every `x`,
-/// including `-0.0` itself), so a lane with no elements never flips another value's sign of
-/// zero, unlike `+0.0` would (`-0.0 + 0.0 == 0.0`).
+/// The sum of `values` with rounding error that grows like `log n` rather than `n`, grouped
+/// exactly as NumPy's floating-point `add` reductions group it, so contiguous sums match NumPy
+/// bit for bit. An empty slice sums to `-0.0`, the exact identity for float addition, so a lane
+/// with no elements never flips another value's sign of zero.
 pub(in crate::python) fn pairwise_sum<F>(values: &[F]) -> F
 where
     F: Copy + std::ops::Add<Output = F> + From<f32>,
 {
-    if values.len() <= PAIRWISE_BASE_CASE {
-        let mut total = F::from(-0.0f32);
-        for &value in values {
-            total = total + value;
-        }
-        total
-    } else {
-        let (left, right) = values.split_at(values.len() / 2);
-        pairwise_sum(left) + pairwise_sum(right)
-    }
+    pairwise(values, 8, F::from(-0.0f32), |left, right| left + right)
 }
 
-/// [`pairwise_sum`] of complex values, returned as `(real, imaginary)`. The real and imaginary
-/// parts are summed by the same recursion tree, so each carries the same `O(log n)` error bound
-/// independently.
+/// [`pairwise_sum`] of complex values, returned as `(real, imaginary)`. NumPy counts the real
+/// and imaginary parts as separate scalars, so the grouping keeps four complex partial sums
+/// where a real sum keeps eight.
 pub(in crate::python) fn pairwise_complex_sum<F>(values: &[Complex<F>]) -> (F, F)
 where
     F: Copy + std::ops::Add<Output = F> + From<f32>,
 {
-    if values.len() <= PAIRWISE_BASE_CASE {
-        let mut real = F::from(-0.0f32);
-        let mut imag = F::from(-0.0f32);
-        for value in values {
-            real = real + value.re;
-            imag = imag + value.im;
-        }
-        (real, imag)
-    } else {
-        let (left, right) = values.split_at(values.len() / 2);
-        let (left_re, left_im) = pairwise_complex_sum(left);
-        let (right_re, right_im) = pairwise_complex_sum(right);
-        (left_re + right_re, left_im + right_im)
+    let zero = Complex {
+        re: F::from(-0.0f32),
+        im: F::from(-0.0f32),
+    };
+    let total = pairwise(values, 4, zero, |left, right| Complex {
+        re: left.re + right.re,
+        im: left.im + right.im,
+    });
+    (total.re, total.im)
+}
+
+/// Pairwise summation with `lanes` (at most 8) interleaved partial sums. A run shorter than
+/// `lanes` adds left to right. A run of at most 16 groups of `lanes` adds element `i` into
+/// partial sum `i % lanes`, combines the partial sums as a balanced tree, then adds the leftover
+/// tail. A longer run splits at half its length rounded down to a whole group and recurses, so
+/// the depth is `O(log n)`.
+fn pairwise<T: Copy>(values: &[T], lanes: usize, zero: T, add: impl Fn(T, T) -> T + Copy) -> T {
+    let length = values.len();
+    if length < lanes {
+        return values.iter().fold(zero, |total, &value| add(total, value));
     }
+    if length > 16 * lanes {
+        let (left, right) = values.split_at(length / (2 * lanes) * lanes);
+        return add(
+            pairwise(left, lanes, zero, add),
+            pairwise(right, lanes, zero, add),
+        );
+    }
+    let grouped = length - length % lanes;
+    let mut partial = [zero; 8];
+    partial[..lanes].copy_from_slice(&values[..lanes]);
+    for group in values[lanes..grouped].chunks_exact(lanes) {
+        for (sum, &value) in partial.iter_mut().zip(group) {
+            *sum = add(*sum, value);
+        }
+    }
+    let mut width = lanes;
+    while width > 1 {
+        width /= 2;
+        for index in 0..width {
+            partial[index] = add(partial[2 * index], partial[2 * index + 1]);
+        }
+    }
+    values[grouped..]
+        .iter()
+        .fold(partial[0], |total, &value| add(total, value))
 }
 
 /// [`float_flags`] for a result computed from many inputs.

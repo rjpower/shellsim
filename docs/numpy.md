@@ -108,13 +108,14 @@ differences, the unsupported frontier, and resource limits.
   a Python function element by element, including the `signature=` form.
 - **Reductions and statistics.** `sum`, `prod`, `min`, `max`, `argmin`, `argmax`, `all`, `any`,
   `cumsum`, `cumprod`, `cumulative_sum`, `cumulative_prod`, `mean`, `var`, `std`, `average`,
-  `median`, quantiles, and the `nan*` variants. A reduction visits each output cell's contributing
-  elements in the logical C order of the reduced axes, not NumPy's buffered, block-unrolled
-  iterator order. Floating-point (and complex) `add` combines each run with pairwise summation
-  (recursive halving down to a sequential base case, the same asymptotic error growth as NumPy's
-  own pairwise sum), but with a different block size, so results agree with NumPy to a few ulps
-  rather than bit for bit. `sum`, `prod`, `max`/`amax`, `min`/`amin`, `any`, `all`, and
-  `ufunc.reduce`/`accumulate` support `where=` masks; `mean`, `var` and `std` do not yet.
+  `median`, quantiles, and the `nan*` variants. A reduction visits the reduced axes in memory
+  order, as NumPy's iterator does, and floating-point (and complex) `add` groups its pairwise
+  sums the way NumPy's inner loop does, so sums and means of contiguous, transposed, and strided
+  arrays match NumPy bit for bit along any axis. A reduction that casts its input, such as
+  `sum(dtype=np.float64)` of `float32` data, may differ in the last bits because shellsim does
+  not split it into NumPy's 8192-element cast buffers. `sum`, `prod`, `max`/`amax`,
+  `min`/`amin`, `any`, `all`, and `ufunc.reduce`/`accumulate` support `where=` masks; `mean`,
+  `var` and `std` do not yet.
 - **Shape.** Reshaping, transposition and axis moves, joining and splitting (including `block`),
   repetition, flips (`flip`, `fliplr`, `flipud`), rolls, `pad`, triangles and diagonals, `kron`,
   and broadcasting helpers, with NumPy's view-or-copy semantics.
