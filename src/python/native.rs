@@ -399,6 +399,14 @@ pub(super) enum PyTypeObject {
     Kind(&'static ValueKindDef),
 }
 
+/// One parameter of a Python function, in declaration order, with its default when it has one.
+#[derive(Clone, Debug)]
+pub(super) struct PyParameter {
+    pub name: String,
+    pub kind: super::bytecode::ParameterKind,
+    pub default: Option<PyValue>,
+}
+
 /// A Python operator applied through the VM's full protocol, including user dunder methods.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PyOperator {
@@ -843,6 +851,9 @@ pub(super) trait PyRuntime {
     /// The script path and source line executing `depth` Python frames below the innermost one,
     /// or `None` when the stack is shallower. Depth 0 is the innermost frame.
     fn caller_location(&self, depth: usize) -> Option<(String, u32)>;
+    /// The parameters of a Python function, or of the function a bound method wraps without its
+    /// bound first parameter. `None` for any other callable.
+    fn function_parameters(&self, value: &PyValue) -> PyResult<Option<Vec<PyParameter>>>;
     /// PID of the logical process running this Python interpreter.
     fn current_pid(&self) -> u32;
     /// PID of the logical parent of the process running this Python interpreter.

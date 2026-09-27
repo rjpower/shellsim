@@ -12,6 +12,8 @@ use super::{
     RaisedException, Stream, ToPrimitive, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
     MODELED_VALUE_BYTES,
 };
+use crate::python::bytecode::ParameterKind;
+use crate::python::native::PyParameter;
 
 /// Check that every element `view` addresses lies inside `buffer` and suits its element kind.
 fn validate_array_view(view: &PyArrayView, buffer: &PyArrayBuffer) -> PyResult<()> {
@@ -2323,6 +2325,57 @@ impl PyRuntime for Vm<'_> {
             .spans
             .get(frame.instruction_pointer.checked_sub(1)?)?;
         Some((self.traceback_filename(), u32::try_from(span.line).ok()?))
+    }
+
+    fn function_parameters(&self, value: &Value) -> PyResult<Option<Vec<PyParameter>>> {
+        let heap = &self.state.heap;
+        let Some(id) = value.object_id() else {
+            return Ok(None);
+        };
+        let (function, bound) = match heap.get(id).map_err(PyError::runtime_error)? {
+            Object::Function { .. } => (id, false),
+            Object::DescriptorBoundMethod { descriptor, .. } => match descriptor.object_id() {
+                Some(function) => (function, true),
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let Object::Function { code, defaults, .. } =
+            heap.get(function).map_err(PyError::runtime_error)?
+        else {
+            return Ok(None);
+        };
+        let mut parameters = code
+            .parameters
+            .iter()
+            .map(|parameter| PyParameter {
+                name: parameter.name.clone(),
+                kind: parameter.kind,
+                default: None,
+            })
+            .collect::<Vec<_>>();
+        // Defaults fill local slots, which the compiler names after their parameters.
+        for (&slot, default) in code.call_signature.default_slots.iter().zip(defaults) {
+            let name = code.local_names.get(slot).map(String::as_str);
+            if let Some(parameter) = parameters
+                .iter_mut()
+                .find(|parameter| Some(parameter.name.as_str()) == name)
+            {
+                parameter.default = Some(*default);
+            }
+        }
+        if bound {
+            // As `inspect.signature` does, a bound method drops its first positional parameter
+            // and keeps a leading `*args`.
+            match parameters.first().map(|parameter| parameter.kind) {
+                Some(ParameterKind::PositionalOnly | ParameterKind::Positional) => {
+                    parameters.remove(0);
+                }
+                Some(ParameterKind::Variadic) => {}
+                _ => return Err(PyError::value_error("invalid method signature")),
+            }
+        }
+        Ok(Some(parameters))
     }
 
     fn current_pid(&self) -> u32 {
