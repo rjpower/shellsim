@@ -454,8 +454,14 @@ fn method_astype(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: Cal
         let text = runtime.string_value(&casting)?.unwrap_or_default();
         let casting = super::dtype::Casting::parse(&text)?;
         if !super::dtype::can_cast(array.dtype, target, casting) {
+            // NumPy names a 0-d source a scalar.
+            let source = if array.ndim() == 0 {
+                "scalar"
+            } else {
+                "array data"
+            };
             return Err(PyError::type_error(format!(
-                "Cannot cast array data from {} to {} according to the rule '{}'",
+                "Cannot cast {source} from {} to {} according to the rule '{}'",
                 array.dtype.repr(),
                 target.repr(),
                 casting.name()

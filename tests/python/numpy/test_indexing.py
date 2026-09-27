@@ -532,3 +532,22 @@ def test_complex_real_and_imag_are_writable_views():
     assert z.tolist() == [1 + 0j, 3 + 0j]
     z.real[1] = 5
     assert z.tolist() == [1 + 0j, 5 + 0j]
+
+
+def test_zero_d_integer_array_index_acts_as_integer():
+    a = np.arange(6).reshape(2, 3)
+    row = a[np.asarray(1)]
+    assert row.tolist() == [3, 4, 5]
+    # NumPy copies rather than views when a 0-d integer array stands in for an integer.
+    assert not np.shares_memory(row, a)
+    value = a[np.asarray(1), np.asarray(2, dtype=np.uint8)]
+    assert isinstance(value, np.int64)
+    assert value == 5
+
+
+def test_integer_index_assignment_accepts_zero_d_array():
+    a = np.zeros(3)
+    a[1] = np.array(2.5)
+    assert a.tolist() == [0.0, 2.5, 0.0]
+    with pytest.raises(ValueError, match="setting an array element with a sequence."):
+        a[0] = np.array([1.0, 2.0])

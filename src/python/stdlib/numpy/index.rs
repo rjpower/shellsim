@@ -8,7 +8,9 @@
 //!    become one integer array per mask axis (their `nonzero`). A boolean scalar or 0-d mask
 //!    adds a new axis of length 1 and selects all of it (`True`) or none of it (`False`), as
 //!    NumPy's `HAS_0D_BOOL` does. When any array is present, plain integers join them as 0-d
-//!    arrays, as in NumPy. The index arrays broadcast to one
+//!    arrays, as in NumPy. A 0-d integer array alone acts as an integer, but a result that
+//!    would be a view is copied instead (NumPy's `HAS_SCALAR_ARRAY`). The index arrays
+//!    broadcast to one
 //!    shape `B`, and the selected elements form a copy:
 //!    - when the advanced items are adjacent, `B` replaces them in place;
 //!    - otherwise `B` comes first, followed by the remaining axes.
@@ -33,6 +35,8 @@ use super::dtype::{Category, DType, Kind};
 /// One parsed index component.
 enum Item {
     Int(i64),
+    /// A 0-d integer array, which indexes like an integer.
+    ScalarArray(i64),
     Slice(Option<i64>, Option<i64>, Option<i64>),
     NewAxis,
     Ellipsis,
@@ -48,7 +52,7 @@ impl Item {
     /// Array axes the item consumes.
     fn consumes(&self) -> usize {
         match self {
-            Self::Int(_) | Self::Slice(..) | Self::Array(_) => 1,
+            Self::Int(_) | Self::ScalarArray(_) | Self::Slice(..) | Self::Array(_) => 1,
             Self::Mask(mask) => mask.ndim(),
             Self::NewAxis | Self::Ellipsis | Self::Bool(_) => 0,
         }
@@ -117,6 +121,10 @@ fn parse_item(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Item> {
     match array.dtype.category() {
         Category::Bool if array.ndim() == 0 => Ok(Item::Bool(truth_values(runtime, &array)?[0])),
         Category::Bool => Ok(Item::Mask(array)),
+        Category::Signed | Category::Unsigned if array.ndim() == 0 => {
+            let array = convert::cast_array(runtime, &array, DType::INT64, false)?;
+            Ok(Item::ScalarArray(read_elements::<i64>(runtime, &array)?[0]))
+        }
         Category::Signed | Category::Unsigned => Ok(Item::Array(convert::cast_array(
             runtime,
             &array,
@@ -164,8 +172,14 @@ pub(in crate::python) fn select(
             "too many indices for array: array is {ndim}-dimensional, but {consumed} were indexed"
         )));
     }
-    let scalar =
-        ellipses == 0 && consumed == ndim && items.iter().all(|item| matches!(item, Item::Int(_)));
+    let scalar = ellipses == 0
+        && consumed == ndim
+        && items
+            .iter()
+            .all(|item| matches!(item, Item::Int(_) | Item::ScalarArray(_)));
+    let copy = items
+        .iter()
+        .any(|item| matches!(item, Item::ScalarArray(_)));
     let mut expanded = Vec::with_capacity(items.len() + ndim);
     let mut axis = 0;
     for item in items {
@@ -197,7 +211,7 @@ pub(in crate::python) fn select(
         .any(|item| matches!(item, Item::Array(_) | Item::Bool(_)));
     if advanced {
         for item in &mut expanded {
-            if let Item::Int(value) = item {
+            if let Item::Int(value) | Item::ScalarArray(value) = item {
                 let zero_d = super::array::array_from_elements(
                     runtime,
                     DType::INT64,
@@ -221,7 +235,7 @@ pub(in crate::python) fn select(
                 shape.push(1);
                 strides.push(0);
             }
-            Item::Int(value) => {
+            Item::Int(value) | Item::ScalarArray(value) => {
                 let length = array.shape()[source_axis];
                 let position = normalize_index(value, length, source_axis)?;
                 offset += position as isize * array.strides()[source_axis];
@@ -263,6 +277,12 @@ pub(in crate::python) fn select(
     }
     if arrays.is_empty() {
         let view = new_view(runtime, array, array.dtype, shape, strides, offset as usize)?;
+        if copy && !scalar {
+            reserve_elements(runtime, DType::INT64, view.size())?;
+            let offsets = view.offsets().collect();
+            let shape = view.shape().to_vec();
+            return Ok(Selection::Gather { shape, offsets });
+        }
         return Ok(Selection::View { view, scalar });
     }
     gather_plan(runtime, &shape, &strides, offset, &arrays)
@@ -517,6 +537,14 @@ pub(in crate::python) fn set_item(
             // One element: object arrays store the value itself, even a list.
             let buffer = if array.dtype.kind() == Kind::Object {
                 PyArrayBuffer::Values(vec![value])
+            } else if runtime.native_kind(&value)? == Some(PyNativeKind::Array) {
+                let source = Array::from_value(runtime, value)?;
+                if source.ndim() > 0 {
+                    return Err(PyError::value_error(
+                        "setting an array element with a sequence.",
+                    ));
+                }
+                return super::array::assign(runtime, &view, &source);
             } else {
                 convert::value_to_buffer(runtime, value, array.dtype)?
             };

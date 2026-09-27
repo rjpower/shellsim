@@ -195,6 +195,18 @@ def test_astype_int_to_narrower_int_wraps():
     assert np.array([-1]).astype(np.uint64).tolist() == [18446744073709551615]
 
 
+@pytest.mark.parametrize(
+    "shape, noun",
+    [((), "scalar"), ((1,), "array data")],
+)
+def test_astype_rejects_unsafe_cast_by_operand_kind(shape, noun):
+    with pytest.raises(TypeError) as info:
+        np.full(shape, 1.5).astype(np.int64, casting="safe")
+    assert str(info.value) == (
+        f"Cannot cast {noun} from dtype('float64') to dtype('int64') according to the rule 'safe'"
+    )
+
+
 def test_astype_to_and_from_bool():
     assert np.array([1, 0, 2]).astype(bool).tolist() == [True, False, True]
     assert np.array([0.0, 0.5]).astype(bool).tolist() == [False, True]
