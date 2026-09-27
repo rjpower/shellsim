@@ -195,6 +195,33 @@ for build in (lambda: Extra(1), Keyword):
 }
 
 #[test]
+fn raising_a_user_exception_class_raises_an_instance() {
+    let source = r#"class Tagged(LookupError):
+    def __init__(self):
+        super().__init__("tagged")
+        self.tag = 7
+class Done(IndexError):
+    pass
+for build in (lambda: Tagged, lambda: Done):
+    try:
+        raise build()
+    except LookupError as error:
+        print(type(error).__name__, error.args, getattr(error, "tag", None))
+try:
+    raise Tagged from None
+except Tagged as error:
+    print("from", error)"#;
+    assert_eq!(
+        run_python_text(source),
+        (
+            0,
+            "Tagged ('tagged',) 7\nDone () None\nfrom tagged\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
 fn user_descriptors_follow_precedence_and_receive_set_name() {
     assert_eq!(
         run_shell(

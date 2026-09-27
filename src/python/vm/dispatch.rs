@@ -476,6 +476,26 @@ impl Vm<'_> {
                     kind: kind.to_string(),
                     value,
                 }
+            } else if self.exception_class_base(&value)?.is_some() {
+                // `raise Cls` raises `Cls()`, running any user `__init__`.
+                self.stack.push(value);
+                let instance = match self.call(0, &[], &[], CallMode::Immediate)? {
+                    CallResult::Value(instance) => instance,
+                    CallResult::Exit(status) => {
+                        return Ok(DispatchControl::Complete(Execution::Exit(status)))
+                    }
+                    CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
+                    CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                        unreachable!("immediate call cannot suspend")
+                    }
+                };
+                let kind = self
+                    .user_exception_kind(&instance)?
+                    .ok_or("exception class produced a non-exception instance")?;
+                RaisedException {
+                    kind,
+                    value: instance,
+                }
             } else {
                 return Err("exceptions must derive from BaseException".into());
             }
