@@ -146,21 +146,55 @@ pub(in crate::python) trait Real: Numeric {
     fn zip(self, other: Self, double: fn(f64, f64) -> f64, single: fn(f32, f32) -> f32) -> Self;
 }
 
-/// The sum of `values` with rounding error that grows like `log n` rather than `n`, as NumPy's
-/// floating-point `add` reductions have. An empty slice sums to `-0.0`.
+/// Elements above this length split in half recursively; at or below it they sum in a plain
+/// left-to-right loop. NumPy's own base case is larger and unrolled by 8; the choice here only
+/// has to keep the recursion tree shallow (`O(log n)` deep) and does not try to match NumPy's
+/// block size, so the two sums agree to a few ulps rather than bit for bit.
+const PAIRWISE_BASE_CASE: usize = 8;
+
+/// The sum of `values` with rounding error that grows like `log n` rather than `n`, by recursive
+/// halving with a sequential base case (Higham, *Accuracy and Stability of Numerical
+/// Algorithms*, 2nd ed., section 4.2). An empty slice sums to `-0.0`, the base case's starting
+/// value: `-0.0` is the exact identity for float addition (`x + -0.0 == x` for every `x`,
+/// including `-0.0` itself), so a lane with no elements never flips another value's sign of
+/// zero, unlike `+0.0` would (`-0.0 + 0.0 == 0.0`).
 pub(in crate::python) fn pairwise_sum<F>(values: &[F]) -> F
 where
     F: Copy + std::ops::Add<Output = F> + From<f32>,
 {
-    todo!("clean-room rewrite: {}", values.len())
+    if values.len() <= PAIRWISE_BASE_CASE {
+        let mut total = F::from(-0.0f32);
+        for &value in values {
+            total = total + value;
+        }
+        total
+    } else {
+        let (left, right) = values.split_at(values.len() / 2);
+        pairwise_sum(left) + pairwise_sum(right)
+    }
 }
 
-/// [`pairwise_sum`] of complex values, returned as `(real, imaginary)`.
+/// [`pairwise_sum`] of complex values, returned as `(real, imaginary)`. The real and imaginary
+/// parts are summed by the same recursion tree, so each carries the same `O(log n)` error bound
+/// independently.
 pub(in crate::python) fn pairwise_complex_sum<F>(values: &[Complex<F>]) -> (F, F)
 where
     F: Copy + std::ops::Add<Output = F> + From<f32>,
 {
-    todo!("clean-room rewrite: {}", values.len())
+    if values.len() <= PAIRWISE_BASE_CASE {
+        let mut real = F::from(-0.0f32);
+        let mut imag = F::from(-0.0f32);
+        for value in values {
+            real = real + value.re;
+            imag = imag + value.im;
+        }
+        (real, imag)
+    } else {
+        let (left, right) = values.split_at(values.len() / 2);
+        let (left_re, left_im) = pairwise_complex_sum(left);
+        let (right_re, right_im) = pairwise_complex_sum(right);
+        (left_re + right_re, left_im + right_im)
+    }
 }
 
 /// [`float_flags`] for a result computed from many inputs.
