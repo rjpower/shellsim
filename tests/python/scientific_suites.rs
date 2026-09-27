@@ -6,9 +6,6 @@
 //! real NumPy is an optional step: build the pinned environment with
 //! `infra/scientific-reference.py` and export its interpreter as `SHELLSIM_SCIENTIFIC_PYTHON`.
 //! Tests never resolve or install packages themselves.
-//!
-//! Suites whose behavior lands in a later phase of the typed-array migration stay ignored with a
-//! reason naming that phase; the reference check still covers them.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -107,6 +104,5 @@ numpy_suites! {
     fft => "test_fft.py";
     random => "test_random.py";
     io => "test_io.py";
-    #[ignore = "pending: NumPy surface completion (phase 4)"]
     testing => "test_testing.py";
 }

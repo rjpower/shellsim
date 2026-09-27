@@ -144,6 +144,31 @@ def test_assert_equal_scalars_and_strings():
 def test_assert_equal_distinguishes_signed_zero_scalars():
     with pytest.raises(AssertionError):
         assert_equal(0.0, -0.0)
+    with pytest.raises(AssertionError):
+        assert_equal(np.float32(-0.0), 0)
+    with pytest.raises(AssertionError):
+        assert_equal(complex(0, 0.0), complex(0, -0.0))
+    assert_equal(-0.0, np.float64(-0.0))
+    assert_equal(complex(np.nan, 1), complex(np.nan, 1))
+
+
+def test_assert_equal_reports_values_and_context():
+    with pytest.raises(AssertionError) as info:
+        assert_equal(0.0, -0.0)
+    assert str(info.value) == "\nItems are not equal:\n ACTUAL: 0.0\n DESIRED: -0.0"
+    with pytest.raises(AssertionError) as info:
+        assert_equal({"a": [1, 2]}, {"a": [1, 3]})
+    assert str(info.value) == "\nItems are not equal:\nitem=1\nkey='a'\n\n ACTUAL: 2\n DESIRED: 3"
+    with pytest.raises(AssertionError) as info:
+        assert_equal(1, 2, err_msg="context")
+    assert str(info.value) == "\nItems are not equal: context\n ACTUAL: 1\n DESIRED: 2"
+
+
+def test_assert_equal_does_not_match_a_list_to_a_scalar():
+    with pytest.raises(AssertionError):
+        assert_equal([np.nan], np.nan)
+    with pytest.raises(AssertionError):
+        assert_equal([1], 1)
 
 
 def test_assert_equal_nested_lists_and_tuples():

@@ -75,27 +75,67 @@ def assert_allclose(actual, desired, rtol=1e-07, atol=0, equal_nan=True, err_msg
             raise AssertionError(_message(f"Not equal to tolerance rtol={rtol:g}, atol={atol:g}", f" ACTUAL: {actual_array!r}\n DESIRED: {desired_array!r}", err_msg))
 
 
-def assert_equal(actual, desired, err_msg="", verbose=True):
-    """Raise ``AssertionError`` unless the values are equal, comparing arrays elementwise."""
+def _build_err_msg(actual, desired, err_msg, header="Items are not equal:"):
+    """NumPy's ``build_err_msg`` for an actual and a desired value."""
+    lines = ["\n" + header]
+    err_msg = str(err_msg)
+    if err_msg:
+        if "\n" not in err_msg and len(err_msg) < 79 - len(header):
+            lines = [lines[0] + " " + err_msg]
+        else:
+            lines.append(err_msg)
+    for name, value in (("ACTUAL", actual), ("DESIRED", desired)):
+        text = repr(value)
+        if text.count("\n") > 3:
+            text = "\n".join(text.splitlines()[:3]) + "..."
+        lines.append(f" {name}: {text}")
+    return "\n".join(lines)
+
+
+def assert_equal(actual, desired, err_msg="", verbose=True, *, strict=False):
+    """Raise ``AssertionError`` unless the values are equal, as NumPy's ``assert_equal``.
+
+    Containers are compared item by item and arrays elementwise. For scalars, NaN equals NaN,
+    zeros of different signs differ, and complex numbers compare their parts separately.
+    """
+    if isinstance(desired, dict):
+        if not isinstance(actual, dict):
+            raise AssertionError(repr(type(actual)))
+        assert_equal(len(actual), len(desired), err_msg)
+        for key in desired:
+            if key not in actual:
+                raise AssertionError(repr(key))
+            assert_equal(actual[key], desired[key], f"key={key!r}\n{err_msg}")
+        return
+    if isinstance(desired, (list, tuple)) and isinstance(actual, (list, tuple)):
+        assert_equal(len(actual), len(desired), err_msg)
+        for index in range(len(desired)):
+            assert_equal(actual[index], desired[index], f"item={index!r}\n{err_msg}")
+        return
     if isinstance(actual, np.ndarray) or isinstance(desired, np.ndarray):
-        assert_array_equal(actual, desired, err_msg)
+        assert_array_equal(actual, desired, err_msg, strict=strict)
         return
-    if isinstance(actual, (list, tuple)) and isinstance(desired, (list, tuple)):
-        if len(actual) != len(desired):
-            raise AssertionError(_message("Items are not equal:", f"length {len(actual)} != {len(desired)}", err_msg))
-        for a, b in zip(actual, desired):
-            assert_equal(a, b, err_msg)
+    msg = _build_err_msg(actual, desired, err_msg)
+    if np.iscomplexobj(actual) or np.iscomplexobj(desired):
+        actual_parts = (np.real(actual), np.imag(actual)) if np.iscomplexobj(actual) else (actual, 0)
+        desired_parts = (np.real(desired), np.imag(desired)) if np.iscomplexobj(desired) else (desired, 0)
+        try:
+            assert_equal(actual_parts[0], desired_parts[0])
+            assert_equal(actual_parts[1], desired_parts[1])
+        except AssertionError:
+            raise AssertionError(msg) from None
         return
-    if isinstance(actual, dict) and isinstance(desired, dict):
-        if actual.keys() != desired.keys():
-            raise AssertionError(_message("Items are not equal:", f" ACTUAL: {actual!r}\n DESIRED: {desired!r}", err_msg))
-        for key in actual:
-            assert_equal(actual[key], desired[key], err_msg)
-        return
-    if actual != actual and desired != desired:
-        return
-    if not actual == desired:
-        raise AssertionError(_message("Items are not equal:", f" ACTUAL: {actual!r}\n DESIRED: {desired!r}", err_msg))
+    if np.isscalar(desired) != np.isscalar(actual):
+        raise AssertionError(msg)
+    try:
+        if np.isnan(desired) and np.isnan(actual):
+            return
+        if desired == 0 and actual == 0 and np.signbit(desired) != np.signbit(actual):
+            raise AssertionError(msg)
+    except (TypeError, ValueError, NotImplementedError):
+        pass
+    if not (desired == actual):
+        raise AssertionError(msg)
 
 
 def assert_array_almost_equal(actual, desired, decimal=6, err_msg="", verbose=True):
