@@ -1,8 +1,6 @@
 # Portable NumPy semantics. Expectations checked against NumPy 2.5.3 on CPython 3.14.4.
 # Scope: exact legacy MT19937 and default_rng PCG64 streams, result types, and seeding rules.
 
-import math
-
 import numpy as np
 import pytest
 
@@ -326,14 +324,8 @@ def test_generator_choice_with_replacement():
 
 
 def test_generator_choice_without_replacement():
-    # Generator's replace=False sampling order (Floyd's algorithm plus a tail shuffle) is not
-    # documented and this module does not reproduce it bit for bit; see docs/numpy.md. Check
-    # the sampling contract instead: no repeats, values drawn from the population.
-    partial = np.random.default_rng(3).choice(10, size=5, replace=False)
-    assert len(set(partial.tolist())) == 5
-    assert all(0 <= v < 10 for v in partial.tolist())
-    full = np.random.default_rng(3).choice(5, size=5, replace=False)
-    assert sorted(full.tolist()) == [0, 1, 2, 3, 4]
+    assert np.random.default_rng(3).choice(10, size=5, replace=False).tolist() == [1, 4, 0, 2, 9]
+    assert np.random.default_rng(3).choice(5, size=5, replace=False).tolist() == [4, 1, 2, 3, 0]
 
 
 def test_generator_choice_with_probabilities():
@@ -352,32 +344,25 @@ def test_generator_choice_scalar_and_errors():
 
 
 def test_generator_permutation_and_shuffle():
-    # Generator's Fisher-Yates draw order does not match NumPy's PCG64 stream bit for bit (the
-    # legacy MT19937 path does, see test_legacy_shuffle_and_permutation_share_stream above);
-    # see docs/numpy.md. Check the permutation contract and that shuffle and permutation agree.
-    permuted = np.random.default_rng(5).permutation(10)
-    assert sorted(permuted.tolist()) == list(range(10))
+    assert np.random.default_rng(5).permutation(10).tolist() == [7, 6, 1, 3, 2, 4, 0, 9, 5, 8]
     values = np.arange(10)
     assert np.random.default_rng(5).shuffle(values) is None
-    assert values.tolist() == permuted.tolist()
+    assert values.tolist() == [7, 6, 1, 3, 2, 4, 0, 9, 5, 8]
 
 
 def test_generator_permutation_copies_array():
     source = np.array([1.5, 2.5, 3.5, 4.5, 5.5])
-    permuted = np.random.default_rng(5).permutation(source)
-    assert sorted(permuted.tolist()) == sorted(source.tolist())
+    assert np.random.default_rng(5).permutation(source).tolist() == [5.5, 4.5, 2.5, 3.5, 1.5]
     assert source.tolist() == [1.5, 2.5, 3.5, 4.5, 5.5]
 
 
 def test_generator_shuffle_rows_and_lists():
     values = np.arange(6).reshape(3, 2)
-    original_rows = sorted(row.tolist() for row in values)
     np.random.default_rng(5).shuffle(values)
-    assert sorted(row.tolist() for row in values) == original_rows
+    assert values.tolist() == [[2, 3], [4, 5], [0, 1]]
     items = [1, 2, 3, 4, 5]
-    original_items = sorted(items)
     np.random.default_rng(5).shuffle(items)
-    assert sorted(items) == original_items
+    assert items == [5, 4, 2, 3, 1]
 
 
 def test_generator_normal_is_deterministic():
@@ -466,56 +451,51 @@ def test_mt19937_seeded_from_seed_sequence():
 
 
 def test_generator_single_precision_streams():
-    # The uniform float32 stream is exact (it only widens a raw 32-bit word), but the ziggurat
-    # normal stream is not (see docs/numpy.md), so only the second assertion is loosened.
     values = np.random.default_rng(2024).random(3, dtype=np.float32)
     assert values.dtype == np.float32
     assert values.tolist() == [0.24152815341949463, 0.6758313179016113, 0.09234333038330078]
     normals = np.random.default_rng(2024).standard_normal(4, dtype=np.float32)
-    assert normals.dtype == np.float32
-    assert normals.shape == (4,)
-    assert all(math.isfinite(v) for v in normals.tolist())
+    assert normals.tolist() == [
+        0.6110844016075134,
+        0.846587061882019,
+        0.21217942237854004,
+        0.38399016857147217,
+    ]
 
 
 def test_generator_normal_matches_numpy_ziggurat():
-    # This module's ziggurat does not reproduce NumPy's PCG64-driven stream bit for bit; see
-    # docs/numpy.md. Check shape, finiteness, and that a large sample lands within a sane
-    # statistical range instead of matching NumPy's exact draws.
-    draws = np.random.default_rng(2024).standard_normal(4)
-    assert draws.shape == (4,)
-    assert all(math.isfinite(v) for v in draws.tolist())
+    assert np.random.default_rng(2024).standard_normal(4).tolist() == [
+        1.0288568739519013,
+        1.6419200406711503,
+        1.1467195295966137,
+        -0.9731795154745656,
+    ]
     # Enough draws to reach the ziggurat's base-layer tail and wedge rejections.
-    large = np.random.default_rng(5).standard_normal(200000)
-    assert abs(float(np.mean(large))) < 0.05
-    assert abs(float(np.std(large)) - 1.0) < 0.05
-    assert -6.0 < float(large.min()) < 0.0
-    assert 0.0 < float(large.max()) < 6.0
-    shifted = np.random.default_rng(1).normal([0, 10, 100], 2)
-    assert shifted.shape == (3,)
-    assert all(math.isfinite(v) for v in shifted.tolist())
+    draws = np.random.default_rng(5).standard_normal(200000)
+    assert [float(draws.min()), float(draws.max())] == [-4.820175842608121, 4.371795668265591]
+    assert np.random.default_rng(1).normal([0, 10, 100], 2).tolist() == [
+        0.691168384129572,
+        11.643236287002317,
+        100.66087415236677,
+    ]
 
 
 @pytest.mark.parametrize(
-    "legacy, seed, low, high, dtype",
+    "legacy, seed, low, high, dtype, expected",
     [
-        (False, 3, -100, 100, "int8"),
-        (False, 9, 0, 100, "uint16"),
-        (False, 9, 0, 2, "bool"),
-        (True, 9, 0, 100, "uint8"),
+        (False, 3, -100, 100, "int8", [93, 51, 48, 61, 14, -80]),
+        (False, 9, 0, 100, "uint16", [52, 42, 65, 87, 1, 96]),
+        (False, 9, 0, 2, "bool", [True, False, False, False, False, True]),
+        (True, 9, 0, 100, "uint8", [97, 39, 2, 92, 81, 77]),
     ],
 )
-def test_integer_dtypes_use_numpy_buffered_draws(legacy, seed, low, high, dtype):
-    # NumPy buffers narrower-than-word draws (int8/uint8/uint16/bool) from each raw generator
-    # word in a way its public documentation does not specify; this module always draws a
-    # fresh word per element instead (see docs/numpy.md), so only dtype, shape, and range are
-    # checked here rather than the exact NumPy values.
+def test_integer_dtypes_use_numpy_buffered_draws(legacy, seed, low, high, dtype, expected):
     if legacy:
         values = np.random.RandomState(seed).randint(low, high, size=6, dtype=dtype)
     else:
         values = np.random.default_rng(seed).integers(low, high, size=6, dtype=dtype)
     assert values.dtype == np.dtype(dtype)
-    assert values.shape == (6,)
-    assert all(low <= int(v) < high for v in values.tolist())
+    assert values.tolist() == expected
 
 
 def test_integer_bounds_broadcast():
@@ -537,15 +517,8 @@ def test_integer_bounds_errors():
 
 
 def test_generator_choice_without_replacement_uses_floyd_and_tail_shuffle():
-    # NumPy's Generator draws large replace=False samples with an undocumented Floyd's-algorithm
-    # plus tail-shuffle scheme; this module does not reproduce its order (see docs/numpy.md), so
-    # only the no-repeats and in-range contract is checked.
-    small = np.random.default_rng(11).choice(1000, 5, replace=False)
-    assert len(set(small.tolist())) == 5
-    assert all(0 <= v < 1000 for v in small.tolist())
-    large = np.random.default_rng(11).choice(20000, 1000, replace=False)
-    assert len(set(large.tolist())) == 1000
-    assert all(0 <= v < 20000 for v in large.tolist())
+    assert np.random.default_rng(11).choice(1000, 5, replace=False).tolist() == [128, 590, 133, 795, 498]
+    assert np.random.default_rng(11).choice(20000, 1000, replace=False)[:4].tolist() == [15148, 11237, 12942, 13198]
 
 
 def test_legacy_array_seed_and_gauss_state():
@@ -576,43 +549,32 @@ def test_distribution_parameter_errors():
 
 
 def test_generator_exponential_and_gamma_streams():
-    # Generator's ziggurat-based standard_exponential/exponential streams, and its standard_gamma
-    # and gamma (which draw normal or extra uniform deviates through the same undocumented
-    # machinery), do not reproduce NumPy's PCG64-driven stream bit for bit; see docs/numpy.md.
-    # Check shape, dtype, and value-domain sanity instead of exact draws.
     rng = np.random.default_rng(12345)
-    exp1 = rng.standard_exponential(4)
-    assert exp1.shape == (4,)
-    assert all(v > 0 and math.isfinite(v) for v in exp1.tolist())
-    exp2 = rng.exponential([0.5, 2.0], size=(2, 2))
-    assert exp2.shape == (2, 2)
-    assert all(v > 0 and math.isfinite(v) for v in exp2.flatten().tolist())
+    assert rng.standard_exponential(4).tolist() == [
+        0.18413256735377503,
+        0.6450270693873458,
+        4.690218692461341,
+        0.4185586661538189,
+    ]
+    assert rng.exponential([0.5, 2.0], size=(2, 2)).tolist() == [
+        [0.25552372206434737, 2.645608513542529],
+        [0.7271540468558736, 0.39866300558055573],
+    ]
     # Shapes below 1 use rejection from the exponential; above 1, Marsaglia and Tsang.
-    gamma_small = rng.standard_gamma(0.3, 3)
-    assert gamma_small.shape == (3,)
-    assert all(v > 0 and math.isfinite(v) for v in gamma_small.tolist())
-    gamma_mixed = rng.standard_gamma([2.5, 100.0])
-    assert gamma_mixed.shape == (2,)
-    assert all(v > 0 and math.isfinite(v) for v in gamma_mixed.tolist())
-    scaled = rng.gamma(3.0, 2.0, 2)
-    assert scaled.shape == (2,)
-    assert all(v > 0 and math.isfinite(v) for v in scaled.tolist())
+    assert rng.standard_gamma(0.3, 3).tolist() == [
+        0.2668038100283782,
+        0.009614776660842888,
+        0.06569752471329031,
+    ]
+    assert rng.standard_gamma([2.5, 100.0]).tolist() == [3.5475905768350997, 105.5268819117015]
+    assert rng.gamma(3.0, 2.0, 2).tolist() == [10.922463334055482, 8.859155392065684]
 
 
 def test_generator_chisquare_f_and_t_streams():
-    # All three distributions route through Generator's non-exact standard_gamma/normal paths
-    # (see test_generator_exponential_and_gamma_streams and docs/numpy.md); check shape and
-    # value-domain sanity instead of exact draws.
     rng = np.random.default_rng(7)
-    chi = rng.chisquare([1.0, 50.0])
-    assert chi.shape == (2,)
-    assert all(v > 0 and math.isfinite(v) for v in chi.tolist())
-    f_values = rng.f(3.0, [7.0, 20.0])
-    assert f_values.shape == (2,)
-    assert all(v > 0 and math.isfinite(v) for v in f_values.tolist())
-    t_values = rng.standard_t([1.0, 30.0])
-    assert t_values.shape == (2,)
-    assert all(math.isfinite(v) for v in t_values.tolist())
+    assert rng.chisquare([1.0, 50.0]).tolist() == [0.8293904490318487, 46.66008573980642]
+    assert rng.f(3.0, [7.0, 20.0]).tolist() == [0.5281338185443447, 0.42095518115438546]
+    assert rng.standard_t([1.0, 30.0]).tolist() == [0.16747494601466173, 0.8474464134087695]
 
 
 def test_generator_binomial_and_poisson_streams():
@@ -635,25 +597,17 @@ def test_degenerate_binomial_draws_only_in_the_legacy_stream():
 
 
 def test_generator_single_precision_and_inverse_exponentials():
-    # The default ("zig") method and standard_gamma do not reproduce NumPy's stream (see
-    # docs/numpy.md), so those two calls only check dtype, shape, and value domain. The "inv"
-    # method is a plain uniform inversion with no rejection loop, so it is exact given a bit
-    # generator with no prior draws; it is checked on a fresh rng rather than continuing the rng
-    # used above, since the "zig" draw already consumed by that rng leaves it in a state NumPy's
-    # own stream would not reach.
     rng = np.random.default_rng(5)
     values = rng.standard_exponential(3, dtype=np.float32)
     assert values.dtype == np.float32
-    assert values.shape == (3,)
-    assert all(v > 0 and math.isfinite(v) for v in values.tolist())
-    assert np.random.default_rng(5).standard_exponential(2, method="inv").tolist() == [
-        1.634770714096847,
-        1.6499515677066925,
+    assert values.tolist() == [2.142340898513794, 4.171111583709717, 0.1283617615699768]
+    assert rng.standard_exponential(2, method="inv").tolist() == [
+        0.7242778733211445,
+        0.33659417617893683,
     ]
     values = rng.standard_gamma([0.4, 3.3], dtype=np.float32)
     assert values.dtype == np.float32
-    assert values.shape == (2,)
-    assert all(v > 0 and math.isfinite(v) for v in values.tolist())
+    assert values.tolist() == [0.7545587420463562, 2.917715072631836]
 
 
 def test_legacy_distribution_streams():
