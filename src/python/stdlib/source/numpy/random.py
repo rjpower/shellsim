@@ -1,1435 +1,1040 @@
-"""``numpy.random``: NumPy 2.5's seeded random streams.
+"""numpy.random: pseudo-random number generation.
 
-This ports the parts of ``numpy/random`` that ordinary code uses from ``bit_generator.pyx``,
-``_mt19937.pyx``, ``_pcg64.pyx``, ``_generator.pyx``, ``mtrand.pyx`` and
-``_bounded_integers.pyx.in``: ``SeedSequence``, the ``MT19937`` and ``PCG64`` bit generators,
-``Generator`` and the legacy ``RandomState`` with the module-level functions bound to its
-global instance. Both draw uniforms, integers, normals, exponentials, gamma, chi-square, F,
-Student's t, binomial and Poisson variates, and choose, shuffle and permute. Seeding and every draw run in the native
-module ``_numpy_random``, so seeded streams match NumPy bit for bit. Each bit generator keeps
-its state in a ``uint64`` array, ``_state``, whose layout the native module defines.
+Two generator families are implemented:
 
-shellsim programs have no host entropy, so an unseeded ``SeedSequence`` uses the fixed entropy
-``_FIXED_ENTROPY``; ``default_rng()``, ``RandomState()`` and the global legacy stream are
-therefore reproducible. Distributions other than these are not provided.
+- ``Generator`` (returned by ``default_rng``), backed by a bit generator
+  (``PCG64`` by default, or ``MT19937``). Bounded integers use Lemire's
+  method; the normal/exponential ziggurat is this module's own clean-room
+  implementation of the published Marsaglia-Tsang algorithm and does not
+  reproduce NumPy's exact stream (see docs/numpy.md). ``standard_gamma`` and
+  the distributions built from it inherit that difference whenever they
+  draw a normal deviate.
+- ``RandomState`` (legacy), always backed by ``MT19937``, matching NumPy's
+  original generator bit for bit: ``init_genrand``/``init_by_array``
+  seeding, masked-rejection bounded integers, and the Marsaglia polar-method
+  Gaussian (with its one-value cache).
+
+The per-element draw loops live in the native ``_numpy_random`` module. This
+file owns object state, argument defaults, dtype/shape resolution, and
+parameter broadcasting (via ``numpy.broadcast_to``), matching NumPy's own
+split between its object layer and its generation loops. A bit generator's
+state is threaded through every native call as a small Python list
+(``[kind, *fields]``) and reassigned on return, so state changes are always
+explicit and never hidden in native-side mutation.
 """
 
-import operator
+import numpy as _np
+import _numpy_random as _nr
 
-import numpy as np
-import _numpy_random as _native
-from _numpy_shape import _normalize_axis_index as normalize_axis_index
+# ---------------------------------------------------------------------------
+# SeedSequence: NumPy's entropy-mixing seed expander.
+#
+# This is Melissa O'Neill's public "seed_seq_fe" design
+# (https://www.pcg-random.org/posts/developing-a-seed_seq-alternative.html),
+# which NumPy documents using the same hashmix/mix building blocks and pool
+# size. The constants and control flow below were derived from that public
+# description and confirmed against NumPy 2.5.3's own generate_state/spawn
+# output treated strictly as a black box (matching scalar, multi-word, and
+# multi-level-spawn entropy, and the low-word-first uint64 packing).
+# ---------------------------------------------------------------------------
 
-__all__ = [
-    "BitGenerator",
-    "Generator",
-    "MT19937",
-    "PCG64",
-    "RandomState",
-    "SeedSequence",
-    "binomial",
-    "chisquare",
-    "choice",
-    "default_rng",
-    "exponential",
-    "f",
-    "gamma",
-    "get_bit_generator",
-    "get_state",
-    "normal",
-    "permutation",
-    "poisson",
-    "rand",
-    "randint",
-    "randn",
-    "random",
-    "random_integers",
-    "random_sample",
-    "ranf",
-    "sample",
-    "seed",
-    "set_bit_generator",
-    "set_state",
-    "shuffle",
-    "standard_exponential",
-    "standard_gamma",
-    "standard_normal",
-    "standard_t",
-    "uniform",
-]
-
-DEFAULT_POOL_SIZE = 4
-# Stands in for `secrets.randbits(128)`: the first 128 fraction bits of pi.
-_FIXED_ENTROPY = 0x243F6A8885A308D313198A2E03707344
 _MASK32 = 0xFFFFFFFF
-_RK_STATE_LEN = 624
-_INTEGER_DTYPES = ("int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "bool")
+_INIT_A = 0x43B0D7E5
+_MULT_A = 0x931E8875
+_INIT_B = 0x8B51F9DD
+_MULT_B = 0x58F38DED
+_MIX_MULT_L = 0xCA01F9DD
+_MIX_MULT_R = 0x4973F715
+_XSHIFT = 16
+_DEFAULT_POOL_SIZE = 4
 
 
-def _normalize_size(size):
-    """The shape and element count ``np.empty(size)`` would allocate."""
-    try:
-        shape = (operator.index(size),)
-    except TypeError:
-        shape = tuple(operator.index(dimension) for dimension in size)
-    count = 1
-    for dimension in shape:
-        if dimension < 0:
-            raise ValueError("negative dimensions are not allowed")
-        count *= dimension
-    return shape, count
+def _hashmix(value, hash_const):
+    value = (value ^ hash_const[0]) & _MASK32
+    hash_const[0] = (hash_const[0] * _MULT_A) & _MASK32
+    value = (value * hash_const[0]) & _MASK32
+    value ^= value >> _XSHIFT
+    return value & _MASK32
 
 
-def _int_to_uint32_array(n):
+def _mix(x, y):
+    result = (_MIX_MULT_L * x - _MIX_MULT_R * y) & _MASK32
+    result ^= result >> _XSHIFT
+    return result & _MASK32
+
+
+def _is_plain_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _int_to_u32_words(value):
+    if value < 0:
+        raise ValueError("expected a non-negative integer")
+    if value == 0:
+        return [0]
     words = []
-    if n < 0:
-        raise ValueError("expected non-negative integer")
-    if n == 0:
-        words.append(0)
-    n = int(n)
-    while n > 0:
-        words.append(n & _MASK32)
-        n //= 2**32
-    return np.array(words, dtype=np.uint32)
+    while value > 0:
+        words.append(value & _MASK32)
+        value >>= 32
+    return words
 
 
-def _coerce_to_uint32_array(x):
-    if isinstance(x, np.ndarray) and x.dtype == np.dtype(np.uint32):
-        return x.copy()
-    elif isinstance(x, str):
-        if x.startswith("0x"):
-            x = int(x, base=16)
-        elif x[:1] and "0" <= x[:1] <= "9":
-            x = int(x)
-        else:
-            raise ValueError("unrecognized seed string")
-    if isinstance(x, (int, np.integer)):
-        return _int_to_uint32_array(x)
-    elif isinstance(x, (float, np.inexact)):
-        raise TypeError("seed must be integer")
-    else:
-        if len(x) == 0:
-            return np.array([], dtype=np.uint32)
-        # Should be a sequence of interpretable-as-ints. Convert each one to a uint32 array and
-        # concatenate.
-        subseqs = []
-        for v in x:
-            if hasattr(v, "__len__") and not isinstance(v, str):
-                raise TypeError("SeedSequence does not accept nested sequences.")
-            subseqs.append(_coerce_to_uint32_array(v))
-        return np.concatenate(subseqs)
+def _coerce_entropy_words(entropy):
+    if _is_plain_int(entropy):
+        return _int_to_u32_words(entropy)
+    try:
+        items = list(entropy)
+    except TypeError:
+        raise TypeError("SeedSequence expects int or sequence of ints") from None
+    words = []
+    for item in items:
+        if not _is_plain_int(item):
+            raise TypeError("SeedSequence expects int or sequence of ints")
+        words.extend(_int_to_u32_words(item))
+    return words
 
 
-class SeedSequence:
-    """Mixes seed entropy into well-distributed initial states for bit generators."""
-
-    def __init__(
-        self, entropy=None, *, spawn_key=(), pool_size=DEFAULT_POOL_SIZE, n_children_spawned=0
-    ):
-        if pool_size < DEFAULT_POOL_SIZE:
-            raise ValueError(
-                f"The size of the entropy pool should be at least {DEFAULT_POOL_SIZE}"
-            )
-        if entropy is None:
-            entropy = _FIXED_ENTROPY
-        elif not isinstance(entropy, (int, np.integer, list, tuple, range, np.ndarray)):
-            raise TypeError(
-                f"SeedSequence expects int or sequence of ints for entropy not {entropy}"
-            )
-        self.entropy = entropy
-        self.spawn_key = tuple(spawn_key)
-        self.pool_size = pool_size
-        self.n_children_spawned = n_children_spawned
-        self.pool = _native.seed_sequence_pool(self._assembled_entropy(), pool_size)
-
-    def __repr__(self):
-        lines = [f"{type(self).__name__}(", f"    entropy={self.entropy!r},"]
-        # Omit some entries if they are left as the defaults in order to simplify things.
-        if self.spawn_key:
-            lines.append(f"    spawn_key={self.spawn_key!r},")
-        if self.pool_size != DEFAULT_POOL_SIZE:
-            lines.append(f"    pool_size={self.pool_size!r},")
-        if self.n_children_spawned != 0:
-            lines.append(f"    n_children_spawned={self.n_children_spawned!r},")
-        lines.append(")")
-        return "\n".join(lines)
-
-    @property
-    def state(self):
-        return {
-            k: getattr(self, k)
-            for k in ["entropy", "spawn_key", "pool_size", "n_children_spawned"]
-            if getattr(self, k) is not None
-        }
-
-    def _assembled_entropy(self):
-        run_entropy = _coerce_to_uint32_array(self.entropy)
-        spawn_entropy = _coerce_to_uint32_array(self.spawn_key)
-        if len(spawn_entropy) > 0 and len(run_entropy) < self.pool_size:
-            # Pad so spawned children never collide with a longer run entropy.
-            diff = self.pool_size - len(run_entropy)
-            run_entropy = np.concatenate([run_entropy, np.zeros(diff, dtype=np.uint32)])
-        return np.concatenate([run_entropy, spawn_entropy])
-
-    def generate_state(self, n_words, dtype=np.uint32):
-        """Return ``n_words`` of seed material as ``uint32``, or ``uint64`` pairs."""
-        out_dtype = np.dtype(dtype)
-        if out_dtype == np.dtype(np.uint32):
-            wide = False
-        elif out_dtype == np.dtype(np.uint64):
-            wide = True
-        else:
-            raise ValueError("only support uint32 or uint64")
-        return _native.seed_sequence_generate(self.pool, operator.index(n_words), wide)
-
-    def spawn(self, n_children):
-        """Create ``n_children`` independent child sequences."""
-        if n_children < 0:
-            raise ValueError("n_children must be non-negative")
-        seqs = []
-        for i in range(self.n_children_spawned, self.n_children_spawned + n_children):
-            seqs.append(
-                type(self)(self.entropy, spawn_key=self.spawn_key + (i,), pool_size=self.pool_size)
-            )
-        self.n_children_spawned += n_children
-        return seqs
+def _mix_entropy(pool_size, entropy):
+    pool = [0] * pool_size
+    hash_const = [_INIT_A]
+    for i in range(pool_size):
+        pool[i] = _hashmix(entropy[i] if i < len(entropy) else 0, hash_const)
+    # Mix all pool words together so every input bit affects every output word.
+    for i_src in range(pool_size):
+        for i_dst in range(pool_size):
+            if i_src != i_dst:
+                pool[i_dst] = _mix(pool[i_dst], _hashmix(pool[i_src], hash_const))
+    # Mix in any entropy words past the pool size, each against every slot.
+    for i_src in range(pool_size, len(entropy)):
+        for i_dst in range(pool_size):
+            pool[i_dst] = _mix(pool[i_dst], _hashmix(entropy[i_src], hash_const))
+    return pool
 
 
-class BitGenerator:
-    """Base class of the bit generators; subclasses set ``_state``."""
-
-    def __init__(self, seed=None):
-        if type(self) is BitGenerator:
-            raise NotImplementedError("BitGenerator is a base class and cannot be instantized")
-        if not isinstance(seed, SeedSequence):
-            seed = SeedSequence(seed)
-        self._seed_seq = seed
-
-    @property
-    def state(self):
-        raise NotImplementedError("Not implemented in base BitGenerator")
-
-    @property
-    def seed_seq(self):
-        return self._seed_seq
-
-    def spawn(self, n_children):
-        """Create new independent child bit generators."""
-        if n_children < 0:
-            raise ValueError("n_children must be non-negative")
-        if not isinstance(self._seed_seq, SeedSequence):
-            raise TypeError("The underlying SeedSequence does not implement spawning.")
-        return [type(self)(seed=s) for s in self._seed_seq.spawn(n_children)]
-
-    def random_raw(self, size=None, output=True):
-        """Return the generator's raw outputs as ``uint64``."""
-        if size is None:
-            value = _native.random_raw(self._state, 1)
-            return int(value[0]) if output else None
-        shape, count = _normalize_size(size)
-        values = _native.random_raw(self._state, count)
-        return values.reshape(shape) if output else None
-
-
-class MT19937(BitGenerator):
-    """The Mersenne Twister bit generator, with NumPy's legacy seeding."""
-
-    def __init__(self, seed=None):
-        BitGenerator.__init__(self, seed)
-        key = self._seed_seq.generate_state(_RK_STATE_LEN, np.uint32)
-        # MSB is 1; assuring non-zero initial array.
-        key[0] = 0x80000000
-        self._state = _native.mt19937_from_key(key, _RK_STATE_LEN - 1)
-
-    def _legacy_seeding(self, seed):
-        try:
-            if seed is None:
-                seed = SeedSequence()
-                key = seed.generate_state(_RK_STATE_LEN)
-                key[0] = 0x80000000
-                # As in NumPy, this path keeps the previous position.
-                self._state = _native.mt19937_from_key(key, int(self._state[5]))
-            else:
-                if hasattr(seed, "squeeze"):
-                    seed = seed.squeeze()
-                idx = operator.index(seed)
-                if idx > int(2**32 - 1) or idx < 0:
-                    raise ValueError("Seed must be between 0 and 2**32 - 1")
-                self._state = _native.mt19937_seed(idx)
-        except TypeError:
-            obj = np.asarray(seed)
-            if obj.size == 0:
-                raise ValueError("Seed must be non-empty")
-            obj = obj.astype(np.int64, casting="safe")
-            if obj.ndim != 1:
-                raise ValueError("Seed array must be 1-d")
-            if ((obj > int(2**32 - 1)) | (obj < 0)).any():
-                raise ValueError("Seed must be between 0 and 2**32 - 1")
-            obj = obj.astype(np.uint32, casting="unsafe", order="C")
-            self._state = _native.mt19937_init_by_array(obj)
-        self._seed_seq = None
-
-    @property
-    def state(self):
-        return {
-            "bit_generator": self.__class__.__name__,
-            "state": {"key": self._state[6:].astype(np.uint32), "pos": int(self._state[5])},
-        }
-
-    @state.setter
-    def state(self, value):
-        if isinstance(value, tuple):
-            if value[0] != "MT19937" or len(value) not in (3, 5):
-                raise ValueError("state is not a legacy MT19937 state")
-            value = {"bit_generator": "MT19937", "state": {"key": value[1], "pos": value[2]}}
-        if not isinstance(value, dict):
-            raise TypeError("state must be a dict")
-        bitgen = value.get("bit_generator", "")
-        if bitgen != self.__class__.__name__:
-            raise ValueError(f"state must be for a {self.__class__.__name__} PRNG")
-        key = value["state"]["key"]
-        if not (isinstance(key, np.ndarray) and key.dtype == np.uint32 and key.shape == (624,)):
-            key = np.array([int(key[i]) for i in range(_RK_STATE_LEN)], dtype=np.uint32)
-        gauss = _native.get_gauss(self._state)
-        self._state = _native.mt19937_from_key(key, operator.index(value["state"]["pos"]))
-        _native.set_gauss(self._state, *gauss)
-
-
-class PCG64(BitGenerator):
-    """The 128-bit permuted congruential bit generator behind ``default_rng``."""
-
-    def __init__(self, seed=None):
-        BitGenerator.__init__(self, seed)
-        self._state = _native.pcg64_from_seed(self._seed_seq.generate_state(4, np.uint64))
-
-    @property
-    def state(self):
-        words = [int(word) for word in self._state[3:9]]
-        return {
-            "bit_generator": self.__class__.__name__,
-            "state": {"state": words[2] * 2**64 + words[3], "inc": words[4] * 2**64 + words[5]},
-            "has_uint32": words[0],
-            "uinteger": words[1],
-        }
-
-    @state.setter
-    def state(self, value):
-        if not isinstance(value, dict):
-            raise TypeError("state must be a dict")
-        bitgen = value.get("bit_generator", "")
-        if bitgen != self.__class__.__name__:
-            raise ValueError(f"state must be for a {self.__class__.__name__} RNG")
-        state = value["state"]["state"]
-        inc = value["state"]["inc"]
-        words = np.array(
-            [state // 2**64, state % 2**64, inc // 2**64, inc % 2**64], dtype=np.uint64
-        )
-        self._state = _native.pcg64_from_parts(words, value["has_uint32"], value["uinteger"])
-
-    def advance(self, delta):
-        """Advance the stream as if ``delta`` draws had been made."""
-        delta = int(delta) % 2**128
-        _native.pcg64_advance(
-            self._state, np.array([delta // 2**64, delta % 2**64], dtype=np.uint64)
-        )
-        return self
-
-    def jumped(self, jumps=1):
-        """A copy of the generator advanced by ``jumps`` times ``(sqrt(5) - 1) / 2 * 2**128``."""
-        bit_generator = self.__class__()
-        bit_generator.state = self.state
-        bit_generator.advance(0x9E3779B97F4A7C15F39CC0605CEDC835 * int(jumps))
-        return bit_generator
-
-
-def _check_output(out, dtype, size, require_c_array):
-    if out is None:
-        return
-    flags = out.flags
-    behaved = flags.writeable and flags.aligned
-    if not (behaved and (flags.c_contiguous or (flags.f_contiguous and not require_c_array))):
-        req = "C-" if require_c_array else ""
-        raise ValueError(
-            f"Supplied output array must be {req}contiguous, writable, "
-            f"aligned, and in machine byte-order."
-        )
-    if out.dtype != dtype:
-        raise TypeError(
-            "Supplied output array has the wrong type. "
-            f"Expected {np.dtype(dtype)}, got {out.dtype}"
-        )
-    if size is not None:
-        try:
-            tup_size = tuple(size)
-        except TypeError:
-            tup_size = tuple([size])
-        if tup_size != out.shape:
-            raise ValueError("size must match out.shape when used together")
-
-
-def _fill(kernel, state, size, out, single):
-    """``double_fill`` and ``float_fill``: draws fill ``out`` in memory order."""
-    if size is None and out is None:
-        return float(kernel(state, 1, single)[0])
-    if out is not None:
-        _check_output(out, np.float32 if single else np.float64, size, False)
-        target = out if out.flags.c_contiguous else out.T
-        target[...] = kernel(state, target.size, single).reshape(target.shape)
-        return out
-    shape, count = _normalize_size(size)
-    return kernel(state, count, single).reshape(shape)
-
-
-def _check_non_negative(value, name):
-    if not np.isnan(value) and np.signbit(value):
-        raise ValueError(f"{name} < 0")
-
-
-def _check_array_non_negative(values, name):
-    if np.any(np.logical_and(np.logical_not(np.isnan(values)), np.signbit(values))):
-        raise ValueError(f"{name} < 0")
-
-
-def _broadcast_shape(size, *parameters):
-    """The output shape of ``cont``'s broadcast path, checked as ``validate_output_shape``."""
-    shapes = [parameter.shape for parameter in parameters]
-    if size is None:
-        return np.broadcast_shapes(*shapes)
-    shape, _ = _normalize_size(size)
-    iter_shape = np.broadcast_shapes(shape, *shapes)
-    if iter_shape != shape:
-        raise ValueError(
-            f"Output size {shape} is not compatible with broadcast "
-            f"dimensions of inputs {iter_shape}."
-        )
-    return shape
-
-
-def _affine(draw, a, b, size, b_name, b_check):
-    """``cont`` for the two-parameter distributions ``a + b * X``.
-
-    NumPy evaluates ``a + b * X`` element by element in C doubles, drawing ``X`` in C order;
-    drawing first and combining with array arithmetic gives the same values.
-    """
-    a_arr = np.asarray(a, dtype=np.float64)
-    b_arr = np.asarray(b, dtype=np.float64)
-    if a_arr.ndim == 0 and b_arr.ndim == 0:
-        a_value, b_value = float(a), float(b)
-        if b_check:
-            _check_non_negative(b_value, b_name)
-        if size is None:
-            return a_value + b_value * float(draw(1)[0])
-        shape, count = _normalize_size(size)
-        return a_value + b_value * draw(count).reshape(shape)
-    if b_check:
-        _check_array_non_negative(b_arr, b_name)
-    shape = _broadcast_shape(size, a_arr, b_arr)
-    count = 1
-    for dimension in shape:
-        count *= dimension
-    return a_arr + b_arr * draw(count).reshape(shape)
-
-
-# Parameter constraints of numpy/random/_common.pyx.
-_NON_NEGATIVE = "non-negative"
-_POSITIVE = "positive"
-_BOUNDED_0_1 = "bounded 0 1"
-_POISSON = "poisson"
-_LEGACY_LONG = "legacy long"
-_INT64_MAX = np.iinfo(np.int64).max
-# `POISSON_LAM_MAX`, and `LEGACY_POISSON_LAM_MAX`, which is the same where C `long` has 64 bits.
-_POISSON_LAM_MAX = float(_INT64_MAX) - float(np.sqrt(_INT64_MAX)) * 10
-
-
-def _check_constraint(value, name, constraint):
-    """``check_constraint``: validate a scalar parameter."""
-    if constraint == _NON_NEGATIVE:
-        _check_non_negative(value, name)
-    elif constraint == _POSITIVE:
-        if value <= 0:
-            raise ValueError(f"{name} <= 0")
-    elif constraint == _BOUNDED_0_1:
-        if not value >= 0 or not value <= 1:
-            raise ValueError(f"{name} < 0, {name} > 1 or {name} is NaN")
-    elif constraint == _POISSON:
-        if not value >= 0:
-            raise ValueError(f"{name} < 0 or {name} is NaN")
-        if not value <= _POISSON_LAM_MAX:
-            raise ValueError(f"{name} value too large")
-    elif constraint == _LEGACY_LONG:
-        if value < 0:
-            raise ValueError(f"{name} < 0")
-        if value > float(_INT64_MAX):
-            raise ValueError(
-                f"{name} is out of bounds for long, consider using the new generator API for "
-                "64bit integers."
-            )
-
-
-def _check_array_constraint(values, name, constraint):
-    """``check_array_constraint``: validate an array parameter."""
-    if constraint == _NON_NEGATIVE:
-        _check_array_non_negative(values, name)
-    elif constraint == _POSITIVE:
-        if np.any(np.less_equal(values, 0)):
-            raise ValueError(f"{name} <= 0")
-    elif constraint == _BOUNDED_0_1:
-        if not np.all(np.greater_equal(values, 0)) or not np.all(np.less_equal(values, 1)):
-            raise ValueError(f"{name} < 0, {name} > 1 or {name} contains NaNs")
-    elif constraint == _POISSON:
-        if not np.all(np.less_equal(values, _POISSON_LAM_MAX)):
-            raise ValueError(f"{name} value too large")
-        if not np.all(np.greater_equal(values, 0.0)):
-            raise ValueError(f"{name} < 0 or {name} contains NaNs")
-    elif constraint == _LEGACY_LONG:
-        if not np.all(values >= 0):
-            raise ValueError(f"{name} < 0")
-        if not np.all(values <= _INT64_MAX):
-            raise ValueError(
-                f"{name} is out of bounds for long, consider using the new generator API for "
-                "64bit integers."
-            )
-
-
-def _draw_parameters(arrays, shape):
-    """Each parameter broadcast to ``shape`` and flattened in C order, as NumPy's multi-iterator
-    visits them."""
-    return [np.ascontiguousarray(np.broadcast_to(array, shape)).reshape(-1) for array in arrays]
-
-
-def _parametric(kernel, dtype, size, out, parameters, require_c_array=True):
-    """NumPy's ``cont``, ``cont_f`` and ``disc`` for one or two parameters.
-
-    ``parameters`` holds ``(array, value, name, constraint)`` for each parameter, where ``array``
-    is the parameter converted to the kernel's dtype and ``value`` the scalar the kernel would
-    receive if every parameter is 0-d. ``kernel(count, *flat_parameters)`` draws ``count``
-    values. Scalar parameters with neither ``size`` nor ``out`` give one Python number.
-    """
-    _check_output(out, dtype, size, require_c_array)
-    arrays = [array for array, _, _, _ in parameters]
-    if any(array.ndim > 0 for array in arrays):
-        for array, _, name, constraint in parameters:
-            _check_array_constraint(array, name, constraint)
-        target = size if out is None else out.shape
-        shape = _broadcast_shape(target, *arrays)
-        draws = kernel(int(np.prod(shape)), *_draw_parameters(arrays, shape)).reshape(shape)
-    else:
-        for _, value, name, constraint in parameters:
-            _check_constraint(value, name, constraint)
-        flat = [np.array([value], dtype=array.dtype) for array, value, _, _ in parameters]
-        if size is None and out is None:
-            return kernel(1, *flat)[0].item()
-        shape, count = _normalize_size(size) if out is None else (out.shape, out.size)
-        draws = kernel(count, *flat).reshape(shape)
-    if out is None:
-        return draws
-    out[...] = draws
+def _generate_words(pool, n_words):
+    hash_const = _INIT_B
+    out = []
+    src = 0
+    for _ in range(n_words):
+        value = pool[src] ^ hash_const
+        hash_const = (hash_const * _MULT_B) & _MASK32
+        value = (value * hash_const) & _MASK32
+        value ^= value >> _XSHIFT
+        out.append(value & _MASK32)
+        src += 1
+        if src == len(pool):
+            src = 0
     return out
 
 
-def _float_parameter(value, name, constraint):
-    return (np.asarray(value, dtype=np.float64), value, name, constraint)
+class SeedSequence:
+    """Spread entropy across a small pool and expand it to any number of words.
 
+    ``entropy`` is an int, a sequence of ints, or ``None``. Shellsim grants
+    no host entropy source (see ``random.py``'s module docstring for the
+    same rule applied to the stdlib ``random`` module), so ``None`` maps to
+    a fixed value rather than OS randomness; give an explicit seed for a
+    reproducible stream, which is the only kind shellsim can produce anyway.
+    """
 
-def _cont(state, name, legacy, size, out, *parameters):
-    """Draws of the continuous distribution ``name`` with ``float64`` parameters."""
-    parameters = [_float_parameter(*parameter) for parameter in parameters]
-    for index, (array, value, pname, constraint) in enumerate(parameters):
-        if array.ndim == 0:
-            parameters[index] = (array, float(value), pname, constraint)
+    def __init__(self, entropy=None, *, spawn_key=(), pool_size=_DEFAULT_POOL_SIZE):
+        if entropy is None:
+            entropy = 0
+        if not (_is_plain_int(entropy) or hasattr(entropy, "__iter__")):
+            raise TypeError("SeedSequence expects int or sequence of ints")
+        self.entropy = entropy
+        self.spawn_key = tuple(spawn_key)
+        self.pool_size = pool_size
+        self.n_children_spawned = 0
+        run_words = _coerce_entropy_words(entropy)
+        spawn_words = []
+        for item in self.spawn_key:
+            spawn_words.extend(_int_to_u32_words(item))
+        if spawn_words and len(run_words) < pool_size:
+            run_words = run_words + [0] * (pool_size - len(run_words))
+        self._pool = _mix_entropy(pool_size, run_words + spawn_words)
 
-    def kernel(count, a, b=None):
-        return _native.continuous(state, name, legacy, count, a, a if b is None else b)
-
-    return _parametric(kernel, np.float64, size, out, parameters)
-
-
-def _standard_gamma_f32(state, shape, size, out):
-    """``Generator.standard_gamma`` with ``dtype=float32``: ``cont_f``, which force-casts the shape
-    to single precision."""
-    array = np.asarray(shape).astype(np.float32)
-    value = float(np.float32(float(shape))) if array.ndim == 0 else shape
-
-    def kernel(count, shapes):
-        return _native.standard_gamma_f32(state, count, shapes)
-
-    return _parametric(kernel, np.float32, size, out, [(array, value, "shape", _NON_NEGATIVE)])
-
-
-def _poisson(state, legacy, lam, size):
-    array = np.asarray(lam, dtype=np.float64)
-    value = float(lam) if array.ndim == 0 else lam
-
-    def kernel(count, lams):
-        return _native.discrete(state, "poisson", legacy, count, lams, lams)
-
-    return _parametric(kernel, np.int64, size, None, [(array, value, "lam", _POISSON)])
-
-
-def _trial_counts(n):
-    """``n`` as ``PyArray_FROM_OTF(n, NPY_INT64)`` converts it: arrays must cast safely, and
-    Python numbers and sequences convert as ``np.array`` does."""
-    if isinstance(n, (np.ndarray, np.generic)):
-        array = np.asarray(n)
-        if not np.can_cast(array.dtype, np.int64):
-            raise TypeError(
-                f"Cannot cast array data from {array.dtype!r} to dtype('int64') according to "
-                "the rule 'safe'"
-            )
-        return array.astype(np.int64)
-    return np.array(n, dtype=np.int64)
-
-
-def _binomial(state, legacy, n, p, size):
-    """``Generator.binomial`` and ``RandomState.binomial``, which check ``p`` before ``n``."""
-    p_array = np.asarray(p, dtype=np.float64)
-    n_array = _trial_counts(n)
-    scalar = p_array.ndim == 0 and n_array.ndim == 0
-    n_constraint = _LEGACY_LONG if legacy else _NON_NEGATIVE
-    parameters = [
-        (p_array, float(p) if scalar else p, "p", _BOUNDED_0_1),
-        (n_array, int(n) if scalar else n, "n", n_constraint),
-    ]
-
-    def kernel(count, ps, ns):
-        return _native.discrete(state, "binomial", legacy, count, ps, ns)
-
-    return _parametric(kernel, np.int64, size, None, parameters)
-
-
-def _format_bounds_error(closed, low):
-    # Special case low == 0 to provide a better exception for users since low = 0 is the
-    # default single-argument case.
-    if not np.any(low):
-        comp = "<" if closed else "<="
-        return f"high {comp} 0"
-    comp = ">" if closed else ">="
-    return f"low {comp} high"
-
-
-def _integer_bounds(dtype):
-    if dtype == np.dtype(np.bool_):
-        return 0, 1
-    info = np.iinfo(dtype)
-    return int(info.min), int(info.max)
-
-
-def _bounded_integers(state, low, high, size, dtype, masked, closed):
-    """``_rand_{int,uint,bool}``: integers in ``[low, high)``, or ``[low, high]`` if closed."""
-    name = dtype.name
-    lb, ub = _integer_bounds(dtype)
-    if size is not None and np.prod(size) == 0:
-        return np.empty(size, dtype=dtype)
-    low_arr = np.asarray(low)
-    high_arr = np.asarray(high)
-    if low_arr.ndim == 0 and high_arr.ndim == 0:
-        low = int(low_arr)
-        high = int(high_arr)
-        # Subtract 1 since internal generator produces on closed interval [low, high].
-        if not closed:
-            high -= 1
-        if low < lb:
-            raise ValueError(f"low is out of bounds for {name}")
-        if high > ub:
-            raise ValueError(f"high is out of bounds for {name}")
-        if low > high:  # -1 already subtracted, closed interval
-            raise ValueError(_format_bounds_error(closed, low))
-        off = np.array([low % 2**64], dtype=np.uint64)
-        rng = np.array([high - low], dtype=np.uint64)
-        if size is None:
-            return _native.bounded_integers(state, off, rng, 1, dtype, masked)[0]
-        shape, count = _normalize_size(size)
-        return _native.bounded_integers(state, off, rng, count, dtype, masked).reshape(shape)
-    # The broadcast path draws element by element over the broadcast bounds.
-    lows = [int(value) for value in np.ravel(low_arr).tolist()]
-    highs = [int(value) - (not closed) for value in np.ravel(high_arr).tolist()]
-    if any(value < lb for value in lows):
-        raise ValueError(f"low is out of bounds for {name}")
-    if any(value > ub for value in highs):
-        raise ValueError(f"high is out of bounds for {name}")
-    low_arr = np.array(lows, dtype=object).reshape(low_arr.shape)
-    high_arr = np.array(highs, dtype=object).reshape(high_arr.shape)
-    shape = _broadcast_shape(size, low_arr, high_arr)
-    lows = np.broadcast_to(low_arr, shape).ravel().tolist()
-    highs = np.broadcast_to(high_arr, shape).ravel().tolist()
-    if any(lo > hi for lo, hi in zip(lows, highs)):
-        raise ValueError(_format_bounds_error(closed, low_arr))
-    off = np.array([lo % 2**64 for lo in lows], dtype=np.uint64)
-    rng = np.array([hi - lo for lo, hi in zip(lows, highs)], dtype=np.uint64)
-    return _native.bounded_integers(state, off, rng, len(lows), dtype, masked).reshape(shape)
-
-
-def _integer_dtype(dtype, method):
-    _dtype = np.dtype(dtype)
-    if _dtype.name not in _INTEGER_DTYPES:
-        raise TypeError(f"Unsupported dtype {_dtype!r} for {method}")
-    return _dtype
-
-
-def _shuffle_order(state, n, first=1, lemire=False):
-    return _native.shuffle_indices(state, n, first, lemire)
-
-
-def _shuffle_sequence(state, x, axis=0):
-    """``shuffle`` for arrays and mutable sequences, via the swap order of a Fisher-Yates pass."""
-    if isinstance(x, np.ndarray):
-        if not x.flags.writeable:
-            raise ValueError("array is read-only")
-        axis = normalize_axis_index(axis, np.ndim(x))
-        if x.size == 0:
-            # shuffling is a no-op
-            return
-        order = _shuffle_order(state, x.shape[axis])
-        index = [slice(None)] * x.ndim
-        index[axis] = order
-        x[...] = x[tuple(index)]
-        return
-    if axis != 0:
-        raise NotImplementedError("Axis argument is only supported on ndarray objects")
-    n = len(x)
-    order = _shuffle_order(state, n).tolist()
-    items = [x[k] for k in order]
-    for i in range(n):
-        x[i] = items[i]
-
-
-class Generator:
-    """NumPy's recommended random interface, drawing from a bit generator."""
-
-    def __init__(self, bit_generator):
-        if not isinstance(bit_generator, BitGenerator):
-            raise AttributeError(
-                f"'{type(bit_generator).__name__}' object has no attribute 'capsule'"
-            )
-        self._bit_generator = bit_generator
-
-    def __repr__(self):
-        return f"{self} at 0x{id(self):X}"
-
-    def __str__(self):
-        return f"{type(self).__name__}({type(self._bit_generator).__name__})"
-
-    @property
-    def bit_generator(self):
-        return self._bit_generator
+    def generate_state(self, n_words, dtype=_np.uint32):
+        dtype_name = _np.dtype(dtype).name
+        if dtype_name == "uint32":
+            return _np.array(_generate_words(self._pool, n_words), dtype=_np.uint32)
+        if dtype_name == "uint64":
+            words = _generate_words(self._pool, n_words * 2)
+            combined = [words[2 * i] | (words[2 * i + 1] << 32) for i in range(n_words)]
+            return _np.array(combined, dtype=_np.uint64)
+        raise ValueError("SeedSequence.generate_state only support uint32 or uint64")
 
     def spawn(self, n_children):
-        """Create new independent child generators."""
-        return [type(self)(g) for g in self._bit_generator.spawn(n_children)]
-
-    def random(self, size=None, dtype=np.float64, out=None):
-        """Return random floats in the half-open interval [0.0, 1.0)."""
-        _dtype = np.dtype(dtype)
-        if _dtype == np.float64:
-            single = False
-        elif _dtype == np.float32:
-            single = True
-        else:
-            raise TypeError(f"Unsupported dtype {_dtype!r} for random")
-        return _fill(_native.standard_uniform, self._bit_generator._state, size, out, single)
-
-    def integers(self, low, high=None, size=None, dtype=np.int64, endpoint=False):
-        """Return random integers from ``low`` (inclusive) to ``high`` (exclusive)."""
-        if high is None:
-            high = low
-            low = 0
-        _dtype = _integer_dtype(dtype, "integers")
-        ret = _bounded_integers(
-            self._bit_generator._state, low, high, size, _dtype, False, endpoint
-        )
-        if size is None and (dtype is bool or dtype is int):
-            if np.array(ret).shape == ():
-                return dtype(ret)
-        return ret
-
-    def uniform(self, low=0.0, high=1.0, size=None):
-        """Draw samples from a uniform distribution over ``[low, high)``."""
-        alow = np.asarray(low, dtype=np.float64)
-        ahigh = np.asarray(high, dtype=np.float64)
-        draw = self._uniform_draws
-        if alow.ndim == ahigh.ndim == 0:
-            rng = float(high) - float(low)
-            if not np.isfinite(rng):
-                raise OverflowError("high - low range exceeds valid bounds")
-            return _affine(draw, float(low), rng, size, "high - low", True)
-        arange = np.subtract(ahigh, alow)
-        if not np.all(np.isfinite(arange)):
-            raise OverflowError("Range exceeds valid bounds")
-        return _affine(draw, alow, arange, size, "high - low", True)
-
-    def _uniform_draws(self, count):
-        return _native.standard_uniform(self._bit_generator._state, count, False)
-
-    def _normal_draws(self, count):
-        return _native.standard_normal(self._bit_generator._state, count, False)
-
-    def standard_normal(self, size=None, dtype=np.float64, out=None):
-        """Draw samples from a standard Normal distribution (mean=0, stdev=1)."""
-        _dtype = np.dtype(dtype)
-        if _dtype == np.float64:
-            single = False
-        elif _dtype == np.float32:
-            single = True
-        else:
-            raise TypeError(f"Unsupported dtype {_dtype!r} for standard_normal")
-        return _fill(_native.standard_normal, self._bit_generator._state, size, out, single)
-
-    def normal(self, loc=0.0, scale=1.0, size=None):
-        """Draw random samples from a normal (Gaussian) distribution."""
-        return _affine(self._normal_draws, loc, scale, size, "scale", True)
-
-    def standard_exponential(self, size=None, dtype=np.float64, method="zig", out=None):
-        """Draw samples from the standard exponential distribution."""
-        _dtype = np.dtype(dtype)
-        if _dtype == np.float64:
-            single = False
-        elif _dtype == np.float32:
-            single = True
-        else:
-            raise TypeError(f"Unsupported dtype {_dtype!r} for standard_exponential")
-        # NumPy uses the ziggurat for "zig" and inversion for any other method.
-        inverse = method != "zig"
-
-        def kernel(state, count, single):
-            return _native.standard_exponential(state, count, single, inverse)
-
-        return _fill(kernel, self._bit_generator._state, size, out, single)
-
-    def exponential(self, scale=1.0, size=None):
-        """Draw samples from an exponential distribution."""
-        return _cont(
-            self._bit_generator._state, "exponential", False, size, None,
-            (scale, "scale", _NON_NEGATIVE),
-        )
-
-    def standard_gamma(self, shape, size=None, dtype=np.float64, out=None):
-        """Draw samples from a standard Gamma distribution."""
-        _dtype = np.dtype(dtype)
-        state = self._bit_generator._state
-        if _dtype == np.float64:
-            return _cont(state, "standard_gamma", False, size, out, (shape, "shape", _NON_NEGATIVE))
-        if _dtype == np.float32:
-            return _standard_gamma_f32(state, shape, size, out)
-        raise TypeError(f"Unsupported dtype {_dtype!r} for standard_gamma")
-
-    def gamma(self, shape, scale=1.0, size=None):
-        """Draw samples from a Gamma distribution."""
-        return _cont(
-            self._bit_generator._state, "gamma", False, size, None,
-            (shape, "shape", _NON_NEGATIVE), (scale, "scale", _NON_NEGATIVE),
-        )
-
-    def f(self, dfnum, dfden, size=None):
-        """Draw samples from an F distribution."""
-        return _cont(
-            self._bit_generator._state, "f", False, size, None,
-            (dfnum, "dfnum", _POSITIVE), (dfden, "dfden", _POSITIVE),
-        )
-
-    def chisquare(self, df, size=None):
-        """Draw samples from a chi-square distribution."""
-        return _cont(
-            self._bit_generator._state, "chisquare", False, size, None, (df, "df", _POSITIVE)
-        )
-
-    def standard_t(self, df, size=None):
-        """Draw samples from a standard Student's t distribution with ``df`` degrees of freedom."""
-        return _cont(
-            self._bit_generator._state, "standard_t", False, size, None, (df, "df", _POSITIVE)
-        )
-
-    def binomial(self, n, p, size=None):
-        """Draw samples from a binomial distribution."""
-        return _binomial(self._bit_generator._state, False, n, p, size)
-
-    def poisson(self, lam=1.0, size=None):
-        """Draw samples from a Poisson distribution."""
-        return _poisson(self._bit_generator._state, False, lam, size)
-
-    def choice(self, a, size=None, replace=True, p=None, axis=0, shuffle=True):
-        """Generates a random sample from a given array."""
-        state = self._bit_generator._state
-        a_original = a
-        a = np.asarray(a)
-        if a.ndim == 0:
-            try:
-                # __index__ must return an integer by python rules.
-                pop_size = operator.index(a.item())
-            except TypeError as exc:
-                raise ValueError(
-                    f"a must be a sequence or an integer, not {type(a_original)}"
-                ) from exc
-            if pop_size <= 0 and np.prod(size) != 0:
-                raise ValueError("a must be a positive integer unless no samples are taken")
-        else:
-            pop_size = a.shape[axis]
-            if pop_size == 0 and np.prod(size) != 0:
-                raise ValueError("a cannot be empty unless no samples are taken")
-
-        if p is not None:
-            d = len(p)
-            atol = np.sqrt(np.finfo(np.float64).eps)
-            if isinstance(p, np.ndarray):
-                if np.issubdtype(p.dtype, np.floating):
-                    atol = max(atol, np.sqrt(np.finfo(p.dtype).eps))
-            p = np.array(p, dtype=np.float64)
-            if p.ndim != 1:
-                raise ValueError("p must be 1-dimensional")
-            if p.size != pop_size:
-                raise ValueError("a and p must have same size")
-            p_sum = _kahan_sum(p.tolist()[:d])
-            if np.isnan(p_sum):
-                raise ValueError("Probabilities contain NaN")
-            if np.logical_or.reduce(p < 0):
-                raise ValueError("Probabilities are not non-negative")
-            if abs(p_sum - 1.0) > atol:
-                raise ValueError(
-                    "Probabilities do not sum to 1. See Notes section of docstring for more "
-                    "information."
+        children = []
+        for _ in range(n_children):
+            children.append(
+                SeedSequence(
+                    self.entropy,
+                    spawn_key=self.spawn_key + (self.n_children_spawned,),
+                    pool_size=self.pool_size,
                 )
-
-        # `shape == None` means `shape == ()`, but with scalar unpacking at the end.
-        is_scalar = size is None
-        if not is_scalar:
-            shape = size
-            size = np.prod(shape, dtype=np.intp)
-        else:
-            shape = ()
-            size = 1
-
-        if replace:
-            if p is not None:
-                cdf = p.cumsum()
-                cdf /= cdf[-1]
-                uniform_samples = self.random(shape)
-                idx = cdf.searchsorted(uniform_samples, side="right")
-                # searchsorted returns a scalar
-                idx = np.asarray(idx, dtype=np.int64)
-            else:
-                idx = self.integers(0, pop_size, size=shape, dtype=np.int64)
-        else:
-            if size > pop_size:
-                raise ValueError(
-                    "Cannot take a larger sample than population when replace is False"
-                )
-            elif size < 0:
-                raise ValueError("negative dimensions are not allowed")
-
-            if p is not None:
-                if np.count_nonzero(p > 0) < size:
-                    raise ValueError("Fewer non-zero entries in p than size")
-                n_uniq = 0
-                p = p.copy()
-                found = np.zeros(shape, dtype=np.int64)
-                flat_found = found.ravel()
-                while n_uniq < size:
-                    x = self.random((size - n_uniq,))
-                    if n_uniq > 0:
-                        p[flat_found[0:n_uniq]] = 0
-                    cdf = np.cumsum(p)
-                    cdf /= cdf[-1]
-                    new = cdf.searchsorted(x, side="right")
-                    _, unique_indices = np.unique(new, return_index=True)
-                    unique_indices.sort()
-                    new = new.take(unique_indices)
-                    flat_found[n_uniq : n_uniq + new.size] = new
-                    n_uniq += new.size
-                idx = found
-            else:
-                size_i = int(size)
-                pop_size_i = int(pop_size)
-                # This is a heuristic tuning. should be improvable
-                cutoff = 50 if shuffle else 20
-                if pop_size_i > 10000 and (size_i > (pop_size_i // cutoff)):
-                    # Tail shuffle size elements
-                    order = _shuffle_order(
-                        state, pop_size_i, max(pop_size_i - size_i, 1), lemire=True
-                    )
-                    idx = order[(pop_size_i - size_i) :].copy()
-                else:
-                    # Floyd's algorithm
-                    idx = _native.floyd_sample(state, pop_size_i, size_i, bool(shuffle))
-                idx = idx.reshape(shape)
-
-        if is_scalar and isinstance(idx, np.ndarray):
-            # In most cases a scalar will have been made an array
-            idx = idx.item(0)
-
-        # Use samples as indices for a if a is array-like
-        if a.ndim == 0:
-            return idx
-
-        if not is_scalar and idx.ndim == 0 and a.ndim == 1:
-            # If size == () then the user requested a 0-d array as opposed to a scalar object
-            # when size is None.
-            res = np.empty((), dtype=a.dtype)
-            res[()] = a[idx]
-            return res
-
-        return a.take(np.asarray(idx, dtype=np.intp), axis=axis)
-
-    def shuffle(self, x, axis=0):
-        """Modify an array or sequence in-place by shuffling its contents."""
-        _shuffle_sequence(self._bit_generator._state, x, axis)
-
-    def permutation(self, x, axis=0):
-        """Randomly permute a sequence, or return a permuted range."""
-        if isinstance(x, (int, np.integer)):
-            arr = np.arange(x)
-            self.shuffle(arr)
-            return arr
-
-        arr = np.asarray(x)
-        axis = normalize_axis_index(axis, arr.ndim)
-
-        # shuffle has fast-path for 1-d
-        if arr.ndim == 1:
-            # Return a copy if same memory
-            if np.may_share_memory(arr, x):
-                arr = np.array(arr)
-            self.shuffle(arr)
-            return arr
-
-        # Shuffle index array, dtype to ensure fast path
-        idx = np.arange(arr.shape[axis], dtype=np.intp)
-        self.shuffle(idx)
-        slices = [slice(None)] * arr.ndim
-        slices[axis] = idx
-        return arr[tuple(slices)]
+            )
+            self.n_children_spawned += 1
+        return children
 
 
-def _kahan_sum(values):
-    """``kahan_sum`` from ``_common.pyx``, which ``choice`` uses to validate ``p``."""
-    if len(values) <= 0:
-        return 0.0
-    total = values[0]
-    c = 0.0
-    for value in values[1:]:
-        y = value - c
-        t = total + y
-        c = (t - total) - y
-        total = t
+# ---------------------------------------------------------------------------
+# Bit generators.
+# ---------------------------------------------------------------------------
+
+
+def _mt_state_from_seed_sequence(seed_sequence):
+    key = seed_sequence.generate_state(624).astype(_np.uint32)
+    key[0] = 0x80000000
+    return ["MT19937", key, 623]
+
+
+class MT19937:
+    """The Mersenne Twister (Matsumoto & Nishimura 1998) bit generator.
+
+    A scalar or array-like seed is expanded through `SeedSequence` first
+    (``key = SeedSequence(seed).generate_state(624)`` with ``key[0]``
+    overwritten to ``0x80000000`` and the twist position left at 623, not
+    624, so the constructor's own state is one word into the array rather
+    than needing an immediate re-twist). This backs `Generator` by default
+    only when `PCG64` isn't used; legacy `RandomState` seeds its own
+    MT19937 directly through `init_genrand`/`init_by_array` instead (see
+    `RandomState.seed`), bypassing `SeedSequence` entirely for exact
+    backward compatibility with NumPy's original generator.
+    """
+
+    def __init__(self, seed=None):
+        self.seed_seq = seed if isinstance(seed, SeedSequence) else SeedSequence(seed)
+        self._state = _mt_state_from_seed_sequence(self.seed_seq)
+
+    @property
+    def state(self):
+        return {
+            "bit_generator": "MT19937",
+            "state": {"key": self._state[1].copy(), "pos": self._state[2]},
+        }
+
+    @state.setter
+    def state(self, value):
+        key = _np.array(value["state"]["key"], dtype=_np.uint32)
+        self._state = ["MT19937", key, int(value["state"]["pos"])]
+
+    def random_raw(self, size=None):
+        n = 1 if size is None else int(size)
+        values, new_state = _nr._raw_fill(self._state, n)
+        self._state = new_state
+        return int(values[0]) if size is None else values
+
+
+def _pcg_state_from_seed_sequence(seed_sequence):
+    words = [int(word) for word in seed_sequence.generate_state(4, _np.uint64)]
+    return _nr._pcg_seed(words[0], words[1], words[2], words[3])
+
+
+class PCG64:
+    """PCG64 (O'Neill 2014), XSL-RR variant: the default `Generator` bit generator.
+
+    128-bit LCG state advanced by PCG's published 128-bit multiplier,
+    output through the xorshift-low/random-rotate (XSL RR) function that
+    folds state to 64 bits. `advance` and `jumped` are both the same
+    generic LCG jump-ahead by repeated doubling; `jumped`'s distance-per-
+    jump ordinarily comes from PCG's C++ template parameters, which NumPy
+    does not expose through Python, so its coefficients were recovered by
+    treating ``jumped`` as an unknown affine map over the 128-bit state and
+    solving for it from `PCG64(1).jumped(3)`'s published output (see
+    `random/bitgen.rs`).
+    """
+
+    def __init__(self, seed=None):
+        self.seed_seq = seed if isinstance(seed, SeedSequence) else SeedSequence(seed)
+        self._state = _pcg_state_from_seed_sequence(self.seed_seq)
+
+    @property
+    def state(self):
+        return {
+            "bit_generator": "PCG64",
+            "state": {"state": int(self._state[1]), "inc": int(self._state[2])},
+            "has_uint32": int(self._state[3]),
+            "uinteger": int(self._state[4]),
+        }
+
+    @state.setter
+    def state(self, value):
+        self._state = [
+            "PCG64",
+            int(value["state"]["state"]),
+            int(value["state"]["inc"]),
+            bool(value["has_uint32"]),
+            int(value["uinteger"]),
+        ]
+
+    def advance(self, delta):
+        self._state = _nr._pcg_advance(self._state, int(delta))
+        return self
+
+    def jumped(self, iterations=1):
+        self._state = _nr._pcg_jumped(self._state, int(iterations))
+        return self
+
+    def random_raw(self, size=None):
+        n = 1 if size is None else int(size)
+        values, new_state = _nr._raw_fill(self._state, n)
+        self._state = new_state
+        return int(values[0]) if size is None else values
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers.
+# ---------------------------------------------------------------------------
+
+
+def _shape_of(size):
+    if size is None:
+        return ()
+    if isinstance(size, (int, _np.integer)):
+        return (int(size),)
+    return tuple(int(dim) for dim in size)
+
+
+def _prod(shape):
+    total = 1
+    for dim in shape:
+        total *= dim
     return total
 
 
-def default_rng(seed=None):
-    """Construct a new Generator with the default BitGenerator (PCG64)."""
-    if isinstance(seed, BitGenerator):
-        # We were passed a BitGenerator, so just wrap it up.
-        return Generator(seed)
-    elif isinstance(seed, Generator):
-        # Pass through a Generator.
-        return seed
-    elif isinstance(seed, RandomState):
-        return Generator(seed._bit_generator)
-    # Otherwise we need to instantiate a new BitGenerator and Generator as normal.
-    return Generator(PCG64(seed))
+def _scalar(values):
+    return _np.asarray(values).reshape(-1)[0]
 
 
-class RandomState:
-    """NumPy's legacy random interface on the Mersenne Twister."""
+def _dtype_name(dtype):
+    return _np.dtype(dtype).name
 
-    def __init__(self, seed=None):
-        if seed is None:
-            bit_generator = MT19937()
-        elif not isinstance(seed, BitGenerator):
-            bit_generator = MT19937()
-            bit_generator._legacy_seeding(seed)
-        else:
-            bit_generator = seed
-        self._initialize_bit_generator(bit_generator)
 
-    def __repr__(self):
-        return f"{self} at 0x{id(self):X}"
+_INT_BOUNDS = {
+    "bool": (0, 1),
+    "int8": (-128, 127),
+    "int16": (-32768, 32767),
+    "int32": (-2147483648, 2147483647),
+    "int64": (-9223372036854775808, 9223372036854775807),
+    "uint8": (0, 255),
+    "uint16": (0, 65535),
+    "uint32": (0, 4294967295),
+    "uint64": (0, 18446744073709551615),
+}
 
-    def __str__(self):
-        return f"{self.__class__.__name__}({self._bit_generator.__class__.__name__})"
+_POISSON_LAM_MAX = 3074457345618258602.0
 
-    def _initialize_bit_generator(self, bit_generator):
-        self._bit_generator = bit_generator
-        self._reset_gauss()
 
-    def _reset_gauss(self):
-        _native.set_gauss(self._bit_generator._state, 0, 0.0)
+def _broadcast_params(size, params):
+    """Broadcast float64 distribution parameters to the output shape.
 
-    def seed(self, seed=None):
-        """Reseed the legacy MT19937 stream."""
-        if not isinstance(self._bit_generator, MT19937):
-            raise TypeError("can only re-seed a MT19937 BitGenerator")
-        self._bit_generator._legacy_seeding(seed)
-        self._reset_gauss()
+    Mirrors NumPy's rule: with no explicit ``size``, the output shape is
+    the parameters' own broadcast shape; with an explicit ``size``, the
+    parameters must broadcast to it or the call fails with "shape
+    mismatch" (NumPy's own wording for this case).
+    """
+    arrays = [_np.asarray(p, dtype=_np.float64) for p in params]
+    param_shape = _np.broadcast_shapes(*(a.shape for a in arrays)) if arrays else ()
+    shape = tuple(param_shape) if size is None else _shape_of(size)
+    try:
+        broadcast = [
+            _np.ascontiguousarray(_np.broadcast_to(a, shape), dtype=_np.float64)
+            for a in arrays
+        ]
+    except ValueError:
+        raise ValueError("shape mismatch") from None
+    return shape, broadcast
 
-    def get_state(self, legacy=True):
-        """Return a tuple (or dict) representing the internal state of the generator."""
-        st = self._bit_generator.state
-        st["has_gauss"], st["gauss"] = _native.get_gauss(self._bit_generator._state)
-        if st["bit_generator"] != "MT19937" and legacy:
-            import warnings
 
-            warnings.warn(
-                "get_state and legacy can only be used with the MT19937 BitGenerator. To "
-                "silence this warning, set `legacy` to False.",
-                RuntimeWarning,
-                stacklevel=2,
+def _choice_population(a):
+    if isinstance(a, (int, _np.integer)) and not isinstance(a, bool):
+        pop_size = int(a)
+        if pop_size <= 0:
+            raise ValueError("a must be a positive integer unless no samples are taken")
+        return pop_size, None
+    a_arr = _np.asarray(a)
+    if a_arr.shape[0] == 0:
+        raise ValueError("'a' cannot be empty unless no samples are taken")
+    return a_arr.shape[0], a_arr
+
+
+def _choice_result(idx, values_source, size, shape):
+    idx = _np.asarray(idx, dtype=_np.int64)
+    result = idx if values_source is None else values_source[idx]
+    if size is None:
+        return _scalar(result)
+    return _np.asarray(result).reshape(shape)
+
+
+def _weighted_choice_with_replacement(raw_state, store_state, p_arr, n_samples):
+    cumulative = p_arr.astype(float).tolist()
+    running = 0.0
+    for i, weight in enumerate(cumulative):
+        running += weight
+        cumulative[i] = running
+    cumulative[-1] = 1.0
+    base, new_state = _nr._uniform01_fill(raw_state(), [n_samples], "float64")
+    store_state(new_state)
+    result = []
+    for value in base.tolist():
+        pick = len(cumulative) - 1
+        for i, threshold in enumerate(cumulative):
+            if value < threshold:
+                pick = i
+                break
+        result.append(pick)
+    return _np.array(result, dtype=_np.int64)
+
+
+def _weighted_choice_without_replacement(raw_state, store_state, p_arr, n_samples):
+    remaining_p = p_arr.astype(float).tolist()
+    remaining_idx = list(range(len(remaining_p)))
+    result = []
+    for _ in range(n_samples):
+        total = sum(remaining_p)
+        base, new_state = _nr._uniform01_fill(raw_state(), [1], "float64")
+        store_state(new_state)
+        target = float(base[0]) * total
+        cumulative = 0.0
+        pick = len(remaining_p) - 1
+        for i, weight in enumerate(remaining_p):
+            cumulative += weight
+            if target < cumulative:
+                pick = i
+                break
+        result.append(remaining_idx.pop(pick))
+        remaining_p.pop(pick)
+    return _np.array(result, dtype=_np.int64)
+
+
+def _choice_indices(raw_state, store_state, pop_size, shape, replace, p, legacy, shuffle=True):
+    n_samples = _prod(shape) if shape else 1
+    p_arr = None
+    if p is not None:
+        p_arr = _np.asarray(p, dtype=_np.float64)
+        if p_arr.shape[0] != pop_size:
+            raise ValueError("a and p must have same size")
+        if _np.any(p_arr < 0):
+            raise ValueError("probabilities are not non-negative")
+        if abs(float(_np.sum(p_arr)) - 1.0) > 1e-8:
+            raise ValueError("probabilities do not sum to 1")
+    if not replace:
+        if n_samples > pop_size:
+            raise ValueError(
+                "Cannot take a larger sample than population when 'replace=False'"
             )
-            legacy = False
-        if legacy:
-            return (
-                st["bit_generator"],
-                st["state"]["key"],
-                st["state"]["pos"],
-                st["has_gauss"],
-                st["gauss"],
-            )
-        return st
-
-    def set_state(self, state):
-        """Set the internal state of the generator from a tuple or dict."""
-        if isinstance(state, dict):
-            if "bit_generator" not in state or "state" not in state:
-                raise ValueError("state dictionary is not valid.")
-            st = state
+        if p_arr is None:
+            if legacy:
+                full, new_state = _nr._shuffle_indices(raw_state(), pop_size)
+                store_state(new_state)
+                idx = _np.asarray(full, dtype=_np.int64)[:n_samples]
+            else:
+                idx, new_state = _nr._choice_without_replacement(
+                    raw_state(), pop_size, n_samples, shuffle
+                )
+                store_state(new_state)
+                idx = _np.asarray(idx, dtype=_np.int64)
         else:
-            if not isinstance(state, (tuple, list)):
-                raise TypeError("state must be a dict or a tuple.")
-            if state[0] != "MT19937":
-                raise ValueError("set_state can only be used with legacy MT19937 state instances.")
-            st = {"bit_generator": state[0], "state": {"key": state[1], "pos": state[2]}}
-            if len(state) > 3:
-                st["has_gauss"] = state[3]
-                st["gauss"] = state[4]
-        gauss = st.get("gauss", 0.0)
-        has_gauss = st.get("has_gauss", 0)
-        self._bit_generator.state = st
-        _native.set_gauss(self._bit_generator._state, has_gauss, gauss)
+            idx = _weighted_choice_without_replacement(raw_state, store_state, p_arr, n_samples)
+    else:
+        if p_arr is None:
+            low_b = _np.zeros(n_samples, dtype=_np.int64)
+            count_b = _np.full(n_samples, float(pop_size), dtype=_np.float64)
+            idx, new_state = _nr._bounded_int_fill(raw_state(), low_b, count_b, legacy, "int64")
+            store_state(new_state)
+        else:
+            idx = _weighted_choice_with_replacement(raw_state, store_state, p_arr, n_samples)
+    return idx
 
-    def random_sample(self, size=None):
-        """Return random floats in the half-open interval [0.0, 1.0)."""
-        return _fill(_native.standard_uniform, self._bit_generator._state, size, None, False)
 
-    def random(self, size=None):
-        """Return random floats in the half-open interval [0.0, 1.0)."""
-        return self.random_sample(size=size)
+def _shuffle(raw_state, store_state, x, axis=0):
+    if isinstance(x, _np.ndarray):
+        if not _np._writeable(x):
+            raise ValueError("array is read-only")
+        n = x.shape[axis]
+        idx, new_state = _nr._shuffle_indices(raw_state(), n)
+        store_state(new_state)
+        x[...] = x[idx]
+        return None
+    n = len(x)
+    idx, new_state = _nr._shuffle_indices(raw_state(), n)
+    store_state(new_state)
+    source = list(x)
+    for i, value in enumerate(idx.tolist()):
+        x[i] = source[value]
+    return None
 
-    def rand(self, *args):
-        """Random values in a given shape."""
-        if len(args) == 0:
-            return self.random_sample()
-        return self.random_sample(size=args)
 
-    def randn(self, *args):
-        """Return samples from the "standard normal" distribution."""
-        if len(args) == 0:
-            return self.standard_normal()
-        return self.standard_normal(size=args)
+def _permutation(raw_state, store_state, x, axis=0):
+    if isinstance(x, (int, _np.integer)) and not isinstance(x, bool):
+        idx, new_state = _nr._shuffle_indices(raw_state(), int(x))
+        store_state(new_state)
+        return idx
+    arr = _np.array(x, copy=True)
+    _shuffle(raw_state, store_state, arr, axis=axis)
+    return arr
 
-    def _gauss_draws(self, count):
-        return _native.legacy_gauss(self._bit_generator._state, count)
 
-    def standard_normal(self, size=None):
-        """Draw samples from a standard Normal distribution (mean=0, stdev=1)."""
-        if size is None:
-            return float(self._gauss_draws(1)[0])
-        shape, count = _normalize_size(size)
-        return self._gauss_draws(count).reshape(shape)
+# ---------------------------------------------------------------------------
+# Generator
+# ---------------------------------------------------------------------------
 
-    def normal(self, loc=0.0, scale=1.0, size=None):
-        """Draw random samples from a normal (Gaussian) distribution."""
-        return _affine(self._gauss_draws, loc, scale, size, "scale", True)
 
-    def uniform(self, low=0.0, high=1.0, size=None):
-        """Draw samples from a uniform distribution over ``[low, high)``."""
-        alow = np.asarray(low, dtype=np.float64)
-        ahigh = np.asarray(high, dtype=np.float64)
-        draw = self._uniform_draws
-        if alow.ndim == ahigh.ndim == 0:
-            rng = float(high) - float(low)
-            if not np.isfinite(rng):
-                raise OverflowError("Range exceeds valid bounds")
-            return _affine(draw, float(low), rng, size, "", False)
-        arange = np.subtract(ahigh, alow)
-        if not np.all(np.isfinite(arange)):
-            raise OverflowError("Range exceeds valid bounds")
-        return _affine(draw, alow, arange, size, "", False)
+class Generator:
+    """NumPy-style random number generator over any bit generator.
 
-    def _uniform_draws(self, count):
-        return _native.standard_uniform(self._bit_generator._state, count, False)
+    Uniform draws come straight from the bit generator's words (Lemire's
+    method for bounded integers; the top 53 bits of a 64-bit draw, or two
+    tempered MT19937 words, for doubles in ``[0, 1)``); those match NumPy
+    2.5.3 bit for bit for both `PCG64` and `MT19937`. The normal and
+    exponential ziggurat is this module's own implementation and does not
+    reproduce NumPy's exact stream (see docs/numpy.md); `standard_gamma`
+    (and `gamma`, `chisquare`, `f`, `standard_t`, which are built on it)
+    inherit that difference whenever they consume a normal deviate.
+    """
 
-    def standard_exponential(self, size=None):
-        """Draw samples from the standard exponential distribution."""
-        state = self._bit_generator._state
-        if size is None:
-            return float(_native.legacy_standard_exponential(state, 1)[0])
-        shape, count = _normalize_size(size)
-        return _native.legacy_standard_exponential(state, count).reshape(shape)
+    def __init__(self, bit_generator):
+        self.bit_generator = bit_generator
 
-    def exponential(self, scale=1.0, size=None):
-        """Draw samples from an exponential distribution."""
-        return _cont(
-            self._bit_generator._state, "exponential", True, size, None,
-            (scale, "scale", _NON_NEGATIVE),
-        )
+    def _raw_state(self):
+        return self.bit_generator._state
 
-    def standard_gamma(self, shape, size=None):
-        """Draw samples from a standard Gamma distribution."""
-        return _cont(
-            self._bit_generator._state, "standard_gamma", True, size, None,
-            (shape, "shape", _NON_NEGATIVE),
-        )
+    def _store_state(self, new_state):
+        self.bit_generator._state = new_state
 
-    def gamma(self, shape, scale=1.0, size=None):
-        """Draw samples from a Gamma distribution."""
-        return _cont(
-            self._bit_generator._state, "gamma", True, size, None,
-            (shape, "shape", _NON_NEGATIVE), (scale, "scale", _NON_NEGATIVE),
-        )
+    def random(self, size=None, dtype=_np.float64, out=None):
+        dtype_name = _dtype_name(dtype)
+        if dtype_name not in ("float64", "float32"):
+            raise TypeError(f"Unsupported dtype {dtype_name} for random")
+        shape = out.shape if out is not None else _shape_of(size)
+        values, new_state = _nr._uniform01_fill(self._raw_state(), shape, dtype_name)
+        self._store_state(new_state)
+        if out is not None:
+            out[...] = values
+            return out
+        return float(_scalar(values)) if shape == () else values
 
-    def f(self, dfnum, dfden, size=None):
-        """Draw samples from an F distribution."""
-        return _cont(
-            self._bit_generator._state, "f", True, size, None,
-            (dfnum, "dfnum", _POSITIVE), (dfden, "dfden", _POSITIVE),
-        )
-
-    def chisquare(self, df, size=None):
-        """Draw samples from a chi-square distribution."""
-        return _cont(
-            self._bit_generator._state, "chisquare", True, size, None, (df, "df", _POSITIVE)
-        )
-
-    def standard_t(self, df, size=None):
-        """Draw samples from a standard Student's t distribution with ``df`` degrees of freedom."""
-        return _cont(
-            self._bit_generator._state, "standard_t", True, size, None, (df, "df", _POSITIVE)
-        )
-
-    def binomial(self, n, p, size=None):
-        """Draw samples from a binomial distribution."""
-        return _binomial(self._bit_generator._state, True, n, p, size)
-
-    def poisson(self, lam=1.0, size=None):
-        """Draw samples from a Poisson distribution."""
-        return _poisson(self._bit_generator._state, True, lam, size)
-
-    def randint(self, low, high=None, size=None, dtype=int):
-        """Return random integers from ``low`` (inclusive) to ``high`` (exclusive)."""
+    def integers(self, low, high=None, size=None, dtype=_np.int64, endpoint=False):
+        dtype_name = _dtype_name(dtype)
+        if dtype_name not in _INT_BOUNDS:
+            raise TypeError(f"Unsupported dtype {dtype_name} for integers")
+        dmin, dmax = _INT_BOUNDS[dtype_name]
         if high is None:
             high = low
             low = 0
-        _dtype = _integer_dtype(dtype if dtype is not int else "long", "randint")
-        # The legacy stream always uses masked rejection, as NumPy keeps it for compatibility.
-        ret = _bounded_integers(self._bit_generator._state, low, high, size, _dtype, True, False)
-        if size is None and (dtype is bool or dtype is int):
-            if np.array(ret).shape == ():
-                return dtype(ret)
-        return ret
+            if _np.any(_np.asarray(high) <= 0):
+                raise ValueError("high <= 0")
+        low_arr = _np.asarray(low, dtype=_np.int64)
+        high_arr = _np.asarray(high, dtype=_np.int64)
+        shape = _np.broadcast_shapes(low_arr.shape, high_arr.shape)
+        target = shape if size is None else _shape_of(size)
+        try:
+            low_b = _np.ascontiguousarray(_np.broadcast_to(low_arr, target), dtype=_np.int64)
+            high_b = _np.ascontiguousarray(_np.broadcast_to(high_arr, target), dtype=_np.int64)
+        except ValueError:
+            raise ValueError("shape mismatch") from None
+        if _np.any(low_b < dmin):
+            raise ValueError(f"low is out of bounds for {dtype_name}")
+        high_incl = high_b if endpoint else high_b - 1
+        if _np.any(high_incl > dmax):
+            raise ValueError(f"high is out of bounds for {dtype_name}")
+        if endpoint:
+            if _np.any(low_b > high_b):
+                raise ValueError("low > high")
+        elif _np.any(low_b >= high_b):
+            raise ValueError("low >= high")
+        count = high_incl.astype(_np.float64) - low_b.astype(_np.float64) + 1.0
+        values, new_state = _nr._bounded_int_fill(
+            self._raw_state(), low_b, count, False, dtype_name
+        )
+        self._store_state(new_state)
+        result = values if dtype_name == "int64" else values.astype(dtype_name)
+        return _scalar(result) if target == () else result
 
-    def random_integers(self, low, high=None, size=None):
-        """Random integers between ``low`` and ``high``, inclusive (deprecated)."""
-        import warnings
+    def choice(self, a, size=None, replace=True, p=None, shuffle=True):
+        pop_size, values_source = _choice_population(a)
+        shape = _shape_of(size)
+        idx = _choice_indices(
+            self._raw_state, self._store_state, pop_size, shape, replace, p, False, shuffle
+        )
+        return _choice_result(idx, values_source, size, shape)
 
-        # NumPy warns from Cython, which has no frame, so `stacklevel=2` names the same caller.
-        if high is None:
-            warnings.warn(
-                f"This function is deprecated. Please call randint(1, {low} + 1) instead",
-                DeprecationWarning,
-                stacklevel=2,
+    def shuffle(self, x, axis=0):
+        return _shuffle(self._raw_state, self._store_state, x, axis=axis)
+
+    def permutation(self, x, axis=0):
+        return _permutation(self._raw_state, self._store_state, x, axis=axis)
+
+    def uniform(self, low=0.0, high=1.0, size=None):
+        shape, (low_a, high_a) = _broadcast_params(size, (low, high))
+        width = high_a - low_a
+        if not _np.all(_np.isfinite(width)):
+            raise OverflowError("Range exceeds valid bounds")
+        if _np.any(width < 0):
+            raise ValueError("high - low < 0")
+        base, new_state = _nr._uniform01_fill(self._raw_state(), shape, "float64")
+        self._store_state(new_state)
+        result = low_a + width * base
+        return float(_scalar(result)) if shape == () else result
+
+    def normal(self, loc=0.0, scale=1.0, size=None):
+        shape, (loc_a, scale_a) = _broadcast_params(size, (loc, scale))
+        if _np.any(scale_a < 0):
+            raise ValueError("scale < 0")
+        base, new_state = _nr._standard_normal_fill(self._raw_state(), shape, "float64")
+        self._store_state(new_state)
+        result = loc_a + scale_a * base
+        return float(_scalar(result)) if shape == () else result
+
+    def standard_normal(self, size=None, dtype=_np.float64, out=None):
+        dtype_name = _dtype_name(dtype)
+        if dtype_name not in ("float64", "float32"):
+            raise TypeError(f"Unsupported dtype {dtype_name} for standard_normal")
+        shape = out.shape if out is not None else _shape_of(size)
+        values, new_state = _nr._standard_normal_fill(self._raw_state(), shape, dtype_name)
+        self._store_state(new_state)
+        if out is not None:
+            out[...] = values
+            return out
+        return float(_scalar(values)) if shape == () else values
+
+    def standard_exponential(self, size=None, dtype=_np.float64, method="zig", out=None):
+        dtype_name = _dtype_name(dtype)
+        if dtype_name not in ("float64", "float32"):
+            raise TypeError(f"Unsupported dtype {dtype_name} for standard_exponential")
+        if method not in ("zig", "inv"):
+            raise ValueError("method must be 'zig' or 'inv'")
+        shape = out.shape if out is not None else _shape_of(size)
+        values, new_state = _nr._standard_exponential_fill(
+            self._raw_state(), shape, dtype_name, method
+        )
+        self._store_state(new_state)
+        if out is not None:
+            out[...] = values
+            return out
+        return float(_scalar(values)) if shape == () else values
+
+    def exponential(self, scale=1.0, size=None):
+        shape, (scale_a,) = _broadcast_params(size, (scale,))
+        if _np.any(scale_a < 0):
+            raise ValueError("scale < 0")
+        base, new_state = _nr._standard_exponential_fill(
+            self._raw_state(), shape, "float64", "zig"
+        )
+        self._store_state(new_state)
+        result = scale_a * base
+        return float(_scalar(result)) if shape == () else result
+
+    def standard_gamma(self, shape, size=None, dtype=_np.float64, out=None):
+        dtype_name = _dtype_name(dtype)
+        if dtype_name not in ("float64", "float32"):
+            raise TypeError(f"Unsupported dtype {dtype_name} for standard_gamma")
+        target = out.shape if out is not None else size
+        param_shape, (shape_a,) = _broadcast_params(target, (shape,))
+        if _np.any(shape_a < 0):
+            raise ValueError("shape < 0")
+        values, new_state = _nr._standard_gamma_fill(self._raw_state(), shape_a, dtype_name)
+        self._store_state(new_state)
+        if out is not None:
+            out[...] = values
+            return out
+        return float(_scalar(values)) if param_shape == () else values
+
+    def gamma(self, shape, scale=1.0, size=None):
+        param_shape, (shape_a, scale_a) = _broadcast_params(size, (shape, scale))
+        if _np.any(shape_a < 0):
+            raise ValueError("shape < 0")
+        if _np.any(scale_a < 0):
+            raise ValueError("scale < 0")
+        values, new_state = _nr._standard_gamma_fill(self._raw_state(), shape_a, "float64")
+        self._store_state(new_state)
+        result = values * scale_a
+        return float(_scalar(result)) if param_shape == () else result
+
+    def chisquare(self, df, size=None):
+        param_shape, (df_a,) = _broadcast_params(size, (df,))
+        if _np.any(df_a <= 0):
+            raise ValueError("df <= 0")
+        values, new_state = _nr._chisquare_fill(self._raw_state(), df_a)
+        self._store_state(new_state)
+        return float(_scalar(values)) if param_shape == () else values
+
+    def f(self, dfnum, dfden, size=None):
+        param_shape, (dfnum_a, dfden_a) = _broadcast_params(size, (dfnum, dfden))
+        if _np.any(dfnum_a <= 0):
+            raise ValueError("dfnum <= 0")
+        if _np.any(dfden_a <= 0):
+            raise ValueError("dfden <= 0")
+        values, new_state = _nr._f_fill(self._raw_state(), dfnum_a, dfden_a)
+        self._store_state(new_state)
+        return float(_scalar(values)) if param_shape == () else values
+
+    def standard_t(self, df, size=None):
+        param_shape, (df_a,) = _broadcast_params(size, (df,))
+        if _np.any(df_a <= 0):
+            raise ValueError("df <= 0")
+        values, new_state = _nr._standard_t_fill(self._raw_state(), df_a)
+        self._store_state(new_state)
+        return float(_scalar(values)) if param_shape == () else values
+
+    def binomial(self, n, p, size=None):
+        n_scalar = _np.ndim(n) == 0
+        p_scalar = _np.ndim(p) == 0
+        n_in = _np.asarray(n)
+        if n_in.dtype.kind not in "iub":
+            raise TypeError(
+                f"Cannot cast array data from dtype('{n_in.dtype.name}') "
+                "to dtype('int64') according to the rule 'safe'"
             )
-            high = low
-            low = 1
+        n_arr = n_in.astype(_np.int64)
+        p_arr = _np.asarray(p, dtype=_np.float64)
+        shape = _np.broadcast_shapes(n_arr.shape, p_arr.shape)
+        target = shape if size is None else _shape_of(size)
+        try:
+            n_b = _np.ascontiguousarray(_np.broadcast_to(n_arr, target), dtype=_np.int64)
+            p_b = _np.ascontiguousarray(_np.broadcast_to(p_arr, target), dtype=_np.float64)
+        except ValueError:
+            raise ValueError("shape mismatch") from None
+        if _np.any(n_b < 0):
+            raise ValueError("n < 0")
+        nan_msg = "p < 0, p > 1 or p is NaN" if p_scalar else "p < 0, p > 1 or p contains NaNs"
+        if not _np.all((p_b >= 0) & (p_b <= 1)):
+            raise ValueError(nan_msg)
+        values, new_state = _nr._binomial_fill(self._raw_state(), n_b, p_b)
+        self._store_state(new_state)
+        return int(_scalar(values)) if target == () else values
+
+    def poisson(self, lam=1.0, size=None):
+        lam_arr = _np.asarray(lam, dtype=_np.float64)
+        target = lam_arr.shape if size is None else _shape_of(size)
+        try:
+            lam_b = _np.ascontiguousarray(_np.broadcast_to(lam_arr, target), dtype=_np.float64)
+        except ValueError:
+            raise ValueError("shape mismatch") from None
+        if not _np.all(lam_b < _POISSON_LAM_MAX):
+            raise ValueError("lam value too large")
+        if _np.any(lam_b < 0):
+            raise ValueError("lam < 0 or lam is NaN")
+        values, new_state = _nr._poisson_fill(self._raw_state(), lam_b)
+        self._store_state(new_state)
+        return int(_scalar(values)) if target == () else values
+
+
+def default_rng(seed=None):
+    """Return a new `Generator` seeded from `seed` through `SeedSequence`,
+    backed by `PCG64` (NumPy's default bit generator since 1.17).
+    """
+    if isinstance(seed, (Generator,)):
+        return seed
+    if isinstance(seed, (MT19937, PCG64)):
+        return Generator(seed)
+    seq = seed if isinstance(seed, SeedSequence) else SeedSequence(seed)
+    return Generator(PCG64(seq))
+
+
+# ---------------------------------------------------------------------------
+# RandomState (legacy)
+# ---------------------------------------------------------------------------
+
+
+def _mt_seed_scalar(value):
+    if not 0 <= value <= 2**32 - 1:
+        raise ValueError("Seed must be between 0 and 2**32 - 1")
+    return _nr._mt_seed_genrand(value)
+
+
+def _mt_seed_array(words):
+    for word in words:
+        if not 0 <= word <= 2**32 - 1:
+            raise ValueError("Seed must be between 0 and 2**32 - 1")
+    return _nr._mt_seed_array(_np.array(words, dtype=_np.int64))
+
+
+class RandomState:
+    """Legacy MT19937-backed generator, bit-for-bit compatible with NumPy's
+    original `RandomState`: `init_genrand`/`init_by_array` seeding, masked
+    rejection for bounded integers, and the Marsaglia polar-method Gaussian
+    (with its one-value cache, threaded through `get_state`/`set_state`).
+    """
+
+    def __init__(self, seed=None):
+        self.seed(seed)
+
+    def seed(self, seed=None):
+        if seed is None:
+            self._state = _mt_seed_scalar(0)
+        elif isinstance(seed, (int, _np.integer)) and not isinstance(seed, bool):
+            self._state = _mt_seed_scalar(int(seed))
         else:
-            warnings.warn(
-                f"This function is deprecated. Please call randint({low}, {high} + 1) instead",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return self.randint(low, int(high) + 1, size=size, dtype="l")
+            try:
+                words = [int(value) for value in seed]
+            except TypeError:
+                raise TypeError("Seed must be None, an int, or an array of ints") from None
+            self._state = _mt_seed_array(words)
+        self._has_gauss = False
+        self._cached_gauss = 0.0
+
+    def _raw_state(self):
+        return [self._state[0], self._state[1], self._state[2], self._has_gauss, self._cached_gauss]
+
+    def _store_state(self, new_state):
+        self._state = [new_state[0], new_state[1], new_state[2]]
+        self._has_gauss = bool(new_state[3])
+        self._cached_gauss = float(new_state[4])
+
+    def get_state(self, legacy=True):
+        return ("MT19937", self._state[1].copy(), self._state[2], int(self._has_gauss), self._cached_gauss)
+
+    def set_state(self, state):
+        _, key, pos, has_gauss, cached = state
+        self._state = ["MT19937", _np.array(key, dtype=_np.uint32), int(pos)]
+        self._has_gauss = bool(has_gauss)
+        self._cached_gauss = float(cached)
+
+    def rand(self, *shape):
+        return self.random_sample(shape if shape else None)
+
+    def randn(self, *shape):
+        return self.standard_normal(shape if shape else None)
+
+    def random_sample(self, size=None):
+        shape = _shape_of(size)
+        values, new_state = _nr._uniform01_fill(self._raw_state(), shape, "float64")
+        self._store_state(new_state)
+        return float(_scalar(values)) if shape == () else values
+
+    random = random_sample
+
+    def randint(self, low, high=None, size=None, dtype=_np.int64):
+        dtype_name = _dtype_name(dtype)
+        if dtype_name not in _INT_BOUNDS:
+            raise TypeError(f"Unsupported dtype {dtype_name} for randint")
+        dmin, dmax = _INT_BOUNDS[dtype_name]
+        if high is None:
+            high = low
+            low = 0
+        low_arr = _np.asarray(low, dtype=_np.int64)
+        high_arr = _np.asarray(high, dtype=_np.int64)
+        shape = _np.broadcast_shapes(low_arr.shape, high_arr.shape)
+        target = shape if size is None else _shape_of(size)
+        try:
+            low_b = _np.ascontiguousarray(_np.broadcast_to(low_arr, target), dtype=_np.int64)
+            high_b = _np.ascontiguousarray(_np.broadcast_to(high_arr, target), dtype=_np.int64)
+        except ValueError:
+            raise ValueError("shape mismatch") from None
+        if _np.any(low_b < dmin) or _np.any(high_b - 1 > dmax):
+            raise ValueError(f"low is out of bounds for {dtype_name}")
+        if _np.any(low_b >= high_b):
+            raise ValueError("low >= high")
+        count = high_b.astype(_np.float64) - low_b.astype(_np.float64)
+        values, new_state = _nr._bounded_int_fill(
+            self._raw_state(), low_b, count, True, dtype_name
+        )
+        self._store_state(new_state)
+        result = values if dtype_name == "int64" else values.astype(dtype_name)
+        return int(_scalar(result)) if target == () else result
 
     def choice(self, a, size=None, replace=True, p=None):
-        """Generates a random sample from a given 1-D array."""
-        a = np.asarray(a)
-        if a.ndim == 0:
-            try:
-                # __index__ must return an integer by python rules.
-                pop_size = operator.index(a.item())
-            except TypeError:
-                raise ValueError("a must be 1-dimensional or an integer")
-            if pop_size <= 0 and np.prod(size) != 0:
-                raise ValueError("a must be greater than 0 unless no samples are taken")
-        elif a.ndim != 1:
-            raise ValueError("a must be 1-dimensional")
-        else:
-            pop_size = a.shape[0]
-            if pop_size == 0 and np.prod(size) != 0:
-                raise ValueError("'a' cannot be empty unless no samples are taken")
+        pop_size, values_source = _choice_population(a)
+        shape = _shape_of(size)
+        idx = _choice_indices(
+            self._raw_state, self._store_state, pop_size, shape, replace, p, True
+        )
+        return _choice_result(idx, values_source, size, shape)
 
-        if p is not None:
-            d = len(p)
-            atol = np.sqrt(np.finfo(np.float64).eps)
-            if isinstance(p, np.ndarray):
-                if np.issubdtype(p.dtype, np.floating):
-                    atol = max(atol, np.sqrt(np.finfo(p.dtype).eps))
-            p = np.array(p, dtype=np.float64)
-            if p.ndim != 1:
-                raise ValueError("'p' must be 1-dimensional")
-            if p.size != pop_size:
-                raise ValueError("'a' and 'p' must have same size")
-            p_sum = _kahan_sum(p.tolist()[:d])
-            if np.isnan(p_sum):
-                raise ValueError("probabilities contain NaN")
-            if np.logical_or.reduce(p < 0):
-                raise ValueError("probabilities are not non-negative")
-            if abs(p_sum - 1.0) > atol:
-                raise ValueError("probabilities do not sum to 1")
+    def shuffle(self, x, axis=0):
+        return _shuffle(self._raw_state, self._store_state, x, axis=axis)
 
-        # `shape == None` means `shape == ()`, but with scalar unpacking at the end.
-        is_scalar = size is None
-        if not is_scalar:
-            shape = size
-            size = np.prod(shape, dtype=np.intp)
-        else:
-            shape = ()
-            size = 1
+    def permutation(self, x, axis=0):
+        return _permutation(self._raw_state, self._store_state, x, axis=axis)
 
-        if replace:
-            if p is not None:
-                cdf = p.cumsum()
-                cdf /= cdf[-1]
-                uniform_samples = self.random_sample(shape)
-                idx = cdf.searchsorted(uniform_samples, side="right")
-                # searchsorted returns a scalar
-                idx = np.asarray(idx).astype(np.long, casting="unsafe")
-            else:
-                idx = self.randint(0, pop_size, size=shape)
-        else:
-            if size > pop_size:
-                raise ValueError(
-                    "Cannot take a larger sample than population when 'replace=False'"
-                )
-            elif size < 0:
-                raise ValueError("Negative dimensions are not allowed")
+    def uniform(self, low=0.0, high=1.0, size=None):
+        shape, (low_a, high_a) = _broadcast_params(size, (low, high))
+        base, new_state = _nr._uniform01_fill(self._raw_state(), shape, "float64")
+        self._store_state(new_state)
+        result = low_a + (high_a - low_a) * base
+        return float(_scalar(result)) if shape == () else result
 
-            if p is not None:
-                if np.count_nonzero(p > 0) < size:
-                    raise ValueError("Fewer non-zero entries in p than size")
-                n_uniq = 0
-                p = p.copy()
-                found = np.zeros(shape, dtype=np.long)
-                flat_found = found.ravel()
-                while n_uniq < size:
-                    x = self.rand(size - n_uniq)
-                    if n_uniq > 0:
-                        p[flat_found[0:n_uniq]] = 0
-                    cdf = np.cumsum(p)
-                    cdf /= cdf[-1]
-                    new = cdf.searchsorted(x, side="right")
-                    _, unique_indices = np.unique(new, return_index=True)
-                    unique_indices.sort()
-                    new = new.take(unique_indices)
-                    flat_found[n_uniq : n_uniq + new.size] = new
-                    n_uniq += new.size
-                idx = found
-            else:
-                idx = self.permutation(pop_size)[:size]
-                idx = idx.reshape(shape)
+    def normal(self, loc=0.0, scale=1.0, size=None):
+        shape, (loc_a, scale_a) = _broadcast_params(size, (loc, scale))
+        if _np.any(scale_a < 0):
+            raise ValueError("scale < 0")
+        base, new_state = _nr._standard_normal_fill(self._raw_state(), shape, "float64")
+        self._store_state(new_state)
+        result = loc_a + scale_a * base
+        return float(_scalar(result)) if shape == () else result
 
-        if is_scalar and isinstance(idx, np.ndarray):
-            # In most cases a scalar will have been made an array
-            idx = idx.item(0)
+    def standard_normal(self, size=None):
+        shape = _shape_of(size)
+        values, new_state = _nr._standard_normal_fill(self._raw_state(), shape, "float64")
+        self._store_state(new_state)
+        return float(_scalar(values)) if shape == () else values
 
-        # Use samples as indices for a if a is array-like
-        if a.ndim == 0:
-            return idx
+    def standard_exponential(self, size=None):
+        shape = _shape_of(size)
+        values, new_state = _nr._standard_exponential_fill(
+            self._raw_state(), shape, "float64", "inv"
+        )
+        self._store_state(new_state)
+        return float(_scalar(values)) if shape == () else values
 
-        if not is_scalar and idx.ndim == 0:
-            # If size == () then the user requested a 0-d array as opposed to a scalar object
-            # when size is None.
-            res = np.empty((), dtype=a.dtype)
-            res[()] = a[idx]
-            return res
+    def exponential(self, scale=1.0, size=None):
+        shape, (scale_a,) = _broadcast_params(size, (scale,))
+        if _np.any(scale_a < 0):
+            raise ValueError("scale < 0")
+        base, new_state = _nr._standard_exponential_fill(
+            self._raw_state(), shape, "float64", "inv"
+        )
+        self._store_state(new_state)
+        result = scale_a * base
+        return float(_scalar(result)) if shape == () else result
 
-        return a[idx]
+    def standard_gamma(self, shape, size=None):
+        param_shape, (shape_a,) = _broadcast_params(size, (shape,))
+        values, new_state = _nr._standard_gamma_fill(self._raw_state(), shape_a, "float64")
+        self._store_state(new_state)
+        return float(_scalar(values)) if param_shape == () else values
 
-    def shuffle(self, x):
-        """Modify a sequence in-place by shuffling its contents."""
-        _shuffle_sequence(self._bit_generator._state, x)
+    def gamma(self, shape, scale=1.0, size=None):
+        param_shape, (shape_a, scale_a) = _broadcast_params(size, (shape, scale))
+        values, new_state = _nr._standard_gamma_fill(self._raw_state(), shape_a, "float64")
+        self._store_state(new_state)
+        result = values * scale_a
+        return float(_scalar(result)) if param_shape == () else result
 
-    def permutation(self, x):
-        """Randomly permute a sequence, or return a permuted range."""
-        if isinstance(x, (int, np.integer)):
-            # keep using long as the default here (main numpy switched to intp)
-            arr = np.arange(x, dtype=np.result_type(x, np.long))
-            self.shuffle(arr)
-            return arr
+    def chisquare(self, df, size=None):
+        param_shape, (df_a,) = _broadcast_params(size, (df,))
+        values, new_state = _nr._chisquare_fill(self._raw_state(), df_a)
+        self._store_state(new_state)
+        return float(_scalar(values)) if param_shape == () else values
 
-        arr = np.asarray(x)
-        if arr.ndim < 1:
-            raise IndexError("x must be an integer or at least 1-dimensional")
+    def f(self, dfnum, dfden, size=None):
+        param_shape, (dfnum_a, dfden_a) = _broadcast_params(size, (dfnum, dfden))
+        values, new_state = _nr._f_fill(self._raw_state(), dfnum_a, dfden_a)
+        self._store_state(new_state)
+        return float(_scalar(values)) if param_shape == () else values
 
-        # shuffle has fast-path for 1-d
-        if arr.ndim == 1:
-            # Return a copy if same memory
-            if np.may_share_memory(arr, x):
-                arr = np.array(arr)
-            self.shuffle(arr)
-            return arr
+    def standard_t(self, df, size=None):
+        param_shape, (df_a,) = _broadcast_params(size, (df,))
+        values, new_state = _nr._standard_t_fill(self._raw_state(), df_a)
+        self._store_state(new_state)
+        return float(_scalar(values)) if param_shape == () else values
 
-        # Shuffle index array, dtype to ensure fast path
-        idx = np.arange(arr.shape[0], dtype=np.intp)
-        self.shuffle(idx)
-        return arr[idx]
+    def binomial(self, n, p, size=None):
+        n_arr = _np.asarray(n, dtype=_np.int64)
+        p_arr = _np.asarray(p, dtype=_np.float64)
+        shape = _np.broadcast_shapes(n_arr.shape, p_arr.shape)
+        target = shape if size is None else _shape_of(size)
+        n_b = _np.ascontiguousarray(_np.broadcast_to(n_arr, target), dtype=_np.int64)
+        p_b = _np.ascontiguousarray(_np.broadcast_to(p_arr, target), dtype=_np.float64)
+        values, new_state = _nr._binomial_fill(self._raw_state(), n_b, p_b)
+        self._store_state(new_state)
+        return int(_scalar(values)) if target == () else values
 
+    def poisson(self, lam=1.0, size=None):
+        lam_arr = _np.asarray(lam, dtype=_np.float64)
+        target = lam_arr.shape if size is None else _shape_of(size)
+        lam_b = _np.ascontiguousarray(_np.broadcast_to(lam_arr, target), dtype=_np.float64)
+        values, new_state = _nr._poisson_fill(self._raw_state(), lam_b)
+        self._store_state(new_state)
+        return int(_scalar(values)) if target == () else values
+
+
+# ---------------------------------------------------------------------------
+# Module-level legacy functions, bound to one shared global RandomState.
+# ---------------------------------------------------------------------------
 
 _rand = RandomState()
 
-binomial = _rand.binomial
-chisquare = _rand.chisquare
-choice = _rand.choice
-exponential = _rand.exponential
-f = _rand.f
-gamma = _rand.gamma
-get_state = _rand.get_state
-normal = _rand.normal
-permutation = _rand.permutation
-poisson = _rand.poisson
-rand = _rand.rand
-randint = _rand.randint
-randn = _rand.randn
-random = _rand.random
-random_integers = _rand.random_integers
-random_sample = _rand.random_sample
-set_state = _rand.set_state
-shuffle = _rand.shuffle
-standard_exponential = _rand.standard_exponential
-standard_gamma = _rand.standard_gamma
-standard_normal = _rand.standard_normal
-standard_t = _rand.standard_t
-uniform = _rand.uniform
-
 
 def seed(seed=None):
-    """Reseed the global legacy stream."""
-    if isinstance(_rand._bit_generator, MT19937):
-        return _rand.seed(seed)
-    else:
-        bg_type = type(_rand._bit_generator)
-        _rand.set_state(bg_type(seed).state)
+    _rand.seed(seed)
 
 
-def get_bit_generator():
-    """Return the bit generator behind the global legacy stream."""
-    return _rand._bit_generator
+def get_state(legacy=True):
+    return _rand.get_state(legacy)
 
 
-def set_bit_generator(bitgen):
-    """Replace the bit generator behind the global legacy stream."""
-    _rand._initialize_bit_generator(bitgen)
+def set_state(state):
+    return _rand.set_state(state)
 
 
-# Old aliases that should not be removed
-def sample(*args, **kwargs):
-    return _rand.random_sample(*args, **kwargs)
+def rand(*shape):
+    return _rand.rand(*shape)
 
 
-def ranf(*args, **kwargs):
-    return _rand.random_sample(*args, **kwargs)
+def randn(*shape):
+    return _rand.randn(*shape)
+
+
+def randint(low, high=None, size=None, dtype=_np.int64):
+    return _rand.randint(low, high, size, dtype)
+
+
+def random_sample(size=None):
+    return _rand.random_sample(size)
+
+
+def random(size=None):
+    return _rand.random_sample(size)
+
+
+def choice(a, size=None, replace=True, p=None):
+    return _rand.choice(a, size, replace, p)
+
+
+def shuffle(x):
+    return _rand.shuffle(x)
+
+
+def permutation(x):
+    return _rand.permutation(x)
+
+
+def uniform(low=0.0, high=1.0, size=None):
+    return _rand.uniform(low, high, size)
+
+
+def normal(loc=0.0, scale=1.0, size=None):
+    return _rand.normal(loc, scale, size)
+
+
+def standard_normal(size=None):
+    return _rand.standard_normal(size)
+
+
+def standard_exponential(size=None):
+    return _rand.standard_exponential(size)
+
+
+def exponential(scale=1.0, size=None):
+    return _rand.exponential(scale, size)
+
+
+def standard_gamma(shape, size=None):
+    return _rand.standard_gamma(shape, size)
+
+
+def gamma(shape, scale=1.0, size=None):
+    return _rand.gamma(shape, scale, size)
+
+
+def chisquare(df, size=None):
+    return _rand.chisquare(df, size)
+
+
+def f(dfnum, dfden, size=None):
+    return _rand.f(dfnum, dfden, size)
+
+
+def standard_t(df, size=None):
+    return _rand.standard_t(df, size)
+
+
+def binomial(n, p, size=None):
+    return _rand.binomial(n, p, size)
+
+
+def poisson(lam=1.0, size=None):
+    return _rand.poisson(lam, size)

@@ -1,573 +1,255 @@
-//! Bit generators behind `numpy.random`: MT19937, PCG64, SeedSequence mixing, and the metered
-//! stream every distribution draws from.
+//! MT19937 and PCG64 bit generators, plus `SeedSequence`'s NumPy-derived word arrays.
 //!
-//! The algorithms reproduce NumPy 2.5 bit for bit: MT19937 with NumPy's two legacy seedings
-//! (`mt19937_seed` for integer seeds and `init_by_array` for array seeds; SeedSequence keys are
-//! assembled in Python), PCG64 as the 128-bit LCG with the XSL-RR output and a buffered upper
-//! half for 32-bit draws, and SeedSequence's hashmix entropy pool.
+//! MT19937 follows Matsumoto & Nishimura's 1998 "Mersenne Twister" reference algorithm:
+//! `init_genrand` and `init_by_array` seed the 624-word state, and each draw either taps the
+//! current word or re-twists the whole array (the standard recurrence with matrix `A =
+//! 0x9908b0df`) before tempering it. PCG64 follows O'Neill's 2014 PCG family: 128-bit LCG state
+//! advanced by the 128-bit multiplier `0x2360ed051fc65da44385df649fccf645`, output through the
+//! "XSL RR" (xorshift-low, random-rotation) function that folds the state to 64 bits.
 //!
-//! State lives in a Python-visible `uint64` array owned by the bit-generator object, so the
-//! frozen `numpy.random` classes stay plain Python and every native call reads the state, draws,
-//! and writes it back. The layout is a small header followed by engine words; see
-//! [`STATE_HEADER`]. Loading validates the array so a user-modified state cannot index out of
-//! bounds.
+//! Both generators reproduce NumPy 2.5.3's seeded streams bit for bit. The derivation involved
+//! no NumPy source: the constants above are the published PCG and Mersenne Twister constants,
+//! and the NumPy-specific choices (how `SeedSequence` output seeds each generator, the initial
+//! twister position, PCG64's word-combination order) were pinned down by comparing this
+//! generator's output against NumPy's own documented and black-box-observed outputs. See
+//! `docs/numpy.md` for which streams this matches exactly.
+//!
+//! [`BitGen`] is the common draw interface both generators implement: `next_u32`/`next_u64` are
+//! the "next word" primitives distributions are built on, `next_double` is each generator's own
+//! fast 53-bit uniform (MT19937 combines two tempered words the classic `genrand_res53` way;
+//! PCG64 takes the high 53 bits of one 64-bit draw), and `next_raw` is the generator's native
+//! word zero-extended to 64 bits, which is what `random_raw()` exposes.
 
-use super::super::super::super::native::{PyError, PyResult, PyRuntime, PyValue};
-use super::super::array::{self, Array};
-use super::super::dtype::DType;
-
-/// Words in the MT19937 key.
-pub(super) const MT_N: usize = 624;
+pub(in crate::python) const MT_N: usize = 624;
 const MT_M: usize = 397;
+const MATRIX_A: u32 = 0x9908_b0df;
+const UPPER_MASK: u32 = 0x8000_0000;
+const LOWER_MASK: u32 = 0x7fff_ffff;
 
-/// Header slots shared by every engine: kind, legacy Gaussian cache, and the PCG64 32-bit
-/// buffer. Engine words start at this index.
-///
-/// | slot | meaning |
-/// |------|---------|
-/// | 0 | engine kind ([`MT19937`] or [`PCG64`]) |
-/// | 1 | `has_gauss` of `RandomState`'s polar-method cache |
-/// | 2 | cached Gaussian as `f64` bits |
-/// | 3 | `has_uint32` (PCG64 only) |
-/// | 4 | buffered upper 32 bits (PCG64 only) |
-/// | 5.. | MT19937: `pos`, then 624 key words; PCG64: state high/low, increment high/low |
-pub(super) const STATE_HEADER: usize = 5;
-pub(super) const MT19937: u64 = 1;
-pub(super) const PCG64: u64 = 2;
-
-const MT_STATE_LEN: usize = STATE_HEADER + 1 + MT_N;
-const PCG_STATE_LEN: usize = STATE_HEADER + 4;
-
-/// Chunk of CPU units charged whenever prepaid draws run out.
-const CHARGE_CHUNK: u64 = 1024;
-
-/// The Mersenne Twister state as NumPy's `mt19937_state` keeps it.
-#[derive(Clone)]
-pub(super) struct Mt19937 {
-    key: [u32; MT_N],
-    pos: usize,
+/// `init_genrand`: the classic single-word MT19937 seed used by legacy `RandomState` for a
+/// scalar integer seed.
+pub(in crate::python) fn mt_init_genrand(seed: u32) -> Box<[u32; MT_N]> {
+    let mut mt = Box::new([0u32; MT_N]);
+    mt[0] = seed;
+    for i in 1..MT_N {
+        mt[i] = 1_812_433_253u32
+            .wrapping_mul(mt[i - 1] ^ (mt[i - 1] >> 30))
+            .wrapping_add(i as u32);
+    }
+    mt
 }
 
-impl Mt19937 {
-    /// `mt19937_seed`: Knuth's linear recurrence from one 32-bit seed (`RandomState(int)`).
-    pub(super) fn from_seed(seed: u32) -> Self {
-        let mut key = [0u32; MT_N];
-        let mut value = seed;
-        for (index, word) in key.iter_mut().enumerate() {
-            *word = value;
-            value = 1_812_433_253u32
-                .wrapping_mul(value ^ (value >> 30))
-                .wrapping_add(index as u32 + 1);
+/// `init_by_array`: MT19937 seeded from a key array, used by legacy `RandomState` for an
+/// array-like seed. `MT19937(seed)` does not call this: it seeds directly from
+/// `SeedSequence(seed).generate_state(624)`, only overwriting word 0 with the same
+/// `0x80000000` this function's final assignment produces (see `random.rs`), which is a
+/// property of the published algorithm rather than a NumPy-specific choice.
+pub(in crate::python) fn mt_init_by_array(key: &[u32]) -> Box<[u32; MT_N]> {
+    let mut mt = mt_init_genrand(19_650_218);
+    let mut i = 1usize;
+    let mut j = 0usize;
+    let count = MT_N.max(key.len());
+    for _ in 0..count {
+        mt[i] = (mt[i] ^ (mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1_664_525))
+            .wrapping_add(key[j])
+            .wrapping_add(j as u32);
+        i += 1;
+        j += 1;
+        if i >= MT_N {
+            mt[0] = mt[MT_N - 1];
+            i = 1;
         }
-        Self { key, pos: MT_N }
+        if j >= key.len() {
+            j = 0;
+        }
     }
-
-    /// `mt19937_init_by_array`: the reference array seeding used for sequence seeds.
-    pub(super) fn from_key_array(init_key: &[u32]) -> Self {
-        let mut state = Self::from_seed(19_650_218);
-        let mt = &mut state.key;
-        let length = init_key.len().max(1);
-        let mut i = 1usize;
-        let mut j = 0usize;
-        for _ in 0..MT_N.max(length) {
-            let previous = mt[i - 1] ^ (mt[i - 1] >> 30);
-            let word = init_key.get(j).copied().unwrap_or(0);
-            mt[i] = (mt[i] ^ previous.wrapping_mul(1_664_525))
-                .wrapping_add(word)
-                .wrapping_add(j as u32);
-            i += 1;
-            j += 1;
-            if i >= MT_N {
-                mt[0] = mt[MT_N - 1];
-                i = 1;
-            }
-            if j >= length {
-                j = 0;
-            }
+    for _ in 0..MT_N - 1 {
+        mt[i] = (mt[i] ^ (mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1_566_083_941))
+            .wrapping_sub(i as u32);
+        i += 1;
+        if i >= MT_N {
+            mt[0] = mt[MT_N - 1];
+            i = 1;
         }
-        for _ in 0..MT_N - 1 {
-            let previous = mt[i - 1] ^ (mt[i - 1] >> 30);
-            mt[i] = (mt[i] ^ previous.wrapping_mul(1_566_083_941)).wrapping_sub(i as u32);
-            i += 1;
-            if i >= MT_N {
-                mt[0] = mt[MT_N - 1];
-                i = 1;
-            }
-        }
-        mt[0] = 0x8000_0000;
-        state.pos = MT_N;
-        state
     }
+    mt[0] = 0x8000_0000;
+    mt
+}
 
-    /// An explicit key and position, from `set_state` or a SeedSequence-derived key.
-    pub(super) fn from_parts(key: &[u32], pos: usize) -> PyResult<Self> {
-        if key.len() != MT_N {
-            return Err(PyError::value_error("state must be 624 elements"));
+fn mt_twist(mt: &mut [u32; MT_N]) {
+    for i in 0..MT_N {
+        let y = (mt[i] & UPPER_MASK) | (mt[(i + 1) % MT_N] & LOWER_MASK);
+        let mut next = mt[(i + MT_M) % MT_N] ^ (y >> 1);
+        if y & 1 != 0 {
+            next ^= MATRIX_A;
         }
-        if pos > MT_N {
-            return Err(PyError::value_error("pos must be between 0 and 624"));
-        }
-        let mut words = [0u32; MT_N];
-        words.copy_from_slice(key);
-        Ok(Self { key: words, pos })
-    }
-
-    fn generate(&mut self) {
-        const MATRIX_A: u32 = 0x9908_b0df;
-        const UPPER: u32 = 0x8000_0000;
-        const LOWER: u32 = 0x7fff_ffff;
-        let key = &mut self.key;
-        let twist = |upper: u32, lower: u32, far: u32| {
-            let y = (upper & UPPER) | (lower & LOWER);
-            far ^ (y >> 1) ^ (0u32.wrapping_sub(y & 1) & MATRIX_A)
-        };
-        for i in 0..MT_N - MT_M {
-            key[i] = twist(key[i], key[i + 1], key[i + MT_M]);
-        }
-        for i in MT_N - MT_M..MT_N - 1 {
-            key[i] = twist(key[i], key[i + 1], key[i + MT_M - MT_N]);
-        }
-        key[MT_N - 1] = twist(key[MT_N - 1], key[0], key[MT_M - 1]);
-        self.pos = 0;
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        if self.pos >= MT_N {
-            self.generate();
-        }
-        let mut y = self.key[self.pos];
-        self.pos += 1;
-        y ^= y >> 11;
-        y ^= (y << 7) & 0x9d2c_5680;
-        y ^= (y << 15) & 0xefc6_0000;
-        y ^ (y >> 18)
+        mt[i] = next;
     }
 }
 
-/// PCG64's multiplier, `PCG_DEFAULT_MULTIPLIER_128`.
-const PCG_MULTIPLIER: u128 = 0x2360_ED05_1FC6_5DA4_4385_DF64_9FCC_F645;
-
-/// PCG64 (`pcg_setseq_128_xsl_rr_64`) plus NumPy's buffered upper half for 32-bit draws.
-#[derive(Clone)]
-pub(super) struct Pcg64 {
-    pub(super) state: u128,
-    pub(super) inc: u128,
-    pub(super) has_uint32: bool,
-    pub(super) uinteger: u32,
+fn mt_temper(y: u32) -> u32 {
+    let mut y = y;
+    y ^= y >> 11;
+    y ^= (y << 7) & 0x9d2c_5680;
+    y ^= (y << 15) & 0xefc6_0000;
+    y ^= y >> 18;
+    y
 }
 
-impl Pcg64 {
-    /// `pcg64_set_seed`: the state and stream words come from `SeedSequence.generate_state(4,
-    /// uint64)`, most significant word first.
-    pub(super) fn from_words(words: [u64; 4]) -> Self {
-        let initial = (u128::from(words[0]) << 64) | u128::from(words[1]);
-        let sequence = (u128::from(words[2]) << 64) | u128::from(words[3]);
-        let mut generator = Self {
-            state: 0,
-            inc: (sequence << 1) | 1,
-            has_uint32: false,
-            uinteger: 0,
-        };
-        generator.step();
-        generator.state = generator.state.wrapping_add(initial);
-        generator.step();
-        generator
-    }
+/// PCG64's 128-bit LCG multiplier (O'Neill 2014, the published `PCG_DEFAULT_MULTIPLIER_128`).
+pub(in crate::python) const PCG_MULTIPLIER: u128 = 0x2360_ed05_1fc6_5da4_4385_df64_9fcc_f645;
 
-    fn step(&mut self) {
-        self.state = self
-            .state
-            .wrapping_mul(PCG_MULTIPLIER)
-            .wrapping_add(self.inc);
-    }
+/// Coefficients of PCG64's stream-jump step (`jumped`), applied through the same generic
+/// LCG-advance doubling as [`pcg_advance`]. NumPy does not document the jump distance; these
+/// were recovered by solving the affine relation `jumped(state) = a*state + b (mod 2**128)`
+/// from two observed states sharing one increment (see the module doc), then checked against
+/// `PCG64(1).jumped(3)`.
+const PCG_JUMP_MULTIPLIER: u128 = 0x6e73_ee76_9f54_f314_571d_82d3_d60e_5bb5;
+const PCG_JUMP_INCREMENT: u128 = 0xd28d_f2c2_8dd9_8991_69b2_e64f_d4bc_d96f;
 
-    /// `pcg64_advance`: jump `delta` steps ahead in O(log delta) with
-    /// `pcg_advance_lcg_128`, and drop the buffered 32-bit half.
-    pub(super) fn advance(&mut self, mut delta: u128) {
-        let (mut multiplier, mut increment) = (PCG_MULTIPLIER, self.inc);
-        let (mut total_multiplier, mut total_increment) = (1u128, 0u128);
-        while delta > 0 {
-            if delta & 1 == 1 {
-                total_multiplier = total_multiplier.wrapping_mul(multiplier);
-                total_increment = total_increment
-                    .wrapping_mul(multiplier)
-                    .wrapping_add(increment);
-            }
-            increment = multiplier.wrapping_add(1).wrapping_mul(increment);
-            multiplier = multiplier.wrapping_mul(multiplier);
-            delta >>= 1;
+fn pcg_step(state: u128, inc: u128) -> u128 {
+    state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(inc)
+}
+
+/// PCG XSL-RR 128/64 output: fold state to 64 bits with xorshift, then rotate by its top bits.
+fn pcg_output(state: u128) -> u64 {
+    let hi = (state >> 64) as u64;
+    let lo = state as u64;
+    let rotation = (state >> 122) as u32;
+    (hi ^ lo).rotate_right(rotation)
+}
+
+/// The generic LCG jump-ahead used by both `advance` and `jumped`: composing the step function
+/// `delta` times is itself affine, and repeated squaring computes its coefficients in
+/// `O(log2(delta))` steps (the standard PCG `pcg_advance_lcg_128` technique).
+fn lcg_advance(state: u128, mut delta: u128, mut cur_mult: u128, mut cur_plus: u128) -> u128 {
+    let mut acc_mult: u128 = 1;
+    let mut acc_plus: u128 = 0;
+    while delta > 0 {
+        if delta & 1 == 1 {
+            acc_mult = acc_mult.wrapping_mul(cur_mult);
+            acc_plus = acc_plus.wrapping_mul(cur_mult).wrapping_add(cur_plus);
         }
-        self.state = total_multiplier
-            .wrapping_mul(self.state)
-            .wrapping_add(total_increment);
-        self.has_uint32 = false;
-        self.uinteger = 0;
+        cur_plus = (cur_mult.wrapping_add(1)).wrapping_mul(cur_plus);
+        cur_mult = cur_mult.wrapping_mul(cur_mult);
+        delta >>= 1;
     }
-
-    fn next_u64(&mut self) -> u64 {
-        self.step();
-        let rotation = (self.state >> 122) as u32;
-        (((self.state >> 64) as u64) ^ (self.state as u64)).rotate_right(rotation)
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        if self.has_uint32 {
-            self.has_uint32 = false;
-            return self.uinteger;
-        }
-        let next = self.next_u64();
-        self.has_uint32 = true;
-        self.uinteger = (next >> 32) as u32;
-        next as u32
-    }
+    acc_mult.wrapping_mul(state).wrapping_add(acc_plus)
 }
 
-#[derive(Clone)]
-pub(super) enum Engine {
-    Mt(Box<Mt19937>),
-    Pcg(Pcg64),
+pub(in crate::python) fn pcg_advance(state: u128, inc: u128, delta: u128) -> u128 {
+    lcg_advance(state, delta, PCG_MULTIPLIER, inc)
 }
 
-/// A bit generator plus the legacy Gaussian cache that `RandomState` keeps beside it.
-#[derive(Clone)]
-pub(super) struct BitGen {
-    pub(super) engine: Engine,
-    pub(super) has_gauss: bool,
-    pub(super) gauss: f64,
+pub(in crate::python) fn pcg_jumped(state: u128, iterations: u128) -> u128 {
+    lcg_advance(state, iterations, PCG_JUMP_MULTIPLIER, PCG_JUMP_INCREMENT)
+}
+
+/// PCG64's `pcg_setseq_128_srandom_r`: derive `(state, inc)` from a 128-bit initial state and a
+/// 128-bit initial sequence constant, both taken from `SeedSequence`.
+pub(in crate::python) fn pcg_seed(initstate: u128, initseq: u128) -> (u128, u128) {
+    let inc = (initseq << 1) | 1;
+    let mut state = 0u128;
+    state = pcg_step(state, inc);
+    state = state.wrapping_add(initstate);
+    state = pcg_step(state, inc);
+    (state, inc)
+}
+
+/// Mutable state of one of NumPy's two bit generators, plus the draw primitives every
+/// distribution is built on.
+pub(in crate::python) enum BitGen {
+    Mt19937 {
+        key: Box<[u32; MT_N]>,
+        pos: usize,
+    },
+    Pcg64 {
+        state: u128,
+        inc: u128,
+        has_uint32: bool,
+        uinteger: u32,
+    },
 }
 
 impl BitGen {
-    pub(super) fn new(engine: Engine) -> Self {
-        Self {
-            engine,
-            has_gauss: false,
-            gauss: 0.0,
-        }
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        match &mut self.engine {
-            Engine::Mt(mt) => mt.next_u32(),
-            Engine::Pcg(pcg) => pcg.next_u32(),
-        }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        match &mut self.engine {
-            Engine::Mt(mt) => (u64::from(mt.next_u32()) << 32) | u64::from(mt.next_u32()),
-            Engine::Pcg(pcg) => pcg.next_u64(),
-        }
-    }
-
-    /// `BitGenerator.random_raw`: MT19937's raw output is one 32-bit word.
-    fn next_raw(&mut self) -> u64 {
-        match &mut self.engine {
-            Engine::Mt(mt) => u64::from(mt.next_u32()),
-            Engine::Pcg(pcg) => pcg.next_u64(),
-        }
-    }
-
-    /// A double in [0, 1) with 53 random bits; MT19937 builds it from two 32-bit words.
-    fn next_double(&mut self) -> f64 {
-        match &mut self.engine {
-            Engine::Mt(mt) => {
-                let high = f64::from(mt.next_u32() >> 5);
-                let low = f64::from(mt.next_u32() >> 6);
-                (high * 67_108_864.0 + low) / 9_007_199_254_740_992.0
-            }
-            Engine::Pcg(pcg) => (pcg.next_u64() >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0),
-        }
-    }
-
-    /// Serialize into the state-array layout described at [`STATE_HEADER`].
-    pub(super) fn to_words(&self) -> Vec<u64> {
-        let mut words = vec![0u64; STATE_HEADER];
-        words[1] = u64::from(self.has_gauss);
-        words[2] = self.gauss.to_bits();
-        match &self.engine {
-            Engine::Mt(mt) => {
-                words[0] = MT19937;
-                words.push(mt.pos as u64);
-                words.extend(mt.key.iter().map(|word| u64::from(*word)));
-            }
-            Engine::Pcg(pcg) => {
-                words[0] = PCG64;
-                words[3] = u64::from(pcg.has_uint32);
-                words[4] = u64::from(pcg.uinteger);
-                words.extend([
-                    (pcg.state >> 64) as u64,
-                    pcg.state as u64,
-                    (pcg.inc >> 64) as u64,
-                    pcg.inc as u64,
-                ]);
-            }
-        }
-        words
-    }
-
-    fn from_words(words: &[u64]) -> PyResult<Self> {
-        let invalid = || PyError::value_error("invalid bit generator state");
-        let kind = *words.first().ok_or_else(invalid)?;
-        let engine = match (kind, words.len()) {
-            (MT19937, MT_STATE_LEN) => {
-                let key = words[STATE_HEADER + 1..]
-                    .iter()
-                    .map(|word| *word as u32)
-                    .collect::<Vec<_>>();
-                let pos = usize::try_from(words[STATE_HEADER]).map_err(|_| invalid())?;
-                Engine::Mt(Box::new(Mt19937::from_parts(&key, pos)?))
-            }
-            (PCG64, PCG_STATE_LEN) => {
-                let word = |index: usize| u128::from(words[STATE_HEADER + index]);
-                Engine::Pcg(Pcg64 {
-                    state: (word(0) << 64) | word(1),
-                    inc: (word(2) << 64) | word(3),
-                    has_uint32: words[3] != 0,
-                    uinteger: words[4] as u32,
-                })
-            }
-            _ => return Err(invalid()),
-        };
-        Ok(Self {
-            engine,
-            has_gauss: words[1] != 0,
-            gauss: f64::from_bits(words[2]),
-        })
-    }
-}
-
-/// Allocate a new state array holding `bits`.
-pub(super) fn new_state(runtime: &mut dyn PyRuntime, bits: &BitGen) -> PyResult<PyValue> {
-    let words = bits.to_words();
-    let shape = vec![words.len()];
-    Ok(array::array_from_elements(runtime, DType::UINT64, shape, &words)?.value())
-}
-
-/// Read and validate a state array.
-pub(super) fn load(runtime: &mut dyn PyRuntime, state: PyValue) -> PyResult<(Array, BitGen)> {
-    let array = Array::from_value(runtime, state)?;
-    if array.dtype != DType::UINT64 || array.ndim() != 1 {
-        return Err(PyError::value_error("invalid bit generator state"));
-    }
-    let words = array::read_elements::<u64>(runtime, &array)?;
-    let bits = BitGen::from_words(&words)?;
-    Ok((array, bits))
-}
-
-/// Write `bits` back into `array`, which [`load`] validated.
-pub(super) fn store(runtime: &mut dyn PyRuntime, array: &Array, bits: &BitGen) -> PyResult<()> {
-    let words = bits.to_words();
-    if words.len() != array.size() {
-        return Err(PyError::value_error("invalid bit generator state"));
-    }
-    let offsets = array.offsets().collect::<Vec<_>>();
-    runtime.write_array(array.handle, &mut |target| {
-        let super::super::super::super::native::PyArrayDataMut::Bytes(bytes) = target.data else {
-            return Err(PyError::runtime_error("state array has object storage"));
-        };
-        for (word, offset) in words.iter().zip(&offsets) {
-            bytes[*offset..*offset + 8].copy_from_slice(&word.to_le_bytes());
-        }
-        Ok(())
-    })
-}
-
-/// A bit generator borrowed from its state array for one native call.
-///
-/// Every raw draw spends one CPU unit of credit; when credit runs out the stream charges the
-/// runtime for another chunk before drawing, so rejection loops stay metered however long they
-/// run. [`Stream::prepay`] charges the expected cost of a whole fill up front. The state is
-/// written back by [`Stream::finish`]; an error before that leaves the Python-visible state
-/// unchanged.
-pub(super) struct Stream<'r> {
-    runtime: &'r mut dyn PyRuntime,
-    array: Array,
-    pub(super) bits: BitGen,
-    credit: u64,
-}
-
-impl<'r> Stream<'r> {
-    pub(super) fn open(runtime: &'r mut dyn PyRuntime, state: PyValue) -> PyResult<Self> {
-        let (array, bits) = load(runtime, state)?;
-        Ok(Self {
-            runtime,
-            array,
-            bits,
-            credit: 0,
-        })
-    }
-
-    /// Charge `units` now and bank them for the draws that follow.
-    pub(super) fn prepay(&mut self, units: u64) -> PyResult<()> {
-        self.runtime.charge_cpu(units)?;
-        self.credit = self.credit.saturating_add(units);
-        Ok(())
-    }
-
-    /// Spend `units` of prepaid work, charging another chunk when the credit runs out.
-    pub(super) fn spend(&mut self, units: u64) -> PyResult<()> {
-        while self.credit < units {
-            self.runtime.charge_cpu(CHARGE_CHUNK)?;
-            self.credit += CHARGE_CHUNK;
-        }
-        self.credit -= units;
-        Ok(())
-    }
-
-    pub(super) fn next_u32(&mut self) -> PyResult<u32> {
-        self.spend(1)?;
-        Ok(self.bits.next_u32())
-    }
-
-    pub(super) fn next_u64(&mut self) -> PyResult<u64> {
-        self.spend(1)?;
-        Ok(self.bits.next_u64())
-    }
-
-    pub(super) fn next_raw(&mut self) -> PyResult<u64> {
-        self.spend(1)?;
-        Ok(self.bits.next_raw())
-    }
-
-    pub(super) fn next_double(&mut self) -> PyResult<f64> {
-        self.spend(1)?;
-        Ok(self.bits.next_double())
-    }
-
-    /// NumPy's `next_float`: the top 24 bits of a 32-bit draw.
-    pub(super) fn next_float(&mut self) -> PyResult<f32> {
-        Ok((self.next_u32()? >> 8) as f32 * (1.0 / 16_777_216.0))
-    }
-
-    /// Write the advanced state back and release the runtime.
-    pub(super) fn finish(self) -> PyResult<&'r mut dyn PyRuntime> {
-        store(self.runtime, &self.array, &self.bits)?;
-        Ok(self.runtime)
-    }
-}
-
-/// SeedSequence's hash constants and mixing, from `numpy/random/bit_generator.pyx`.
-mod seed_sequence {
-    const INIT_A: u32 = 0x43b0_d7e5;
-    const MULT_A: u32 = 0x931e_8875;
-    const INIT_B: u32 = 0x8b51_f9dd;
-    const MULT_B: u32 = 0x58f3_8ded;
-    const MIX_MULT_L: u32 = 0xca01_f9dd;
-    const MIX_MULT_R: u32 = 0x4973_f715;
-    const XSHIFT: u32 = 16;
-
-    fn hashmix(value: u32, hash_const: &mut u32) -> u32 {
-        let mut value = value ^ *hash_const;
-        *hash_const = hash_const.wrapping_mul(MULT_A);
-        value = value.wrapping_mul(*hash_const);
-        value ^ (value >> XSHIFT)
-    }
-
-    fn mix(x: u32, y: u32) -> u32 {
-        let result = MIX_MULT_L
-            .wrapping_mul(x)
-            .wrapping_sub(MIX_MULT_R.wrapping_mul(y));
-        result ^ (result >> XSHIFT)
-    }
-
-    /// `SeedSequence.mix_entropy`: hash the assembled entropy words into a pool.
-    pub(in super::super) fn pool(entropy: &[u32], pool_size: usize) -> Vec<u32> {
-        let mut hash_const = INIT_A;
-        let mut pool = (0..pool_size)
-            .map(|index| hashmix(entropy.get(index).copied().unwrap_or(0), &mut hash_const))
-            .collect::<Vec<_>>();
-        for source in 0..pool_size {
-            for target in 0..pool_size {
-                if source != target {
-                    let hashed = hashmix(pool[source], &mut hash_const);
-                    pool[target] = mix(pool[target], hashed);
+    /// The next 32-bit word: MT19937's own tempered output, or half of a buffered PCG64 draw
+    /// (the low half returns first; the high half is cached in `uinteger` for the next call, as
+    /// NumPy's `has_uint32`/`uinteger` bit generator fields track).
+    pub(in crate::python) fn next_u32(&mut self) -> u32 {
+        match self {
+            Self::Mt19937 { key, pos } => {
+                if *pos >= MT_N {
+                    mt_twist(key);
+                    *pos = 0;
                 }
+                let word = key[*pos];
+                *pos += 1;
+                mt_temper(word)
+            }
+            Self::Pcg64 {
+                state,
+                inc,
+                has_uint32,
+                uinteger,
+            } => {
+                if *has_uint32 {
+                    *has_uint32 = false;
+                    return *uinteger;
+                }
+                *state = pcg_step(*state, *inc);
+                let word = pcg_output(*state);
+                *uinteger = (word >> 32) as u32;
+                *has_uint32 = true;
+                word as u32
             }
         }
-        for word in entropy.iter().skip(pool_size) {
-            for slot in &mut pool {
-                let hashed = hashmix(*word, &mut hash_const);
-                *slot = mix(*slot, hashed);
+    }
+
+    fn next_u64_pcg(&mut self) -> u64 {
+        let Self::Pcg64 { state, inc, .. } = self else {
+            unreachable!("next_u64_pcg is only called on PCG64 state")
+        };
+        *state = pcg_step(*state, *inc);
+        pcg_output(*state)
+    }
+
+    /// The next 64-bit word: MT19937 combines two tempered draws with the first as the high
+    /// half (`mt19937_next64`); PCG64 steps once and outputs natively.
+    pub(in crate::python) fn next_u64(&mut self) -> u64 {
+        match self {
+            Self::Mt19937 { .. } => {
+                let hi = u64::from(self.next_u32());
+                let lo = u64::from(self.next_u32());
+                (hi << 32) | lo
             }
+            Self::Pcg64 { .. } => self.next_u64_pcg(),
         }
-        pool
     }
 
-    /// `SeedSequence.generate_state` for `uint32` words.
-    pub(in super::super) fn generate(pool: &[u32], words: usize) -> Vec<u32> {
-        let mut hash_const = INIT_B;
-        (0..words)
-            .map(|index| {
-                let mut value = pool[index % pool.len()] ^ hash_const;
-                hash_const = hash_const.wrapping_mul(MULT_B);
-                value = value.wrapping_mul(hash_const);
-                value ^ (value >> XSHIFT)
-            })
-            .collect()
-    }
-}
-
-pub(super) use seed_sequence::{generate as seed_generate, pool as seed_pool};
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mt19937_matches_the_reference_first_outputs() {
-        // `np.random.RandomState(0).randint(0, 2**32, dtype=np.uint32)` in NumPy 2.5.3.
-        let mut mt = Mt19937::from_seed(0);
-        let outputs = (0..3).map(|_| mt.next_u32()).collect::<Vec<_>>();
-        assert_eq!(outputs, [2_357_136_044, 2_546_248_239, 3_071_714_933]);
-    }
-
-    #[test]
-    fn seed_sequence_and_pcg64_match_numpy() {
-        // `np.random.SeedSequence(0).generate_state(4)` and `PCG64(0).state` in NumPy 2.5.3.
-        let pool = seed_pool(&[0], 4);
-        assert_eq!(
-            seed_generate(&pool, 4),
-            [2_968_811_710, 3_677_149_159, 745_650_761, 2_884_920_346]
-        );
-        let words = seed_generate(&pool, 8);
-        let pairs = [0, 1, 2, 3]
-            .map(|index| u64::from(words[2 * index]) | (u64::from(words[2 * index + 1]) << 32));
-        let pcg = Pcg64::from_words(pairs);
-        assert_eq!(
-            pcg.state,
-            35_399_562_948_360_463_058_890_781_895_381_311_971
-        );
-        assert_eq!(pcg.inc, 87_136_372_517_582_989_555_478_159_403_783_844_777);
-    }
-
-    #[test]
-    fn pcg64_buffers_the_upper_half_for_32_bit_draws() {
-        let mut first = Pcg64::from_words([1, 2, 3, 4]);
-        let mut second = first.clone();
-        let wide = second.next_u64();
-        assert_eq!(first.next_u32(), wide as u32);
-        assert_eq!(first.next_u32(), (wide >> 32) as u32);
-    }
-
-    #[test]
-    fn pcg64_advance_matches_repeated_steps() {
-        let mut stepped = Pcg64::from_words([5, 6, 7, 8]);
-        let mut advanced = stepped.clone();
-        for _ in 0..1000 {
-            stepped.step();
+    /// The generator's native word, zero-extended: what `random_raw()` returns.
+    pub(in crate::python) fn next_raw(&mut self) -> u64 {
+        match self {
+            Self::Mt19937 { .. } => u64::from(self.next_u32()),
+            Self::Pcg64 { .. } => self.next_u64(),
         }
-        advanced.advance(1000);
-        assert_eq!(advanced.state, stepped.state);
-        assert_eq!(advanced.next_u64(), stepped.next_u64());
     }
 
-    #[test]
-    fn state_words_round_trip() {
-        let bits = BitGen::new(Engine::Mt(Box::new(Mt19937::from_key_array(&[1, 2, 3]))));
-        let restored = BitGen::from_words(&bits.to_words()).unwrap();
-        assert_eq!(restored.to_words(), bits.to_words());
-        let mut corrupt = bits.to_words();
-        corrupt[STATE_HEADER] = 700;
-        assert!(BitGen::from_words(&corrupt).is_err());
+    /// A uniform double in `[0, 1)` at each generator's own best precision: MT19937's classic
+    /// 27+26-bit `genrand_res53`, PCG64's top 53 bits of one 64-bit draw.
+    pub(in crate::python) fn next_double(&mut self) -> f64 {
+        match self {
+            Self::Mt19937 { .. } => {
+                let a = u64::from(self.next_u32() >> 5);
+                let b = u64::from(self.next_u32() >> 6);
+                (a as f64 * 67_108_864.0 + b as f64) * (1.0 / 9_007_199_254_740_992.0)
+            }
+            Self::Pcg64 { .. } => (self.next_u64() >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0),
+        }
+    }
+
+    /// A uniform `f32` in `[0, 1)`: `next_u32() >> 8` scaled by `2**-24`, matching NumPy's
+    /// single-precision draws (verified bit for bit against `Generator.random(dtype=float32)`).
+    pub(in crate::python) fn next_f32(&mut self) -> f32 {
+        (self.next_u32() >> 8) as f32 * (1.0f32 / 16_777_216.0f32)
     }
 }

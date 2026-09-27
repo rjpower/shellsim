@@ -9,7 +9,7 @@ description = "In-process BusyBox-like environment for RL rollouts and agent tes
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE.md"]
+license-files = ["LICENSE"]
 authors = [{ name = "The shellsim authors" }]
 classifiers = [
     "Development Status :: 3 - Alpha",

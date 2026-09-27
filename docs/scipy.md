@@ -23,8 +23,8 @@ raise `NotImplementedError` when imported.
   "Deliberate differences" below for the specific, measured gaps.
 - **Frozen Python** (`src/python/stdlib/source/scipy/`). `scipy.special` star-imports the
   native module and adds the functions SciPy writes in Python: `zeta`, `comb`, `perm`,
-  `factorial`, `factorial2`, `factorialk`, `logsumexp`, `softmax` and `log_softmax`. They
-  follow SciPy's code, so their argument handling and messages match. `scipy.special._ufuncs`
+  `factorial`, `factorial2`, `factorialk`, `logsumexp`, `softmax` and `log_softmax`, with
+  SciPy's argument handling and error messages. `scipy.special._ufuncs`
   holds every ufunc, including the private `_binom_pmf`, `_binom_cdf`, `_binom_sf`, `_binom_ppf`
   and `_binom_isf` that `scipy.stats` calls. The `scipy` package loads subpackages on first
   access, as SciPy does.
@@ -37,7 +37,7 @@ raise `NotImplementedError` when imported.
   of `_pdf` and `_cdf` gives a distribution's shape parameters. Each statistic declares SciPy's
   full signature, including `axis`, `nan_policy` and `keepdims`, rather than having a decorator
   add them.
-- **`scipy.linalg`** is frozen Python that follows SciPy's modules over a native module,
+- **`scipy.linalg`** is frozen Python with SciPy's module layout over a native module,
   `_scipy_linalg`, which plays the parts of SciPy's compiled code: the C++ `_batched_linalg`
   loops behind `solve`, `inv`, `det`, `lu`, `cholesky` and `qr`, the `expm` kernel, and the f2py
   wrappers in `scipy.linalg.lapack` and `scipy.linalg.blas`. The LAPACK and BLAS routines are
