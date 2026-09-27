@@ -1187,8 +1187,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
     ));
     slots.delete_item = Some(intrinsic(super::stdlib::core::slot_list_delete_item));
 
-    types[BuiltinType::Dict as usize].slots.delete_item =
-        Some(intrinsic(super::stdlib::core::slot_dict_delete_item));
+    let slots = &mut types[BuiltinType::Dict as usize].slots;
+    slots.delete_item = Some(intrinsic(super::stdlib::core::slot_dict_delete_item));
+    slots.bitwise_or = Some(intrinsic(super::stdlib::core::slot_dict_union));
+    slots.reflected_bitwise_or = Some(intrinsic(super::stdlib::core::slot_dict_reflected_union));
 
     let slots = &mut types[BuiltinType::Set as usize].slots;
     slots.subtract = Some(intrinsic(super::stdlib::core::slot_set_subtract));

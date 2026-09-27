@@ -131,8 +131,16 @@ impl Vm<'_> {
         if is_dataclass {
             return Err(self.unhashable(value));
         }
-        // An `int` or `tuple` subclass hashes as the value it holds.
+        // An `int` or `tuple` subclass hashes as the value it holds; a `dict` subclass is
+        // unhashable like `dict`, and the error names the subclass.
         if let Some(payload) = protocol::builtin_payload(&self.state.heap, value)? {
+            let holds_dict = match payload.object_id() {
+                Some(id) => matches!(self.state.heap.get(id)?, Object::Dict(_)),
+                None => false,
+            };
+            if holds_dict {
+                return Err(self.unhashable(value));
+            }
             return self.hash_value(&payload);
         }
         let id = value.object_id().expect("instances are arena objects");

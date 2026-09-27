@@ -70,6 +70,36 @@ impl Vm<'_> {
         Ok((integer, decimal.len()))
     }
 
+    /// `dir(value)` through a `__dir__` that the value's class defines: the names it returns,
+    /// sorted, or `None` when the class defines none.
+    fn custom_dir(&mut self, value: &Value) -> Result<Option<Value>, String> {
+        let Some(id) = value.object_id() else {
+            return Ok(None);
+        };
+        let Object::Instance { class, .. } = self.state.heap.get(id)? else {
+            return Ok(None);
+        };
+        let class = *class;
+        if self.class_attribute(class, "__dir__")?.is_none() {
+            return Ok(None);
+        }
+        let method = self
+            .resolve_attribute(*value, "__dir__")?
+            .ok_or("__dir__ disappeared during lookup")?;
+        let result = self.invoke_value(method, Vec::new())?;
+        let mut names = Vec::new();
+        for item in self.iterable_values(&result)? {
+            let Some(name) = protocol::string_value(&self.state.heap, &item)? else {
+                return Err(self.raise_exception("TypeError", "__dir__() must return strings"));
+            };
+            names.push((name, item));
+        }
+        self.charge_cpu(u64::try_from(names.len()).unwrap_or(u64::MAX))?;
+        names.sort_by(|left, right| left.0.cmp(&right.0));
+        let values = names.into_iter().map(|(_, item)| item).collect();
+        self.allocate_object(Object::List(values)).map(Some)
+    }
+
     fn dir_names(&self, value: &Value) -> Result<Vec<String>, String> {
         if let Some(NativeValue::Module(module)) = value.native_value() {
             return Ok(module
@@ -155,7 +185,8 @@ impl Vm<'_> {
             let additions = match (name, expanded) {
                 (Some(name), false) => vec![(name.clone(), value)],
                 (None, true) => {
-                    let entries = match value
+                    let entries = match self
+                        .builtin_view(value)?
                         .object_id()
                         .map(|id| self.state.heap.get(id).cloned())
                         .transpose()?
@@ -373,6 +404,17 @@ impl Vm<'_> {
                     }
                     let payload = match layout {
                         ClassLayout::Object => InstancePayload::Object,
+                        // A dict subclass with its own `__init__` starts empty and fills itself
+                        // through `super().__init__`, since `dict.__new__` ignores arguments.
+                        ClassLayout::Builtin(BuiltinType::Dict)
+                            if self.class_attribute(id, "__init__")?.is_some() =>
+                        {
+                            InstancePayload::Builtin(self.builtin_value(
+                                BuiltinType::Dict,
+                                Vec::new(),
+                                Vec::new(),
+                            )?)
+                        }
                         ClassLayout::Builtin(builtin) => {
                             InstancePayload::Builtin(self.builtin_value(
                                 builtin,
@@ -917,6 +959,11 @@ impl Vm<'_> {
             }
             Builtin::Dir => {
                 expect_arity(&arguments, 0, 1)?;
+                if let Some(value) = arguments.first() {
+                    if let Some(names) = self.custom_dir(value)? {
+                        return Ok(CallResult::Value(names));
+                    }
+                }
                 let mut names = if let Some(value) = arguments.first() {
                     self.dir_names(value)?
                 } else {

@@ -195,6 +195,14 @@ pub(crate) static TUPLE_TYPE: NativeTypeDef = NativeTypeDef {
 pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
     name: "dict",
     methods: &[
+        method("dict", "__init__", dict_init),
+        method("dict", "__getitem__", dict_getitem),
+        method("dict", "__setitem__", dict_setitem),
+        method("dict", "__delitem__", dict_delitem),
+        method("dict", "__contains__", dict_contains),
+        method("dict", "__len__", dict_len),
+        method("dict", "__iter__", dict_iter),
+        method("dict", "__repr__", dict_repr),
         method("dict", "get", dict_get),
         method("dict", "keys", dict_keys),
         method("dict", "values", dict_values),
@@ -2782,6 +2790,84 @@ fn list_sort(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
     Ok(Value::None)
 }
 
+/// `dict.__init__(self, other=(), **pairs)`: add the entries to `self`, which a subclass's own
+/// `__init__` reaches through `super().__init__(...)`.
+fn dict_init(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    if args.positional().len() > 1 {
+        return Err(PyError::type_error(format!(
+            "dict expected at most 1 argument, got {}",
+            args.positional().len()
+        )));
+    }
+    dict_update(runtime, receiver, args)
+}
+
+/// `dict.__getitem__(self, key)`, which a subclass's own `__getitem__` may call.
+fn dict_getitem(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__getitem__", 1, 1)?;
+    args.reject_keywords("dict.__getitem__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    let key = args.positional()[0];
+    match runtime.dict_get(dict, &key)? {
+        Some(value) => Ok(value),
+        None => Err(runtime.exception_with_args("KeyError", vec![key])),
+    }
+}
+
+fn dict_setitem(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__setitem__", 2, 2)?;
+    args.reject_keywords("dict.__setitem__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    runtime.dict_insert(dict, args.positional()[0], args.positional()[1])?;
+    Ok(Value::None)
+}
+
+fn dict_delitem(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__delitem__", 1, 1)?;
+    args.reject_keywords("dict.__delitem__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    let key = args.positional()[0];
+    match runtime.dict_remove(dict, &key)? {
+        Some(_) => Ok(Value::None),
+        None => Err(runtime.exception_with_args("KeyError", vec![key])),
+    }
+}
+
+fn dict_contains(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__contains__", 1, 1)?;
+    args.reject_keywords("dict.__contains__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    Ok(Value::Bool(
+        runtime.dict_get(dict, &args.positional()[0])?.is_some(),
+    ))
+}
+
+fn dict_len(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__len__", 0, 0)?;
+    args.reject_keywords("dict.__len__")?;
+    let entries = receiver.cast::<PyDict>(runtime)?.items(runtime)?;
+    let length =
+        i64::try_from(entries.len()).map_err(|_| PyError::overflow_error("dict is too large"))?;
+    Ok(Value::Int(length))
+}
+
+fn dict_iter(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__iter__", 0, 0)?;
+    args.reject_keywords("dict.__iter__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    let iterator = runtime.iterator(Value::Object(dict.object_id()))?;
+    Ok(Value::Object(iterator.object_id()))
+}
+
+/// `dict.__repr__(self)`, which a subclass's own `__repr__` may call.
+fn dict_repr(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__repr__", 0, 0)?;
+    args.reject_keywords("dict.__repr__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    let text = runtime.repr(&Value::Object(dict.object_id()))?;
+    runtime.new_string(text)
+}
+
 fn dict_get(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     dict_lookup(runtime, receiver, args, false)
 }
@@ -2928,8 +3014,8 @@ fn dict_fromkeys(runtime: &mut dyn PyRuntime, _class: PyValue, args: CallArgs) -
 fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("dict.copy", 0, 0)?;
     args.reject_keywords("dict.copy")?;
-    let entries = receiver.cast::<PyDict>(runtime)?.items(runtime)?;
-    runtime.new_dict(entries)
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    runtime.dict_copy(dict)
 }
 
 fn set_add(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -4264,6 +4350,44 @@ fn delete_slice<T>(
         keep
     });
     Ok(())
+}
+
+/// `left | right` for two dicts: a new dict holding `left`'s entries updated by `right`'s.
+/// Anything but a dict (or dict subclass) on either side declines, so `{} | [1]` raises
+/// `TypeError`.
+pub(crate) fn slot_dict_union(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    dict_union(runtime, left, right)
+}
+
+/// `left | right` reached through the right operand's dict type.
+pub(crate) fn slot_dict_reflected_union(
+    runtime: &mut dyn PyRuntime,
+    right: PyValue,
+    left: PyValue,
+) -> PyResult<Option<PyValue>> {
+    dict_union(runtime, left, right)
+}
+
+fn dict_union(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (Ok(left), Ok(right)) = (left.cast::<PyDict>(runtime), right.cast::<PyDict>(runtime))
+    else {
+        return Ok(None);
+    };
+    let additions = right.items(runtime)?;
+    let union = runtime.dict_copy(left)?;
+    let dict = union.cast::<PyDict>(runtime)?;
+    for (key, value) in additions {
+        runtime.dict_insert(dict, key, value)?;
+    }
+    Ok(Some(union))
 }
 
 pub(crate) fn slot_dict_delete_item(

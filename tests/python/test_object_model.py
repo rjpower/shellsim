@@ -694,6 +694,68 @@ def test_tuple_subclasses_behave_as_tuples():
     assert Pair.__mro__ == (Pair, tuple, object)
 
 
+class Record(dict):
+    """A dict whose keys read and write as attributes, like SciPy's result objects."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+
+    def __dir__(self):
+        return list(self.keys())
+
+
+class Scaled(dict):
+    def __init__(self, factor):
+        super().__init__(factor=factor)
+        self.note = "kept"
+
+    def __missing__(self, key):
+        return key * self["factor"]
+
+
+def test_dict_subclasses_behave_as_dicts():
+    import json
+
+    record = Record(b=[2], a=1)
+    record.c = 3
+    assert (record.a, record["c"], len(record), "b" in record, list(record)) == (1, 3, 3, True, ["b", "a", "c"])
+    del record.c
+    assert "c" not in record and dir(record) == ["a", "b"]
+    try:
+        _ = record.missing
+    except AttributeError as error:
+        assert str(error) == "missing"
+    assert isinstance(record, dict) and type(record) is Record and repr(record) == "{'b': [2], 'a': 1}"
+    assert record == {"a": 1, "b": [2]} and {"a": 1, "b": [2]} == record
+    assert (dict(record), {**record}, (lambda **kw: kw)(**record)) == ({"b": [2], "a": 1},) * 3
+    assert (record.get("z", 9), sorted(record.items()), json.dumps(Record(k=1))) == (
+        9,
+        [("a", 1), ("b", [2])],
+        '{"k": 1}',
+    )
+    assert type(record.copy()) is dict and type(record | {}) is dict
+    alias = record
+    record |= {"d": 4}
+    assert record is alias and type(record) is Record and record.d == 4
+    try:
+        hash(record)
+    except TypeError as error:
+        assert str(error) == "unhashable type: 'Record'"
+    scaled = Scaled(3)
+    assert (scaled, scaled.note, scaled["ab"], dict.__getitem__(scaled, "factor")) == (
+        {"factor": 3},
+        "kept",
+        "ababab",
+        3,
+    )
+
+
 def test_builtin_new_constructs_subclass_instances():
     assert (Doubled(3), type(Doubled(3)), Doubled(3) + 1) == (6, Doubled, 7)
     try:

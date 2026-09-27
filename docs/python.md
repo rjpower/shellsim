@@ -80,13 +80,17 @@ functions, native methods and bound methods report `__name__`, and bound methods
 `__self__` and `__func__`. A function holds its own attributes, as decorators expect: they may be
 assigned and deleted, and assigning `__name__` renames the function.
 
-A class may subclass `int` or `tuple`. Its instances carry the builtin value, so arithmetic,
-comparison, hashing, indexing, iteration, `len`, `repr` and `json.dumps` act on that value unless
-the class overrides them. The subclass inherits the native methods such as `bit_length`,
-`to_bytes`, `count` and `index`, and `from_bytes` called on the subclass returns an instance of
-it. `int.__new__(cls, ...)` and `tuple.__new__(cls, ...)` build a subclass instance from a user
-`__new__`. Subclassing any other builtin type, such as `list`, `dict` or `str`, fails with exit
-status 2 rather than producing an instance that lacks the builtin behavior.
+A class may subclass `int`, `tuple` or `dict`. Its instances carry the builtin value, so
+arithmetic, comparison, hashing, indexing, iteration, `len`, `repr` and `json.dumps` act on that
+value unless the class overrides them. The subclass inherits the native methods such as
+`bit_length`, `to_bytes`, `count`, `index`, `get` and `update`, and `from_bytes` called on the
+subclass returns an instance of it. `int.__new__(cls, ...)` and `tuple.__new__(cls, ...)` build a
+subclass instance from a user `__new__`. A `dict` subclass with its own `__init__` starts empty
+and fills itself through `super().__init__(...)`; its `__missing__` supplies absent keys, and
+`dict.__getitem__`, `dict.__setitem__` and the other mapping methods can be called or assigned
+explicitly, as in `__setattr__ = dict.__setitem__`. Subclassing any other builtin type, such as
+`list` or `str`, fails with exit status 2 rather than producing an instance that lacks the
+builtin behavior.
 
 Calling a class whose MRO defines `__new__` calls it with the class and the arguments, then
 calls `__init__` only if the result is an instance of the class. `object.__new__` creates a plain

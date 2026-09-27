@@ -706,6 +706,8 @@ pub(super) trait PyRuntime {
     fn dict_insert(&mut self, dict: PyDict, key: PyValue, value: PyValue) -> PyResult<()>;
     fn dict_remove(&mut self, dict: PyDict, key: &PyValue) -> PyResult<Option<PyValue>>;
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(PyValue, PyValue)>) -> PyResult<()>;
+    /// A shallow copy of `dict` of the same kind: a `defaultdict` copy keeps its factory.
+    fn dict_copy(&mut self, dict: PyDict) -> PyResult<PyValue>;
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<PyValue>>;
     fn set_is_frozen(&self, set: PySet) -> PyResult<bool>;
     fn set_insert(&mut self, set: PySet, value: PyValue) -> PyResult<bool>;
@@ -1337,16 +1339,15 @@ impl FromPyValue for PyIterator {
 pub(super) struct PyDict(ObjectId);
 
 impl FromPyValue for PyDict {
+    /// Accepts a dict, or an instance of a `dict` subclass through the dict it holds.
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
-            let actual = runtime.type_name(&value)?;
-            return Err(PyError::type_error(format!("expected dict, got {actual}")));
-        };
-        if runtime.kind(&Value::Object(id))? == PyKind::Dict {
-            Ok(Self(id))
-        } else {
-            let actual = runtime.type_name(&Value::Object(id))?;
-            Err(PyError::type_error(format!("expected dict, got {actual}")))
+        let dict = runtime.builtin_payload(&value)?.unwrap_or(value);
+        match dict.object_id() {
+            Some(id) if runtime.kind(&dict)? == PyKind::Dict => Ok(Self(id)),
+            _ => {
+                let actual = runtime.type_name(&value)?;
+                Err(PyError::type_error(format!("expected dict, got {actual}")))
+            }
         }
     }
 }

@@ -47,7 +47,10 @@ impl ContainerItems {
 /// Whether user classes may derive from `builtin`, holding its values as
 /// [`InstancePayload::Builtin`](super::super::heap::InstancePayload::Builtin).
 pub(super) fn is_subclassable_builtin(builtin: BuiltinType) -> bool {
-    matches!(builtin, BuiltinType::Int | BuiltinType::Tuple)
+    matches!(
+        builtin,
+        BuiltinType::Int | BuiltinType::Tuple | BuiltinType::Dict
+    )
 }
 
 impl Vm<'_> {
@@ -931,6 +934,7 @@ impl Vm<'_> {
             self.stack.push(value);
             return Ok(());
         }
+        let subject = owner;
         let owner = self.builtin_view(owner)?;
         // A slice is an ordinary key to a mapping; only sequences slice with it.
         let mapping = match owner.object_id() {
@@ -1104,6 +1108,8 @@ impl Vm<'_> {
                         };
                         entries.push((index, value));
                         value
+                    } else if let Some(value) = self.missing_key(&subject, index)? {
+                        value
                     } else {
                         return Err(self.raise_exception_args("KeyError", vec![index]));
                     }
@@ -1117,6 +1123,25 @@ impl Vm<'_> {
         };
         self.stack.push(value);
         Ok(())
+    }
+
+    /// The value a dict subclass's `__missing__(key)` supplies for an absent key, or `None` when
+    /// `subject` is not an instance whose class defines `__missing__`.
+    fn missing_key(&mut self, subject: &Value, key: Value) -> Result<Option<Value>, String> {
+        let Some(id) = subject.object_id() else {
+            return Ok(None);
+        };
+        let Object::Instance { class, .. } = self.state.heap.get(id)? else {
+            return Ok(None);
+        };
+        let class = *class;
+        if self.class_attribute(class, "__missing__")?.is_none() {
+            return Ok(None);
+        }
+        let method = self
+            .resolve_attribute(*subject, "__missing__")?
+            .ok_or("__missing__ disappeared during lookup")?;
+        self.invoke_value(method, vec![key]).map(Some)
     }
 
     /// Index a string, raising CPython's errors for a bad index. `None` means `owner` is not a
@@ -2993,7 +3018,8 @@ impl Vm<'_> {
     }
 
     fn dict_source_entries(&mut self, source: &Value) -> Result<Vec<(Value, Value)>, String> {
-        if let Some(id) = source.object_id() {
+        // A dict subclass contributes the entries it holds, as CPython's dict merge does.
+        if let Some(id) = self.builtin_view(*source)?.object_id() {
             if let Object::Dict(entries) | Object::DefaultDict { entries, .. } =
                 self.state.heap.get(id)?
             {

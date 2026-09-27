@@ -37,6 +37,20 @@ def test_dict_update_accepts_mappings_pairs_and_keywords():
     assert value == {"a": 1, "b": 2, "c": 3, "d": 4}
 
 
+def test_dict_union_builds_a_new_dict_and_in_place_union_updates():
+    left = {"a": 1, "b": 0}
+    assert left | {"b": 2} == {"a": 1, "b": 2} and left == {"a": 1, "b": 0}
+    alias = left
+    left |= [("c", 3)]
+    assert alias is left and left == {"a": 1, "b": 0, "c": 3}
+    try:
+        _ = {} | [1]
+    except TypeError as error:
+        assert str(error) == "unsupported operand type(s) for |: 'dict' and 'list'"
+    else:
+        raise AssertionError("dict | list did not raise TypeError")
+
+
 def test_dict_pop_supports_defaults():
     value = {"a": 1}
     assert value.pop("a") == 1

@@ -1028,6 +1028,23 @@ impl PyRuntime for Vm<'_> {
             .map_err(PyError::resource_error)
     }
 
+    fn dict_copy(&mut self, dict: PyDict) -> PyResult<Value> {
+        let copy = match self
+            .state
+            .heap
+            .get(dict.object_id())
+            .map_err(PyError::runtime_error)?
+        {
+            Object::Dict(entries) => Object::Dict(entries.clone()),
+            Object::DefaultDict { factory, entries } => Object::DefaultDict {
+                factory: *factory,
+                entries: entries.clone(),
+            },
+            _ => return Err(PyError::runtime_error("dict handle changed object kind")),
+        };
+        Vm::allocate_object(self, copy).map_err(PyError::resource_error)
+    }
+
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<Value>> {
         let items = match self
             .state
