@@ -89,10 +89,19 @@ pub(crate) static BYTES_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytes", "startswith", bytes_startswith),
         method("bytes", "endswith", bytes_endswith),
         method("bytes", "find", bytes_find),
+        method("bytes", "index", bytes_index),
         method("bytes", "count", bytes_count),
         method("bytes", "partition", bytes_partition),
         method("bytes", "rpartition", bytes_rpartition),
         method("bytes", "center", bytes_center),
+        method("bytes", "strip", bytes_strip),
+        method("bytes", "lstrip", bytes_lstrip),
+        method("bytes", "rstrip", bytes_rstrip),
+        method("bytes", "split", bytes_split),
+        method("bytes", "join", bytes_join),
+        method("bytes", "upper", bytes_upper),
+        method("bytes", "lower", bytes_lower),
+        method("bytes", "replace", bytes_replace),
     ],
     getters: &[],
 };
@@ -102,13 +111,29 @@ pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
     methods: &[
         method("bytearray", "append", bytearray_append),
         method("bytearray", "extend", bytearray_extend),
+        method("bytearray", "insert", bytearray_insert),
+        method("bytearray", "pop", bytearray_pop),
+        method("bytearray", "remove", bytearray_remove),
+        method("bytearray", "clear", bytearray_clear),
+        method("bytearray", "copy", bytearray_copy),
         method("bytearray", "decode", bytes_decode),
         method("bytearray", "hex", bytes_hex),
+        method("bytearray", "startswith", bytes_startswith),
+        method("bytearray", "endswith", bytes_endswith),
         method("bytearray", "find", bytes_find),
+        method("bytearray", "index", bytes_index),
         method("bytearray", "count", bytes_count),
         method("bytearray", "partition", bytes_partition),
         method("bytearray", "rpartition", bytes_rpartition),
         method("bytearray", "center", bytes_center),
+        method("bytearray", "strip", bytes_strip),
+        method("bytearray", "lstrip", bytes_lstrip),
+        method("bytearray", "rstrip", bytes_rstrip),
+        method("bytearray", "split", bytes_split),
+        method("bytearray", "join", bytes_join),
+        method("bytearray", "upper", bytes_upper),
+        method("bytearray", "lower", bytes_lower),
+        method("bytearray", "replace", bytes_replace),
         method("bytearray", "reverse", bytearray_reverse),
     ],
     getters: &[],
@@ -142,10 +167,15 @@ pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
         method("dict", "setdefault", dict_setdefault),
         method("dict", "update", dict_update),
         method("dict", "pop", dict_pop),
+        method("dict", "popitem", dict_popitem),
+        method("dict", "clear", dict_clear),
         method("dict", "copy", dict_copy),
     ],
     getters: &[],
 };
+
+/// `dict` methods bound to the type, so `dict.fromkeys(...)` and `{}.fromkeys(...)` agree.
+pub(crate) static DICT_CLASS_METHODS: &[MethodDef] = &[method("dict", "fromkeys", dict_fromkeys)];
 
 pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
     name: "set",
@@ -154,7 +184,22 @@ pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
         method("set", "update", set_update),
         method("set", "remove", set_remove),
         method("set", "discard", set_discard),
+        method("set", "pop", set_pop),
+        method("set", "clear", set_clear),
         method("set", "union", set_union),
+        method("set", "intersection", set_intersection),
+        method("set", "difference", set_difference),
+        method("set", "symmetric_difference", set_symmetric_difference),
+        method("set", "intersection_update", set_intersection_update),
+        method("set", "difference_update", set_difference_update),
+        method(
+            "set",
+            "symmetric_difference_update",
+            set_symmetric_difference_update,
+        ),
+        method("set", "issubset", set_issubset),
+        method("set", "issuperset", set_issuperset),
+        method("set", "isdisjoint", set_isdisjoint),
         method("set", "copy", set_copy),
     ],
     getters: &[],
@@ -164,6 +209,16 @@ pub(crate) static FROZENSET_TYPE: NativeTypeDef = NativeTypeDef {
     name: "frozenset",
     methods: &[
         method("frozenset", "union", set_union),
+        method("frozenset", "intersection", set_intersection),
+        method("frozenset", "difference", set_difference),
+        method(
+            "frozenset",
+            "symmetric_difference",
+            set_symmetric_difference,
+        ),
+        method("frozenset", "issubset", set_issubset),
+        method("frozenset", "issuperset", set_issuperset),
+        method("frozenset", "isdisjoint", set_isdisjoint),
         method("frozenset", "copy", set_copy),
     ],
     getters: &[],
@@ -484,8 +539,31 @@ fn bytes_affix(
 }
 
 fn bytes_find(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    args.expect_positional("bytes.find", 1, 3)?;
-    args.reject_keywords("bytes.find")?;
+    let found = bytes_search(runtime, receiver, &args, "bytes.find")?;
+    Ok(PyValue::Int(
+        found
+            .and_then(|value| i64::try_from(value).ok())
+            .unwrap_or(-1),
+    ))
+}
+
+fn bytes_index(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let found = bytes_search(runtime, receiver, &args, "bytes.index")?
+        .ok_or_else(|| PyError::value_error("subsection not found"))?;
+    i64::try_from(found)
+        .map(PyValue::Int)
+        .map_err(|_| PyError::overflow_error("byte index is too large"))
+}
+
+/// Position of the first occurrence of `sub` within the optional `[start:end]` window.
+fn bytes_search(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: &CallArgs,
+    name: &str,
+) -> PyResult<Option<usize>> {
+    args.expect_positional(name, 1, 3)?;
+    args.reject_keywords(name)?;
     let PyBytes(value) = receiver.cast(runtime)?;
     let PyBytes(needle) = args.positional()[0].cast(runtime)?;
     let optional_index = |value: Option<&PyValue>, default| -> PyResult<i64> {
@@ -516,7 +594,7 @@ fn bytes_find(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
     let start = normalize(start);
     let end = normalize(end);
     runtime.charge_cpu(u64::try_from(end.saturating_sub(start)).unwrap_or(u64::MAX))?;
-    let found = if start <= end && needle.len() <= end - start {
+    Ok(if start <= end && needle.len() <= end - start {
         if needle.is_empty() {
             Some(start)
         } else {
@@ -527,12 +605,7 @@ fn bytes_find(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
         }
     } else {
         None
-    };
-    Ok(PyValue::Int(
-        found
-            .and_then(|value| i64::try_from(value).ok())
-            .unwrap_or(-1),
-    ))
+    })
 }
 
 fn bytes_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -655,18 +728,347 @@ fn new_bytes_like(runtime: &mut dyn PyRuntime, kind: PyKind, value: Vec<u8>) -> 
     }
 }
 
+/// ASCII whitespace as `bytes.isspace` defines it, which includes vertical tab.
+fn is_bytes_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
+}
+
+fn bytes_strip(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    bytes_strip_impl(runtime, receiver, args, StripKind::Both, "bytes.strip")
+}
+
+fn bytes_lstrip(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    bytes_strip_impl(runtime, receiver, args, StripKind::Left, "bytes.lstrip")
+}
+
+fn bytes_rstrip(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    bytes_strip_impl(runtime, receiver, args, StripKind::Right, "bytes.rstrip")
+}
+
+/// Strip bytes found in the optional argument, or ASCII whitespace when it is absent or `None`.
+fn bytes_strip_impl(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    strip: StripKind,
+    name: &str,
+) -> PyResult {
+    args.expect_positional(name, 0, 1)?;
+    args.reject_keywords(name)?;
+    let kind = runtime.kind(&receiver)?;
+    let PyBytes(value) = receiver.cast(runtime)?;
+    let characters = match args.positional().first() {
+        None => None,
+        Some(value) if runtime.kind(value)? == PyKind::None => None,
+        Some(value) => Some((*value).cast::<PyBytes>(runtime)?.0),
+    };
+    let stripped = |byte: &u8| match &characters {
+        Some(characters) => characters.contains(byte),
+        None => is_bytes_whitespace(*byte),
+    };
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    let start = if matches!(strip, StripKind::Right) {
+        0
+    } else {
+        value
+            .iter()
+            .position(|byte| !stripped(byte))
+            .unwrap_or(value.len())
+    };
+    let end = if matches!(strip, StripKind::Left) {
+        value.len()
+    } else {
+        value
+            .iter()
+            .rposition(|byte| !stripped(byte))
+            .map_or(0, |position| position + 1)
+    };
+    let result = value[start..end.max(start)].to_vec();
+    new_bytes_like(runtime, kind, result)
+}
+
+/// `split(sep=None, maxsplit=-1)` with positional arguments, as `str.split` accepts them.
+fn bytes_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytes.split", 0, 2)?;
+    args.reject_keywords("bytes.split")?;
+    let kind = runtime.kind(&receiver)?;
+    let PyBytes(value) = receiver.cast(runtime)?;
+    let separator = match args.positional().first() {
+        None => None,
+        Some(value) if runtime.kind(value)? == PyKind::None => None,
+        Some(value) => {
+            let PyBytes(separator) = (*value).cast(runtime)?;
+            if separator.is_empty() {
+                return Err(PyError::value_error("empty separator"));
+            }
+            Some(separator)
+        }
+    };
+    let maximum = args
+        .positional()
+        .get(1)
+        .map(|value| index_argument(runtime, value))
+        .transpose()?
+        .and_then(|maximum| usize::try_from(maximum).ok());
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    let mut parts = Vec::new();
+    split_bytes(&value, separator.as_deref(), maximum, |part| {
+        runtime.reserve_memory(std::mem::size_of::<PyValue>().saturating_add(part.len()))?;
+        parts.push(new_bytes_like(runtime, kind, part.to_vec())?);
+        Ok(())
+    })?;
+    runtime.new_list(parts)
+}
+
+/// Pass each part of `value` to `part` in order, as CPython's `bytes.split` divides it, with at
+/// most `maximum` splits when it is set.
+///
+/// Without a separator, runs of ASCII whitespace separate parts and never produce empty ones;
+/// the unsplit remainder keeps its trailing whitespace. The callback lets the caller meter each
+/// part before allocating it.
+fn split_bytes(
+    value: &[u8],
+    separator: Option<&[u8]>,
+    maximum: Option<usize>,
+    mut part: impl FnMut(&[u8]) -> PyResult<()>,
+) -> PyResult<()> {
+    let mut splits = 0;
+    let Some(separator) = separator else {
+        let mut index = 0;
+        loop {
+            while index < value.len() && is_bytes_whitespace(value[index]) {
+                index += 1;
+            }
+            if index == value.len() {
+                return Ok(());
+            }
+            if maximum == Some(splits) {
+                return part(&value[index..]);
+            }
+            let start = index;
+            while index < value.len() && !is_bytes_whitespace(value[index]) {
+                index += 1;
+            }
+            part(&value[start..index])?;
+            splits += 1;
+        }
+    };
+    let mut start = 0;
+    while maximum != Some(splits) {
+        let Some(offset) = value[start..]
+            .windows(separator.len())
+            .position(|window| window == separator)
+        else {
+            break;
+        };
+        part(&value[start..start + offset])?;
+        start += offset + separator.len();
+        splits += 1;
+    }
+    part(&value[start..])
+}
+
+fn bytes_join(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytes.join", 1, 1)?;
+    args.reject_keywords("bytes.join")?;
+    let kind = runtime.kind(&receiver)?;
+    let PyBytes(separator) = receiver.cast(runtime)?;
+    let items = collect_values(runtime, args.positional()[0])?;
+    let mut result = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(part) = runtime.bytes_value(item)? else {
+            let actual = runtime.type_name(item)?;
+            return Err(PyError::type_error(format!(
+                "sequence item {index}: expected a bytes-like object, {actual} found"
+            )));
+        };
+        let separator = if index == 0 { &[][..] } else { &separator[..] };
+        let growth = part
+            .len()
+            .checked_add(separator.len())
+            .ok_or_else(|| PyError::resource_error("joined bytes are too large"))?;
+        runtime.reserve_memory(growth)?;
+        runtime.charge_cpu(u64::try_from(growth).unwrap_or(u64::MAX))?;
+        result.extend_from_slice(separator);
+        result.extend(part);
+    }
+    new_bytes_like(runtime, kind, result)
+}
+
+fn bytes_upper(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    bytes_transform(
+        runtime,
+        receiver,
+        args,
+        "bytes.upper",
+        <[u8]>::to_ascii_uppercase,
+    )
+}
+
+fn bytes_lower(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    bytes_transform(
+        runtime,
+        receiver,
+        args,
+        "bytes.lower",
+        <[u8]>::to_ascii_lowercase,
+    )
+}
+
+/// Apply a length-preserving ASCII transform. Bytes outside ASCII are unchanged, as in CPython.
+fn bytes_transform(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    name: &str,
+    transform: fn(&[u8]) -> Vec<u8>,
+) -> PyResult {
+    args.expect_positional(name, 0, 0)?;
+    args.reject_keywords(name)?;
+    let kind = runtime.kind(&receiver)?;
+    let PyBytes(value) = receiver.cast(runtime)?;
+    runtime.reserve_memory(value.len())?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    new_bytes_like(runtime, kind, transform(&value))
+}
+
+/// `replace(old, new, count=-1)`, reserving the exact result size before building it.
+fn bytes_replace(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytes.replace", 2, 3)?;
+    args.reject_keywords("bytes.replace")?;
+    let kind = runtime.kind(&receiver)?;
+    let PyBytes(value) = receiver.cast(runtime)?;
+    let PyBytes(old) = args.positional()[0].cast(runtime)?;
+    let PyBytes(new) = args.positional()[1].cast(runtime)?;
+    // A negative count, the default, replaces every occurrence.
+    let limit = args
+        .positional()
+        .get(2)
+        .map(|value| index_argument(runtime, value))
+        .transpose()?
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(usize::MAX);
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    let mut count = 0usize;
+    for_each_replacement(&value, &old, limit, |_| count += 1);
+    // Matches never overlap, so they cover at most `value.len()` bytes.
+    let length = count
+        .checked_mul(new.len())
+        .and_then(|inserted| inserted.checked_add(value.len() - count * old.len()))
+        .ok_or_else(|| PyError::resource_error("replaced bytes are too large"))?;
+    runtime.reserve_memory(length)?;
+    runtime.charge_cpu(u64::try_from(length).unwrap_or(u64::MAX))?;
+    let mut result = Vec::with_capacity(length);
+    let mut copied = 0;
+    for_each_replacement(&value, &old, limit, |position| {
+        result.extend_from_slice(&value[copied..position]);
+        result.extend_from_slice(&new);
+        copied = position + old.len();
+    });
+    result.extend_from_slice(&value[copied..]);
+    new_bytes_like(runtime, kind, result)
+}
+
+/// Visit the start offsets of the first `limit` non-overlapping occurrences of `old`, left to
+/// right. An empty `old` matches before every byte and at the end, as in CPython.
+fn for_each_replacement(value: &[u8], old: &[u8], limit: usize, mut visit: impl FnMut(usize)) {
+    let mut found = 0;
+    let mut index = 0;
+    while found < limit && index <= value.len() {
+        if value[index..].starts_with(old) {
+            visit(index);
+            found += 1;
+            // An empty match must still advance to the next byte.
+            index += old.len().max(1);
+        } else {
+            index += 1;
+        }
+    }
+}
+
 fn bytearray_append(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("bytearray.append", 1, 1)?;
     args.reject_keywords("bytearray.append")?;
     let array = receiver.cast::<PyByteArray>(runtime)?;
-    let byte = runtime
-        .int_value(&args.positional()[0])
-        .and_then(|value| u8::try_from(value).ok())
-        .ok_or_else(|| PyError::value_error("byte must be in range(0, 256)"))?;
+    let byte = byte_argument(runtime, &args.positional()[0])?;
     let mut items = runtime.bytearray_items(array)?;
     items.push(byte);
     runtime.replace_bytearray_items(array, items)?;
     Ok(PyValue::None)
+}
+
+/// Convert an integer argument to one byte, raising CPython's errors for other values.
+fn byte_argument(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<u8> {
+    let out_of_range = || PyError::value_error("byte must be in range(0, 256)");
+    // An integer too large for an index is still just out of the byte range.
+    if runtime.kind(value)? == PyKind::Int && runtime.int_value(value).is_none() {
+        return Err(out_of_range());
+    }
+    u8::try_from(index_argument(runtime, value)?).map_err(|_| out_of_range())
+}
+
+fn bytearray_insert(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytearray.insert", 2, 2)?;
+    args.reject_keywords("bytearray.insert")?;
+    let array = receiver.cast::<PyByteArray>(runtime)?;
+    let raw = index_argument(runtime, &args.positional()[0])?;
+    let byte = byte_argument(runtime, &args.positional()[1])?;
+    let mut items = runtime.bytearray_items(array)?;
+    runtime.charge_cpu(u64::try_from(items.len()).unwrap_or(u64::MAX))?;
+    items.insert(insert_index(raw, items.len()), byte);
+    runtime.replace_bytearray_items(array, items)?;
+    Ok(PyValue::None)
+}
+
+fn bytearray_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytearray.pop", 0, 1)?;
+    args.reject_keywords("bytearray.pop")?;
+    let array = receiver.cast::<PyByteArray>(runtime)?;
+    let raw = args
+        .positional()
+        .first()
+        .map_or(Ok(-1), |value| index_argument(runtime, value))?;
+    let mut items = runtime.bytearray_items(array)?;
+    if items.is_empty() {
+        return Err(PyError::exception("IndexError", "pop from empty bytearray"));
+    }
+    let index = pop_index(raw, items.len())?;
+    runtime.charge_cpu(u64::try_from(items.len()).unwrap_or(u64::MAX))?;
+    let byte = items.remove(index);
+    runtime.replace_bytearray_items(array, items)?;
+    Ok(PyValue::Int(i64::from(byte)))
+}
+
+fn bytearray_remove(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytearray.remove", 1, 1)?;
+    args.reject_keywords("bytearray.remove")?;
+    let array = receiver.cast::<PyByteArray>(runtime)?;
+    let byte = byte_argument(runtime, &args.positional()[0])?;
+    let mut items = runtime.bytearray_items(array)?;
+    runtime.charge_cpu(u64::try_from(items.len()).unwrap_or(u64::MAX))?;
+    let position = items
+        .iter()
+        .position(|item| *item == byte)
+        .ok_or_else(|| PyError::value_error("value not found in bytearray"))?;
+    items.remove(position);
+    runtime.replace_bytearray_items(array, items)?;
+    Ok(PyValue::None)
+}
+
+fn bytearray_clear(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytearray.clear", 0, 0)?;
+    args.reject_keywords("bytearray.clear")?;
+    let array = receiver.cast::<PyByteArray>(runtime)?;
+    runtime.replace_bytearray_items(array, Vec::new())?;
+    Ok(PyValue::None)
+}
+
+fn bytearray_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytearray.copy", 0, 0)?;
+    args.reject_keywords("bytearray.copy")?;
+    let array = receiver.cast::<PyByteArray>(runtime)?;
+    let items = runtime.bytearray_items(array)?;
+    runtime.new_bytearray(items)
 }
 
 fn bytearray_extend(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -700,10 +1102,7 @@ fn collect_bytes(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<u8
     let iterator = runtime.iterator(value)?;
     let mut bytes = Vec::new();
     while let Some(value) = runtime.iterator_next(iterator)? {
-        let byte = runtime
-            .int_value(&value)
-            .and_then(|value| u8::try_from(value).ok())
-            .ok_or_else(|| PyError::value_error("byte must be in range(0, 256)"))?;
+        let byte = byte_argument(runtime, &value)?;
         runtime.reserve_memory(1)?;
         runtime.charge_cpu(1)?;
         bytes.push(byte);
@@ -1661,30 +2060,32 @@ fn list_insert(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     args.expect_positional("list.insert", 2, 2)?;
     args.reject_keywords("list.insert")?;
     let list = receiver.cast::<PyList>(runtime)?;
-    let raw = runtime
-        .int_value(&args.positional()[0])
-        .ok_or_else(|| PyError::type_error("list index must be an integer"))?;
-    let len = i64::try_from(runtime.list_len(list)?)
-        .map_err(|_| PyError::overflow_error("list too large"))?;
-    let index = if raw < 0 {
-        usize::try_from(len.saturating_add(raw).max(0)).unwrap_or(0)
-    } else {
-        usize::try_from(raw).unwrap_or(usize::MAX).min(len as usize)
-    };
+    let raw = index_argument(runtime, &args.positional()[0])?;
+    let index = insert_index(raw, runtime.list_len(list)?);
     runtime.list_insert(list, index, args.positional()[1])?;
     Ok(Value::None)
+}
+
+/// Resolve an `insert` index as CPython does: negative values count from the end and every
+/// out-of-range value clamps to the nearest end.
+fn insert_index(raw: i64, length: usize) -> usize {
+    let resolved = if raw < 0 {
+        i64::try_from(length)
+            .unwrap_or(i64::MAX)
+            .saturating_add(raw)
+    } else {
+        raw
+    };
+    usize::try_from(resolved.max(0))
+        .unwrap_or(usize::MAX)
+        .min(length)
 }
 
 fn list_extend(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("list.extend", 1, 1)?;
     args.reject_keywords("list.extend")?;
     let list = receiver.cast::<PyList>(runtime)?;
-    let iterator = runtime.iterator(args.positional()[0])?;
-    let mut values = Vec::new();
-    while let Some(value) = runtime.iterator_next(iterator)? {
-        runtime.reserve_memory(std::mem::size_of::<PyValue>())?;
-        values.push(value);
-    }
+    let values = collect_values(runtime, args.positional()[0])?;
     runtime.list_extend(list, values)?;
     Ok(Value::None)
 }
@@ -1693,26 +2094,47 @@ fn list_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     args.expect_positional("list.pop", 0, 1)?;
     args.reject_keywords("list.pop")?;
     let list = receiver.cast::<PyList>(runtime)?;
+    let raw = args
+        .positional()
+        .first()
+        .map_or(Ok(-1), |value| index_argument(runtime, value))?;
     let length = runtime.list_len(list)?;
     if length == 0 {
         return Err(PyError::exception("IndexError", "pop from empty list"));
     }
-    let raw = args.positional().first().map_or(Ok(-1), |value| {
-        runtime
-            .int_value(value)
-            .ok_or_else(|| PyError::type_error("list index must be an integer"))
-    })?;
-    let len = i64::try_from(length).map_err(|_| PyError::overflow_error("list too large"))?;
-    let raw = if raw < 0 {
-        len.saturating_add(raw)
+    let index = pop_index(raw, length)?;
+    runtime.list_pop(list, index)
+}
+
+/// Resolve a possibly negative `pop` index against `length`, raising CPython's `IndexError`.
+fn pop_index(raw: i64, length: usize) -> PyResult<usize> {
+    let resolved = if raw < 0 {
+        i64::try_from(length)
+            .unwrap_or(i64::MAX)
+            .saturating_add(raw)
     } else {
         raw
     };
-    let index = usize::try_from(raw).map_err(|_| PyError::value_error("pop index out of range"))?;
-    if index >= length {
-        return Err(PyError::value_error("pop index out of range"));
+    usize::try_from(resolved)
+        .ok()
+        .filter(|index| *index < length)
+        .ok_or_else(|| PyError::exception("IndexError", "pop index out of range"))
+}
+
+/// Convert an index argument as CPython's `__index__` protocol does for builtin methods.
+fn index_argument(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<i64> {
+    if let Some(index) = runtime.int_value(value) {
+        return Ok(index);
     }
-    runtime.list_pop(list, index)
+    if runtime.kind(value)? == PyKind::Int {
+        return Err(PyError::overflow_error(
+            "Python int too large to convert to C ssize_t",
+        ));
+    }
+    let actual = runtime.type_name(value)?;
+    Err(PyError::type_error(format!(
+        "'{actual}' object cannot be interpreted as an integer"
+    )))
 }
 
 fn list_remove(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -1947,6 +2369,50 @@ fn dict_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     Err(PyError::exception("KeyError", key))
 }
 
+/// Remove and return the most recently inserted `(key, value)` pair.
+fn dict_popitem(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.popitem", 0, 0)?;
+    args.reject_keywords("dict.popitem")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    let mut entries = dict.items(runtime)?;
+    let Some((key, value)) = entries.pop() else {
+        // The message is the `str()` of CPython's KeyError, which quotes its argument.
+        return Err(PyError::exception(
+            "KeyError",
+            "'popitem(): dictionary is empty'",
+        ));
+    };
+    // Committing the shorter snapshot rebuilds the key index in time linear in the size.
+    runtime.charge_cpu(u64::try_from(entries.len()).unwrap_or(u64::MAX))?;
+    runtime.replace_dict_items(dict, entries)?;
+    runtime.new_tuple(vec![key, value])
+}
+
+fn dict_clear(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.clear", 0, 0)?;
+    args.reject_keywords("dict.clear")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    runtime.replace_dict_items(dict, Vec::new())?;
+    Ok(Value::None)
+}
+
+/// `dict.fromkeys(iterable, value=None)`: map every key to the same `value` object.
+///
+/// The receiver is the `dict` type, bound through `DICT_CLASS_METHODS`. Shellsim does not support
+/// subclasses of builtin `dict`, so the result is always a plain `dict`.
+fn dict_fromkeys(runtime: &mut dyn PyRuntime, _class: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.fromkeys", 1, 2)?;
+    args.reject_keywords("dict.fromkeys")?;
+    let value = args.positional().get(1).copied().unwrap_or(Value::None);
+    let keys = collect_values(runtime, args.positional()[0])?;
+    let result = runtime.new_dict(Vec::new())?;
+    let dict = result.cast::<PyDict>(runtime)?;
+    for key in keys {
+        runtime.dict_insert(dict, key, value)?;
+    }
+    Ok(result)
+}
+
 fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("dict.copy", 0, 0)?;
     args.reject_keywords("dict.copy")?;
@@ -1956,10 +2422,6 @@ fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
 
 fn set_add(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     set_modify(runtime, receiver, args, SetOperation::Add)
-}
-
-fn set_update(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    set_modify(runtime, receiver, args, SetOperation::Update)
 }
 
 fn set_remove(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -1972,7 +2434,6 @@ fn set_discard(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
 
 enum SetOperation {
     Add,
-    Update,
     Remove,
     Discard,
 }
@@ -1985,34 +2446,259 @@ fn set_modify(
 ) -> PyResult {
     args.expect_positional("set method", 1, 1)?;
     args.reject_keywords("set method")?;
-    let set = receiver.cast::<PySet>(runtime)?;
-    let additions = if matches!(operation, SetOperation::Update) {
-        let iterator = runtime.iterator(args.positional()[0])?;
-        let mut items = Vec::new();
-        while let Some(value) = runtime.iterator_next(iterator)? {
-            items.push(value);
-        }
-        items
-    } else {
-        vec![args.positional()[0]]
+    let name = match operation {
+        SetOperation::Add => "add",
+        SetOperation::Remove => "remove",
+        SetOperation::Discard => "discard",
     };
-    for value in additions {
-        match operation {
-            SetOperation::Add | SetOperation::Update => {
-                runtime.set_insert(set, value)?;
+    let set = mutable_set(runtime, receiver, name)?;
+    let value = args.positional()[0];
+    match operation {
+        SetOperation::Add => {
+            runtime.set_insert(set, value)?;
+        }
+        SetOperation::Remove => {
+            if !runtime.set_remove(set, &value)? {
+                let element = runtime.repr(&value)?;
+                return Err(PyError::exception("KeyError", element));
             }
-            SetOperation::Remove => {
-                if !runtime.set_remove(set, &value)? {
-                    let element = runtime.repr(&value)?;
-                    return Err(PyError::exception("KeyError", element));
-                }
-            }
-            SetOperation::Discard => {
-                runtime.set_remove(set, &value)?;
-            }
+        }
+        SetOperation::Discard => {
+            runtime.set_remove(set, &value)?;
         }
     }
     Ok(Value::None)
+}
+
+/// Cast the receiver of a mutating `set` method.
+///
+/// Method lookup never finds these methods on a `frozenset`, but the unbound form
+/// `set.add(frozenset(), 1)` still reaches them and must fail as it does in CPython.
+fn mutable_set(runtime: &mut dyn PyRuntime, receiver: PyValue, method: &str) -> PyResult<PySet> {
+    let set = receiver.cast::<PySet>(runtime)?;
+    if runtime.set_is_frozen(set)? {
+        return Err(PyError::type_error(format!(
+            "descriptor '{method}' for 'set' objects doesn't apply to a 'frozenset' object"
+        )));
+    }
+    Ok(set)
+}
+
+/// `set.update(*iterables)`: add the items of every iterable.
+fn set_update(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("set.update")?;
+    let set = mutable_set(runtime, receiver, "update")?;
+    for source in args.positional() {
+        // Snapshot each iterable before inserting so an iterator over the receiver itself does
+        // not observe the insertions.
+        for value in collect_values(runtime, *source)? {
+            runtime.set_insert(set, value)?;
+        }
+    }
+    Ok(Value::None)
+}
+
+/// Remove and return one member. CPython picks a member by hash position; shellsim's sets keep
+/// insertion order, so this removes the oldest member.
+fn set_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("set.pop", 0, 0)?;
+    args.reject_keywords("set.pop")?;
+    let set = mutable_set(runtime, receiver, "pop")?;
+    let members = set.items(runtime)?;
+    let Some(&value) = members.first() else {
+        // The message is the `str()` of CPython's KeyError, which quotes its argument.
+        return Err(PyError::exception("KeyError", "'pop from an empty set'"));
+    };
+    // Removing the first member shifts the rest of the member vector.
+    runtime.charge_cpu(u64::try_from(members.len()).unwrap_or(u64::MAX))?;
+    runtime.set_remove(set, &value)?;
+    Ok(value)
+}
+
+fn set_clear(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("set.clear", 0, 0)?;
+    args.reject_keywords("set.clear")?;
+    let set = mutable_set(runtime, receiver, "clear")?;
+    runtime.replace_set_items(set, Vec::new())?;
+    Ok(Value::None)
+}
+
+/// `intersection(*iterables)`: members present in the receiver and in every iterable.
+fn set_intersection(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("set.intersection")?;
+    let set = receiver.cast::<PySet>(runtime)?;
+    let members = set.items(runtime)?;
+    let members = filter_set_members(runtime, members, args.positional(), true)?;
+    new_set_like(runtime, set, members)
+}
+
+/// `difference(*iterables)`: receiver members absent from every iterable.
+fn set_difference(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("set.difference")?;
+    let set = receiver.cast::<PySet>(runtime)?;
+    let members = set.items(runtime)?;
+    let members = filter_set_members(runtime, members, args.positional(), false)?;
+    new_set_like(runtime, set, members)
+}
+
+fn set_symmetric_difference(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    args.expect_positional("set.symmetric_difference", 1, 1)?;
+    args.reject_keywords("set.symmetric_difference")?;
+    let set = receiver.cast::<PySet>(runtime)?;
+    let members = set.items(runtime)?;
+    let members = symmetric_difference_members(runtime, members, args.positional()[0])?;
+    new_set_like(runtime, set, members)
+}
+
+fn set_intersection_update(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    args.reject_keywords("set.intersection_update")?;
+    let set = mutable_set(runtime, receiver, "intersection_update")?;
+    let members = set.items(runtime)?;
+    let members = filter_set_members(runtime, members, args.positional(), true)?;
+    runtime.replace_set_items(set, members)?;
+    Ok(Value::None)
+}
+
+fn set_difference_update(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    args.reject_keywords("set.difference_update")?;
+    let set = mutable_set(runtime, receiver, "difference_update")?;
+    let members = set.items(runtime)?;
+    let members = filter_set_members(runtime, members, args.positional(), false)?;
+    runtime.replace_set_items(set, members)?;
+    Ok(Value::None)
+}
+
+fn set_symmetric_difference_update(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    args.expect_positional("set.symmetric_difference_update", 1, 1)?;
+    args.reject_keywords("set.symmetric_difference_update")?;
+    let set = mutable_set(runtime, receiver, "symmetric_difference_update")?;
+    let members = set.items(runtime)?;
+    let members = symmetric_difference_members(runtime, members, args.positional()[0])?;
+    runtime.replace_set_items(set, members)?;
+    Ok(Value::None)
+}
+
+/// `issubset(iterable)`: every receiver member is an item of the iterable.
+fn set_issubset(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("set.issubset", 1, 1)?;
+    args.reject_keywords("set.issubset")?;
+    let members = receiver.cast::<PySet>(runtime)?.items(runtime)?;
+    let operand = collect_values(runtime, args.positional()[0])?;
+    for member in &members {
+        if !set_contains(runtime, &operand, member)? {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+/// `issuperset(iterable)`: every item of the iterable is a receiver member. As in CPython, this
+/// stops consuming the iterable at the first item that is not a member.
+fn set_issuperset(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    set_all_items(runtime, receiver, args, "set.issuperset", true)
+}
+
+/// `isdisjoint(iterable)`: no item of the iterable is a receiver member. As in CPython, this
+/// stops consuming the iterable at the first shared item.
+fn set_isdisjoint(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    set_all_items(runtime, receiver, args, "set.isdisjoint", false)
+}
+
+/// Whether every item of the single iterable argument has receiver membership `expected`.
+fn set_all_items(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    name: &str,
+    expected: bool,
+) -> PyResult {
+    args.expect_positional(name, 1, 1)?;
+    args.reject_keywords(name)?;
+    let members = receiver.cast::<PySet>(runtime)?.items(runtime)?;
+    let iterator = runtime.iterator(args.positional()[0])?;
+    while let Some(item) = runtime.iterator_next(iterator)? {
+        runtime.charge_cpu(1)?;
+        if set_contains(runtime, &members, &item)? != expected {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+/// Keep the members whose presence in each iterable operand equals `keep_present`.
+///
+/// `keep_present` selects intersection (`true`) or difference (`false`). Every operand is
+/// consumed even after `members` becomes empty, so a non-iterable operand raises `TypeError` as
+/// it does in CPython.
+fn filter_set_members(
+    runtime: &mut dyn PyRuntime,
+    mut members: Vec<PyValue>,
+    operands: &[PyValue],
+    keep_present: bool,
+) -> PyResult<Vec<PyValue>> {
+    for operand in operands {
+        let operand = collect_values(runtime, *operand)?;
+        let mut kept = Vec::new();
+        for member in members {
+            if set_contains(runtime, &operand, &member)? == keep_present {
+                runtime.reserve_memory(std::mem::size_of::<PyValue>())?;
+                kept.push(member);
+            }
+        }
+        members = kept;
+    }
+    Ok(members)
+}
+
+/// Members of exactly one of `members` and the iterable `operand`: receiver members first, then
+/// the operand's remaining items without duplicates.
+fn symmetric_difference_members(
+    runtime: &mut dyn PyRuntime,
+    members: Vec<PyValue>,
+    operand: PyValue,
+) -> PyResult<Vec<PyValue>> {
+    let operand = collect_values(runtime, operand)?;
+    let mut result = Vec::new();
+    for member in &members {
+        if !set_contains(runtime, &operand, member)? {
+            runtime.reserve_memory(std::mem::size_of::<PyValue>())?;
+            result.push(*member);
+        }
+    }
+    for item in operand {
+        // Receiver-only members never equal an operand item, so searching `result` only finds
+        // an earlier duplicate within the operand.
+        if !set_contains(runtime, &members, &item)? && !set_contains(runtime, &result, &item)? {
+            runtime.reserve_memory(std::mem::size_of::<PyValue>())?;
+            result.push(item);
+        }
+    }
+    Ok(result)
+}
+
+/// Allocate a result of the same builtin type, `set` or `frozenset`, as `like`.
+fn new_set_like(runtime: &mut dyn PyRuntime, like: PySet, members: Vec<PyValue>) -> PyResult {
+    if runtime.set_is_frozen(like)? {
+        runtime.new_frozen_set(members)
+    } else {
+        runtime.new_set(members)
+    }
 }
 
 fn set_union(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

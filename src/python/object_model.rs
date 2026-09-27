@@ -618,6 +618,10 @@ impl Default for TypeRegistry {
             &mut types[BuiltinType::Dict as usize],
             &super::stdlib::core::DICT_TYPE,
         );
+        install_native_class_methods(
+            &mut types[BuiltinType::Dict as usize],
+            super::stdlib::core::DICT_CLASS_METHODS,
+        );
         install_native_attributes(
             &mut types[BuiltinType::Set as usize],
             &super::stdlib::core::SET_TYPE,
@@ -879,6 +883,17 @@ fn insert_native_attributes(
         ty.attributes.insert(
             getter.name.into(),
             Value::Native(super::vm::NativeValue::NativeGetter(getter)),
+        );
+    }
+}
+
+/// Install methods such as `dict.fromkeys` that receive the type rather than an instance.
+fn install_native_class_methods(ty: &mut PyType, methods: &'static [super::native::MethodDef]) {
+    debug_assert!(methods.iter().all(|method| method.type_name == ty.name));
+    for method in methods {
+        ty.attributes.insert(
+            method.name.into(),
+            Value::Native(super::vm::NativeValue::NativeClassMethod(method)),
         );
     }
 }

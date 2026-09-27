@@ -1005,6 +1005,21 @@ impl PyRuntime for Vm<'_> {
         Ok(true)
     }
 
+    fn replace_set_items(&mut self, set: PySet, items: Vec<Value>) -> PyResult<()> {
+        let id = set.object_id();
+        match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::Set(_) => {}
+            Object::FrozenSet(_) => {
+                return Err(PyError::runtime_error("frozenset items cannot be replaced"))
+            }
+            _ => return Err(PyError::runtime_error("set handle changed object kind")),
+        }
+        self.state
+            .heap
+            .replace_payload(id, Object::Set(items), &mut self.interp.resources)
+            .map_err(PyError::resource_error)
+    }
+
     fn property_getter(&self, property: PyProperty) -> PyResult<Value> {
         match self
             .state

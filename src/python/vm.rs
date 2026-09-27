@@ -56,6 +56,9 @@ pub(super) enum NativeValue {
     BuiltinType(BuiltinType),
     NativeFunction(&'static FunctionDef),
     NativeMethod(&'static super::native::MethodDef),
+    /// Native method that attribute lookup binds to the type, as CPython binds a classmethod,
+    /// whether it is reached through the type or through an instance.
+    NativeClassMethod(&'static super::native::MethodDef),
     /// Read-only data descriptor stored in a native type's attribute table.
     NativeGetter(&'static super::native::GetterDef),
     ValueKind(&'static super::native::ValueKindDef),
@@ -84,6 +87,7 @@ impl NativeValue {
     const UNITTEST_BASE: u8 = 10;
     const VALUE_KIND: u8 = 11;
     const NATIVE_GETTER: u8 = 12;
+    const NATIVE_CLASS_METHOD: u8 = 13;
 
     pub(super) fn encode(self) -> (u64, u8) {
         match self {
@@ -97,6 +101,10 @@ impl NativeValue {
             Self::NativeMethod(value) => (
                 value as *const super::native::MethodDef as usize as u64,
                 Self::NATIVE_METHOD,
+            ),
+            Self::NativeClassMethod(value) => (
+                value as *const super::native::MethodDef as usize as u64,
+                Self::NATIVE_CLASS_METHOD,
             ),
             Self::NativeGetter(value) => (
                 value as *const super::native::GetterDef as usize as u64,
@@ -139,6 +147,12 @@ impl NativeValue {
             Self::NATIVE_METHOD => {
                 // SAFETY: `encode` stores a non-null pointer to a static `MethodDef`.
                 Self::NativeMethod(unsafe {
+                    &*(payload as usize as *const super::native::MethodDef)
+                })
+            }
+            Self::NATIVE_CLASS_METHOD => {
+                // SAFETY: `encode` stores a non-null pointer to a static `MethodDef`.
+                Self::NativeClassMethod(unsafe {
                     &*(payload as usize as *const super::native::MethodDef)
                 })
             }
