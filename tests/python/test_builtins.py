@@ -349,15 +349,15 @@ def test_dict_constructor_accepts_mappings_pairs_and_keywords():
         def __getitem__(self, key):
             return key.upper()
 
-    assert dict() == {}
-    assert dict([(1, 2), ("a", "b")]) == {1: 2, "a": "b"}
+    assert dict() == {}  # noqa: C408 - exercise the dict constructor
+    assert dict([(1, 2), ("a", "b")]) == {1: 2, "a": "b"}  # noqa: C406 - exercise the dict constructor
     assert dict(zip("ab", [1, 2])) == {"a": 1, "b": 2}
-    assert dict((key, key * 2) for key in range(3)) == {0: 0, 1: 2, 2: 4}
+    assert dict((key, key * 2) for key in range(3)) == {0: 0, 1: 2, 2: 4}  # noqa: C402 - exercise the dict constructor
     assert dict(["ab", "cd"]) == {"a": "b", "c": "d"}
     assert dict({"a": 1}, b=2, a=3) == {"a": 3, "b": 2}
     assert dict(Mapping(), x=5) == {"x": 5, "y": "Y"}
     assert dict({1: 2}.items()) == {1: 2}
-    assert list(dict([(2, "a"), (1, "b"), (2, "c")]).items()) == [(2, "c"), (1, "b")]
+    assert list(dict([(2, "a"), (1, "b"), (2, "c")]).items()) == [(2, "c"), (1, "b")]  # noqa: C406 - exercise the dict constructor
     source = {"a": 1}
     copy = dict(source)
     copy["b"] = 2
