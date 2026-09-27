@@ -490,13 +490,17 @@ impl Vm<'_> {
                             code,
                             closure,
                             defaults,
-                            ..
+                            defining_class,
                         } = self.state.heap.get(function)?.clone()
                         else {
                             return Err(format!("{name}.__init__ is not a function"));
                         };
                         arguments.insert(0, instance);
-                        match self.call_python_function(
+                        // Zero-argument `super()` in the initializer reads this frame.
+                        if let Some(owner) = defining_class {
+                            self.method_frames.push((owner, instance));
+                        }
+                        let result = self.call_python_function(
                             &function_name,
                             &code,
                             closure,
@@ -507,7 +511,11 @@ impl Vm<'_> {
                                 mode: CallMode::Immediate,
                                 pop_method_frame: false,
                             },
-                        )? {
+                        );
+                        if defining_class.is_some() {
+                            self.method_frames.pop();
+                        }
+                        match result? {
                             CallResult::Value(value) if value.is_none() => {}
                             CallResult::Value(_) => {
                                 return Err("__init__() should return None".into())

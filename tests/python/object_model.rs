@@ -142,6 +142,18 @@ fn descriptors_and_zero_argument_super_share_method_binding() {
 }
 
 #[test]
+fn zero_argument_super_works_in_initializers_run_by_instantiation() {
+    // `Leaf()` runs the inherited `Middle.__init__`, whose `super()` must start after `Middle`.
+    // The failed `Broken()` must not leave its method frame behind for later calls.
+    assert_eq!(
+        run_shell(
+            "python3.14 -c 'class Root:\n    def __init__(self, seed=None):\n        self.seed = seed\nclass Middle(Root):\n    def __init__(self, name=None):\n        super().__init__(7)\n        self.name = name\n    def label(self):\n        return \"middle\"\nclass Leaf(Middle):\n    def label(self):\n        return super().label() + \"-leaf\"\nclass Broken(Root):\n    def __init__(self):\n        super().__init__(1)\n        raise ValueError(\"boom\")\nleaf = Leaf(name=\"x\")\ntry:\n    Broken()\nexcept ValueError as error:\n    print(error)\nprint(leaf.seed, leaf.name, leaf.label())'"
+        ),
+        (0, b"boom\n7 x middle-leaf\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
 fn user_descriptors_follow_precedence_and_receive_set_name() {
     assert_eq!(
         run_shell(
