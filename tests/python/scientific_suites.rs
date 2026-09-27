@@ -106,7 +106,6 @@ numpy_suites! {
     linalg => "test_linalg.py";
     fft => "test_fft.py";
     random => "test_random.py";
-    #[ignore = "pending: NumPy surface completion (phase 4)"]
     io => "test_io.py";
     #[ignore = "pending: NumPy surface completion (phase 4)"]
     testing => "test_testing.py";

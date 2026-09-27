@@ -292,9 +292,20 @@ pub(in crate::python) fn dtype(runtime: &mut dyn PyRuntime, value: PyValue) -> P
     if let Some(dtype) = super::dtype_object::unpack(runtime, &value) {
         return Ok(dtype);
     }
-    if runtime.kind(&value)? == PyKind::String {
-        let text = runtime.string_value(&value)?.unwrap_or_default();
-        return DType::parse(&text);
+    match runtime.kind(&value)? {
+        PyKind::String => {
+            let text = runtime.string_value(&value)?.unwrap_or_default();
+            return DType::parse(&text);
+        }
+        // Field lists and dicts describe structured dtypes; a `(base, shape)` tuple describes a
+        // subarray dtype.
+        PyKind::List | PyKind::Dict | PyKind::Tuple => {
+            let repr = runtime.repr(&value)?;
+            return Err(PyError::unsupported(format!(
+                "NumPy dtype {repr} is not supported"
+            )));
+        }
+        _ => {}
     }
     match runtime.type_object(&value) {
         Some(PyTypeObject::Builtin(name)) => match name {

@@ -568,6 +568,110 @@ except ValueError as error:
     );
 }
 
+/// Object arrays load through a restricted unpickler. A pickle that names any global other
+/// than NumPy's reconstructors and a few builtins fails before anything is imported or called.
+#[test]
+fn npy_object_pickles_resolve_only_numpy_globals() {
+    let source = r#"import io
+import numpy as np
+from numpy.lib import format
+
+def load(payload):
+    buffer = io.BytesIO()
+    format.write_array_header_1_0(buffer, {"descr": "|O", "fortran_order": False, "shape": (1,)})
+    buffer.write(payload)
+    buffer.seek(0)
+    try:
+        np.load(buffer, allow_pickle=True)
+    except Exception as error:
+        print(type(error).__name__, error)
+
+load(b"\x80\x04cos\nsystem\n\x8c\x07echo hi\x85R.")
+load(b"\x80\x04\x8c\x08builtins\x8c\x04eval\x93\x8c\x011\x85R.")
+load(b"\x80\x04cnumpy\nndarray\n)R.")
+load(b"\x80\x04]\x94(K\x01")
+buffer = io.BytesIO()
+np.save(buffer, np.array([1, "a"], dtype=object))
+buffer.seek(0)
+try:
+    np.load(buffer)
+except ValueError as error:
+    print(error)
+"#;
+    let (status, stdout, stderr) = run(source);
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        concat!(
+            "UnpicklingError global 'os.system' is forbidden\n",
+            "UnpicklingError global 'builtins.eval' is forbidden\n",
+            "UnpicklingError only NumPy array and scalar reconstructors may be called\n",
+            "UnpicklingError pickle data was truncated\n",
+            "Object arrays cannot be loaded when allow_pickle=False\n",
+        )
+    );
+}
+
+/// shellsim memoizes equal strings by value because short strings have no identity. CPython
+/// memoizes by identity, so NumPy writes each computed duplicate again; both files load to
+/// equal arrays.
+#[test]
+fn npy_object_pickles_write_equal_strings_once() {
+    let source = r#"import io
+import numpy as np
+values = np.empty(3, dtype=object)
+values[:] = [str(10), str(10), "10"]
+buffer = io.BytesIO()
+np.save(buffer, values)
+print(buffer.getvalue().count(b"\x8c\x0210"))
+buffer.seek(0)
+print(np.load(buffer, allow_pickle=True).tolist())
+"#;
+    let (status, stdout, stderr) = run(source);
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8_lossy(&stdout), "1\n['10', '10', '10']\n");
+}
+
+#[test]
+fn numpy_file_io_frontier_fails_explicitly() {
+    for (source, expected) in [
+        (
+            "np.genfromtxt(io.StringIO('a b\\n1 2'), names=True)",
+            "genfromtxt with names= builds structured arrays",
+        ),
+        (
+            "np.genfromtxt(io.StringIO('1 2'), usemask=True)",
+            "masked arrays are not supported by shellsim's NumPy",
+        ),
+        (
+            "np.genfromtxt(io.StringIO('1 x'), dtype=None, encoding='utf-8')",
+            "genfromtxt columns of different types need a structured array",
+        ),
+        (
+            "np.loadtxt(io.StringIO('1 2'), dtype=[('a', int), ('b', int)])",
+            "NumPy dtype [('a', <class 'int'>), ('b', <class 'int'>)] is not supported",
+        ),
+        (
+            "np.loadtxt(io.StringIO('1 2'), dtype='i4,i4')",
+            "NumPy dtype 'i4,i4' is not supported",
+        ),
+        (
+            "b = io.BytesIO(); np.save(b, np.arange(2)); b.seek(0); np.load(b, mmap_mode='r')",
+            "memory-mapped arrays are not supported by shellsim's NumPy",
+        ),
+        (
+            "from numpy.lib import format\nb = io.BytesIO()\nformat.write_array_header_1_0(b, {'descr': [('a', '<i4')], 'fortran_order': False, 'shape': (1,)})\nb.write(bytes(4)); b.seek(0); np.load(b)",
+            "structured dtypes are not supported by shellsim's NumPy",
+        ),
+        (
+            "class Point: pass\na = np.empty(1, dtype=object); a[0] = Point(); np.save(io.BytesIO(), a)",
+            "np.save cannot pickle 'Point' array elements in shellsim",
+        ),
+    ] {
+        assert_fails_with(&format!("import io\nimport numpy as np\n{source}"), expected);
+    }
+}
+
 #[test]
 fn array_allocation_obeys_the_modeled_memory_limit() {
     let environment = Environment::with_limits(Limits {

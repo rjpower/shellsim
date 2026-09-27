@@ -567,6 +567,22 @@ fn numpy_random_reserves_and_charges_before_drawing() {
 }
 
 #[test]
+fn numpy_loadtxt_stops_at_the_memory_limit() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import io\nimport numpy as np\ntext = '1 2 3\\n' * 5000\nprint(np.loadtxt(io.StringIO(text[:60])).shape)\nnp.loadtxt(io.StringIO(text * 100))",
+        Limits {
+            cpu: 50_000_000,
+            memory: 8 * 1024 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137, "{}", String::from_utf8_lossy(&stderr));
+    assert!(usage.memory_peak <= 8 * 1024 * 1024);
+    assert_eq!(stdout, b"(10, 3)\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn numpy_byte_copies_reserve_memory_before_copying() {
     // Bytes are charged at their length, and each copy reserves its host buffer before it is
     // made. Peak use is about 20 MB after `frombuffer` and 26 MB during `tobytes`.

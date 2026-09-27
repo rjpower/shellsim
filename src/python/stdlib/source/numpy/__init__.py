@@ -2,9 +2,9 @@
 
 Arrays, dtypes, ufuncs and most functions are native and live in the ``_numpy*`` modules; this
 package re-exports them and adds the parts written in Python: floating-point error state,
-``flatiter``, ``ndarray.flags``, order statistics, histograms, set operations, and the
-``linalg``, ``fft``, ``random``, ``strings``, ``testing`` and ``exceptions`` submodules. The
-behavior targets NumPy 2.5.
+``flatiter``, ``ndarray.flags``, order statistics, histograms, set operations, file I/O, and
+the ``linalg``, ``fft``, ``random``, ``strings``, ``testing``, ``lib`` and ``exceptions``
+submodules. The behavior targets NumPy 2.5.
 """
 
 from _numpy import *
@@ -227,6 +227,17 @@ import numpy.linalg as linalg
 from numpy._arraypad import pad
 
 
+_NPYIO_EXPORTS = {
+    "genfromtxt",
+    "load",
+    "loadtxt",
+    "save",
+    "savetxt",
+    "savez",
+    "savez_compressed",
+}
+
+
 def __getattr__(attr):
     # As in NumPy, the larger submodules load on first access rather than with the package.
     if attr == "fft":
@@ -245,4 +256,12 @@ def __getattr__(attr):
         import numpy.testing as testing
 
         return testing
+    elif attr == "lib":
+        import numpy.lib as lib
+
+        return lib
+    elif attr in _NPYIO_EXPORTS:
+        from numpy.lib import npyio
+
+        return getattr(npyio, attr)
     raise AttributeError(f"module {__name__!r} has no attribute {attr!r}")

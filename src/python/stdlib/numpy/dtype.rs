@@ -393,7 +393,7 @@ impl DType {
             "float64" | "f8" | "d" | "float" | "double" => Kind::Float64,
             "complex64" | "c8" | "F" | "csingle" => Kind::Complex64,
             "complex128" | "c16" | "D" | "complex" | "cdouble" => Kind::Complex128,
-            "object" | "O" | "object_" => Kind::Object,
+            "object" | "O" | "O8" | "object_" => Kind::Object,
             "str" | "str_" | "unicode" => return Self::str(0),
             "g" | "G" | "f16" | "c32" | "longdouble" | "clongdouble" | "S" | "a" | "V"
             | "bytes" | "bytes_" | "void" | "M" | "m" | "M8" | "m8" | "datetime64"
@@ -402,7 +402,10 @@ impl DType {
                     "NumPy dtype '{text}' is not supported"
                 )))
             }
+            // Comma-separated strings are structured dtypes, and `V<n>` is raw void storage.
             _ if body.starts_with('S')
+                || body.starts_with('V')
+                || body.contains(',')
                 || body.starts_with("M8[")
                 || body.starts_with("m8[")
                 || body.starts_with("datetime64[")
