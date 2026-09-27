@@ -19,7 +19,7 @@ mod args;
 mod array;
 mod construct;
 mod convert;
-mod dragon4;
+mod float_digits;
 mod dtype;
 mod dtype_object;
 mod element;

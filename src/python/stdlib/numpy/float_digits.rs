@@ -1,8 +1,8 @@
-//! Dragon4-equivalent float text: NumPy's positional and scientific formatting, with its
+//! Decimal text for one float: NumPy's positional and scientific formatting, with its
 //! rounding, trimming and padding rules.
 //!
 //! [`positional`] and [`scientific`] generate decimal text for one finite value at the caller's
-//! choice of digit count and layout, matching NumPy's `dragon4_positional`/`dragon4_scientific`
+//! choice of digit count and layout, matching NumPy's `format_positional`/`format_scientific`
 //! C functions. Python sees them as `np.format_float_positional`/`np.format_float_scientific`
 //! (thin argument-validating wrappers in `numpy._arrayprint`) and array printing calls them once
 //! per element with explicit padding so a column of numbers lines up.
@@ -27,13 +27,13 @@
 //!
 //! A generated digit count or padding width beyond [`MAX_DIGITS`] is rejected rather than
 //! formatted, so `precision`, `min_digits`, `pad_left`, `pad_right` and `exp_digits` cannot force
-//! an unbounded allocation; NumPy's own Dragon4 buffer is bounded similarly, if more tightly.
+//! an unbounded allocation; NumPy bounds its own formatting buffer similarly, if more tightly.
 
 use super::super::super::native::{PyError, PyResult};
 use super::format::{shortest_digits, Precision};
 use crate::python::float_text;
 
-/// Positional/scientific formatting options, in NumPy's `dragon4_positional`/`dragon4_scientific`
+/// Positional/scientific formatting options, in NumPy's `format_positional`/`format_scientific`
 /// argument conventions: a negative integer field means "unset". Argument validation (negative
 /// values a caller supplied explicitly, mutually inconsistent options) happens in
 /// `numpy._arrayprint` before these options are built; by the time code here runs, a negative
@@ -240,7 +240,7 @@ fn assemble(
     )
 }
 
-/// `dragon4_positional`: decimal text in positional (non-exponential) notation. See the module
+/// `format_positional`: decimal text in positional (non-exponential) notation. See the module
 /// documentation for the digit-generation regimes; `options.fractional` chooses whether
 /// `precision`/`min_digits` count fractional digits or total significant digits.
 pub(in crate::python) fn positional(
@@ -305,7 +305,7 @@ pub(in crate::python) fn positional(
     Ok(text)
 }
 
-/// `dragon4_scientific`: decimal text in scientific (exponential) notation, always with exactly
+/// `format_scientific`: decimal text in scientific (exponential) notation, always with exactly
 /// one digit before the decimal point and an `e±EE` suffix.
 pub(in crate::python) fn scientific(
     value: f64,

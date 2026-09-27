@@ -43,7 +43,7 @@ where
 /// Correctly-rounded digits of a finite, non-negative magnitude at a fixed count of significant
 /// digits, keeping trailing zeros (unlike [`shortest`]): `magnitude == digits[0].digits[1..] ×
 /// 10^exponent`. Ties round to even, via `{:.N$e}`. Used where a caller needs an exact digit
-/// count rather than the shortest round-trip text, e.g. NumPy Dragon4's `precision` and
+/// count rather than the shortest round-trip text, e.g. NumPy's `precision` and
 /// `min_digits` options.
 pub(crate) fn fixed_digits(magnitude: f64, significant_digits: usize) -> (String, i32) {
     debug_assert!(significant_digits >= 1);

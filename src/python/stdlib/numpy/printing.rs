@@ -1,10 +1,9 @@
 //! Array printing: the ndarray `repr`/`str` slots and the native `_numpy_print` module.
 //!
-//! The layout rules are NumPy's own Python code, ported in `numpy/_arrayprint.py`; the slots
-//! call its `_array_repr_implementation` and `_array_str_implementation`, which read the
-//! current print options. This module supplies the part that code needs natively: Dragon4
-//! digit generation as `dragon4_positional` and `dragon4_scientific`, with the argument
-//! conventions of NumPy's C functions, where `-1` means unset.
+//! The layout rules live in the frozen `numpy/_arrayprint.py`; the slots call its
+//! `_array_repr_implementation` and `_array_str_implementation`, which read the current print
+//! options. This module supplies the part that code needs natively: digit generation as
+//! `format_positional` and `format_scientific`, where `-1` means an unset option.
 //!
 //! A NumPy `float16` or `float32` scalar is formatted at its own precision, so its shortest
 //! digits identify it among values of that width. Any other argument is converted with
@@ -14,7 +13,7 @@ use super::super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyError, PyKind, PyResult, PyRuntime, PyValue,
 };
 use super::args::{float_arg, index_int, Bound, Signature};
-use super::dragon4::{self, Options, Trim};
+use super::float_digits::{self, Options, Trim};
 use super::element::Number;
 use super::format::Precision;
 use super::scalar::{precision, unbox_number};
@@ -24,13 +23,13 @@ pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
     functions: &[
         FunctionDef {
             module: "numpy",
-            name: "dragon4_positional",
-            call: dragon4_positional,
+            name: "format_positional",
+            call: format_positional,
         },
         FunctionDef {
             module: "numpy",
-            name: "dragon4_scientific",
-            call: dragon4_scientific,
+            name: "format_scientific",
+            call: format_scientific,
         },
     ],
     values: &[],
@@ -113,11 +112,11 @@ fn common_options(runtime: &mut dyn PyRuntime, bound: &Bound) -> PyResult<Option
     Ok(options)
 }
 
-/// `dragon4_positional(x, precision=-1, unique=1, fractional=0, sign=0, trim='k', pad_left=-1,
+/// `format_positional(x, precision=-1, unique=1, fractional=0, sign=0, trim='k', pad_left=-1,
 /// pad_right=-1, min_digits=-1)`.
-fn dragon4_positional(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn format_positional(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new(
-        "dragon4_positional",
+        "format_positional",
         &[
             "x",
             "precision",
@@ -139,16 +138,16 @@ fn dragon4_positional(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         ..common_options(runtime, &bound)?
     };
     let mut work = 0;
-    let text = dragon4::positional(value, precision, &options, &mut work)?;
+    let text = float_digits::positional(value, precision, &options, &mut work)?;
     runtime.charge_cpu(work)?;
     runtime.new_string(text)
 }
 
-/// `dragon4_scientific(x, precision=-1, unique=1, sign=0, trim='k', pad_left=-1,
+/// `format_scientific(x, precision=-1, unique=1, sign=0, trim='k', pad_left=-1,
 /// exp_digits=-1, min_digits=-1)`.
-fn dragon4_scientific(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn format_scientific(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new(
-        "dragon4_scientific",
+        "format_scientific",
         &[
             "x",
             "precision",
@@ -168,7 +167,7 @@ fn dragon4_scientific(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         ..common_options(runtime, &bound)?
     };
     let mut work = 0;
-    let text = dragon4::scientific(value, precision, &options, &mut work)?;
+    let text = float_digits::scientific(value, precision, &options, &mut work)?;
     runtime.charge_cpu(work)?;
     runtime.new_string(text)
 }

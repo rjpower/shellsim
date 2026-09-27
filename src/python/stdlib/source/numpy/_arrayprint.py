@@ -1,8 +1,8 @@
 """NumPy-compatible text for scalars and arrays: print options, ``format_float_*``, and the
 ``array2string``/``array_repr``/``array_str`` family that ``ndarray.__repr__``/``__str__`` call.
 
-Digit generation for a single float goes through the native ``_numpy_print`` module (Dragon4),
-imported below as ``dragon4_positional``/``dragon4_scientific``. This module supplies everything
+Digit generation for a single float goes through the native ``_numpy_print`` module,
+imported below as ``format_positional``/``format_scientific``. This module supplies everything
 around that: argument validation for ``format_float_positional``/``format_float_scientific``, the
 global print-options state, and the array layout algorithm (per-element formatting, column
 alignment, line wrapping, summarization, and the ``dtype=``/``shape=`` suffixes ``repr`` adds).
@@ -17,7 +17,7 @@ lines up. String and object elements are not column-aligned, matching NumPy.
 import contextlib
 import math
 
-from _numpy_print import dragon4_positional, dragon4_scientific
+from _numpy_print import format_positional, format_scientific
 
 _DEFAULTS = {
     "precision": 8,
@@ -102,7 +102,7 @@ def printoptions(*args, **kwargs):
 # format_float_positional / format_float_scientific
 #
 # These validate arguments the way NumPy's Python wrappers do (a negative value supplied
-# explicitly is an error, not "unset") and then call the native Dragon4 engine, which uses -1 to
+# explicitly is an error, not "unset") and then call the native formatter, which uses -1 to
 # mean "unset". The checks and their order and messages match NumPy 2.5.3 (observed, since the
 # reference implementation is off limits here).
 # ---------------------------------------------------------------------------------------------
@@ -141,7 +141,7 @@ def format_float_positional(
         raise ValueError("min_digits must be less than or equal to precision")
     if not fractional and precision == 0:
         raise ValueError("precision must be greater than 0 if fractional=False")
-    return dragon4_positional(
+    return format_positional(
         x,
         precision=_unset(precision),
         unique=unique,
@@ -183,7 +183,7 @@ def format_float_scientific(
         raise ValueError("min_digits must be >= 0")
     if precision and min_digits is not None and min_digits > precision:
         raise ValueError("min_digits must be less than or equal to precision")
-    return dragon4_scientific(
+    return format_scientific(
         x,
         precision=_unset(precision),
         unique=unique,
@@ -292,7 +292,7 @@ def _bool_formatter(values, _options, ndim=1):
 
 
 def _sign_prefix(text, sign_mode):
-    """`text` from a `sign=False` Dragon4 call; add NumPy's `+`/` ` sign for a non-negative value."""
+    """`text` from a `sign=False` native call; add NumPy's `+`/` ` sign for a non-negative value."""
     if text.startswith("-") or sign_mode == "-":
         return text
     if sign_mode == "+":
