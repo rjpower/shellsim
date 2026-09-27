@@ -10,8 +10,8 @@ use std::fmt;
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 
-use super::super::native::PyValue as Value;
 use super::super::ast::BinaryOperator;
+use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyOperator, PyResult, PyRuntime,
     PyValueCast, ValueDef,

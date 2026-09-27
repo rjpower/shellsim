@@ -6,9 +6,9 @@ use super::super::heap::ObjectId;
 use super::{
     exception_types, expect_arity, protocol, range_length, select_string_slice, Arc,
     BuiltinSubscript, BuiltinType, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout,
-    CodeCaches, CodeRef, ExceptionType, Execution, HashMap, LoadAttributeCache, NameId,
-    NativeValue, Object, Ordering, PyError, PyErrorKind, PyRuntime, SlicePlan, Slot, SlotValue,
-    SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution, HashMap, LoadAttributeCache,
+    NameId, NativeValue, Object, Ordering, PyError, PyErrorKind, PyRuntime, SlicePlan, Slot,
+    SlotValue, SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 /// Items of a builtin container whose `repr` the VM renders item by item.
@@ -1976,13 +1976,16 @@ impl Vm<'_> {
         protocol::compare(&self.state.heap, left, right)
     }
 
-    /// Order two values for `sorted`, `min` and `max`, which compare with `<` as CPython does.
-    /// A NaN orders as equal, so the earlier value stays in place.
+    /// Order two values for native sorting, heap and bisection helpers with the `<` operator
+    /// alone, as CPython's do: `left < right` is `Less`, `right < left` is `Greater`, and
+    /// anything else, such as a NaN, is `Equal`, so the earlier value stays in place.
     pub(super) fn sort_order(&mut self, left: &Value, right: &Value) -> Result<Ordering, String> {
-        match self.compare_values(left, right)? {
-            protocol::Comparison::Ordered(ordering) => Ok(ordering),
-            protocol::Comparison::Unordered => Ok(Ordering::Equal),
-            protocol::Comparison::Unsupported => Err(self.raise_unorderable("<", left, right)),
+        if self.compare_truth(ComparisonOperator::Less, left, right)? {
+            Ok(Ordering::Less)
+        } else if self.compare_truth(ComparisonOperator::Less, right, left)? {
+            Ok(Ordering::Greater)
+        } else {
+            Ok(Ordering::Equal)
         }
     }
 

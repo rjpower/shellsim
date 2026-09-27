@@ -2,10 +2,10 @@
 
 use super::{
     expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BytecodeFrame, CallArgs,
-    CallMode, CallResult, ClassLayout, CodeRef, Execution, FunctionInvocation, FunctionReturn,
-    HashMap, InstanceAttributes, InstancePayload, NativeValue, Object, Ordering, PendingNativeCall,
-    PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, ScopeId, Slot, Stream, Value,
-    Vm,
+    CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator, Execution, FunctionInvocation,
+    FunctionReturn, HashMap, InstanceAttributes, InstancePayload, NativeValue, Object,
+    PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, ScopeId,
+    Slot, Stream, Value, Vm,
 };
 use num_traits::{Signed, Zero};
 
@@ -1020,18 +1020,18 @@ impl Vm<'_> {
                     self.reserve_result(64)?;
                     keyed.push((key, value));
                 }
-                // Stable insertion sort keeps comparison dispatch and failure order obvious.
+                // Stable insertion sort keeps comparison dispatch and failure order obvious. Like
+                // CPython's sort it only asks `<`, and a reversed sort keeps equal items in order.
                 for index in 1..keyed.len() {
                     let mut current = index;
                     while current > 0 {
                         self.charge_cpu(1)?;
-                        if self.sort_order(&keyed[current].0, &keyed[current - 1].0)?
-                            != if reverse {
-                                Ordering::Greater
-                            } else {
-                                Ordering::Less
-                            }
-                        {
+                        let (left, right) = if reverse {
+                            (keyed[current - 1].0, keyed[current].0)
+                        } else {
+                            (keyed[current].0, keyed[current - 1].0)
+                        };
+                        if !self.compare_truth(ComparisonOperator::Less, &left, &right)? {
                             break;
                         }
                         keyed.swap(current, current - 1);
@@ -1044,9 +1044,9 @@ impl Vm<'_> {
                 ))
             }
             Builtin::Minimum | Builtin::Maximum => {
-                let (name, symbol, wanted) = match function {
-                    Builtin::Minimum => ("min", "<", Ordering::Less),
-                    _ => ("max", ">", Ordering::Greater),
+                let (name, operator) = match function {
+                    Builtin::Minimum => ("min", ComparisonOperator::Less),
+                    _ => ("max", ComparisonOperator::Greater),
                 };
                 let mut key_function = None;
                 let mut default = None;
@@ -1100,13 +1100,9 @@ impl Vm<'_> {
                     };
                     let replace = match &selected {
                         None => true,
-                        Some((selected_key, _)) => match self.compare_values(&key, selected_key)? {
-                            protocol::Comparison::Ordered(ordering) => ordering == wanted,
-                            protocol::Comparison::Unordered => false,
-                            protocol::Comparison::Unsupported => {
-                                return Err(self.raise_unorderable(symbol, &key, selected_key));
-                            }
-                        },
+                        Some((selected_key, _)) => {
+                            self.compare_truth(operator, &key, &selected_key.clone())?
+                        }
                     };
                     if replace {
                         selected = Some((key, value));

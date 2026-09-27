@@ -157,6 +157,22 @@ impl Vm<'_> {
         Ok(())
     }
 
+    /// The truth of `left <operator> right` under the full rich-comparison protocol, including
+    /// the reflected operand, as CPython's `PyObject_RichCompareBool` computes it for `min`,
+    /// `max` and sorting.
+    pub(super) fn compare_truth(
+        &mut self,
+        operator: ComparisonOperator,
+        left: &Value,
+        right: &Value,
+    ) -> Result<bool, String> {
+        self.stack.push(*left);
+        self.stack.push(*right);
+        self.compare(operator)?;
+        let result = self.pop()?;
+        self.truth_value(&result)
+    }
+
     pub(super) fn compare(&mut self, operator: ComparisonOperator) -> Result<(), String> {
         let right = self.pop()?;
         let left = self.pop()?;
