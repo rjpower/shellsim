@@ -50,8 +50,20 @@ fn reference_python_passes_every_suite() {
     let Some(python) = std::env::var_os(REFERENCE_PYTHON) else {
         return;
     };
+    // `--import-mode=importlib`: the `numpy` and `scipy` suite directories both hold a
+    // `test_linalg.py` (and could hold other repeated basenames in the future); pytest's default
+    // "prepend" import mode imports each test file as a top-level module by basename, so
+    // collecting both directories in one run raises "import file mismatch" on the second
+    // `test_linalg.py`. `importlib` mode imports each file by its own path instead.
     let output = Command::new(&python)
-        .args(["-m", "pytest", "-q", "-p", "no:cacheprovider"])
+        .args([
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--import-mode=importlib",
+        ])
         .args(SUITE_DIRECTORIES.map(suite_directory))
         .output()
         .unwrap_or_else(|error| panic!("could not run {python:?}: {error}"));

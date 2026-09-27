@@ -55,7 +55,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
         run(["uv", "venv", "--python", PYTHON_VERSION, str(venv)])
     run(["uv", "pip", "install", "--python", str(python), "-r", str(REQUIREMENTS)])
     if not options.no_run:
-        run([str(python), "-m", "pytest", "-q", "-p", "no:cacheprovider", *map(str, SUITES)])
+        # `--import-mode=importlib`: some suite directories share a basename (for example, both
+        # `numpy` and `scipy` have a `test_linalg.py`); pytest's default import mode collides on
+        # that when collecting multiple directories in one run.
+        run(
+            [
+                str(python),
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "--import-mode=importlib",
+                *map(str, SUITES),
+            ]
+        )
     print(f"export SHELLSIM_SCIENTIFIC_PYTHON={python}")
     return 0
 

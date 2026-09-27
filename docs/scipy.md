@@ -34,31 +34,36 @@ raise `NotImplementedError` when imported.
   `_scipy_linalg`, which plays the parts of SciPy's compiled code: the C++ `_batched_linalg`
   loops behind `solve`, `inv`, `det`, `lu`, `cholesky` and `qr`, the `expm` kernel, and the f2py
   wrappers in `scipy.linalg.lapack` and `scipy.linalg.blas`. The LAPACK and BLAS routines are
-  ports of the ones SciPy's OpenBLAS runs (see below). `svd`, `eigh` and the functions built on
-  them (`lstsq`, `pinv`, `pinvh`, `polar`, `null_space`, `orth` and `subspace_angles`) use
-  shellsim's `numpy.linalg`.
+  shellsim's own dense kernels, not a port of OpenBLAS or reference LAPACK (see below). `svd`,
+  `eigh` and the functions built on them (`lstsq`, `pinv`, `pinvh`, `polar`, `null_space`,
+  `orth`, `subspace_angles` and `orthogonal_procrustes`) use shellsim's `numpy.linalg`.
 
 ### Rounding in `scipy.linalg`
 
-SciPy's wheels bundle OpenBLAS, which selects kernels for the CPU when it loads, replaces some
-LAPACK routines with its own, and runs the rest from reference LAPACK on its kernels. The same
-matrix can therefore round differently on different machines. shellsim ports the kernels and
-routines that SciPy 1.18.1's OpenBLAS 0.3.31 uses on the reference machine, an AMD Zen 2 CPU for
-which OpenBLAS picks its Haswell kernels and starts 16 threads. With them, LU, Cholesky and
-triangular factorizations, the solves and inverses built on them, and `det` agree with SciPy's
-to the last bit within these limits:
+shellsim's dense kernels (`src/python/stdlib/numpy/linalg/dense.rs`, shared by `numpy.linalg`
+and `scipy.linalg`) are original implementations of the standard backward-stable algorithms: LU
+factorization with partial pivoting, Cholesky, Householder QR (with Businger & Golub 1965 column
+pivoting), a one-sided Jacobi SVD, a cyclic Jacobi symmetric eigensolver, banded and tridiagonal
+solves, and Higham's (2005) scaling-and-squaring Padé method for `expm`. They are not a port of
+LAPACK or OpenBLAS, and bit-exact agreement with SciPy's output is not a goal.
 
-- OpenBLAS switches to blocked drivers above order 33 for `getrf`, 32 for `potrf`, 64 for
-  `lauum` and 256 for `trsm`. shellsim keeps the unblocked kernels at every order, so larger
-  results can differ in the last bits.
-- From order 17, OpenBLAS runs `potri`, behind `inv(a, assume_a="pos")`, on its threaded
-  drivers, which shellsim does not model.
-- OpenBLAS splits several right-hand sides among its threads, and a column solved alone takes
-  a different kernel. shellsim splits them as the 16 threads of the reference machine do, so
-  up to 16 right-hand sides are each solved alone.
-- `float32` input follows the double-precision kernels. OpenBLAS's single-precision kernels
-  block by eight columns and 32 elements, so `float32` results can differ in the last bit from
-  about order 5.
+SciPy's wheels bundle OpenBLAS, which selects kernels for the CPU when it loads and can itself
+round the same input differently on different machines: its blocked drivers, threaded solves and
+single-precision blocking all shift results in the last few bits depending on matrix order and
+CPU. The literal expectations in `tests/python/scipy/test_linalg.py` were measured with SciPy's
+OpenBLAS on an AMD Zen 2 machine, where OpenBLAS selects its Haswell kernels and runs 16 threads;
+other OpenBLAS kernel selections round the order-12 and order-70 cases in that suite differently
+again.
+
+Because of both effects, the suite checks `scipy.linalg` results with `numpy.testing`'s
+`assert_allclose` (`rtol=1e-13, atol=1e-14` by default; `rtol=1e-6, atol=1e-6` for `float32` and
+`float16` input) rather than exact equality, except where shellsim happens to reproduce SciPy's
+literal bits (integer pivots and permutations, and a handful of inputs whose exact answer is a
+small integer). Results are backward-stable and agree with SciPy's to about that tolerance for
+well-conditioned input. Eigenvalues, singular values and least-squares solutions come from a
+different algorithm than SciPy's and are checked the same way, with eigenvectors and singular
+vectors normalized so each column's largest-magnitude entry is non-negative (SciPy's sign, from
+LAPACK, need not match).
 
 ### Loop selection
 
@@ -133,10 +138,9 @@ limits.
 
 The reference is SciPy's x86-64 build. There Boost evaluates its Lanczos sums with SSE2
 instructions, which shellsim reproduces; SciPy's ARM builds round those sums differently, so
-their Boost-based results can differ from shellsim's and from each other in the last place.
-The exact `scipy.linalg` expectations were measured on the reference machine described above;
-on a CPU for which OpenBLAS selects other kernels, SciPy itself rounds the order-12 and
-order-70 cases differently.
+their Boost-based results can differ from shellsim's and from each other in the last place. The
+`scipy.linalg` expectations were measured on the reference machine described above; see
+"Rounding in `scipy.linalg`" for why they are checked with a tolerance rather than bit for bit.
 
 ## Deliberate differences
 
@@ -168,15 +172,28 @@ order-70 cases differently.
   thin wrapper instead of a decorator, so a warning whose `stacklevel` SciPy chose for its
   decorated call, such as the precision-loss `RuntimeWarning` from `skew`, is attributed one
   frame deeper than in SciPy.
-- **Eigenvalues and singular values.** `eigh`, `eigvalsh`, `svd` and `svdvals` use Jacobi
-  methods where SciPy calls LAPACK's `syevr` and `gesdd`. Their values agree with SciPy's to
-  about `1e-15` relatively, and eigenvectors and singular vectors can differ in sign. `lstsq`
-  computes its solution from the SVD for every driver, and `pinv`, `pinvh`, `polar`,
-  `null_space`, `orth` and `subspace_angles` build on the SVD or `eigh`, so their results can
-  differ from SciPy's in the last bits, and a zero singular value can be exactly zero where
-  SciPy's is near `1e-16`.
+- **Eigenvalues and singular values.** `eigh`, `eigvalsh`, `svd` and `svdvals` use shellsim's
+  Jacobi methods (see "Rounding in `scipy.linalg`") where SciPy calls LAPACK's `syevr` and
+  `gesdd`. `lstsq` computes its solution from the SVD for every driver, and `pinv`, `pinvh`,
+  `polar`, `null_space`, `orth`, `subspace_angles` and `orthogonal_procrustes` build on the SVD
+  or `eigh`; a singular value or eigenvalue that is mathematically zero can come out exactly
+  zero where SciPy's is near `1e-16`.
 - **`lstsq.default_lapack_driver`** does not exist, because shellsim's functions cannot hold
   attributes. The default driver is still `gelsd`.
+- **`gecon`'s reciprocal condition number**, and the `LinAlgWarning` that `solve` raises for an
+  ill-conditioned matrix, come from the explicit inverse (which the same factorization already
+  gives cheaply) rather than LAPACK's Hager-style iterative estimator. Both report a very small
+  number for the same ill-conditioned matrix, but not LAPACK's number.
+- **f2py wrapper exceptions.** Real SciPy's `scipy.linalg.lapack` and `scipy.linalg.blas`
+  wrappers raise a generated, per-module exception (for example
+  `scipy.linalg.lapack._flapack.error`) on a bad argument. shellsim raises a plain `ValueError`
+  carrying the same f2py-generated message instead of replicating those generated classes.
+- **`fiedler_companion`** swaps the top-right and bottom sub-diagonal entries of `companion(a)`,
+  which reproduces M. Fiedler's 2003 construction for a cubic polynomial but not his general
+  interleaving construction for higher degree.
+- **`dft`'s signed zeros.** SciPy builds `dft` from an internal FFT routine whose intermediate
+  rounding leaves a machine-dependent pattern of signed zeros in the imaginary part. shellsim's
+  closed-form construction gives the same values but not always the same zero sign.
 - **Output layout of batched results.** The f2py wrappers, and the functions that return their
   results, return Fortran-ordered arrays as SciPy's do. For stacked input, `eigh` and
   `qr(mode="raw")` return C-ordered arrays where SciPy's are not contiguous.
