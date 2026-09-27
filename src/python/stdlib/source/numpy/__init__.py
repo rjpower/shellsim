@@ -14,7 +14,16 @@ from _numpy_sort import *
 from _numpy_products import *
 from _numpy_math import *
 from _numpy_io import *
-from _numpy_print import *
+from numpy._arrayprint import (
+    array2string,
+    array_repr,
+    array_str,
+    format_float_positional,
+    format_float_scientific,
+    get_printoptions,
+    printoptions,
+    set_printoptions,
+)
 from numpy._errstate import errstate, geterr, geterrcall, seterr, seterrcall
 from numpy._getlimits import finfo, iinfo
 from numpy._numeric import allclose, array_equal, array_equiv, isclose

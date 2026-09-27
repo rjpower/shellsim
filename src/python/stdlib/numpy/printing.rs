@@ -1,107 +1,174 @@
-//! Array `repr` and `str`.
+//! Array printing: the ndarray `repr`/`str` slots and the native `_numpy_print` module.
 //!
-//! This is the minimal layout: elements joined with `, ` (repr) or a space (str), nested
-//! brackets per axis, and a `dtype=` suffix for dtypes other than the defaults NumPy omits.
-//! Column padding, float precision trimming, line wrapping, summarization, and print options
-//! are not modeled yet.
+//! The layout rules are NumPy's own Python code, ported in `numpy/_arrayprint.py`; the slots
+//! call its `_array_repr_implementation` and `_array_str_implementation`, which read the
+//! current print options. This module supplies the part that code needs natively: Dragon4
+//! digit generation as `dragon4_positional` and `dragon4_scientific`, with the argument
+//! conventions of NumPy's C functions, where `-1` means unset.
+//!
+//! A NumPy `float16` or `float32` scalar is formatted at its own precision, so its shortest
+//! digits identify it among values of that width. Any other argument is converted with
+//! `float()` and formatted as a double.
 
-use super::super::super::native::{PyResult, PyRuntime};
-use super::array::Array;
-use super::convert::{self, Element};
-use super::dtype::{Category, DType, Kind};
-use super::element::{read_number, Number};
-use super::format::{complex_repr, float_repr};
-use super::scalar::precision;
+use super::super::super::native::{
+    CallArgs, FunctionDef, ModuleDef, PyError, PyKind, PyResult, PyRuntime, PyValue,
+};
+use super::args::{float_arg, index_int, Bound, Signature};
+use super::dragon4::{self, Options, Trim};
+use super::element::Number;
+use super::format::Precision;
+use super::scalar::{precision, unbox_number};
 
-/// Text of one element inside an array.
-fn element_text(runtime: &mut dyn PyRuntime, array: &Array, offset: usize) -> PyResult<String> {
-    Ok(match convert::read_element(runtime, array, offset)? {
-        Element::Number(bytes) => match read_number(array.dtype.kind(), &bytes) {
-            Number::Bool(value) => if value { "True" } else { "False" }.to_string(),
-            Number::Int(value) => value.to_string(),
-            Number::UInt(value) => value.to_string(),
-            Number::Float(value) => trim_float(float_repr(value, precision(array.dtype))),
-            Number::Complex(real, imag) => complex_repr(real, imag, precision(array.dtype)),
+pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
+    name: "_numpy_print",
+    functions: &[
+        FunctionDef {
+            module: "numpy",
+            name: "dragon4_positional",
+            call: dragon4_positional,
         },
-        Element::Str(text) => format!("'{text}'"),
-        Element::Object(value) => runtime.repr(&value)?,
-    })
-}
+        FunctionDef {
+            module: "numpy",
+            name: "dragon4_scientific",
+            call: dragon4_scientific,
+        },
+    ],
+    values: &[],
+};
 
-/// NumPy prints integral floats as `1.` rather than `1.0`.
-fn trim_float(text: String) -> String {
-    match text.strip_suffix(".0") {
-        Some(stripped) => format!("{stripped}."),
-        None => text,
-    }
-}
-
-fn nested(
+/// `repr(array)` or `str(array)` through `numpy._arrayprint.<function>`.
+pub(in crate::python) fn array_text(
     runtime: &mut dyn PyRuntime,
-    array: &Array,
-    axis: usize,
-    offset: usize,
-    separator: &str,
-    indent: usize,
-) -> PyResult<String> {
-    if axis == array.ndim() {
-        return element_text(runtime, array, offset);
+    array: PyValue,
+    function: &str,
+) -> PyResult<PyValue> {
+    let module = runtime.import_module("numpy._arrayprint")?;
+    let implementation = runtime.get_attribute(module, function)?.ok_or_else(|| {
+        PyError::runtime_error(format!("numpy._arrayprint.{function} is missing"))
+    })?;
+    runtime.call_value(implementation, CallArgs::new(vec![array], Vec::new()))
+}
+
+/// The value to format and the precision whose shortest digits identify it.
+fn float_operand(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<(f64, Precision)> {
+    match unbox_number(runtime, value) {
+        Some((dtype, Number::Float(number))) => Ok((number, precision(dtype))),
+        Some((_, Number::Complex(..))) => Err(PyError::type_error(format!(
+            "must be real number, not {}",
+            runtime.type_name(value)?
+        ))),
+        _ => Ok((float_arg(runtime, value)?, Precision::Double)),
     }
-    let length = array.shape()[axis];
-    let stride = array.strides()[axis];
-    let mut parts = Vec::with_capacity(length);
-    for position in 0..length {
-        let offset = (offset as isize + position as isize * stride) as usize;
-        parts.push(nested(
-            runtime,
-            array,
-            axis + 1,
-            offset,
-            separator,
-            indent + 1,
-        )?);
-    }
-    let rows_separator = if axis + 1 < array.ndim() {
-        let blank_lines = "\n".repeat(array.ndim() - axis - 1);
-        format!(
-            "{}{blank_lines}{}",
-            separator.trim_end(),
-            " ".repeat(indent + 1)
-        )
-    } else {
-        separator.to_string()
+}
+
+/// An `int` option; NumPy converts these to a C `int`.
+fn int_option(
+    runtime: &mut dyn PyRuntime,
+    bound: &Bound,
+    name: &str,
+    default: i32,
+) -> PyResult<i32> {
+    let Some(value) = bound.get(name) else {
+        return Ok(default);
     };
-    Ok(format!("[{}]", parts.join(&rows_separator)))
+    let value = index_int(runtime, &value)?;
+    i32::try_from(value)
+        .map_err(|_| PyError::overflow_error("Python int too large to convert to C int"))
 }
 
-/// Whether `repr` omits the dtype, as NumPy does for its default dtypes.
-fn implicit_dtype(dtype: DType) -> bool {
-    matches!(
-        dtype.kind(),
-        Kind::Bool | Kind::Int64 | Kind::Float64 | Kind::Complex128
-    )
+fn trim_option(runtime: &mut dyn PyRuntime, bound: &Bound) -> PyResult<Trim> {
+    let Some(value) = bound.get("trim") else {
+        return Ok(Trim::Keep);
+    };
+    let code = match runtime.kind(&value)? {
+        PyKind::String => runtime.string_value(&value)?,
+        _ => None,
+    };
+    match code.as_deref().and_then(Trim::parse) {
+        Some(trim) => Ok(trim),
+        // NumPy formats the value with `%100S`, which right-aligns it in 100 columns.
+        None => Err(PyError::type_error(format!(
+            "if supplied, trim must be 'k', '.', '0' or '-' found `{:>100}`",
+            runtime.display(&value)?
+        ))),
+    }
 }
 
-pub(in crate::python) fn array_repr(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-) -> PyResult<String> {
-    runtime.charge_cpu(array.size() as u64 + 1)?;
-    let prefix = "array(";
-    let body = nested(runtime, array, 0, array.view.offset, ", ", prefix.len())?;
-    let show_dtype = !implicit_dtype(array.dtype) || array.size() == 0;
-    Ok(if show_dtype {
-        let dtype = match array.dtype.category() {
-            Category::Str => format!("'{}'", array.dtype.descr()),
-            _ => array.dtype.name(),
-        };
-        format!("{prefix}{body}, dtype={dtype})")
-    } else {
-        format!("{prefix}{body})")
-    })
+/// The options both entry points share.
+fn common_options(runtime: &mut dyn PyRuntime, bound: &Bound) -> PyResult<Options> {
+    let options = Options {
+        precision: int_option(runtime, bound, "precision", -1)?,
+        unique: int_option(runtime, bound, "unique", 1)? != 0,
+        sign: int_option(runtime, bound, "sign", 0)? != 0,
+        trim: trim_option(runtime, bound)?,
+        pad_left: int_option(runtime, bound, "pad_left", -1)?,
+        min_digits: int_option(runtime, bound, "min_digits", -1)?,
+        ..Options::new()
+    };
+    if !options.unique && options.precision < 0 {
+        return Err(PyError::type_error(
+            "in non-unique mode `precision` must be supplied",
+        ));
+    }
+    Ok(options)
 }
 
-pub(in crate::python) fn array_str(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<String> {
-    runtime.charge_cpu(array.size() as u64 + 1)?;
-    nested(runtime, array, 0, array.view.offset, " ", 0)
+/// `dragon4_positional(x, precision=-1, unique=1, fractional=0, sign=0, trim='k', pad_left=-1,
+/// pad_right=-1, min_digits=-1)`.
+fn dragon4_positional(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new(
+        "dragon4_positional",
+        &[
+            "x",
+            "precision",
+            "unique",
+            "fractional",
+            "sign",
+            "trim",
+            "pad_left",
+            "pad_right",
+            "min_digits",
+        ],
+        1,
+    );
+    let bound = SIGNATURE.bind(&args)?;
+    let (value, precision) = float_operand(runtime, &bound.required("x"))?;
+    let options = Options {
+        fractional: int_option(runtime, &bound, "fractional", 0)? != 0,
+        pad_right: int_option(runtime, &bound, "pad_right", -1)?,
+        ..common_options(runtime, &bound)?
+    };
+    let mut work = 0;
+    let text = dragon4::positional(value, precision, &options, &mut work)?;
+    runtime.charge_cpu(work)?;
+    runtime.new_string(text)
+}
+
+/// `dragon4_scientific(x, precision=-1, unique=1, sign=0, trim='k', pad_left=-1,
+/// exp_digits=-1, min_digits=-1)`.
+fn dragon4_scientific(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new(
+        "dragon4_scientific",
+        &[
+            "x",
+            "precision",
+            "unique",
+            "sign",
+            "trim",
+            "pad_left",
+            "exp_digits",
+            "min_digits",
+        ],
+        1,
+    );
+    let bound = SIGNATURE.bind(&args)?;
+    let (value, precision) = float_operand(runtime, &bound.required("x"))?;
+    let options = Options {
+        exp_digits: int_option(runtime, &bound, "exp_digits", -1)?,
+        ..common_options(runtime, &bound)?
+    };
+    let mut work = 0;
+    let text = dragon4::scientific(value, precision, &options, &mut work);
+    runtime.charge_cpu(work)?;
+    runtime.new_string(text)
 }

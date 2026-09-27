@@ -19,6 +19,7 @@ mod args;
 mod array;
 mod construct;
 mod convert;
+mod dragon4;
 mod dtype;
 mod dtype_object;
 mod element;
@@ -32,7 +33,6 @@ mod math;
 mod ndarray;
 mod ops;
 mod printing;
-mod printoptions;
 mod products;
 mod random;
 mod reduce;
@@ -102,7 +102,7 @@ pub(in crate::python) fn native_module(name: &str) -> Option<&'static ModuleDef>
         "_numpy_io" => &io::MODULE,
         "_numpy_math" => &math::MODULE,
         "_numpy_strings" => &strings::MODULE,
-        "_numpy_print" => &printoptions::MODULE,
+        "_numpy_print" => &printing::MODULE,
         _ => return None,
     })
 }

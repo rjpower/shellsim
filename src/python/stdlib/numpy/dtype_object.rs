@@ -40,6 +40,7 @@ pub(in crate::python) static DTYPE: ValueKindDef = ValueKindDef {
         getter("metadata", get_none),
         getter("base", get_base),
         getter("isbuiltin", get_isbuiltin),
+        getter("isnative", get_isnative),
         getter("hasobject", get_hasobject),
         getter("num", get_num),
     ],
@@ -193,6 +194,11 @@ fn get_base(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
 
 fn get_isbuiltin(_runtime: &mut dyn PyRuntime, _value: PyValue) -> PyResult {
     Ok(Value::Int(1))
+}
+
+/// Every modeled dtype stores elements in the host's byte order.
+fn get_isnative(_runtime: &mut dyn PyRuntime, _value: PyValue) -> PyResult {
+    Ok(Value::Bool(true))
 }
 
 fn get_hasobject(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {

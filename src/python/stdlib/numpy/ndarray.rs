@@ -755,18 +755,14 @@ pub(in crate::python) fn slot_repr(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    let array = receiver(runtime, value)?;
-    let text = super::printing::array_repr(runtime, &array)?;
-    runtime.new_string(text).map(Some)
+    super::printing::array_text(runtime, value, "_array_repr_implementation").map(Some)
 }
 
 pub(in crate::python) fn slot_str(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    let array = receiver(runtime, value)?;
-    let text = super::printing::array_str(runtime, &array)?;
-    runtime.new_string(text).map(Some)
+    super::printing::array_text(runtime, value, "_array_str_implementation").map(Some)
 }
 
 pub(in crate::python) fn slot_bool(

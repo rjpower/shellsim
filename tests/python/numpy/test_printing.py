@@ -408,3 +408,53 @@ def test_array2string_options():
     assert np.array2string(np.array([1e-6, 1.0]), suppress_small=True) == "[0.000001 1.      ]"
     assert np.array2string(np.arange(12), threshold=5) == "[ 0  1  2 ...  9 10 11]"
     assert np.array2string(np.array([[1, 2], [3, 4]]), separator=",", prefix="x = ") == "[[1,2],\n     [3,4]]"
+
+
+def test_format_float_positional_and_scientific():
+    assert np.format_float_positional(np.float32(np.pi)) == "3.1415927"
+    assert np.format_float_positional(np.float16(0.3), unique=False, precision=10) == "0.3000488281"
+    assert np.format_float_positional(0.1, precision=20, unique=False) == "0.10000000000000000555"
+    assert np.format_float_positional(1.5, pad_left=3, pad_right=4) == "  1.5   "
+    assert np.format_float_positional(1.0, trim="-") == "1"
+    assert np.format_float_scientific(np.float32(1.23e24), unique=False, precision=15) == (
+        "1.230000071797338e+24"
+    )
+    assert np.format_float_scientific(np.float32(1.23e24), exp_digits=4) == "1.23e+0024"
+    assert np.format_float_scientific(5e-324) == "5.e-324"
+
+
+def test_format_float_argument_errors():
+    for call, kind, message in [
+        (lambda: np.format_float_positional(1.5, unique=False), TypeError, "in non-unique mode `precision` must be supplied"),
+        (lambda: np.format_float_positional(1.5, precision=-1), ValueError, "precision must be >= 0"),
+        (lambda: np.format_float_positional(1.5, precision=2, min_digits=3), ValueError, "min_digits must be less than or equal to precision"),
+        (lambda: np.format_float_positional(1.5, fractional=False, precision=0), ValueError, "precision must be greater than 0 if fractional=False"),
+    ]:
+        try:
+            call()
+        except kind as error:
+            assert str(error) == message
+        else:
+            raise AssertionError(message)
+
+
+def test_sign_and_floatmode_options():
+    values = np.array([1.5, -2.0, 3.25])
+    assert np.array2string(values, sign=" ") == "[ 1.5  -2.    3.25]"
+    assert np.array2string(values, sign="+") == "[+1.5  -2.   +3.25]"
+    assert np.array2string(np.arange(3), sign="+") == "[+0 +1 +2]"
+    assert np.array2string(values, floatmode="fixed", precision=3) == "[ 1.500 -2.000  3.250]"
+    halves = np.array([0.5, 0.25])
+    assert np.array2string(halves, floatmode="maxprec_equal") == "[0.50 0.25]"
+    assert np.array2string(halves, floatmode="unique", precision=1) == "[0.5  0.25]"
+    assert np.array2string(halves, precision=1) == "[0.5 0.2]"
+
+
+def test_formatter_option():
+    assert np.array2string(np.arange(3.0), formatter={"float_kind": lambda x: "%.2f" % x}) == "[0.00 1.00 2.00]"
+    assert np.array2string(np.arange(3), formatter={"int": lambda x: hex(x)}) == "[0x0 0x1 0x2]"
+
+
+def test_dtypes_are_native_byte_order():
+    assert np.dtype(np.int32).isnative
+    assert np.dtype("U3").isnative

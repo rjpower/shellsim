@@ -29,6 +29,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "numpy" => Some(include_str!("source/numpy/__init__.py")),
         "numpy._arraypad" => Some(include_str!("source/numpy/_arraypad.py")),
         "numpy._arraysetops" => Some(include_str!("source/numpy/_arraysetops.py")),
+        "numpy._arrayprint" => Some(include_str!("source/numpy/_arrayprint.py")),
         "numpy._errstate" => Some(include_str!("source/numpy/_errstate.py")),
         "numpy._function_base" => Some(include_str!("source/numpy/_function_base.py")),
         "numpy._getlimits" => Some(include_str!("source/numpy/_getlimits.py")),
