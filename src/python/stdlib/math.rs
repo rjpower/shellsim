@@ -173,6 +173,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
         FunctionDef {
             module: "math",
+            name: "perm",
+            call: native_perm,
+        },
+        FunctionDef {
+            module: "math",
             name: "pow",
             call: native_pow,
         },
@@ -395,6 +400,45 @@ fn native_comb(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     for index in 1..=count {
         runtime.charge_cpu(result.bits().div_ceil(64).saturating_add(1))?;
         result = result * (&n - &selected + index) / index;
+    }
+    runtime.new_integer(&result.to_string())
+}
+
+/// Compute exact permutations `n! / (n - k)!` (`n!` when `k` is omitted or `None`), bounding work
+/// and result storage before multiplication as [`native_comb`] does.
+fn native_perm(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("math.perm", 1, 2)?;
+    args.reject_keywords("math.perm")?;
+    let n = integer_argument(runtime, &args.positional()[0], "perm")?;
+    let k = match args.positional().get(1) {
+        Some(value) if runtime.kind(value)? != PyKind::None => {
+            integer_argument(runtime, value, "perm")?
+        }
+        _ => n.clone(),
+    };
+    if n.is_negative() {
+        return Err(PyError::value_error("n must be a non-negative integer"));
+    }
+    if k.is_negative() {
+        return Err(PyError::value_error("k must be a non-negative integer"));
+    }
+    if k > n {
+        return runtime.new_integer("0");
+    }
+    let count = k
+        .to_usize()
+        .ok_or_else(|| PyError::resource_error("permutation length is too large"))?;
+    if count > 100_000 {
+        return Err(PyError::resource_error("permutation length is too large"));
+    }
+    let bytes = bigint_bytes(&n)?
+        .checked_mul(count.saturating_add(1))
+        .ok_or_else(|| PyError::resource_error("permutation result is too large"))?;
+    runtime.reserve_memory(bytes)?;
+    let mut result = BigInt::from(1_u8);
+    for index in 0..count {
+        runtime.charge_cpu(result.bits().div_ceil(64).saturating_add(1))?;
+        result *= &n - index;
     }
     runtime.new_integer(&result.to_string())
 }
