@@ -341,6 +341,42 @@ def test_percent_formatting_matches_cpython():
         raise AssertionError("%x accepted a float")
 
 
+def test_dict_constructor_accepts_mappings_pairs_and_keywords():
+    class Mapping:
+        def keys(self):
+            return ["x", "y"]
+
+        def __getitem__(self, key):
+            return key.upper()
+
+    assert dict() == {}
+    assert dict([(1, 2), ("a", "b")]) == {1: 2, "a": "b"}
+    assert dict(zip("ab", [1, 2])) == {"a": 1, "b": 2}
+    assert dict((key, key * 2) for key in range(3)) == {0: 0, 1: 2, 2: 4}
+    assert dict(["ab", "cd"]) == {"a": "b", "c": "d"}
+    assert dict({"a": 1}, b=2, a=3) == {"a": 3, "b": 2}
+    assert dict(Mapping(), x=5) == {"x": 5, "y": "Y"}
+    assert dict({1: 2}.items()) == {1: 2}
+    assert list(dict([(2, "a"), (1, "b"), (2, "c")]).items()) == [(2, "c"), (1, "b")]
+    source = {"a": 1}
+    copy = dict(source)
+    copy["b"] = 2
+    assert source == {"a": 1}
+    _assert_raises(lambda: dict([], []), TypeError, "dict expected at most 1 argument, got 2")
+    _assert_raises(lambda: dict(5), TypeError, "'int' object is not iterable")
+    _assert_raises(lambda: dict([(1, 2), 3]), TypeError, "object is not iterable")
+    _assert_raises(
+        lambda: dict([(1, 2, 3)]),
+        ValueError,
+        "dictionary update sequence element #0 has length 3; 2 is required",
+    )
+    _assert_raises(
+        lambda: dict(["ab", "c"]),
+        ValueError,
+        "dictionary update sequence element #1 has length 1; 2 is required",
+    )
+
+
 def test_bytes_affixes_membership_find_and_join():
     for value in (b"abcab", bytearray(b"abcab")):
         assert value.startswith((b"x", b"ab")) and not value.startswith(())

@@ -1000,24 +1000,7 @@ impl Vm<'_> {
                 values[index] = value;
             }
             Object::Dict(_) | Object::DefaultDict { .. } => {
-                if let Some(position) = self.find_mapping_entry(id, &index)? {
-                    let entries = match self.state.heap.get_mut(id)? {
-                        Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
-                        _ => unreachable!(),
-                    };
-                    entries.set_value(position, value);
-                } else {
-                    self.state.heap.reserve_object_growth(
-                        id,
-                        MODELED_MAPPING_ENTRY_BYTES,
-                        &mut self.interp.resources,
-                    )?;
-                    let entries = match self.state.heap.get_mut(id)? {
-                        Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
-                        _ => unreachable!(),
-                    };
-                    entries.push((index, value));
-                }
+                self.dict_set_entry(id, index, value)?
             }
             // Item assignment on these would be a shellsim gap, not a CPython TypeError.
             Object::ByteArray(_) | Object::ArrayStorage(_) | Object::Array { .. } => {
@@ -2074,12 +2057,122 @@ impl Vm<'_> {
     /// Construction is centralized here so type identity, `type()`, and calling a type do not
     /// depend on the unrelated builtin-function dispatch table. Collection construction remains
     /// metered through the normal iterator and allocation paths.
+    /// `d[key] = value` for the dict `id`: replace the value of an equal key, or append the pair.
+    fn dict_set_entry(&mut self, id: ObjectId, key: Value, value: Value) -> Result<(), String> {
+        if let Some(position) = self.find_mapping_entry(id, &key)? {
+            let entries = match self.state.heap.get_mut(id)? {
+                Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
+                _ => unreachable!("dict kind was checked during lookup"),
+            };
+            entries.set_value(position, value);
+            return Ok(());
+        }
+        self.state.heap.reserve_object_growth(
+            id,
+            MODELED_MAPPING_ENTRY_BYTES,
+            &mut self.interp.resources,
+        )?;
+        let entries = match self.state.heap.get_mut(id)? {
+            Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
+            _ => unreachable!("dict kind was checked during lookup"),
+        };
+        entries.push((key, value));
+        Ok(())
+    }
+
+    /// `dict(source=(), /, **keywords)`: the entries of a mapping (a dict, or any object with
+    /// `keys()` and `__getitem__`) or the pairs of an iterable, followed by the keywords.
+    fn construct_dict(
+        &mut self,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<Value, String> {
+        if arguments.len() > 1 {
+            let message = format!("dict expected at most 1 argument, got {}", arguments.len());
+            return Err(self.raise_exception("TypeError", message));
+        }
+        let dict = self.allocate_object(Object::Dict(Vec::new().into()))?;
+        let id = dict.object_id().expect("dicts are arena objects");
+        if let Some(source) = arguments.first() {
+            for (key, value) in self.dict_source_entries(source)? {
+                self.charge_cpu(1)?;
+                self.dict_set_entry(id, key, value)?;
+            }
+        }
+        for (name, value) in keyword_arguments {
+            let key = self.allocate_string(name)?;
+            self.dict_set_entry(id, key, value)?;
+        }
+        Ok(dict)
+    }
+
+    fn dict_source_entries(&mut self, source: &Value) -> Result<Vec<(Value, Value)>, String> {
+        if let Some(id) = source.object_id() {
+            if let Object::Dict(entries) | Object::DefaultDict { entries, .. } =
+                self.state.heap.get(id)?
+            {
+                return Ok(entries.to_vec());
+            }
+        }
+        if let Some(keys) = self.resolve_optional_attribute(*source, "keys")? {
+            let keys = <Self as PyRuntime>::call_value(
+                self,
+                keys,
+                super::CallArgs::new(Vec::new(), Vec::new()),
+            )
+            .map_err(|error| self.record_native_error(error))?;
+            let mut entries = Vec::new();
+            for key in self.iterable_values(&keys)? {
+                let Some(value) =
+                    self.invoke_slot(source, Slot::GetItem, "__getitem__", vec![key])?
+                else {
+                    return Err(self.raise_object_type_error(source, "is not subscriptable"));
+                };
+                entries.push((key, value));
+            }
+            return Ok(entries);
+        }
+        let mut entries = Vec::new();
+        for (index, item) in self.iterable_values(source)?.into_iter().enumerate() {
+            let pair = match self.iterable_values(&item) {
+                Ok(pair) => pair,
+                // CPython 3.14 replaces the "'int' object is not iterable" of a non-iterable
+                // element with a message that omits the type name.
+                Err(message)
+                    if message.ends_with("object is not iterable")
+                        && self
+                            .pending_exception
+                            .as_ref()
+                            .is_some_and(|exception| exception.kind == "TypeError") =>
+                {
+                    self.pending_exception = None;
+                    return Err(self.raise_exception("TypeError", "object is not iterable"));
+                }
+                Err(error) => return Err(error),
+            };
+            let [key, value] = pair.as_slice() else {
+                let message = format!(
+                    "dictionary update sequence element #{index} has length {}; 2 is required",
+                    pair.len()
+                );
+                return Err(self.raise_exception("ValueError", message));
+            };
+            entries.push((*key, *value));
+        }
+        Ok(entries)
+    }
+
     pub(super) fn call_builtin_type(
         &mut self,
         builtin_type: BuiltinType,
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
     ) -> Result<CallResult, String> {
+        if builtin_type == BuiltinType::Dict {
+            return self
+                .construct_dict(arguments, keyword_arguments)
+                .map(CallResult::Value);
+        }
         if builtin_type == BuiltinType::Complex {
             let arguments = super::CallArgs::new(arguments, keyword_arguments);
             let value = super::super::complex::construct(self, arguments)
@@ -2386,24 +2479,7 @@ impl Vm<'_> {
                 };
                 self.allocate_object(object)?
             }
-            BuiltinType::Dict => {
-                expect_arity(&arguments, 0, 1)?;
-                let entries = match arguments.first() {
-                    None => Vec::new(),
-                    Some(value) if value.object_id().is_some() => {
-                        match self.state.heap.get(value.object_id().unwrap())? {
-                            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                                entries.to_vec()
-                            }
-                            _ => {
-                                return Err("dict() argument is not a mapping in this slice".into())
-                            }
-                        }
-                    }
-                    Some(_) => return Err("dict() argument is not a mapping in this slice".into()),
-                };
-                self.allocate_object(Object::Dict(entries.into()))?
-            }
+            BuiltinType::Dict => unreachable!("dict construction returned above"),
             BuiltinType::Function
             | BuiltinType::Module
             | BuiltinType::Iterator
