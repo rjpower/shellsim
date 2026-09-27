@@ -275,12 +275,14 @@ def test_builtin_exceptions_keep_their_constructor_arguments():
 
 
 def test_key_errors_from_lookups_carry_the_key():
+    # The templates are variables so that linters do not reject their missing keys.
+    field, mapping_field = "{name}", "%(name)s"
     for operation, key in [
         (lambda: {}["missing"], "missing"),
         (lambda: {}.pop(("a", 1)), ("a", 1)),
         (lambda: set().remove(3), 3),
-        (lambda: "{name}".format(), "name"),
-        (lambda: "%(name)s" % {}, "name"),
+        (lambda: field.format(), "name"),
+        (lambda: mapping_field % {}, "name"),
     ]:
         try:
             operation()
