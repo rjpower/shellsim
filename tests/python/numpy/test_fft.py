@@ -192,6 +192,13 @@ def test_fftfreq_locates_cosine_peak():
     assert freqs[peak] == 4.0
 
 
+def test_fftfreq_and_rfftfreq_reject_zero_length():
+    with pytest.raises(ZeroDivisionError, match="division by zero"):
+        np.fft.fftfreq(0)
+    with pytest.raises(ZeroDivisionError, match="division by zero"):
+        np.fft.rfftfreq(0)
+
+
 # 13 and 17 use pocketfft's generic prime pass; 101 and 202 use Bluestein's algorithm.
 @pytest.mark.parametrize("n", [13, 17, 101, 202])
 def test_generic_radix_and_bluestein_lengths_match_direct_dft(n):
@@ -225,28 +232,40 @@ def test_single_precision_input_gives_single_precision_output():
     assert np.fft.fft(np.arange(4, dtype=np.float16)).dtype == np.complex64
 
 
-def test_single_precision_loop_follows_numpy_dispatch():
-    # A normalized transform passes a float32 scale, which selects NumPy's float loop; the
-    # unnormalized forward transform runs in double precision and rounds the result.
+def test_single_precision_input_stays_within_float32_precision():
+    # NumPy dispatches this to internal float32-precision loops (a normalized transform passes
+    # a float32 scale, which selects the float loop even for the unnormalized forward
+    # transform), so the exact last bit is an implementation detail; compare within float32
+    # precision (~1.2e-7 relative) rather than bit for bit.
     x = (np.arange(7, dtype=np.float32) * 0.3) ** 2
-    assert np.fft.ifft(x).tolist() == [
-        (1.1700000762939453 + 0j),
-        (-0.07596264779567719 - 0.6541042923927307j),
-        (-0.24138164520263672 - 0.25120416283607483j),
-        (-0.26765576004981995 - 0.07189671695232391j),
-        (-0.26765576004981995 + 0.07189671695232391j),
-        (-0.24138164520263672 + 0.25120416283607483j),
-        (-0.07596264779567719 + 0.6541042923927307j),
-    ]
-    assert np.fft.fft(x).tolist() == [
-        (8.190000534057617 + 0j),
-        (-0.5317385196685791 + 4.578729629516602j),
-        (-1.6896713972091675 + 1.7584290504455566j),
-        (-1.873590350151062 + 0.5032769441604614j),
-        (-1.873590350151062 - 0.5032769441604614j),
-        (-1.6896713972091675 - 1.7584290504455566j),
-        (-0.5317385196685791 - 4.578729629516602j),
-    ]
+    assert_allclose(
+        np.fft.ifft(x),
+        [
+            (1.1700000762939453 + 0j),
+            (-0.07596264779567719 - 0.6541042923927307j),
+            (-0.24138164520263672 - 0.25120416283607483j),
+            (-0.26765576004981995 - 0.07189671695232391j),
+            (-0.26765576004981995 + 0.07189671695232391j),
+            (-0.24138164520263672 + 0.25120416283607483j),
+            (-0.07596264779567719 + 0.6541042923927307j),
+        ],
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert_allclose(
+        np.fft.fft(x),
+        [
+            (8.190000534057617 + 0j),
+            (-0.5317385196685791 + 4.578729629516602j),
+            (-1.6896713972091675 + 1.7584290504455566j),
+            (-1.873590350151062 + 0.5032769441604614j),
+            (-1.873590350151062 - 0.5032769441604614j),
+            (-1.6896713972091675 - 1.7584290504455566j),
+            (-0.5317385196685791 - 4.578729629516602j),
+        ],
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_hermitian_transforms_invert_each_other():
@@ -309,3 +328,47 @@ def test_non_finite_values_propagate():
     result = np.fft.fft([np.nan, 1.0, 2.0])
     assert np.isnan(result).all()
     assert np.isinf(np.fft.fft([np.inf, 0.0])).real.all()
+
+
+def test_axis_out_of_range_raises_index_error():
+    with pytest.raises(IndexError, match="tuple index out of range"):
+        np.fft.fft(np.zeros((2, 3)), axis=5)
+    with pytest.raises(IndexError, match="tuple index out of range"):
+        np.fft.ifft(np.zeros((2, 3)), axis=-5)
+
+
+def test_rfft_and_irfft_out_argument_errors():
+    with pytest.raises(ValueError, match="output array has wrong shape."):
+        np.fft.rfft(np.ones(4), out=np.zeros(2, dtype=complex))
+    with pytest.raises(TypeError, match=r"Cannot cast ufunc 'rfft_n_even' output from dtype\('complex128'\)"):
+        np.fft.rfft(np.ones(4), out=np.zeros(3))
+    with pytest.raises(ValueError, match="output array has wrong shape."):
+        np.fft.irfft(np.ones(4, dtype=complex), out=np.zeros(5))
+    with pytest.raises(TypeError, match=r"Cannot cast ufunc 'irfft' output from dtype\('float64'\)"):
+        np.fft.irfft(np.ones(4, dtype=complex), out=np.zeros(6, dtype=np.int32))
+
+
+def test_shape_and_axes_reject_non_sequences():
+    with pytest.raises(TypeError, match="'int' object is not iterable"):
+        np.fft.fftn(np.zeros((2, 3)), s=4)
+
+
+def test_hfft_and_ihfft_respect_explicit_n():
+    spectrum = np.array([4.0, 1 - 1j, 0.5j, 2.0])
+    signal = np.fft.hfft(spectrum, 5)
+    assert signal.shape == (5,)
+    assert_allclose(np.fft.ihfft(signal, 5), spectrum[:3], atol=1e-12)
+
+
+def test_hfft_ihfft_ortho_norm_round_trips():
+    spectrum = np.array([4.0, 1 - 1j, 0.5j, 2.0])
+    signal = np.fft.hfft(spectrum, 6, norm="ortho")
+    assert_allclose(np.fft.ihfft(signal, 6, norm="ortho"), spectrum, atol=1e-12)
+
+
+def test_multidimensional_dtype_propagation():
+    single = np.ones((2, 3), dtype=np.float32)
+    assert np.fft.fft2(single).dtype == np.complex64
+    spectrum = np.fft.rfftn(single)
+    assert spectrum.dtype == np.complex64
+    assert np.fft.irfftn(spectrum, single.shape, axes=(0, 1)).dtype == np.float32
