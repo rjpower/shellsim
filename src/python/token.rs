@@ -64,6 +64,7 @@ pub enum TokenKind {
     GreaterEqual,
     Dot,
     At,
+    AtEqual,
     Comma,
     LeftParen,
     RightParen,
