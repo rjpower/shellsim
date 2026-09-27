@@ -77,6 +77,10 @@ work, and `float64` and `complex128` derive from Python's `float` and `complex`.
 arithmetic shares the ufuncs' element semantics, so it wraps, promotes, and reports
 floating-point errors as NumPy does.
 
+Array and scalar operators follow NEP 13's opt-out: when the other operand's type sets
+`__array_ufunc__ = None`, the operator returns `NotImplemented` and Python calls that operand's
+reflected method, which is how `pytest.approx` compares arrays.
+
 ## Compatibility contract
 
 The portable suites in `tests/python/numpy/` are the contract. Each file states literal

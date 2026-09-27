@@ -193,7 +193,8 @@ synchronous calls made inside a coroutine retain their usual blocking behavior.
 
 The bounded `pytest` runner supports ordinary and yield fixtures, fixture dependencies,
 `@pytest.mark.parametrize`, `tmp_path`/`tmpdir`, skip markers, `pytest.raises` with exception
-tuples and `match`, and explicit test files. Parametrized values are evaluated when the test module
+tuples and `match`, `pytest.warns`, `pytest.approx` (numbers, lists, tuples, dicts and NumPy
+arrays), and explicit test files. Parametrized values are evaluated when the test module
 runs, so they may be any expression, and stacked decorators vary the topmost fastest, as in
 pytest. Fixture scopes, `pytest.param` and custom `ids` remain outside this small runner. `unittest`
 supports straightforward test classes. Unsupported syntax and runner features produce an error

@@ -361,3 +361,46 @@ def test_missing_warning():
          Emitted warnings: [UserWarning('careful')].\n"
     );
 }
+
+#[test]
+fn approx_compares_numbers_containers_and_arrays_within_tolerance() {
+    let source = r#"import numpy as np
+import pytest
+
+def test_scalars():
+    assert 0.1 + 0.2 == pytest.approx(0.3)
+    assert 0.2 != pytest.approx(0.21)
+    assert 1.0005 == pytest.approx(1.0, abs=1e-3)
+    assert 1.0005 == pytest.approx(1.0, rel=1e-3, abs=0)
+    assert float("nan") != pytest.approx(float("nan"))
+    assert float("nan") == pytest.approx(float("nan"), nan_ok=True)
+    assert 2.8 + 2.8j == pytest.approx(2.8000001 + 2.8j)
+    assert None == pytest.approx(None)
+    assert repr(pytest.approx(0.2)) == "0.2 ± 2.0e-07"
+    assert repr(pytest.approx(float("nan"))) == "nan ± ???"
+
+def test_containers():
+    assert [1, 2] == pytest.approx((1, 2.0000001))
+    assert {"a": 1.0} == pytest.approx({"a": 1.0000001})
+    assert [1.0, 1.0] != pytest.approx(1.0)
+    assert repr(pytest.approx([0.2, 1])) == "approx([0.2 ± 2.0e-07, 1 ± 1.0e-06])"
+
+def test_arrays():
+    assert np.array([1.0, 1.0000001]) == pytest.approx(1.0)
+    assert np.array([1.0, 1.1]) != pytest.approx(1.0)
+    assert np.array([1.0, 2.0]) == pytest.approx([1.0, 2.0])
+    assert np.array([[1.0, 2.0]]) != pytest.approx(np.array([1.0, 2.0]))
+    assert np.array(0.2) == pytest.approx(0.2)
+
+def test_negative_tolerance():
+    with pytest.raises(ValueError, match="absolute tolerance can't be negative: -1"):
+        0.2 == pytest.approx(1.0, abs=-1)
+
+def test_nested_sequences():
+    with pytest.raises(TypeError, match="does not support nested data structures"):
+        pytest.approx([[1.0]])
+"#;
+    let (status, stdout, stderr) = run_pytest(source, "pytest /test_sample.py");
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stdout));
+    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+}

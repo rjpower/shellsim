@@ -941,3 +941,28 @@ def test_vectorize_with_otypes_accepts_empty_input():
     result = np.vectorize(lambda x: x, otypes="d")(np.array([]))
     assert result.dtype == np.float64
     assert result.shape == (0,)
+
+
+class _OptsOut:
+    """Declines NumPy's operators (NEP 13), so Python asks its reflected methods instead."""
+
+    __array_ufunc__ = None
+
+    def __eq__(self, other):
+        return "eq"
+
+    def __radd__(self, other):
+        return "radd"
+
+    def __rmatmul__(self, other):
+        return "rmatmul"
+
+
+def test_operators_defer_to_operands_that_opt_out_of_ufuncs():
+    array = np.array([1.0, 2.0])
+    assert (array == _OptsOut()) == "eq"
+    assert array + _OptsOut() == "radd"
+    assert array @ _OptsOut() == "rmatmul"
+    assert np.float64(1.0) + _OptsOut() == "radd"
+    with pytest.raises(TypeError, match="unsupported operand type"):
+        array - _OptsOut()

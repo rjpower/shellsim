@@ -1668,6 +1668,9 @@ pub(in crate::python) fn slot_divmod(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
+    if defers_to(runtime, right)? {
+        return Ok(None);
+    }
     divmod(runtime, &[left, right], &Options::operator(), [None, None]).map(Some)
 }
 
@@ -1676,6 +1679,9 @@ pub(in crate::python) fn slot_reflected_divmod(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
+    if defers_to(runtime, right)? {
+        return Ok(None);
+    }
     divmod(runtime, &[right, left], &Options::operator(), [None, None]).map(Some)
 }
 
@@ -2626,6 +2632,9 @@ macro_rules! operator_slots {
                 left: PyValue,
                 right: PyValue,
             ) -> PyResult<Option<PyValue>> {
+                if defers_to(runtime, right)? {
+                    return Ok(None);
+                }
                 apply(runtime, named($name), &[left, right], &Options::operator()).map(Some)
             }
 
@@ -2634,10 +2643,28 @@ macro_rules! operator_slots {
                 left: PyValue,
                 right: PyValue,
             ) -> PyResult<Option<PyValue>> {
+                if defers_to(runtime, right)? {
+                    return Ok(None);
+                }
                 apply(runtime, named($name), &[right, left], &Options::operator()).map(Some)
             }
         )*
     };
+}
+
+/// NEP 13's opt-out: an operand whose type sets `__array_ufunc__ = None` does not take part in
+/// NumPy's operators, so an array or NumPy scalar operator returns `NotImplemented` and Python
+/// tries the operand's reflected method instead. `pytest.approx` relies on this to compare
+/// arrays itself. Every operator slot receives the array as `left` and the other operand as
+/// `right`, reflected slots included.
+pub(in crate::python) fn defers_to(runtime: &mut dyn PyRuntime, other: PyValue) -> PyResult<bool> {
+    if runtime.kind(&other)? != PyKind::Instance {
+        return Ok(false);
+    }
+    match runtime.get_attribute(other, "__array_ufunc__")? {
+        Some(value) => Ok(runtime.kind(&value)? == PyKind::None),
+        None => Ok(false),
+    }
 }
 
 operator_slots! {
@@ -2660,6 +2687,9 @@ pub(in crate::python) fn slot_power(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
+    if defers_to(runtime, right)? {
+        return Ok(None);
+    }
     if let Some(name) = fast_power(runtime, left, right)? {
         return apply(runtime, named(name), &[left], &Options::operator()).map(Some);
     }
@@ -2677,6 +2707,9 @@ pub(in crate::python) fn slot_reflected_power(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
+    if defers_to(runtime, right)? {
+        return Ok(None);
+    }
     apply(
         runtime,
         named("power"),
@@ -2739,6 +2772,9 @@ macro_rules! comparison_slots {
                 left: PyValue,
                 right: PyValue,
             ) -> PyResult<Option<PyValue>> {
+                if defers_to(runtime, right)? {
+                    return Ok(None);
+                }
                 apply(runtime, named($name), &[left, right], &Options::operator()).map(Some)
             }
         )*
@@ -2771,6 +2807,9 @@ fn equality(
     name: &str,
     unequal: bool,
 ) -> PyResult<Option<PyValue>> {
+    if defers_to(runtime, right)? {
+        return Ok(None);
+    }
     let error = match apply(runtime, named(name), &[left, right], &Options::operator()) {
         Ok(value) => return Ok(Some(value)),
         Err(error) => error,

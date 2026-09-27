@@ -918,6 +918,9 @@ pub(in crate::python) fn slot_matrix_multiply(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
+    if super::ufunc::defers_to(runtime, right)? {
+        return Ok(None);
+    }
     super::products::matmul(runtime, left, right).map(Some)
 }
 
@@ -926,6 +929,9 @@ pub(in crate::python) fn slot_reflected_matrix_multiply(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
+    if super::ufunc::defers_to(runtime, right)? {
+        return Ok(None);
+    }
     super::products::matmul(runtime, right, left).map(Some)
 }
 
